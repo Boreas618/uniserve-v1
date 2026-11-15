@@ -38,7 +38,7 @@ use storage::runtime::{
     Completion, GroupId, Open, OwnerId, Request, RequestId, Stamps, Tier, VERSION,
 };
 
-use super::{Block, BufferPool, ClientId, Copy, Deferred, Held, QueueId, SLOT, Target};
+use super::{Block, BufferPool, ClientId, Copy, Deferred, Encoding, Held, QueueId, SLOT, Target};
 
 /// A task: the queue pair and the number of the request that started it.
 type Task = (QueueId, RequestId);
@@ -62,6 +62,7 @@ const GRANT: u8 = 14;
 const WITHDRAW: u8 = 15;
 /// The kind of the records of the completions beside the inputs.
 const COMPLETION: u8 = 16;
+const PEER_COPIES: u8 = 17;
 
 /// The bytes a trace buffers before it writes them out.
 const BUFFER: usize = 1 << 20;
@@ -96,6 +97,9 @@ pub(crate) enum Input {
     /// unit and its units, or withdrawn.
     Grant(String, Segment, u32, u32),
     Withdraw(String, Segment),
+    /// What the peers hold of a prefetch's keys: per copy of the task, in
+    /// order, the encoding of the peer's host copy it reads, if any.
+    PeerCopies(Task, Vec<Option<Encoding>>),
 }
 
 impl Input {
@@ -179,6 +183,18 @@ impl Input {
                 body.extend_from_slice(region.as_bytes());
                 WITHDRAW
             }
+            Self::PeerCopies(task, held) => {
+                tasked(&mut body, *task);
+                // Per copy a byte, 1 when its encoding's two digests follow.
+                for encoding in held {
+                    body.push(u8::from(encoding.is_some()));
+                    if let Some((tensors, layout)) = encoding {
+                        body.extend_from_slice(tensors);
+                        body.extend_from_slice(layout);
+                    }
+                }
+                PEER_COPIES
+            }
         };
         Ok((kind, body))
     }
@@ -230,6 +246,17 @@ impl Input {
             WITHDRAW => {
                 let segment = segment(body)?;
                 Self::Withdraw(named(body)?, segment)
+            }
+            PEER_COPIES => {
+                let task = task(body)?;
+                let mut held = Vec::new();
+                while !body.is_empty() {
+                    held.push(match field::<1>(body)? {
+                        [0] => None,
+                        _ => Some((field(body)?, field(body)?)),
+                    });
+                }
+                Self::PeerCopies(task, held)
             }
             other => return Err(format!("no input is of the kind {other}")),
         };
@@ -494,6 +521,9 @@ pub(crate) fn apply(pool: &mut BufferPool, input: &Input) -> Result<(), String> 
                 let _ = pool.withdraw_segment(number, *segment);
             }
         }
+        Input::PeerCopies(task, held) => {
+            pool.peer_copies(*task, held);
+        }
     }
     Ok(())
 }
@@ -743,6 +773,12 @@ pub(crate) fn stated_input(pool: &BufferPool, names: &SessionNames, input: &Inpu
         Input::ReleasePeer(_) => "release-peer".into(),
         Input::Grant(..) => "grant".into(),
         Input::Withdraw(..) => "withdraw".into(),
+        Input::PeerCopies(_, held) => format!(
+            "peer-copies held={}",
+            held.iter()
+                .take_while(|encoding| encoding.is_some())
+                .count()
+        ),
     }
 }
 
@@ -1565,6 +1601,7 @@ mod tests {
             Input::ReleasePeer(15),
             Input::Grant("units".into(), segment, 16, 17),
             Input::Withdraw("units".into(), segment),
+            Input::PeerCopies(task, vec![Some(([18; 32], [19; 32])), None]),
         ];
         let mut kinds = Vec::new();
         for input in inputs {
@@ -1574,7 +1611,7 @@ mod tests {
             kinds.push(kind);
         }
         kinds.dedup();
-        assert_eq!(kinds.len(), 16, "each input has a kind of its own");
+        assert_eq!(kinds.len(), 17, "each input has a kind of its own");
     }
 
     /// The replay of a run's traces: `replay.sh` runs it with the run's

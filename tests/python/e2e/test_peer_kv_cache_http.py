@@ -24,9 +24,11 @@ request, ``specs/buffer-pool.md`` §12.4).
 **Converted reuse across hosts.** Deployment B keeps its device KV blocks in
 FP8 (``kv_cache_config.dtype=float8_e4m3fn``) while A keeps BF16: a key
 names the tokens and the weights that compute them, not the cache's
-precision, so B's prefetch brings A's BF16 host copies, and B's load
-converts each through a staging block into its FP8 device block
-(``specs/buffer-pool.md`` §13, §20), as B's own writes encode it. B's
+precision, so B's prefetch finds A's BF16 host copies, which A's Storage
+Server states in the encoding A's class wrote them in; B's buffer pool reads
+them into its converted-load source region (``Class::source``), and B's load
+converts each into its FP8 device block (``specs/buffer-pool.md`` §13, §20),
+as B's own writes encode it. B's
 ``prefix_cache_peer_hits`` grows by the prompt's full blocks, and its greedy
 answer over the converted blocks agrees with its answer over the same
 prompt's blocks it computed and wrote itself (another ``cache_salt``, asked
@@ -74,6 +76,7 @@ from tests.python.e2e.http_helpers import (
     qwen3_checkpoint,
     require_uniserve_binary,
     server_process,
+    stop_remote_storage_server,
     stop_storage_server,
     tokens_found,
     wait_until,
@@ -339,14 +342,8 @@ def _follower_deployment(
                 process.wait(timeout=120)
             except subprocess.TimeoutExpired:
                 process.kill()
-            kept = shlex.quote(str(log.with_suffix(".storage.log")))
-            # The bracket keeps the pattern from matching the shell that runs
-            # it.
-            server = shlex.quote(f"[s]torage-server serve.*{socket}")
-            _on_follower(
-                f"pkill -TERM -f {server}; "
-                f"cp {runtime}/uniserve/storage-server.log {kept} "
-                f"2>/dev/null; rm -rf {runtime}; true"
+            stop_remote_storage_server(
+                FOLLOWER, runtime, log.with_suffix(".storage.log")
             )
 
 

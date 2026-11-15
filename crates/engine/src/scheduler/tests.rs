@@ -152,6 +152,7 @@ fn built(
         state_in_slot: false,
         tensors: [0; 32],
         encoding: [0; 32],
+        source: None,
     };
     let layout = runtime::Open {
         version: runtime::VERSION,

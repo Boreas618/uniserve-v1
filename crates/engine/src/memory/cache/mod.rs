@@ -78,7 +78,7 @@ mod tables;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use self::info::{PoolConversion, PrefixCacheInfo};
+use self::info::PrefixCacheInfo;
 use nn::{KvCache, KvPlanes};
 use platform::{DeviceId, Event, Stream};
 use storage::runtime::Run;
@@ -598,6 +598,14 @@ impl KvCacheMemory {
         })
     }
 
+    /// Whether `region` is a cache group's converted-load source region, whose pages the cache
+    /// converts into its own representation as it loads them ([`Self::copy`]).
+    pub(crate) fn converts_from(&self, region: u8) -> bool {
+        self.regions
+            .as_ref()
+            .is_some_and(|regions| regions.sources.contains(&Some(region)))
+    }
+
     /// Applies `changes`, the rank's device block table's changes since the last batch
     /// (`BlockTables::take_changes`), on `stream` for a cache on a device and with `None` for
     /// one that holds none: the units of each entry the buffer pool allocated since are reset
@@ -659,12 +667,12 @@ impl KvCacheMemory {
     /// Maps the cache's host tier: part `part` (the rank's index in its worker group) of each
     /// cache group's host region at the rank's host's Storage Server through `client`, whose
     /// copies run on `stream`, the rank's copy stream. `regions` names, per cache group, the host
-    /// region of its pages as the
-    /// session's layout states it (unit `u` of the region is page `u` of the group), or `None`
-    /// for a group whose pages have no host copy; the open session must state them. A cache
-    /// that admits converted loads also takes its source buffers and conversion scratch, and
-    /// launches its conversions with `kernels`. Returns what the rank reports of each group's
-    /// converted loads, in group order; empty for a cache that converts none.
+    /// region of its pages as the session's layout states it (unit `u` of the region is page `u`
+    /// of the group), or `None` for a group whose pages have no host copy, and `sources` its
+    /// converted-load source region (unit `u` is slot `u` of the group's source buffer), or
+    /// `None` for a group that converts none; the open session must state them. A cache that
+    /// admits converted loads takes its part of each source region as the group's source buffer,
+    /// with its conversion scratch, and launches its conversions with `kernels`.
     ///
     /// # Errors
     ///
@@ -673,10 +681,10 @@ impl KvCacheMemory {
     pub(crate) fn map_host_parts(
         &mut self,
         client: &StorageClient,
-        (regions, part): (&[Option<&str>], u32),
+        (regions, sources, part): (&[Option<&str>], &[Option<&str>], u32),
         stream: Stream,
         kernels: Arc<ops::Generation>,
-    ) -> Result<Vec<PoolConversion>> {
+    ) -> Result<()> {
         let device = self.planes.device_id().ok_or(Error::State(
             "the cache holds no device: it maps no host tier",
         ))?;
@@ -685,21 +693,25 @@ impl KvCacheMemory {
         }
 
         let layout = &self.config.layout;
-        if regions.len() != layout.groups.len() {
+        if regions.len() != layout.groups.len() || sources.len() != layout.groups.len() {
             return Err(Error::Invalid(format!(
-                "host regions stated for {} cache groups of a cache of {}",
+                "host regions stated for {} and source regions for {} cache groups of a cache \
+                 of {}",
                 regions.len(),
+                sources.len(),
                 layout.groups.len()
             )));
         }
 
-        let conversion =
-            Conversion::open(client, layout, device, self.config.width, &stream, kernels)?;
-        let (conversion, converted) = match conversion {
-            Some((conversion, converted)) => (Some(conversion), converted),
-            None => (None, Vec::new()),
-        };
-
+        let conversion = Conversion::open(
+            client,
+            layout,
+            device,
+            (sources, part),
+            self.config.width,
+            &stream,
+            kernels,
+        )?;
         self.host = Some(HostTier::map(
             client,
             layout,
@@ -708,7 +720,7 @@ impl KvCacheMemory {
             stream,
             conversion,
         )?);
-        Ok(converted)
+        Ok(())
     }
 
     /// The page identity of each cache group for weights of `fingerprint`

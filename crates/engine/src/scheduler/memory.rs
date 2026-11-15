@@ -2746,6 +2746,7 @@ mod tests {
             state_in_slot: false,
             tensors: [0; 32],
             encoding: [0; 32],
+            source: None,
         };
         let mut classes: Vec<Class> = shapes.iter().map(|_| class(1)).collect();
         classes.extend((0..=sized).map(|_| class(0)));

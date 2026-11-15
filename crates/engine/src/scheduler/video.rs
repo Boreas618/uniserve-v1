@@ -1434,6 +1434,7 @@ mod tests {
             state_in_slot: false,
             tensors: [0; 32],
             encoding: [0; 32],
+            source: None,
         };
         let mut classes = vec![Class {
             units: 1,
@@ -1441,6 +1442,7 @@ mod tests {
             state_in_slot: false,
             tensors: [0; 32],
             encoding: [0; 32],
+            source: None,
         }];
         classes.extend(PRODUCTS.iter().map(|_| sized(None)));
         classes.push(sized(Some((LATENTS, 0))));
@@ -2041,6 +2043,7 @@ mod tests {
             state_in_slot: false,
             tensors: [0; 32],
             encoding: [0; 32],
+            source: None,
         };
         let mut classes = vec![class(1, None)];
         classes.extend(PRODUCTS.iter().map(|_| class(0, None)));

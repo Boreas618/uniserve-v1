@@ -27,7 +27,7 @@ use super::speculation::DraftPool;
 use super::{CausalLmConfig, CausalLmRunner, PageWork, PageWorkHook};
 use crate::memory::cache::KvCacheMemory;
 use crate::memory::state::StateMemory;
-use crate::memory::tables::BlockTables;
+use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::runner::graphs::Graphs;
 use crate::worker::{Error, Result};
 use service::lock;
@@ -189,9 +189,18 @@ pub(crate) fn page_work(
         match work {
             PageWork::Tables(changes) => cache.apply(changes, stream.as_ref())?,
             PageWork::Copies(copies) => {
-                // The cache copies a unit's bytes as its own layout holds them: a copy from a
-                // host copy of another encoding is refused, and the worker reports it failed.
-                if let Some(copy) = copies.iter().find(|copy| copy.encodings.is_some()) {
+                // The cache copies a unit's bytes as its own layout holds them, and converts the
+                // pages of its converted-load source regions into its own representation as it
+                // loads them: a copy of another encoding from anywhere else is refused, and the
+                // worker reports it failed.
+                let unconverted = |copy: &&BlockCopy| {
+                    copy.encodings.is_some()
+                        && !copy
+                            .runs
+                            .iter()
+                            .all(|(from, _)| cache.converts_from(from.0))
+                };
+                if let Some(copy) = copies.iter().find(unconverted) {
                     return Err(Error::Unsupported(format!(
                         "the copies of request {} read a block of another encoding, which the \
                          cache does not convert",

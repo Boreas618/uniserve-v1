@@ -260,6 +260,7 @@ impl Driver {
                 state_in_slot: false,
                 tensors: [0; 32],
                 encoding: [0; 32],
+                source: None,
             },
             Class {
                 units: 0,
@@ -267,6 +268,7 @@ impl Driver {
                 state_in_slot: false,
                 tensors: [1; 32],
                 encoding: [0; 32],
+                source: None,
             },
         ];
         let mut pool = BufferPool::new((1_000, 1_000));
@@ -348,6 +350,7 @@ impl Driver {
                     state_in_slot: false,
                     tensors: [0; 32],
                     encoding: [0; 32],
+                    source: None,
                 },
                 Class {
                     units: 0,
@@ -355,6 +358,7 @@ impl Driver {
                     state_in_slot: false,
                     tensors: [1; 32],
                     encoding: [0; 32],
+                    source: None,
                 },
             ]
         };

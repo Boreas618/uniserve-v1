@@ -2302,3 +2302,52 @@ fn a_text_group_splits_its_model_along_one_axis_and_every_group_alike() {
         "{refusal}"
     );
 }
+
+/// An FP8 cache that reads its peers' pages converts the dense pages they store: the session
+/// states each cache group's converted-load source region, a dense page a unit, as many as one
+/// rank's source buffer holds, apart from the group's host region of FP8 pages, and the group's
+/// class names it as its source with the encoding a dense deployment's class of the same pages
+/// states, so the buffer pool reads a dense peer's copies there. A dense cache converts nothing.
+#[test]
+fn an_fp8_cache_with_peers_states_the_source_region_of_the_dense_pages_it_converts() {
+    use crate::memory::cache::{CacheLayout, conversion, host};
+    use proto::request::PrefixCacheDtype;
+
+    let mut launch = launch();
+    launch.engine_config.kv_cache.peers = vec!["peer:1".to_owned()];
+    let dense = |dtype| {
+        CacheLayout::dense(64, 4, 2, 128, dtype)
+            .validated()
+            .unwrap()
+    };
+    let fp8 = dense(PrefixCacheDtype::Float8E4m3Fn)
+        .with_conversion()
+        .unwrap();
+    let bf16 = dense(PrefixCacheDtype::BFloat16);
+
+    let converting = super::text_layout(&launch, &fp8, (9, 0), 1, (2, 64), None).unwrap();
+    let class = &converting.classes[0];
+    let (region, encoding) = class.source.expect("the FP8 class names its source");
+    let (host, _) = class.host.expect("the FP8 class has a host region");
+    assert_ne!(region, host);
+
+    // One dense page a unit; the launch's rows hold one page, as many as a source buffer holds.
+    let source = &converting.regions[usize::from(region)];
+    let page_bytes = host::page_shape(&bf16, 0).unwrap().page_bytes;
+    assert_eq!(source.tier, Tier::Host);
+    assert_eq!(source.part_bytes, page_bytes);
+    assert_eq!(source.units, conversion::source_slots(page_bytes, 1));
+    let own = &converting.regions[usize::from(host)];
+    assert_eq!(
+        own.part_bytes,
+        host::page_shape(&fp8, 0).unwrap().page_bytes
+    );
+
+    // A dense deployment of the same pages converts nothing, and its class's encoding is the one
+    // the FP8 class converts from.
+    let dense = super::text_layout(&launch, &bf16, (9, 0), 1, (2, 64), None).unwrap();
+    assert_eq!(dense.classes[0].source, None);
+    assert_eq!(dense.classes[0].tensors, class.tensors);
+    assert_eq!(dense.classes[0].encoding, encoding);
+    assert_ne!(class.encoding, encoding);
+}

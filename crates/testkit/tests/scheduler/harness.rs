@@ -561,6 +561,7 @@ impl Deployment {
             state_in_slot,
             tensors: [0; 32],
             encoding: [0; 32],
+            source: None,
         };
         let mut classes: Vec<Class> = self
             .cache

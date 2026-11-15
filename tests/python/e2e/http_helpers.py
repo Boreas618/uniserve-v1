@@ -513,6 +513,26 @@ def _on_host(host: str, command: str, timeout: float = 120) -> str:
     return done.stdout
 
 
+def stop_remote_storage_server(host: str, runtime: str, kept_log: Path) -> None:
+    """Stop the Storage Server serving under the runtime directory `runtime`
+    (its ``XDG_RUNTIME_DIR``) on the ssh destination `host`, keep its log at
+    `kept_log` on this host, and remove the directory.
+
+    The log travels back over the ssh connection: `kept_log` lies in this
+    test's temporary directory, which exists on this host alone. A server
+    that wrote no log leaves `kept_log` empty.
+    """  # noqa: D205
+    socket = shlex.quote(f"{runtime}/uniserve/storage-server.sock")
+    directory = shlex.quote(runtime)
+    log = _on_host(
+        host,
+        f"python3 -c {shlex.quote(_STOP_STORAGE)} {socket}; "
+        f"cat {directory}/uniserve/storage-server.log 2>/dev/null; "
+        f"rm -rf {directory}; true",
+    )
+    kept_log.write_text(log, encoding="utf-8")
+
+
 @contextmanager
 def second_host(
     host: str,
@@ -593,13 +613,8 @@ def second_host(
             _on_host(host, f"kill {pid}")
             process.wait(timeout=120)
             outlived = True
-        storage_socket = f"{runtime}/uniserve/storage-server.sock"
-        kept = shlex.quote(str(log.with_suffix(".storage.log")))
-        _on_host(
-            host,
-            f"python3 -c {shlex.quote(_STOP_STORAGE)} {storage_socket}; "
-            f"cp {runtime}/uniserve/storage-server.log {kept} 2>/dev/null; "
-            f"rm -rf {runtime}",
+        stop_remote_storage_server(
+            host, runtime, log.with_suffix(".storage.log")
         )
         if outlived:
             raise AssertionError("the second host's daemon outlived its leader")
@@ -822,9 +837,12 @@ def tokens_found(
 
     A hit is counted when its admission's answers arrive, before the request
     computes, so the counters are read once the report holding the query
-    arrived and another followed. `ask` must look its prompt up: a deployment
+    arrived and another followed. The counters before `ask` are read the same
+    way, after the reports of the admissions before it, so the growth counts
+    `ask`'s admissions alone. `ask` must look its prompt up: a deployment
     without ``prefix_caching`` counts no query.
     """  # noqa: D205
+    time.sleep(scaled(REPORT_SETTLE_S))
     before = prefix_counters(base_url)
     result = ask()
     wait_until(

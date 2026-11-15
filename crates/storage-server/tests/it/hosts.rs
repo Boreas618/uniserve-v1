@@ -308,6 +308,112 @@ fn a_prefetch_from_the_peers_reads_the_host_copies_a_peer_held_throughout() {
     peer_schedulers[0].await_capacity(peer_opened.regions[HOST].0, (3, 0, 1));
 }
 
+/// A reading engine whose KV class keeps its own copies in another encoding than the peer's,
+/// in a host region of 8 bytes a part, and converts from the peer's encoding: the class names a
+/// converted-load source region of the peer's 16 bytes a part as its source. A prefetch from the
+/// peers reads the peer's copy into the source region, never into the class's host region, and
+/// a load of the key names that copy with the two encodings the worker converts between.
+#[test]
+fn a_prefetch_from_the_peers_reads_a_copy_of_the_source_encoding_into_the_source_region() {
+    let network = tempfile::tempdir().unwrap();
+
+    // The peer cached key 7 on its host in the layout's encoding, in unit 0 of each part of its
+    // host region.
+    let peer = Running::with_transfer(|_| None);
+    let (_peer_engine, _peer_schedulers, _, peer_parts) = host_copy(&peer);
+    let peer_parts = files(peer_parts);
+    let written = [pattern(16, 3), pattern(16, 4)];
+    for (rank, (part, bytes)) in peer_parts.iter().zip(&written).enumerate() {
+        part.write_all_at(bytes, 0).unwrap();
+        let region = Region::Part {
+            region: "host".into(),
+            rank: rank as u32,
+        };
+        link(network.path(), &peer.tcp, &region, part);
+    }
+
+    // The reading engine's class is written in encoding 1, in a host region of half the bytes,
+    // and converts from the peer's encoding 0 through a source region of two units.
+    let reading = network_server(network.path(), None, None);
+    let claim = head(&reading.socket)
+        .claim(
+            0,
+            vec![scope("prefill", 0), scope("prefill", 1)],
+            Vec::new(),
+        )
+        .unwrap();
+    let mut open = layout(0);
+    open.peers = vec![peer.tcp.clone()];
+    let source = open.regions.len();
+    let mut region = open.regions[HOST].clone();
+    (region.unit_bytes, region.part_bytes) = (16, 8);
+    open.regions[HOST] = region.clone();
+    (region.name, region.space) = ("source".into(), "source".into());
+    (
+        region.unit_bytes,
+        region.part_bytes,
+        region.units,
+        region.limit,
+    ) = (32, 16, 2, 2);
+    open.regions.push(region);
+    let class = &mut open.classes[usize::from(KV)];
+    class.encoding = [1; 32];
+    class.source = Some((source as u8, [0; 32]));
+    let mut engine = engine_head(&reading.socket, 0);
+    let (opened, descriptors) = engine.open_pool(open).unwrap();
+
+    // Each prefill rank takes its part of both host regions.
+    let parts: Vec<(File, File)> = (0..2)
+        .map(|index| {
+            let mut taking = rank(&reading.socket, "prefill", index, claim);
+            let (_, own) = taking.host_part("host".into(), index, 8, None).unwrap();
+            let (units, staged) = taking.host_part("source".into(), index, 16, None).unwrap();
+            assert_eq!(units, 2);
+            (File::from(own), File::from(staged))
+        })
+        .collect();
+    let mut schedulers = Scheduler::all(&opened, descriptors);
+    let prefill = &mut schedulers[0];
+
+    // Key 7 is read into unit 0 of each part of the source region and nothing into the host
+    // region; key 9 is held by no peer.
+    assert_eq!(
+        prefill.ask(from_peers()),
+        Completion::Prefetched {
+            found: 1,
+            evicted: Vec::new()
+        }
+    );
+    for ((own, staged), bytes) in parts.iter().zip(&written) {
+        assert_eq!(read(staged, 0, 16), *bytes);
+        assert_eq!(read(own, 0, 8), [0; 8]);
+    }
+
+    // A load of key 7 reads the staged copy and names the encodings to convert between.
+    prefill.ask(Request::Attach {
+        owner: OwnerId(1),
+        group: PREFILL,
+    });
+    let load = Request::Load {
+        owner: OwnerId(1),
+        class: KV,
+        at: 0,
+        keys: vec![key(7)],
+    };
+    let Completion::Copy {
+        keys,
+        from,
+        encodings,
+        ..
+    } = prefill.ask(load)
+    else {
+        panic!("the load copies nothing")
+    };
+    assert_eq!(keys, [key(7)]);
+    assert_eq!(from, [(opened.regions[source].0, 0, 1)]);
+    assert_eq!(encodings, Some(([0; 32], [1; 32])));
+}
+
 /// Both the reading engine and the peer's have a rank on each of two hosts:
 /// each part of the read copy is read from the host the peer's part of its
 /// index lies on, by the Transfer Server of the host the reader's part lies
@@ -583,6 +689,7 @@ fn processes() -> Open {
             state_in_slot: false,
             tensors: [1; 32],
             encoding: [0; 32],
+            source: None,
         }],
         trajectory: PRODUCT,
         groups: vec![

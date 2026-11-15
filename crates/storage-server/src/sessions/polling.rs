@@ -70,7 +70,9 @@ use storage::runtime::{
 
 use crate::Server;
 use crate::buffer_pool::trace::{Input, SessionNames, Trace, stated_input};
-use crate::buffer_pool::{BufferPool, ClientId, FORMAT, QueueId, format1, format2, format3};
+use crate::buffer_pool::{
+    BufferPool, ClientId, Encoding, FORMAT, QueueId, format1, format2, format3,
+};
 
 /// How long the thread sleeps when every queue is empty and nothing is
 /// deferred: the longest a request of an idle engine waits to be taken.
@@ -1100,15 +1102,46 @@ impl Pools {
                 .collect()
         };
         held.into_iter()
-            .map(|(key, (region, first, count), tokens)| {
-                let copy = HostCopy {
-                    key,
-                    tokens,
-                    region: pool.region_name(region).unwrap_or_default().to_owned(),
-                    first,
-                    count,
-                };
-                (copy, parts(&key))
+            .map(
+                |(key, (region, first, count), tokens, (tensors, encoding))| {
+                    let copy = HostCopy {
+                        key,
+                        tokens,
+                        region: pool.region_name(region).unwrap_or_default().to_owned(),
+                        first,
+                        count,
+                        tensors,
+                        encoding,
+                    };
+                    (copy, parts(&key))
+                },
+            )
+            .collect()
+    }
+
+    /// What the peers hold of the keys of `deployment`'s prefetch `task`:
+    /// per copy, in order, the encoding of the peer's host copy it reads
+    /// ([`BufferPool::peer_copies`]). Returns the runs the leading copies
+    /// write, by the names of their regions.
+    pub(crate) fn peer_copies(
+        &mut self,
+        deployment: &str,
+        task: (QueueId, RequestId),
+        held: &[Option<Encoding>],
+    ) -> Vec<NamedRun> {
+        let Some(hosted) = self.deployments.get_mut(deployment) else {
+            return Vec::new();
+        };
+        hosted.dirty = true;
+        let runs = hosted.pool.peer_copies(task, held);
+        let input = || Input::PeerCopies(task, held.to_vec());
+        hosted.watch.acted(deployment, &hosted.pool, input);
+
+        let pool = &hosted.pool;
+        runs.into_iter()
+            .map(|(region, first, count)| {
+                let name = pool.region_name(region).unwrap_or_default();
+                (name.to_owned(), first, count)
             })
             .collect()
     }
@@ -1342,6 +1375,7 @@ mod tests {
                 state_in_slot: false,
                 tensors: [0; 32],
                 encoding: [0; 32],
+                source: None,
             }],
             trajectory: 0,
             groups: vec![Group {

@@ -910,9 +910,14 @@ pub struct UnitRun {
 }
 
 /// A host copy another host's Storage Server holds for its reads
-/// ([`Request::PeerHold`]): the key, the tokens its block holds, and the
-/// units of the host region `region` that hold it, `count` from `first`.
-/// Each part of the region ([`RegionPart`]) holds its bytes of those units.
+/// ([`Request::PeerHold`]): the key, the tokens its block holds, the units
+/// of the host region `region` that hold it, `count` from `first`, and the
+/// encoding it is written in, as the class that wrote it states it
+/// (`crate::runtime::Class::tensors` and `Class::encoding`). Each part of
+/// the region ([`RegionPart`]) holds its bytes of those units. The reader
+/// reads a copy only into a block of a class of the same encoding, or of a
+/// class that converts from it (`crate::runtime::Class::source`); a server
+/// that states no encoding states zeros, which no class has.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostCopy {
     pub key: Key,
@@ -920,6 +925,10 @@ pub struct HostCopy {
     pub region: String,
     pub first: u32,
     pub count: u32,
+    #[serde(default)]
+    pub tensors: [u8; 32],
+    #[serde(default)]
+    pub encoding: [u8; 32],
 }
 
 /// One rank's part of a host region: unit `u` lies at byte `u × bytes` of

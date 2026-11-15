@@ -84,7 +84,7 @@ use storage::protocol::{
 };
 use storage::runtime::{Open, RequestId, Source, Tier};
 
-use crate::buffer_pool::{ClientId as PoolSession, QueueId};
+use crate::buffer_pool::{ClientId as PoolSession, Encoding, QueueId};
 use crate::kv_storage::{Owner, Task};
 use crate::{
     Attachment, Client, ClientId, Handling, Holder, Server, StorageEntry, StorageId, invalid,
@@ -226,9 +226,9 @@ struct Running {
     /// tokens its block holds, for the leading copies being read.
     release: Option<mpsc::Sender<()>>,
     reads: Vec<(usize, u16)>,
-    /// For a read from the peers, the block each copy writes, with the host
-    /// parts it fills (none for a copy of groups that state no host parts).
-    writes: Vec<(NamedRun, Vec<HostPart>)>,
+    /// For a read from the peers, the host parts each copy fills (none for a
+    /// copy of groups that state no host parts).
+    parts: Vec<Vec<HostPart>>,
 }
 
 impl Running {
@@ -243,7 +243,7 @@ impl Running {
             cancels: Vec::new(),
             release: None,
             reads: Vec::new(),
-            writes: Vec::new(),
+            parts: Vec::new(),
         }
     }
 }
@@ -1651,45 +1651,66 @@ impl Server {
         .map_err(|error| format!("a read from the peers cannot start: {error}"))?;
         if let Some(running) = self.sessions.running.get_mut(&number) {
             running.release = Some(release);
-            running.writes = copies
+            running.parts = copies
                 .iter()
-                .map(|(_, _, writes, _, (_, parts))| {
-                    let write = writes.first().cloned().unwrap_or_default();
-                    (write, parts.clone())
-                })
+                .map(|(.., (_, parts))| parts.clone())
                 .collect();
         }
         Ok(true)
     }
 
-    /// The peers hold what they hold of a read's keys: the Transfer Server
-    /// of each part's host reads the leading copies held into the blocks the
-    /// buffer pool allocated for them, in each host part the copy fills (in
-    /// every part of the region, this host's and those of the session's
-    /// ranks of other hosts, for groups that state no host parts), from the
-    /// peer's part of the same index, wherever that lies, which must hold the
-    /// same bytes of a unit, and the copy the same units ([`read_spans`]).
-    /// A copy with a host part to fill that no place states is not read.
-    /// With nothing to read, the holds are released at once.
+    /// The peers hold what they hold of a read's keys: the buffer pool
+    /// chooses the block each leading copy held is read into by the encoding
+    /// of the peer's copy ([`crate::buffer_pool::BufferPool::peer_copies`]),
+    /// and the Transfer Server of each part's host reads the copies into
+    /// them, in each host part the copy fills (in every part of the region,
+    /// this host's and those of the session's ranks of other hosts, for
+    /// groups that state no host parts), from the peer's part of the same
+    /// index, wherever that lies, which must hold the same bytes of a unit,
+    /// and the copy the same units ([`read_spans`]). A copy with a host part
+    /// to fill that no place states is not read. With nothing to read, the
+    /// holds are released at once.
     pub(crate) fn peers_held(&mut self, number: u64, (sources, peers): hosts::Held) {
         let Some(running) = self.sessions.running.get(&number) else {
             return;
         };
         let session = running.session.clone();
+        let task = running.task;
         // The engine whose session submitted the task: where its ranks' parts lie.
-        let pool = running.task.0.0;
-        let writes = if running.stopped {
+        let pool = task.0.0;
+        let parts = if running.stopped {
             Vec::new()
         } else {
-            running.writes.clone()
+            running.parts.clone()
         };
         let here = self.tcp.as_ref().map(|(_, address)| address.as_str());
+
+        // The block each copy is read into follows the encoding of the peer's
+        // copy, which the buffer pool weighs against its class.
+        let encodings: Vec<Option<Encoding>> = sources
+            .iter()
+            .take(parts.len())
+            .map(|source| {
+                source
+                    .as_ref()
+                    .map(|(_, copy)| (copy.tensors, copy.encoding))
+            })
+            .collect();
+        let writes = if encodings.is_empty() {
+            Vec::new()
+        } else {
+            let deployment = session.0.clone();
+            self.sessions
+                .thread
+                .call(move |pools| pools.peer_copies(&deployment, task, &encodings))
+                .unwrap_or_default()
+        };
 
         // By the host of the parts they write, `None` for this one: the spans,
         // each with whether its source is storage of this host.
         let mut tasks: BTreeMap<Option<String>, Vec<(Span, bool)>> = BTreeMap::new();
         let mut reads = Vec::new();
-        for (index, (write, named)) in writes.iter().enumerate() {
+        for (index, (write, named)) in writes.iter().zip(&parts).enumerate() {
             let Some(Some((connection, copy))) = sources.get(index) else {
                 break;
             };
@@ -1711,6 +1732,14 @@ impl Server {
 
         if let Some(running) = self.sessions.running.get_mut(&number) {
             running.reads = reads;
+        }
+        let held = sources.iter().take(parts.len()).flatten().count();
+        if tasks.is_empty() && held > 0 {
+            tracing::info!(
+                deployment = session.0,
+                held,
+                "the peers hold no copy of the prefetch's leading keys that its class reads"
+            );
         }
         let started = if tasks.is_empty() {
             Err(None)

@@ -17,8 +17,8 @@ use storage::runtime::{Cause, Completion, GroupId, OwnerId, RequestId, Stamps};
 use super::region::Run;
 
 use super::{
-    Block, BufferPool, ClientId, Copy, Deferred, EVERYWHERE, Entry, Held, QueueId, SLOT, Taken,
-    Target,
+    Block, BufferPool, ClientId, Copy, Deferred, EVERYWHERE, Encoding, Entry, Held, QueueId, SLOT,
+    Taken, Target,
 };
 
 /// The deadline of a task that was told to stop: it has no further one.
@@ -751,6 +751,123 @@ impl BufferPool {
         Ok(None)
     }
 
+    /// A prefetch from the peers learned what the peers hold of its keys:
+    /// per copy of the task, in order, the encoding of the peer's host copy
+    /// it reads, `None` for a key no peer holds. A copy keeps its block of
+    /// the class's host region where the peer's copy is in the class's own
+    /// encoding; one in the encoding of the class's converted-load source
+    /// (`Class::source`) moves to a new block of the source region, which a
+    /// `Load` then answers with the two encodings to convert between.
+    /// Returns the runs the leading copies write, up to the first that no
+    /// peer copy fills: one without a peer copy, in another encoding, or
+    /// without room in the source region. Nothing for a task answered
+    /// already, which caches nothing more.
+    pub fn peer_copies(&mut self, task: (QueueId, RequestId), held: &[Option<Encoding>]) -> Runs {
+        if !self.answers.contains_key(&task) {
+            return Vec::new();
+        }
+        let first = self.copies.get(&task).and_then(|copies| copies.first());
+        let Some(class) = first.map(|copy| copy.write.class) else {
+            return Vec::new();
+        };
+        let Ok(found) = self.class(task.0.0, class) else {
+            return Vec::new();
+        };
+        let own = (found.tensors, found.encoding);
+        let source = found
+            .source
+            .map(|(region, encoding)| (region, (found.tensors, encoding)));
+
+        let mut runs = Vec::new();
+        let mut evicted = Vec::new();
+        for (index, encoding) in held.iter().enumerate() {
+            let Some(copy) = self.copies.get(&task).and_then(|copies| copies.get(index)) else {
+                break;
+            };
+            match (encoding, source) {
+                (Some(encoding), _) if *encoding == own => {}
+                (Some(encoding), Some((region, written))) if *encoding == written => {
+                    let units = copy.write.units();
+                    let Some(block) = self.staged(region, class, units, &mut evicted) else {
+                        break;
+                    };
+                    self.restage(task, index, block);
+                }
+                _ => break,
+            }
+            match self.copies.get(&task).and_then(|copies| copies.get(index)) {
+                Some(copy) => runs.extend(copy.write.stated()),
+                None => break,
+            }
+        }
+
+        if let Some(listed) = self.evictions.get_mut(&task) {
+            listed.extend(evicted);
+        }
+        self.settle_counts();
+        runs
+    }
+
+    /// A new block of `units` units of the converted-load source region
+    /// `region` for `class`: from its free units, else in the place of its
+    /// unheld host copies, lowest unit first. No queue pair orders the
+    /// region, whose copies are the staged reads of prefetches, so the order
+    /// is the units'; the keys whose copies leave are added to `evicted`.
+    /// `None` when held blocks fill the region.
+    fn staged(
+        &mut self,
+        region: u8,
+        class: u8,
+        units: u32,
+        evicted: &mut Vec<Key>,
+    ) -> Option<Rc<Block>> {
+        loop {
+            if let Some(run) = self.regions[usize::from(region)].take(units) {
+                // The copy that writes it makes it private (`Self::restage`).
+                return Some(Rc::new(Block::new(class, vec![run], 0, 0)));
+            }
+            let lowest = self
+                .cache
+                .iter()
+                .filter_map(|(key, entry)| {
+                    let (block, ..) = entry.host.as_ref()?;
+                    let unheld = block.region() == region && Rc::strong_count(block) == 1;
+                    let first = block.runs.borrow().first().map(Run::first)?;
+                    unheld.then_some((first, *key))
+                })
+                .min();
+            let (_, key) = lowest?;
+            if !self.evict_in(&key, region) {
+                return None;
+            }
+            evicted.push(key);
+        }
+    }
+
+    /// Copy `index` of `task` writes `block` instead of the block it was
+    /// given, which it lets go.
+    fn restage(&mut self, task: (QueueId, RequestId), index: usize, block: Rc<Block>) {
+        let live = match self.copies.get(&task).and_then(|copies| copies.get(index)) {
+            Some(copy) => self.live(task.0.0, copy),
+            None => return,
+        };
+        let Some(copy) = self
+            .copies
+            .get_mut(&task)
+            .and_then(|copies| copies.get_mut(index))
+        else {
+            return;
+        };
+        let given = std::mem::replace(&mut copy.write, block);
+        if live {
+            copy.write.own();
+            given.disown();
+        }
+        let written = Rc::clone(&copy.write);
+        self.touch(&written);
+        self.reclaim(given);
+    }
+
     /// The answer to the prefetch `task`, which found `found` leading keys:
     /// with the keys it evicted for its blocks.
     fn prefetched(&mut self, task: (QueueId, RequestId), found: u32) -> Completion {
@@ -832,9 +949,17 @@ impl BufferPool {
         if self.answers.contains_key(&task) {
             let class = copy.write.class;
             // A prefetched copy is taken as written in the encoding of the class the prefetch
-            // names; a session that no longer states the class caches nothing of it.
-            let written = self.class(task.0.0, class).ok();
-            let written = written.map(|found| (found.tensors, found.encoding));
+            // names, or in its converted-load source's when it lies in the source region
+            // ([`Self::peer_copies`]); a session that no longer states the class caches nothing
+            // of it.
+            let written = self.class(task.0.0, class).ok().map(|found| {
+                let region = copy.write.region();
+                let staged = found.source.filter(|(source, _)| *source == region);
+                (
+                    found.tensors,
+                    staged.map_or(found.encoding, |(_, encoding)| encoding),
+                )
+            });
             let done = match self.cache.get_mut(&key) {
                 // The remote store holds the content of the key's host copy.
                 Some(entry) if remote => {

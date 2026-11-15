@@ -372,6 +372,9 @@ impl BufferPool {
         let number = |index: u8| numbers[usize::from(index)];
         let classes = open.classes.iter().map(|class| Class {
             host: class.host.map(|(region, units)| (number(region), units)),
+            source: class
+                .source
+                .map(|(region, encoding)| (number(region), encoding)),
             ..class.clone()
         });
         let numbered = |lists: &Vec<Vec<u8>>| -> Vec<Vec<u8>> {
@@ -600,6 +603,14 @@ impl BufferPool {
                     "class {index}'s host region {host} is no host region"
                 ));
             }
+            if let Some((source, _)) = class.source
+                && (tier(source) != Some(Tier::Host) || class.host.is_none())
+            {
+                return Err(format!(
+                    "class {index}'s converted-load source region {source} is no host region \
+                     of a class with a host region"
+                ));
+            }
         }
 
         let mut ids = HashSet::new();
@@ -717,11 +728,11 @@ impl BufferPool {
             })
             .collect();
         if let Some((classes, _)) = self.classes.get(&client) {
-            named.extend(
-                classes
-                    .iter()
-                    .filter_map(|class| class.host.map(|(region, _)| region)),
-            );
+            named.extend(classes.iter().flat_map(|class| {
+                let host = class.host.map(|(region, _)| region);
+                host.into_iter()
+                    .chain(class.source.map(|(region, _)| region))
+            }));
         }
         named
     }

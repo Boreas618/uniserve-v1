@@ -560,6 +560,9 @@ def acts(text):
         if len(keys) > 1:
             raise Outside("a store of several keys")
         return {"host": ["Store", "EvictHost"], "remote": ["StoreRemote"]}.get(found["tier"], [])
+    if kind == "peer-copies":
+        # The blocks a prefetch from the peers reads its peers' copies into.
+        raise Outside("a prefetch from the peers")
     if kind == "prefetch":
         if found["source"] != "remote":
             raise Outside("a prefetch from the peers")

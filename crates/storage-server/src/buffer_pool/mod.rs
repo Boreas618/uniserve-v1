@@ -222,7 +222,7 @@ struct Owner<B = Rc<Block>> {
 /// The encoding a host copy is written in: the digests of the tensors and of
 /// the layout of the class that wrote it (`Class::tensors`,
 /// `Class::encoding`).
-type Encoding = ([u8; 32], [u8; 32]);
+pub type Encoding = ([u8; 32], [u8; 32]);
 
 /// A key's content, per tier.
 #[derive(Serialize, Deserialize)]

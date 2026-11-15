@@ -68,7 +68,9 @@ use crate::executor::Route;
 use crate::executor::peers::Remote;
 use crate::memory::allocation::Storage;
 use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
-use crate::memory::cache::{CacheLayout, CacheRegions, GroupLayout, KvCacheMemory, host};
+use crate::memory::cache::{
+    CacheLayout, CacheRegions, GroupLayout, KvCacheMemory, conversion, host,
+};
 use crate::memory::client::{StorageClient, unit_runs};
 use crate::memory::division;
 use crate::memory::encoders;
@@ -99,7 +101,7 @@ use storage::runtime::{Class, Group, GroupId, Open, Opened, Region, Segments, Ti
 use self::rank::{Collective, ModelRunner, RankModel, Weights, media_tasks, parallel_order};
 use crate::process::binding::{self, Served};
 use crate::process::ranks::rank::memory::{
-    Peaks, fewest_states, fewest_units, granularity, plane_segments, scratch_bytes,
+    PAGE_TOKENS, Peaks, fewest_states, fewest_units, granularity, plane_segments, scratch_bytes,
 };
 use crate::process::ranks::rank::text::{
     Keys, encoder_class, encodes, feature_tensors, keys, profile, vision_runner,
@@ -1386,7 +1388,11 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 ///   per scheduler the device region of its state units beside its KV region, one checkpoint a
 ///   unit, named by the layout alone (`states_region`) and numbered `states`, with no reserved
 ///   unit, which asks for no unit at `Open` as the KV region does; and the host region of the
-///   state class, one checkpoint a unit (`specs/engine-worker-port.md` §1.6).
+///   state class, one checkpoint a unit (`specs/engine-worker-port.md` §1.6). For a cache that
+///   converts its peers' pages from another representation, per cache group with a host region
+///   its converted-load source region, one source page a unit, as many as one rank's source
+///   buffer holds (`conversion::source_slots`), which its class names as its source with the
+///   encoding of the source representation.
 /// - **Encoder outputs.** When a group encodes images (a group that prefills, of a model with a
 ///   vision tower, [`encodes`]): per such group, the region of its encoder outputs, the engine's
 ///   own memory of its ranks, the same units on every rank of it (the tower is whole on each,
@@ -1490,6 +1496,39 @@ pub fn text_layout(
                 reserved: 0,
                 units: pages,
                 limit: pages,
+                segments: Vec::new(),
+                memory: String::new(),
+            });
+        }
+    }
+
+    // The converted-load source region of each cache group of a cache that converts the pages
+    // its peers store in another representation (`CacheLayout::with_conversion`): one source page
+    // a unit, each rank's part of it the group's source buffer on that rank. A prefetch from the
+    // peers reads a peer's copy written in the source's encoding there, and a load converts it
+    // into the group's own (`storage::runtime::Class::source`).
+    let ranks_per_unit = u32::try_from(tensor).unwrap_or(u32::MAX);
+    let mut source_regions: Vec<Option<(u8, [u8; 32])>> = vec![None; cache.groups.len()];
+    if let Some(source) = cache.source().filter(|_| host_tier) {
+        let width = config.model.max_model_len.div_ceil(PAGE_TOKENS);
+        for (index, held) in source_regions.iter_mut().enumerate() {
+            if host_regions[index].is_none() {
+                continue;
+            }
+            let shape = host::page_shape(&source, index)?;
+            let slots = conversion::source_slots(shape.page_bytes, width);
+            let (_, encoding) = host::class_digests(&source, index, ranks_per_unit)?;
+            let name = format!("source kv {index} {}", short(&shape.layout.0));
+            *held = Some((region_index(&regions)?, encoding));
+            regions.push(Region {
+                space: name.clone(),
+                name,
+                tier: Tier::Host,
+                unit_bytes: shape.page_bytes * tensor,
+                part_bytes: shape.page_bytes,
+                reserved: 0,
+                units: slots,
+                limit: slots,
                 segments: Vec::new(),
                 memory: String::new(),
             });
@@ -1650,7 +1689,6 @@ pub fn text_layout(
     // Class `g` is cache group `g`; then the encoder outputs of a deployment that encodes
     // images; then the product kinds and the stored trajectories, which a text deployment sizes
     // per request and holds none of.
-    let ranks_per_unit = u32::try_from(tensor).unwrap_or(u32::MAX);
     let kinds = product::KINDS.len();
     let mut classes: Vec<Class> = Vec::with_capacity(cache.groups.len() + kinds + 2);
     for (index, (group, host)) in cache.groups.iter().zip(&host_regions).enumerate() {
@@ -1661,6 +1699,7 @@ pub fn text_layout(
             state_in_slot: group.state(),
             tensors,
             encoding,
+            source: source_regions[index],
         });
     }
     // An encoder output's bytes are its rows in order under every parallel configuration, so
@@ -1672,6 +1711,7 @@ pub fn text_layout(
             state_in_slot: false,
             tensors,
             encoding: encoders::layout(),
+            source: None,
         });
     }
     // A text deployment keeps no product on the host, so no host copy of these classes is
@@ -1682,6 +1722,7 @@ pub fn text_layout(
         state_in_slot: false,
         tensors: [0; 32],
         encoding: [0; 32],
+        source: None,
     }));
     let trajectory =
         u8::try_from(classes.len() - 1).context("more classes than a session numbers")?;
@@ -1918,6 +1959,7 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
             state_in_slot: false,
             tensors: stated.map_or([0; 32], |((tensors, _), _)| tensors),
             encoding: stated.map_or([0; 32], |((_, encoding), _)| encoding),
+            source: None,
         });
     }
     classes.push(Class {
@@ -1926,6 +1968,7 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
         state_in_slot: false,
         tensors,
         encoding,
+        source: None,
     });
     let trajectory =
         u8::try_from(classes.len() - 1).context("more classes than a session numbers")?;
@@ -3513,6 +3556,7 @@ pub(crate) fn bind(
         let Some((group, (kv, states), host_regions)) = stated_regions(rank, layout)? else {
             continue;
         };
+        let (host_named, source_named) = &host_regions;
 
         // The rank's part of its scheduler's KV units, and of its state units, in its group's
         // memory.
@@ -3529,25 +3573,31 @@ pub(crate) fn bind(
         }
 
         // The stores and loads the buffer pool asks of this rank copy between its units and its
-        // part of each group's host region, unit `u` of the region being page `u`.
+        // part of each group's host region, unit `u` of the region being page `u`; a converted
+        // load reads its part of the group's converted-load source region, its source buffer.
         let mut copies = None;
-        if host_regions.iter().any(Option::is_some) {
-            let names: Vec<Option<&str>> = host_regions
-                .iter()
-                .map(|region| region.map(|index| layout.regions[usize::from(index)].name.as_str()))
-                .collect();
+        if host_named.iter().any(Option::is_some) {
+            let named = |regions: &[Option<u8>]| -> Vec<Option<&str>> {
+                regions
+                    .iter()
+                    .map(|region| {
+                        region.map(|index| layout.regions[usize::from(index)].name.as_str())
+                    })
+                    .collect()
+            };
+            let (names, sources) = (named(host_named), named(source_named));
             let device = rank.device()?;
             let stream = Stream::new(device)
                 .with_context(|| format!("creating device {}'s copy stream", device.0))?;
             service::lock(&text.cache)
                 .map_host_parts(
                     &client,
-                    (&names, part),
+                    (&names, &sources, part),
                     stream.clone(),
                     Arc::clone(&rank.kernels),
                 )
                 .context("mapping the rank's parts of the host KV regions")?;
-            for name in names.into_iter().flatten() {
+            for name in names.into_iter().chain(sources).flatten() {
                 stated((name.to_owned(), host.clone(), part, Vec::new()))?;
             }
             copies = Some(stream);
@@ -3558,17 +3608,16 @@ pub(crate) fn bind(
 }
 
 /// Tells the cache of text rank `rank` the numbers of the regions its copies name, its KV region
-/// `kv`, its state region `states` and per cache group its host region, by the session's answer
-/// `opened`, and keeps the
-/// stream its copies to and from its host parts run on (`copies`, `None` for a rank that maps
-/// none).
+/// `kv`, its state region `states` and per cache group its host region and its converted-load
+/// source region, by the session's answer `opened`, and keeps the stream its copies to and from
+/// its host parts run on (`copies`, `None` for a rank that maps none).
 ///
 /// # Errors
 ///
 /// A region the answer does not number, or a text rank's cache's refusal.
 fn set_regions(
     rank: &mut LoadedRank,
-    ((kv, states), host): ((u8, Option<u8>), Vec<Option<u8>>),
+    ((kv, states), (host, sources)): ((u8, Option<u8>), HostRegions),
     opened: &Opened,
     copies: Option<Stream>,
 ) -> Result<()> {
@@ -3579,17 +3628,18 @@ fn set_regions(
             .map(|(number, _)| *number)
             .with_context(|| format!("the answer numbers no region {index}"))
     };
+    let numbered = |regions: Vec<Option<u8>>| {
+        regions
+            .into_iter()
+            .map(|region| region.map(number).transpose())
+            .collect::<Result<Vec<_>>>()
+    };
     let mut cache = service::lock(&rank.text()?.cache);
-    let groups = cache.layout().groups.len();
-    let host = host
-        .into_iter()
-        .map(|region| region.map(number).transpose())
-        .collect::<Result<Vec<_>>>()?;
     cache.set_regions(CacheRegions {
         units: number(kv)?,
         states: states.map(number).transpose()?,
-        host,
-        sources: vec![None; groups],
+        host: numbered(host)?,
+        sources: numbered(sources)?,
     })?;
     drop(cache);
 
@@ -3641,8 +3691,9 @@ fn rank_host(rank: &LoadedRank) -> Result<String> {
 
 /// The session's statement of `rank`'s group, the index of its KV region and of its state region
 /// (`None` for a model that keeps no recurrent state), and per cache group the index of its host
-/// region; `None` for a rank of a group the session does not state, a dedicated expert group's,
-/// which serves no request and maps no region ([`session_group`]).
+/// region and of its converted-load source region; `None` for a rank of a group the session does
+/// not state, a dedicated expert group's, which serves no request and maps no region
+/// ([`session_group`]).
 #[expect(
     clippy::type_complexity,
     reason = "the session's statement of a rank's regions, as the layout's own types state it"
@@ -3650,7 +3701,7 @@ fn rank_host(rank: &LoadedRank) -> Result<String> {
 fn stated_regions<'a>(
     rank: &LoadedRank,
     layout: &'a Open,
-) -> Result<Option<(&'a Group, (u8, Option<u8>), Vec<Option<u8>>)>> {
+) -> Result<Option<(&'a Group, (u8, Option<u8>), HostRegions)>> {
     let id = session_group(rank, layout)?;
     let Some(group) = layout.groups.iter().find(|group| group.id == id) else {
         return Ok(None);
@@ -3677,14 +3728,20 @@ fn stated_regions<'a>(
         ),
         None => None,
     };
-    let host = layout
-        .classes
-        .iter()
-        .take(groups)
+    let classes = layout.classes.iter().take(groups);
+    let host = classes
+        .clone()
         .map(|class| class.host.map(|(region, _)| region))
         .collect();
-    Ok(Some((group, (kv, states), host)))
+    let sources = classes
+        .map(|class| class.source.map(|(region, _)| region))
+        .collect();
+    Ok(Some((group, (kv, states), (host, sources))))
 }
+
+/// Per cache group, the index of its host region and of its converted-load source region in a
+/// session's layout, `None` where it has none.
+type HostRegions = (Vec<Option<u8>>, Vec<Option<u8>>);
 
 /// The session's statement of `rank`'s group.
 fn stated_group<'a>(rank: &LoadedRank, layout: &'a Open) -> Result<&'a Group> {
@@ -3922,19 +3979,19 @@ fn host_part_bits(
 }
 
 /// The regions a text rank of the session's group `group` maps, by the answer's numbers: the
-/// group's slot rows, its regions of every class, and every host region a class copies to.
+/// group's slot rows, its regions of every class, every host region a class copies to, and every
+/// converted-load source region a class loads from.
 fn text_regions(layout: &Open, opened: &Opened, group: Option<&Group>) -> Vec<u8> {
     let Some(group) = group else {
         return Vec::new();
     };
     std::iter::once(group.slots)
         .chain(group.regions.iter().flatten().copied())
-        .chain(
-            layout
-                .classes
-                .iter()
-                .filter_map(|class| class.host.map(|(region, _)| region)),
-        )
+        .chain(layout.classes.iter().flat_map(|class| {
+            let host = class.host.map(|(region, _)| region);
+            host.into_iter()
+                .chain(class.source.map(|(region, _)| region))
+        }))
         .filter_map(|index| {
             opened
                 .regions

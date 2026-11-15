@@ -80,6 +80,7 @@ pub(crate) fn layout(epoch: u64) -> Open {
             state_in_slot: false,
             tensors: [0; 32],
             encoding: [0; 32],
+            source: None,
         }],
         trajectory: KV,
         groups: vec![
@@ -1331,12 +1332,15 @@ fn a_peer_holds_the_host_copies_it_reads_until_it_releases_them() {
     let (copies, mut parts) = peer
         .peer_hold("model".into(), vec![key(7), key(8)])
         .unwrap();
+    // The copy states the encoding the class that wrote it states.
     let held = HostCopy {
         key: key(7),
         tokens: 64,
         region: "host".into(),
         first: 0,
         count: 1,
+        tensors: [0; 32],
+        encoding: [0; 32],
     };
     assert_eq!(copies, [held]);
     parts.sort_by_key(|part| part.rank);

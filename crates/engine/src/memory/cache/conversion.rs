@@ -2,11 +2,13 @@
 //! rank's units in its own.
 //!
 //! A cache that admits converted loads ([`CacheLayout::with_conversion`]: an FP8 cache, from its
-//! groups' dense compute type) keeps, per attention group, a source buffer of host storage: an
-//! exclusive tensor its host's Storage Server retains, into which the host's Transfer Server reads
-//! a peer's pages of the dense source layout (`crate::memory::cache::info::PoolConversion`). A page
-//! read there is never committed to a host pool. The buffer pool names a page of it as a run of the
-//! group's source region, whose unit `u` is slot `u` of the buffer, and a copy from there into
+//! groups' dense compute type) keeps, per attention group, a source buffer of host storage: the
+//! rank's part of the group's converted-load source region at its host's Storage Server
+//! (`storage::runtime::Class::source`), one source page a unit, into which the host's Transfer
+//! Server reads a peer's pages of the dense source layout when a prefetch from the peers finds
+//! them in that representation. The buffer pool keeps those reads apart from the group's host
+//! region, which holds pages in the cache's own representation, and names a page of the buffer as
+//! a run of the source region, whose unit `u` is slot `u` of the buffer; a copy from there into
 //! units is a converted load, which runs on the rank's copy stream, page by page:
 //!
 //! 1. both fields of the source page are copied into the device scratch, keys at `[0, 8E)` and
@@ -28,8 +30,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::memory::cache::info::PoolConversion;
-use ::storage::Key;
 use ops::prefix_cache::{
     CacheCopyRegion, ConversionArgs, ConversionDescriptor, CopyRegionArgs, CopyRegionDescriptor,
     Field, PageConversion, scratch_bytes,
@@ -42,14 +42,20 @@ use super::layout::{CacheLayout, GroupLayout};
 use super::planes::Planes;
 use crate::memory::allocation::Storage;
 use crate::memory::client::StorageClient;
+use crate::memory::host_pages::{self, HostPart};
 use crate::memory::lend;
 use crate::worker::{Error, Result};
 
 /// The most host bytes one group's source buffer holds.
 const SOURCE_BYTES: u64 = 1 << 30;
 
-/// Numbers the source buffers this process maps, so no two share a key.
-static SOURCE_BUFFERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The source pages of `page_bytes` one group's source buffer holds for a cache whose widest row
+/// holds `width` pages: one request's pages of that row, at most [`SOURCE_BYTES`] of them. The
+/// session states them as the units of the group's converted-load source region, whose parts
+/// are the ranks' buffers; a page the buffer pool finds no slot for is computed instead.
+pub(crate) fn source_slots(page_bytes: u64, width: u32) -> u32 {
+    (SOURCE_BYTES / page_bytes.max(1)).clamp(1, u64::from(width.max(1))) as u32
+}
 
 /// The two fields a page holds, in the page encoding's order.
 const FIELDS: [Field; 2] = [Field::Key, Field::Value];
@@ -210,9 +216,9 @@ pub(crate) fn keys(
 pub(crate) struct Conversion {
     layout: Arc<CacheLayout>,
     source: DType,
-    /// Each group's source buffer, mapped and registered with the device, with the source
-    /// pages it holds and the bytes of one.
-    buffers: Vec<(Arc<Storage>, u32, u64)>,
+    /// Each group's source buffer, the rank's part of the group's converted-load source region
+    /// mapped and registered with the device, with the bytes of one source page.
+    buffers: Vec<(HostPart, u64)>,
     /// The conversion scratch of the largest group's page, on the device.
     scratch: Arc<Storage>,
     /// The units of the pages of one batch, `[width, units_per_page]` I32 on the device.
@@ -226,67 +232,42 @@ pub(crate) struct Conversion {
 
 impl Conversion {
     /// The converted loads of a cache of `layout` on `device`, `width` pages a batch at most,
-    /// launching on `stream` with `kernels`, with each group's source buffer of up to `width`
-    /// source pages (at most [`SOURCE_BYTES`]) allocated at the rank's host's Storage Server.
-    /// `None` for a layout without converted loads. Returns with it what the rank reports of
-    /// each group's conversion, in group order.
+    /// launching on `stream` with `kernels`, with each group's source buffer the rank's part
+    /// `part` (its index in its worker group) of the converted-load source region `regions` names
+    /// for the group, taken at the rank's host's Storage Server: one source page a unit (see
+    /// [`source_slots`]). `None` for a layout without converted loads.
     ///
     /// # Errors
     ///
-    /// When the server refuses a source buffer or a device allocation fails.
+    /// When the session names no source region for a group, the server refuses a part, or a
+    /// device allocation fails.
     pub(crate) fn open(
         client: &StorageClient,
         layout: &Arc<CacheLayout>,
         device: DeviceId,
+        (regions, part): (&[Option<&str>], u32),
         width: u32,
         stream: &Stream,
         kernels: Arc<ops::Generation>,
-    ) -> Result<Option<(Self, Vec<PoolConversion>)>> {
+    ) -> Result<Option<Self>> {
         let Some(source_layout) = layout.source() else {
             return Ok(None);
         };
         let source = source_dtype(layout)?;
 
+        // A part the device's rank index creates lies on the host NUMA node closest to the
+        // device, as the host tier's parts do.
+        let numa_node = host_pages::numa_node(device);
         let mut buffers = Vec::with_capacity(layout.groups.len());
-        let mut reports = Vec::with_capacity(layout.groups.len());
         for index in 0..layout.groups.len() {
             let shape = host::page_shape(&source_layout, index)?;
-
-            // The buffer is named by the rank's process, device, group and mapping: it is this
-            // rank's own writable buffer, which nothing else retains or reads.
-            let mut digest = ::storage::key::Digest::new(b"uniserve-converted-load-source");
-            digest.number(u64::from(std::process::id()));
-            digest.number(device.0 as u64);
-            digest.number(index as u64);
-            digest.number(SOURCE_BUFFERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-            let key = Key(digest.finish());
-
-            // One request's pages of the widest row, at most `SOURCE_BYTES` of them: a page the
-            // scheduler finds no free slot for is computed instead.
-            let slots =
-                (SOURCE_BYTES / shape.page_bytes.max(1)).clamp(1, u64::from(width.max(1))) as u32;
-            let bytes = u64::from(slots) * shape.page_bytes;
-
-            let (_, descriptors) = client.call("a converted-load source buffer", |client| {
-                client.allocate_host(key, format!("converted-load source {index}"), bytes)
-            })?;
-            let descriptor = descriptors.into_iter().next().ok_or_else(|| {
-                Error::Interface("a source buffer arrived without its storage".into())
-            })?;
-            let storage = Storage::map_host(descriptor, bytes as usize, device, true)?;
-            tracing::info!(
-                group = index,
-                slots,
-                page_bytes = shape.page_bytes,
-                "mapped a converted-load source buffer"
-            );
-
-            buffers.push((storage, slots, shape.page_bytes));
-            reports.push(PoolConversion {
-                source: shape,
-                staging: key,
-                slots,
-            });
+            let Some(Some(region)) = regions.get(index) else {
+                return Err(Error::Invalid(format!(
+                    "the session states no converted-load source region of cache group {index}"
+                )));
+            };
+            let buffer = HostPart::map(client, device, region, part, shape.page_bytes, numa_node)?;
+            buffers.push((buffer, shape.page_bytes));
         }
 
         let units_per_page = units_per_page(layout);
@@ -303,19 +284,16 @@ impl Conversion {
         let region = DeviceRange::new(DevicePtr::from_address(scratch.address()), 0);
         let context = ops::Context::new(ordinal, stream.clone(), kernels, region);
 
-        Ok(Some((
-            Self {
-                layout: Arc::clone(layout),
-                source,
-                buffers,
-                scratch,
-                units,
-                width,
-                units_per_page,
-                context,
-            },
-            reports,
-        )))
+        Ok(Some(Self {
+            layout: Arc::clone(layout),
+            source,
+            buffers,
+            scratch,
+            units,
+            width,
+            units_per_page,
+            context,
+        }))
     }
 
     /// The generation the conversions launch from, from the next load on: set at a switch.
@@ -348,17 +326,18 @@ impl Conversion {
         let stride = self.units_per_page as usize;
         for (group, slot, units) in loads {
             let group = *group as usize;
-            let (Some((_, slots, _)), Some(layout)) =
+            let (Some((buffer, _)), Some(layout)) =
                 (self.buffers.get(group), self.layout.groups.get(group))
             else {
                 return Err(Error::Invalid(format!(
                     "a converted load names cache group {group}, which converts nothing"
                 )));
             };
-            if *slot >= u64::from(*slots) || units.len() != layout.units_per_page as usize {
+            // A slot outside the buffer is refused by its address.
+            buffer.address(*slot)?;
+            if units.len() != layout.units_per_page as usize {
                 return Err(Error::Invalid(format!(
-                    "a converted load of slot {slot} with {} units, of a source buffer of \
-                     {slots} slots and pages of {} units",
+                    "a converted load of slot {slot} with {} units, of pages of {} units",
                     units.len(),
                     layout.units_per_page
                 )));
@@ -389,14 +368,14 @@ impl Conversion {
 
         let _installed = self.context.enter();
         for (row, (group, slot, _)) in loads.iter().enumerate() {
-            let (buffer, _, page_bytes) = &self.buffers[*group as usize];
+            let (buffer, page_bytes) = &self.buffers[*group as usize];
             let group = &self.layout.groups[*group as usize];
             let elements = group.page_elements();
 
             // The source page is the host page encoding of the source: keys, then values, each
             // `elements` elements of the source type.
             let field_bytes = page_bytes / 2;
-            let page = buffer.address() + slot * page_bytes;
+            let page = buffer.address(*slot)?;
             let mut fields = CopyBatch::new(SourceOrder::Stream);
             for index in 0..FIELDS.len() as u64 {
                 fields.push(

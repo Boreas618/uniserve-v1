@@ -222,6 +222,19 @@ pub struct Class {
     /// another encoding is answered with a [`Completion::Copy`] that names
     /// both, and the worker runs it through the copy manifest of the two.
     pub encoding: [u8; 32],
+    /// The converted-load source of the class: a host region, as an index
+    /// into [`Open::regions`], whose unit `u` is slot `u` of each rank's
+    /// source buffer, and the encoding of the class's tensors that a copy
+    /// there is written in (another representation of the same logical
+    /// tensors, such as the dense pages an FP8 cache converts). A
+    /// [`Request::Prefetch`] from the peers reads a peer's host copy written
+    /// in that encoding into a block of that region, and a [`Request::Load`]
+    /// of it is answered with a [`Completion::Copy`] from that region, which
+    /// the worker converts into the class's encoding as it loads it
+    /// (`specs/buffer-pool.md` §13). `None` for a class that converts no
+    /// copy, as an `Open` that states none.
+    #[serde(default)]
+    pub source: Option<(u8, [u8; 32])>,
 }
 
 /// The digests a class states of the layout its blocks are written in, from

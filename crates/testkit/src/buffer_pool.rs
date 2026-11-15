@@ -592,6 +592,7 @@ mod tests {
                 state_in_slot: false,
                 tensors: [0; 32],
                 encoding: [0; 32],
+                source: None,
             }],
             trajectory: KV,
             peers: Vec::new(),

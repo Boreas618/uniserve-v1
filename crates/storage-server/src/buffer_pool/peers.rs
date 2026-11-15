@@ -8,19 +8,23 @@ use std::rc::Rc;
 
 use storage::protocol::Key;
 
-use super::{BufferPool, Entry};
+use super::{BufferPool, Encoding, Entry};
 
 impl BufferPool {
     /// Holds for `peer` the host copies of `keys` that every epoch may use:
     /// a copy an epoch on trial made is its own until its update is
     /// committed (R8). Returns, for each key held, the run of its host
-    /// block and the tokens it holds. A key without such a copy is left
-    /// out.
-    pub fn hold(&mut self, peer: u64, keys: &[Key]) -> Vec<(Key, storage::runtime::Run, u16)> {
+    /// block, the tokens it holds and the encoding it is written in. A key
+    /// without such a copy is left out.
+    pub fn hold(
+        &mut self,
+        peer: u64,
+        keys: &[Key],
+    ) -> Vec<(Key, storage::runtime::Run, u16, Encoding)> {
         let mut held = Vec::new();
         for key in keys {
             let Some(Entry {
-                host: Some((block, None, _)),
+                host: Some((block, None, encoding)),
                 tokens,
                 ..
             }) = self.cache.get(key)
@@ -32,7 +36,7 @@ impl BufferPool {
                 [run] => run.stated(),
                 _ => continue,
             };
-            held.push((*key, run, *tokens));
+            held.push((*key, run, *tokens, *encoding));
             let block = Rc::clone(block);
             // A hold is a holder: the copy is no longer evictable.
             self.touch(&block);
