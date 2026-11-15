@@ -1590,10 +1590,6 @@ pub struct BufferPoolListing {
     pub groups: Vec<GroupListing>,
     /// Every request whose copies are in flight.
     pub copies: Vec<CopyListing>,
-    /// The checks of the pool's tables after an input that found them
-    /// inconsistent, while the server checks them
-    /// (the server's `buffer_pool_check` setting).
-    pub check_failures: u64,
 }
 
 /// The blocks of one region and class observed in one state.

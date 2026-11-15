@@ -347,7 +347,7 @@ message StorageSettings {
   reserved 6;
   // The directory of the buffer pools' traces; empty for none.
   string buffer_pool_trace = 7;
-  bool buffer_pool_check = 8;
+  reserved 8;
   // The Mooncake connector the server runs; none when unset.
   MooncakeConnector connector = 9;
   uint64 child_restart_s = 10;

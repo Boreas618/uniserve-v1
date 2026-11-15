@@ -341,12 +341,11 @@ pub(crate) fn serve_a_session(server: &Running) {
 }
 
 /// The operator's `list` prints each deployment's buffer pool as `specs/buffer-pool.md` §8 states
-/// it, a line each: the inconsistencies the checks found, the blocks of each region and class in
-/// each observed state, each worker group's `completed` word with the stamps of what waits on it,
+/// it, a line each: the blocks of each region and class in each observed state, each worker group's `completed` word with the stamps of what waits on it,
 /// and each request whose copies are in flight.
 #[test]
-fn the_operator_s_list_prints_the_buffer_pool_s_blocks_groups_copies_and_check_failures() {
-    let server = Running::configured(|server| server.watch_pools(None, true));
+fn the_operator_s_list_prints_the_buffer_pool_s_blocks_groups_and_copies() {
+    let server = Running::with_children(None);
     let mut engine = engine_head(&server.socket, 0);
     let (opened, descriptors) = engine.open_pool(layout(0)).unwrap();
     let mut schedulers = Scheduler::all(&opened, descriptors);
@@ -419,7 +418,6 @@ fn the_operator_s_list_prints_the_buffer_pool_s_blocks_groups_copies_and_check_f
         store.0
     );
     let mut expected = vec![
-        "buffer pool of model: 0 check failures",
         "buffer pool of model: 1 shared blocks of class 0 in region units",
         "buffer pool of model: 1 private blocks of class 0 in region units",
         "buffer pool of model: 1 retired blocks of class 0 in region units",

@@ -66,11 +66,6 @@ pub struct ServerSettings {
     /// input its pool acts on and every completion it produces (`specs/buffer-pool.md` §18). A
     /// failure to write stops the trace, not the pool. No trace when unset.
     pub buffer_pool_trace: Option<PathBuf>,
-    /// Check every buffer pool's tables after an input it acts on, whenever its thread has run at
-    /// least nine times the previous check's duration since that check ended, so that checking
-    /// takes at most a tenth of the thread that answers the steps: an inconsistency is logged when
-    /// the pool turns inconsistent and counted in its listing (`check_failures`). Default off.
-    pub buffer_pool_check: bool,
     /// How long the server waits before it starts a child process again (its Mooncake connector
     /// or its Transfer Server) after one ended, in seconds; the wait doubles with each process in
     /// a row that ended before it connected, up to `child_restart_max_s`, so a child that cannot
@@ -91,7 +86,6 @@ impl Default for ServerSettings {
             transfer_deadline_s: 60,
             put_deadline_s: 60,
             buffer_pool_trace: None,
-            buffer_pool_check: false,
             child_restart_s: 5,
             child_restart_max_s: 300,
         }
@@ -187,7 +181,6 @@ mod tests {
             server: ServerSettings {
                 tcp: Some("10.0.0.2:0".parse().unwrap()),
                 host_reserve_gib: 4,
-                buffer_pool_check: true,
                 ..ServerSettings::default()
             },
             connector: Some(connector::Settings {

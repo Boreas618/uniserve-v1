@@ -181,14 +181,12 @@ pub fn list(socket: &Path, out: &mut impl Write) -> anyhow::Result<()> {
 }
 
 /// Write one deployment's buffer pool as `specs/buffer-pool.md` §8 states
-/// it, each line led by `buffer pool of <deployment>:`: the inconsistencies
-/// its checks found, the blocks of each region and class in each observed
+/// it, each line led by `buffer pool of <deployment>:`: the blocks of each region and class in each observed
 /// state, each worker group with the `completed` word last read and the
 /// stamps its deferred work waits for, and each request whose copies are in
 /// flight, with the time left to a task's deadline.
 fn list_pool(pool: &BufferPoolListing, out: &mut impl Write) -> std::io::Result<()> {
     let of = format!("buffer pool of {}:", pool.deployment);
-    writeln!(out, "{of} {} check failures", pool.check_failures)?;
 
     for count in &pool.blocks {
         let state = match count.state {

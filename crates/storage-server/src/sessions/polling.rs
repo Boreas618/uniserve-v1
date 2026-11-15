@@ -46,9 +46,8 @@
 //!
 //! The thread acts on its inputs at one place per input, and there each
 //! pool's [`Watch`] sees them: when the server's options say so, a trace of
-//! every input and completion ([`Trace`], `specs/buffer-pool.md` §18), and
-//! the pool's check of its tables after every input, whose failures are
-//! logged and counted in the pool's listing while the pool goes on.
+//! every input and completion ([`Trace`], `specs/buffer-pool.md` §18), whose
+//! replay checks the pool's tables after every input.
 //!
 //! A restart in place freezes the thread: it takes no request and reads no
 //! `completed` word, so no work starts, while the tasks run to their end
@@ -64,7 +63,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use service::{Wake, Waker};
@@ -75,7 +73,7 @@ use storage::runtime::{
 use storage::{Interest, QueueDescriptors, QueuePair, Signals};
 
 use crate::Server;
-use crate::buffer_pool::trace::{Input, SessionNames, Trace, stated_input};
+use crate::buffer_pool::trace::{Input, Trace};
 use crate::buffer_pool::{BufferPool, ClientId, Encoding, QueueId};
 
 /// The longest a trace keeps what it recorded in its buffers, in
@@ -202,7 +200,6 @@ impl Thread {
                     limits,
                     notifier: thread_notifier,
                     trace: None,
-                    check: false,
                     flushed: 0,
                 };
                 serve(&jobs, waker, pools);
@@ -309,8 +306,6 @@ pub(crate) struct Pools {
     notifier: Notifier,
     /// The directory of the pools' traces, while the server records them.
     trace: Option<PathBuf>,
-    /// Whether each pool checks its tables after every input.
-    check: bool,
     /// When the traces last wrote out their buffers, on the host's
     /// monotonic clock.
     flushed: u64,
@@ -366,34 +361,16 @@ struct QueueHandoff {
     broken: bool,
 }
 
-/// What sees one pool's inputs: its trace, and its check.
+/// What sees one pool's inputs: its trace, which the replay checks after every input
+/// (`buffer_pool::trace::replay`).
 struct Watch {
     trace: Option<Trace>,
-    /// Whether the pool's check runs (`--buffer-pool-check`).
-    check: bool,
-    /// The checks that found the pool inconsistent, and whether the last
-    /// one did: a failure is logged when the pool turns inconsistent.
-    failures: u64,
-    failing: bool,
-    /// When the last check ended and how long it took. The check costs time
-    /// in proportion to the pool's blocks and owners, on the thread whose
-    /// answers the schedulers' steps wait for, so it runs after an input
-    /// only once the thread has run at least [`CHECK_SPACING`] times that
-    /// long since: checking takes at most a tenth of the thread
-    /// (`specs/buffer-pool.md` §18). The replay of the trace checks after
-    /// every input.
-    checked: Option<(Instant, Duration)>,
 }
-
-/// The time the thread runs between two checks, in multiples of the
-/// previous check's duration.
-const CHECK_SPACING: u32 = 9;
 
 impl Watch {
     /// The watch of the pool of `deployment`: a trace in `trace`, from the
-    /// pool's image on, and the check when `check` is set. A trace that
-    /// cannot be started is logged and left out.
-    fn new(deployment: &str, pool: &BufferPool, trace: Option<&Path>, check: bool) -> Self {
+    /// pool's image on. A trace that cannot be started is logged and left out.
+    fn new(deployment: &str, pool: &BufferPool, trace: Option<&Path>) -> Self {
         let trace = trace.and_then(|directory| match Trace::start(directory, deployment, pool) {
             Ok(trace) => Some(trace),
             Err(error) => {
@@ -401,69 +378,25 @@ impl Watch {
                 None
             }
         });
-        Self {
-            trace,
-            check,
-            failures: 0,
-            failing: false,
-            checked: None,
-        }
+        Self { trace }
     }
 
-    /// The pool acted on an input: the trace records it, and the check
-    /// runs when it is due ([`Watch::checked`]). `input` is made only when
-    /// either is on.
-    fn acted(&mut self, deployment: &str, pool: &BufferPool, input: impl FnOnce() -> Input) {
-        if self.trace.is_none() && !self.check {
+    /// The pool acted on an input: the trace records it. `input` is made only while the pool is
+    /// traced.
+    fn acted(&mut self, deployment: &str, input: impl FnOnce() -> Input) {
+        let Some(trace) = &mut self.trace else {
             return;
-        }
-        let input = input();
-        let recorded = self.trace.as_mut().map(|trace| trace.record(&input));
-        let position = match recorded {
-            Some(Ok(position)) => Some(position),
-            Some(Err(error)) => {
-                self.stop(deployment, &error);
-                None
-            }
-            None => None,
         };
-        if !self.check {
-            return;
-        }
-        if let Some((ended, took)) = self.checked
-            && ended.elapsed() < took * CHECK_SPACING
-        {
-            return;
-        }
-        let started = Instant::now();
-        let found = pool.check();
-        let ended = Instant::now();
-        self.checked = Some((ended, ended - started));
-        match found {
-            Ok(()) => self.failing = false,
-            Err(inconsistency) => {
-                self.failures += 1;
-                if !self.failing {
-                    // The input named as a state's sessions are named
-                    // before any of them is (`e<epoch>`).
-                    tracing::error!(
-                        deployment,
-                        input = %stated_input(pool, &SessionNames::default(), &input),
-                        position = ?position,
-                        %inconsistency,
-                        "the buffer pool is inconsistent after an input; it goes on"
-                    );
-                }
-                self.failing = true;
-            }
+        if let Err(error) = trace.record(&input()) {
+            self.stop(deployment, &error);
         }
     }
 
     /// The pool was told the time: an input when a task passed its
     /// deadline, and otherwise the time the next input is recorded at.
-    fn ticked(&mut self, deployment: &str, pool: &BufferPool, now: u64, late: bool) {
+    fn ticked(&mut self, deployment: &str, now: u64, late: bool) {
         if late {
-            self.acted(deployment, pool, || Input::Tick(now));
+            self.acted(deployment, || Input::Tick(now));
         } else if let Some(trace) = &mut self.trace {
             trace.clock(now);
         }
@@ -504,10 +437,10 @@ impl Watch {
 
 impl Hosted {
     /// A new pool of `deployment`, watched as `trace` and `check` say.
-    fn new(deployment: &str, limits: (u64, u64), trace: Option<&Path>, check: bool) -> Self {
+    fn new(deployment: &str, limits: (u64, u64), trace: Option<&Path>) -> Self {
         let pool = BufferPool::new(limits);
         Self {
-            watch: Watch::new(deployment, &pool, trace, check),
+            watch: Watch::new(deployment, &pool, trace),
             pool,
             queues: BTreeMap::new(),
             next: 1,
@@ -559,7 +492,7 @@ impl Hosted {
                         busy = true;
                         self.pool.advance(queue.0, *group, completed);
                         let input = || Input::Completed(queue.0, *group, completed);
-                        self.watch.acted(deployment, &self.pool, input);
+                        self.watch.acted(deployment, input);
                     }
                 }
             }
@@ -596,12 +529,12 @@ impl Hosted {
                         }
                     }
                     let input = || Input::Request(*queue, record.clone());
-                    self.watch.acted(deployment, &self.pool, input);
+                    self.watch.acted(deployment, input);
                 }
             }
         }
         let late = self.pool.tick(now);
-        self.watch.ticked(deployment, &self.pool, now, late);
+        self.watch.ticked(deployment, now, late);
 
         let delivered = self.deliver(deployment);
         self.dirty |= busy || delivered;
@@ -763,15 +696,13 @@ impl Pools {
         busy
     }
 
-    /// From now on, records each pool's trace in `trace`, and checks each
-    /// pool's tables after every input when `check` is set; a pool's trace
-    /// starts again from its image.
-    pub(crate) fn watch(&mut self, trace: Option<PathBuf>, check: bool) {
+    /// From now on, records each pool's trace in `trace`; a pool's trace starts again from its
+    /// image.
+    pub(crate) fn watch(&mut self, trace: Option<PathBuf>) {
         for (deployment, hosted) in &mut self.deployments {
-            hosted.watch = Watch::new(deployment, &hosted.pool, trace.as_deref(), check);
+            hosted.watch = Watch::new(deployment, &hosted.pool, trace.as_deref());
         }
         self.trace = trace;
-        self.check = check;
     }
 
     /// Sleeps after a turn that found nothing, until an engine publishes
@@ -864,7 +795,7 @@ impl Pools {
         for (deployment, hosted) in &mut self.deployments {
             hosted.pool.set_limits(limits);
             let input = || Input::Limits(limits);
-            hosted.watch.acted(deployment, &hosted.pool, input);
+            hosted.watch.acted(deployment, input);
         }
     }
 
@@ -888,7 +819,7 @@ impl Pools {
             .ok_or_else(|| format!("no session of {deployment} stated a region {region}"))?;
         let granted = hosted.pool.grant_segment(number, segment, first, units);
         let input = || Input::Grant(region.to_owned(), segment, first, units);
-        hosted.watch.acted(deployment, &hosted.pool, input);
+        hosted.watch.acted(deployment, input);
         granted
     }
 
@@ -910,7 +841,7 @@ impl Pools {
             .ok_or_else(|| format!("no session of {deployment} stated a region {region}"))?;
         let withdrawn = hosted.pool.withdraw_segment(number, segment);
         let input = || Input::Withdraw(region.to_owned(), segment);
-        hosted.watch.acted(deployment, &hosted.pool, input);
+        hosted.watch.acted(deployment, input);
         withdrawn
     }
 
@@ -933,15 +864,15 @@ impl Pools {
         deployment: &str,
         open: &Open,
     ) -> Result<(ClientId, Opened, Vec<OwnedFd>), String> {
-        let (limits, trace, check) = (self.limits, self.trace.as_deref(), self.check);
+        let (limits, trace) = (self.limits, self.trace.as_deref());
         let hosted = self
             .deployments
             .entry(deployment.to_owned())
-            .or_insert_with(|| Hosted::new(deployment, limits, trace, check));
+            .or_insert_with(|| Hosted::new(deployment, limits, trace));
         let client = hosted.next;
         let admitted = hosted.pool.admit(client, open);
         let input = || Input::Open(client, open.clone());
-        hosted.watch.acted(deployment, &hosted.pool, input);
+        hosted.watch.acted(deployment, input);
         let regions = admitted?;
         hosted.next += 1;
         hosted.dirty = true;
@@ -981,9 +912,7 @@ impl Pools {
                 Ok(made) => made,
                 Err(error) => {
                     hosted.pool.end(client);
-                    hosted
-                        .watch
-                        .acted(deployment, &hosted.pool, || Input::Close(client));
+                    hosted.watch.acted(deployment, || Input::Close(client));
                     return Err(format!("a queue pair cannot be made: {error}"));
                 }
             };
@@ -1053,9 +982,7 @@ impl Pools {
         // completions leave with its queue pairs, the others' are kept.
         hosted.deliver(deployment);
         hosted.pool.end(client);
-        hosted
-            .watch
-            .acted(deployment, &hosted.pool, || Input::Close(client));
+        hosted.watch.acted(deployment, || Input::Close(client));
         hosted.queues.retain(|queue, _| queue.0 != client);
         hosted.sources.retain(|(queue, _), _| queue.0 != client);
         hosted.dirty = true;
@@ -1073,9 +1000,7 @@ impl Pools {
     pub(crate) fn commit_update(&mut self, deployment: &str, epoch: u64) {
         if let Some(hosted) = self.deployments.get_mut(deployment) {
             hosted.pool.commit_update(epoch);
-            hosted
-                .watch
-                .acted(deployment, &hosted.pool, || Input::Publish(epoch));
+            hosted.watch.acted(deployment, || Input::Publish(epoch));
             hosted.dirty = true;
         }
     }
@@ -1085,9 +1010,7 @@ impl Pools {
     pub(crate) fn roll_back(&mut self, deployment: &str, epoch: u64) {
         if let Some(hosted) = self.deployments.get_mut(deployment) {
             hosted.pool.roll_back(epoch);
-            hosted
-                .watch
-                .acted(deployment, &hosted.pool, || Input::RollBack(epoch));
+            hosted.watch.acted(deployment, || Input::RollBack(epoch));
             hosted.dirty = true;
         }
     }
@@ -1105,9 +1028,7 @@ impl Pools {
     pub(crate) fn done(&mut self, deployment: &str, task: (QueueId, RequestId), tokens: u16) {
         if let Some(hosted) = self.deployments.get_mut(deployment) {
             hosted.pool.done(task, tokens);
-            hosted
-                .watch
-                .acted(deployment, &hosted.pool, || Input::Done(task, tokens));
+            hosted.watch.acted(deployment, || Input::Done(task, tokens));
             hosted.dirty = true;
         }
     }
@@ -1116,9 +1037,7 @@ impl Pools {
     pub(crate) fn ended(&mut self, deployment: &str, task: (QueueId, RequestId), ok: bool) {
         if let Some(hosted) = self.deployments.get_mut(deployment) {
             hosted.pool.ended(task, ok);
-            hosted
-                .watch
-                .acted(deployment, &hosted.pool, || Input::Ended(task, ok));
+            hosted.watch.acted(deployment, || Input::Ended(task, ok));
             hosted.dirty = true;
         }
     }
@@ -1139,7 +1058,7 @@ impl Pools {
         hosted.dirty = true;
         let held = hosted.pool.hold(peer, keys);
         let input = || Input::Hold(peer, keys.to_vec());
-        hosted.watch.acted(deployment, &hosted.pool, input);
+        hosted.watch.acted(deployment, input);
 
         let pool = &hosted.pool;
         let parts = |key: &Key| -> Vec<HostPart> {
@@ -1184,7 +1103,7 @@ impl Pools {
         hosted.dirty = true;
         let runs = hosted.pool.peer_copies(task, held);
         let input = || Input::PeerCopies(task, held.to_vec());
-        hosted.watch.acted(deployment, &hosted.pool, input);
+        hosted.watch.acted(deployment, input);
 
         let pool = &hosted.pool;
         runs.into_iter()
@@ -1204,7 +1123,7 @@ impl Pools {
         hosted.dirty = true;
         let released = hosted.pool.release_peer(peer);
         let input = || Input::ReleasePeer(peer);
-        hosted.watch.acted(deployment, &hosted.pool, input);
+        hosted.watch.acted(deployment, input);
         released
     }
 
@@ -1213,14 +1132,13 @@ impl Pools {
         for (deployment, hosted) in &mut self.deployments {
             hosted.dirty |= hosted.pool.release_peer(peer);
             let input = || Input::ReleasePeer(peer);
-            hosted.watch.acted(deployment, &hosted.pool, input);
+            hosted.watch.acted(deployment, input);
         }
     }
 
     /// Every pool as an operator's listing states it.
     pub(crate) fn listing(&self) -> Vec<BufferPoolListing> {
         let listed = |(deployment, hosted): (&String, &Hosted)| BufferPoolListing {
-            check_failures: hosted.watch.failures,
             ..hosted.pool.listing(deployment)
         };
         self.deployments.iter().map(listed).collect()
@@ -1307,7 +1225,7 @@ impl Pools {
                 ))
             })?;
             // The server's options start a watch of the pool once it runs.
-            let mut hosted = Hosted::new(&deployment, limits, None, false);
+            let mut hosted = Hosted::new(&deployment, limits, None);
             hosted.pool = pool;
             hosted.next = next;
             for queue in queues {
@@ -1341,264 +1259,5 @@ impl Pools {
             deployments.insert(deployment, hosted);
         }
         Ok(deployments)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-    use std::sync::{Arc, mpsc};
-    use std::time::{Duration, Instant};
-
-    use storage::protocol::Key;
-    use storage::runtime::{
-        Class, Completion, Group, GroupId, Open, OwnerId, Region, Request, RequestId, Tier, VERSION,
-    };
-    use storage::{QueueDescriptors, QueuePair};
-
-    use super::{Notifier, Pools};
-
-    /// The thread's state with the check on, serving the session of a
-    /// layout of one group over four KV units and two slot rows, and the
-    /// engine's end of its queue pair.
-    fn served() -> (Pools, QueuePair) {
-        served_with(4, true)
-    }
-
-    /// As [`served`], with `units` KV units, and the check on when `check`.
-    fn served_with(units: u32, check: bool) -> (Pools, QueuePair) {
-        let (_, wake) = rustix::pipe::pipe().unwrap();
-        let notifier = Notifier {
-            notices: mpsc::channel().0,
-            wake: Arc::new(wake),
-        };
-        let mut pools = Pools {
-            deployments: BTreeMap::new(),
-            frozen: false,
-            limits: (1_000, 1_000),
-            notifier,
-            trace: None,
-            check,
-            flushed: 0,
-        };
-        let region = |name: &str, units| Region {
-            name: name.into(),
-            tier: Tier::Device,
-            space: name.into(),
-            unit_bytes: 64,
-            part_bytes: 64,
-            reserved: 1,
-            units,
-            limit: units + 1,
-            segments: Vec::new(),
-            memory: String::new(),
-        };
-        let open = Open {
-            version: VERSION,
-            epoch: 0,
-            trial: false,
-            regions: vec![region("units", units), region("rows", 2)],
-            classes: vec![Class {
-                units: 1,
-                host: None,
-                state_in_slot: false,
-                tensors: [0; 32],
-                encoding: [0; 32],
-                source: None,
-            }],
-            trajectory: 0,
-            groups: vec![Group {
-                id: GroupId(0),
-                memory: "gpu0".into(),
-                slots: 1,
-                regions: vec![vec![0]],
-                receives: Vec::new(),
-                parts: Vec::new(),
-            }],
-            schedulers: vec![vec![GroupId(0)]],
-            peers: Vec::new(),
-        };
-        let (_, _, descriptors) = pools.open("model", &open).unwrap();
-        let pair = QueueDescriptors::take(&mut descriptors.into_iter()).unwrap();
-        let engine = QueuePair::open(pair, true).unwrap();
-        (pools, engine)
-    }
-
-    fn submit(engine: &mut QueuePair, number: u64, request: &Request) {
-        let mut record = Vec::new();
-        request.encode(RequestId(number), &mut record);
-        assert!(engine.submit(&record).unwrap());
-    }
-
-    fn failures(pools: &Pools) -> u64 {
-        pools.listing()[0].check_failures
-    }
-
-    /// With the check on, a pool whose tables a fault made inconsistent is
-    /// reported by the first check after an input, and goes on serving.
-    #[test]
-    fn a_pool_made_inconsistent_is_reported_by_the_next_check_and_goes_on() {
-        let (mut pools, mut engine) = served();
-        let attach = Request::Attach {
-            owner: OwnerId(1),
-            group: GroupId(0),
-        };
-        submit(&mut engine, 1, &attach);
-        pools.turn();
-        assert_eq!(failures(&pools), 0);
-
-        // The bytes of the region's first unit join the free quota of its
-        // memory space while the region holds them: two places hold them
-        // (R10). That is no input, and nothing is reported yet.
-        let pool = &mut pools.deployments.get_mut("model").unwrap().pool;
-        pool.grant(0, 64, 64);
-        pools.turn();
-        assert_eq!(failures(&pools), 0);
-
-        // The check of four units takes microseconds, so after a pause the
-        // thread has run far longer than nine checks since the last one and
-        // the next input is checked.
-        std::thread::sleep(Duration::from_millis(5));
-        let allocate = Request::Allocate {
-            owner: OwnerId(1),
-            class: 0,
-            at: 0,
-            count: 1,
-            units: 0,
-        };
-        submit(&mut engine, 2, &allocate);
-        pools.turn();
-        assert_eq!(failures(&pools), 1);
-
-        let mut answers = Vec::new();
-        let mut record = Vec::new();
-        while engine.next_completion(&mut record).unwrap() {
-            answers.push(Completion::decode(&record).unwrap().1);
-        }
-        assert!(
-            matches!(
-                answers[..],
-                [Completion::Attached { .. }, Completion::Allocated { .. }]
-            ),
-            "{answers:?}"
-        );
-    }
-
-    /// Serves `requests` in turns of at most 64, numbering them on from
-    /// `number` (a queue pair's numbers rise), and returns the time the
-    /// turns took and the completions, in order.
-    fn serve(
-        pools: &mut Pools,
-        engine: &mut QueuePair,
-        number: &mut u64,
-        requests: &[Request],
-    ) -> (Duration, Vec<Completion>) {
-        let mut took = Duration::ZERO;
-        let mut answers = Vec::new();
-        let mut record = Vec::new();
-        for chunk in requests.chunks(64) {
-            for request in chunk {
-                *number += 1;
-                submit(engine, *number, request);
-            }
-            let started = Instant::now();
-            pools.turn();
-            took += started.elapsed();
-            while engine.next_completion(&mut record).unwrap() {
-                answers.push(Completion::decode(&record).unwrap().1);
-            }
-        }
-        (took, answers)
-    }
-
-    /// The live check costs time in proportion to the pool's blocks, on the
-    /// thread whose answers the steps wait for, and takes at most a tenth of
-    /// that thread: a pool of 3000 cached blocks, whose check takes
-    /// hundreds of times as long as an allocation, serves allocations with
-    /// the check on in about the time it takes with the check off (checked
-    /// after every input, it would take tens of times as long).
-    #[test]
-    fn the_live_check_takes_at_most_a_tenth_of_the_thread() {
-        const BLOCKS: u32 = 3000;
-        let named = |index: u32| {
-            let mut bytes = [0; 32];
-            bytes[..4].copy_from_slice(&index.to_le_bytes());
-            Key(bytes)
-        };
-
-        // One owner commits 3000 blocks; one unit stays free, which the
-        // timed requests allocate and release in turn.
-        let mut filling = vec![
-            Request::Attach {
-                owner: OwnerId(1),
-                group: GroupId(0),
-            },
-            Request::Allocate {
-                owner: OwnerId(1),
-                class: 0,
-                at: 0,
-                count: BLOCKS,
-                units: 0,
-            },
-        ];
-        filling.extend((0..BLOCKS).map(|at| Request::Commit {
-            owner: OwnerId(1),
-            class: 0,
-            at,
-            key: named(at),
-            tokens: 64,
-            after: Vec::new(),
-        }));
-        let cycles: Vec<Request> = (0..20_000)
-            .flat_map(|_| {
-                [
-                    Request::Allocate {
-                        owner: OwnerId(1),
-                        class: 0,
-                        at: BLOCKS,
-                        count: 1,
-                        units: 0,
-                    },
-                    Request::Release {
-                        owner: OwnerId(1),
-                        class: 0,
-                        at: BLOCKS,
-                        count: 1,
-                        after: Vec::new(),
-                    },
-                ]
-            })
-            .collect();
-
-        let mut times = [Duration::MAX; 2];
-        for _ in 0..3 {
-            for (check, time) in [false, true].into_iter().zip(&mut times) {
-                let (mut pools, mut engine) = served_with(BLOCKS + 1, check);
-                let mut number = 0;
-                let (_, filled) = serve(&mut pools, &mut engine, &mut number, &filling);
-                let committed = filled
-                    .iter()
-                    .filter(|answer| matches!(answer, Completion::Committed))
-                    .count();
-                assert_eq!(committed, BLOCKS as usize, "{:?}", &filled[..2]);
-
-                let (took, served) = serve(&mut pools, &mut engine, &mut number, &cycles);
-                assert!(
-                    served
-                        .iter()
-                        .step_by(2)
-                        .all(|answer| matches!(answer, Completion::Allocated { .. })),
-                    "{:?}",
-                    &served[..2]
-                );
-                *time = (*time).min(took);
-                assert_eq!(failures(&pools), 0);
-            }
-        }
-        let [off, on] = times;
-        assert!(
-            on < off * 3 / 2,
-            "40000 allocations and releases took {off:?} without the check and {on:?} with it"
-        );
     }
 }

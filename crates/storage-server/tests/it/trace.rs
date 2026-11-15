@@ -7,7 +7,7 @@ use ::storage::runtime::{Completion, RequestId};
 use storage_server::buffer_pool::trace::{files, replay};
 
 use crate::server::Running;
-use crate::sessions::{listed, serve_a_session};
+use crate::sessions::serve_a_session;
 
 /// The integration test of the buffer pool's sessions, run with the trace
 /// and the check on, replays with every completion equal, and the replay
@@ -20,9 +20,8 @@ fn a_recorded_run_replays_with_every_completion_equal_and_an_altered_one_is_caug
     let trace = directory.path().to_owned();
     {
         let recorded = trace.clone();
-        let server = Running::configured(move |server| server.watch_pools(Some(recorded), true));
+        let server = Running::configured(move |server| server.watch_pools(Some(recorded)));
         serve_a_session(&server);
-        assert_eq!(listed(&server.socket).check_failures, 0);
     }
     let (inputs, completions) = files(&trace, "model");
     if let Ok(kept) = std::env::var("UNISERVE_POOL_TRACE") {

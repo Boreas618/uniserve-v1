@@ -758,10 +758,7 @@ impl Server {
             server_settings.transfer_deadline(),
             server_settings.put_deadline(),
         );
-        server.watch_pools(
-            server_settings.buffer_pool_trace.clone(),
-            server_settings.buffer_pool_check,
-        );
+        server.watch_pools(server_settings.buffer_pool_trace.clone());
         tracing::info!(
             clients = server.clients.len(),
             tensors = server.tensors.len(),

@@ -311,12 +311,9 @@ impl Server {
             server_settings.transfer_deadline(),
             server_settings.put_deadline(),
         );
-        let watch = (
-            server_settings.buffer_pool_trace.clone(),
-            server_settings.buffer_pool_check,
-        );
+        let trace = server_settings.buffer_pool_trace.clone();
         server.set_deadlines(deadlines.0, deadlines.1);
-        server.watch_pools(watch.0, watch.1);
+        server.watch_pools(trace);
         Ok(server)
     }
 
@@ -343,11 +340,9 @@ impl Server {
 
     /// From now on, records the trace of every buffer pool's inputs in the
     /// directory `trace` (`specs/buffer-pool.md` §18;
-    /// [`buffer_pool::trace::replay`] replays it), and checks every pool's
-    /// tables after each input when `check` is set: an inconsistency is
-    /// logged and counted in the pool's listing, and the pool goes on.
-    pub fn watch_pools(&mut self, trace: Option<std::path::PathBuf>, check: bool) {
-        self.sessions.watch_pools(trace, check);
+    /// [`buffer_pool::trace::replay`] replays it and checks the pool's tables after every input).
+    pub fn watch_pools(&mut self, trace: Option<std::path::PathBuf>) {
+        self.sessions.watch_pools(trace);
     }
 
     /// Also accept connections from other hosts on `listener`, which carry no descriptors.

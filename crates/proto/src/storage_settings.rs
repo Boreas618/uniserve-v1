@@ -22,7 +22,6 @@ impl From<&storage::Settings> for StorageSettings {
             transfer_deadline_s: server.transfer_deadline_s,
             put_deadline_s: server.put_deadline_s,
             buffer_pool_trace: path(&server.buffer_pool_trace),
-            buffer_pool_check: server.buffer_pool_check,
             child_restart_s: server.child_restart_s,
             child_restart_max_s: server.child_restart_max_s,
             transfer_gpus: server.transfer_gpus,
@@ -89,7 +88,6 @@ impl TryFrom<&StorageSettings> for storage::Settings {
                 transfer_deadline_s: message.transfer_deadline_s,
                 put_deadline_s: message.put_deadline_s,
                 buffer_pool_trace: path(&message.buffer_pool_trace),
-                buffer_pool_check: message.buffer_pool_check,
                 child_restart_s: message.child_restart_s,
                 child_restart_max_s: message.child_restart_max_s,
                 transfer_gpus: message.transfer_gpus,
@@ -109,7 +107,6 @@ mod tests {
         let settings = storage::Settings {
             server: storage::ServerSettings {
                 tcp: Some("0.0.0.0:0".parse().unwrap()),
-                buffer_pool_check: true,
                 ..storage::ServerSettings::default()
             },
             connector: Some(storage::connector::Settings {
