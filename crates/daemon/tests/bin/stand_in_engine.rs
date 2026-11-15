@@ -19,15 +19,19 @@
 use std::io::{Read as _, Write as _};
 use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
 
+use anyhow::Context as _;
+
 /// The value of option `name` on this process's command line, as a descriptor number.
-fn descriptor(arguments: &[String], name: &str) -> RawFd {
+fn descriptor(arguments: &[String], name: &str) -> anyhow::Result<RawFd> {
     let position = arguments
         .iter()
         .position(|argument| argument == name)
-        .unwrap_or_else(|| panic!("the command line names no {name}"));
-    arguments[position + 1]
+        .with_context(|| format!("the command line names no {name}"))?;
+    arguments
+        .get(position + 1)
+        .with_context(|| format!("{name} names no descriptor"))?
         .parse()
-        .unwrap_or_else(|error| panic!("{name} names no descriptor: {error}"))
+        .with_context(|| format!("{name} names no descriptor"))
 }
 
 /// Takes the inherited descriptor `descriptor`.
@@ -37,33 +41,36 @@ fn inherited(descriptor: RawFd) -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(descriptor) }
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
     let mut text = String::new();
-    std::fs::File::from(inherited(descriptor(&arguments, proto::LAUNCH_OPTION)))
+    std::fs::File::from(inherited(descriptor(&arguments, proto::LAUNCH_OPTION)?))
         .read_to_string(&mut text)
-        .expect("the launch reads");
+        .context("reading the launch")?;
     let launch: proto::config::EngineArgs =
-        serde_json::from_str(&text).expect("the launch is an engine's");
-    let lifeline = inherited(descriptor(&arguments, proto::LIFELINE_OPTION));
+        serde_json::from_str(&text).context("reading the launch as an engine's")?;
+    let lifeline = inherited(descriptor(&arguments, proto::LIFELINE_OPTION)?);
 
     match launch.modules.engine.backend.as_str() {
         "fails" => std::process::exit(1),
-        "succeeds" => {}
+        "succeeds" => Ok(()),
         "follows-lifeline" => {
             // The read returns at the pipe's end: no byte is ever written to it.
-            let _ = std::fs::File::from(lifeline).read(&mut [0]);
+            std::fs::File::from(lifeline)
+                .read(&mut [0])
+                .context("following the lifeline")?;
+            Ok(())
         }
         "serves-store" => {
             let inherited = launch
                 .world
                 .and_then(|world| world.inherited)
-                .expect("the launch states the sockets the process inherited");
+                .context("the launch states no socket the process inherited")?;
             let store = std::net::TcpListener::from(self::inherited(inherited.store));
-            let (mut peer, _) = store.accept().expect("a peer of the store");
+            let (mut peer, _) = store.accept().context("accepting the store's peer")?;
             peer.write_all(format!("served {}\n", launch.engine).as_bytes())
-                .expect("the answer is written");
+                .context("answering the store's peer")
         }
-        other => panic!("no stand-in engine package {other}"),
+        other => anyhow::bail!("no stand-in engine package {other}"),
     }
 }

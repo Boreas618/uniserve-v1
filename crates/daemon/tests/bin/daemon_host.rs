@@ -9,16 +9,21 @@
 use std::io::Write as _;
 use std::path::PathBuf;
 
+use anyhow::Context as _;
+
 /// The value of option `name` on this process's command line.
-fn option(arguments: &[String], name: &str) -> PathBuf {
+fn option(arguments: &[String], name: &str) -> anyhow::Result<PathBuf> {
     let position = arguments
         .iter()
         .position(|argument| argument == name)
-        .unwrap_or_else(|| panic!("the command line names no {name}"));
-    PathBuf::from(&arguments[position + 1])
+        .with_context(|| format!("the command line names no {name}"))?;
+    arguments
+        .get(position + 1)
+        .map(PathBuf::from)
+        .with_context(|| format!("{name} names no path"))
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
     let _daemon = daemon::Daemon::start(
         daemon::DaemonOptions {
@@ -26,20 +31,20 @@ fn main() {
             node_rank: 0,
             host: "node".to_owned(),
             dist_init_addr: None,
-            socket: option(&arguments, "--socket"),
+            socket: option(&arguments, "--socket")?,
             join_timeout: daemon::JOIN_TIMEOUT,
             build_server: build_server::command::Settings {
-                socket: Some(option(&arguments, "--build-server")),
+                socket: Some(option(&arguments, "--build-server")?),
                 ..build_server::command::Settings::default()
             },
             storage: storage::Settings::default(),
         },
         None,
     )
-    .expect("the daemon starts");
+    .context("starting the daemon")?;
     let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "serving").expect("the readiness line is written");
-    stdout.flush().expect("the readiness line is written");
+    writeln!(stdout, "serving").context("reporting that the daemon serves")?;
+    stdout.flush().context("reporting that the daemon serves")?;
     drop(stdout);
     // The daemon's service runs on its own thread until this process is killed.
     loop {
