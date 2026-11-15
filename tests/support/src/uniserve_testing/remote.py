@@ -56,6 +56,23 @@ class RemoteHost:
             check=True,
         ).stdout
 
+    def write(self, path: str, text: str) -> None:
+        """Write `text` to the file `path` there.
+
+        ``tee`` reads it from the connection's standard input.
+
+        Raises:
+            subprocess.CalledProcessError: When it cannot be written.
+        """
+        subprocess.run(
+            self._ssh(["tee", path]),
+            input=text,
+            stdout=subprocess.DEVNULL,
+            text=True,
+            timeout=COMMAND_S,
+            check=True,
+        )
+
     @contextmanager
     def runtime_directory(self) -> Iterator[str]:
         """A runtime directory there (mode 0700, which ``mktemp`` makes),

@@ -32,6 +32,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import tomli_w
+
 from uniserve_testing.servers import Server, environment, launch, socket_path
 
 #: How long a Build Server takes to serve, in seconds: it describes its
@@ -96,6 +98,15 @@ class BuildServer:
     def socket(self) -> Path:
         """The server's socket, as its readiness record states it."""
         return socket_path(self.server.endpoint("build"))
+
+    @property
+    def settings(self) -> dict[str, Any]:
+        """The settings the server serves with, as its readiness record
+        states them (``build_server::command::Settings``, its socket
+        explicit): what a deployment at this server states as its
+        ``build_config`` (:func:`build_config`).
+        """  # noqa: D205
+        return self.server.record["settings"]
 
     def install(self, package: Path) -> Installed:
         """Install the package directory `package` and return its revision.
@@ -166,6 +177,18 @@ class BuildServer:
                 f"{completed.stderr.strip()}"
             )
         return json.loads(completed.stdout)
+
+
+def build_config(settings: dict[str, Any]) -> str:
+    """The serving options, as a ``--config`` file holds them, that state a
+    Build Server's `settings` as a deployment's ``build_config``.
+
+    The deployment states its host's Build Server, and its daemon refuses a
+    server that serves with other settings (decision D15), so a deployment
+    at a server a test started states exactly the settings that server's
+    readiness record states.
+    """  # noqa: D205
+    return tomli_w.dumps({"build_config": settings})
 
 
 def require_toolchain() -> None:

@@ -191,19 +191,31 @@ class Deployments:
         )
         return [*engine, *self.settings.serve_set]
 
-    def options(self, build_socket: str | None = None) -> list[str]:
-        """The options every deployment of the run states after its own: the
-        Build Server at `build_socket` (the run's by default) and the run's
+    def options(self, build_config: str | None = None) -> list[str]:
+        """The options every deployment of the run states after its own: its
+        host's Build Server, stated by the ``--config`` file `build_config`
+        (the run's server's, :meth:`build_config`, by default), and the run's
         :meth:`assignments`.
         """  # noqa: D205
-        if build_socket is None and self.build_server is not None:
-            build_socket = str(self.build_server.socket)
-        stated: list[str] = []
-        if build_socket is not None:
-            stated += ["--set", f'build_config.socket="{build_socket}"']
+        if build_config is None and self.build_server is not None:
+            build_config = str(self.build_config())
+        stated = ["--config", build_config] if build_config is not None else []
         for assignment in self.assignments():
             stated += ["--set", assignment]
         return stated
+
+    def build_config(self) -> Path:
+        """The ``--config`` file that states the run's Build Server as the
+        deployments' ``build_config``: exactly the settings its readiness
+        record states (:func:`uniserve_testing.builds.build_config`), which
+        a deployment's daemon holds the server it is given to.
+        """  # noqa: D205
+        assert self.build_server is not None, "the run has no Build Server"
+        path = self.directory / "build-server.toml"
+        if not path.exists():
+            self.directory.mkdir(parents=True, exist_ok=True)
+            path.write_text(builds.build_config(self.build_server.settings))
+        return path
 
     def command(self, *options: str, model: str | None = None) -> list[str]:
         """The ``uniserve serve`` command of a deployment of `model` (a
@@ -347,9 +359,13 @@ class Deployments:
         """  # noqa: D205
         with ExitStack() as owned:
             runtime = owned.enter_context(host.runtime_directory())
-            socket = owned.enter_context(
+            settings = owned.enter_context(
                 remote_build_server(host, repository, runtime)
             )
+            # The member states its host's Build Server as the leader states
+            # this host's: by a `--config` file of the server's settings.
+            build_config = f"{runtime}/build-server.toml"
+            host.write(build_config, builds.build_config(settings))
             declared = {"XDG_RUNTIME_DIR": runtime}
             if devices is not None:
                 declared["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, devices))
@@ -379,7 +395,7 @@ class Deployments:
                 "--host-identity",
                 "rank-1",
                 *options,
-                *self.options(build_socket=socket),
+                *self.options(build_config=build_config),
             ]
             member = host.start(
                 argv, self.directory / f"{name}.log", environment=declared
@@ -403,9 +419,10 @@ class Deployments:
 @contextmanager
 def remote_build_server(
     host: RemoteHost, repository: Path, runtime: str
-) -> Iterator[str]:
+) -> Iterator[dict]:
     """A Build Server on `host` under its runtime directory `runtime`, with
-    the tree's packages installed, until the block ends; its socket there.
+    the tree's packages installed, until the block ends; the settings it
+    serves with, as its readiness record states them.
 
     A main process resolves its modules at its own host's Build Server, and
     nothing distributes the leader's package revisions to another host's
@@ -440,7 +457,7 @@ def remote_build_server(
                 str(socket),
                 str(package),
             )
-        yield str(socket)
+        yield record["settings"]
     finally:
         # The Build Server has no stop request: it ends on SIGTERM, and it
         # holds the lock beside its socket for its life, so taking the lock
