@@ -40,6 +40,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/impls/barrier.cuh>
@@ -77,7 +78,14 @@ constexpr int kFullSMs = UNISERVE_MULTIPROCESSORS;
 constexpr int kQPs = UNISERVE_QUEUE_PAIRS;
 constexpr int kSharedBytes = UNISERVE_SHARED_MEMORY;
 static_assert(kSMs <= kFullSMs, "the exchange runs on the device's multiprocessors");
-constexpr int64_t kTimeoutCycles = 120ll * 1900 * 1000 * 1000;
+
+// DeepEP bounds each wait for a peer by a count of `clock64` cycles, after which it traps. A
+// rank of this exchange waits without a bound of its own, as the alltoall backend's do: a peer
+// that never arrives leaves the launch in flight, and the host detects it as it detects any job
+// that stops progressing (the worker's watchdog reports the stalled job after half
+// `worker_config.watchdog_timeout`, which fails the rank's group, and the group is replaced;
+// `crates/engine/src/worker/watchdog.rs`). The largest count is one no wait reaches.
+constexpr int64_t kTimeoutCycles = std::numeric_limits<int64_t>::max();
 constexpr int kNotifyWarps = 4;
 constexpr int kHiddenBytes = kHidden * 2;
 
