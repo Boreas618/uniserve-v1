@@ -32,6 +32,7 @@
 //! inputs ([`crate::inputs`]).
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -182,9 +183,10 @@ pub enum ToolchainKind {
     /// CuTe DSL (the `nvidia-cutlass-dsl` distribution), from the same
     /// environment.
     CuteDsl,
-    /// cargo, at the compiler release the package states: it builds a crate
-    /// of its workspace snapshot, for the host or for wasm32, with the
-    /// lockfile and vendored registry sources, offline.
+    /// cargo, at the compiler release the `rust-toolchain.toml` of the
+    /// package's workspace snapshot selects: it builds a crate of that
+    /// snapshot, for the host or for wasm32, with the lockfile and vendored
+    /// registry sources, offline.
     Cargo,
     /// Nothing: a source that compiles nothing, such as a vendor cubin or an
     /// executable, has no toolchain version to match.
@@ -727,12 +729,19 @@ pub struct Manifest {
     /// The backend's name, which the configuration field selects.
     pub backend: String,
     /// The version of the interface the package implements: its operator's
-    /// descriptor and argument layout, the scheduling policy's decisions, or
-    /// the engine's messages. Versions start at 1 and an interface raises its
-    /// own with any change that is not an addition. The Build Server records
-    /// it with every module the package builds, and a loader built for
-    /// another version refuses the module.
-    pub interface_version: u32,
+    /// descriptor and argument layout, or the scheduling policy's decisions.
+    /// Versions start at 1 and an interface raises its own with any change
+    /// that is not an addition. The Build Server records it with every module
+    /// the package builds, and a loader built for another version refuses the
+    /// module.
+    ///
+    /// A cargo source (the engine) states none: its executable states the
+    /// version of the interface it was compiled to implement in its
+    /// [`crate::source::INTERFACE_SECTION`] ([`crate::interface_section!`]),
+    /// which the build reads, so the interface's own constant is the one
+    /// statement of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_version: Option<NonZeroU32>,
     /// The package's place among its operator's backends: of the packages
     /// that cover a descriptor key, the Build Server selects the one with
     /// the highest priority, after the backend a deployment names (design
@@ -767,7 +776,8 @@ pub struct Manifest {
 struct Declared {
     op: String,
     backend: String,
-    interface_version: u32,
+    #[serde(default)]
+    interface_version: Option<NonZeroU32>,
     #[serde(default)]
     priority: u32,
     #[serde(default)]
@@ -863,12 +873,23 @@ impl Manifest {
                 "the operator and backend names must not be empty".into(),
             ));
         }
-        if self.interface_version == 0 {
-            return Err(ManifestError::Invalid(
-                "interface versions start at 1: state the version of the interface the package \
-                 implements in `interface_version`"
-                    .into(),
-            ));
+        match (self.source.kind, self.interface_version) {
+            (SourceKind::Cargo, Some(_)) => {
+                return Err(ManifestError::Invalid(
+                    "a cargo source's executable states the interface version it implements in \
+                     its interface section (`build_server::interface_section!`): its manifest \
+                     states no `interface_version`"
+                        .into(),
+                ));
+            }
+            (SourceKind::Cargo, None) | (_, Some(_)) => {}
+            (_, None) => {
+                return Err(ManifestError::Invalid(
+                    "state the version of the interface the package implements in \
+                     `interface_version`, a positive number"
+                        .into(),
+                ));
+            }
         }
         match (&self.kernel, self.module.form) {
             (Some(_), ModuleForm::Wasm) => {

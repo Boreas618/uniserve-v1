@@ -311,25 +311,22 @@ dimensions = { dtype = ["bf16"], head_dim = ["128"], q_heads = ["56"], rotation 
 /// not tell what it would be loading.
 #[test]
 fn a_manifest_states_the_interface_version_it_implements() {
-    assert_eq!(
-        load(REASONABLE, &REASONABLE_FILES)
+    let stated = |text: &str| {
+        load(text, &REASONABLE_FILES)
             .unwrap()
-            .interface_version,
-        1
-    );
+            .interface_version
+            .map(std::num::NonZeroU32::get)
+    };
+    assert_eq!(stated(REASONABLE), Some(1));
     let later = REASONABLE.replace("interface_version = 1", "interface_version = 4");
-    assert_eq!(
-        load(&later, &REASONABLE_FILES).unwrap().interface_version,
-        4
-    );
+    assert_eq!(stated(&later), Some(4));
 
     let unstated = REASONABLE.replace("interface_version = 1\n", "");
     let error = load(&unstated, &REASONABLE_FILES).unwrap_err();
     assert!(error.contains("interface_version"), "{error}");
 
     let zero = REASONABLE.replace("interface_version = 1", "interface_version = 0");
-    let error = load(&zero, &REASONABLE_FILES).unwrap_err();
-    assert!(error.contains("start at 1"), "{error}");
+    assert!(load(&zero, &REASONABLE_FILES).is_err());
 }
 
 /// A kernel package builds for every target of the Build Server's description that meets its
@@ -558,13 +555,14 @@ fn a_native_module_names_its_launch_entry_and_any_lifecycle_entries() {
 }
 
 /// The manifest of an engine package with the `[source]` lines `source` and
-/// the `kernel` section.
+/// the `kernel` section: it states neither its interface version, which its
+/// executable states, nor its compiler release, which its workspace's
+/// `rust-toolchain.toml` selects.
 fn cargo(source: &str, kernel: &str) -> String {
     format!(
         r#"
 op = "engine"
 backend = "uniserve"
-interface_version = 1
 
 [source]
 kind = "cargo"
@@ -595,6 +593,28 @@ fn a_cargo_package_names_its_binary_and_no_kernel() {
     let kernel = "[kernel]\ndescriptors = [{ dimensions = { dtype = [\"bf16\"] } }]";
     let error = load(&cargo(binary, kernel), &[]).unwrap_err();
     assert!(error.contains("no [kernel]"), "{error}");
+}
+
+/// A cargo package states its interface version and its compiler release
+/// once each, where they are owned: its executable states the interface it
+/// implements and its workspace's `rust-toolchain.toml` the release, so a
+/// manifest that states either is refused rather than kept as a second copy.
+#[test]
+fn a_cargo_package_states_no_interface_version_and_no_compiler_release() {
+    let binary = r#"binary = "uniserve-engine""#;
+    let manifest = load(&cargo(binary, ""), &[]).unwrap();
+    assert_eq!(manifest.interface_version, None);
+
+    let versioned = cargo(binary, "").replace(
+        "op = \"engine\"\n",
+        "op = \"engine\"\ninterface_version = 9\n",
+    );
+    let error = load(&versioned, &[]).unwrap_err();
+    assert!(error.contains("interface_version"), "{error}");
+
+    let released = format!("{}\n[toolchain]\nversion = \"1.99.1\"\n", cargo(binary, ""));
+    let error = load(&released, &[]).unwrap_err();
+    assert!(error.contains("version"), "{error}");
 }
 
 /// A scheduling policy: a crate cargo builds for wasm32, which fills the

@@ -11,12 +11,14 @@
 
 op = "engine"
 backend = "uniserve"
-# The engine interface: its messages with the daemon
-# (`proto::ENGINE_INTERFACE_VERSION`). The Storage Server's protocol and the
+# The engine interface the executable implements, its messages with the daemon
+# (`proto::ENGINE_INTERFACE_VERSION`), is stated by the executable itself
+# (`build_server::interface_section!` in `src/main.rs`), and the Build Server
+# records the version it reads there; the Storage Server's protocol and the
 # buffer pool's runtime interface have versions of their own, checked at their
 # own hellos.
-interface_version = 9
 
+# cargo at the release the workspace's `rust-toolchain.toml` selects.
 [toolchain]
 kind = "cargo"
 

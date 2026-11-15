@@ -1458,12 +1458,19 @@ impl Queue {
                 message: "the build wrote no file".into(),
             });
         }
-        self.store.publish(
-            path,
-            workspace.path(),
-            &built,
-            package.manifest.interface_version,
-        )?;
+        let interface_version =
+            crate::source::stated_interface(&package.manifest, workspace.path()).map_err(
+                |message| Error::Build {
+                    op: path.op.clone(),
+                    backend: path.backend.clone(),
+                    revision: path.revision,
+                    target: path.target.clone(),
+                    descriptor: path.descriptor.clone(),
+                    message,
+                },
+            )?;
+        self.store
+            .publish(path, workspace.path(), &built, interface_version)?;
         Ok(())
     }
 

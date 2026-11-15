@@ -45,6 +45,65 @@ pub const MODULE_SO: &str = "module.so";
 /// section 5.3).
 pub const MODULE_WASM: &str = "module.wasm";
 
+/// The section of a cargo source's executable that states the version of the
+/// interface it implements, as four little-endian bytes: what a build records
+/// with the module ([`stated_interface`]). The executable defines it with
+/// [`crate::interface_section!`], whose section name is this one.
+pub const INTERFACE_SECTION: &str = ".uniserve.interface";
+
+/// Defines the [`INTERFACE_SECTION`] of the executable it expands in: the
+/// version of the interface the executable implements, `$version` (a `u32`
+/// constant of the interface's owner, such as `proto::ENGINE_INTERFACE_VERSION`).
+/// A cargo package's build reads it from the executable it built, so the
+/// interface's own constant is the one statement of the version its modules
+/// record. The section is retained in the executable whether or not anything
+/// reads the static (`#[used]`).
+#[macro_export]
+macro_rules! interface_section {
+    ($version:expr) => {
+        #[used]
+        #[unsafe(link_section = ".uniserve.interface")]
+        static UNISERVE_INTERFACE_SECTION: [u8; 4] = u32::to_le_bytes($version);
+    };
+}
+
+/// The version of its interface the module a build of `manifest`'s package
+/// wrote into `workspace` implements: the one the manifest states, or, for a
+/// cargo source, the one its executable states in its [`INTERFACE_SECTION`]
+/// (the manifest's validation leaves exactly one of the two).
+///
+/// # Errors
+///
+/// Why no version was read: the executable cannot be read, or states none
+/// there, or states 0.
+pub fn stated_interface(manifest: &Manifest, workspace: &Path) -> std::result::Result<u32, String> {
+    if let Some(version) = manifest.interface_version {
+        return Ok(version.get());
+    }
+
+    let binary = manifest
+        .source
+        .binary
+        .as_deref()
+        .ok_or("the package names no [source] binary")?;
+    let bytes = std::fs::read(workspace.join(binary))
+        .map_err(|error| format!("reading the built {binary}: {error}"))?;
+    let stated = platform::NativeLibrary::section(&bytes, INTERFACE_SECTION)
+        .and_then(|section| <[u8; 4]>::try_from(section).ok())
+        .ok_or_else(|| {
+            format!(
+                "the built {binary} states no interface version in a four-byte \
+                 {INTERFACE_SECTION} section (`build_server::interface_section!`)"
+            )
+        })?;
+    match u32::from_le_bytes(stated) {
+        0 => Err(format!(
+            "the built {binary} states interface version 0; versions start at 1"
+        )),
+        version => Ok(version),
+    }
+}
+
 /// The file a build's compiler writes its output to, inside the build's
 /// workspace. A dot file is the build's own bookkeeping: [`collect`] leaves it
 /// out of the module.
@@ -742,6 +801,51 @@ fn cargo_build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // This test executable states interface version 7, as a cargo package's executable states its
+    // own.
+    crate::interface_section!(7);
+
+    /// The manifest of a cargo package whose executable is `binary`.
+    fn cargo_manifest(binary: &str) -> Manifest {
+        toml::from_str(&format!(
+            r#"
+op = "engine"
+backend = "test"
+
+[toolchain]
+kind = "cargo"
+
+[module]
+form = "executable"
+
+[source]
+kind = "cargo"
+files = []
+binary = "{binary}"
+"#
+        ))
+        .unwrap()
+    }
+
+    /// The interface version a cargo package's module records is the one its executable states
+    /// in its interface section, read from the built file; a file that states none is refused,
+    /// naming the section.
+    #[test]
+    fn a_cargo_executable_states_its_interface_version_in_its_section() {
+        let executable = std::env::current_exe().unwrap();
+        let name = executable.file_name().unwrap().to_str().unwrap();
+        let manifest = cargo_manifest(name);
+        assert_eq!(
+            stated_interface(&manifest, executable.parent().unwrap()),
+            Ok(7)
+        );
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join(name), b"not an executable").unwrap();
+        let refused = stated_interface(&manifest, workspace.path()).unwrap_err();
+        assert!(refused.contains(INTERFACE_SECTION), "{refused}");
+    }
 
     /// A vendor package carrying one cubin and one metadata JSON per descriptor, as
     /// `CubinSource` reads it (design 5.3), with or without its metadata.

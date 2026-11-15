@@ -1,7 +1,8 @@
 # The workspace's Rust toolchain, which rustup installs and selects for every
 # cargo command in the tree and in the Build Server's snapshot of it: a release,
-# so the compiler that builds a cargo package is the one its manifest declares
-# (`[toolchain] version`) and the identity its modules are stored under.
+# so the compiler that builds a cargo package (the engine, a scheduling policy)
+# is the one stated here, which the package's snapshot carries and the identity
+# its modules are stored under records; no package manifest restates it.
 [toolchain]
 channel = "1.99.1"
 components = ["rustfmt", "clippy"]

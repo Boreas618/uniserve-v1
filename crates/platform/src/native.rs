@@ -18,17 +18,17 @@
 //! rebind the graphs that call it first) is the owner's rule, not this
 //! module's.
 //!
-//! Before an object is opened, its bytes can be asked what it defines
-//! ([`NativeLibrary::defined_functions`]) and where it finds its siblings
-//! ([`NativeLibrary::run_path`]): a reader of the ELF dynamic tables that
-//! runs no code of the object.
+//! An object's bytes can be asked what it defines
+//! ([`NativeLibrary::defined_functions`]) and what a named section of it holds
+//! ([`NativeLibrary::section`]): a reader of the ELF tables that runs no code
+//! of the object.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use libloading::Library;
 use object::read::elf::ElfFile64;
-use object::{Endianness, Object as _, ObjectSymbol as _, SymbolKind, elf};
+use object::{Endianness, Object as _, ObjectSection as _, ObjectSymbol as _, SymbolKind};
 
 use crate::{Error, Result};
 
@@ -101,8 +101,7 @@ impl NativeLibrary {
 
     /// Every function name an ELF object defines for the dynamic linker, read from its bytes.
     ///
-    /// This answers which file of a multi-file module is its library (the file that defines the
-    /// entry the package declared) and what an object defines when `dlsym` refused an entry,
+    /// This answers whether a built native module defines every entry its package declares,
     /// without opening the object. The dynamic symbol table is read with the `object` crate's ELF
     /// reader, which bounds-checks every read against `bytes`. Anything it does not understand -
     /// another format, a table that runs off the end, a name that is not UTF-8 - is `None`, so a
@@ -117,21 +116,16 @@ impl NativeLibrary {
             .collect()
     }
 
-    /// The run path an ELF object states, read from its bytes: the first `DT_RUNPATH` or `DT_RPATH`
-    /// entry of its dynamic table. `None` when it states neither, or when the bytes are not an
-    /// object the reader understands (as for [`Self::defined_functions`]).
+    /// The contents of the section `name` of an ELF object, read from its bytes: what an
+    /// executable states about itself for a reader that runs none of its code, such as the
+    /// interface version a cargo-built package's executable implements. `None` when the object has
+    /// no such section, or when the bytes are not an object the reader understands (as for
+    /// [`Self::defined_functions`]).
     #[must_use]
-    pub fn run_path(bytes: &[u8]) -> Option<String> {
+    pub fn section(bytes: &[u8], name: &str) -> Option<Vec<u8>> {
         let file = ElfFile64::<Endianness>::parse(bytes).ok()?;
-        let table = file
-            .elf_section_table()
-            .dynamic_table(file.endian(), bytes)
-            .ok()?;
-        let entry = table
-            .iter()
-            .find(|entry| entry.tag == elf::DT_RUNPATH || entry.tag == elf::DT_RPATH)?;
-        let path = table.string(entry).ok()?;
-        std::str::from_utf8(path).ok().map(str::to_owned)
+        let section = file.section_by_name(name)?;
+        section.data().ok().map(<[u8]>::to_vec)
     }
 }
 
@@ -231,6 +225,6 @@ mod tests {
             &names[..names.len().min(8)]
         );
         assert_eq!(NativeLibrary::defined_functions(b"not an object"), None);
-        assert_eq!(NativeLibrary::run_path(b"not an object"), None);
+        assert_eq!(NativeLibrary::section(b"not an object", ".text"), None);
     }
 }
