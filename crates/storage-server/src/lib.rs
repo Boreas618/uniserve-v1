@@ -46,6 +46,7 @@ mod restart;
 mod serve;
 mod sessions;
 mod shoot;
+mod timer;
 pub mod transfer;
 mod transfers;
 
@@ -55,7 +56,6 @@ use std::net::TcpListener;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
-use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags, poll};
 
@@ -72,10 +72,6 @@ pub use restart::Resumed;
 pub use serve::{ServeOptions, Start, list, retire, serve};
 use service::Connection;
 use shoot::ShootDowns;
-
-/// How often a shoot-down that waits for a GPU to drop its victim polls
-/// NVML.
-const NVML_POLL: Duration = Duration::from_millis(20);
 
 type ClientId = u64;
 type StorageId = u64;
@@ -282,7 +278,7 @@ impl Server {
         children: Option<Children>,
     ) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
-        let (program, connector, transfer) = child::supervisors(children, &settings.server);
+        let (program, connector, transfer) = child::supervisors(children, &settings.server)?;
         let mut server = Self {
             listener,
             tcp: None,
@@ -293,7 +289,7 @@ impl Server {
             tensors: HashMap::new(),
             copies: HashMap::new(),
             deployments: HashMap::new(),
-            shootdowns: ShootDowns::new(settings.server.shoot_down()),
+            shootdowns: ShootDowns::new(settings.server.shoot_down())?,
             quotas: quota::Quotas::default(),
             kv_storage: KvStorage::new(connector),
             transfers: transfers::Transfers::new(transfer),
@@ -410,17 +406,17 @@ impl Server {
             if let Some(pidfd) = process.pidfd() {
                 fds.push(PollFd::new(pidfd, PollFlags::IN));
             }
+            // A child's restart, due at the time its timer fires.
+            if let Some(timer) = process.restart_timer() {
+                fds.push(PollFd::from_borrowed_fd(timer, PollFlags::IN));
+            }
         }
-        let timeout = [
-            self.shootdowns.polling().then_some(NVML_POLL),
-            self.kv_storage.process.timeout(),
-            self.transfers.process.timeout(),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
-        .map(|timeout| rustix::time::Timespec::try_from(timeout).unwrap_or_default());
-        match poll(&mut fds, timeout.as_ref()) {
+        // A shoot-down's next question to NVML.
+        if let Some(timer) = self.shootdowns.timer() {
+            fds.push(PollFd::from_borrowed_fd(timer, PollFlags::IN));
+        }
+        // Every wait is a descriptor's: the loop sleeps until one is ready.
+        match poll(&mut fds, None) {
             Ok(_) | Err(rustix::io::Errno::INTR) => {}
             Err(error) => return Err(error.into()),
         }

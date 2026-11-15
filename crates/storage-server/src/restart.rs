@@ -723,7 +723,7 @@ impl Server {
             .map(|_| next())
             .collect::<io::Result<Vec<_>>>()?;
         let sessions = Sessions::resume(handoff.sessions, queues, pidfd, &handoff.settings.server)?;
-        let mut shootdowns = crate::shoot::ShootDowns::new(handoff.settings.server.shoot_down());
+        let mut shootdowns = crate::shoot::ShootDowns::new(handoff.settings.server.shoot_down())?;
         for index in handoff.shot_finished {
             shootdowns.note_finished(pidfd(index)?);
         }
@@ -735,7 +735,7 @@ impl Server {
         }
         let children = program.map(|program| crate::Children::of(program, &handoff.settings));
         let (program, connector, transfer) =
-            crate::child::supervisors(children, &handoff.settings.server);
+            crate::child::supervisors(children, &handoff.settings.server)?;
         let mut server = Self {
             listener,
             tcp,

@@ -24,6 +24,13 @@ use rustix::event::{PollFd, PollFlags, poll};
 
 use platform::{DeviceUuid, Nvml};
 
+use crate::timer::Timer;
+
+/// How long a shoot-down that waits for NVML to stop listing its process waits before it asks
+/// again: NVML states no event when a process leaves a GPU, so the question is asked at this
+/// period, on the shoot-downs' own timer.
+const NVML_PERIOD: Duration = Duration::from_millis(20);
+
 struct ShootDown {
     pid: i32,
     pidfd: Arc<OwnedFd>,
@@ -41,6 +48,9 @@ pub(super) struct ShootDowns {
     /// How long a process may take to leave every GPU it held once it exited
     /// (`storage_config.shoot_down_s`).
     deadline: Duration,
+    /// Fires when a shoot-down that waits on NVML or on its deadline is to be asked again;
+    /// armed only while one does.
+    timer: Timer,
     running: Vec<ShootDown>,
     /// Processes that left every GPU; dropped once nothing else refers to
     /// their pidfd.
@@ -54,14 +64,19 @@ pub(super) struct ShootDowns {
 
 impl ShootDowns {
     /// No shoot-down, each to come allowed `deadline` to leave its GPUs.
-    pub(super) fn new(deadline: Duration) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Fails when the shoot-downs' timer cannot be created.
+    pub(super) fn new(deadline: Duration) -> std::io::Result<Self> {
+        Ok(Self {
             deadline,
+            timer: Timer::new()?,
             running: Vec::new(),
             finished: Vec::new(),
             failed: Vec::new(),
             nvml: None,
-        }
+        })
     }
 
     /// Kill the process behind `pidfd` and follow it until it left `gpus`.
@@ -155,8 +170,14 @@ impl ShootDowns {
     /// Whether a shoot-down waits on something no descriptor signals: NVML,
     /// or its deadline. A process followed that has not exited waits on its
     /// pidfd.
-    pub(super) fn polling(&self) -> bool {
+    fn polling(&self) -> bool {
         self.running.iter().any(|shot| shot.killed || shot.exited)
+    }
+
+    /// The timer the loop waits on while a shoot-down waits on NVML or its deadline: readable
+    /// when it is to be asked again ([`Self::advance`]).
+    pub(super) fn timer(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.polling().then(|| self.timer.as_fd())
     }
 
     /// Follow every running shoot-down. Returns whether any ended.
@@ -209,6 +230,13 @@ impl ShootDowns {
         self.running = still;
         // A record nothing else refers to names no holder any more.
         self.finished.retain(|pidfd| Arc::strong_count(pidfd) > 1);
+        // The next question to NVML, while a shoot-down waits on it or on its deadline.
+        let _ = self.timer.fired();
+        if self.polling()
+            && let Err(error) = self.timer.arm(NVML_PERIOD)
+        {
+            tracing::error!(%error, "the shoot-downs' next question cannot be scheduled");
+        }
         ended
     }
 

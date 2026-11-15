@@ -28,7 +28,9 @@ use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::timer::Timer;
 
 use ::storage::protocol::{Child, ChildListing};
 use serde::{Deserialize, Serialize};
@@ -292,23 +294,27 @@ impl Children {
 
 /// The supervisors of `children` with the waits `settings` state (the connector's, then the
 /// Transfer Server's), and the program they run; supervisors that run nothing without children.
+///
+/// # Errors
+///
+/// Fails when a supervisor's restart timer cannot be created.
 pub(super) fn supervisors(
     children: Option<Children>,
     settings: &::storage::ServerSettings,
-) -> (Option<Program>, Process, Process) {
+) -> io::Result<(Option<Program>, Process, Process)> {
     let backoff = Backoff::of(settings);
     let Some(children) = children else {
-        return (
+        return Ok((
             None,
-            Process::new(None, backoff),
-            Process::new(None, backoff),
-        );
+            Process::new(None, backoff)?,
+            Process::new(None, backoff)?,
+        ));
     };
-    (
+    Ok((
         Some(children.program),
-        Process::new(children.connector.map(Launch::Connector), backoff),
-        Process::new(children.transfer.map(Launch::Transfer), backoff),
-    )
+        Process::new(children.connector.map(Launch::Connector), backoff)?,
+        Process::new(children.transfer.map(Launch::Transfer), backoff)?,
+    ))
 }
 
 /// The entry arguments of a child of `channel` (`storage-server child --channel FD`), as the
@@ -337,8 +343,8 @@ pub(super) struct Process {
     restart_after: Backoff,
     /// The running process, with its pidfd.
     running: Option<(std::process::Child, Arc<OwnedFd>)>,
-    /// When to start a process again, while none runs.
-    restart: Option<Instant>,
+    /// Fires when a process is to start again, while none runs; armed only then.
+    restart: Timer,
     /// How many processes in a row ended before they connected.
     failures: u32,
     /// Whether the running process connected.
@@ -374,9 +380,16 @@ impl Backoff {
 
 impl Process {
     /// A child of `launch`, due at once; none without a launch.
-    pub(super) fn new(launch: Option<Launch>, restart_after: Backoff) -> Self {
-        let restart = launch.as_ref().map(|_| Instant::now());
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Fails when its restart timer cannot be created.
+    pub(super) fn new(launch: Option<Launch>, restart_after: Backoff) -> io::Result<Self> {
+        let restart = Timer::new()?;
+        if launch.is_some() {
+            restart.arm(Duration::ZERO)?;
+        }
+        Ok(Self {
             launch,
             restart_after,
             running: None,
@@ -384,7 +397,7 @@ impl Process {
             failures: 0,
             connected: false,
             ended: None,
-        }
+        })
     }
 
     /// The child the supervisor runs, while it runs one.
@@ -413,10 +426,9 @@ impl Process {
     /// server's end of the channel, the launch queued on it, and the process.
     pub(super) fn start_due(&mut self, program: &Program) -> Option<Started> {
         let launch = self.launch.as_ref()?;
-        if self.running.is_some() || self.restart.is_none_or(|at| Instant::now() < at) {
+        if self.running.is_some() || !self.restart.fired() {
             return None;
         }
-        self.restart = None;
         let child = launch.child();
         let started = UnixStream::pair().and_then(|(ours, theirs)| {
             let (process, pidfd) = program.spawn(
@@ -471,7 +483,9 @@ impl Process {
         }
         self.connected = false;
         let wait = self.restart_after.after(self.failures.saturating_sub(1));
-        self.restart = Some(Instant::now() + wait);
+        if let Err(error) = self.restart.arm(wait) {
+            tracing::error!(%error, "the next start of a child cannot be scheduled");
+        }
         self.ended = Some(how);
     }
 
@@ -479,18 +493,17 @@ impl Process {
     /// one of its own; none starts here again.
     pub(super) fn stop(&mut self) {
         self.launch = None;
-        self.restart = None;
+        self.restart.disarm();
         if let Some((mut process, _)) = self.running.take() {
             let _ = process.kill();
             let _ = process.wait();
         }
     }
 
-    /// How long the server may sleep before a start is due.
-    pub(super) fn timeout(&self) -> Option<Duration> {
-        self.restart
-            .filter(|_| self.launch.is_some() && self.running.is_none())
-            .map(|at| at.saturating_duration_since(Instant::now()))
+    /// The timer the loop waits on while a start of the child is due later: readable once it
+    /// is due.
+    pub(super) fn restart_timer(&self) -> Option<BorrowedFd<'_>> {
+        (self.launch.is_some() && self.running.is_none()).then(|| self.restart.as_fd())
     }
 
     /// The child in a listing, while the server runs one.
@@ -502,7 +515,8 @@ impl Process {
             failures: self.failures,
             ended: self.ended.clone(),
             restart_in_ms: self
-                .timeout()
+                .restart_timer()
+                .and(self.restart.remaining())
                 .map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
         })
     }
