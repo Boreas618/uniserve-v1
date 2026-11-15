@@ -622,6 +622,13 @@ impl NativeCall for RouteCall {
 /// variant of [`GatherGemm`]: the weight operand's type changes — packed E2M1 nibbles, the swizzled
 /// block scales, one FP32 tensor scale per expert — and an optional-and-branch form would put the
 /// branch in the descriptor key and in the hot path of the dense case that never has it.
+/// The block-scale layout both routed NVFP4 products read their weights' scales in.
+///
+/// The packages compile their kernels for this layout of the weight operand (their manifests'
+/// `mSfLayoutA`), while the tokens' layout is the descriptor's [`GatherGemmNvfp4Descriptor::layout`];
+/// a caller transforms every checkpoint's weight scales into this layout before it binds them.
+pub const WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct GatherGemmNvfp4Descriptor {
     /// Hidden elements of a token: the contraction length.

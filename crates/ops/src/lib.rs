@@ -139,11 +139,6 @@
 //! derived from the reduction length, the accumulation dtype and the output dtype, operator by
 //! operator, and never from a measurement of the pair being compared.
 
-/// This crate's kernel packages, one directory per operator and backend: a tree
-/// of this crate's own, which the model crates' tests and the Build Server's
-/// tools read.
-pub const KERNELS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/kernels");
-
 pub mod abi;
 pub mod activation;
 pub mod activation1d;

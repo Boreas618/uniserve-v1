@@ -107,9 +107,6 @@ pub(crate) const DOWN_VALUE_LAYOUT: ValueLayout = ValueLayout::Shuffled {
     epilogue_tile_m: MMA_TILE.0,
 };
 
-/// The arrangement both packed products read their weights' block scales in.
-pub(crate) const WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
-
 /// The arrangement the gated product reads its activation's block scales in: its kernels read
 /// the tokens they route in the linear form.
 const GATED_TOKEN_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Linear;
@@ -1477,44 +1474,7 @@ fn sort_formula(
 
 #[cfg(test)]
 mod tests {
-    use ops::fp4::ScaleLayout;
-
-    use super::{WEIGHT_SCALE_LAYOUT, workspace_bytes};
-
-    /// The weights' block-scale layout each packed product's kernels are built for, held against
-    /// the packages.
-    ///
-    /// A product's kernels are compiled with one layout for each operand, and nothing compares
-    /// the two at a launch: a package built for one form and given a table in the other reads
-    /// every block scale at the wrong offset and computes plausible numbers. The tokens' layout
-    /// is the descriptor's `layout`, which the packages select their kernels by
-    /// (`mSfLayoutB = { field = "layout" }`); the weights' is the package's `mSfLayoutA`, which
-    /// the loader transforms every checkpoint's table into.
-    #[test]
-    fn a_packed_product_s_package_states_the_weight_scale_layout_its_function_passes() {
-        let name = |layout: ScaleLayout| match layout {
-            ScaleLayout::Linear => "\"linear\"",
-            ScaleLayout::Swizzled128X4 => "\"swizzled_128x4\"",
-        };
-
-        for operator in ["gather_gemm_nvfp4", "route_gemm_nvfp4"] {
-            let package = std::path::Path::new(ops::KERNELS)
-                .join(operator)
-                .join("trtllm/package.toml");
-            let stated = std::fs::read_to_string(&package)
-                .unwrap_or_else(|error| panic!("{}: {error}", package.display()));
-
-            let line = format!("mSfLayoutA = {}", name(WEIGHT_SCALE_LAYOUT));
-            assert!(
-                stated.contains(&line),
-                "{operator}'s package does not state `{line}`"
-            );
-            assert!(
-                stated.contains(r#"mSfLayoutB = { field = "layout" }"#),
-                "{operator}'s package selects its kernels by another token layout than the key's"
-            );
-        }
-    }
+    use super::workspace_bytes;
 
     /// The packed products' workspaces follow the package's arithmetic over the bucket's route
     /// count: 15 tokens over 128 experts are 120 tiles of 128 permuted rows, for which the

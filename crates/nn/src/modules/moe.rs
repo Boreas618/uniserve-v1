@@ -55,9 +55,7 @@ use tensor::{DType, Device, Shape, Tensor};
 use crate::capability::ExpertExchange;
 use crate::collective::{self, Split};
 use crate::error::{Error, Result};
-use crate::functional::{
-    self, Activation, DOWN_VALUE_LAYOUT, GATED_VALUE_LAYOUT, WEIGHT_SCALE_LAYOUT, WeightOrder,
-};
+use crate::functional::{self, Activation, DOWN_VALUE_LAYOUT, GATED_VALUE_LAYOUT, WeightOrder};
 use crate::modules::linear::{Linear, LinearConfig, Parallel};
 use crate::modules::mlp::{Mlp, MlpConfig};
 use crate::quantization::{Nvfp4Share, Nvfp4Stack, Scheme, ValueLayout};
@@ -475,7 +473,7 @@ impl MoE {
             window,
             config.experts,
             names,
-            (gated_layout, WEIGHT_SCALE_LAYOUT),
+            (gated_layout, ops::moe::grouped::WEIGHT_SCALE_LAYOUT),
             true,
             rows,
         )?;
@@ -486,7 +484,7 @@ impl MoE {
             window,
             config.experts,
             names,
-            (down_layout, WEIGHT_SCALE_LAYOUT),
+            (down_layout, ops::moe::grouped::WEIGHT_SCALE_LAYOUT),
             true,
             columns,
         )?;
