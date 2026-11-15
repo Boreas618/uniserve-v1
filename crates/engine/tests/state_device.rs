@@ -1,8 +1,8 @@
 //! Recurrent state on a device: a keep and a restore move a slot's state through a unit of the
 //! state region, and a settle takes a trail's entry as a slot's live state.
 //!
-//! Every case needs GPU 0; the case that launches the block-copy kernels also needs a running
-//! Build Server (`UNISERVE_BUILD_SERVER_SOCKET`). Run them on a GPU host:
+//! Every case needs GPU 0; the case that launches the block-copy kernels also needs this host's
+//! Build Server (`uniserve build-server serve`). Run them on a GPU host:
 //!
 //! ```text
 //! cargo test -p engine --test state_device -- --ignored --test-threads 1

@@ -2,8 +2,8 @@
 //! what the eager forward computes; a replay's columns and host values reach the device through
 //! the input buffer; a generation is rebound, shadowed, switched to and rolled back.
 //!
-//! Every case needs GPU 0; the cases that launch kernels also need a running Build Server
-//! (`UNISERVE_BUILD_SERVER_SOCKET`). Run them on a GPU host:
+//! Every case needs GPU 0; the cases that launch kernels also need this host's Build Server
+//! (`uniserve build-server serve`). Run them on a GPU host:
 //!
 //! ```text
 //! cargo test -p engine --test graphs_device -- --ignored --test-threads 1

@@ -4,8 +4,8 @@
 //! a batch's page work is issued around the replay; a runner that speculates commits the
 //! prefix a verification's samples agree with and proposes the drafts after it.
 //!
-//! Every case needs GPU 0 and a running Build Server (`UNISERVE_BUILD_SERVER_SOCKET`). Run
-//! them on a GPU host:
+//! Every case needs GPU 0 and this host's Build Server (`uniserve build-server serve`). Run them
+//! on a GPU host:
 //!
 //! ```text
 //! cargo test -p engine --test causal_lm_device -- --ignored --test-threads 1

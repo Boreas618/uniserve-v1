@@ -2,11 +2,11 @@
 //! Server through the engine's own module load (`engine::modules::load`), and device tensors with
 //! stated values.
 //!
-//! The device is GPU 0 of the process (`CUDA_VISIBLE_DEVICES`' first) and the server the one
-//! whose socket `UNISERVE_BUILD_SERVER_SOCKET` names (`uniserve build-server serve`).
+//! The device is GPU 0 of the process (`CUDA_VISIBLE_DEVICES`' first) and the server this host's
+//! Build Server, which `uniserve build-server serve` starts on its socket in the user's runtime
+//! directory (`build_server::default_socket`).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use std::sync::Arc;
 
 use build_server::{Client, Target};
@@ -28,14 +28,18 @@ pub(crate) struct Kernels {
 }
 
 impl Kernels {
-    /// Connects to the Build Server the environment names.
+    /// Connects to this host's Build Server.
     pub(crate) fn open() -> Outcome<Self> {
-        let socket = std::env::var_os("UNISERVE_BUILD_SERVER_SOCKET").ok_or(
-            "UNISERVE_BUILD_SERVER_SOCKET names no Build Server: start one with `uniserve \
-             build-server serve`",
-        )?;
+        let socket = build_server::default_socket()?;
+        let client = Client::connect(&socket).map_err(|error| {
+            format!(
+                "no Build Server serves on {}: start one with `uniserve build-server serve` \
+                 ({error})",
+                socket.display()
+            )
+        })?;
         Ok(Self {
-            client: Client::connect(Path::new(&socket))?,
+            client,
             target: Target::arch(DEVICE.compute_capability()?)?,
         })
     }
