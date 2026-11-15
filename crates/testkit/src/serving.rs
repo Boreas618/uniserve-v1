@@ -1,6 +1,6 @@
 //! What the engine's own tests serve from: a Storage Server on a thread of the test's process, the
-//! launch of one main process serving the Qwen3-MoE fixture of the `models` crate, and the bound
-//! of a test's waits.
+//! launch of one main process serving the Qwen3-MoE fixture of the `models` crate, the kernel a
+//! generation holds that no test launches, and the bound of a test's waits.
 //!
 //! The engine's unit tests and its integration tests share these, so they live in this
 //! development crate rather than in the engine's test tree. None of them names an engine type:
@@ -18,6 +18,20 @@ use proto::config::{EngineArgs, WorkerGroupConfig};
 /// The bound of a test's wait that only a defect reaches: a passing test's waits end on the event
 /// they wait for, long before it.
 pub const LONG: Duration = Duration::from_secs(60);
+
+/// A kernel a test's generation holds and never launches: the C library's `getpid`, which takes
+/// no argument and touches no state, stands in for a package's launch entry, so a runner's
+/// generation, its graphs' bindings and their comparisons hold entries without a device or a
+/// Build Server.
+///
+/// # Panics
+///
+/// When the process's C library cannot be opened by its soname.
+#[expect(clippy::unwrap_used, reason = "test support fails the test that asks")]
+pub fn unlaunched_kernel() -> Arc<ops::Kernel> {
+    let library = platform::NativeLibrary::open("libc.so.6").unwrap();
+    Arc::new(ops::Kernel::load_native(library, "getpid").unwrap())
+}
 
 /// The deployment [`launch`] serves, and the one a test's sessions are of.
 pub const DEPLOYMENT: &str = "model";

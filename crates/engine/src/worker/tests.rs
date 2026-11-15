@@ -13,8 +13,7 @@ use crate::batch::{
 };
 use crossbeam_channel::{Receiver, Sender};
 use nn::functional::{embedding, rms_norm};
-use ops::{Generation, Kernel, KernelEntry};
-use platform::NativeLibrary;
+use ops::{Generation, KernelEntry};
 use proto::request::RequestId;
 use storage::QueuePair;
 use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Run, Tier};
@@ -32,6 +31,7 @@ use crate::worker::completion::{Outcome, Submission, Waker};
 use crate::worker::{Error, Result};
 use service::lock;
 use testkit::LONG;
+use testkit::serving::unlaunched_kernel;
 
 const VOCABULARY: usize = 32;
 const HIDDEN: usize = 16;
@@ -302,12 +302,6 @@ fn completed(token: u64) -> CallOutput {
     }
 }
 
-/// A kernel no test launches: an entry of the C library stands in for a package's.
-fn kernel() -> Arc<Kernel> {
-    let library = NativeLibrary::open("libc.so.6").unwrap();
-    Arc::new(Kernel::load_native(library, "getpid").unwrap())
-}
-
 /// Generation 1, holding a kernel for every key a profile run of the test runner states.
 fn serving() -> Arc<Generation> {
     let profiled = LoggingRunner::new(
@@ -317,7 +311,7 @@ fn serving() -> Arc<Generation> {
         &Log::default(),
     );
     profiled.graphs.profile_run(&profiled).unwrap();
-    let kernel = kernel();
+    let kernel = unlaunched_kernel();
 
     Arc::new(Generation::new(
         1,
@@ -331,7 +325,7 @@ fn serving() -> Arc<Generation> {
 
 /// The generation `number` after `serving` in which every kernel of `operator` is another one.
 fn replacing(serving: &Generation, number: u64, operator: &'static str) -> Arc<Generation> {
-    let kernel = kernel();
+    let kernel = unlaunched_kernel();
     let keys: Vec<String> = serving.keys(operator).map(str::to_owned).collect();
 
     Arc::new(
@@ -1014,7 +1008,7 @@ fn a_shadow_batch_compares_the_replaced_operators_its_bucket_launches() {
         [KernelEntry::keyed(
             "softmax",
             "dtype_f32".to_owned(),
-            kernel(),
+            unlaunched_kernel(),
         )],
     ));
     output_of(&worker.prepare(adding).unwrap());

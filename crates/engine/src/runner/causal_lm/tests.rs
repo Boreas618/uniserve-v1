@@ -46,6 +46,7 @@ use crate::runner::graphs::Graphs;
 use crate::worker::Error;
 use crate::worker::completion::Outcome;
 use crate::worker::{Sequences, Worker};
+use testkit::serving::unlaunched_kernel;
 
 const VOCABULARY: usize = 64;
 const HIDDEN: usize = 16;
@@ -1739,12 +1740,6 @@ fn a_paired_forward_is_prepared_over_a_scratch_set_the_cache_lends() {
     assert_eq!(paired, serving);
 }
 
-/// A kernel no test launches: an entry of the C library stands in for a package's.
-fn kernel() -> Arc<ops::Kernel> {
-    let library = platform::NativeLibrary::open("libc.so.6").unwrap();
-    Arc::new(ops::Kernel::load_native(library, "getpid").unwrap())
-}
-
 /// One entry of `kernel` for every key of `keys`.
 fn entries<'a>(
     keys: impl IntoIterator<Item = &'a (&'static str, String)>,
@@ -1765,7 +1760,7 @@ fn a_shadow_batch_whose_rows_do_not_fit_the_scratch_set_is_reported_uncompared()
     cache.open_scratch(SCRATCH_PAGES, None).unwrap();
     let cache = Arc::new(Mutex::new(cache));
     let keys = over(&lock(&cache), None).graphs().keys();
-    let serving = Arc::new(Generation::new(1, entries(&keys, &kernel())));
+    let serving = Arc::new(Generation::new(1, entries(&keys, &unlaunched_kernel())));
 
     // The runner over the cache, each part of a batch's page work recorded before the cache
     // issues it.
@@ -1810,7 +1805,7 @@ fn a_shadow_batch_whose_rows_do_not_fit_the_scratch_set_is_reported_uncompared()
     let attention = keys
         .iter()
         .filter(|(operator, _)| *operator == "paged_attention");
-    let next = Arc::new(serving.replace(2, entries(attention, &kernel())));
+    let next = Arc::new(serving.replace(2, entries(attention, &unlaunched_kernel())));
     assert!(matches!(
         ended(worker.prepare(next)),
         Some(Outcome::Success(_))

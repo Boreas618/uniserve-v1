@@ -4418,6 +4418,8 @@ dependencies = [
  "libc",
  "media",
  "models",
+ "ops",
+ "platform",
  "proto",
  "rustix",
  "scheduling",

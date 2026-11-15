@@ -11,8 +11,7 @@ use nn::modules::Linear;
 use nn::{CausalLm, ExpertExchange, KvCache, RecurrentState, TokenBatch};
 use ops::fill;
 use ops::norm::{RmsNorm, RmsNormArgs, RmsNormDescriptor};
-use ops::{Generation, Kernel, KernelEntry};
-use platform::NativeLibrary;
+use ops::{Generation, KernelEntry};
 use tensor::{DType, Device, Tensor};
 
 use storage::runtime::GroupId;
@@ -22,6 +21,7 @@ use crate::memory::tables::BlockTables;
 use crate::runner::Runner;
 use crate::runner::buckets::Bucket;
 use crate::worker::{Error, Result};
+use testkit::serving::unlaunched_kernel;
 
 const VOCABULARY: usize = 32;
 const HIDDEN: usize = 16;
@@ -218,15 +218,9 @@ fn tables() -> BlockTables {
     BlockTables::new(GroupId(0), &[], &[])
 }
 
-/// A kernel no test launches: an entry of the C library stands in for a package's.
-fn kernel() -> Arc<Kernel> {
-    let library = NativeLibrary::open("libc.so.6").unwrap();
-    Arc::new(Kernel::load_native(library, "getpid").unwrap())
-}
-
 /// Generation `number` holding one kernel for every key a profile run of the runner states.
 fn generation_of(runner: &TinyRunner, number: u64) -> Arc<Generation> {
-    let kernel = kernel();
+    let kernel = unlaunched_kernel();
 
     Arc::new(Generation::new(
         number,
@@ -240,7 +234,7 @@ fn generation_of(runner: &TinyRunner, number: u64) -> Arc<Generation> {
 
 /// The generation after `serving` in which every kernel of `operator` is another one.
 fn replacing(serving: &Generation, number: u64, operator: &'static str) -> Arc<Generation> {
-    let kernel = kernel();
+    let kernel = unlaunched_kernel();
     let keys: Vec<String> = serving.keys(operator).map(str::to_owned).collect();
 
     Arc::new(
@@ -593,7 +587,7 @@ fn a_generation_that_changes_no_launched_kernel_keeps_every_graph() {
         [KernelEntry::keyed(
             "softmax",
             "dtype_f32".to_owned(),
-            kernel(),
+            unlaunched_kernel(),
         )],
     ));
 

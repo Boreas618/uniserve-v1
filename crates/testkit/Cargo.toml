@@ -34,6 +34,9 @@ storage-server.workspace = true
 # The policy's parameters and limits; a test engine's policy module is loaded with the
 # engine's own policy host (`engine::scheduler::policy`).
 scheduling.workspace = true
+# The kernel a test's generation holds and never launches (`serving::unlaunched_kernel`).
+ops.workspace = true
+platform.workspace = true
 # The pipe that wakes a Storage Server's loop to stop.
 rustix = { workspace = true, features = ["pipe"] }
 # The reports of `cargo metadata` and of a policy package's build.
