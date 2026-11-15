@@ -296,10 +296,10 @@ pub(super) mod tests {
             if case.get("expected").is_none() {
                 continue;
             }
-            let generation = Request::parse(case).prepare().unwrap();
-            let prompt = case["prompt"].as_str().unwrap();
+            let request = Request::parse(case);
+            let generation = request.prepare().unwrap();
             assert_eq!(
-                segments(&generation, prompt),
+                segments(&generation, request.prompt()),
                 expected_segments(case),
                 "{}",
                 case["name"]
@@ -318,8 +318,9 @@ pub(super) mod tests {
             if case.get("expected").is_none() {
                 continue;
             }
-            let generation = Request::parse(case).prepare().unwrap();
-            let prompt = present(&tokenizer, &generation, case["prompt"].as_str().unwrap())
+            let request = Request::parse(case);
+            let generation = request.prepare().unwrap();
+            let prompt = present(&tokenizer, &generation, request.prompt())
                 .unwrap_or_else(|error| panic!("{}: {error}", case["name"]));
             let (token_ids, spans) = expected_prompt(&vectors, case);
             assert_eq!(prompt.token_ids, token_ids, "{}", case["name"]);

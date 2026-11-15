@@ -1132,48 +1132,19 @@ pub(super) mod tests {
         ProcessorConfig::deserialize(&vectors["vision"]).unwrap()
     }
 
-    /// The canvases of the vectors' accepted requests, as a deployment that prepares them all
-    /// declares them, the canvas an `auto` target names first, as the default of a request that
-    /// states no size. A `t2va` or `ref2va` request's ratio names its canvas (`auto` naming
-    /// 16:9); an `fl2va` canvas, which the canvas rule resolves from a free ratio or the first
-    /// keyframe, is declared under its own size.
+    /// The canvases of the deployment the vectors' requests are stated to, the first the size of a
+    /// request that names none.
     fn vector_canvases() -> Vec<ServedCanvas> {
-        let mut declared: Vec<ServedCanvas> = Vec::new();
-        let mut default = None;
-        for case in vectors()["requests"].as_array().unwrap() {
-            let Some(expected) = case.get("expected") else {
-                continue;
-            };
-            let canvas = size(&expected["canvas"]);
-            let target = &case["target"];
-            let short_edge = target["short_edge"].as_u64().unwrap() as u32;
-            let named = target["aspect_ratio"].as_str().unwrap();
-            let aspect_ratio = match (case["task"].as_str().unwrap(), named) {
-                ("fl2va", _) => format!("{}:{}", canvas.width, canvas.height),
-                (_, "auto") => {
-                    default = default.or(Some(canvas));
-                    "16:9".to_owned()
-                }
-                (_, named) => named.to_owned(),
-            };
-            if !declared.iter().any(|served| {
-                served.short_edge == short_edge && served.aspect_ratio == aspect_ratio
-            }) {
-                declared.push(ServedCanvas {
-                    short_edge,
-                    aspect_ratio,
-                    canvas,
-                });
-            }
-        }
-        if let Some(index) = declared
+        vectors()["deployment"]["canvases"]
+            .as_array()
+            .unwrap()
             .iter()
-            .position(|served| Some(served.canvas) == default)
-        {
-            let first = declared.remove(index);
-            declared.insert(0, first);
-        }
-        declared
+            .map(|served| ServedCanvas {
+                short_edge: served["short_edge"].as_u64().unwrap() as u32,
+                aspect_ratio: served["aspect_ratio"].as_str().unwrap().to_owned(),
+                canvas: size(&served["size"]),
+            })
+            .collect()
     }
 
     /// The sizing of a deployment whose processor options enlarge references, as the released
@@ -1284,49 +1255,38 @@ pub(super) mod tests {
         }
     }
 
-    /// A size no deployment of the vectors serves: what a request states for a target the public
-    /// schema names no served canvas for.
-    const UNSERVED: Canvas = Canvas {
-        width: 1,
-        height: 1,
-    };
-
-    /// A vectors request as the public API states it, and the media of its references.
-    ///
-    /// The vectors are written in the reference pipeline's schema: a task, a target of short edge,
-    /// aspect ratio and duration, and conditions with roles. A request states them as references,
-    /// whose frame indices select the task, a size and a duration.
+    /// A vectors request, stated in the public schema, and the media of its references.
     pub(in crate::minimax_h3) struct Request {
         spec: VideoSpec,
         media: Vec<MediaMetadata>,
     }
 
     impl Request {
-        /// The public request of `case`; `None` for a case the public schema cannot state: an
-        /// explicit task its references do not select, or a `video_audio` condition's required
-        /// soundtrack.
-        pub(in crate::minimax_h3) fn stated(case: &Value) -> Option<Self> {
-            let target = &case["target"];
-            let conditions = case["conditions"].as_array().unwrap();
-            let references: Vec<Reference> = conditions
+        /// The public request of `case`, which states the task its references select.
+        pub(in crate::minimax_h3) fn parse(case: &Value) -> Self {
+            let request = &case["request"];
+            let references: Vec<Reference> = request["input_references"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .map(|entry| Reference {
-                    kind: match entry["type"].as_str().unwrap() {
-                        "video_audio" => ReferenceKind::Video,
-                        kind => ReferenceKind::named(kind).unwrap(),
-                    },
-                    frame_index: (entry["role"] == "keyframe")
-                        .then(|| entry.get("frame_index").and_then(Value::as_i64))
-                        .flatten(),
-                    start_time_seconds: entry.get("start_time_seconds").and_then(Value::as_f64),
+                .map(|reference| Reference {
+                    kind: ReferenceKind::named(reference["type"].as_str().unwrap()).unwrap(),
+                    frame_index: reference.get("frame_index").and_then(Value::as_i64),
+                    start_time_seconds: reference.get("start_time_seconds").and_then(Value::as_f64),
                 })
                 .collect();
             let spec = VideoSpec {
-                prompt: case["prompt"].as_str().unwrap().to_owned(),
+                prompt: request["prompt"].as_str().unwrap().to_owned(),
                 negative_prompt: None,
-                size: public_size(case),
-                length: target
-                    .get("duration_seconds")
+                size: request.get("size").map(|size| {
+                    let (width, height) = size.as_str().unwrap().split_once('x').unwrap();
+                    Canvas {
+                        width: width.parse().unwrap(),
+                        height: height.parse().unwrap(),
+                    }
+                }),
+                length: request
+                    .get("seconds")
                     .and_then(Value::as_f64)
                     .map(Length::Seconds),
                 fps: None,
@@ -1336,23 +1296,26 @@ pub(super) mod tests {
                 references,
                 extra_params: Map::new(),
             };
-            let silent_video = case.get("error").is_some()
-                && conditions
-                    .iter()
-                    .any(|entry| entry["type"] == "video_audio");
-            let selects = task(&spec) == VideoTask::deserialize(&case["task"]).unwrap();
-            (selects && !silent_video).then(|| Self {
+            assert_eq!(
+                task(&spec),
+                VideoTask::deserialize(&case["task"]).unwrap(),
+                "{}",
+                case["name"]
+            );
+            Self {
                 spec,
-                media: conditions
+                media: case["media"]
+                    .as_array()
+                    .unwrap()
                     .iter()
-                    .map(|entry| media(&entry["media"]))
+                    .map(media)
                     .collect(),
-            })
+            }
         }
 
-        /// The public request of an accepted case.
-        pub(in crate::minimax_h3) fn parse(case: &Value) -> Self {
-            Self::stated(case).expect("an accepted request is stated in the public schema")
+        /// The request's prompt.
+        pub(in crate::minimax_h3) fn prompt(&self) -> &str {
+            &self.spec.prompt
         }
 
         /// What the request generates, its request-only rules applied first as the server applies
@@ -1361,48 +1324,6 @@ pub(super) mod tests {
             let processor = processor();
             processor.check_request(&self.spec)?;
             processor.prepare(&self.spec, &self.media)
-        }
-    }
-
-    /// The size a vectors target states: none for `auto` at the vectors' first short edge, the
-    /// served canvas its ratio names, the canvas the canvas rule resolves an `fl2va` ratio to, and
-    /// otherwise a size no deployment serves.
-    fn public_size(case: &Value) -> Option<Canvas> {
-        let target = &case["target"];
-        let short_edge = target["short_edge"].as_u64().unwrap() as u32;
-        let ratio = target["aspect_ratio"].as_str().unwrap();
-        let canvases = vector_canvases();
-        if ratio == "auto" {
-            return (short_edge != canvases[0].short_edge).then_some(UNSERVED);
-        }
-        if let Some(served) = canvases
-            .iter()
-            .find(|served| served.short_edge == short_edge && served.aspect_ratio == ratio)
-        {
-            return Some(served.canvas);
-        }
-        let by_rule = case["task"] == "fl2va" && short_edge == CANVAS_RULE.short_edge;
-        let resolved = ratio
-            .split_once(':')
-            .and_then(|(width, height)| {
-                Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?))
-            })
-            .filter(|_| by_rule)
-            .and_then(|(width, height)| {
-                CANVAS_RULE.canvas(f64::from(width), f64::from(height)).ok()
-            });
-        Some(resolved.unwrap_or(UNSERVED))
-    }
-
-    /// The public request parameter a vectors refusal's reference-schema field is: the target's
-    /// short edge and aspect ratio are the size, its duration the seconds, the task and the
-    /// conditions the references.
-    fn public_param(field: &str) -> String {
-        match field {
-            "target.short_edge" | "target.aspect_ratio" => "size".to_owned(),
-            "target.duration_seconds" => "seconds".to_owned(),
-            "task" | "conditions" => "input_references".to_owned(),
-            field => field.replacen("conditions", "input_references", 1),
         }
     }
 
@@ -1913,32 +1834,21 @@ pub(super) mod tests {
         }
     }
 
-    /// Each refused request the public schema states names the public parameter of the field the
-    /// reference blames, whether preparation or the prompt refuses it.
+    /// Each refused request names the public parameter the reference blames, whether preparation
+    /// or the prompt refuses it.
     #[test]
     fn refused_requests_name_the_field() {
         for case in vectors()["requests"].as_array().unwrap() {
             let Some(error) = case.get("error") else {
                 continue;
             };
-            let Some(request) = Request::stated(case) else {
-                continue;
-            };
+            let request = Request::parse(case);
             let refusal = match request.prepare() {
-                Ok(generation) => present(
-                    &CharacterTokenizer,
-                    &generation,
-                    case["prompt"].as_str().unwrap(),
-                )
-                .expect_err("the request was accepted"),
+                Ok(generation) => present(&CharacterTokenizer, &generation, request.prompt())
+                    .expect_err("the request was accepted"),
                 Err(refusal) => refusal,
             };
-            assert_eq!(
-                param(refusal),
-                public_param(error["field"].as_str().unwrap()),
-                "{}",
-                case["name"]
-            );
+            assert_eq!(param(refusal), error["param"], "{}", case["name"]);
         }
     }
 
