@@ -1746,7 +1746,7 @@ pub(super) mod tests {
     #[test]
     fn a_reference_video_runs_at_the_frame_rates_the_rules_take() {
         let vision = vision(&vectors());
-        let sizing = ReferenceSizing::released(&REFERENCE_LIMITS);
+        let sizing = released();
         let at = |numerator: u32, denominator: u32| {
             let facts = VideoMetadata {
                 display_width: 16,
