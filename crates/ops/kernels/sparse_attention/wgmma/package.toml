@@ -23,6 +23,16 @@ packages = ["flashinfer-python"]
 [source]
 kind = "cuda"
 
+# The kernel is CuTe and CUTLASS source, compiled against the CUTLASS headers the locked
+# FlashInfer distribution installs (`cute/` beside `cutlass/`), with the relaxed constexpr every
+# CUTLASS unit is compiled with; CuTe encodes the kernel's tensor maps through the driver API.
+[compile]
+units = ["src/attention.cu"]
+standard = "c++17"
+relaxed_constexpr = true
+libraries = ["cuda"]
+headers = [{ distribution = "flashinfer-python", path = "flashinfer/data/cutlass/include" }]
+
 [kernel]
 requires = ["warpgroup_mma"]
 

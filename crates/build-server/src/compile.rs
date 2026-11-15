@@ -44,6 +44,18 @@ pub struct Compile {
     /// found where the toolchain description states it.
     #[serde(default)]
     pub libraries: Vec<Library>,
+    /// The header sets the units include beyond the package's own and the
+    /// shared kernel sources': each a directory a distribution of the Build
+    /// Server's locked environment installs, which the package names in its
+    /// `[toolchain] packages`. The lock fixes the distribution by its wheel's
+    /// hash, so a header set it installs is not pinned again.
+    #[serde(default)]
+    pub headers: Vec<Headers>,
+    /// Whether `constexpr` functions may be called from host and device code
+    /// alike (nvcc's relaxed constexpr), which CuTe's and CUTLASS's headers
+    /// require of every unit that includes them.
+    #[serde(default)]
+    pub relaxed_constexpr: bool,
     /// Whether the host compiler may contract floating-point expressions into
     /// fused multiply-adds, its default. A package whose host arithmetic must
     /// round every operation, as the reference it reproduces does, states
@@ -85,6 +97,16 @@ pub enum Library {
     /// the distribution the toolchain description names.
     #[serde(rename = "cudnn")]
     Cudnn,
+}
+
+/// A header set a locked distribution installs: the distribution's name and
+/// the directory, relative to where it installs its files, that the units
+/// search.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Headers {
+    pub distribution: String,
+    pub path: String,
 }
 
 /// The kernel of a cubin module: what the module's launch metadata states.
@@ -139,6 +161,15 @@ impl Compile {
         if self.units.is_empty() || self.units.iter().any(String::is_empty) {
             return Some("a compilation names its translation units in `units`".into());
         }
+        if let Some(headers) = self
+            .headers
+            .iter()
+            .find(|headers| headers.distribution.is_empty() || !relative(&headers.path))
+        {
+            return Some(format!(
+                "the header set {headers:?} names a distribution and a relative directory of it"
+            ));
+        }
         if let Some(name) = self.definitions.keys().find(|name| !identifier(name)) {
             return Some(format!("the definition `{name}` is no C identifier"));
         }
@@ -178,4 +209,14 @@ fn identifier(name: &str) -> bool {
         .next()
         .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
         && characters.all(|rest| rest.is_ascii_alphanumeric() || rest == '_')
+}
+
+/// Whether `path` is a non-empty relative path that stays inside the directory
+/// it is relative to.
+fn relative(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }

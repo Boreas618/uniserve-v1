@@ -1174,6 +1174,24 @@ impl Manifest {
             )));
         }
         self.check_fields("the compilation", compile.fields())?;
+        let undeclared: Vec<&str> = compile
+            .headers
+            .iter()
+            .map(|headers| headers.distribution.as_str())
+            .filter(|distribution| {
+                !self
+                    .toolchain
+                    .packages
+                    .iter()
+                    .any(|name| name == distribution)
+            })
+            .collect();
+        if !undeclared.is_empty() {
+            return Err(ManifestError::Invalid(format!(
+                "the compilation includes headers of distributions its [toolchain] packages do \
+                 not name: {undeclared:?}"
+            )));
+        }
         if root
             .join(SOURCE_DIRECTORY)
             .join(format!("{BUILD_MODULE}.py"))

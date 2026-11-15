@@ -48,6 +48,7 @@ import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
+from uniserve_build_server import fetch
 from uniserve_build_server.binding import argument_type, constant
 from uniserve_build_server.request import Request
 
@@ -371,11 +372,20 @@ def build(request: Request) -> None:
     definitions = {
         name: bound(stated) for name, stated in declared["definitions"].items()
     }
+    try:
+        headers = [
+            fetch.installed(stated["distribution"], stated["path"])
+            for stated in declared["headers"]
+        ]
+    except fetch.FetchError as error:
+        raise SystemExit(str(error)) from error
     units = [
         Unit(
             source=request.package / relative,
             standard=declared["standard"],
             definitions=definitions,
+            includes=headers,
+            relaxed_constexpr=declared["relaxed_constexpr"],
             host_contraction=declared["host_contraction"],
         )
         for relative in declared["units"]
