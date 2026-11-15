@@ -5,7 +5,7 @@ Mixture-of-experts models can shard their routed experts across GPUs. UniServe s
 ## Schedulers sharing their experts
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 .venv/bin/uniserve serve Qwen/Qwen3-30B-A3B \
+CUDA_VISIBLE_DEVICES=0,1 uniserve serve Qwen/Qwen3-30B-A3B \
   --served-model-name qwen3-moe --data-parallel-size 2 \
   --set moe_config.expert_parallel=true --set 'moe_config.exchange="alltoall"'
 ```
@@ -25,7 +25,7 @@ Each step's capacity is the smallest power of two (or the batch token bound) tha
 ## Tensor-parallel ranks sharing their experts
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/uniserve serve Qwen/Qwen3-30B-A3B \
+CUDA_VISIBLE_DEVICES=0,1,2,3 uniserve serve Qwen/Qwen3-30B-A3B \
   --served-model-name qwen3-moe --tensor-parallel-size 4 \
   --set moe_config.expert_parallel=true
 ```
@@ -33,7 +33,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/uniserve serve Qwen/Qwen3-30B-A3B \
 Without dedicated expert workers and without schedulers of one rank each, expert parallelism shards the experts over the ranks of each scheduler's tensor-parallel worker group: attention and the other layers stay tensor-parallel, and rank `r` of `P` keeps the whole experts `[r * E / P, (r + 1) * E / P)` of every layer, at their full intermediate width, instead of `1 / P` of every expert's channels. The ranks hold every token of the batch, so no exchange moves tokens: each runs its experts over all of them, routes to the other ranks' experts contributing nothing, and the group sums the ranks' outputs with the all-reduce that sums tensor-parallel expert shards. The key/value cache is laid out as the same group's without the flag, and the shards of a calibrated NVFP4 checkpoint's experts are read whole, unpadded.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/uniserve serve Qwen/Qwen3-30B-A3B \
+CUDA_VISIBLE_DEVICES=0,1,2,3 uniserve serve Qwen/Qwen3-30B-A3B \
   --served-model-name qwen3-moe --tensor-parallel-size 2 --data-parallel-size 2 \
   --set moe_config.expert_parallel=true
 ```
@@ -60,7 +60,7 @@ queue_depth = 2
 ```
 
 ```bash
-.venv/bin/uniserve serve Qwen/Qwen3-30B-A3B \
+uniserve serve Qwen/Qwen3-30B-A3B \
   --config attention_experts.toml --set moe_config.expert_parallel=true \
   --set 'moe_config.exchange="deepep"' --set moe_config.microbatches=2
 ```

@@ -17,47 +17,45 @@ The executable serves two model families, Qwen3-MoE (chat) and MiniMax-H3 (video
 | CUPTI | `libcupti.so.13` of release 13.4.92 or later on the default loader path |
 | FFmpeg | FFmpeg 8.1 with libx264, as shared libraries that pkg-config and the loader find |
 | libclang | libclang 18 or later with its headers, which bindgen loads at build time (`libclang-18-dev` on Ubuntu 24.04) |
-| Python | Python 3.12 |
-| Rust | Stable Rust toolchain with edition 2024 support |
+| Python | Python 3.12, which uv installs when the host has none |
+| uv | uv, which creates the locked Python environments |
+| Rust | rustup, which installs the Rust release `rust-toolchain.toml` pins, with its components and the wasm32 target |
 
 ## Installation
 
-Run from the repository root:
+Install uv and rustup from the host's packages or their releases, then run from the repository root:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-
-uv sync --locked --python /usr/bin/python3.12 --extra gpu
+rustup toolchain install
+uv sync --locked --extra gpu
+uv sync --locked --project crates/build-server/python
 source .venv/bin/activate
 ```
 
-The sync builds the `uniserve` executable. The native libraries come from the host, where the standard mechanisms find them, and nothing points the build or the processes at them:
+`rustup toolchain install` installs the release `rust-toolchain.toml` pins. The first sync builds the `uniserve` executable; uv selects the interpreter by the project's `requires-python`. The native libraries come from the host, where the standard mechanisms find them, and nothing points the build or the processes at them:
 
 - The NVIDIA driver, NCCL and CUPTI are opened at run time by their sonames from the default loader path, as NVIDIA's distribution packages install them (`/etc/ld.so.conf.d` registers any other directory that holds them). A process refuses a library older than the release the table above names with an error that names it, before it uses it.
 - FFmpeg 8.1 is found at build time through pkg-config, at exactly the library versions of that release: a distribution package, or an installation prefix whose `lib/pkgconfig` the build's `PKG_CONFIG_PATH` names and whose `lib` the loader configuration (`/etc/ld.so.conf.d`, then `ldconfig`) registers. A host whose distribution lacks FFmpeg 8.1 builds the FFmpeg 8.1.2 release and libx264 into such a prefix with their own build systems, configured as [the media crate](crates/media/README.md) configures them.
 - A build that runs from its target directory, such as a development or CI build, can instead build the pinned FFmpeg 8.1.2 and libx264 from source with `--features media/vendored` (it needs curl, tar, xz, make, a C compiler and, on x86-64, nasm). Its executables find those libraries through their run path into the target directory.
 
-The Build Server keeps an environment of its own, which `uv sync --locked --python /usr/bin/python3.12 --project crates/build-server/python` creates; it compiles the kernel packages with that environment and the host's CUDA toolkit. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages.
+The second sync creates the Build Server's own environment, the locked compilers of the kernel packages ([its README](crates/build-server/python/README.md)); the Build Server compiles the kernel packages with it and the CUDA toolkit NVIDIA's packages register with pkg-config. The Build Server runs the environment's program `uniserve-build-server` from its search path, so the environment's `bin` directory (`crates/build-server/python/.venv/bin`) must be on the search path of the processes that start Build Servers: a daemon, or `uniserve build-server serve`. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages.
 
 For RDMA transfers between hosts, install the pinned UCX and NIXL builds described in [NIXL transfers](docs/nixl.md).
 
 ## Quickstart
 
-Download the checkpoint and serve it on four GPUs:
+Serve the checkpoint on four GPUs:
 
 ```bash
-export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
-hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
-
-uniserve serve --model-dir "$H3_MODEL" \
+uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 \
   --config configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
   --max-running-requests 2 \
   --max-model-len 2048
 ```
+
+The model is a Hugging Face repository, `<owner>/<name>[@<revision>][/<folder>]`: the server reads it from the standard Hugging Face cache and downloads what the cache lacks, at the repository's default branch unless a revision is named. A host without network access populates the cache beforehand and sets `HF_HUB_OFFLINE`; `--model-dir` serves a local checkpoint directory instead ([Configuration](docs/configuration.md)).
 
 A video deployment states `--max-model-len`, the longest prompt it admits in tokens: the pipeline keeps no key/value cache from which a length would follow. Startup captures prompt capacities up to it (`video_config.text_capacities`, by default 1024 and then steps of 2048), the length itself the largest.
 
@@ -104,7 +102,7 @@ One replica spanning every GPU gives the lowest latency; replicas serve more req
 | `POST /v1/chat/completions` | Streaming and non-streaming chat generation, with reasoning and tool-call parsing where the model's chat profile names them |
 | `/admin/*` | The admin API, served apart from the routes above on the daemon's operator and harness Unix sockets: configuration changes (`PUT /admin/config`), each applied as the least it needs and, when it moves modules, as an update on trial that fails no request, their commit and rollback, and the other operations of a serving deployment ([docs/admin.md](docs/admin.md)) |
 
-The server registers the routes of the tasks the served model performs: the video routes and `/v1/capabilities` for a video model, and chat completions for a text model. Any other path answers `404` with `{"detail": "Not Found"}`. With an API key configured, every route but `/health` and `/metrics` requires it. Another build of the engine and workers is a configuration change of `worker_config.executable` (`PUT /admin/config` with `{"set": ["worker_config.executable=/path/to/uniserve"]}`): it answers once the new epoch serves on trial, with `pause_seconds`, how long requests waited for it, and `POST /admin/config/commit` ends the trial. On SIGTERM or Ctrl-C the server stops accepting connections and lets requests in flight, streamed responses included, finish within `server_config.shutdown_timeout`; asynchronous video jobs end at once, since a restarted server keeps none.
+The server registers the routes of the tasks the served model performs: the video routes and `/v1/capabilities` for a video model, and chat completions for a text model. Any other path answers `404` with `{"detail": "Not Found"}`. With an API key configured, every route but `/health` and `/metrics` requires it. Another build of the engine and workers is a revision of the engine package installed at the Build Server (`uniserve build-server install crates/engine`), which a configuration change of `worker_config.engine_revision` selects (`PUT /admin/config` with `{"set": ["worker_config.engine_revision=REVISION"]}`): it answers once the new epoch serves on trial, with `pause_seconds`, how long requests waited for it, and `POST /admin/config/commit` ends the trial. On SIGTERM or Ctrl-C the server stops accepting connections and lets requests in flight, streamed responses included, finish within `server_config.shutdown_timeout`; asynchronous video jobs end at once, since a restarted server keeps none.
 
 
 
@@ -119,7 +117,7 @@ The metrics endpoint publishes scheduler, worker, request and HTTP metrics in on
 UniServe's options form one tree, following TensorRT-LLM's serving configuration: the options most deployments state sit at its top level, and the rest in `*_config` tables, one per part of the system. `uniserve serve` reads the tree from a `--config` TOML file, from flags for the most common options, and from repeatable `--set PATH=VALUE` assignments that reach any option by its path, each overriding the last:
 
 ```bash
-uniserve serve --model-dir "$H3_MODEL" --config configs/minimax_h3/ulysses4.toml \
+uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 --config configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 --max-running-requests 2 \
   --set 'quantization.mode="balanced"'
 ```
@@ -153,8 +151,8 @@ Run `uniserve serve --help` for the flags; [Configuration](docs/configuration.md
 The serving evaluator runs HTTP workloads against a server, validates every response, and writes reproducible result bundles. `uniserve_eval/fast_h3.toml` holds the deployments and workload of the UniServe FastH3 post, and `uniserve_eval/fast_h3_h200.toml` the H200 measurements in the FastH3 guide. The `bench` extra installs the evaluator; `uv sync` keeps exactly the extras it names, so name `gpu` beside it:
 
 ```bash
-uv sync --locked --python /usr/bin/python3.12 --extra gpu --extra bench
-export UNISERVE_FAST_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
+uv sync --locked --extra gpu --extra bench
+export UNISERVE_FAST_H3_MODEL=<local copy of FastVideo/FastVideo-FastH3-8-Step-V2>
 .venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml plan gb200-4-bf16
 .venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml run gb200-4-bf16
 ```

@@ -10,25 +10,19 @@ UniServe serves the MiniMax-H3 video-and-audio models: the base MiniMax-H3 check
 
 ## Install
 
-Run from the UniServe repository root:
+With uv and rustup installed from the host's packages or their releases, run from the UniServe repository root:
 
 ```bash
 apt-get update
 apt-get install -y build-essential python3.12-dev pkg-config cmake git curl ca-certificates
 
-curl -LsSf https://astral.sh/uv/install.sh | sh
-curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-
-export CUDA_HOME=/usr/local/cuda
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$CUDA_HOME/bin:$PATH"
-
-uv sync --locked --python /usr/bin/python3.12 --extra gpu
-uv sync --locked --python /usr/bin/python3.12 --project crates/build-server/python
-export PATH="$PWD/crates/build-server/python/.venv/bin:$PATH"
+rustup toolchain install
+uv sync --locked --extra gpu
+uv sync --locked --project crates/build-server/python
 source .venv/bin/activate
 ```
 
-The first sync builds the `uniserve` executable and installs the NCCL and CUPTI libraries serving loads. The second creates the Build Server's own environment, the locked compilers of the kernel packages (Triton, the CuTe DSL, FlashInfer and FlashAttention-4), whose program `uniserve-build-server` the Build Server runs from the search path; the Build Server compiles a kernel the first time a deployment asks for it, for the target GPU, with that environment and the CUDA toolkit NVIDIA's packages register with pkg-config.
+`rustup toolchain install` installs the Rust release `rust-toolchain.toml` pins. The first sync builds the `uniserve` executable. The second creates the Build Server's own environment, the locked compilers of the kernel packages (Triton, the CuTe DSL, FlashInfer and FlashAttention-4), whose program `uniserve-build-server` the Build Server runs from its search path, so the environment's `bin` directory (`crates/build-server/python/.venv/bin`) must be on the search path of the processes that start Build Servers. The Build Server compiles a kernel the first time a deployment asks for it, for the target GPU, with that environment and the CUDA toolkit NVIDIA's packages register with pkg-config.
 
 ## Checkpoints
 
@@ -36,7 +30,7 @@ The first sync builds the `uniserve` executable and installs the NCCL and CUPTI 
 | --- | --- | --- | --- |
 | [`FastVideo/FastVideo-FastH3-8-Step-V2`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4) | `t2va`, `fl2va` | 768p | 8 |
 | [`FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | `t2va`, `fl2va` | 768p | 4 |
-| FastH3 OmniRef exports | `ref2va` | 768p | The export's schedule |
+| FastH3 OmniRef exports, such as [`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`](https://huggingface.co/FastVideo/FastVideo-FastH3-Omni-8-Step-V1) | `ref2va` | 768p | The export's schedule |
 | [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) with a [FastH3 adapter](#fasth3-adapters) | `t2va`, `fl2va` | 768p | 4 |
 | [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `transformer` | `t2va`, `fl2va` | 768p | 49 |
 | [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `transformer_ref` | `ref2va` | 768p | 49 |
@@ -54,36 +48,38 @@ The [FastH3 Preview v1 adapters](https://huggingface.co/FastVideo/FastVideo-Fast
 A deployment ships an adapter as one directory that holds the container as `adapter_model.safetensors` and, beside it, the contract of the student the adapter is, `fastvideo_inference.json`, which states the partition the adapter edits (its task), its schedule and its attention backend. The adapter release publishes no contract of its own, so the deployment copies the contract its student's export publishes: `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`'s for `vsa-datafree` (four DMD rungs, `[999, 749, 500, 250]`, with `VIDEO_SPARSE_ATTN_H3` at 64-row tiles and 0.9 sparsity), and the same contract with `"attention_backend": "DENSE"` for `dense-datafree`. Serve the adapter over the base release with `--lora`, naming a repository folder that holds both files, or with `--lora-dir`, naming that directory:
 
 ```bash
-export H3_ADAPTER=/workspace/adapters/fasth3-vsa-datafree
-mkdir -p "$H3_ADAPTER"
-cp /workspace/models/FastH3-LoRA/vsa-datafree/adapter_model.safetensors "$H3_ADAPTER"/
-cp /workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree/fastvideo_inference.json "$H3_ADAPTER"/
-uniserve serve --model-dir "$H3_ROOT" --lora-dir "$H3_ADAPTER" \
+# The adapter's container, and beside it the contract of its student.
+hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
+  vsa-datafree/adapter_model.safetensors --local-dir fasth3-adapter
+hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree \
+  fastvideo_inference.json --local-dir fasth3-adapter/vsa-datafree
+uniserve serve MiniMaxAI/MiniMax-H3 --lora-dir fasth3-adapter/vsa-datafree \
   --config configs/minimax_h3/ulysses4.toml --served-model-name FastH3 \
   --host 0.0.0.0 --max-running-requests 2
 ```
 
 The adapter is fused into the partition its contract names once, as each rank loads its weights: every element of an edited parameter is `(lora_B @ lora_A + diff) + base`, evaluated in FP32 and rounded once to the base tensor's element type, the container's own reconstruction with no `alpha` (a scale of one), and a parameter the adapter does not edit is read unchanged. The deployment then serves that student for every request, as its full export would: the contract's tasks from the partition it names, on the contract's schedule at the base schedulers' shifts, with the contract's attention. A request cannot select or drop the adapter; another adapter is another deployment, and changing `lora` or `lora_dir` with `PUT /admin/config` starts a new epoch. An adapter is refused at startup when its directory holds no `adapter_model.safetensors` or no contract, when its metadata states another container or other tensor counts or another rank than it carries, when it edits a tensor the partition does not hold, with other extents, or assigns one it does, or when the checkpoint is a FastH3 export rather than the base release.
 
+A server names its checkpoint by Hugging Face repository, `<owner>/<name>[@<revision>][/<folder>]` (a revision pins a branch, tag or commit; the default branch otherwise), and reads it from the standard Hugging Face cache, downloading the files its pipeline index declares that the cache lacks; an OmniRef export's server resolves the base revision its contract pins the same way. A host without network access fills the cache beforehand and sets `HF_HUB_OFFLINE`:
+
 ```bash
-export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
-hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
+hf download FastVideo/FastVideo-FastH3-8-Step-V2
+hf download MiniMaxAI/MiniMax-H3
 
-export H3_ROOT=/workspace/models/MiniMax-H3
-hf download MiniMaxAI/MiniMax-H3 --local-dir "$H3_ROOT"
-
-# The base model's parts an OmniRef export omits, at the revision it pins, into the Hugging Face cache.
+# The base model's parts an OmniRef export omits, at the revision it pins.
 hf download MiniMaxAI/MiniMax-H3 --revision <base_model_revision> \
   --include 'text_encoder/*' --include 'tokenizer/*' --include 'processor/*' \
   --include 'vae/*' --include 'audio_vae/*'
 ```
+
+`--model-dir` serves a local checkpoint directory instead, read in place.
 
 ## Start the server
 
 FastH3 text-to-video and keyframe requests:
 
 ```bash
-uniserve serve --model-dir "$H3_MODEL" \
+uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 \
   --config configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
@@ -94,7 +90,7 @@ uniserve serve --model-dir "$H3_MODEL" \
 Base text-to-video and keyframe requests:
 
 ```bash
-uniserve serve --model-dir "$H3_ROOT" \
+uniserve serve MiniMaxAI/MiniMax-H3 \
   --config configs/minimax_h3/ulysses4.toml --served-model-name MiniMax-H3 \
   --host 0.0.0.0 --set video_config.max_seconds=8 --max-model-len 2048 \
   --set 'video_config.text_capacities=[2048]'
@@ -103,7 +99,7 @@ uniserve serve --model-dir "$H3_ROOT" \
 Reference requests, with the base reference denoiser or an OmniRef export:
 
 ```bash
-uniserve serve --model-dir "$H3_ROOT" \
+uniserve serve MiniMaxAI/MiniMax-H3 \
   --config configs/minimax_h3/ulysses4-reference.toml \
   --served-model-name MiniMax-H3 --host 0.0.0.0 \
   --set video_config.max_seconds=5 --max-model-len 8192 \
@@ -111,7 +107,7 @@ uniserve serve --model-dir "$H3_ROOT" \
   --set video_config.max_condition_rows=40960 \
   --set 'media_config.directory="/srv/media"'
 
-uniserve serve --model-dir "$OMNIREF_EXPORT" \
+uniserve serve FastVideo/FastVideo-FastH3-Omni-8-Step-V1 \
   --config configs/minimax_h3/ulysses4-reference.toml \
   --served-model-name MiniMax-H3-OmniRef --host 0.0.0.0 \
   --set video_config.max_seconds=5 --max-model-len 8192 \

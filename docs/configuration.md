@@ -13,7 +13,7 @@ A UniServe server is configured by one tree of serving options and, for a parall
 Options none of them states keep their defaults. `GET /admin/config` returns the resolved non-default options as reloadable TOML. Reading it restores defaults without treating options belonging to other model families or rank-assignment modes as explicitly configured.
 
 ```bash
-uniserve serve --model-dir "$H3_MODEL" --config configs/minimax_h3/ulysses4.toml \
+uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 --config configs/minimax_h3/ulysses4.toml \
   --max-running-requests 2 --max-model-len 10240 \
   --set 'video_config.text_capacities=[1024]'
 
@@ -52,7 +52,7 @@ Each host's Build Server (`uniserve build-server serve`, see `architecture.md`) 
 uniserve keys Qwen/Qwen3-30B-A3B --max-model-len 2048 --max-running-requests 8 \
   --set 'dtype="bfloat16"' --set 'attention_backend="trtllm"' > keys.txt \
   && uniserve build-server build --keys keys.txt --packages crates/ops/kernels --target sm_100a \
-       --store /var/lib/uniserve/store
+       --store store
 ```
 
 `build --package DIR` installs a package that fills a whole interface with one module, the engine (`crates/engine`) or a scheduling policy, and builds that module for its own target (the host's Rust target triple, or `wasm32-unknown-unknown`) with cargo; it is repeatable and combines with `--keys`.
@@ -64,7 +64,7 @@ Some options configure one kind of model, by what the served model family serves
 A configuration file is the tree in TOML, as `GET /admin/config` returns it:
 
 ```toml
-model = "/workspace/models/FastVideo-FastH3-8-Step-V2"
+model = "FastVideo/FastVideo-FastH3-8-Step-V2"
 served_model_name = "FastH3"
 max_running_requests = 2
 
@@ -472,7 +472,7 @@ queue_depth = 6
 mem_fraction_static = 0.73
 
 [worker_groups.blocks.transformer]
-sequence_parallel = { kind = "ulysses", ulysses_degree = 4 }
+sequence_parallel = { kind = "ulysses", ulysses_degree = 4, projection = "exchange" }
 
 [worker_groups.blocks.video_decoder]
 distribution = "temporal_units"
@@ -483,29 +483,18 @@ distribution = "temporal_units"
 [worker_groups.blocks.latent_encoder]
 distribution = "temporal_units"
 
-[[worker_groups]]
-id = "encoder"
-replicas = 2
-ranks = ["cpu*8"]
-queue_depth = 6
-
+# The host media blocks, on each replica's CUDA ranks.
 [worker_groups.blocks.video_codec]
 distribution = "temporal_units"
 
-[[worker_groups]]
-id = "reader"
-ranks = ["cpu"]
-queue_depth = 6
+[worker_groups.blocks.muxer]
+ranks = [0]
 
 [worker_groups.blocks.media_reader]
-
-[[worker_groups]]
-id = "muxer"
-ranks = ["cpu"]
-queue_depth = 12
-
-[worker_groups.blocks.muxer]
+ranks = [0]
 ```
+
+The host media blocks, the H.264 encoders (`video_codec`), the muxer and the media reader, run on the host inside the main process of the ranks they are placed on, and a main process serves CUDA devices only, so a deployment places them on CUDA ranks: a rank on `cpu` is refused when the node is launched.
 
 A `[[worker_groups]]` table takes:
 
