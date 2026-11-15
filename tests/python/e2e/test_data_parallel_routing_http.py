@@ -7,8 +7,8 @@ asks the epoch's scheduling policy where each request goes (its ``route``),
 and the policy the deployment serves names the live replica with the fewest
 requests in flight, rotating among equally loaded ones
 (``docs/architecture.md``, The request interface). Each replica's scheduler
-reports its admissions under its own ``engine`` label
-(``uniserve:num_requests_admitted``).
+reports its admissions under its own ``scheduler`` label
+(``uniserve:scheduler_admitted``).
 
 Requests sent one at a time find both replicas idle, so the policy alternates
 between them and each admits half. While one replica holds a long streaming
@@ -49,10 +49,10 @@ SEQUENTIAL = 6
 # Requests sent while a long one streams on one replica.
 BESIDE = 4
 ADMITTED = re.compile(
-    r'^uniserve:num_requests_admitted_total\{.*engine="(\d+)".*\} (\S+)$'
+    r'^uniserve:scheduler_admitted_total\{.*scheduler="(\d+)".*\} (\S+)$'
 )
 RUNNING = re.compile(
-    r'^uniserve:num_requests_running\{.*engine="(\d+)".*\} (\S+)$'
+    r'^uniserve:scheduler_running\{.*scheduler="(\d+)".*\} (\S+)$'
 )
 
 

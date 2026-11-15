@@ -5,8 +5,8 @@
 use crate::request::wire;
 
 use super::{
-    BaseCacheStats, DomainSchedulerStats, FenceHistogram, ForwardStats, PrefixCacheStats,
-    ProfileProgress, SchedulerStats,
+    BaseCacheStats, BlockingCall, DomainSchedulerStats, FenceHistogram, FenceStep, ForwardStats,
+    PrefixCacheStats, ProfileProgress, SchedulerStats, StreamTime,
 };
 
 impl From<&SchedulerStats> for wire::SchedulerStats {
@@ -164,12 +164,32 @@ impl From<&ForwardStats> for wire::ForwardStats {
             mode_counts: counts(&stats.mode_counts),
             mode_tokens: counts(&stats.mode_tokens),
             mode_us: counts(&stats.mode_us),
-            stream_us: counts(&stats.stream_us),
-            blocking_calls: counts(&stats.blocking_calls),
+            stream_us: stats
+                .stream_us
+                .iter()
+                .map(|(time, &us)| wire::StreamTime {
+                    stream: time.stream.clone(),
+                    state: time.state.clone(),
+                    us,
+                })
+                .collect(),
+            blocking_calls: stats
+                .blocking_calls
+                .iter()
+                .map(|(call, &count)| wire::BlockingCalls {
+                    thread: call.thread.clone(),
+                    call: call.call.clone(),
+                    count,
+                })
+                .collect(),
             fence_us: stats
                 .fence_us
                 .iter()
-                .map(|(name, histogram)| (name.clone(), histogram.into()))
+                .map(|(step, histogram)| wire::FenceStep {
+                    stage: step.stage.clone(),
+                    module: step.module.clone(),
+                    histogram: Some(histogram.into()),
+                })
                 .collect(),
             fence_records_lost: stats.fence_records_lost,
             profile: stats
@@ -207,12 +227,38 @@ impl From<wire::ForwardStats> for ForwardStats {
             mode_counts: stats.mode_counts.into_iter().collect(),
             mode_tokens: stats.mode_tokens.into_iter().collect(),
             mode_us: stats.mode_us.into_iter().collect(),
-            stream_us: stats.stream_us.into_iter().collect(),
-            blocking_calls: stats.blocking_calls.into_iter().collect(),
+            stream_us: stats
+                .stream_us
+                .into_iter()
+                .map(|time| {
+                    let key = StreamTime {
+                        stream: time.stream,
+                        state: time.state,
+                    };
+                    (key, time.us)
+                })
+                .collect(),
+            blocking_calls: stats
+                .blocking_calls
+                .into_iter()
+                .map(|calls| {
+                    let key = BlockingCall {
+                        thread: calls.thread,
+                        call: calls.call,
+                    };
+                    (key, calls.count)
+                })
+                .collect(),
             fence_us: stats
                 .fence_us
                 .into_iter()
-                .map(|(name, histogram)| (name, histogram.into()))
+                .map(|step| {
+                    let key = FenceStep {
+                        stage: step.stage,
+                        module: step.module,
+                    };
+                    (key, step.histogram.map(Into::into).unwrap_or_default())
+                })
                 .collect(),
             fence_records_lost: stats.fence_records_lost,
             profile: stats
@@ -298,7 +344,30 @@ mod tests {
         fence.observe(9_000);
         let forward = ForwardStats {
             mode_counts: [("graph".to_owned(), 7)].into(),
-            fence_us: [("decode/step".to_owned(), fence)].into(),
+            stream_us: [(
+                StreamTime {
+                    stream: "device".to_owned(),
+                    state: "busy".to_owned(),
+                },
+                12,
+            )]
+            .into(),
+            blocking_calls: [(
+                BlockingCall {
+                    thread: "control".to_owned(),
+                    call: "synchronize".to_owned(),
+                },
+                1,
+            )]
+            .into(),
+            fence_us: [(
+                FenceStep {
+                    stage: "decode".to_owned(),
+                    module: "step".to_owned(),
+                },
+                fence,
+            )]
+            .into(),
             spec_verify_accepted_tokens: 3,
             ..ForwardStats::default()
         };

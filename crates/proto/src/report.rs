@@ -14,7 +14,10 @@
 mod forward;
 mod wire;
 
-pub use forward::{FENCE_BUCKETS_US, FenceHistogram, ForwardStats, ProfileProgress};
+pub use forward::{
+    BlockingCall, FENCE_BUCKETS_US, FenceHistogram, FenceStep, ForwardStats, ProfileProgress,
+    StreamTime,
+};
 use serde::{Deserialize, Serialize};
 
 /// Cache query and hit counters for one reporting interval.

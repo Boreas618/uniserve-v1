@@ -54,6 +54,7 @@ mod resize;
 mod rows;
 mod schedule;
 mod stats;
+pub(crate) use stats::STATS_PERIOD;
 #[cfg(test)]
 pub(crate) mod tests;
 mod update;

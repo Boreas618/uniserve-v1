@@ -210,10 +210,11 @@ impl ConcurrencyLimit {
 
 /// Records the API server's HTTP metrics (`metrics::api_server`).
 ///
-/// It is a route layer, so it runs only for a request a route matched: the
-/// `handler` label is that route's template, and the `method` label the
-/// request method, `other` for a method outside the standard set, which keeps
-/// the label set bounded. The `status` label is the status class of the
+/// It wraps the API's routes alone (the router's fallback is outside it), so
+/// every request it sees matched a route's path: the `handler` label is that
+/// route's template, a method the route does not serve included, and the
+/// `method` label the request method, `other` for a method outside the
+/// standard set, which keeps the label set bounded. The `status` label is the status class of the
 /// response head, so a stream that fails after its head was sent still counts
 /// under that class. The duration is measured until the response body is
 /// dropped: an SSE handler returns its body at once, so observing at handler
@@ -221,7 +222,8 @@ impl ConcurrencyLimit {
 pub(crate) async fn track_http_metrics(request: Request, next: Next) -> Response {
     #[expect(
         clippy::expect_used,
-        reason = "a route layer runs for a matched route, which the router names"
+        reason = "the layer wraps the API's routes, and the router names the route of every \
+                  request it hands one"
     )]
     let handler = request
         .extensions()

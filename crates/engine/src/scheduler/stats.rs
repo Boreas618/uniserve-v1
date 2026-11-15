@@ -40,6 +40,9 @@ enum Domain {
     Flow,
 }
 
+/// How often a scheduler reports: one report per second.
+pub(crate) const STATS_PERIOD: Duration = Duration::from_secs(1);
+
 impl Domain {
     /// The domain of the calls of a phase of `class`.
     const fn of(class: PhaseClass) -> Self {

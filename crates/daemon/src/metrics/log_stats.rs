@@ -1,234 +1,162 @@
 //! Periodic logging of generation throughput and scheduler occupancy.
 //!
-//! The logger only reads the process-wide `METRICS` registry and updates no
-//! metric value, although resolving its handles creates any of its series
-//! that do not exist yet. Scheduler gauges and prefix-cache counters are
-//! written by the engine's scheduler-stats export tasks
-//! (`metrics::record_scheduler_stats`). The prompt and generation token
-//! counters are written when a request ends with its final usage
-//! (`metrics::RequestStats`), so an interval's throughput counts the tokens of
-//! the requests that completed in it; a request whose stream ended before its
-//! usage report adds none. `Leader::new` starts the logger when
-//! `logging_config.log_stats` is set.
+//! The statistics sources feed the log as they record their families: every finished request's
+//! token usage ([`StatsLog::usage`], from `stats::StatLogger`) and every scheduler's interval
+//! report ([`StatsLog::scheduler`], from the leader's statistics sink). The log keeps one
+//! interval's sums and each scheduler's latest occupancy; the logger takes them once per
+//! `logging_config.stats_interval` and logs one line of structured fields. It reads no metric
+//! family back.
+//!
+//! An interval's throughput counts the tokens of the requests that finished in it, so a request
+//! whose stream ended before its usage report adds none. Occupancy is the latest report of every
+//! scheduler that reported in the interval: a retired scheduler stops reporting and leaves the
+//! next interval's line.
 
-use std::fmt::Write;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::metrics::{EngineLabels, F64Gauge, METRICS, U64Counter, U64Gauge};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info};
 
-/// Period between log lines. Throughput is averaged over the measured time
-/// between samples, which can exceed this period when a tick is delayed.
-const LOG_STATS_INTERVAL: Duration = Duration::from_secs(10);
+use proto::report::SchedulerStats;
 
-/// Cached, cloned metric handles for one engine. Each clone shares the same
-/// underlying `Arc<Atomic*>` as the prometheus `Family` entry, so reads go
-/// straight to the atomic with no lock.
-struct EngineMetrics {
-    // Counters for throughput deltas.
-    prompt_tokens: U64Counter,
-    generation_tokens: U64Counter,
-    prefix_cache_queries: U64Counter,
-    prefix_cache_hits: U64Counter,
+use crate::metrics::SchedulerLabels;
 
-    // Gauges for instantaneous scheduler state.
-    scheduler_running: U64Gauge,
-    scheduler_waiting: U64Gauge,
-    prefix_cache_usage: F64Gauge,
+/// The sums of one interval of the statistics log.
+#[derive(Debug, Default)]
+struct Interval {
+    /// Prompt tokens of the requests that finished.
+    prompt_tokens: u64,
+    /// Generated tokens of the requests that finished.
+    generation_tokens: u64,
+    /// Prefix-cache query tokens the schedulers reported.
+    prefix_cache_queries: u64,
+    /// Prefix-cache hit tokens the schedulers reported.
+    prefix_cache_hits: u64,
+    /// Each scheduler's latest occupancy: running and waiting requests, and
+    /// its cache usage.
+    occupancy: BTreeMap<(String, u32, u32), (u64, u64, f64)>,
 }
 
-/// Cumulative counter values summed across engines at one sample, used to
-/// compute per-interval deltas.
-struct CounterSnapshot {
-    prompt_tokens: u64,
-    generation_tokens: u64,
-    prefix_cache_queries: u64,
-    prefix_cache_hits: u64,
+/// What the statistics sources feed the statistics log.
+#[derive(Debug, Default)]
+pub(crate) struct StatsLog {
+    interval: Mutex<Interval>,
+}
+
+impl StatsLog {
+    /// Adds a finished request's tokens.
+    pub(crate) fn usage(&self, prompt_tokens: u64, generation_tokens: u64) {
+        let mut interval = service::lock(&self.interval);
+        interval.prompt_tokens += prompt_tokens;
+        interval.generation_tokens += generation_tokens;
+    }
+
+    /// Adds one scheduler's interval report.
+    pub(crate) fn scheduler(&self, labels: &SchedulerLabels, stats: &SchedulerStats) {
+        let mut interval = service::lock(&self.interval);
+        interval.prefix_cache_queries += stats.prefix_cache_stats.base.queries;
+        interval.prefix_cache_hits += stats.prefix_cache_stats.base.hits;
+        interval.occupancy.insert(
+            (labels.model_name.clone(), labels.replica, labels.scheduler),
+            (
+                stats.num_running_reqs,
+                stats.num_waiting_reqs,
+                stats.prefix_cache_usage,
+            ),
+        );
+    }
+
+    /// Takes the interval's sums, starting the next interval from none.
+    fn take(&self) -> Interval {
+        std::mem::take(&mut *service::lock(&self.interval))
+    }
 }
 
 /// Periodic logger for throughput and scheduler state.
 ///
-/// Spawns a background task that logs throughput and scheduler state at a fixed
-/// interval. When idle (both current and previous throughputs are zero), logs
-/// at DEBUG level. When load drops to zero, emits one final INFO-level line
-/// before going quiet. Dropping the logger aborts the task.
+/// Spawns a background task that logs one line per interval. When idle (both current and
+/// previous throughputs are zero), it logs at DEBUG level; when load drops to zero, it emits one
+/// final INFO-level line before going quiet. Dropping the logger aborts the task.
 pub(crate) struct StatsLogger {
     _task: AbortOnDropHandle<()>,
 }
 
 impl StatsLogger {
-    /// Starts the background stats logging task for engines
-    /// `0..engine_count`.
+    /// Starts the background task that logs `log` every `period`.
     ///
-    /// Must be called within a Tokio runtime, since it spawns onto the current
-    /// one.
-    pub(crate) fn start(model_name: String, engine_count: Arc<AtomicUsize>) -> Self {
-        let task = AbortOnDropHandle::new(tokio::spawn(async move {
-            run_stats_logger(model_name, engine_count).await;
-        }));
+    /// Must be called within a Tokio runtime, since it spawns onto the current one.
+    pub(crate) fn start(log: &'static StatsLog, period: Duration) -> Self {
+        let task = AbortOnDropHandle::new(tokio::spawn(run(log, period)));
         Self { _task: task }
     }
 }
 
-/// Resolves and clones all metric handles once, so each interval reads the
-/// atomics without locking the metric families.
-fn resolve_engine_metrics(model_name: &str, engine_count: usize) -> Vec<EngineMetrics> {
-    let m = &METRICS;
-    (0..engine_count as u32)
-        .map(|engine| {
-            let el = EngineLabels {
-                model_name: model_name.to_string(),
-                engine,
-            };
-            EngineMetrics {
-                // Prompt throughput counts every prompt token, including
-                // tokens reused from the prefix cache: a request's cache hits
-                // do not reach the request lifecycle that records the counter.
-                prompt_tokens: m.request.prompt_tokens.get_or_create_owned(&el),
-                generation_tokens: m.request.generation_tokens.get_or_create_owned(&el),
-                prefix_cache_queries: m.scheduler.prefix_cache_queries.get_or_create_owned(&el),
-                prefix_cache_hits: m.scheduler.prefix_cache_hits.get_or_create_owned(&el),
-                scheduler_running: m.scheduler.scheduler_running.get_or_create_owned(&el),
-                scheduler_waiting: m.scheduler.scheduler_waiting.get_or_create_owned(&el),
-                prefix_cache_usage: m.scheduler.prefix_cache_usage.get_or_create_owned(&el),
-            }
-        })
-        .collect()
-}
-
-/// Samples cumulative engine metrics and periodically logs interval throughput and occupancy.
-///
-/// Runs until its task is aborted.
-async fn run_stats_logger(model_name: String, engine_count: Arc<AtomicUsize>) {
-    let mut engines = resolve_engine_metrics(&model_name, engine_count.load(Ordering::Relaxed));
-
-    let mut interval = tokio::time::interval(LOG_STATS_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The first tick fires immediately; skip it so the first log is after one full
-    // interval.
-    interval.tick().await;
-
-    let mut prev = read_counters(&engines);
-    let mut last_log_time = Instant::now();
-    let mut last_prompt_throughput: f64 = 0.0;
-    let mut last_generation_throughput: f64 = 0.0;
-
-    let mut msg = String::new();
+/// Logs `log`'s interval every `period` until its task is aborted.
+async fn run(log: &'static StatsLog, period: Duration) {
+    let mut ticks = tokio::time::interval(period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick fires at once and starts the first interval.
+    ticks.tick().await;
+    drop(log.take());
+    let mut started = Instant::now();
+    let mut was_idle = true;
     loop {
-        interval.tick().await;
-
-        let active = engine_count.load(Ordering::Relaxed);
-        if active > engines.len() {
-            engines = resolve_engine_metrics(&model_name, active);
-        }
-
+        ticks.tick().await;
+        let interval = log.take();
         let now = Instant::now();
-        let elapsed = now.duration_since(last_log_time).as_secs_f64();
-        if elapsed <= 0.0 {
-            continue;
-        }
+        let seconds = now.duration_since(started).as_secs_f64();
+        started = now;
 
-        let curr = read_counters(&engines);
-
-        let prompt_throughput =
-            curr.prompt_tokens.wrapping_sub(prev.prompt_tokens) as f64 / elapsed;
-        let generation_throughput =
-            curr.generation_tokens.wrapping_sub(prev.generation_tokens) as f64 / elapsed;
-
-        // Idle = both current and previous throughputs are zero, so the first
-        // zero interval after load still logs at INFO.
-        let is_idle = prompt_throughput == 0.0
-            && generation_throughput == 0.0
-            && last_prompt_throughput == 0.0
-            && last_generation_throughput == 0.0;
-
-        // Read scheduler gauges (aggregate across engines).
-        // Retired schedulers still own completed-request counters, while
-        // occupancy describes only the current serving group.
-        let (num_running, num_waiting, prefix_cache_usage) =
-            read_scheduler_gauges(&engines[..active]);
-
-        // Compute prefix cache hit rate over this interval.
-        let delta_queries = curr
-            .prefix_cache_queries
-            .wrapping_sub(prev.prefix_cache_queries);
-        let prefix_cache_hit_rate = if delta_queries > 0 {
-            let delta_hits = curr.prefix_cache_hits.wrapping_sub(prev.prefix_cache_hits);
-            delta_hits as f64 / delta_queries as f64 * 100.0
+        let prompt_throughput = interval.prompt_tokens as f64 / seconds;
+        let generation_throughput = interval.generation_tokens as f64 / seconds;
+        let idle = interval.prompt_tokens == 0 && interval.generation_tokens == 0;
+        let (running, waiting, usage) = interval.occupancy.values().fold(
+            (0, 0, 0.0),
+            |(running, waiting, usage), &(more_running, more_waiting, more_usage)| {
+                (
+                    running + more_running,
+                    waiting + more_waiting,
+                    usage + more_usage,
+                )
+            },
+        );
+        // Cache usage is each scheduler's fraction, averaged over the schedulers.
+        let cache_usage = if interval.occupancy.is_empty() {
+            0.0
+        } else {
+            usage / interval.occupancy.len() as f64
+        };
+        let prefix_cache_hit_rate = if interval.prefix_cache_queries > 0 {
+            interval.prefix_cache_hits as f64 / interval.prefix_cache_queries as f64
         } else {
             0.0
         };
 
-        // Build the log line.
-        msg.clear();
-        if write!(
-            msg,
-            "Avg prompt tput: {prompt_throughput:.1} toks/s, \
-             Avg generation tput: {generation_throughput:.1} toks/s, \
-             Reqs Running: {num_running}, \
-             Waiting: {num_waiting}, \
-             GPU KV cache used: {:.1}%, \
-             Prefix cache hit rate: {prefix_cache_hit_rate:.1}%",
-            prefix_cache_usage * 100.0,
-        )
-        .is_err()
-        {
-            msg.clear();
-        }
-
-        if is_idle {
-            debug!("{msg}");
+        // An idle interval after an idle one logs at DEBUG; the first idle
+        // interval after load still logs at INFO.
+        if idle && was_idle {
+            debug!(
+                prompt_throughput,
+                generation_throughput,
+                running,
+                waiting,
+                cache_usage,
+                prefix_cache_hit_rate,
+                "engine statistics"
+            );
         } else {
-            info!("{msg}");
+            info!(
+                prompt_throughput,
+                generation_throughput,
+                running,
+                waiting,
+                cache_usage,
+                prefix_cache_hit_rate,
+                "engine statistics"
+            );
         }
-
-        last_prompt_throughput = prompt_throughput;
-        last_generation_throughput = generation_throughput;
-        last_log_time = now;
-        prev = curr;
+        was_idle = idle;
     }
-}
-
-/// Reads the current cumulative counter values for throughput computation.
-fn read_counters(engines: &[EngineMetrics]) -> CounterSnapshot {
-    let mut snap = CounterSnapshot {
-        prompt_tokens: 0,
-        generation_tokens: 0,
-        prefix_cache_queries: 0,
-        prefix_cache_hits: 0,
-    };
-    for e in engines {
-        snap.prompt_tokens += e.prompt_tokens.get();
-        snap.generation_tokens += e.generation_tokens.get();
-        snap.prefix_cache_queries += e.prefix_cache_queries.get();
-        snap.prefix_cache_hits += e.prefix_cache_hits.get();
-    }
-    snap
-}
-
-/// Reads the current scheduler gauge values, aggregated across engines.
-///
-/// Running and waiting counts are summed; prefix cache usage is the mean of the
-/// per-engine usage fractions (0.0 to 1.0), or 0.0 with no engines.
-fn read_scheduler_gauges(engines: &[EngineMetrics]) -> (u64, u64, f64) {
-    let mut num_running = 0u64;
-    let mut num_waiting = 0u64;
-    let mut prefix_cache_usage_sum = 0.0f64;
-
-    for e in engines {
-        num_running += e.scheduler_running.get();
-        num_waiting += e.scheduler_waiting.get();
-        prefix_cache_usage_sum += e.prefix_cache_usage.get();
-    }
-
-    let prefix_cache_usage = if !engines.is_empty() {
-        prefix_cache_usage_sum / engines.len() as f64
-    } else {
-        0.0
-    };
-
-    (num_running, num_waiting, prefix_cache_usage)
 }

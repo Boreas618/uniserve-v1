@@ -1,24 +1,18 @@
-//! The main process's allocator as the deployment exports it.
+//! The main processes' allocators as the deployment exports them.
 //!
 //! Two questions, one family each: how much physical memory a device's budget allows this epoch
-//! (`uniserve:memory_budget`, labelled by device) and how much the device's allocator pools and
-//! its KV regions' planes have mapped now (`uniserve:memory_mapped`, labelled by device and
-//! pool). The invariant the design
-//! states - a device never maps more than its budget allows - is then a comparison of two series the
+//! (`uniserve:memory_budget`) and how much the device's allocator pools and its KV regions'
+//! planes have mapped now (`uniserve:memory_mapped`, by pool). The invariant the design states -
+//! a device never maps more than its budget allows - is then a comparison of two series the
 //! deployment publishes, rather than a claim only the main process can see.
 //!
-//! The main process reports both once a second in `Metrics.memory`, per device, listing every pool
-//! its allocator has. A report sets the series it names; a series no report names keeps its last
-//! value, which is what a drained epoch leaves behind until the next epoch on that device reports.
-//!
-//! **A device index identifies a series only because the deployment executes one main process.** A
-//! device index is chosen by the process that owns the device, so two hosts' processes both report
-//! `device = 0` and the later report wins: on a multi-host deployment these two families would
-//! describe no host's allocator, and the reader that compares mapped bytes against a budget would
-//! compare across machines that never shared one. The epoch path is one node and one process today
-//! (a replica count is refused by name), so the labels stay `device` alone -
-//! and when several hosts report, the labels gain the host **together with every reader's key**,
-//! because a label added on one side only turns a real comparison into a vacuous one.
+//! Each replica's main process reports both at its report period
+//! (`EngineInfo::report_period`), per device, listing every pool its allocator has. A device is
+//! numbered by the process that owns it, so a series is labelled by the replica whose process
+//! reported it as well as by the device: two replicas' processes on different hosts both have a
+//! device 0, and their series stay apart, each comparable with its own budget. A report sets the
+//! series it names; a series no report names keeps its last value, which is what a drained
+//! epoch leaves behind until the next epoch on that device reports.
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
@@ -29,14 +23,18 @@ use crate::metrics::U64Gauge;
 /// The device a budget belongs to.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct DeviceLabels {
-    /// The device's index, as the main process numbers it.
+    /// The replica whose main process reports the device.
+    pub replica: u32,
+    /// The device's index, as that process numbers it.
     pub device: u32,
 }
 
 /// The device and pool a mapping belongs to.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PoolLabels {
-    /// The device's index, as the main process numbers it.
+    /// The replica whose main process reports the device.
+    pub replica: u32,
+    /// The device's index, as that process numbers it.
     pub device: u32,
     /// The pool: an allocator's `graph`, `scratch` or `resident`, or `kv`, the planes of the
     /// device's KV regions.
@@ -45,9 +43,9 @@ pub struct PoolLabels {
 
 /// The allocator families: one budget per device, one mapping per device and pool.
 pub struct MemoryMetrics {
-    /// `uniserve:memory_budget{device}` in bytes.
+    /// `uniserve:memory_budget{replica, device}` in bytes.
     pub budget: Family<DeviceLabels, U64Gauge>,
-    /// `uniserve:memory_mapped{device, pool}` in bytes.
+    /// `uniserve:memory_mapped{replica, device, pool}` in bytes.
     pub mapped: Family<PoolLabels, U64Gauge>,
 }
 
@@ -70,17 +68,20 @@ impl MemoryMetrics {
         Self { budget, mapped }
     }
 
-    /// Writes one `Metrics.memory` report: every device's budget, and every pool it lists.
-    pub fn record(&self, devices: &[proto::request::wire::DeviceMemory]) {
+    /// Writes one report of `replica`'s main process: every device's budget, and every pool it
+    /// lists.
+    pub fn record(&self, replica: u32, devices: &[proto::request::wire::DeviceMemory]) {
         for device in devices {
             self.budget
                 .get_or_create(&DeviceLabels {
+                    replica,
                     device: device.device,
                 })
                 .set(device.budget);
             for pool in &device.pools {
                 self.mapped
                     .get_or_create(&PoolLabels {
+                        replica,
                         device: device.device,
                         pool: pool.pool.clone(),
                     })
@@ -92,85 +93,84 @@ impl MemoryMetrics {
 
 #[cfg(test)]
 mod tests {
-    use prometheus_client::encoding::text::encode;
-
-    use super::MemoryMetrics;
+    use super::{DeviceLabels, MemoryMetrics, PoolLabels};
     use proto::request::wire::{DeviceMemory, PoolMemory};
 
-    fn rendered(devices: &[DeviceMemory]) -> String {
-        let mut registry = Default::default();
-        let metrics = MemoryMetrics::register(&mut registry);
-        metrics.record(devices);
-        let mut text = String::new();
-        encode(&mut text, &registry).expect("the registry encodes as text");
-        text
+    /// The series of `pool` on device `device` of replica `replica`.
+    fn pool(replica: u32, device: u32, pool: &str) -> PoolLabels {
+        PoolLabels {
+            replica,
+            device,
+            pool: pool.to_owned(),
+        }
     }
 
-    /// The two families a deployment's mapping budget is read from, under the names the design
-    /// exports, each device's pools summed by the reader rather than by the writer.
+    /// A report publishes the device's budget and each pool's mapping, each a series of its own,
+    /// summed by the reader rather than by the writer.
     #[test]
     fn a_report_publishes_the_budget_and_each_pools_mapping() {
-        let text = rendered(&[DeviceMemory {
-            device: 1,
-            budget: 8_388_608,
-            pools: vec![
-                PoolMemory {
-                    pool: "graph".to_owned(),
-                    mapped: 2_097_152,
-                },
-                PoolMemory {
-                    pool: "resident".to_owned(),
-                    mapped: 4_194_304,
-                },
-            ],
-        }]);
+        let metrics = MemoryMetrics::register(&mut Default::default());
+        metrics.record(
+            0,
+            &[DeviceMemory {
+                device: 1,
+                budget: 8_388_608,
+                pools: vec![
+                    PoolMemory {
+                        pool: "graph".to_owned(),
+                        mapped: 2_097_152,
+                    },
+                    PoolMemory {
+                        pool: "resident".to_owned(),
+                        mapped: 4_194_304,
+                    },
+                ],
+            }],
+        );
 
-        assert!(
-            text.contains("uniserve:memory_budget{device=\"1\"} 8388608"),
-            "the device's budget is a series of its own: {text}"
+        let device = DeviceLabels {
+            replica: 0,
+            device: 1,
+        };
+        assert_eq!(metrics.budget.get_or_create(&device).get(), 8_388_608);
+        assert_eq!(
+            metrics.mapped.get_or_create(&pool(0, 1, "graph")).get(),
+            2_097_152
         );
-        assert!(
-            text.contains("uniserve:memory_mapped{device=\"1\",pool=\"graph\"} 2097152"),
-            "each pool's mapping is exported under its own pool: {text}"
-        );
-        assert!(
-            text.contains("uniserve:memory_mapped{device=\"1\",pool=\"resident\"} 4194304"),
-            "every pool the report lists is exported: {text}"
+        assert_eq!(
+            metrics.mapped.get_or_create(&pool(0, 1, "resident")).get(),
+            4_194_304
         );
     }
 
     /// A later report replaces the values it names, so the series follows the allocator instead of
-    /// accumulating across the reports a serving epoch sends once a second.
+    /// accumulating across reports; another replica's device of the same number is its own series.
     #[test]
     fn a_later_report_replaces_the_values_it_names() {
-        let mut registry = Default::default();
-        let metrics = MemoryMetrics::register(&mut registry);
-        metrics.record(&[DeviceMemory {
-            device: 0,
-            budget: 8_388_608,
-            pools: vec![PoolMemory {
-                pool: "scratch".to_owned(),
-                mapped: 1_048_576,
-            }],
-        }]);
-        metrics.record(&[DeviceMemory {
-            device: 0,
-            budget: 8_388_608,
-            pools: vec![PoolMemory {
-                pool: "scratch".to_owned(),
-                mapped: 3_145_728,
-            }],
-        }]);
+        let metrics = MemoryMetrics::register(&mut Default::default());
+        let report = |mapped| {
+            [DeviceMemory {
+                device: 0,
+                budget: 8_388_608,
+                pools: vec![PoolMemory {
+                    pool: "scratch".to_owned(),
+                    mapped,
+                }],
+            }]
+        };
+        metrics.record(0, &report(1_048_576));
+        metrics.record(0, &report(3_145_728));
+        metrics.record(1, &report(524_288));
 
-        let mut text = String::new();
-        encode(&mut text, &registry).expect("the registry encodes as text");
-        assert!(
-            text.contains("uniserve:memory_mapped{device=\"0\",pool=\"scratch\"} 3145728"),
-            "the second report's value is the series: {text}"
+        assert_eq!(
+            metrics.mapped.get_or_create(&pool(0, 0, "scratch")).get(),
+            3_145_728,
+            "the second report's value is the series"
         );
-        assert!(
-            !text.contains("1048576"),
-            "the first report is not added to the second: {text}"
+        assert_eq!(
+            metrics.mapped.get_or_create(&pool(1, 0, "scratch")).get(),
+            524_288,
+            "another replica's device 0 is a series of its own"
         );
     }
 }

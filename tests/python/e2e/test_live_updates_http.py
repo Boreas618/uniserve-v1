@@ -399,9 +399,10 @@ def _stream_count_body(
 def _requests_running(base_url: str) -> float:
     """The requests the schedulers serve now.
 
-    The gauge is ``uniserve:num_requests_running``, reported every second.
+    The gauge is ``uniserve:scheduler_running``, reported each statistics
+    period.
     """
-    return metric(base_url, "uniserve:num_requests_running")
+    return metric(base_url, "uniserve:scheduler_running")
 
 
 #: How often a case reads a stream it acts in the middle of: a kill or a switch
@@ -1830,9 +1831,7 @@ def test_an_epoch_switch_to_a_new_executable_fails_no_request(
 
 def _failed_requests(base_url: str) -> float:
     """The requests that ended in an error so far."""
-    return metric(
-        base_url, "uniserve:request_success", 'finished_reason="error"'
-    )
+    return metric(base_url, "uniserve:request_outcomes", 'outcome="error"')
 
 
 # The span a trial's step time and throughput are averaged over.

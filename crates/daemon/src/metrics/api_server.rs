@@ -1,35 +1,20 @@
 //! HTTP request counters and latency metrics for the API server.
 //!
-//! The server's `track_http_metrics` middleware records all three families
-//! once per request, when the response body finishes or is dropped, so
-//! streamed responses count their full delivery time. Requests matched to the
-//! operational routes in its `EXCLUDED_HANDLERS` (`/metrics`, `/health`,
-//! `/version`) are not recorded. Family names, labels, and bucket layouts
-//! match the request-count and latency metrics of the Python
-//! prometheus-fastapi-instrumentator package's default instrumentation.
+//! The server's `track_http_metrics` route layer records both families once per request a route
+//! matched, when the response body finishes or is dropped, so streamed responses count their full
+//! delivery time. The operational routes (`/metrics`, `/health`, `/version`) are outside that
+//! layer and are not recorded.
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
+use prometheus_client::registry::Registry;
 
-use crate::metrics::U64Counter;
+use crate::metrics::{U64Counter, latency_buckets};
 
-/// Upper bounds, in seconds, of the labeled per-handler latency histogram.
-const HTTP_REQUEST_DURATION_BUCKETS: [f64; 3] = [0.1, 0.5, 1.0];
-/// Upper bounds, in seconds, of the unlabeled high-resolution histogram.
-const HTTP_REQUEST_DURATION_HIGHR_BUCKETS: [f64; 21] = [
-    0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0,
-    7.5, 10.0, 30.0, 60.0,
-];
-
-/// Builds one series of the per-method, per-handler latency histogram family.
-fn http_request_duration_histogram() -> Histogram {
-    Histogram::new(HTTP_REQUEST_DURATION_BUCKETS.iter().copied())
-}
-
-/// Builds the unlabeled high-resolution latency histogram.
-fn http_request_duration_highr_histogram() -> Histogram {
-    Histogram::new(HTTP_REQUEST_DURATION_HIGHR_BUCKETS.iter().copied())
+/// A latency histogram over [`latency_buckets`].
+fn latency_histogram() -> Histogram {
+    Histogram::new(latency_buckets())
 }
 
 /// Labels identifying an HTTP request by method, status, and handler.
@@ -39,7 +24,7 @@ pub struct HttpRequestLabels {
     pub method: String,
     /// Status class of the response head: `1xx` through `5xx`, or `unknown`.
     pub status: &'static str,
-    /// Matched route template, or `none` when no route matched.
+    /// Matched route template.
     pub handler: String,
 }
 
@@ -48,7 +33,7 @@ pub struct HttpRequestLabels {
 pub struct HttpHandlerLabels {
     /// HTTP request method.
     pub method: String,
-    /// Matched route template, or `none` when no route matched.
+    /// Matched route template.
     pub handler: String,
 }
 
@@ -64,40 +49,30 @@ pub struct ApiServerMetrics {
     pub http_requests: HttpRequestCounterFamily,
     /// HTTP request latency grouped by method and handler.
     pub http_request_duration_seconds: HttpHandlerHistogramFamily,
-    /// High-resolution HTTP request latency across all tracked handlers,
-    /// without labels.
-    pub http_request_duration_highr_seconds: Histogram,
 }
 
 impl ApiServerMetrics {
     /// Registers every family under its exported name and help, and
     /// returns the handles; the registry keeps a clone of each, whose state
     /// it shares.
-    pub fn register(registry: &mut prometheus_client::registry::Registry) -> Self {
+    pub fn register(registry: &mut Registry) -> Self {
         let http_requests: HttpRequestCounterFamily = Default::default();
         registry.register(
-            "http_requests",
-            "Total number of HTTP requests by method, status, and handler.",
+            "uniserve:http_requests",
+            "HTTP requests by method, status class and matched route.",
             http_requests.clone(),
         );
-        let http_request_duration_seconds = HttpHandlerHistogramFamily::new_with_constructor(
-            http_request_duration_histogram as fn() -> Histogram,
-        );
+        let http_request_duration_seconds =
+            HttpHandlerHistogramFamily::new_with_constructor(latency_histogram);
         registry.register(
-            "http_request_duration_seconds",
-            "Duration of HTTP requests in seconds grouped by method and handler.",
+            "uniserve:http_request_duration_seconds",
+            "Time from an HTTP request's arrival to the end of its response body, in seconds, by \
+             method and matched route.",
             http_request_duration_seconds.clone(),
-        );
-        let http_request_duration_highr_seconds = http_request_duration_highr_histogram();
-        registry.register(
-            "http_request_duration_highr_seconds",
-            "High-resolution duration of HTTP requests in seconds.",
-            http_request_duration_highr_seconds.clone(),
         );
         Self {
             http_requests,
             http_request_duration_seconds,
-            http_request_duration_highr_seconds,
         }
     }
 }

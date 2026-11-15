@@ -364,6 +364,7 @@ pub(crate) fn leader_over(
         logging_config: LoggingConfig {
             log_requests: false,
             log_stats: false,
+            ..LoggingConfig::default()
         },
         ..ServerArgs::default()
     };

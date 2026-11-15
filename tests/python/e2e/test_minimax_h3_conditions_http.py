@@ -213,7 +213,7 @@ def _graph_replays(client: httpx.Client) -> float:
         total = 0.0
         for line in response.text.splitlines():
             match = re.match(
-                r"uniserve:worker_cuda_graph_runtime_mode_counts_total"
+                r"uniserve:worker_graph_runtime_mode_counts_total"
                 r"\{([^}]*)\} (\S+)",
                 line,
             )

@@ -4,6 +4,38 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// One state of one observed stream's device time: the key of
+/// [`ForwardStats::stream_us`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct StreamTime {
+    /// The stream: `device` (the rank's primary stream) or `copy` (the stream
+    /// of page copies through the host KV cache).
+    pub stream: String,
+    /// `busy`, `gap` or `late` ([`ForwardStats::stream_us`]).
+    pub state: String,
+}
+
+/// One driver call one serving thread made that waited for the device: the
+/// key of [`ForwardStats::blocking_calls`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct BlockingCall {
+    /// The thread (`builder`, `control`, `device`).
+    pub thread: String,
+    /// The driver call.
+    pub call: String,
+}
+
+/// One module class of the steps of one stage: the key of
+/// [`ForwardStats::fence_us`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct FenceStep {
+    /// The steps' stage: their call kind, such as `decode`.
+    pub stage: String,
+    /// The module class (the name its modules give their profiler range), or
+    /// `step` for the step's span between its markers.
+    pub module: String,
+}
+
 /// Worker-local forward/kernel counters folded into scheduler stats.
 ///
 /// In a worker batch result (`BatchOutput::forward_stats` in the worker
@@ -27,24 +59,23 @@ pub struct ForwardStats {
     /// Forward time in microseconds by runtime mode.
     pub mode_us: BTreeMap<String, u64>,
     /// Device time of the rank's primary and copy streams in microseconds,
-    /// keyed `{stream}/{state}`, where `stream` is `device` (the primary
-    /// stream) or `copy` (the stream of page copies through the host KV
-    /// cache), from CUPTI's records of the kernels, copies and fills on
-    /// each stream, graph nodes included: `busy` is the length of the union
-    /// of their intervals, `gap` the rest of the span from the stream's
-    /// first operation to its latest end (idle while it waited for the
-    /// host, another stream or any work), and `late` the time of records
-    /// that arrived too far out of order to merge, counted in neither.
-    pub stream_us: BTreeMap<String, u64>,
+    /// by stream and state ([`StreamTime`]), from the profiler's records of
+    /// the kernels, copies and fills on each stream, graph nodes included:
+    /// `busy` is the length of the union of their intervals, `gap` the rest
+    /// of the span from the stream's first operation to its latest end (idle
+    /// while it waited for the host, another stream or any work), and `late`
+    /// the time of records that arrived too far out of order to merge,
+    /// counted in neither.
+    pub stream_us: BTreeMap<StreamTime, u64>,
     /// Driver calls that made a serving thread of the rank wait for the
-    /// device, keyed `{thread}/{call}` (`builder`, `control`). A serving
-    /// call of the worker that made one failed.
-    pub blocking_calls: BTreeMap<String, u64>,
-    /// Per-step durations from the fence probes, keyed `{stage}/{class}`:
-    /// a step's summed durations of the module class's probed instances, or
-    /// the step's span between its markers for the class `step`, of the
-    /// steps of that stage (a call kind, such as `decode`).
-    pub fence_us: BTreeMap<String, FenceHistogram>,
+    /// device, by thread and call ([`BlockingCall`]). A serving call of the
+    /// worker that made one failed.
+    pub blocking_calls: BTreeMap<BlockingCall, u64>,
+    /// Per-step durations from the fence probes, by stage and module class
+    /// ([`FenceStep`]): a step's summed durations of the module class's
+    /// probed instances, or the step's span between its markers for the
+    /// class `step`, of the steps of that stage.
+    pub fence_us: BTreeMap<FenceStep, FenceHistogram>,
     /// Fence probe records the rank's reader lost: overwritten before it
     /// read them.
     pub fence_records_lost: u64,
@@ -117,12 +148,12 @@ impl ForwardStats {
     /// Add another invocation's counters, retaining every keyed breakdown.
     /// Counters saturate at the wire representation's unsigned 64-bit limit.
     pub fn merge(&mut self, other: &Self) {
+        add_counts(&mut self.stream_us, &other.stream_us);
+        add_counts(&mut self.blocking_calls, &other.blocking_calls);
         for (target, values) in [
             (&mut self.mode_counts, &other.mode_counts),
             (&mut self.mode_tokens, &other.mode_tokens),
             (&mut self.mode_us, &other.mode_us),
-            (&mut self.stream_us, &other.stream_us),
-            (&mut self.blocking_calls, &other.blocking_calls),
             (
                 &mut self.attention_backend_counts,
                 &other.attention_backend_counts,
@@ -136,10 +167,7 @@ impl ForwardStats {
                 &other.spec_verify_path_counts,
             ),
         ] {
-            for (name, &value) in values {
-                let count = target.entry(name.clone()).or_default();
-                *count = count.saturating_add(value);
-            }
+            add_counts(target, values);
         }
         for (session, progress) in &other.profile {
             self.profile.entry(*session).or_default().add(progress);
@@ -239,6 +267,15 @@ impl ForwardStats {
             && self.spec_verify_rejected_tokens == 0
             && self.spec_verify_committed_tokens == 0
             && self.spec_verify_path_counts.is_empty()
+    }
+}
+
+/// Adds `values`' counts into `target`'s, key by key, saturating at the wire's unsigned 64-bit
+/// limit.
+fn add_counts<K: Ord + Clone>(target: &mut BTreeMap<K, u64>, values: &BTreeMap<K, u64>) {
+    for (key, &value) in values {
+        let count = target.entry(key.clone()).or_default();
+        *count = count.saturating_add(value);
     }
 }
 
@@ -342,8 +379,12 @@ mod tests {
 
         let mut stats = ForwardStats::default();
         assert!(stats.is_empty());
+        let step = FenceStep {
+            stage: "decode".to_owned(),
+            module: "step".to_owned(),
+        };
         stats.merge(&ForwardStats {
-            fence_us: [("decode/step".to_owned(), second)].into(),
+            fence_us: [(step, second)].into(),
             ..ForwardStats::default()
         });
         assert!(!stats.is_empty());

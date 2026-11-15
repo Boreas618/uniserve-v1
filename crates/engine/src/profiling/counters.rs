@@ -17,6 +17,7 @@ use platform::Stream;
 use platform::cupti::activity::StreamActivity;
 use platform::cupti::blocking::BlockingWatch;
 
+use proto::report::BlockingCall;
 use service::lock;
 
 /// Subscribe the process to CUPTI; a failure (another CUPTI client holds the subscription, or the
@@ -96,9 +97,9 @@ impl Counters {
     }
 }
 
-/// The driver calls that made the process's serving threads wait for the device, under
-/// `{thread}/{call}`, since the last take. They travel with the next batch result.
-static BLOCKING: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+/// The driver calls that made the process's serving threads wait for the device,
+/// by thread and call, since the last take. They travel with the next batch result.
+static BLOCKING: Mutex<BTreeMap<BlockingCall, u64>> = Mutex::new(BTreeMap::new());
 
 /// Counts `calls` (by call name) that `thread` made.
 pub(crate) fn add_blocking(thread: &str, calls: &[(&'static str, u64)]) {
@@ -107,11 +108,15 @@ pub(crate) fn add_blocking(thread: &str, calls: &[(&'static str, u64)]) {
     }
     let mut counts = lock(&BLOCKING);
     for &(call, count) in calls {
-        *counts.entry(format!("{thread}/{call}")).or_default() += count;
+        let key = BlockingCall {
+            thread: thread.to_owned(),
+            call: call.to_owned(),
+        };
+        *counts.entry(key).or_default() += count;
     }
 }
 
 /// The counts since the last take.
-pub(crate) fn take_blocking() -> BTreeMap<String, u64> {
+pub(crate) fn take_blocking() -> BTreeMap<BlockingCall, u64> {
     std::mem::take(&mut *lock(&BLOCKING))
 }

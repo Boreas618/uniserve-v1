@@ -111,7 +111,7 @@ const EAGER: &str = "eager";
 ///   to now, and what other threads added ([`counters::add_blocking`]);
 /// - the device time of the process's observed streams (`stream_us`);
 /// - the per-step module times the device's range markers measured, as histograms by
-///   `{stage}/{class}`, and the stamps its reader lost (`fence_us`, `fence_records_lost`);
+///   stage and class, and the stamps its reader lost (`fence_us`, `fence_records_lost`);
 /// - the progress of `session`, the rank's profiling session (`profile`).
 ///
 /// Called by the rank's worker, on its own thread, once per batch result. It never waits for
@@ -161,10 +161,11 @@ pub(crate) fn forward_stats(
             ("late", stream.late_us),
         ] {
             if us > 0 {
-                *stats
-                    .stream_us
-                    .entry(format!("{}/{state}", stream.name))
-                    .or_default() += us;
+                let time = proto::report::StreamTime {
+                    stream: stream.name.clone(),
+                    state: state.to_owned(),
+                };
+                *stats.stream_us.entry(time).or_default() += us;
             }
         }
     }

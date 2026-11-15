@@ -156,8 +156,7 @@ impl RemoteHold {
             let epoch = attachment.epoch;
             let engine = attachment.engine;
             let attached = tokio::task::spawn_blocking(move || {
-                let client =
-                    control.adopt(engine, engine + 1, epoch, None, Box::new(|_, _, _| {}))?;
+                let client = control.adopt(engine, engine + 1, epoch, None, Box::new(|_| {}))?;
                 client.number_requests_from(first);
                 Ok::<_, anyhow::Error>(client)
             })

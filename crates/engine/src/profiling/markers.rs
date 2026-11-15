@@ -69,7 +69,7 @@ use crossbeam_channel::Sender;
 use ops::{Arguments, Kernel, KernelEntry, LaunchGrid};
 use platform::{DeviceAllocation, DeviceId, DevicePtr, PinnedBuffer, Stream};
 use proto::config::ProfilingConfig;
-use proto::report::FenceHistogram;
+use proto::report::{FenceHistogram, FenceStep};
 
 use super::artifact::{ClockRow, Message};
 use crate::worker::{Error, Result};
@@ -214,7 +214,7 @@ struct DeviceMarkers {
     /// The steps whose begin marker was launched and whose end was not read, in launch order.
     launched: Mutex<VecDeque<Launched>>,
     /// Histograms of completed steps since the last take, by `{stage}/{class}`.
-    histograms: Mutex<BTreeMap<String, FenceHistogram>>,
+    histograms: Mutex<BTreeMap<FenceStep, FenceHistogram>>,
     /// Where the stamps read go while a session keeps them: the class patterns it keeps (empty
     /// for every class) and its file's writer.
     tap: Mutex<Option<(Vec<String>, Sender<Message>)>>,
@@ -626,23 +626,28 @@ impl Markers {
         let instances = lock(&self.instances);
         for (stage, end, mut open) in measured {
             let begin = open.iter().rev().find(|stamp| stamp.marker == STEP_BEGIN);
+            let step_of = |module: &str| FenceStep {
+                stage: stage.to_string(),
+                module: module.to_owned(),
+            };
             if let Some(begin) = begin {
                 histograms
-                    .entry(format!("{stage}/step"))
+                    .entry(step_of("step"))
                     .or_default()
                     .observe(end.saturating_sub(begin.time) / 1000);
             }
             for (class, ns) in class_time(&instances.instance_classes, &mut open) {
                 histograms
-                    .entry(format!("{stage}/{}", instances.classes[class - 1]))
+                    .entry(step_of(&instances.classes[class - 1]))
                     .or_default()
                     .observe(ns / 1000);
             }
         }
     }
-    /// The histograms of `device`'s steps completed since the last take, in microseconds by
-    /// `{stage}/{class}`, and its stamps lost.
-    pub(crate) fn take(&self, device: DeviceId) -> (BTreeMap<String, FenceHistogram>, u64) {
+
+    /// The histograms of `device`'s steps completed since the last take, in microseconds by stage
+    /// and class, and its stamps lost.
+    pub(crate) fn take(&self, device: DeviceId) -> (BTreeMap<FenceStep, FenceHistogram>, u64) {
         let Ok(markers) = self.device(device) else {
             return Default::default();
         };
@@ -1194,10 +1199,16 @@ mod tests {
         markers.read_device(device);
 
         let (histograms, lost) = markers.take(device);
-        let steps = |name: &str| histograms[name].buckets.iter().sum::<u64>();
+        let steps = |module: &str| {
+            let step = FenceStep {
+                stage: "decode".to_owned(),
+                module: module.to_owned(),
+            };
+            histograms[&step].buckets.iter().sum::<u64>()
+        };
         assert_eq!(lost, 0);
-        assert_eq!(steps("decode/step"), 2);
-        assert_eq!(steps("decode/Mlp"), 2);
+        assert_eq!(steps("step"), 2);
+        assert_eq!(steps("Mlp"), 2);
         assert_eq!(
             markers.instances(),
             [("Mlp".to_owned(), "layers.0.mlp".to_owned())]

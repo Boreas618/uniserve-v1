@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use crate::updates::update::Phase;
 
-use crate::metrics::{EngineLabels, METRICS};
+use crate::metrics::{METRICS, RequestLabels, SchedulerLabels};
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use proto::request::Request;
@@ -50,7 +50,7 @@ use crate::api::input::{
 use crate::api::model::ModelConfig;
 use crate::api::output::RequestOutputStream;
 use crate::api::protocol::VideoGenerationRequest;
-use crate::engine::client::{EngineClient, EngineState, StatsSink, SubmitError};
+use crate::engine::client::{EngineClient, EngineReport, EngineState, StatsSink, SubmitError};
 use crate::engine::control::EngineControl;
 use crate::engine::hold::{HoldState, RequestHold};
 use crate::metrics::log_stats::StatsLogger;
@@ -173,21 +173,30 @@ pub(crate) struct EpochTarget {
     pub(crate) epoch: u64,
 }
 
-/// Records each scheduler's statistics under `model_name`, and with
-/// `observer`, which reads each epoch's rates.
+/// Records what replica `replica`'s engine reports under `model_name`: each
+/// scheduler's statistics, also read by `observer` for each epoch's rates, and
+/// its main process's allocators.
 pub(crate) fn stats_sink(
     model_name: String,
     observer: Arc<crate::observe::Observer>,
     replica: usize,
 ) -> StatsSink {
-    Box::new(move |epoch, scheduler, snapshot| {
-        observer.record(epoch, scheduler, &snapshot);
-        metrics::record_scheduler_stats(
-            &METRICS.scheduler,
-            &model_name,
-            scheduler + replica as u32,
-            &snapshot,
-        );
+    let replica = replica as u32;
+    Box::new(move |report| match report {
+        EngineReport::Scheduler {
+            epoch,
+            scheduler,
+            stats,
+        } => {
+            observer.record(epoch, scheduler, &stats);
+            let labels = SchedulerLabels {
+                model_name: model_name.clone(),
+                replica,
+                scheduler,
+            };
+            METRICS.record_scheduler(&labels, &stats);
+        }
+        EngineReport::Memory(devices) => METRICS.memory.record(replica, &devices),
     })
 }
 
@@ -346,6 +355,26 @@ pub(crate) struct Prepared {
     renderer: LoadedRenderer,
     /// The deployment's engine configuration, with the facts the model's files determine.
     pub(crate) engine: proto::config::EngineConfig,
+}
+
+/// Where a submitted request is served: its replica, and the scheduler of that
+/// replica's engine, which a request the engine ended at submission names
+/// none of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Placement {
+    replica: u32,
+    scheduler: Option<u32>,
+}
+
+impl Placement {
+    /// The request metrics' labels of a request of `model_name` served here.
+    fn labels(self, model_name: &str) -> RequestLabels {
+        RequestLabels {
+            model_name: model_name.to_owned(),
+            replica: self.replica,
+            scheduler: self.scheduler,
+        }
+    }
 }
 
 impl Leader {
@@ -1039,16 +1068,9 @@ impl Leader {
         let images = MediaConnector::new(&options.image_fetch_config)
             .context("failed to initialize the image URL fetcher")?;
         let logging = &options.logging_config;
-        // The engines state their schedulers: the throughput log divides by every replica's.
-        let schedulers = Arc::new(std::sync::atomic::AtomicUsize::new(
-            clients
-                .iter()
-                .map(|client| client.info().schedulers as usize)
-                .sum(),
-        ));
         let stats_logger = logging
             .log_stats
-            .then(|| StatsLogger::start(model_name.clone(), Arc::clone(&schedulers)));
+            .then(|| StatsLogger::start(&METRICS.log, logging.stats_interval));
         let replica_options = ServerArgs {
             model: Some(model_name.clone()),
             served_model_name: Some(served_model_name.clone()),
@@ -1182,14 +1204,11 @@ impl Leader {
         .await?;
 
         let compile_us = elapsed_us(started);
-        let (events, core) = self
+        let (events, placement) = self
             .submit(request.into())
             .await
             .map_err(ServeError::from)?;
-        let labels = EngineLabels {
-            model_name: self.model_name.clone(),
-            engine: core,
-        };
+        let labels = placement.labels(&self.model_name);
         let log = self.log_requests.then_some(request_id);
         let stats = crate::metrics::stats::StatLogger::new(labels, started, log);
         // Dropping the events on a failure cancels the request in its engine.
@@ -1217,9 +1236,11 @@ impl Leader {
         replica: u32,
         started: std::time::Instant,
     ) -> crate::metrics::stats::StatLogger {
-        let labels = EngineLabels {
+        // The process that handed the request over named its replica alone.
+        let labels = RequestLabels {
             model_name: self.model_name.clone(),
-            engine: replica,
+            replica,
+            scheduler: None,
         };
         let log = self.log_requests.then(|| request_id.to_owned());
         crate::metrics::stats::StatLogger::new(labels, started, log)
@@ -1286,7 +1307,7 @@ impl Leader {
             .process(&request_id, &request, self.processor.config().max_model_len)
             .await?;
         let prompt_tokens = request.prompt_token_ids.len();
-        let (events, core) = self.submit(Request::Diffusion(request)).await?;
+        let (events, placement) = self.submit(Request::Diffusion(request)).await?;
         let output = crate::api::output::media_output(
             request_id.clone(),
             started,
@@ -1294,22 +1315,18 @@ impl Leader {
             prompt_tokens,
             Box::new(events),
         );
-        Ok((processed, self.stats(request_id, started, core, output)))
+        Ok((processed, self.stats(request_id, started, placement, output)))
     }
 
-    /// Records `output`'s request metrics under the scheduler that serves
-    /// it.
+    /// Records `output`'s request metrics under where it is served.
     fn stats(
         &self,
         request_id: String,
         started: Instant,
-        core: u32,
+        placement: Placement,
         output: RequestOutputStream,
     ) -> RequestOutputStream {
-        let labels = EngineLabels {
-            model_name: self.model_name.clone(),
-            engine: core,
-        };
+        let labels = placement.labels(&self.model_name);
         let log = self.log_requests.then_some(request_id);
         Box::pin(RequestStats::new(output, labels, started, log))
     }
@@ -1318,9 +1335,8 @@ impl Leader {
     /// least loaded live scheduler; while no engine is ready, the request
     /// waits in the hold until one is.
     ///
-    /// Returns the request's event stream and the index of the scheduler
-    /// that serves it. Dropping the stream before its terminal event cancels
-    /// the request.
+    /// Returns the request's event stream and where it is served. Dropping
+    /// the stream before its terminal event cancels the request.
     ///
     /// # Errors
     ///
@@ -1328,12 +1344,14 @@ impl Leader {
     pub(crate) async fn submit(
         &self,
         request: Request,
-    ) -> Result<(RequestEvents, u32), SubmitError> {
+    ) -> Result<(RequestEvents, Placement), SubmitError> {
         let replica = self.replica_for_request().await?;
         let (events, scheduler) = replica.migrator.submit(request).await?;
-        // A request the engine ended at submission names no scheduler; its
-        // stream holds its terminal event.
-        Ok((events, scheduler.unwrap_or(0) + replica.ordinal as u32))
+        let placement = Placement {
+            replica: replica.ordinal as u32,
+            scheduler,
+        };
+        Ok((events, placement))
     }
 }
 
@@ -3692,22 +3710,39 @@ mod tests {
         (status, document)
     }
 
-    /// Waits until the rendered process-wide metrics hold `line`.
-    async fn metrics_reach(line: &str) {
+    /// Waits until the process-wide metrics `reached`, which `what` names.
+    async fn metrics_reach(what: &str, reached: impl Fn() -> bool) {
         let deadline = tokio::time::Instant::now() + STALL;
-        while !rendered_metrics_hold(line) {
+        while !reached() {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the metrics never held `{line}`"
+                "the metrics never reached {what}"
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
-    /// Returns whether the rendered process-wide metrics hold `line`.
-    fn rendered_metrics_hold(line: &str) -> bool {
-        let rendered = METRICS.render().unwrap();
-        rendered.lines().any(|rendered| rendered == line)
+    /// The request labels of scheduler `scheduler` of replica 0 of `model_name`.
+    fn request_labels(model_name: &str, scheduler: u32) -> crate::metrics::RequestLabels {
+        crate::metrics::RequestLabels {
+            model_name: model_name.to_owned(),
+            replica: 0,
+            scheduler: Some(scheduler),
+        }
+    }
+
+    /// How many requests of scheduler `scheduler` of replica 0 of `model_name`
+    /// ended as `outcome`.
+    fn outcomes(model_name: &str, scheduler: u32, outcome: crate::metrics::Outcome) -> u64 {
+        let labels = crate::metrics::OutcomeLabels {
+            served: request_labels(model_name, scheduler),
+            outcome,
+        };
+        METRICS
+            .request
+            .request_outcomes
+            .get(&labels)
+            .map_or(0, |count| count.get())
     }
 
     /// A text request that generates until the simulator's EOS.
@@ -3832,7 +3867,7 @@ mod tests {
         }
         assert!(engine.is_healthy());
         let (mut stream, replica) = engine.submit(text_request()).await.unwrap();
-        assert_eq!(replica, 1);
+        assert_eq!(replica.replica, 1);
         let mut finished = false;
         while let Some(event) = stream.next().await {
             if let Event::Finished { reason, .. } = event {
@@ -3908,15 +3943,11 @@ mod tests {
 
             let (status, document) = pending.await.unwrap();
             assert_eq!(status, axum::http::StatusCode::OK, "{document}");
-            let labels = format!("model_name=\"{engine_model}\",engine=\"0\"");
-            let series = format!("uniserve:e2e_request_latency_seconds_sum{{{labels}}} ");
-            let rendered = METRICS.render().unwrap();
-            let seconds: f64 = rendered
-                .lines()
-                .find_map(|line| line.strip_prefix(&series))
-                .unwrap_or_else(|| panic!("no `{series}` in:\n{rendered}"))
-                .parse()
-                .unwrap();
+            let seconds = METRICS
+                .request
+                .e2e_request_latency_seconds
+                .get_or_create(&request_labels(engine_model, 0))
+                .sum();
             assert!(seconds >= wait.as_secs_f64(), "{seconds} s");
             engine.shutdown().await.unwrap();
         });
@@ -3938,19 +3969,29 @@ mod tests {
         assert_eq!(document["usage"]["completion_tokens"], 3);
         let prompt_tokens = &document["usage"]["prompt_tokens"];
 
-        let labels = format!("model_name=\"{engine_model}\",engine=\"0\"");
-        for expected in [
-            format!("uniserve:request_success_total{{{labels},finished_reason=\"length\"}} 1"),
-            format!("uniserve:prompt_tokens_total{{{labels}}} {prompt_tokens}"),
-            format!("uniserve:generation_tokens_total{{{labels}}} 3"),
-            format!("uniserve:request_prompt_tokens_count{{{labels}}} 1"),
-            format!("uniserve:request_generation_tokens_count{{{labels}}} 1"),
-            format!("uniserve:request_max_num_generation_tokens_count{{{labels}}} 1"),
-            format!("uniserve:e2e_request_latency_seconds_count{{{labels}}} 1"),
-            format!("uniserve:request_queue_time_seconds_count{{{labels}}} 1"),
-            format!("uniserve:time_to_first_token_seconds_count{{{labels}}} 1"),
+        let request = &METRICS.request;
+        let labels = request_labels(engine_model, 0);
+        assert_eq!(
+            outcomes(engine_model, 0, crate::metrics::Outcome::Length),
+            1
+        );
+        assert_eq!(
+            request.prompt_tokens.get_or_create(&labels).get(),
+            prompt_tokens.as_u64().unwrap()
+        );
+        assert_eq!(request.generation_tokens.get_or_create(&labels).get(), 3);
+        for histogram in [
+            &request.request_prompt_tokens,
+            &request.request_generation_tokens,
+            &request.e2e_request_latency_seconds,
+            &request.request_queue_time_seconds,
+            &request.time_to_first_token_seconds,
         ] {
-            assert!(rendered_metrics_hold(&expected), "missing `{expected}`");
+            let observed = histogram.get_or_create(&labels);
+            assert_eq!(
+                prometheus_client::metrics::histogram::Histogram::count(&observed),
+                1
+            );
         }
         engine.shutdown().await.unwrap();
     }
@@ -4032,12 +4073,12 @@ mod tests {
         assert_eq!(first, axum::http::StatusCode::OK);
         assert_eq!(second, axum::http::StatusCode::OK);
 
-        for core in 0..2 {
-            let expected = format!(
-                "uniserve:request_success_total{{model_name=\"{engine_model}\",\
-                 engine=\"{core}\",finished_reason=\"length\"}} 1"
+        for scheduler in 0..2 {
+            assert_eq!(
+                outcomes(engine_model, scheduler, crate::metrics::Outcome::Length),
+                1,
+                "scheduler {scheduler}"
             );
-            assert!(rendered_metrics_hold(&expected), "missing `{expected}`");
         }
         engine.shutdown().await.unwrap();
     }
@@ -4065,24 +4106,20 @@ mod tests {
         // The connection is gone: the body's frames have no reader.
         drop(stream);
 
-        let labels = format!("model_name=\"{engine_model}\",engine=\"0\"");
-        for expected in [
-            format!("uniserve:request_success_total{{{labels},finished_reason=\"abort\"}} 1"),
-            format!("uniserve:e2e_request_latency_seconds_count{{{labels}}} 1"),
-        ] {
-            metrics_reach(&expected).await;
-        }
-        let rendered = METRICS.render().unwrap();
-        for family in [
-            "uniserve:generation_tokens_total",
-            "uniserve:request_generation_tokens_count",
-        ] {
-            let series = format!("{family}{{{labels}}}");
-            assert!(
-                !rendered.lines().any(|line| line.starts_with(&series)),
-                "unexpected `{series}` in:\n{rendered}"
-            );
-        }
+        let request = &METRICS.request;
+        let labels = request_labels(engine_model, 0);
+        metrics_reach("the abort", || {
+            outcomes(engine_model, 0, crate::metrics::Outcome::Abort) == 1
+        })
+        .await;
+        let latency = request.e2e_request_latency_seconds.get_or_create(&labels);
+        assert_eq!(
+            prometheus_client::metrics::histogram::Histogram::count(&latency),
+            1
+        );
+        drop(latency);
+        assert!(request.generation_tokens.get(&labels).is_none());
+        assert!(request.request_generation_tokens.get(&labels).is_none());
         engine.shutdown().await.unwrap();
     }
 

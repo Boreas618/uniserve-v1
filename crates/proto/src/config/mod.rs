@@ -921,13 +921,23 @@ pub struct LoggingConfig {
     pub log_requests: bool,
     /// Log engine statistics periodically.
     pub log_stats: bool,
+    /// Interval of the statistics log line: the throughput it states is
+    /// averaged over it.
+    #[serde(with = "values::duration")]
+    pub stats_interval: Duration,
 }
+
+/// The interval of the statistics log line when the deployment states none
+/// (`logging_config.stats_interval`): an operator's reading cadence, long
+/// enough that each line averages many scheduler reports.
+pub const STATS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             log_requests: false,
             log_stats: true,
+            stats_interval: STATS_LOG_INTERVAL,
         }
     }
 }

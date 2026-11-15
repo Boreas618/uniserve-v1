@@ -213,7 +213,7 @@ impl EngineControl {
             .zip(launches.iter().zip(started))
         {
             // A peer holds no scheduler, so it reports no statistics.
-            let sink = sinks.next().unwrap_or_else(|| Box::new(|_, _, _| {}));
+            let sink = sinks.next().unwrap_or_else(|| Box::new(|_| {}));
             clients.push(
                 EngineClient::new(reader, writer, info, state, sink, Some(control))?
                     .numbered(launch.engine)
@@ -365,7 +365,7 @@ impl EngineControl {
         let mut sinks = std::iter::once(stats);
         for (host, engine) in processes {
             // A peer holds no scheduler, so it reports no statistics.
-            let sink = sinks.next().unwrap_or_else(|| Box::new(|_, _, _| {}));
+            let sink = sinks.next().unwrap_or_else(|| Box::new(|_| {}));
             clients.push(self.join(*engine, epoch, sink)?.on_host(host));
         }
         let mut clients = clients.into_iter();

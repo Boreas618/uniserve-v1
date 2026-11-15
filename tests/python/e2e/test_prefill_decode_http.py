@@ -202,10 +202,10 @@ def _idle(base_url: str) -> bool:
     waiting.
     """  # noqa: D205
     text = httpx.get(f"{base_url}/metrics", timeout=10).text
-    busy = metric(base_url, "uniserve:num_requests_running") + metric(
-        base_url, "uniserve:num_requests_waiting"
+    busy = metric(base_url, "uniserve:scheduler_running") + metric(
+        base_url, "uniserve:scheduler_waiting"
     )
-    return "uniserve:num_requests_running{" in text and busy == 0
+    return "uniserve:scheduler_running{" in text and busy == 0
 
 
 def _transfers(

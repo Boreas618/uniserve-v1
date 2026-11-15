@@ -374,7 +374,8 @@ The workers' always-on profiling: the fence probes at the entry and exit of the 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `log_requests` | `false` | Log a summary line for each completed request |
-| `log_stats` | `true` | Log engine statistics periodically |
+| `log_stats` | `true` | Log engine statistics periodically: request throughput, scheduler occupancy, cache usage and prefix-cache hit rate, as structured fields |
+| `stats_interval` | `"10s"` | Interval of the statistics log line, over which its throughput is averaged |
 
 ### `chat_config`
 

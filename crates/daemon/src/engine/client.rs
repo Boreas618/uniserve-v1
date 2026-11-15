@@ -53,6 +53,10 @@ pub struct EngineInfo {
     /// whose denoising computes the same; zero without a denoiser or host
     /// latent pools.
     pub latent_seed: u64,
+    /// How often each scheduler reports its statistics: the period whose
+    /// interval each report covers, which the readers of the reports (the
+    /// metrics, an epoch's observer and trial) take as the reports' cadence.
+    pub stats_period: std::time::Duration,
 }
 
 impl From<wire::EngineInfo> for EngineInfo {
@@ -71,6 +75,7 @@ impl From<wire::EngineInfo> for EngineInfo {
                 .filter_map(|seed| <[u8; 32]>::try_from(seed.as_slice()).ok())
                 .collect(),
             latent_seed: info.latent_seed,
+            stats_period: std::time::Duration::from_millis(u64::from(info.stats_period_ms)),
         }
     }
 }
@@ -115,9 +120,26 @@ pub enum SubmitError {
     Unavailable(String),
 }
 
-/// Receives each scheduler's statistics: the scheduler's index and its
-/// snapshot of the last interval.
-pub type StatsSink = Box<dyn Fn(u64, u32, SchedulerStats) + Send + Sync>;
+/// What an engine reports of itself at its report period
+/// (`EngineInfo::report_period`), which the client hands its [`StatsSink`].
+pub enum EngineReport {
+    /// One scheduler's statistics of the last interval, in the epoch the
+    /// engine serves.
+    Scheduler {
+        /// The epoch the engine serves.
+        epoch: u64,
+        /// The scheduler's index in the engine.
+        scheduler: u32,
+        /// The interval's snapshot.
+        stats: Box<SchedulerStats>,
+    },
+    /// The main process's allocators: each device's budget and the bytes each
+    /// of its pools has mapped now.
+    Memory(Vec<wire::DeviceMemory>),
+}
+
+/// Receives what the engine reports of itself.
+pub type StatsSink = Box<dyn Fn(EngineReport) + Send + Sync>;
 
 /// Why the consumer of a request's events closes them before the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1089,23 +1111,22 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             }
             Some(from_engine::Kind::Metrics(metrics)) => {
                 // The engine's allocator, which the deployment exports: each device's budget
-                // and, per pool, the bytes it has mapped now (`uniserve:memory_budget`,
-                // `uniserve:memory_mapped`). The message arrives once a second
-                // while the process serves, so the series follow the allocator rather than a snapshot
-                // taken at launch.
+                // and, per pool, the bytes it has mapped now. The message arrives at the
+                // engine's report period while the process serves, so the series follow the
+                // allocator rather than a snapshot taken at launch.
                 //
                 // The message's counters - `steps`, `batches`, `tokens`, `kernel_launches`,
                 // `device_ns`, `policy_fuel`, `policy_calls`, and each rank's `queue` depth - have no
-                // family here: the engine's scheduler and request families are recorded from
+                // family: the engine's scheduler and request families are recorded from
                 // `SchedulerStats` and `RequestStats`, which arrive beside this message.
-                crate::metrics::METRICS.memory.record(&metrics.memory);
+                stats(EngineReport::Memory(metrics.memory));
             }
             Some(from_engine::Kind::Stats(report)) => match report.snapshot {
-                Some(snapshot) => stats(
-                    shared.epoch.load(Ordering::Relaxed),
-                    report.scheduler,
-                    SchedulerStats::from(snapshot),
-                ),
+                Some(snapshot) => stats(EngineReport::Scheduler {
+                    epoch: shared.epoch.load(Ordering::Relaxed),
+                    scheduler: report.scheduler,
+                    stats: Box::new(SchedulerStats::from(snapshot)),
+                }),
                 None => tracing::warn!(
                     scheduler = report.scheduler,
                     "the engine sent statistics without a snapshot"

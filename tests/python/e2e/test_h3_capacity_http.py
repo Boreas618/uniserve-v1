@@ -72,7 +72,7 @@ def _graph_modes(client: httpx.Client) -> dict[str, float]:
     result: dict[str, float] = {}
     for line in response.text.splitlines():
         match = re.match(
-            r"uniserve:worker_cuda_graph_runtime_mode_counts_total"
+            r"uniserve:worker_graph_runtime_mode_counts_total"
             r"\{([^}]*)\} (\S+)",
             line,
         )

@@ -217,6 +217,9 @@ message EngineInfo {
   // between epochs whose denoising computes the same, which continue each
   // other's trajectories exactly; zero for an engine that stores none.
   uint64 latent_seed = 9;
+  // How often each scheduler reports its statistics (`Stats`), in
+  // milliseconds: the period whose interval each report covers. Positive.
+  uint32 stats_period_ms = 12;
 }
 
 // The batch an engine's workers were started for.
@@ -839,9 +842,9 @@ message ForwardStats {
   map<string, uint64> mode_counts = 1;
   map<string, uint64> mode_tokens = 2;
   map<string, uint64> mode_us = 3;
-  map<string, uint64> stream_us = 4;
-  map<string, uint64> blocking_calls = 5;
-  map<string, FenceHistogram> fence_us = 6;
+  repeated StreamTime stream_us = 4;
+  repeated BlockingCalls blocking_calls = 5;
+  repeated FenceStep fence_us = 6;
   uint64 fence_records_lost = 7;
   uint64 attention_launches = 9;
   uint64 attention_us = 10;
@@ -879,6 +882,29 @@ message ProfileProgress {
 message FenceHistogram {
   repeated uint64 buckets = 1;
   uint64 sum_us = 2;
+}
+
+// The device time of one state of one observed stream (`ForwardStats.stream_us`).
+message StreamTime {
+  string stream = 1;
+  string state = 2;
+  uint64 us = 3;
+}
+
+// The driver calls one serving thread made that waited for the device
+// (`ForwardStats.blocking_calls`).
+message BlockingCalls {
+  string thread = 1;
+  string call = 2;
+  uint64 count = 3;
+}
+
+// The fence probes' step durations of one stage and module class
+// (`ForwardStats.fence_us`).
+message FenceStep {
+  string stage = 1;
+  string module = 2;
+  FenceHistogram histogram = 3;
 }
 
 // ---------------------------------------------------------------- requests

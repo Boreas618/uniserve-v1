@@ -634,7 +634,7 @@ pub(crate) fn router(
     });
     let api = timeout(api)
         .merge(generation)
-        .route_layer(from_fn(middleware::track_http_metrics));
+        .layer(from_fn(middleware::track_http_metrics));
 
     let mut authenticated = Router::new().route("/version", get(version)).merge(api);
     if let Some(key) = &server.api_key {
@@ -1381,15 +1381,18 @@ mod tests {
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         drop(response);
 
-        let metrics = METRICS.render().unwrap();
+        let labels = crate::metrics::HttpRequestLabels {
+            method: "other".to_owned(),
+            status: "4xx",
+            handler: "/v1/models".to_owned(),
+        };
         assert!(
-            metrics
-                .lines()
-                .any(|line| line.starts_with("http_requests_total{")
-                    && line.contains(r#"method="other""#)
-                    && line.contains(r#"status="4xx""#)
-                    && line.contains(r#"handler="/v1/models""#)),
-            "{metrics}"
+            METRICS
+                .api_server
+                .http_requests
+                .get_or_create(&labels)
+                .get()
+                >= 1
         );
     }
 

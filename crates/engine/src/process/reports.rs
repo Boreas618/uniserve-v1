@@ -84,6 +84,8 @@ impl MainProcess {
             segments: Vec::new(),
             prefix_seeds,
             latent_seed: 0,
+            stats_period_ms: u32::try_from(crate::scheduler::STATS_PERIOD.as_millis())
+                .unwrap_or(u32::MAX),
         })
     }
 

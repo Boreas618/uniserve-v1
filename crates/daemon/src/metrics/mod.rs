@@ -1,23 +1,22 @@
-//! Process-wide Prometheus registry and UniServe metric families.
+//! The daemon's Prometheus registry and UniServe's metric families.
 //!
-//! [`METRICS`] is the one registry the server exports. Each submodule defines
-//! one group of families, listed here with the code that updates it:
+//! [`METRICS`] is the registry the daemon exports. Each submodule defines one group of families,
+//! listed here with the code that updates it:
 //!
-//! - `api_server`: the HTTP metrics middleware (`track_http_metrics`), when
-//!   each response body finishes or is dropped.
-//! - `scheduler`: the server engine's scheduler-stats export tasks
-//!   (`record_scheduler_stats`), from periodic `SchedulerStats` snapshots.
-//! - `request`: the server engine's `RequestStats`, once for each request an
-//!   scheduler accepted, when the request ends; the server's `StatsLogger`
-//!   reads its prompt and generation token counters.
-//! - `memory`: the main process's `Metrics.memory`, once a second while it
-//!   serves (`record_device_memory`): each device's allocator budget and the
-//!   bytes each of its pools has mapped.
+//! - `api_server`: the HTTP metrics route layer (`track_http_metrics`), when each response body
+//!   finishes or is dropped.
+//! - `scheduler`: each scheduler's interval report ([`Metrics::record_scheduler`]).
+//! - `request`: each request a scheduler accepted, when it ends (`stats::StatLogger`).
+//! - `memory`: each replica's main process report of its allocators.
 //!
-//! Every metric field is a `prometheus-client` handle whose clones share their
-//! underlying state, so updates through a field reach the clone held by the
-//! registry. Registration names are base names; `prometheus-client` appends
-//! `_total` to counters when encoding.
+//! The families are UniServe's own schema: names under `uniserve:`, one name per quantity (a
+//! report's scalar is exported under its field's name), latency histograms over
+//! [`latency_buckets`] and count histograms over [`count_buckets`]. The statistics log
+//! (`log_stats`) is fed by the same recorders and reads no family back.
+//!
+//! Every metric field is a `prometheus-client` handle whose clones share their underlying
+//! state, so updates through a field reach the clone held by the registry. Registration names
+//! are base names; `prometheus-client` appends `_total` to counters when encoding.
 
 use std::fmt;
 use std::sync::LazyLock;
@@ -25,9 +24,7 @@ use std::sync::atomic::AtomicU64;
 
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
-use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
-use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 
 mod api_server;
@@ -39,10 +36,10 @@ pub(crate) mod stats;
 
 pub use api_server::{ApiServerMetrics, HttpHandlerLabels, HttpRequestLabels};
 pub use memory::{DeviceLabels, MemoryMetrics, PoolLabels};
-pub use request::{FinishedReasonLabels, RequestMetrics};
+pub use request::{Outcome, OutcomeLabels, RequestLabels, RequestMetrics};
 pub use scheduler::{
-    EngineBackendLabels, EngineBlockingLabels, EngineDomainKindLabels, EngineDomainLabels,
-    EngineLabels, EngineModeLabels, EnginePathLabels, EngineStreamLabels, SchedulerMetrics,
+    BackendLabel, BlockingLabel, DomainKindLabel, DomainLabel, FenceLabel, KeyedLabels, ModeLabel,
+    PathLabel, ScalarMetrics, SchedulerLabels, SchedulerMetrics, StreamLabel,
 };
 
 /// Unsigned Prometheus counter used by metric families.
@@ -51,12 +48,25 @@ pub type U64Counter = Counter<u64, AtomicU64>;
 pub type U64Gauge = Gauge<u64, AtomicU64>;
 /// Floating-point Prometheus gauge used by metric families.
 pub type F64Gauge = Gauge<f64, AtomicU64>;
-/// Histogram family keyed by engine identity.
+
+/// The bucket bounds, in seconds, of every latency histogram: powers of two from 1 ms to about
+/// 35 minutes.
 ///
-/// The `fn() -> Histogram` constructor lets each family choose its bucket
-/// layout through `Family::new_with_constructor`; every series created for a
-/// new label set uses that layout.
-pub(crate) type HistogramFamily = Family<EngineLabels, Histogram, fn() -> Histogram>;
+/// A latency spans a cached decode step to a long video generation, five orders of magnitude, so
+/// the bounds double: any quantile read from the histogram is within a factor of two of the
+/// observation at every scale, with 22 buckets.
+pub fn latency_buckets() -> impl Iterator<Item = f64> {
+    prometheus_client::metrics::histogram::exponential_buckets(0.001, 2.0, 22)
+}
+
+/// The bucket bounds of every count histogram (a request's prompt or generated tokens): powers
+/// of two from 1 to 2^20.
+///
+/// The bounds double for the reason [`latency_buckets`] states, and reach past the longest
+/// context any served model states.
+pub fn count_buckets() -> impl Iterator<Item = f64> {
+    prometheus_client::metrics::histogram::exponential_buckets(1.0, 2.0, 21)
+}
 
 /// A histogram whose observations arrive already counted per bucket of
 /// [`proto::report::FENCE_BUCKETS_US`] (`proto::report::FenceHistogram`): the workers count each
@@ -116,17 +126,20 @@ impl prometheus_client::encoding::EncodeMetric for CountedHistogram {
     }
 }
 
-/// Prometheus registry together with handles to every UniServe metric family.
+/// Prometheus registry together with handles to every UniServe metric family, and the
+/// statistics log its recorders feed.
 pub struct Metrics {
     registry: Registry,
     /// Scheduler, cache, and worker execution metric families.
     pub scheduler: SchedulerMetrics,
-    /// Request latency, token, and completion metric families.
+    /// Request latency, token, and outcome metric families.
     pub request: RequestMetrics,
     /// HTTP transport metric families.
     pub api_server: ApiServerMetrics,
     /// Each device's allocator budget and the bytes its pools have mapped.
     pub memory: MemoryMetrics,
+    /// What the statistics log line states, fed by the same recorders.
+    pub(crate) log: log_stats::StatsLog,
 }
 
 impl Metrics {
@@ -144,7 +157,19 @@ impl Metrics {
             request,
             api_server,
             memory,
+            log: log_stats::StatsLog::default(),
         }
+    }
+
+    /// Records one scheduler's interval report: its families, and the
+    /// statistics log's interval.
+    pub(crate) fn record_scheduler(
+        &self,
+        labels: &SchedulerLabels,
+        stats: &proto::report::SchedulerStats,
+    ) {
+        self.scheduler.record(labels, stats);
+        self.log.scheduler(labels, stats);
     }
 
     /// Renders the current metrics registry into OpenMetrics text format.
