@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas::{CanvasError, CanvasRule};
 use crate::frames::FrameClips;
+use crate::qwen_vl::ProcessorConfig;
 use crate::video::{VideoBinding, VideoFamily, VideoProcessor};
 
 pub use processor::H3Processor;
@@ -109,11 +110,15 @@ pub const REFERENCE_LIMITS: ReferenceLimits = ReferenceLimits {
     image_short_edge: 2048,
 };
 
+/// The pipeline stage that holds the conditioner's Qwen3-VL processor.
+const PROCESSOR_STAGE: &str = "processor";
+
 /// The checkpoint files the processor reads, as `(stage, file)` of the pipeline: the conditioner's
-/// Qwen3-VL processor, which fixes how condition media is patched.
-pub const PROCESSOR_FILES: &[(&str, &str)] = &[
-    ("processor", "preprocessor_config.json"),
-    ("processor", "video_preprocessor_config.json"),
+/// Qwen3-VL processor files ([`ProcessorConfig::FILES`]), which fix how condition media is
+/// patched, in the stage that holds them.
+pub const PROCESSOR_FILES: [(&str, &str); 2] = [
+    (PROCESSOR_STAGE, ProcessorConfig::FILES[0]),
+    (PROCESSOR_STAGE, ProcessorConfig::FILES[1]),
 ];
 
 /// The canvases every H3 checkpoint generates: the canvas rule's canvas of each named aspect ratio,
@@ -529,7 +534,7 @@ pub const FAMILY: crate::Family = crate::Family {
 
 impl VideoFamily for H3Family {
     fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
-        PROCESSOR_FILES
+        &PROCESSOR_FILES
     }
 
     fn default_sizes(&self) -> &'static [&'static str] {
@@ -546,14 +551,11 @@ impl VideoFamily for H3Family {
 }
 
 /// The vectors the request rules are tested against, generated from the diffusers MiniMax-H3
-/// pipeline and the checkpoint's Qwen3-VL processor and tokenizer.
+/// pipeline and the checkpoint's Qwen3-VL processor and tokenizer (`vectors.json`, whose
+/// `sources` state the revisions).
 #[cfg(test)]
 pub(crate) fn vectors() -> serde_json::Value {
-    serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/data/minimax_h3_requests.json"
-    )))
-    .expect("the request vectors are JSON")
+    serde_json::from_str(include_str!("vectors.json")).expect("the request vectors are JSON")
 }
 
 #[cfg(test)]

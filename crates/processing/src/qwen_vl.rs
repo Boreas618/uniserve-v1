@@ -24,12 +24,22 @@ pub const SAMPLE_FPS: f64 = 2.0;
 /// The widest aspect a processor resizes: 200:1.
 const MAX_ASPECT: f64 = 200.0;
 
-/// The token text Qwen chat templates write for one image, which request processing replaces by
-/// the image's block.
-pub const PLACEHOLDER: &str = "<|image_pad|>";
+/// The token that opens a vision block.
+pub const VISION_START: &str = "<|vision_start|>";
 
-/// The markup Qwen chat templates write for one image part.
-pub const MARKUP: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+/// The token that closes a vision block.
+pub const VISION_END: &str = "<|vision_end|>";
+
+/// The token one image block repeats per vision token; Qwen chat templates write one for an
+/// image, which request processing replaces by the image's block.
+pub const IMAGE_PAD: &str = "<|image_pad|>";
+
+/// The token one video block repeats per vision token.
+pub const VIDEO_PAD: &str = "<|video_pad|>";
+
+/// The markup Qwen chat templates write for one image part: a vision block of one placeholder.
+static MARKUP: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| [VISION_START, IMAGE_PAD, VISION_END].concat());
 
 /// Media the processor cannot size, named in request terms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -221,11 +231,11 @@ impl ProcessorConfig {
 
 impl ImageProcessor for ProcessorConfig {
     fn placeholder(&self) -> &str {
-        PLACEHOLDER
+        IMAGE_PAD
     }
 
     fn markup(&self) -> &str {
-        MARKUP
+        &MARKUP
     }
 
     /// The block an image takes in a context: its merged rows, and the positions the text after

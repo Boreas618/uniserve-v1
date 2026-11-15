@@ -12,9 +12,8 @@ use serde::{Deserialize, Serialize};
 /// The short edge starts at [`Self::short_edge`] pixels, an area above [`Self::max_pixels`] scales
 /// both sides down, and each side rounds half to even to a multiple of [`Self::multiple`], at least
 /// one multiple, so the final area may end up slightly above the cap. Only aspects from
-/// [`Self::narrowest`] to [`Self::widest`] resolve. This is the diffusers `adapt_shape_v1` rule;
-/// the released MiniMax-H3 checkpoint states a 768-pixel short edge, `768 * 1344` pixels, a
-/// 32-pixel multiple and 1:4 to 4:1.
+/// [`Self::narrowest`] to [`Self::widest`] resolve. A family states the four values of its
+/// resolution class.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CanvasRule {
     /// The short edge a canvas starts at, in pixels: the resolution class the rule generates.
@@ -235,48 +234,45 @@ mod tests {
 
     use super::*;
 
-    /// The released MiniMax-H3 rule.
+    /// A rule of a 512-pixel short edge, a cap of `512 * 896` pixels, a 64-pixel grid and aspects
+    /// from 1:3 to 3:1.
     const RULE: CanvasRule = CanvasRule {
-        short_edge: 768,
-        max_pixels: 768 * 1344,
-        multiple: 32,
-        narrowest: (1, 4),
-        widest: (4, 1),
+        short_edge: 512,
+        max_pixels: 512 * 896,
+        multiple: 64,
+        narrowest: (1, 3),
+        widest: (3, 1),
     };
 
     #[test]
     fn an_aspect_resolves_to_its_canvas_on_the_grid() {
         let canvas = |width, height| RULE.canvas(width, height).unwrap();
+        // 910 x 512 exceeds the cap and scales by `sqrt(458752 / 466033)` to 903 x 508, which
+        // round to 14 and 8 multiples of 64.
         assert_eq!(
             canvas(16.0, 9.0),
             Canvas {
-                width: 1344,
-                height: 768
+                width: 896,
+                height: 512
             }
         );
-        assert_eq!(
-            canvas(21.0, 9.0),
-            Canvas {
-                width: 1536,
-                height: 672
-            }
-        );
+        // 683 x 512 is under the cap; 683 is 10.67 multiples and rounds to 11.
         assert_eq!(
             canvas(4.0, 3.0),
             Canvas {
-                width: 1024,
-                height: 768
+                width: 704,
+                height: 512
             }
         );
         assert_eq!(
             canvas(1.0, 1.0),
             Canvas {
-                width: 768,
-                height: 768
+                width: 512,
+                height: 512
             }
         );
-        let error = RULE.canvas(5.0, 1.0).unwrap_err();
-        assert_eq!(error.to_string(), "aspect 5:1 lies outside 1:4 to 4:1");
+        let error = RULE.canvas(4.0, 1.0).unwrap_err();
+        assert_eq!(error.to_string(), "aspect 4:1 lies outside 1:3 to 3:1");
         assert!(RULE.canvas(0.0, 1.0).is_err());
     }
 
@@ -301,8 +297,8 @@ mod tests {
 
     #[test]
     fn the_range_is_compared_exactly() {
-        assert!(RULE.admits(400, 100) && RULE.admits(100, 400));
-        assert!(!RULE.admits(401, 100) && !RULE.admits(100, 401));
+        assert!(RULE.admits(300, 100) && RULE.admits(100, 300));
+        assert!(!RULE.admits(301, 100) && !RULE.admits(100, 301));
     }
 
     #[test]
@@ -311,17 +307,17 @@ mod tests {
             1000,
             1000,
             Canvas {
-                width: 1344,
-                height: 768,
+                width: 896,
+                height: 512,
             },
         );
         assert_eq!(
             crop,
             CoverCrop {
-                width: 1344,
-                height: 1344,
+                width: 896,
+                height: 896,
                 left: 0,
-                top: 288
+                top: 192
             }
         );
     }

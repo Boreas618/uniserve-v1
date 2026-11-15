@@ -9,7 +9,9 @@
 //!
 //! The arithmetic reproduces the diffusers MiniMax-H3 pipeline and the checkpoint's Qwen3-VL
 //! processor operation for operation, in `f64` where they compute in Python floats, so that every
-//! rounding lands on the same side. Rules the reference leaves open are fixed here:
+//! rounding lands on the same side. The request contract the FastH3 guide publishes
+//! (`docs/minimax_h3/minimax_h3.md`, MiniMax-H3 mapping) also states what the public API asks
+//! beyond the pipeline's own inputs, and these rules implement it:
 //!
 //! - `start_time_seconds` skips the first `floor(s * fps + 0.5)` frames of a reference video's
 //!   timeline at the output frame rate and the first `floor(s * rate + 0.5)` samples of its

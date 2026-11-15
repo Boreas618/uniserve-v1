@@ -1,9 +1,8 @@
 //! The frame rule of a video family whose VAE encodes a video in clips: which frame counts it
 //! generates, how many latent frames a count encodes to, and how a condition is cut into clips.
 //!
-//! A family states the four values of [`FrameClips`] once, and every count the request processing,
-//! the denoiser's layouts, the encoders and the decoders derive from a frame count follows from
-//! them here.
+//! A family states the four values of [`FrameClips`] once, and every count its request processing
+//! derives from a frame count follows from them here.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,9 +18,6 @@ use serde::{Deserialize, Serialize};
 /// the last one shorter, and encodes to `clip_latent_frames` latent frames per clip less the
 /// dropped ones ([`Self::latent_frames`]); a single frame is a still and encodes to one. The two
 /// counts agree on every frame count the rule generates.
-///
-/// For the released MiniMax-H3 checkpoint the rule is `17n + 5` frames, five latent frames a clip
-/// and two for the tail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FrameClips {
     /// Fewest frames of a video: one clip and the tail.
@@ -89,10 +85,9 @@ impl FrameClips {
     ///
     /// The frames are cut into clips of [`Self::clip_frames`], each yielding
     /// [`Self::clip_latent_frames`] latent frames, and the last clip's trailing
-    /// [`Self::token_drop`] latent frames are dropped: `ceil(frames / clip) * latents - drop`, so for
-    /// the released rule 17 frames are 2 latent frames, 22 are 7 and 30 are 7. A single frame is a
-    /// still and encodes to one: the network's causal front padding makes one frame one latent frame.
-    /// No frame encodes to none.
+    /// [`Self::token_drop`] latent frames are dropped: `ceil(frames / clip) * latents - drop`. A
+    /// single frame is a still and encodes to one: the network's causal front padding makes one
+    /// frame one latent frame. No frame encodes to none.
     ///
     /// On a legal count this is `units * clip_latent_frames + tail_latent_frames`, the generated
     /// video's latent timeline.
@@ -164,27 +159,26 @@ pub fn requested_frames(seconds: f64, fps: u32) -> u32 {
 mod tests {
     use super::*;
 
-    /// The released MiniMax-H3 rule: `17n + 5` frames, five latent frames a clip and two for the
-    /// tail.
+    /// A rule of `8n + 13` frames: three latent frames a clip and two for the five-frame tail.
     const RULE: FrameClips = FrameClips {
-        min_frames: 22,
-        clip_frames: 17,
-        clip_latent_frames: 5,
+        min_frames: 13,
+        clip_frames: 8,
+        clip_latent_frames: 3,
         tail_latent_frames: 2,
     };
 
     #[test]
     fn a_duration_aligns_up_to_the_next_generated_count() {
-        assert_eq!(RULE.align_up(requested_frames(4.0, 24)), 107);
-        assert_eq!(RULE.align_up(requested_frames(5.0, 24)), 124);
-        assert_eq!(RULE.align_up(requested_frames(15.0, 24)), 362);
-        assert_eq!(RULE.align_up(22), 22);
-        assert_eq!(RULE.align_up(23), 39);
+        // 96 frames are 83 past the first clip and its tail, eleven clips rounded up.
+        assert_eq!(RULE.align_up(requested_frames(4.0, 24)), 101);
+        assert_eq!(RULE.align_up(requested_frames(5.0, 24)), 125);
+        assert_eq!(RULE.align_up(13), 13);
+        assert_eq!(RULE.align_up(14), 21);
         // Fewer frames than one clip and its tail generate one clip and its tail.
-        assert_eq!(RULE.align_up(1), 22);
-        assert_eq!(RULE.align_down(21), None);
-        assert_eq!(RULE.align_down(38), Some(22));
-        assert!(RULE.is_legal(124) && !RULE.is_legal(123) && !RULE.is_legal(5));
+        assert_eq!(RULE.align_up(1), 13);
+        assert_eq!(RULE.align_down(12), None);
+        assert_eq!(RULE.align_down(20), Some(13));
+        assert!(RULE.is_legal(125) && !RULE.is_legal(124) && !RULE.is_legal(5));
     }
 
     #[test]
@@ -196,38 +190,38 @@ mod tests {
 
     #[test]
     fn a_count_encodes_to_whole_clips_less_the_dropped_latents() {
-        assert_eq!(RULE.token_drop(), 3);
+        assert_eq!(RULE.token_drop(), 1);
         assert_eq!(RULE.tail_frames(), 5);
         assert_eq!(RULE.latent_frames(1), 1, "a still");
-        assert_eq!(RULE.latent_frames(17), 2);
-        assert_eq!(RULE.latent_frames(30), 7);
-        // A generated count's latent timeline: five a clip and the tail's two, which the inverse
+        assert_eq!(RULE.latent_frames(8), 2);
+        assert_eq!(RULE.latent_frames(15), 5);
+        // A generated count's latent timeline: three a clip and the tail's two, which the inverse
         // returns to the count.
-        for frames in (22..=400).filter(|frames| RULE.is_legal(*frames)) {
+        for frames in (13..=400).filter(|frames| RULE.is_legal(*frames)) {
             let latents = RULE.latent_frames(frames);
-            assert_eq!(latents, RULE.units(frames) * 5 + 2);
+            assert_eq!(latents, RULE.units(frames) * 3 + 2);
             assert_eq!(RULE.frames_of_latents(latents), Some(frames));
         }
         assert_eq!(RULE.frames_of_latents(2), None);
-        assert_eq!(RULE.frames_of_latents(8), None);
+        assert_eq!(RULE.frames_of_latents(6), None);
     }
 
     #[test]
     fn a_condition_is_cut_into_clips_that_partition_its_latents() {
-        let spans = RULE.clips(30);
+        let spans = RULE.clips(15);
         assert_eq!(
             spans,
             [
                 ClipSpan {
                     first: 0,
-                    frames: 17,
+                    frames: 8,
                     latent: 0,
-                    latents: 5
+                    latents: 3
                 },
                 ClipSpan {
-                    first: 17,
-                    frames: 13,
-                    latent: 5,
+                    first: 8,
+                    frames: 7,
+                    latent: 3,
                     latents: 2
                 },
             ]

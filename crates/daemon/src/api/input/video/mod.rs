@@ -467,7 +467,7 @@ mod tests {
     fn vectors() -> Value {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../processing/tests/data/minimax_h3_requests.json"
+            "/../processing/src/minimax_h3/vectors.json"
         );
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }

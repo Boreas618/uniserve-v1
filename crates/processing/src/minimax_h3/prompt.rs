@@ -16,13 +16,9 @@
 use std::borrow::Cow;
 
 use super::rules::{Generation, PROMPT, Preparation, Vision};
+use crate::qwen_vl::{IMAGE_PAD, VIDEO_PAD, VISION_END, VISION_START};
 use crate::video::InputError;
 use crate::vocabulary::Vocabulary;
-
-const VISION_START: &str = "<|vision_start|>";
-const VISION_END: &str = "<|vision_end|>";
-const IMAGE_PAD: &str = "<|image_pad|>";
-const VIDEO_PAD: &str = "<|video_pad|>";
 
 /// One piece of the prompt, before tokenization.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,14 +159,15 @@ pub(super) mod tests {
     use super::super::rules::tests::Request;
     use super::super::vectors;
     use super::{Segment, present, segments};
+    use crate::qwen_vl::{IMAGE_PAD, VIDEO_PAD, VISION_END, VISION_START};
     use crate::vocabulary::{Vocabulary, VocabularyError};
 
     /// The ids of the vision markers and placeholders in [`CharacterTokenizer`]'s vocabulary.
     const VISION_TOKENS: [(&str, u32); 4] = [
-        ("<|vision_start|>", 128),
-        ("<|vision_end|>", 129),
-        ("<|image_pad|>", 130),
-        ("<|video_pad|>", 131),
+        (VISION_START, 128),
+        (VISION_END, 129),
+        (IMAGE_PAD, 130),
+        (VIDEO_PAD, 131),
     ];
 
     /// A deterministic tokenizer: one token per character, its code point, plus the vision markers
@@ -277,12 +274,12 @@ pub(super) mod tests {
         let mut spans = Vec::new();
         for segment in case["expected"]["segments"].as_array().unwrap() {
             if let Some(pad) = segment.get("vision") {
-                let pad = token(&format!("<|{}_pad|>", pad.as_str().unwrap()));
+                let pad = token(if pad == "image" { IMAGE_PAD } else { VIDEO_PAD });
                 let count = segment["tokens"].as_u64().unwrap() as usize;
                 spans.push((token_ids.len() as u32, count as u32 + 2));
-                token_ids.push(token("<|vision_start|>"));
+                token_ids.push(token(VISION_START));
                 token_ids.extend(std::iter::repeat_n(pad, count));
-                token_ids.push(token("<|vision_end|>"));
+                token_ids.push(token(VISION_END));
             } else {
                 let ids = segment["token_ids"].as_array().unwrap();
                 token_ids.extend(ids.iter().map(|id| id.as_u64().unwrap() as u32));
@@ -334,7 +331,7 @@ pub(super) mod tests {
     #[test]
     fn prompts_must_be_plain_text() {
         let generation = Request::parse(&vectors()["requests"][0]).prepare().unwrap();
-        for prompt in ["", " \n", "a <|image_pad|> b", "<|vision_start|>"] {
+        for prompt in ["", " \n", &format!("a {IMAGE_PAD} b"), VISION_START] {
             let error = present(&CharacterTokenizer, &generation, prompt).unwrap_err();
             assert!(
                 matches!(&error, crate::InputError::Invalid { param, .. } if param == "prompt"),
