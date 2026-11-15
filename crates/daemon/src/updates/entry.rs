@@ -146,17 +146,74 @@ fn switches_probes_only(served: &EngineConfig, target: &EngineConfig) -> bool {
 /// module selection owns (the package backends, the scheduling policy, the
 /// expert exchange and the speculative cost figures). A change reaches a
 /// replica only once the module set has accounted for those.
+///
+/// Every field of the configuration is named here, so a field added to it does not compile
+/// until it is classified as compared or as a module selection's.
 fn comparable(config: &EngineConfig) -> EngineConfig {
-    let mut comparable = config.clone();
-    comparable.attention_backend = None;
-    comparable.prefill_attention_backend = None;
-    comparable.decode_attention_backend = None;
-    comparable.moe_runner_backend = None;
-    comparable.scheduler.policy = proto::config::SchedulerConfig::default().policy;
-    comparable.moe.exchange = None;
-    comparable.speculative.expected_speedup = None;
-    comparable.speculative.refill_token_cost = None;
-    comparable
+    let EngineConfig {
+        executable,
+        model,
+        parallel,
+        deployment,
+        max_running_requests,
+        max_num_batched_tokens,
+        max_logprobs,
+        attention_backend: _,
+        prefill_attention_backend: _,
+        decode_attention_backend: _,
+        moe_runner_backend: _,
+        device,
+        scheduler,
+        media,
+        mem_fraction_static,
+        load,
+        kv_cache,
+        moe,
+        cuda_graph,
+        worker,
+        speculative,
+        video,
+        profiling,
+    } = config.clone();
+    EngineConfig {
+        executable,
+        model,
+        parallel,
+        deployment,
+        max_running_requests,
+        max_num_batched_tokens,
+        max_logprobs,
+        // The package backends are the module set's.
+        attention_backend: None,
+        prefill_attention_backend: None,
+        decode_attention_backend: None,
+        moe_runner_backend: None,
+        device,
+        // The scheduling policy's package is the module set's; its parameters are compared.
+        scheduler: proto::config::SchedulerConfig {
+            policy: proto::config::SchedulerConfig::default().policy,
+            ..scheduler
+        },
+        media,
+        mem_fraction_static,
+        load,
+        kv_cache,
+        // The expert exchange's package is the module set's.
+        moe: proto::config::MoeConfig {
+            exchange: None,
+            ..moe
+        },
+        cuda_graph,
+        worker,
+        // The speculative cost figures are the scheduling policy package's parameters.
+        speculative: proto::config::SpeculativeConfig {
+            expected_speedup: None,
+            refill_token_cost: None,
+            ..speculative
+        },
+        video,
+        profiling,
+    }
 }
 
 /// Keeps an existing replica's assigned devices when an update changes its
