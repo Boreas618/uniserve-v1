@@ -2787,7 +2787,7 @@ mod tests {
             QueuePair::open(pool.descriptor().try_clone_to_owned().unwrap(), true).unwrap();
         let groups = WorkerGroupConfig::data_parallel(
             &["localhost".to_owned()],
-            "cpu",
+            proto::config::DeviceKind::Cpu,
             1,
             1,
             2,

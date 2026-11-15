@@ -1031,7 +1031,7 @@ mod tests {
     fn group(id: u8, phases: &[Phase], window: u32, chunk: u32) -> WorkerGroup {
         let configs = WorkerGroupConfig::data_parallel(
             &["localhost".to_owned()],
-            "cpu",
+            proto::config::DeviceKind::Cpu,
             1,
             1,
             2,

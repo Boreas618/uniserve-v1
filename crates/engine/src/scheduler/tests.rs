@@ -110,7 +110,14 @@ pub(super) fn bench(ring_bytes: usize) -> Bench {
 
 /// The configurations of groups A and B: one rank each, on one host.
 fn configs() -> Vec<WorkerGroupConfig> {
-    WorkerGroupConfig::data_parallel(&["localhost".to_owned()], "cpu", 2, 1, 2, BTreeMap::new())
+    WorkerGroupConfig::data_parallel(
+        &["localhost".to_owned()],
+        proto::config::DeviceKind::Cpu,
+        2,
+        1,
+        2,
+        BTreeMap::new(),
+    )
 }
 
 /// A scheduler of `config` over the first `groups.len()` of groups A and B, each with its

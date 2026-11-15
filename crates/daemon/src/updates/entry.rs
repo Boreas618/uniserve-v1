@@ -828,7 +828,8 @@ impl Replica {
             UpdateError::Refused("the target changes the replica group".to_owned())
         })?;
         let explicit_devices = target.worker_groups.is_some()
-            || (stated.contains("device_config.device") && target.device_config.device != "cuda")
+            || (stated.contains("device_config.device")
+                && target.device_config.device != proto::config::DeviceKind::Cuda)
             || !target.device_config.devices.is_empty();
         if !explicit_devices
             && target.tensor_parallel_size == current.tensor_parallel_size

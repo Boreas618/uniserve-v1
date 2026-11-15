@@ -175,7 +175,7 @@ impl Node {
                 .unwrap();
         let config = WorkerGroupConfig::data_parallel(
             &["localhost".to_owned()],
-            "cpu",
+            proto::config::DeviceKind::Cpu,
             1,
             1,
             2,

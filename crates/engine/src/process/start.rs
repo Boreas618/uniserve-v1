@@ -72,7 +72,7 @@ use build_server::Target;
 use crossbeam_channel::{Receiver, Sender};
 use ops::KernelEntry;
 use platform::DeviceId;
-use proto::config::{EngineArgs, EngineConfig, SchedulerConfig, WorkerGroupConfig};
+use proto::config::{DeviceKind, EngineArgs, EngineConfig, SchedulerConfig, WorkerGroupConfig};
 use proto::request::{GenerationFeatures, GenerationLimits};
 use scheduling::limits::{Limits, Parameters};
 use scheduling::view::{RankView, Snapshot};
@@ -92,10 +92,6 @@ use crate::process::ranks::rank::ModelRunner;
 use crate::process::ranks::rank::text::Keys;
 use crate::scheduler::policy::{self, Policy};
 use crate::scheduler::{Message, Output, Scheduler};
-
-/// The device a launch names when its ranks are backed by nothing outside the process
-/// (`engine_config.device.device`): [`Backing::Meta`].
-const META_DEVICE: &str = "meta";
 
 /// How long the scheduler node waits for every peer main process to register, and a peer for the
 /// scheduler node to accept it: each starts at once and registers before it loads anything.
@@ -509,7 +505,7 @@ pub(crate) fn start(
     let family =
         crate::process::catalogue::resolve(registry, Path::new(&launch.engine_config.model.model))?;
     let model_runner = ModelRunner::of(launch, family)?;
-    let meta = launch.engine_config.device.device == META_DEVICE;
+    let meta = launch.engine_config.device.device == DeviceKind::Meta;
 
     // CUPTI accepts one subscriber per process, and what it observes begins at the subscription,
     // so a process that serves on devices subscribes before it loads a module
@@ -853,7 +849,7 @@ fn start_peer(
     let places = bind(&mut ranks, &open, &opened, false)?;
 
     // What attaches to the graphs precedes the workers and the warm-up, as on the scheduler node.
-    if launch.engine_config.device.device != META_DEVICE {
+    if launch.engine_config.device.device != DeviceKind::Meta {
         instrument(launch, model_runner.devices())?;
     }
     // A peer holds no queue pair: its ended sequences reach the scheduler node over its link.

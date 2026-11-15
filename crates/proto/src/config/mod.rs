@@ -296,13 +296,53 @@ pub struct SpeculativeConfig {
     pub refill_token_cost: Option<f64>,
 }
 
+/// The kind of device the command line's shorthand places every rank on (`device_config.device`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceKind {
+    /// A CUDA GPU: each host numbers its ranks' GPUs from zero.
+    #[default]
+    Cuda,
+    /// The host's CPU, which every rank of a host shares.
+    Cpu,
+    /// PyTorch's meta device: the ranks build their modules' shapes and allocate no storage, so a
+    /// launch runs on a host without a GPU.
+    Meta,
+}
+
+impl DeviceKind {
+    /// The kind as the configuration and a rank's device string name it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Cuda => "cuda",
+            Self::Cpu => "cpu",
+            Self::Meta => "meta",
+        }
+    }
+
+    /// The device string of the rank with index `local` among its host's ranks of this kind:
+    /// `cuda:<local>` for a GPU, the kind's name alone for the devices a host's ranks share.
+    pub fn rank_device(self, local: u32) -> String {
+        match self {
+            Self::Cuda => format!("cuda:{local}"),
+            Self::Cpu | Self::Meta => self.name().to_owned(),
+        }
+    }
+}
+
+impl fmt::Display for DeviceKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
 /// Rank layout without a deployment file, and product transport
 /// (`device_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeviceConfig {
-    /// Device of every rank; `cuda` numbers each host's GPUs from zero.
-    pub device: String,
+    /// Device kind of every rank; `cuda` numbers each host's GPUs from zero.
+    pub device: DeviceKind,
     /// Each rank's CUDA device index on its host, in rank order; empty
     /// numbers each host's ranks from zero. A change of the parallel
     /// configuration that does not state it takes the order that leaves
@@ -319,7 +359,7 @@ pub struct DeviceConfig {
 impl Default for DeviceConfig {
     fn default() -> Self {
         Self {
-            device: "cuda".to_owned(),
+            device: DeviceKind::Cuda,
             devices: Vec::new(),
             worker_hosts: Vec::new(),
             queue_depth: positive(2),

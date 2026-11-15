@@ -53,7 +53,7 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
     // host of one GPU per data-parallel scheduler.
     let mut groups = WorkerGroupConfig::data_parallel(
         &["localhost".to_owned()],
-        "cpu",
+        proto::config::DeviceKind::Cpu,
         schedulers,
         1,
         2,
@@ -117,7 +117,7 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
         moe_runner_backend: None,
         // The ranks are no device's: the engine launches nothing on one, and warms nothing.
         device: proto::config::DeviceConfig {
-            device: "cpu".to_owned(),
+            device: proto::config::DeviceKind::Cpu,
             ..Default::default()
         },
         scheduler: Default::default(),

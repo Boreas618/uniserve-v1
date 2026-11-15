@@ -86,7 +86,7 @@ fn build_server(directory: &Path) -> (PathBuf, std::os::unix::net::UnixStream) {
 /// sockets are in `directory`, and its Build Server's at `build_server`.
 fn launch(directory: &Path, build_server: &Path) -> EngineArgs {
     let mut launch = support::launch();
-    launch.engine_config.device.device = "meta".to_owned();
+    launch.engine_config.device.device = proto::config::DeviceKind::Meta;
     launch.engine = 1;
     launch.scheduler_node = true;
     launch.requests = format!("unix:{}", directory.join("requests.sock").display());
@@ -415,7 +415,7 @@ fn two_host_launch(directory: &Path, build_server: &Path, host: &str, world: Wor
     let mut launch = launch(directory, build_server);
     let group = WorkerGroupConfig::placed(
         &["a".to_owned(), "b".to_owned()],
-        "cuda",
+        proto::config::DeviceKind::Cuda,
         2,
         2,
         WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, 2),

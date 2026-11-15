@@ -816,8 +816,8 @@ impl ServerArgs {
         if !devices.is_empty() {
             let ranks = self.tensor_parallel_size.get() * self.data_parallel_size.get();
             anyhow::ensure!(
-                matches!(self.device_config.device.as_str(), "cuda" | "gpu"),
-                "`device_config.devices` orders CUDA devices: `device_config.device` is {:?}",
+                self.device_config.device == proto::config::DeviceKind::Cuda,
+                "`device_config.devices` orders CUDA devices: `device_config.device` is `{}`",
                 self.device_config.device
             );
             anyhow::ensure!(

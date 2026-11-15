@@ -98,7 +98,7 @@ pub(crate) fn launch() -> EngineArgs {
         .into_owned();
     let group = WorkerGroupConfig::placed(
         &["localhost".to_owned()],
-        "cuda",
+        proto::config::DeviceKind::Cuda,
         1,
         2,
         WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, 1),

@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::BlockConfig;
+use super::{BlockConfig, DeviceKind};
 
 /// The block used when a deployment does not partition a model by capability.
 pub const DEFAULT_BLOCK: &str = "model";
@@ -557,17 +557,16 @@ impl WorkerGroupConfig {
     ///
     /// Ranks are assigned in blocks, so the lowest ranks stay on the first
     /// host, and each host numbers its devices from zero. A rank layout on one
-    /// host is the same arithmetic with one block. A `device` of `cuda` or
-    /// `gpu` becomes `cuda:<local index>`; any other string is used verbatim
-    /// for every rank.
+    /// host is the same arithmetic with one block. Each rank's device is
+    /// `device`'s for its index on its host ([`DeviceKind::rank_device`]).
     ///
     /// `blocks` must already be resolved for `rank_count`; this assigns
-    /// rank identity and nothing else. The group is named `model` and has no
-    /// `mem_fraction_static` of its own. Nothing is validated here, and an empty
-    /// `hosts` yields no ranks.
+    /// rank identity and nothing else. The group is named after the shorthand's
+    /// block, [`DEFAULT_BLOCK`], and has no `mem_fraction_static` of its own.
+    /// Nothing is validated here, and an empty `hosts` yields no ranks.
     pub fn placed(
         hosts: &[String],
-        device: &str,
+        device: DeviceKind,
         rank_count: usize,
         queue_depth: usize,
         blocks: BTreeMap<String, BlockConfig>,
@@ -584,16 +583,12 @@ impl WorkerGroupConfig {
             for local in 0..count {
                 rank_layout.push(WorkerRank {
                     host: host.clone(),
-                    device: if matches!(device, "cuda" | "gpu") {
-                        format!("cuda:{local}")
-                    } else {
-                        device.into()
-                    },
+                    device: device.rank_device(local as u32),
                 });
             }
         }
         Self {
-            id: WorkerGroupId("model".into()),
+            id: WorkerGroupId(DEFAULT_BLOCK.into()),
             role: WorkerGroupRole::Model,
             replicas: 1,
             ranks: rank_layout,
@@ -611,10 +606,11 @@ impl WorkerGroupConfig {
     /// [`WorkerGroupConfig::placed`] places them, in blocks over `hosts`, and
     /// consecutive runs of `ranks_per_core` form the groups, so the first
     /// schedulers fill the engine's host first. The group of one scheduler
-    /// is `model`; the group of core `i` of several is `model-<i>`.
+    /// is named after the shorthand's block, [`DEFAULT_BLOCK`]; the group of
+    /// core `i` of several is `<block>-<i>`.
     pub fn data_parallel(
         hosts: &[String],
-        device: &str,
+        device: DeviceKind,
         cores: usize,
         ranks_per_core: usize,
         queue_depth: usize,
@@ -629,7 +625,7 @@ impl WorkerGroupConfig {
             .chunks(ranks_per_core.max(1))
             .enumerate()
             .map(|(index, ranks)| Self {
-                id: WorkerGroupId(format!("model-{index}")),
+                id: WorkerGroupId(format!("{DEFAULT_BLOCK}-{index}")),
                 role: WorkerGroupRole::Model,
                 replicas: 1,
                 ranks: ranks.to_vec(),
@@ -669,14 +665,14 @@ impl WorkerGroupConfig {
         let tensor_parallel_size = tensor_parallel_size.max(1);
         let mut groups = Self::data_parallel(
             &hosts,
-            &device.device,
+            device.device,
             data_parallel_size.max(1),
             tensor_parallel_size,
             device.queue_depth.get(),
             Self::single_block(DEFAULT_BLOCK, tensor_parallel_size),
         );
         if !device.devices.is_empty() {
-            order_devices(&mut groups, &device.device, &device.devices)?;
+            order_devices(&mut groups, device.device, &device.devices)?;
         }
         Ok(groups)
     }
@@ -687,12 +683,12 @@ impl WorkerGroupConfig {
 /// assigned to the GPUs that already hold most of their weights, or an operator's order.
 fn order_devices(
     groups: &mut [WorkerGroupConfig],
-    device: &str,
+    device: DeviceKind,
     devices: &[u32],
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        matches!(device, "cuda" | "gpu"),
-        "`device_config.devices` orders CUDA devices; `device_config.device` is {device:?}"
+        device == DeviceKind::Cuda,
+        "`device_config.devices` orders CUDA devices; `device_config.device` is `{device}`"
     );
     let ranks: usize = groups.iter().map(|group| group.ranks.len()).sum();
     anyhow::ensure!(
@@ -708,7 +704,7 @@ fn order_devices(
             "`device_config.devices` puts two ranks of host {} on device {index}",
             rank.host
         );
-        rank.device = format!("cuda:{index}");
+        rank.device = DeviceKind::Cuda.rank_device(*index);
     }
     Ok(())
 }
@@ -816,7 +812,7 @@ mod tests {
             );
         }
         let cpu = crate::config::DeviceConfig {
-            device: "cpu".into(),
+            device: DeviceKind::Cpu,
             devices: vec![0, 1],
             ..crate::config::DeviceConfig::default()
         };
@@ -970,7 +966,7 @@ mod tests {
 
         let shorthand = WorkerGroupConfig::data_parallel(
             &["engine".to_owned()],
-            "cuda",
+            DeviceKind::Cuda,
             2,
             2,
             2,

@@ -340,7 +340,13 @@ pub(crate) fn video_launch() -> EngineArgs {
         ("muxer".to_owned(), every()),
         ("media_reader".to_owned(), every()),
     ]);
-    let group = WorkerGroupConfig::placed(&["localhost".to_owned()], "cuda", 1, 2, blocks);
+    let group = WorkerGroupConfig::placed(
+        &["localhost".to_owned()],
+        proto::config::DeviceKind::Cuda,
+        1,
+        2,
+        blocks,
+    );
 
     let config = &mut launch.engine_config;
     config.model.model = FAST_H3.to_owned();
@@ -1646,7 +1652,7 @@ fn replicas_in_engines_of_their_own_name_regions_of_their_own() {
     let server = StorageServer::start();
     let groups = WorkerGroupConfig::data_parallel(
         &["localhost".to_owned()],
-        "cuda",
+        proto::config::DeviceKind::Cuda,
         2,
         1,
         2,

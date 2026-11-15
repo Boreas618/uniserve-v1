@@ -484,8 +484,7 @@ impl MainProcess {
     /// events the scheduler drops. A deployment that launches nothing on a device (the meta
     /// device) or does not serve such a request warms nothing.
     pub(super) fn warm_up(&mut self) {
-        let device = &self.launch.engine_config.device.device;
-        if device != "cuda" && !device.starts_with("cuda:") {
+        if self.launch.engine_config.device.device != proto::config::DeviceKind::Cuda {
             return;
         }
         let Some(engine) = self.engine.as_ref() else {

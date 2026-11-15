@@ -272,7 +272,7 @@ Each entry is the median over the point's reports of the step time over its run'
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `device` | `"cuda"` | Device of every rank; `cuda` numbers each host's GPUs from zero |
+| `device` | `"cuda"` | Device kind of every rank: `cuda` numbers each host's GPUs from zero (`cuda:<index>`), `cpu` places every rank of a host on its CPU, and `meta` builds the modules' shapes without storage |
 | `devices` | `[]` | Each rank's CUDA device index on its host, in rank order; empty numbers each host's ranks from zero. A change of the parallel configuration (`PUT /admin/config`) that does not state it takes the order that leaves the most weights on the GPUs already holding them, and reports it |
 | `worker_hosts` | `[]` | Hosts after this one the ranks spread across, in equal blocks |
 | `queue_depth` | `2` | Batches in flight per rank; a deployment group states its own |

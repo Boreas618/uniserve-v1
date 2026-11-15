@@ -148,7 +148,7 @@ fn held(server: &StorageServer, open: &Open, names: &BTreeSet<String>) -> BTreeM
 /// the serving epoch's.
 fn update(server: &StorageServer) -> (Engine, EngineArgs, Open) {
     let mut serving = launch();
-    serving.engine_config.device.device = "meta".to_owned();
+    serving.engine_config.device.device = proto::config::DeviceKind::Meta;
     serving.engine_config.kv_cache.host_gib = NonZeroU64::new(SERVING_HOST_GIB);
 
     let mut target = serving.clone();
@@ -283,7 +283,7 @@ fn a_rollback_restores_the_serving_size_of_every_shared_region() {
 fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     let server = StorageServer::start();
     let mut launch = launch();
-    launch.engine_config.device.device = "meta".to_owned();
+    launch.engine_config.device.device = proto::config::DeviceKind::Meta;
     let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
     let storage = crate::memory::client::StorageLaunch {
         socket: server.socket.to_string_lossy().into_owned(),
@@ -380,7 +380,7 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
 fn a_standby_of_the_serving_epoch_opens_a_session_of_its_own_and_maps_its_region() {
     let server = StorageServer::start();
     let mut launch = launch();
-    launch.engine_config.device.device = "meta".to_owned();
+    launch.engine_config.device.device = proto::config::DeviceKind::Meta;
     let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
     let storage = crate::memory::client::StorageLaunch {
         socket: server.socket.to_string_lossy().into_owned(),
@@ -442,7 +442,7 @@ fn a_standby_of_the_serving_epoch_opens_a_session_of_its_own_and_maps_its_region
 fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session() {
     let server = StorageServer::start();
     let mut launch = video_launch();
-    launch.engine_config.device.device = "meta".to_owned();
+    launch.engine_config.device.device = proto::config::DeviceKind::Meta;
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
     let storage = crate::memory::client::StorageLaunch {
         socket: server.socket.to_string_lossy().into_owned(),
@@ -510,7 +510,7 @@ fn a_meta_start_of_a_model_with_a_vision_tower_encodes_images_beside_its_prefill
     // The fixture's launch, one rank of one group with prefill buckets of up to 32 tokens, over
     // the checkpoint, with the limits of a family that takes images.
     let mut launch = launch();
-    launch.engine_config.device.device = "meta".to_owned();
+    launch.engine_config.device.device = proto::config::DeviceKind::Meta;
     launch.engine_config.model.model = QWEN_VISION.to_owned();
     launch.engine_config.model.generation_limits = unbounded();
     let registry = nn::family::Registry::new([models::qwen3::family::HYBRID_FAMILY]).unwrap();
