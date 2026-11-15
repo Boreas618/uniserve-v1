@@ -50,7 +50,9 @@ pub(crate) struct Cached {
     pub tokens: u16,
     /// The tiers that hold a copy: [`DEVICE`], [`HOST`], [`REMOTE`].
     pub tiers: u8,
-    /// The worker groups whose memory holds its device copy, one bit per group number.
+    /// The worker groups that hold its device copy, one bit per group number: the copy lies in
+    /// the group's region of its class, valid in the memory the group reads it in, so a `Pin` of
+    /// the group finds it and the group's orders may evict it.
     pub groups: u8,
     /// Requests of this scheduler holding it.
     pub pins: u32,
@@ -742,7 +744,7 @@ impl Scheduler {
     }
 
     /// The tiers on which `cache` expects each of an admission's lookup keys of one class, read
-    /// by an owner on `group`: [`DEVICE`] when its device copy is valid in `group`, [`HOST`] and
+    /// by an owner on `group`: [`DEVICE`] when `group` holds its device copy, [`HOST`] and
     /// [`REMOTE`] as `cache` holds them, 0 for a key it does not know. Memory's rule of the hit
     /// (SD §4.4) turns them into what the admission pins, loads, clones and prefetches.
     pub(super) fn expected_hit(&self, keys: &[Key], group: GroupId) -> Vec<u8> {
@@ -814,9 +816,9 @@ impl Scheduler {
             .is_some_and(|row| row.pins == 0 && row.tiers & DEVICE != 0)
     }
 
-    /// A group whose memory holds `row`'s device copy, the first of the scheduler's groups that
-    /// does: the group a `Store` of the block to the host names, whose workers copy it (SD
-    /// §3.4, §4.4). `None` for a block with no device copy.
+    /// A group that holds `row`'s device copy (`Cached::groups`), the first of the scheduler's
+    /// groups that does: the group a `Store` of the block to the host names, whose workers copy
+    /// it (SD §3.4, §4.4). `None` for a block with no device copy.
     pub(super) fn holder(&self, row: &Cached) -> Option<GroupId> {
         if row.tiers & DEVICE == 0 {
             return None;

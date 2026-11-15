@@ -1579,26 +1579,26 @@ impl BufferPool {
     }
 
     fn list(&self, client: ClientId) -> Completion {
-        // The session's groups: each one's number, its memory and its own bit, which admission
-        // keeps within a byte (`LISTED_GROUPS`).
-        let groups: Vec<(GroupId, Memories, u8)> = self
+        // The session's groups: each one's number and its own bit, which admission keeps within
+        // a byte (`LISTED_GROUPS`).
+        let groups: Vec<(GroupId, u8)> = self
             .groups
-            .iter()
-            .filter(|((of, _), _)| *of == client)
-            .map(|((_, group), found)| (*group, Memories::one(found.memory), 1 << group.0))
+            .keys()
+            .filter(|(of, _)| *of == client)
+            .map(|&(_, group)| (group, 1 << group.0))
             .collect();
 
         let mut keys: Vec<(Key, u8, u16, u8, u8, u8)> = Vec::new();
         for (key, entry) in &self.cache {
-            let device = entry
-                .device
-                .iter()
-                .filter(|(_, maker)| self.visible(*maker, client));
-            let device: Vec<Validity> = device.map(|(block, _)| block.valid.get()).collect();
+            // The groups that hold the device copy: those that may pin it, the copy in the
+            // group's region of the class and valid in the memory the group reads it in
+            // (`usable`). A copy that an epoch of another layout keeps in a region of its own
+            // on the same device is valid in the same memory but lies in no region of this
+            // session: its groups can neither pin it nor evict it by their orders.
             let held = groups
                 .iter()
-                .filter(|(_, memory, _)| device.iter().any(|valid| valid.meets(*memory)))
-                .fold(0, |all, (_, _, bit)| all | bit);
+                .filter(|(group, _)| self.usable(client, *group, entry.class, key).is_some())
+                .fold(0, |all, (_, bit)| all | bit);
             let host = entry
                 .host
                 .as_ref()
@@ -1606,12 +1606,12 @@ impl BufferPool {
             // The groups that can load the host copy: it holds their host parts (R11).
             let hosts = groups
                 .iter()
-                .filter(|(group, _, _)| {
+                .filter(|(group, _)| {
                     host.is_some_and(|(block, ..)| {
                         self.loadable(client, *group, entry.class, block)
                     })
                 })
-                .fold(0, |all, (_, _, bit)| all | bit);
+                .fold(0, |all, (_, bit)| all | bit);
             let tiers =
                 u8::from(held != 0) | u8::from(host.is_some()) << 1 | u8::from(entry.remote) << 2;
             if tiers != 0 {

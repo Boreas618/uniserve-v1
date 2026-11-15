@@ -1343,3 +1343,86 @@ fn evictable_beyond_the_schedulers_order_leads_to_one_list() {
         "the next `Victims` installs the block it learned"
     );
 }
+
+/// An epoch of another layout on the same device keeps its blocks in a region of its own, valid
+/// in the memory of this scheduler's group (SD §3.8, §4.5; `specs/buffer-pool.md` §11 `List`):
+/// once their host copies lead this scheduler to list the cache, it learns them as host copies
+/// alone, which its host region's order installs, and no `Victims` of its KV region names one, so
+/// its `available` counts no unit of theirs as one its allocations or its shrink could take.
+#[test]
+fn a_listing_puts_no_block_of_another_layout_s_region_in_the_kv_region_s_order() {
+    let mut harness = Deployment::tokens().host(64).build();
+    let (kv, host) = (harness.region("kv-0"), harness.region("host"));
+
+    // The other epoch commits sixteen blocks in its own region and stores them to the host.
+    harness.apart("kv-0", 16);
+    let owner = OwnerId(1);
+    let after = vec![(A, 0)];
+    let keys: Vec<Key> = (0..16).map(|at| Key([100 + at; 32])).collect();
+    let mut asks = vec![
+        Request::Attach { owner, group: A },
+        Request::Allocate {
+            owner,
+            class: 0,
+            at: 0,
+            count: 16,
+            units: 0,
+        },
+    ];
+    for (at, &key) in (0u32..).zip(&keys) {
+        asks.push(Request::Commit {
+            owner,
+            class: 0,
+            at,
+            key,
+            tokens: BLOCK as u16,
+            after: after.clone(),
+        });
+    }
+    asks.push(Request::Store {
+        group: A,
+        keys: keys.clone(),
+        tier: Tier::Host,
+    });
+    let answers = harness.elsewhere(&asks);
+    let committed = answers
+        .iter()
+        .filter(|answer| **answer == Completion::Committed)
+        .count();
+    assert_eq!(committed, 16, "{answers:?}");
+    // The `Store` is the last request of the other epoch's queue pair, which numbers them from 1.
+    let store = storage::runtime::RequestId(asks.len() as u64);
+    let answers = harness.elsewhere(&[Request::Finish {
+        copy: store,
+        ok: true,
+        after,
+    }]);
+    assert!(
+        answers
+            .iter()
+            .any(|answer| matches!(answer, Completion::Stored { .. })),
+        "{answers:?}"
+    );
+
+    let from = harness.taken().len();
+    harness.run(10);
+    let taken = harness.taken().split_off(from);
+    assert!(
+        taken.contains(&Request::List),
+        "the host copies lead to a `List`"
+    );
+    let names = |region: u8| {
+        taken.iter().any(|request| match request {
+            Request::Victims {
+                region: of,
+                keys: named,
+            } => *of == region && named.iter().any(|key| keys.contains(key)),
+            _ => false,
+        })
+    };
+    assert!(
+        names(host),
+        "the host region's order installs their host copies"
+    );
+    assert!(!names(kv), "the KV region's order names no block of theirs");
+}

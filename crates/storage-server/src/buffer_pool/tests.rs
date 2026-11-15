@@ -906,6 +906,82 @@ fn a_store_reads_no_block_of_another_layout_s_region() {
     assert_eq!(from, vec![(UNITS, unit, 1)]);
 }
 
+/// A `Listing` states a group as holding a key's device copy only when the group may pin it: in
+/// the group's own region, valid in the memory the group reads it in. Two epochs of different
+/// layouts on one device each keep blocks in a region of their own, valid in the same memory;
+/// neither session's listing states the other's block as a device copy of its groups, which
+/// could neither pin it nor evict it by their orders.
+#[test]
+fn a_listing_states_no_group_holding_a_block_of_another_layout_s_region() {
+    let mut fixture = Fixture::new();
+    fixture.cached(1, 7);
+    // The other layout's KV units, over a memory space of its own on the same device.
+    fixture.pool.grant(8, 0, 1 << 20);
+    let other = fixture.pool.open_region(
+        "units of another layout",
+        Tier::Device,
+        8,
+        (64, 64),
+        1,
+        4,
+        5,
+    );
+    let regions = vec![vec![other], Vec::new(), vec![5, 6], vec![5]];
+    fixture.pool.open(
+        2,
+        2,
+        false,
+        classes(),
+        vec![(GroupId(0), group(0, 2, regions, Memories::one(0)))],
+    );
+
+    // The other epoch commits a block of its own in its region, on the prefill group's memory.
+    let queue = (2, 0);
+    let owner = OwnerId(1);
+    let asks = [
+        Request::Attach {
+            owner,
+            group: GroupId(0),
+        },
+        Request::Allocate {
+            owner,
+            class: KV,
+            at: 0,
+            count: 1,
+            units: 0,
+        },
+        Request::Commit {
+            owner,
+            class: KV,
+            at: 0,
+            key: key(8),
+            tokens: 64,
+            after: Vec::new(),
+        },
+    ];
+    let numbers: Vec<RequestId> = asks
+        .into_iter()
+        .map(|request| fixture.submit(queue, request))
+        .collect();
+    let committed = numbers.last().copied().unwrap();
+    assert_eq!(fixture.answer(committed), Some(Completion::Committed));
+
+    // Each session lists its own block as held by its group and the other's as no device copy:
+    // with no host copy, not at all.
+    let held = |listing: Vec<(Key, u8, u16, u8, u8, u8)>| -> Vec<(Key, u8, u8)> {
+        let listed = listing.into_iter();
+        listed
+            .map(|(key, _, _, tiers, held, _)| (key, tiers, held))
+            .collect()
+    };
+    assert_eq!(held(fixture.listing()), [(key(7), 1, 1 << PREFILL.0)]);
+    let listed = fixture.submit(queue, Request::List);
+    let Some(Completion::Listing { keys }) = fixture.answer(listed) else {
+        panic!("no listing")
+    };
+    assert_eq!(held(keys), [(key(8), 1, 1)]);
+}
+
 #[test]
 fn a_key_that_gained_a_copy_before_the_finish_keeps_it() {
     let mut fixture = Fixture::new();

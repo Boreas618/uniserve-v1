@@ -542,12 +542,15 @@ pub enum Completion {
         evicted: Vec<Key>,
     },
     /// Each cached key: its class, its tokens, the tiers that hold it (bit 0
-    /// device, bit 1 host, bit 2 remote), the groups whose memory holds its
-    /// device copy and the groups whose host parts hold its host copy (a
-    /// bit per group each). The keys some queue pair's installed eviction
-    /// order names come first, each at its earliest place in any such order,
-    /// least recently used first; the others follow in the order of their
-    /// keys.
+    /// device, bit 1 host, bit 2 remote), the groups that hold its device
+    /// copy (the copy a `Pin` of the group finds: in the group's region of
+    /// the class, valid in the memory the group reads it in, visible to the
+    /// session's epoch) and the groups whose host parts hold its host copy (a
+    /// bit per group each). A device copy only in a region of another session
+    /// (an epoch of another layout on the same device) states no device tier.
+    /// The keys some queue pair's installed eviction order names come first,
+    /// each at its earliest place in any such order, least recently used
+    /// first; the others follow in the order of their keys.
     Listing {
         keys: Vec<(Key, u8, u16, u8, u8, u8)>,
     },

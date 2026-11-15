@@ -99,11 +99,10 @@ impl Scheduler {
     /// scheduler's own count of its requests. `available` alone may show more than the region
     /// can give, since the capacity words read with an answer may not show what it changed yet,
     /// a `Resized` among them, and since it counts, beyond the installed head, the blocks the
-    /// scheduler's view places in the region's order, among them those a `Listing` states as
-    /// device copies in its groups' memory that lie in a region of another session over that
-    /// memory (the target of an epoch update of another layout). A `Resize` that asked for
-    /// fewer units would take the units a running request is still to take, which would end it
-    /// at the length the region holds.
+    /// scheduler believes to be in the region's order, a belief that another queue pair's
+    /// evictions may have made wrong (SD §4.5). A `Resize` that asked for fewer units would take
+    /// the units a running request is still to take, which would end it at the length the
+    /// region holds.
     fn shrink_regions(&mut self) {
         let ended = self.requests.is_empty();
         let kept = self.units_to_end();

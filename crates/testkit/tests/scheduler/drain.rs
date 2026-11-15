@@ -18,9 +18,9 @@ use engine::batch::{Batch, Phase};
 use engine::scheduler::{Message, Output};
 use proto::request::{Event, FinishReason, GenerationRequest, MigrationCause, RequestId};
 use storage::Key;
-use storage::runtime::{self, Completion, OwnerId, Request, Tier};
+use storage::runtime::{Completion, Request};
 
-use crate::harness::{A, BLOCK, Deployment, Harness, VIDEO_PHASES, token, video};
+use crate::harness::{BLOCK, Deployment, Harness, VIDEO_PHASES, token, video};
 
 /// Whether `event` is the `Migratable` of a drain with no stored step.
 fn drained(event: Option<&Event>) -> bool {
@@ -495,20 +495,20 @@ fn a_request_running_through_a_shrinking_drain_steps_on_to_its_end() {
     assert_eq!((reason, completion_tokens), (FinishReason::MaxTokens, 30));
 }
 
-/// A request running through a shrinking drain steps on to its end while the target of another
-/// layout serves from the memory the drain gave back (SD §3.8; §10 E10). The target's blocks lie
-/// in its own region over the same device memory; once the host tier the two epochs share holds
-/// copies of them, this scheduler lists the cache and learns each as a device copy in its group's
-/// memory, though no unit of its own region holds it. The shrink still keeps what the running
-/// request may take before it ends.
+/// A request running through a shrinking drain steps on to its end when the capacity words read
+/// with a `Resized` predate it (SD §3.8): the Storage Server writes a turn's completions before
+/// its capacity words, so a shrink's answer can arrive with words that still show free the units
+/// it just took. What the shrink gives back stays within what the region holds beyond the blocks
+/// the running request asked for and those it is still to take.
 #[test]
-fn a_request_running_through_a_shrinking_drain_steps_on_beside_the_targets_blocks() {
-    // Blocks of sixteen tokens: the running request fills none, and so gives nothing back, until
-    // the scheduler has read the listing.
+fn a_shrinking_drain_keeps_what_a_running_request_takes_when_the_words_predate_its_resized() {
+    // Blocks of sixteen tokens: the running request fills none, and so gives nothing back, while
+    // the first shrink is answered.
     const WIDE_BLOCK: u32 = 16;
+    const UNITS: u32 = 256;
     let mut harness = Deployment::tokens()
         .cache(&[(CacheGroupKind::Full, WIDE_BLOCK)])
-        .host(64)
+        .kv_units(UNITS)
         .build();
     let kv = harness.region("kv-0");
 
@@ -517,64 +517,19 @@ fn a_request_running_through_a_shrinking_drain_steps_on_beside_the_targets_block
     let running = harness.submit(token(1, 6, 30));
     harness.run_until(20, |harness| !harness.tokens(running).is_empty());
 
-    // The drain gives back what the running request will not take.
+    // The drain asks for the request's four units; the next step writes the `Resize`, and the one
+    // after it takes it, with words that still show free every unit but the request's two.
     let replied = harness.drain(Instant::now() + Duration::from_secs(60), true);
-    harness.run_until(20, |harness| {
-        let mut outputs = harness.outputs().iter();
-        outputs.any(|output| matches!(output, Output::Shrunk(region, _) if *region == kv))
-    });
+    harness.step();
+    harness.pool.set_capacity(kv, Some((UNITS - 2, 0, 0)));
+    harness.step();
+    harness.pool.set_capacity(kv, None);
+    let shrunk = harness.outputs().iter().any(
+        |output| matches!(output, Output::Shrunk(region, units) if *region == kv && *units < UNITS),
+    );
+    assert!(shrunk, "the first shrink was answered");
     let generated = harness.tokens(running).len() as u32;
     assert!(6 + generated < WIDE_BLOCK, "it filled a block: {generated}");
-
-    // The target commits sixteen blocks in a region of its own and stores them to the host.
-    harness.apart("kv-0", 16);
-    let owner = OwnerId(1);
-    let after = vec![(A, 0)];
-    let keys: Vec<Key> = (0..16).map(|at| Key([100 + at; 32])).collect();
-    let mut asks = vec![
-        Request::Attach { owner, group: A },
-        Request::Allocate {
-            owner,
-            class: 0,
-            at: 0,
-            count: 16,
-            units: 0,
-        },
-    ];
-    for (at, &key) in (0u32..).zip(&keys) {
-        asks.push(Request::Commit {
-            owner,
-            class: 0,
-            at,
-            key,
-            tokens: WIDE_BLOCK as u16,
-            after: after.clone(),
-        });
-    }
-    asks.push(Request::Store {
-        group: A,
-        keys,
-        tier: Tier::Host,
-    });
-    let answers = harness.elsewhere(&asks);
-    let committed = answers
-        .iter()
-        .filter(|answer| **answer == Completion::Committed)
-        .count();
-    assert_eq!(committed, 16, "{answers:?}");
-    // The `Store` is the last request of the target's queue pair, which numbers them from 1.
-    let store = runtime::RequestId(asks.len() as u64);
-    let answers = harness.elsewhere(&[Request::Finish {
-        copy: store,
-        ok: true,
-        after,
-    }]);
-    assert!(
-        answers
-            .iter()
-            .any(|answer| matches!(answer, Completion::Stored { .. })),
-        "{answers:?}"
-    );
 
     answered_after(&mut harness, &replied);
     let Some(Event::Finished {
