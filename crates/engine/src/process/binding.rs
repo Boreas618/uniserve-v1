@@ -86,7 +86,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::executor::peers::messages::{
@@ -97,7 +97,7 @@ use crate::memory::cache::KvCacheMemory;
 use crate::memory::cache::info::CacheTable;
 use crate::memory::client::{StorageClient, quota_limit};
 use crate::memory::division::{self, process_bytes};
-use crate::memory::graph_pool::GraphPool;
+use crate::memory::graph_pool::{GraphPool, Usage};
 use crate::memory::reload::{MetaWeights, Reload, paired};
 use crate::memory::state::StateMemory;
 use crate::memory::weights::WeightStore;
@@ -350,6 +350,20 @@ pub(crate) struct WeightBinding {
     poisoned: Mutex<Option<String>>,
     /// What each rank's process reserves, in rank order, once the ranks serve.
     reserved: Mutex<Vec<Reservation>>,
+    /// What each rank's device maps, in rank order, as its owners publish it.
+    gauges: Vec<Gauge>,
+}
+
+/// What one rank's device maps, published by the owners of that memory at each change, so the
+/// process's metrics read it without taking the rank ([`WeightBinding::memory`]).
+struct Gauge {
+    /// The device's pools, which their reservation publishes at every booking.
+    pools: Arc<Usage>,
+    /// The bytes the rank's KV cache maps on the device, on a rank that keeps one: published by
+    /// the binding when it opens over the cache and after every change of the cache's segments,
+    /// which only the binding makes ([`WeightBinding::release_segments`],
+    /// [`WeightBinding::create_segments`] and a sleep).
+    kv: Option<Arc<AtomicU64>>,
 }
 
 fn rejected(what: &str, error: impl std::fmt::Display) -> Error {
@@ -528,6 +542,15 @@ fn segment_table(cache: &KvCacheMemory, region: u8) -> Option<CacheTable> {
     cache.segment_table(region).map(|(table, _)| table)
 }
 
+/// Publishes the bytes `cache` maps on the device to the rank's KV gauge `gauge` ([`Gauge`]),
+/// after a change of the cache's segments.
+fn publish(gauge: Option<&AtomicU64>, cache: &KvCacheMemory) {
+    if let Some(gauge) = gauge {
+        // A gauge: the value is read alone, and orders no other memory.
+        gauge.store(cache.mapped_bytes(), Ordering::Relaxed);
+    }
+}
+
 /// One rank's second load of `target` through `weights`, beside the weights of `serving`: it
 /// publishes what changed and returns the load's order. A load that fails leaves the store with
 /// no load in progress; what it published is the discard's to release.
@@ -558,7 +581,19 @@ impl WeightBinding {
         target: Target,
         remotes: Vec<(Vec<GroupId>, Arc<Remote>)>,
     ) -> Self {
+        let gauges = ranks
+            .iter()
+            .map(|rank| Gauge {
+                pools: lock(&rank.graphs).gauge(),
+                kv: rank
+                    .cache
+                    .as_ref()
+                    .map(|cache| Arc::new(AtomicU64::new(lock(cache).mapped_bytes()))),
+            })
+            .collect();
+
         Self {
+            gauges,
             ranks: ranks.into_iter().map(Mutex::new).collect(),
             remotes,
             target: Mutex::new(target),
@@ -570,6 +605,11 @@ impl WeightBinding {
             poisoned: Mutex::new(None),
             reserved: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The KV gauge of rank `index`, on a rank that keeps a cache ([`Gauge::kv`]).
+    fn kv_gauge(&self, index: usize) -> Option<Arc<AtomicU64>> {
+        self.gauges.get(index).and_then(|gauge| gauge.kv.clone())
     }
 
     /// Runs the operation `work` makes for each rank, given its index, as a control operation
@@ -1065,26 +1105,17 @@ impl WeightBinding {
     /// the bytes the planes of the ranks' KV regions map, as the pool [`KV_POOL`]. The ranks of
     /// one device add up.
     ///
-    /// A rank whose owners another thread holds at the moment is left out of this sample: the
-    /// control thread that takes it once a second waits on no rank, and a series a report does
-    /// not name keeps its last value.
+    /// Every figure is a gauge its owner published at its last change ([`Gauge`]), so the
+    /// control thread that takes the sample once a second takes no rank, pool or cache, which
+    /// their owners hold across long work, and states every rank.
     pub(crate) fn memory(&self) -> Vec<DeviceMemory> {
         let mut devices: Vec<DeviceMemory> = Vec::new();
-        for rank in &self.ranks {
-            let Ok(rank) = rank.try_lock() else {
-                continue;
-            };
-            let Ok(graphs) = rank.graphs.try_lock() else {
-                continue;
-            };
-            let mut stated = graphs.usage();
-            drop(graphs);
-            if let Some(cache) = &rank.cache
-                && let Ok(cache) = cache.try_lock()
-            {
+        for gauge in &self.gauges {
+            let mut stated = gauge.pools.report();
+            if let Some(kv) = &gauge.kv {
                 stated.pools.push(PoolMemory {
                     pool: KV_POOL.to_owned(),
-                    mapped: cache.mapped_bytes(),
+                    mapped: kv.load(Ordering::Relaxed),
                 });
             }
 
@@ -1616,9 +1647,10 @@ impl WeightBinding {
         region: Option<u8>,
         first: u32,
     ) -> Result<Vec<Option<CacheTable>>> {
-        self.each_of(groups, "releasing the cache's segments", |_, rank| {
+        self.each_of(groups, "releasing the cache's segments", |index, rank| {
             let cache = rank.cache.as_ref().map(Arc::clone);
             let client = Arc::clone(&rank.client);
+            let gauge = self.kv_gauge(index);
 
             Box::new(move |_: &mut [Box<dyn Runner>]| {
                 let Some(cache) = cache else {
@@ -1636,7 +1668,10 @@ impl WeightBinding {
                 };
 
                 for region in &released {
-                    cache.release_segments(*region, first, &*client)?;
+                    let releasing = cache.release_segments(*region, first, &*client);
+                    // What a release that stopped part of the way gave back is published too.
+                    publish(gauge.as_deref(), &cache);
+                    releasing?;
                 }
                 // The graphs address the planes, whose tail was unmapped.
                 crate::profiling::storage_remapped();
@@ -1694,10 +1729,11 @@ impl WeightBinding {
         region: u8,
         limit: Option<u32>,
     ) -> Result<Vec<Option<CacheTable>>> {
-        self.each_of(groups, "creating the cache's segments", |_, rank| {
+        self.each_of(groups, "creating the cache's segments", |index, rank| {
             let cache = rank.cache.as_ref().map(Arc::clone);
             let client = Arc::clone(&rank.client);
             let stream = rank.stream.clone();
+            let gauge = self.kv_gauge(index);
 
             Box::new(move |_: &mut [Box<dyn Runner>]| {
                 let Some(cache) = cache else {
@@ -1705,7 +1741,10 @@ impl WeightBinding {
                 };
                 let mut cache = lock(&cache);
 
-                cache.wake(region, &*client, &stream, limit)?;
+                let waking = cache.wake(region, &*client, &stream, limit);
+                // What a wake that stopped part of the way created is published too.
+                publish(gauge.as_deref(), &cache);
+                waking?;
                 crate::profiling::storage_remapped();
                 Ok(segment_table(&cache, region))
             })

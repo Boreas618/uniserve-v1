@@ -30,6 +30,7 @@
 //! [`GraphPool::restore`] maps storage at the same addresses again. Each graph's executable is then
 //! instantiated again before its next replay (`Executable::refresh` in `runner::graphs`).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use platform::{Allocator, Budget, Buffer, DeviceId, DeviceRange, PoolKind};
@@ -41,11 +42,44 @@ use crate::runner::RunnerId;
 use crate::worker::{Error, Result};
 use service::lock;
 
+/// What a device's pools map, as the pools' reservation last booked it: published at every
+/// booking that succeeded, so a reader (the process's metrics) states the pools' usage without
+/// taking the pool, which its owners hold across captures, suspensions and restores.
+pub(crate) struct Usage {
+    /// The device's CUDA ordinal.
+    device: u32,
+    /// The epoch's limit of the GPU, which the report states.
+    limit: u64,
+    /// The bytes each pool maps, at its `PoolKind::index`.
+    mapped: [AtomicU64; PoolKind::ALL.len()],
+}
+
+impl Usage {
+    /// The device's report: the limit its mappings are reserved against and the bytes each pool
+    /// maps.
+    pub(crate) fn report(&self) -> DeviceMemory {
+        DeviceMemory {
+            device: self.device,
+            budget: self.limit,
+            pools: PoolKind::ALL
+                .into_iter()
+                .zip(&self.mapped)
+                .map(|(pool, mapped)| PoolMemory {
+                    pool: pool.name().to_owned(),
+                    // A gauge: each value is read alone, and none orders other memory.
+                    mapped: mapped.load(Ordering::Relaxed),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// The reservation of a device's pools in its GPU's quota at the Storage Server.
 ///
 /// The allocator states one pool's mapped bytes at a time; the quota holds one item for the
 /// rank's pools. This keeps each pool's last stated bytes and reserves their sum, so the item
-/// is what the allocator maps whenever a mapping succeeded.
+/// is what the allocator maps whenever a mapping succeeded, and publishes them as the pools'
+/// [`Usage`].
 struct Reservation {
     client: Arc<StorageClient>,
     /// The GPU's total bytes and the epoch's limit of them, which every reservation restates.
@@ -53,6 +87,8 @@ struct Reservation {
     limit: u64,
     /// The bytes each pool last stated, at its `PoolKind::index`.
     mapped: Mutex<[u64; PoolKind::ALL.len()]>,
+    /// Where the bytes of a booking that succeeded are published.
+    usage: Arc<Usage>,
 }
 
 impl Budget for Reservation {
@@ -69,6 +105,9 @@ impl Budget for Reservation {
             .reserve(device, self.total, self.limit, vec![(Item::GraphPool, sum)])
             .map_err(|error| platform::Error::InvalidArgument(error.to_string()))?;
 
+        for (published, bytes) in self.usage.mapped.iter().zip(stated) {
+            published.store(bytes, Ordering::Relaxed);
+        }
         *mapped = stated;
         Ok(())
     }
@@ -77,8 +116,8 @@ impl Budget for Reservation {
 /// The regions of a device's runners and its scratch pool; see the module documentation.
 pub struct GraphPool {
     allocator: Allocator,
-    /// The epoch's limit of the GPU, which the usage report states.
-    limit: u64,
+    /// What the pools map, as their reservation publishes it.
+    usage: Arc<Usage>,
     /// Each runner's region, mapped for the life of the pool.
     regions: Vec<(RunnerId, Buffer)>,
 }
@@ -110,11 +149,18 @@ impl GraphPool {
         let total = device.memory_info()?.total;
         let limit = quota_limit(total, fraction);
 
+        let usage = Arc::new(Usage {
+            device: u32::try_from(device.0)
+                .map_err(|_| Error::Invalid("a CUDA ordinal past u32".into()))?,
+            limit,
+            mapped: Default::default(),
+        });
         let reservation = Reservation {
             client,
             total,
             limit,
             mapped: Mutex::new([0; PoolKind::ALL.len()]),
+            usage: Arc::clone(&usage),
         };
         let mut allocator = Allocator::new(&platform::Device::new(device)?, Arc::new(reservation))?;
 
@@ -148,7 +194,7 @@ impl GraphPool {
 
         Ok(Self {
             allocator,
-            limit,
+            usage,
             regions: mapped,
         })
     }
@@ -207,19 +253,15 @@ impl GraphPool {
     }
 
     /// What the rank reports of the device's allocator: the limit its mappings are reserved
-    /// against and the bytes each pool maps now.
+    /// against and the bytes each pool maps, as the pools' reservation last booked them.
     pub fn usage(&self) -> DeviceMemory {
-        DeviceMemory {
-            device: self.allocator.device().0 as u32,
-            budget: self.limit,
-            pools: PoolKind::ALL
-                .into_iter()
-                .map(|pool| PoolMemory {
-                    pool: pool.name().to_owned(),
-                    mapped: self.allocator.mapped_bytes(pool) as u64,
-                })
-                .collect(),
-        }
+        self.usage.report()
+    }
+
+    /// The pools' usage as their reservation publishes it at every booking, which a reader
+    /// reports without taking the pool ([`Usage::report`]).
+    pub(crate) fn gauge(&self) -> Arc<Usage> {
+        Arc::clone(&self.usage)
     }
 
     /// Gives the pools' storage back to the device for a sleeping rank: every region's bytes
