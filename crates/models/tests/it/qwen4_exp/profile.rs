@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nn::family::{TextModel, TextPlacement};
-use nn::{DType, Phase, Shape, Split, Tensor, WeightLoader};
+use nn::{DType, MetaWeights, Phase, Shape, Split, Tensor, WeightLoader};
 
 /// Where the released checkpoints are.
 const MODELS: &str = "/workspace/models";
@@ -76,11 +76,12 @@ fn checkpoint(name: &str) -> nn::Checkpoint {
 /// and is the weight's.
 fn load(name: &str, placement: &TextPlacement) -> (Arc<dyn TextModel>, Vec<String>) {
     let checkpoint = checkpoint(name);
-    let mut loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     let model = support::load(&checkpoint, &mut loader, placement)
         .unwrap_or_else(|error| panic!("{name}: {error}"));
 
-    let named = loader.named().expect("a meta loader");
+    let named = store.tensors();
     let unnamed = checkpoint
         .names()
         .filter(|tensor| {
@@ -560,7 +561,8 @@ fn the_fp8_export_is_refused_by_its_experts_representation() {
     assert_eq!(config.ngram.table_rows(), 320_001_536);
 
     for tensor in [Split::WHOLE, Split { size: 4, rank: 0 }] {
-        let mut loader = WeightLoader::meta(&checkpoint, None);
+        let store = MetaWeights::new();
+        let mut loader = WeightLoader::new(&checkpoint, &store, None);
         let refused = support::load(
             &checkpoint,
             &mut loader,

@@ -15,7 +15,7 @@ use nn::modules::{
     AdaLnBlock, AdaLnBlockConfig, AdaLnOut, AdaLnOutConfig, FrameNorm, FrameNormConfig, GateUp,
     MlpConfig, ResnetBlock3d, ResnetBlock3dConfig,
 };
-use nn::{Checkpoint, CpuWeights, DType, Device, Tensor, WeightLoader};
+use nn::{Checkpoint, CpuWeights, DType, Device, MetaWeights, Tensor, WeightLoader};
 use support::{
     assert_close, f32_bytes, meta, operators, recorded, sequence, shard, tensor, values,
 };
@@ -632,7 +632,8 @@ fn a_resnet_block_adds_its_input_or_its_projection() {
 
     // On a device each normalization is two launches and each convolution one; a block that
     // keeps its width adds its input and launches no projection.
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let wide = ResnetBlock3d::load(&RESNET, loader.root().pp("wide")).unwrap();
     let same = ResnetBlock3d::load(&same_config, loader.root().pp("same")).unwrap();
 
@@ -835,7 +836,8 @@ fn an_adaln_block_modulates_both_inputs_and_gates_both_updates() {
 fn an_adaln_block_states_two_modulated_norms_around_the_attention() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = adaln_checkpoint(directory.path());
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let block = AdaLnBlock::load(&ADALN, loader.root().pp("block")).unwrap();
     let norm = AdaLnOut::load(
         &AdaLnOutConfig {

@@ -26,7 +26,7 @@ use std::path::Path;
 use nn::collective::Split;
 use nn::modules::{Linear, LinearConfig, Parallel};
 use nn::quantization::{Declaration, Scheme};
-use nn::{Checkpoint, CpuWeights, DType, WeightLoader};
+use nn::{Checkpoint, CpuWeights, DType, MetaWeights, WeightLoader};
 use support::{encode, meta, operators, recorded, sequence, shard, tensor, values};
 
 /// The FP32 unit roundoff, and BF16's: the accumulation's and the output's.
@@ -260,7 +260,8 @@ fn a_converted_projection_states_its_measurement_and_its_product() {
             &["reduce", "dynamic_scale", "nvfp4_quantize", "nvfp4_gemm"][..],
         ),
     ] {
-        let mut loader = WeightLoader::meta(&checkpoint, None);
+        let store = MetaWeights::new();
+        let mut loader = WeightLoader::new(&checkpoint, &store, None);
         loader.declare(&converting(scheme)).unwrap();
         let linear = Linear::load(
             &LinearConfig {
@@ -299,7 +300,9 @@ fn a_converted_weight_is_refused_where_no_encoded_product_reads_it() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = dense(directory.path(), 256, 512, &sequence(256 * 512, 6));
 
-    let mut loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     loader.declare(&converting(Scheme::DynamicFp8)).unwrap();
     let dense_read = loader.root().pp("proj").get((256, 512), "weight");
     let message = dense_read.unwrap_err().to_string();

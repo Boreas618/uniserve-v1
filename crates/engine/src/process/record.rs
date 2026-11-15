@@ -9,7 +9,7 @@
 //!
 //! - no daemon connection: the epoch is the one the launch states;
 //! - no Storage Server: each weight's element type and extents come from the checkpoint's shard
-//!   headers ([`nn::WeightLoader::meta`]), no payload is read and nothing is published;
+//!   headers ([`nn::MetaWeights`]), no payload is read and nothing is published;
 //! - no device memory and no communicator: a profile run launches nothing, and a parallel group
 //!   states its split alone;
 //! - no session with the buffer pool, Build Server, scheduler or worker.

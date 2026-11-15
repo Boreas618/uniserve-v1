@@ -19,7 +19,7 @@ use nn::modules::{
     QkvLinear, QkvLinearConfig, QkvNames, RmsNorm, RmsNormConfig,
 };
 use nn::quantization::Declaration;
-use nn::{Adapter, Checkpoint, CpuWeights, DType, Device, Tensor, WeightLoader};
+use nn::{Adapter, Checkpoint, CpuWeights, DType, Device, MetaWeights, Tensor, WeightLoader};
 use support::{
     assert_close, encode, f32_bytes, meta, operators, recorded, recorded_split, sequence, shard,
     shard_stating, tensor, values,
@@ -187,7 +187,8 @@ fn a_row_parallel_projection_reduces_under_its_group() {
         DType::BF16,
         &[("proj.weight", vec![8, 32], sequence(8 * 32, 7))],
     );
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let row = Linear::load(
         &LinearConfig {
             inputs: 32,
@@ -317,7 +318,8 @@ fn a_per_tensor_fp8_projection_is_chosen_by_the_checkpoint_s_declaration() {
     assert_eq!(values(&linear.forward(&x).unwrap()), values(&expected));
 
     // A meta load chooses the same representation, and its forward states the FP8 product.
-    let mut loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     loader
         .declare(&Declaration::read(&checkpoint).unwrap())
         .unwrap();
@@ -470,7 +472,9 @@ fn a_meta_load_of_a_packed_projection_states_the_encoder_and_the_product() {
     let directory = tempfile::tempdir().unwrap();
     let (checkpoint, ..) = nvfp4_checkpoint(directory.path());
 
-    let mut loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     loader
         .declare(&Declaration::read(&checkpoint).unwrap())
         .unwrap();
@@ -715,7 +719,8 @@ fn a_sharded_embedding_states_its_shard_in_its_kernel() {
         DType::BF16,
         &[("embed_tokens.weight", vec![32, 8], sequence(32 * 8, 21))],
     );
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let shard = Embedding::load(
         &EmbeddingConfig {
             vocabulary: 32,
@@ -786,7 +791,8 @@ fn a_head_projects_onto_the_vocabulary_and_widens_the_logits() {
 fn a_split_head_gathers_the_shards_of_its_group() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = head_checkpoint(directory.path(), 32);
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     // Rank 1 holds rows 16..32, a whole number of the head's eight-row tiles.
     let head = LmHead::load(
@@ -826,7 +832,8 @@ fn a_split_head_gathers_the_shards_of_its_group() {
 fn a_whole_head_gathers_nothing_in_a_group_that_splits_something_else() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = head_checkpoint(directory.path(), 32);
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let head = LmHead::load(
         &LmHeadConfig {
             vocabulary: 32,
@@ -855,7 +862,8 @@ fn a_whole_head_gathers_nothing_in_a_group_that_splits_something_else() {
 fn a_shard_of_a_partial_tile_is_refused_at_load() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = head_checkpoint(directory.path(), 30);
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let refused = LmHead::load(
         &LmHeadConfig {
@@ -992,7 +1000,8 @@ fn a_narrowing_normalization_states_the_narrowing_kernel_and_takes_no_residual()
         directory.path(),
         &[("norm.weight", vec![8], sequence(8, 30))],
     );
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let norm = RmsNorm::load(
         &RmsNormConfig {
             width: 8,
@@ -1140,7 +1149,8 @@ fn a_gated_mlp_states_the_gate_its_rounding_names() {
             ),
         ],
     );
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let launched = |rounding, gate_up, module: &str, rows: usize| {
         let mlp = Mlp::load(&mlp_config(rounding, gate_up), loader.root().pp(module)).unwrap();
         let (output, launches) = recorded(|| {

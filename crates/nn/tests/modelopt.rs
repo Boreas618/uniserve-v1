@@ -16,7 +16,7 @@ use std::path::Path;
 
 use nn::modules::{Linear, LinearConfig, Parallel};
 use nn::quantization::{Declaration, ModeloptManifest};
-use nn::{Checkpoint, CpuWeights, DType, Error, WeightLoader};
+use nn::{Checkpoint, CpuWeights, DType, Error, MetaWeights, WeightLoader};
 use support::{encode, meta, operators, recorded, sequence, shard, tensor, values};
 
 /// The largest magnitudes an activation's calibration measured, as the manifest lists them:
@@ -391,7 +391,9 @@ fn a_meta_load_of_a_packed_export_states_the_encoder_and_the_product() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = export(directory.path(), &LISTED);
 
-    let mut loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     loader.declare(&declaration(&checkpoint)).unwrap();
 
     let fused = Linear::load(&whole(32, 8, false), loader.root().pp(FUSED)).unwrap();
@@ -431,7 +433,8 @@ fn a_manifest_and_its_shards_that_disagree_are_refused_by_the_module() {
     // A packed projection the manifest does not calibrate has no scale to encode by.
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = export(directory.path(), &LISTED[..3]);
-    let mut loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     loader.declare(&declaration(&checkpoint)).unwrap();
 
     let error = Linear::load(&whole(32, 4, true), loader.root().pp(OUTPUT))
@@ -461,7 +464,9 @@ fn a_manifest_and_its_shards_that_disagree_are_refused_by_the_module() {
         })
         .unwrap();
 
-    let mut loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     let error = loader.declare(&misplaced).unwrap_err();
     assert!(
         matches!(&error, Error::Weight { tensor, .. } if tensor == "blocks.0.proj.weight_packed"),

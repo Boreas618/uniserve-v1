@@ -221,6 +221,6 @@ pub use launch::launch;
 pub use op::{Call, Checked, Op, Route};
 pub use operand::Operand;
 pub use profiler::Profiler;
-pub use storage::{empty, external, operand, retained};
+pub use storage::{empty, external, meta_tensor, operand, retained};
 pub use tolerance::Tolerance;
 pub use twins::{Twin, Twins};

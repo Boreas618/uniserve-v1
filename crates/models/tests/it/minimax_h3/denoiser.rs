@@ -37,7 +37,7 @@ use models::minimax_h3::{VideoTask, packing};
 use nn::family::{DenoiserSplit, Projection, SequenceSplit};
 use nn::{
     Checkpoint, ConditionRole, ConditionShape, Conditioning, CpuWeights, DType, Denoiser as _,
-    Device, Split, Tensor, VideoRequest, WeightLoader,
+    Device, MetaWeights, Split, Tensor, VideoRequest, WeightLoader,
 };
 use support::{assert_close, f32_shard, meta, recorded_at, sequence, values};
 
@@ -440,7 +440,8 @@ fn an_eight_way_ulysses_rank_steps_the_largest_profiled_layout() {
             },
             ..DenoiserSplit::WHOLE
         };
-        let loader = WeightLoader::meta(&checkpoint, Some(DType::BF16));
+        let store = MetaWeights::new();
+        let loader = WeightLoader::new(&checkpoint, &store, Some(DType::BF16));
         let denoiser =
             Denoiser::load(&config, (16_384, 2_048), split, None, loader.root()).unwrap();
 

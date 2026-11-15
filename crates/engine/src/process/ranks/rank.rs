@@ -53,29 +53,6 @@ use proto::config::{
 use buckets::tier_refusal;
 use placement::Mapping;
 
-/// Where a rank's model load puts its weights.
-pub(crate) enum Weights<'a> {
-    /// Retained storage: each weight is read from the checkpoint, converted and published.
-    Retained(&'a dyn nn::RetainedWeights),
-    /// Nowhere: each weight's element type and extents come from the shard headers, at a synthetic
-    /// address ([`nn::WeightLoader::meta`]), for a profile run, which launches nothing.
-    Meta,
-}
-
-impl<'a> Weights<'a> {
-    /// The loader of `checkpoint` that puts its weights here, keeping the checkpoint's own
-    /// representation: the launch states no precision of its own to the loader.
-    fn loader<'c>(self, checkpoint: &'c nn::Checkpoint) -> nn::WeightLoader<'c>
-    where
-        'a: 'c,
-    {
-        match self {
-            Self::Retained(store) => nn::WeightLoader::new(checkpoint, store, None),
-            Self::Meta => nn::WeightLoader::meta(checkpoint, None),
-        }
-    }
-}
-
 /// How the weight binding loads this rank's model again: the rank's model runner, pointed at the
 /// target.
 pub(crate) struct RankModel {
@@ -100,12 +77,8 @@ impl crate::process::binding::ModelLoad for RankModel {
             .model
             .model = target.checkpoint.to_string_lossy().into_owned();
         let loaded = match model_runner.family.model {
-            Model::Text(_) => model_runner
-                .load_text(Weights::Retained(weights), &target.experts)
-                .map(drop),
-            Model::Video(_) => model_runner
-                .load_video(Weights::Retained(weights))
-                .map(drop),
+            Model::Text(_) => model_runner.load_text(weights, &target.experts).map(drop),
+            Model::Video(_) => model_runner.load_video(weights).map(drop),
         };
         loaded.map_err(|error| format!("{error:#}"))
     }
@@ -770,7 +743,7 @@ impl ModelRunner {
     /// The checkpoint's or the family's refusal, and a checkpoint of a media family.
     pub(crate) fn load_text(
         &self,
-        weights: Weights<'_>,
+        weights: &dyn nn::RetainedWeights,
         experts: &ExpertOrder,
     ) -> Result<Arc<dyn TextModel>> {
         let Model::Text(family) = self.family.model else {
@@ -781,7 +754,7 @@ impl ModelRunner {
         };
         let opened = nn::Checkpoint::open(self.checkpoint())?;
         let checkpoint = family.open(&opened, &self.engine_config().model.quantization)?;
-        let mut loader = weights.loader(&opened);
+        let mut loader = nn::WeightLoader::new(&opened, weights, None);
         Ok(checkpoint.load(&opened, &mut loader, &self.text_placement(), experts)?)
     }
 

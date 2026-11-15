@@ -26,6 +26,7 @@
 //! error.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use platform::{CaptureStatus, DevicePtr, Stream};
 use tensor::backend::{BackendDevice, BackendStorage};
@@ -33,7 +34,7 @@ use tensor::nditer::MAX_DIMS;
 use tensor::{CpuStorage, DType, Device, Layout, Shape, Storage, Tensor};
 
 use crate::Operand;
-use crate::allocator::Allocator;
+use crate::allocator::{ALIGNMENT, Allocator};
 use crate::device::{self, CudaDevice, MetaDevice};
 use crate::{Error, Result, context};
 
@@ -423,6 +424,49 @@ pub fn retained(
     device: &Device,
 ) -> Result<Tensor> {
     borrowed(address, shape.into(), dtype, device)
+}
+
+/// The first address [`meta_tensor`] states a tensor at: far above any region an execution
+/// context allocates in, so a meta weight and an activation of one profile run never share an
+/// address, and far from zero, so no argument check takes one for a null pointer.
+const META_BASE: u64 = 1 << 48;
+
+/// The next address [`meta_tensor`] states a tensor at. Every meta tensor of the process draws
+/// from this one cursor, so two of them never share an address.
+static META_CURSOR: AtomicU64 = AtomicU64::new(META_BASE);
+
+/// A meta tensor of `shape` elements of `dtype` at an address no other meta tensor of the
+/// process takes: an input or a weight of a profile run, which has a shape and an element type
+/// and no bytes, and takes no block of a context's allocator.
+///
+/// Each tensor takes its bytes rounded up to whole [`ALIGNMENT`] blocks, at least one, so the
+/// distance between two meta tensors is a multiple of the alignment a device allocation has.
+///
+/// # Errors
+///
+/// When `shape` elements of `dtype` overflow the address space, or the meta address range is
+/// exhausted.
+pub fn meta_tensor(shape: impl Into<Shape>, dtype: DType) -> Result<Tensor> {
+    let shape = shape.into();
+    let span = dtype
+        .storage_bytes(shape.elem_count())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .and_then(|bytes| bytes.max(1).checked_next_multiple_of(ALIGNMENT))
+        .ok_or_else(|| {
+            Error::Shape(format!(
+                "a meta tensor of {:?} {} elements overflows the address space",
+                shape.dims(),
+                crate::abi::name(dtype)
+            ))
+        })?;
+
+    let address = META_CURSOR.fetch_add(span, Ordering::Relaxed);
+    if address.checked_add(span).is_none() {
+        return Err(Error::Shape(
+            "the meta device's address range is exhausted".to_owned(),
+        ));
+    }
+    retained(address, shape, dtype, &device::meta())
 }
 
 /// The tensor of `shape` elements of `dtype` at `address` on `device`, which nothing frees.

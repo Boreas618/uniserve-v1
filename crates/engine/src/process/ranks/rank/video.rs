@@ -63,9 +63,9 @@ use proto::video::Layout;
 use strum::IntoEnumIterator as _;
 use tensor::DType;
 
+use super::ModelRunner;
 use super::memory::{Peaks, granularity, unreserved};
 use super::text::Keys;
-use super::{ModelRunner, Weights};
 
 /// The runners of a media rank that compute on the device, by the region of the graph pool
 /// each replays in. The media host computes nothing there.
@@ -252,7 +252,10 @@ impl ModelRunner {
     /// # Errors
     ///
     /// The checkpoint's or the family's refusal, or a split the deployment's groups do not state.
-    pub(crate) fn load_video(&self, weights: Weights<'_>) -> Result<Arc<dyn VideoModel>> {
+    pub(crate) fn load_video(
+        &self,
+        weights: &dyn nn::RetainedWeights,
+    ) -> Result<Arc<dyn VideoModel>> {
         self.load_stages(weights, false)
     }
 
@@ -265,7 +268,7 @@ impl ModelRunner {
     ///
     /// As [`Self::load_video`].
     pub(crate) fn load_profiled(&self) -> Result<Arc<dyn VideoModel>> {
-        self.load_stages(Weights::Meta, true)
+        self.load_stages(&nn::MetaWeights::new(), true)
     }
 
     /// The media pipeline the rank's checkpoint serves, as its family declares it (`nn::pipeline`),
@@ -287,7 +290,11 @@ impl ModelRunner {
     /// # Errors
     ///
     /// As [`Self::load_video`].
-    fn load_stages(&self, weights: Weights<'_>, sized: bool) -> Result<Arc<dyn VideoModel>> {
+    fn load_stages(
+        &self,
+        weights: &dyn nn::RetainedWeights,
+        sized: bool,
+    ) -> Result<Arc<dyn VideoModel>> {
         let opened = self.open_video_checkpoint()?;
         let checkpoint = self.open_video_family(&opened)?;
         let (denoiser, tensor) = self.video_split()?;
@@ -296,7 +303,7 @@ impl ModelRunner {
             false => self.stages()?,
         };
 
-        let mut loader = weights.loader(&opened);
+        let mut loader = nn::WeightLoader::new(&opened, weights, None);
         let placement = VideoPlacement {
             stages,
             denoiser,

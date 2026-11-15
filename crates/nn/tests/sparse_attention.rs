@@ -13,7 +13,7 @@ use nn::collective::Split;
 use nn::family::Projection;
 use nn::functional;
 use nn::modules::{UlyssesAttention, UlyssesAttentionConfig, VsaAttention, VsaAttentionConfig};
-use nn::{Checkpoint, CpuWeights, DType, Device, Tensor, WeightLoader};
+use nn::{Checkpoint, CpuWeights, DType, Device, MetaWeights, Tensor, WeightLoader};
 use support::{
     assert_close, encode, meta, operators, recorded, recorded_split, sequence, shard, tensor,
     values,
@@ -568,7 +568,8 @@ fn a_sparse_layer_states_its_tiles_bounds_and_rotation() {
             ("attn.norm_k.weight", vec![256], sequence(256, 20)),
         ],
     );
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let load = |config: VsaAttentionConfig| VsaAttention::load(&config, loader.root().pp("attn"));
 
     // A tile is whole sixteen-row kernel blocks: 64, 128 and 96 rows serve, 100 do not.
@@ -627,7 +628,8 @@ fn an_attend_prepares_scores_selects_attends_and_compresses() {
             ("attn.norm_k.weight", vec![128], sequence(128, 22)),
         ],
     );
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let layer =
         VsaAttention::load(&vsa_config(64, 4, 128, true, 96), loader.root().pp("attn")).unwrap();
 
@@ -831,7 +833,8 @@ fn a_member_of_an_all_gather_group_attends_its_interval_over_every_tile() {
             ("attn.norm_k.weight", vec![128], sequence(128, 22)),
         ],
     );
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let layer =
         VsaAttention::load(&vsa_config(64, 4, 128, true, 96), loader.root().pp("attn")).unwrap();
 
@@ -870,7 +873,8 @@ fn a_member_of_an_all_gather_group_attends_its_interval_over_every_tile() {
 
 /// Member 1 of 2 of a four-head, sixteen-wide attention reaching its heads by `projection`.
 fn ulysses(checkpoint: &Checkpoint, projection: Projection) -> UlyssesAttention {
-    let loader = WeightLoader::meta(checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(checkpoint, &store, None);
 
     UlyssesAttention::load(
         &UlyssesAttentionConfig {
@@ -984,7 +988,8 @@ fn a_sequence_split_inside_a_tensor_split_holds_its_share_of_the_tensor_rank_s_h
             ("attn.to_out.weight", vec![32, 64], sequence(32 * 64, 31)),
         ],
     );
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let member = UlyssesAttention::load(
         &UlyssesAttentionConfig {
             hidden: 32,

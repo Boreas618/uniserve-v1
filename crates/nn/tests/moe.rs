@@ -16,7 +16,9 @@ use nn::collective::Split;
 use nn::functional::{self, Activation, Rounding};
 use nn::modules::{GateUp, MlpConfig, MoE, MoEConfig, SharedExpert, SharedExpertConfig};
 use nn::quantization::{Declaration, Nvfp4Stack, UNIFIED_EXPORT, ValueLayout};
-use nn::{Checkpoint, CpuWeights, DType, Device, ExpertExchange, Tensor, WeightLoader};
+use nn::{
+    Checkpoint, CpuWeights, DType, Device, ExpertExchange, MetaWeights, Tensor, WeightLoader,
+};
 use ops::fp4::ScaleLayout;
 use support::{
     assert_close, encode, f32_bytes, meta, operators, recorded, recorded_split, sequence, shard,
@@ -1168,7 +1170,8 @@ fn a_block_reads_stacked_experts_as_it_reads_one_module_each() {
 fn a_block_refuses_a_routing_or_a_share_its_checkpoint_does_not_have() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = dense_checkpoint(directory.path(), DType::F32);
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let refused = |config: MoEConfig| {
         MoE::load(&config, loader.root().pp("mlp"))
             .err()
@@ -1260,7 +1263,8 @@ fn a_block_split_over_a_tensor_group_holds_its_share_and_reduces_its_sum() {
 
     // Its output is a partial sum: a forward with no group is refused, and one with a group
     // states the same kernels as a whole block over half the width.
-    let meta_loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let meta_loader = WeightLoader::new(&checkpoint, &store, None);
     let block = MoE::load(&config, meta_loader.root().pp("mlp")).unwrap();
     let (alone, _) = recorded(|| block.forward(&meta((4, 8), DType::BF16), None, None));
     let message = alone.err().unwrap().to_string();
@@ -1334,7 +1338,8 @@ fn a_tensor_group_holding_whole_experts_runs_its_window_over_every_token_and_red
 
     // Its output is a partial sum: a forward with no group is refused, and one with a group
     // states the kernels of a block of two whole experts routed from four.
-    let meta_loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let meta_loader = WeightLoader::new(&checkpoint, &store, None);
     let block = MoE::load(&config, meta_loader.root().pp("mlp")).unwrap();
     assert_eq!(
         (block.experts(), block.local_experts(), block.top()),
@@ -1398,7 +1403,8 @@ fn a_tensor_group_holding_whole_experts_runs_its_window_over_every_token_and_red
 fn a_dense_block_states_its_routing_its_products_and_its_combine() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = dense_checkpoint(directory.path(), DType::BF16);
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let block = MoE::load(&dense_config(), loader.root().pp("mlp")).unwrap();
 
     let (output, launches) = recorded(|| {
@@ -1578,7 +1584,8 @@ fn a_calibrated_block_runs_the_packed_products_over_its_stacks() {
 fn a_tensor_group_holding_whole_packed_experts_runs_the_packed_products_over_its_window() {
     let directory = tempfile::tempdir().unwrap();
     let (checkpoint, _) = packed_checkpoint(directory.path(), 2);
-    let mut loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     loader
         .declare(&Declaration::read(&checkpoint).unwrap())
         .unwrap();
@@ -1651,7 +1658,8 @@ fn exchange_key(mode: &str) -> String {
 fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = dense_checkpoint(directory.path(), DType::BF16);
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let block = MoE::load(
         &MoEConfig {
             exchange: Split { size: 2, rank: 1 },
@@ -1759,7 +1767,8 @@ fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
 fn a_calibrated_block_over_an_expert_group_runs_in_the_exchange_s_one_launch() {
     let directory = tempfile::tempdir().unwrap();
     let (checkpoint, _) = packed_checkpoint(directory.path(), 2);
-    let mut loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     loader
         .declare(&Declaration::read(&checkpoint).unwrap())
         .unwrap();
@@ -1990,7 +1999,8 @@ fn a_shared_expert_adds_its_gated_mlp_into_the_routed_output() {
     assert_eq!(values(&routed), values(&out));
 
     // Under a meta context: the MLP's products and gate, the gate's logit, and the gated add.
-    let meta_loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let meta_loader = WeightLoader::new(&checkpoint, &store, None);
     let shared = SharedExpert::load(&config, meta_loader.root().pp("mlp")).unwrap();
     let (output, launches) = recorded(|| {
         shared.forward(

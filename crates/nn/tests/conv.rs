@@ -11,7 +11,7 @@ mod support;
 
 use nn::functional::{self, Padding};
 use nn::modules::{Conv1d, Conv3d, ConvConfig, ConvTranspose1d};
-use nn::{Checkpoint, CpuWeights, DType, WeightLoader};
+use nn::{Checkpoint, CpuWeights, DType, MetaWeights, WeightLoader};
 use support::{
     assert_close, f32_bytes, meta, operators, recorded, sequence, shard, tensor, values,
 };
@@ -477,7 +477,8 @@ fn each_convolution_is_one_launch_keyed_by_its_element_types() {
             ("frame.weight", vec![8, 4, 2, 2, 2], sequence(8 * 4 * 8, 26)),
         ],
     );
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     // A grouped, biased convolution is still one launch: the groups and the bias travel in it.
     let grouped = ConvConfig {

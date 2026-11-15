@@ -569,33 +569,9 @@ impl WeightLoader<'_> {
             ));
         }
 
-        // A calibrated export never packs an all-zero matrix: every E2M1 code would be zero and
-        // the product would give zeros for every activation. One host read of a few megabytes
-        // per projection, at load only, says so by name.
-        self.check_values(|checkpoint| {
-            if checkpoint.read(values_name)?.iter().all(|byte| *byte == 0) {
-                return Err(Error::weight(
-                    values_name,
-                    "every packed E2M1 byte is zero: the product would give zeros for every \
-                     activation, so this tensor's calibration did not run"
-                        .to_owned(),
-                ));
-            }
-
-            // The block scales are the second way a product gives zeros for every activation:
-            // an E4M3 scale of zero multiplies its whole block to zero whatever the codes are.
-            // One zero scale is legitimate (a block whose values are all zero); every scale
-            // zero is a calibration that did not run, and it is invisible in the values.
-            if checkpoint.read(scales_name)?.iter().all(|byte| *byte == 0) {
-                return Err(Error::weight(
-                    scales_name,
-                    "every block scale is zero: the product would give zeros for every \
-                     activation whatever the codes hold, so this tensor's calibration did not run"
-                        .to_owned(),
-                ));
-            }
-            Ok(())
-        })?;
+        // A calibrated export never packs an all-zero matrix or all-zero block scales: either
+        // makes the product give zeros for every activation. Both loads above ask for a value
+        // (`nonzero`), so a calibration that did not run is refused where the bytes are read.
 
         // The file's arrangement and the product's are two statements, and the permutation
         // between them happens here once: a kernel must never read a table under a claim it
@@ -714,6 +690,16 @@ impl WeightLoader<'_> {
 
             for range in ranges {
                 linear.extend_from_slice(&bytes[range]);
+            }
+
+            // Every scale zero multiplies every block to zero whatever the codes hold: a
+            // calibration that did not run, refused where its bytes are read.
+            if linear.iter().all(|byte| *byte == 0) {
+                return Err(Error::weight(
+                    name,
+                    "every block scale is zero: the product would give zeros for every \
+                     activation whatever the codes hold, so this tensor's calibration did not run",
+                ));
             }
             Ok(Cow::Owned(swizzled_scales(&linear, rows, blocks)))
         })

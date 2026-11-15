@@ -14,7 +14,7 @@ use std::path::Path;
 use nn::config::Fields;
 use nn::functional;
 use nn::modules::{Precision, Rotary, RotaryConfig, Spectrum, Yarn};
-use nn::{Checkpoint, CpuWeights, DType, Device, Tensor, WeightLoader};
+use nn::{Checkpoint, CpuWeights, DType, Device, MetaWeights, Tensor, WeightLoader};
 use support::{assert_close, f32_bytes, meta, recorded, sequence, shard, tensor, values};
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
@@ -754,7 +754,8 @@ fn a_rotary_publishes_its_spectrum_and_computes_a_batchs_factors() {
 fn a_rotary_reads_one_coordinate_per_axis_into_one_column_per_pair() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(directory.path());
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
 
     // Sixteen pairs repeated over three axes of a 128-channel head.
     let repeated = config(10_000.0, 96, Spectrum::Repeated { axes: 3 }, Precision::F64);

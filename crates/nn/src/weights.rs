@@ -32,20 +32,17 @@
 //!
 //! ## Meta loading
 //!
-//! [`WeightLoader::meta`] runs the same loading code over the same shard headers and stops where
-//! bytes would be read: every weight it returns is a meta tensor of the element type and extents
-//! the device load gives, and it publishes nothing, so a profile run of a model's load needs no
-//! payload and no device.
+//! A load over [`MetaWeights`] runs the same loading code over the same shard headers and reads
+//! no weight's payload: the store holds every key already, so every weight is a meta tensor of
+//! the element type and extents a device load gives, and a profile run of a model's load needs
+//! no device. The loader has no meta mode of its own; what a load is follows from its store.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use half::{bf16, f16};
-use ops::allocator::ALIGNMENT;
 use sha2::{Digest, Sha256};
 use tensor::{CpuStorage, DType, Device, Shape, Storage, Tensor};
 
@@ -404,37 +401,67 @@ impl RetainedWeights for CpuWeights {
     }
 }
 
-/// The first address a meta loader gives a weight.
+/// Retained storage of a profile run: every weight is a meta tensor, and nothing is read or
+/// published.
 ///
-/// Far above any region an execution context allocates in, so a weight and an activation of one
-/// profile run never share an address, and far from zero, so no weight reads as a null pointer
-/// to an argument check.
-const META_BASE: u64 = 1 << 48;
-
-/// The next address a meta loader gives a weight.
+/// A load over this store runs the same decisions over the shard headers as a load over a
+/// device's store and reads no weight's payload, because every key is held already
+/// ([`RetainedWeights::retained`] answers a meta tensor of the extents asked for), so the loader
+/// never produces a weight's bytes. A key asked twice gives the same tensor, as a device store
+/// returns a key it holds, so two modules that share a weight on the device share it here too;
+/// a table the model writes after the load is a tensor of its own each time. Each tensor lies
+/// at an address no other meta tensor takes ([`ops::meta_tensor`]).
 ///
-/// Every meta loader of the process draws from this one cursor, so two loaders of one profile
-/// run (one per pipeline stage, say) never give one address to two different weights.
-static META_CURSOR: AtomicU64 = AtomicU64::new(META_BASE);
+/// What a load over it cannot give is a computed weight's **value**: a table a module derives
+/// from its weights is a meta tensor like the rest. The shapes and element types decide the
+/// kernels a model launches, and the values never enter a kernel key.
+#[derive(Default)]
+pub struct MetaWeights {
+    /// The weights asked for so far, by key.
+    held: RefCell<HashMap<WeightKey, Tensor>>,
+}
 
-/// The tensor scale a meta loader returns for every calibrated scale it is asked for.
-///
-/// A meta loader reads no payload, so it has no scale to give; one is a positive, finite number,
-/// so every check a caller makes on a scale passes, and a value derived from it is a valid one.
-/// A scale only ever reaches a kernel as data (a launch scalar or a published table), so a
-/// profile run over this placeholder states the same kernels as a device load over the real
-/// scales.
-const META_TENSOR_SCALE: f32 = 1.0;
+impl MetaWeights {
+    /// A store no load has asked yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-/// Where a loader's weights go.
-enum Retention<'a> {
-    /// Retained storage, which converted bytes are published to.
-    Store(&'a dyn RetainedWeights),
-    /// Meta tensors, by the key a device load would publish them under: a key given once is
-    /// given the same tensor again, as a retained store returns a key it already holds, so two
-    /// modules that share a weight on the device share it here too. Shared by the loaders
-    /// reborrowed from one meta loader.
-    Meta(Rc<RefCell<HashMap<WeightKey, Tensor>>>),
+    /// The checkpoint tensors the weights asked for so far are read from, as their keys name
+    /// them: for a profile run's check that a load reaches every tensor a checkpoint holds. A
+    /// table a module computes names itself and no checkpoint tensor, and a scalar a module
+    /// reads beside a weight (a tensor scale) is no weight and is not named.
+    pub fn tensors(&self) -> std::collections::BTreeSet<String> {
+        self.held
+            .borrow()
+            .keys()
+            .flat_map(|key| key.tensors.iter().cloned())
+            .collect()
+    }
+}
+
+impl RetainedWeights for MetaWeights {
+    fn retained(&self, key: &WeightKey, shape: &Shape) -> Result<Option<Tensor>> {
+        if let Some(tensor) = self.held.borrow().get(key) {
+            return Ok(Some(tensor.reshape(shape.clone())?));
+        }
+
+        let tensor = ops::meta_tensor(shape.clone(), key.dtype)?;
+        self.held.borrow_mut().insert(key.clone(), tensor.clone());
+        Ok(Some(tensor))
+    }
+
+    fn publish(&self, key: &WeightKey, shape: &Shape, _bytes: &[u8]) -> Result<Tensor> {
+        // Every key is held already, so a loader publishes nothing to this store; a caller that
+        // publishes anyway gets the held tensor of the key.
+        self.retained(key, shape)?
+            .ok_or_else(|| Error::weight(&key.region(), "a meta store holds every key"))
+    }
+
+    fn writable(&self, key: &WeightKey, shape: &Shape, _bytes: &[u8]) -> Result<Tensor> {
+        // A writable table is one load's own: it is never returned for a later key.
+        Ok(ops::meta_tensor(shape.clone(), key.dtype)?)
+    }
 }
 
 /// One contiguous byte range of a checkpoint tensor that a weight's bytes are gathered from: the
@@ -480,21 +507,18 @@ pub(crate) fn extents(dims: &[u64]) -> Shape {
 /// The boundary between a checkpoint and retained storage: converts a weight once and publishes
 /// it.
 ///
-/// A loader is one of two kinds, and both run the same decisions over the same shard headers:
-///
-/// - a loader over a store ([`WeightLoader::new`]) reads each tensor's payload, converts it and
-///   publishes it to a [`RetainedWeights`] store;
-/// - a **meta** loader ([`WeightLoader::meta`]) reads no payload and publishes nothing: every
-///   weight it returns is a meta tensor of the element type and extents the other kind returns.
-///
-/// Every refusal a load decides from a tensor's name, element type or extents is a meta load's
-/// refusal too. Only a refusal that depends on a tensor's values (an all-zero matrix asked to
-/// hold a value, a zero or non-finite tensor scale) needs the payload.
+/// A loader reads each weight's payload, converts it and publishes it to its
+/// [`RetainedWeights`] store, unless the store already holds the weight's key: then it reads
+/// nothing. What a load is follows from the store: a device's retained storage, the CPU's
+/// ([`CpuWeights`]), or a profile run's ([`MetaWeights`]), which holds every key and so makes a
+/// load that reads no weight's payload. Every refusal a load decides from a tensor's name,
+/// element type or extents is the same over every store; a refusal that depends on a weight's
+/// values (an all-zero matrix asked to hold a value) is made where its bytes are produced.
 pub struct WeightLoader<'a> {
     /// The checkpoint the weights come from.
     checkpoint: &'a Checkpoint,
-    /// Where the weights go: retained storage, or meta tensors.
-    retention: Retention<'a>,
+    /// Where the weights go.
+    store: &'a dyn RetainedWeights,
     /// The element type every weight is read as unless the model pins another: the launch's
     /// explicit choice, or `None` for the checkpoint's own.
     dtype: Option<DType>,
@@ -516,31 +540,7 @@ impl<'a> WeightLoader<'a> {
     ) -> Self {
         Self {
             checkpoint,
-            retention: Retention::Store(store),
-            dtype,
-            representation: Representation::dense(),
-        }
-    }
-
-    /// A loader over `checkpoint` that reads no tensor payload and publishes nothing.
-    ///
-    /// Each weight's element type and extents come from the shard headers [`Checkpoint::open`]
-    /// already parsed, and `dtype` is the same element type [`WeightLoader::new`] takes. Every method returns what the device load of the same
-    /// arguments returns (the same element type, the same extents, the same representation, the
-    /// block-scale type the checkpoint stores, the published layout) and the same refusals,
-    /// because it runs the device load's own code up to the point where bytes would be read. The
-    /// tensors it returns are meta tensors at distinct addresses that no memory backs; a
-    /// weight's key gives the same tensor twice, as a retained store returns a key it holds.
-    ///
-    /// What a meta load cannot give is a tensor's **value**: [`Self::tensor_scale`] returns a
-    /// placeholder of one, a value-dependent refusal does not run, and the bytes of a computed
-    /// constant derived from a placeholder are not the device's. The caller is a model's load
-    /// for a profile run, which launches nothing and reads no weight: the shapes and element
-    /// types decide the kernels a model launches, and the values never enter a kernel key.
-    pub fn meta(checkpoint: &'a Checkpoint, dtype: Option<DType>) -> Self {
-        Self {
-            checkpoint,
-            retention: Retention::Meta(Rc::default()),
+            store,
             dtype,
             representation: Representation::dense(),
         }
@@ -554,8 +554,7 @@ impl<'a> WeightLoader<'a> {
     /// Reads every later weight by `declaration`, resolved against this loader's checkpoint.
     ///
     /// The resolution reads the shard headers once: a weight is packed when its shard stores a
-    /// block scale beside it, whatever the declaration's exclusion list says. A meta loader's
-    /// checkpoint holds the same headers, so it resolves the same way.
+    /// block scale beside it, whatever the declaration's exclusion list says.
     ///
     /// # Errors
     ///
@@ -584,50 +583,20 @@ impl<'a> WeightLoader<'a> {
         VarBuilder::new(self)
     }
 
-    /// The names of the tensors the weights of a meta load are gathered or computed from, as
-    /// their keys state them: for a profile run's check that a load names every tensor a
-    /// checkpoint holds. A table a module computes is named by itself and is no checkpoint
-    /// tensor; a scalar a module reads beside a weight (a tensor scale) is not a weight and is
-    /// not named. `None` for a loader over retained storage, whose checkpoint records the
-    /// tensors it read ([`Checkpoint::reading`]).
-    pub fn named(&self) -> Option<std::collections::BTreeSet<String>> {
-        match &self.retention {
-            Retention::Store(_) => None,
-            Retention::Meta(tensors) => Some(
-                tensors
-                    .borrow()
-                    .keys()
-                    .flat_map(|key| key.tensors.iter().cloned())
-                    .collect(),
-            ),
-        }
-    }
-
-    /// Whether this loader returns meta tensors instead of reading and publishing.
-    pub(crate) fn is_meta(&self) -> bool {
-        matches!(self.retention, Retention::Meta(_))
-    }
-
     /// The weight already held under `key`, as `shape` elements of its type.
     fn retained(&self, key: &WeightKey, shape: &Shape) -> Result<Option<Tensor>> {
-        match &self.retention {
-            Retention::Store(store) => match store.retained(key, shape)? {
-                Some(tensor) => Ok(Some(held(key, shape, tensor)?)),
-                None => Ok(None),
-            },
-            Retention::Meta(tensors) => match tensors.borrow().get(key) {
-                Some(tensor) => Ok(Some(tensor.reshape(shape.clone())?)),
-                None => Ok(None),
-            },
+        match self.store.retained(key, shape)? {
+            Some(tensor) => Ok(Some(held(key, shape, tensor)?)),
+            None => Ok(None),
         }
     }
 
     /// Publishes the weight of `key`, `shape` elements of `key.dtype`, and returns its tensor.
     ///
-    /// `bytes` produces the converted bytes from the checkpoint's payload; only a loader over a
-    /// store calls it, so everything a meta load must decide happens before this call. A
-    /// `writable` table goes to the store's writable storage and is never returned for a later
-    /// key.
+    /// `bytes` produces the converted bytes from the checkpoint's payload; it runs only for a
+    /// key the store does not hold, so everything a load decides from the shard headers happens
+    /// before this call, and a refusal that depends on the bytes happens in it. A `writable`
+    /// table goes to the store's writable storage and is never returned for a later key.
     pub(crate) fn publish_with<'c>(
         &self,
         key: &WeightKey,
@@ -635,38 +604,13 @@ impl<'a> WeightLoader<'a> {
         writable: bool,
         bytes: impl FnOnce(&Self) -> Result<Cow<'c, [u8]>>,
     ) -> Result<Tensor> {
-        match &self.retention {
-            Retention::Meta(tensors) => {
-                let element = ops::abi::bytes(key.dtype).ok_or_else(|| {
-                    Error::weight(
-                        &key.region(),
-                        format!(
-                            "{} has no whole-byte element size",
-                            ops::abi::name(key.dtype)
-                        ),
-                    )
-                })?;
-                let length = numel(shape)
-                    .checked_mul(element)
-                    .ok_or_else(|| Error::weight(&key.region(), "the weight's bytes overflow"))?;
-
-                let tensor = meta_tensor(key, shape, length)?;
-                if !writable {
-                    tensors.borrow_mut().insert(key.clone(), tensor.clone());
-                }
-                Ok(tensor)
-            }
-
-            Retention::Store(store) => {
-                let produced = bytes(self)?;
-                let tensor = if writable {
-                    store.writable(key, shape, &produced)?
-                } else {
-                    store.publish(key, shape, &produced)?
-                };
-                held(key, shape, tensor)
-            }
-        }
+        let produced = bytes(self)?;
+        let tensor = if writable {
+            self.store.writable(key, shape, &produced)?
+        } else {
+            self.store.publish(key, shape, &produced)?
+        };
+        held(key, shape, tensor)
     }
 
     /// Loads the weight `name` from `source`, converting and publishing it the first time and
@@ -725,12 +669,9 @@ impl<'a> WeightLoader<'a> {
             provenance: None,
         };
 
-        if let Some(weight) = self.retained(&key, shape)? {
-            return Ok(weight);
-        }
-
         // The bytes the source names, computed from the headers: every bound below is checked
-        // on a meta load as on a device load, and only the copy waits for the publish.
+        // on every load, over every store and whether or not the store holds the key, and only
+        // the copy waits for the publish.
         let spans = self.spans(source, &key)?;
         if source_dtype != dtype {
             conversion(source_dtype, dtype, name)?;
@@ -770,6 +711,9 @@ impl<'a> WeightLoader<'a> {
         }
         check_layout(name, source, layout)?;
 
+        if let Some(weight) = self.retained(&key, shape)? {
+            return Ok(weight);
+        }
         self.publish_with(&key, shape, false, |loader| {
             let bytes = loader.gather(&spans)?;
 
@@ -897,8 +841,7 @@ impl<'a> WeightLoader<'a> {
     /// A pipeline root holds one stage per subdirectory (`transformer/`, `vae/`,
     /// `text_encoder/`, …), each with its own index and its own file identities, so a model
     /// crate opens the root once and reads every stage through one store: a weight converted
-    /// once for one stage is reused for another and never converted twice. A meta loader's
-    /// reborrow is a meta loader over the same meta tensors.
+    /// once for one stage is reused for another and never converted twice.
     ///
     /// The element type is the loader's, not the stage's, so a stage it does not describe is
     /// refused here: a stage whose weights are an FP8 or NVFP4 encoding is read by its
@@ -912,13 +855,9 @@ impl<'a> WeightLoader<'a> {
     pub fn reborrow<'b>(&'b self, checkpoint: &'b Checkpoint) -> Result<WeightLoader<'b>> {
         self.check_policy(checkpoint)?;
 
-        let retention = match &self.retention {
-            Retention::Store(store) => Retention::Store(*store),
-            Retention::Meta(tensors) => Retention::Meta(Rc::clone(tensors)),
-        };
         Ok(WeightLoader {
             checkpoint,
-            retention,
+            store: self.store,
             dtype: self.dtype,
             representation: self.representation.clone(),
         })
@@ -944,17 +883,6 @@ impl<'a> WeightLoader<'a> {
         Ok(())
     }
 
-    /// Runs `check` over the checkpoint's payload, on a loader that reads one.
-    ///
-    /// A refusal that depends on a tensor's values and not on its element type or extents can
-    /// only be made with the payload in hand; a meta load skips it.
-    pub(crate) fn check_values(&self, check: impl FnOnce(&Checkpoint) -> Result<()>) -> Result<()> {
-        if self.is_meta() {
-            return Ok(());
-        }
-        check(self.checkpoint)
-    }
-
     /// The single positive scale the tensor named `tensor` holds, as the checkpoint states it.
     ///
     /// Both tensor scales a calibrated NVFP4 export writes (the weight's `weight_scale_2` and
@@ -963,8 +891,7 @@ impl<'a> WeightLoader<'a> {
     /// magnitude. A projection reads its weight's scale to build the product's `alpha` and its
     /// activation's to build the encoder's operand; the reciprocals are its callers'.
     ///
-    /// The tensor must be one floating number by its header on either kind of loader. A meta
-    /// loader reads no value and returns a placeholder of one.
+    /// The tensor must be one floating number by its header.
     ///
     /// # Errors
     ///
@@ -983,10 +910,6 @@ impl<'a> WeightLoader<'a> {
             ));
         }
         conversion(location.dtype, DType::F32, tensor)?;
-        if self.is_meta() {
-            return Ok(META_TENSOR_SCALE);
-        }
-
         let bytes = self.checkpoint.read(tensor)?;
         let scale = to_f32(location.dtype, &bytes, tensor)?[0];
         if !(scale.is_finite() && scale > 0.0) {
@@ -1000,7 +923,7 @@ impl<'a> WeightLoader<'a> {
 
     /// Publishes bytes this loader computes, under a key it built, and returns the weight.
     ///
-    /// A key already held is returned without calling `bytes`, and a meta loader never calls it.
+    /// A key already held is returned without calling `bytes`.
     pub(crate) fn publish_computed<'c>(
         &self,
         key: &WeightKey,
@@ -1223,31 +1146,6 @@ fn held(key: &WeightKey, shape: &Shape, tensor: Tensor) -> Result<Tensor> {
         ));
     }
     Ok(tensor)
-}
-
-/// A meta tensor of `shape` elements of the key's type, `bytes` bytes long, at an address of its
-/// own.
-fn meta_tensor(key: &WeightKey, shape: &Shape, bytes: u64) -> Result<Tensor> {
-    // Every weight takes at least one block, so even an empty weight has an address no other
-    // weight shares.
-    let span = bytes
-        .max(1)
-        .checked_next_multiple_of(ALIGNMENT)
-        .ok_or_else(|| Error::weight(&key.region(), "the weight's bytes overflow"))?;
-    let address = META_CURSOR.fetch_add(span, Ordering::Relaxed);
-
-    if address.checked_add(span).is_none() {
-        return Err(Error::weight(
-            &key.region(),
-            "the meta loader's address range is exhausted",
-        ));
-    }
-    Ok(ops::retained(
-        address,
-        shape.clone(),
-        key.dtype,
-        &ops::meta(),
-    )?)
 }
 
 /// The checkpoint tensors `source` reads, each once, in the order it first names them.
@@ -1598,9 +1496,9 @@ pub(crate) fn host_bytes(name: &str, tensor: &Tensor) -> Result<Vec<u8>> {
 /// launch states another, and an explicit statement is one conversion. `tensor` is what the
 /// refusal names when the pair is not one this loader converts.
 ///
-/// A weight narrowed to BF16 keeps its top sixteen bits: the loader truncates where the tensor
-/// library's `to_dtype` rounds to nearest. Served weights were narrowed this way, so a module
-/// that narrows a weight at load asks the loader for the element type and does not cast.
+/// Every narrowing rounds to the nearest value of the target type, ties to even: the IEEE rule
+/// the tensor library's `to_dtype` applies, so a weight the loader narrows holds the value a
+/// cast of the stored one holds.
 ///
 /// # Errors
 ///
@@ -1611,8 +1509,17 @@ pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec
         return Ok(bytes.to_vec());
     }
 
-    let source_bytes = usize::try_from(ops::abi::bytes(from).unwrap_or(4)).unwrap_or(4);
-    let target_bytes = usize::try_from(ops::abi::bytes(to).unwrap_or(4)).unwrap_or(4);
+    let width = |dtype: DType| {
+        ops::abi::bytes(dtype)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| {
+                Error::weight(
+                    tensor,
+                    format!("{} has no whole-byte element", ops::abi::name(dtype)),
+                )
+            })
+    };
+    let (source_bytes, target_bytes) = (width(from)?, width(to)?);
     if !bytes.len().is_multiple_of(source_bytes) {
         return Err(Error::weight(
             tensor,
@@ -1646,10 +1553,7 @@ pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec
         };
 
         match to {
-            // The top sixteen bits: truncation, as the function's documentation states.
-            DType::BF16 => {
-                converted.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes());
-            }
+            DType::BF16 => converted.extend_from_slice(&bf16::from_f32(value).to_le_bytes()),
             DType::F16 => converted.extend_from_slice(&f16::from_f32(value).to_le_bytes()),
             DType::F32 => converted.extend_from_slice(&value.to_le_bytes()),
             DType::I16 => converted.extend_from_slice(&f32_to_i16(value).to_le_bytes()),
@@ -1826,15 +1730,27 @@ mod tests {
         }
     }
 
-    /// A weight narrowed to BF16 keeps its top sixteen bits, where rounding to nearest would
-    /// carry into them.
+    /// A weight narrowed to BF16 rounds to the nearest value, ties to even, as the tensor
+    /// library's conversion does.
     #[test]
-    fn a_weight_narrowed_to_bf16_is_truncated() {
-        // 1 + 2⁻⁸ + 2⁻⁹ lies three quarters of a BF16 step above one: nearest is the next value
-        // up, the truncation is one.
-        let value = 1.0_f32 + 2f32.powi(-8) + 2f32.powi(-9);
-        let narrowed = convert(DType::F32, DType::BF16, &value.to_le_bytes(), "w").unwrap();
-        assert_eq!(u16::from_le_bytes([narrowed[0], narrowed[1]]), 0x3f80);
+    fn a_weight_narrowed_to_bf16_rounds_to_nearest_even() {
+        // 1 + 2⁻⁸ + 2⁻⁹ lies three quarters of a BF16 step above one: the nearest value is the
+        // next one up. 1 + 2⁻⁸ lies half a step above one: the tie goes to the even one.
+        for (value, expected) in [
+            (1.0_f32 + 2f32.powi(-8) + 2f32.powi(-9), 0x3f81_u16),
+            (1.0_f32 + 2f32.powi(-8), 0x3f80),
+        ] {
+            let narrowed = convert(DType::F32, DType::BF16, &value.to_le_bytes(), "w").unwrap();
+            assert_eq!(u16::from_le_bytes([narrowed[0], narrowed[1]]), expected);
+
+            let library = Tensor::new(&[value], &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_vec1::<bf16>()
+                .unwrap();
+            assert_eq!(library[0].to_bits(), expected);
+        }
     }
 
     #[test]

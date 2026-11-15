@@ -11,7 +11,8 @@ mod support;
 
 use nn::modules::{TimestepEmbedding, TimestepEmbeddingConfig, TimestepTable, TimestepTableConfig};
 use nn::{
-    Checkpoint, CpuWeights, DType, Device, Step, Tensor, WeightLoader, diffusion, functional,
+    Checkpoint, CpuWeights, DType, Device, MetaWeights, Step, Tensor, WeightLoader, diffusion,
+    functional,
 };
 use support::{
     assert_close, f32_bytes, meta, operators, recorded, sequence, shard, tensor, values,
@@ -199,7 +200,9 @@ fn a_timestep_embedding_projects_activates_and_projects() {
         F32_TOLERANCE,
     );
 
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let embedding = TimestepEmbedding::load(&config, loader.root().pp("time")).unwrap();
     let (out, launches) = recorded(|| embedding.forward(&meta((2, 16), DType::F32)));
     assert_eq!(out.unwrap().dims(), [2, 5]);
@@ -278,7 +281,8 @@ fn a_timestep_table_holds_each_distinct_level_once() {
 fn a_step_gathers_its_entries_and_its_rows_on_the_device() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(directory.path(), &[("placeholder", vec![1], vec![0.0])]);
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let levels = tensor(&LEVELS, (3, 2), DType::F32);
     let table = TimestepTable::load(&TABLE, &levels, loader.root().pp("adaln")).unwrap();
 

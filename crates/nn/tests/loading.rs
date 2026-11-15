@@ -15,8 +15,8 @@ use std::path::Path;
 use nn::quantization::{ModeloptManifest, Nvfp4Names, UNIFIED_EXPORT, ValueLayout};
 use nn::weights::PartBlock;
 use nn::{
-    Checkpoint, CpuWeights, DType, Device, Shape, Tensor, WeightKey, WeightLayout, WeightLoader,
-    WeightSource,
+    Checkpoint, CpuWeights, DType, Device, MetaWeights, Shape, Tensor, WeightKey, WeightLayout,
+    WeightLoader, WeightSource,
 };
 use ops::fp4::ScaleLayout;
 use support::{encode, f32_bytes, shard, values};
@@ -372,7 +372,8 @@ fn a_region_of_zeros_is_refused_when_the_load_asks_for_a_value() {
     asked(&loader, "k_proj.weight", true).unwrap();
 
     // A meta loader reads no payload, so the zeros are not there for it to refuse.
-    let meta = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let meta = WeightLoader::new(&checkpoint, &store, None);
     asked(&meta, "v_proj.weight", true).unwrap();
 }
 
@@ -998,7 +999,9 @@ fn a_meta_load_returns_what_a_load_of_the_payload_returns() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = dense_checkpoint(directory.path());
 
-    let meta = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+
+    let meta = WeightLoader::new(&checkpoint, &store, None);
     let from_headers = dense_loads(&meta);
     assert_eq!(
         checkpoint.reading().0,
@@ -1051,7 +1054,8 @@ fn a_meta_load_refuses_what_the_header_contradicts() {
     let checkpoint = dense_checkpoint(directory.path());
     let store = CpuWeights::new();
     let payload = WeightLoader::new(&checkpoint, &store, None);
-    let meta = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let meta = WeightLoader::new(&checkpoint, &store, None);
 
     let past = region("proj.weight", (8, 8));
     let tails = WeightSource::Parts {
@@ -1123,8 +1127,8 @@ fn a_meta_load_refuses_what_the_header_contradicts() {
             .expect_err("block scales of another table")
             .to_string()
     };
-    let store = CpuWeights::new();
-    let refused = stack(&WeightLoader::meta(&checkpoint, None));
+    let (store, meta) = (CpuWeights::new(), MetaWeights::new());
+    let refused = stack(&WeightLoader::new(&checkpoint, &meta, None));
     assert_eq!(
         refused,
         stack(&WeightLoader::new(&checkpoint, &store, None))
@@ -1132,10 +1136,10 @@ fn a_meta_load_refuses_what_the_header_contradicts() {
     assert!(refused.contains("linear"), "{refused}");
 }
 
-/// A meta load never sees a value: a tensor scale of zero, which a load of the payload refuses,
-/// is the placeholder of one.
+/// A tensor scale is read and refused by its value over every store: a zero scale encodes no
+/// product, whether the load publishes its weights or states meta tensors.
 #[test]
-fn a_meta_load_reads_no_value() {
+fn a_tensor_scale_is_refused_by_its_value_over_every_store() {
     let directory = tempfile::tempdir().unwrap();
     shard(
         directory.path(),
@@ -1148,17 +1152,16 @@ fn a_meta_load_reads_no_value() {
         )],
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
-    let store = CpuWeights::new();
+    let (store, meta) = (CpuWeights::new(), MetaWeights::new());
 
-    let meta = WeightLoader::meta(&checkpoint, None);
-    assert_eq!(meta.tensor_scale("proj.weight_scale_2").unwrap(), 1.0);
-    assert!(checkpoint.reading().0.is_empty(), "no tensor was read");
-
-    let refused = WeightLoader::new(&checkpoint, &store, None)
-        .tensor_scale("proj.weight_scale_2")
-        .unwrap_err();
-    assert!(
-        refused.to_string().contains("not a positive number"),
-        "{refused}"
-    );
+    for loader in [
+        WeightLoader::new(&checkpoint, &store, None),
+        WeightLoader::new(&checkpoint, &meta, None),
+    ] {
+        let refused = loader.tensor_scale("proj.weight_scale_2").unwrap_err();
+        assert!(
+            refused.to_string().contains("not a positive number"),
+            "{refused}"
+        );
+    }
 }

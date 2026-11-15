@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use models::qwen3::{Config, Qwen3VlModel};
 use nn::config::Fields;
 use nn::family::{Projection, SequenceSplit, TextModel, TextPlacement};
-use nn::{DType, Encoder, ExpertExchange, Phase, Shape, Split, Tensor, WeightLoader};
+use nn::{DType, Encoder, ExpertExchange, MetaWeights, Phase, Shape, Split, Tensor, WeightLoader};
 use processing::qwen_vl::ProcessorConfig;
 
 /// Where the released checkpoints are.
@@ -63,7 +63,8 @@ fn load(name: &str, placement: &TextPlacement) -> Arc<dyn TextModel> {
     );
 
     let checkpoint = support::checkpoint(&root);
-    let mut loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
     support::load(&checkpoint, &mut loader, placement)
 }
 
@@ -693,7 +694,9 @@ fn the_vl_encoder_profiles_a_prompt_with_an_image() {
             .expect("the pixel normalization"),
     );
 
-    let loader = WeightLoader::meta(checkpoint, None);
+    let store = MetaWeights::new();
+
+    let loader = WeightLoader::new(checkpoint, &store, None);
     let model = Qwen3VlModel::load(&config, loader.root(), images, Split::WHOLE, 50, false)
         .expect("the meta load");
     let vision = config.vision.as_ref().expect("a tower");

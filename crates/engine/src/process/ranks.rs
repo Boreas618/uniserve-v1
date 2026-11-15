@@ -96,7 +96,7 @@ use storage::QueuePair;
 use storage::protocol::UnitRun;
 use storage::runtime::{Class, Group, GroupId, Open, Opened, Region, Segments, Tier, VERSION};
 
-use self::rank::{Collective, ModelRunner, RankModel, Weights, parallel_order};
+use self::rank::{Collective, ModelRunner, RankModel, parallel_order};
 use crate::process::binding::{self, Served};
 use crate::process::ranks::rank::memory::{
     Peaks, fewest_states, fewest_units, granularity, plane_segments,
@@ -144,7 +144,7 @@ pub(crate) enum Backing<'a> {
         kernels: &'a Resolve<'a>,
     },
     /// Nothing outside this process: each rank's model is loaded from the shard headers alone
-    /// ([`nn::WeightLoader::meta`]), its runner and owners hold no device, its tensor group
+    /// ([`nn::MetaWeights`]), its runner and owners hold no device, its tensor group
     /// states its split with no communicator, and it serves generation [`FIRST_GENERATION`] of
     /// no kernel.
     Meta,
@@ -576,7 +576,7 @@ fn load_rank(
     // Steps 4-8: the meta load, the cache's layout, the meta owners and the profiled runner.
     let experts = model_runner.experts();
     let meta = model_runner
-        .load_text(Weights::Meta, &experts)
+        .load_text(&nn::MetaWeights::new(), &experts)
         .context("loading the epoch's model from its checkpoint's headers")?;
     let layout = Arc::new(model_runner.cache_layout(meta.as_ref())?);
     let least = fewest_units(&layout);
@@ -715,7 +715,7 @@ fn load_rank(
     // Step 10: the weights, retained at the Storage Server and mapped on the device.
     let store = Arc::new(WeightStore::new(Arc::clone(&client), device)?);
     let model = model_runner
-        .load_text(Weights::Retained(store.as_ref()), &experts)
+        .load_text(store.as_ref(), &experts)
         .context("loading the epoch's model")?;
     let weights = store
         .finish()
@@ -955,7 +955,7 @@ fn load_video_rank(
     // Step 10: the weights, retained at the Storage Server and mapped on the device.
     let store = Arc::new(WeightStore::new(Arc::clone(&client), device)?);
     video.model = model_runner
-        .load_video(Weights::Retained(store.as_ref()))
+        .load_video(store.as_ref())
         .context("loading the epoch's pipeline")?;
     let weights = store
         .finish()

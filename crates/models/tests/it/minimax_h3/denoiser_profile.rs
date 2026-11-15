@@ -1,7 +1,7 @@
 //! Profile runs of the denoiser on the meta device, over the released checkpoints' headers.
 //!
 //! Each run opens a checkpoint through the family, loads the network a deployment places from
-//! the shard headers alone (`nn::WeightLoader::meta`) and runs its forwards under a meta
+//! the shard headers alone (`nn::MetaWeights`) and runs its forwards under a meta
 //! context over meta tensors: the tables filled after the load, the conditioning of a prompt,
 //! and one denoising step of a small and of a large layout. A meta forward computes nothing; it
 //! checks every operand and states the kernel each launch would run, so a run yields the
@@ -26,8 +26,8 @@ use nn::family::{
     VideoServing,
 };
 use nn::{
-    Checkpoint, Clip, ConditionRole, ConditionShape, Conditioning, DType, Split, VideoRequest,
-    WeightLoader,
+    Checkpoint, Clip, ConditionRole, ConditionShape, Conditioning, DType, MetaWeights, Split,
+    VideoRequest, WeightLoader,
 };
 use proto::config::{PrecisionMode, Quantization, WeightFormat};
 use support::{Recording, meta, recorded, recorded_at, report};
@@ -87,7 +87,8 @@ fn load_under(
         dtype: DType::BF16,
         serving: serving(),
     };
-    let mut loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let mut loader = WeightLoader::new(&checkpoint, &store, None);
 
     opened.load(&checkpoint, &mut loader, &placement)
 }

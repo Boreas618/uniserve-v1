@@ -14,7 +14,7 @@ use std::ops::Range;
 use nn::modules::{
     Activation1d, Activation1dConfig, BigVgan, BigVganConfig, DacEncoder, DacEncoderConfig,
 };
-use nn::{Checkpoint, CpuWeights, DType, Tensor, WeightLoader, functional, vae};
+use nn::{Checkpoint, CpuWeights, DType, MetaWeights, Tensor, WeightLoader, functional, vae};
 use support::{
     assert_close, f32_bytes, meta, operators, recorded, recorded_split, sequence, shard, tensor,
     values,
@@ -490,7 +490,9 @@ fn a_bigvgan_generator_upsamples_through_its_stages() {
     let checkpoint = checkpoint(directory.path(), &bigvgan_tensors());
     let config = bigvgan_config();
 
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let generator = BigVgan::load(&config, loader.root().pp("decoder")).unwrap();
     assert_eq!(generator.samples(16), 32);
     let odd = BigVganConfig {
@@ -577,7 +579,9 @@ fn a_dac_encoder_widens_and_strides_through_its_stages() {
         latent_channels: 8,
     };
 
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let encoder = DacEncoder::load(&config, loader.root().pp("enc")).unwrap();
     assert_eq!(encoder.hop(), 2);
     let no_stage = DacEncoderConfig {

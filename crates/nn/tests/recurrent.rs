@@ -17,8 +17,8 @@ use nn::family::StateField;
 use nn::functional::{self, WeightOrder};
 use nn::modules::{GatedDeltaNet, GatedDeltaNetConfig};
 use nn::{
-    Checkpoint, CpuWeights, DType, Device, NO_SLOT, Phase, RecurrentState, Tensor, TokenBatch,
-    WeightLoader,
+    Checkpoint, CpuWeights, DType, Device, MetaWeights, NO_SLOT, Phase, RecurrentState, Tensor,
+    TokenBatch, WeightLoader,
 };
 use support::{assert_close, encode, meta, operators, recorded, sequence, shard, tensor, values};
 
@@ -913,7 +913,8 @@ fn a_gated_delta_net_states_its_fields_and_its_kernels() {
 
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(directory.path(), DType::BF16, &weights(&config));
-    let loader = WeightLoader::meta(&checkpoint, None);
+    let store = MetaWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None);
     let network = GatedDeltaNet::load(&config, loader.root().pp("mixer")).unwrap();
 
     // The heads of the convolved row are views of it, so the forward is the eight launches of
