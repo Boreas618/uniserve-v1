@@ -15,13 +15,11 @@
 
 use std::sync::Arc;
 
+use ops::allocator::ALIGNMENT;
 use platform::{CopyBatch, DeviceId, Event, EventFlags, PinnedBuffer, SourceOrder, Stream};
 use tensor::{DType, Device, Tensor};
 
 use crate::worker::{Error, Result};
-
-/// The alignment of each output in a turn: the widest element type's, and a copy's preferred one.
-const ALIGNMENT: usize = 256;
 
 /// The page-locked turns a runner's steps read their outputs into.
 pub(crate) struct Readback {
@@ -85,7 +83,9 @@ impl Readback {
 
             layout.push((output.dtype(), output.dims().to_vec(), bytes, size));
             sources.push(source);
-            bytes += size.next_multiple_of(ALIGNMENT);
+            // Each output starts at the allocator's alignment, which covers the widest element
+            // type and is a copy's preferred one.
+            bytes += size.next_multiple_of(ALIGNMENT as usize);
         }
 
         let turn = self.free_turn(bytes)?;

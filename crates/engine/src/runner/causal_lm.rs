@@ -175,7 +175,7 @@ use self::experts::Member;
 use self::features::Features;
 use self::readback::{Pending, Readback};
 use self::slots::Slots;
-use self::speculation::{DraftPool, DraftTable, Kept, Speculation};
+use self::speculation::{DraftPool, DraftTable, Entry, Kept, Speculation};
 use crate::memory::buffers::BufferMemory;
 use crate::memory::cache::{CacheLayout, scratch};
 use crate::memory::state::layer_fields;
@@ -1703,29 +1703,22 @@ impl Runner for CausalLmRunner {
 
         // The order `output` states, each entry with its place among the kept tensors.
         let mut scores = scores.into_iter();
-        let mut outputs = vec![(speculation::CHOSEN, chosen)];
+        let mut outputs = vec![(Entry::Chosen, chosen)];
 
         outputs.extend(
-            [speculation::LOGPROBS, speculation::RANKS]
+            [Entry::Logprobs, Entry::Ranks]
                 .into_iter()
                 .zip(scores.by_ref()),
         );
-        outputs.extend([
-            (speculation::LOGICAL, logical),
-            (speculation::SAMPLING, sampling),
-        ]);
-        outputs.extend(
-            [speculation::TOP_VALUES, speculation::TOP_IDS]
-                .into_iter()
-                .zip(scores),
-        );
-        outputs.extend(valid.map(|valid| (speculation::VALID, valid)));
+        outputs.extend([(Entry::Logical, logical), (Entry::Sampling, sampling)]);
+        outputs.extend([Entry::TopValues, Entry::TopIds].into_iter().zip(scores));
+        outputs.extend(valid.map(|valid| (Entry::Valid, valid)));
         outputs.extend(
             [
-                speculation::PROMPT_LOGPROBS,
-                speculation::PROMPT_RANKS,
-                speculation::PROMPT_VALUES,
-                speculation::PROMPT_IDS,
+                Entry::PromptLogprobs,
+                Entry::PromptRanks,
+                Entry::PromptValues,
+                Entry::PromptIds,
             ]
             .into_iter()
             .zip(prompt),
@@ -1735,7 +1728,7 @@ impl Runner for CausalLmRunner {
         // runner that speculates keeps the outputs and the hidden rows in its own.
         match &self.speculation {
             Some(speculation) => {
-                speculation.kept.keep(speculation::HIDDEN, &hidden)?;
+                speculation.kept.keep(Entry::Hidden, &hidden)?;
 
                 outputs
                     .into_iter()

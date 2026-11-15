@@ -15,10 +15,7 @@
 use platform::{CopyBatch, DeviceId, Event, EventFlags, PinnedBuffer, SourceOrder, Stream};
 
 use crate::worker::{Error, Result};
-
-/// The alignment of a slot and of its two areas: the alignment of the device blocks the bytes
-/// are copied to.
-const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
+use ops::allocator::ALIGNMENT;
 
 /// The memory behind the ring.
 enum Memory {

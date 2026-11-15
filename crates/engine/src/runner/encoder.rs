@@ -46,12 +46,10 @@ use crate::runner::Runner;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
 use crate::worker::{Error, Result};
+use ops::allocator::ALIGNMENT;
 
 /// The phase an encoder runner serves.
 const PHASES: &[Phase] = &[Phase::TextEncode];
-
-/// The alignment of each input column in the input block.
-const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
 
 /// The input columns, in the order they lie in the input block, each of 4-byte elements:
 /// `[tokens]` U32 ids, `[tokens]` I32 positions, `[tokens]` U32 slot mapping, `[rows]` U32

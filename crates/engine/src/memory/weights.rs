@@ -66,10 +66,6 @@ use crate::worker::error::report;
 use crate::worker::{Error, Result};
 use service::lock;
 
-/// The alignment of a packed weight's first byte in its allocation: what a device allocation
-/// of its own guarantees, so a kernel reads a packed weight as it reads any other.
-const PACKED_ALIGNMENT: usize = 256;
-
 /// The key `weight` is filed under at the Storage Server, before the GPU that holds a copy is
 /// named: the digest of its text, which is every file's identity, the element type, the layout
 /// name and the region, and nothing about which kernel reads it.
@@ -104,7 +100,9 @@ fn packed_offset(
             .map(|range| range.end)
             .max()
             .unwrap_or(0)
-            .next_multiple_of(PACKED_ALIGNMENT),
+            // A packed weight's first byte is aligned as a device allocation of its own is, so a
+            // kernel reads a packed weight as it reads any other.
+            .next_multiple_of(ops::allocator::ALIGNMENT as usize),
     };
     let range = offset..offset.checked_add(length)?;
 

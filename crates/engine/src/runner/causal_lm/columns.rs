@@ -164,13 +164,13 @@ use crate::memory::tables::BlockTables;
 use crate::runner::buckets::Bucket;
 use crate::runner::sampler;
 use crate::worker::{Error, Result};
+use ops::allocator::ALIGNMENT;
+use strum::{EnumCount, EnumIter, IntoEnumIterator as _};
 
-/// The alignment of a column in the input block: the allocator's, which `Graphs::input` asks
-/// of every input tensor.
-const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
-
-/// One input tensor of the runner (module documentation).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// One input tensor of the runner (module documentation), declared in the order the layout
+/// places them: [`Column::iter`] walks them in that order, and a column's discriminant is its
+/// place among them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, EnumCount, EnumIter)]
 pub(crate) enum Column {
     InputIds,
     Positions,
@@ -225,60 +225,6 @@ pub(crate) enum Column {
 }
 
 impl Column {
-    /// Every column, in the order the layout places them.
-    const ALL: [Self; 50] = [
-        Self::InputIds,
-        Self::Positions,
-        Self::SlotMapping,
-        Self::Targets,
-        Self::SeqLens,
-        Self::QueryOffsets,
-        Self::LogitsRows,
-        Self::Slots,
-        Self::TableRows,
-        Self::SlotRows,
-        Self::CallSlots,
-        Self::Parameters,
-        Self::Draws,
-        Self::Adjustments,
-        Self::Checkpoints,
-        Self::Commit,
-        Self::Valid,
-        Self::Active,
-        Self::Continuation,
-        Self::Points,
-        Self::LiveTokens,
-        Self::StateOffsets,
-        Self::StateLens,
-        Self::StateSlots,
-        Self::Drafts,
-        Self::Extras,
-        Self::Windows,
-        Self::Firsts,
-        Self::DraftTokens,
-        Self::DraftSteps,
-        Self::TokenCap,
-        Self::NextIds,
-        Self::NextRows,
-        Self::EntryRows,
-        Self::EntrySteps,
-        Self::DraftSlots,
-        Self::NoSlots,
-        Self::DraftLens,
-        Self::DraftTables,
-        Self::LastEntries,
-        Self::ProposalRows,
-        Self::ChainPositions,
-        Self::ChainLens,
-        Self::ChainSlots,
-        Self::ChainIndex,
-        Self::ChainOffsets,
-        Self::LiveRows,
-        Self::NextContext,
-        Self::StateIndices,
-        Self::TokenContext,
-    ];
-
     /// The element type of the column's tensor.
     pub(crate) const fn dtype(self) -> DType {
         match self {
@@ -353,8 +299,8 @@ pub(crate) struct Layout {
     drafts: usize,
     /// The pages of a row of the drafter's page table; zero without speculation.
     pages: usize,
-    /// Each column's offset in the block, in the order of [`Column::ALL`].
-    offsets: [u64; Column::ALL.len()],
+    /// Each column's offset in the block, by the column's discriminant.
+    offsets: [u64; Column::COUNT],
     /// The bytes of the block.
     bytes: u64,
 }
@@ -363,10 +309,10 @@ impl Layout {
     /// The layout of columns of `rows` rows and `tokens` tokens, for verifications of at most
     /// `drafts` drafts and a drafter's page table of `pages` pages a row.
     pub(crate) fn new(rows: usize, tokens: usize, drafts: usize, pages: usize) -> Self {
-        let mut offsets = [0; Column::ALL.len()];
+        let mut offsets = [0; Column::COUNT];
         let mut bytes = 0_u64;
 
-        for (offset, column) in offsets.iter_mut().zip(Column::ALL) {
+        for (offset, column) in offsets.iter_mut().zip(Column::iter()) {
             *offset = bytes;
 
             let elements = column.elements(rows, tokens, drafts, pages) as u64;

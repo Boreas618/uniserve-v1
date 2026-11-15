@@ -57,8 +57,10 @@
 use std::sync::Arc;
 
 use crate::batch::{Columns, NewSlot, StateCopy, StateDirection};
+use ops::allocator::ALIGNMENT;
 use ops::sampler::ban_words;
 use platform::{PinnedBuffer, Stream};
+use strum::{EnumCount, EnumIter, IntoEnumIterator as _};
 use tensor::{DType, Shape, Tensor};
 
 use super::columns::slot_row;
@@ -66,27 +68,67 @@ use crate::memory::allocation::Storage;
 use crate::runner::sampler::Sampler;
 use crate::worker::{Error, Result};
 
-/// The alignment of a table in the slot memory.
-const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
-
 /// The least bytes of page-locked memory the write buffer grows by: a step's small writes
 /// (slot starts, a few ban masks) fit one such block.
 const WRITE_BLOCK: usize = 1 << 16;
 
-/// The tables of the slot memory, in the order they lie in it. Every runner holds the first
-/// [`HELD`]; the last two are held where a forward reads them (module documentation).
-const TABLES: usize = 10;
-const HELD: usize = 8;
-const COUNTS: usize = 0;
-const BIAS: usize = 1;
-const FUTURE: usize = 2;
-const PREDICATES: usize = 3;
-const LOGICAL: usize = 4;
-const SAMPLING: usize = 5;
-const VERIFIED: usize = 6;
-const BANS: usize = 7;
-const CONTEXT: usize = 8;
-const ACCEPTED: usize = 9;
+/// One table of the slot memory, declared in the order the tables lie in it: [`Table::iter`]
+/// walks them in that order, and a table's discriminant is its place among them. Every runner
+/// holds the tables up to the ban masks ([`Held`]); the context table and the accepted counts
+/// are held where a forward reads them (module documentation).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, EnumCount, EnumIter)]
+enum Table {
+    Counts,
+    Bias,
+    Future,
+    Predicates,
+    Logical,
+    Sampling,
+    Verified,
+    Bans,
+    Context,
+    Accepted,
+}
+
+impl Table {
+    /// The shape and the element type of the table, for `slots` request slots over a
+    /// `vocabulary`-wide logit row, buckets of at most `rows` rows and `width` next input tokens
+    /// a slot. `context` and `accepted` state whether the runner holds the context table and the
+    /// accepted counts; a table it does not hold has no row.
+    fn shape(
+        self,
+        (slots, vocabulary, rows, width): (usize, usize, usize, usize),
+        context: bool,
+        accepted: bool,
+    ) -> (Shape, DType) {
+        let held = |held: bool| if held { slots + 1 } else { 0 };
+        match self {
+            Self::Counts => ((slots, vocabulary).into(), DType::I32),
+            Self::Bias => ((slots, vocabulary).into(), DType::F32),
+            Self::Future => ((slots + 1, width).into(), DType::U32),
+            Self::Predicates => (slots.into(), DType::U8),
+            Self::Logical | Self::Sampling | Self::Verified => ((slots + 1).into(), DType::I32),
+            Self::Bans => {
+                let words = ban_words(vocabulary as u32) as usize;
+                ((rows, words).into(), DType::U32)
+            }
+            Self::Context => ((held(context), 2).into(), DType::U32),
+            Self::Accepted => (held(accepted).into(), DType::U32),
+        }
+    }
+}
+
+/// The tables every runner holds, each over its part of the slot memory.
+struct Held {
+    counts: Tensor,
+    bias: Tensor,
+    future: Tensor,
+    predicates: Tensor,
+    logical: Tensor,
+    sampling: Tensor,
+    verified: Tensor,
+    bans: Tensor,
+}
 
 /// The request slots' device state (module documentation).
 pub(crate) struct Slots {
@@ -98,8 +140,8 @@ pub(crate) struct Slots {
     rows: u32,
     /// The next input tokens a slot holds: one, and one per draft of a runner that speculates.
     width: u32,
-    /// Each table every runner holds, in the order of the table constants.
-    tables: [Tensor; HELD],
+    /// Each table every runner holds.
+    tables: Held,
     /// The context table, for a model whose layers read token ids.
     context: Option<Tensor>,
     /// The accepted counts, for a runner whose forwards lend verify slots.
@@ -114,8 +156,8 @@ struct Device {
     stream: Stream,
     /// The tables' memory.
     storage: Arc<Storage>,
-    /// Each table's offset in `storage`.
-    offsets: [u64; TABLES],
+    /// Each table's offset in `storage`, by the table's discriminant.
+    offsets: [u64; Table::COUNT],
     /// The page-locked blocks the step's copies read. A step that needs more than the blocks
     /// hold adds one; the blocks are folded into one when the next step begins.
     blocks: Vec<PinnedBuffer>,
@@ -125,8 +167,8 @@ struct Device {
     unsettled: bool,
 }
 
-/// The shape and the element type of each table. `context` and `accepted` state whether the
-/// runner holds the context table and the accepted counts; a table it does not hold has no row.
+/// The shape and the element type of each table, by the table's discriminant (as
+/// [`Table::shape`] states them).
 fn shapes(
     slots: u32,
     vocabulary: u32,
@@ -134,28 +176,21 @@ fn shapes(
     width: u32,
     context: bool,
     accepted: bool,
-) -> [(Shape, DType); TABLES] {
-    let (slots, vocabulary) = (slots as usize, vocabulary as usize);
-    let words = ban_words(vocabulary as u32) as usize;
-    let held = |held: bool| if held { slots + 1 } else { 0 };
-
-    [
-        ((slots, vocabulary).into(), DType::I32),
-        ((slots, vocabulary).into(), DType::F32),
-        ((slots + 1, width as usize).into(), DType::U32),
-        (slots.into(), DType::U8),
-        ((slots + 1).into(), DType::I32),
-        ((slots + 1).into(), DType::I32),
-        ((slots + 1).into(), DType::I32),
-        ((rows as usize, words).into(), DType::U32),
-        ((held(context), 2).into(), DType::U32),
-        (held(accepted).into(), DType::U32),
-    ]
+) -> Vec<(Shape, DType)> {
+    let extents = (
+        slots as usize,
+        vocabulary as usize,
+        rows as usize,
+        width as usize,
+    );
+    Table::iter()
+        .map(|table| table.shape(extents, context, accepted))
+        .collect()
 }
 
-/// Each table's offset in the slot memory, and the memory's bytes.
-fn offsets(shapes: &[(Shape, DType); TABLES]) -> ([u64; TABLES], u64) {
-    let mut offsets = [0; TABLES];
+/// Each table's offset in the slot memory, by the table's discriminant, and the memory's bytes.
+fn offsets(shapes: &[(Shape, DType)]) -> ([u64; Table::COUNT], u64) {
+    let mut offsets = [0; Table::COUNT];
     let mut bytes = 0_u64;
 
     for (offset, (shape, dtype)) in offsets.iter_mut().zip(shapes) {
@@ -230,7 +265,7 @@ impl Slots {
                 // it, which this value keeps for as long as the tensors over it exist.
                 unsafe { platform::memset_d8(storage.address(), 0, bytes, &stream) }?;
                 if accepted {
-                    let address = storage.address() + offsets[ACCEPTED];
+                    let address = storage.address() + offsets[Table::Accepted as usize];
                     // SAFETY: as above.
                     unsafe { platform::memset_d32(address, 1, slots as usize + 1, &stream) }?;
                 }
@@ -248,7 +283,8 @@ impl Slots {
         };
 
         // Each table's tensor over the memory, or a meta tensor for graphs that hold no device.
-        let table = |index: usize| -> Result<Tensor> {
+        let table = |table: Table| -> Result<Tensor> {
+            let index = table as usize;
             let (shape, dtype) = shapes[index].clone();
             match &device {
                 // SAFETY: this value owns the storage and outlives the tensors' work: the
@@ -265,19 +301,25 @@ impl Slots {
             }
         };
 
-        let mut held = Vec::with_capacity(HELD);
-        for index in 0..HELD {
-            held.push(table(index)?);
-        }
-        let context = context.then(|| table(CONTEXT)).transpose()?;
-        let accepted = accepted.then(|| table(ACCEPTED)).transpose()?;
+        let held = Held {
+            counts: table(Table::Counts)?,
+            bias: table(Table::Bias)?,
+            future: table(Table::Future)?,
+            predicates: table(Table::Predicates)?,
+            logical: table(Table::Logical)?,
+            sampling: table(Table::Sampling)?,
+            verified: table(Table::Verified)?,
+            bans: table(Table::Bans)?,
+        };
+        let context = context.then(|| table(Table::Context)).transpose()?;
+        let accepted = accepted.then(|| table(Table::Accepted)).transpose()?;
 
         Ok(Self {
             slots,
             vocabulary,
             rows,
             width,
-            tables: into_tables(held)?,
+            tables: held,
             context,
             accepted,
             device,
@@ -286,33 +328,33 @@ impl Slots {
 
     /// The count table, `[slots, vocabulary]` I32.
     pub(crate) const fn counts(&self) -> &Tensor {
-        &self.tables[COUNTS]
+        &self.tables.counts
     }
 
     /// The bias table, `[slots, vocabulary]` F32.
     pub(crate) const fn bias(&self) -> &Tensor {
-        &self.tables[BIAS]
+        &self.tables.bias
     }
 
     /// The next input tokens, `[slots + 1, width]` U32, the padding row included: what a
     /// decode row gathers its input token from.
     pub(crate) const fn future(&self) -> &Tensor {
-        &self.tables[FUTURE]
+        &self.tables.future
     }
 
     /// The logical positions, `[slots + 1]` I32, the padding row included.
     pub(crate) const fn logical(&self) -> &Tensor {
-        &self.tables[LOGICAL]
+        &self.tables.logical
     }
 
     /// The sampling positions, `[slots + 1]` I32, the padding row included.
     pub(crate) const fn sampling(&self) -> &Tensor {
-        &self.tables[SAMPLING]
+        &self.tables.sampling
     }
 
     /// The ban masks, `[rows, ceil(vocabulary / 32)]` U32.
     pub(crate) const fn bans(&self) -> &Tensor {
-        &self.tables[BANS]
+        &self.tables.bans
     }
 
     /// The context table, `[slots + 1, 2]` U32, the padding row included: row `s - 1` holds the
@@ -338,14 +380,14 @@ impl Slots {
     /// What the tensor library refuses of a view.
     pub(crate) fn committed(&self) -> Result<[Tensor; 5]> {
         let slots = self.slots as usize;
-        let requests = |table: usize| self.tables[table].narrow(0, 0, slots);
+        let requests = |table: &Tensor| table.narrow(0, 0, slots);
 
         Ok([
-            requests(FUTURE)?,
-            self.tables[PREDICATES].clone(),
-            requests(LOGICAL)?,
-            requests(SAMPLING)?,
-            requests(VERIFIED)?,
+            requests(&self.tables.future)?,
+            self.tables.predicates.clone(),
+            requests(&self.tables.logical)?,
+            requests(&self.tables.sampling)?,
+            requests(&self.tables.verified)?,
         ])
     }
 
@@ -422,22 +464,22 @@ impl Slots {
             // An empty history is a zeroed row, which the device fills without a copy. The
             // sampler states a row's values for the row of its tables the slot owns.
             if new.history.is_empty() {
-                self.zero(COUNTS, u64::from(own) * row_bytes, self.vocabulary)?;
+                self.zero(Table::Counts, u64::from(own) * row_bytes, self.vocabulary)?;
             } else {
                 let row = sampler.count_row(own, &new.history)?;
-                self.write(COUNTS, u64::from(own) * row_bytes, &row)?;
+                self.write(Table::Counts, u64::from(own) * row_bytes, &row)?;
             }
 
             if !new.bias.is_empty() || new.allowed.is_some() {
                 let row = sampler.bias_row(own, &new.bias, new.allowed.as_deref())?;
-                self.write(BIAS, u64::from(own) * row_bytes, &row)?;
+                self.write(Table::Bias, u64::from(own) * row_bytes, &row)?;
             }
 
             if self.context.is_some() {
-                self.write(CONTEXT, u64::from(own) * 8, &new.context)?;
+                self.write(Table::Context, u64::from(own) * 8, &new.context)?;
             }
             if self.accepted.is_some() {
-                self.write(ACCEPTED, u64::from(own) * 4, &[1_u32])?;
+                self.write(Table::Accepted, u64::from(own) * 4, &[1_u32])?;
             }
 
             if decode {
@@ -464,7 +506,7 @@ impl Slots {
         for copy in copies {
             if copy.direction == StateDirection::Restore {
                 let own = slot_row(copy.slot, self.slots)?;
-                self.write(ACCEPTED, u64::from(own) * 4, &[1_u32])?;
+                self.write(Table::Accepted, u64::from(own) * 4, &[1_u32])?;
             }
         }
         Ok(())
@@ -487,7 +529,7 @@ impl Slots {
             )));
         }
 
-        self.write(BANS, 0, masks)
+        self.write(Table::Bans, 0, masks)
     }
 
     /// Starts request slot `slot`'s commit state from its row of the decode batch `columns`.
@@ -522,15 +564,15 @@ impl Slots {
             ))
         })?;
 
-        self.write(FUTURE, own * u64::from(self.width) * 4, &[id])?;
-        self.write(LOGICAL, own * 4, &[logical])?;
-        self.write(SAMPLING, own * 4, &[sampling])?;
-        self.write(VERIFIED, own * 4, &[verified])?;
-        self.write(PREDICATES, own, &[1_u8])
+        self.write(Table::Future, own * u64::from(self.width) * 4, &[id])?;
+        self.write(Table::Logical, own * 4, &[logical])?;
+        self.write(Table::Sampling, own * 4, &[sampling])?;
+        self.write(Table::Verified, own * 4, &[verified])?;
+        self.write(Table::Predicates, own, &[1_u8])
     }
 
     /// Copies `values` to byte `offset` of `table`, on the stream.
-    fn write<T: bytemuck::Pod>(&mut self, table: usize, offset: u64, values: &[T]) -> Result<()> {
+    fn write<T: bytemuck::Pod>(&mut self, table: Table, offset: u64, values: &[T]) -> Result<()> {
         let Some(device) = &mut self.device else {
             return Ok(());
         };
@@ -564,7 +606,7 @@ impl Slots {
             std::ptr::copy_nonoverlapping(source.as_ptr(), block.as_ptr().add(at), source.len());
         }
 
-        let destination = device.storage.address() + device.offsets[table] + offset;
+        let destination = device.storage.address() + device.offsets[table as usize] + offset;
         device.unsettled = true;
 
         // SAFETY: the destination is `source.len()` bytes of a table of this value's storage,
@@ -582,11 +624,11 @@ impl Slots {
     }
 
     /// Zeroes `words` 32-bit words at byte `offset` of `table`, on the stream.
-    fn zero(&mut self, table: usize, offset: u64, words: u32) -> Result<()> {
+    fn zero(&mut self, table: Table, offset: u64, words: u32) -> Result<()> {
         let Some(device) = &mut self.device else {
             return Ok(());
         };
-        let destination = device.storage.address() + device.offsets[table] + offset;
+        let destination = device.storage.address() + device.offsets[table as usize] + offset;
         device.unsettled = true;
 
         // SAFETY: the destination is a row of a table of this value's storage, which the
@@ -594,11 +636,4 @@ impl Slots {
         unsafe { platform::memset_d32(destination, 0, words as usize, &device.stream) }?;
         Ok(())
     }
-}
-
-/// `tables` as the array of the tables every runner holds.
-fn into_tables(tables: Vec<Tensor>) -> Result<[Tensor; HELD]> {
-    tables
-        .try_into()
-        .map_err(|_| Error::Invariant("the slot state holds another number of tables".into()))
 }

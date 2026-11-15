@@ -26,10 +26,6 @@ use crate::worker::{Error, Result};
 /// a weight for a null pointer.
 const META_BASE: u64 = 1 << 47;
 
-/// The distance between the addresses of two tensors of [`MetaWeights`] is a multiple of this,
-/// as between two device allocations.
-const META_ALIGNMENT: u64 = 256;
-
 /// Retained storage on the meta device: every weight a load asks for is a tensor with a shape
 /// and an element type and no data, and the store records the order the load asked in.
 ///
@@ -78,9 +74,11 @@ impl MetaWeights {
         let address = self.next.get();
         self.next.set(
             address.saturating_add(
+                // Two tensors lie a multiple of the allocator's alignment apart, as two
+                // device allocations do.
                 bytes
-                    .div_ceil(META_ALIGNMENT)
-                    .saturating_mul(META_ALIGNMENT),
+                    .div_ceil(ops::allocator::ALIGNMENT)
+                    .saturating_mul(ops::allocator::ALIGNMENT),
             ),
         );
 

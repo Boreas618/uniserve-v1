@@ -38,9 +38,7 @@ use crate::memory::buffers::BufferMemory;
 use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::runner::{DeviceCopy, address, element_bytes, issue};
 use crate::worker::{Error, Result};
-
-/// The alignment of each buffer in the feature buffer's memory.
-const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
+use ops::allocator::ALIGNMENT;
 
 /// The runner's feature buffer (module documentation).
 pub(super) struct Features {

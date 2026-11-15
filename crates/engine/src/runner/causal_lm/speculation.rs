@@ -112,27 +112,56 @@ use crate::memory::tables::BlockTables;
 use crate::runner::buckets::Bucket;
 use crate::runner::sampler::{self, Sampler};
 use crate::worker::{Error, Result};
+use ops::allocator::ALIGNMENT;
+use strum::{EnumCount, EnumIter, IntoEnumIterator as _};
 
-/// The alignment of a kept tensor in its memory.
-const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
+/// One kept tensor, declared in the order the tensors lie in their memory: [`Entry::iter`]
+/// walks them in that order, and an entry's discriminant is its place among them. The first
+/// twelve are the entries of a sampling forward's outputs in their order (`output`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, EnumCount, EnumIter)]
+pub(crate) enum Entry {
+    Chosen,
+    Logprobs,
+    Ranks,
+    Logical,
+    Sampling,
+    TopValues,
+    TopIds,
+    Valid,
+    PromptLogprobs,
+    PromptRanks,
+    PromptValues,
+    PromptIds,
+    Agreed,
+    Hidden,
+}
 
-/// The kept tensors, in the order they lie in their memory. The first twelve are the entries
-/// of a sampling forward's outputs in their order (`output`).
-pub(crate) const KEPT: usize = 14;
-pub(crate) const CHOSEN: usize = 0;
-pub(crate) const LOGPROBS: usize = 1;
-pub(crate) const RANKS: usize = 2;
-pub(crate) const LOGICAL: usize = 3;
-pub(crate) const SAMPLING: usize = 4;
-pub(crate) const TOP_VALUES: usize = 5;
-pub(crate) const TOP_IDS: usize = 6;
-pub(crate) const VALID: usize = 7;
-pub(crate) const PROMPT_LOGPROBS: usize = 8;
-pub(crate) const PROMPT_RANKS: usize = 9;
-pub(crate) const PROMPT_VALUES: usize = 10;
-pub(crate) const PROMPT_IDS: usize = 11;
-pub(crate) const AGREED: usize = 12;
-pub(crate) const HIDDEN: usize = 13;
+impl Entry {
+    /// The shape and the element type of the entry's tensor, for sampling rows `rows`, `tokens`
+    /// tokens, `width` reported candidates per row and hidden rows of `hidden` elements of
+    /// `dtype`.
+    fn shape(
+        self,
+        rows: usize,
+        tokens: usize,
+        width: usize,
+        hidden: usize,
+        dtype: DType,
+    ) -> (Shape, DType) {
+        match self {
+            Self::Chosen | Self::Agreed => (rows.into(), DType::U32),
+            Self::Logprobs => (rows.into(), DType::F32),
+            Self::Ranks | Self::Logical | Self::Sampling | Self::Valid => (rows.into(), DType::I32),
+            Self::TopValues => ((rows, width).into(), DType::F32),
+            Self::TopIds => ((rows, width).into(), DType::U32),
+            Self::PromptLogprobs => (tokens.into(), DType::F32),
+            Self::PromptRanks => (tokens.into(), DType::I32),
+            Self::PromptValues => ((tokens, width).into(), DType::F32),
+            Self::PromptIds => ((tokens, width).into(), DType::U32),
+            Self::Hidden => ((tokens, hidden).into(), dtype),
+        }
+    }
+}
 
 /// The sampling parameters of a row that states none: a greedy row.
 const NO_PARAMETERS: [f32; PARAMETER_COLUMNS as usize] = [0.0; PARAMETER_COLUMNS as usize];
@@ -264,45 +293,33 @@ pub(crate) type DraftTable = (u32, Vec<u32>, Vec<u32>);
 /// the runner owns: one tensor per entry of the sampling outputs, each verification's agreed
 /// length, and the hidden rows (module documentation).
 pub(crate) struct Kept {
-    /// Each kept tensor, in the order of the entry constants.
-    tensors: [Tensor; KEPT],
+    /// Each kept tensor, by its entry's discriminant.
+    tensors: [Tensor; Entry::COUNT],
     /// The tensors' memory; `None` for a runner whose graphs hold no device.
     _storage: Option<Arc<Storage>>,
 }
 
-/// The shape and the element type of each kept tensor, for sampling rows `rows`, `tokens`
-/// tokens, `candidates` reported candidates and hidden rows of `hidden` elements of `dtype`.
+/// The shape and the element type of each kept tensor, in the order of [`Entry::iter`], for
+/// sampling rows `rows`, `tokens` tokens, `candidates` reported candidates and hidden rows of
+/// `hidden` elements of `dtype`.
 fn kept_shapes(
     rows: usize,
     tokens: usize,
     candidates: u32,
     hidden: u32,
     dtype: DType,
-) -> [(Shape, DType); KEPT] {
+) -> Vec<(Shape, DType)> {
     // A runner that reports no candidate keeps one unread column.
     let width = candidates.max(1) as usize;
 
-    [
-        (rows.into(), DType::U32),
-        (rows.into(), DType::F32),
-        (rows.into(), DType::I32),
-        (rows.into(), DType::I32),
-        (rows.into(), DType::I32),
-        ((rows, width).into(), DType::F32),
-        ((rows, width).into(), DType::U32),
-        (rows.into(), DType::I32),
-        (tokens.into(), DType::F32),
-        (tokens.into(), DType::I32),
-        ((tokens, width).into(), DType::F32),
-        ((tokens, width).into(), DType::U32),
-        (rows.into(), DType::U32),
-        ((tokens, hidden as usize).into(), dtype),
-    ]
+    Entry::iter()
+        .map(|entry| entry.shape(rows, tokens, width, hidden as usize, dtype))
+        .collect()
 }
 
 /// Each kept tensor's offset in its memory, and the memory's bytes.
-fn kept_offsets(shapes: &[(Shape, DType); KEPT]) -> Result<([u64; KEPT], u64)> {
-    let mut offsets = [0; KEPT];
+fn kept_offsets(shapes: &[(Shape, DType)]) -> Result<(Vec<u64>, u64)> {
+    let mut offsets = vec![0; shapes.len()];
     let mut bytes = 0_u64;
 
     for (offset, (shape, dtype)) in offsets.iter_mut().zip(shapes) {
@@ -352,7 +369,7 @@ impl Kept {
         let shapes = kept_shapes(rows, tokens, candidates, hidden, dtype);
         let (offsets, bytes) = kept_offsets(&shapes)?;
 
-        let mut tensors = Vec::with_capacity(KEPT);
+        let mut tensors = Vec::with_capacity(Entry::COUNT);
         let storage = match stream {
             Some(stream) => {
                 let bytes = usize::try_from(bytes).map_err(|_| {
@@ -396,8 +413,8 @@ impl Kept {
     }
 
     /// Kept tensor `entry`, over its whole extent.
-    pub(crate) const fn tensor(&self, entry: usize) -> &Tensor {
-        &self.tensors[entry]
+    pub(crate) const fn tensor(&self, entry: Entry) -> &Tensor {
+        &self.tensors[entry as usize]
     }
 
     /// Copies `value` to the head of kept tensor `entry` and returns that head: the tensor a
@@ -407,9 +424,9 @@ impl Kept {
     ///
     /// A value of more rows, another trailing extent or another element type than the kept
     /// tensor's.
-    pub(crate) fn keep(&self, entry: usize, value: &Tensor) -> Result<Tensor> {
+    pub(crate) fn keep(&self, entry: Entry, value: &Tensor) -> Result<Tensor> {
         let rows = value.dims().first().copied().unwrap_or(0);
-        let head = self.tensors[entry].narrow(0, 0, rows)?;
+        let head = self.tensors[entry as usize].narrow(0, 0, rows)?;
 
         head.slice_set(value, 0, 0)?;
         Ok(head)
@@ -1342,22 +1359,25 @@ impl CausalLmRunner {
 
         let kept = &speculation.kept;
         let mut scores = scores.into_iter();
-        let mut outputs = vec![kept.keep(CHOSEN, &chosen)?];
+        let mut outputs = vec![kept.keep(Entry::Chosen, &chosen)?];
 
-        for (entry, score) in [LOGPROBS, RANKS].into_iter().zip(scores.by_ref()) {
+        for (entry, score) in [Entry::Logprobs, Entry::Ranks]
+            .into_iter()
+            .zip(scores.by_ref())
+        {
             outputs.push(kept.keep(entry, &score)?);
         }
-        outputs.push(kept.keep(LOGICAL, &logical)?);
-        outputs.push(kept.keep(SAMPLING, &sampling)?);
-        for (entry, score) in [TOP_VALUES, TOP_IDS].into_iter().zip(scores) {
+        outputs.push(kept.keep(Entry::Logical, &logical)?);
+        outputs.push(kept.keep(Entry::Sampling, &sampling)?);
+        for (entry, score) in [Entry::TopValues, Entry::TopIds].into_iter().zip(scores) {
             outputs.push(kept.keep(entry, &score)?);
         }
         if let Some(valid) = &valid {
-            outputs.push(kept.keep(VALID, valid)?);
+            outputs.push(kept.keep(Entry::Valid, valid)?);
         }
-        outputs.push(kept.keep(AGREED, &agreed)?);
+        outputs.push(kept.keep(Entry::Agreed, &agreed)?);
 
-        kept.keep(HIDDEN, &hidden)?;
+        kept.keep(Entry::Hidden, &hidden)?;
         Ok(outputs)
     }
 
@@ -1388,7 +1408,7 @@ impl CausalLmRunner {
         // The token after each entry: the one the batch states, or the one its sampling row
         // chose, held to the vocabulary so a row that chose none embeds a token.
         let chosen = kept
-            .tensor(CHOSEN)
+            .tensor(Entry::Chosen)
             .index_select(&self.column(Column::NextRows, tokens)?, 0)?;
         let next = self
             .column(Column::NextIds, tokens)?
@@ -1397,7 +1417,7 @@ impl CausalLmRunner {
 
         // An entry of a verification is written up to the length its row agreed.
         let bound = kept
-            .tensor(AGREED)
+            .tensor(Entry::Agreed)
             .index_select(&self.column(Column::EntryRows, tokens)?, 0)?;
         let written = self.column(Column::EntrySteps, tokens)?.le(&bound)?;
         let slot_mapping = written.where_cond(
@@ -1455,7 +1475,7 @@ impl CausalLmRunner {
 
         let drafted = {
             let embedded = self.model.embed_input_ids(&next)?;
-            let hidden = kept.tensor(HIDDEN).narrow(0, 0, tokens)?;
+            let hidden = kept.tensor(Entry::Hidden).narrow(0, 0, tokens)?;
 
             run(&batch, &embedded, &hidden)?
         };
@@ -1463,7 +1483,7 @@ impl CausalLmRunner {
         // ---- The proposals: the first from each row's last entry, then the chained steps ----
 
         let ahead = kept
-            .tensor(AGREED)
+            .tensor(Entry::Agreed)
             .index_select(&self.column(Column::ProposalRows, rows)?, 0)?;
         let ahead_positions = ahead.view(DType::I32)?;
         let last = self.column(Column::LastEntries, rows)?.add(&ahead)?;

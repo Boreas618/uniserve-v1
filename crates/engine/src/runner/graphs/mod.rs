@@ -58,6 +58,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use ops::Generation;
+use ops::allocator::ALIGNMENT;
 use ops::breaks::{BREAK, HostWork};
 use ops::collective::Meet;
 use ops::moe::ExchangeTransport;
@@ -71,9 +72,6 @@ use self::shadow::Shadow;
 use crate::runner::Runner;
 use crate::runner::buckets::Bucket;
 use crate::worker::{Error, Result};
-
-/// The alignment of the input tensors' block and of the allocator region behind it.
-const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
 
 /// A launch table: `(operator, key, module path)` per launch, in launch order.
 type Table = Vec<(&'static str, String, String)>;
