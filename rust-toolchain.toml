@@ -1,6 +1,11 @@
+# The workspace's Rust toolchain, which rustup installs and selects for every
+# cargo command in the tree and in the Build Server's snapshot of it: a release,
+# so the compiler that builds a cargo package is the one its manifest declares
+# (`[toolchain] version`) and the identity its modules are stored under.
 [toolchain]
-channel = "stable"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
-# Scheduling policies are WebAssembly modules: the Build Server installs one
-# built for this target, and the scheduler's tests build the fcfs policy for it.
+# Scheduling policies are WebAssembly modules: the Build Server builds a policy
+# package for this target from its workspace snapshot, and the scheduler's tests
+# build the fcfs policy for it.
 targets = ["wasm32-unknown-unknown"]
