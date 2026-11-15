@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use libloading::Library;
+use object::read::elf::ElfFile64;
+use object::{Endianness, Object as _, ObjectSymbol as _, SymbolKind, elf};
 
 use crate::{Error, Result};
 
@@ -101,76 +103,35 @@ impl NativeLibrary {
     ///
     /// This answers which file of a multi-file module is its library (the file that defines the
     /// entry the package declared) and what an object defines when `dlsym` refused an entry,
-    /// without opening the object. Only the dynamic symbol table and its string table are read, and
-    /// every read is bounds-checked against `bytes`. Anything this reader does not understand -
-    /// another class, another byte order, a table that runs off the end - is `None`, so a caller
-    /// diagnosing a fault cannot be handed a second one.
+    /// without opening the object. The dynamic symbol table is read with the `object` crate's ELF
+    /// reader, which bounds-checks every read against `bytes`. Anything it does not understand -
+    /// another format, a table that runs off the end, a name that is not UTF-8 - is `None`, so a
+    /// caller diagnosing a fault cannot be handed a second one.
     #[must_use]
     pub fn defined_functions(bytes: &[u8]) -> Option<Vec<String>> {
-        const SHT_DYNSYM: u32 = 11;
-        const STT_FUNC: u8 = 2;
-        // An `Elf64_Sym` is 24 bytes: name (u32), info (u8), other (u8), section index (u16),
-        // value (u64), size (u64).
-        const SYMBOL_SIZE: usize = 24;
-
-        let sections = sections(bytes)?;
-        let symbols = sections
-            .iter()
-            .position(|section| section.kind == SHT_DYNSYM)?;
-        let (symbols_at, symbols_size) = (sections[symbols].at, sections[symbols].size);
-        let strings = sections.get(sections[symbols].link)?;
-        let table = bytes.get(strings.at..strings.at.checked_add(strings.size)?)?;
-
-        let mut names = Vec::new();
-        let limit = symbols_at.checked_add(symbols_size)?;
-        let mut at = symbols_at;
-        while at.checked_add(SYMBOL_SIZE)? <= limit {
-            let name = quarter(bytes, at)? as usize;
-            let info = *bytes.get(at.checked_add(4)?)?;
-            let section = half(bytes, at.checked_add(6)?)?;
-            at = at.checked_add(SYMBOL_SIZE)?;
-            // An undefined symbol (section index 0) is one the object imports, not one it defines.
-            if name == 0 || section == 0 || (info & 0xf) != STT_FUNC {
-                continue;
-            }
-            let tail = table.get(name..)?;
-            let end = tail.iter().position(|held| *held == 0)?;
-            names.push(std::str::from_utf8(&tail[..end]).ok()?.to_owned());
-        }
-        Some(names)
+        let file = ElfFile64::<Endianness>::parse(bytes).ok()?;
+        file.dynamic_symbols()
+            // An undefined symbol is one the object imports, not one it defines.
+            .filter(|symbol| symbol.is_definition() && symbol.kind() == SymbolKind::Text)
+            .map(|symbol| symbol.name().ok().map(str::to_owned))
+            .collect()
     }
 
     /// The run path an ELF object states, read from its bytes: the first `DT_RUNPATH` or `DT_RPATH`
     /// entry of its dynamic table. `None` when it states neither, or when the bytes are not an
-    /// object this reader understands (as for [`Self::defined_functions`]).
+    /// object the reader understands (as for [`Self::defined_functions`]).
     #[must_use]
     pub fn run_path(bytes: &[u8]) -> Option<String> {
-        const SHT_DYNAMIC: u32 = 6;
-        const DT_RPATH: u64 = 15;
-        const DT_RUNPATH: u64 = 29;
-        // An `Elf64_Dyn` is 16 bytes: tag (u64), value (u64).
-        const ENTRY_SIZE: usize = 16;
-
-        let sections = sections(bytes)?;
-        let dynamic = sections
+        let file = ElfFile64::<Endianness>::parse(bytes).ok()?;
+        let table = file
+            .elf_section_table()
+            .dynamic_table(file.endian(), bytes)
+            .ok()?;
+        let entry = table
             .iter()
-            .find(|section| section.kind == SHT_DYNAMIC)?;
-        let strings = sections.get(dynamic.link)?;
-        let table = bytes.get(strings.at..strings.at.checked_add(strings.size)?)?;
-        let limit = dynamic.at.checked_add(dynamic.size)?;
-        let mut at = dynamic.at;
-        while at.checked_add(ENTRY_SIZE)? <= limit {
-            let tag = word(bytes, at)?;
-            let value = word(bytes, at.checked_add(8)?)? as usize;
-            at = at.checked_add(ENTRY_SIZE)?;
-            if tag != DT_RUNPATH && tag != DT_RPATH {
-                continue;
-            }
-            let tail = table.get(value..)?;
-            let end = tail.iter().position(|held| *held == 0)?;
-            return std::str::from_utf8(&tail[..end]).ok().map(str::to_owned);
-        }
-        None
+            .find(|entry| entry.tag == elf::DT_RUNPATH || entry.tag == elf::DT_RPATH)?;
+        let path = table.string(entry).ok()?;
+        std::str::from_utf8(path).ok().map(str::to_owned)
     }
 }
 
@@ -181,67 +142,6 @@ impl std::fmt::Debug for NativeLibrary {
             .field(&self.path)
             .finish()
     }
-}
-
-/// One section header of an ELF object, as much of it as the dynamic-table reader uses.
-struct Section {
-    /// `sh_type`.
-    kind: u32,
-    /// `sh_offset`: where the section's bytes start in the file.
-    at: usize,
-    /// `sh_size`, in bytes.
-    size: usize,
-    /// `sh_link`: the index of the section this one names its strings in.
-    link: usize,
-}
-
-/// The section headers of a 64-bit little-endian ELF object; `None` for any other file.
-fn sections(bytes: &[u8]) -> Option<Vec<Section>> {
-    const ELFCLASS64: u8 = 2;
-    const ELFDATA2LSB: u8 = 1;
-
-    if bytes.get(0..4)? != b"\x7fELF"
-        || *bytes.get(4)? != ELFCLASS64
-        || *bytes.get(5)? != ELFDATA2LSB
-    {
-        return None;
-    }
-    // `e_shoff`, `e_shentsize` and `e_shnum` of the ELF header.
-    let at = word(bytes, 0x28)? as usize;
-    let entry = half(bytes, 0x3a)? as usize;
-    let count = half(bytes, 0x3c)? as usize;
-    let mut sections = Vec::with_capacity(count.min(256));
-    for index in 0..count {
-        let header = at.checked_add(index.checked_mul(entry)?)?;
-        sections.push(Section {
-            kind: quarter(bytes, header.checked_add(4)?)?,
-            at: word(bytes, header.checked_add(0x18)?)? as usize,
-            size: word(bytes, header.checked_add(0x20)?)? as usize,
-            link: quarter(bytes, header.checked_add(0x28)?)? as usize,
-        });
-    }
-    Some(sections)
-}
-
-/// The little-endian `u64` at `at`, when the bytes hold one there.
-fn word(bytes: &[u8], at: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(
-        bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
-    ))
-}
-
-/// The little-endian `u16` at `at`, when the bytes hold one there.
-fn half(bytes: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(
-        bytes.get(at..at.checked_add(2)?)?.try_into().ok()?,
-    ))
-}
-
-/// The little-endian `u32` at `at`, when the bytes hold one there.
-fn quarter(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
-    ))
 }
 
 #[cfg(test)]
@@ -294,20 +194,21 @@ mod tests {
 
     /// The dynamic-table reader answers about a real object, and says nothing it cannot check.
     ///
-    /// Every Linux process has its C library loaded, and this one is asked about the object its maps
-    /// name; a host whose maps name no such path is the one case where the test has nothing to ask.
-    /// Bytes that are not an object are no answer at all.
+    /// Every Linux process has its C library loaded, and the dynamic loader names the object that
+    /// defines `malloc` (`dladdr`); that object is asked what it defines. Bytes that are not an
+    /// object are no answer at all.
     #[test]
     fn the_functions_an_object_defines_are_read_from_its_bytes() {
-        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
-        let libc = maps
-            .lines()
-            .filter_map(|line| line.split_whitespace().last())
-            .find(|path| path.contains("libc.so.6") && path.starts_with('/'))
-            .map(str::to_owned);
-        let Some(libc) = libc else {
-            return;
-        };
+        // SAFETY: an all-zero `Dl_info` is a valid value of the plain C struct.
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        // SAFETY: `malloc` is an address in a loaded object; the loader fills `info`.
+        let found = unsafe { libc::dladdr(libc::malloc as *const std::ffi::c_void, &mut info) };
+        assert_ne!(found, 0, "the loader names the object that defines malloc");
+        // SAFETY: the loader returned the object's NUL-terminated path, valid while it is loaded.
+        let libc = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }
+            .to_str()
+            .unwrap()
+            .to_owned();
         let bytes = std::fs::read(&libc).expect("a loaded object is readable");
 
         let names = NativeLibrary::defined_functions(&bytes)

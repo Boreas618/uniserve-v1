@@ -9,6 +9,8 @@ publish = false
 [dependencies]
 libc.workspace = true
 libloading.workspace = true
+# The ELF reader of `NativeLibrary::defined_functions` and `NativeLibrary::run_path`.
+object = { version = "0.40.0", default-features = false, features = ["read_core", "elf", "std"] }
 # Joins a driver call's name to its generated CUPTI callback id, so the id and the name the
 # collectors report are one token (`cupti::blocking`, `cupti::range_profiler`).
 paste = "1.0.15"

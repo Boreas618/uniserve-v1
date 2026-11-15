@@ -3050,6 +3050,7 @@ dependencies = [
  "bindgen",
  "libc",
  "libloading",
+ "object",
  "paste",
  "pkg-config",
  "tempfile",
