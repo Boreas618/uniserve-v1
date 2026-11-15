@@ -164,7 +164,6 @@ pub mod fill;
 pub mod fp4;
 pub mod fp8;
 pub mod frame;
-pub mod gelu;
 pub mod gemm;
 pub mod generation;
 pub mod index;

@@ -230,8 +230,6 @@ pub mod operator {
     pub const DYNAMIC_SCALE: &str = "dynamic_scale";
     pub const SNAKE: &str = "snake";
     pub const CHANNEL_AFFINE: &str = "channel_affine";
-    pub const GELU: &str = "gelu";
-    pub const SILU: &str = "silu";
     pub const ADAPTIVE_POOL: &str = "adaptive_pool";
     pub const ROWS: &str = "rows";
     pub const POSITION_INTERPOLATE: &str = "position_interpolate";
@@ -335,8 +333,6 @@ pub mod operator {
         DYNAMIC_SCALE,
         SNAKE,
         CHANNEL_AFFINE,
-        GELU,
-        SILU,
         ADAPTIVE_POOL,
         ROWS,
         POSITION_INTERPOLATE,
