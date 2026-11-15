@@ -618,8 +618,8 @@ impl StorageClient {
         // reads its completion queue.
         let pairs = descriptors
             .into_iter()
-            .map(|descriptor| {
-                QueuePair::open(descriptor, true).context("mapping a scheduler's queue pair")
+            .map(|descriptors| {
+                QueuePair::open(descriptors, true).context("mapping a scheduler's queue pair")
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -701,12 +701,11 @@ impl StorageClient {
                 .get(scheduler)
                 .with_context(|| format!("scheduler {scheduler} has no queue pair"))?;
 
-            let descriptor = pair
-                .descriptor()
-                .try_clone_to_owned()
-                .context("duplicating a queue pair's descriptor")?;
+            let descriptors = pair
+                .duplicate()
+                .context("duplicating a queue pair's descriptors")?;
             let mapping =
-                QueuePair::open(descriptor, true).context("mapping a queue pair's registers")?;
+                QueuePair::open(descriptors, true).context("mapping a queue pair's registers")?;
             registers.push((mapping, *index as usize));
         }
 

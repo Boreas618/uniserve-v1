@@ -90,6 +90,8 @@ impl Sequences {
         registers.0 = completed;
         for (pair, index) in &registers.1 {
             pair.register(*index).store(completed, Ordering::Release);
+            // A buffer pool asleep with requests waiting for this stamp wakes.
+            pair.notify_registers();
         }
     }
 }

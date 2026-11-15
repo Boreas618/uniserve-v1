@@ -1255,8 +1255,7 @@ struct Group {
 impl Group {
     fn start(peers: &Peers, turns: Turns) -> Self {
         let pool = QueuePair::create(4096, 1).unwrap();
-        let engine =
-            QueuePair::open(pool.descriptor().try_clone_to_owned().unwrap(), true).unwrap();
+        let engine = QueuePair::open(pool.duplicate().unwrap(), true).unwrap();
         let sequences = Sequences::new(GROUP, RANKS, vec![(engine, 0)]);
         let watch = Arc::new(Watch {
             sequences: Arc::clone(&sequences),

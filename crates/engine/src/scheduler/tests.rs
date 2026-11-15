@@ -188,7 +188,7 @@ fn built(
     };
 
     let pool = QueuePair::create(ring_bytes, 14).unwrap();
-    let engine = QueuePair::open(pool.descriptor().try_clone_to_owned().unwrap(), true).unwrap();
+    let engine = QueuePair::open(pool.duplicate().unwrap(), true).unwrap();
 
     let executor = Arc::new(Mutex::new(Recorded::default()));
     let (output, _) = crossbeam_channel::unbounded();

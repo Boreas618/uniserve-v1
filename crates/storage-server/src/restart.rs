@@ -24,7 +24,7 @@
 //! Otherwise the server stops both children, and passes the successor its
 //! state with every descriptor it holds: the listening sockets and their
 //! lock, each client's connection and pidfd, each storage's storage and each
-//! queue pair's memfd ([`Server::handoff`]). The buffer pools travel as
+//! queue pair's memfd and doorbells ([`Server::handoff`]). The buffer pools travel as
 //! images, with the sessions, the parts of the host regions and where the
 //! units lie, and the queue pairs keep their indices. The successor goes on
 //! from there ([`Server::resume`]), serving every connection and session,
@@ -105,7 +105,7 @@ impl service::Message for Message {
 /// A server's state, its descriptors travelling apart: first the listener
 /// and its lock, then the TCP listener when there is one, then every pidfd
 /// of [`Handoff::pidfds`], every client's connection, every storage's
-/// storage and every queue pair's memfd.
+/// storage and every queue pair's memfd and doorbells.
 #[derive(Debug, Serialize, Deserialize)]
 struct Handoff {
     tcp: Option<String>,
@@ -1047,11 +1047,13 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut record = Vec::new();
         loop {
+            let seen = pair.signals();
             if pair.next_completion(&mut record).unwrap() {
                 return ::storage::runtime::Completion::decode(&record).unwrap();
             }
-            assert!(Instant::now() < deadline, "no completion arrived");
-            std::thread::sleep(Duration::from_micros(100));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let woken = pair.wait(::storage::Interest::RECORDS, seen, Some(remaining));
+            assert!(woken.unwrap(), "no completion arrived");
         }
     }
 
@@ -1207,6 +1209,7 @@ mod tests {
 
         // The workers complete batch 2 after the restart, and submit more.
         pair.register(completed).store(2, Ordering::Release);
+        pair.notify_registers();
         assert_eq!(completion(&mut pair), (RequestId(3), Completion::Committed));
         submit(&mut pair, 4, Request::List);
         let listing = Completion::Listing {

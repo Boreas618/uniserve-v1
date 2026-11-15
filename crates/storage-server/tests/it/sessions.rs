@@ -20,7 +20,10 @@ use ::storage::runtime::{
     Cause, Class, Completion, Group, GroupId, Open, Opened, OwnerId, Region, Registers, Request,
     RequestId, Source, Tier, VERSION,
 };
-use ::storage::{Access, Claim, Claimant, Client, Key, Location, Mode, QueuePair, Role, Segment};
+use ::storage::{
+    Access, Claim, Claimant, Client, Interest, Key, Location, Mode, QueueDescriptors, QueuePair,
+    Role, Segment,
+};
 
 use crate::server::{
     FORKING, Running, engine_head, head, host, key, memfd, scope, server_error, tensor, worker,
@@ -115,7 +118,7 @@ pub(crate) struct Scheduler {
 
 impl Scheduler {
     /// Each scheduler of an answer to `Open`, in order.
-    pub(crate) fn all(opened: &Opened, descriptors: Vec<OwnedFd>) -> Vec<Self> {
+    pub(crate) fn all(opened: &Opened, descriptors: Vec<QueueDescriptors>) -> Vec<Self> {
         opened
             .registers
             .iter()
@@ -146,11 +149,13 @@ impl Scheduler {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut record = Vec::new();
         loop {
+            let seen = self.pair.signals();
             if self.pair.next_completion(&mut record).unwrap() {
                 return Completion::decode(&record).unwrap();
             }
-            assert!(Instant::now() < deadline, "no completion arrived");
-            std::thread::sleep(Duration::from_micros(100));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let woken = self.pair.wait(Interest::RECORDS, seen, Some(remaining));
+            assert!(woken.unwrap(), "no completion arrived");
         }
     }
 
@@ -169,6 +174,7 @@ impl Scheduler {
         self.pair
             .register(register)
             .store(completed, Ordering::Release);
+        self.pair.notify_registers();
     }
 
     /// Waits until region `region`'s capacity words read `words`.
@@ -184,13 +190,18 @@ impl Scheduler {
             register.load(Ordering::Acquire)
         };
         let deadline = Instant::now() + Duration::from_secs(10);
-        while (read(0), read(1), read(2)) != words {
+        loop {
+            let seen = self.pair.signals();
+            if (read(0), read(1), read(2)) == words {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let woken = self.pair.wait(Interest::REGISTERS, seen, Some(remaining));
             assert!(
-                Instant::now() < deadline,
+                woken.unwrap(),
                 "the capacity words read {:?}, not {words:?}",
                 (read(0), read(1), read(2))
             );
-            std::thread::sleep(Duration::from_micros(100));
         }
     }
 }

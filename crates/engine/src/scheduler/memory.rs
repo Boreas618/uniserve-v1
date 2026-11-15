@@ -2783,8 +2783,7 @@ mod tests {
         };
 
         let pool = QueuePair::create(1 << 16, 10).unwrap();
-        let engine =
-            QueuePair::open(pool.descriptor().try_clone_to_owned().unwrap(), true).unwrap();
+        let engine = QueuePair::open(pool.duplicate().unwrap(), true).unwrap();
         let groups = WorkerGroupConfig::data_parallel(
             &["localhost".to_owned()],
             proto::config::DeviceKind::Cpu,

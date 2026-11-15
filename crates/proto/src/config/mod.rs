@@ -164,9 +164,6 @@ pub const DEFAULT_CHUNKED_PREFILL_SIZE: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
 /// The scheduling policy package a deployment runs when its configuration names none: arrival
 /// order (`crates/scheduling/policies/fcfs`).
 pub const DEFAULT_SCHEDULING_POLICY: &str = "fcfs";
-/// Default period at which a scheduler reads its completion queue while it waits on the buffer
-/// pool and forms no batch.
-pub const DEFAULT_POLL_PERIOD: Duration = Duration::from_millis(1);
 
 /// Admission and batching (`scheduler_config`), and the limits a scheduler runs with once the
 /// engine resolved them.
@@ -210,11 +207,6 @@ pub struct SchedulerConfig {
     /// eagerly, and the tier bound is honest but vacuous.
     #[serde(skip)]
     pub graph_tiers: Vec<u32>,
-    /// The period at which the scheduler reads its completion queue and capacity words while
-    /// requests to the buffer pool are outstanding and its last pass formed no batch: the queue
-    /// pair runs in poll mode, and no wake-up crosses from the Storage Server to the engine.
-    #[serde(with = "values::duration")]
-    pub poll_period: Duration,
 }
 
 impl Default for SchedulerConfig {
@@ -228,7 +220,6 @@ impl Default for SchedulerConfig {
             max_running_requests: DEFAULT_MAX_RUNNING_REQUESTS,
             draft_tokens: 0,
             graph_tiers: Vec::new(),
-            poll_period: DEFAULT_POLL_PERIOD,
         }
     }
 }
@@ -238,8 +229,8 @@ impl SchedulerConfig {
     /// `max_batch` calls and `max_num_batched_tokens` tokens, `graph_tiers` being the catalog's
     /// sizes in tokens, ascending (§4.4, §4.5).
     ///
-    /// The rest is the configuration's: its running requests, its waiting queue, its prefill
-    /// chunk and its polling period, and the drafter's tokens.
+    /// The rest is the configuration's: its running requests, its waiting queue and its prefill
+    /// chunk, and the drafter's tokens.
     pub fn of(
         engine: &EngineConfig,
         max_batch: usize,
@@ -260,7 +251,6 @@ impl SchedulerConfig {
             max_running_requests: engine.max_running_requests.get(),
             draft_tokens: engine.speculative.num_draft_tokens as usize,
             graph_tiers,
-            poll_period: engine.scheduler.poll_period,
         }
     }
 

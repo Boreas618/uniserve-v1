@@ -9,6 +9,7 @@ publish = false
 # crate but `service` and never links CUDA: the Storage Server outlives
 # builds of every other process, which speak to it through this crate.
 [dependencies]
+bitflags.workspace = true
 # The destructive interference size of the build's target, which separates the queue pair's
 # words written by different sides (`queue::SEPARATION`).
 crossbeam-utils.workspace = true

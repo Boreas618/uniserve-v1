@@ -13,7 +13,7 @@
 //!   connection's hello, each a frame with its file descriptors on the workspace's one
 //!   connection (`service::Connection`).
 //! - [`queue`]: the queue pair in shared memory between a scheduler and the
-//!   buffer pool.
+//!   buffer pool, with the doorbell each end sleeps on.
 //! - [`runtime`]: the requests and completions that travel on a queue pair.
 //! - [`Client`]: one connection, used synchronously by workers and
 //!   asynchronously by the head.
@@ -43,7 +43,7 @@ pub mod settings;
 
 pub use client::{ClaimClient, ClaimHandoff, Client};
 pub use error::{Error, Result};
-pub use queue::QueuePair;
+pub use queue::{Interest, QueueDescriptors, QueuePair, Signals};
 pub use settings::{Readiness, ServerSettings, Settings};
 
 /// The host service name of the Storage Server: its command and the name of its socket and the

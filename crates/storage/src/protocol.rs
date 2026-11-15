@@ -1221,8 +1221,9 @@ pub enum Request {
     /// layout states, connected on the host: open the engine's session with
     /// the buffer pool of its deployment (`specs/buffer-pool.md` §11), one of
     /// its epoch's sessions, named by the head's launch generation.
-    /// Responded with [`Response::Opened`], with the descriptor of each
-    /// scheduler's queue pair, in the order of [`Open::schedulers`]; the
+    /// Responded with [`Response::Opened`], with the descriptors of each
+    /// scheduler's queue pair (`crate::QueueDescriptors`), in the order of
+    /// [`Open::schedulers`]; the
     /// server's end of each is served from then on. A region another
     /// session of the deployment stated under the same name is that
     /// region, and groups that state one device memory read and write the
@@ -1458,9 +1459,9 @@ pub enum Response {
     },
     /// A [`Request::Unexpose`] was taken.
     Unexposed,
-    /// The session a [`Request::Open`] opened. The descriptor of each
-    /// scheduler's queue pair travels with it, in the order of
-    /// [`Open::schedulers`].
+    /// The session a [`Request::Open`] opened. The descriptors of each
+    /// scheduler's queue pair (`crate::QueueDescriptors`) travel with it, in
+    /// the order of [`Open::schedulers`].
     Opened(Opened),
     Closed,
     Placed,

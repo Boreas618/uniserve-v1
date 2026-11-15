@@ -84,6 +84,17 @@ impl BufferPool {
         copies.iter().map(stated).collect()
     }
 
+    /// The earliest deadline of a task not yet told to stop, in nanoseconds
+    /// of the host's monotonic clock: the time at which [`BufferPool::tick`]
+    /// next has something to do. `None` when no task has one.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.copies
+            .values()
+            .filter_map(|copies| copies.first()?.deadline)
+            .filter(|deadline| *deadline != STOPPING)
+            .min()
+    }
+
     /// Whether a task is outstanding: started and not ended, or not yet
     /// handed to whoever runs it. A restart in place waits until none is.
     pub fn tasks(&self) -> bool {

@@ -1,13 +1,17 @@
 //! The buffer pool's thread: it serves every session's queue pairs.
 //!
 //! The buffer pools of the host's deployments, one per deployment, live on
-//! one thread of their own, which serves their queue pairs in poll mode
-//! (`specs/buffer-pool.md` §9, §10). Neither side interrupts the other: the
-//! thread reads the submission queues and the `completed` registers in
-//! shared memory, and backs off to a bounded sleep ([`SLEEP`]) only when
-//! every queue is empty and nothing is deferred, so it makes no system call
-//! for an engine and an engine's step path makes none for it. It moves no
-//! bytes and waits on nothing inside a handler, and it uses one core.
+//! one thread of their own, which serves their queue pairs
+//! (`specs/buffer-pool.md` §9, §10). The thread reads the submission queues
+//! and the `completed` registers in shared memory and turns while any of
+//! them gave it something; once a turn found nothing it sleeps on the
+//! doorbells of its queue pairs (`storage::queue`), the wake of the main
+//! loop's work and the earliest task deadline, having declared on each queue
+//! pair that it waits for requests and `completed` words (and for room in
+//! the completion queue while completions wait for it). An engine's step
+//! therefore makes a system call for the thread only when the thread sleeps,
+//! and the thread makes one for a scheduler only when that scheduler sleeps.
+//! It moves no bytes and waits on nothing inside a handler.
 //!
 //! A buffer pool holds its blocks by `Rc` and is not `Send`: it is made,
 //! used and dropped on this thread. The server's main loop (one `poll(2)`
@@ -19,7 +23,7 @@
 //!   opened or closed, an engine found gone, a task's progress and end, a
 //!   peer's holds, the pools' listing, and at a restart in place the freeze
 //!   and the hand-off. The thread takes work at the start of each turn, and
-//!   a send wakes it from its sleep.
+//!   a send fires the thread's wake, which ends its sleep.
 //! - The thread sends notices ([`Thread::notices`]): a task to start, with
 //!   what it copies, and a task to stop. A notice wakes the main loop
 //!   through a pipe in its poll set; a task runs on a child process, which
@@ -34,7 +38,8 @@
 //! that finds no room staying pending in order (the scheduler keeps room for
 //! everything outstanding, so that is the engine's fault and never a reason
 //! to wait); write each region's three capacity words for each queue pair
-//! when they changed; and send the tasks to start and to stop. A completion
+//! when they changed, ringing the scheduler's doorbell if it waits for them;
+//! and send the tasks to start and to stop. A completion
 //! longer than a ring holds is answered `Refused { cause: Request }`: only a
 //! `List` of a cache too large for the ring comes to that, and it changed
 //! nothing. A queue pair whose indices the engine broke is served no more.
@@ -54,7 +59,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
@@ -62,19 +67,16 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use storage::QueuePair;
+use service::{Wake, Waker};
 use storage::protocol::{BufferPoolListing, HostCopy, Key, Segment};
 use storage::runtime::{
     Cause, Completion, GroupId, Open, Opened, Registers, Request, RequestId, Source,
 };
+use storage::{Interest, QueueDescriptors, QueuePair, Signals};
 
 use crate::Server;
 use crate::buffer_pool::trace::{Input, SessionNames, Trace, stated_input};
 use crate::buffer_pool::{BufferPool, ClientId, Encoding, QueueId};
-
-/// How long the thread sleeps when every queue is empty and nothing is
-/// deferred: the longest a request of an idle engine waits to be taken.
-pub(crate) const SLEEP: Duration = Duration::from_micros(200);
 
 /// The longest a trace keeps what it recorded in its buffers, in
 /// nanoseconds, while the thread is busy; it writes out whenever the thread
@@ -140,6 +142,8 @@ impl Notifier {
 /// The main loop's end of the thread.
 pub(crate) struct Thread {
     work: Option<mpsc::Sender<Work>>,
+    /// Ends the thread's sleep once work was sent.
+    awake: Wake,
     notices: mpsc::Receiver<Notice>,
     /// The read end of the pipe a notice wakes the main loop through.
     wake: OwnedFd,
@@ -150,7 +154,7 @@ pub(crate) struct Thread {
 impl Thread {
     /// Starts the thread: with no pool, or going on with the state a
     /// predecessor handed over (`image`, the bytes of [`Pools::hand_off`] in
-    /// this build's image format, with the queue pairs' memfds in its
+    /// this build's image format, with the queue pairs' descriptors in its
     /// order). `limits` is how long a transfer and a put to the remote store
     /// may take, in nanoseconds.
     ///
@@ -172,6 +176,8 @@ impl Thread {
             wake: Arc::new(writer),
         };
         let thread_notifier = notifier.clone();
+        let waker = Waker::new()?;
+        let awake = waker.wake();
         let (started, result) = mpsc::channel::<io::Result<()>>();
         let thread = std::thread::Builder::new()
             .name("buffer-pool".into())
@@ -199,13 +205,14 @@ impl Thread {
                     check: false,
                     flushed: 0,
                 };
-                serve(&jobs, pools);
+                serve(&jobs, waker, pools);
             })?;
         result
             .recv()
             .map_err(|_| io::Error::other("the buffer pool's thread ended at its start"))??;
         Ok(Self {
             work: Some(work),
+            awake,
             notices,
             wake: reader,
             notifier,
@@ -223,9 +230,7 @@ impl Thread {
         if let Some(sender) = &self.work {
             let _ = sender.send(Box::new(work));
         }
-        if let Some(thread) = &self.thread {
-            thread.thread().unpark();
-        }
+        self.awake.wake();
     }
 
     /// Runs `work` on the thread and returns its result; `None` when the
@@ -258,15 +263,17 @@ impl Drop for Thread {
     fn drop(&mut self) {
         // The thread ends at its next turn once no work can arrive.
         self.work = None;
+        self.awake.wake();
         if let Some(thread) = self.thread.take() {
-            thread.thread().unpark();
             let _ = thread.join();
         }
     }
 }
 
-/// The thread's loop: work first, then a turn, then the back-off.
-fn serve(jobs: &mpsc::Receiver<Work>, mut pools: Pools) {
+/// The thread's loop: work first, then a turn; after a turn that found
+/// nothing, the sleep ([`Pools::sleep`]), which `waker` ends when the main
+/// loop sends work.
+fn serve(jobs: &mpsc::Receiver<Work>, mut waker: Waker, mut pools: Pools) {
     loop {
         loop {
             match jobs.try_recv() {
@@ -275,14 +282,8 @@ fn serve(jobs: &mpsc::Receiver<Work>, mut pools: Pools) {
                 Err(mpsc::TryRecvError::Disconnected) => return,
             }
         }
-        if pools.turn() {
-            std::hint::spin_loop();
-        } else if pools.idle() {
-            // Nothing but work from the main loop can make work, and its
-            // send wakes the thread.
-            std::thread::park();
-        } else {
-            std::thread::park_timeout(SLEEP);
+        if !pools.turn() {
+            pools.sleep(&mut waker);
         }
     }
 }
@@ -331,6 +332,9 @@ struct Hosted {
 /// The buffer pool's end of one scheduler's queue pair.
 struct Queue {
     pair: QueuePair,
+    /// What the engine had published to this end when the last turn looked
+    /// at the pair, which the sleep compares with ([`QueuePair::arm`]).
+    seen: Signals,
     /// Per group of the scheduler, its id, the register of its `completed`
     /// word and the value last read there.
     completed: Vec<(GroupId, usize, u64)>,
@@ -345,8 +349,8 @@ struct Queue {
 
 /// The thread's state as a restart in place hands it over: per deployment,
 /// its pool `P` (borrowed to write it, owned to read it), the number of its
-/// next session and its queue pairs; the queue pairs' memfds travel apart,
-/// in this order.
+/// next session and its queue pairs; the queue pairs' descriptors
+/// ([`QueueDescriptors`]) travel apart, in this order.
 #[derive(Serialize, Deserialize)]
 struct Handed<P> {
     deployments: Vec<(String, P, ClientId, Vec<QueueHandoff>)>,
@@ -532,9 +536,16 @@ impl Hosted {
     }
 
     /// One turn for the deployment; returns whether the thread has work
-    /// without sleeping: a request was taken or a `completed` word moved,
-    /// or deferred work waits for one.
+    /// without sleeping: a request was taken or a `completed` word moved.
+    /// Deferred work waits for an input that comes with a wake: a
+    /// `completed` word, which rings the doorbell, or a task's end, which
+    /// is work from the main loop.
     fn turn(&mut self, deployment: &str, frozen: bool, now: u64) -> (bool, Vec<Notice>) {
+        // What the engines published before this look: a publication after
+        // it keeps the sleep that follows from starting.
+        for served in self.queues.values_mut() {
+            served.seen = served.pair.signals();
+        }
         let mut busy = false;
         if !frozen {
             for (queue, served) in &mut self.queues {
@@ -600,6 +611,7 @@ impl Hosted {
         if self.dirty {
             self.dirty = false;
             for (queue, served) in &mut self.queues {
+                let mut written = false;
                 for (region, register, last) in &mut served.capacity {
                     let words = self.pool.capacity(*queue, *region);
                     if *last != Some(words) {
@@ -611,7 +623,13 @@ impl Hosted {
                             register.store(u64::from(word), Ordering::Release);
                         }
                         *last = Some(words);
+                        written = true;
                     }
+                }
+                // A scheduler asleep while a request waits for units wakes to
+                // read them.
+                if written {
+                    served.pair.notify_registers();
                 }
             }
         }
@@ -628,7 +646,7 @@ impl Hosted {
             });
             notices.push(stop);
         }
-        (busy || (!frozen && self.pool.deferred()), notices)
+        (busy, notices)
     }
 
     /// The notice that starts a task: the epoch of its session, what it
@@ -756,12 +774,82 @@ impl Pools {
         self.check = check;
     }
 
-    /// Whether no session is open and no task outstanding: no queue to
-    /// read and no deadline to keep.
-    fn idle(&self) -> bool {
+    /// Sleeps after a turn that found nothing, until an engine publishes
+    /// what the thread waits for on one of its queue pairs, the main loop
+    /// sends work (`waker`), or the earliest task deadline of any pool
+    /// passes.
+    ///
+    /// On every queue pair it serves the thread declares that it waits for
+    /// requests and `completed` words (none while frozen, when it takes
+    /// neither) and, while completions wait for room, for the room the
+    /// scheduler makes ([`QueuePair::arm`]). An engine that published such a
+    /// thing since the turn looked keeps the thread from sleeping: the
+    /// declarations are withdrawn and the thread turns again. Once awake the
+    /// thread withdraws every declaration, so that an engine makes no system
+    /// call for it while it is busy, and drains the doorbells.
+    fn sleep(&mut self, waker: &mut Waker) {
+        let frozen = self.frozen;
+        let queues = || {
+            self.deployments
+                .values()
+                .flat_map(|hosted| hosted.queues.values())
+                .filter(|served| !served.broken)
+        };
+
+        let mut armed = true;
+        for served in queues() {
+            let mut interest = Interest::empty();
+            if !frozen {
+                interest |= Interest::RECORDS | Interest::REGISTERS;
+            }
+            if !served.pending.is_empty() {
+                interest |= Interest::ROOM;
+            }
+            if !served.pair.arm(interest, served.seen) {
+                armed = false;
+                break;
+            }
+        }
+
+        if armed {
+            let mut descriptors = vec![waker.poll_fd()];
+            descriptors.extend(queues().map(|served| libc::pollfd {
+                fd: served.pair.doorbell().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }));
+            // Until the earliest deadline, rounded up to whole milliseconds so
+            // the poll does not return before it; without one, until a wake.
+            let timeout = self.next_deadline().map_or(-1, |deadline| {
+                let left = deadline.saturating_sub(monotonic());
+                libc::c_int::try_from(left.div_ceil(1_000_000)).unwrap_or(libc::c_int::MAX)
+            });
+            // SAFETY: poll borrows this live array only for the call. A
+            // failure (a signal) ends the sleep like a wake: the next turn
+            // looks at everything.
+            unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as libc::nfds_t,
+                    timeout,
+                )
+            };
+        }
+
+        for served in queues() {
+            served.pair.disarm();
+            served.pair.drain();
+        }
+        waker.drain();
+    }
+
+    /// The earliest deadline of a task of any pool, on the host's monotonic
+    /// clock: when the next tick may stop one.
+    fn next_deadline(&self) -> Option<u64> {
         self.deployments
             .values()
-            .all(|hosted| hosted.queues.is_empty() && !hosted.pool.tasks())
+            .filter_map(|hosted| hosted.pool.next_deadline())
+            .min()
     }
 
     /// Sends the main loop a notice and wakes it.
@@ -833,7 +921,8 @@ impl Pools {
     /// groups, in the order the scheduler lists them, then the three
     /// capacity words of each region its groups and its classes name, by the
     /// region's number. Returns the session's number in the pool, the
-    /// answer and the queue pairs' memfds.
+    /// answer and the queue pairs' descriptors ([`QueueDescriptors`]), in
+    /// order.
     ///
     /// # Errors
     ///
@@ -865,7 +954,7 @@ impl Pools {
             .filter_map(|class| class.host.and_then(|(region, _)| number(region)))
             .collect();
         let mut registers = Vec::with_capacity(open.schedulers.len());
-        let mut descriptors = Vec::with_capacity(open.schedulers.len());
+        let mut descriptors = Vec::with_capacity(open.schedulers.len() * QueueDescriptors::COUNT);
         let mut queues = Vec::with_capacity(open.schedulers.len());
         for (index, groups) in open.schedulers.iter().enumerate() {
             let mut used = hosts.clone();
@@ -885,10 +974,10 @@ impl Pools {
                 .collect();
             let made =
                 QueuePair::create(RING_BYTES, groups.len() + 3 * used.len()).and_then(|pair| {
-                    let descriptor = pair.descriptor().try_clone_to_owned()?;
-                    Ok((pair, descriptor))
+                    let descriptors = pair.duplicate()?;
+                    Ok((pair, descriptors))
                 });
-            let (pair, descriptor) = match made {
+            let (pair, pair_descriptors) = match made {
                 Ok(made) => made,
                 Err(error) => {
                     hosted.pool.end(client);
@@ -898,11 +987,12 @@ impl Pools {
                     return Err(format!("a queue pair cannot be made: {error}"));
                 }
             };
-            descriptors.push(descriptor);
+            descriptors.extend(pair_descriptors.into_array());
             queues.push((
                 (client, index as u16),
                 Queue {
                     pair,
+                    seen: Signals::default(),
                     completed: groups
                         .iter()
                         .zip(&completed)
@@ -1155,13 +1245,13 @@ impl Pools {
     }
 
     /// The thread's whole state for a successor: the bytes of every pool's
-    /// image with its queue pairs, and the queue pairs' memfds in their
+    /// image with its queue pairs, and the queue pairs' descriptors in their
     /// order. The thread is frozen first, and holds nothing afterwards, so
     /// that it writes nothing the successor writes again.
     ///
     /// # Errors
     ///
-    /// Fails when a pool cannot be written or a memfd duplicated.
+    /// Fails when a pool cannot be written or a descriptor duplicated.
     pub(crate) fn hand_off(&mut self) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
         self.frozen = true;
         // The completions the pools produced go into the queue pairs'
@@ -1174,7 +1264,8 @@ impl Pools {
         for (deployment, hosted) in &self.deployments {
             let mut queues = Vec::with_capacity(hosted.queues.len());
             for (queue, served) in &hosted.queues {
-                descriptors.push(served.pair.descriptor().try_clone_to_owned()?);
+                let pair = served.pair.duplicate().map_err(io::Error::other)?;
+                descriptors.extend(pair.into_array());
                 queues.push(QueueHandoff {
                     queue: *queue,
                     completed: served
@@ -1220,17 +1311,18 @@ impl Pools {
             hosted.pool = pool;
             hosted.next = next;
             for queue in queues {
-                let descriptor = descriptors.next().ok_or_else(|| {
+                let handed = QueueDescriptors::take(&mut descriptors).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "a queue pair's memfd is missing",
+                        "a queue pair's descriptors are missing",
                     )
                 })?;
-                let pair = QueuePair::open(descriptor, false).map_err(io::Error::other)?;
+                let pair = QueuePair::open(handed, false).map_err(io::Error::other)?;
                 hosted.queues.insert(
                     queue.queue,
                     Queue {
                         pair,
+                        seen: Signals::default(),
                         completed: queue
                             .completed
                             .into_iter()
@@ -1258,11 +1350,11 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
-    use storage::QueuePair;
     use storage::protocol::Key;
     use storage::runtime::{
         Class, Completion, Group, GroupId, Open, OwnerId, Region, Request, RequestId, Tier, VERSION,
     };
+    use storage::{QueueDescriptors, QueuePair};
 
     use super::{Notifier, Pools};
 
@@ -1327,7 +1419,8 @@ mod tests {
             peers: Vec::new(),
         };
         let (_, _, descriptors) = pools.open("model", &open).unwrap();
-        let engine = QueuePair::open(descriptors.into_iter().next().unwrap(), true).unwrap();
+        let pair = QueueDescriptors::take(&mut descriptors.into_iter()).unwrap();
+        let engine = QueuePair::open(pair, true).unwrap();
         (pools, engine)
     }
 

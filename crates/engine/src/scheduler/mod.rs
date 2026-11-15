@@ -17,10 +17,10 @@
 //! message that arrived ([`Scheduler::apply`]) and takes one [`Scheduler::step`], which reads the
 //! completion queue and the capacity words once, schedules, hands the batches to the executor and
 //! writes the step's requests into the submission queue. The loop's one blocking call is the
-//! wait on its inbox, taken only after a step that formed no batch, until the next message, the
-//! next starvation or drain deadline, the next statistics second, or, while the buffer pool owes
-//! answers or a request waits for units, one polling period (`SchedulerConfig::poll_period`): the
-//! queue pair runs in poll mode, and no wake-up crosses from the buffer pool.
+//! wait taken only after a step that formed no batch, until the next message, the next
+//! starvation or drain deadline, the next statistics second, or, while the buffer pool owes
+//! answers, requests wait for room or a request waits for units, the buffer pool's ring of the
+//! queue pair's doorbell (`storage::queue`), which it rings only while the scheduler sleeps.
 //!
 //! - `submit` takes a request for the buffer pool. A request the workers first apply to their
 //!   device block tables (`Release`, `Detach`, `Commit`, `Transfer`, `Replicate`, and the
@@ -70,14 +70,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::batch::{Batch, BatchId, BatchOutput, Capacity, Phase};
 use crate::executor::Executor;
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use proto::config::{SchedulerConfig, WorkerGroupConfig};
 use proto::report::SchedulerStats;
 use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, FinishReason, GenerationLimits, MigrationCause, RequestId};
 use scheduling::Parameters;
 use storage::runtime::{self, Cause, Completion, GroupId, OwnerId, Tier};
-use storage::{Key, QueuePair};
+use storage::{Interest, Key, QueuePair, Signals};
 
 pub(crate) use cache::Cached;
 pub(crate) use group::WorkerGroup;
@@ -254,6 +254,10 @@ pub struct Scheduler {
     /// This scheduler's end of its queue pair with the buffer pool: it writes the submission
     /// queue and reads the completion queue.
     queue: QueuePair,
+    /// What the buffer pool had published to this end when the last step began to read the
+    /// pair: the loop sleeps on the pair's doorbell only while nothing arrived since
+    /// ([`Scheduler::run`]).
+    seen: Signals,
     /// Requests the submission queue had no room for, in the order they are to be written.
     held: Vec<runtime::Request>,
     /// Requests handed to the executor for the groups' stamps, by the number they were handed
@@ -521,6 +525,7 @@ impl Scheduler {
             running: Vec::new(),
             groups: workers,
             queue,
+            seen: Signals::default(),
             held: Vec::new(),
             stamping: HashMap::new(),
             outstanding: HashMap::new(),
@@ -706,24 +711,49 @@ impl Scheduler {
     /// it reports as `Output::Failed`, or once no sender of `inbox` is left, which is a shutdown.
     ///
     /// Each pass applies every message that arrived ([`Scheduler::apply`]) and takes one
-    /// [`Scheduler::step`]. It blocks on `inbox` only after a step that formed no batch: a formed
-    /// batch may have left room for another (a pipelined decode), which the next pass finds
-    /// without waiting. It then waits until the next message or the next deadline of
-    /// [`Scheduler::next_deadline`].
+    /// [`Scheduler::step`]. It blocks only after a step that formed no batch: a formed batch may
+    /// have left room for another (a pipelined decode), which the next pass finds without
+    /// waiting. It then declares on the queue pair what it waits for there
+    /// ([`Scheduler::interest`], [`QueuePair::arm`]) and waits until the next message, the
+    /// buffer pool's ring of its doorbell, or the next deadline of [`Scheduler::next_deadline`];
+    /// when the buffer pool published something it waits for since the step looked, it takes the
+    /// next pass at once instead.
+    ///
+    /// The doorbell reaches the loop as a message of its own channel: a relay thread blocks on
+    /// the doorbell's descriptor, which the inbox cannot be waited on with, and forwards each
+    /// ring ([`Relay`]). A relay that cannot start is a fault of the scheduler.
     pub(crate) fn run(mut self, inbox: Receiver<Message>) {
-        let mut formed = false;
+        let relay = match Relay::start(&self.queue) {
+            Ok(relay) => relay,
+            Err(error) => {
+                self.fail(Error::Storage(format!(
+                    "the scheduler's doorbell relay cannot start: {error}"
+                )));
+                return;
+            }
+        };
+
+        let mut ready = false;
         while !self.stopped {
-            let first = if formed {
+            let first = if ready {
                 match inbox.try_recv() {
                     Ok(message) => Some(message),
                     Err(TryRecvError::Empty) => None,
                     Err(TryRecvError::Disconnected) => return self.shutdown(),
                 }
             } else {
-                match inbox.recv_deadline(self.next_deadline()) {
-                    Ok(message) => Some(message),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => return self.shutdown(),
+                let deadline = self.next_deadline();
+                let received = crossbeam_channel::select! {
+                    recv(inbox) -> message => message.map(Some),
+                    recv(relay.rings) -> _ => Ok(None),
+                    default(deadline.saturating_duration_since(Instant::now())) => Ok(None),
+                };
+                // Whatever ended the wait, the buffer pool rings for nothing more until the
+                // next declaration.
+                self.queue.disarm();
+                match received {
+                    Ok(message) => message,
+                    Err(_) => return self.shutdown(),
                 }
             };
 
@@ -733,7 +763,10 @@ impl Scheduler {
                     return;
                 }
             }
-            formed = self.step();
+            let formed = self.step();
+            // A step that formed no batch is followed by a wait, unless the buffer pool published
+            // something the scheduler waits for since the step looked at the pair.
+            ready = formed || (!self.stopped && !self.queue.arm(self.interest(), self.seen));
         }
     }
 
@@ -807,6 +840,10 @@ impl Scheduler {
         }
         let _range = crate::profiling::ranges::range(c"uniserve.scheduler.step", None);
 
+        // What the buffer pool published before this look at the pair: anything it publishes
+        // later keeps the loop from sleeping after the step (`run`).
+        self.seen = self.queue.signals();
+
         // The running requests before the completions, of which the step's trace states the
         // admissions they end (`schedule::STEPS`).
         let running = self.running.len();
@@ -866,10 +903,11 @@ impl Scheduler {
         formed
     }
 
-    /// Until when the loop may block on its inbox after a step that formed no batch: the next
-    /// statistics second; the moment the first running request passes its starvation bound (the
-    /// policy's `timeout` from its last progress), at least [`STARVATION_WAKE`] away; a drain's
-    /// deadline still ahead; and one polling period from now while [`Scheduler::polls`].
+    /// Until when the loop may block after a step that formed no batch: the next statistics
+    /// second; the moment the first running request passes its starvation bound (the policy's
+    /// `timeout` from its last progress), at least [`STARVATION_WAKE`] away; a drain's deadline
+    /// still ahead; and the earliest bound of a copy in flight. What changes on the queue pair
+    /// rings the doorbell instead ([`Scheduler::interest`]).
     fn next_deadline(&self) -> Instant {
         let now = Instant::now();
         let mut deadline = self.stats_due();
@@ -894,19 +932,30 @@ impl Scheduler {
             deadline = deadline.min(*due);
         }
 
-        if self.polls() {
-            deadline = deadline.min(now + self.config.poll_period);
+        // A copy handed to the executor is given up at its bound if it has not finished by then
+        // (`give_up_late_copies`).
+        if let Some(bound) = self.copies.values().map(|&(_, bound)| bound).min() {
+            deadline = deadline.min(bound);
         }
         deadline
     }
 
-    /// Whether the loop polls the queue pair (BP §9, poll mode): something changes there without
-    /// a message to wake the loop. That is the case while the buffer pool owes answers to
-    /// requests written, while requests wait for room in the submission queue, and, unless the
-    /// scheduler is paused, while a request may wait for units of a region: one in the waiting
-    /// queue, whose admission waits for `available`, or a running request with no call in flight,
-    /// which may wait for the units its next call needs.
-    fn polls(&self) -> bool {
+    /// What the loop waits for on the queue pair while it sleeps (BP §9, doorbells): what
+    /// changes there without a message to wake the loop. Completions while the buffer pool owes
+    /// answers to requests written; room in the submission queue while requests are held for it
+    /// (a request held for room in the completion queue waits for the answers outstanding); and,
+    /// unless the scheduler is paused, the capacity words while a request may wait for units of
+    /// a region: one in the waiting queue, whose admission waits for `available`, or a running
+    /// request with no call in flight, which may wait for the units its next call needs. Nothing
+    /// otherwise, and the buffer pool then rings for nothing.
+    fn interest(&self) -> Interest {
+        let mut interest = Interest::empty();
+        if !self.outstanding.is_empty() {
+            interest |= Interest::RECORDS;
+        }
+        if !self.held.is_empty() {
+            interest |= Interest::ROOM;
+        }
         let units = !self.paused
             && (!self.waiting.is_empty()
                 || self
@@ -914,7 +963,10 @@ impl Scheduler {
                     .iter()
                     .filter_map(|id| self.requests.get(id))
                     .any(Request::idle));
-        !self.outstanding.is_empty() || !self.held.is_empty() || units
+        if units {
+            interest |= Interest::REGISTERS;
+        }
+        interest
     }
 
     /// Answers `Pause` once the scheduler is paused and no group has a batch in flight, and a
@@ -2491,4 +2543,89 @@ fn stamps_of(request: &mut runtime::Request) -> Option<&mut runtime::Stamps> {
 
 fn storage_error(error: storage::Error) -> Error {
     Error::Storage(error.to_string())
+}
+
+/// Forwards the rings of a scheduler's doorbell to its loop ([`Scheduler::run`]).
+///
+/// The loop waits on its inbox, a channel, and the doorbell is a descriptor, which a channel
+/// cannot be waited on together with. The relay's thread blocks on the doorbell, takes each
+/// ring and sends it on a channel of its own, which the loop waits on beside its inbox; rings
+/// the loop has not taken yet coalesce into one. The thread ends when the relay is dropped:
+/// it waits on its end of a socket pair beside the doorbell, whose other end the relay holds.
+struct Relay {
+    /// One message per ring the loop has not taken yet, at most one.
+    rings: Receiver<()>,
+    /// Closing it ends the thread.
+    stop: std::os::unix::net::UnixStream,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Relay {
+    /// Starts the relay of `queue`'s doorbell.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the doorbell cannot be duplicated, the socket pair made, or the thread
+    /// started.
+    fn start(queue: &QueuePair) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+
+        let doorbell = queue.doorbell().try_clone_to_owned()?;
+        let (stop, stopped) = std::os::unix::net::UnixStream::pair()?;
+        let (ring, rings) = crossbeam_channel::bounded(1);
+        let thread = std::thread::Builder::new()
+            .name("scheduler-doorbell".into())
+            .spawn(move || {
+                let mut count = [0_u8; 8];
+                loop {
+                    let mut descriptors = [
+                        libc::pollfd {
+                            fd: doorbell.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: stopped.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // SAFETY: poll borrows this live array only for the call.
+                    let polled = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+                    if polled < 0 {
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
+                        return;
+                    }
+                    // The relay's end closed: the scheduler stopped.
+                    if descriptors[1].revents != 0 {
+                        return;
+                    }
+                    if descriptors[0].revents & libc::POLLIN != 0 {
+                        // SAFETY: an eventfd read of its eight-byte counter into a live buffer,
+                        // which resets it; the descriptor is non-blocking.
+                        unsafe { libc::read(doorbell.as_raw_fd(), count.as_mut_ptr().cast(), 8) };
+                        // A full channel already holds a ring the loop has not taken.
+                        let _ = ring.try_send(());
+                    }
+                }
+            })?;
+        Ok(Self {
+            rings,
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        // Closing the relay's end of the socket pair ends the thread's poll.
+        let _ = self.stop.shutdown(std::net::Shutdown::Both);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }

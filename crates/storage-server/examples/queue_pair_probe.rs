@@ -6,9 +6,10 @@
 //! with the buffer pool (§10, F1): it reads the completions that arrived and
 //! the capacity registers, writes the step's requests into the submission
 //! queue and publishes `completed`. A second process runs the buffer pool's
-//! loop with no buffer pool logic: it polls the submission queue, answers
-//! every request with one completion, and backs off to a bounded sleep when
-//! the queue is empty. Three modes:
+//! loop with no buffer pool logic: it answers every request with one
+//! completion and, once a look found nothing, sleeps on its doorbell until
+//! the engine writes a request or `completed` (`storage::queue`), as the
+//! buffer pool's thread does. Three modes:
 //!
 //! - `baseline`: the graph alone, no queue pair and no second process.
 //! - `live`: the queue pair with the buffer pool's process running.
@@ -38,7 +39,7 @@ use platform::{
     Capture, CaptureMode, Device, DeviceAllocation, DeviceId, Event, EventFlags, LaunchConfig,
     Library,
 };
-use storage::QueuePair;
+use storage::{Interest, QueueDescriptors, QueuePair};
 
 const KERNEL: &str = r#"
 extern "C" __global__ void fill(unsigned int* words, unsigned long long count, unsigned int seed) {
@@ -76,8 +77,9 @@ struct Options {
     work: PathBuf,
     nvcc: String,
     samples: Option<PathBuf>,
-    /// Set for the buffer pool's process: the inherited queue pair.
-    pool: Option<i32>,
+    /// Set for the buffer pool's process: the inherited queue pair's
+    /// descriptors, in the order `QueueDescriptors` gives them.
+    pool: Option<[i32; QueueDescriptors::COUNT]>,
 }
 
 fn options() -> Result<Options, Box<dyn std::error::Error>> {
@@ -117,7 +119,16 @@ fn options() -> Result<Options, Box<dyn std::error::Error>> {
             "--work" => options.work = value.into(),
             "--nvcc" => options.nvcc = value,
             "--samples" => options.samples = Some(value.into()),
-            "--pool-descriptor" => options.pool = Some(value.parse()?),
+            "--pool-descriptors" => {
+                let numbers = value
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<Vec<i32>, _>>()?;
+                let numbers: [i32; QueueDescriptors::COUNT] = numbers
+                    .try_into()
+                    .map_err(|_| "--pool-descriptors names a queue pair's three descriptors")?;
+                options.pool = Some(numbers);
+            }
             other => return Err(format!("unknown flag {other}").into()),
         }
     }
@@ -125,17 +136,28 @@ fn options() -> Result<Options, Box<dyn std::error::Error>> {
 }
 
 /// The buffer pool's loop without its logic: one completion per request, the
-/// capacity registers rewritten, `completed` read, and a bounded sleep once
-/// the submission queue has stayed empty.
-fn pool(descriptor: i32) -> Result<(), Box<dyn std::error::Error>> {
-    // SAFETY: the engine's process passed this descriptor to this process alone.
-    let mut queue = QueuePair::open(unsafe { OwnedFd::from_raw_fd(descriptor) }, false)?;
+/// capacity registers rewritten, `completed` read, and a sleep on the
+/// doorbell once a look found nothing to do.
+fn pool(descriptors: [i32; QueueDescriptors::COUNT]) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: the engine's process passed these descriptors to this process alone.
+    let [memory, pool, engine] = descriptors.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+    let mut queue = QueuePair::open(
+        QueueDescriptors {
+            memory,
+            pool,
+            engine,
+        },
+        false,
+    )?;
     let mut request = Vec::new();
     let mut pending: Option<[u8; COMPLETION_BYTES]> = None;
     let mut served = 0u64;
-    let mut idle = 0u32;
+    let mut last_completed = 0u64;
 
     loop {
+        // What the engine published before this look: anything later keeps
+        // the sleep below from starting.
+        let seen = queue.signals();
         let mut progressed = false;
         loop {
             // A completion the queue had no room for is written before the next
@@ -161,24 +183,21 @@ fn pool(descriptor: i32) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let completed = queue.register(0).load(Ordering::Acquire);
+        progressed |= completed != last_completed;
+        last_completed = completed;
         for word in 1..REGISTERS {
             queue
                 .register(word)
                 .store(served + completed, Ordering::Release);
         }
+        queue.notify_registers();
 
-        if progressed {
-            idle = 0;
-        } else {
-            idle += 1;
-            if idle < 1_000 {
-                std::hint::spin_loop();
-            } else {
-                // At most a millisecond without looking.
-                std::thread::sleep(Duration::from_micros(
-                    u64::from(idle - 1_000).clamp(50, 1_000),
-                ));
+        if !progressed {
+            let mut interest = Interest::RECORDS | Interest::REGISTERS;
+            if pending.is_some() {
+                interest |= Interest::ROOM;
             }
+            queue.wait(interest, seen, None)?;
         }
     }
 }
@@ -237,16 +256,21 @@ fn engine(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     let mut child = None;
     if options.mode != Mode::Baseline {
         let created = QueuePair::create(RING_BYTES, REGISTERS)?;
-        let descriptor = created.descriptor().try_clone_to_owned()?;
-        // SAFETY: clearing close-on-exec on a descriptor this process owns.
-        let cleared = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, 0) };
-        assert_eq!(cleared, 0, "clearing close-on-exec");
+        let descriptors = created.duplicate()?;
+        let mut numbers = Vec::with_capacity(QueueDescriptors::COUNT);
+        for descriptor in created.descriptors() {
+            // SAFETY: clearing close-on-exec on a descriptor this process owns.
+            let cleared = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, 0) };
+            assert_eq!(cleared, 0, "clearing close-on-exec");
+            numbers.push(descriptor.as_raw_fd().to_string());
+        }
         child = Some(
             Command::new(std::env::current_exe()?)
-                .args(["--pool-descriptor", &descriptor.as_raw_fd().to_string()])
+                .args(["--pool-descriptors", &numbers.join(",")])
                 .spawn()?,
         );
-        queue = Some(QueuePair::open(descriptor, true)?);
+        drop(created);
+        queue = Some(QueuePair::open(descriptors, true)?);
     }
 
     let mut samples = Vec::with_capacity(options.steps);
@@ -295,6 +319,7 @@ fn engine(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
         event.synchronize()?;
         if let Some(queue) = &queue {
             queue.register(0).store(step as u64, Ordering::Release);
+            queue.notify_registers();
         }
 
         if step >= options.warmup {
@@ -309,14 +334,26 @@ fn engine(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
             signal(&child, libc::SIGCONT);
         }
         let resumed = Instant::now();
-        while completions < submitted && resumed.elapsed() < Duration::from_secs(10) {
+        let deadline = resumed + Duration::from_secs(10);
+        while completions < submitted && Instant::now() < deadline {
+            let seen = queue.signals();
             while queue.next_completion(&mut completion)? {
                 completions += 1;
+            }
+            if completions < submitted {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                queue.wait(Interest::RECORDS, seen, Some(remaining))?;
             }
         }
         drained_after = Some(resumed.elapsed().as_secs_f64());
         request[0] = 0xff;
-        while !queue.submit(&request)? {}
+        loop {
+            let seen = queue.signals();
+            if queue.submit(&request)? {
+                break;
+            }
+            queue.wait(Interest::ROOM, seen, None)?;
+        }
         child.wait()?;
     }
 

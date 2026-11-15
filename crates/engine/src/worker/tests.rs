@@ -1052,7 +1052,7 @@ fn a_worker_with_no_device_records_no_profiling_session() {
 /// it that a group's sequences write the `completed` word into.
 fn queue_pair(registers: usize) -> (QueuePair, QueuePair) {
     let pool = QueuePair::create(64, registers).unwrap();
-    let engine = QueuePair::open(pool.descriptor().try_clone_to_owned().unwrap(), true).unwrap();
+    let engine = QueuePair::open(pool.duplicate().unwrap(), true).unwrap();
     (pool, engine)
 }
 

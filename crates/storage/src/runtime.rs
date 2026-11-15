@@ -80,7 +80,7 @@ pub enum Cause {
 
 /// What an engine epoch states to open its session with the buffer pool of
 /// its deployment: its layout. It travels on the Storage Server's socket;
-/// the answer is [`Opened`], with one queue pair's descriptor per scheduler.
+/// the answer is [`Opened`], with one queue pair's descriptors per scheduler.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Open {
     /// The version of this interface the engine speaks: its build's
@@ -274,7 +274,8 @@ pub struct Group {
 }
 
 /// The answer to [`Open`]. The descriptors of the queue pairs travel with
-/// it, one per scheduler in the order of [`Open::schedulers`].
+/// it (`crate::QueueDescriptors`), one queue pair per scheduler in the order
+/// of [`Open::schedulers`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Opened {
     /// Per region of [`Open::regions`]: the number completions name it by,

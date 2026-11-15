@@ -30,6 +30,7 @@ use crate::protocol::{
     Role, Scope, Segment, ServerMessage, Span, StorageRecord, TaskStatus, TensorRecord, Tensors,
     Throttle, UnitRun, Usage, VERSION, Welcome,
 };
+use crate::queue::QueueDescriptors;
 use crate::runtime::{Open, Opened};
 use service::Connection;
 
@@ -646,20 +647,25 @@ impl Client {
     }
 
     /// See [`Request::Open`]: open the epoch's session with the buffer
-    /// pool. Returns the answer and one queue pair's memfd per scheduler,
-    /// in the order the layout lists them, each for
+    /// pool. Returns the answer and one queue pair's descriptors per
+    /// scheduler, in the order the layout lists them, each for
     /// [`QueuePair::open`](crate::QueuePair::open) as the engine's end.
-    pub fn open_pool(&mut self, open: Open) -> Result<(Opened, Vec<OwnedFd>)> {
+    pub fn open_pool(&mut self, open: Open) -> Result<(Opened, Vec<QueueDescriptors>)> {
         let schedulers = open.schedulers.len();
         match self.request(&Request::Open(open), &[])? {
             (Response::Opened(opened), descriptors) => {
-                if descriptors.len() != schedulers || opened.registers.len() != schedulers {
+                let count = descriptors.len();
+                if count != schedulers * QueueDescriptors::COUNT
+                    || opened.registers.len() != schedulers
+                {
                     return Err(Error::Protocol(format!(
-                        "{schedulers} schedulers were answered with {} queue pairs",
-                        descriptors.len()
+                        "{schedulers} schedulers were answered with {count} descriptors of queue \
+                         pairs"
                     )));
                 }
-                Ok((opened, descriptors))
+                let mut descriptors = descriptors.into_iter();
+                let pairs = std::iter::from_fn(|| QueueDescriptors::take(&mut descriptors));
+                Ok((opened, pairs.collect()))
             }
             (other, _) => Err(unexpected("open", &other)),
         }

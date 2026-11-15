@@ -211,10 +211,7 @@ impl InProcessPool {
                 .collect();
 
             let pair = QueuePair::create(self.ring_bytes, groups.len() + 3 * used.len())?;
-            ends.push(QueuePair::open(
-                pair.descriptor().try_clone_to_owned()?,
-                true,
-            )?);
+            ends.push(QueuePair::open(pair.duplicate()?, true)?);
             served.push(Served {
                 queue: (client, index as u16),
                 pair,
@@ -312,8 +309,10 @@ impl InProcessPool {
         }
         self.write();
 
-        // 6. The capacity words.
+        // 6. The capacity words, and the scheduler's doorbell when they changed, as the server's
+        // thread rings it.
         for served in &self.queues {
+            let mut changed = false;
             for &(region, register) in &served.capacity {
                 let words = self
                     .capacity
@@ -323,8 +322,11 @@ impl InProcessPool {
                 let (available, retiring, evictable) = words;
                 for (offset, word) in [available, retiring, evictable].into_iter().enumerate() {
                     let register = served.pair.register(register + offset);
-                    register.store(u64::from(word), Ordering::Release);
+                    changed |= register.swap(u64::from(word), Ordering::AcqRel) != u64::from(word);
                 }
+            }
+            if changed {
+                served.pair.notify_registers();
             }
         }
         Ok(())

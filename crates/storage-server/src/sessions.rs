@@ -249,13 +249,15 @@ impl Running {
 
 /// What the sessions are as a restart in place hands them over: the
 /// pools' image in this build's format ([`crate::buffer_pool::FORMAT`],
-/// which the successor agreed to before the takeover), and the number of
-/// queue pairs, whose memfds travel apart, and what the main loop keeps. No
+/// which the successor agreed to before the takeover), the number of queue
+/// pairs, whose descriptors travel apart, and what the main loop keeps. No
 /// task runs then.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SessionsHandoff {
     #[serde(with = "serde_bytes")]
     image: Vec<u8>,
+    /// The queue pairs, whose descriptors travel apart,
+    /// [`storage::QueueDescriptors::COUNT`] per queue pair.
     pub(crate) queues: usize,
     open: Vec<(Engine, (ClientId, PoolSession))>,
     /// The sessions waiting for their engine's processes, each process by
@@ -328,7 +330,7 @@ impl Sessions {
             && self.thread.call(|pools| pools.quiet()).unwrap_or(true)
     }
 
-    /// The sessions for a successor, with the queue pairs' memfds; the
+    /// The sessions for a successor, with the queue pairs' descriptors; the
     /// waiting sessions' pidfds are named by `pidfd`.
     pub(crate) fn hand_off(
         &mut self,
