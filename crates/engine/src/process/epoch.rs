@@ -16,13 +16,14 @@
 //! ([`StorageClient::session`]) is where these jobs read a region's name, its reserved units,
 //! the units it serves, its segment table and the worker groups whose ranks map it. A region of
 //! the KV planes serves the epoch's capacity, within the numbering the buffer pool holds for it:
-//! an epoch of the same layout shares the regions of the epoch it succeeds and resizes them to
-//! its own capacity, and a promotion resizes them to the promoted epoch's again, so that a
-//! rollback restores what the target changed. A model that keeps a
-//! recurrent state has a state region beside each KV region, one checkpoint a unit
-//! (`specs/engine-worker-port.md` §1.6): every job names the region whose memory the ranks change,
-//! a growth creates a state region's segments before a KV region's, and a start's give-back once
-//! warm takes a KV region's tail first.
+//! an epoch of the same layout shares the regions of the epoch it succeeds, which keep the
+//! serving epoch's sizes through the target's start, and resizes them to its own capacity when
+//! it is promoted ([`promote`]). A promotion of the epoch it succeeds, at a rollback, resizes them
+//! to that epoch's sizes again, and an update abandoned before its switch resizes nothing. A
+//! model that keeps a recurrent state has a state region beside each KV region, one checkpoint a
+//! unit (`specs/engine-worker-port.md` §1.6): every job names the region whose memory the ranks
+//! change, a growth creates a state region's segments before a KV region's, and a start's
+//! give-back once warm takes a KV region's tail first.
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -257,8 +258,8 @@ pub(crate) fn create_fitting(
 /// fits its quota and is reserved (`WeightBinding::reserve_serving`). A stated capacity that gave
 /// a segment back here is refused by name when the ranks create what fits ([`create_fitting`]).
 ///
-/// The session's regions hold no unit yet (the schedulers resize them after), so no withdrawal is
-/// refused for a held block.
+/// The session's regions hold no unit yet (the schedulers resize them once the engine is
+/// promoted), so no withdrawal is refused for a held block.
 ///
 /// # Errors
 ///
@@ -370,10 +371,13 @@ fn whole(
 /// ([`grow_regions`]), and every scheduler admits again. The regions a drain shrank grow by
 /// [`grow`].
 ///
-/// The resize is how a rollback restores the promoted epoch's sizes: a target of the same layout
-/// shares the promoted engine's regions and resized them to its own device cache's capacity and
-/// host pools. A shrink that stops short of the blocks requests still hold goes on in the
-/// scheduler as they come free.
+/// The resize is where the epoch's sizes take effect: the start resizes no region, and a parked
+/// engine grows none ([`crate::process::lifecycle::grow`]), so the regions a target of the same
+/// layout shares with the serving engine keep the serving epoch's sizes until the target's
+/// promotion at the switch resizes them to its own device cache's capacity and host pools, and
+/// an update abandoned before its switch leaves them as they were. A rollback's promotion of the
+/// engine the target succeeded resizes them to that engine's sizes again. A shrink that stops
+/// short of the blocks requests still hold goes on in the scheduler as they come free.
 ///
 /// # Errors
 ///
@@ -608,11 +612,12 @@ pub(super) fn grant_held(
 /// Every region is asked before any reply is waited for.
 ///
 /// The session asks for no unit of a region whose memory the ranks create once it is open, so
-/// this is how the start's regions, and a woken engine's, reach the segments the head granted.
-/// A region an earlier epoch opened keeps that epoch's numbering and units at `Open`, so this is
-/// how the epoch's own statement of its device cache (`kv_cache_config.max_tokens`) and of its
-/// host tier (`kv_cache_config.host_gib`) takes effect on a region of the same layout
-/// (`specs/buffer-pool.md` §14.1): a shrink to fewer units and a grow back alike.
+/// this is how a promoted engine's regions ([`promote`]), and a woken engine's, reach the
+/// segments the head granted. A region an earlier epoch opened keeps that epoch's numbering and
+/// units at `Open`, so this is how the epoch's own statement of its device cache
+/// (`kv_cache_config.max_tokens`) and of its host tier (`kv_cache_config.host_gib`) takes effect
+/// on a region of the same layout (`specs/buffer-pool.md` §14.1), a shrink to fewer units and a
+/// grow back alike, once the epoch is promoted.
 ///
 /// # Errors
 ///

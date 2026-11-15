@@ -267,8 +267,8 @@ pub(crate) struct MainProcess {
     /// Whether admission opened once and the serving path's warm-up ran.
     warmed: bool,
     /// A grow that arrived while the engine could not apply it (`lifecycle::grow`): during its
-    /// start, or during a drain; applied once the engine is parked or serves after its start, or
-    /// serves again after the drain.
+    /// start, while it is parked, or during a drain; applied once a promotion makes the engine
+    /// serve.
     grow: bool,
     operations: Sender<Job>,
     watchdog: Watchdog,
@@ -654,12 +654,11 @@ impl MainProcess {
         self.park();
     }
 
-    /// The start ends parked.
+    /// The start ends parked. A grow kept during the start waits for the promotion.
     fn park(&mut self) {
         self.lifecycle = lifecycle::started(true);
         self.announce(true);
         self.report(lifecycle::parked(self.launch.engine, self.generation));
-        self.grow_kept();
     }
 
     /// Opens admission: the graph storage restored, what serving holds reserved, the regions
@@ -729,8 +728,8 @@ impl MainProcess {
                 self.recompute = promote.recompute;
                 let serving = lifecycle::serving(self.launch.engine, self.generation);
                 match lifecycle::promote(&mut self.lifecycle, serving) {
-                    // Parked, the engine grows behind the opening; draining, once it serves
-                    // again.
+                    // The grow is kept until the engine serves: behind the opening when it is
+                    // parked, once it serves again when it drains.
                     Ok(admits) => {
                         if admits {
                             self.open_admission();
@@ -1158,7 +1157,7 @@ impl MainProcess {
 
     /// `Grow`, or a promotion with `grow`: the ranks create the segments their quotas now hold,
     /// the head grants them, and the schedulers grow their regions into them. While the engine
-    /// starts or drains the grow is kept instead ([`lifecycle::grow`]).
+    /// starts, is parked or drains the grow is kept instead ([`lifecycle::grow`]).
     fn grow(&mut self) {
         if !lifecycle::grow(self.lifecycle, &mut self.grow) {
             return;
@@ -1180,7 +1179,7 @@ impl MainProcess {
         }));
     }
 
-    /// Applies the grow kept while the engine could not grow, once it is parked or serves.
+    /// Applies the grow kept while the engine could not grow, once it serves.
     fn grow_kept(&mut self) {
         if std::mem::take(&mut self.grow) {
             self.grow();

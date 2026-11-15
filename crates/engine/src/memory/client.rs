@@ -568,12 +568,13 @@ impl StorageClient {
     /// states, which the ranks lay their memory out by.
     ///
     /// The kept layout's units are those each region serves, which its schedulers resize it to
-    /// (`crate::process::epoch::grow_regions`). A device region that asks for no unit at `Open`,
-    /// the memory of the KV planes and the state units its ranks create once the session is
-    /// open, serves its capacity: the units past its reserved ones of the numbering `layout`
-    /// states, the epoch's own (`kv_cache_config.max_tokens`, or what its share holds), within
-    /// the numbering the buffer pool holds. An epoch of the same layout that shares the region
-    /// with an epoch of another capacity therefore resizes it to its own.
+    /// once the engine is promoted (`crate::process::epoch::promote`); until then each region
+    /// holds what the answer states. A device region that asks for no unit at `Open`, the memory
+    /// of the KV planes and the state units its ranks create once the session is open, serves its
+    /// capacity: the units past its reserved ones of the numbering `layout` states, the epoch's
+    /// own (`kv_cache_config.max_tokens`, or what its share holds), within the numbering the
+    /// buffer pool holds. An epoch of the same layout that shares the region with an epoch of
+    /// another capacity therefore resizes it to its own at its promotion, and not before.
     ///
     /// # Errors
     ///

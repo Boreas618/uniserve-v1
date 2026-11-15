@@ -29,8 +29,11 @@
 //!    region beside a draining predecessor creates what its quota then holds, which the head
 //!    grants; a stated capacity (`kv_cache_config.max_tokens`) is created whole before the
 //!    warm-up and refused by name when it does not fit beside the warm processes;
-//! 6. the schedulers are built over the workers, and each grows its KV regions into the granted
-//!    segments and resizes the regions of a media group to the slots it kept.
+//! 6. the schedulers are built over the workers, sizing no region: each region keeps the units
+//!    the buffer pool holds for it until the engine is promoted
+//!    ([`crate::process::epoch::promote`]), when its scheduler grows the KV regions into the
+//!    granted segments, resizes the regions of a media group to the slots it kept, and resizes the
+//!    regions a target of the same layout shares with the serving epoch to the target's sizes.
 //!
 //! A standby of the serving engine maps its epoch's regions and reserves its process when it is
 //! promoted, as the process it replaces held them until then: it commits nothing at its start. A
@@ -684,7 +687,7 @@ pub(crate) fn start(
     let capacities = capacities(&ranks, &open, (&peers, stated_by_peers))?;
 
     // The session's regions of each media group serve the slots it kept, as every rank of it
-    // states them; the schedulers resize them so.
+    // states them; the schedulers resize them so once the engine is promoted.
     for (region, units) in kept_regions(launch, &ranks, &open, &capacities)? {
         head.keep_units(region, units)?;
     }
@@ -706,6 +709,15 @@ pub(crate) fn start(
         let head = Arc::clone(&head);
         Box::new(move || service::lock(&head).close())
     };
+
+    // The schedulers start over the regions as the buffer pool holds them, and the start resizes
+    // none: each takes the units the session states of it once the engine is promoted
+    // (`epoch::promote`), the KV regions growing into the granted segments and a media group's
+    // regions shrinking to the slots it kept. A target of the serving epoch's layout names the
+    // serving engine's regions, which so keep the serving epoch's sizes while the target prepares
+    // and after an update abandoned before its switch: the target's process then ends unpromoted,
+    // and the Storage Server closes its session once the process has exited
+    // (`specs/buffer-pool.md` §14.1).
     let mut engine = Engine::new(
         launch,
         &open,
@@ -721,12 +733,6 @@ pub(crate) fn start(
         },
         session,
     )?;
-
-    // The schedulers grow their device regions, the KV regions into the granted segments, and
-    // resize a media group's regions to the slots it kept: no unit entered a region before its
-    // memory existed. A start that fails ends its process, whose session the Storage Server
-    // closes once the process has exited (`specs/buffer-pool.md` §14.1).
-    epoch::grow_regions(&engine.inboxes(), &head)?;
 
     engine.workers = workers;
     engine.groups = Some(route);

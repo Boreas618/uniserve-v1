@@ -1,8 +1,10 @@
 //! The binary's start on the meta device against a Storage Server in the test's process: one
-//! engine whose scheduler grew its KV region into the segments its rank created, and whose close
-//! ends the session; one engine of a media launch; and one engine of a model with a vision tower,
-//! whose rank encodes images beside its prefills. Then the generation limits an engine reports,
-//! against what its groups state.
+//! engine whose scheduler grew its KV region into the segments its rank created once admission
+//! opened, and whose close ends the session; the regions a target of the same layout that states
+//! smaller host pools shares with the serving engine, through its start, its promotion, a commit,
+//! a rollback and an abandoned update; one engine of a media launch; and one engine of a model
+//! with a vision tower, whose rank encodes images beside its prefills. Then the generation limits
+//! an engine reports, against what its groups state.
 //!
 //! The text model is the Qwen3-MoE fixture of the `qwen3` crate, the media model a released
 //! FastH3 checkpoint (`crate::process::ranks::tests::FAST_H3`) and the model with a vision tower
@@ -10,8 +12,11 @@
 //! loaded from its shard headers alone, and the policy the packaged `fcfs`; no GPU and no Build
 //! Server is touched.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use crate::batch::Capacity;
 use crate::batch::product::KINDS;
@@ -19,15 +24,260 @@ use crate::batch::{Phase, Shape, Variant};
 use crate::executor::peers::{LOST_EXIT, Liveness};
 use crate::memory::buffers::UNIT_BYTES;
 use crate::memory::encoders;
+use proto::config::EngineArgs;
 use proto::request::GenerationLimits;
-use storage::runtime::{GroupId, Tier};
+use storage::runtime::{GroupId, Open, Tier};
 
-use super::{FIRST_GENERATION, lowered, start};
-use crate::memory::client::StorageClient;
-use crate::process::epoch::kv_regions;
+use super::{Engine, FIRST_GENERATION, lowered, start};
+use crate::memory::client::{StorageClient, StorageLaunch};
+use crate::process::epoch::{drain, kv_regions, promote};
 use crate::process::ranks::layout;
 use crate::process::ranks::tests::{FAST_H3, loaded, video_launch};
 use crate::support::{DEPLOYMENT, StorageServer, launch};
+
+/// The epoch and launch generation of the sessions that read what the buffer pool holds, beside
+/// the engines of a case.
+const READER: u64 = 9;
+
+/// The host pools of the serving epoch and of a target of its layout that halves them
+/// (`kv_cache_config.host_gib`). A meta start numbers its KV planes at their fewest units
+/// whatever `kv_cache_config.max_tokens` states, so the host pools are what such a target sizes
+/// apart from the serving epoch there; the regions of either size are resized alike
+/// (`crate::process::epoch::grow_regions`).
+const SERVING_HOST_GIB: u64 = 2;
+const TARGET_HOST_GIB: u64 = 1;
+
+/// A bound on the tests' waits that only a defect reaches.
+const LONG: Duration = Duration::from_secs(30);
+
+/// The Storage Server launch of `launch`'s engine, whose Storage Server is `server`.
+fn storage_launch(server: &StorageServer, launch: &EngineArgs) -> StorageLaunch {
+    StorageLaunch {
+        socket: server.socket.to_string_lossy().into_owned(),
+        deployment: launch.engine_config.deployment.clone(),
+        claim: [0; 16],
+        tcp: None,
+        peers: Vec::new(),
+        epoch: launch.epoch,
+        standby: false,
+        standby_storage: Default::default(),
+    }
+}
+
+/// `launch`'s engine, started on the meta device at `server` with the packaged policy the launch
+/// names.
+fn start_on_meta(server: &StorageServer, launch: &EngineArgs) -> Engine {
+    let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
+    let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
+    let policy = (crate::scheduler::packaged("fcfs"), parameters);
+    // An engine of one main process has no peer link to lose.
+    let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
+    start(
+        launch,
+        &registry,
+        &storage_launch(server, launch),
+        None,
+        policy,
+        liveness,
+    )
+    .unwrap()
+}
+
+/// Opens admission on `engine` as its process does when the engine is promoted: once its start
+/// ends unparked, and at each `Promote` that finds it parked, a rollback's included
+/// (`MainProcess::open_admission`).
+fn open_admission(engine: &Engine) {
+    promote(&engine.inboxes(), engine.head.as_deref(), &engine.binding).unwrap();
+}
+
+/// Drains `engine` beside an epoch of the same layout, which keeps the regions the two share
+/// (`Drain` without `shrink`), and waits until every scheduler holds no request.
+fn drain_beside(engine: &Engine) {
+    for reply in drain(&engine.inboxes(), Instant::now() + LONG, false).unwrap() {
+        reply.recv_timeout(LONG).unwrap();
+    }
+}
+
+/// Ends `engine`, as its process's exit does, its session included.
+fn close(engine: Engine) {
+    let mut outputs = Vec::new();
+    engine
+        .close(|scheduler, output| outputs.push((scheduler, output)))
+        .unwrap();
+    assert!(
+        outputs
+            .iter()
+            .all(|(_, output)| !matches!(output, crate::scheduler::Output::Failed(_))),
+        "{outputs:?}"
+    );
+}
+
+/// The regions `engine`'s session names, by name, each with the units the session states the
+/// region serves: what the engine sizes it to once it is promoted.
+fn stated(engine: &Engine) -> BTreeMap<String, u32> {
+    let head = service::lock(engine.head.as_ref().unwrap());
+    let (open, _) = head.session().unwrap();
+    open.regions
+        .iter()
+        .map(|region| (region.name.clone(), region.units))
+        .collect()
+}
+
+/// The units in each region of `names` that the reader's layout `open` names: what a session of
+/// that layout, of epoch [`READER`], opened now at `server` is answered.
+fn held(server: &StorageServer, open: &Open, names: &BTreeSet<String>) -> BTreeMap<String, u32> {
+    let mut reader =
+        StorageClient::connect_head(&server.socket, DEPLOYMENT, READER, READER).unwrap();
+    let _pairs = reader.open(open.clone()).unwrap();
+    let (_, opened) = reader.session().unwrap();
+    let held = open
+        .regions
+        .iter()
+        .zip(&opened.regions)
+        .filter(|(region, _)| names.contains(&region.name))
+        .map(|(region, &(_, units))| (region.name.clone(), units))
+        .collect();
+    reader.close().unwrap();
+    held
+}
+
+/// The parts of an update of the host pools' size (`kv_cache_config.host_gib`) over the
+/// fixture's layout, at `server`: the serving engine of epoch 1, of [`SERVING_HOST_GIB`], started
+/// with its admission open; the launch of the target of epoch 2, of the same layout, which states
+/// [`TARGET_HOST_GIB`] and parks (it succeeds epoch 1); and the layout of the reader's sessions,
+/// the serving epoch's.
+fn update(server: &StorageServer) -> (Engine, EngineArgs, Open) {
+    let mut serving = launch();
+    serving.engine_config.device.device = "meta".to_owned();
+    serving.engine_config.kv_cache.host_gib = NonZeroU64::new(SERVING_HOST_GIB);
+
+    let mut target = serving.clone();
+    target.epoch = 2;
+    target.engine = 2;
+    target.predecessor = Some(proto::request::wire::Predecessor {
+        epoch: serving.epoch,
+    });
+    target.engine_config.kv_cache.host_gib = NonZeroU64::new(TARGET_HOST_GIB);
+
+    let mut reader = serving.clone();
+    reader.epoch = READER;
+    reader.engine = READER;
+    let reader = layout(&reader, &loaded(&reader)).unwrap();
+
+    let engine = start_on_meta(server, &serving);
+    open_admission(&engine);
+    (engine, target, reader)
+}
+
+/// The names of the regions both engines' sessions name, which the buffer pool holds once for
+/// both: the region of the KV planes and the host pools among them, the target stating half the
+/// serving engine's units of each host pool.
+fn shared(serving: &Engine, target: &Engine) -> BTreeSet<String> {
+    let (theirs, ours) = (stated(serving), stated(target));
+    let shared: BTreeSet<String> = theirs
+        .keys()
+        .filter(|name| ours.contains_key(*name))
+        .cloned()
+        .collect();
+
+    let head = service::lock(serving.head.as_ref().unwrap());
+    let (open, _) = head.session().unwrap();
+    let kv = &open.regions[kv_regions(open)[0]].name;
+    assert!(shared.contains(kv), "{shared:?}");
+    let pools: Vec<&String> = open
+        .regions
+        .iter()
+        .filter(|region| region.tier == Tier::Host)
+        .map(|region| &region.name)
+        .collect();
+    assert!(!pools.is_empty(), "the launch keeps a host tier");
+    for pool in pools {
+        assert!(shared.contains(pool), "{shared:?}");
+        assert_eq!(ours[pool], theirs[pool] / 2, "{pool}");
+    }
+    shared
+}
+
+/// The units `engine`'s session states of each region of `names`.
+fn stated_of(engine: &Engine, names: &BTreeSet<String>) -> BTreeMap<String, u32> {
+    stated(engine)
+        .into_iter()
+        .filter(|(name, _)| names.contains(name))
+        .collect()
+}
+
+/// The cache's size is no layout: a target of the serving epoch's layout that states half its
+/// host pools names the regions the serving engine's session names, and its start parks it with
+/// every region the two share at the serving epoch's size, so the serving epoch keeps its
+/// capacity while the target prepares. Its promotion resizes them to its own sizes, and a commit,
+/// which drains the serving engine beside it and ends it, keeps them.
+#[test]
+fn a_target_of_the_same_layout_resizes_the_shared_regions_once_it_is_promoted() {
+    let server = StorageServer::start();
+    let (serving, target, reader) = update(&server);
+    let target = start_on_meta(&server, &target);
+    let shared = shared(&serving, &target);
+    let before = stated_of(&serving, &shared);
+    assert_eq!(held(&server, &reader, &shared), before);
+
+    // The switch: the target opens admission, sized as it states.
+    open_admission(&target);
+    let ours = stated_of(&target, &shared);
+    assert_eq!(held(&server, &reader, &shared), ours);
+
+    // The commit: the serving engine drains beside the target and ends.
+    drain_beside(&serving);
+    close(serving);
+    assert_eq!(held(&server, &reader, &shared), ours);
+    close(target);
+}
+
+/// An update abandoned after its target started (refused, failed or cancelled before its switch)
+/// changes nothing: the daemon stops the target, whose engine ends unpromoted, and every region
+/// it shared with the serving engine holds what it held before the target started.
+#[test]
+fn a_target_abandoned_before_its_promotion_leaves_every_shared_region_at_the_serving_size() {
+    let server = StorageServer::start();
+    let (serving, target, reader) = update(&server);
+    let everything: BTreeSet<String> = stated(&serving).into_keys().collect();
+    let before = held(&server, &reader, &everything);
+
+    let target = start_on_meta(&server, &target);
+    let shared = shared(&serving, &target);
+    close(target);
+    let before: BTreeMap<String, u32> = before
+        .into_iter()
+        .filter(|(name, _)| shared.contains(name))
+        .collect();
+    assert_eq!(held(&server, &reader, &shared), before);
+    close(serving);
+}
+
+/// A rollback runs the switch back: the serving engine keeps its sizes while the target starts,
+/// the target's promotion resizes the regions the two share to its own, and the serving engine,
+/// drained beside it, is promoted again and resizes them to the serving epoch's; the target then
+/// drains and ends, and they stay so.
+#[test]
+fn a_rollback_restores_the_serving_size_of_every_shared_region() {
+    let server = StorageServer::start();
+    let (serving, target, reader) = update(&server);
+    let target = start_on_meta(&server, &target);
+    let shared = shared(&serving, &target);
+    let before = stated_of(&serving, &shared);
+    assert_eq!(held(&server, &reader, &shared), before);
+
+    open_admission(&target);
+    assert_eq!(held(&server, &reader, &shared), stated_of(&target, &shared));
+    drain_beside(&serving);
+
+    // The rollback: the drained serving engine is promoted again, and the target drains and ends.
+    open_admission(&serving);
+    assert_eq!(held(&server, &reader, &shared), before);
+    drain_beside(&target);
+    close(target);
+    assert_eq!(held(&server, &reader, &shared), before);
+    close(serving);
+}
 
 #[test]
 fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
@@ -82,8 +332,9 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     assert_eq!(regions.len(), 1);
     let kv = regions[0];
 
-    // A successor epoch of the layout finds the region holding every unit past the padding unit,
-    // over the segments the start's rank created and its head granted.
+    // Once admission opened, a successor epoch of the layout finds the region holding every unit
+    // past the padding unit, over the segments the start's rank created and its head granted.
+    open_admission(&engine);
     let mut successor = launch.clone();
     successor.epoch = 2;
     let next_open = layout(&successor, &loaded(&successor)).unwrap();
