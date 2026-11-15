@@ -42,6 +42,16 @@ use nn::pipeline::{Pipeline, Product};
 use testkit::LONG;
 use testkit::serving::{DEPLOYMENT, SLOTS, StorageServer, launch};
 
+/// The multiprocessors of the device each rank of the tests' starts stands in for, which a member
+/// of an expert union states in its exchange's key: the count the exchange's own tests state.
+const MULTIPROCESSORS: u32 = 148;
+
+/// What the tests' starts load onto: nothing outside the process, each rank's device stating
+/// [`MULTIPROCESSORS`], since the host need not hold the devices the launches name.
+const META: Backing<'static> = Backing::Meta {
+    multiprocessors: |_| Ok(MULTIPROCESSORS),
+};
+
 /// The pipeline of the media cases: MiniMax-H3's, as its family declares it.
 fn pipeline() -> Pipeline {
     models::minimax_h3::family::pipeline()
@@ -108,13 +118,7 @@ pub(crate) fn loaded(launch: &EngineArgs) -> Vec<LoadedRank> {
             .unwrap();
     let model_runner = ModelRunner::of(launch, family).unwrap();
 
-    load_ranks(
-        model_runner.ranks().unwrap(),
-        Backing::Meta,
-        launch,
-        Meeting::Local,
-    )
-    .unwrap()
+    load_ranks(model_runner.ranks().unwrap(), META, launch, Meeting::Local).unwrap()
 }
 
 /// The layout of the session of `ranks`, `launch`'s ranks of one group of one rank.
@@ -392,13 +396,8 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
     let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
-    let mut ranks = load_ranks(
-        model_runner.ranks().unwrap(),
-        Backing::Meta,
-        &launch,
-        Meeting::Local,
-    )
-    .unwrap();
+    let mut ranks =
+        load_ranks(model_runner.ranks().unwrap(), META, &launch, Meeting::Local).unwrap();
     assert_eq!(ranks.len(), 1);
     assert!(!ranks[0].keys.is_empty(), "the profile run names kernels");
     let video = ranks[0].video().unwrap();
@@ -610,15 +609,7 @@ fn a_media_group_holds_as_many_request_slots_as_its_ranks_shares_hold() {
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
     let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
-    let load = || {
-        load_ranks(
-            model_runner.ranks().unwrap(),
-            Backing::Meta,
-            &launch,
-            Meeting::Local,
-        )
-        .unwrap()
-    };
+    let load = || load_ranks(model_runner.ranks().unwrap(), META, &launch, Meeting::Local).unwrap();
     let region = |open: &storage::runtime::Open, name: &str| {
         open.regions
             .iter()
@@ -826,13 +817,7 @@ fn every_denoising_rank_encodes_the_conditions_of_its_requests() {
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
     let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
-    let ranks = load_ranks(
-        model_runner.ranks().unwrap(),
-        Backing::Meta,
-        &launch,
-        Meeting::Local,
-    )
-    .unwrap();
+    let ranks = load_ranks(model_runner.ranks().unwrap(), META, &launch, Meeting::Local).unwrap();
 
     let pixels = pipeline().kind(Product::ConditionPixels).unwrap();
     for rank in &ranks {
@@ -917,13 +902,8 @@ fn a_group_of_no_phase_spawns_a_worker_that_serves_nothing() {
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
     let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
-    let mut ranks = load_ranks(
-        model_runner.ranks().unwrap(),
-        Backing::Meta,
-        &launch,
-        Meeting::Local,
-    )
-    .unwrap();
+    let mut ranks =
+        load_ranks(model_runner.ranks().unwrap(), META, &launch, Meeting::Local).unwrap();
     assert_eq!(ranks[2].video().unwrap().capacity.phases, 0);
 
     let open = layout(&launch, &ranks).unwrap();
@@ -954,13 +934,8 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
     let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
-    let mut ranks = load_ranks(
-        model_runner.ranks().unwrap(),
-        Backing::Meta,
-        &launch,
-        Meeting::Local,
-    )
-    .unwrap();
+    let mut ranks =
+        load_ranks(model_runner.ranks().unwrap(), META, &launch, Meeting::Local).unwrap();
     assert_eq!(ranks.len(), 2);
     assert_eq!(
         ranks[0].video().unwrap().row,
@@ -1091,7 +1066,7 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
             .collect();
         assert_eq!(on, [device as u32, 8 + device as u32], "device {device}");
     }
-    let mut ranks = load_ranks(placed, Backing::Meta, &launch, Meeting::Local).unwrap();
+    let mut ranks = load_ranks(placed, META, &launch, Meeting::Local).unwrap();
     for (index, rank) in ranks.iter().enumerate() {
         let denoises = rank.video().unwrap().row > 0;
         assert_eq!(denoises, index >= 8, "rank {index}");
@@ -1242,12 +1217,7 @@ fn two_host_ranks(layout: Layout, checkpoint: &Path) -> (EngineArgs, Vec<LoadedR
             epoch: launch.epoch,
             timeout: launch.engine_config.worker.join_timeout,
         });
-        let ranks = load_ranks(
-            model_runner.ranks().unwrap(),
-            Backing::Meta,
-            &launch,
-            meeting,
-        );
+        let ranks = load_ranks(model_runner.ranks().unwrap(), META, &launch, meeting);
         (launch, ranks.unwrap())
     };
 
@@ -1751,7 +1721,8 @@ fn a_target_of_another_layout_maps_none_of_the_serving_epochs_segments() {
 /// `tests/python/e2e/http_helpers.py` places one) opens one KV region, its attention group's:
 /// the expert group serves no request, the session states it nowhere, and its rank opens a cache
 /// of the fewest units of its own, maps no region and creates nothing the head grants, beside
-/// the attention rank's region, whose segments the head grants.
+/// the attention rank's region, whose segments the head grants. Both ranks are members of the
+/// expert union, whose exchange keys state the multiprocessors the start states of their devices.
 #[test]
 fn a_dedicated_expert_rank_maps_no_kv_region() {
     let server = StorageServer::start();
@@ -1786,6 +1757,28 @@ fn a_dedicated_expert_rank_maps_no_kv_region() {
 
     let mut ranks = loaded(&launch);
     assert_eq!(ranks.len(), 2);
+
+    // Both members' profile runs exchange, and every exchange key they record states the
+    // multiprocessors the start states of their devices.
+    let stated = format!("_multiprocessors_{MULTIPROCESSORS}_");
+    for rank in &ranks {
+        let exchanges: Vec<&String> = rank
+            .keys
+            .iter()
+            .filter(|(operator, _)| *operator == proto::module::operator::EXPERT_EXCHANGE)
+            .map(|(_, key)| key)
+            .collect();
+        assert!(
+            !exchanges.is_empty(),
+            "rank {} records no exchange",
+            rank.model_runner.rank()
+        );
+        assert!(
+            exchanges.iter().all(|key| key.contains(&stated)),
+            "{exchanges:?}"
+        );
+    }
+
     let (mut head, pairs, open, opened) = opened_session(&server, &launch, &ranks);
     assert_eq!(
         open.groups.len(),
@@ -1928,13 +1921,8 @@ fn a_rank_opening_resolves_the_kernels_of_its_cache_over_its_region_s_units() {
         )
         .unwrap();
         let model_runner = ModelRunner::of(&launch, family).unwrap();
-        let mut ranks = load_ranks(
-            model_runner.ranks().unwrap(),
-            Backing::Meta,
-            &launch,
-            Meeting::Local,
-        )
-        .unwrap();
+        let mut ranks =
+            load_ranks(model_runner.ranks().unwrap(), META, &launch, Meeting::Local).unwrap();
 
         // The regions numbered for more units than the fewest, in whole segments, as a division
         // of a device's quota numbers them.
@@ -2014,13 +2002,7 @@ fn the_regions_of_a_media_group_serve_the_slots_it_kept() {
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
     let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
-    let ranks = load_ranks(
-        model_runner.ranks().unwrap(),
-        Backing::Meta,
-        &launch,
-        Meeting::Local,
-    )
-    .unwrap();
+    let ranks = load_ranks(model_runner.ranks().unwrap(), META, &launch, Meeting::Local).unwrap();
     let open = layout(&launch, &ranks).unwrap();
     let group = &open.groups[0];
     let slot_region = usize::from(group.slots);

@@ -135,9 +135,10 @@ pub struct Descriptor {
     pub ranks: u32,
     /// Leading ranks of the group that hold no experts.
     pub attention: u32,
-    /// Multiprocessors of the device the exchange runs on ([`multiprocessors`]). A backend whose
-    /// kernels spread over the whole device compiles its grid for them: a persistent grid that
-    /// synchronizes grid-wide needs every block resident, so it is sized to the device's count.
+    /// Multiprocessors of the device the exchange runs on (`platform::DeviceId::multiprocessors`).
+    /// A backend whose kernels spread over the whole device compiles its grid for them: a
+    /// persistent grid that synchronizes grid-wide needs every block resident, so it is sized to
+    /// the device's count.
     pub multiprocessors: u32,
     /// Element type of the states.
     pub dtype: DType,
@@ -174,24 +175,6 @@ impl fmt::Display for Descriptor {
             .field("dtype", abi::name(self.dtype))
             .finish(formatter)
     }
-}
-
-/// The multiprocessors of `device` (`platform::DeviceAttribute::MultiprocessorCount`), as an
-/// exchange descriptor and a transport shape state them.
-///
-/// # Errors
-///
-/// [`Error::Platform`] when the driver cannot report the device's count, and
-/// [`Error::Unsupported`] for a count that is not positive.
-pub fn multiprocessors(device: platform::DeviceId) -> Result<u32> {
-    let count = device.attribute(platform::DeviceAttribute::MultiprocessorCount)?;
-    u32::try_from(count)
-        .ok()
-        .filter(|count| *count > 0)
-        .ok_or_else(|| Error::Unsupported {
-            operation: ExpertExchange::NAME,
-            reason: format!("device {} reports {count} multiprocessors", device.0),
-        })
 }
 
 /// The arguments of one exchange launch.
@@ -353,7 +336,7 @@ pub struct TransportShape {
     pub dtype: DType,
     /// The CUDA device of this rank.
     pub device: i32,
-    /// Multiprocessors of that device ([`multiprocessors`]).
+    /// Multiprocessors of that device ([`Descriptor::multiprocessors`]).
     pub multiprocessors: u32,
     /// Leading ranks that hold no experts; zero when every rank holds its share.
     pub attention_ranks: u32,

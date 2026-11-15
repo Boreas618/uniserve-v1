@@ -71,9 +71,8 @@ impl fmt::Display for DeviceUuid {
     }
 }
 
-/// A device this process uses: its ordinal, its compute capability, its
-/// multiprocessor count and total storage, and a retained reference to its
-/// primary context.
+/// A device this process uses: its ordinal, its compute capability and a
+/// retained reference to its primary context.
 ///
 /// Cloning shares the retained context; the last handle releases the driver's
 /// reference. Everything in this crate that creates a driver object takes a
@@ -218,6 +217,22 @@ impl DeviceId {
             self.attribute(DeviceAttribute::ComputeCapabilityMajor)?,
             self.attribute(DeviceAttribute::ComputeCapabilityMinor)?,
         ))
+    }
+
+    /// The device's multiprocessors (`MultiprocessorCount`), read without creating a context:
+    /// what a grid of one block per multiprocessor launches, and what a module compiled for the
+    /// whole device states.
+    ///
+    /// # Errors
+    ///
+    /// The driver's failure, and [`crate::Error::InvalidArgument`] for a count that is not
+    /// positive, which no device reports.
+    pub fn multiprocessors(self) -> Result<u32> {
+        let count = self.attribute(DeviceAttribute::MultiprocessorCount)?;
+        u32::try_from(count)
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| crate::Error::invalid(format!("{self} reports {count} multiprocessors")))
     }
 
     pub fn uuid(self) -> Result<DeviceUuid> {

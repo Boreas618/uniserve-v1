@@ -121,9 +121,10 @@ const COUNTER_GROUP: u64 = 8;
 
 /// The bytes at the head of a paged attention's workspace that hold a decode's arrival counters
 /// on `device`, for `rows` rows of `q_heads` query heads: one counter per (row, query head) pair
-/// and at least one per multiprocessor of the device, in whole groups of [`COUNTER_GROUP`], as
-/// the package's entry carves its workspace. The meta device launches no decode, so its counters
-/// are the (row, head) pairs alone.
+/// and at least one per multiprocessor of the device (`platform::DeviceId::multiprocessors`, the
+/// count the expert exchange's descriptor states of a rank's device), in whole groups of
+/// [`COUNTER_GROUP`], as the package's entry carves its workspace. The meta device launches no
+/// decode, so its counters are the (row, head) pairs alone.
 ///
 /// A prefill's split-key scratch starts at the head of the same workspace, so a forward clears
 /// these bytes once before its first decode attention.
@@ -138,7 +139,7 @@ pub fn arrival_counter_bytes(device: &Device, rows: u64, q_heads: u64) -> Result
             let id = DeviceId(i32::try_from(ordinal).map_err(|_| {
                 Error::Shape(format!("GPU {ordinal} is outside the driver's ordinals"))
             })?);
-            u64::from(crate::moe::exchange::multiprocessors(id)?)
+            u64::from(id.multiprocessors()?)
         }
         None => 0,
     };

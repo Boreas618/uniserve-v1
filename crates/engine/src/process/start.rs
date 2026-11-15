@@ -563,7 +563,12 @@ pub(crate) fn start(
         Ok(entries)
     };
     let backing = if meta {
-        Backing::Meta
+        // The ranks are placed on this host's CUDA devices whatever they load onto: a member of
+        // an expert union shapes its exchange for the multiprocessors the driver counts on its
+        // device, as a serving start of the launch does.
+        Backing::Meta {
+            multiprocessors: DeviceId::multiprocessors,
+        }
     } else {
         Backing::Serving {
             storage,

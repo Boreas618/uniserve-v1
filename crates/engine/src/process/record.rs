@@ -13,11 +13,17 @@
 //! - no device memory and no communicator: a profile run launches nothing, and a parallel group
 //!   states its split alone;
 //! - no session with the buffer pool, Build Server, scheduler or worker.
+//!
+//! The one fact it reads of a device is the multiprocessors of each expert union member's device,
+//! as the driver counts them on this host (`platform::DeviceId::multiprocessors`): a dimension
+//! of the exchange's key, which the recorded keys state as a serving start of the launch on this
+//! host resolves them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::Result;
+use platform::DeviceId;
 use proto::config::EngineArgs;
 
 use super::ranks::{Backing, Meeting, load_ranks};
@@ -40,7 +46,10 @@ pub fn record(launch: &EngineArgs, registry: &nn::family::Registry) -> Result<Re
     let family =
         crate::process::catalogue::resolve(registry, Path::new(&launch.engine_config.model.model))?;
     let model_runner = ModelRunner::of(launch, family)?;
-    let ranks = load_ranks(model_runner.ranks()?, Backing::Meta, launch, Meeting::Local)?;
+    let backing = Backing::Meta {
+        multiprocessors: DeviceId::multiprocessors,
+    };
+    let ranks = load_ranks(model_runner.ranks()?, backing, launch, Meeting::Local)?;
 
     let mut recorded = Recorded::new();
     for rank in &ranks {

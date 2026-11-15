@@ -52,9 +52,10 @@
 //!
 //! A start that is backed by nothing outside the process ([`Backing::Meta`]) takes the same
 //! steps over owners that hold no device: its loads stop after the profile run, its "segments"
-//! are statements of units with no memory behind them, and it serves generation
-//! [`FIRST_GENERATION`] of no kernel. That is what a recorded start reads and what the engine's
-//! host tests start.
+//! are statements of units with no memory behind them, the multiprocessors a member of an expert
+//! union shapes its exchange for are what the start states of the device each rank stands in
+//! for, and it serves generation [`FIRST_GENERATION`] of no kernel. That is what a recorded start
+//! reads and what the engine's host tests start.
 
 pub(crate) mod rank;
 
@@ -147,7 +148,37 @@ pub(crate) enum Backing<'a> {
     /// ([`nn::MetaWeights`]), its runner and owners hold no device, its tensor group
     /// states its split with no communicator, and it serves generation [`FIRST_GENERATION`] of
     /// no kernel.
-    Meta,
+    Meta {
+        /// The multiprocessors of the device a rank stands in for, which a member of an expert
+        /// union shapes its exchange for and the exchange's key states: the driver's count of
+        /// this host's device (`platform::DeviceId::multiprocessors`) for a start whose keys are
+        /// those a serving start of the launch resolves, a stated count for a start of devices
+        /// the host does not hold. It is asked only of a rank of an expert union.
+        multiprocessors: fn(DeviceId) -> platform::Result<u32>,
+    },
+}
+
+impl Backing<'_> {
+    /// The multiprocessors of `device`, which a member of an expert union shapes its exchange
+    /// for: the device's own count on a start that holds it, what a meta start states of the
+    /// device the rank stands in for.
+    ///
+    /// # Errors
+    ///
+    /// The driver's or the statement's failure to state the count.
+    fn multiprocessors(&self, device: DeviceId) -> Result<u32> {
+        let count = match self {
+            Self::Serving { .. } => device.multiprocessors(),
+            Self::Meta { multiprocessors } => multiprocessors(device),
+        };
+        count.with_context(|| {
+            format!(
+                "reading the multiprocessors of device {}, which its expert exchange is compiled \
+                 for",
+                device.0
+            )
+        })
+    }
 }
 
 /// One rank of this process: loaded to its division by [`load_ranks`], then opened over the
@@ -230,9 +261,10 @@ pub(crate) struct TextRank {
     /// takes it beside the causal runner.
     pub(crate) vision_runner: Option<VisionRunner>,
     /// The node's expert union this rank is a member of: the union's host group, the members'
-    /// workers once [`spawn`] set them, and the rank's place among them; `None` outside a
-    /// union.
-    pub(crate) union: Option<(Arc<HostGroup>, Members, usize)>,
+    /// workers once [`spawn`] set them, the rank's place among them, and the multiprocessors of
+    /// the rank's device its exchange is compiled for, as its start's backing stated them
+    /// ([`Backing`]); `None` outside a union.
+    pub(crate) union: Option<(Arc<HostGroup>, Members, usize, u32)>,
 }
 
 impl LoadedRank {
@@ -550,7 +582,7 @@ fn load_rank(
                 .context("stating this rank's quota of its device")?;
             Some(client)
         }
-        Backing::Meta => None,
+        Backing::Meta { .. } => None,
     };
 
     // Step 2: the host group the division agrees over, and the expert union's, which the start
@@ -558,10 +590,6 @@ fn load_rank(
     if model_runner.is_video() {
         return load_video_rank(model_runner, device, client, host, meets, backing);
     }
-    let union = union.map(|(group, targets)| {
-        let place = group.rank();
-        (Arc::new(group), targets, place)
-    });
 
     // Step 3: the worker group's communicator, opened before any device measurement because
     // NCCL keeps device buffers. A text rank's parallel group is its worker group's ranks in their
@@ -581,9 +609,21 @@ fn load_rank(
     let layout = Arc::new(model_runner.cache_layout(meta.as_ref())?);
     let least = fewest_units(&layout);
     let (meta_config, meta_cache, meta_state) = meta_owners(&model_runner, meta.as_ref(), &layout)?;
+
+    // A member of the expert union takes its place in the union and the multiprocessors its
+    // exchange is compiled for, which the backing states of its device; the profile run's
+    // member records the exchange's keys for them, and the opening's member is shaped alike.
+    let union = match union {
+        Some((group, targets)) => {
+            let multiprocessors = backing.multiprocessors(device)?;
+            let place = group.rank();
+            Some((Arc::new(group), targets, place, multiprocessors))
+        }
+        None => None,
+    };
     let meta_member = match &union {
-        Some((group, targets, place)) => model_runner.union_member(
-            device,
+        Some((group, targets, place, multiprocessors)) => model_runner.union_member(
+            (device, *multiprocessors),
             meta.as_ref(),
             Arc::clone(group),
             join_hook(Arc::clone(targets), *place),
@@ -667,7 +707,7 @@ fn load_rank(
 
     let (storage, resolve) = match backing {
         Backing::Serving { storage, kernels } => (storage, kernels),
-        Backing::Meta => {
+        Backing::Meta { .. } => {
             // The meta device allocates nothing, so each unit is a whole granule of it: its cache
             // is the fewest units it serves with, each unit a segment, and its state region the
             // fewest checkpoints.
@@ -736,7 +776,13 @@ fn load_rank(
         let features = CausalLmRunner::image_bytes(&meta_config, model.as_ref())?;
         regions.push(("image features", features));
     }
-    let transport = model_runner.transport_bytes(device, model.as_ref(), &kernels)?;
+    // Only a member of the expert union holds a transport.
+    let transport = match &union {
+        Some((.., multiprocessors)) => {
+            model_runner.transport_bytes((device, *multiprocessors), model.as_ref(), &kernels)?
+        }
+        None => 0,
+    };
     regions.push(("expert transport", transport));
     let (slots, (units, first), states) =
         model_runner.divide(&client, device, &host, model.as_ref(), &layout, &regions)?;
@@ -929,7 +975,7 @@ fn load_video_rank(
 
     let (storage, resolve) = match backing {
         Backing::Serving { storage, kernels } => (storage, kernels),
-        Backing::Meta => {
+        Backing::Meta { .. } => {
             return Ok(LoadedRank {
                 model_runner,
                 client: None,
@@ -2718,8 +2764,8 @@ fn open_rank(
     let config = model_runner.causal_config(rank.model.as_ref(), &layout, units)?;
     let inputs = CausalLmRunner::input_bytes(&config, rank.model.as_ref())?;
     let member = match &rank.union {
-        Some((group, targets, place)) => model_runner.union_member(
-            device,
+        Some((group, targets, place, multiprocessors)) => model_runner.union_member(
+            (device, *multiprocessors),
             rank.model.as_ref(),
             Arc::clone(group),
             join_hook(Arc::clone(targets), *place),
@@ -3909,7 +3955,7 @@ pub(crate) fn spawn(
         Loaded::Text(text) => text.union.as_ref(),
         Loaded::Video(_) => None,
     });
-    if let Some((_, targets, _)) = union {
+    if let Some((_, targets, ..)) = union {
         targets
             .set(workers.iter().map(Arc::downgrade).collect())
             .map_err(|_| anyhow::anyhow!("the expert union's workers were set already"))?;

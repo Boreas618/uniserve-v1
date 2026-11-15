@@ -376,14 +376,11 @@ pub(crate) mod tests {
         pub(crate) fn load(stream: &Stream) -> Result<Self> {
             let library = Library::load(&Device::new(stream.device())?, SPIN)?;
             let function = library.kernel("spin")?;
-            let multiprocessors = stream
-                .device()
-                .attribute(crate::DeviceAttribute::MultiprocessorCount)?;
             Ok(Self {
                 _library: library,
                 function,
                 out: DeviceAllocation::linear(stream.device(), 4)?,
-                multiprocessors: multiprocessors.unsigned_abs(),
+                multiprocessors: stream.device().multiprocessors()?,
             })
         }
 

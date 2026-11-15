@@ -606,12 +606,12 @@ impl ModelRunner {
             .context("more attention ranks than the exchange addresses")
     }
 
-    /// The member of the node's expert union this rank is on `device`, over the union's host
-    /// group `group`, asking the other members to join its steps through `join`; `None` for a
-    /// rank of no union.
+    /// The member of the node's expert union this rank is on `device` of `multiprocessors`
+    /// multiprocessors, over the union's host group `group`, asking the other members to join
+    /// its steps through `join`; `None` for a rank of no union.
     pub(crate) fn union_member(
         &self,
-        device: DeviceId,
+        (device, multiprocessors): (DeviceId, u32),
         model: &dyn TextModel,
         group: Arc<HostGroup>,
         join: JoinHook,
@@ -619,16 +619,21 @@ impl ModelRunner {
         if self.union.is_none() {
             return Ok(None);
         }
-        let (shape, mode) = self.transport_shape(device, model)?;
+        let (shape, mode) = self.transport_shape((device, multiprocessors), model)?;
         let beside = self.engine_config().moe.beside_rows.get();
         Ok(Some(Member::new(group, shape, mode, join, beside)?))
     }
 
-    /// The shape of the transport a member of an expert union creates on `device`, and the mode
-    /// of the module that creates it: an encoded block runs in the exchange's one fused launch.
+    /// The shape of the transport a member of an expert union creates on `device`, whose
+    /// `multiprocessors` its exchange is compiled for, and the mode of the module that creates
+    /// it: an encoded block runs in the exchange's one fused launch.
+    ///
+    /// The count is the start's statement of the rank's device (`crate::process::ranks::Backing`):
+    /// the device's own on a start that holds it, what a meta start states of the device the rank
+    /// stands in for. It is a dimension of the exchange's key.
     fn transport_shape(
         &self,
-        device: DeviceId,
+        (device, multiprocessors): (DeviceId, u32),
         model: &dyn TextModel,
     ) -> Result<(ops::moe::exchange::TransportShape, ops::moe::exchange::Mode)> {
         let experts = model
@@ -645,8 +650,7 @@ impl ModelRunner {
             top: experts.top,
             dtype: model.dtype(),
             device: device.0,
-            multiprocessors: ops::moe::exchange::multiprocessors(device)
-                .context("reading the multiprocessors the exchange is compiled for")?,
+            multiprocessors,
             attention_ranks: self.mapping.attention_ranks,
         };
         let mode = if experts.encoded {
@@ -657,18 +661,16 @@ impl ModelRunner {
         Ok((shape, mode))
     }
 
-    /// What this rank's expert transport takes of its device, for the division: what the
-    /// exchange package of `kernels` states for the transport's shape.
+    /// What the expert transport of this member of an expert union takes of `device` of
+    /// `multiprocessors` multiprocessors, for the division: what the exchange package of
+    /// `kernels` states for the transport's shape.
     pub(crate) fn transport_bytes(
         &self,
-        device: DeviceId,
+        (device, multiprocessors): (DeviceId, u32),
         model: &dyn TextModel,
         kernels: &ops::Generation,
     ) -> Result<u64> {
-        if self.union.is_none() {
-            return Ok(0);
-        }
-        let (shape, mode) = self.transport_shape(device, model)?;
+        let (shape, mode) = self.transport_shape((device, multiprocessors), model)?;
         let kernel = kernels
             .op::<ops::moe::ExpertExchange>(&shape.descriptor(mode))
             .context("the expert exchange's kernel")?;
