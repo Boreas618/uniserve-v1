@@ -839,19 +839,21 @@ impl DeviceMarkers {
         step: Option<u32>,
     ) -> Result<()> {
         let address = DevicePtr::from_address;
-        let mut arguments = Arguments::new();
+        // Each word names the stamp kernel's parameter it fills; the launch holds them to the
+        // module's signature.
+        let mut arguments = Arguments::new(proto::module::operator::RANGE_MARKER);
         arguments
-            .pointer(address(self.switches.address()))
-            .u32(class)
-            .u32(marker)
-            .pointer(address(self.cells.address() + 4 * cell as u64))
-            .u32(u32::from(step.is_some()))
-            .u32(step.unwrap_or(0))
-            .pointer(address(self.counters.address()))
-            .pointer(address(self.counters.address() + 8))
-            .pointer(address(self.stamps.address()))
-            .pointer(address(self.filled.address()))
-            .u32(SHIFT);
+            .pointer("switches", address(self.switches.address()))
+            .u32("klass", class)
+            .u32("marker", marker)
+            .pointer("cell", address(self.cells.address() + 4 * cell as u64))
+            .u32("mark", u32::from(step.is_some()))
+            .u32("step", step.unwrap_or(0))
+            .pointer("counter", address(self.counters.address()))
+            .pointer("written", address(self.counters.address() + 8))
+            .pointer("stamps", address(self.stamps.address()))
+            .pointer("filled", address(self.filled.address()))
+            .u32("shift", SHIFT);
 
         // Every buffer the arguments address lives with the process's markers, past every replay
         // of a graph that captured the launch.
@@ -938,8 +940,8 @@ impl DeviceMarkers {
     /// function: a kernel that queued behind the device's work gives a wide sample, which a
     /// narrower one replaces.
     fn calibrate(&self) -> Result<ClockRow> {
-        let mut arguments = Arguments::new();
-        arguments.pointer(DevicePtr::from_address(self.clock_out.address()));
+        let mut arguments = Arguments::new(proto::module::operator::RANGE_MARKER);
+        arguments.pointer("out", DevicePtr::from_address(self.clock_out.address()));
         let before = (realtime(), platform::cupti::timestamp().unwrap_or(0));
         self.kernels
             .clock
