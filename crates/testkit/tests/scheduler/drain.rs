@@ -20,7 +20,7 @@ use proto::request::{Event, FinishReason, GenerationRequest, MigrationCause, Req
 use storage::Key;
 use storage::runtime::{Completion, Request};
 
-use crate::harness::{BLOCK, Deployment, Harness, VIDEO_PHASES, token, video};
+use crate::harness::{BLOCK, Deployment, Harness, pipeline, token, video};
 
 /// Whether `event` is the `Migratable` of a drain with no stored step.
 fn drained(event: Option<&Event>) -> bool {
@@ -143,7 +143,7 @@ fn requests_that_end_before_the_deadline_end_on_this_engine() {
 /// returned. With no trajectory identity it stores nothing (SD §3.8, §7.3 "Preemption").
 #[test]
 fn a_video_request_at_the_deadline_leaves_at_its_step_boundary() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let id = harness.submit_video(video(1, 1));
     harness.denoise_and_hold(id, 1);
     assert!(harness.fake.held() > 0, "a denoising step is on the device");

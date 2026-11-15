@@ -18,10 +18,9 @@ anyhow.workspace = true
 build-server.workspace = true
 crossbeam-channel.workspace = true
 engine.workspace = true
-# The host's monotonic clock, which the buffer pool's task deadlines are stated in.
-libc.workspace = true
-# The released checkpoints an ignored test reads, resolved into the Hugging Face cache.
-hf-hub.workspace = true
+# The released checkpoints an ignored test reads, resolved into the Hugging Face cache
+# (`nn_testing::Release`).
+nn-testing.workspace = true
 # The tiny checkpoints the engine's tests serve (`models::fixtures`).
 models = { workspace = true, features = ["fixtures"] }
 # The FFmpeg libraries the engine links through the media crate; `build.rs` reads their

@@ -1,9 +1,8 @@
 //! The serving command's follower role needs no model on its command line.
 
 use std::process::{Child, Command};
-use std::time::Duration;
 
-use daemon::{Daemon, DaemonOptions};
+use daemon::{Daemon, DaemonOptions, JOIN_TIMEOUT};
 
 struct Follower(Child);
 
@@ -34,6 +33,8 @@ fn a_follower_joins_without_a_model() {
                 "--dist-init-addr",
                 &address,
             ])
+            // The follower creates its instance directory in the user's runtime directory, which
+            // a process names by the XDG variable (`service::RuntimeDirectory`).
             .env("XDG_RUNTIME_DIR", directory.path())
             .spawn()
             .unwrap(),
@@ -47,7 +48,7 @@ fn a_follower_joins_without_a_model() {
             host: "leader".into(),
             dist_init_addr: Some(endpoint),
             socket: directory.path().join("leader.sock"),
-            join_timeout: Duration::from_secs(10),
+            join_timeout: JOIN_TIMEOUT,
             build_server: build_server::command::Settings::default(),
             storage: Default::default(),
         },

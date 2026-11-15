@@ -81,26 +81,12 @@ pub(crate) const STEPS: u32 = 4;
 /// (`Capacity::latent_seed`), which keys the trajectories it stores.
 pub(crate) const LATENT_SEED: u64 = 0x5eed;
 
-/// Every phase of a video request, which a video deployment of one group serves.
-pub(crate) const VIDEO_PHASES: [Phase; 11] = [
-    Phase::MediaRead,
-    Phase::VisionEncode,
-    Phase::TextEncode,
-    Phase::LatentEncode,
-    Phase::LatentPrepare,
-    Phase::Denoise,
-    Phase::VideoEncode,
-    Phase::AudioEncode,
-    Phase::VideoDecode,
-    Phase::AudioDecode,
-    Phase::Mux,
-];
-
 /// The media pipeline a video deployment's groups serve and state (`Capacity::pipeline`):
-/// MiniMax-H3's, as its family declares it. Its products are the classes a session states between
+/// MiniMax-H3's, as its family declares it. Its phases are every phase of a video request, which
+/// a video deployment of one group serves; its products are the classes a session states between
 /// the encoder outputs and the stored trajectories, which the scheduler finds as the classes just
 /// before the stored trajectories'.
-fn pipeline() -> nn::pipeline::Pipeline {
+pub(crate) fn pipeline() -> nn::pipeline::Pipeline {
     models::minimax_h3::family::pipeline()
 }
 
@@ -204,7 +190,7 @@ impl Deployment {
     }
 
     /// A video deployment: one group per entry of `groups`, of the `Model` role, serving the
-    /// phases it lists ([`VIDEO_PHASES`] on one group serves every phase), with [`STEPS`]
+    /// phases it lists (the [`pipeline`]'s phases on one group serve every phase), with [`STEPS`]
     /// denoising steps on the group that denoises and the captured shapes of the harness's video
     /// requests ([`video`]).
     pub(crate) fn video(groups: &[&[Phase]]) -> Self {
@@ -443,8 +429,9 @@ impl Deployment {
         // groups serve.
         let module = Arc::new(policy::load(&testkit::packaged_module()).unwrap());
         let (output, outputs) = unbounded();
+        let config = self.scheduler_config();
         let scheduler = Scheduler::new(
-            self.scheduler_config(),
+            config.clone(),
             limits(),
             &layout,
             &opened,
@@ -461,6 +448,7 @@ impl Deployment {
 
         let mut harness = Harness {
             scheduler,
+            config,
             pool,
             fake,
             inbox: messages,
@@ -962,6 +950,8 @@ fn drafts_of(batch: &Batch, index: usize) -> Vec<u32> {
 /// record of everything the scheduler reported.
 pub(crate) struct Harness {
     pub(crate) scheduler: Scheduler,
+    /// The configuration the scheduler was built with.
+    pub(crate) config: SchedulerConfig,
     pub(crate) pool: InProcessPool,
     pub(crate) fake: FakeExecutor,
     /// The scheduler's inbox, which the fake's outputs and stamped requests reach.

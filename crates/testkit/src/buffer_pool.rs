@@ -14,7 +14,8 @@
 //! 3. the tasks the pool started run to their end: a transfer copies the owner's blocks, a
 //!    prefetch brings the leading keys its source holds ([`InProcessPool::hold_in`]), a put to
 //!    the remote store is acknowledged key by key;
-//! 4. the pool is told the host's monotonic clock, which a task's deadline is stated in;
+//! 4. the pool is told the host's monotonic clock ([`runtime::monotonic_nanos`]), which a
+//!    task's deadline is stated in;
 //! 5. the completions that are due are written, in order, as far as each completion queue has
 //!    room, the rest staying in order for the next turn;
 //! 6. each region's capacity words are written as the pool states them.
@@ -33,13 +34,10 @@ use std::sync::atomic::Ordering;
 use storage::runtime::{
     self, Cause, Completion, GroupId, Open, Opened, Registers, Request, Source,
 };
-use storage::{Key, QueuePair};
-use storage_server::buffer_pool::{BufferPool, ClientId, QueueId};
+use storage::{Key, QueuePair, ServerSettings};
+use storage_server::buffer_pool::{self, BufferPool, ClientId, QueueId};
 
 use crate::executor::FakeExecutor;
-
-/// How long a transfer and a put to the remote store may take: their tasks end within a turn.
-const TASK_LIMIT_NS: u64 = 60_000_000_000;
 
 /// Which completions to withhold, by the request each answers.
 type Withhold = Box<dyn Fn(&Request, &Completion) -> bool>;
@@ -98,10 +96,12 @@ pub struct InProcessPool {
 
 impl InProcessPool {
     /// A buffer pool with no session, whose queue pairs' rings each hold `ring_bytes` (a power of
-    /// two of at least 64; the Storage Server's are 4 MiB).
+    /// two of at least 64; the Storage Server's are 4 MiB). Its transfers and puts are bounded as
+    /// a Storage Server of the default settings bounds them; their tasks end within the turn that
+    /// starts them, long before.
     pub fn new(ring_bytes: usize) -> Self {
         Self {
-            pool: BufferPool::new((TASK_LIMIT_NS, TASK_LIMIT_NS)),
+            pool: BufferPool::new(buffer_pool::limits(&ServerSettings::default())),
             ring_bytes,
             queues: Vec::new(),
             next_client: 1,
@@ -303,7 +303,7 @@ impl InProcessPool {
         }
 
         // 4. The clock, and 5. the completions that are due.
-        self.pool.tick(monotonic());
+        self.pool.tick(runtime::monotonic_nanos());
         for (queue, id, completion) in self.pool.completions() {
             self.produced(queue, id, completion);
         }
@@ -518,20 +518,6 @@ impl InProcessPool {
     pub fn pool(&mut self) -> &mut BufferPool {
         &mut self.pool
     }
-}
-
-/// The host's monotonic clock in nanoseconds, which a task's deadline is stated in.
-fn monotonic() -> u64 {
-    let mut now = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `clock_gettime` writes the clock into the `timespec` it is given, which lives here.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
-    u64::try_from(now.tv_sec)
-        .unwrap_or(0)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(u64::try_from(now.tv_nsec).unwrap_or(0))
 }
 
 #[cfg(test)]

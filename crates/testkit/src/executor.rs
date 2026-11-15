@@ -825,8 +825,9 @@ impl Executor for FakeExecutor {
 /// and nothing when that row's logits are not wanted; it reports the keys that row sees as its
 /// extent and scores every prompt target its tokens name. A media call completes its denoising
 /// step, opens its trajectory at the step its row states, and on the final muxing call (the one
-/// that hands no round) publishes the artifact into a POSIX shared-memory object. A case's own
-/// [`OutputFn`] starts from this to change some calls and keep the rest.
+/// that hands no round) copies the artifact into a sealed memory file (`proto::MappedMedia`), as a
+/// worker's media host holds one. A case's own [`OutputFn`] starts from this to change some calls
+/// and keep the rest.
 pub fn output_of(batch: &Batch, end: Option<EndOfText>) -> BatchOutput {
     let token = matches!(
         batch.phase,

@@ -28,7 +28,7 @@ use storage::Key;
 use storage::key::encoder_output;
 use storage::runtime::{Completion, Request};
 
-use crate::harness::{A, B, Deployment, Harness, STEPS, VIDEO_PHASES, token, video};
+use crate::harness::{A, B, Deployment, Harness, STEPS, pipeline, token, video};
 
 /// The video decoder's block as a deployment names it, a block of MiniMax-H3's pipeline.
 const VIDEO_DECODER_BLOCK: &str = "video_decoder";
@@ -136,7 +136,7 @@ fn digested(mut request: DiffusionRequest, text: u8) -> DiffusionRequest {
 /// latent encoding, and no row names a rank.
 #[test]
 fn a_text_request_makes_its_calls_in_order_each_reading_what_the_one_before_wrote() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let id = harness.submit_video(video(1, 1));
     harness.settle(200);
     completed(&harness, id);
@@ -228,7 +228,7 @@ fn a_text_request_makes_its_calls_in_order_each_reading_what_the_one_before_wrot
 #[test]
 fn a_request_of_several_units_decodes_in_rounds_of_the_decoder_width_in_order() {
     const UNITS: u32 = 3;
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let id = harness.submit_video(video(1, UNITS));
     harness.settle(300);
     completed(&harness, id);
@@ -270,7 +270,7 @@ fn a_request_of_several_units_decodes_in_rounds_of_the_decoder_width_in_order() 
 #[test]
 fn a_reference_request_reads_its_conditions_and_encodes_them_inside_its_text_encoding_and_preparation()
  {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let id = harness.submit_video(reference(1));
     harness.settle(200);
     completed(&harness, id);
@@ -302,7 +302,7 @@ fn a_reference_request_reads_its_conditions_and_encodes_them_inside_its_text_enc
 /// vision pixels, and its latent preparation reads the conditioning and the samples.
 #[test]
 fn an_audio_reference_request_reads_only_its_samples_and_prepares_its_latents_from_them() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let id = harness.submit_video(audio_reference(1));
     harness.settle(200);
     completed(&harness, id);
@@ -328,7 +328,7 @@ fn an_audio_reference_request_reads_only_its_samples_and_prepares_its_latents_fr
 /// `finalizing` after each muxing call.
 #[test]
 fn a_video_request_is_scheduled_before_its_progress_which_follows_every_applied_call() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let id = harness.submit_video(video(1, 1));
     harness.settle(200);
 
@@ -377,7 +377,7 @@ fn a_video_request_is_scheduled_before_its_progress_which_follows_every_applied_
 /// request ends `Completed` with its prompt as its usage (SD §7.3 "Progress and artifact").
 #[test]
 fn the_artifact_reaches_a_consumer_that_took_nothing_before_the_terminal() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let id = harness.submit_video(video(1, 1));
     harness.settle(200);
 
@@ -409,7 +409,7 @@ fn the_artifact_reaches_a_consumer_that_took_nothing_before_the_terminal() {
 /// digest keeps its own private.
 #[test]
 fn a_repeated_request_finds_its_conditioning_and_makes_no_text_encoding() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES])
+    let mut harness = Deployment::video(&[&pipeline().phases])
         .encoder_identity("text-encoder")
         .build();
     let first = digested(video(1, 1), 1);
@@ -470,7 +470,7 @@ fn a_repeated_request_finds_its_conditioning_and_makes_no_text_encoding() {
 /// and every request completes (SD §3.5 `answered`, §4.3).
 #[test]
 fn requests_of_the_same_inputs_admitted_together_each_complete_with_their_own_conditioning() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES])
+    let mut harness = Deployment::video(&[&pipeline().phases])
         .encoder_identity("text-encoder")
         .build();
     let first = digested(video(1, 1), 1);
@@ -508,7 +508,7 @@ fn requests_of_the_same_inputs_admitted_together_each_complete_with_their_own_co
 /// "Admission to the cache").
 #[test]
 fn a_conditioning_its_admission_will_pin_takes_no_units_of_the_buffers() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     // A text request of one unit holds 49 units of the buffers, 4 of them its conditioning's
     // (`a_video_request_holds_every_product_from_admission_and_asks_for_no_block_ahead`): room
     // for one such request and the other products of a second.
@@ -558,7 +558,7 @@ fn a_decoder_that_deals_no_units_decodes_one_a_rank_and_a_codec_covering_that_ro
         distribution: Some(BlockDistribution::TemporalUnits),
         ..BlockConfig::parallel(vec![0])
     };
-    let mut harness = Deployment::video(&[&VIDEO_PHASES])
+    let mut harness = Deployment::video(&[&pipeline().phases])
         .block(0, VIDEO_DECODER_BLOCK, decoder)
         .block(0, HostBlock::VideoCodec.name(), codec)
         .build();
@@ -588,7 +588,7 @@ fn a_decode_waits_for_the_last_step_s_output_where_a_decoder_rank_does_not_denoi
         ..BlockConfig::parallel(vec![0, 1])
     };
     for (denoisers, follows) in [(vec![0, 1], true), (vec![0], false)] {
-        let mut harness = Deployment::video(&[&VIDEO_PHASES])
+        let mut harness = Deployment::video(&[&pipeline().phases])
             .ranks(0, 2)
             .block(0, VIDEO_DECODER_BLOCK, decoder.clone())
             .block(0, DENOISER_BLOCK, BlockConfig::parallel(denoisers))
@@ -632,7 +632,7 @@ fn a_latent_preparation_waits_for_the_encode_s_output_where_a_denoising_rank_enc
     const DENOISER_BLOCK: &str = "transformer";
     const TEXT_BLOCK: &str = "text_encoder";
     for (encoders, follows) in [(vec![0, 1], true), (vec![0], false)] {
-        let mut harness = Deployment::video(&[&VIDEO_PHASES])
+        let mut harness = Deployment::video(&[&pipeline().phases])
             .ranks(0, 2)
             .block(0, DENOISER_BLOCK, BlockConfig::parallel(vec![0, 1]))
             .block(0, TEXT_BLOCK, BlockConfig::parallel(encoders))
@@ -660,7 +660,7 @@ fn a_latent_preparation_waits_for_the_encode_s_output_where_a_denoising_rank_enc
 /// request's (SD §4.4 "Products", §7.3 "Media products").
 #[test]
 fn a_video_request_holds_every_product_from_admission_and_asks_for_no_block_ahead() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let id = harness.submit_video(video(1, 1));
     harness.settle(200);
     completed(&harness, id);
@@ -717,7 +717,8 @@ fn unsupported_media_is_rejected_and_the_deployment_serves_on() {
     harness.settle(100);
     assert_eq!(harness.tokens(served).len(), 3);
 
-    let unread: Vec<Phase> = VIDEO_PHASES
+    let unread: Vec<Phase> = pipeline()
+        .phases
         .into_iter()
         .filter(|phase| *phase != Phase::MediaRead)
         .collect();
@@ -747,13 +748,14 @@ fn unsupported_media_is_rejected_and_the_deployment_serves_on() {
 /// it on a denoiser of its own.
 #[test]
 fn a_call_reading_another_groups_product_waits_for_it_to_complete() {
-    let others: Vec<Phase> = VIDEO_PHASES
+    let others: Vec<Phase> = pipeline()
+        .phases
         .into_iter()
         .filter(|phase| !matches!(phase, Phase::LatentPrepare | Phase::Denoise))
         .collect();
     let split: [&[Phase]; 2] = [&[Phase::LatentPrepare, Phase::Denoise], &others];
     for (deployment, apart) in [
-        (Deployment::video(&[&VIDEO_PHASES]), false),
+        (Deployment::video(&[&pipeline().phases]), false),
         (Deployment::video(&split), true),
     ] {
         let mut harness = deployment.build();

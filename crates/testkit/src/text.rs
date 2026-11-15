@@ -8,11 +8,11 @@
 
 use engine::batch::philox::DrawAddress;
 
-/// The first token id a fake samples: every token it samples lies in `SAMPLED..SAMPLED + 5000`, a
-/// window of legal ids that no prompt of the tests uses.
+/// The first token id a fake samples: every token it draws lies in `SAMPLED..EOS`, a window of
+/// legal ids that no prompt of the tests uses.
 pub const SAMPLED: u32 = 1000;
 
-/// Width of the window of sampled token ids above [`SAMPLED`].
+/// Width of the window of drawn token ids above [`SAMPLED`].
 const VOCABULARY: u32 = 5_000;
 
 /// The token a fake samples at `draw`: a function of the request's Philox stream and the logical
@@ -34,8 +34,9 @@ pub fn draw_token(draw: DrawAddress) -> u32 {
 }
 
 /// The end-of-text token a fake samples, which a fake engine's launch states as its model's end
-/// of sequence (`crate::args`), so a request whose text ends finishes with `Eos`.
-pub const EOS: u32 = 151_645;
+/// of sequence (`crate::args`), so a request whose text ends finishes with `Eos`: the id just past
+/// the window of draws, so no draw and no prompt of the tests is it.
+pub const EOS: u32 = SAMPLED + VOCABULARY;
 
 /// The raw log-probability the fake reports for every token it samples.
 pub const LOGPROB: f32 = -0.5;

@@ -265,19 +265,12 @@ pub(crate) struct SessionsHandoff {
     rolled: Vec<(String, u64)>,
 }
 
-/// The limits of a transfer and of a put to the remote store, in
-/// nanoseconds, as the buffer pool keeps them.
-fn limits(transfer: Duration, put: Duration) -> (u64, u64) {
-    let nanoseconds = |deadline: Duration| u64::try_from(deadline.as_nanos()).unwrap_or(u64::MAX);
-    (nanoseconds(transfer), nanoseconds(put))
-}
-
 impl Sessions {
     /// No session, and the buffer pool's thread started, its transfers between worker groups
     /// and its puts to the remote store bounded as `settings` states
     /// (`transfer_deadline_s`, `put_deadline_s`).
     pub(crate) fn new(settings: &ServerSettings) -> std::io::Result<Self> {
-        let limits = limits(settings.transfer_deadline(), settings.put_deadline());
+        let limits = crate::buffer_pool::limits(settings);
         Self::with(polling::Thread::start(limits, None)?, settings)
     }
 
@@ -358,7 +351,7 @@ impl Sessions {
         settings: &ServerSettings,
     ) -> std::io::Result<Self> {
         let image = Some((handoff.image, queues));
-        let limits = limits(settings.transfer_deadline(), settings.put_deadline());
+        let limits = crate::buffer_pool::limits(settings);
         let thread = polling::Thread::start(limits, image)?;
         let mut sessions = Self::with(thread, settings)?;
         sessions.open = handoff.open.into_iter().collect();

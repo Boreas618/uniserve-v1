@@ -12,7 +12,7 @@ use engine::batch::{ErrorCode, Phase};
 use engine::scheduler::{Message, Output};
 use proto::request::{Event, FinishReason, RejectionKind, RequestId, StopReason};
 
-use crate::harness::{Deployment, EOS, Harness, VIDEO_PHASES, chat_image, token, video};
+use crate::harness::{Deployment, EOS, Harness, chat_image, pipeline, token, video};
 
 /// Tokens a case scripts: below the fake's sampled window, above every prompt's ids.
 const FIRST: u32 = 950;
@@ -407,7 +407,7 @@ fn a_request_that_outgrows_the_cache_ends_at_the_length_the_cache_holds() {
 /// artifact, then its end (SD §7.3 "Progress and artifact").
 #[test]
 fn a_video_request_finishes_completed_after_its_artifact() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let id = harness.submit_video(video(1, 1));
     harness.settle(200);
     video_completed(&harness, id);
@@ -416,7 +416,7 @@ fn a_video_request_finishes_completed_after_its_artifact() {
 /// A video request whose media units take several decode rounds completes as one of one round.
 #[test]
 fn a_video_request_of_several_units_finishes_completed() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let id = harness.submit_video(video(1, 2));
     harness.settle(300);
     video_completed(&harness, id);
@@ -491,7 +491,7 @@ fn a_request_beyond_the_queue_bound_is_rejected_at_arrival_as_overloaded() {
 /// A token request to a deployment that holds no KV cache is rejected as invalid at its arrival.
 #[test]
 fn a_token_request_without_a_kv_cache_to_run_on_is_rejected_at_arrival() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let id = harness.submit(token(1, 10, 4));
     let events = harness.events(id);
     let [Event::Rejected { kind, message }] = &events[..] else {

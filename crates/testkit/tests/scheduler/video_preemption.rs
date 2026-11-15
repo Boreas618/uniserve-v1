@@ -21,7 +21,7 @@ use storage::Key;
 use storage::key::latent_content;
 use storage::runtime::{Cause, Completion, Request};
 
-use crate::harness::{A, Deployment, Harness, LATENT_SEED, STEPS, VIDEO_PHASES, video};
+use crate::harness::{A, Deployment, Harness, LATENT_SEED, STEPS, pipeline, video};
 
 /// The trajectory identity the daemon gives the cases' video requests.
 const TRAJECTORY: u64 = 7;
@@ -151,7 +151,7 @@ fn drained_mid_denoising(
 /// §4.3, §4.4 "Classes").
 #[test]
 fn a_drain_mid_denoising_saves_the_trajectory_and_sends_the_terminal_at_saved_before_its_detach() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let (id, replied) = drained_mid_denoising(&mut harness, identified(1));
     harness.fake.resume();
 
@@ -211,7 +211,7 @@ fn a_drain_mid_denoising_saves_the_trajectory_and_sends_the_terminal_at_saved_be
 /// with 0 steps").
 #[test]
 fn a_save_whose_copy_fails_leaves_the_request_with_no_stored_step() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     harness.fake.fail_copies(true);
     let (id, replied) = drained_mid_denoising(&mut harness, identified(1));
     harness.fake.resume();
@@ -269,7 +269,7 @@ fn second_life(harness: &Harness, id: RequestId, from: usize) -> (Vec<u32>, Vec<
 /// steps that remain, then completes (SD §3.8 "Resume", §7.3 "Resume").
 #[test]
 fn a_resumed_request_restores_its_stored_step_and_denoises_only_the_rest() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let (request, steps) = stored(&mut harness);
     let id = request.request_id;
     let from = harness.batches().len();
@@ -307,7 +307,7 @@ fn a_resumed_request_restores_its_stored_step_and_denoises_only_the_rest() {
 #[test]
 fn a_resumed_request_whose_trajectory_is_missing_starts_from_noise() {
     const OTHER: u64 = 9;
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let (request, steps) = stored(&mut harness);
     let id = request.request_id;
     let from = harness.batches().len();
@@ -335,7 +335,7 @@ fn a_resumed_request_whose_trajectory_is_missing_starts_from_noise() {
 /// "Resume": restored when `0 < denoised_steps < steps`).
 #[test]
 fn a_request_naming_every_step_denoised_starts_from_noise_without_a_restore() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let id = harness.submit_video(resumed(&identified(1), STEPS, None));
     harness.settle(200);
     completed(&harness, id);
@@ -354,7 +354,7 @@ fn a_request_naming_every_step_denoised_starts_from_noise_without_a_restore() {
 /// whichever arrived first (SD §3.2 "resume first", §7.2 "The queue's order").
 #[test]
 fn a_resumed_request_is_admitted_before_one_that_starts() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).slots(1).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).slots(1).build();
     let running = harness.submit_video(video(1, 1));
     harness.run_until(10, |harness| !harness.events(running).is_empty());
     let starting = harness.submit_video(video(2, 1));
@@ -377,7 +377,7 @@ fn a_resumed_request_is_admitted_before_one_that_starts() {
 /// scheduled steps are fewer than its steps).
 #[test]
 fn a_request_with_every_step_scheduled_runs_to_its_end_through_a_drain() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let id = harness.submit_video(identified(1));
     harness.fake.hold();
     harness.run_until(60, |harness| {
@@ -402,7 +402,7 @@ fn a_request_with_every_step_scheduled_runs_to_its_end_through_a_drain() {
 /// request leaves with 0 steps).
 #[test]
 fn a_waiting_video_request_leaves_with_no_stored_step() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).slots(1).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).slots(1).build();
     let running = harness.submit_video(video(1, 1));
     harness.run_until(10, |harness| !harness.events(running).is_empty());
     let waiting = harness.submit_video(resumed(&identified(2), 2, None));

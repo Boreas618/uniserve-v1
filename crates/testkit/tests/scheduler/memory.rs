@@ -18,7 +18,6 @@
 //!   completion evicted correct.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 use engine::batch::cache::CacheGroupKind;
 use engine::batch::{Batch, Phase};
@@ -27,7 +26,9 @@ use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, FinishReason, MigrationCause, RejectionKind, RequestId};
 use storage::Key;
 use storage::key::{page_key, page_root};
-use storage::runtime::{Cause, Completion, GroupId, OwnerId, Request, Source, Tier};
+use storage::runtime::{
+    Cause, Completion, GroupId, OwnerId, Request, Source, Tier, monotonic_nanos,
+};
 
 use crate::harness::{A, BLOCK, Deployment, Harness, prompt, sharing, token};
 
@@ -91,24 +92,6 @@ fn prompt_keys(tokens: &[u32]) -> Vec<Key> {
             parent
         })
         .collect()
-}
-
-/// The host's monotonic clock in nanoseconds, which a prefetch's deadline is stated in.
-fn monotonic_nanos() -> u64 {
-    let mut now = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `clock_gettime` writes the clock into the `timespec` it is given, which lives here.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
-    let seconds = u64::try_from(now.tv_sec).unwrap_or(0);
-    seconds * 1_000_000_000 + u64::try_from(now.tv_nsec).unwrap_or(0)
-}
-
-/// How long a prefetch of `tokens` tokens may take (SD §4.4): one second, and a quarter second
-/// per 1024 tokens.
-fn prefetch_wait(tokens: u32) -> Duration {
-    Duration::from_secs(1) + Duration::from_millis(250 * u64::from(tokens) / 1024)
 }
 
 /// The hit counters of every report up to the next one: the tokens of the hits, those loaded
@@ -649,8 +632,9 @@ fn in_the_remote_store_alone() -> (Harness, Vec<Key>) {
 
 /// When the remote store holds, by `cache`, keys that deepen the hit of the device and the host
 /// by at least `prefetch_min_tokens` (256), the admission prefetches them from it, with the
-/// deadline `prefetch_wait` of the deepening from now; its next round loads what was found, and
-/// the request computes from the deepened hit (SD §4.4 "Pins, loads, clones and prefetches",
+/// deadline the scheduler's copy timeout of the deepening (`SchedulerConfig::copy_timeout`) from
+/// now, in the host's monotonic clock the buffer pool reads; its next round loads what was found,
+/// and the request computes from the deepened hit (SD §4.4 "Pins, loads, clones and prefetches",
 /// §7.4 "Loads and prefetches", "The prefetch wait").
 #[test]
 fn a_deep_enough_remainder_is_prefetched_from_the_remote_store_and_loaded() {
@@ -679,7 +663,7 @@ fn a_deep_enough_remainder_is_prefetched_from_the_remote_store_and_loaded() {
     let (class, asked, source, deadline) = prefetch(&harness).unwrap();
     assert_eq!((class, source), (0, Source::Remote));
     assert_eq!(asked, keys[..65]);
-    let wait = u64::try_from(prefetch_wait(260).as_nanos()).unwrap();
+    let wait = u64::try_from(harness.config.copy_timeout(260).as_nanos()).unwrap();
     assert!(
         (before + wait..=after + wait).contains(&deadline),
         "{deadline} not in {before} + {wait} ..= {after} + {wait}"

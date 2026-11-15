@@ -22,7 +22,7 @@ use storage::Key;
 use storage::runtime::{Cause, Completion, OwnerId, Request, Tier};
 
 use crate::harness::{
-    A, B, BLOCK, Deployment, Harness, STEPS, VIDEO_PHASES, chat_image, prompt, token, video,
+    A, B, BLOCK, Deployment, Harness, STEPS, chat_image, pipeline, prompt, token, video,
 };
 
 /// The requests the buffer pool took, each with its number, in the order taken.
@@ -850,7 +850,7 @@ fn a_dropped_copy_is_given_up_with_a_finish_that_fails_it() {
 /// §3.8 "Resume").
 #[test]
 fn a_refused_key_of_a_restore_starts_the_video_from_noise() {
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).build();
     let mut resumed = video(1, 1);
     resumed.trajectory = Trajectory {
         id: std::num::NonZeroU64::new(7),
@@ -1176,7 +1176,7 @@ fn a_full_to_a_load_returns_the_admission_detached() {
 #[test]
 fn a_full_to_a_save_ends_the_video_with_no_stored_step() {
     // The latent pool holds one unit of 4096 bytes; a trajectory takes 30 000.
-    let mut harness = Deployment::video(&[&VIDEO_PHASES]).latents(1).build();
+    let mut harness = Deployment::video(&[&pipeline().phases]).latents(1).build();
     let mut request = video(1, 1);
     request.trajectory.id = std::num::NonZeroU64::new(7);
     let id = harness.submit_video(request);

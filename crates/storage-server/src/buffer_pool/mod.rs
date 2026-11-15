@@ -47,8 +47,10 @@ pub mod replay;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::{Rc, Weak};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use storage::ServerSettings;
 use storage::protocol::Key;
 use storage::runtime::{Cause, Completion, GroupId, OwnerId, Request, RequestId, Segments, Stamps};
 
@@ -629,9 +631,22 @@ pub struct BufferPool {
     touched: RefCell<Vec<Weak<Block>>>,
 }
 
+/// How long a transfer and a put to the remote store may take under
+/// `settings` (`transfer_deadline_s`, `put_deadline_s`), in nanoseconds of the
+/// clock the pool's deadlines are stated in: the limits [`BufferPool::new`]
+/// takes.
+pub fn limits(settings: &ServerSettings) -> (u64, u64) {
+    let nanoseconds = |deadline: Duration| u64::try_from(deadline.as_nanos()).unwrap_or(u64::MAX);
+    (
+        nanoseconds(settings.transfer_deadline()),
+        nanoseconds(settings.put_deadline()),
+    )
+}
+
 impl BufferPool {
     /// A buffer pool without regions or sessions. `limits` is how long a
-    /// transfer and a put to the remote store may take, in nanoseconds.
+    /// transfer and a put to the remote store may take, in nanoseconds
+    /// ([`limits`] states them from the server's settings).
     pub fn new(limits: (u64, u64)) -> Self {
         Self {
             classes: HashMap::new(),
