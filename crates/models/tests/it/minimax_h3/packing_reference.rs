@@ -1,8 +1,8 @@
 //! The packed sequence against the reference, on CPU.
 //!
 //! `fixtures/packing/` holds requests of every task and the tensors vLLM-Omni's packing builds
-//! for each (`fixtures/generate_packing.py`, which runs the reference's own functions with
-//! torch). Every tensor is compared exactly:
+//! for each (the `minimax-h3-packing-fixtures` generator, `crates/models/python`, which runs the
+//! reference's own functions with torch). Every tensor is compared exactly:
 //!
 //! - the document's coordinates, tags, timestep groups and conditioning rows, in the
 //!   reference's row order. The coordinates are compared as the rotary embedding reads them,

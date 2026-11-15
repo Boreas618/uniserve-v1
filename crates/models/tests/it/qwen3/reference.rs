@@ -1,6 +1,6 @@
 //! Reference vectors on the CPU device: each architecture's tiny checkpoint, loaded through
 //! the family's own loading path, computes what the reference implementation computed from the
-//! same weights in PyTorch (`generate_reference.py`).
+//! same weights in PyTorch (the `qwen3-fixtures` generator, `crates/models/python`).
 //!
 //! | Fixture | Reference | What is compared |
 //! | --- | --- | --- |

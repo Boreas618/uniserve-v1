@@ -1,8 +1,8 @@
-"""Generates the reference vectors of the qwen3 crate's CPU tests.
+"""Generates the reference vectors of the qwen3 family's tests.
 
 Each fixture is a tiny random checkpoint (`model/config.json` and
 `model/model.safetensors`, FP32) and the outputs the reference implementation
-computes from it on the CPU (`reference.safetensors`):
+computes from it (`reference.safetensors`), under `--out`:
 
 - `qwen3_moe`: transformers' `Qwen3MoeForCausalLM`, saved with one module per
   expert as the released Qwen3-30B-A3B stores them.
@@ -11,8 +11,7 @@ computes from it on the CPU (`reference.safetensors`):
   the multi-token-prediction module the released checkpoints carry under
   `mtp.*`. Transformers has no class for that module, so
   `MultiTokenPredictor` below states vLLM's `Qwen3_5MultiTokenPredictor`
-  (`refs/vllm/vllm/model_executor/models/qwen3_5_mtp.py:68-193`) over
-  transformers' modules: its `ColumnParallelLinear` is `nn.Linear`, its
+  over transformers' modules: its `ColumnParallelLinear` is `nn.Linear`, its
   `Qwen3_5DecoderLayer` and `GemmaRMSNorm` are transformers'
   `Qwen3_5MoeDecoderLayer` and `Qwen3_5MoeRMSNorm`, and the layer's
   `(hidden, residual)` pair is the sum transformers' layer returns. Nothing
@@ -21,17 +20,17 @@ computes from it on the CPU (`reference.safetensors`):
   a pipeline uses as its text encoder, whole and truncated before its final
   norm.
 
-Run from the repository root with the repository's interpreter:
+The reference is the Transformers release of this project's `reference`
+dependency group. The generator draws from `--seed` and runs on `--device`
+under the determinism contract of `run.options`; the committed fixtures are
+those of the default arguments on the CPU:
 
-    .venv/bin/python crates/models/tests/it/qwen3/generate_reference.py
-
-The script is deterministic: every weight and input is drawn from a seeded
-generator, so a rerun on the same PyTorch build writes the same bytes.
+    qwen3-fixtures --out crates/models/tests/it/qwen3/data
 """
 
 import copy
 import json
-import pathlib
+from pathlib import Path
 
 import torch
 from safetensors.torch import save_file
@@ -49,7 +48,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeRMSNorm,
 )
 
-DATA = pathlib.Path(__file__).parent / "data"
+from model_fixtures import run
 
 # The placeholder tokens of the two vision fixtures, the last two entries of
 # their 32-entry vocabularies.
@@ -124,6 +123,7 @@ def pixels(grid: list[int], tubelet: int, seed: int) -> torch.Tensor:
 
 
 def write(
+    out: Path,
     name: str,
     config: dict,
     weights: dict[str, torch.Tensor],
@@ -133,19 +133,20 @@ def write(
     """Writes the fixture `name`: its checkpoint and its reference vectors.
 
     Args:
-        name: The fixture's directory under `data`.
+        out: The directory the fixtures are written under.
+        name: The fixture's directory under `out`.
         config: The checkpoint's `config.json`.
-        weights: The checkpoint's tensors by name.
-        reference: The inputs and expected outputs by name.
+        weights: The checkpoint's tensors by name, on any device.
+        reference: The inputs and expected outputs by name, on any device.
         processor: Whether the checkpoint states the Qwen-VL processor files
             its images are sized by.
     """
-    model = DATA / name / "model"
+    model = out / name / "model"
     model.mkdir(parents=True, exist_ok=True)
 
     (model / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     save_file(
-        {key: value.contiguous() for key, value in weights.items()},
+        {key: value.cpu().contiguous() for key, value in weights.items()},
         model / "model.safetensors",
     )
     if processor:
@@ -166,14 +167,14 @@ def write(
 
     stored = {}
     for key, value in reference.items():
-        value = value.detach()
+        value = value.detach().cpu()
         if not value.dtype.is_floating_point:
             value = value.to(torch.int32)
         stored[key] = value.contiguous()
-    save_file(stored, DATA / name / "reference.safetensors")
+    save_file(stored, out / name / "reference.safetensors")
 
 
-def qwen3_moe() -> None:
+def qwen3_moe(out: Path, device: torch.device, seed: int) -> None:
     """Qwen3-MoE: two rows of text through `Qwen3MoeForCausalLM`."""
     config = {
         "vocab_size": 32,
@@ -196,8 +197,8 @@ def qwen3_moe() -> None:
         "decoder_sparse_step": 1,
         "mlp_only_layers": [],
     }
-    model = Qwen3MoeForCausalLM(Qwen3MoeConfig(**config)).eval()
-    randomize(model, 1)
+    model = Qwen3MoeForCausalLM(Qwen3MoeConfig(**config)).eval().to(device)
+    randomize(model, seed + 1)
 
     # The released checkpoints store one module per expert; transformers
     # stacks them, each expert's gate rows before its up rows.
@@ -219,28 +220,29 @@ def qwen3_moe() -> None:
     reference = {}
     with torch.no_grad():
         for row, count in enumerate(ROWS):
-            ids = token_ids(count, 10 + row)
+            ids = token_ids(count, seed + 10 + row).to(device)
             hidden = model.model(input_ids=ids).last_hidden_state[0]
             reference[f"rows.{row}.ids"] = ids[0]
             reference[f"rows.{row}.hidden"] = hidden
             reference[f"rows.{row}.logits"] = model.lm_head(hidden)
 
     config["architectures"] = ["Qwen3MoeForCausalLM"]
-    write("qwen3_moe", config, weights, reference)
+    write(out, "qwen3_moe", config, weights, reference)
 
 
 class MultiTokenPredictor(nn.Module):
     """vLLM's `Qwen3_5MultiTokenPredictor` over transformers' modules.
 
-    `refs/vllm/vllm/model_executor/models/qwen3_5_mtp.py:68-193`; the module
-    documentation lists what stands in for vLLM's layers.
+    vLLM's module at the revision the fixture states it from:
+    https://github.com/vllm-project/vllm/blob/cdd09707378563a4228270bd0bb5b83bcb0d1acc/vllm/model_executor/models/qwen3_5_mtp.py#L68-L193.
+    The module documentation lists what stands in for vLLM's layers.
     """
 
     def __init__(self, config) -> None:
         super().__init__()
         hidden = config.hidden_size
 
-        # Every multi-token-prediction layer attends (`qwen3_5_mtp.py:123`).
+        # Every multi-token-prediction layer attends (`qwen3_5_mtp.py#L123`).
         layer = copy.deepcopy(config)
         layer.layer_types = ["full_attention"]
 
@@ -267,7 +269,9 @@ class MultiTokenPredictor(nn.Module):
 
         # A decoder layer over the entries, each attending the ones before it.
         tokens = hidden_states.shape[1]
-        causal = torch.full((tokens, tokens), float("-inf")).triu(1)
+        causal = torch.full(
+            (tokens, tokens), float("-inf"), device=hidden_states.device
+        ).triu(1)
         hidden_states = self.layers[0](
             hidden_states,
             position_embeddings=position_embeddings,
@@ -276,7 +280,7 @@ class MultiTokenPredictor(nn.Module):
         return self.norm(hidden_states)
 
 
-def qwen3_5_moe() -> None:
+def qwen3_5_moe(out: Path, device: torch.device, seed: int) -> None:
     """Qwen3.5-MoE: text rows, the drafter, an image and a prompt with it."""
     text = {
         "vocab_size": 32,
@@ -336,12 +340,12 @@ def qwen3_5_moe() -> None:
         "video_token_id": VIDEO_TOKEN,
     }
     model = Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeConfig(**config))
-    model = model.eval()
-    randomize(model, 2)
+    model = model.eval().to(device)
+    randomize(model, seed + 2)
     language = model.model.language_model
 
-    mtp = MultiTokenPredictor(language.config).eval()
-    randomize(mtp, 3)
+    mtp = MultiTokenPredictor(language.config).eval().to(device)
+    randomize(mtp, seed + 3)
 
     weights = dict(model.state_dict())
     for name, value in mtp.state_dict().items():
@@ -350,7 +354,7 @@ def qwen3_5_moe() -> None:
     reference = {}
     with torch.no_grad():
         for row, count in enumerate(ROWS):
-            ids = token_ids(count, 20 + row)
+            ids = token_ids(count, seed + 20 + row).to(device)
             hidden = language(input_ids=ids).last_hidden_state
             reference[f"rows.{row}.ids"] = ids[0]
             reference[f"rows.{row}.hidden"] = hidden[0]
@@ -359,7 +363,8 @@ def qwen3_5_moe() -> None:
             # The drafter's entry at `i` reads the model's hidden state at
             # `i` and the embedding of the token at `i + 1`, at position `i`.
             entries = count - 1
-            positions = torch.arange(entries).view(1, 1, -1).expand(3, 1, -1)
+            positions = torch.arange(entries, device=device)
+            positions = positions.view(1, 1, -1).expand(3, 1, -1)
             rotary = language.rotary_emb(hidden, positions)
             drafted = mtp(
                 language.embed_tokens(ids[:, 1:]), rotary, hidden[:, :entries]
@@ -368,27 +373,28 @@ def qwen3_5_moe() -> None:
 
         # One image of a 4x6 patch grid, alone and inside a prompt.
         grid = [1, 4, 6]
-        image = pixels(grid, 3 * 2 * 2 * 2, 30)
-        features = model.model.visual(image, grid_thw=torch.tensor([grid]))
+        image = pixels(grid, 3 * 2 * 2 * 2, seed + 30).to(device)
+        grid_thw = torch.tensor([grid], device=device)
+        features = model.model.visual(image, grid_thw=grid_thw)
         reference["image.pixels"] = image
         reference["image.features"] = features.pooler_output
 
-        ids = token_ids(11, 31)
+        ids = token_ids(11, seed + 31).to(device)
         ids[0, 2:8] = IMAGE_TOKEN
         prompt = model.model(
             input_ids=ids,
             pixel_values=image,
-            image_grid_thw=torch.tensor([grid]),
+            image_grid_thw=grid_thw,
             mm_token_type_ids=(ids == IMAGE_TOKEN).int(),
         )
         reference["prompt.ids"] = ids[0]
         reference["prompt.hidden"] = prompt.last_hidden_state[0]
 
     config["architectures"] = ["Qwen3_5MoeForConditionalGeneration"]
-    write("qwen3_5_moe", config, weights, reference, processor=True)
+    write(out, "qwen3_5_moe", config, weights, reference, processor=True)
 
 
-def qwen3_vl() -> None:
+def qwen3_vl(out: Path, device: torch.device, seed: int) -> None:
     """Qwen3-VL: a prompt with an image and a video through `Qwen3VLModel`."""
     text = {
         "vocab_size": 32,
@@ -429,8 +435,8 @@ def qwen3_vl() -> None:
         "image_token_id": IMAGE_TOKEN,
         "video_token_id": VIDEO_TOKEN,
     }
-    model = Qwen3VLModel(Qwen3VLConfig(**config)).eval()
-    randomize(model, 4)
+    model = Qwen3VLModel(Qwen3VLConfig(**config)).eval().to(device)
+    randomize(model, seed + 4)
     weights = {
         f"model.{name}": value for name, value in model.state_dict().items()
     }
@@ -438,21 +444,22 @@ def qwen3_vl() -> None:
     # Two text tokens, an image of six merged rows, a text token, and a
     # video of two time steps of two merged rows, each behind its timestamp.
     image_grid, video_grid = [1, 4, 6], [2, 2, 4]
-    ids = token_ids(15, 40)
+    ids = token_ids(15, seed + 40).to(device)
     ids[0, 2:8] = IMAGE_TOKEN
     ids[0, 9:11] = VIDEO_TOKEN
     ids[0, 12:14] = VIDEO_TOKEN
     kinds = (ids == IMAGE_TOKEN).int() + 2 * (ids == VIDEO_TOKEN).int()
 
     tubelet = 3 * 2 * 2 * 2
-    image = pixels(image_grid, tubelet, 41)
-    video = pixels(video_grid, tubelet, 42)
+    image = pixels(image_grid, tubelet, seed + 41).to(device)
+    video = pixels(video_grid, tubelet, seed + 42).to(device)
+    image_grid_thw = torch.tensor([image_grid], device=device)
     inputs = {
         "input_ids": ids,
         "pixel_values": image,
-        "image_grid_thw": torch.tensor([image_grid]),
+        "image_grid_thw": image_grid_thw,
         "pixel_values_videos": video,
-        "video_grid_thw": torch.tensor([video_grid]),
+        "video_grid_thw": torch.tensor([video_grid], device=device),
         "mm_token_type_ids": kinds,
     }
 
@@ -464,8 +471,9 @@ def qwen3_vl() -> None:
     with torch.no_grad():
         # The tower's rows of the image: its merged features, then each
         # DeepStack feature, side by side as vLLM's tower returns them
-        # (`refs/vllm/vllm/model_executor/models/qwen3_vl.py:905-906`).
-        tower = model.visual(image, grid_thw=torch.tensor([image_grid]))
+        # (vLLM's `qwen3_vl.py#L905-L906` at the revision `MultiTokenPredictor`
+        # cites).
+        tower = model.visual(image, grid_thw=image_grid_thw)
         reference["image.features"] = torch.cat(
             [tower.pooler_output, *tower.deepstack_features], dim=1
         )
@@ -483,10 +491,14 @@ def qwen3_vl() -> None:
         reference["prompt.truncated"] = state
 
     config["architectures"] = ["Qwen3VLForConditionalGeneration"]
-    write("qwen3_vl", config, weights, reference, processor=True)
+    write(out, "qwen3_vl", config, weights, reference, processor=True)
+
+
+def main() -> None:
+    arguments = run.options(__doc__.splitlines()[0], seed=0)
+    for fixture in (qwen3_moe, qwen3_5_moe, qwen3_vl):
+        fixture(arguments.out, arguments.device, arguments.seed)
 
 
 if __name__ == "__main__":
-    qwen3_moe()
-    qwen3_5_moe()
-    qwen3_vl()
+    main()

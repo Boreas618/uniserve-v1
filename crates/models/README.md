@@ -57,10 +57,18 @@ A ModelOpt NVFP4 export of the family (a FastH3 export with a `modelopt_manifest
 
 ## Tests
 
-`cargo test -p models` runs the unit tests and the integration tests of [`tests/it`](tests/it), one module per family, on CPU tensors without a GPU. Each reference test loads a family through its own loading path and compares it with outputs the reference implementation computed from the same weights; the reference tensors are read with `nn::Checkpoint` ([`tests/it/fixture.rs`](tests/it/fixture.rs)). Each generator states the reference classes it runs and what stands in for the serving framework they import.
+`cargo test -p models` runs the unit tests and the integration tests of [`tests/it`](tests/it), one module per family, on CPU tensors without a GPU. Each reference test loads a family through its own loading path and compares it with outputs the reference implementation computed from the same weights; the reference tensors are read with `nn::Checkpoint` ([`tests/it/fixture.rs`](tests/it/fixture.rs)). Each generator states the reference classes it runs.
 
-- `qwen3::reference`: tiny random checkpoints under [`tests/it/qwen3/data`](tests/it/qwen3/data), loaded onto the CPU device, against outputs transformers computed in PyTorch ([`generate_reference.py`](tests/it/qwen3/generate_reference.py) writes the fixtures).
+The generators of [`python`](python) are console programs of one project, which imports each reference as a package pinned to one revision by its own lock (`python/uv.lock`): its `reference` group holds vLLM-Omni, the vLLM release it is written against and their Transformers. Each generator writes under `--out`, runs on `--device` and draws from `--seed` under `torch.use_deterministic_algorithms(True)` (`model_fixtures.run`); the committed fixtures are those of the default arguments on the CPU. The environment is installed apart from the root project's, whose `test` extra pins another PyTorch:
+
+```bash
+UV_PROJECT_ENVIRONMENT=<directory> uv sync --locked --project crates/models/python --group reference
+<directory>/bin/qwen3-fixtures --out crates/models/tests/it/qwen3/data
+<directory>/bin/minimax-h3-packing-fixtures --out crates/models/tests/it/minimax_h3/fixtures/packing
+```
+
+- `qwen3::reference`: tiny random checkpoints under [`tests/it/qwen3/data`](tests/it/qwen3/data), loaded onto the CPU device, against outputs transformers computed in PyTorch (`qwen3-fixtures` writes the fixtures).
 - `qwen4_exp::reference`: the family's modules and the whole model against the references of [`generate_reference.py`](tests/it/qwen4_exp/generate_reference.py), and prefill against steps.
-- `minimax_h3::packing_reference` compares every packed tensor exactly with fixtures of vLLM-Omni's packing (`fixtures/generate_packing.py`); `minimax_h3::transformer_reference` and `minimax_h3::vae_reference` compare the modules over tiny checkpoints with the reference modules run on CPU (`fixtures/generate_transformer.py`, `fixtures/generate_vae.py`); `minimax_h3::denoiser` steps a tiny denoiser through `nn::Denoiser` in several layouts of one request.
+- `minimax_h3::packing_reference` compares every packed tensor exactly with fixtures of vLLM-Omni's packing (`minimax-h3-packing-fixtures`); `minimax_h3::transformer_reference` and `minimax_h3::vae_reference` compare the modules over tiny checkpoints with the reference modules run on CPU (`fixtures/generate_transformer.py`, `fixtures/generate_vae.py`); `minimax_h3::denoiser` steps a tiny denoiser through `nn::Denoiser` in several layouts of one request.
 
 The profile runs (`qwen3::profile`, `qwen4_exp::profile`, `minimax_h3::denoiser_profile`, `minimax_h3::vae_profile`) run on the meta device over the headers of the released checkpoints under `/workspace/models` and print their kernel keys and allocator peaks; they are ignored by default and run with `cargo test -p models --test it -- --ignored --nocapture`, or one family's with its module path as the filter.

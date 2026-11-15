@@ -1,38 +1,31 @@
-"""Generate the packed-sequence fixtures from the reference implementation.
+"""Generates the packed-sequence fixtures from the reference implementation.
 
-The reference is vLLM-Omni's MiniMax-H3 packing (`packed_sequence.py`), its
-denoise branch (`denoise_loop.py`, for the timestep group of every row and the
+The reference is vLLM-Omni's MiniMax-H3 packing (`packed_sequence`), its
+denoise branch (`denoise_loop`, for the timestep group of every row and the
 prefix segments of the native layouts) and its video sparse attention tiling
-(`attention/fastvideo_h3.py`, `attention/ops/video_tiles.py`). They run on CPU
-with torch, loaded by path: the packages they live in import the serving
-framework, which this environment does not install, so the modules they import
-from it are replaced by empty stand-ins (`_stub`). No reference source is
-modified.
+(`attention.fastvideo_h3`), imported from this project's `reference`
+dependency group and run on `--device`. The packing draws nothing, so its
+tensors are those of the reference functions alone:
 
-Run from the repository root:
+    minimax-h3-packing-fixtures \
+        --out crates/models/tests/it/minimax_h3/fixtures/packing
 
-    cd crates/models/tests/it/minimax_h3/fixtures
-    ../../../../../../.venv/bin/python generate_packing.py \
-        --reference ../../../../../../refs/vllm-omni
-
-It writes `packing/cases.json` (the requests, in the model's own terms) and
-`packing/expected.safetensors` (the reference's tensors of each request) beside
-this script.
+It writes `cases.json` (the requests, in the model's own terms) and
+`expected.safetensors` (the reference's tensors of each request) under
+`--out`.
 """
 
 from __future__ import annotations
 
-import argparse
-import importlib.util
 import json
 import math
-import sys
-import types
-from pathlib import Path
-from types import SimpleNamespace
 
 import torch
 from safetensors.torch import save_file
+from vllm_omni.diffusion.models.minimax_h3 import denoise_loop, packed_sequence
+from vllm_omni.diffusion.models.minimax_h3.attention import fastvideo_h3
+
+from model_fixtures import run
 
 # The request rules the cases are stated in (`processing::minimax_h3`): 24
 # frames and 40 audio latent steps a second, 800 samples a step, `17n + 5`
@@ -45,91 +38,6 @@ CLIP_FRAMES = 17
 CLIP_LATENTS = 5
 TOKEN_DROP = 3
 LATENT_COMPRESSION = 16
-
-PACKAGE = "vllm_omni.diffusion.models.minimax_h3"
-
-
-class _Stub(types.ModuleType):
-    """A stand-in for a framework module: every attribute is a class."""
-
-    def __getattr__(self, name: str):
-        if name.startswith("__"):
-            raise AttributeError(name)
-
-        def init(self, *args, **kwargs):
-            self.__dict__.update(kwargs)
-
-        value = type(name, (), {"__init__": init})
-        setattr(self, name, value)
-        return value
-
-
-def _stub(name: str) -> None:
-    """Register a stand-in for `name` and for every parent package it has."""
-    parts = name.split(".")
-    for depth in range(1, len(parts) + 1):
-        module = ".".join(parts[:depth])
-        if module not in sys.modules:
-            stub = _Stub(module)
-            stub.__path__ = []
-            sys.modules[module] = stub
-
-
-def _load(name: str, path: Path):
-    """Load the reference source at `path` as the module `name`."""
-    _stub(name.rpartition(".")[0])
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_reference(root: Path) -> SimpleNamespace:
-    """The reference modules the fixtures are generated from."""
-    diffusion = root / "vllm_omni" / "diffusion"
-    model = diffusion / "models" / "minimax_h3"
-
-    # `packed_sequence.py` raises the framework's client error; its module is
-    # self-contained.
-    _load("vllm_omni.errors", root / "vllm_omni" / "errors.py")
-    packing = _load(f"{PACKAGE}.packed_sequence", model / "packed_sequence.py")
-
-    # The tiling is self-contained; the attention module around it imports the
-    # logger, the attention backends and the sparse attention kernels, none of
-    # which the tiling calls.
-    tiles = _load(
-        "vllm_omni.diffusion.attention.ops.video_tiles",
-        diffusion / "attention" / "ops" / "video_tiles.py",
-    )
-    for name in (
-        "vllm.logger",
-        "vllm_omni.diffusion.attention.backends.abstract",
-        "vllm_omni.diffusion.attention.backends.fastvideo_vsa",
-        "vllm_omni.diffusion.attention.ops.block_sparse",
-    ):
-        _stub(name)
-    sys.modules["vllm.logger"].init_logger = lambda name: None
-    vsa = _load(
-        f"{PACKAGE}.attention.fastvideo_h3",
-        model / "attention" / "fastvideo_h3.py",
-    )
-
-    # The denoise branch reads a packed sequence; the solvers, the latent edits
-    # and the forward context it imports are not reached by its constructor or
-    # by `fill_timesteps`.
-    for name in (
-        "vllm_omni.diffusion.cancellation",
-        "vllm_omni.diffusion.forward_context",
-        "vllm_omni.platforms",
-        f"{PACKAGE}.latent_mask",
-        f"{PACKAGE}.sampling",
-        f"{PACKAGE}.scheduling_minimax_h3_euler_ancestral",
-    ):
-        _stub(name)
-    loop = _load(f"{PACKAGE}.denoise_loop", model / "denoise_loop.py")
-
-    return SimpleNamespace(packing=packing, tiles=tiles, vsa=vsa, loop=loop)
 
 
 def latent_frames(frames: int) -> int:
@@ -183,7 +91,7 @@ def reference_block(shape: dict) -> dict:
     }
 
 
-def pack(reference: SimpleNamespace, case: dict) -> dict:
+def pack(case: dict) -> dict:
     """The reference's packed sequence of `case`."""
     target = {
         "text_len": case["text_tokens"],
@@ -206,7 +114,7 @@ def pack(reference: SimpleNamespace, case: dict) -> dict:
     # the block layout, whose keyframes are timeline guides at the frame they
     # anchor.
     if not references:
-        return reference.packing.minimax_h3_packed_sequence(
+        return packed_sequence.minimax_h3_packed_sequence(
             **target,
             include_keyframe_cond=bool(keyframes),
             keyframe_frame_indices=indices or None,
@@ -222,16 +130,16 @@ def pack(reference: SimpleNamespace, case: dict) -> dict:
         }
         for index in indices
     ]
-    return reference.packing.minimax_h3_packed_sequence_ref2va_blocks(
+    return packed_sequence.minimax_h3_packed_sequence_ref2va_blocks(
         **target,
         ref_blocks=[reference_block(shape) for shape in references],
         guide_blocks=guides,
     )
 
 
-def expected(reference: SimpleNamespace, case: dict) -> dict[str, torch.Tensor]:
+def expected(case: dict, device: torch.device) -> dict[str, torch.Tensor]:
     """The reference's tensors of `case`, over the rows its document uses."""
-    packed = pack(reference, case)
+    packed = pack(case)
     used = int(packed["cu_seqlens"][1])
     text_len = case["text_tokens"]
 
@@ -243,17 +151,17 @@ def expected(reference: SimpleNamespace, case: dict) -> dict[str, torch.Tensor]:
     tags = packed["token_tags"].clone()
     tags[packed["text_pos"]] = text_tags
 
-    branch = reference.loop.MiniMaxH3DenoiseBranch(
+    branch = denoise_loop.MiniMaxH3DenoiseBranch(
         packed=packed,
         text_embeddings=torch.zeros(text_len, 1),
         token_tags=tags,
-        device=torch.device("cpu"),
+        device=device,
     )
 
     # Each row's timestep, with the four levels standing for their groups: the
     # generated video 0, the generated audio 1, a visual condition 2, an audio
     # reference 3.
-    groups = torch.zeros(branch.seq_len)
+    groups = torch.zeros(branch.seq_len, device=device)
     branch.fill_timesteps(
         groups,
         t_video=0.0,
@@ -279,11 +187,11 @@ def expected(reference: SimpleNamespace, case: dict) -> dict[str, torch.Tensor]:
         .values
     )
     prefix_index = torch.full(
-        (used,), case["text_rows"] + case["condition_rows"]
+        (used,), case["text_rows"] + case["condition_rows"], device=device
     )
-    prefix_index[:text_len] = torch.arange(text_len)
+    prefix_index[:text_len] = torch.arange(text_len, device=device)
     prefix_index[conditions] = case["text_rows"] + torch.arange(
-        conditions.numel()
+        conditions.numel(), device=device
     )
 
     tensors = {
@@ -294,24 +202,25 @@ def expected(reference: SimpleNamespace, case: dict) -> dict[str, torch.Tensor]:
         # The dense layout leads with the generated rows: the video, the audio,
         # then the prefix.
         "dense_rows": torch.cat(
-            [target_video, target_audio, torch.arange(int(target_audio[0]))]
+            [
+                target_video,
+                target_audio,
+                torch.arange(int(target_audio[0]), device=device),
+            ]
         ),
         "used": torch.tensor([used]),
     }
 
     if case["tile_rows"] is not None:
-        tensors.update(tiles(reference, case, branch))
+        tensors.update(tiles(case, branch, device))
     return {
         name: tensor.to(torch.int32) if name != "positions" else tensor
         for name, tensor in tensors.items()
     }
 
 
-def tiles(
-    reference: SimpleNamespace, case: dict, branch
-) -> dict[str, torch.Tensor]:
+def tiles(case: dict, branch, device: torch.device) -> dict[str, torch.Tensor]:
     """The reference tiles of `case`: every tile and each video span."""
-    cpu = torch.device("cpu")
     layout = branch.static_kwargs["video_token_layout"]
     prefix = tuple(
         branch.static_kwargs["packed_seq_params"]["vsa_prefix_segments"]
@@ -320,8 +229,8 @@ def tiles(
 
     if case["tile_rows"] == 64:
         partition, sizes, _, _, prefix_blocks, video_blocks = (
-            reference.vsa._get_h3_tile_metadata(
-                prefix, tuple(target.latent_grid), cpu
+            fastvideo_h3._get_h3_tile_metadata(
+                prefix, tuple(target.latent_grid), device
             )
         )
         spans = ((prefix_blocks, prefix_blocks + video_blocks),)
@@ -330,8 +239,8 @@ def tiles(
             (span.start, tuple(span.latent_grid)) for span in layout.video_spans
         )
         partition, sizes, _, _, _, spans = (
-            reference.vsa._get_h3_multiregion_tile_metadata(
-                prefix, regions, cpu
+            fastvideo_h3._get_h3_multiregion_tile_metadata(
+                prefix, regions, device
             )
         )
 
@@ -353,7 +262,8 @@ def tiles(
             [
                 [start, end, count]
                 for (start, end), count in zip(spans, kept, strict=True)
-            ]
+            ],
+            device=device,
         ),
     }
 
@@ -559,22 +469,16 @@ def cases() -> list[dict]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument(
-        "--reference", type=Path, required=True, help="the vLLM-Omni checkout"
-    )
-    arguments = parser.parse_args()
-
-    reference = load_reference(arguments.reference.resolve())
+    arguments = run.options(__doc__.splitlines()[0])
     requests = cases()
 
     tensors = {}
     for case in requests:
-        for name, tensor in expected(reference, case).items():
-            tensors[f"{case['name']}.{name}"] = tensor.contiguous()
+        for name, tensor in expected(case, arguments.device).items():
+            tensors[f"{case['name']}.{name}"] = tensor.cpu().contiguous()
 
-    out = Path(__file__).resolve().parent / "packing"
-    out.mkdir(exist_ok=True)
+    out = arguments.out
+    out.mkdir(parents=True, exist_ok=True)
     (out / "cases.json").write_text(json.dumps(requests, indent=2) + "\n")
     save_file(tensors, out / "expected.safetensors")
 
