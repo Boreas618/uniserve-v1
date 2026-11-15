@@ -3,8 +3,9 @@
 //!
 //! The engine is a package: this crate with the crates it depends on, built by
 //! the Build Server into this executable (`package.toml`). A node's daemon
-//! resolves the revision its epoch names and starts it with one launch file
-//! (`--launch`, [`proto::config::EngineArgs`]) and its lifeline (`--lifeline`);
+//! resolves the revision its epoch names and starts it with one launch
+//! (`--launch`, an inherited descriptor of a sealed file holding its
+//! [`proto::config::EngineArgs`]) and its lifeline (`--lifeline`);
 //! the process serves until its daemon commands it down, the epoch fails, or
 //! the daemon is gone ([`follow_lifeline`]). The process states the settings its
 //! CUDA and NCCL libraries read at initialization itself ([`RUNTIME_SETTINGS`]).
@@ -18,7 +19,6 @@
 //! capability.
 
 use std::io::Write as _;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
@@ -61,10 +61,10 @@ const FAMILIES: [nn::family::Family; 4] = [
     about = "A node's main process for one epoch of a UniServe deployment."
 )]
 struct Cli {
-    /// The launch file the daemon wrote for this process
-    /// (`proto::config::EngineArgs`).
-    #[arg(long, value_name = "FILE")]
-    launch: PathBuf,
+    /// The descriptor of the launch the daemon passed (`proto::LAUNCH_OPTION`): a sealed file
+    /// that holds this process's `proto::config::EngineArgs`.
+    #[arg(long, value_name = "FD")]
+    launch: i32,
     /// The descriptor of the lifeline the supervising daemon passed
     /// (`proto::LIFELINE_OPTION`): the read end of a pipe whose write end the
     /// daemon holds. The process ends once the pipe does.
@@ -97,7 +97,7 @@ fn main() -> Result<ExitCode> {
     runtime_settings();
     let cli = Cli::parse();
     let lifeline = cli.lifeline.map(take_lifeline);
-    let launch_file = cli.launch;
+    let launch = read_launch(cli.launch)?;
     let registry = nn::family::Registry::new(FAMILIES)?;
 
     if cli.keys {
@@ -108,10 +108,6 @@ fn main() -> Result<ExitCode> {
             &logging::Levels::new(cli.log_level),
             logging::Output::Stderr,
         );
-        let launch: proto::config::EngineArgs = std::fs::read(&launch_file)
-            .map_err(anyhow::Error::new)
-            .and_then(|text| serde_json::from_slice(&text).map_err(anyhow::Error::new))
-            .with_context(|| format!("reading the launch file {}", launch_file.display()))?;
         let recorded = engine::record(&launch, &registry)?;
         let list = build_server::build::key_list(&recorded)?;
         let mut stdout = std::io::stdout().lock();
@@ -130,7 +126,7 @@ fn main() -> Result<ExitCode> {
         &logging::Levels::new(cli.log_level),
         logging::Output::Stdout,
     );
-    engine::run(&launch_file, &registry).map(|()| ExitCode::SUCCESS)
+    engine::run(launch, &registry).map(|()| ExitCode::SUCCESS)
 }
 
 /// Settings this process's CUDA and NCCL libraries read from the process environment when they
@@ -159,6 +155,26 @@ fn runtime_settings() {
         // SAFETY: no other thread exists yet to read the environment.
         unsafe { std::env::set_var(name, value) };
     }
+}
+
+/// The launch the daemon passed at the inherited descriptor `descriptor`, read whole; the
+/// descriptor closes once it is read.
+///
+/// # Errors
+///
+/// When the descriptor cannot be read or holds no launch.
+fn read_launch(descriptor: i32) -> Result<proto::config::EngineArgs> {
+    use std::io::Read as _;
+    use std::os::fd::FromRawFd as _;
+
+    // SAFETY: the daemon passed this descriptor for the launch, and nothing else in this process
+    // owns it; the file takes it over and closes it.
+    let mut file = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) });
+    let mut text = Vec::new();
+    file.read_to_end(&mut text)
+        .with_context(|| format!("reading the launch at descriptor {descriptor}"))?;
+    serde_json::from_slice(&text)
+        .with_context(|| format!("reading the launch at descriptor {descriptor}"))
 }
 
 /// Takes the lifeline at `descriptor`, which this process inherited from the daemon that

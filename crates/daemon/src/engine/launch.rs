@@ -1,80 +1,86 @@
-//! The launch file an engine is started with (`uniserve engine --launch
-//! <path>`).
+//! The launch an engine process is started with (`uniserve-engine --launch <fd>`): one
+//! inherited descriptor of a sealed anonymous file holding the process's [`EngineArgs`].
 //!
-//! The engine takes the file's contents as its whole description: one flag,
-//! no second account of what the process is or which build it serves. The
-//! file carries the epoch's engine configuration inline, so the process reads
-//! nothing else the daemon wrote, and the daemon writes it atomically: a
-//! temporary file beside the target, synced, then renamed.
-//! The engine reads it in its first instruction, so nothing may be observable
-//! half-written.
-//!
-//! The launch's contents travel in the spawn request (`process::Spawn::launch`),
-//! and the daemon of the node that starts the engine writes the file into its own
-//! runtime directory (`supervision::supervisor`), so an engine on any node reads a
-//! file of its own host.
+//! The engine takes the launch as its whole description: one option, no second account of what
+//! the process is or which build it serves. The launch carries the epoch's engine configuration
+//! inline, so the process reads nothing else the daemon wrote. It lives in no file system: the
+//! daemon of the node that starts the engine writes it into a memfd, seals the memfd so its
+//! contents can no longer change, and passes the descriptor to the process it starts
+//! ([`inherit`]), which reads it whole in its first instruction; the memory goes with the last
+//! descriptor. The launch's contents travel to that daemon in the spawn request
+//! (`process::Spawn::launch`), so an engine on any node reads a launch of its own host.
 
-use std::io;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{self, Seek as _, Write as _};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::unix::process::CommandExt as _;
+use std::process::Command;
 
 use proto::config::EngineArgs;
 
-/// The path of one engine process's launch file.
-pub(crate) fn launch_path(directory: &Path, engine: u64) -> PathBuf {
-    directory.join(format!("launch-{engine}.json"))
-}
+/// The seals that make a launch's memfd immutable: no write, no change of size, and no further
+/// change of the seals themselves.
+const SEALS: libc::c_int =
+    libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
 
-/// Writes `launch` for the process `engine` and returns the path it was
-/// written to.
+/// A sealed memfd that holds `launch`, positioned at its start, for the process it starts to read
+/// ([`inherit`]). The descriptor is close-on-exec in this process.
 ///
 /// # Errors
 ///
-/// Fails when the directory or the file cannot be written.
-pub(crate) fn write(directory: &Path, engine: u64, launch: &EngineArgs) -> io::Result<PathBuf> {
-    let path = launch_path(directory, engine);
-    let bytes = serde_json::to_vec_pretty(launch)
+/// Fails when the launch does not encode, or the memfd cannot be created, written or sealed.
+pub(crate) fn memfd(launch: &EngineArgs) -> io::Result<OwnedFd> {
+    let bytes = serde_json::to_vec(launch)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    write_atomically(&path, &bytes)?;
-    Ok(path)
+    // SAFETY: the name is a NUL-terminated literal; a successful call returns a descriptor this
+    // function owns.
+    let descriptor = unsafe {
+        libc::memfd_create(
+            c"uniserve-launch".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor was just created and is owned by nothing else.
+    let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(descriptor) });
+    file.write_all(&bytes)?;
+    file.rewind()?;
+    // SAFETY: fcntl on the descriptor `file` owns, with an integer argument.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, SEALS) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(OwnedFd::from(file))
 }
 
-/// Writes `bytes` to `path` so that a reader sees either nothing or the whole
-/// file: a temporary file in the same directory, synced, renamed into place.
-fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    /// Distinguishes the temporary files of one process writing twice in the
-    /// same microsecond.
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(directory)?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("launch");
-    let temporary = directory.join(format!(
-        ".{name}.{}.{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let written = (|| {
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        // The rename is the first moment the file exists under its real name,
-        // and it is atomic, so an engine either reads the whole file or is
-        // started after a failure this call reports.
-        std::fs::rename(&temporary, path)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+/// Has the process `command` starts inherit `launch` at its descriptor number, named by the
+/// engine's launch option (`proto::LAUNCH_OPTION`) on its command line.
+///
+/// The command owns `launch` from here on and closes it when the command is dropped, so the
+/// memfd stays open until the spawn has duplicated it. Close-on-exec is cleared only in the
+/// forked child: no other process this daemon starts meanwhile inherits the launch.
+pub(crate) fn inherit(command: &mut Command, launch: OwnedFd) {
+    let descriptor = launch.as_raw_fd();
+    command
+        .arg(proto::LAUNCH_OPTION)
+        .arg(descriptor.to_string());
+    // SAFETY: the closure runs in the forked child between fork and exec and only calls
+    // `fcntl`, which is async-signal-safe. `launch` is moved into the closure, so the descriptor
+    // is open in the parent at fork time.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(launch.as_raw_fd(), libc::F_SETFD, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
-    written
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::io::Read as _;
 
     use serde_json::{Value, json};
 
@@ -117,28 +123,16 @@ mod tests {
         }
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let directory = std::env::temp_dir().join(format!(
-            "uniserve-launch-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&directory).expect("a scratch directory");
-        directory
-    }
-
-    /// The launch file states exactly the engine's fields, the epoch's engine
+    /// The launch states exactly the engine's fields, the epoch's engine
     /// configuration and the handover state among them, and the engine reads
     /// it back as the one type both sides use (`proto::config::EngineArgs`).
     /// A key the engine does not know is refused.
     #[test]
-    fn a_launch_file_states_exactly_the_engines_fields() {
-        let directory = scratch("keys");
-        let path = write(&directory, 7, &launch()).expect("the launch file");
-        let text = std::fs::read_to_string(&path).expect("the written file");
+    fn a_launch_states_exactly_the_engines_fields() {
+        let mut text = String::new();
+        std::fs::File::from(memfd(&launch()).expect("the launch"))
+            .read_to_string(&mut text)
+            .expect("the launch reads");
         let value: Value = serde_json::from_str(&text).expect("JSON");
         let keys = value
             .as_object()
@@ -184,41 +178,22 @@ mod tests {
         assert!(value["engine_config"].is_object());
 
         // The engine reads back what the writer wrote.
-        let read: EngineArgs = serde_json::from_str(&text).expect("the launch file reads back");
+        let read: EngineArgs = serde_json::from_str(&text).expect("the launch reads back");
         assert_eq!(read, launch());
 
         // A key this build does not know is refused.
         let mut extra = value;
         extra["generation"] = json!(7);
         serde_json::from_value::<EngineArgs>(extra).expect_err("an unknown key is refused");
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// The launch file is per process: a standby and a serving engine of one
-    /// epoch write different names in one directory.
+    /// A launch cannot change once written: the memfd refuses a write and a change of its size.
     #[test]
-    fn a_launch_file_is_named_for_its_process() {
-        let directory = scratch("names");
-        let mut standby = launch();
-        standby.engine = 8;
-        let serving = write(&directory, 7, &launch()).expect("the serving launch");
-        let standing = write(&directory, 8, &standby).expect("the standby launch");
-        assert_ne!(serving, standing);
-        assert_eq!(
-            serving.file_name().and_then(|name| name.to_str()),
-            Some("launch-7.json")
-        );
-        assert_eq!(
-            standing.file_name().and_then(|name| name.to_str()),
-            Some("launch-8.json")
-        );
-        // No temporary file survives a completed write.
-        let leftovers = std::fs::read_dir(&directory)
-            .expect("the directory")
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
-            .count();
-        assert_eq!(leftovers, 0);
-        let _ = std::fs::remove_dir_all(&directory);
+    fn a_launch_is_sealed() {
+        let mut file = std::fs::File::from(memfd(&launch()).expect("the launch"));
+        file.write_all(b"{}")
+            .expect_err("a sealed launch refuses a write");
+        file.set_len(0)
+            .expect_err("a sealed launch refuses a change of its size");
     }
 }

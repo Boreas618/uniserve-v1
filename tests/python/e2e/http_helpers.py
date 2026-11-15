@@ -743,8 +743,7 @@ class Follower:
 
     def __init__(self, server: Server, runtime: str) -> None:
         self.server = server
-        #: Its runtime directory there, holding its Storage Server's socket
-        #: and the launch files of the processes it starts.
+        #: Its runtime directory there, holding its Storage Server's socket.
         self.runtime = runtime
 
 

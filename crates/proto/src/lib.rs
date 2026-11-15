@@ -213,6 +213,11 @@ envelopes!(
 /// it to every process's command line; an engine ends once the pipe does.
 pub const LIFELINE_OPTION: &str = "--lifeline";
 
+/// The command-line option that names an engine process's launch: the descriptor number,
+/// inherited from the daemon that starts the process, of a sealed anonymous file that holds the
+/// process's [`config::EngineArgs`] (JSON). The process reads it whole as it starts.
+pub const LAUNCH_OPTION: &str = "--launch";
+
 /// The build this crate is compiled in: the package version, then `+` and a
 /// digest of the workspace sources every artifact of the build is compiled
 /// from, as the engine interface's registration states it.

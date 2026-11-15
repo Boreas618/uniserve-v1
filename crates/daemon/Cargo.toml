@@ -56,7 +56,6 @@ sha2.workspace = true
 # The Storage Server's claim and protocol; content digests of media, in the key chain the cache
 # stores pages under.
 storage.workspace = true
-tempfile.workspace = true
 thiserror.workspace = true
 thiserror-ext.workspace = true
 tokio.workspace = true
@@ -76,6 +75,8 @@ criterion.workspace = true
 # The paused clock of the tests that wait on a deadline (`tokio::time::pause`).
 tokio = { workspace = true, features = ["test-util"] }
 expect-test.workspace = true
+# The scratch directories of the tests' files and sockets.
+tempfile.workspace = true
 # Builds the deterministic serving tokenizers of the test fixtures (`api::test_support`).
 tokenizers.workspace = true
 # The test engine: the engine's own control thread over a fake executor and

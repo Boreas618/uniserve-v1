@@ -176,11 +176,12 @@ struct Daemon {
     processes: Connection,
 }
 
-/// Starts the built `uniserve-engine` with `launch`, written into `directory`, and plays its
-/// daemon up to the claim, which it answers with `storage`: the engine says hello and `Starting`
-/// on its request interface, says hello on its process interface and claims. The process
-/// inherits the descriptors `inherited` open, as the daemon's supervisor places the sockets it
-/// reserved for a scheduler node.
+/// Starts the built `uniserve-engine` with `launch`, written into `directory` and passed as the
+/// inherited descriptor of that file (`proto::LAUNCH_OPTION`), and plays its daemon up to the
+/// claim, which it answers with `storage`: the engine says hello and `Starting` on its request
+/// interface, says hello on its process interface and claims. The process also inherits the
+/// descriptors `inherited` open, as the daemon's supervisor places the sockets it reserved for a
+/// scheduler node.
 fn started(
     directory: &Path,
     launch: &EngineArgs,
@@ -191,10 +192,16 @@ fn started(
     let processes_socket = Listener::bind(&launch.processes.parse().unwrap()).unwrap();
     let launch_file = directory.join("launch.json");
     std::fs::write(&launch_file, serde_json::to_vec(launch).unwrap()).unwrap();
+    // The engine reads its launch whole from the descriptor it inherits; the test's copy closes
+    // once the child is spawned.
+    let launch_file = std::fs::File::open(&launch_file).unwrap();
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_uniserve-engine"));
-    command.arg("--launch").arg(&launch_file);
-    let inherited = inherited.to_vec();
+    command
+        .arg(proto::LAUNCH_OPTION)
+        .arg(launch_file.as_raw_fd().to_string());
+    let mut inherited = inherited.to_vec();
+    inherited.push(launch_file.as_raw_fd());
     // SAFETY: the hook runs in the forked child before it executes the engine, and only clears
     // the close-on-exec flag of descriptors the test process holds open.
     unsafe {
@@ -208,6 +215,7 @@ fn started(
         });
     }
     let mut engine = Engine(command.spawn().unwrap());
+    drop(launch_file);
 
     // The request interface: hello, welcome, `Starting`.
     let mut requests = accept(&requests_socket, &mut engine, READ);

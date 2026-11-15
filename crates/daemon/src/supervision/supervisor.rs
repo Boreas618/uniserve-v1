@@ -266,13 +266,13 @@ impl Supervisor {
         self.build_server.as_ref()
     }
 
-    /// The executable of the engine `spawn` starts and the launch file written for it,
-    /// with this node's facts stated in it.
+    /// The executable of the engine `spawn` starts and the launch it reads
+    /// ([`crate::engine::launch::memfd`]), with this node's facts stated in it.
     ///
     /// The executable is the engine package the launch's module set names, resolved at this
     /// node's Build Server: every node runs the revision the epoch fixed, built for its own
     /// platform.
-    fn main_process(&self, spawn: &Spawn) -> Result<(PathBuf, PathBuf), String> {
+    fn main_process(&self, spawn: &Spawn) -> Result<(PathBuf, OwnedFd), String> {
         let mut launch: proto::config::EngineArgs =
             serde_json::from_slice(&spawn.launch).map_err(|error| {
                 format!("reading the launch of engine {}: {error}", spawn.generation)
@@ -283,16 +283,10 @@ impl Supervisor {
             launch.build_server = socket.display().to_string();
         }
         let executable = engine_executable(&launch)?;
-        let directory = service::RuntimeDirectory::of_user()
-            .map_err(|error| format!("finding the user's runtime directory: {error}"))?;
-        let file = crate::engine::launch::write(directory.path(), spawn.generation, &launch)
-            .map_err(|error| {
-                format!(
-                    "writing the launch file of engine {}: {error}",
-                    spawn.generation
-                )
-            })?;
-        Ok((executable, file))
+        let launch = crate::engine::launch::memfd(&launch).map_err(|error| {
+            format!("writing the launch of engine {}: {error}", spawn.generation)
+        })?;
+        Ok((executable, launch))
     }
 
     /// Starts the process `spawn` describes for `engine`, as a child of this
@@ -324,7 +318,7 @@ impl Supervisor {
         } else {
             let (executable, launch) = self.main_process(spawn)?;
             let mut command = Command::new(executable);
-            command.arg("--launch").arg(launch);
+            crate::engine::launch::inherit(&mut command, launch);
             // An engine process logs at this daemon's level.
             command.args(::service::logging::arguments());
             command

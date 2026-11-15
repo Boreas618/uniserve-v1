@@ -1,10 +1,11 @@
 //! A node's main process for one epoch.
 //!
 //! The daemon starts one main process per node and epoch and hands it one
-//! launch file ([`proto::config::EngineArgs`]): the epoch's engine
+//! launch ([`proto::config::EngineArgs`], read from the sealed file the
+//! process inherits, `proto::LAUNCH_OPTION`): the epoch's engine
 //! configuration, what the process takes over from the one it succeeds, the
 //! request address, the Storage Server namespacing, the Build Server's
-//! socket, the devices, the rank and the durations. [`run`] reads it, starts
+//! socket, the devices, the rank and the durations. [`run`] takes it, starts
 //! the control thread, one scheduler per DP rank and one worker per device,
 //! and serves until its daemon commands it down or the epoch fails. [`serve`]
 //! is the same control thread over two given connections and a [`Start`], the

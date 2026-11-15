@@ -97,22 +97,23 @@ def _chunk_tokens(line: str) -> tuple[list[str], dict | None, bool]:
     return tokens, chunk.get("usage"), False
 
 
-def _kill_serving_peer(host: str, runtime: str) -> None:
+def _kill_serving_peer(host: str, daemon: int) -> None:
     """Kill the second host's serving main process.
 
-    It is the oldest main process this test's follower daemon started there,
-    whose launch file lies in the follower's runtime directory `runtime`
-    (:attr:`http_helpers.Follower.runtime`).
+    It is the oldest main process the follower daemon `daemon` (its process
+    on `host`) started there: the daemon starts each main process as its own
+    child, ``uniserve-engine --launch FD`` naming the launch it inherits.
     """
-    # The bracket keeps the pattern from matching the shell that runs it.
-    pattern = f"[e]ngine --launch {runtime}/"
+    # Only the daemon's children are matched, so neither another deployment's
+    # engines nor the shell that runs the command are.
+    pattern = "engine --launch "
     subprocess.run(
         [
             "ssh",
             "-o",
             "BatchMode=yes",
             host,
-            f"pkill -KILL -o -f {shlex.quote(pattern)}",
+            f"pkill -KILL -o -P {daemon} -f {shlex.quote(pattern)}",
         ],
         check=True,
         timeout=60,
@@ -213,7 +214,7 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
                     streamed.extend(tokens)
                     usage = chunk_usage or usage
                     if not killed and len(streamed) >= EARLY_TOKENS:
-                        _kill_serving_peer(FOLLOWER, follower.runtime)
+                        _kill_serving_peer(FOLLOWER, follower.server.pid)
                         killed = True
             reply = httpx.post(
                 f"{base_url}/v1/chat/completions",

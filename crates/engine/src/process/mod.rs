@@ -124,20 +124,16 @@ fn kernels_of(packages: &Packages) -> Packages {
         .collect()
 }
 
-/// Runs the main process the launch file at `launch_file` describes, until its daemon commands
+/// Runs the main process `launch` describes, until its daemon commands
 /// it down or its epoch fails. Its checkpoint is served by the family of `registry` that claims
 /// the class it declares.
 ///
 /// # Errors
 ///
-/// When the launch file cannot be read or is refused, or the daemon refuses the process or its
+/// When the launch is refused, or the daemon refuses the process or its
 /// claim. A process whose epoch fails or loses a peer exits with status 1 without its orderly
 /// close: a device or a collective may hold every rank.
-pub fn run(launch_file: &Path, registry: &nn::family::Registry) -> Result<()> {
-    let launch: EngineArgs = std::fs::read(launch_file)
-        .map_err(anyhow::Error::new)
-        .and_then(|text| serde_json::from_slice(&text).map_err(anyhow::Error::new))
-        .with_context(|| format!("reading the launch file {}", launch_file.display()))?;
+pub fn run(launch: EngineArgs, registry: &nn::family::Registry) -> Result<()> {
     let mut requests = launch
         .requests
         .parse()

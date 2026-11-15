@@ -93,20 +93,18 @@ pub async fn record(
         .await
         .map_err(anyhow::Error::from)?;
     tokio::task::spawn_blocking(move || {
-        let directory = tempfile::tempdir().context("creating the launch files' directory")?;
         let mut recorded: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for mut launch in launches {
             launch.build_server = socket.display().to_string();
             launch.modules = modules.clone();
             let executable =
                 crate::supervision::engine_executable(&launch).map_err(anyhow::Error::msg)?;
-            let file = crate::engine::launch::write(directory.path(), launch.engine, &launch)
-                .context("writing a launch file")?;
+            let memfd = crate::engine::launch::memfd(&launch).context("writing a launch")?;
 
             // The process's logs are this command's: they go to its standard error.
-            let output = Command::new(&executable)
-                .arg("--launch")
-                .arg(&file)
+            let mut command = Command::new(&executable);
+            crate::engine::launch::inherit(&mut command, memfd);
+            let output = command
                 .arg("--keys")
                 .args(service::logging::arguments())
                 .stderr(Stdio::inherit())
