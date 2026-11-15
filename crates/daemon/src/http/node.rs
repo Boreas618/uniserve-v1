@@ -146,15 +146,14 @@ pub async fn node(
     info!(%address, "the node serves no deployment yet");
     // The connection writer is what takes a response's body out of its extensions (`conn`), so a
     // deployment's routes respond with nothing through any other server.
-    let served = super::conn::serve(
-        listener,
+    let connections = super::conn::Server {
         app,
-        super::conn::Limits::of(&server),
-        shutdown.clone(),
-        super::handoff::Admissions::default(),
-    )
-    .await
-    .context("the node's HTTP server failed");
+        limits: super::conn::Limits::of(&server),
+        admitting: super::handoff::Admissions::default(),
+    };
+    let served = super::conn::serve(listener, connections, shutdown.clone())
+        .await
+        .context("the node's HTTP server failed");
     // The deployment serving now comes down with the node.
     let current = service::lock(&node.current).take();
     if let Some(token) = current {

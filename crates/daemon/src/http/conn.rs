@@ -92,7 +92,20 @@ impl Limits {
     }
 }
 
-/// Serves connections accepted on `listener` with `app` until `accepting` is
+/// What every connection of one server serves with: its router, the limits it
+/// reads requests under, and whether the daemon admits new requests.
+#[derive(Clone)]
+pub(crate) struct Server {
+    /// The routes requests are served by.
+    pub(crate) app: Router,
+    /// The limits requests are read under.
+    pub(crate) limits: Limits,
+    /// Whether the daemon admits new requests; a hot restart closes it, and a
+    /// connection then ends at its next request boundary.
+    pub(crate) admitting: Admissions,
+}
+
+/// Serves connections accepted on `listener` with `server` until `accepting` is
 /// cancelled, then finishes the requests in flight and returns.
 ///
 /// A cancelled `accepting` ends each connection between two requests, as
@@ -102,10 +115,8 @@ impl Limits {
 /// handing the deployment over (design §7.5.1 step 1).
 pub(crate) async fn serve(
     mut listener: Listener,
-    app: Router,
-    limits: Limits,
+    server: Server,
     accepting: CancellationToken,
-    admitting: Admissions,
 ) -> anyhow::Result<()> {
     let mut connections = tokio::task::JoinSet::new();
     loop {
@@ -113,13 +124,10 @@ pub(crate) async fn serve(
             biased;
             () = accepting.cancelled() => break,
             (io, _address) = axum::serve::Listener::accept(&mut listener) => {
-                let app = app.clone();
+                let server = server.clone();
                 let stopping = accepting.clone();
-                let admitting = admitting.clone();
                 connections.spawn(async move {
-                    if let Err(error) =
-                        serve_connection(io, app, limits, stopping, admitting).await
-                    {
+                    if let Err(error) = serve_connection(io, server, stopping).await {
                         debug!(%error, "a connection ended with an error");
                     }
                 });
@@ -151,23 +159,16 @@ pub(crate) async fn serve(
 /// body's framing, and serves the next request on the connection when it is
 /// kept alive. `http.read_ahead` are request bytes the predecessor read and
 /// the successor reads as its own.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the two callbacks are the handoff record's two moments; every other argument is \
-              the connection's own state, as `serve` takes it"
-)]
 pub(crate) async fn adopt(
     descriptor: OwnedFd,
     http: proto::handoff::Http,
     mut body: crate::http::stream::ResponseStream,
-    app: Router,
-    limits: Limits,
-    admitting: Admissions,
+    server: Server,
     started: impl FnOnce(),
     finished: impl FnOnce(),
 ) -> anyhow::Result<()> {
     let io = socket_of(descriptor).context("taking over a handed connection")?;
-    let mut connection = Connection::new(io, app, limits, CancellationToken::new(), admitting)
+    let mut connection = Connection::new(io, server, CancellationToken::new())
         .context("reading the handed connection's receive buffer")?;
     connection.buffer = BytesMut::from(http.read_ahead.as_slice());
     // The counters continue the record the pause made.
@@ -268,12 +269,10 @@ fn socket_of(descriptor: OwnedFd) -> io::Result<Io> {
 /// serving, or the connection ends it.
 async fn serve_connection(
     io: Io,
-    app: Router,
-    limits: Limits,
+    server: Server,
     accepting: CancellationToken,
-    admitting: Admissions,
 ) -> anyhow::Result<()> {
-    let mut connection = Connection::new(io, app, limits, accepting, admitting)
+    let mut connection = Connection::new(io, server, accepting)
         .context("reading the connection's receive buffer")?;
     connection.run().await
 }
@@ -327,13 +326,12 @@ struct Exchange {
 }
 
 impl Connection {
-    fn new(
-        io: Io,
-        app: Router,
-        limits: Limits,
-        accepting: CancellationToken,
-        admitting: Admissions,
-    ) -> io::Result<Self> {
+    fn new(io: Io, server: Server, accepting: CancellationToken) -> io::Result<Self> {
+        let Server {
+            app,
+            limits,
+            admitting,
+        } = server;
         let socket = match &io {
             Either::Left(stream) => stream.as_fd(),
             Either::Right(stream) => stream.as_fd(),
@@ -1781,9 +1779,14 @@ mod tests {
     use crate::http::handoff::{Handoff, Registration};
     use crate::http::stream::{self, ResponseStream, Session, Step};
 
-    /// The limits the tests serve under: the schema's default head bound.
-    fn limits() -> Limits {
-        Limits::of(&crate::options::ServerConfig::default())
+    /// The server of `app` the tests serve with: the schema's default limits,
+    /// admitting.
+    fn server(app: Router) -> Server {
+        Server {
+            app,
+            limits: Limits::of(&crate::options::ServerConfig::default()),
+            admitting: Admissions::default(),
+        }
     }
 
     /// The server side of an in-memory socket pair, and the client side.
@@ -1936,13 +1939,7 @@ mod tests {
     /// Serves `app` on a socket pair and returns the client side.
     fn serve_on_pair(app: Router) -> TestClient {
         let (io, client) = pair();
-        tokio::spawn(serve_connection(
-            io,
-            app,
-            limits(),
-            CancellationToken::new(),
-            Admissions::default(),
-        ));
+        tokio::spawn(serve_connection(io, server(app), CancellationToken::new()));
         TestClient::new(client)
     }
 
@@ -2307,13 +2304,7 @@ mod tests {
             }),
         );
         let (io, client) = pair();
-        let connection = tokio::spawn(serve_connection(
-            io,
-            app,
-            limits(),
-            CancellationToken::new(),
-            Admissions::default(),
-        ));
+        let connection = tokio::spawn(serve_connection(io, server(app), CancellationToken::new()));
         Handing {
             client: TestClient::new(client),
             frames,
@@ -2340,7 +2331,11 @@ mod tests {
         client
             .send(b"GET /health HTTP/1.1\r\nhost: test\r\n\r\n")
             .await;
-        serve_connection(io, app, limits(), CancellationToken::new(), admitting)
+        let server = Server {
+            admitting,
+            ..server(app)
+        };
+        serve_connection(io, server, CancellationToken::new())
             .await
             .expect("the connection ends without an error");
 
@@ -2433,9 +2428,7 @@ mod tests {
             descriptor,
             http,
             body,
-            app(),
-            limits(),
-            Admissions::default(),
+            server(app()),
             move || {
                 recorded.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
@@ -2489,9 +2482,7 @@ mod tests {
             descriptor,
             chunked_http(false, head.len() as u64),
             body,
-            app(),
-            limits(),
-            Admissions::default(),
+            server(app()),
             move || going_on.store(true, std::sync::atomic::Ordering::SeqCst),
             move || {
                 assert!(
@@ -2673,16 +2664,7 @@ mod tests {
             body_bytes: 18,
             ..chunked_http(true, written.len() as u64)
         };
-        let adopted = tokio::spawn(adopt(
-            descriptor,
-            http,
-            body,
-            app(),
-            limits(),
-            Admissions::default(),
-            || {},
-            || {},
-        ));
+        let adopted = tokio::spawn(adopt(descriptor, http, body, server(app()), || {}, || {}));
         frames.send(Bytes::from_static(b"data: c\n\n")).unwrap();
         drop(frames);
 
@@ -2890,16 +2872,7 @@ mod tests {
             unwritten: held.to_vec(),
             ..chunked_http(true, 0)
         };
-        let adopted = tokio::spawn(adopt(
-            descriptor,
-            http,
-            body,
-            app(),
-            limits(),
-            Admissions::default(),
-            || {},
-            || {},
-        ));
+        let adopted = tokio::spawn(adopt(descriptor, http, body, server(app()), || {}, || {}));
 
         let response = client.read_response().await;
         assert_eq!(response.status, 500);
@@ -2925,16 +2898,7 @@ mod tests {
             unwritten: held.to_vec(),
             ..chunked_http(true, 0)
         };
-        let adopted = tokio::spawn(adopt(
-            descriptor,
-            http,
-            body,
-            app(),
-            limits(),
-            Admissions::default(),
-            || {},
-            || {},
-        ));
+        let adopted = tokio::spawn(adopt(descriptor, http, body, server(app()), || {}, || {}));
 
         let response = client.read_response().await;
         assert_eq!(response.status, 200);

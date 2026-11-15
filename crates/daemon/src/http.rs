@@ -496,10 +496,13 @@ async fn serve_on(
     // The responses the daemon this one replaced handed over go on here: each
     // connection writes the bytes the predecessor did not write and then goes
     // on with the resumed body.
-    let limits = conn::Limits::of(server);
+    let connections = conn::Server {
+        app,
+        limits: conn::Limits::of(server),
+        admitting,
+    };
     for stream in adopted {
-        let app = app.clone();
-        let admitting = admitting.clone();
+        let server = connections.clone();
         tokio::spawn(async move {
             let request_id = stream.request_id.clone();
             let frozen_at_ns = stream.frozen_at_ns;
@@ -514,9 +517,7 @@ async fn serve_on(
                 stream.descriptor,
                 stream.http,
                 stream.body,
-                app,
-                limits,
-                admitting.clone(),
+                server,
                 move || {
                     crate::restart::streams::adopted(&adopted, frozen_at_ns);
                 },
@@ -532,7 +533,7 @@ async fn serve_on(
         });
     }
 
-    let serving = conn::serve(listener, app, limits, accepting.clone(), admitting);
+    let serving = conn::serve(listener, connections, accepting.clone());
     let drain = async {
         serving.await.context("HTTP server failed")?;
         jobs.wait().await;
