@@ -437,27 +437,42 @@ impl Leader {
 
     /// The deployment's aggregate serving state.
     pub fn status(&self) -> LeaderStatus {
-        let replicas = self.replicas();
-        let states: Vec<_> = replicas.iter().map(|replica| replica.status()).collect();
-        let mut state = states[0].clone();
-        if states.iter().any(|state| state.engine == "serving") {
-            state.engine = "serving".to_owned();
-            state.reason = None;
+        let replicas: Vec<ReplicaStatus> = self
+            .replicas()
+            .iter()
+            .map(|replica| replica.status())
+            .collect();
+        // The deployment serves while any replica does; otherwise its state is its first
+        // replica's, which the generation and the standby name as well.
+        let first = replicas.first();
+        let (engine, reason) = if replicas
+            .iter()
+            .any(|replica| replica.engine == ServingState::Serving)
+        {
+            (ServingState::Serving, None)
+        } else {
+            first.map_or((ServingState::Closed, None), |replica| {
+                (replica.engine, replica.reason.clone())
+            })
+        };
+        LeaderStatus {
+            deployment: self.served_model_name.clone(),
+            model: self.model_name.clone(),
+            engine,
+            reason,
+            paused: replicas.iter().all(|replica| replica.paused),
+            asleep: replicas.iter().all(|replica| replica.asleep),
+            replacing: self.replicas.replacing.try_lock().is_err()
+                || replicas.iter().any(|replica| replica.replacing),
+            in_flight: replicas.iter().map(|replica| replica.in_flight).sum(),
+            held: self.replicas.held.load(Ordering::Relaxed),
+            generation: first.and_then(|replica| replica.generation),
+            standby: first.map(|replica| replica.standby.clone()).unwrap_or_default(),
+            update: self
+                .updates
+                .in_flight()
+                .map(|(number, phase)| UpdateStatus { number, phase }),
         }
-        state.update = self
-            .updates
-            .in_flight()
-            .map(|(number, phase)| UpdateStatus {
-                number,
-                phase: phase.name().to_owned(),
-            });
-        state.paused = states.iter().all(|state| state.paused);
-        state.asleep = states.iter().all(|state| state.asleep);
-        state.replacing = self.replicas.replacing.try_lock().is_err()
-            || states.iter().any(|state| state.replacing);
-        state.in_flight = states.iter().map(|state| state.in_flight).sum();
-        state.held = self.replicas.held.load(Ordering::Relaxed);
-        state
     }
 
     /// Holds new requests across all replicas.
@@ -1342,6 +1357,63 @@ pub(crate) struct EngineHandoff {
     pub(crate) unavailable: Vec<crate::updates::Unavailable>,
 }
 
+/// The lifecycle state of the engine a deployment's requests go to, as `GET /admin/status`
+/// names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingState {
+    /// It loads its ranks, resolves its modules and captures its graphs.
+    Starting,
+    /// It executes and admits nothing.
+    Parked,
+    /// It admits and executes requests.
+    Serving,
+    /// It admits nothing more; its requests end as migratable.
+    Draining,
+    /// It shut down, or its connection closed.
+    Stopped,
+    /// It serves nothing more: its start failed or its ranks are lost.
+    Failed,
+    /// An engine is being replaced, and requests wait for the next.
+    Holding,
+    /// No engine will serve.
+    Closed,
+}
+
+impl ServingState {
+    /// The state's name, as the status serializes it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Parked => "parked",
+            Self::Serving => "serving",
+            Self::Draining => "draining",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+            Self::Holding => "holding",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+impl std::fmt::Display for ServingState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+/// What one replica serves, of which the deployment's status ([`LeaderStatus`]) is made.
+pub(crate) struct ReplicaStatus {
+    engine: ServingState,
+    reason: Option<String>,
+    paused: bool,
+    asleep: bool,
+    replacing: bool,
+    in_flight: usize,
+    generation: Option<u64>,
+    standby: Vec<u64>,
+}
+
 /// What the leader serves, for `GET /admin/status`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct LeaderStatus {
@@ -1349,10 +1421,9 @@ pub struct LeaderStatus {
     pub deployment: String,
     /// The model the deployment serves.
     pub model: String,
-    /// The lifecycle state of the engine requests go to: `starting`,
-    /// `parked`, `serving`, `draining`, `stopped` or `failed`; `holding`
-    /// while an engine is being replaced; `closed` once none will serve.
-    pub engine: String,
+    /// The lifecycle state of the engine requests go to: `serving` while any
+    /// replica's engine serves, otherwise the first replica's.
+    pub engine: ServingState,
     /// Why the engine failed or no engine will serve.
     pub reason: Option<String>,
     /// Whether new requests wait (`/admin/pause_generation`).
@@ -1367,14 +1438,14 @@ pub struct LeaderStatus {
     /// The new requests the daemon holds before any engine takes them: while
     /// generation is paused, the engine sleeps, or no engine is ready.
     pub held: usize,
-    /// The launch generation of the engine that serves (the scheduler
+    /// The launch generation of the first replica's engine (the scheduler
     /// node's, for a worker group over several hosts); `None` while none
     /// serves, or for an engine this daemon did not start. It names that
     /// process's row in `GET /admin/config`'s `processes`.
     pub generation: Option<u64>,
     /// The launch generation of each engine of the parked standby beside
-    /// the serving engine (`worker_config.standby`), one per host in the
-    /// world's order: the serving `generation` a promotion leaves is its
+    /// the first replica's engine (`worker_config.standby`), one per host in
+    /// the world's order: the serving `generation` a promotion leaves is its
     /// first. Empty while there is none.
     pub standby: Vec<u64>,
     /// The update in flight; `None` when none is.
@@ -1388,7 +1459,13 @@ pub struct UpdateStatus {
     /// The admin operation that applied it.
     pub number: u64,
     /// `preparing`, `switching` or `trial`.
-    pub phase: String,
+    #[serde(serialize_with = "phase_name")]
+    pub(crate) phase: Phase,
+}
+
+/// An update's phase by its name ([`Phase::name`]).
+fn phase_name<S: serde::Serializer>(phase: &Phase, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(phase.name())
 }
 
 /// How the requests in flight continue through an in-place weight update
@@ -3008,31 +3085,27 @@ impl Replica {
 }
 impl Replica {
     /// What the leader serves now.
-    pub(crate) fn status(&self) -> LeaderStatus {
+    pub(crate) fn status(&self) -> ReplicaStatus {
         let hold = self.hold();
         let (engine, reason) = match hold.state() {
             HoldState::Engine(state) => match state {
-                EngineState::Starting => ("starting", None),
-                EngineState::Parked => ("parked", None),
-                EngineState::Serving => ("serving", None),
-                EngineState::Draining => ("draining", None),
-                EngineState::Stopped => ("stopped", None),
-                EngineState::Failed(reason) => ("failed", Some(reason)),
+                EngineState::Starting => (ServingState::Starting, None),
+                EngineState::Parked => (ServingState::Parked, None),
+                EngineState::Serving => (ServingState::Serving, None),
+                EngineState::Draining => (ServingState::Draining, None),
+                EngineState::Stopped => (ServingState::Stopped, None),
+                EngineState::Failed(reason) => (ServingState::Failed, Some(reason)),
             },
-            HoldState::Holding => ("holding", None),
-            HoldState::Closed(reason) => ("closed", Some(reason)),
+            HoldState::Holding => (ServingState::Holding, None),
+            HoldState::Closed(reason) => (ServingState::Closed, Some(reason)),
         };
-        LeaderStatus {
-            deployment: self.served_model_name.clone(),
-            model: self.model_name.clone(),
-            engine: engine.to_owned(),
+        ReplicaStatus {
+            engine,
             reason,
             paused: hold.is_paused(),
             asleep: self.asleep.load(Ordering::Acquire),
             replacing: self.replacing.try_lock().is_err(),
             in_flight: hold.client().map_or(0, |client| client.in_flight()),
-            // The leader's status counts the deployment's held requests.
-            held: 0,
             generation: hold.client().and_then(|client| client.engine()),
             standby: service::lock(&self.standby)
                 .as_ref()
@@ -3044,8 +3117,6 @@ impl Replica {
                         .collect()
                 })
                 .unwrap_or_default(),
-            // The leader's status states the deployment's update.
-            update: None,
         }
     }
 
