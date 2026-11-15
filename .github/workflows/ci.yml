@@ -10,29 +10,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # The toolchain, its components and the wasm32 target scheduling policies are built for
-      # come from rust-toolchain.toml.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
+      # The toolchain, its components and the wasm32 target scheduling policies
+      # are built for, as rust-toolchain.toml states them.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
       # The runner has no FFmpeg 8.1, so the media crate builds the pinned FFmpeg 8.1.2 and
       # libx264 from source (its `vendored` feature), which assembles x86-64 kernels with nasm.
       - run: sudo apt-get update && sudo apt-get install -y nasm
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --features media/vendored -- -D warnings
-      - run: cargo test --workspace --features media/vendored
-      - run: cargo bench --workspace --no-run --features media/vendored
+      - run: just fmt
+      - run: just clippy --features media/vendored
+      - run: just test-rust --features media/vendored
+      - run: just bench-build --features media/vendored
 
   python:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      # The job checks the Python sources and needs no `uniserve` executable, so the locked
-      # environment is synced without building the project itself (the rust job builds it).
-      - run: uv sync --locked --python 3.12 --no-install-project --extra dev --extra test --extra bench
+      # The environment is synced without building the project: the `uniserve`
+      # executable's build needs FFmpeg 8.1, which the runner lacks, and the
+      # vendored FFmpeg serves builds that run from cargo's target directory
+      # alone. The kernel checks that launch through the installed `uniserve`
+      # (`tests/python/kernels/tensor`) need it.
+      - run: uv sync --locked --no-install-project --extra dev --extra test --extra bench
       - run: .venv/bin/python -m ruff check uniserve_eval tests
       - run: .venv/bin/python -m ruff format --check uniserve_eval tests
       - run: .venv/bin/python -m mypy
