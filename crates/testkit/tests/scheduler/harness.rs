@@ -725,16 +725,8 @@ impl Deployment {
                 .iter()
                 .fold(0, |bits, phase| bits | 1 << phase.index()),
             slots: self.slots,
-            // The block size of the cache group with the widest token rows: the largest of the
-            // model's that is not the draft cache's.
             kv_cache: tokens.then(|| KvCacheConfig {
-                block_size: self
-                    .cache
-                    .iter()
-                    .filter(|(kind, _)| !kind.is_draft())
-                    .map(|(_, block)| *block)
-                    .max()
-                    .and_then(NonZeroU32::new),
+                block_size: self.block_size(),
                 host_tier: self.host_units > 0,
                 state_interval: self.state_interval,
                 mooncake: self.remote.then(|| storage::connector::Settings {
@@ -803,8 +795,21 @@ impl Deployment {
         products.into_iter()
     }
 
+    /// The deployment's block size: that of the cache group with the widest token rows, the
+    /// largest of the model's that is not the draft cache's; `None` for a model of no cache.
+    fn block_size(&self) -> Option<NonZeroU32> {
+        self.cache
+            .iter()
+            .filter(|(kind, _)| !kind.is_draft())
+            .map(|(_, block)| *block)
+            .max()
+            .and_then(NonZeroU32::new)
+    }
+
     /// The scheduler's configuration: as many running requests as the groups hold slots for
-    /// together in the phase fewest slots serve, and the step's limits of the buckets.
+    /// together in the phase fewest slots serve, the step's limits of the buckets, and the
+    /// deployment's block size, which the groups' capacities state too (as
+    /// `SchedulerConfig::of` resolves it from the engine's configuration).
     fn scheduler_config(&self) -> SchedulerConfig {
         let mut served: HashMap<Phase, u32> = HashMap::new();
         for (_, phases) in &self.groups {
@@ -818,6 +823,9 @@ impl Deployment {
             max_num_batched_tokens: self.tokens as usize,
             max_running_requests: running as usize,
             draft_tokens: self.drafts as usize,
+            block_tokens: self
+                .block_size()
+                .map_or(proto::config::DEFAULT_BLOCK_SIZE, NonZeroU32::get),
             ..SchedulerConfig::default()
         }
     }
