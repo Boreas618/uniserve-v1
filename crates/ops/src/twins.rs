@@ -31,14 +31,9 @@
 use platform::{Allocator, Buffer, DevicePtr, PoolKind, Stream};
 
 use crate::abi;
+use crate::allocator::ALIGNMENT;
 use crate::operand::Operand;
 use crate::{Error, Result};
-
-/// The alignment every twin buffer starts at.
-///
-/// Kernels read their operands through vector loads, so a twin must be at least as aligned as the
-/// tensor it shadows; 256 bytes covers every element type and vector width here.
-pub const ALIGNMENT: u64 = 256;
 
 /// One shadow buffer and the real buffer it shadows.
 #[derive(Clone, Debug)]

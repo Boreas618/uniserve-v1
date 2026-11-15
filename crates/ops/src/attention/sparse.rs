@@ -66,7 +66,7 @@ use std::fmt;
 
 use platform::Stream;
 
-use super::{address, head_stride, row_stride, to_i64};
+use super::{address, check_vector_alignment, head_stride, row_stride, to_i64};
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
@@ -74,12 +74,6 @@ use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 use tensor::DType;
-
-/// The smallest alignment a query, key, value or output base address must have.
-///
-/// The kernels move rows with 128-byte-swizzled TMA boxes, which requires the tensor base to be
-/// 16-byte aligned and the row and head strides to be whole 8-element groups.
-pub const BASE_ALIGNMENT: u64 = 16;
 
 /// One compilation of `sparse_attention`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -440,33 +434,15 @@ impl Op for SparseAttention {
                 format!("expected a positive finite scale, found {}", args.scale),
             ));
         }
-        // 128-byte-swizzled TMA boxes: 16-byte base alignment and whole 8-element stride groups.
+        // The kernels move rows with 128-byte-swizzled TMA boxes: every attention program's
+        // operand alignment.
         for (name, view) in [
             ("query", &args.query),
             ("key", &args.key),
             ("value", &args.value),
             ("out", &args.out),
         ] {
-            if !address(view.ptr).is_multiple_of(BASE_ALIGNMENT) {
-                return Err(Error::argument(
-                    operator,
-                    format!(
-                        "{name} must be {BASE_ALIGNMENT}-byte aligned, found {}",
-                        address(view.ptr)
-                    ),
-                ));
-            }
-            for axis in [0, 1] {
-                if !view.stride(axis).is_multiple_of(8) {
-                    return Err(Error::argument(
-                        operator,
-                        format!(
-                            "{name} axis {axis} stride {} is not a whole 8-element group",
-                            view.stride(axis)
-                        ),
-                    ));
-                }
-            }
+            check_vector_alignment(operator, name, view)?;
         }
         Ok(())
     }

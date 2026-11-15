@@ -50,11 +50,11 @@ pub(crate) fn bytes(layout: &CacheLayout, pages: u32, width: u32, granularity: u
 /// The bytes the shadow path copies when a cache write of a paired forward writes one layer of
 /// a set of `pages` pages of a cache of `layout` in place (`ops::Twins::in_place`): the layer's
 /// key and value planes over the set, their flags, their scales for an FP8 cache and the
-/// layer's index keys, each copy from an `ops::twins::ALIGNMENT` boundary. A paired call is one
+/// layer's index keys, each copy from an `ops::allocator::ALIGNMENT` boundary. A paired call is one
 /// layer's write, and the region holds one call's twins. Zero for a set of no pages.
 pub(crate) fn in_place(layout: &CacheLayout, pages: u32) -> u64 {
     let pages = u64::from(pages);
-    let copy = |bytes: u64| bytes.next_multiple_of(ops::twins::ALIGNMENT);
+    let copy = |bytes: u64| bytes.next_multiple_of(ops::allocator::ALIGNMENT);
 
     let mut column = 2 * copy(pages * layout.plane_bytes) + 2 * copy(pages);
     if layout.quantized {

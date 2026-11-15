@@ -1275,10 +1275,12 @@ fn axis_stride(view: &Operand, from_last: usize) -> u64 {
     }
 }
 
-/// The alignment every attention program's descriptor states for its tensor pointers.
+/// The alignment every attention program states for its tensor operands.
 ///
-/// The sm100 programs are compiled with `gmemalign16` and take `i64` strides, so an operand's base and
-/// every axis they walk must fall on a whole sixteen-byte unit.
+/// The tensor-core programs move rows with sixteen-byte vector loads and 128-byte-swizzled TMA
+/// boxes (`gmemalign16`) and take `i64` strides, so an operand's base and every axis they walk must
+/// fall on a whole sixteen-byte unit; the dense, paged and sparse attention operators all hold their
+/// operands to it.
 pub(super) const ATTENTION_ALIGNMENT: u64 = 16;
 
 /// Refuse an operand the tensor-core programs cannot address.

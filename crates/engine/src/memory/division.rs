@@ -40,7 +40,7 @@
 //! are copied to page-locked host memory right behind the serving kernel, before any later
 //! launch writes over the real outputs, and compared there (`Graphs::shadow`). The region
 //! therefore holds one call's twins at a time: the call's outputs and the operands it writes in
-//! place, each from an `ops::twins::ALIGNMENT` boundary.
+//! place, each from an `ops::allocator::ALIGNMENT` boundary.
 //!
 //! The figure is the profile run's: each launch of a recorded launch table states the bytes its
 //! shadow carves (`ops::Call::shadow_bytes`, `ops::Context::record_launches`), the request
