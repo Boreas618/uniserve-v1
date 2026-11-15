@@ -36,6 +36,7 @@
 //! it; an engine whose connection closes takes its remaining processes with
 //! it.
 
+use proto::process::{Exit, Reserve, Reserved, Spawn};
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
@@ -44,15 +45,6 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use proto::process::{Exit, Reserve, Reserved, Spawn};
-
-/// How often a running child's NCCL names are noted
-/// (`Child::note_nccl_segments`). A worker reports that it is ready to its
-/// engine, not to its daemon, so the daemon notes them while the worker
-/// lives; its communicators exist from its startup on.
-const SEGMENT_NOTE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub use proto::LIFELINE_ENV;
 
@@ -67,8 +59,6 @@ type Key = (u64, u64, String, u32, u64);
 /// One supervised process.
 struct Supervised {
     child: Child,
-    /// When the process's NCCL names were last noted.
-    noted: Instant,
     /// The last lines the process wrote to its standard error, which its exit
     /// report carries: a worker that dies before it registers explains itself
     /// there and nowhere else the daemon can see.
@@ -412,14 +402,7 @@ impl Supervisor {
             .map_or_else(StderrTail::default, StderrTail::read);
         let pid = child.id();
         tracing::info!(group = %spawn.group, rank = spawn.rank, generation = spawn.generation, pid, "started a process");
-        if let Some(mut previous) = self.children.insert(
-            key,
-            Supervised {
-                child,
-                noted: Instant::now(),
-                tail,
-            },
-        ) {
+        if let Some(mut previous) = self.children.insert(key, Supervised { child, tail }) {
             // A spawn repeated for one launch replaces its process.
             let _ = previous.child.kill();
             let _ = previous.child.wait();
@@ -520,18 +503,12 @@ impl Supervisor {
         self.reservations.clear();
     }
 
-    /// Notes each running child's NCCL names every
-    /// [`SEGMENT_NOTE_INTERVAL`], and returns, with the connection that asked
-    /// for its launch, every child that exited since the last call, which is
-    /// supervised no longer. A
+    /// Returns, with the connection that asked for its launch, every child
+    /// that exited since the last call, which is supervised no longer. A
     /// child whose status cannot be read is reported as exited.
     pub(crate) fn exits(&mut self) -> Vec<(u64, Exit)> {
         let mut exited = Vec::new();
         for (key, supervised) in &mut self.children {
-            if supervised.noted.elapsed() >= SEGMENT_NOTE_INTERVAL {
-                supervised.noted = Instant::now();
-                let _ = supervised.child.note_nccl_segments();
-            }
             let (status, success) = match supervised.child.try_wait() {
                 Ok(Some(Exited::Status(status))) => (status.to_string(), status.success()),
                 // An adopted process's parent was the daemon this one
@@ -683,8 +660,7 @@ impl Supervisor {
         };
         let mut supervisor = Self::new(host)?;
         for process in handoff.processes {
-            let mut child = Child::adopt(process.pid, next()?);
-            let _ = child.note_nccl_segments();
+            let child = Child::adopt(process.pid, next()?);
             tracing::info!(group = %process.group, rank = process.rank, generation = process.generation, pid = process.pid, "adopted a process");
             supervisor.children.insert(
                 (
@@ -696,7 +672,6 @@ impl Supervisor {
                 ),
                 Supervised {
                     child,
-                    noted: Instant::now(),
                     // An adopted process's standard error was this daemon's
                     // predecessor's pipe: its last line is not readable here.
                     tail: StderrTail::default(),
@@ -812,31 +787,18 @@ fn inherit_listener(command: &mut Command, listener: TcpListener) {
 }
 
 /// A process this daemon supervises: one it spawned and reaps as its
-/// parent, or one a daemon it replaced spawned (adopted).
+/// parent, or one a daemon it replaced spawned (adopted), whose parent is
+/// the host's init and whose exit this daemon observes through its pidfd.
 ///
-/// A rank that ends in order destroys its CUDA contexts, which removes the
-/// shared memory the driver keeps for each context's interprocess events. A
-/// rank that is killed or crashes leaves that storage in `/dev/shm`, named
-/// for the rank's process id (`service::shm::remove_event_storage`), and the names of
-/// its NCCL communicators' proxy storage (`service::shm::NcclSegments`), which the
-/// daemon notes while the rank lives. Every wait here therefore observes
-/// the exit first without reaping it, removes the storage named for the rank
-/// while its zombie still holds the process id, so that no live process can
-/// own those names, and the noted NCCL names, and then reaps it.
-///
-/// An adopted process's parent is the host's init, which reaps it: this
-/// daemon observes its exit through its pidfd and removes what it left at
-/// once. Its id may be taken again only after the kernel handed out every
-/// other id up to `pid_max`, so a process that took it would have to do so,
-/// and create interprocess events, between the exit and the removal.
+/// What a process holds of the host is its own to release: a rank that ends
+/// in order destroys its NCCL communicators and its CUDA contexts, which
+/// removes the shared memory the libraries keep for them. The daemon reaps
+/// and reports; it releases nothing on a rank's behalf.
 pub(crate) struct Child {
     process: Process,
     /// How the process ended, once it did; a reaped child's id may name
     /// another process from then on, so it is never waited on again.
     exited: Option<Exited>,
-    /// The NCCL shared memory the rank was last seen to map under names
-    /// still linked ([`Self::note_nccl_segments`]).
-    segments: service::shm::NcclSegments,
 }
 
 enum Process {
@@ -855,24 +817,12 @@ pub(crate) enum Exited {
     Unread,
 }
 
-impl Exited {
-    /// The exit status, when this daemon read it.
-    #[cfg(test)]
-    pub(crate) fn status(self) -> Option<ExitStatus> {
-        match self {
-            Self::Status(status) => Some(status),
-            Self::Unread => None,
-        }
-    }
-}
-
 impl Child {
     /// Spawns the process `command` describes.
     pub(crate) fn spawn(command: &mut Command) -> std::io::Result<Self> {
         Ok(Self {
             process: Process::Spawned(command.spawn()?),
             exited: None,
-            segments: service::shm::NcclSegments::default(),
         })
     }
 
@@ -882,7 +832,6 @@ impl Child {
         Self {
             process: Process::Adopted { pid, pidfd },
             exited: None,
-            segments: service::shm::NcclSegments::default(),
         }
     }
 
@@ -911,18 +860,6 @@ impl Child {
             Process::Spawned(child) => pidfd_open(child.id()),
             Process::Adopted { pidfd, .. } => pidfd.try_clone(),
         }
-    }
-
-    /// Notes the NCCL shared memory the running rank maps under names still
-    /// linked, which the reaping of a rank that died without destroying its
-    /// communicators removes. A rank's communicators exist once it reported
-    /// that it is ready: warmup and graph capture have connected them all.
-    pub(crate) fn note_nccl_segments(&mut self) -> std::io::Result<()> {
-        if self.exited.is_none() {
-            self.segments
-                .extend(service::shm::NcclSegments::mapped_by(Some(self.id()))?);
-        }
-        Ok(())
     }
 
     /// Sends the rank SIGKILL, unless it already ended.
@@ -956,81 +893,35 @@ impl Child {
         }
     }
 
-    /// Returns how the rank ended if it has, after releasing what it left
-    /// (and reaping it, when this daemon is its parent), and `None` while it
-    /// runs.
+    /// Returns how the rank ended if it has (reaping it, when this daemon is
+    /// its parent), and `None` while it runs.
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<Exited>> {
-        if self.exited.is_none() && self.ended(false)? {
-            self.release()?;
+        if self.exited.is_none() {
+            self.exited = match &mut self.process {
+                Process::Spawned(child) => child.try_wait()?.map(Exited::Status),
+                Process::Adopted { pidfd, .. } => {
+                    pidfd_exited(pidfd, false)?.then_some(Exited::Unread)
+                }
+            };
         }
         Ok(self.exited)
     }
 
-    /// Waits for the rank to exit, releases what it left, reaps it when
-    /// this daemon is its parent, and returns how it ended.
+    /// Waits for the rank to exit, reaps it when this daemon is its parent,
+    /// and returns how it ended.
     pub(crate) fn wait(&mut self) -> std::io::Result<Exited> {
         if let Some(exited) = self.exited {
             return Ok(exited);
         }
-        self.ended(true)?;
-        self.release()
-    }
-
-    /// Whether the rank has exited, leaving a child unreaped
-    /// (`waitid(WNOWAIT)`) and an adopted process observed through its
-    /// pidfd. Blocks until it exits when `block`.
-    fn ended(&self, block: bool) -> std::io::Result<bool> {
-        match &self.process {
-            Process::Spawned(child) => exited(child.id(), if block { 0 } else { libc::WNOHANG }),
-            Process::Adopted { pidfd, .. } => pidfd_exited(pidfd, block),
-        }
-    }
-
-    /// Releases what the exited rank left and, as its parent, reaps it.
-    fn release(&mut self) -> std::io::Result<Exited> {
-        // The rank inherited this process's user. The removal is best
-        // effort: the rank is reaped whatever it finds.
-        // SAFETY: getuid has no preconditions.
-        let uid = unsafe { libc::getuid() };
-        let _ = service::shm::remove_event_storage(uid, self.id());
-        let _ = self.segments.remove();
         let exited = match &mut self.process {
             Process::Spawned(child) => Exited::Status(child.wait()?),
-            Process::Adopted { .. } => Exited::Unread,
+            Process::Adopted { pidfd, .. } => {
+                pidfd_exited(pidfd, true)?;
+                Exited::Unread
+            }
         };
         self.exited = Some(exited);
         Ok(exited)
-    }
-}
-
-/// Whether child `pid` has exited, observed with `waitid(WNOWAIT)`, which
-/// leaves it unreaped. Blocks until it exits unless `flags` holds
-/// `WNOHANG`.
-fn exited(pid: u32, flags: libc::c_int) -> std::io::Result<bool> {
-    loop {
-        // SAFETY: an all-zero `siginfo_t` is a valid value for the call to
-        // fill.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is a valid out-pointer and `pid` is this process's
-        // unreaped child.
-        let waited = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT | flags,
-            )
-        };
-        if waited == -1 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        // With WNOHANG, a child that has not exited leaves `si_pid` zero.
-        // SAFETY: the call succeeded, so `info` describes the child.
-        return Ok(unsafe { info.si_pid() } != 0);
     }
 }
 
@@ -1071,8 +962,7 @@ pub(crate) fn pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::process::ExitStatusExt;
-    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -1097,203 +987,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(last, "line 23");
-    }
-
-    /// Names the role of the process [`event_holder_rank`] runs in.
-    const EVENT_HOLDER_PROCESS: &str = "UNISERVE_TEST_EVENT_HOLDER";
-
-    /// The child role [`hold_event`] re-executes this test binary as: it creates
-    /// an interprocess event on device 0 through `platform`, which makes the
-    /// driver create the shared memory it names for this process, and waits to
-    /// be killed.
-    ///
-    /// The role is a rank's, not the supervisor's: a rank is a process of its
-    /// own, and the driver calls this stand-in makes are `platform`'s, so the
-    /// supervisor's code reaches no driver entry point. It is a test of its own
-    /// so that this binary can be run as the stand-in — the mechanism
-    /// `crates/platform/tests/it/gpu.rs` uses for a role.
-    #[test]
-    #[ignore = "a stand-in rank process, started by `hold_event`"]
-    fn event_holder_rank() {
-        if std::env::var_os(EVENT_HOLDER_PROCESS).is_none() {
-            return;
-        }
-        let device = platform::Device::new(platform::DeviceId(0)).expect("device 0");
-        let stream = device.stream().expect("a stream on device 0");
-        // Timing and interprocess are exclusive, and interprocess is what makes
-        // the driver name shared memory for this process.
-        let event = platform::Event::new(platform::EventFlags {
-            timing: false,
-            interprocess: true,
-            external: false,
-        });
-        event.record(&stream).expect("an interprocess event");
-        stream.synchronize().expect("the event recorded");
-        // Exporting the handle is what makes the driver publish that storage.
-        let handle = event.ipc_handle().expect("the event's interprocess handle");
-        assert_ne!(handle.0, [0; 64], "the handle names no event");
-        std::thread::sleep(Duration::from_secs(3600));
-    }
-
-    /// A stand-in rank that maps shared memory under NCCL's prefix, as a
-    /// communicator's proxy maps its pool, writes the object's path to the
-    /// file its argument names and waits to be killed.
-    const NCCL_HOLDER: &str = "\
-import mmap, os, sys, tempfile, time
-fd, path = tempfile.mkstemp(prefix='nccl-', dir='/dev/shm')
-os.ftruncate(fd, 4096)
-pool = mmap.mmap(fd, 4096)
-with open(sys.argv[1] + '.tmp', 'w') as file:
-    file.write(path)
-os.rename(sys.argv[1] + '.tmp', sys.argv[1])
-time.sleep(600)
-";
-
-    /// Kills and reaps a holder when a test ends, including when it panics.
-    struct Holder(Child);
-
-    impl Drop for Holder {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
-    /// The interprocess-event storage the driver created for process `pid`,
-    /// by its name in `/dev/shm` (`cuda.shm.<uid in hex>.<pid in hex>.<n>`).
-    fn event_storage(pid: u32) -> Vec<PathBuf> {
-        // SAFETY: getuid has no preconditions.
-        let prefix = format!("cuda.shm.{:x}.{pid:x}.", unsafe { libc::getuid() });
-        std::fs::read_dir("/dev/shm")
-            .unwrap()
-            .map(|entry| entry.unwrap())
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
-            .map(|entry| entry.path())
-            .collect()
-    }
-
-    /// Starts [`event_holder_rank`] and waits until its event storage exists.
-    fn hold_event() -> (Holder, Vec<PathBuf>) {
-        let mut command =
-            Command::new(std::env::current_exe().expect("this test's own executable"));
-        // The name is this binary's own path to the role: a test binary passes
-        // the module path it printed in its own diagnostics, which is this
-        // crate's modules under `daemon`'s lib.
-        command
-            .args([
-                "--exact",
-                "supervision::supervisor::tests::event_holder_rank",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env(EVENT_HOLDER_PROCESS, "1")
-            // The stand-in's own output is not what this test reads.
-            .stdout(Stdio::null());
-        let mut holder = Holder(Child::spawn(&mut command).unwrap());
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let storage = event_storage(holder.0.id());
-            if !storage.is_empty() {
-                return (holder, storage);
-            }
-            // A stand-in that ended has made no storage and never will, so its
-            // failure is reported here rather than as a full minute of waiting.
-            if let Some(ended) = holder.0.try_wait().expect("the stand-in's state") {
-                panic!("the rank stand-in ended before it created an event: {ended:?}");
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the holder created no event storage"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Starts an [`NCCL_HOLDER`] and returns it with its object's path, once
-    /// the object is mapped.
-    fn hold_nccl(directory: &Path, name: &str) -> (Holder, PathBuf) {
-        let path_file = directory.join(name);
-        let mut command = Command::new("python3");
-        command.args(["-c", NCCL_HOLDER]).arg(&path_file);
-        let holder = Holder(Child::spawn(&mut command).unwrap());
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Ok(path) = std::fs::read_to_string(&path_file) {
-                return (holder, PathBuf::from(path));
-            }
-            assert!(Instant::now() < deadline, "the holder mapped nothing");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    /// Sends SIGKILL to `holder` from outside, as a crash or an operator
-    /// would, and polls until it is reaped.
-    fn kill_and_poll(holder: &mut Holder) -> ExitStatus {
-        assert_eq!(
-            // SAFETY: kill takes integers only; the pid is this test's own
-            // unreaped child, so it names no other process.
-            unsafe { libc::kill(holder.0.id() as libc::pid_t, libc::SIGKILL) },
-            0
-        );
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(exited) = holder.0.try_wait().unwrap() {
-                return exited.status().unwrap();
-            }
-            assert!(Instant::now() < deadline, "the killed rank was not reaped");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// A rank killed by someone else is reaped by polling, as the daemon
-    /// polls its children, and one killed by its parent is reaped by
-    /// waiting: either way no storage named for the dead rank remains, while
-    /// a live rank's stays.
-    #[test]
-    #[ignore = "requires a CUDA device"]
-    fn a_killed_rank_leaves_no_event_storage_once_reaped() {
-        let (mut killed, killed_storage) = hold_event();
-        let (mut live, live_storage) = hold_event();
-
-        assert_eq!(kill_and_poll(&mut killed).signal(), Some(libc::SIGKILL));
-        assert!(
-            killed_storage.iter().all(|path| !path.exists()),
-            "{killed_storage:?} outlived its rank"
-        );
-        assert!(
-            live_storage.iter().all(|path| path.exists()),
-            "a live rank lost {live_storage:?}"
-        );
-
-        live.0.kill().unwrap();
-        assert_eq!(
-            live.0.wait().unwrap().status().unwrap().signal(),
-            Some(libc::SIGKILL)
-        );
-        assert!(
-            live_storage.iter().all(|path| !path.exists()),
-            "{live_storage:?} outlived its rank"
-        );
-    }
-
-    /// A rank killed by someone else leaves its NCCL names, which carry no
-    /// process id; its parent noted the names it mapped while it ran and
-    /// removes them when it reaps it, while a live rank's stay.
-    #[test]
-    fn a_killed_rank_leaves_none_of_its_nccl_names_once_reaped() {
-        let directory = tempfile::tempdir().unwrap();
-        let (mut killed, killed_path) = hold_nccl(directory.path(), "killed");
-        let (mut live, live_path) = hold_nccl(directory.path(), "live");
-        killed.0.note_nccl_segments().unwrap();
-        live.0.note_nccl_segments().unwrap();
-
-        kill_and_poll(&mut killed);
-        assert!(!killed_path.exists(), "{killed_path:?} outlived its rank");
-        assert!(live_path.exists(), "a live rank lost {live_path:?}");
-
-        live.0.kill().unwrap();
-        live.0.wait().unwrap();
-        assert!(!live_path.exists(), "{live_path:?} outlived its rank");
     }
 
     /// A successor's supervisor adopts the processes and reservations a

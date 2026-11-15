@@ -179,8 +179,7 @@ impl PrimaryContext {
     /// Some driver state outlives the process unless its context is
     /// destroyed: the driver backs the interprocess events of a context with
     /// a POSIX shared-memory object named for the process
-    /// (`/dev/shm/cuda.shm.<uid>.<pid>.<n>`, ids in hexadecimal; see
-    /// `service::shm::remove_event_storage`), created by the first
+    /// (`/dev/shm/cuda.shm.<uid>.<pid>.<n>`, ids in hexadecimal), created by the first
     /// `cuEventCreate` with `CU_EVENT_INTERPROCESS`, and unlinks it only when
     /// the context is destroyed. Destroying the events does not unlink it, and neither does
     /// the process's exit, by `exit` or `_exit`. A context the CUDA runtime

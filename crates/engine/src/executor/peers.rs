@@ -151,8 +151,7 @@ impl Liveness {
         // The control thread ends the process on its next pass. A pass that never comes (a call
         // of the control thread that waits on a device whose collective waits for the lost
         // process's ranks) does not keep the process: it ends at the deadline all the same,
-        // without its orderly close, which a hung collective could not finish either. Its
-        // daemon removes the driver and NCCL files it leaves when it reaps it.
+        // without its orderly close, which a hung collective could not finish either.
         if first {
             let exit_after = self.exit_after;
             let spawned = std::thread::Builder::new()

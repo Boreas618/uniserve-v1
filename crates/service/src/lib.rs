@@ -15,10 +15,6 @@
 //! convention of every process ([`logging`]) and stops on SIGTERM or SIGINT
 //! ([`stop_signals`]), the one stop mechanism every process waits on.
 //!
-//! [`shm`] removes the shared memory a process of the host's libraries leaves
-//! behind when it ends without closing them, which the process that reaps it
-//! clears.
-//!
 //! Every process interface runs on one [`Connection`] over a Unix or TCP
 //! socket, framed by [`frame`], whose messages each protocol encodes
 //! ([`Message`]). [`lock`] is the one way a thread takes a mutex, and [`wait`],
@@ -28,7 +24,6 @@ mod connection;
 mod directories;
 pub mod frame;
 pub mod logging;
-pub mod shm;
 
 pub use connection::{
     Connection, Handed, Hangup, Listener, Liveness, Message, Socket, Wake, Waker,

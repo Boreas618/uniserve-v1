@@ -2,9 +2,8 @@
 //! node.
 //!
 //! The daemons are peers. A daemon supervises the processes of its node
-//! (`supervisor`): it starts them as its children, reaps them, cleans what a
-//! process that did not end in order left in `/dev/shm`, and reports their
-//! exits. It holds its node's claim at the Storage Server (`claims`), so a
+//! (`supervisor`): it starts them as its children, reaps them and reports
+//! their exits. It holds its node's claim at the Storage Server (`claims`), so a
 //! claim outlives every engine.
 //!
 //! The daemons talk the process interface (`proto::process`). Each member
