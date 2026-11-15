@@ -27,12 +27,14 @@
 //! leading axis counts rows. A tensor of more axes is viewed as its rows and the result takes its
 //! leading axes back.
 //!
-//! ## Kernel constants
+//! ## Kernel facts
 //!
-//! A few descriptor values belong to the kernel package and not to the model: the row tile a
-//! normalization loads, the elements one activation kernel handles, whether a launch is a
-//! programmatic dependent launch. Each is one rule stated once here or beside its function, so
-//! every launch site of an operator states the same key.
+//! The descriptor values that belong to a kernel package and not to the model, such as the row
+//! tile a normalization loads, the elements one activation program handles, the tile and
+//! workspace of a grouped product or whether a launch is a programmatic dependent launch, are
+//! the operator's: each `ops` descriptor derives them from the call (`Descriptor::new` or
+//! `Descriptor::of`), so a function states only its call's mathematics and every launch site of
+//! an operator states the same key.
 
 mod activation;
 mod activation1d;
@@ -79,15 +81,15 @@ pub use logits::{LOGITS, vocab_unpad};
 pub(crate) use moe::{DOWN_VALUE_LAYOUT, GATED_VALUE_LAYOUT};
 pub use moe::{
     EXPANDED_TO_PERMUTED, NUM_NON_EXITING_TILES, PERMUTED_TO_EXPANDED, PERMUTED_TO_TOKEN,
-    SORT_MAPS, TILE_ROWS, TILE_TO_EXPERT, TILE_TO_LIMIT, TOTAL_PADDED_TOKENS, expert_combine,
-    expert_dispatch, expert_exchange_fused, gather_gemm, gather_gemm_nvfp4, moe_sort,
-    moe_unpermute, route_gemm, route_gemm_nvfp4, sigmoid_gated_add_, topk_softmax,
+    SORT_MAPS, TILE_TO_EXPERT, TILE_TO_LIMIT, TOTAL_PADDED_TOKENS, expert_combine, expert_dispatch,
+    expert_exchange_fused, gather_gemm, gather_gemm_nvfp4, moe_sort, moe_unpermute, route_gemm,
+    route_gemm_nvfp4, sigmoid_gated_add_, topk_softmax,
 };
 pub use noise::{philox_normal, philox_normal_like, philox_normal_rows};
 pub use norm::{add_rms_norm, gated_rms_norm, layer_norm, rms_norm};
-pub use nvfp4::{ENCODE_CHUNK, encode_block, nvfp4_quantize};
+pub use nvfp4::nvfp4_quantize;
 pub use pool::adaptive_avg_pool2d;
-pub use recurrent::{DELTA_RULE_CHUNK, StateAxes, causal_conv1d, gated_delta_rule};
+pub use recurrent::{StateAxes, causal_conv1d, gated_delta_rule};
 pub use residual_norm::{
     modulated_rms_norm, modulated_rms_norm_, scaled_residual_layer_norm, scaled_residual_rms_norm_,
 };
@@ -103,16 +105,8 @@ pub use vsa::{
     vsa_prepare_tiles_, vsa_scores, vsa_select_tiles, vsa_zero_padding_,
 };
 
-/// Whether the descriptors this crate builds are the programmatic-dependent-launch variants.
-pub(crate) const PDL: bool = false;
-
 /// The accumulation element type of every floating-point operator here.
 pub(crate) const ACCUMULATE: DType = DType::F32;
-
-/// The row width a row-wise kernel loads at a time: the width rounded up to a power of two.
-pub(crate) fn row_tile(columns: u32) -> u32 {
-    columns.max(1).next_power_of_two()
-}
 
 /// Whether `x` is computed on the CPU device, by a function's formula in tensor operations.
 pub(crate) fn on_cpu(x: &Tensor) -> bool {

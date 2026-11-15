@@ -48,13 +48,40 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{Key, row_tile};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::launch::PDL;
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
 use proto::module::sampler::PARAMETER_COLUMNS;
+
+/// The element type the sampling kernels read an index as: a token id, a slot or a mask index
+/// reaches them as `I32`, where the entry that names nothing is `-1`.
+pub const INDEX: DType = DType::I32;
+
+/// Columns one program of the candidates' filter, distribution and draw reads at a time: a
+/// chunk of the row, so a candidate width may be the whole vocabulary.
+pub const CANDIDATE_TILE: u32 = 8192;
+
+/// The most columns one program of `logits_shape` shapes: one register tile of its kernel, so a
+/// row is shaped by `ceil(vocabulary / SHAPE_TILE)` programs side by side. The shaping is one
+/// element at a time, so the tile changes no value; a program per row would leave a decode
+/// step's few rows to as few programs, each walking a vocabulary-wide row alone.
+const SHAPE_TILE: u32 = 4096;
+
+/// Columns one pass of `top_k` reads: the only size its key names, since the vocabulary and the
+/// kept count are launch values.
+const TOP_TILE: u32 = 2048;
+
+/// Columns one program of the first, direct `top_logprobs` selection reads: a vocabulary-wide
+/// row is selected in chunks of this many columns in parallel.
+const LOGPROB_TILE: u32 = 4096;
+
+/// The widest row one `top_logprobs` program selects from, which bounds the chunks' candidates
+/// the second selection reads.
+const LOGPROB_MAX_TILE: u32 = 8192;
 
 /// One compilation of `logits_shape`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -71,6 +98,22 @@ pub struct ShapeDescriptor {
     pub divide: bool,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl ShapeDescriptor {
+    /// The compilation that shapes `dtype` logits of `vocabulary` tokens with `extras` extra
+    /// token columns, dividing by the temperature when `divide`: a program shapes a row's tile,
+    /// at most [`SHAPE_TILE`] columns.
+    pub fn new(dtype: DType, vocabulary: u32, extras: u32, divide: bool) -> Self {
+        Self {
+            dtype,
+            vocabulary,
+            block: row_tile(vocabulary).min(SHAPE_TILE),
+            extras,
+            divide,
+            pdl: PDL,
+        }
+    }
 }
 
 impl fmt::Display for ShapeDescriptor {
@@ -267,6 +310,20 @@ pub fn top_k_workspace(rows: u64, width: u64) -> [u64; 2] {
     [rows, 4 * width + 2 * u64::from(TOP_K_BINS)]
 }
 
+impl TopKDescriptor {
+    /// The compilation that keeps the `width` largest of rows of `vocabulary` `dtype` logits.
+    pub fn new(dtype: DType, vocabulary: u32, width: u32) -> Self {
+        Self {
+            dtype,
+            vocabulary,
+            width,
+            tile: TOP_TILE,
+            ids: INDEX,
+            pdl: PDL,
+        }
+    }
+}
+
 impl fmt::Display for TopKDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // `vocabulary` and the kept count are absent on purpose: the program takes both as runtime
@@ -412,6 +469,18 @@ pub struct FilterDescriptor {
     pub pdl: bool,
 }
 
+impl FilterDescriptor {
+    /// The compilation that filters rows of `width` candidates.
+    pub fn new(width: u32) -> Self {
+        Self {
+            width,
+            tile: CANDIDATE_TILE,
+            ids: INDEX,
+            pdl: PDL,
+        }
+    }
+}
+
 impl fmt::Display for FilterDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
@@ -524,6 +593,19 @@ pub struct InverseCdfDescriptor {
     pub tokens: DType,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl InverseCdfDescriptor {
+    /// The compilation that draws from rows of `width` candidates.
+    pub fn new(width: u32) -> Self {
+        Self {
+            width,
+            tile: CANDIDATE_TILE,
+            ids: INDEX,
+            tokens: INDEX,
+            pdl: PDL,
+        }
+    }
 }
 
 impl fmt::Display for InverseCdfDescriptor {
@@ -648,6 +730,18 @@ pub struct ArgMaxDescriptor {
     pub pdl: bool,
 }
 
+impl ArgMaxDescriptor {
+    /// The compilation that finds the largest of rows of `width` `dtype` values.
+    pub fn new(dtype: DType, width: u32) -> Self {
+        Self {
+            dtype,
+            width,
+            ids: INDEX,
+            pdl: PDL,
+        }
+    }
+}
+
 impl fmt::Display for ArgMaxDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
@@ -748,6 +842,19 @@ pub struct LogSoftmaxDescriptor {
     pub pdl: bool,
 }
 
+impl LogSoftmaxDescriptor {
+    /// The compilation that takes the log-softmax of rows of `columns` `dtype` logits: one
+    /// program loads its whole row in one tile.
+    pub fn new(dtype: DType, columns: u32) -> Self {
+        Self {
+            dtype,
+            columns,
+            tile: row_tile(columns),
+            pdl: PDL,
+        }
+    }
+}
+
 impl fmt::Display for LogSoftmaxDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
@@ -834,6 +941,19 @@ pub struct LogprobDescriptor {
     pub tile: u32,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl LogprobDescriptor {
+    /// The compilation that gathers one log-probability of rows of `columns` and ranks it: one
+    /// program loads its whole row in one tile.
+    pub fn new(columns: u32) -> Self {
+        Self {
+            columns,
+            ids: INDEX,
+            tile: row_tile(columns),
+            pdl: PDL,
+        }
+    }
 }
 
 impl fmt::Display for LogprobDescriptor {
@@ -956,6 +1076,50 @@ pub struct TopLogprobsDescriptor {
     pub indirect: bool,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl TopLogprobsDescriptor {
+    /// The two selections of the `candidates` largest entries of rows `width` wide: `(chunks,
+    /// merge)`. The first keeps each [`LOGPROB_TILE`]-column chunk's own; the second reads every
+    /// chunk's candidates of a row, with their ids, in one tile of the power of two that holds
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] when `candidates` is zero, or when the chunks' candidates of a row are
+    /// more than one program selects from ([`LOGPROB_MAX_TILE`]).
+    pub fn selections(width: u64, candidates: u32) -> Result<(Self, Self)> {
+        let chunks = Self {
+            candidates,
+            tile: LOGPROB_TILE,
+            indirect: false,
+            pdl: PDL,
+        };
+        let kept = chunks.written(width);
+        let merge_tile = kept.next_power_of_two();
+        if candidates == 0 || merge_tile > u64::from(LOGPROB_MAX_TILE) {
+            return Err(Error::argument(
+                TopLogprobs::NAME,
+                format!(
+                    "{candidates} candidates keep {kept} of the chunks of a row of {width}: one \
+                     to {LOGPROB_MAX_TILE} expected"
+                ),
+            ));
+        }
+
+        let merge = Self {
+            tile: merge_tile as u32,
+            indirect: true,
+            ..chunks
+        };
+        Ok((chunks, merge))
+    }
+
+    /// The entries a launch of this compilation writes a row of a `width`-wide input:
+    /// `chunks · candidates`.
+    pub fn written(&self, width: u64) -> u64 {
+        top_logprobs_chunks(width, self.tile) * u64::from(self.candidates)
+    }
 }
 
 impl fmt::Display for TopLogprobsDescriptor {
@@ -1096,6 +1260,23 @@ pub struct OrderDescriptor {
     pub ids: DType,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl OrderDescriptor {
+    /// The compilation that orders FP32 candidates by their ids.
+    pub fn new() -> Self {
+        Self {
+            values: DType::F32,
+            ids: INDEX,
+            pdl: PDL,
+        }
+    }
+}
+
+impl Default for OrderDescriptor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl fmt::Display for OrderDescriptor {

@@ -47,9 +47,6 @@ use crate::error::{Error, Result};
 /// lays out whole blocks for every member.
 pub const VSA_BLOCK_ROWS: u32 = BLOCK_ROWS;
 
-/// The fewest tiles a selection's kernel is compiled to rank, however few a layout holds.
-const SELECT_FLOOR: usize = 256;
-
 /// The `[rows, heads, width]` extents of tile rows, with their tile count.
 fn tile_rows_of(
     owner: &'static str,
@@ -385,12 +382,7 @@ pub fn vsa_scores(pooled_query: &Tensor, pooled_key: &Tensor) -> Result<Tensor> 
     let width = field(OWNER, width)?;
 
     ops::launch::<VsaScores>(
-        &ScoresDescriptor::new(
-            field(OWNER, heads)?,
-            width,
-            width.next_power_of_two(),
-            false,
-        ),
+        &ScoresDescriptor::new(field(OWNER, heads)?, width),
         ScoresArgs {
             pooled_query: ops::operand(pooled_query)?,
             pooled_key: ops::operand(pooled_key)?,
@@ -524,11 +516,7 @@ pub fn vsa_select_tiles(
     let scores = scores.contiguous()?;
 
     ops::launch::<VsaSelectTiles>(
-        // The kernel masks the tiles past the layout's own, so one compilation ranks every
-        // layout up to its power of two.
-        &SelectTilesDescriptor {
-            block: field(OWNER, tiles.max(SELECT_FLOOR).next_power_of_two())?,
-        },
+        &SelectTilesDescriptor::new(field(OWNER, tiles)?),
         SelectTilesArgs {
             scores: ops::operand(&scores)?,
             segments: ops::operand(segments)?,
@@ -631,14 +619,7 @@ pub fn vsa_compress_pooled(
     let width = field(OWNER, width)?;
 
     ops::launch::<VsaCompressPooled>(
-        &CompressPooledDescriptor::new(
-            output,
-            field(OWNER, heads)?,
-            width,
-            max_tiles,
-            width.next_power_of_two(),
-            false,
-        ),
+        &CompressPooledDescriptor::new(output, field(OWNER, heads)?, width, max_tiles),
         CompressPooledArgs {
             scores: ops::operand(&scores)?,
             values: ops::operand(values)?,

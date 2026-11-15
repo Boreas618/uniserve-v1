@@ -25,7 +25,7 @@ use ops::norm::{
 use ops::residual::{WeightedRmsNorm, WeightedRmsNormArgs, WeightedRmsNormDescriptor};
 use tensor::{D, DType, Tensor};
 
-use super::{PDL, as_rows, columns, like_rows, on_cpu, row_tile, same_rows, vector};
+use super::{as_rows, columns, like_rows, on_cpu, same_rows, vector};
 use crate::error::{Error, Result};
 
 /// `rows`, FP32 `[..., columns]`, scaled by the reciprocal root of each row's mean square plus
@@ -113,18 +113,10 @@ pub fn rms_norm(
 
     let rows = as_rows(OWNER, x)?;
     let out = ops::empty(rows.shape(), output)?;
-    let tile = row_tile(width);
 
     if output == x.dtype() {
         ops::launch::<RmsNorm>(
-            &RmsNormDescriptor {
-                dtype: x.dtype(),
-                columns: width,
-                tile,
-                pdl: PDL,
-                centred,
-                groups: groups as u32,
-            },
+            &RmsNormDescriptor::new(x.dtype(), width, centred, groups as u32),
             RmsNormArgs {
                 x: ops::operand(&rows)?,
                 weight: ops::operand(weight)?,
@@ -134,13 +126,7 @@ pub fn rms_norm(
         )?;
     } else {
         ops::launch::<WeightedRmsNorm>(
-            &WeightedRmsNormDescriptor {
-                dtype: x.dtype(),
-                columns: width,
-                tile,
-                absmax: false,
-                activation: output,
-            },
+            &WeightedRmsNormDescriptor::new(x.dtype(), width, output, false),
             WeightedRmsNormArgs {
                 x: ops::operand(&rows)?,
                 weight: ops::operand(weight)?,
@@ -190,13 +176,7 @@ pub fn add_rms_norm(
     let sum = ops::empty(rows.shape(), x.dtype())?;
 
     ops::launch::<AddRmsNorm>(
-        &AddRmsNormDescriptor {
-            dtype: x.dtype(),
-            columns: width,
-            tile: row_tile(width),
-            pdl: PDL,
-            centred,
-        },
+        &AddRmsNormDescriptor::new(x.dtype(), width, centred),
         AddRmsNormArgs {
             x: ops::operand(&rows)?,
             residual: ops::operand(&residual_rows)?,
@@ -251,12 +231,7 @@ pub fn gated_rms_norm(
     let out = ops::empty(rows.shape(), x.dtype())?;
 
     ops::launch::<GatedRmsNorm>(
-        &GatedRmsNormDescriptor {
-            dtype: x.dtype(),
-            columns: width,
-            tile: row_tile(width),
-            sigmoid,
-        },
+        &GatedRmsNormDescriptor::new(x.dtype(), width, sigmoid),
         GatedRmsNormArgs {
             x: ops::operand(&rows)?,
             gate: ops::operand(&gate_rows)?,
@@ -306,13 +281,7 @@ pub fn layer_norm(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>, eps: f32) 
     ops::launch::<LayerNorm>(
         // The bias is in the descriptor, so a normalization with one and one without are two
         // kernels: the epilogue loads a second vector or it does not.
-        &LayerNormDescriptor {
-            dtype: x.dtype(),
-            columns: width,
-            tile: row_tile(width),
-            bias: bias.is_some(),
-            pdl: PDL,
-        },
+        &LayerNormDescriptor::new(x.dtype(), width, bias.is_some()),
         LayerNormArgs {
             x: ops::operand(&rows)?,
             weight: ops::operand(weight)?,

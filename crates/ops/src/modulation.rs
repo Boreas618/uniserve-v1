@@ -29,7 +29,7 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::{Float, Key};
+use crate::descriptor::{Float, Key, row_tile};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
@@ -65,6 +65,42 @@ pub struct ModulatedRmsNormDescriptor {
     pub update: bool,
     /// Whether the normalized source is copied out for the caller.
     pub retain: bool,
+}
+
+impl ModulatedRmsNormDescriptor {
+    /// The compilation of the call `args` makes with the normalization's `epsilon`: the element
+    /// types and the row width are its operands', the strides those of its modulation tables (a
+    /// gate stride of zero when it has no gate), the update and the retained rows present when
+    /// the call passes them, and one program loads its whole row in one tile.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] when the rows are wider than a descriptor's 32 bits.
+    pub fn of(args: &Args, epsilon: f32) -> Result<Self> {
+        let width = u32::try_from(args.value.last()).map_err(|_| {
+            Error::argument(
+                ModulatedRmsNorm::NAME,
+                format!(
+                    "rows of {} elements exceed a descriptor's width",
+                    args.value.last()
+                ),
+            )
+        })?;
+
+        Ok(Self {
+            dtype: args.value.dtype,
+            output: args.out.dtype,
+            indices: args.row_indices.dtype,
+            width,
+            block: row_tile(width),
+            epsilon: Float::from(epsilon),
+            gate_stride: args.gate.as_ref().map_or(0, |gate| gate.stride(0)),
+            shift_stride: args.shift.stride(0),
+            scale_stride: args.scale.stride(0),
+            update: args.update.is_some(),
+            retain: args.retain.is_some(),
+        })
+    }
 }
 
 impl fmt::Display for ModulatedRmsNormDescriptor {

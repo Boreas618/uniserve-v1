@@ -11,11 +11,8 @@
 use ops::adaptive_pool::{AdaptivePool, Args, Descriptor};
 use tensor::{DType, Device, Tensor};
 
-use super::{PDL, on_cpu};
+use super::on_cpu;
 use crate::error::{Error, Result};
-
-/// The output elements one pool kernel produces.
-const BLOCK: u32 = 1024;
 
 /// `x`, `[batch, rows, columns]`, pooled to `[batch, 1, size[1]]` in its element type: element
 /// `i` of a row is the mean over every input row and column window `i`. `size` is torch's
@@ -70,14 +67,7 @@ pub fn adaptive_avg_pool2d(x: &Tensor, size: [u32; 2]) -> Result<Tensor> {
     let out = ops::empty((batch, outputs as usize), x.dtype())?;
 
     ops::launch::<AdaptivePool>(
-        &Descriptor {
-            dtype: x.dtype(),
-            heads,
-            width: columns,
-            output: outputs,
-            block: BLOCK,
-            pdl: PDL,
-        },
+        &Descriptor::new(x.dtype(), heads, columns, outputs),
         Args {
             x: ops::operand(&values)?,
             out: ops::operand(&out)?,

@@ -13,8 +13,9 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::launch::PDL;
 use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
@@ -140,6 +141,21 @@ pub struct UnpadDescriptor {
     pub block: u32,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl UnpadDescriptor {
+    /// The compilation that reads a `vocabulary`-wide row of `output` logits out of `dtype`
+    /// shards gathered into `padded` columns.
+    pub fn new(dtype: DType, output: DType, vocabulary: u32, padded: u32) -> Self {
+        Self {
+            dtype,
+            output,
+            vocabulary,
+            padded,
+            block: descriptor::BLOCK,
+            pdl: PDL,
+        }
+    }
 }
 
 impl fmt::Display for UnpadDescriptor {

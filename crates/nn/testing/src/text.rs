@@ -16,13 +16,18 @@ use proto::config::Quantization;
 /// whole chunks of the gated delta rule and whole groups of an indexer.
 pub const PAGE_TOKENS: u32 = 64;
 
+/// The most (row, query head) pairs a test's batch attends: a decode bucket of 4096 rows over
+/// 64 query heads.
+const ATTENDED_PAIRS: u64 = 4096 * 64;
+
 /// Bytes of the attention workspace a test lends a cache group (`nn::KvCache::workspace`).
 ///
 /// Execution reserves the workspace the loaded kernel needs; what a forward itself touches is
-/// the decode's arrival counters at its head, which it clears once per forward, and those take
-/// one mebibyte (the counter region of `nn`'s paged attention). A workspace of this size makes
-/// that clear what a deployment's is, so a profile run states the same launches.
-pub const WORKSPACE_BYTES: usize = 1 << 20;
+/// the decode's arrival counters at its head, which it clears once per forward. A workspace of
+/// this size holds the counters of every batch a test attends
+/// ([`ops::attention::counter_bytes`] of [`ATTENDED_PAIRS`]), the meta device stating no
+/// multiprocessors of its own, so a profile run clears them as a deployment does.
+pub const WORKSPACE_BYTES: usize = ops::attention::counter_bytes(ATTENDED_PAIRS) as usize;
 
 /// The causal language model of `checkpoint`, opened ([`open`]) and loaded as execution does:
 /// the opened checkpoint loads `placement`'s share through `loader`.

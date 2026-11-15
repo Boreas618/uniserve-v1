@@ -63,6 +63,22 @@ pub struct Descriptor {
     pub counted: bool,
 }
 
+impl Descriptor {
+    /// The compilation that sorts the routes of `top` of `experts` experts, of which this rank
+    /// holds `local_experts`, with `scales` route weights, into tiles of the grouped products'
+    /// rows ([`super::TILE`]), reading the batch's live token count.
+    pub fn new(experts: u32, top: u32, local_experts: u32, scales: DType) -> Self {
+        Self {
+            experts,
+            top,
+            local_experts,
+            tile_tokens: super::TILE.0,
+            scales,
+            counted: true,
+        }
+    }
+}
+
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()

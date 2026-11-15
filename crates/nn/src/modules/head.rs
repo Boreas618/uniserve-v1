@@ -2,8 +2,14 @@
 //!
 //! The head is a column-parallel projection across the tensor-parallel ranks: each rank holds
 //! its [`vocabulary_shard`] of the vocabulary rows and projects into its shard, the ranks
-//! all-gather the shards, and the padding the shards hold is removed. Selecting the rows is the
-//! caller's (a row gather before the head), so the head reads `[rows, hidden]`.
+//! all-gather the shards, and the gathered columns are read back into vocabulary order.
+//! Selecting the rows is the caller's (a row gather before the head), so the head reads
+//! `[rows, hidden]`.
+//!
+//! The dense product takes any output width, so a shard is its vocabulary rows as the
+//! checkpoint holds them. The gather lays equal blocks side by side, one per rank, so a split
+//! head holds `ceil(vocabulary / ranks)` rows on every rank: a last shard that is shorter has no
+//! rows in the checkpoint to fill its block with, and such a split is refused at load.
 
 use tensor::{Module, Tensor};
 
@@ -12,9 +18,6 @@ use crate::error::{Error, Result};
 use crate::functional::{self, WeightOrder, vocabulary_shard};
 use crate::modules::embedding::Embedding;
 use crate::var_builder::VarBuilder;
-
-/// The rows a shard's projection is padded to: whole eight-row tiles of the product.
-const PADDING: u32 = 8;
 
 /// What a checkpoint states of an [`LmHead`], and this rank's share of it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -44,8 +47,8 @@ impl LmHead {
     ///
     /// # Errors
     ///
-    /// When the checkpoint lacks the table, or the rank's shard is not a whole number of tiles:
-    /// the checkpoint's rows are contiguous, so a shard's padded rows would be another rank's.
+    /// When the checkpoint lacks the table, or the split leaves the rank a shorter shard than
+    /// its peers (module documentation).
     pub fn load(config: &LmHeadConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
         let (first, rows) = vocabulary_shard(config.vocabulary, config.split);
         let weight = vb.get_rows(
@@ -73,26 +76,24 @@ impl LmHead {
     /// The head over `weight`, one shard of the rows of a `vocabulary`-row table split over
     /// `shards` ranks.
     fn over(weight: Tensor, vocabulary: u32, shards: u32) -> Result<Self> {
-        let rows = weight.dims().first().copied().unwrap_or(0) as u32;
-        let padded = rows.next_multiple_of(PADDING);
+        let shards = shards.max(1);
+        let rows = weight.dims().first().copied().unwrap_or(0);
+        let block = vocabulary.div_ceil(shards) as usize;
 
-        if padded != rows {
+        // The gather's blocks are equal, and a shorter shard has no checkpoint rows to fill its
+        // block with.
+        if shards > 1 && rows != block {
             return Err(Error::Unsupported(format!(
-                "LmHead: a vocabulary shard of {rows} rows needs {padded} padded rows; the \
-                 checkpoint's rows are contiguous, so a rank whose shard is not its padded \
-                 width is not loadable"
+                "LmHead: a vocabulary shard of {rows} rows beside peers of {block}; the \
+                 checkpoint's rows are contiguous, so a split whose last shard is shorter than \
+                 its peers is not loadable"
             )));
         }
         Ok(Self {
             weight,
             vocabulary,
-            shards: shards.max(1),
+            shards,
         })
-    }
-
-    /// The width of this rank's shard: its vocabulary rows, a whole number of tiles.
-    pub fn padded(&self) -> u32 {
-        self.weight.dims()[0] as u32
     }
 
     /// The logits of `hidden` `[rows, hidden]`, the rows the batch asks logits for:

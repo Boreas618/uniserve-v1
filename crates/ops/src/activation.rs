@@ -27,11 +27,30 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{Key, row_tile};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::launch::PDL;
 use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
+
+/// The elements one program of a gated activation over a strided pair walks
+/// (`act_and_mul`, `value_first_swiglu`): wide enough that each lane moves a whole vector of a
+/// half-precision row, which is what this memory-bound step runs at.
+const PACKED_BLOCK: u32 = 4096;
+
+/// The width of a row in a descriptor's 32 bits, for `operator`.
+fn row_width(operator: &'static str, row: &Operand) -> Result<u32> {
+    u32::try_from(row.last()).map_err(|_| {
+        Error::argument(
+            operator,
+            format!(
+                "rows of {} elements exceed a descriptor's width",
+                row.last()
+            ),
+        )
+    })
+}
 
 /// The activation a gated pair applies to its gate half.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -89,6 +108,41 @@ pub struct ActAndMulDescriptor {
     /// Evaluate the activation step by step instead of contraction-free, for a caller that needs
     /// the eager expression's rounding rather than the kernel's default evaluation.
     pub stepwise: bool,
+}
+
+impl ActAndMulDescriptor {
+    /// The compilation of the call `args` makes with `activation`, evaluated step by step when
+    /// `stepwise`: the element type and the row width are the output's, the strides those of
+    /// the two halves' rows, and the index width the one the furthest element either half's
+    /// rows reach takes (the halves of one packed projection stride over twice the output's
+    /// row).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] when the rows are wider than a descriptor's 32 bits.
+    pub fn of(args: &ActAndMulArgs, activation: Activation, stepwise: bool) -> Result<Self> {
+        let width = row_width(ActAndMul::NAME, &args.out)?;
+        let (gate_stride, value_stride) = (args.gate.stride(0), args.value.stride(0));
+
+        let elements = args.out.numel();
+        let span = elements.max(
+            args.out
+                .rows()
+                .saturating_mul(gate_stride.max(value_stride)),
+        );
+
+        Ok(Self {
+            dtype: args.out.dtype,
+            width,
+            block: PACKED_BLOCK,
+            activation,
+            gate_stride,
+            value_stride,
+            wide: span >= 1 << 31,
+            pdl: PDL,
+            stepwise,
+        })
+    }
 }
 
 impl fmt::Display for ActAndMulDescriptor {
@@ -293,6 +347,26 @@ pub struct ValueFirstSwigluDescriptor {
     pub absmax: bool,
 }
 
+impl ValueFirstSwigluDescriptor {
+    /// The compilation of the call `args` makes, recording each program's largest magnitude when
+    /// `absmax`: the element type and the row width are the output's, the stride that of the
+    /// packed projection's rows, and a bias when the call passes one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] when the rows are wider than a descriptor's 32 bits.
+    pub fn of(args: &ValueFirstSwigluArgs, absmax: bool) -> Result<Self> {
+        Ok(Self {
+            dtype: args.out.dtype,
+            width: row_width(ValueFirstSwiglu::NAME, &args.out)?,
+            block: PACKED_BLOCK,
+            input_stride: args.value_gate.stride(0),
+            bias: args.bias.is_some(),
+            absmax,
+        })
+    }
+}
+
 impl fmt::Display for ValueFirstSwigluDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
@@ -471,6 +545,31 @@ pub struct SwigluDescriptor {
     pub gate_bias: bool,
     /// Whether each program records its largest magnitude into `partials`.
     pub absmax: bool,
+}
+
+impl SwigluDescriptor {
+    /// The compilation of the call `args` makes, recording each program's largest magnitude when
+    /// `absmax`: the element type and the row width are the output's, the strides those of the
+    /// two halves' rows, a bias on each half the call passes one for, and one program loads its
+    /// whole row in one tile.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] when the rows are wider than a descriptor's 32 bits.
+    pub fn of(args: &SwigluArgs, absmax: bool) -> Result<Self> {
+        let width = row_width(Swiglu::NAME, &args.out)?;
+
+        Ok(Self {
+            dtype: args.out.dtype,
+            width,
+            block: row_tile(width),
+            value_stride: args.value.stride(0),
+            gate_stride: args.gate.stride(0),
+            value_bias: args.value_bias.is_some(),
+            gate_bias: args.gate_bias.is_some(),
+            absmax,
+        })
+    }
 }
 
 impl fmt::Display for SwigluDescriptor {

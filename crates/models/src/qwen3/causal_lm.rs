@@ -364,10 +364,14 @@ impl CausalLm for Qwen3ForCausalLm {
 
             // The model's attention layers share one cache group. Its workspace is execution's
             // and every forward reuses it, so the decode kernel's arrival counters are cleared
-            // once before the first layer.
+            // once before the first layer, for the batch's rows of this rank's query heads (the
+            // load checked that the splits divide the heads).
             let group = cache.first();
             if let Some(group) = group {
-                functional::zero_arrival_counters_(&group.workspace)?;
+                let text = &self.config.text;
+                let q_heads =
+                    text.num_attention_heads / (self.tensor.size * self.sequence.split.size);
+                functional::zero_arrival_counters_(&group.workspace, batch.rows(), q_heads)?;
             }
 
             // A sequence member's layers run over its share of the rows. The batch's live

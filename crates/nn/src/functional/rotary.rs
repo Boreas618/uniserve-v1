@@ -37,24 +37,8 @@ use tensor::{D, DType, Device, Tensor};
 
 use super::norm::{gain, rms_scaled};
 use super::nvfp4::integer;
-use super::{ACCUMULATE, PDL, on_cpu, vector};
+use super::{ACCUMULATE, on_cpu, vector};
 use crate::error::{Error, Result};
-
-/// Elements one `rotary_factors` kernel handles.
-const FACTORS_BLOCK: u32 = 256;
-
-/// Head rows one `qk_norm_rope` kernel handles: a token holds one per head, so a step of few
-/// tokens still spreads over the device.
-const QK_NORM_ROWS: u32 = 16;
-
-/// The tokens one kernel of the in-place q/k rotation normalizes, per head.
-const IN_PLACE_TOKENS: u32 = 8;
-
-/// The tokens one `rope_apply` kernel rotates.
-const APPLY_TOKENS: u32 = 8;
-
-/// The head elements one `rope_apply` kernel loads at a time.
-const APPLY_BLOCK: u32 = 128;
 
 /// The heads and the head width of `x`, the tensor `name` of `[tokens, heads, head_dim]`.
 pub(super) fn heads_of(owner: &'static str, name: &str, x: &Tensor) -> Result<(u32, u32)> {
@@ -245,20 +229,15 @@ pub fn rotary_factors(
     let cos = ops::empty((tokens, columns), DType::F32)?;
     let sin = ops::empty((tokens, columns), DType::F32)?;
 
-    let mut owned = [0; MAX_AXES];
-    owned[..sections.len()].copy_from_slice(sections);
     ops::launch::<RotaryFactors>(
-        &FactorsDescriptor {
-            dtype: DType::F32,
-            positions: positions.dtype(),
-            columns: columns as u32,
-            block: FACTORS_BLOCK,
-            scale: 1.0_f32.into(),
-            pdl: PDL,
-            axes: axes as u32,
-            sections: owned,
-            interleaved: !sections.is_empty() && interleaved,
-        },
+        &FactorsDescriptor::new(
+            DType::F32,
+            positions.dtype(),
+            columns as u32,
+            1.0,
+            sections,
+            interleaved,
+        )?,
         FactorsArgs {
             positions: ops::operand(positions)?,
             frequencies: ops::operand(inv_freq)?,
@@ -279,8 +258,8 @@ pub fn rotary_factors(
 pub fn rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     const OWNER: &str = "rotary";
 
-    let (heads, head_dim) = heads_of(OWNER, "the input", x)?;
-    let rotated = rotated(OWNER, cos, sin, head_dim)?;
+    let (_, head_dim) = heads_of(OWNER, "the input", x)?;
+    rotated(OWNER, cos, sin, head_dim)?;
     per_token(OWNER, cos, x.dims()[0])?;
 
     if on_cpu(x) {
@@ -288,25 +267,13 @@ pub fn rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     }
 
     let out = ops::empty(x.shape(), x.dtype())?;
-    ops::launch::<RopeApply>(
-        &RopeApplyDescriptor {
-            dtype: x.dtype(),
-            output: out.dtype(),
-            head_dim,
-            heads,
-            rotation: Rotation::Half,
-            rotated,
-            rows: APPLY_TOKENS,
-            block: APPLY_BLOCK,
-            pdl: PDL,
-        },
-        RopeApplyArgs {
-            x: ops::operand(x)?,
-            cosine: ops::operand(cos)?,
-            sine: ops::operand(sin)?,
-            out: ops::operand(&out)?,
-        },
-    )?;
+    let args = RopeApplyArgs {
+        x: ops::operand(x)?,
+        cosine: ops::operand(cos)?,
+        sine: ops::operand(sin)?,
+        out: ops::operand(&out)?,
+    };
+    ops::launch::<RopeApply>(&RopeApplyDescriptor::of(&args, Rotation::Half)?, args)?;
     Ok(out)
 }
 
@@ -336,8 +303,8 @@ pub fn qk_norm_rope(
 ) -> Result<(Tensor, Tensor)> {
     const OWNER: &str = "qk_norm_rope";
 
-    let (heads, head_dim) = heads_of(OWNER, "the query", query)?;
-    let (kv_heads, key_dim) = heads_of(OWNER, "the key", key)?;
+    let (_, head_dim) = heads_of(OWNER, "the query", query)?;
+    let (_, key_dim) = heads_of(OWNER, "the key", key)?;
     let tokens = query.dims()[0];
     if key.dims()[0] != tokens || key_dim != head_dim || key.dtype() != query.dtype() {
         return Err(Error::shape(
@@ -352,7 +319,7 @@ pub fn qk_norm_rope(
             ),
         ));
     }
-    let rotated = rotated(OWNER, cos, sin, head_dim)?;
+    rotated(OWNER, cos, sin, head_dim)?;
     per_token(OWNER, cos, tokens)?;
     if let Some((query_weight, key_weight)) = weights {
         vector(OWNER, "query gain", query_weight, head_dim)?;
@@ -379,42 +346,23 @@ pub fn qk_norm_rope(
 
     let query_out = ops::empty(query.shape(), query.dtype())?;
     let key_out = ops::empty(key.shape(), key.dtype())?;
+
+    // With learned gains the kernel loads them; without, it has no weight arguments.
+    let args = QkNormRopeArgs {
+        query: ops::operand(query)?,
+        key: ops::operand(key)?,
+        q_weight: weights.map(|(query, _)| ops::operand(query)).transpose()?,
+        k_weight: weights.map(|(_, key)| ops::operand(key)).transpose()?,
+        cosine: ops::operand(cos)?,
+        sine: ops::operand(sin)?,
+        q_out: ops::operand(&query_out)?,
+        k_out: ops::operand(&key_out)?,
+    };
     ops::launch::<QkNormRope>(
-        // With learned gains the kernel loads them; without, it has no weight arguments.
-        &QkNormRopeDescriptor {
-            dtype: query.dtype(),
-            output: query_out.dtype(),
-            head_dim,
-            q_heads: heads,
-            k_heads: kv_heads,
-            rotation: Rotation::Half,
-            epsilon: eps.into(),
-            rotated,
-            rows: QK_NORM_ROWS,
-            block: head_tile(head_dim),
-            affine: weights.is_some(),
-            pdl: PDL,
-            factors: DType::F32,
-            strided: false,
-            centred,
-        },
-        QkNormRopeArgs {
-            query: ops::operand(query)?,
-            key: ops::operand(key)?,
-            q_weight: weights.map(|(query, _)| ops::operand(query)).transpose()?,
-            k_weight: weights.map(|(_, key)| ops::operand(key)).transpose()?,
-            cosine: ops::operand(cos)?,
-            sine: ops::operand(sin)?,
-            q_out: ops::operand(&query_out)?,
-            k_out: ops::operand(&key_out)?,
-        },
+        &QkNormRopeDescriptor::of(&args, Rotation::Half, eps, centred, false)?,
+        args,
     )?;
     Ok((query_out, key_out))
-}
-
-/// The head tile one `qk_norm_rope` kernel loads at a time.
-fn head_tile(head_dim: u32) -> u32 {
-    head_dim.next_power_of_two().min(1024)
 }
 
 /// [`qk_norm_rope`] without a gain, in place over the queries and keys of a merged projection:
@@ -470,7 +418,7 @@ pub fn qk_norm_rope_(
             "a strided projection has no storage of its own to turn its heads in".to_owned(),
         ));
     }
-    let rotated = rotated(OWNER, cos, sin, head_dim)?;
+    rotated(OWNER, cos, sin, head_dim)?;
     let table = cos.dims()[0];
     if table == 0 || !tokens.is_multiple_of(table) {
         return Err(Error::shape(
@@ -506,37 +454,22 @@ pub fn qk_norm_rope_(
         return Ok(projected);
     }
 
+    // Each kernel owns some tokens of one head, the queries' heads and the keys' alike, and the
+    // outputs are the inputs.
     let (query_operand, key_operand) = (ops::operand(&query_heads)?, ops::operand(&key_heads)?);
+    let args = QkNormRopeArgs {
+        query: query_operand.clone(),
+        key: key_operand.clone(),
+        q_weight: None,
+        k_weight: None,
+        cosine: ops::operand(cos)?,
+        sine: ops::operand(sin)?,
+        q_out: query_operand,
+        k_out: key_operand,
+    };
     ops::launch::<QkNormRope>(
-        // Each kernel owns some tokens of one head, the queries' heads and the keys' alike, and
-        // the outputs are the inputs.
-        &QkNormRopeDescriptor {
-            dtype: projected.dtype(),
-            output: projected.dtype(),
-            head_dim,
-            q_heads: heads as u32,
-            k_heads: heads as u32,
-            rotation: Rotation::Half,
-            epsilon: eps.into(),
-            rotated,
-            rows: IN_PLACE_TOKENS,
-            block: head_tile(head_dim),
-            affine: false,
-            pdl: PDL,
-            factors: cos.dtype(),
-            strided: true,
-            centred: false,
-        },
-        QkNormRopeArgs {
-            query: query_operand.clone(),
-            key: key_operand.clone(),
-            q_weight: None,
-            k_weight: None,
-            cosine: ops::operand(cos)?,
-            sine: ops::operand(sin)?,
-            q_out: query_operand,
-            k_out: key_operand,
-        },
+        &QkNormRopeDescriptor::of(&args, Rotation::Half, eps, false, true)?,
+        args,
     )?;
     Ok(projected)
 }

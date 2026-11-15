@@ -52,14 +52,15 @@ pub struct Descriptor {
 
 impl Descriptor {
     /// The descriptor of the call `args` makes, over the operators' block
-    /// ([`descriptor::BLOCK`]).
-    pub fn of(args: &Args, pdl: bool) -> Self {
+    /// ([`descriptor::BLOCK`]), in the launch variant
+    /// the backend launches every kernel in.
+    pub fn of(args: &Args) -> Self {
         Self {
             input: args.x.dtype,
             output: args.out.dtype,
             rank: strided::rank([&args.x, &args.out]),
             block: descriptor::BLOCK,
-            pdl,
+            pdl: crate::launch::PDL,
         }
     }
 }
@@ -217,7 +218,7 @@ mod tests {
     #[test]
     fn the_key_names_both_types_and_the_axes_traversed() {
         let args = args(DType::F32, DType::BF16, &[2, 3, 5]);
-        let descriptor = Descriptor::of(&args, false);
+        let descriptor = Descriptor::of(&args);
         assert_eq!(
             descriptor.to_string(),
             "input_f32_output_bf16_rank_1_block_1024_pdl_false"
@@ -230,14 +231,14 @@ mod tests {
         for input in strided::ELEMENTS {
             for output in strided::ELEMENTS {
                 let args = args(input, output, &[4, 8]);
-                let checked = Cast::check(&Descriptor::of(&args, false), &args);
+                let checked = Cast::check(&Descriptor::of(&args), &args);
                 assert_eq!(checked.is_ok(), input != output, "{input:?} to {output:?}");
             }
         }
 
         // A packed narrow float is no element of a conversion.
         let args = args(DType::F8E4M3, DType::F32, &[4, 8]);
-        let message = refusal(Cast::check(&Descriptor::of(&args, false), &args));
+        let message = refusal(Cast::check(&Descriptor::of(&args), &args));
         assert!(message.contains("input is f8e4m3"), "{message}");
     }
 
@@ -252,7 +253,7 @@ mod tests {
             ),
             out: contiguous(DType::F32, &[5, 3, 2]),
         };
-        let descriptor = Descriptor::of(&permuted, false);
+        let descriptor = Descriptor::of(&permuted);
         assert_eq!(descriptor.rank, 3);
         Cast::check(&descriptor, &permuted).unwrap();
 
@@ -265,7 +266,7 @@ mod tests {
             ),
             ..permuted.clone()
         };
-        let descriptor = Descriptor::of(&strided_out, false);
+        let descriptor = Descriptor::of(&strided_out);
         let message = refusal(Cast::check(&descriptor, &strided_out));
         assert!(message.contains("out must be contiguous"), "{message}");
 
@@ -273,7 +274,7 @@ mod tests {
             out: contiguous(DType::F32, &[5, 6]),
             ..permuted
         };
-        let descriptor = Descriptor::of(&other_shape, false);
+        let descriptor = Descriptor::of(&other_shape);
         let message = refusal(Cast::check(&descriptor, &other_shape));
         assert!(message.contains("expected out of shape"), "{message}");
     }
@@ -281,7 +282,7 @@ mod tests {
     #[test]
     fn a_conversion_is_exact_unless_it_rounds_into_a_float() {
         let tolerance =
-            |input, output| Cast::tolerance(&Descriptor::of(&args(input, output, &[8]), false));
+            |input, output| Cast::tolerance(&Descriptor::of(&args(input, output, &[8])));
 
         // Between integers the low bits are kept, and a float truncates into an integer.
         assert_eq!(tolerance(DType::I64, DType::U8), Tolerance::exact());

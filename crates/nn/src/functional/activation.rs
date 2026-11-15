@@ -24,18 +24,10 @@ use ops::activation::{
 };
 use tensor::{D, DType, Tensor};
 
-use super::{PDL, as_rows, columns, like_rows, on_cpu, same_rows, vector};
+use super::{as_rows, columns, like_rows, on_cpu, same_rows, vector};
 use crate::error::{Error, Result};
 
 pub use ops::activation::Activation;
-
-/// The elements one kernel of a plain activation handles: a power of two keeps every vector load
-/// aligned.
-const BLOCK: u32 = 1024;
-
-/// The elements one kernel of a gated activation handles: wide enough that each lane moves a
-/// whole vector of a half-precision row, which is what this memory-bound step runs at.
-const PACKED_BLOCK: u32 = 4096;
 
 /// The FP32 evaluation order and rounding points of a gated product; see the module table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -89,12 +81,6 @@ pub(super) fn activate(x: &Tensor, activation: Activation) -> Result<Tensor> {
     })
 }
 
-/// The row stride of `rows`, a `[rows, width]` tensor, in elements, as a kernel argument states
-/// it.
-fn row_stride(rows: &ops::Operand) -> u64 {
-    rows.stride(0)
-}
-
 /// The gated activation `act(gate) · value`, the activation evaluated in FP32.
 ///
 /// `gate` and `value` are `[rows, width]` of one element type, each with unit stride along its
@@ -114,7 +100,7 @@ pub fn act_and_mul(
 ) -> Result<Tensor> {
     const OWNER: &str = "act_and_mul";
 
-    let width = columns(OWNER, gate)?;
+    columns(OWNER, gate)?;
     same_rows(OWNER, "value half", value, gate)?;
 
     if on_cpu(gate) {
@@ -129,33 +115,13 @@ pub fn act_and_mul(
 
     let (gate_rows, value_rows) = (as_rows(OWNER, gate)?, as_rows(OWNER, value)?);
     let out = ops::empty(gate_rows.shape(), gate.dtype())?;
-    let (gate_operand, value_operand) = (ops::operand(&gate_rows)?, ops::operand(&value_rows)?);
-    let (gate_stride, value_stride) = (row_stride(&gate_operand), row_stride(&value_operand));
+    let args = ActAndMulArgs {
+        gate: ops::operand(&gate_rows)?,
+        value: ops::operand(&value_rows)?,
+        out: ops::operand(&out)?,
+    };
 
-    // The 64-bit form follows the furthest element either input row reaches: the halves of one
-    // packed projection stride over twice the output's row.
-    let elements = out.elem_count() as u64;
-    let rows = elements.div_ceil(u64::from(width));
-    let span = elements.max(rows.saturating_mul(gate_stride.max(value_stride)));
-
-    ops::launch::<ActAndMul>(
-        &ActAndMulDescriptor {
-            dtype: gate.dtype(),
-            width,
-            block: PACKED_BLOCK,
-            activation,
-            gate_stride,
-            value_stride,
-            wide: span >= 1 << 31,
-            pdl: PDL,
-            stepwise,
-        },
-        ActAndMulArgs {
-            gate: gate_operand,
-            value: value_operand,
-            out: ops::operand(&out)?,
-        },
-    )?;
+    ops::launch::<ActAndMul>(&ActAndMulDescriptor::of(&args, activation, stepwise)?, args)?;
     like_rows(out, gate)
 }
 
@@ -202,28 +168,16 @@ pub fn swiglu(
 
     let (value_rows, gate_rows) = (as_rows(OWNER, value)?, as_rows(OWNER, gate)?);
     let out = ops::empty(value_rows.shape(), value.dtype())?;
-    let (value_operand, gate_operand) = (ops::operand(&value_rows)?, ops::operand(&gate_rows)?);
+    let args = SwigluArgs {
+        value: ops::operand(&value_rows)?,
+        gate: ops::operand(&gate_rows)?,
+        value_bias: value_bias.map(ops::operand).transpose()?,
+        gate_bias: gate_bias.map(ops::operand).transpose()?,
+        out: ops::operand(&out)?,
+        partials: None,
+    };
 
-    ops::launch::<Swiglu>(
-        &SwigluDescriptor {
-            dtype: value.dtype(),
-            width,
-            block: width.next_power_of_two(),
-            value_stride: row_stride(&value_operand),
-            gate_stride: row_stride(&gate_operand),
-            value_bias: value_bias.is_some(),
-            gate_bias: gate_bias.is_some(),
-            absmax: false,
-        },
-        SwigluArgs {
-            value: value_operand,
-            gate: gate_operand,
-            value_bias: value_bias.map(ops::operand).transpose()?,
-            gate_bias: gate_bias.map(ops::operand).transpose()?,
-            out: ops::operand(&out)?,
-            partials: None,
-        },
-    )?;
+    ops::launch::<Swiglu>(&SwigluDescriptor::of(&args, false)?, args)?;
     like_rows(out, value)
 }
 
@@ -266,24 +220,14 @@ pub fn value_first_swiglu(value_gate: &Tensor, bias: Option<&Tensor>) -> Result<
     }
 
     let out = ops::empty((rows.dims()[0], width as usize), value_gate.dtype())?;
-    let projection = ops::operand(&rows)?;
+    let args = ValueFirstSwigluArgs {
+        value_gate: ops::operand(&rows)?,
+        bias: bias.map(ops::operand).transpose()?,
+        out: ops::operand(&out)?,
+        partials: None,
+    };
 
-    ops::launch::<ValueFirstSwiglu>(
-        &ValueFirstSwigluDescriptor {
-            dtype: value_gate.dtype(),
-            width,
-            block: PACKED_BLOCK,
-            input_stride: row_stride(&projection),
-            bias: bias.is_some(),
-            absmax: false,
-        },
-        ValueFirstSwigluArgs {
-            value_gate: projection,
-            bias: bias.map(ops::operand).transpose()?,
-            out: ops::operand(&out)?,
-            partials: None,
-        },
-    )?;
+    ops::launch::<ValueFirstSwiglu>(&ValueFirstSwigluDescriptor::of(&args, false)?, args)?;
     like_rows(out, value_gate)
 }
 
@@ -326,14 +270,11 @@ pub fn snake(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {
         return Ok((x32 + periodic)?.to_dtype(x.dtype())?);
     }
 
+    let channels = u32::try_from(channels)
+        .map_err(|_| Error::shape(OWNER, format!("{channels} channels exceed a launch value")))?;
     let out = ops::empty(x.shape(), x.dtype())?;
     ops::launch::<ops::snake::Snake>(
-        &ops::snake::Descriptor {
-            dtype: x.dtype(),
-            channels: u32::try_from(channels).unwrap_or(u32::MAX),
-            block: BLOCK,
-            pdl: PDL,
-        },
+        &ops::snake::Descriptor::new(x.dtype(), channels),
         ops::snake::Args {
             x: ops::operand(x)?,
             alpha: ops::operand(alpha)?,

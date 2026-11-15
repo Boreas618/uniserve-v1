@@ -26,7 +26,6 @@
 //! intermediate into the activation's element type, as the eager expression they replace does,
 //! and only the mean square accumulates in FP32.
 
-use ops::descriptor::Float;
 use ops::modulation::{self, ModulatedRmsNorm, ModulatedRmsNormDescriptor};
 use ops::residual::{
     ScaledResidualLayerNorm, ScaledResidualLayerNormArgs, ScaledResidualLayerNormDescriptor,
@@ -35,7 +34,7 @@ use ops::residual::{
 use tensor::{D, DType, Tensor};
 
 use super::norm::rms_scaled;
-use super::{as_rows, columns, like_rows, on_cpu, row_tile, vector};
+use super::{as_rows, columns, like_rows, on_cpu, vector};
 use crate::error::{Error, Result};
 
 /// Checks the operands a scaled-residual normalization shares: an `update` of the stream's
@@ -137,14 +136,13 @@ pub fn scaled_residual_rms_norm_(
     let out = ops::empty(rows.shape(), update.dtype())?;
 
     ops::launch::<ScaledResidualRmsNorm>(
-        &ScaledResidualRmsNormDescriptor {
-            dtype: hidden.dtype(),
-            columns: width,
-            tile: row_tile(width),
-            update_bias: update_bias.is_some(),
-            absmax: false,
-            activation: update.dtype(),
-        },
+        &ScaledResidualRmsNormDescriptor::new(
+            hidden.dtype(),
+            width,
+            update_bias.is_some(),
+            update.dtype(),
+            false,
+        ),
         ScaledResidualRmsNormArgs {
             hidden: ops::operand(&rows)?,
             update: ops::operand(&update_rows)?,
@@ -203,14 +201,13 @@ pub fn scaled_residual_layer_norm(
     let out = ops::empty(rows.shape(), update.dtype())?;
 
     ops::launch::<ScaledResidualLayerNorm>(
-        &ScaledResidualLayerNormDescriptor {
-            dtype: hidden.dtype(),
-            columns: width,
-            tile: row_tile(width),
-            update_bias: update_bias.is_some(),
-            absmax: false,
-            activation: update.dtype(),
-        },
+        &ScaledResidualLayerNormDescriptor::new(
+            hidden.dtype(),
+            width,
+            update_bias.is_some(),
+            update.dtype(),
+            false,
+        ),
         ScaledResidualLayerNormArgs {
             hidden: ops::operand(&rows)?,
             update: ops::operand(&update_rows)?,
@@ -304,12 +301,6 @@ fn modulate(
     rounded(&(scaled + shift)?, activation)
 }
 
-/// The leading stride of `table`, a `[parameters, width]` view, in elements: where the kernel
-/// finds the next parameter row.
-fn row_stride(table: &ops::Operand) -> u64 {
-    table.stride(0)
-}
-
 /// The per-row modulation of an RMS normalization:
 /// `rms_norm(x) · weight · (1 + scale[i]) + shift[i]`, where `i = rows[row]`.
 ///
@@ -346,35 +337,19 @@ pub fn modulated_rms_norm(
 
     let value = x.contiguous()?;
     let out = ops::empty(x.shape(), output)?;
-    let (shift, scale) = (ops::operand(shift)?, ops::operand(scale)?);
-
-    ops::launch::<ModulatedRmsNorm>(
-        &ModulatedRmsNormDescriptor {
-            dtype: x.dtype(),
-            output,
-            indices: rows.dtype(),
-            width,
-            block: row_tile(width),
-            epsilon: Float::from(eps),
-            gate_stride: 0,
-            shift_stride: row_stride(&shift),
-            scale_stride: row_stride(&scale),
-            update: false,
-            retain: false,
-        },
-        modulation::Args {
-            value: ops::operand(&value)?,
-            update: None,
-            gate: None,
-            weight: ops::operand(weight)?,
-            shift,
-            scale,
-            row_indices: ops::operand(rows)?,
-            out: ops::operand(&out)?,
-            output_scale: None,
-            retain: None,
-        },
-    )?;
+    let args = modulation::Args {
+        value: ops::operand(&value)?,
+        update: None,
+        gate: None,
+        weight: ops::operand(weight)?,
+        shift: ops::operand(shift)?,
+        scale: ops::operand(scale)?,
+        row_indices: ops::operand(rows)?,
+        out: ops::operand(&out)?,
+        output_scale: None,
+        retain: None,
+    };
+    ops::launch::<ModulatedRmsNorm>(&ModulatedRmsNormDescriptor::of(&args, eps)?, args)?;
     Ok(out)
 }
 
@@ -446,38 +421,18 @@ pub fn modulated_rms_norm_(
     let value = hidden.contiguous()?;
     let out = ops::empty(update.shape(), output)?;
     let sum = ops::empty(update.shape(), output)?;
-    let (shift, scale, gate) = (
-        ops::operand(shift)?,
-        ops::operand(scale)?,
-        ops::operand(gate)?,
-    );
-
-    ops::launch::<ModulatedRmsNorm>(
-        &ModulatedRmsNormDescriptor {
-            dtype: activation,
-            output,
-            indices: rows.dtype(),
-            width,
-            block: row_tile(width),
-            epsilon: Float::from(eps),
-            gate_stride: row_stride(&gate),
-            shift_stride: row_stride(&shift),
-            scale_stride: row_stride(&scale),
-            update: true,
-            retain: true,
-        },
-        modulation::Args {
-            value: ops::operand(&value)?,
-            update: Some(ops::operand(&update)?),
-            gate: Some(gate),
-            weight: ops::operand(weight)?,
-            shift,
-            scale,
-            row_indices: ops::operand(rows)?,
-            out: ops::operand(&out)?,
-            output_scale: None,
-            retain: Some(ops::operand(&sum)?),
-        },
-    )?;
+    let args = modulation::Args {
+        value: ops::operand(&value)?,
+        update: Some(ops::operand(&update)?),
+        gate: Some(ops::operand(gate)?),
+        weight: ops::operand(weight)?,
+        shift: ops::operand(shift)?,
+        scale: ops::operand(scale)?,
+        row_indices: ops::operand(rows)?,
+        out: ops::operand(&out)?,
+        output_scale: None,
+        retain: Some(ops::operand(&sum)?),
+    };
+    ops::launch::<ModulatedRmsNorm>(&ModulatedRmsNormDescriptor::of(&args, eps)?, args)?;
     Ok((out, sum))
 }

@@ -251,6 +251,36 @@ impl CausalConv1dDescriptor {
     }
 }
 
+/// The most channels one `causal_conv1d` program covers.
+const CONV_BLOCK: u32 = 256;
+
+impl CausalConv1dDescriptor {
+    /// The compilation that convolves `channels` channels of `dtype` with filters of `width`
+    /// taps at `dilation` over a window of `window` tokens, applying the SiLU when `activation`
+    /// and evaluating it step by step when `stepwise`: one program covers the channels' tile, at
+    /// most [`CONV_BLOCK`].
+    pub fn new(
+        dtype: DType,
+        channels: u32,
+        width: u32,
+        dilation: u32,
+        activation: bool,
+        window: u32,
+        stepwise: bool,
+    ) -> Self {
+        Self {
+            dtype,
+            channels,
+            width,
+            block: channels.max(1).next_power_of_two().min(CONV_BLOCK),
+            dilation,
+            activation,
+            window,
+            stepwise,
+        }
+    }
+}
+
 impl fmt::Display for CausalConv1dDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key = Key::new()
@@ -537,6 +567,57 @@ impl GatedDeltaRuleDescriptor {
             StateAxes::KeyValue => [self.value_heads as u64, key, value],
             StateAxes::ValueKey => [self.value_heads as u64, value, key],
         }
+    }
+}
+
+/// Tokens of one chunk of [`Form::Chunked`]: the chunked form solves this many tokens at once,
+/// and a state's checkpoints land on chunk ends.
+pub const DELTA_RULE_CHUNK: u32 = 64;
+
+/// The most value columns one `gated_delta_rule` program owns of a head's state: the chunked
+/// form's tensor memory holds `2 · chunk + 4 · block` columns, which bounds it at 64.
+const DELTA_RULE_BLOCK: u32 = 64;
+
+impl GatedDeltaRuleDescriptor {
+    /// The compilation of the call `args` makes in `form` over states stored in `axes`: the
+    /// heads and their widths are the queries' and the values', the slots a request owns those
+    /// of the call's request slots (zero without them), a chunk of [`DELTA_RULE_CHUNK`] tokens in
+    /// the chunked form and of one in the recurrent, and one program owns at most
+    /// [`DELTA_RULE_BLOCK`] value columns.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] when an extent exceeds a descriptor's 32 bits.
+    pub fn of(args: &GatedDeltaRuleArgs, form: Form, axes: StateAxes) -> Result<Self> {
+        let field = |name: &str, value: u64| {
+            u32::try_from(value).map_err(|_| {
+                Error::argument(
+                    GatedDeltaRule::NAME,
+                    format!("{value} {name} exceed a descriptor's field"),
+                )
+            })
+        };
+        let value_dim = field("value columns", args.value.dim(2))?;
+        let request_slots = match &args.slots {
+            Some(slots) => field("request slots", slots.state_indices.dim(1))?,
+            None => 0,
+        };
+
+        Ok(Self {
+            dtype: args.query.dtype,
+            key_heads: field("key heads", args.query.dim(1))?,
+            value_heads: field("value heads", args.value.dim(1))?,
+            key_dim: field("key columns", args.query.dim(2))?,
+            value_dim,
+            block: value_dim.min(DELTA_RULE_BLOCK),
+            form,
+            chunk: match form {
+                Form::Chunked => DELTA_RULE_CHUNK,
+                Form::Recurrent => 1,
+            },
+            axes,
+            request_slots,
+        })
     }
 }
 

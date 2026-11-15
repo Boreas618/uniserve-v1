@@ -834,19 +834,25 @@ fn the_cache_writes_key_the_plane_type_and_the_reads_key_the_phase() {
 
 #[test]
 fn the_arrival_counters_are_cleared_at_the_head_of_the_workspace() {
-    // On the CPU the head of the workspace is zeroed and the rest is as it was.
+    // The CPU attention keeps no counters: the workspace is as it was.
     let workspace = Tensor::ones(8, DType::U8, &Device::Cpu).unwrap();
-    functional::zero_arrival_counters_(&workspace).unwrap();
-    assert_eq!(values(&workspace), [0.0; 8]);
+    functional::zero_arrival_counters_(&workspace, 3, 3).unwrap();
+    assert_eq!(values(&workspace), [1.0; 8]);
 
-    // Under a meta context the fill is one launch over the counters' megabyte.
-    let workspace = meta(1 << 21, DType::U8);
+    // Under a meta context the fill is one launch over the counters of the batch's (row, head)
+    // pairs: nine of them, two groups of eight four-byte counters, which a workspace of 64
+    // bytes holds and one of 32 does not.
+    let workspace = meta(64, DType::U8);
     let (cleared, Recording { launches, .. }) =
-        record(&[], || functional::zero_arrival_counters_(&workspace));
+        record(&[], || functional::zero_arrival_counters_(&workspace, 3, 3));
     cleared.unwrap();
     assert_eq!(operators(&launches), ["fill"]);
 
-    assert!(functional::zero_arrival_counters_(&meta((2, 4), DType::U8)).is_err());
+    let (refused, _) = record(&[], || {
+        functional::zero_arrival_counters_(&meta(32, DType::U8), 3, 3)
+    });
+    assert!(refused.is_err());
+    assert!(functional::zero_arrival_counters_(&meta((2, 4), DType::U8), 3, 3).is_err());
 }
 
 // ---- The module -------------------------------------------------------------------------------

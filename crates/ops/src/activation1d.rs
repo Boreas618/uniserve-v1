@@ -46,6 +46,7 @@ use tensor::DType;
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::launch::PDL;
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
@@ -71,7 +72,23 @@ pub struct Descriptor {
     pub pdl: bool,
 }
 
+/// The channels one thread block of the activation handles.
+const BLOCK: u32 = 256;
+
 impl Descriptor {
+    /// The compilation that runs the chain over signals of `channels` channels of `dtype`, with
+    /// filters of `kernel` taps at `ratio`.
+    pub fn new(dtype: DType, channels: u32, kernel: u32, ratio: u32) -> Self {
+        Self {
+            dtype,
+            channels,
+            kernel,
+            ratio,
+            block: BLOCK,
+            pdl: PDL,
+        }
+    }
+
     /// The replicate pad of stage 1: `kernel/ratio - 1` samples on each side.
     pub fn upsample_pad(&self) -> u64 {
         u64::from(self.kernel / self.ratio) - 1

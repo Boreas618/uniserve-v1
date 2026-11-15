@@ -33,7 +33,7 @@ use ops::reduce::{self, Function, Reduce};
 use tensor::{D, DType, Device, Tensor};
 
 use super::nvfp4::{decoded, encoded, launch_quantize};
-use super::{ACCUMULATE, PDL, as_rows, columns, like_rows, on_cpu, vector};
+use super::{ACCUMULATE, as_rows, columns, like_rows, on_cpu, vector};
 use crate::error::{Error, Result};
 
 pub use ops::gemm::WeightOrder;
@@ -41,16 +41,6 @@ pub use ops::gemm::WeightOrder;
 /// The arrangement the packed product reads block scales in, the weight's and the encoded
 /// activation's alike.
 pub(crate) const PRODUCT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
-
-/// The tile an `fp8_gemm` kernel covers, `(rows, output columns, contraction elements)`: one
-/// kernel set serves every projection.
-const FP8_TILE: (u32, u32, u32) = (128, 128, 128);
-
-/// The elements of a row one `fp8_quantize` program encodes.
-const FP8_ENCODE_BLOCK: u32 = 1024;
-
-/// The partials the one program of `dynamic_scale` reads at a time.
-const SCALE_TILE: u32 = 1024;
 
 /// `x · weightᵀ + bias` over a dense weight: `[..., n]` in `x`'s element type for `x` of
 /// `[..., k]`.
@@ -195,10 +185,7 @@ pub fn linear_fp8(
     let (m, k) = (rows.dims()[0], rows.dims()[1]);
     let codes = ops::empty((m, k), DType::F8E4M3)?;
     ops::launch::<Fp8Quantize>(
-        &Fp8QuantizeDescriptor {
-            dtype: x.dtype(),
-            block: FP8_ENCODE_BLOCK,
-        },
+        &Fp8QuantizeDescriptor::new(x.dtype()),
         Fp8QuantizeArgs {
             input: ops::operand(&rows)?,
             out: ops::operand(&codes)?,
@@ -208,15 +195,8 @@ pub fn linear_fp8(
 
     // 2. The product over the two encodings.
     let out = ops::empty((m, n as usize), x.dtype())?;
-    let (block_m, block_n, block_k) = FP8_TILE;
     ops::launch::<Fp8Gemm>(
-        &Fp8GemmDescriptor {
-            dtype: x.dtype(),
-            block_m,
-            block_n,
-            block_k,
-            bias: bias.is_some(),
-        },
+        &Fp8GemmDescriptor::new(x.dtype(), bias.is_some()),
         Fp8GemmArgs {
             input: ops::operand(&codes)?,
             weight: ops::operand(weight)?,
@@ -288,24 +268,22 @@ pub fn dynamic_scales(x: &Tensor, weight_amax: &Tensor, range: f32) -> Result<(T
         return Ok((encode, alpha));
     }
 
-    // 1. Each row's largest magnitude, in the activation's own type: a magnitude is exact.
+    // 1. Each row's largest magnitude, in the activation's own type: a magnitude is exact. The
+    //    fold is the tensor primitives' own reduction, so every projection's rows are folded by
+    //    the module of one key.
     let partials = ops::empty((count, 1), x.dtype())?;
     let fold = reduce::Args {
         x: ops::operand(&rows)?,
         out: ops::operand(&partials)?,
         axes: &[1],
     };
-    ops::launch::<Reduce>(&reduce::Descriptor::of(Function::AbsMax, &fold, PDL), fold)?;
+    ops::launch::<Reduce>(&reduce::Descriptor::of(Function::AbsMax, &fold), fold)?;
 
     // 2. The rows' largest, and the two factors from it and the weight's.
     let encode = ops::empty(1, DType::F32)?;
     let alpha = ops::empty(1, DType::F32)?;
     ops::launch::<DynamicScale>(
-        &dynamic_scale::Descriptor {
-            dtype: x.dtype(),
-            tile: SCALE_TILE,
-            pdl: PDL,
-        },
+        &dynamic_scale::Descriptor::new(x.dtype()),
         dynamic_scale::Args {
             partials: ops::operand(&partials.flatten_all()?)?,
             weight_amax: ops::operand(weight_amax)?,

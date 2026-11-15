@@ -28,8 +28,9 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::launch::PDL;
 use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
@@ -49,6 +50,21 @@ pub struct Descriptor {
     pub block: u32,
     /// Whether the module was compiled for programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl Descriptor {
+    /// The compilation that pools rows of `heads` heads of `width` `dtype` elements into
+    /// `output` columns.
+    pub fn new(dtype: DType, heads: u32, width: u32, output: u32) -> Self {
+        Self {
+            dtype,
+            heads,
+            width,
+            output,
+            block: descriptor::BLOCK,
+            pdl: PDL,
+        }
+    }
 }
 
 impl fmt::Display for Descriptor {

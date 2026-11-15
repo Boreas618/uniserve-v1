@@ -28,8 +28,9 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::launch::PDL;
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
@@ -54,6 +55,17 @@ pub struct Descriptor {
     pub tile: u32,
     /// Whether the module was compiled for programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl Descriptor {
+    /// The compilation that folds partials of `dtype` magnitudes into the two factors.
+    pub fn new(dtype: DType) -> Self {
+        Self {
+            dtype,
+            tile: descriptor::BLOCK,
+            pdl: PDL,
+        }
+    }
 }
 
 impl fmt::Display for Descriptor {

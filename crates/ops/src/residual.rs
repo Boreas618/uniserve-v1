@@ -31,7 +31,7 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::{self, Key};
+use crate::descriptor::{self, Key, row_tile};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
@@ -53,6 +53,21 @@ pub struct WeightedRmsNormDescriptor {
     pub absmax: bool,
     /// Element type of the output, when it is narrower than the rows.
     pub activation: DType,
+}
+
+impl WeightedRmsNormDescriptor {
+    /// The compilation that normalizes rows of `columns` elements of `dtype` and narrows them
+    /// into `activation` elements, recording each program's largest magnitude when `absmax`.
+    /// One program loads its whole row in one tile.
+    pub fn new(dtype: DType, columns: u32, activation: DType, absmax: bool) -> Self {
+        Self {
+            dtype,
+            columns,
+            tile: row_tile(columns),
+            absmax,
+            activation,
+        }
+    }
 }
 
 impl fmt::Display for WeightedRmsNormDescriptor {
@@ -179,6 +194,29 @@ pub struct ScaledResidualRmsNormDescriptor {
     pub absmax: bool,
     /// Element type of the update and of the normalized rows.
     pub activation: DType,
+}
+
+impl ScaledResidualRmsNormDescriptor {
+    /// The compilation that adds a scaled `activation` update, with its bias when
+    /// `update_bias`, into a residual of rows of `columns` elements of `dtype` and RMS-normalizes
+    /// the sum, recording each program's largest magnitude when `absmax`. One program loads its
+    /// whole row in one tile.
+    pub fn new(
+        dtype: DType,
+        columns: u32,
+        update_bias: bool,
+        activation: DType,
+        absmax: bool,
+    ) -> Self {
+        Self {
+            dtype,
+            columns,
+            tile: row_tile(columns),
+            update_bias,
+            absmax,
+            activation,
+        }
+    }
 }
 
 impl fmt::Display for ScaledResidualRmsNormDescriptor {
@@ -343,6 +381,29 @@ pub struct ScaledResidualLayerNormDescriptor {
     pub absmax: bool,
     /// Element type of the update and of the normalized rows.
     pub activation: DType,
+}
+
+impl ScaledResidualLayerNormDescriptor {
+    /// The compilation that adds a scaled `activation` update, with its bias when
+    /// `update_bias`, into a residual of rows of `columns` elements of `dtype` and
+    /// layer-normalizes the sum, recording each program's largest magnitude when `absmax`. One
+    /// program loads its whole row in one tile.
+    pub fn new(
+        dtype: DType,
+        columns: u32,
+        update_bias: bool,
+        activation: DType,
+        absmax: bool,
+    ) -> Self {
+        Self {
+            dtype,
+            columns,
+            tile: row_tile(columns),
+            update_bias,
+            absmax,
+            activation,
+        }
+    }
 }
 
 impl fmt::Display for ScaledResidualLayerNormDescriptor {
@@ -708,6 +769,19 @@ pub struct SigmoidGatedAddDescriptor {
     pub columns: u32,
     /// The elements of a row one program walks.
     pub block: u32,
+}
+
+impl SigmoidGatedAddDescriptor {
+    /// The compilation that adds gated updates into rows of `columns` elements of `dtype`: one
+    /// program walks its row in blocks of the row's tile, at most the operators' block
+    /// ([`descriptor::BLOCK`]).
+    pub fn new(dtype: DType, columns: u32) -> Self {
+        Self {
+            dtype,
+            columns,
+            block: row_tile(columns).min(descriptor::BLOCK),
+        }
+    }
 }
 
 impl fmt::Display for SigmoidGatedAddDescriptor {

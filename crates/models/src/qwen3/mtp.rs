@@ -43,6 +43,8 @@ pub struct Mtp {
     norm: RmsNorm,
     /// The width of the rows it reads and writes.
     hidden: usize,
+    /// The query heads of this rank's attention, whose decode counters a forward clears.
+    q_heads: u32,
     cache: CacheShape,
     /// The module's path in the checkpoint, which names its profiler range.
     path: String,
@@ -109,6 +111,7 @@ impl Mtp {
             )?,
             norm: RmsNorm::load(&norm, vb.pp("norm"))?,
             hidden: text.hidden_size as usize,
+            q_heads: text.local_heads(placement.tensor)?.0,
             cache: CacheShape {
                 layers: 1,
                 kv_heads: text.local_heads(placement.tensor)?.1,
@@ -160,7 +163,7 @@ impl Drafter for Mtp {
 
             // The decode kernel's arrival counters are cleared once per forward, as the
             // model's own forward clears them.
-            functional::zero_arrival_counters_(&cache.workspace)?;
+            functional::zero_arrival_counters_(&cache.workspace, batch.rows(), self.q_heads)?;
 
             let (output, residual) = self.layer.forward(
                 &stream,

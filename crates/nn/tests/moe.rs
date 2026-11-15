@@ -31,7 +31,7 @@ const F32_TOLERANCE: f32 = 1e-4;
 const BF16_TOLERANCE: f32 = 1e-2;
 
 /// The rows of a tile.
-const TILE: usize = functional::TILE_ROWS as usize;
+const TILE: usize = ops::moe::TILE.0 as usize;
 
 /// A CPU tensor of U32 `entries` in `shape`.
 fn indices(entries: &[u32], shape: impl Into<nn::Shape>) -> Tensor {

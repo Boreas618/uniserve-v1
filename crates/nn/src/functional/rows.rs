@@ -12,11 +12,8 @@
 use ops::rows::{Args, Descriptor, Mode, Rows};
 use tensor::{DType, Tensor};
 
-use super::{PDL, on_cpu};
+use super::on_cpu;
 use crate::error::{Error, Result};
-
-/// Elements of a row one `rows` kernel handles.
-const BLOCK: u32 = 1024;
 
 /// Writes the rows of `source`, `[count, columns]`, into `destination`, `[rows, columns]` of
 /// the same element type, in place: source row `j` at destination row `indices[j]`, an I32
@@ -68,13 +65,7 @@ pub fn place_rows_(destination: &Tensor, indices: &Tensor, source: &Tensor) -> R
     }
 
     ops::launch::<Rows>(
-        &Descriptor {
-            dtype: destination.dtype(),
-            mode: Mode::Place,
-            columns: columns as u32,
-            block: BLOCK.min((columns as u32).next_power_of_two()),
-            pdl: PDL,
-        },
+        &Descriptor::new(destination.dtype(), Mode::Place, columns as u32),
         Args {
             source: ops::operand(source)?,
             destination: ops::operand(destination)?,

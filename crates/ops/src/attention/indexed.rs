@@ -82,6 +82,24 @@ pub struct IndexScoresDescriptor {
     pub block: u32,
 }
 
+/// The index keys one `index_scores` program scores.
+const SCORES_BLOCK: u32 = 256;
+
+impl IndexScoresDescriptor {
+    /// The compilation that scores `dtype` queries of `heads` heads of `width` against `keys`
+    /// index keys in groups of `groups` per page.
+    pub fn new(dtype: DType, keys: DType, heads: u32, width: u32, groups: u32) -> Self {
+        Self {
+            dtype,
+            keys,
+            heads,
+            width,
+            groups,
+            block: SCORES_BLOCK,
+        }
+    }
+}
+
 impl fmt::Display for IndexScoresDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()

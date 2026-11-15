@@ -30,8 +30,9 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi::{self, MESSAGE};
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
+use crate::launch::PDL;
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
@@ -144,6 +145,35 @@ pub struct QuantizeDescriptor {
     pub block: u32,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+}
+
+/// The operators' block is whole scale blocks, so a chunk of it has no partial block without a
+/// scale to name it.
+const _: () = assert!(descriptor::BLOCK.is_multiple_of(BLOCK_ELEMENTS));
+
+impl QuantizeDescriptor {
+    /// The compilation that encodes rows of `columns` `input` elements with block scales in
+    /// `layout`.
+    ///
+    /// One program encodes a chunk of the operators' block ([`descriptor::BLOCK`]) of a row,
+    /// which every packed product and expert block shares. The package refuses a chunk that does
+    /// not divide the row, so the chunk is halved until it divides: a row narrower than the
+    /// block, such as a mixture of experts' 768-element second encode, takes the largest chunk
+    /// that fits it.
+    pub fn new(input: DType, columns: u32, layout: ScaleLayout) -> Self {
+        let mut block = descriptor::BLOCK;
+        while block > 1 && !columns.is_multiple_of(block) {
+            block /= 2;
+        }
+
+        Self {
+            input,
+            columns,
+            layout,
+            block,
+            pdl: PDL,
+        }
+    }
 }
 
 impl fmt::Display for QuantizeDescriptor {

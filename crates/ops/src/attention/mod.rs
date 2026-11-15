@@ -96,8 +96,8 @@ pub use sparse::{SparseArgs, SparseAttention, SparseCall, SparseDescriptor};
 use std::ffi::{c_char, c_void};
 use std::fmt;
 
-use platform::{DevicePtr, Stream};
-use tensor::DType;
+use platform::{DeviceId, DevicePtr, Stream};
+use tensor::{DType, Device};
 
 use crate::abi::{self, MESSAGE};
 use crate::descriptor::Key;
@@ -111,6 +111,48 @@ use crate::{Error, Op, Result, Twins};
 /// one key-value head. The package derives it from its tile and the head group; the launch
 /// counts its grid in such tiles, read from the module it launches.
 const PREFILL_QUERY_TILE: &str = "BLOCK_Q";
+
+/// The bytes of one arrival counter of a decode's multi-block reduction.
+const COUNTER_BYTES: u64 = 4;
+
+/// The counters a decode's workspace holds come in whole groups of this many, as the kernel's
+/// semaphores expect.
+const COUNTER_GROUP: u64 = 8;
+
+/// The bytes at the head of a paged attention's workspace that hold a decode's arrival counters
+/// on `device`, for `rows` rows of `q_heads` query heads: one counter per (row, query head) pair
+/// and at least one per multiprocessor of the device, in whole groups of [`COUNTER_GROUP`], as
+/// the package's entry carves its workspace. The meta device launches no decode, so its counters
+/// are the (row, head) pairs alone.
+///
+/// A prefill's split-key scratch starts at the head of the same workspace, so a forward clears
+/// these bytes once before its first decode attention.
+///
+/// # Errors
+///
+/// [`Error::ForeignTensor`] for a device of another backend, and the driver's failure to state
+/// the multiprocessor count.
+pub fn arrival_counter_bytes(device: &Device, rows: u64, q_heads: u64) -> Result<u64> {
+    let multiprocessors = match crate::device::gpu(device, "an attention workspace")? {
+        Some(ordinal) => {
+            let id = DeviceId(i32::try_from(ordinal).map_err(|_| {
+                Error::Shape(format!("GPU {ordinal} is outside the driver's ordinals"))
+            })?);
+            u64::from(crate::moe::exchange::multiprocessors(id)?)
+        }
+        None => 0,
+    };
+
+    Ok(counter_bytes(
+        rows.saturating_mul(q_heads).max(multiprocessors),
+    ))
+}
+
+/// The bytes `slots` arrival counters take at the head of a decode's workspace: whole groups of
+/// [`COUNTER_GROUP`] counters of [`COUNTER_BYTES`] each.
+pub const fn counter_bytes(slots: u64) -> u64 {
+    slots.next_multiple_of(COUNTER_GROUP) * COUNTER_BYTES
+}
 
 /// Which half of a batch's attention work a module serves.
 ///

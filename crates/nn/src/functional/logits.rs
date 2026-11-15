@@ -8,14 +8,11 @@
 use ops::logits::{UnpadArgs, UnpadDescriptor, VocabUnpad};
 use tensor::{DType, Tensor};
 
-use super::{PDL, on_cpu};
+use super::on_cpu;
 use crate::error::{Error, Result};
 
 /// The element type of the logits a head returns: the sampler reads FP32.
 pub const LOGITS: DType = DType::F32;
-
-/// Elements one `vocab_unpad` kernel handles.
-const BLOCK: u32 = 1024;
 
 /// The `[rows, vocabulary]` logits, in [`LOGITS`], of `gathered`: the shards of `ranks` ranks as
 /// a collective gather lays them, one `[rows, width]` block per rank in rank order, stated as one
@@ -70,15 +67,13 @@ pub fn vocab_unpad(gathered: &Tensor, vocabulary: u32, ranks: u32) -> Result<Ten
         // The gathered width is a launch value that follows the deployment's rank count; the
         // two element types are separate because the head's product is in the model's type and
         // the sampler reads FP32: the logits are widened here, once.
-        &UnpadDescriptor {
-            dtype: gathered.dtype(),
-            output: LOGITS,
+        &UnpadDescriptor::new(
+            gathered.dtype(),
+            LOGITS,
             vocabulary,
-            padded: u32::try_from(padded)
+            u32::try_from(padded)
                 .map_err(|_| Error::shape(OWNER, "a gathered width above u32::MAX"))?,
-            block: BLOCK,
-            pdl: PDL,
-        },
+        ),
         UnpadArgs {
             gathered: ops::operand(gathered)?,
             out: ops::operand(&out)?,

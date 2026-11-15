@@ -25,8 +25,9 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::{Float, Key};
+use crate::descriptor::{Float, Key, row_tile};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::launch::PDL;
 use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
@@ -564,6 +565,20 @@ mod compose_gated_rows_tests {
 pub struct SelectTilesDescriptor {
     /// The lanes one program loads: the tile count rounded up to a power of two.
     pub block: u32,
+}
+
+/// The fewest tiles a selection's program is compiled to rank, however few a layout holds.
+const SELECT_FLOOR: u32 = 256;
+
+impl SelectTilesDescriptor {
+    /// The compilation that ranks layouts of `tiles` tiles: the program masks the tiles past the
+    /// layout's own, so one compilation ranks every layout up to its power of two, and at least
+    /// [`SELECT_FLOOR`].
+    pub fn new(tiles: u32) -> Self {
+        Self {
+            block: row_tile(tiles.max(SELECT_FLOOR)),
+        }
+    }
 }
 
 impl fmt::Display for SelectTilesDescriptor {
@@ -1147,12 +1162,14 @@ impl ScoresDescriptor {
     /// `vsa_prepare_tiles` writes each tile's per-head means as FP32 — the accumulation its pooling
     /// runs in — and the reference computes the similarities in FP32 as well, so a BF16 or F16
     /// product would have to narrow operands that are already FP32.
-    pub fn new(heads: u32, width: u32, block: u32, pdl: bool) -> Self {
+    ///
+    /// One program loads a whole head row in one tile.
+    pub fn new(heads: u32, width: u32) -> Self {
         Self {
             heads,
             width,
-            block,
-            pdl,
+            block: row_tile(width),
+            pdl: PDL,
         }
     }
 }
@@ -1331,7 +1348,7 @@ mod scores_tests {
 
     #[test]
     fn the_key_names_the_contraction_and_the_lanes() {
-        let descriptor = ScoresDescriptor::new(56, 128, 128, false);
+        let descriptor = ScoresDescriptor::new(56, 128);
         assert_eq!(
             descriptor.to_string(),
             "heads_56_width_128_block_128_pdl_false"
@@ -1342,8 +1359,8 @@ mod scores_tests {
     fn the_bound_is_the_contraction_and_the_accumulator() {
         // Two widths differ only in the reduction length, and the bound follows it: a wider
         // contraction cannot share a bound with a narrower one, which is why `width` is a key field.
-        let narrow = VsaScores::tolerance(&ScoresDescriptor::new(56, 64, 64, false));
-        let wide = VsaScores::tolerance(&ScoresDescriptor::new(56, 256, 256, false));
+        let narrow = VsaScores::tolerance(&ScoresDescriptor::new(56, 64));
+        let wide = VsaScores::tolerance(&ScoresDescriptor::new(56, 256));
         assert!(wide.rtol > narrow.rtol);
     }
 }
@@ -1378,21 +1395,15 @@ impl CompressPooledDescriptor {
     /// The scores and the pooled values are FP32 and only the result narrows: `vsa_prepare_tiles`
     /// pools in FP32 and the reference's softmax runs in FP32, so a descriptor naming a narrower
     /// operand would describe a program that narrows before the softmax and biases every weight.
-    pub fn new(
-        dtype: DType,
-        heads: u32,
-        width: u32,
-        max_tiles: u32,
-        block: u32,
-        pdl: bool,
-    ) -> Self {
+    /// One program loads a whole head row in one tile.
+    pub fn new(dtype: DType, heads: u32, width: u32, max_tiles: u32) -> Self {
         Self {
             dtype,
             heads,
             width,
             max_tiles,
-            block,
-            pdl,
+            block: row_tile(width),
+            pdl: PDL,
         }
     }
 }
@@ -1610,7 +1621,7 @@ mod compress_pooled_tests {
 
     #[test]
     fn the_key_names_the_geometry_the_tile_bound_and_the_lanes() {
-        let descriptor = CompressPooledDescriptor::new(DType::BF16, 56, 128, 4_096, 128, false);
+        let descriptor = CompressPooledDescriptor::new(DType::BF16, 56, 128, 4_096);
         assert_eq!(
             descriptor.to_string(),
             "dtype_bf16_heads_56_width_128_max_tiles_4096_block_128_pdl_false"
@@ -1624,16 +1635,12 @@ mod compress_pooled_tests {
             56,
             128,
             1_024,
-            128,
-            false,
         ));
         let wide = VsaCompressPooled::tolerance(&CompressPooledDescriptor::new(
             DType::F32,
             56,
             128,
             8_192,
-            128,
-            false,
         ));
         assert!(wide.rtol > narrow.rtol);
         // The output's rounding is in the bound: a narrower result type cannot share it.
@@ -1642,8 +1649,6 @@ mod compress_pooled_tests {
             56,
             128,
             1_024,
-            128,
-            false,
         ));
         assert!(narrowed.rtol > narrow.rtol);
     }

@@ -42,7 +42,7 @@ use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
-use super::{address, to_i64};
+use super::{CLUSTER, TILE, address, to_i64};
 
 /// Refuses the exact GELU: a FC1 gates with `silu` or `gelu_tanh`, the two its kernels compile.
 fn require_gate(operator: &'static str, activation: Activation) -> Result<()> {
@@ -73,6 +73,31 @@ pub struct GatherGemmDescriptor {
     pub tile: (u32, u32),
     /// The cluster shape the package compiled for: rows by columns.
     pub cluster: (u32, u32),
+}
+
+impl GatherGemmDescriptor {
+    /// The compilation of the gated product of `top` routes over `experts` experts of
+    /// `intermediate` gated width from `hidden`-wide `dtype` rows, gated by `activation`, at the
+    /// products' tile and cluster.
+    pub fn new(
+        hidden: u32,
+        intermediate: u32,
+        experts: u32,
+        top: u32,
+        activation: Activation,
+        dtype: DType,
+    ) -> Self {
+        Self {
+            hidden,
+            intermediate,
+            experts,
+            top,
+            activation,
+            dtype,
+            tile: TILE,
+            cluster: CLUSTER,
+        }
+    }
 }
 
 impl fmt::Display for GatherGemmDescriptor {
@@ -113,6 +138,23 @@ pub struct RouteGemmDescriptor {
     pub tile: (u32, u32),
     /// The cluster shape the package compiled for: rows by columns.
     pub cluster: (u32, u32),
+}
+
+impl RouteGemmDescriptor {
+    /// The compilation of the second product of `top` routes over `experts` experts from
+    /// `intermediate`-wide `dtype` rows into `hidden` columns, at the products' tile and
+    /// cluster.
+    pub fn new(hidden: u32, intermediate: u32, experts: u32, top: u32, dtype: DType) -> Self {
+        Self {
+            hidden,
+            intermediate,
+            experts,
+            top,
+            dtype,
+            tile: TILE,
+            cluster: CLUSTER,
+        }
+    }
 }
 
 impl fmt::Display for RouteGemmDescriptor {
@@ -558,6 +600,43 @@ pub struct GatherGemmNvfp4Descriptor {
     pub tile: (u32, u32),
     /// The cluster shape the package compiled for: rows by columns.
     pub cluster: (u32, u32),
+}
+
+/// The bytes an encoded product's entry writes before the package's workspace: a header that
+/// holds the padded route count.
+const ENTRY_PREAMBLE: u64 = 16;
+
+/// The workspace an encoded product of `routes` permuted rows and `width` output columns at
+/// `tile` and `cluster` asks for, in bytes: the package's own sizing of its row-maximum planes
+/// and tile bars, each padded to a kibibyte, its scheduler's counter, and the entry's preamble
+/// before them.
+///
+/// The size follows from a bucket's worst-case route count, so every replay of a captured bucket
+/// takes the same bytes.
+fn packed_workspace(routes: u64, width: u64, tile: (u32, u32), cluster: (u32, u32)) -> u64 {
+    let kibibytes = |bytes: u64| bytes.div_ceil(1024) * 1024;
+    let token_tile = u64::from(tile.0) * u64::from(cluster.0);
+    let padded = routes.max(1).div_ceil(token_tile) * token_tile;
+
+    // One FP32 row maximum per 128 elements of the padded tile grid.
+    let row_maxima = width * padded / 128 * 4;
+    // One half-word of tile bars per (token tile, width tile) pair.
+    let bars = (padded / token_tile) * width.div_ceil(u64::from(tile.1)) / 2 * 4;
+
+    ENTRY_PREAMBLE + kibibytes(row_maxima) + kibibytes(bars) + 4
+}
+
+impl GatherGemmNvfp4Descriptor {
+    /// The bytes of workspace a launch of `routes` permuted rows takes: the package's sizing over
+    /// the gated product's `2 · intermediate` output columns.
+    pub fn workspace_bytes(&self, routes: u64) -> u64 {
+        packed_workspace(
+            routes,
+            2 * u64::from(self.intermediate),
+            self.tile,
+            self.cluster,
+        )
+    }
 }
 
 impl fmt::Display for GatherGemmNvfp4Descriptor {
@@ -1148,6 +1227,24 @@ mod nvfp4_tests {
         );
     }
 
+    /// The workspaces follow the package's arithmetic over a bucket's route count: 15 tokens over
+    /// 128 experts are 120 tiles of 128 permuted rows, for which the gated product (1536 columns)
+    /// asks 16 + 740 356 bytes and the second (2048 columns) 16 + 987 140; a bucket of a single
+    /// tile still carries the entry's preamble.
+    #[test]
+    fn a_workspace_is_sized_from_the_route_count() {
+        let (gated, second) = (descriptor(), route_descriptor());
+
+        assert_eq!(gated.workspace_bytes(15_360), 740_372);
+        assert_eq!(second.workspace_bytes(15_360), 987_156);
+        assert_eq!(gated.workspace_bytes(8), 7_188);
+        assert_eq!(second.workspace_bytes(8), 9_236);
+
+        // The size grows with the routes and stays far below a fixed floor of mebibytes.
+        assert!(second.workspace_bytes(4096) > second.workspace_bytes(8));
+        assert!(second.workspace_bytes(4096) < 16 << 20);
+    }
+
     #[test]
     fn the_scale_table_covers_the_contraction_in_blocks_of_sixteen() {
         // The scales are one per sixteen elements *along the contraction*, one row per output row:
@@ -1190,6 +1287,14 @@ pub struct RouteGemmNvfp4Descriptor {
     pub tile: (u32, u32),
     /// The cluster shape the package compiled for: rows by columns.
     pub cluster: (u32, u32),
+}
+
+impl RouteGemmNvfp4Descriptor {
+    /// The bytes of workspace a launch of `routes` permuted rows takes: the package's sizing over
+    /// the product's `hidden` output columns.
+    pub fn workspace_bytes(&self, routes: u64) -> u64 {
+        packed_workspace(routes, u64::from(self.hidden), self.tile, self.cluster)
+    }
 }
 
 impl fmt::Display for RouteGemmNvfp4Descriptor {

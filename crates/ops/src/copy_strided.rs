@@ -52,13 +52,14 @@ pub struct Descriptor {
 
 impl Descriptor {
     /// The descriptor of the call `args` makes, over the operators' block
-    /// ([`descriptor::BLOCK`]).
-    pub fn of(args: &Args, pdl: bool) -> Self {
+    /// ([`descriptor::BLOCK`]), in the launch variant
+    /// the backend launches every kernel in.
+    pub fn of(args: &Args) -> Self {
         Self {
             dtype: args.source.dtype,
             rank: strided::rank([&args.source, &args.destination]),
             block: descriptor::BLOCK,
-            pdl,
+            pdl: crate::launch::PDL,
         }
     }
 }
@@ -177,7 +178,7 @@ mod tests {
     }
 
     fn refusal(args: &Args) -> String {
-        CopyStrided::check(&Descriptor::of(args, false), args)
+        CopyStrided::check(&Descriptor::of(args), args)
             .unwrap_err()
             .to_string()
     }
@@ -188,7 +189,7 @@ mod tests {
             source: contiguous(0x1000, &[4, 8]),
             destination: contiguous(0x2000, &[4, 8]),
         };
-        let descriptor = Descriptor::of(&args, false);
+        let descriptor = Descriptor::of(&args);
         assert_eq!(
             descriptor.to_string(),
             "dtype_bf16_rank_1_block_1024_pdl_false"
@@ -204,7 +205,7 @@ mod tests {
             source: operand(0x1000, &[5, 2, 3], &[1, 15, 5]),
             destination: contiguous(0x2000, &[5, 2, 3]),
         };
-        let descriptor = Descriptor::of(&args, false);
+        let descriptor = Descriptor::of(&args);
         assert_eq!(descriptor.rank, 2);
         CopyStrided::check(&descriptor, &args).unwrap();
 
@@ -213,7 +214,7 @@ mod tests {
             source: operand(0x1000, &[4, 8], &[0, 1]),
             destination: contiguous(0x2000, &[4, 8]),
         };
-        let descriptor = Descriptor::of(&args, false);
+        let descriptor = Descriptor::of(&args);
         assert_eq!(descriptor.rank, 2);
         CopyStrided::check(&descriptor, &args).unwrap();
     }
@@ -226,7 +227,7 @@ mod tests {
             source: operand(0x1000, &[3, 8], &[16, 1]),
             destination: operand(0x2000, &[3, 8], &[20, 1]),
         };
-        let descriptor = Descriptor::of(&args, false);
+        let descriptor = Descriptor::of(&args);
         assert_eq!(descriptor.rank, 2);
         CopyStrided::check(&descriptor, &args).unwrap();
 
@@ -235,7 +236,7 @@ mod tests {
             source: operand(0x1000, &[3, 8], &[8, 1]),
             destination: operand(0x2000, &[3, 8], &[8, 1]),
         };
-        assert_eq!(Descriptor::of(&args, false).rank, 1);
+        assert_eq!(Descriptor::of(&args).rank, 1);
     }
 
     #[test]
@@ -247,7 +248,7 @@ mod tests {
             source: source.clone(),
             destination: operand(0x2000, &[4, 8], &[32, 1]),
         };
-        CopyStrided::check(&Descriptor::of(&window, false), &window).unwrap();
+        CopyStrided::check(&Descriptor::of(&window), &window).unwrap();
 
         // A permuted destination is no window.
         let permuted = Args {
@@ -307,7 +308,7 @@ mod tests {
 
         // A permuted FP8 view made contiguous.
         let narrow = of(DType::F8E4M3, &[1, 15, 5]);
-        let descriptor = Descriptor::of(&narrow, false);
+        let descriptor = Descriptor::of(&narrow);
         assert_eq!(
             descriptor.to_string(),
             "dtype_f8e4m3_rank_2_block_1024_pdl_false"

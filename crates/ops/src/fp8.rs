@@ -30,7 +30,7 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
@@ -65,6 +65,16 @@ pub struct Fp8QuantizeDescriptor {
     pub dtype: DType,
     /// Elements of a row one program encodes; a power of two.
     pub block: u32,
+}
+
+impl Fp8QuantizeDescriptor {
+    /// The compilation that encodes `dtype` activations.
+    pub fn new(dtype: DType) -> Self {
+        Self {
+            dtype,
+            block: descriptor::BLOCK,
+        }
+    }
 }
 
 impl fmt::Display for Fp8QuantizeDescriptor {
@@ -184,6 +194,25 @@ pub struct Fp8GemmDescriptor {
     pub block_k: u32,
     /// Whether a bias of the output's columns is added.
     pub bias: bool,
+}
+
+/// The tile an `fp8_gemm` program covers, `(rows, output columns, contraction elements)`: one
+/// program set serves every projection.
+const GEMM_TILE: (u32, u32, u32) = (128, 128, 128);
+
+impl Fp8GemmDescriptor {
+    /// The compilation of a product into `dtype` rows, adding a bias when `bias`.
+    pub fn new(dtype: DType, bias: bool) -> Self {
+        let (block_m, block_n, block_k) = GEMM_TILE;
+
+        Self {
+            dtype,
+            block_m,
+            block_n,
+            block_k,
+            bias,
+        }
+    }
 }
 
 impl fmt::Display for Fp8GemmDescriptor {

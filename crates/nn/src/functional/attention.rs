@@ -40,22 +40,13 @@ use tensor::{D, DType, Device, Shape, Tensor};
 
 use super::nvfp4::integer;
 use super::rotary::heads_of;
-use super::{ACCUMULATE, PDL, on_cpu};
+use super::{ACCUMULATE, on_cpu};
 use crate::capability::{KvCache, KvPlanes, NO_SLOT, TokenBatch};
 use crate::error::{Error, Result};
-
-/// Bytes at the head of the paged kernel's workspace that hold the decode's arrival counters:
-/// four bytes per row and query head, at least one per multiprocessor, for any bucket.
-const COUNTER_BYTES: usize = 1 << 20;
 
 /// The floor under a page's largest magnitude, so a write of zeros still has a scale to divide
 /// by.
 const SCALE_FLOOR: f32 = 1e-12;
-
-/// The elements of one cache row a `kv_write` kernel covers.
-fn kv_tile(head_dim: u32) -> u32 {
-    head_dim.clamp(1, 128).next_power_of_two().min(128)
-}
 
 /// A history window as a launch states it: the keys before a query's own it sees, or `-1` for
 /// no window.
@@ -840,15 +831,7 @@ pub fn kv_write_(
 
     ops::launch::<KvWrite>(
         // The projection's type and the plane's are both key fields.
-        &kv::Descriptor {
-            dtype: key.dtype(),
-            kv: planes.key.dtype(),
-            page,
-            heads,
-            head_dim,
-            tile: kv_tile(head_dim),
-            pdl: PDL,
-        },
+        &kv::Descriptor::new(key.dtype(), planes.key.dtype(), page, heads, head_dim),
         kv::Args {
             key: ops::operand(key)?,
             value: ops::operand(value)?,
@@ -875,15 +858,13 @@ fn write_scaled(
 
     // One descriptor serves both planes: the projections are one element type, which
     // `kv_write_` has checked.
-    let descriptor = kv::ScaledWriteDescriptor {
-        dtype: key.dtype(),
-        scale: DType::F32,
+    let descriptor = kv::ScaledWriteDescriptor::new(
+        key.dtype(),
+        DType::F32,
         page,
-        heads: heads as u32,
-        head_dim: head_dim as u32,
-        block: kv_tile(head_dim as u32),
-        pdl: PDL,
-    };
+        heads as u32,
+        head_dim as u32,
+    );
 
     for (name, plane, scale, flags, source) in [
         (
@@ -1064,21 +1045,27 @@ fn write_scaled_formula(
 }
 
 /// Zeroes the arrival counters at the head of `workspace`, a cache's `[bytes]` U8 kernel
-/// workspace, in place: once per forward, before its first [`paged_attention`].
+/// workspace, in place: once per forward of `rows` batch rows over attention layers of
+/// `q_heads` query heads, before its first [`paged_attention`].
 ///
 /// The decode kernel splits a row's keys over thread blocks and counts their arrivals at the
 /// head of its workspace; it needs that count at zero on entry and leaves it at zero itself. A
-/// workspace holds whatever an earlier forward of another shape left there, and a stale count
-/// reduces a row before its blocks are in, so a forward clears it once and every layer of the
-/// forward then finds it as the layer before left it.
+/// workspace holds whatever an earlier forward of another shape left there, a prefill's scratch
+/// among it, and a stale count reduces a row before its blocks are in, so a forward clears the
+/// counters its decode reads ([`ops::attention::arrival_counter_bytes`]) once and every layer
+/// of the forward then finds them as the layer before left them. The CPU attention keeps no
+/// counters, so on the CPU there is nothing to clear.
 ///
 /// # Errors
 ///
-/// When the workspace is not a vector of bytes, or the fill cannot be issued.
-pub fn zero_arrival_counters_(workspace: &Tensor) -> Result<()> {
+/// When the workspace is not a vector of bytes or is smaller than the counters, or the fill
+/// cannot be issued.
+pub fn zero_arrival_counters_(workspace: &Tensor, rows: usize, q_heads: u32) -> Result<()> {
+    const OWNER: &str = "zero_arrival_counters_";
+
     if workspace.rank() != 1 || workspace.dtype() != DType::U8 {
         return Err(Error::shape(
-            "zero_arrival_counters_",
+            OWNER,
             format!(
                 "the workspace is {} {:?}, a vector of bytes expected",
                 ops::abi::name(workspace.dtype()),
@@ -1086,7 +1073,24 @@ pub fn zero_arrival_counters_(workspace: &Tensor) -> Result<()> {
             ),
         ));
     }
+    if on_cpu(workspace) {
+        return Ok(());
+    }
 
-    let counters = workspace.elem_count().min(COUNTER_BYTES);
+    let counters =
+        ops::attention::arrival_counter_bytes(workspace.device(), rows as u64, q_heads.into())?;
+    let counters = usize::try_from(counters)
+        .ok()
+        .filter(|counters| *counters <= workspace.elem_count())
+        .ok_or_else(|| {
+            Error::shape(
+                OWNER,
+                format!(
+                    "a workspace of {} bytes holds no {counters} bytes of arrival counters for \
+                     {rows} rows of {q_heads} query heads",
+                    workspace.elem_count()
+                ),
+            )
+        })?;
     Ok(workspace.narrow(0, 0, counters)?.zero_set()?)
 }

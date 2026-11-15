@@ -784,7 +784,7 @@ fn a_split_head_gathers_the_shards_of_its_group() {
     let store = MetaWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
 
-    // Rank 1 holds rows 16..32, a whole number of the head's eight-row tiles.
+    // Rank 1 holds rows 16..32, as many as rank 0.
     let head = LmHead::load(
         &LmHeadConfig {
             vocabulary: 32,
@@ -794,7 +794,6 @@ fn a_split_head_gathers_the_shards_of_its_group() {
         loader.root().pp("lm_head"),
     )
     .unwrap();
-    assert_eq!(head.padded(), 16);
 
     let (output, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
         let logits = head.forward(&meta((3, 8), DType::BF16))?;
@@ -856,26 +855,34 @@ fn a_whole_head_gathers_nothing_in_a_group_that_splits_something_else() {
     assert_eq!(in_group, outside);
 }
 
-/// A shard that is not a whole number of tiles has no padded rows in the checkpoint to read:
-/// the next rank's rows follow it, so the head is refused at load.
+/// A split whose last shard is shorter than its peers has no checkpoint rows to fill its block
+/// of the gather with, so the head is refused at load; a split into equal shards of any width
+/// loads.
 #[test]
-fn a_shard_of_a_partial_tile_is_refused_at_load() {
-    let directory = tempfile::tempdir().unwrap();
-    let checkpoint = head_checkpoint(directory.path(), 30);
-    let store = MetaWeights::new();
-    let loader = WeightLoader::new(&checkpoint, &store, None);
+fn a_shard_shorter_than_its_peers_is_refused_at_load() {
+    let load = |vocabulary: u32| {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = head_checkpoint(directory.path(), vocabulary as usize);
+        let store = MetaWeights::new();
+        let loader = WeightLoader::new(&checkpoint, &store, None);
 
-    let refused = LmHead::load(
-        &LmHeadConfig {
-            vocabulary: 30,
-            hidden: 8,
-            split: Split { size: 2, rank: 1 },
-        },
-        loader.root().pp("lm_head"),
-    )
-    .err()
-    .expect("fifteen rows");
+        LmHead::load(
+            &LmHeadConfig {
+                vocabulary,
+                hidden: 8,
+                split: Split { size: 2, rank: 1 },
+            },
+            loader.root().pp("lm_head"),
+        )
+        .map(|_| ())
+    };
+
+    // Thirty-one rows: rank 1 holds fifteen beside rank 0's sixteen.
+    let refused = load(31).expect_err("a shorter last shard");
     assert!(refused.to_string().contains("15"), "{refused}");
+
+    // Thirty rows: fifteen on each rank.
+    load(30).unwrap();
 }
 
 #[test]

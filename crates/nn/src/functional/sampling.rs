@@ -40,16 +40,17 @@ use ops::Operand;
 use ops::norm::{Softmax, SoftmaxArgs, SoftmaxDescriptor};
 use ops::sampler::{
     ArgMax, ArgMaxArgs, ArgMaxDescriptor, CandidateOrder, FilterArgs, FilterCandidates,
-    FilterDescriptor, InverseCdf, InverseCdfArgs, InverseCdfDescriptor, LogSoftmax, LogSoftmaxArgs,
-    LogSoftmaxDescriptor, LogitsShape, LogprobArgs, LogprobDescriptor, LogprobGather, OrderArgs,
-    OrderDescriptor, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor, TopLogprobs,
-    TopLogprobsArgs, TopLogprobsDescriptor, ban_words, top_k_workspace, top_logprobs_chunks,
+    FilterDescriptor, INDEX, InverseCdf, InverseCdfArgs, InverseCdfDescriptor, LogSoftmax,
+    LogSoftmaxArgs, LogSoftmaxDescriptor, LogitsShape, LogprobArgs, LogprobDescriptor,
+    LogprobGather, OrderArgs, OrderDescriptor, ShapeArgs, ShapeDescriptor, TopK, TopKArgs,
+    TopKDescriptor, TopLogprobs, TopLogprobsArgs, TopLogprobsDescriptor, ban_words,
+    top_k_workspace,
 };
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE, TOP_K, TOP_P};
 use tensor::{D, DType, Device, Tensor};
 
 use super::nvfp4::integer;
-use super::{ACCUMULATE, PDL, as_rows, like_rows, on_cpu, row_tile};
+use super::{ACCUMULATE, as_rows, like_rows, on_cpu};
 use crate::capability::NO_SLOT;
 use crate::error::{Error, Result};
 
@@ -65,31 +66,6 @@ const FREQUENCY: usize = 5;
 
 /// The offset of the presence penalty among a row's parameters.
 const PRESENCE: usize = 6;
-
-/// Columns one kernel of the candidates' filter, distribution and draw reads at a time: a
-/// chunk of the row, so a candidate width may be the whole vocabulary.
-const CANDIDATE_TILE: u32 = 8192;
-
-/// Columns one program of `logits_shape` shapes: one register tile of its kernel, so a row is
-/// shaped by `ceil(vocabulary / SHAPE_TILE)` programs side by side. The shaping is one element
-/// at a time, so the tile changes no value; a program per row would leave a decode step's few
-/// rows to as few programs, each walking a vocabulary-wide row alone.
-const SHAPE_TILE: u32 = 4096;
-
-/// Columns one pass of `top_k` reads: the only size its key names, since the vocabulary and
-/// the kept count are launch values.
-const TOP_TILE: u32 = 2048;
-
-/// Columns one kernel of the first `top_logprobs` selection reads: a vocabulary-wide row is
-/// selected in chunks of this many columns in parallel.
-const LOGPROB_TILE: u32 = 4096;
-
-/// The widest row one `top_logprobs` kernel selects from, which bounds the chunks' candidates
-/// the second selection reads.
-const LOGPROB_MAX_TILE: u32 = 8192;
-
-/// The element type the sampling kernels read an index as.
-const INDEX: DType = DType::I32;
 
 /// The first index the kernels read as negative: an index at or above it names nothing.
 const UNNAMED: u32 = 1 << 31;
@@ -417,14 +393,12 @@ pub fn logits_shape(
 
     let out = ops::empty((rows, width), DType::F32)?;
     ops::launch::<LogitsShape>(
-        &ShapeDescriptor {
-            dtype: logits.dtype(),
+        &ShapeDescriptor::new(
+            logits.dtype(),
             vocabulary,
-            block: SHAPE_TILE.min(row_tile(vocabulary)),
-            extras: extent(OWNER, "extra tokens", extra_columns)?,
-            divide: true,
-            pdl: PDL,
-        },
+            extent(OWNER, "extra tokens", extra_columns)?,
+            true,
+        ),
         ShapeArgs {
             logits: ops::operand(logits)?,
             counts: ops::operand(counts)?,
@@ -481,14 +455,7 @@ pub fn top_k(logits: &Tensor, width: u32) -> Result<(Tensor, Tensor)> {
     let workspace = ops::empty((rows, scratch[1] as usize), DType::I32)?;
 
     ops::launch::<TopK>(
-        &TopKDescriptor {
-            dtype: logits.dtype(),
-            vocabulary,
-            width,
-            tile: TOP_TILE,
-            ids: INDEX,
-            pdl: PDL,
-        },
+        &TopKDescriptor::new(logits.dtype(), vocabulary, width),
         TopKArgs {
             logits: ops::operand(logits)?,
             values: ops::operand(&values)?,
@@ -616,12 +583,7 @@ pub fn filter_candidates_(
 
     let valid = ops::empty(rows, DType::I32)?;
     ops::launch::<FilterCandidates>(
-        &FilterDescriptor {
-            width: extent(OWNER, "candidates", width)?,
-            tile: CANDIDATE_TILE,
-            ids: INDEX,
-            pdl: PDL,
-        },
+        &FilterDescriptor::new(extent(OWNER, "candidates", width)?),
         FilterArgs {
             values: ops::operand(&values)?,
             ids: signed(ids)?,
@@ -696,11 +658,7 @@ pub fn candidate_order(values: &Tensor, ids: &Tensor, vocabulary: u32) -> Result
     let counts = ops::empty((rows, vocabulary as usize), DType::I32)?;
 
     ops::launch::<CandidateOrder>(
-        &OrderDescriptor {
-            values: DType::F32,
-            ids: INDEX,
-            pdl: PDL,
-        },
+        &OrderDescriptor::new(),
         OrderArgs {
             values: ops::operand(values)?,
             ids: signed(ids)?,
@@ -741,12 +699,7 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
     let out = ops::empty(rows.shape(), x.dtype())?;
 
     ops::launch::<Softmax>(
-        &SoftmaxDescriptor {
-            dtype: x.dtype(),
-            columns: width,
-            tile: CANDIDATE_TILE,
-            pdl: PDL,
-        },
+        &SoftmaxDescriptor::new(x.dtype(), width),
         SoftmaxArgs {
             x: ops::operand(&rows)?,
             out: ops::operand(&out)?,
@@ -817,13 +770,7 @@ pub fn inverse_cdf(probabilities: &Tensor, ids: &Tensor, draws: &Tensor) -> Resu
 
     let tokens = ops::empty(rows, DType::U32)?;
     ops::launch::<InverseCdf>(
-        &InverseCdfDescriptor {
-            width: extent(OWNER, "candidates", width)?,
-            tile: CANDIDATE_TILE,
-            ids: INDEX,
-            tokens: INDEX,
-            pdl: PDL,
-        },
+        &InverseCdfDescriptor::new(extent(OWNER, "candidates", width)?),
         InverseCdfArgs {
             probabilities: ops::operand(probabilities)?,
             ids: signed(ids)?,
@@ -867,12 +814,7 @@ pub fn argmax(values: &Tensor) -> Result<Tensor> {
 
     let out = ops::empty(rows, DType::U32)?;
     ops::launch::<ArgMax>(
-        &ArgMaxDescriptor {
-            dtype: values.dtype(),
-            width,
-            ids: INDEX,
-            pdl: PDL,
-        },
+        &ArgMaxDescriptor::new(values.dtype(), width),
         ArgMaxArgs {
             values: ops::operand(values)?,
             out: signed(&out)?,
@@ -906,12 +848,7 @@ pub fn log_softmax(logits: &Tensor) -> Result<Tensor> {
 
     let out = ops::empty((rows, width), DType::F32)?;
     ops::launch::<LogSoftmax>(
-        &LogSoftmaxDescriptor {
-            dtype: logits.dtype(),
-            columns,
-            tile: row_tile(columns),
-            pdl: PDL,
-        },
+        &LogSoftmaxDescriptor::new(logits.dtype(), columns),
         LogSoftmaxArgs {
             x: ops::operand(logits)?,
             out: ops::operand(&out)?,
@@ -971,12 +908,7 @@ pub fn logprob_gather(logprobs: &Tensor, tokens: &Tensor) -> Result<(Tensor, Ten
     let ranks = ops::empty(rows, DType::I32)?;
 
     ops::launch::<LogprobGather>(
-        &LogprobDescriptor {
-            columns,
-            ids: INDEX,
-            tile: row_tile(columns),
-            pdl: PDL,
-        },
+        &LogprobDescriptor::new(columns),
         LogprobArgs {
             logprobabilities: ops::operand(logprobs)?,
             tokens: signed(tokens)?,
@@ -1014,18 +946,9 @@ pub fn top_logprobs(logprobs: &Tensor, candidates: u32) -> Result<(Tensor, Tenso
         &[Some(rows), Some(width)],
     )?;
 
-    // What the first selection keeps of a row, which the second selection reads whole.
-    let chunk_candidates = top_logprobs_chunks(width as u64, LOGPROB_TILE) * u64::from(candidates);
-    let merge_tile = chunk_candidates.next_power_of_two();
-    if candidates == 0 || merge_tile > u64::from(LOGPROB_MAX_TILE) {
-        return Err(Error::shape(
-            OWNER,
-            format!(
-                "{candidates} candidates keep {chunk_candidates} of the chunks of a row of \
-                 {width}: one to {LOGPROB_MAX_TILE} expected"
-            ),
-        ));
-    }
+    // The two selections, and what the first keeps of a row, which the second reads whole.
+    let (chunks, merge) = TopLogprobsDescriptor::selections(width as u64, candidates)?;
+    let chunk_candidates = chunks.written(width as u64);
     let kept = candidates as usize;
 
     if on_cpu(logprobs) {
@@ -1059,13 +982,6 @@ pub fn top_logprobs(logprobs: &Tensor, candidates: u32) -> Result<(Tensor, Tenso
 
     let chunk_values = ops::empty((rows, chunk_candidates as usize), DType::F32)?;
     let chunk_ids = ops::empty((rows, chunk_candidates as usize), DType::U32)?;
-    let chunks = TopLogprobsDescriptor {
-        candidates,
-        tile: LOGPROB_TILE,
-        indirect: false,
-        pdl: PDL,
-    };
-
     ops::launch::<TopLogprobs>(
         &chunks,
         TopLogprobsArgs {
@@ -1080,13 +996,9 @@ pub fn top_logprobs(logprobs: &Tensor, candidates: u32) -> Result<(Tensor, Tenso
     let ids = ops::empty((rows, kept), DType::U32)?;
 
     ops::launch::<TopLogprobs>(
-        // The second selection reads each candidate's id beside it, and its one chunk is the
-        // chunks' candidates rounded up to the power of two a kernel's width is.
-        &TopLogprobsDescriptor {
-            tile: merge_tile as u32,
-            indirect: true,
-            ..chunks
-        },
+        // The second selection reads each candidate's id beside it, in one chunk of the chunks'
+        // candidates.
+        &merge,
         TopLogprobsArgs {
             values: ops::operand(&chunk_values)?,
             ids: Some(signed(&chunk_ids)?),

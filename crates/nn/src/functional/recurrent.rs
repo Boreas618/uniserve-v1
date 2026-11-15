@@ -47,7 +47,7 @@ use std::ops::Range;
 
 pub use ops::recurrent::StateAxes;
 use ops::recurrent::{
-    CausalConv1d, CausalConv1dArgs, CausalConv1dDescriptor, Form, GatedDeltaRule,
+    CausalConv1d, CausalConv1dArgs, CausalConv1dDescriptor, DELTA_RULE_CHUNK, Form, GatedDeltaRule,
     GatedDeltaRuleArgs, GatedDeltaRuleDescriptor, RequestSlots, RowColumns, Trail,
 };
 use proto::module::Phase;
@@ -56,17 +56,6 @@ use tensor::{D, DType, Device, Tensor};
 use super::{ACCUMULATE, on_cpu, vector};
 use crate::capability::{NO_SLOT, RecurrentState, TokenBatch, VerifySlots};
 use crate::error::{Error, Result};
-
-/// Channels one `causal_conv1d` kernel covers.
-const CONV_BLOCK: u32 = 256;
-
-/// Tokens of one chunk of the chunked delta rule: a cache page holds a whole number of them,
-/// so a checkpoint at a page boundary lands on a chunk end.
-pub const DELTA_RULE_CHUNK: u32 = 64;
-
-/// Value columns one `gated_delta_rule` kernel owns of a head's state; the chunked form's
-/// tensor memory holds `2 · chunk + 4 · block` columns, which bounds it at 64.
-const DELTA_RULE_BLOCK: u32 = 64;
 
 /// The floor under the square root of a query's or a key's normalization.
 const L2_EPS: f64 = 1e-6;
@@ -415,16 +404,15 @@ pub fn causal_conv1d(
 
     let out = ops::empty((tokens, channels), x.dtype())?;
     ops::launch::<CausalConv1d>(
-        &CausalConv1dDescriptor {
-            dtype: x.dtype(),
-            channels: channels as u32,
-            width: width as u32,
-            block: CONV_BLOCK.min((channels as u32).next_power_of_two()),
+        &CausalConv1dDescriptor::new(
+            x.dtype(),
+            channels as u32,
+            width as u32,
             dilation,
             activation,
-            window: window as u32,
+            window as u32,
             stepwise,
-        },
+        ),
         CausalConv1dArgs {
             x: ops::operand(x)?,
             weight: ops::operand(weight)?,
@@ -667,9 +655,11 @@ pub fn gated_delta_rule(
         ));
     }
 
-    let (form, chunk) = match batch.phase {
-        Phase::Decode => (Form::Recurrent, 1),
-        _ => (Form::Chunked, DELTA_RULE_CHUNK),
+    // A page holds whole chunks of the chunked form, so a checkpoint at a page boundary lands on
+    // a chunk end.
+    let form = match batch.phase {
+        Phase::Decode => Form::Recurrent,
+        _ => Form::Chunked,
     };
     if form == Form::Chunked {
         if !batch.page_size.is_multiple_of(DELTA_RULE_CHUNK) {
@@ -704,35 +694,22 @@ pub fn gated_delta_rule(
     }
 
     let out = ops::empty((tokens, value_heads, value_dim), query.dtype())?;
-    ops::launch::<GatedDeltaRule>(
-        &GatedDeltaRuleDescriptor {
-            dtype: query.dtype(),
-            key_heads: key_heads as u32,
-            value_heads: value_heads as u32,
-            key_dim: key_dim as u32,
-            value_dim: value_dim as u32,
-            block: DELTA_RULE_BLOCK.min(value_dim as u32),
-            form,
-            chunk,
-            axes,
-            request_slots: owned as u32,
-        },
-        GatedDeltaRuleArgs {
-            query: ops::operand(query)?,
-            key: ops::operand(key)?,
-            value: ops::operand(value)?,
-            a: ops::operand(a)?,
-            b: ops::operand(b)?,
-            a_log: ops::operand(a_log)?,
-            dt_bias: ops::operand(dt_bias)?,
-            rows: row_columns(state)?,
-            state: ops::operand(live)?,
-            checkpoint: ops::operand(checkpoint)?,
-            trail: trail_operand(trail)?,
-            out: ops::operand(&out)?,
-            slots: slots_operand(state.verify.as_ref())?,
-        },
-    )?;
+    let args = GatedDeltaRuleArgs {
+        query: ops::operand(query)?,
+        key: ops::operand(key)?,
+        value: ops::operand(value)?,
+        a: ops::operand(a)?,
+        b: ops::operand(b)?,
+        a_log: ops::operand(a_log)?,
+        dt_bias: ops::operand(dt_bias)?,
+        rows: row_columns(state)?,
+        state: ops::operand(live)?,
+        checkpoint: ops::operand(checkpoint)?,
+        trail: trail_operand(trail)?,
+        out: ops::operand(&out)?,
+        slots: slots_operand(state.verify.as_ref())?,
+    };
+    ops::launch::<GatedDeltaRule>(&GatedDeltaRuleDescriptor::of(&args, form, axes)?, args)?;
     Ok(out)
 }
 

@@ -117,3 +117,9 @@ impl Display for Float {
 pub fn key(descriptor: &impl Display) -> String {
     descriptor.to_string()
 }
+
+/// The row tile of a row-wise program over rows of `columns` elements: the width rounded up to
+/// a power of two, since a program's block is a power of two and holds a whole row.
+pub(crate) fn row_tile(columns: u32) -> u32 {
+    columns.max(1).next_power_of_two()
+}

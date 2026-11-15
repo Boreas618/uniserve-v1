@@ -9,12 +9,9 @@
 use ops::embedding::{Args, Descriptor, Embedding};
 use tensor::Tensor;
 
-use super::{PDL, columns, on_cpu};
+use super::{columns, on_cpu};
 use crate::collective::Split;
 use crate::error::{Error, Result};
-
-/// Tokens one `embedding` kernel handles.
-const TOKENS: u32 = 8;
 
 /// The rows of a `vocabulary`-row table `split`'s rank holds, as `(first id, rows)`.
 ///
@@ -84,15 +81,7 @@ pub fn embedding(ids: &Tensor, weight: &Tensor, first: u32) -> Result<Tensor> {
     let out = ops::empty((tokens, hidden as usize), weight.dtype())?;
     ops::launch::<Embedding>(
         // The token count is not in the descriptor: the ids' length is a launch value.
-        &Descriptor {
-            dtype: weight.dtype(),
-            ids: ids.dtype(),
-            hidden,
-            first,
-            rows,
-            block: TOKENS,
-            pdl: PDL,
-        },
+        &Descriptor::new(weight.dtype(), ids.dtype(), hidden, first, rows),
         Args {
             ids: ops::operand(ids)?,
             weight: ops::operand(weight)?,

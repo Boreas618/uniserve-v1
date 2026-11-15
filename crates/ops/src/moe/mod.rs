@@ -42,6 +42,16 @@ pub use grouped::{GatherGemm, GatherGemmArgs, RouteGemm, RouteGemmArgs};
 pub use routing::{TopkArgs, TopkSoftmax};
 pub use sort::{MoeSort, SortArgs};
 
+/// The MMA tile the grouped expert products are compiled for, permuted rows by output columns.
+///
+/// The packages compile any tile of their list and the tile is part of the key; every product of
+/// a block reads the sort's tiles of `TILE.0` rows, so the sort, both products and their
+/// workspaces state this one tile.
+pub const TILE: (u32, u32) = (128, 128);
+
+/// The thread-block cluster the grouped expert products are compiled for, rows by columns.
+pub const CLUSTER: (u32, u32) = (1, 1);
+
 /// The most tiles `skip` routes over `local_experts` can produce at `tile` rows per tile.
 ///
 /// The worst case is every expert with a single route and one with the rest, which collapses to

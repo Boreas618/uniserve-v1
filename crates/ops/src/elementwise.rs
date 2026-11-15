@@ -222,14 +222,15 @@ pub struct UnaryDescriptor {
 
 impl UnaryDescriptor {
     /// The descriptor of the call `args` makes of `function`, over the operators' block
-    /// ([`descriptor::BLOCK`]).
-    pub fn of(function: UnaryFunction, args: &UnaryArgs, pdl: bool) -> Self {
+    /// ([`descriptor::BLOCK`]), in the launch variant
+    /// the backend launches every kernel in.
+    pub fn of(function: UnaryFunction, args: &UnaryArgs) -> Self {
         Self {
             function,
             dtype: args.x.dtype,
             rank: strided::rank([&args.x, &args.out]),
             block: descriptor::BLOCK,
-            pdl,
+            pdl: crate::launch::PDL,
         }
     }
 }
@@ -491,14 +492,15 @@ pub struct BinaryDescriptor {
 
 impl BinaryDescriptor {
     /// The descriptor of the call `args` makes of `function`, over the operators' block
-    /// ([`descriptor::BLOCK`]).
-    pub fn of(function: BinaryFunction, args: &BinaryArgs, pdl: bool) -> Self {
+    /// ([`descriptor::BLOCK`]), in the launch variant
+    /// the backend launches every kernel in.
+    pub fn of(function: BinaryFunction, args: &BinaryArgs) -> Self {
         Self {
             function,
             dtype: args.lhs.dtype,
             rank: strided::rank([&args.lhs, &args.rhs, &args.out]),
             block: descriptor::BLOCK,
-            pdl,
+            pdl: crate::launch::PDL,
         }
     }
 }
@@ -634,14 +636,15 @@ pub struct WhereDescriptor {
 
 impl WhereDescriptor {
     /// The descriptor of the call `args` makes, over the operators' block
-    /// ([`descriptor::BLOCK`]).
-    pub fn of(args: &WhereArgs, pdl: bool) -> Self {
+    /// ([`descriptor::BLOCK`]), in the launch variant
+    /// the backend launches every kernel in.
+    pub fn of(args: &WhereArgs) -> Self {
         Self {
             dtype: args.on_true.dtype,
             condition: args.condition.dtype,
             rank: strided::rank([&args.condition, &args.on_true, &args.on_false, &args.out]),
             block: descriptor::BLOCK,
-            pdl,
+            pdl: crate::launch::PDL,
         }
     }
 }
@@ -792,7 +795,7 @@ mod tests {
     #[test]
     fn a_unary_key_names_the_function_the_type_and_the_axes_traversed() {
         let args = unary(contiguous(DType::BF16, &[2, 3, 5]));
-        let descriptor = UnaryDescriptor::of(UnaryFunction::GeluErf, &args, false);
+        let descriptor = UnaryDescriptor::of(UnaryFunction::GeluErf, &args);
         assert_eq!(
             descriptor.to_string(),
             "function_gelu_erf_dtype_bf16_rank_1_block_1024_pdl_false"
@@ -812,24 +815,24 @@ mod tests {
         // Every shape of a contiguous call is one run of elements.
         for shape in [&[7][..], &[2, 3], &[2, 3, 5], &[2, 1, 3, 1, 5]] {
             let args = unary(contiguous(DType::F32, shape));
-            let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &args, false);
+            let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &args);
             assert_eq!(descriptor.rank, 1, "{shape:?}");
         }
 
         // `[2, 3, 5]` read as `[5, 2, 3]`: the last two axes are still one run, the first is not.
         let permuted = unary(operand(DType::F32, &[5, 2, 3], &[1, 15, 5]));
-        let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &permuted, false);
+        let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &permuted);
         assert_eq!(descriptor.rank, 2);
         ElementwiseUnary::check(&descriptor, &permuted).unwrap();
 
         // The fully reversed order shares no run at all.
         let reversed = unary(operand(DType::F32, &[5, 3, 2], &[1, 5, 15]));
-        let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &reversed, false);
+        let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &reversed);
         assert_eq!(descriptor.rank, 3);
 
         // An operand of no axis is one element.
         let scalar = unary(contiguous(DType::F32, &[]));
-        let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &scalar, false);
+        let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &scalar);
         assert_eq!(descriptor.rank, 1);
         ElementwiseUnary::check(&descriptor, &scalar).unwrap();
     }
@@ -839,7 +842,7 @@ mod tests {
         let args = unary(contiguous(DType::F32, &[4, 8]));
         let stated = UnaryDescriptor {
             rank: 2,
-            ..UnaryDescriptor::of(UnaryFunction::Exp, &args, false)
+            ..UnaryDescriptor::of(UnaryFunction::Exp, &args)
         };
         let message = refusal(ElementwiseUnary::check(&stated, &args));
         assert!(message.contains("traverse 1 axes"), "{message}");
@@ -848,7 +851,7 @@ mod tests {
     #[test]
     fn a_unary_call_states_its_types_its_shape_and_a_contiguous_output() {
         let x = contiguous(DType::F32, &[4, 8]);
-        let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &unary(x.clone()), false);
+        let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &unary(x.clone()));
 
         let other_type = UnaryArgs {
             out: contiguous(DType::BF16, &[4, 8]),
@@ -872,13 +875,13 @@ mod tests {
         assert!(message.contains("out must be contiguous"), "{message}");
 
         let empty = unary(contiguous(DType::F32, &[4, 0]));
-        let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &empty, false);
+        let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &empty);
         let message = refusal(ElementwiseUnary::check(&descriptor, &empty));
         assert!(message.contains("nothing to launch"), "{message}");
 
         let odd_block = UnaryDescriptor {
             block: 1000,
-            ..UnaryDescriptor::of(UnaryFunction::Exp, &unary(x.clone()), false)
+            ..UnaryDescriptor::of(UnaryFunction::Exp, &unary(x.clone()))
         };
         let message = refusal(ElementwiseUnary::check(&odd_block, &unary(x.clone())));
         assert!(message.contains("not a power of two"), "{message}");
@@ -888,14 +891,14 @@ mod tests {
     fn an_integer_element_takes_only_the_functions_closed_over_the_integers() {
         let args = unary(contiguous(DType::I64, &[16]));
         for function in UnaryFunction::ALL {
-            let descriptor = UnaryDescriptor::of(function, &args, false);
+            let descriptor = UnaryDescriptor::of(function, &args);
             let checked = ElementwiseUnary::check(&descriptor, &args);
             assert_eq!(checked.is_ok(), function.integral(), "{function}");
         }
 
         // A narrow float is no element of a primitive.
         let packed = unary(contiguous(DType::F8E4M3, &[16]));
-        let descriptor = UnaryDescriptor::of(UnaryFunction::Neg, &packed, false);
+        let descriptor = UnaryDescriptor::of(UnaryFunction::Neg, &packed);
         let message = refusal(ElementwiseUnary::check(&descriptor, &packed));
         assert!(message.contains("dtype is f8e4m3"), "{message}");
     }
@@ -904,7 +907,7 @@ mod tests {
     fn a_unary_tolerance_follows_the_formula_and_the_element_type() {
         let tolerance = |function, dtype| {
             let args = unary(contiguous(dtype, &[16]));
-            ElementwiseUnary::tolerance(&UnaryDescriptor::of(function, &args, false))
+            ElementwiseUnary::tolerance(&UnaryDescriptor::of(function, &args))
         };
 
         // A sign change or a selection returns one of the type's own values.
@@ -954,10 +957,10 @@ mod tests {
     fn a_binary_key_names_the_function_the_type_and_the_axes_traversed() {
         let lhs = contiguous(DType::BF16, &[2, 3, 5]);
         let args = binary(lhs.clone(), lhs, BinaryFunction::Maximum);
-        let descriptor = BinaryDescriptor::of(BinaryFunction::Maximum, &args, true);
+        let descriptor = BinaryDescriptor::of(BinaryFunction::Maximum, &args);
         assert_eq!(
             descriptor.to_string(),
-            "function_maximum_dtype_bf16_rank_1_block_1024_pdl_true"
+            "function_maximum_dtype_bf16_rank_1_block_1024_pdl_false"
         );
         ElementwiseBinary::check(&descriptor, &args).unwrap();
     }
@@ -969,21 +972,21 @@ mod tests {
         // One value for every element: no stride at all, and still one run.
         let scalar = operand(DType::F32, &[2, 3, 5], &[0, 0, 0]);
         let args = binary(lhs.clone(), scalar, BinaryFunction::Mul);
-        let descriptor = BinaryDescriptor::of(BinaryFunction::Mul, &args, false);
+        let descriptor = BinaryDescriptor::of(BinaryFunction::Mul, &args);
         assert_eq!(descriptor.rank, 1);
         ElementwiseBinary::check(&descriptor, &args).unwrap();
 
         // A bias along the last axis repeats over the two leading ones, which merge.
         let bias = operand(DType::F32, &[2, 3, 5], &[0, 0, 1]);
         let args = binary(lhs.clone(), bias, BinaryFunction::Add);
-        let descriptor = BinaryDescriptor::of(BinaryFunction::Add, &args, false);
+        let descriptor = BinaryDescriptor::of(BinaryFunction::Add, &args);
         assert_eq!(descriptor.rank, 2);
         ElementwiseBinary::check(&descriptor, &args).unwrap();
 
         // A value per middle index repeats on both sides of it.
         let middle = operand(DType::F32, &[2, 3, 5], &[0, 1, 0]);
         let args = binary(lhs.clone(), middle, BinaryFunction::Add);
-        let descriptor = BinaryDescriptor::of(BinaryFunction::Add, &args, false);
+        let descriptor = BinaryDescriptor::of(BinaryFunction::Add, &args);
         assert_eq!(descriptor.rank, 3);
     }
 
@@ -992,7 +995,7 @@ mod tests {
         let lhs = contiguous(DType::F32, &[4, 8]);
         let args = binary(lhs.clone(), lhs, BinaryFunction::Lt);
         assert_eq!(args.out.dtype, DType::U8);
-        let descriptor = BinaryDescriptor::of(BinaryFunction::Lt, &args, false);
+        let descriptor = BinaryDescriptor::of(BinaryFunction::Lt, &args);
         ElementwiseBinary::check(&descriptor, &args).unwrap();
 
         // The same operands under an arithmetic function need an output of their own type.
@@ -1056,7 +1059,7 @@ mod tests {
             for dtype in [DType::U8, DType::U32, DType::I16, DType::I32, DType::I64] {
                 let lhs = contiguous(dtype, &[4, 8]);
                 let args = binary(lhs.clone(), lhs, function);
-                let descriptor = BinaryDescriptor::of(function, &args, false);
+                let descriptor = BinaryDescriptor::of(function, &args);
 
                 assert_eq!(
                     descriptor.to_string(),
@@ -1076,7 +1079,7 @@ mod tests {
             for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
                 let lhs = contiguous(dtype, &[4, 8]);
                 let args = binary(lhs.clone(), lhs, function);
-                let descriptor = BinaryDescriptor::of(function, &args, false);
+                let descriptor = BinaryDescriptor::of(function, &args);
 
                 let message = refusal(ElementwiseBinary::check(&descriptor, &args));
                 assert!(
@@ -1090,7 +1093,7 @@ mod tests {
         let lhs = contiguous(DType::I64, &[4, 8]);
         let count = operand(DType::I64, &[4, 8], &[0, 0]);
         let args = binary(lhs.clone(), count, BinaryFunction::BitwiseRightShift);
-        let descriptor = BinaryDescriptor::of(BinaryFunction::BitwiseRightShift, &args, false);
+        let descriptor = BinaryDescriptor::of(BinaryFunction::BitwiseRightShift, &args);
         assert_eq!(descriptor.rank, 1);
         ElementwiseBinary::check(&descriptor, &args).unwrap();
     }
@@ -1100,7 +1103,7 @@ mod tests {
         let tolerance = |function, dtype| {
             let lhs = contiguous(dtype, &[16]);
             let args = binary(lhs.clone(), lhs, function);
-            ElementwiseBinary::tolerance(&BinaryDescriptor::of(function, &args, false))
+            ElementwiseBinary::tolerance(&BinaryDescriptor::of(function, &args))
         };
 
         assert_eq!(
@@ -1137,7 +1140,7 @@ mod tests {
             contiguous(DType::U8, &[4, 8]),
             contiguous(DType::BF16, &[4, 8]),
         );
-        let descriptor = WhereDescriptor::of(&args, false);
+        let descriptor = WhereDescriptor::of(&args);
         assert_eq!(
             descriptor.to_string(),
             "dtype_bf16_condition_u8_rank_1_block_1024_pdl_false"
@@ -1152,7 +1155,7 @@ mod tests {
             contiguous(DType::U8, &[4, 8]),
             operand(DType::F8E4M3, &[4, 8], &[0, 1]),
         );
-        let descriptor = WhereDescriptor::of(&args, false);
+        let descriptor = WhereDescriptor::of(&args);
         assert_eq!(
             descriptor.to_string(),
             "dtype_f8e4m3_condition_u8_rank_2_block_1024_pdl_false"
@@ -1166,7 +1169,7 @@ mod tests {
             contiguous(DType::F4, &[4, 8]),
         );
         let message = refusal(ElementwiseWhere::check(
-            &WhereDescriptor::of(&packed, false),
+            &WhereDescriptor::of(&packed),
             &packed,
         ));
         assert!(message.contains("dtype is f4e2m1"), "{message}");
@@ -1175,7 +1178,7 @@ mod tests {
         let lhs = contiguous(DType::F8E4M3, &[4, 8]);
         let sum = binary(lhs.clone(), lhs, BinaryFunction::Add);
         let message = refusal(ElementwiseBinary::check(
-            &BinaryDescriptor::of(BinaryFunction::Add, &sum, false),
+            &BinaryDescriptor::of(BinaryFunction::Add, &sum),
             &sum,
         ));
         assert!(message.contains("dtype is f8e4m3"), "{message}");
@@ -1187,26 +1190,20 @@ mod tests {
 
         for condition in [DType::U8, DType::U32, DType::I64] {
             let args = selection(contiguous(condition, &[4, 8]), values.clone());
-            ElementwiseWhere::check(&WhereDescriptor::of(&args, false), &args).unwrap();
+            ElementwiseWhere::check(&WhereDescriptor::of(&args), &args).unwrap();
         }
 
         let args = selection(contiguous(DType::I32, &[4, 8]), values.clone());
-        let message = refusal(ElementwiseWhere::check(
-            &WhereDescriptor::of(&args, false),
-            &args,
-        ));
+        let message = refusal(ElementwiseWhere::check(&WhereDescriptor::of(&args), &args));
         assert!(message.contains("condition is i32"), "{message}");
 
         let args = selection(contiguous(DType::U8, &[4]), values.clone());
-        let message = refusal(ElementwiseWhere::check(
-            &WhereDescriptor::of(&args, false),
-            &args,
-        ));
+        let message = refusal(ElementwiseWhere::check(&WhereDescriptor::of(&args), &args));
         assert!(message.contains("expected on_true of shape"), "{message}");
 
         // A row-wise condition repeated along the last axis traverses two axes.
         let args = selection(operand(DType::U8, &[4, 8], &[1, 0]), values.clone());
-        let descriptor = WhereDescriptor::of(&args, false);
+        let descriptor = WhereDescriptor::of(&args);
         assert_eq!(descriptor.rank, 2);
         ElementwiseWhere::check(&descriptor, &args).unwrap();
     }

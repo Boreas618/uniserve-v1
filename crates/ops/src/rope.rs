@@ -23,6 +23,7 @@ use tensor::DType;
 use crate::abi;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::launch::PDL;
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
@@ -137,6 +138,51 @@ pub fn interleaved_axes(widths: &[u32]) -> Vec<u32> {
             }
         })
         .collect()
+}
+
+/// The elements one `rotary_factors` program handles.
+const FACTORS_BLOCK: u32 = 256;
+
+impl FactorsDescriptor {
+    /// The compilation that writes `dtype` factor tables of `columns` frequencies from
+    /// `positions` coordinates, every angle times `scale`, over the `sections` of the position
+    /// axes (one axis when empty), the axes interleaved over the frequencies when `interleaved`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] when there are more sections than [`MAX_AXES`].
+    pub fn new(
+        dtype: DType,
+        positions: DType,
+        columns: u32,
+        scale: f32,
+        sections: &[u32],
+        interleaved: bool,
+    ) -> Result<Self> {
+        if sections.len() > MAX_AXES {
+            return Err(Error::argument(
+                RotaryFactors::NAME,
+                format!(
+                    "{} sections, at most {MAX_AXES} position axes",
+                    sections.len()
+                ),
+            ));
+        }
+        let mut owned = [0; MAX_AXES];
+        owned[..sections.len()].copy_from_slice(sections);
+
+        Ok(Self {
+            dtype,
+            positions,
+            columns,
+            block: FACTORS_BLOCK,
+            scale: scale.into(),
+            pdl: PDL,
+            axes: sections.len().max(1) as u32,
+            sections: owned,
+            interleaved: !sections.is_empty() && interleaved,
+        })
+    }
 }
 
 impl fmt::Display for FactorsDescriptor {
@@ -368,6 +414,75 @@ pub struct QkNormRopeDescriptor {
     /// `1 + weight`, the one added in FP32. Only an
     /// affine form has scales to centre, and a key names it only when set.
     pub centred: bool,
+}
+
+/// Head rows one program of the packed form handles: a token holds one per head, so a step of
+/// few tokens still spreads over the device.
+const QK_NORM_ROWS: u32 = 16;
+
+/// The tokens one program of the strided form normalizes, per head.
+const STRIDED_TOKENS: u32 = 8;
+
+/// The most head elements one program loads at a time.
+const HEAD_TILE: u32 = 1024;
+
+/// The head tile of heads `head_dim` elements wide: the width rounded up to a power of two, at
+/// most [`HEAD_TILE`].
+fn head_tile(head_dim: u32) -> u32 {
+    head_dim.max(1).next_power_of_two().min(HEAD_TILE)
+}
+
+/// `value`, an extent of `operand`'s, as a descriptor's 32-bit field of `operator`.
+fn extent(operator: &'static str, operand: &str, value: u64) -> Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        Error::argument(
+            operator,
+            format!("the {operand}'s extent {value} exceeds a descriptor's field"),
+        )
+    })
+}
+
+impl QkNormRopeDescriptor {
+    /// The compilation of the call `args` makes, rotating by `rotation` after a normalization
+    /// with floor `epsilon`, whose learned scales are stored zero-centred when `centred`, in the
+    /// strided form when `strided`: the element types, heads and widths are the operands', the
+    /// rotated channels twice the factor tables' columns, the normalization weighted when the
+    /// call passes scales, and the rows a program handles the form's.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] when an extent exceeds a descriptor's 32 bits.
+    pub fn of(
+        args: &QkNormRopeArgs,
+        rotation: Rotation,
+        epsilon: f32,
+        centred: bool,
+        strided: bool,
+    ) -> Result<Self> {
+        let head_dim = extent(QkNormRope::NAME, "query", args.query.last())?;
+
+        Ok(Self {
+            dtype: args.query.dtype,
+            output: args.q_out.dtype,
+            head_dim,
+            q_heads: extent(QkNormRope::NAME, "query", args.query.dim(1))?,
+            k_heads: extent(QkNormRope::NAME, "key", args.key.dim(1))?,
+            rotation,
+            epsilon: epsilon.into(),
+            rotated: 2 * extent(QkNormRope::NAME, "factor table", args.cosine.last())?,
+            rows: if strided {
+                STRIDED_TOKENS
+            } else {
+                QK_NORM_ROWS
+            },
+            block: head_tile(head_dim),
+            affine: args.q_weight.is_some(),
+            pdl: PDL,
+            factors: args.cosine.dtype,
+            strided,
+            centred,
+        })
+    }
 }
 
 impl fmt::Display for QkNormRopeDescriptor {
@@ -711,6 +826,35 @@ pub struct RopeApplyDescriptor {
     pub block: u32,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+}
+
+/// The tokens one `rope_apply` program rotates.
+const APPLY_TOKENS: u32 = 8;
+
+/// The head elements one `rope_apply` program loads at a time.
+const APPLY_BLOCK: u32 = 128;
+
+impl RopeApplyDescriptor {
+    /// The compilation of the call `args` makes, rotating by `rotation`: the element types,
+    /// heads and widths are the operands', and the rotated channels twice the factor tables'
+    /// columns.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] when an extent exceeds a descriptor's 32 bits.
+    pub fn of(args: &RopeApplyArgs, rotation: Rotation) -> Result<Self> {
+        Ok(Self {
+            dtype: args.x.dtype,
+            output: args.out.dtype,
+            head_dim: extent(RopeApply::NAME, "input", args.x.last())?,
+            heads: extent(RopeApply::NAME, "input", args.x.dim(1))?,
+            rotation,
+            rotated: 2 * extent(RopeApply::NAME, "factor table", args.cosine.last())?,
+            rows: APPLY_TOKENS,
+            block: APPLY_BLOCK,
+            pdl: PDL,
+        })
+    }
 }
 
 impl fmt::Display for RopeApplyDescriptor {

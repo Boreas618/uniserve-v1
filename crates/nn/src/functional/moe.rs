@@ -11,7 +11,7 @@
 //! ```
 //!
 //! A token's `top` routes are one row each of both products. The sort does not move rows: it
-//! groups the routes of one expert into **tiles** of [`TILE_ROWS`] permuted rows and states the
+//! groups the routes of one expert into **tiles** of [`ops::moe::TILE`]'s permuted rows and states the
 //! maps between a route (`token · top + route`, the *expanded* row) and its *permuted* row, so
 //! one launch multiplies every expert's weight. The maps' extents follow from the token count,
 //! the top-k and the expert count alone, never from one batch's routing, so a captured graph
@@ -44,25 +44,16 @@ use ops::moe::grouped::{
 };
 use ops::moe::routing::{TopkArgs, TopkDescriptor, TopkSoftmax};
 use ops::moe::sort::{self, MoeSort, SortArgs};
+use ops::moe::{CLUSTER, TILE};
 use ops::residual::{SigmoidGatedAdd, SigmoidGatedAddArgs, SigmoidGatedAddDescriptor};
 use tensor::{D, DType, Device, Tensor};
 
 use super::activation::activate;
 use super::nvfp4::{decoded, encoded, integer, launch_quantize};
-use super::{ACCUMULATE, Activation, as_rows, columns, on_cpu, row_tile, same_rows};
+use super::{ACCUMULATE, Activation, as_rows, columns, on_cpu, same_rows};
 use crate::capability::ExpertExchange;
 use crate::error::{Error, Result};
 use crate::quantization::{Nvfp4Stack, ValueLayout};
-
-/// Permuted rows per tile: the row extent of the tile the grouped products are compiled for,
-/// which each expert's rows are padded to.
-pub const TILE_ROWS: u32 = MMA_TILE.0;
-
-/// The tile the grouped products' packages are compiled for, rows by columns.
-const MMA_TILE: (u32, u32) = (128, 128);
-
-/// The cluster shape the grouped products' packages are compiled for.
-const MMA_CLUSTER: (u32, u32) = (1, 1);
 
 /// The rows of the route maps [`moe_sort`] returns, `[SORT_MAPS, permuted rows]` U32: each row is
 /// one map, in its leading entries.
@@ -99,12 +90,12 @@ const NOT_LIVE: u32 = u32::MAX - 1;
 /// The arrangement the gated product reads its `[up; gate]` stack's packed rows in: the two
 /// halves interleaved row by row, then shuffled inside the blocks of one tile.
 pub(crate) const GATED_VALUE_LAYOUT: ValueLayout = ValueLayout::InterleavedShuffled {
-    epilogue_tile_m: MMA_TILE.0,
+    epilogue_tile_m: TILE.0,
 };
 
 /// The arrangement the second product reads its `down` stack's packed rows in.
 pub(crate) const DOWN_VALUE_LAYOUT: ValueLayout = ValueLayout::Shuffled {
-    epilogue_tile_m: MMA_TILE.0,
+    epilogue_tile_m: TILE.0,
 };
 
 /// The arrangement the gated product reads its activation's block scales in: its kernels read
@@ -113,10 +104,6 @@ const GATED_TOKEN_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Linear;
 
 /// The arrangement the second product reads its activation's block scales in.
 const ACTIVATION_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
-
-/// The bytes a packed product's entry writes before the package's workspace: a header holding
-/// the padded route count.
-const ENTRY_PREAMBLE: u64 = 16;
 
 /// The router's choice: `(ids, weights)`, the `top` most probable experts of each token and
 /// their probabilities, `[tokens, top]` U32 and FP32.
@@ -256,7 +243,7 @@ pub fn topk_softmax(
 ///
 /// The routes this rank holds are laid out expert by expert in the window's order, each
 /// expert's from a tile boundary and in route order (`token · top + route`); an expert with no
-/// route takes no tile. There are `max_tiles · TILE_ROWS` permuted rows for the worst routing
+/// route takes no tile. There are `max_tiles` tiles of [`ops::moe::TILE`]'s permuted rows for the worst routing
 /// of this many routes ([`ops::moe::max_tiles`]), of which a batch fills the leading
 /// [`TOTAL_PADDED_TOKENS`].
 ///
@@ -303,9 +290,9 @@ pub fn moe_sort(
         tokens as u64,
         top as u64,
         u64::from(local_experts),
-        u64::from(TILE_ROWS),
+        u64::from(TILE.0),
     ) as usize;
-    let rows = tiles * TILE_ROWS as usize;
+    let rows = tiles * TILE.0 as usize;
 
     if on_cpu(ids) {
         return sort_formula(ids, &local, live_tokens, (tiles, rows));
@@ -316,14 +303,7 @@ pub fn moe_sort(
         |row: usize, entries: usize| -> Result<ops::Operand> { map_operand(&maps, row, entries) };
 
     ops::launch::<MoeSort>(
-        &sort::Descriptor {
-            experts,
-            top: top as u32,
-            local_experts,
-            tile_tokens: TILE_ROWS,
-            scales: weights.dtype(),
-            counted: true,
-        },
+        &sort::Descriptor::new(experts, top as u32, local_experts, weights.dtype()),
         SortArgs {
             ids: ops::operand(ids)?,
             scales: ops::operand(weights)?,
@@ -418,16 +398,14 @@ pub fn gather_gemm(
 
     let out = ops::empty((rows, intermediate), hidden.dtype())?;
     ops::launch::<GatherGemm>(
-        &GatherGemmDescriptor {
-            hidden: width,
-            intermediate: intermediate as u32,
-            experts: experts as u32,
-            top: top as u32,
+        &GatherGemmDescriptor::new(
+            width,
+            intermediate as u32,
+            experts as u32,
+            top as u32,
             activation,
-            dtype: hidden.dtype(),
-            tile: MMA_TILE,
-            cluster: MMA_CLUSTER,
-        },
+            hidden.dtype(),
+        ),
         GatherGemmArgs {
             hidden: ops::operand(hidden)?,
             weights: ops::operand(up_gate)?,
@@ -503,15 +481,13 @@ pub fn route_gemm(gated: &Tensor, down: &Tensor, ids: &Tensor, maps: &Tensor) ->
 
     let out = ops::empty((rows, width), gated.dtype())?;
     ops::launch::<RouteGemm>(
-        &RouteGemmDescriptor {
-            hidden: width as u32,
+        &RouteGemmDescriptor::new(
+            width as u32,
             intermediate,
-            experts: experts as u32,
-            top: top as u32,
-            dtype: gated.dtype(),
-            tile: MMA_TILE,
-            cluster: MMA_CLUSTER,
-        },
+            experts as u32,
+            top as u32,
+            gated.dtype(),
+        ),
         RouteGemmArgs {
             rows: ops::operand(gated)?,
             weights: ops::operand(down)?,
@@ -641,26 +617,24 @@ pub fn gather_gemm_nvfp4(
     )?;
 
     // 2. The product, token-major: it gathers each permuted row's token itself.
+    let descriptor = GatherGemmNvfp4Descriptor {
+        hidden: width,
+        intermediate: intermediate as u32,
+        experts: experts as u32,
+        top,
+        activation,
+        dtype: hidden.dtype(),
+        // The weights' scale type is the checkpoint's; the layout is the tokens', which the
+        // encoding above wrote.
+        scale: up_gate.scales.dtype(),
+        layout: GATED_TOKEN_SCALE_LAYOUT,
+        tile: TILE,
+        cluster: CLUSTER,
+    };
     let out = ops::empty((rows, intermediate), hidden.dtype())?;
-    let workspace = ops::empty(
-        workspace_bytes(rows as u64, gated as u64) as usize,
-        DType::U8,
-    )?;
+    let workspace = ops::empty(descriptor.workspace_bytes(rows as u64) as usize, DType::U8)?;
     ops::launch::<GatherGemmNvfp4>(
-        &GatherGemmNvfp4Descriptor {
-            hidden: width,
-            intermediate: intermediate as u32,
-            experts: experts as u32,
-            top,
-            activation,
-            dtype: hidden.dtype(),
-            // The weights' scale type is the checkpoint's; the layout is the tokens', which
-            // the encoding above wrote.
-            scale: up_gate.scales.dtype(),
-            layout: GATED_TOKEN_SCALE_LAYOUT,
-            tile: MMA_TILE,
-            cluster: MMA_CLUSTER,
-        },
+        &descriptor,
         GatherGemmNvfp4Args {
             hidden: ops::operand(&values)?,
             hidden_scale: ops::operand(&scales)?,
@@ -776,23 +750,21 @@ pub fn route_gemm_nvfp4(
     )?;
 
     // 2. The product: one row per permuted row, the `top` routes of a token still separate.
+    let descriptor = RouteGemmNvfp4Descriptor {
+        hidden: width as u32,
+        intermediate,
+        experts: experts as u32,
+        top,
+        dtype: gated.dtype(),
+        scale: down.scales.dtype(),
+        layout: ACTIVATION_SCALE_LAYOUT,
+        tile: TILE,
+        cluster: CLUSTER,
+    };
     let out = ops::empty((rows, width), gated.dtype())?;
-    let workspace = ops::empty(
-        workspace_bytes(rows as u64, width as u64) as usize,
-        DType::U8,
-    )?;
+    let workspace = ops::empty(descriptor.workspace_bytes(rows as u64) as usize, DType::U8)?;
     ops::launch::<RouteGemmNvfp4>(
-        &RouteGemmNvfp4Descriptor {
-            hidden: width as u32,
-            intermediate,
-            experts: experts as u32,
-            top,
-            dtype: gated.dtype(),
-            scale: down.scales.dtype(),
-            layout: ACTIVATION_SCALE_LAYOUT,
-            tile: MMA_TILE,
-            cluster: MMA_CLUSTER,
-        },
+        &descriptor,
         RouteGemmNvfp4Args {
             hidden: ops::operand(&values)?,
             hidden_scale: ops::operand(&scales)?,
@@ -1160,11 +1132,7 @@ pub fn sigmoid_gated_add_(target: Tensor, update: &Tensor, gate: &Tensor) -> Res
     }
 
     ops::launch::<SigmoidGatedAdd>(
-        &SigmoidGatedAddDescriptor {
-            dtype: target.dtype(),
-            columns: width,
-            block: row_tile(width).min(1024),
-        },
+        &SigmoidGatedAddDescriptor::new(target.dtype(), width),
         SigmoidGatedAddArgs {
             target: ops::operand(&as_rows(OWNER, &target)?)?,
             update: ops::operand(&as_rows(OWNER, update)?)?,
@@ -1193,9 +1161,9 @@ fn sorted(owner: &'static str, maps: &Tensor, routes: usize) -> Result<(usize, u
         [SORT_MAPS, rows]
             if maps.dtype() == DType::U32
                 && rows >= routes.max(1)
-                && rows.is_multiple_of(TILE_ROWS as usize) =>
+                && rows.is_multiple_of(TILE.0 as usize) =>
         {
-            Ok((rows / TILE_ROWS as usize, rows))
+            Ok((rows / TILE.0 as usize, rows))
         }
         _ => Err(Error::shape(
             owner,
@@ -1244,8 +1212,8 @@ fn live_rows(maps: &Tensor, rows: usize) -> Result<Tensor> {
 /// stack; zero on the rows that are not `live`.
 fn row_experts(maps: &Tensor, live: &Tensor, rows: usize) -> Result<Tensor> {
     let row = Tensor::arange(0_u32, rows as u32, &Device::Cpu)?;
-    let tile = row.broadcast_div(&integer(TILE_ROWS, &row)?)?;
-    let expert = map(maps, TILE_TO_EXPERT, rows / TILE_ROWS as usize)?.index_select(&tile, 0)?;
+    let tile = row.broadcast_div(&integer(TILE.0, &row)?)?;
+    let expert = map(maps, TILE_TO_EXPERT, rows / TILE.0 as usize)?.index_select(&tile, 0)?;
 
     Ok(live.where_cond(&expert, &expert.zeros_like()?)?)
 }
@@ -1277,25 +1245,6 @@ fn shuffled(rows: &Tensor) -> Result<Tensor> {
         .broadcast_mul(&integer(8, rows)?)?;
 
     Ok(((block + group)? + within.broadcast_div(&integer(4, rows)?)?)?)
-}
-
-/// The workspace one packed product of `routes` permuted rows and `width` output columns asks
-/// for, in bytes: the package's own sizing of its row-maximum planes and tile bars, each padded
-/// to a kibibyte, its scheduler's counter, and the entry's preamble before them.
-///
-/// The size follows from the bucket's worst-case route count, so every replay of a captured
-/// bucket takes the same bytes.
-fn workspace_bytes(routes: u64, width: u64) -> u64 {
-    let kibibytes = |bytes: u64| bytes.div_ceil(1024) * 1024;
-    let token_tile = u64::from(MMA_TILE.0) * u64::from(MMA_CLUSTER.0);
-    let padded = routes.max(1).div_ceil(token_tile) * token_tile;
-
-    // One FP32 row maximum per 128 elements of the padded tile grid.
-    let row_maxima = width * padded / 128 * 4;
-    // One half-word of tile bars per (token tile, width tile) pair.
-    let bars = (padded / token_tile) * width.div_ceil(u64::from(MMA_TILE.1)) / 2 * 4;
-
-    ENTRY_PREAMBLE + kibibytes(row_maxima) + kibibytes(bars) + 4
 }
 
 /// The descriptor of one launch of the expert exchange in `mode` over `exchange`'s group, for a
@@ -1370,7 +1319,7 @@ fn sort_formula(
     let (tokens, top) = (ids.dims()[0], ids.dims()[1]);
     let count = tokens * top;
     let experts = (local.end - local.start) as usize;
-    let tile = f64::from(TILE_ROWS);
+    let tile = f64::from(TILE.0);
 
     // The arithmetic is F64, which holds every index exactly.
     let route = Tensor::arange(0_f64, count as f64, cpu)?;
@@ -1474,25 +1423,4 @@ fn sort_formula(
         ],
         0,
     )?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::workspace_bytes;
-
-    /// The packed products' workspaces follow the package's arithmetic over the bucket's route
-    /// count: 15 tokens over 128 experts are 120 tiles of 128 permuted rows, for which the
-    /// gated product (1536 columns) asks 16 + 740 356 bytes and the second (2048 columns)
-    /// 16 + 987 140; a bucket of a single tile still carries the entry's preamble.
-    #[test]
-    fn a_packed_product_s_workspace_is_sized_from_its_route_count() {
-        assert_eq!(workspace_bytes(15_360, 1536), 740_372);
-        assert_eq!(workspace_bytes(15_360, 2048), 987_156);
-        assert_eq!(workspace_bytes(8, 1536), 7_188);
-        assert_eq!(workspace_bytes(8, 2048), 9_236);
-
-        // The size grows with the routes and stays far below a fixed floor of mebibytes.
-        assert!(workspace_bytes(4096, 2048) > workspace_bytes(8, 2048));
-        assert!(workspace_bytes(4096, 2048) < 16 << 20);
-    }
 }

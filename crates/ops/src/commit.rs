@@ -39,7 +39,7 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{Key, row_tile};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
@@ -69,6 +69,34 @@ pub struct CommitDescriptor {
     pub vocab: u32,
     /// The lanes one program covers: the step's row count rounded up to a power of two.
     pub block: u32,
+}
+
+impl CommitDescriptor {
+    /// The compilation over a commit table whose fields lie `stride` elements apart, a future
+    /// table of rows `future_stride` apart and a vocabulary of `vocab` tokens. The kernels read
+    /// every index as `I32`, and one program covers the table's rows in one tile.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] when the table holds more rows than a program's tile covers.
+    pub fn new(stride: u64, future_stride: u64, vocab: u32) -> Result<Self> {
+        let rows = u32::try_from(stride).map_err(|_| {
+            Error::argument(
+                SlotCommit::NAME,
+                format!("a commit table of {stride} rows exceeds a program's tile"),
+            )
+        })?;
+
+        Ok(Self {
+            index: DType::I32,
+            verified: DType::I32,
+            penalties: DType::I32,
+            stride,
+            future_stride,
+            vocab,
+            block: row_tile(rows),
+        })
+    }
 }
 
 impl fmt::Display for CommitDescriptor {

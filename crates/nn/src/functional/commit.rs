@@ -26,8 +26,8 @@ use proto::module::commit::{COMMIT_FIELDS, column, mode};
 use tensor::{DType, Device, Tensor};
 
 use super::nvfp4::integer;
+use super::on_cpu;
 use super::sampling::{require, signed};
-use super::{on_cpu, row_tile};
 use crate::capability::NO_SLOT;
 use crate::error::{Error, Result};
 
@@ -245,22 +245,14 @@ pub fn slot_commit_(
         return Ok(());
     }
 
-    // The fields of the table lie `stride` elements apart, and one kernel covers that many
-    // rows: both follow the table the rows were taken from, so every step of a runner states
-    // one key.
-    let stride = table.stride()[0] as u64;
+    // The fields of the table lie `stride` elements apart: the stride follows the table the
+    // rows were taken from, so every step of a runner states one key.
     ops::launch::<SlotCommit>(
-        &CommitDescriptor {
-            index: DType::I32,
-            verified: DType::I32,
-            penalties: DType::I32,
-            stride,
-            future_stride: future.stride()[0] as u64,
-            vocab: vocabulary,
-            block: row_tile(u32::try_from(stride).map_err(|_| {
-                Error::shape(OWNER, "a commit table of more rows than a kernel covers")
-            })?),
-        },
+        &CommitDescriptor::new(
+            table.stride()[0] as u64,
+            future.stride()[0] as u64,
+            vocabulary,
+        )?,
         CommitArgs {
             columns: ops::operand(table)?,
             tokens: signed(tokens)?,

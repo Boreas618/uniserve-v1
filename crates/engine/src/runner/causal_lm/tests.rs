@@ -191,7 +191,7 @@ impl TinyDrafter {
         let tokens = batch.tokens();
         let fused = embedded.add(hidden)?;
 
-        zero_arrival_counters_(&cache.workspace)?;
+        zero_arrival_counters_(&cache.workspace, batch.rows(), HEADS as u32)?;
         let heads = |projected: Tensor| projected.reshape((tokens, HEADS, DIM));
         kv_write_(
             cache,
@@ -360,7 +360,7 @@ impl CausalLm for Tiny {
             .to_dtype(hidden.dtype())?;
         let hidden = hidden.broadcast_add(&bound)?;
 
-        zero_arrival_counters_(&group.workspace)?;
+        zero_arrival_counters_(&group.workspace, batch.rows(), HEADS as u32)?;
         let heads = |projected: Tensor| projected.reshape((tokens, HEADS, DIM));
         kv_write_(
             group,

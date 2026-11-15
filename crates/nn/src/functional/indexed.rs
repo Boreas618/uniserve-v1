@@ -29,9 +29,6 @@ use super::{ACCUMULATE, on_cpu};
 use crate::capability::KvCache;
 use crate::error::{Error, Result};
 
-/// Index keys one `index_scores` kernel scores.
-const SCORES_BLOCK: u32 = 256;
-
 /// The values of `column`, a U32 index column of a CPU batch.
 fn column(column: &Tensor) -> Result<Vec<u32>> {
     Ok(column.flatten_all()?.to_vec1::<u32>()?)
@@ -148,14 +145,13 @@ pub fn index_scores(
 
     let out = ops::empty((tokens, columns), DType::F32)?;
     ops::launch::<IndexScores>(
-        &IndexScoresDescriptor {
-            dtype: query.dtype(),
-            keys: keys.dtype(),
-            heads: heads as u32,
-            width: width as u32,
-            groups: groups as u32,
-            block: SCORES_BLOCK,
-        },
+        &IndexScoresDescriptor::new(
+            query.dtype(),
+            keys.dtype(),
+            heads as u32,
+            width as u32,
+            groups as u32,
+        ),
         IndexScoresArgs {
             query: ops::operand(query)?,
             keys: ops::operand(keys)?,

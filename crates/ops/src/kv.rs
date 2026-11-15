@@ -36,6 +36,7 @@ use tensor::DType;
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::launch::PDL;
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
@@ -63,6 +64,34 @@ pub struct Descriptor {
     pub tile: u32,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+}
+
+/// The elements of one cache row a cache-write program covers: the head width rounded up to a
+/// power of two, at most this many.
+const ROW_TILE: u32 = 128;
+
+/// The cache-write tile of heads `head_dim` elements wide.
+fn row_tile(head_dim: u32) -> u32 {
+    head_dim
+        .clamp(1, ROW_TILE)
+        .next_power_of_two()
+        .min(ROW_TILE)
+}
+
+impl Descriptor {
+    /// The compilation that writes `dtype` projections of `heads` heads of `head_dim` into
+    /// `kv` planes of `page`-token pages.
+    pub fn new(dtype: DType, kv: DType, page: u32, heads: u32, head_dim: u32) -> Self {
+        Self {
+            dtype,
+            kv,
+            page,
+            heads,
+            head_dim,
+            tile: row_tile(head_dim),
+            pdl: PDL,
+        }
+    }
 }
 
 impl fmt::Display for Descriptor {
@@ -291,6 +320,22 @@ pub struct ScaledWriteDescriptor {
     pub block: u32,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl ScaledWriteDescriptor {
+    /// The compilation that quantizes `dtype` projections of `heads` heads of `head_dim` into
+    /// E4M3 planes of `page`-token pages with `scale` page scales.
+    pub fn new(dtype: DType, scale: DType, page: u32, heads: u32, head_dim: u32) -> Self {
+        Self {
+            dtype,
+            scale,
+            page,
+            heads,
+            head_dim,
+            block: row_tile(head_dim),
+            pdl: PDL,
+        }
+    }
 }
 
 impl fmt::Display for ScaledWriteDescriptor {

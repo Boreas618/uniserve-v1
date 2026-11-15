@@ -34,8 +34,9 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::launch::PDL;
 use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
@@ -51,6 +52,18 @@ pub struct Descriptor {
     pub block: u32,
     /// Whether the module was compiled for programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl Descriptor {
+    /// The compilation that applies the activation to signals of `channels` channels of `dtype`.
+    pub fn new(dtype: DType, channels: u32) -> Self {
+        Self {
+            dtype,
+            channels,
+            block: descriptor::BLOCK,
+            pdl: PDL,
+        }
+    }
 }
 
 impl fmt::Display for Descriptor {

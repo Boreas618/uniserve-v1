@@ -86,11 +86,6 @@ fn normal_stream(key: u64, stage: u32, draw: u32, offset: u64, count: usize) -> 
         .collect()
 }
 
-/// The descriptor of a normal draw into `dtype` elements keyed by `source`.
-fn descriptor(dtype: DType, source: KeySource) -> NoiseDescriptor {
-    NoiseDescriptor::new(dtype, NoiseKind::Normal, source)
-}
-
 /// Draws standard normal noise into `out`, in place and in its element type, from one `seed`
 /// over the flattened buffer: element `i` is element `offset + i` of the seed's stream, whatever
 /// shape `out` has.
@@ -126,7 +121,7 @@ pub fn philox_normal(out: &Tensor, seed: u64, stage: u32, draw: u32, offset: u64
 
     let rows = out.reshape((elements / width.max(1), width))?;
     ops::launch::<PhiloxNoise>(
-        &descriptor(out.dtype(), KeySource::Scalar),
+        &NoiseDescriptor::new(out.dtype(), NoiseKind::Normal, KeySource::Scalar),
         NoiseArgs {
             out: ops::operand(&rows)?,
             keys: None,
@@ -216,7 +211,7 @@ pub fn philox_normal_rows(
     }
 
     ops::launch::<PhiloxNoise>(
-        &descriptor(out.dtype(), KeySource::Rows),
+        &NoiseDescriptor::new(out.dtype(), NoiseKind::Normal, KeySource::Rows),
         NoiseArgs {
             out: ops::operand(out)?,
             keys: Some(ops::operand(keys)?),

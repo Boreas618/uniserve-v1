@@ -18,11 +18,8 @@
 use ops::activation1d::{Activation1d, Args, BETA_FLOOR, Descriptor};
 use tensor::{DType, Device, Tensor};
 
-use super::{PDL, on_cpu};
+use super::on_cpu;
 use crate::error::{Error, Result};
-
-/// Channels one kernel of the activation handles.
-const BLOCK: u32 = 256;
 
 /// The alias-free SnakeBeta of `x`, `[channels, length]` or `[batch, channels, length]`: a
 /// tensor of `x`'s shape and element type.
@@ -89,16 +86,13 @@ pub fn activation1d(
             ),
         ));
     }
-    let descriptor = Descriptor {
-        dtype: x.dtype(),
-        channels: u32::try_from(channels)
-            .map_err(|_| Error::shape(OWNER, format!("{channels} channels")))?,
-        kernel: u32::try_from(kernel)
+    let descriptor = Descriptor::new(
+        x.dtype(),
+        u32::try_from(channels).map_err(|_| Error::shape(OWNER, format!("{channels} channels")))?,
+        u32::try_from(kernel)
             .map_err(|_| Error::shape(OWNER, format!("a filter of {kernel} taps")))?,
         ratio,
-        block: BLOCK,
-        pdl: PDL,
-    };
+    );
     let expected = descriptor.output(length as u64)? as usize;
 
     if on_cpu(x) {

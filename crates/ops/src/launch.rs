@@ -12,6 +12,13 @@ use crate::{Call, Checked, Op};
 use crate::context::{self, Context};
 use crate::{Error, Result, profiler};
 
+/// Whether the device backend launches a kernel as a programmatic dependent launch: the `pdl`
+/// value of every descriptor this crate derives for a launch through [`launch`].
+///
+/// A package compiles both variants and the variant is part of the key; the backend launches the
+/// plain one, ordered by its stream alone, so every operator's descriptor states this one value.
+pub(crate) const PDL: bool = false;
+
 /// Checks the call against `O`'s rules, then launches `O`'s kernel for `descriptor` by the
 /// context installed on this thread.
 ///

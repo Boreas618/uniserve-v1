@@ -13,6 +13,7 @@ use tensor::DType;
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::launch::PDL;
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
@@ -34,6 +35,25 @@ pub struct Descriptor {
     pub block: u32,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+}
+
+/// Tokens one program of the embedding gathers.
+const TOKENS: u32 = 8;
+
+impl Descriptor {
+    /// The compilation that gathers rows of `hidden` `dtype` elements by `ids` ids from a shard
+    /// of `rows` rows that opens at vocabulary id `first`.
+    pub fn new(dtype: DType, ids: DType, hidden: u32, first: u32, rows: u32) -> Self {
+        Self {
+            dtype,
+            ids,
+            hidden,
+            first,
+            rows,
+            block: TOKENS,
+            pdl: PDL,
+        }
+    }
 }
 
 impl fmt::Display for Descriptor {

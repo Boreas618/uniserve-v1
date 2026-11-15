@@ -24,19 +24,8 @@ use float8::F8E4M3;
 use ops::fp4::{BLOCK_ELEMENTS, Nvfp4Quantize, QuantizeArgs, QuantizeDescriptor, ScaleLayout};
 use tensor::{D, DType, Device, Tensor};
 
-use super::{ACCUMULATE, PDL, as_rows, columns, on_cpu};
+use super::{ACCUMULATE, as_rows, columns, on_cpu};
 use crate::error::{Error, Result};
-
-/// Elements of a row one activation-encoding kernel covers.
-///
-/// A whole number of sixteen-element scale blocks, as the layout requires, and a key field of
-/// `nvfp4_quantize`: every packed projection and expert block states this one value, so one
-/// launch site compiles one kernel.
-pub const ENCODE_CHUNK: u32 = 1024;
-
-/// The encoder's chunk is a whole number of scale blocks; a chunk that were not would have a
-/// partial block with no scale to name it.
-const _: () = assert!(ENCODE_CHUNK.is_multiple_of(BLOCK_ELEMENTS));
 
 /// The eight magnitudes an E2M1 code states, then the same negated: a code's fourth bit is its
 /// sign.
@@ -46,20 +35,6 @@ const E2M1: [f32; 16] = [
 
 /// The largest byte that is a finite E4M3 value, 448; the byte after it is the format's NaN.
 const E4M3_LARGEST: u8 = 0x7e;
-
-/// The tile one encoding of a `columns`-wide row runs in.
-///
-/// The package refuses a tile that does not divide the row, so the requested tile is halved
-/// until it divides. A row narrower than the largest tile, such as the mixture-of-experts'
-/// 768-element second encode, gets the largest tile that fits it instead of a key no package
-/// can build.
-pub fn encode_block(columns: u32, requested: u32) -> u32 {
-    let mut block = requested.max(1);
-    while block > 1 && !columns.is_multiple_of(block) {
-        block /= 2;
-    }
-    block
-}
 
 /// The NVFP4 encoding of `x`: `(values, scales)`, the packed E2M1 codes and their E4M3 block
 /// scales under `global_scale` (module formula).
@@ -190,13 +165,7 @@ pub(super) fn launch_quantize(
     let (values, scales, token_scale) = encoded;
 
     ops::launch::<Nvfp4Quantize>(
-        &QuantizeDescriptor {
-            input: rows.dtype(),
-            columns: k,
-            layout,
-            block: encode_block(k, ENCODE_CHUNK),
-            pdl: PDL,
-        },
+        &QuantizeDescriptor::new(rows.dtype(), k, layout),
         QuantizeArgs {
             input: ops::operand(rows)?,
             values,

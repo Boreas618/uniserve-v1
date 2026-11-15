@@ -25,8 +25,9 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{Key, row_tile};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
+use crate::launch::PDL;
 use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
@@ -47,6 +48,22 @@ pub struct RmsNormDescriptor {
     /// Rows of the gain: row `i` of the input is scaled by gain row `i mod groups`. One for a
     /// gain every row shares; the streams of a hyper-connected residual each have their own.
     pub groups: u32,
+}
+
+impl RmsNormDescriptor {
+    /// The compilation that normalizes rows of `columns` elements of `dtype` by a gain of
+    /// `groups` rows, stored zero-centred when `centred`. One program loads its whole row in one
+    /// tile.
+    pub fn new(dtype: DType, columns: u32, centred: bool, groups: u32) -> Self {
+        Self {
+            dtype,
+            columns,
+            tile: row_tile(columns),
+            pdl: PDL,
+            centred,
+            groups,
+        }
+    }
 }
 
 impl fmt::Display for RmsNormDescriptor {
@@ -174,6 +191,21 @@ pub struct AddRmsNormDescriptor {
     pub centred: bool,
 }
 
+impl AddRmsNormDescriptor {
+    /// The compilation that adds rows of `columns` elements of `dtype` into their residual and
+    /// normalizes the sum by a gain stored zero-centred when `centred`. One program loads its
+    /// whole row in one tile.
+    pub fn new(dtype: DType, columns: u32, centred: bool) -> Self {
+        Self {
+            dtype,
+            columns,
+            tile: row_tile(columns),
+            pdl: PDL,
+            centred,
+        }
+    }
+}
+
 impl fmt::Display for AddRmsNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key = Key::new()
@@ -283,6 +315,20 @@ pub struct GatedRmsNormDescriptor {
     /// Whether the gate passes through a sigmoid in place of the SiLU: `x̂ · w · sigmoid(z)`
     /// rather than `x̂ · w · silu(z)`.
     pub sigmoid: bool,
+}
+
+impl GatedRmsNormDescriptor {
+    /// The compilation that normalizes rows of `columns` elements of `dtype` and gates them by
+    /// the SiLU of the gate, or its sigmoid when `sigmoid`. One program loads its whole row in
+    /// one tile.
+    pub fn new(dtype: DType, columns: u32, sigmoid: bool) -> Self {
+        Self {
+            dtype,
+            columns,
+            tile: row_tile(columns),
+            sigmoid,
+        }
+    }
 }
 
 impl fmt::Display for GatedRmsNormDescriptor {
@@ -418,6 +464,20 @@ pub struct LayerNormDescriptor {
     pub pdl: bool,
 }
 
+impl LayerNormDescriptor {
+    /// The compilation that normalizes rows of `columns` elements of `dtype`, adding a bias when
+    /// `bias`. One program loads its whole row in one tile.
+    pub fn new(dtype: DType, columns: u32, bias: bool) -> Self {
+        Self {
+            dtype,
+            columns,
+            tile: row_tile(columns),
+            bias,
+            pdl: PDL,
+        }
+    }
+}
+
 impl fmt::Display for LayerNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
@@ -541,6 +601,20 @@ pub struct SoftmaxDescriptor {
     pub tile: u32,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl SoftmaxDescriptor {
+    /// The compilation that takes the softmax of rows of `columns` elements of `dtype`: one
+    /// program reads a row in chunks of the candidates' tile ([`crate::sampler::CANDIDATE_TILE`]),
+    /// so a row may be a whole vocabulary of candidates.
+    pub fn new(dtype: DType, columns: u32) -> Self {
+        Self {
+            dtype,
+            columns,
+            tile: crate::sampler::CANDIDATE_TILE,
+            pdl: PDL,
+        }
+    }
 }
 
 impl fmt::Display for SoftmaxDescriptor {
