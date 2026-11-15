@@ -1,7 +1,10 @@
 //! The daemon's Prometheus registry and UniServe's metric families.
 //!
-//! [`METRICS`] is the registry the daemon exports. Each submodule defines one group of families,
-//! listed here with the code that updates it:
+//! A deployment's leader owns one [`Metrics`], made when it reads its model
+//! (`Leader::prepare`) and handed to every recorder: the statistics sink of each
+//! engine client, each request's `stats::StatLogger`, the HTTP metrics layer and
+//! the statistics log. Its route renders it. Each submodule defines one group of
+//! families, listed here with the code that updates it:
 //!
 //! - `api_server`: the HTTP metrics route layer (`track_http_metrics`), when each response body
 //!   finishes or is dropped.
@@ -11,15 +14,15 @@
 //!
 //! The families are UniServe's own schema: names under `uniserve:`, one name per quantity (a
 //! report's scalar is exported under its field's name), latency histograms over
-//! [`latency_buckets`] and count histograms over [`count_buckets`]. The statistics log
-//! (`log_stats`) is fed by the same recorders and reads no family back.
+//! [`latency_buckets`] and token count histograms over [`count_buckets`] up to the
+//! served context length. The statistics log (`log_stats`) is fed by the same
+//! recorders and reads no family back.
 //!
 //! Every metric field is a `prometheus-client` handle whose clones share their underlying
 //! state, so updates through a field reach the clone held by the registry. Registration names
 //! are base names; `prometheus-client` appends `_total` to counters when encoding.
 
 use std::fmt;
-use std::sync::LazyLock;
 use std::sync::atomic::AtomicU64;
 
 use prometheus_client::encoding::text::encode;
@@ -59,13 +62,16 @@ pub fn latency_buckets() -> impl Iterator<Item = f64> {
     prometheus_client::metrics::histogram::exponential_buckets(0.001, 2.0, 22)
 }
 
-/// The bucket bounds of every count histogram (a request's prompt or generated tokens): powers
-/// of two from 1 to 2^20.
+/// The bucket bounds of a count histogram of tokens of one request (its prompt or its
+/// generated tokens) of a model served with a context of `max_model_len` tokens: powers of two
+/// from 1 to the first one that holds `max_model_len`.
 ///
-/// The bounds double for the reason [`latency_buckets`] states, and reach past the longest
-/// context any served model states.
-pub fn count_buckets() -> impl Iterator<Item = f64> {
-    prometheus_client::metrics::histogram::exponential_buckets(1.0, 2.0, 21)
+/// The bounds double for the reason [`latency_buckets`] states; no request has more tokens than
+/// the context, so the last bound is the context's.
+pub fn count_buckets(max_model_len: u32) -> Vec<f64> {
+    // One bound per power of two up to the first at least `max_model_len`.
+    let bounds = u32::BITS - max_model_len.saturating_sub(1).leading_zeros() + 1;
+    prometheus_client::metrics::histogram::exponential_buckets(1.0, 2.0, bounds as u16).collect()
 }
 
 /// A histogram whose observations arrive already counted per bucket of
@@ -143,11 +149,12 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// Constructs a metrics registry with every UniServe family registered.
-    pub fn new() -> Self {
+    /// The registry of a deployment whose model serves a context of `max_model_len` tokens,
+    /// with every UniServe family registered.
+    pub fn new(max_model_len: u32) -> Self {
         let mut registry = Registry::default();
         let scheduler = SchedulerMetrics::register(&mut registry);
-        let request = RequestMetrics::register(&mut registry);
+        let request = RequestMetrics::register(&mut registry, max_model_len);
         let api_server = ApiServerMetrics::register(&mut registry);
         let memory = MemoryMetrics::register(&mut registry);
 
@@ -184,13 +191,19 @@ impl Metrics {
     }
 }
 
-impl Default for Metrics {
-    /// Constructs the fully registered default metrics collection.
-    fn default() -> Self {
-        Self::new()
+#[cfg(test)]
+mod tests {
+    use super::count_buckets;
+
+    /// A token count histogram's bounds double from one token up to the first power of two that
+    /// holds the served context, so no request's count lands past them.
+    #[test]
+    fn count_buckets_reach_the_served_context() {
+        assert_eq!(count_buckets(1), [1.0]);
+        let context = count_buckets(4096);
+        assert_eq!(context.first(), Some(&1.0));
+        assert_eq!(context.last(), Some(&4096.0));
+        assert_eq!(context.len(), 13);
+        assert_eq!(count_buckets(4097).last(), Some(&8192.0));
     }
 }
-
-/// Process-global metrics registry, written and rendered by the leader's
-/// daemon.
-pub static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::new);

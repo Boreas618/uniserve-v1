@@ -201,6 +201,7 @@ pub(crate) fn fake_engine(
     build_policy();
     let engine = launch.engine;
     let model_name = launch.engine_config.model.model.clone();
+    let max_model_len = launch.engine_config.model.max_model_len;
     let (mut reader, process, _) =
         testkit::spawn(launch, testkit::fake_start(fixture)).expect("start the test's engine");
 
@@ -241,6 +242,7 @@ pub(crate) fn fake_engine(
             std::sync::Arc::new(crate::observe::Observer::new(crate::observe::span(
                 &crate::options::UpdateConfig::default(),
             ))),
+            std::sync::Arc::new(crate::metrics::Metrics::new(max_model_len)),
             0,
         ),
         None,
@@ -350,6 +352,7 @@ pub(crate) fn leader_over(
             .unwrap(),
         ),
     };
+    let metrics = std::sync::Arc::new(crate::metrics::Metrics::new(model.max_model_len));
     let processor = Processor::new(
         model,
         tokenizer,
@@ -377,6 +380,7 @@ pub(crate) fn leader_over(
         processor,
         &options,
         observer,
+        metrics,
         test_updater(),
     )
     .unwrap()

@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use crate::updates::update::Phase;
 
-use crate::metrics::{METRICS, RequestLabels, SchedulerLabels};
+use crate::metrics::{Metrics, RequestLabels, SchedulerLabels};
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use proto::request::Request;
@@ -80,6 +80,8 @@ pub struct Leader {
     pub(crate) updates: Arc<crate::updates::Updater>,
     /// Whether every request logs a summary line when it ends.
     log_requests: bool,
+    /// The deployment's metrics, which its route renders.
+    metrics: Arc<Metrics>,
     /// Periodic throughput logging, stopped with the engine.
     _stats_logger: Option<StatsLogger>,
 }
@@ -173,12 +175,13 @@ pub(crate) struct EpochTarget {
     pub(crate) epoch: u64,
 }
 
-/// Records what replica `replica`'s engine reports under `model_name`: each
-/// scheduler's statistics, also read by `observer` for each epoch's rates, and
-/// its main process's allocators.
+/// Records what replica `replica`'s engine reports into the deployment's
+/// `metrics` under `model_name`: each scheduler's statistics, also read by
+/// `observer` for each epoch's rates, and its main process's allocators.
 pub(crate) fn stats_sink(
     model_name: String,
     observer: Arc<crate::observe::Observer>,
+    metrics: Arc<Metrics>,
     replica: usize,
 ) -> StatsSink {
     let replica = replica as u32;
@@ -194,9 +197,9 @@ pub(crate) fn stats_sink(
                 replica,
                 scheduler,
             };
-            METRICS.record_scheduler(&labels, &stats);
+            metrics.record_scheduler(&labels, &stats);
         }
-        EngineReport::Memory(devices) => METRICS.memory.record(replica, &devices),
+        EngineReport::Memory(devices) => metrics.memory.record(replica, &devices),
     })
 }
 
@@ -355,6 +358,9 @@ pub(crate) struct Prepared {
     renderer: LoadedRenderer,
     /// The deployment's engine configuration, with the facts the model's files determine.
     pub(crate) engine: proto::config::EngineConfig,
+    /// The deployment's metrics, sized to the model's context, which its
+    /// engines' statistics sinks record into before the leader exists.
+    pub(crate) metrics: Arc<Metrics>,
 }
 
 /// Where a submitted request is served: its replica, and the scheduler of that
@@ -796,9 +802,10 @@ impl Leader {
             futures::future::join_all(launches.into_iter().enumerate().map(|(index, args)| {
                 let model = config.model().to_owned();
                 let starting = Arc::clone(&control);
+                let metrics = Arc::clone(&prepared.metrics);
                 tokio::task::spawn_blocking(move || {
                     let observer = Arc::new(crate::observe::Observer::new(span));
-                    let sink = stats_sink(model, Arc::clone(&observer), index);
+                    let sink = stats_sink(model, Arc::clone(&observer), metrics, index);
                     let client = starting.start(args.clone(), sink)?;
                     Ok::<_, anyhow::Error>((client, args, observer))
                 })
@@ -827,6 +834,7 @@ impl Leader {
                 config,
                 Arc::new(client),
                 observer,
+                Arc::clone(&leader.metrics),
                 index + 1,
                 Arc::downgrade(&leader.replicas),
                 Arc::clone(&leader.replicas.adapters),
@@ -951,12 +959,14 @@ impl Leader {
                 .get_or_insert_with(|| family.default_max_seconds());
         }
 
+        let metrics = Arc::new(Metrics::new(model_config.max_model_len));
         Ok(Prepared {
             families: families.clone(),
             model_config,
             tokenizer,
             renderer,
             engine,
+            metrics,
         })
     }
 
@@ -982,6 +992,7 @@ impl Leader {
             tokenizer,
             renderer,
             engine: _,
+            metrics,
         } = prepared;
         let info = client.info().clone();
 
@@ -1037,6 +1048,7 @@ impl Leader {
             processor,
             config,
             observer,
+            metrics,
             updates,
         )?;
         let replica = Arc::clone(&engine.replicas.serving.borrow()[0]);
@@ -1061,6 +1073,7 @@ impl Leader {
         processor: Processor,
         options: &ServerArgs,
         observer: Arc<crate::observe::Observer>,
+        metrics: Arc<Metrics>,
         updates: Arc<crate::updates::Updater>,
     ) -> anyhow::Result<Self> {
         let served_model_name = options.served_model_name().to_owned();
@@ -1070,7 +1083,7 @@ impl Leader {
         let logging = &options.logging_config;
         let stats_logger = logging
             .log_stats
-            .then(|| StatsLogger::start(&METRICS.log, logging.stats_interval));
+            .then(|| StatsLogger::start(Arc::clone(&metrics), logging.stats_interval));
         let replica_options = ServerArgs {
             model: Some(model_name.clone()),
             served_model_name: Some(served_model_name.clone()),
@@ -1088,6 +1101,7 @@ impl Leader {
                             &replica_options,
                             client,
                             Arc::clone(&observer),
+                            Arc::clone(&metrics),
                             index,
                             std::sync::Weak::clone(registry),
                             Arc::clone(&adapters),
@@ -1113,6 +1127,7 @@ impl Leader {
             images,
             updates,
             log_requests: logging.log_requests,
+            metrics,
             _stats_logger: stats_logger,
         })
     }
@@ -1120,6 +1135,11 @@ impl Leader {
     /// The loaded model's input processor.
     pub fn processor(&self) -> &Processor {
         &self.processor
+    }
+
+    /// The deployment's metrics.
+    pub(crate) fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
     }
 
     /// The single model name the API serves.
@@ -1210,7 +1230,8 @@ impl Leader {
             .map_err(ServeError::from)?;
         let labels = placement.labels(&self.model_name);
         let log = self.log_requests.then_some(request_id);
-        let stats = crate::metrics::stats::StatLogger::new(labels, started, log);
+        let stats =
+            crate::metrics::stats::StatLogger::new(Arc::clone(&self.metrics), labels, started, log);
         // Dropping the events on a failure cancels the request in its engine.
         let output = crate::api::output::OutputProcessor::new(
             self.processor.tokenizer(),
@@ -1243,7 +1264,7 @@ impl Leader {
             scheduler: None,
         };
         let log = self.log_requests.then(|| request_id.to_owned());
-        crate::metrics::stats::StatLogger::new(labels, started, log)
+        crate::metrics::stats::StatLogger::new(Arc::clone(&self.metrics), labels, started, log)
     }
 
     /// Takes one request's engine event stream over from the process that
@@ -1328,7 +1349,13 @@ impl Leader {
     ) -> RequestOutputStream {
         let labels = placement.labels(&self.model_name);
         let log = self.log_requests.then_some(request_id);
-        Box::pin(RequestStats::new(output, labels, started, log))
+        Box::pin(RequestStats::new(
+            output,
+            Arc::clone(&self.metrics),
+            labels,
+            started,
+            log,
+        ))
     }
 
     /// Submits one tokenized request to the engine, which routes it to its
@@ -1842,6 +1869,9 @@ pub(crate) struct Replica {
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
     /// Every engine's scheduler statistics, which the status reads.
     pub(crate) observer: Arc<crate::observe::Observer>,
+    /// The deployment's metrics, which the statistics sinks of the engines
+    /// this replica starts record into.
+    pub(crate) metrics: Arc<Metrics>,
     /// The profiling session that runs, or the last that ended
     /// (`crate::profiling`).
     pub(crate) profiles: crate::profiling::Profiles,
@@ -1869,11 +1899,18 @@ pub(crate) struct Replica {
 }
 
 impl Replica {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a replica's model families, options and engine, the two readers of its \
+                  engine's reports (its observer and the deployment's metrics), and its place in \
+                  the replica set with the set's adapters"
+    )]
     pub(crate) fn new(
         families: processing::Registry,
         options: &ServerArgs,
         client: Arc<EngineClient>,
         observer: Arc<crate::observe::Observer>,
+        metrics: Arc<Metrics>,
         ordinal: usize,
         registry: std::sync::Weak<Replicas>,
         adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
@@ -1895,6 +1932,7 @@ impl Replica {
             sleep_paused: AtomicBool::new(false),
             adapters,
             observer,
+            metrics,
             profiles: crate::profiling::Profiles::default(),
             standby: std::sync::Mutex::new(None),
             domain: std::sync::Mutex::new(None),
@@ -2166,7 +2204,12 @@ impl Replica {
                 .zip(&observers)
                 .enumerate()
                 .map(|(index, (target, observer))| {
-                    let sink = stats_sink(self.model_name.clone(), Arc::clone(observer), index);
+                    let sink = stats_sink(
+                        self.model_name.clone(),
+                        Arc::clone(observer),
+                        Arc::clone(&self.metrics),
+                        index,
+                    );
                     let (control, processes) = (Arc::clone(&control), target.1.clone());
                     tokio::task::spawn_blocking(move || {
                         control.join_target(&processes, epoch, sink)
@@ -2240,6 +2283,7 @@ impl Replica {
                         &config,
                         Arc::clone(client),
                         Arc::clone(&observers[index]),
+                        Arc::clone(&self.metrics),
                         index,
                         Arc::downgrade(&registry),
                         Arc::clone(&self.adapters),
@@ -2448,6 +2492,7 @@ impl Replica {
             let sink = stats_sink(
                 self.model_name.clone(),
                 Arc::clone(&self.observer),
+                Arc::clone(&self.metrics),
                 self.ordinal,
             );
             let starting = Arc::clone(control);
@@ -2492,6 +2537,7 @@ impl Replica {
         let sink = stats_sink(
             self.model_name.clone(),
             Arc::clone(&self.observer),
+            Arc::clone(&self.metrics),
             self.ordinal,
         );
         let client =
@@ -2922,6 +2968,7 @@ impl Replica {
         let sink = stats_sink(
             self.model_name.clone(),
             Arc::clone(&self.observer),
+            Arc::clone(&self.metrics),
             self.ordinal,
         );
         let numbers: Vec<u64> = generations
@@ -3645,7 +3692,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::metrics::METRICS;
     use proto::request::SamplingParams;
     use proto::request::{Event, GenerationRequest, Request};
 
@@ -3732,13 +3778,19 @@ mod tests {
     }
 
     /// How many requests of scheduler `scheduler` of replica 0 of `model_name`
-    /// ended as `outcome`.
-    fn outcomes(model_name: &str, scheduler: u32, outcome: crate::metrics::Outcome) -> u64 {
+    /// ended as `outcome` in `engine`'s metrics.
+    fn outcomes(
+        engine: &Leader,
+        model_name: &str,
+        scheduler: u32,
+        outcome: crate::metrics::Outcome,
+    ) -> u64 {
         let labels = crate::metrics::OutcomeLabels {
             served: request_labels(model_name, scheduler),
             outcome,
         };
-        METRICS
+        engine
+            .metrics()
             .request
             .request_outcomes
             .get(&labels)
@@ -3943,7 +3995,8 @@ mod tests {
 
             let (status, document) = pending.await.unwrap();
             assert_eq!(status, axum::http::StatusCode::OK, "{document}");
-            let seconds = METRICS
+            let seconds = engine
+                .metrics()
                 .request
                 .e2e_request_latency_seconds
                 .get_or_create(&request_labels(engine_model, 0))
@@ -3969,10 +4022,10 @@ mod tests {
         assert_eq!(document["usage"]["completion_tokens"], 3);
         let prompt_tokens = &document["usage"]["prompt_tokens"];
 
-        let request = &METRICS.request;
+        let request = &engine.metrics().request;
         let labels = request_labels(engine_model, 0);
         assert_eq!(
-            outcomes(engine_model, 0, crate::metrics::Outcome::Length),
+            outcomes(&engine, engine_model, 0, crate::metrics::Outcome::Length),
             1
         );
         assert_eq!(
@@ -4075,7 +4128,12 @@ mod tests {
 
         for scheduler in 0..2 {
             assert_eq!(
-                outcomes(engine_model, scheduler, crate::metrics::Outcome::Length),
+                outcomes(
+                    &engine,
+                    engine_model,
+                    scheduler,
+                    crate::metrics::Outcome::Length
+                ),
                 1,
                 "scheduler {scheduler}"
             );
@@ -4106,10 +4164,10 @@ mod tests {
         // The connection is gone: the body's frames have no reader.
         drop(stream);
 
-        let request = &METRICS.request;
+        let request = &engine.metrics().request;
         let labels = request_labels(engine_model, 0);
         metrics_reach("the abort", || {
-            outcomes(engine_model, 0, crate::metrics::Outcome::Abort) == 1
+            outcomes(&engine, engine_model, 0, crate::metrics::Outcome::Abort) == 1
         })
         .await;
         let latency = request.e2e_request_latency_seconds.get_or_create(&labels);

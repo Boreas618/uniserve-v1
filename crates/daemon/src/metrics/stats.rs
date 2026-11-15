@@ -14,7 +14,7 @@ use futures::{Stream, StreamExt as _};
 use tracing::info;
 
 use crate::api::output::{RequestOutput, RequestOutputStream, RequestUsage};
-use crate::metrics::{METRICS, Outcome, OutcomeLabels, RequestLabels, RequestMetrics};
+use crate::metrics::{Metrics, Outcome, OutcomeLabels, RequestLabels, RequestMetrics};
 
 /// How many requests ended since the daemon started, and how many of them
 /// failed, which an epoch's trial reads its failure rate from.
@@ -45,17 +45,18 @@ pub(crate) struct RequestStats {
 }
 
 impl RequestStats {
-    /// Wraps the output of a request accepted at `started`, recorded under
-    /// `labels`.
+    /// Wraps the output of a request accepted at `started`, recorded into
+    /// `metrics` under `labels`.
     pub(crate) fn new(
         inner: RequestOutputStream,
+        metrics: std::sync::Arc<Metrics>,
         labels: RequestLabels,
         started: Instant,
         log: Option<String>,
     ) -> Self {
         Self {
             inner,
-            logger: StatLogger::new(labels, started, log),
+            logger: StatLogger::new(metrics, labels, started, log),
         }
     }
 }
@@ -76,6 +77,8 @@ impl Stream for RequestStats {
 /// One request's statistics, folded from its output events and recorded once
 /// when the request ends; a recorder dropped before then records an abort.
 pub(crate) struct StatLogger {
+    /// The deployment's registry the request is recorded into.
+    metrics: std::sync::Arc<Metrics>,
     labels: RequestLabels,
     started: Instant,
     /// The request whose summary line is logged when it ends, when request
@@ -85,10 +88,16 @@ pub(crate) struct StatLogger {
 }
 
 impl StatLogger {
-    /// A recorder for a request accepted at `started`, recorded under
-    /// `labels`.
-    pub(crate) fn new(labels: RequestLabels, started: Instant, log: Option<String>) -> Self {
+    /// A recorder for a request accepted at `started`, recorded into
+    /// `metrics` under `labels`.
+    pub(crate) fn new(
+        metrics: std::sync::Arc<Metrics>,
+        labels: RequestLabels,
+        started: Instant,
+        log: Option<String>,
+    ) -> Self {
         Self {
+            metrics,
             labels,
             started,
             log,
@@ -118,7 +127,7 @@ impl StatLogger {
             }
         }
         let latency = self.started.elapsed().as_secs_f64();
-        let metrics = &METRICS.request;
+        let metrics = &self.metrics.request;
         metrics
             .request_outcomes
             .get_or_create(&OutcomeLabels {
@@ -132,7 +141,7 @@ impl StatLogger {
             .observe(latency);
         if let Some(usage) = usage {
             record_usage(metrics, &self.labels, usage);
-            METRICS.log.usage(
+            self.metrics.log.usage(
                 u64::from(usage.prompt_tokens),
                 u64::from(usage.output_tokens),
             );

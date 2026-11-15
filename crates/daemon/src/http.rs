@@ -24,7 +24,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::metrics::METRICS;
 use crate::supervision::Daemon;
 use anyhow::{Context as _, Result};
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -581,6 +580,8 @@ pub(crate) fn router(
     video_body_limit: usize,
     restarter: Option<Arc<crate::restart::Restarter>>,
 ) -> Router {
+    // Every route and layer records into, and renders, the deployment's own registry.
+    let metrics = Arc::clone(engine.metrics());
     let handoff = Arc::new(handoff::Handoff::new());
     if let Some(restarter) = restarter.as_ref() {
         restarter.attach_handoff(Arc::clone(&handoff));
@@ -632,9 +633,12 @@ pub(crate) fn router(
     let generation = limited(timeout(generation), |message| {
         ApiError::service_unavailable("server_overloaded", message).into_response()
     });
-    let api = timeout(api)
-        .merge(generation)
-        .layer(from_fn(middleware::track_http_metrics));
+    let api = timeout(api).merge(generation).layer(from_fn({
+        let metrics = Arc::clone(&metrics);
+        move |request: Request, next: Next| {
+            middleware::track_http_metrics(Arc::clone(&metrics), request, next)
+        }
+    }));
 
     let mut authenticated = Router::new().route("/version", get(version)).merge(api);
     if let Some(key) = &server.api_key {
@@ -649,7 +653,10 @@ pub(crate) fn router(
     Router::new()
         .route("/health", get(health))
         .with_state(engine)
-        .route("/metrics", get(scrape_metrics))
+        .route(
+            "/metrics",
+            get(move || scrape_metrics(Arc::clone(&metrics))),
+        )
         .merge(authenticated)
         .fallback(not_found)
         // Sets the limit that axum's body extractors (`Json`, `Multipart`,
@@ -671,9 +678,9 @@ async fn health(State(engine): State<Arc<Leader>>) -> StatusCode {
     }
 }
 
-/// Renders the process-global metrics registry in OpenMetrics text format.
-async fn scrape_metrics() -> Response {
-    match METRICS.render() {
+/// Renders the deployment's metrics in OpenMetrics text format.
+async fn scrape_metrics(metrics: Arc<crate::metrics::Metrics>) -> Response {
+    match metrics.render() {
         Ok(body) => ([(CONTENT_TYPE, OPENMETRICS_CONTENT_TYPE)], body).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1371,7 +1378,8 @@ mod tests {
     /// count an extension method under `other`.
     #[tokio::test]
     async fn http_metrics_bound_the_method_label() {
-        let router = router(served_engine(crate::test_support::CHAT));
+        let engine = Arc::new(served_engine(crate::test_support::CHAT));
+        let router = router(Arc::clone(&engine));
         let request = Request::builder()
             .method("PURGE")
             .uri("/v1/models")
@@ -1387,7 +1395,8 @@ mod tests {
             handler: "/v1/models".to_owned(),
         };
         assert!(
-            METRICS
+            engine
+                .metrics()
                 .api_server
                 .http_requests
                 .get_or_create(&labels)

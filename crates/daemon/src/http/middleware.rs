@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use crate::metrics::{HttpHandlerLabels, HttpRequestLabels, METRICS};
+use crate::metrics::{HttpHandlerLabels, HttpRequestLabels, Metrics};
 use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{MatchedPath, Request};
 use axum::http::header::{HeaderName, RETRY_AFTER};
@@ -219,7 +219,11 @@ impl ConcurrencyLimit {
 /// under that class. The duration is measured until the response body is
 /// dropped: an SSE handler returns its body at once, so observing at handler
 /// return would record a near-zero duration.
-pub(crate) async fn track_http_metrics(request: Request, next: Next) -> Response {
+pub(crate) async fn track_http_metrics(
+    metrics: Arc<Metrics>,
+    request: Request,
+    next: Next,
+) -> Response {
     #[expect(
         clippy::expect_used,
         reason = "the layer wraps the API's routes, and the router names the route of every \
@@ -239,6 +243,7 @@ pub(crate) async fn track_http_metrics(request: Request, next: Next) -> Response
     guard_body(
         response,
         MetricsGuard {
+            metrics,
             started_at,
             method,
             handler,
@@ -251,6 +256,8 @@ pub(crate) async fn track_http_metrics(request: Request, next: Next) -> Response
 /// fully sent (or aborted). Carries the labels and start time captured at
 /// request entry.
 struct MetricsGuard {
+    /// The deployment's registry the request is recorded into.
+    metrics: Arc<Metrics>,
     started_at: Instant,
     method: &'static str,
     handler: String,
@@ -261,7 +268,7 @@ impl Drop for MetricsGuard {
     /// Records request count and end-to-end body delivery latency.
     fn drop(&mut self) {
         let elapsed = self.started_at.elapsed().as_secs_f64();
-        let metrics = &METRICS.api_server;
+        let metrics = &self.metrics.api_server;
 
         metrics
             .http_requests

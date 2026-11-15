@@ -13,7 +13,7 @@
 //! next interval's line.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio_util::task::AbortOnDropHandle;
@@ -21,7 +21,7 @@ use tracing::{debug, info};
 
 use proto::report::SchedulerStats;
 
-use crate::metrics::SchedulerLabels;
+use crate::metrics::{Metrics, SchedulerLabels};
 
 /// The sums of one interval of the statistics log.
 #[derive(Debug, Default)]
@@ -84,17 +84,18 @@ pub(crate) struct StatsLogger {
 }
 
 impl StatsLogger {
-    /// Starts the background task that logs `log` every `period`.
+    /// Starts the background task that logs `metrics`' statistics log every `period`.
     ///
     /// Must be called within a Tokio runtime, since it spawns onto the current one.
-    pub(crate) fn start(log: &'static StatsLog, period: Duration) -> Self {
-        let task = AbortOnDropHandle::new(tokio::spawn(run(log, period)));
+    pub(crate) fn start(metrics: Arc<Metrics>, period: Duration) -> Self {
+        let task = AbortOnDropHandle::new(tokio::spawn(run(metrics, period)));
         Self { _task: task }
     }
 }
 
-/// Logs `log`'s interval every `period` until its task is aborted.
-async fn run(log: &'static StatsLog, period: Duration) {
+/// Logs `metrics`' statistics log every `period` until its task is aborted.
+async fn run(metrics: Arc<Metrics>, period: Duration) {
+    let log = &metrics.log;
     let mut ticks = tokio::time::interval(period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick fires at once and starts the first interval.

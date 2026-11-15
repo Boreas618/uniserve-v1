@@ -1,10 +1,10 @@
 //! Request latency, token and outcome metrics.
 //!
 //! Time histograms observe seconds over [`latency_buckets`]; token histograms observe a request's
-//! token counts over [`count_buckets`].
+//! token counts over [`count_buckets`] of the served context length.
 
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
-use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::family::{Family, MetricConstructor};
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 
@@ -85,18 +85,18 @@ pub struct OutcomeLabels {
     pub outcome: Outcome,
 }
 
+/// The bucket bounds a histogram family's series are made with.
+#[derive(Debug, Clone)]
+pub struct Buckets(std::sync::Arc<[f64]>);
+
+impl MetricConstructor<Histogram> for Buckets {
+    fn new_metric(&self) -> Histogram {
+        Histogram::new(self.0.iter().copied())
+    }
+}
+
 /// A histogram family keyed by where a request was served.
-pub(crate) type HistogramFamily = Family<RequestLabels, Histogram, fn() -> Histogram>;
-
-/// A histogram over [`latency_buckets`].
-fn latency_histogram() -> Histogram {
-    Histogram::new(latency_buckets())
-}
-
-/// A histogram over [`count_buckets`].
-fn count_histogram() -> Histogram {
-    Histogram::new(count_buckets())
-}
+pub(crate) type HistogramFamily = Family<RequestLabels, Histogram, Buckets>;
 
 /// Request-lifecycle Prometheus families.
 ///
@@ -126,9 +126,12 @@ impl RequestMetrics {
     /// Registers every family under its exported name and help, and
     /// returns the handles; the registry keeps a clone of each, whose state
     /// it shares.
-    pub fn register(registry: &mut Registry) -> Self {
-        let histograms = |registry: &mut Registry, name, help, buckets: fn() -> Histogram| {
-            let family = HistogramFamily::new_with_constructor(buckets);
+    /// The token count histograms' bounds reach `max_model_len`, the served context.
+    pub fn register(registry: &mut Registry, max_model_len: u32) -> Self {
+        let latency = Buckets(latency_buckets().collect());
+        let counts = Buckets(count_buckets(max_model_len).into());
+        let histograms = |registry: &mut Registry, name, help, buckets: &Buckets| {
+            let family = HistogramFamily::new_with_constructor(buckets.clone());
             registry.register(name, help, family.clone());
             family
         };
@@ -158,32 +161,32 @@ impl RequestMetrics {
                 registry,
                 "uniserve:request_prompt_tokens",
                 "Prompt tokens per finished request.",
-                count_histogram,
+                &counts,
             ),
             request_generation_tokens: histograms(
                 registry,
                 "uniserve:request_generation_tokens",
                 "Generated tokens per finished request.",
-                count_histogram,
+                &counts,
             ),
             time_to_first_token_seconds: histograms(
                 registry,
                 "uniserve:time_to_first_token_seconds",
                 "Time from a request's start to its first visible output, in seconds.",
-                latency_histogram,
+                &latency,
             ),
             e2e_request_latency_seconds: histograms(
                 registry,
                 "uniserve:e2e_request_latency_seconds",
                 "Time from a request's start to its end as the daemon observed it, in seconds.",
-                latency_histogram,
+                &latency,
             ),
             request_queue_time_seconds: histograms(
                 registry,
                 "uniserve:request_queue_time_seconds",
                 "Time a request waited for scheduler admission, as the engine measured it, in \
                  seconds.",
-                latency_histogram,
+                &latency,
             ),
         }
     }

@@ -828,6 +828,7 @@ async fn prepared_successor(
     let control = Arc::new(control);
     let adopting = Arc::clone(&control);
     let daemon_options = config.clone();
+    let metrics = Arc::clone(&prepared.metrics);
     let adopted = tokio::task::spawn_blocking(move || {
         replicas
             .into_iter()
@@ -839,7 +840,12 @@ async fn prepared_successor(
                 let observer = Arc::new(crate::observe::Observer::new(crate::observe::span(
                     &options.update_config,
                 )));
-                let sink = stats_sink(options.model().to_owned(), Arc::clone(&observer), index);
+                let sink = stats_sink(
+                    options.model().to_owned(),
+                    Arc::clone(&observer),
+                    Arc::clone(&metrics),
+                    index,
+                );
                 let client = adopting.adopt(
                     replica.engine,
                     replica.next_engine,
@@ -898,6 +904,7 @@ async fn prepared_successor(
             &options,
             Arc::new(client),
             observer,
+            Arc::clone(leader.metrics()),
             index + 1,
             Arc::downgrade(&leader.replicas),
             Arc::clone(&leader.replicas.adapters),
