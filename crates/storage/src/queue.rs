@@ -14,12 +14,14 @@
 //! or consumed, so the bytes in a ring are the difference of its two indices.
 //!
 //! The layout is what two builds share, in bytes from the start of the memfd,
-//! every word a native 64-bit integer: the magic at 0, a ring's bytes at 8 and
-//! the number of registers at 16; the submission queue's producer index at 128
-//! and its consumer index at 256; the completion queue's producer index at 384
-//! and its consumer index at 512; the registers from 640; then, from the next
-//! multiple of 128, the submission queue's bytes followed by the completion
-//! queue's.
+//! every word a native 64-bit integer: the magic at 0, a ring's bytes at 8, the
+//! number of registers at 16 and the separation `S` of words written by
+//! different sides at 24; the submission queue's producer index at `S` and its
+//! consumer index at `2S`; the completion queue's producer index at `3S` and its
+//! consumer index at `4S`; the registers from `5S`; then, from the next multiple
+//! of `S`, the submission queue's bytes followed by the completion queue's. The
+//! creator states `S` in the header ([`SEPARATION`] of its build's target), and
+//! an end that opens the memory lays the pair out by the header's value.
 //!
 //! Each end keeps its own index privately and only publishes it, and checks
 //! the other side's index and every length word before it uses them, so a
@@ -34,22 +36,39 @@ use crate::{Error, Result};
 
 /// Identifies the layout below; a mapping that does not start with it is not
 /// a queue pair of this layout.
-const MAGIC: u64 = 0x756e_6973_7170_0001;
+const MAGIC: u64 = 0x756e_6973_7170_0002;
 
 /// The separation of words written by different sides, so that one side's
-/// index does not share a cache line with the other's.
-const LINE: usize = 128;
+/// index shares no cache line, nor the pair of lines an adjacent-line prefetcher
+/// fetches together, with the other's: the destructive interference size of the
+/// build's target, as crossbeam's `CachePadded` declares it per architecture
+/// (128 bytes on x86-64 and AArch64). A queue pair's creator states it in the
+/// header.
+pub const SEPARATION: usize = std::mem::align_of::<crossbeam_utils::CachePadded<u8>>();
 
-/// The header: the magic, a ring's bytes, the number of registers.
+/// The header: the magic, a ring's bytes, the number of registers and the
+/// separation, a word each.
 const HEADER_RING_BYTES: usize = 8;
 const HEADER_REGISTERS: usize = 16;
+const HEADER_SEPARATION: usize = 24;
+const HEADER_BYTES: usize = 32;
 
-/// The four indices, one cache line each, in the order: submission produced,
-/// submission consumed, completion produced, completion consumed.
-const INDICES: usize = LINE;
+/// Where the registers begin in a layout of separation `separation`: after the
+/// header's line and the four indices, a separation each, in the order
+/// submission produced, submission consumed, completion produced, completion
+/// consumed.
+fn registers_at(separation: usize) -> Option<usize> {
+    separation.checked_mul(5)
+}
 
-/// The registers follow the indices.
-const REGISTERS: usize = INDICES + 4 * LINE;
+/// Where the rings begin in a layout of separation `separation` with
+/// `registers` registers: the next multiple of the separation after them.
+fn rings_at(separation: usize, registers: usize) -> Option<usize> {
+    registers
+        .checked_mul(8)?
+        .checked_add(registers_at(separation)?)?
+        .checked_next_multiple_of(separation)
+}
 
 /// The bytes of a record's length word.
 const LENGTH: usize = 8;
@@ -64,6 +83,8 @@ pub struct QueuePair {
     /// A ring's bytes, a power of two.
     ring_bytes: usize,
     registers: usize,
+    /// The separation of words written by different sides, as the header states it.
+    separation: usize,
     /// Where the submission ring's bytes begin; the completion ring follows.
     rings: usize,
 
@@ -90,7 +111,8 @@ impl QueuePair {
                 "a ring of {ring_bytes} bytes is not a power of two of at least 64"
             )));
         }
-        let rings = (REGISTERS + registers * 8).next_multiple_of(LINE);
+        let rings = rings_at(SEPARATION, registers)
+            .ok_or_else(|| Error::Protocol(format!("{registers} registers overflow a layout")))?;
         let bytes = rings + 2 * ring_bytes;
 
         // SAFETY: the name is a NUL-terminated literal; the call creates a new
@@ -119,6 +141,10 @@ impl QueuePair {
                 .add(HEADER_REGISTERS)
                 .cast::<u64>()
                 .write(registers as u64);
+            base.as_ptr()
+                .add(HEADER_SEPARATION)
+                .cast::<u64>()
+                .write(SEPARATION as u64);
             base.as_ptr().cast::<u64>().write(MAGIC);
         }
         Ok(Self {
@@ -127,6 +153,7 @@ impl QueuePair {
             memory,
             ring_bytes,
             registers,
+            separation: SEPARATION,
             rings,
             engine: false,
             produced: 0,
@@ -146,7 +173,7 @@ impl QueuePair {
             return Err(std::io::Error::last_os_error().into());
         }
         let bytes = stat.st_size as usize;
-        if bytes < REGISTERS {
+        if bytes < HEADER_BYTES {
             return Err(Error::Protocol(format!(
                 "a queue pair of {bytes} bytes has no header"
             )));
@@ -154,17 +181,17 @@ impl QueuePair {
 
         let base = map(&memory, bytes)?;
         // SAFETY: the mapping holds at least the header, at aligned offsets.
-        let (magic, ring_bytes, registers) = unsafe {
+        let (magic, ring_bytes, registers, separation) = unsafe {
             (
                 base.as_ptr().cast::<u64>().read(),
                 base.as_ptr().add(HEADER_RING_BYTES).cast::<u64>().read() as usize,
                 base.as_ptr().add(HEADER_REGISTERS).cast::<u64>().read() as usize,
+                base.as_ptr().add(HEADER_SEPARATION).cast::<u64>().read() as usize,
             )
         };
-        let rings = registers
-            .checked_mul(8)
-            .and_then(|words| words.checked_add(REGISTERS))
-            .map(|end| end.next_multiple_of(LINE));
+        // The indices start a separation in, after the header's line.
+        let separated = separation.is_power_of_two() && separation >= HEADER_BYTES;
+        let rings = separated.then(|| rings_at(separation, registers)).flatten();
         let fits = rings
             .and_then(|rings| ring_bytes.checked_mul(2)?.checked_add(rings))
             .is_some_and(|total| total == bytes);
@@ -182,6 +209,7 @@ impl QueuePair {
             memory,
             ring_bytes,
             registers,
+            separation,
             rings: rings.unwrap_or_default(),
             engine,
             produced: 0,
@@ -210,15 +238,11 @@ impl QueuePair {
             "register {index} of {}",
             self.registers
         );
+        // The layout was checked to hold the registers when the end was made.
+        let at = 5 * self.separation + index * 8;
         // SAFETY: the register lies inside the mapping at an aligned offset, and
         // the mapping lives as long as `self`.
-        unsafe {
-            &*self
-                .base
-                .as_ptr()
-                .add(REGISTERS + index * 8)
-                .cast::<AtomicU64>()
-        }
+        unsafe { &*self.base.as_ptr().add(at).cast::<AtomicU64>() }
     }
 
     /// Writes a request into the submission queue (the engine's end). False:
@@ -275,7 +299,8 @@ impl QueuePair {
 
     /// The producer index of `ring`, or its consumer index.
     fn index(&self, ring: usize, consumer: bool) -> &AtomicU64 {
-        let offset = INDICES + (2 * ring + usize::from(consumer)) * LINE;
+        // The four indices follow the header's line, a separation each.
+        let offset = (1 + 2 * ring + usize::from(consumer)) * self.separation;
         // SAFETY: the index lies inside the mapping at an aligned offset, and the
         // mapping lives as long as `self`.
         unsafe { &*self.base.as_ptr().add(offset).cast::<AtomicU64>() }
@@ -525,18 +550,19 @@ mod tests {
         let (mut engine, mut pool) = ends(64, 0);
         let mut taken = Vec::new();
 
+        let separation = SEPARATION as i64;
         // The submission queue's producer index, further ahead than a ring holds.
-        write_word(&engine, 128, 72);
+        write_word(&engine, separation, 72);
         assert!(pool.next_request(&mut taken).is_err());
 
         // A length word, the first of the submission queue's bytes, that states
         // more than was produced.
-        write_word(&engine, 128, 16);
-        write_word(&engine, 640, 40);
+        write_word(&engine, separation, 16);
+        write_word(&engine, 5 * separation, 40);
         assert!(pool.next_request(&mut taken).is_err());
 
         // The submission queue's consumer index, ahead of what the engine produced.
-        write_word(&engine, 256, 1 << 40);
+        write_word(&engine, 2 * separation, 1 << 40);
         assert!(engine.submit(b"record").is_err());
     }
 
@@ -554,6 +580,14 @@ mod tests {
         let pool = QueuePair::create(64, 0).unwrap();
         write_word(&pool, 0, 0);
         assert!(QueuePair::open(pool.descriptor().try_clone_to_owned().unwrap(), true).is_err());
+
+        // A separation that would lay the indices over the header, or is no power of two.
+        for separation in [16, 96] {
+            let pool = QueuePair::create(64, 0).unwrap();
+            write_word(&pool, HEADER_SEPARATION as i64, separation);
+            let memory = pool.descriptor().try_clone_to_owned().unwrap();
+            assert!(QueuePair::open(memory, true).is_err(), "{separation}");
+        }
     }
 
     #[test]

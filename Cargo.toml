@@ -94,6 +94,7 @@ storage-server = { path = "crates/storage-server" }
 
 # ---- engine third-party deps ----
 crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
 sha2 = "0.10"
 signal-hook-registry = "1.4.8"
 
