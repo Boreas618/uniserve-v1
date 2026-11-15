@@ -336,6 +336,12 @@ impl fmt::Display for DeviceKind {
     }
 }
 
+/// Batches a rank keeps in flight when its deployment states no depth: one that the device
+/// executes and one that the host prepares meanwhile, so the host's preparation of a step
+/// overlaps the device's execution of the step before it, and no more, since a third would only
+/// hold its slot's storage idle.
+pub const DEFAULT_QUEUE_DEPTH: usize = 2;
+
 /// Rank layout without a deployment file, and product transport
 /// (`device_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -360,7 +366,7 @@ impl Default for DeviceConfig {
             device: DeviceKind::Cuda,
             devices: Vec::new(),
             worker_hosts: Vec::new(),
-            queue_depth: positive(2),
+            queue_depth: positive(DEFAULT_QUEUE_DEPTH),
         }
     }
 }
@@ -477,13 +483,19 @@ impl Default for WorkerConfig {
         Self {
             engine: DEFAULT_ENGINE.to_owned(),
             engine_revision: None,
-            watchdog_timeout: Duration::from_secs(300),
+            watchdog_timeout: DEFAULT_WATCHDOG_TIMEOUT,
             mesh: None,
             standby: false,
             standby_storage: StandbyStorage::Auto,
         }
     }
 }
+
+/// How long a batch may run without its ranks' progress before its worker group is replaced, when
+/// the deployment states no bound (`worker_config.watchdog_timeout`): five minutes, a policy bound
+/// above the longest step a served model takes (a denoising step of the longest video, a prefill
+/// of the longest prompt) and below what an operator waits before replacing a stuck group by hand.
+pub const DEFAULT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The engine package a deployment runs when its configuration names none: the implementation
 /// of the engine interface this tree holds (`crates/engine/package.toml`).
@@ -537,6 +549,16 @@ pub struct ChatConfig {
     pub reasoning_parser: ReasoningParser,
 }
 
+/// The time one input image's fetch may take when the deployment states none
+/// (`image_fetch_config.timeout`): a request-admission policy bound on one remote fetch,
+/// redirects and body included.
+pub const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The largest input image a request may carry when the deployment states none
+/// (`image_fetch_config.max_bytes`), in bytes: a request-admission policy of 20 MB, the
+/// per-image limit OpenAI's API states for image inputs.
+pub const IMAGE_FETCH_MAX_BYTES: u64 = 20_000_000;
+
 /// Fetching input images of chat requests (`image_fetch_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -555,9 +577,8 @@ pub struct ImageFetchConfig {
 impl Default for ImageFetchConfig {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(20),
-            // 20 MB.
-            max_bytes: 20_000_000,
+            timeout: IMAGE_FETCH_TIMEOUT,
+            max_bytes: IMAGE_FETCH_MAX_BYTES,
             allow_private: false,
         }
     }
@@ -717,6 +738,12 @@ mod content_format {
     }
 }
 
+/// The migrations caused by losses a request survives when the deployment states none
+/// (`migration_config.max_migrations`): a policy bound, so that a request whose own content
+/// fails every engine it reaches fails after a few attempts instead of taking each engine down in
+/// turn.
+pub const DEFAULT_MAX_MIGRATIONS: u32 = 3;
+
 /// Moving token requests between engines (`migration_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -729,9 +756,20 @@ pub struct MigrationConfig {
 
 impl Default for MigrationConfig {
     fn default() -> Self {
-        Self { max_migrations: 3 }
+        Self {
+            max_migrations: DEFAULT_MAX_MIGRATIONS,
+        }
     }
 }
+
+/// How long a finished asynchronous video job stays retrievable when the deployment states none
+/// (`video_job_config.retention`): a client policy of one hour.
+pub const VIDEO_JOB_RETENTION: Duration = Duration::from_secs(3600);
+
+/// The generated video the asynchronous jobs keep in shared memory when the deployment states no
+/// budget (`video_job_config.max_bytes`), in bytes: a policy budget of 1 GiB, which an operator
+/// sizes to the host storage the daemon may hold.
+pub const VIDEO_JOB_MAX_BYTES: usize = 1 << 30;
 
 /// Asynchronous video jobs (`video_job_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -748,9 +786,8 @@ pub struct VideoJobConfig {
 impl Default for VideoJobConfig {
     fn default() -> Self {
         Self {
-            retention: Duration::from_secs(3600),
-            // 1 GiB.
-            max_bytes: 1 << 30,
+            retention: VIDEO_JOB_RETENTION,
+            max_bytes: VIDEO_JOB_MAX_BYTES,
         }
     }
 }
