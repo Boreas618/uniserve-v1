@@ -124,9 +124,10 @@ class ServerProfile:
     listener, which a timeline load's changes call and whose event log it
     reads. A relative path is taken in the deployment's runtime directory,
     the `XDG_RUNTIME_DIR` the evaluator creates for it
-    (`server.ManagedDeployment`); `uniserve serve` listens at
-    `uniserve/admin-<port>.sock` there unless `admin_config.admin_uds`
-    names another socket.
+    (`server.ManagedDeployment`); `uniserve serve` places its admin socket
+    in an instance directory of its own unless `admin_config.admin_uds`
+    names one, so a profile that names `admin_socket` states that socket to
+    the server as `admin_config.admin_uds`.
     """
 
     name: str
