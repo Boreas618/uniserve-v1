@@ -22,7 +22,6 @@ from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     QWEN3_CHECKPOINT,
     engine_selection,
-    find_free_port,
     granted_devices,
     host_asset,
     require_uniserve_binary,
@@ -55,8 +54,6 @@ def _generate(
     Returns each prompt's generated tokens, each with the set of its
     position's most likely tokens, as ``token_id:<id>`` strings.
     """
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -65,8 +62,6 @@ def _generate(
         SERVED_MODEL,
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
         "--set",
         "dtype=bfloat16",
@@ -87,11 +82,11 @@ def _generate(
     outputs = []
     with server_process(
         command,
-        base_url,
         tmp_path / f"{label}.log",
         timeout_s=900,
         env={"CUDA_VISIBLE_DEVICES": granted_devices(1)},
-    ):
+    ) as server:
+        base_url = server.base_url
         for prompt in PROMPTS:
             response = httpx.post(
                 f"{base_url}/v1/chat/completions",

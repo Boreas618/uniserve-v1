@@ -30,7 +30,6 @@ from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     QWEN3_CHECKPOINT,
     engine_selection,
-    find_free_port,
     granted_devices,
     host_asset,
     require_uniserve_binary,
@@ -123,8 +122,6 @@ def test_requests_are_served_by_the_replicas_the_policy_routes_them_to(
     tmp_path: Path,
 ):
     checkpoint = str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -133,8 +130,6 @@ def test_requests_are_served_by_the_replicas_the_policy_routes_them_to(
         SERVED_MODEL,
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
         "--data-parallel-size",
         "2",
@@ -155,8 +150,9 @@ def test_requests_are_served_by_the_replicas_the_policy_routes_them_to(
     ]
     env = {"CUDA_VISIBLE_DEVICES": granted_devices(2)}
     with server_process(
-        command, base_url, tmp_path / "server.log", 1800, env=env
-    ):
+        command, tmp_path / "server.log", 1800, env=env
+    ) as server:
+        base_url = server.base_url
         # Idle replicas: the policy rotates, and each admits half.
         before = _quiet(base_url)
         for index in range(SEQUENTIAL):

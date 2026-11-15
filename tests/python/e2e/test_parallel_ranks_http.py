@@ -23,7 +23,6 @@ from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     QWEN3_CHECKPOINT,
     engine_selection,
-    find_free_port,
     granted_devices,
     host_asset,
     require_uniserve_binary,
@@ -46,7 +45,6 @@ TOP_LOGPROBS = 5
 def _command(
     description: str,
     checkpoint: str,
-    port: int,
     directory: Path,
     group: dict[str, Any],
 ) -> list[str]:
@@ -60,8 +58,6 @@ def _command(
         description,
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
         "--worker-groups",
         str(written_deployment(directory, [group])),
@@ -150,8 +146,6 @@ def one_device(
     def ranked(description: str, checkpoint: str) -> dict[str, list[Any]]:
         if description not in outputs:
             directory = tmp_path_factory.mktemp(f"{description}-one-device")
-            port = find_free_port()
-            base_url = f"http://127.0.0.1:{port}"
             group = {
                 "id": "model",
                 "ranks": ["cuda:0"],
@@ -159,12 +153,12 @@ def one_device(
                 "queue_depth": 2,
             }
             with server_process(
-                _command(description, checkpoint, port, directory, group),
-                base_url,
+                _command(description, checkpoint, directory, group),
                 directory / f"{description}.log",
                 timeout_s=300,
                 env={"CUDA_VISIBLE_DEVICES": granted_devices(1)},
-            ):
+            ) as server:
+                base_url = server.base_url
                 outputs[description] = _ranked(base_url, description)
         return outputs[description]
 
@@ -188,8 +182,6 @@ def test_ranks_out_of_order_generate_the_one_device_outputs(
     one_device: Callable[[str, str], dict[str, list[Any]]],
 ):
     checkpoint = str(host_asset(model_env, QWEN3_CHECKPOINT))
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     parallel = (
         {"sequence_parallel": {"kind": "ulysses", "ulysses_degree": 2}}
         if parallel_axis == "sequence"
@@ -203,12 +195,12 @@ def test_ranks_out_of_order_generate_the_one_device_outputs(
         "queue_depth": 2,
     }
     with server_process(
-        _command(description, checkpoint, port, tmp_path, group),
-        base_url,
+        _command(description, checkpoint, tmp_path, group),
         tmp_path / f"{description}-{parallel_axis}.log",
         timeout_s=300,
         env={"CUDA_VISIBLE_DEVICES": granted_devices(2)},
-    ):
+    ) as server:
+        base_url = server.base_url
         for name, messages in _chats(description).items():
             response = httpx.post(
                 f"{base_url}/v1/chat/completions",

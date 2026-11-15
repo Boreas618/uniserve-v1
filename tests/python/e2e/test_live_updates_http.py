@@ -31,7 +31,6 @@ import os
 import re
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -60,7 +59,6 @@ from tests.python.e2e.http_helpers import (
     engine_processes,
     engine_revision,
     engine_selection,
-    find_free_port,
     granted_devices,
     host_asset,
     install_engine,
@@ -75,6 +73,8 @@ from tests.python.e2e.http_helpers import (
     serving_engine,
     start_server,
     stop_server,
+    storage_status,
+    taken_over,
     tokens_found,
     update_report,
     wait_for_phase,
@@ -411,39 +411,26 @@ STREAM_POLL_S = 0.01
 
 @contextmanager
 def _node(runtime: Path, device: str, log: Path) -> Iterator[tuple[str, int]]:
-    """A node serving no deployment yet; its URL and process id."""
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    process = start_server(
+    """A node serving no deployment yet; its URL and process id. The node
+    serves its own routes once its readiness record states it serves.
+    """  # noqa: D205
+    server = start_server(
         [
             str(require_uniserve_binary()),
             "serve",
             "--host",
             "127.0.0.1",
-            "--port",
-            str(port),
             *build_server_option(),
         ],
         log,
         env={"CUDA_VISIBLE_DEVICES": device, "XDG_RUNTIME_DIR": str(runtime)},
     )
     try:
-
-        def answers() -> bool:
-            if process.poll() is not None:
-                raise RuntimeError(f"the node exited with {process.returncode}")
-            try:
-                answered = admin_request(
-                    base_url, "GET", "/admin/node", timeout_s=2
-                )
-            except (httpx.HTTPError, FileNotFoundError):
-                return False
-            return answered.status_code == 200
-
-        wait_until(answers, 60, "the node did not answer")
-        yield base_url, process.pid
+        server.wait("serving", 60)
+        yield server.base_url, server.process.pid
     finally:
-        stop_server(process)
+        stop_server(server.process)
+        server.close()
 
 
 def _node_state(base_url: str) -> dict:
@@ -558,8 +545,6 @@ def _serving(
     checkpoint: str | None = None,
 ) -> Iterator[tuple[str, int]]:
     """A deployment serving `name`, its URL and its daemon's process id."""
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -568,8 +553,6 @@ def _serving(
         name,
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
         "--set",
         f"kv_cache_config.host_gib={HOST_GIB}",
@@ -582,10 +565,8 @@ def _serving(
         "XDG_RUNTIME_DIR": str(runtime),
         **(env or {}),
     }
-    with server_process(
-        command, base_url, log, timeout_s=900, env=environment
-    ) as process:
-        yield base_url, process.pid
+    with server_process(command, log, timeout_s=900, env=environment) as server:
+        yield server.base_url, server.pid
 
 
 @contextmanager
@@ -632,15 +613,6 @@ def _weight_bytes(base_url: str) -> int:
         for entry in _quota_reservations(base_url)
         if entry["item"] == "weights"
     )
-
-
-def _listens(port: int) -> bool:
-    """Whether a server accepts connections on `port` of this host."""
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=1):
-            return True
-    except OSError:
-        return False
 
 
 def _apply(base_url: str, *assignments: str) -> dict:
@@ -1109,14 +1081,13 @@ def _restart_while_streaming(
     # A change of the listening address restarts the daemon on it: the new
     # address serves, and the old one closes once the replaced daemon exits.
     previous = successors[-1]
-    port = find_free_port()
-    moved = _apply(base_url, f"admin_config.port={port}")
+    moved = _apply(base_url, "admin_config.host=localhost")
     assert moved["change"] == "daemon", moved
     successors.append(moved["pid"])
-    moved_url = f"http://127.0.0.1:{port}"
     # The answer comes from the daemon on the previous address, and the
-    # successor binds a new address once it holds the deployment.
-    wait_until(lambda: _listens(port), 60, "the new address did not open")
+    # successor binds a new address, on a port it picks, once it holds the
+    # deployment; its readiness record states it.
+    moved_url = taken_over(base_url, moved["pid"])
     reply = _chat(moved_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
     wait_until(
@@ -1128,18 +1099,17 @@ def _restart_while_streaming(
         httpx.get(f"{base_url}/health", timeout=5)
     status = admin_config(moved_url)
     server = tomllib.loads(status["config"])["admin_config"]
-    assert server["port"] == port, server
+    assert server["host"] == "localhost", server
 
     # A change of both the daemon's options and what an epoch executes
     # restarts the daemon on its new options first, and its successor then
     # changes the epoch in an operation of its own.
     previous = successors[-1]
-    port = find_free_port()
-    both = _apply(moved_url, f"admin_config.port={port}", CHANGE)
+    both = _apply(moved_url, "admin_config.host=127.0.0.1", CHANGE)
     assert both["change"] == "daemon", both
     assert both["then"] == "update", both
     successors.append(both["pid"])
-    both_url = f"http://127.0.0.1:{port}"
+    both_url = taken_over(moved_url, both["pid"])
 
     def changed() -> dict | None:
         status = admin_status(both_url)
@@ -1169,7 +1139,7 @@ def _restart_while_streaming(
         300,
         "the switch's target never served its configuration",
     )
-    assert served_config()["admin_config"]["port"] == port
+    assert served_config()["admin_config"]["host"] == "127.0.0.1"
     reply = _chat(both_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
     wait_until(
@@ -1241,18 +1211,10 @@ def _restart_with_a_json_body(
 
 
 def _storage_pid(runtime: Path) -> int:
-    """The process id of the Storage Server serving the test's socket."""
-    socket = str(runtime / "uniserve" / "storage-server.sock").encode()
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            command = (entry / "cmdline").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        if b"serve" in command and socket in command:
-            return int(entry.name)
-    raise AssertionError("no Storage Server serves the test's socket")
+    """The process id of the Storage Server serving the test's socket, as
+    its readiness record states it.
+    """  # noqa: D205
+    return storage_status(runtime)["pid"]
 
 
 def test_a_storage_server_restart_keeps_the_deployment_serving(

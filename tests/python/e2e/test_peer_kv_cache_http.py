@@ -42,8 +42,10 @@ round differently, so the two are not required to be identical.
 The second host is named by the suite's two-host variables (docs/testing.md,
 Two hosts): ``UNISERVE_H3_FOLLOWER``, an ssh destination with this checkout
 at the same path, and ``UNISERVE_H3_LEADER_ADDRESS``, this host's address as
-the second reaches it. Both hosts' Storage Servers are the test's own,
-started with a TCP endpoint and NIXL (``UNISERVE_NIXL_LIBRARY``, the
+the second reaches it. Both hosts' Storage Servers are the deployments'
+own, which their daemons start with the settings the deployments state: a
+TCP endpoint on a port each picks, which A's readiness record states as the
+peer endpoint B names, and NIXL (``UNISERVE_NIXL_LIBRARY``, the
 ``libnixl_capi.so`` of docs/nixl.md); without these variables the two-host
 case is skipped. The peer endpoints are unauthenticated: the hosts share an
 isolated network.
@@ -53,12 +55,8 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shlex
-import shutil
 import subprocess
-import tempfile
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -71,13 +69,18 @@ from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     admin,
     engine_selection,
-    find_free_port,
     granted_devices,
+    on_host,
     qwen3_checkpoint,
+    remote_environment,
+    remote_runtime_directory,
     require_uniserve_binary,
+    runtime_directory,
     server_process,
+    start_remote_server,
     stop_remote_storage_server,
     stop_storage_server,
+    storage_socket,
     tokens_found,
     wait_until,
 )
@@ -205,8 +208,13 @@ def _logprobs_close(left: list, right: list) -> bool:
 
 
 def _serve_command(
-    checkpoint: str, port: int, host: str, extra: tuple[str, ...] = ()
+    checkpoint: str, host: str, address: str, extra: tuple[str, ...] = ()
 ) -> list[str]:
+    """Serve the checkpoint on `host`, with a Storage Server that accepts
+    other hosts at `address`, on a port it picks, and reads them through
+    NIXL.
+    """  # noqa: D205
+    assert NIXL_LIBRARY is not None
     return [
         str(require_uniserve_binary()),
         "serve",
@@ -215,8 +223,6 @@ def _serve_command(
         SERVED_MODEL,
         "--host",
         host,
-        "--port",
-        str(port),
         *engine_selection(),
         "--set",
         "dtype=bfloat16",
@@ -228,153 +234,68 @@ def _serve_command(
         f"kv_cache_config.block_size={BLOCK_SIZE}",
         "--set",
         "chat_config.reasoning_parser=none",
+        "--set",
+        f"storage_config.tcp={address}:0",
+        "--set",
+        f"storage_config.nixl_library={NIXL_LIBRARY}",
         *extra,
     ]
 
 
-def _storage_command(socket: str, tcp: str) -> list[str]:
-    """The Storage Server of a test host: on `socket`, reached by other hosts
-    at `tcp`, its Transfer Server reading them through NIXL.
-    """  # noqa: D205
-    assert NIXL_LIBRARY is not None
-    return [
-        str(require_uniserve_binary()),
-        "storage-server",
-        "serve",
-        "--daemon",
-        "--socket",
-        socket,
-        "--tcp",
-        tcp,
-        "--nixl-library",
-        NIXL_LIBRARY,
-    ]
-
-
-def _environment() -> dict[str, str]:
-    """The variables a test host's processes take from this test's."""
-    return {
-        name: os.environ.get(name, "")
-        for name in (
-            "PATH",
-            "LD_LIBRARY_PATH",
-            "PYTHONPATH",
-            "MAX_JOBS",
-            "FLASHINFER_WORKSPACE_BASE",
-            "UCX_NET_DEVICES",
-        )
-    }
-
-
-def _on_follower(command: str, timeout: float = 120) -> str:
-    assert FOLLOWER is not None
-    done = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", FOLLOWER, command],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=True,
-    )
-    return done.stdout
-
-
 @contextmanager
 def _follower_deployment(
-    log: Path, port: int, devices: str, extra: list[str]
+    log: Path, devices: str, extra: list[str]
 ) -> Iterator[tuple[str, str]]:
-    """Deployment B on the second host, its own Storage Server started first
-    with a TCP endpoint and NIXL, and its own Build Server.
+    """Deployment B on the second host, with its own Storage Server, which
+    its daemon starts with a TCP endpoint and NIXL, and its own Build Server.
 
     Yields B's HTTP base URL and its runtime directory there; on exit it
     stops the daemon and the Storage Server, keeping their logs beside `log`.
     """  # noqa: D205
     assert FOLLOWER is not None
-    address = _on_follower("hostname -I").split()[0]
-    runtime = f"/tmp/uniserve-peer-{os.getpid()}-{find_free_port()}"
-    socket = f"{runtime}/uniserve/storage-server.sock"
-    variables = _environment()
-    variables["XDG_RUNTIME_DIR"] = runtime
-    variables["CUDA_VISIBLE_DEVICES"] = devices
-    environment = " ".join(
-        f"{name}={shlex.quote(value)}" for name, value in variables.items()
-    )
-    _on_follower(
-        f"mkdir -p -m 700 {runtime}/uniserve && env {environment} "
-        + shlex.join(_storage_command(socket, f"{address}:0"))
+    address = on_host(FOLLOWER, "hostname -I").split()[0]
+    runtime = remote_runtime_directory(FOLLOWER, "uniserve-peer")
+    environment = remote_environment(
+        {"XDG_RUNTIME_DIR": runtime, "CUDA_VISIBLE_DEVICES": devices}
     )
     with remote_build_server(FOLLOWER) as modules:
-        command = _serve_command(qwen3_checkpoint(), port, "0.0.0.0") + [
-            "--set",
-            f"build_config.socket={modules}",
-            *extra,
-        ]
-        remote = (
-            f"cd {shlex.quote(str(Path.cwd()))} && echo follower pid $$ && "
-            f"exec env {environment} {shlex.join(command)}"
+        command = _serve_command(
+            qwen3_checkpoint(),
+            "0.0.0.0",
+            address,
+            ("--set", f"build_config.socket={modules}", *extra),
         )
-        process = subprocess.Popen(
-            ["ssh", "-o", "BatchMode=yes", FOLLOWER, remote],
-            stdout=log.open("w", encoding="utf-8"),
-            stderr=subprocess.STDOUT,
-            text=True,
+        server = start_remote_server(
+            FOLLOWER,
+            command,
+            log,
+            environment=environment,
+            timeout_s=1800,
+            address=address,
         )
-        base_url = f"http://{address}:{port}"
         try:
-            deadline = time.monotonic() + 1800
-            while True:
-                try:
-                    if httpx.get(f"{base_url}/health", timeout=5).is_success:
-                        break
-                except httpx.HTTPError:
-                    pass
-                assert process.poll() is None, (
-                    f"deployment B ended: {log.read_text()[-4000:]}"
-                )
-                assert time.monotonic() < deadline, "deployment B did not start"
-                time.sleep(2)
-            yield base_url, runtime
+            server.wait("serving", 1800)
+            yield server.base_url, runtime
         finally:
-            pid = re.search(r"follower pid (\d+)", log.read_text())
-            if pid is not None and process.poll() is None:
-                _on_follower(f"kill -TERM -- {pid.group(1)}; true")
+            if server.record and server.process.poll() is None:
+                on_host(FOLLOWER, f"kill -TERM -- {server.pid}; true")
             try:
-                process.wait(timeout=120)
+                server.process.wait(timeout=120)
             except subprocess.TimeoutExpired:
-                process.kill()
+                server.process.kill()
             stop_remote_storage_server(
                 FOLLOWER, runtime, log.with_suffix(".storage.log")
             )
 
 
-def _leader_storage() -> tuple[Path, dict[str, str], str]:
-    """Deployment A's Storage Server, started on this host with a TCP
-    endpoint and NIXL before A starts: its runtime directory, the
-    environment A serves under, and the endpoint B's peers name.
+def _leader_environment(runtime: Path) -> dict[str, str]:
+    """The environment deployment A serves under: its GPU and the runtime
+    directory its Storage Server serves in.
     """  # noqa: D205
-    runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
-    socket = runtime / "uniserve" / "storage-server.sock"
-    socket.parent.mkdir(mode=0o700)
-    env = {
+    return {
         "CUDA_VISIBLE_DEVICES": granted_devices(1),
         "XDG_RUNTIME_DIR": str(runtime),
     }
-    peer = f"{LEADER_ADDRESS}:{find_free_port()}"
-    subprocess.run(
-        _storage_command(str(socket), peer),
-        env={**os.environ, **env},
-        check=True,
-        timeout=120,
-    )
-    return runtime, env, peer
-
-
-def _release_leader_storage(runtime: Path, tmp_path: Path) -> None:
-    """Stops A's Storage Server and keeps its log beside the test's."""
-    stop_storage_server(runtime)
-    storage_log = runtime / "uniserve" / "storage-server.log"
-    if storage_log.is_file():
-        shutil.copy(storage_log, tmp_path / "storage-server.log")
-    shutil.rmtree(runtime, ignore_errors=True)
 
 
 def _skip_without_two_hosts() -> None:
@@ -389,58 +310,65 @@ def test_a_host_loads_a_prompts_blocks_from_a_peer_hosts_host_tier(
     tmp_path: Path,
 ):
     _skip_without_two_hosts()
+    assert LEADER_ADDRESS is not None
     shared = _records("Shared")
     dropped = _records("Dropped")
-    runtime, env, peer = _leader_storage()
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     listing = ""
-    try:
-        with server_process(
-            _serve_command(qwen3_checkpoint(), port, "127.0.0.1"),
-            base_url,
+    with (
+        runtime_directory(tmp_path / "storage-server.log") as runtime,
+        server_process(
+            _serve_command(qwen3_checkpoint(), "127.0.0.1", LEADER_ADDRESS),
             tmp_path / "a.log",
             timeout_s=1800,
-            env=env,
-        ):
-            # A computes both prompts and stores their full blocks to its
-            # host tier. Its answer to the shared prompt over the stored
-            # blocks computes only the last tokens over them, as B's does over
-            # the blocks it reads: the two compute the same tokens over the
-            # same cached keys and values (a prompt computed whole may round
-            # otherwise, as `test_host_kv_cache_http.py` states).
-            prompt_tokens, _ = _ask(base_url, shared)
-            reusable = _reusable(prompt_tokens)
-            a_shared = _stored(base_url, shared, reusable)
-            _, a_dropped = _ask(base_url, dropped)
-            _stored(base_url, dropped, reusable)
+            env=_leader_environment(runtime),
+        ) as server,
+    ):
+        base_url = server.base_url
+        # The endpoint B's peers name: A's Storage Server's, as A's
+        # readiness record states it.
+        peer = server.endpoint("peer")
+        # A computes both prompts and stores their full blocks to its host
+        # tier. Its answer to the shared prompt over the stored blocks
+        # computes only the last tokens over them, as B's does over the blocks
+        # it reads: the two compute the same tokens over the same cached keys
+        # and values (a prompt computed whole may round otherwise, as
+        # `test_host_kv_cache_http.py` states).
+        prompt_tokens, _ = _ask(base_url, shared)
+        reusable = _reusable(prompt_tokens)
+        a_shared = _stored(base_url, shared, reusable)
+        _, a_dropped = _ask(base_url, dropped)
+        _stored(base_url, dropped, reusable)
 
-            with _follower_deployment(
-                tmp_path / "b.log",
-                find_free_port(),
-                FOLLOWER_DEVICE,
-                ["--set", f'kv_cache_config.peers=["{peer}"]'],
-            ) as (b_url, b_runtime):
-                # B reads the shared prompt's blocks from A.
-                b_shared, shared_found = _found(b_url, shared)
-                libraries = shlex.quote(os.environ.get("LD_LIBRARY_PATH", ""))
-                listing = _on_follower(
-                    f"env XDG_RUNTIME_DIR={b_runtime} "
-                    f"LD_LIBRARY_PATH={libraries} "
-                    f"{shlex.quote(str(require_uniserve_binary()))} "
-                    "storage-server list"
-                )
+        with _follower_deployment(
+            tmp_path / "b.log",
+            FOLLOWER_DEVICE,
+            ["--set", f'kv_cache_config.peers=["{peer}"]'],
+        ) as (b_url, b_runtime):
+            # B reads the shared prompt's blocks from A.
+            b_shared, shared_found = _found(b_url, shared)
+            assert FOLLOWER is not None
+            listing = on_host(
+                FOLLOWER,
+                f"env {remote_environment()} "
+                + shlex.join(
+                    [
+                        str(require_uniserve_binary()),
+                        "storage-server",
+                        "list",
+                        "--socket",
+                        storage_socket(b_runtime),
+                    ]
+                ),
+            )
 
-                # A prompt A never saw brings nothing from A, and B's answer
-                # is A's.
-                unseen = _records("Unseen")
-                b_unseen, unseen_found = _found(b_url, unseen)
-                _, a_unseen = _ask(base_url, unseen)
-                # A's Storage Server is gone: B computes what A stored.
-                stop_storage_server(runtime)
-                b_dropped, dropped_found = _found(b_url, dropped)
-    finally:
-        _release_leader_storage(runtime, tmp_path)
+            # A prompt A never saw brings nothing from A, and B's answer
+            # is A's.
+            unseen = _records("Unseen")
+            b_unseen, unseen_found = _found(b_url, unseen)
+            _, a_unseen = _ask(base_url, unseen)
+            # A's Storage Server is gone: B computes what A stored.
+            stop_storage_server(runtime)
+            b_dropped, dropped_found = _found(b_url, dropped)
 
     assert reusable >= PEER_BLOCKS * BLOCK_SIZE, prompt_tokens
     assert shared_found["peer_hits"] >= PEER_BLOCKS * BLOCK_SIZE, shared_found
@@ -458,44 +386,42 @@ def test_an_fp8_host_loads_a_bf16_hosts_blocks_by_converting_them(
     tmp_path: Path,
 ):
     _skip_without_two_hosts()
+    assert LEADER_ADDRESS is not None
     shared = _records("Converted")
-    runtime, env, peer = _leader_storage()
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    try:
-        with server_process(
-            _serve_command(qwen3_checkpoint(), port, "127.0.0.1"),
-            base_url,
+    with (
+        runtime_directory(tmp_path / "storage-server.log") as runtime,
+        server_process(
+            _serve_command(qwen3_checkpoint(), "127.0.0.1", LEADER_ADDRESS),
             tmp_path / "a.log",
             timeout_s=1800,
-            env=env,
-        ):
-            # A computes the prompt in BF16 and stores its full blocks to its
-            # host tier.
-            prompt_tokens, _ = _ask(base_url, shared)
-            reusable = _reusable(prompt_tokens)
-            bf16 = _stored(base_url, shared, reusable)
+            env=_leader_environment(runtime),
+        ) as server,
+    ):
+        base_url = server.base_url
+        peer = server.endpoint("peer")
+        # A computes the prompt in BF16 and stores its full blocks to its host
+        # tier.
+        prompt_tokens, _ = _ask(base_url, shared)
+        reusable = _reusable(prompt_tokens)
+        bf16 = _stored(base_url, shared, reusable)
 
-            with _follower_deployment(
-                tmp_path / "b.log",
-                find_free_port(),
-                FOLLOWER_DEVICE,
-                [
-                    "--set",
-                    "kv_cache_config.dtype=float8_e4m3fn",
-                    "--set",
-                    f'kv_cache_config.peers=["{peer}"]',
-                ],
-            ) as (b_url, _):
-                # The same prompt on B under a salt no cache holds: computed
-                # cold, then over the FP8 blocks B wrote itself.
-                cold = _candidates(b_url, shared, cache_salt="local")
-                local = _candidates(b_url, shared, cache_salt="local")
-                converted, found = tokens_found(
-                    b_url, lambda: _candidates(b_url, shared)
-                )
-    finally:
-        _release_leader_storage(runtime, tmp_path)
+        with _follower_deployment(
+            tmp_path / "b.log",
+            FOLLOWER_DEVICE,
+            [
+                "--set",
+                "kv_cache_config.dtype=float8_e4m3fn",
+                "--set",
+                f'kv_cache_config.peers=["{peer}"]',
+            ],
+        ) as (b_url, _):
+            # The same prompt on B under a salt no cache holds: computed
+            # cold, then over the FP8 blocks B wrote itself.
+            cold = _candidates(b_url, shared, cache_salt="local")
+            local = _candidates(b_url, shared, cache_salt="local")
+            converted, found = tokens_found(
+                b_url, lambda: _candidates(b_url, shared)
+            )
 
     (tmp_path / "answers.json").write_text(
         json.dumps(

@@ -68,7 +68,6 @@ from tests.python.e2e.http_helpers import (
     admin_status,
     apply_config,
     engine_selection,
-    find_free_port,
     granted_devices,
     host_asset,
     require_uniserve_binary,
@@ -154,8 +153,6 @@ def _serve(tmp_path: Path, deployment=_deployment) -> Iterator[str]:
     """The deployment `deployment` writes, with a Storage Server of its own;
     its URL.
     """  # noqa: D205
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -164,8 +161,6 @@ def _serve(tmp_path: Path, deployment=_deployment) -> Iterator[str]:
         NAME,
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
         "--worker-groups",
         str(deployment(tmp_path)),
@@ -191,8 +186,9 @@ def _serve(tmp_path: Path, deployment=_deployment) -> Iterator[str]:
             "XDG_RUNTIME_DIR": str(runtime),
         }
         with server_process(
-            command, base_url, log, timeout_s=3600, env=environment
-        ):
+            command, log, timeout_s=3600, env=environment
+        ) as server:
+            base_url = server.base_url
             yield base_url
 
 

@@ -21,7 +21,6 @@ from tests.python.e2e.http_helpers import (
     FASTH3_ADAPTER,
     MINIMAX_H3_CHECKPOINT,
     engine_selection,
-    find_free_port,
     host_asset,
     require_uniserve_binary,
     server_process,
@@ -56,8 +55,6 @@ def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
         / "minimax_h3"
         / "ulysses4.toml"
     )
-    port = find_free_port()
-    base = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -67,8 +64,6 @@ def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
         *engine_selection(),
         "--served-model-name",
         "MiniMax-H3",
-        "--port",
-        str(port),
         # Five seconds bound the layouts startup prepares: two frame counts
         # at each of the six sizes and one text capacity.
         "--set",
@@ -87,9 +82,13 @@ def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
         "steaming, while birds call from the pines."
     )
     with (
-        server_process(command, base, tmp_path / "server.log", timeout_s=3600),
-        httpx.Client(base_url=base, timeout=1800) as client,
+        server_process(
+            command, tmp_path / "server.log", timeout_s=3600
+        ) as server,
+        httpx.Client(timeout=1800) as client,
     ):
+        base = server.base_url
+        client.base_url = base
         video = client.get("/v1/capabilities").json()["video"]["model"]
         # The base DiT generates from the prompt alone and from keyframes.
         assert video["tasks"] == ["t2va", "fl2va"]
@@ -175,8 +174,6 @@ def test_a_fasth3_adapter_over_the_base_release_serves_its_student(
         / "minimax_h3"
         / "ulysses4.toml"
     )
-    port = find_free_port()
-    base = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -188,8 +185,6 @@ def test_a_fasth3_adapter_over_the_base_release_serves_its_student(
         *engine_selection(),
         "--served-model-name",
         "FastH3",
-        "--port",
-        str(port),
         "--set",
         'video_config.sizes=["1344x768"]',
         "--set",
@@ -204,9 +199,13 @@ def test_a_fasth3_adapter_over_the_base_release_serves_its_student(
         "steaming, while birds call from the pines."
     )
     with (
-        server_process(command, base, tmp_path / "server.log", timeout_s=3600),
-        httpx.Client(base_url=base, timeout=1800) as client,
+        server_process(
+            command, tmp_path / "server.log", timeout_s=3600
+        ) as server,
+        httpx.Client(timeout=1800) as client,
     ):
+        base = server.base_url
+        client.base_url = base
         video = client.get("/v1/capabilities").json()["video"]["model"]
         # The student is distilled from the base partition, which serves
         # text-to-video and keyframes, on four DMD rungs at the base shifts.

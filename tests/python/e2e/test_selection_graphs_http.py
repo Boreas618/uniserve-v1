@@ -24,7 +24,6 @@ import tokenizers
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     engine_selection,
-    find_free_port,
     qwen3_checkpoint,
     require_uniserve_binary,
     server_process,
@@ -52,8 +51,6 @@ PROMPT = (
 
 @pytest.fixture(scope="module")
 def graphs(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     args = [
         str(require_uniserve_binary()),
         "serve",
@@ -62,8 +59,6 @@ def graphs(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
         "qwen3-selection",
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
         "--set",
         "dtype=bfloat16",
@@ -81,10 +76,10 @@ def graphs(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     log = tmp_path_factory.mktemp("selection") / "server.log"
     with server_process(
         args,
-        base_url,
         log,
         timeout_s=1800.0,
-    ):
+    ) as server:
+        base_url = server.base_url
         yield base_url
 
 

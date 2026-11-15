@@ -17,12 +17,12 @@ these tests has that environment installed with its program there.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
 import subprocess
 import tempfile
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -31,10 +31,16 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     granted_devices,
+    on_host,
+    remote_runtime_directory,
     require_uniserve_binary,
     start_server,
     stop_server,
 )
+
+#: How long a Build Server takes to serve: it discovers its toolchains, which
+#: imports the compilers of its Python environment, before it serves.
+BUILD_SERVER_START_S = 120.0
 
 # The packages this file installs: the scheduling policy, and every kernel
 # package of the tree. A deployment's epoch is resolved at this host's Build
@@ -162,18 +168,11 @@ def build_server(
         module_target(),
     ]
     require_toolchain_environment()
-    process = start_server(command, log)
-    deadline = time.monotonic() + 120.0
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(f"the Build Server exited: {log.read_text()}")
-        if socket.exists():
-            break
-        time.sleep(0.2)
-    else:
-        raise TimeoutError(f"the Build Server left no socket at {socket}")
+    server = start_server(command, log)
 
     try:
+        # The server states its readiness record once it serves.
+        server.wait("serving", BUILD_SERVER_START_S)
         for package in packages_in_order():
             installed = subprocess.run(
                 [
@@ -197,7 +196,8 @@ def build_server(
                 )
         yield socket
     finally:
-        stop_server(process)
+        stop_server(server.process)
+        server.close()
         shutil.rmtree(sockets, ignore_errors=True)
 
 
@@ -231,10 +231,11 @@ def remote_build_server(host: str) -> Iterator[str]:
     it numbers them alike and builds each module the second host's main
     process asks for. The checkout lies at the same path on `host`; the
     server's sockets, packages and store lie in a directory of its own there,
-    removed with the server.
+    removed with the server. The server starts detached (``--daemon``), and
+    its starter prints its readiness record once it serves.
     """  # noqa: D205
     binary = require_uniserve_binary()
-    work = f"/tmp/uniserve-modules-{os.getpid()}-{time.monotonic_ns()}"
+    work = remote_runtime_directory(host, "uniserve-modules")
     socket = f"{work}/build-server.sock"
     serve = [
         str(binary),
@@ -248,6 +249,7 @@ def remote_build_server(host: str) -> Iterator[str]:
         f"{work}/modules",
         "--target",
         module_target(),
+        "--daemon",
     ]
     # The server runs in this test's environment: its search paths, native
     # libraries and CUDA toolkit, the libclang (with its bindgen arguments)
@@ -264,35 +266,21 @@ def remote_build_server(host: str) -> Iterator[str]:
             ("MAX_JOBS", "16"),
         )
     )
+    # The detached server logs beside its socket (`build-server.log`); its
+    # starter returns, printing the record, once the server serves.
     remote = (
-        f"mkdir -m 700 {work} && cd {shlex.quote(str(repository()))} "
-        "|| exit 1; "
-        f"{variables} nohup {shlex.join(serve)} > {work}/build-server.log "
-        f"2>&1 < /dev/null & echo $!"
+        f"cd {shlex.quote(str(repository()))} && "
+        f"env {variables} {shlex.join(serve)}"
     )
-
-    def on_host(command: str, timeout: float = 120) -> str:
-        return subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", host, command],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=True,
-        ).stdout
-
-    pid = on_host(remote).strip()
+    record = json.loads(
+        on_host(host, remote, timeout=BUILD_SERVER_START_S).splitlines()[-1]
+    )
+    pid = record["pid"]
     try:
-        deadline = time.monotonic() + 120.0
-        while on_host(f"test -S {socket} && echo up || true").strip() != "up":
-            if time.monotonic() > deadline:
-                raise TimeoutError(
-                    f"the Build Server on {host} left no socket at {socket}: "
-                    + on_host(f"cat {work}/build-server.log")
-                )
-            time.sleep(0.5)
         for package in packages_in_order():
             on_host(
-                f"{variables} "
+                host,
+                f"env {variables} "
                 + shlex.join(
                     [
                         str(binary),
@@ -307,4 +295,10 @@ def remote_build_server(host: str) -> Iterator[str]:
             )
         yield socket
     finally:
-        on_host(f"kill {pid}; sleep 1; rm -rf {work}")
+        # The server holds its socket's lock for its life: taking the lock
+        # waits until the server ended, and the directory goes then.
+        lock = shlex.quote(f"{work}/build-server.lock")
+        on_host(
+            host,
+            f"kill {pid}; flock {lock} true; rm -rf {shlex.quote(work)}",
+        )

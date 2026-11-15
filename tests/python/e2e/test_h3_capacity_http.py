@@ -13,7 +13,6 @@ from transformers import AutoTokenizer
 from tests.python.e2e.http_helpers import (
     H3_CHECKPOINT,
     engine_selection,
-    find_free_port,
     host_asset,
     require_uniserve_binary,
     server_process,
@@ -119,8 +118,6 @@ def test_every_admitted_duration_and_prompt_length_replays(
         / "minimax_h3"
         / "ulysses4.toml"
     )
-    port = find_free_port()
-    base = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -130,8 +127,6 @@ def test_every_admitted_duration_and_prompt_length_replays(
         *engine_selection(),
         "--served-model-name",
         "FastH3",
-        "--port",
-        str(port),
         "--max-running-requests",
         "2",
         "--max-model-len",
@@ -145,10 +140,12 @@ def test_every_admitted_duration_and_prompt_length_replays(
 
     with (
         server_process(
-            command, base, tmp_path / "capacity.log", timeout_s=2400
-        ),
-        httpx.Client(base_url=base, timeout=900) as client,
+            command, tmp_path / "capacity.log", timeout_s=2400
+        ) as server,
+        httpx.Client(timeout=900) as client,
     ):
+        base = server.base_url
+        client.base_url = base
         capabilities = client.get("/v1/capabilities").json()["video"]["model"]
         assert (
             capabilities["min_seconds"],

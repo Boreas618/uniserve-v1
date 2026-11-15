@@ -4,11 +4,10 @@ import base64
 import io
 import json
 import os
-import secrets
+import select
 import shlex
 import shutil
 import signal
-import socket
 import subprocess
 import tempfile
 import time
@@ -112,46 +111,6 @@ def granted_devices(count: int) -> str:
     if len(devices) < count:
         raise RuntimeError(f"{count} GPUs are needed, {granted!r} were granted")
     return ",".join(devices[:count])
-
-
-# The lowest port `find_free_port` draws: above the well-known and common
-# service ports.
-PORT_FLOOR = 20000
-
-
-def _ephemeral_floor() -> int:
-    """The lowest port of the kernel's ephemeral range (Linux: 32768)."""
-    try:
-        text = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text()
-        return int(text.split()[0])
-    except (OSError, ValueError, IndexError):
-        return 32768
-
-
-def find_free_port() -> int:
-    """A loopback TCP port that is free now and outside the ephemeral range.
-
-    A server binds the port it is given only once it serves, which can be
-    minutes after the port was chosen, and the deployment's processes bind
-    ephemeral ports meanwhile (their ranks' rendezvous listeners, NCCL's
-    bootstrap): a port taken from the ephemeral range can be handed to one of
-    them, so that the test's readiness probe reaches that process and the
-    server cannot bind its port. The port is drawn at random below the range,
-    so concurrent tests seldom draw the same one, and checked free by binding
-    it.
-    """
-    ceiling = _ephemeral_floor()
-    for _ in range(1000):
-        port = PORT_FLOOR + secrets.randbelow(ceiling - PORT_FLOOR)
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            try:
-                sock.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-            return port
-    raise RuntimeError(
-        f"no free port between {PORT_FLOOR} and {ceiling} after 1000 draws"
-    )
 
 
 def require_uniserve_binary() -> Path:
@@ -360,36 +319,6 @@ def log_tail(log_path: Path | None, lines: int = 40) -> str:
     )
 
 
-def wait_health(
-    base_url: str,
-    process: subprocess.Popen[str],
-    timeout_s: float,
-    log_path: Path | None = None,
-) -> None:
-    deadline = time.monotonic() + scaled(timeout_s)
-    last_error: str | None = None
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(
-                f"server exited early with code {process.returncode}"
-                f"{log_tail(log_path)}"
-            )
-        try:
-            response = httpx.get(f"{base_url}/health", timeout=2.0)
-            if response.status_code == 200:
-                return
-            last_error = (
-                f"health returned {response.status_code}: {response.text[:200]}"
-            )
-        except Exception as error:  # noqa: BLE001 - readiness polling reports the last failure.
-            last_error = f"{type(error).__name__}: {error}"
-        time.sleep(1.0)
-    raise TimeoutError(
-        f"server did not become healthy within {timeout_s}s; last error: "
-        f"{last_error}{log_tail(log_path)}"
-    )
-
-
 def _serves_a_deployment(args: list[str]) -> bool:
     """Whether `args` starts a deployment: the `serve` subcommand of the one
     executable.
@@ -401,38 +330,167 @@ def _serves_a_deployment(args: list[str]) -> bool:
     return len(args) > 1 and args[1] == "serve"
 
 
-#: The runtime directories (``XDG_RUNTIME_DIR``) of the daemons this process
-#: started, where each daemon's operator socket lies (:func:`admin_socket`).
-_RUNTIMES: list[Path] = []
-
-
-def _daemon_directory(runtime: str | None) -> Path:
-    """The directory a daemon under the runtime directory `runtime` keeps its
-    sockets in, as the daemon names it: ``uniserve`` under its
-    ``XDG_RUNTIME_DIR``, else ``/tmp/uniserve-<uid>``.
+def _reports_readiness(args: list[str]) -> bool:
+    """Whether `args` starts a server that reports its readiness record on
+    the descriptor `--ready-fd` names: a deployment's daemon, a Build Server
+    or a Storage Server.
     """  # noqa: D205
-    if runtime:
-        return Path(runtime) / "uniserve"
-    return Path(f"/tmp/uniserve-{os.getuid()}")
+    return _serves_a_deployment(args) or args[1:3] in (
+        ["build-server", "serve"],
+        ["storage-server", "serve"],
+    )
+
+
+#: The admin socket of every daemon this process started, by the base URL of
+#: its client API, as the daemon's readiness record states both
+#: (:func:`admin_socket`).
+_ADMIN_SOCKETS: dict[str, Path] = {}
+
+
+def _socket_path(endpoint: str) -> Path:
+    """The path of the Unix socket a record's endpoint (``unix:PATH``) names."""
+    if not endpoint.startswith("unix:"):
+        raise ValueError(f"{endpoint} is no Unix socket")
+    return Path(endpoint.removeprefix("unix:"))
+
+
+class Server:
+    """A server this process started, and what its readiness records state.
+
+    A server writes one JSON line per state to the descriptor its caller
+    passes (``--ready-fd``, ``docs/admin.md``, Listeners): ``listening`` once
+    its listeners are bound, with their endpoints, and ``serving`` once it
+    serves; then it closes the descriptor. :meth:`wait` reads the records as
+    they arrive, so a caller neither chooses a port nor probes one.
+    """
+
+    def __init__(
+        self,
+        process: subprocess.Popen[str],
+        records: int,
+        log_path: Path | None,
+        *,
+        timeout_s: float = 0.0,
+        address: str | None = None,
+        remote: bool = False,
+    ) -> None:
+        """A server run as `process`, its records arriving on the descriptor
+        `records`, its log at `log_path`.
+
+        `timeout_s` is the longest its start may take, for a caller that
+        waits on it later (:func:`second_host`). `address` replaces an
+        unspecified host (``0.0.0.0``) of its client endpoint in
+        :attr:`base_url`. A `remote` server's records cross an ssh
+        connection's standard error, where ssh's own warnings may precede
+        them, so a line that is no record is skipped there.
+        """  # noqa: D205
+        self.process = process
+        self.log_path = log_path
+        self.timeout_s = timeout_s
+        self.record: dict[str, Any] = {}
+        self._records = records
+        self._pending = b""
+        self._address = address
+        self._remote = remote
+
+    def wait(self, state: str, timeout_s: float) -> dict[str, Any]:
+        """The record that states `state` (``listening`` or ``serving``),
+        once it arrived within `timeout_s` seconds stretched by `TIME_SCALE`.
+
+        Raises :class:`RuntimeError`, with the server's log tail, when the
+        server closed its descriptor first, as a server that ends does, and
+        :class:`TimeoutError` when no such record arrived in time.
+        """  # noqa: D205
+        deadline = time.monotonic() + scaled(timeout_s)
+        while self.record.get("state") != state:
+            if b"\n" not in self._pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"the server was not {state} within "
+                        f"{scaled(timeout_s):.0f} s{log_tail(self.log_path)}"
+                    )
+                readable, _, _ = select.select(
+                    [self._records], [], [], remaining
+                )
+                if not readable:
+                    continue
+                chunk = os.read(self._records, 65536)
+                if not chunk:
+                    raise RuntimeError(
+                        f"the server ended before it was {state} (exit "
+                        f"{self.process.poll()}){log_tail(self.log_path)}"
+                    )
+                self._pending += chunk
+                continue
+            line, self._pending = self._pending.split(b"\n", 1)
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                if self._remote:
+                    continue
+                raise
+            if not isinstance(record, dict) or "state" not in record:
+                if self._remote:
+                    continue
+                raise ValueError(f"no readiness record: {line!r}")
+            self.record = record
+            admin = record["endpoints"].get("admin")
+            if record["endpoints"].get("client") and admin:
+                _ADMIN_SOCKETS[self.base_url] = _socket_path(admin)
+        return self.record
+
+    def endpoint(self, name: str) -> str:
+        """The endpoint `name` (``client``, ``admin``, ``join``, ``peer``,
+        ...) the latest record states.
+        """  # noqa: D205
+        endpoint = self.record.get("endpoints", {}).get(name)
+        if endpoint is None:
+            raise KeyError(f"the server's record states no {name} endpoint")
+        return endpoint
+
+    @property
+    def base_url(self) -> str:
+        """The base URL of the server's client API."""
+        host, _, port = self.endpoint("client").rpartition(":")
+        if self._address is not None and host in ("0.0.0.0", "[::]"):
+            host = self._address
+        return f"http://{host}:{port}"
+
+    @property
+    def admin_socket(self) -> Path:
+        """The daemon's operator socket."""
+        return _socket_path(self.endpoint("admin"))
+
+    @property
+    def join(self) -> str:
+        """The endpoint a deployment's other nodes join the leader at."""
+        return self.endpoint("join")
+
+    @property
+    def pid(self) -> int:
+        """The server's process, as its record states it."""
+        return int(self.record["pid"])
+
+    def close(self) -> None:
+        """Closes this process's end of the server's readiness descriptor."""
+        if self._records >= 0:
+            os.close(self._records)
+            self._records = -1
 
 
 def start_server(
     args: list[str], log_path: Path, env: dict[str, str] | None = None
-) -> subprocess.Popen[str]:
+) -> Server:
     """Start `args` in a session of its own, its output to `log_path`.
 
-    A deployment that sizes no host tier (``kv_cache_config.host_*``) holds
-    `HOST_CACHE_GIB` of it; one that names no Build Server is given the
-    module's (:func:`modules_from`); and every deployment adds `E2E_SET`.
-    The runtime directory the process runs under is kept, so that
-    :func:`admin_socket` finds the daemon's operator socket there.
+    A server that reports its readiness (:func:`_reports_readiness`) is
+    passed the write end of a pipe (``--ready-fd``), whose records the
+    returned :class:`Server` reads. A deployment that sizes no host tier
+    (``kv_cache_config.host_*``) holds `HOST_CACHE_GIB` of it; one that names
+    no Build Server is given the module's (:func:`modules_from`); and every
+    deployment adds `E2E_SET`.
     """
-    runtime = (env or {}).get("XDG_RUNTIME_DIR") or os.environ.get(
-        "XDG_RUNTIME_DIR"
-    )
-    directory = _daemon_directory(runtime)
-    if directory not in _RUNTIMES:
-        _RUNTIMES.append(directory)
     if _serves_a_deployment(args):
         named = any("build_config.socket" in arg for arg in args)
         if not named and _BUILD_SERVER is not None:
@@ -450,20 +508,32 @@ def start_server(
             ]
         for assignment in E2E_SET:
             args = [*args, "--set", assignment]
+    records, ready = os.pipe()
+    passed: tuple[int, ...] = ()
+    if _reports_readiness(args):
+        args = [*args, "--ready-fd", str(ready)]
+        passed = (ready,)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("w", encoding="utf-8")
     merged_env = os.environ.copy()
     if env:
         merged_env.update(env)
-    return subprocess.Popen(
-        args,
-        cwd=Path.cwd(),
-        env=merged_env,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
-    )
+    try:
+        process = subprocess.Popen(
+            args,
+            cwd=Path.cwd(),
+            env=merged_env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+            pass_fds=passed,
+        )
+    finally:
+        # The child holds the write end now: the read end sees the end of
+        # file once the child closed it or ended.
+        os.close(ready)
+    return Server(process, records, log_path)
 
 
 def stop_server(process: subprocess.Popen[str]) -> None:
@@ -477,22 +547,57 @@ def stop_server(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=30)
 
 
-def stop_storage_server(runtime: Path) -> None:
-    """Stop the Storage Server a server started under the runtime directory
-    `runtime` (its ``XDG_RUNTIME_DIR``), found by its socket on its command
-    line: it outlives the server, and holds the deployment's host and
-    device storage until it stops.
+def storage_socket(runtime: Path | str) -> str:
+    """The socket of the Storage Server a server under the runtime directory
+    `runtime` (its ``XDG_RUNTIME_DIR``) uses.
     """  # noqa: D205
-    socket = str(runtime / "uniserve" / "storage-server.sock").encode()
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            command = (entry / "cmdline").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        if b"serve" in command and socket in command:
-            os.kill(int(entry.name), signal.SIGTERM)
+    return f"{runtime}/uniserve/storage-server.sock"
+
+
+def storage_status(runtime: Path) -> dict[str, Any]:
+    """The readiness record of the Storage Server serving under the runtime
+    directory `runtime` (``storage-server status``): its process, its
+    endpoints (``storage``, ``peer``) and its settings.
+    """  # noqa: D205
+    answered = subprocess.run(
+        [
+            str(require_uniserve_binary()),
+            "storage-server",
+            "status",
+            "--socket",
+            storage_socket(runtime),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return json.loads(answered.stdout)
+
+
+def stop_storage_server(runtime: Path) -> None:
+    """Stop the Storage Server serving under the runtime directory `runtime`
+    (its ``XDG_RUNTIME_DIR``), which outlives the deployment that started it
+    and holds its host and device storage until it stops: its ``stop``
+    request returns once it ended. A runtime directory whose server is gone
+    holds no socket, and nothing is stopped.
+    """  # noqa: D205
+    socket = storage_socket(runtime)
+    if not Path(socket).exists():
+        return
+    subprocess.run(
+        [
+            str(require_uniserve_binary()),
+            "storage-server",
+            "stop",
+            "--socket",
+            socket,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
 
 
 @contextmanager
@@ -517,29 +622,41 @@ def runtime_directory(kept_log: Path | None = None) -> Iterator[Path]:
         shutil.rmtree(runtime, ignore_errors=True)
 
 
-# Stops the Storage Server serving the socket given as its argument, found by
-# its command line, as `stop_storage_server` does on this host.
-_STOP_STORAGE = """
-import os
-import signal
-import sys
-
-for entry in os.listdir("/proc"):
-    if not entry.isdigit():
-        continue
-    try:
-        command = open(f"/proc/{entry}/cmdline", "rb").read().split(b"\\0")
-    except OSError:
-        continue
-    if b"serve" in command and sys.argv[1].encode() in command:
-        os.kill(int(entry), signal.SIGTERM)
-"""
+#: The variables a second host's processes take from this test's
+#: environment: their search and package paths, native libraries, kernel
+#: build settings and the network devices UCX may use.
+REMOTE_VARIABLES = (
+    "PATH",
+    "LD_LIBRARY_PATH",
+    "PYTHONPATH",
+    "MAX_JOBS",
+    "FLASHINFER_WORKSPACE_BASE",
+    "UCX_NET_DEVICES",
+)
 
 
-def _on_host(host: str, command: str, timeout: float = 120) -> str:
+def remote_environment(extra: dict[str, str] | None = None) -> str:
+    """The ``NAME=VALUE`` words, shell-quoted, of :data:`REMOTE_VARIABLES`
+    as this test has them, with `extra` beside them.
+    """  # noqa: D205
+    variables = {name: os.environ.get(name, "") for name in REMOTE_VARIABLES}
+    variables.update(extra or {})
+    return " ".join(
+        f"{name}={shlex.quote(value)}" for name, value in variables.items()
+    )
+
+
+def _ssh(host: str) -> list[str]:
+    """The ssh command that runs a command on `host`, with ssh's own
+    messages limited to errors.
+    """  # noqa: D205
+    return ["ssh", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", host]
+
+
+def on_host(host: str, command: str, timeout: float = 120) -> str:
     """Runs `command` on `host` over ssh; returns its output."""
     done = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", host, command],
+        [*_ssh(host), command],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -548,104 +665,156 @@ def _on_host(host: str, command: str, timeout: float = 120) -> str:
     return done.stdout
 
 
+def remote_runtime_directory(host: str, label: str) -> str:
+    """A new runtime directory (mode 0700) on `host`, named after `label`
+    and created there by ``mktemp``.
+    """  # noqa: D205
+    return on_host(
+        host, f"mktemp -d -t {shlex.quote(label)}.XXXXXXXXXX"
+    ).strip()
+
+
+def start_remote_server(
+    host: str,
+    words: list[str],
+    log: Path,
+    *,
+    environment: str,
+    timeout_s: float,
+    address: str | None = None,
+) -> Server:
+    """Run the server `words` on the ssh destination `host`, in this
+    checkout's path there and with the variables `environment` states, its
+    output to `log` on this host.
+
+    Its readiness records cross the ssh connection's standard error: the
+    server writes them to its descriptor 3, which the remote shell points at
+    that stream before its own output goes to the log. `address` is the
+    host's address as this host reaches it, which replaces an unspecified
+    host in the server's base URL.
+    """  # noqa: D205
+    remote = (
+        f"cd {shlex.quote(str(Path.cwd()))} && exec env {environment} "
+        f"{shlex.join(words)} --ready-fd 3 3>&2 2>&1"
+    )
+    process = subprocess.Popen(
+        [*_ssh(host), remote],
+        stdout=log.open("w", encoding="utf-8"),
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stderr is not None
+    return Server(
+        process,
+        process.stderr.fileno(),
+        log,
+        timeout_s=timeout_s,
+        address=address,
+        remote=True,
+    )
+
+
 def stop_remote_storage_server(host: str, runtime: str, kept_log: Path) -> None:
     """Stop the Storage Server serving under the runtime directory `runtime`
-    (its ``XDG_RUNTIME_DIR``) on the ssh destination `host`, keep its log at
-    `kept_log` on this host, and remove the directory.
+    (its ``XDG_RUNTIME_DIR``) on the ssh destination `host` with its ``stop``
+    request, keep its log at `kept_log` on this host, and remove the
+    directory.
 
     The log travels back over the ssh connection: `kept_log` lies in this
     test's temporary directory, which exists on this host alone. A server
     that wrote no log leaves `kept_log` empty.
     """  # noqa: D205
-    socket = shlex.quote(f"{runtime}/uniserve/storage-server.sock")
+    socket = shlex.quote(storage_socket(runtime))
     directory = shlex.quote(runtime)
-    log = _on_host(
+    stop = shlex.join(
+        [str(require_uniserve_binary()), "storage-server", "stop", "--socket"]
+    )
+    log = on_host(
         host,
-        f"python3 -c {shlex.quote(_STOP_STORAGE)} {socket}; "
+        f"test -S {socket} && env {remote_environment()} {stop} {socket}; "
         f"cat {directory}/uniserve/storage-server.log 2>/dev/null; "
         f"rm -rf {directory}; true",
     )
     kept_log.write_text(log, encoding="utf-8")
 
 
+class Follower:
+    """The daemon of a deployment's second host (:func:`second_host`)."""
+
+    def __init__(self, server: Server, runtime: str) -> None:
+        self.server = server
+        #: Its runtime directory there, holding its Storage Server's socket
+        #: and the launch files of the processes it starts.
+        self.runtime = runtime
+
+
 @contextmanager
 def second_host(
     host: str,
     log: Path,
-    address: str,
+    leader: Server,
     *,
     devices: str | None = None,
     env: dict[str, str] | None = None,
     arguments: tuple[str, ...] = (),
-) -> Iterator[None]:
-    """The daemon of a deployment's second host, joining the leader at
-    `address` as node `rank-1`, with `arguments` after its own options.
+) -> Iterator[Follower]:
+    """The daemon of a deployment's second host, joining `leader` as node
+    `rank-1`, with `arguments` after its own options.
 
-    `host` is an ssh destination whose checkout path holds this build. The
-    daemon runs in this test's environment (its search and package paths,
-    native libraries, kernel build settings and the network devices UCX
-    may use), with `env` beside it and on `devices` (all of the host's
-    without them), under a runtime directory of its own: the Storage Server
-    it starts serves this deployment alone, in that environment. It starts
-    when the block begins: a member retries its join until the leader binds
-    `address`, which the leader does first when it starts, within the join
-    timeout (300 s), so the caller starts the leader in the block. On exit,
-    which follows the leader's, it waits until the daemon ended, which it
-    does when the leader's connection closes, keeps the Storage Server's
-    log beside `log` and stops that server. A daemon that outlives its
+    `leader` is a leader started with ``serving=False``
+    (:func:`server_process`): its listening record states the endpoint its
+    members join at, and it serves once this member joined, which this
+    waits for before the block begins. `host` is an ssh destination whose
+    checkout path holds this build. The daemon runs in this test's
+    environment (:data:`REMOTE_VARIABLES`), with `env` beside it and on
+    `devices` (all of the host's without them), under a runtime directory
+    of its own: the Storage Server it starts serves this deployment alone.
+    On exit the leader stops first, the daemon ends when the leader's
+    connection closes, which this waits for, and its Storage Server is
+    stopped with its log kept beside `log`. A daemon that outlives its
     leader fails the test.
     """  # noqa: D205
-    runtime = os.path.join(
-        tempfile.gettempdir(),
-        f"uniserve-follower-{os.getpid()}-{find_free_port()}",
-    )
-    variables = {
-        name: os.environ.get(name, "")
-        for name in (
-            "PATH",
-            "LD_LIBRARY_PATH",
-            "PYTHONPATH",
-            "MAX_JOBS",
-            "FLASHINFER_WORKSPACE_BASE",
-            "UCX_NET_DEVICES",
-        )
-    }
-    variables.update(env or {})
+    runtime = remote_runtime_directory(host, "uniserve-follower")
+    variables = dict(env or {})
     variables["XDG_RUNTIME_DIR"] = runtime
     if devices is not None:
         variables["CUDA_VISIBLE_DEVICES"] = devices
-    environment = " ".join(
-        f"{name}={shlex.quote(value)}" for name, value in variables.items()
-    )
     launcher = os.environ.get("UNISERVE_FOLLOWER_LAUNCHER")
-    command_prefix = f"{shlex.quote(launcher)} " if launcher else ""
-    remote = (
-        f"mkdir -m 700 {runtime} && cd {shlex.quote(str(Path.cwd()))} && "
-        f"echo follower pid $$ && exec env {environment} "
-        f"{command_prefix}{shlex.quote(str(require_uniserve_binary()))} "
-        "serve --nnodes 2 "
-        f"--node-rank 1 --dist-init-addr {address} --host-identity rank-1 "
-        f"{shlex.join(engine_selection())}"
-    )
-    if arguments:
-        remote += " " + shlex.join(arguments)
-    process = subprocess.Popen(
-        ["ssh", "-o", "BatchMode=yes", host, remote],
-        stdout=log.open("w", encoding="utf-8"),
-        stderr=subprocess.STDOUT,
-        text=True,
+    words = [
+        *([launcher] if launcher else []),
+        str(require_uniserve_binary()),
+        "serve",
+        "--nnodes",
+        "2",
+        "--node-rank",
+        "1",
+        "--dist-init-addr",
+        leader.join,
+        "--host-identity",
+        "rank-1",
+        *engine_selection(),
+        *arguments,
+    ]
+    member = start_remote_server(
+        host,
+        words,
+        log,
+        environment=remote_environment(variables),
+        timeout_s=leader.timeout_s,
     )
     try:
-        yield
+        member.wait("listening", leader.timeout_s)
+        leader.wait("serving", leader.timeout_s)
+        yield Follower(member, runtime)
     finally:
+        stop_server(leader.process)
         outlived = False
         try:
-            process.wait(timeout=120)
+            member.process.wait(timeout=120)
         except subprocess.TimeoutExpired:
-            # The remote shell echoed its pid before it became the daemon.
-            pid = log.read_text().split("follower pid ")[1].split()[0]
-            _on_host(host, f"kill {pid}")
-            process.wait(timeout=120)
+            if member.record:
+                on_host(host, f"kill {member.pid}")
+            member.process.wait(timeout=120)
             outlived = True
         stop_remote_storage_server(
             host, runtime, log.with_suffix(".storage.log")
@@ -657,19 +826,24 @@ def second_host(
 @contextmanager
 def server_process(
     args: list[str],
-    base_url: str,
     log_path: Path,
     timeout_s: float,
     env: dict[str, str] | None = None,
-) -> Iterator[subprocess.Popen[str]]:
-    """Serve `args` until the block ends, once its health answers.
+    *,
+    serving: bool = True,
+) -> Iterator[Server]:
+    """Serve `args` until the block ends, once its readiness record states
+    it serves; with `serving` unset, once it states its listeners, for a
+    leader whose members join it next (:func:`second_host`).
 
-    Unless `env` names them, the server runs on the GPUs the GPU locks
-    granted (``UNISERVE_WORLD_DEVICES``) and under a runtime directory of
-    its own (``XDG_RUNTIME_DIR``), whose Storage Server, which outlives the
-    server with the deployment's host and device storage, is stopped at the
-    end. A caller that names its runtime directory owns that Storage Server.
-    """
+    The server binds a port of its own choosing (``--port`` defaults to 0)
+    and states it in its record (:attr:`Server.base_url`). Unless `env`
+    names them, the server runs on the GPUs the GPU locks granted
+    (``UNISERVE_WORLD_DEVICES``) and under a runtime directory of its own
+    (``XDG_RUNTIME_DIR``), whose Storage Server, which outlives the server
+    with the deployment's host and device storage, is stopped at the end. A
+    caller that names its runtime directory owns that Storage Server.
+    """  # noqa: D205
     env = dict(env or {})
     granted = os.environ.get("UNISERVE_WORLD_DEVICES")
     if granted and "CUDA_VISIBLE_DEVICES" not in env:
@@ -679,37 +853,64 @@ def server_process(
             env["XDG_RUNTIME_DIR"] = str(
                 owned.enter_context(runtime_directory())
             )
-        process = start_server(args, log_path, env)
+        server = start_server(args, log_path, env)
+        server.timeout_s = timeout_s
         try:
-            wait_health(base_url, process, timeout_s, log_path)
-            yield process
+            server.wait("serving" if serving else "listening", timeout_s)
+            yield server
         finally:
-            stop_server(process)
+            stop_server(server.process)
+            server.close()
 
 
 def admin_socket(base_url: str) -> Path:
     """The operator socket of the daemon whose client API is `base_url`.
 
     A daemon serves its admin API apart from the client API, on a Unix
-    socket of its own (``docs/admin.md``, Listeners): ``admin-<port>.sock``
-    in its runtime directory, named by its client API's port. A daemon that
-    moved to another port binds the socket of that port in the same
-    directory, so every runtime directory this process started a daemon
-    under is searched.
+    socket of its own (``docs/admin.md``, Listeners), which its readiness
+    record states beside its client endpoint; every daemon this process
+    started is registered by its base URL once its record arrived. A hot
+    restart's successor goes on with both, so the socket stays the
+    daemon's.
     """
-    port = httpx.URL(base_url).port
-    candidates = [
-        *_RUNTIMES,
-        _daemon_directory(os.environ.get("XDG_RUNTIME_DIR")),
-    ]
-    for directory in candidates:
-        socket_path = directory / f"admin-{port}.sock"
-        if socket_path.exists():
-            return socket_path
-    raise FileNotFoundError(
-        f"no operator socket admin-{port}.sock in "
-        f"{', '.join(str(directory) for directory in candidates)}"
+    try:
+        return _ADMIN_SOCKETS[base_url]
+    except KeyError:
+        raise FileNotFoundError(
+            f"no daemon this process started states the client API {base_url}"
+        ) from None
+
+
+def taken_over(base_url: str, pid: int, timeout_s: float = 120) -> str:
+    """The base URL of the daemon `pid` that took the deployment serving at
+    `base_url` over in a hot restart, as its readiness record states it.
+
+    A successor goes on in its predecessor's instance directory and binds the
+    admin sockets over its predecessor's, so `base_url`'s admin socket
+    answers for the successor once it holds the deployment; its record
+    (``GET /admin/status``, ``readiness``) states the client API it serves,
+    a new one when the restart changed the listening address. The returned
+    URL is registered with the same admin socket.
+    """  # noqa: D205
+
+    def readiness() -> dict[str, Any] | None:
+        try:
+            record = admin_status(base_url).get("readiness")
+        except (httpx.HTTPError, OSError):
+            return None
+        return record if record and record["pid"] == pid else None
+
+    wait_until(
+        lambda: readiness() is not None,
+        timeout_s,
+        f"daemon {pid} did not take the deployment over",
     )
+    record = readiness()
+    assert record is not None
+    host, _, port = record["endpoints"]["client"].rpartition(":")
+    url = f"http://{host}:{port}"
+    _ADMIN_SOCKETS[url] = admin_socket(base_url)
+    return url
 
 
 def admin_request(

@@ -38,7 +38,6 @@ from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     admin_status,
     engine_selection,
-    find_free_port,
     granted_devices,
     log_tail,
     qwen3_checkpoint,
@@ -98,15 +97,15 @@ def _chunk_tokens(line: str) -> tuple[list[str], dict | None, bool]:
     return tokens, chunk.get("usage"), False
 
 
-def _kill_serving_peer(host: str) -> None:
+def _kill_serving_peer(host: str, runtime: str) -> None:
     """Kill the second host's serving main process.
 
     It is the oldest main process this test's follower daemon started there,
-    whose launch file lies in the follower's runtime directory, which
-    `http_helpers.second_host` names after this process.
+    whose launch file lies in the follower's runtime directory `runtime`
+    (:attr:`http_helpers.Follower.runtime`).
     """
     # The bracket keeps the pattern from matching the shell that runs it.
-    pattern = f"[e]ngine --launch .*uniserve-follower-{os.getpid()}-"
+    pattern = f"[e]ngine --launch {runtime}/"
     subprocess.run(
         [
             "ssh",
@@ -129,9 +128,6 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
             "UNISERVE_H3_LEADER_ADDRESS"
         )
     checkpoint = qwen3_checkpoint()
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    address = f"{LEADER_ADDRESS}:{find_free_port()}"
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -140,15 +136,14 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
         SERVED_MODEL,
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
         "--host-identity",
         "rank-0",
         "--nnodes",
         "2",
+        # The leader binds its join endpoint on a port it picks.
         "--dist-init-addr",
-        address,
+        f"{LEADER_ADDRESS}:0",
         # Rank 0 on this host and rank 1 on the second: the shorthand
         # spreads the group's ranks over this host and the hosts after it in
         # equal blocks.
@@ -181,17 +176,20 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
         }
         with (
             remote_build_server(FOLLOWER) as follower_modules,
+            server_process(
+                command, log, timeout_s=1800, env=env, serving=False
+            ) as server,
             second_host(
                 FOLLOWER,
                 tmp_path / "follower.log",
-                address,
+                server,
                 arguments=(
                     "--set",
                     f"build_config.socket={follower_modules}",
                 ),
-            ),
-            server_process(command, base_url, log, timeout_s=1800, env=env),
+            ) as follower,
         ):
+            base_url = server.base_url
             # The standby epoch over both hosts parked with its graphs.
             wait_until(
                 lambda: admin_status(base_url)["deployment"]["standby"],
@@ -215,7 +213,7 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
                     streamed.extend(tokens)
                     usage = chunk_usage or usage
                     if not killed and len(streamed) >= EARLY_TOKENS:
-                        _kill_serving_peer(FOLLOWER)
+                        _kill_serving_peer(FOLLOWER, follower.runtime)
                         killed = True
             reply = httpx.post(
                 f"{base_url}/v1/chat/completions",

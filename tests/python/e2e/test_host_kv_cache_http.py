@@ -33,7 +33,6 @@ import pytest
 from tests.python.e2e.http_helpers import (
     ATTENTION_BACKEND,
     engine_selection,
-    find_free_port,
     granted_devices,
     qwen3_checkpoint,
     require_uniserve_binary,
@@ -100,7 +99,7 @@ def _reusable(prompt_tokens: int) -> int:
     return (prompt_tokens - 1) // BLOCK_SIZE * BLOCK_SIZE
 
 
-def _command(checkpoint: str, port: int) -> list[str]:
+def _command(checkpoint: str) -> list[str]:
     return [
         str(require_uniserve_binary()),
         "serve",
@@ -109,8 +108,6 @@ def _command(checkpoint: str, port: int) -> list[str]:
         SERVED_MODEL,
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
         "--set",
         "dtype=bfloat16",
@@ -128,23 +125,23 @@ def _command(checkpoint: str, port: int) -> list[str]:
 def test_a_restarted_engine_loads_a_prompts_blocks_from_the_host_tier(
     tmp_path: Path,
 ):
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    command = _command(qwen3_checkpoint(), port)
+    command = _command(qwen3_checkpoint())
     with runtime_directory() as runtime:
         env = {
             "CUDA_VISIBLE_DEVICES": granted_devices(1),
             "XDG_RUNTIME_DIR": str(runtime),
         }
         with server_process(
-            command, base_url, tmp_path / "first.log", timeout_s=900, env=env
-        ):
+            command, tmp_path / "first.log", timeout_s=900, env=env
+        ) as server:
+            base_url = server.base_url
             prompt_tokens, _, cold = _ask(base_url)
             _, device, warm = _ask(base_url)
         restarted = tmp_path / "restarted.log"
         with server_process(
-            command, base_url, restarted, timeout_s=900, env=env
-        ):
+            command, restarted, timeout_s=900, env=env
+        ) as server:
+            base_url = server.base_url
             _, host, loaded = _ask(base_url)
 
     reusable = _reusable(prompt_tokens)
@@ -163,25 +160,24 @@ def test_a_stopping_engine_stores_its_last_blocks_to_the_host_tier(
     # Another prompt than the other test's, whose blocks a shared server
     # might still hold.
     prompt = "Closing. " + PROMPT
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    command = _command(qwen3_checkpoint(), port)
+    command = _command(qwen3_checkpoint())
     with runtime_directory() as runtime:
         env = {
             "CUDA_VISIBLE_DEVICES": granted_devices(1),
             "XDG_RUNTIME_DIR": str(runtime),
         }
         with server_process(
-            command, base_url, tmp_path / "first.log", timeout_s=900, env=env
-        ):
+            command, tmp_path / "first.log", timeout_s=900, env=env
+        ) as server:
+            base_url = server.base_url
             prompt_tokens, first, cold = _ask(base_url, prompt, 1)
         with server_process(
             command,
-            base_url,
             tmp_path / "restarted.log",
             timeout_s=900,
             env=env,
-        ):
+        ) as server:
+            base_url = server.base_url
             _, host, loaded = _ask(base_url, prompt, 1)
 
     reusable = _reusable(prompt_tokens)

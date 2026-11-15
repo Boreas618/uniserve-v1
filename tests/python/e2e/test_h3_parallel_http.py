@@ -20,7 +20,6 @@ from tests.python.e2e.build_server import remote_build_server
 from tests.python.e2e.http_helpers import (
     H3_CHECKPOINT,
     engine_selection,
-    find_free_port,
     granted_devices,
     host_asset,
     require_uniserve_binary,
@@ -211,8 +210,6 @@ def test_block_bindings_release_cancelled_requests(
         else ((5, 1000, 124), (15, 16384, 362))
     )
     max_video_seconds = str(max(seconds for seconds, _, _ in shapes))
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     if parallel_kind in ("local", "ulysses4"):
         degree = {"local": 1, "ulysses4": 4}[parallel_kind]
         ranks = list(range(degree))
@@ -330,8 +327,6 @@ def test_block_bindings_release_cancelled_requests(
         "MiniMax-H3",
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
         "--worker-groups",
         str(written_deployment(tmp_path, workers)),
@@ -357,14 +352,14 @@ def test_block_bindings_release_cancelled_requests(
         "quantization.mode=balanced",
     ]
     if two_hosts:
-        address = f"{LEADER_ADDRESS}:{find_free_port()}"
+        # The leader binds its join endpoint on a port it picks.
         command += [
             "--host-identity",
             "rank-0",
             "--nnodes",
             "2",
             "--dist-init-addr",
-            address,
+            f"{LEADER_ADDRESS}:0",
         ]
     tokenizer = AutoTokenizer.from_pretrained(Path(model_value) / "tokenizer")
     payloads = []
@@ -404,29 +399,33 @@ def test_block_bindings_release_cancelled_requests(
             follower_modules = deployment.enter_context(
                 remote_build_server(FOLLOWER)
             )
-            deployment.enter_context(
-                second_host(
-                    FOLLOWER,
-                    log.with_name("h3-follower.log"),
-                    address,
-                    arguments=(
-                        "--set",
-                        f"build_config.socket={follower_modules}",
-                    ),
-                )
-            )
-        deployment.enter_context(
+        server = deployment.enter_context(
             server_process(
                 command,
-                base_url,
                 # Startup prepares and captures every admitted duration at
                 # both text capacities; two-way tensor or pipeline layouts
                 # took 9 to 11 minutes to become ready on 4 x GB200.
                 log,
                 timeout_s=1800,
                 env=environment,
+                serving=not two_hosts,
             )
         )
+        if two_hosts:
+            # The second host joins the leader at the endpoint its readiness
+            # record states; the leader serves once it joined.
+            deployment.enter_context(
+                second_host(
+                    FOLLOWER,
+                    log.with_name("h3-follower.log"),
+                    server,
+                    arguments=(
+                        "--set",
+                        f"build_config.socket={follower_modules}",
+                    ),
+                )
+            )
+        base_url = server.base_url
 
         # Warm both decode geometries before exercising cancellation. Three
         # disconnects exceed the two provisioned slots and require their reuse.
@@ -489,9 +488,6 @@ def test_replicas_on_two_hosts_serve_complete_media(tmp_path: Path) -> None:
         / "minimax_h3"
         / "fasth3-ulysses4x2-two-host.toml"
     )
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    address = f"{LEADER_ADDRESS}:{find_free_port()}"
     # The validated throughput setting of 8 x GB200 over two hosts, bounded to
     # one five-second duration and one text capacity so that startup captures
     # little.
@@ -504,8 +500,6 @@ def test_replicas_on_two_hosts_serve_complete_media(tmp_path: Path) -> None:
         "FastH3",
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
         "--worker-groups",
         str(deployment),
@@ -521,8 +515,9 @@ def test_replicas_on_two_hosts_serve_complete_media(tmp_path: Path) -> None:
         "rank-0",
         "--nnodes",
         "2",
+        # The leader binds its join endpoint on a port it picks.
         "--dist-init-addr",
-        address,
+        f"{LEADER_ADDRESS}:0",
     ]
     payloads = [
         t2va_request(
@@ -535,30 +530,31 @@ def test_replicas_on_two_hosts_serve_complete_media(tmp_path: Path) -> None:
     ]
     environment = {"CUDA_VISIBLE_DEVICES": granted_devices(4)}
 
-    def generate(payload: dict) -> tuple[bytes, str]:
-        response = httpx.post(
-            f"{base_url}/v1/videos/sync", json=payload, timeout=1200
-        )
-        response.raise_for_status()
-        return response.content, response.headers["content-type"]
-
     with (
         remote_build_server(FOLLOWER) as follower_modules,
-        second_host(
-            FOLLOWER,
-            tmp_path / "h3-follower.log",
-            address,
-            arguments=("--set", f"build_config.socket={follower_modules}"),
-        ),
         server_process(
             command,
-            base_url,
             tmp_path / "h3-replicas.log",
             timeout_s=1800,
             env=environment,
+            serving=False,
+        ) as server,
+        second_host(
+            FOLLOWER,
+            tmp_path / "h3-follower.log",
+            server,
+            arguments=("--set", f"build_config.socket={follower_modules}"),
         ),
         ThreadPoolExecutor(max_workers=len(payloads)) as pool,
     ):
+
+        def generate(payload: dict) -> tuple[bytes, str]:
+            response = httpx.post(
+                f"{server.base_url}/v1/videos/sync", json=payload, timeout=1200
+            )
+            response.raise_for_status()
+            return response.content, response.headers["content-type"]
+
         for content, content_type in pool.map(generate, payloads):
             media = inspect_video_bytes(content, declared_mime=content_type)
             assert media.frame_count == 124
@@ -587,8 +583,6 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         / "minimax_h3"
         / "ulysses4.toml"
     )
-    port = find_free_port()
-    base = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -598,8 +592,6 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         *engine_selection(),
         "--served-model-name",
         "FastH3",
-        "--port",
-        str(port),
         # A media deployment states the prompt length it admits; one text
         # capacity of that length bounds the startup capture of every
         # admitted duration.
@@ -627,10 +619,11 @@ def test_video_jobs_retain_content_and_cancel_active_work(
 
     with (
         server_process(
-            command, base, tmp_path / "video-jobs.log", timeout_s=900
-        ),
-        httpx.Client(base_url=base, timeout=600) as client,
+            command, tmp_path / "video-jobs.log", timeout_s=900
+        ) as server,
+        httpx.Client(timeout=600) as client,
     ):
+        client.base_url = server.base_url
         caps = client.get("/v1/capabilities").json()
         assert caps["model"] == "FastH3"
         video = caps["video"]

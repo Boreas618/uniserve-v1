@@ -34,11 +34,8 @@ from __future__ import annotations
 
 import math
 import os
-import shutil
-import tempfile
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -50,15 +47,14 @@ from tests.python.e2e.http_helpers import (
     QWEN3_CHECKPOINT,
     REPORT_SETTLE_S,
     engine_selection,
-    find_free_port,
     granted_devices,
     host_asset,
     metric,
     require_uniserve_binary,
+    runtime_directory,
     scaled,
     second_host,
     server_process,
-    stop_storage_server,
     wait_until,
     written_deployment,
 )
@@ -126,7 +122,7 @@ def _checkpoint() -> str:
     return str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
 
 
-def _command(port: int, *options: str) -> list[str]:
+def _command(*options: str) -> list[str]:
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -135,8 +131,6 @@ def _command(port: int, *options: str) -> list[str]:
         SERVED_MODEL,
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
     ]
     for option in OPTIONS:
@@ -257,55 +251,35 @@ def _expected(answers: list[Answer]) -> tuple[int, ...]:
     return len(answers), 0, blocks
 
 
-@contextmanager
-def _runtime(tmp_path: Path) -> Iterator[Path]:
-    """A runtime directory of its own, whose Storage Server is stopped and
-    whose log is kept beside the test's at the end.
-    """  # noqa: D205
-    runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
-    try:
-        yield runtime
-    finally:
-        stop_storage_server(runtime)
-        storage_log = runtime / "uniserve" / "storage-server.log"
-        if storage_log.is_file():
-            shutil.copy(storage_log, tmp_path / "storage-server.log")
-        shutil.rmtree(runtime, ignore_errors=True)
-
-
 @pytest.fixture(scope="module")
 def reference(tmp_path_factory: pytest.TempPathFactory) -> list[list[str]]:
     """Each prompt's greedy tokens on an undivided deployment of one GPU."""
     directory = tmp_path_factory.mktemp("undivided")
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     env = {"CUDA_VISIBLE_DEVICES": granted_devices(1)}
     with server_process(
-        _command(port), base_url, directory / "server.log", 1800, env=env
-    ):
-        return [_greedy(base_url, prompt)[0] for prompt in PROMPTS]
+        _command(), directory / "server.log", 1800, env=env
+    ) as server:
+        return [_greedy(server.base_url, prompt)[0] for prompt in PROMPTS]
 
 
 def test_a_prefill_group_transfers_requests_to_a_decode_group_on_one_host(
     tmp_path: Path, reference: list[list[str]]
 ):
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     log = tmp_path / "server.log"
-    command = _command(port, "--worker-groups", str(_split(tmp_path, None)))
+    command = _command("--worker-groups", str(_split(tmp_path, None)))
     with (
-        _runtime(tmp_path) as runtime,
+        runtime_directory(tmp_path / "storage-server.log") as runtime,
         server_process(
             command,
-            base_url,
             log,
             1800,
             env={
                 "CUDA_VISIBLE_DEVICES": granted_devices(2),
                 "XDG_RUNTIME_DIR": str(runtime),
             },
-        ),
+        ) as server,
     ):
+        base_url = server.base_url
         answers, transferred = _transfers(
             base_url, lambda: [_greedy(base_url, prompt) for prompt in PROMPTS]
         )
@@ -322,12 +296,11 @@ def test_a_prefill_group_transfers_requests_to_a_decode_group_on_another_host(
             "a decode group on another host needs UNISERVE_H3_FOLLOWER, "
             "UNISERVE_H3_LEADER_ADDRESS and UNISERVE_NIXL_LIBRARY"
         )
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    address = f"{LEADER_ADDRESS}:{find_free_port()}"
     log = tmp_path / "server.log"
+    # The leader binds its join endpoint on a port it picks, and both hosts'
+    # Storage Servers, which the daemons start with the deployment's
+    # settings, load NIXL.
     command = _command(
-        port,
         "--worker-groups",
         str(_split(tmp_path, "rank-1")),
         "--host-identity",
@@ -335,36 +308,32 @@ def test_a_prefill_group_transfers_requests_to_a_decode_group_on_another_host(
         "--nnodes",
         "2",
         "--dist-init-addr",
-        address,
-    )
-    # Both hosts' Storage Servers, which the daemons start, load NIXL from
-    # the loader's search path.
-    library_path = ":".join(
-        [str(Path(NIXL_LIBRARY).parent), os.environ.get("LD_LIBRARY_PATH", "")]
+        f"{LEADER_ADDRESS}:0",
+        "--set",
+        f"storage_config.nixl_library={NIXL_LIBRARY}",
     )
     with (
-        _runtime(tmp_path) as runtime,
+        runtime_directory(tmp_path / "storage-server.log") as runtime,
         remote_build_server(FOLLOWER) as follower_modules,
-        second_host(
-            FOLLOWER,
-            tmp_path / "follower.log",
-            address,
-            devices=FOLLOWER_DEVICE,
-            env={"LD_LIBRARY_PATH": library_path},
-            arguments=("--set", f"build_config.socket={follower_modules}"),
-        ),
         server_process(
             command,
-            base_url,
             log,
             1800,
             env={
                 "CUDA_VISIBLE_DEVICES": granted_devices(1),
                 "XDG_RUNTIME_DIR": str(runtime),
-                "LD_LIBRARY_PATH": library_path,
             },
+            serving=False,
+        ) as server,
+        second_host(
+            FOLLOWER,
+            tmp_path / "follower.log",
+            server,
+            devices=FOLLOWER_DEVICE,
+            arguments=("--set", f"build_config.socket={follower_modules}"),
         ),
     ):
+        base_url = server.base_url
         answers, transferred = _transfers(
             base_url, lambda: [_greedy(base_url, prompt) for prompt in PROMPTS]
         )

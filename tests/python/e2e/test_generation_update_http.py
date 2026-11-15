@@ -71,7 +71,6 @@ from tests.python.e2e.http_helpers import (
     admin_status,
     apply_config,
     engine_selection,
-    find_free_port,
     host_asset,
     require_uniserve_binary,
     server_process,
@@ -188,8 +187,6 @@ def server(
     """
     directory = tmp_path_factory.mktemp("deployment")
     log = directory / "deployment.log"
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -198,8 +195,6 @@ def server(
         "qwen3-moe",
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
         "--set",
         f"build_config.socket={build_server['socket']}",
@@ -208,7 +203,8 @@ def server(
     ]
     for option in DEPLOYMENT_OPTIONS:
         command += ["--set", option]
-    with server_process(command, base_url, log, timeout_s=1800):
+    with server_process(command, log, timeout_s=1800) as server:
+        base_url = server.base_url
         yield base_url
 
 

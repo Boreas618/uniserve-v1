@@ -58,7 +58,6 @@ from tests.python.e2e.http_helpers import (
     admin_status,
     dedicated_experts,
     engine_selection,
-    find_free_port,
     granted_devices,
     log_tail,
     qwen3_checkpoint,
@@ -146,8 +145,6 @@ def _stream_through_a_kill(
     The server runs on `devices` with the extra `options`; with `standby`,
     the stream starts once the deployment reports its standby parked.
     """  # noqa: D205
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -156,8 +153,6 @@ def _stream_through_a_kill(
         SERVED_MODEL,
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
         "--set",
         "dtype=bfloat16",
@@ -181,7 +176,8 @@ def _stream_through_a_kill(
             "CUDA_VISIBLE_DEVICES": devices or granted_devices(1),
             "XDG_RUNTIME_DIR": str(runtime),
         }
-        with server_process(command, base_url, log, timeout_s=900, env=env):
+        with server_process(command, log, timeout_s=900, env=env) as server:
+            base_url = server.base_url
             if standby:
                 wait_until(
                     lambda: admin_status(base_url)["deployment"]["standby"],

@@ -32,7 +32,6 @@ from tests.python.e2e.http_helpers import (
     H3_CHECKPOINT,
     MINIMAX_H3_CHECKPOINT,
     engine_selection,
-    find_free_port,
     host_asset,
     require_uniserve_binary,
     server_process,
@@ -95,7 +94,7 @@ def _inputs() -> Path:
     return inputs.resolve()
 
 
-def _command(model, deployment, port, inputs, options) -> list[str]:
+def _command(model, deployment, inputs, options) -> list[str]:
     return [
         str(require_uniserve_binary()),
         "serve",
@@ -105,8 +104,6 @@ def _command(model, deployment, port, inputs, options) -> list[str]:
         *engine_selection(),
         "--served-model-name",
         "MiniMax-H3",
-        "--port",
-        str(port),
         "--set",
         f"media_config.directory={inputs}",
         *options,
@@ -136,8 +133,6 @@ def _check_media(response, *, width, height, frames) -> None:
 
 def test_base_first_frame_request(tmp_path: Path) -> None:
     model, inputs = _root(), _inputs()
-    port = find_free_port()
-    base = f"http://127.0.0.1:{port}"
     # The official first-frame presentation holds 1935 text rows and its
     # keyframe 1008 condition rows; without a stated condition capacity the
     # deployment provisions the two keyframes a request may bring.
@@ -151,13 +146,14 @@ def test_base_first_frame_request(tmp_path: Path) -> None:
     ]
     with (
         server_process(
-            _command(model, "ulysses4.toml", port, inputs, options),
-            base,
+            _command(model, "ulysses4.toml", inputs, options),
             tmp_path / "server.log",
             timeout_s=3600,
-        ),
-        httpx.Client(base_url=base, timeout=3600) as client,
+        ) as server,
+        httpx.Client(timeout=3600) as client,
     ):
+        base = server.base_url
+        client.base_url = base
         video = client.get("/v1/capabilities").json()["video"]["model"]
         assert set(video["tasks"]) == {"t2va", "fl2va"}
 
@@ -172,8 +168,6 @@ def test_fasth3_first_frame_request(tmp_path: Path) -> None:
     """A FastH3 DMD student serves its partition's keyframe requests."""
     model = str(host_asset("UNISERVE_H3_MODEL", H3_CHECKPOINT))
     inputs = _inputs()
-    port = find_free_port()
-    base = f"http://127.0.0.1:{port}"
     # The student generates 16:9 at 768p; eight seconds and a 2048-token
     # prompt capacity admit W3, and the deployment provisions the two
     # keyframes a request may bring in tiles of their own.
@@ -189,13 +183,14 @@ def test_fasth3_first_frame_request(tmp_path: Path) -> None:
     ]
     with (
         server_process(
-            _command(model, "ulysses4.toml", port, inputs, options),
-            base,
+            _command(model, "ulysses4.toml", inputs, options),
             tmp_path / "server.log",
             timeout_s=3600,
-        ),
-        httpx.Client(base_url=base, timeout=3600) as client,
+        ) as server,
+        httpx.Client(timeout=3600) as client,
     ):
+        base = server.base_url
+        client.base_url = base
         video = client.get("/v1/capabilities").json()["video"]["model"]
         assert video["tasks"] == ["t2va", "fl2va"]
 
@@ -237,14 +232,18 @@ def _graph_replays(client: httpx.Client) -> float:
     return current
 
 
-def _reference_requests(command, base, tmp_path, *, inputs):
+def _reference_requests(command, tmp_path, *, inputs):
     """Serve ``command`` and check W4 and W5 against it; each request's
     denoising steps replay captured graphs.
     """  # noqa: D205
     with (
-        server_process(command, base, tmp_path / "server.log", timeout_s=3600),
-        httpx.Client(base_url=base, timeout=3600) as client,
+        server_process(
+            command, tmp_path / "server.log", timeout_s=3600
+        ) as server,
+        httpx.Client(timeout=3600) as client,
     ):
+        base = server.base_url
+        client.base_url = base
         video = client.get("/v1/capabilities").json()["video"]["model"]
         assert video["tasks"] == ["ref2va"]
         steps = video["num_inference_steps"]
@@ -277,12 +276,8 @@ REFERENCE_OPTIONS = [
 
 def test_base_reference_requests(tmp_path: Path) -> None:
     model, inputs = _root(), _inputs()
-    port = find_free_port()
     _reference_requests(
-        _command(
-            model, "ulysses4-reference.toml", port, inputs, REFERENCE_OPTIONS
-        ),
-        f"http://127.0.0.1:{port}",
+        _command(model, "ulysses4-reference.toml", inputs, REFERENCE_OPTIONS),
         tmp_path,
         inputs=inputs,
     )
@@ -319,16 +314,13 @@ def _omniref() -> str:
 def test_omniref_reference_requests(tmp_path: Path) -> None:
     inputs = _inputs()
     export = _omniref()
-    port = find_free_port()
     _reference_requests(
         _command(
             export,
             "ulysses4-reference.toml",
-            port,
             inputs,
             OMNIREF_OPTIONS,
         ),
-        f"http://127.0.0.1:{port}",
         tmp_path,
         inputs=inputs,
     )
@@ -361,12 +353,9 @@ def test_omniref_refuses_conditions_above_capacity(tmp_path: Path) -> None:
     # then serves its image-only form.
     inputs = _inputs()
     export = _omniref()
-    port = find_free_port()
-    base = f"http://127.0.0.1:{port}"
     command = _command(
         export,
         "ulysses4-reference.toml",
-        port,
         inputs,
         SMALL_CAPACITY_OPTIONS,
     )
@@ -376,9 +365,13 @@ def test_omniref_refuses_conditions_above_capacity(tmp_path: Path) -> None:
         "input_references": packed["input_references"][:1],
     }
     with (
-        server_process(command, base, tmp_path / "server.log", timeout_s=3600),
-        httpx.Client(base_url=base, timeout=3600) as client,
+        server_process(
+            command, tmp_path / "server.log", timeout_s=3600
+        ) as server,
+        httpx.Client(timeout=3600) as client,
     ):
+        base = server.base_url
+        client.base_url = base
         refused = client.post("/v1/videos/sync", json=packed)
         assert refused.status_code == 400, refused.text
         error = refused.json()["error"]

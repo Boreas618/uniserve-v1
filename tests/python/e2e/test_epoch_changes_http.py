@@ -71,7 +71,6 @@ from tests.python.e2e.http_helpers import (
     engine_processes,
     engine_revision,
     engine_selection,
-    find_free_port,
     granted_devices,
     host_asset,
     prefix_counters,
@@ -151,8 +150,6 @@ def _serve(
     options: tuple[str, ...] = (),
 ) -> Iterator[str]:
     """A deployment serving `name` on `devices`; its URL."""
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -161,8 +158,6 @@ def _serve(
         name,
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
     ]
     for option in OPTIONS:
@@ -175,11 +170,11 @@ def _serve(
         }
         with server_process(
             command,
-            base_url,
             tmp_path / "server.log",
             timeout_s=900,
             env=environment,
-        ):
+        ) as server:
+            base_url = server.base_url
             yield base_url
 
 
@@ -857,10 +852,10 @@ def test_a_change_of_model_files_loads_the_targets_weights(
 
 
 # The remote store behind the host tier (`kv_cache_config.mooncake`): the
-# Mooncake master this host runs (`host:port`) and the library its clients
-# load (`libmooncake_store.so`).
+# Mooncake master this host runs (`host:port`). The Storage Server's connector
+# opens Mooncake Store's C API (`libmooncake_store.so`) from the loader's
+# default search path, where the Mooncake package installs it.
 MOONCAKE_MASTER = os.environ.get("UNISERVE_MOONCAKE_MASTER")
-MOONCAKE_LIBRARY = os.environ.get("MOONCAKE_STORE_LIBRARY")
 
 # A prompt of 17 blocks of 64 tokens, which the fill prompts cached after it
 # push out of a small host tier, and which a rollback prefetches from the
@@ -878,18 +873,14 @@ def _mooncake_options() -> tuple[str, ...]:
         "--set",
         f'kv_cache_config.mooncake.master="{MOONCAKE_MASTER}"',
         "--set",
-        "kv_cache_config.mooncake.global_segment_gib=8",
-        "--set",
-        f'kv_cache_config.mooncake.library="{MOONCAKE_LIBRARY}"',
+        "kv_cache_config.mooncake.segment_gib=8",
     )
 
 
-# Without a Mooncake master and its library, the case with a remote store
-# does not run.
+# Without a Mooncake master, the case with a remote store does not run.
 WITHOUT_MOONCAKE = pytest.mark.skipif(
-    not (MOONCAKE_MASTER and MOONCAKE_LIBRARY),
-    reason="no Mooncake master (UNISERVE_MOONCAKE_MASTER) and library "
-    "(MOONCAKE_STORE_LIBRARY)",
+    not MOONCAKE_MASTER,
+    reason="no Mooncake master (UNISERVE_MOONCAKE_MASTER)",
 )
 
 

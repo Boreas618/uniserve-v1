@@ -18,7 +18,6 @@ import httpx
 from tests.python.e2e.http_helpers import (
     admin_request,
     engine_selection,
-    find_free_port,
     granted_devices,
     qwen3_checkpoint,
     require_uniserve_binary,
@@ -45,8 +44,6 @@ def serve(
     """Serve Qwen3 under ``options`` (``--set`` assignments), its modules from
     the host's ``build_server``, until the block ends; yields the base URL.
     """  # noqa: D205
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -55,8 +52,6 @@ def serve(
         NAME,
         "--host",
         "127.0.0.1",
-        "--port",
-        str(port),
         *engine_selection(),
         "--set",
         f"build_config.socket={build_server}",
@@ -69,8 +64,9 @@ def serve(
             "XDG_RUNTIME_DIR": str(runtime),
         }
         with server_process(
-            command, base_url, tmp_path / "server.log", 900, environment
-        ):
+            command, tmp_path / "server.log", 900, environment
+        ) as server:
+            base_url = server.base_url
             yield base_url
 
 
