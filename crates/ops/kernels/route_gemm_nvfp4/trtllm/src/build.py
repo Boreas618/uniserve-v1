@@ -20,24 +20,7 @@ scale, layout, tile, cluster.
 from uniserve_build_server import trtllm
 from uniserve_build_server.request import Request
 
-#: The eltwise activation each of the operator's activations is, in the
-#: artifact's own enumeration (`gemm::EltwiseActType`). This product is linear,
-#: so it is `none`; the `relu2` family beside it applies a squared ReLU and is a
-#: different kernel.
-ELTWISE_ACTIVATIONS = {"none": 0, "gelu": 1, "relu2": 2}
-
 
 def compile(request: Request) -> None:
-    """Compile the request's descriptor into ``module.so`` with its cubins.
-
-    The manifest selects `mEltwiseActType`, an option only this product's
-    kernels carry, so its rendering is added to the shared ones.
-    """
-    trtllm.build_routed_gemm(
-        request,
-        renderings={
-            "mEltwiseActType": lambda name: (
-                f"gemm::EltwiseActType({ELTWISE_ACTIVATIONS[name]})"
-            )
-        },
-    )
+    """Compile the request's descriptor into ``module.so`` with its cubins."""
+    trtllm.build_routed_gemm(request)

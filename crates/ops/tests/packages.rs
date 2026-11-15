@@ -244,7 +244,9 @@ fn every_package_names_an_operator_of_ops() {
 ///
 /// A product's kernels are compiled with one layout for each operand, and nothing compares the
 /// two at a launch: a package built for one form and handed a table in the other reads every
-/// block scale at the wrong offset and computes plausible numbers.
+/// block scale at the wrong offset and computes plausible numbers. The package names each of the
+/// operator's layouts by the library's enumerator once, in the token layout's values, so the
+/// weights' layout is the enumerator those values give the operator's weight scale layout.
 #[test]
 fn a_routed_nvfp4_package_reads_the_weight_scale_layout_its_operator_states() {
     let kernels = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
@@ -255,15 +257,17 @@ fn a_routed_nvfp4_package_reads_the_weight_scale_layout_its_operator_states() {
             .parse()
             .unwrap();
         let selected = &manifest["parameters"]["selected"];
+        let tokens = &selected["mSfLayoutB"];
         assert_eq!(
-            selected["mSfLayoutA"].as_str(),
-            Some(ops::moe::grouped::WEIGHT_SCALE_LAYOUT.to_string().as_str()),
-            "{operator}'s package compiles for another weight scale layout than its operator's"
-        );
-        assert_eq!(
-            selected["mSfLayoutB"]["field"].as_str(),
+            tokens["field"].as_str(),
             Some("layout"),
             "{operator}'s package selects its kernels by another token layout than the key's"
+        );
+        let weights = ops::moe::grouped::WEIGHT_SCALE_LAYOUT.to_string();
+        assert_eq!(
+            selected["mSfLayoutA"].as_str(),
+            tokens["values"][weights.as_str()].as_str(),
+            "{operator}'s package compiles for another weight scale layout than its operator's"
         );
     }
 }

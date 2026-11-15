@@ -25,9 +25,9 @@ def compile(request: Request) -> None:
     """Compile the request's descriptor into ``module.so`` with its cubins.
 
     The descriptor's activation selects the gated epilogue twice: the
-    artifact's kernels by their `mActType` (the manifest states it as the
-    field), and the runner's activation in the entry unit, which reads
-    `UNISERVE_GELU_TANH`.
+    library's kernels by their `mActType` (the manifest states the
+    enumerator each activation selects), and the runner's activation in the
+    entry unit, which reads `UNISERVE_GELU_TANH`.
     """
     gelu_tanh = request.field("activation") == "gelu_tanh"
     trtllm.build_routed_gemm(

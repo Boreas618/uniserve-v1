@@ -2,20 +2,19 @@
 
 One descriptor -> one module.
 
-The module is trtllm-gen's FMHA launch code — the artifact's kernel table plus
+The module is trtllm-gen's FMHA launch code — the library's kernel table plus
 `TllmGenFmhaRunner` — compiled against the generated header, with the cubins
-the descriptor's configurations can select published beside the module in
-`cubins/`. The Build Server compiles a descriptor by calling :func:`compile`
-with the compile request.
+the descriptor's calls can select published beside the module in `cubins/`.
+The Build Server compiles a descriptor by calling :func:`compile` with the
+compile request.
 
 Steps:
-1. stage the pinned `trtllm-gen-fmha` artifact's generated
+1. stage the pinned `trtllm-gen-fmha` library's generated
    `flashInferMetaInfo.h` (`uniserve_build_server.trtllm.stage`, which
    verifies every file against the pin);
-2. read the artifact's kernel table and keep the entries the descriptor can
-   select — the element types, `head_dim`, `page`, the mask and the phase, on
-   the architecture families the target runs;
-3. fetch those cubins and publish them beside the module, under `cubins/`;
+2. read the library's kernel table and select the kernels the descriptor's
+   calls can run (:func:`options`, `uniserve_build_server.trtllm.select`);
+3. publish those cubins beside the module, under `cubins/`;
 4. compile the entry unit and the FMHA launch code against the staged header,
    and link `module.so` (`uniserve_build_server.trtllm.build`).
 
@@ -24,115 +23,110 @@ kv_heads, mask, window, len.
 """
 
 import hashlib
-import re
-import shutil
-import sys
+from typing import Any
 
 from uniserve_build_server import cuda, trtllm
 from uniserve_build_server.request import Request
 
-#: The operator's element types, as the artifact names them in a kernel.
-NAMES = {"bf16": "Bfloat16", "f16": "Fp16", "f8e4m3": "E4m3", "f4e2m1": "E2m1"}
+#: The library's generated kernel table.
+TABLE = "include/flashInferMetaInfo.h"
 
-#: The artifact's generated kernel table.
-METADATA_HEADER = "include/flashInferMetaInfo.h"
+#: The headers of FlashInfer's data tree that declare the enumerations the
+#: table's members take: the element types, and the FMHA runner's options.
+ENUMERATIONS = (
+    "include/flashinfer/trtllm/common.h",
+    "include/flashinfer/trtllm/fmha/fmhaRunnerParams.h",
+)
+
+#: The operator's element types, as FlashInfer's `Data_type` names them.
+DATA_TYPES = {
+    "bf16": "Data_type::DATA_TYPE_BF16",
+    "f16": "Data_type::DATA_TYPE_FP16",
+}
 
 
-def matching_kernels(header, fields, target):
-    """The kernel names of the artifact the descriptor's configurations select.
+def options(fields: dict[str, Any]) -> dict[str, Any]:
+    """The table's options of every kernel a call of this descriptor can run.
 
-    The table is the artifact's own: an entry names its element types, head
-    width, page size, mask, phase and architecture family, so the filter is the
-    descriptor's values, not a guess. A target none of whose families the
-    artifact was built for matches no kernel, which refuses the descriptor.
+    They are the options the entry fixes in the runner's parameters
+    (`src/entry.cu`): the element types, the head width, a paged cache of the
+    descriptor's page, and none of the variants it never asks for (skipped
+    softmax, sparse attention, an FP16 softmax, compressed pages, the
+    BF16-query FP8-cache transforms). The runner chooses among the rest --
+    tiles, schedulers, the multi-CTA split -- for each call's shape, so every
+    kernel that differs only in those is published.
+
+    The decode is the generation kernels, which take a causal mask whatever
+    the call's: with one query token per request, a dense and a causal mask
+    cover the same keys, and the entry hands them a causal one. The
+    prefill's mask is the call's.
     """
-    families = trtllm.families(target)
-    query = NAMES[fields["dtype"]]
-    key_value = NAMES[fields["kv"]]
-    out_type = NAMES[fields["out"]]
-    prefix = (
-        f"Q{query}Kv{key_value}O{out_type}"
-        if query != key_value
-        else f"Qkv{query}O{out_type}"
-    )
-    head = f"H{fields['head_dim']}"
-    page = f"P{fields['page']}"
     decode = fields["phase"] == "decode"
-    # The artifact's generation kernels are named causally whatever mask a call
-    # asks for: with one query token per request, a dense and a causal mask
-    # cover the same keys, which is why the vendor's own launcher hands its
-    # generation kernels a causal mask either way. The prefill's mask does pick
-    # the name, since its tiles see whole queries.
-    mask = "Causal" if decode or fields["mask"] == "causal" else "Dense"
-    kept = []
-    for line in header.splitlines():
-        if not line.startswith("{ DATA_TYPE_"):
-            continue
-        name = re.search(r'"([^"]+)"', line)
-        if name is None:
-            continue
-        name = name.group(1)
-        if prefix not in name or head not in name:
-            continue
-        if f"PagedKv{mask}{page}" not in name:
-            continue
-        if not any(
-            name.startswith(f"fmha{family}Kernel") for family in families
-        ):
-            continue
-        # The artifact's prefill kernels end in `Context`; the decode ones carry
-        # the generation phase in their name.
-        if ("Context" in name) == decode:
-            continue
-        # A skipped softmax is a variant this module never asks for, and the
-        # sliding-window ones only serve a window the descriptor does not have.
-        if "SkipsSoftmax" in name:
-            continue
-        # A window is its own trade: the sliding kernels read a window size the
-        # operator's call states, and this package does not serve one.
-        if "SlidingOrChunked" in name:
-            continue
-        kept.append(name)
-    if not kept:
-        raise SystemExit(
-            f"the artifact has no {prefix}{head} {mask}{page} kernel for "
-            f"{target}"
-        )
-    return sorted(set(kept))
+    causal = decode or fields["mask"] == "causal"
+    return {
+        "mDataTypeQ": DATA_TYPES[fields["dtype"]],
+        "mDataTypeKv": DATA_TYPES[fields["kv"]],
+        "mDataTypeO": DATA_TYPES[fields["out"]],
+        "mHeadDimQk": fields["head_dim"],
+        "mHeadDimV": fields["head_dim"],
+        "mQkvLayout": "QkvLayout::PagedKv",
+        "mNumTokensPerPage": fields["page"],
+        "mMaskType": (
+            "TrtllmGenAttentionMaskType::Causal"
+            if causal
+            else "TrtllmGenAttentionMaskType::Dense"
+        ),
+        "mKernelType": (
+            [
+                "FmhaKernelType::SwapsMmaAbForGeneration",
+                "FmhaKernelType::KeepsMmaAbForGeneration",
+            ]
+            if decode
+            else "FmhaKernelType::Context"
+        ),
+        "mSkipsSoftmaxWhenPossible": False,
+        "mSparseAttn": "TrtllmGenSparseMlaType::None",
+        "mFp16Softmax": False,
+        "mUsesSpcompress": False,
+        "mEnablesBf16QFp8KvKOnlyTransform": False,
+        "mSeparateTransformedKv": False,
+    }
 
 
 def compile(request: Request) -> None:
     """Compile the request's descriptor into ``module.so`` with its cubins.
 
-    The artifact is the build's input, not the module: it is staged into the
+    The library is the build's input, not the module: it is staged into the
     build's scratch (`uniserve_build_server.cuda.scratch`), compiled
     against, and never enters the directory a runner is handed.
     """
-    with cuda.scratch(request) as artifact:
-        trtllm.stage(request, trtllm.FMHA.library, artifact, [METADATA_HEADER])
-        header_path = artifact / METADATA_HEADER
-        names = matching_kernels(
-            header_path.read_text(), request.fields, request.target
+    library = trtllm.FMHA.library
+    data = trtllm.data_tree()
+    with cuda.scratch(request) as staging:
+        trtllm.stage(request, library, staging, [TABLE])
+        enums = trtllm.enumerations(
+            (data / one).read_text() for one in ENUMERATIONS
         )
-
-        cubins = [f"{name}.cubin" for name in names]
-        trtllm.stage(request, trtllm.FMHA.library, artifact, cubins)
-        published = request.output / "cubins"
-        published.mkdir(parents=True, exist_ok=True)
-        for cubin in cubins:
-            shutil.copyfile(artifact / cubin, published / cubin)
-        print(f"published {len(names)} cubins", file=sys.stderr)
+        kernels = trtllm.select(
+            trtllm.fmha_table((staging / TABLE).read_text(), enums),
+            {
+                name: trtllm.resolve(value, enums)
+                for name, value in options(request.fields).items()
+            },
+            request.target,
+        )
+        trtllm.publish(request, library, kernels, staging)
 
         # The launch code's header refuses to compile without the table's hash
         # and the directory its loader prefixes to a cubin's name, both of
         # which FlashInfer's own build defines.
-        metainfo_hash = hashlib.sha256(header_path.read_bytes()).hexdigest()
+        table_hash = hashlib.sha256((staging / TABLE).read_bytes()).hexdigest()
         trtllm.build(
             request,
             trtllm.FMHA,
-            includes=[artifact / "include"],
+            includes=[staging / "include"],
             definitions={
                 "TLLM_GEN_FMHA_CUBIN_PATH": '"."',
-                "TLLM_GEN_FMHA_METAINFO_HASH": f'"{metainfo_hash}"',
+                "TLLM_GEN_FMHA_METAINFO_HASH": f'"{table_hash}"',
             },
         )
