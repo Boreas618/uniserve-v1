@@ -772,6 +772,7 @@ impl Leader {
                 targets,
                 config: Box::new(target.clone()),
                 epoch: target_epoch,
+                keep: request.in_flight == InFlight::Keep,
             }),
         );
         Ok(Applied::Update(Box::new(report)))
@@ -983,7 +984,7 @@ impl Replica {
         let in_place = crate::leader::configurable(
             &comparable(&served.engine_config),
             &comparable(&target_engine),
-            running.info().capacity.as_ref(),
+            &running.info().capacity,
         );
         // A successor serving other model files processes requests as the
         // daemon does only with the same tokenizer, templates, generation
@@ -1141,13 +1142,9 @@ mod tests {
         assert!(crate::leader::configurable(
             &comparable(&served),
             &comparable(&target),
-            Some(&capacity)
+            &capacity
         ));
-        assert!(!crate::leader::configurable(
-            &served,
-            &target,
-            Some(&capacity)
-        ));
+        assert!(!crate::leader::configurable(&served, &target, &capacity));
     }
 
     /// The target's layout differs from the serving one's in its parallel
@@ -1194,6 +1191,9 @@ mod tests {
         let replica = Arc::clone(&leader.replicas()[0]);
         let client = replica.hold().client().expect("the replica serves");
         let epoch = client.epoch();
+        // The replica serves the arguments its engine was launched with, as a deployment's
+        // start records them.
+        *service::lock(&replica.served) = Some(testkit::args(crate::test_support::SERVED_MODEL));
 
         let status = serde_json::to_value(leader.config_status().await.unwrap()).unwrap();
         assert_eq!(

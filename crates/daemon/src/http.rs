@@ -721,8 +721,8 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        SERVED_MODEL, admin_router, daemon_routers, engine_of, harness_router, post_json,
-        read_response, router, router_with, send, served_engine, text_fake,
+        SERVED_MODEL, admin_router, daemon_routers, engine_of, harness_router, post_json, router,
+        router_with, send, served_engine, text_fake,
     };
 
     /// A `GET` request to `path`.
@@ -1309,8 +1309,7 @@ mod tests {
                 fake
             }),
         );
-        // Shorter than a fixture's stall, so the timeout is the first wait
-        // the paused clock reaches.
+        // The timeout is the first wait the paused clock reaches.
         let timeout = Duration::from_secs(10);
         let router = router_with(
             engine,
@@ -1321,12 +1320,12 @@ mod tests {
         );
 
         let sent = tokio::time::Instant::now();
-        let response = router
-            .oneshot(post_json("/v1/chat/completions", &chat_body(2, false)))
-            .await
-            .unwrap();
         tokio::time::pause();
-        let (status, _, body) = read_response(response, "the chat completion").await;
+        let (status, _, body) = send(
+            &router,
+            post_json("/v1/chat/completions", &chat_body(2, false)),
+        )
+        .await;
 
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
         assert_eq!(body["error"]["code"], "request_timeout");

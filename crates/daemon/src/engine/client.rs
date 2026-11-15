@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use proto::report::SchedulerStats;
 use proto::request::wire::{self, from_engine, to_engine};
@@ -21,10 +20,6 @@ use proto::request::{ArtifactMedia as _, Event, GenerationLimits, Request, Reque
 use proto::{MappedMedia, MediaReceiver};
 use service::{Connection, lock};
 use tokio::sync::{mpsc, oneshot, watch};
-
-/// How long a read of the engine's frames waits before it rechecks whether
-/// the client closed.
-const READ_INTERVAL: Duration = Duration::from_millis(200);
 
 /// What a ready engine reported it serves.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,9 +36,8 @@ pub struct EngineInfo {
     /// them.
     pub segments: Vec<wire::CacheSegments>,
     /// The batch the workers were started for, within which the schedulers
-    /// take scheduling limits in place; `None` from an engine that does not
-    /// state it.
-    pub capacity: Option<wire::BatchCapacity>,
+    /// take scheduling limits in place.
+    pub capacity: wire::BatchCapacity,
     /// The page seeds of the page chains the engine's workers compute
     /// (`storage::key::page_seed`): equal between epochs whose models,
     /// numerics and page layouts agree.
@@ -59,24 +53,45 @@ pub struct EngineInfo {
     pub stats_period: std::time::Duration,
 }
 
-impl From<wire::EngineInfo> for EngineInfo {
-    fn from(info: wire::EngineInfo) -> Self {
-        Self {
-            limits: info.limits.map(GenerationLimits::from).unwrap_or_default(),
+/// Why an engine's report of what it serves is refused: it leaves out a part
+/// the request interface requires, or states one in another form.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InfoError {
+    /// It states no generation limits.
+    #[error("the engine stated no generation limits")]
+    Limits,
+    /// It states no batch capacity.
+    #[error("the engine stated no batch capacity")]
+    Capacity,
+    /// A page seed is not a 32-byte key.
+    #[error("the engine stated a page seed of {0} bytes, not 32")]
+    Seed(usize),
+}
+
+impl TryFrom<wire::EngineInfo> for EngineInfo {
+    type Error = InfoError;
+
+    fn try_from(info: wire::EngineInfo) -> Result<Self, InfoError> {
+        let prefix_seeds = info
+            .prefix_seeds
+            .iter()
+            .map(|seed| {
+                <[u8; 32]>::try_from(seed.as_slice()).map_err(|_| InfoError::Seed(seed.len()))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            limits: info
+                .limits
+                .map(GenerationLimits::from)
+                .ok_or(InfoError::Limits)?,
             video_denoiser: info.video_denoiser,
             schedulers: info.schedulers,
             segments: info.segments,
-            capacity: info.capacity,
-            // A seed of another length is no engine's: the build checks keep
-            // daemons and engines of one wire version.
-            prefix_seeds: info
-                .prefix_seeds
-                .iter()
-                .filter_map(|seed| <[u8; 32]>::try_from(seed.as_slice()).ok())
-                .collect(),
+            capacity: info.capacity.ok_or(InfoError::Capacity)?,
+            prefix_seeds,
             latent_seed: info.latent_seed,
             stats_period: std::time::Duration::from_millis(u64::from(info.stats_period_ms)),
-        }
+        })
     }
 }
 
@@ -169,8 +184,8 @@ struct Shared {
     /// The engine commands awaiting their answer, by identity.
     responses: Mutex<HashMap<u64, Responder>>,
     /// The epoch the engine executes, which its statistics are recorded
-    /// under; 0 for an engine this daemon did not start.
-    epoch: AtomicU64,
+    /// under.
+    epoch: u64,
 }
 
 /// Where an engine command's response goes: each worker's result, or why the
@@ -282,13 +297,13 @@ pub struct EngineClient {
 }
 
 impl EngineClient {
-    /// A client of the engine read through `reader` and written through
-    /// `writer`, two ends of one connection, over which the engine reported
-    /// itself in
-    /// `state` (ready or standing by) with `info`; frames `reader` already
-    /// holds are filed first. `stats` receives the schedulers' statistics.
-    /// `control` is the daemon connection the engine's process lives under,
-    /// which the client keeps; the process ends with it.
+    /// A client of the engine of epoch `epoch`, read through `reader` and
+    /// written through `writer`, two ends of one connection, over which the
+    /// engine reported itself in `state` (ready or standing by) with `info`;
+    /// frames `reader` already holds are filed first. `stats` receives the
+    /// schedulers' statistics. `control` is the daemon connection the
+    /// engine's process lives under, which the client keeps; the process ends
+    /// with it.
     ///
     /// # Errors
     ///
@@ -296,6 +311,7 @@ impl EngineClient {
     pub fn new(
         reader: Connection,
         writer: Connection,
+        epoch: u64,
         info: EngineInfo,
         state: EngineState,
         stats: StatsSink,
@@ -308,7 +324,7 @@ impl EngineClient {
             state,
             next_id: AtomicU64::new(1),
             responses: Mutex::default(),
-            epoch: AtomicU64::new(0),
+            epoch,
         });
         let thread = {
             let shared = Arc::clone(&shared);
@@ -333,13 +349,6 @@ impl EngineClient {
     #[must_use]
     pub fn numbered(mut self, engine: u64) -> Self {
         self.engine = Some(engine);
-        self
-    }
-
-    /// The client of an engine that executes epoch `epoch`.
-    #[must_use]
-    pub fn in_epoch(self, epoch: u64) -> Self {
-        self.shared.epoch.store(epoch, Ordering::Relaxed);
         self
     }
 
@@ -378,10 +387,9 @@ impl EngineClient {
         self.engine
     }
 
-    /// The epoch the engine executes; 0 for an engine this daemon did not
-    /// start.
+    /// The epoch the engine executes.
     pub fn epoch(&self) -> u64 {
-        self.shared.epoch.load(Ordering::Relaxed)
+        self.shared.epoch
     }
 
     /// What the engine reported it serves.
@@ -442,14 +450,13 @@ impl EngineClient {
         let stream = EventStream {
             id,
             events: receiver,
-            shared: Some(Arc::clone(&self.shared)),
+            shared: Arc::clone(&self.shared),
             awaits_decoder,
             text_tokens: 0,
             acknowledged: 0,
             consumed: 0,
             reported: 0,
             open: true,
-            on_finish: None,
         };
         self.shared.submit(&request);
         // A closed connection drops the acceptance with the request, whose
@@ -504,7 +511,7 @@ impl EngineClient {
         let stream = EventStream {
             id: request,
             events: receiver,
-            shared: Some(Arc::clone(&self.shared)),
+            shared: Arc::clone(&self.shared),
             // The event stream the predecessor consumed already told the
             // engine whether the request awaits its decoder.
             awaits_decoder: false,
@@ -513,7 +520,6 @@ impl EngineClient {
             consumed,
             reported: consumed,
             open: true,
-            on_finish: None,
         };
         self.shared.command(
             request,
@@ -884,13 +890,9 @@ impl EngineClient {
     pub async fn update_weights(
         &self,
         model_path: &str,
-        in_flight: crate::leader::WeightsInFlight,
+        in_flight: wire::WeightsInFlight,
     ) -> Result<Vec<wire::WeightReport>, String> {
-        let in_flight = match in_flight {
-            crate::leader::WeightsInFlight::Keep => wire::WeightsInFlight::Keep,
-            crate::leader::WeightsInFlight::Recompute => wire::WeightsInFlight::Recompute,
-            crate::leader::WeightsInFlight::Abort => wire::WeightsInFlight::Abort,
-        } as i32;
+        let in_flight = in_flight as i32;
         let model_path = model_path.to_owned();
         match self
             .ask(|id| {
@@ -991,13 +993,6 @@ impl EngineClient {
         if self.detached.load(Ordering::Acquire) {
             return;
         }
-        // Which daemon tells which engine to end, and for what: a relaunched engine shut down
-        // within a second of connecting is a recovery that undid itself, and only the sender
-        // can say who asked.
-        tracing::info!(
-            engine = ?self.engine,
-            "this daemon shuts an engine down"
-        );
         self.shared
             .send(to_engine::Kind::Engine(wire::EngineCommand {
                 kind: Some(wire::engine_command::Kind::Shutdown(wire::Shutdown {})),
@@ -1031,17 +1026,14 @@ fn unexpected(command: &str, reports: Response) -> String {
 
 /// Files the engine's frames until its connection closes, then ends every
 /// request still in flight.
+///
+/// The read blocks: it ends with the connection, when the engine closes it or
+/// when the client shuts its socket down ([`EngineClient::detach`]).
 fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
     let mut artifact_transfer: Option<MediaReceiver> = None;
     loop {
-        let (message, mut descriptors) = match reader.try_recv_with::<wire::FromEngine>() {
-            Ok(Some(received)) => received,
-            Ok(None) => {
-                if reader.wait(READ_INTERVAL).is_err() {
-                    break;
-                }
-                continue;
-            }
+        let (message, mut descriptors) = match reader.recv_next_with::<wire::FromEngine>() {
+            Ok(received) => received,
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(error) => {
                 tracing::error!(%error, "the engine's connection failed");
@@ -1121,7 +1113,7 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             }
             Some(from_engine::Kind::Stats(report)) => match report.snapshot {
                 Some(snapshot) => stats(EngineReport::Scheduler {
-                    epoch: shared.epoch.load(Ordering::Relaxed),
+                    epoch: shared.epoch,
                     scheduler: report.scheduler,
                     stats: Box::new(SchedulerStats::from(snapshot)),
                 }),
@@ -1132,28 +1124,36 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             },
             Some(from_engine::Kind::State(state)) => {
                 // The engine announces its lifecycle; the client keeps what
-                // it last announced.
+                // it last announced. A state the interface does not define is
+                // a protocol error, which ends the connection as a failure.
                 let announced = match wire::EngineState::try_from(state.state) {
-                    Ok(wire::EngineState::Starting) => Some(EngineState::Starting),
-                    Ok(wire::EngineState::Parked) => Some(EngineState::Parked),
-                    Ok(wire::EngineState::Serving) => Some(EngineState::Serving),
-                    Ok(wire::EngineState::Draining) => Some(EngineState::Draining),
-                    Ok(wire::EngineState::Stopped) => Some(EngineState::Stopped),
+                    Ok(wire::EngineState::Starting) => EngineState::Starting,
+                    Ok(wire::EngineState::Parked) => EngineState::Parked,
+                    Ok(wire::EngineState::Serving) => EngineState::Serving,
+                    Ok(wire::EngineState::Draining) => EngineState::Draining,
+                    Ok(wire::EngineState::Stopped) => EngineState::Stopped,
                     Ok(wire::EngineState::Failed) => {
                         tracing::error!(error = %state.error, "the engine failed");
-                        Some(EngineState::Failed(state.error))
+                        EngineState::Failed(state.error)
                     }
-                    Ok(wire::EngineState::Unspecified) | Err(_) => None,
+                    Ok(wire::EngineState::Unspecified) | Err(_) => {
+                        let reason = format!(
+                            "the engine announced the state {}, which the request interface \
+                             does not define",
+                            state.state
+                        );
+                        tracing::error!(%reason, "the engine broke the request interface");
+                        shared.state.send_replace(EngineState::Failed(reason));
+                        break;
+                    }
                 };
-                if let Some(announced) = announced {
-                    shared.state.send_if_modified(|current| {
-                        let changes = *current != announced;
-                        if changes {
-                            *current = announced;
-                        }
-                        changes
-                    });
-                }
+                shared.state.send_if_modified(|current| {
+                    let changes = *current != announced;
+                    if changes {
+                        *current = announced;
+                    }
+                    changes
+                });
             }
             Some(from_engine::Kind::Operated(operated)) => {
                 if let Some(responder) = lock(&shared.responses).remove(&operated.id) {
@@ -1210,9 +1210,15 @@ fn file(shared: &Shared, id: RequestId, event: Event) {
 
 /// The events of one request this daemon takes ahead of its `Consumed` reports, which it states
 /// to every engine in its welcome (`wire::Welcome::event_window`): a request's events queue in its
-/// stream unboundedly, so the window bounds what a slow consumer leaves queued, and a report
-/// every half window keeps a consumer that keeps up from ever holding the engine back.
+/// stream unboundedly, so the window bounds what a slow consumer leaves queued.
 pub(crate) const EVENT_WINDOW: u32 = 64;
+
+/// The events a consumer takes between two `Consumed` reports while its request streams: half the
+/// window, so the engine always holds at least half a window of credit for a consumer that keeps
+/// up and never waits on a report. The end of a stream reports what was taken since the last
+/// report ([`EventStream::report_consumed`]). The window and this cadence are the request
+/// interface's flow control as this daemon runs it.
+const REPORT_EVERY: u64 = EVENT_WINDOW as u64 / 2;
 
 /// One request's events, as the engine sends them.
 ///
@@ -1226,8 +1232,8 @@ pub(crate) const EVENT_WINDOW: u32 = 64;
 pub struct EventStream {
     id: RequestId,
     events: mpsc::UnboundedReceiver<Event>,
-    /// The engine's connection; `None` for a stream no engine feeds.
-    shared: Option<Arc<Shared>>,
+    /// The engine's connection.
+    shared: Arc<Shared>,
     /// Whether the request's tokens await the decoder's stop-string
     /// decisions.
     awaits_decoder: bool,
@@ -1241,40 +1247,20 @@ pub struct EventStream {
     /// Whether the request may still be cancelled: neither ended nor
     /// cancelled.
     open: bool,
-    on_finish: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl EventStream {
     /// Provenance of private cache pages when this request resumes elsewhere.
-    pub fn cache_resume(&self) -> Option<proto::request::CacheResume> {
-        self.epoch().map(|epoch| proto::request::CacheResume {
-            epoch,
+    pub fn cache_resume(&self) -> proto::request::CacheResume {
+        proto::request::CacheResume {
+            epoch: self.epoch(),
             request_id: self.id.0,
-        })
-    }
-    /// The epoch of the engine that feeds the stream; `None` for a stream no
-    /// engine feeds.
-    pub fn epoch(&self) -> Option<u64> {
-        self.shared
-            .as_ref()
-            .map(|shared| shared.epoch.load(Ordering::Relaxed))
+        }
     }
 
-    /// A stream of the events `events` delivers, which no engine feeds.
-    #[cfg(test)]
-    pub(crate) fn detached(events: mpsc::UnboundedReceiver<Event>) -> Self {
-        Self {
-            id: RequestId::default(),
-            events,
-            shared: None,
-            awaits_decoder: false,
-            text_tokens: 0,
-            acknowledged: 0,
-            consumed: 0,
-            reported: 0,
-            open: true,
-            on_finish: None,
-        }
+    /// The epoch of the engine that feeds the stream.
+    pub fn epoch(&self) -> u64 {
+        self.shared.epoch
     }
 
     /// The request's identity in the engine that serves it.
@@ -1304,11 +1290,6 @@ impl EventStream {
         event
     }
 
-    /// Receives the next event; the same as [`Self::recv`].
-    pub async fn next(&mut self) -> Option<Event> {
-        self.recv().await
-    }
-
     /// Polls the next event, registering `cx`'s waker; the same stream
     /// [`Self::recv`] offers.
     ///
@@ -1325,29 +1306,23 @@ impl EventStream {
 
     /// Counts a received event, reports consumption to the engine, and
     /// finishes the stream on a terminal event.
+    ///
+    /// The terminal event is one the consumer took, and the engine counts it
+    /// in the position a takeover replays from. Positions are reported
+    /// whether or not the request is still open: the engine owns the
+    /// request's retirement, and a position for a request it retired is a
+    /// command it ignores.
     fn observe(&mut self, event: &Event) {
+        self.consumed += 1;
         match event {
             Event::TextToken { .. } => self.text_tokens += 1,
             event if event.is_terminal() => {
-                // The terminal event is one the consumer took, and the engine
-                // counts it in the position a takeover replays from: a stream
-                // that reported one short of it would leave the engine holding
-                // the request for an event nobody is behind.
-                self.consumed += 1;
                 self.finish();
                 return;
             }
             _ => {}
         }
-        self.consumed += 1;
-        // A request that ended or was cancelled is not the engine's to hear
-        // about: its routing has retired the request, and a position that
-        // arrives after that is a command the engine cannot file — the run at
-        // `9f6da2177` lost its second engine to exactly this, `a request
-        // command failed: a consumer's position is the connection's
-        // bookkeeping`. Events already queued when a stream ended still reach
-        // `observe`, so the gate is here and not in the caller.
-        if self.open && self.consumed - self.reported >= u64::from(EVENT_WINDOW / 2) {
+        if self.consumed - self.reported >= REPORT_EVERY {
             self.report_consumed();
         }
     }
@@ -1361,10 +1336,8 @@ impl EventStream {
     /// the forwarder whose join holds an epoch's shutdown, and a takeover's
     /// replay — would wait for a report that only a long request ever sends.
     fn report_consumed(&mut self) {
-        if self.consumed > self.reported
-            && let Some(shared) = &self.shared
-        {
-            shared.command(
+        if self.consumed > self.reported {
+            self.shared.command(
                 self.id,
                 wire::command::Kind::Consumed(wire::Consumed {
                     events: self.consumed,
@@ -1383,14 +1356,12 @@ impl EventStream {
         if !self.open || !self.awaits_decoder || self.text_tokens <= self.acknowledged {
             return;
         }
-        if let Some(shared) = &self.shared {
-            shared.command(
-                self.id,
-                wire::command::Kind::Acknowledge(wire::Acknowledge {
-                    output_tokens: self.text_tokens as u64,
-                }),
-            );
-        }
+        self.shared.command(
+            self.id,
+            wire::command::Kind::Acknowledge(wire::Acknowledge {
+                output_tokens: self.text_tokens as u64,
+            }),
+        );
         self.acknowledged = self.text_tokens;
     }
 
@@ -1406,30 +1377,23 @@ impl EventStream {
         if !std::mem::replace(&mut self.open, false) {
             return;
         }
-        if let Some(shared) = &self.shared {
-            let command = match cause {
-                StreamCancelCause::DroppedStream => wire::command::Kind::Cancel(wire::Cancel {}),
-                StreamCancelCause::StopStringMatched => {
-                    wire::command::Kind::Stop(wire::StopRequest {})
-                }
-            };
-            shared.command(self.id, command);
-        }
+        let command = match cause {
+            StreamCancelCause::DroppedStream => wire::command::Kind::Cancel(wire::Cancel {}),
+            StreamCancelCause::StopStringMatched => wire::command::Kind::Stop(wire::StopRequest {}),
+        };
+        self.shared.command(self.id, command);
     }
 
-    /// Ends the stream's request on its side and runs its callback once.
+    /// Ends the stream's request on its side.
     fn finish(&mut self) {
         self.open = false;
         self.report_consumed();
-        if let Some(on_finish) = self.on_finish.take() {
-            on_finish();
-        }
     }
 }
 
 impl Drop for EventStream {
-    /// Reports the position the consumer reached, cancels a request that has not
-    /// ended, and runs a callback that has not run.
+    /// Reports the position the consumer reached and cancels a request that has
+    /// not ended.
     ///
     /// The report goes out on the way out even though the request is about to be
     /// cancelled: the engine's forwarder holds a request until its consumer has
@@ -1438,8 +1402,148 @@ impl Drop for EventStream {
     fn drop(&mut self) {
         self.report_consumed();
         self.cancel();
-        if let Some(on_finish) = self.on_finish.take() {
-            on_finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proto::request::{FinishReason, GenerationRequest, SamplingParams};
+
+    use super::*;
+    use crate::test_support::{Arrival, ScriptedEngine, engine_info, scripted_client};
+
+    /// A text request that generates `max_tokens` tokens.
+    fn request(max_tokens: usize) -> Request {
+        GenerationRequest {
+            request_id: Default::default(),
+            prompt_token_ids: vec![1, 2, 3, 4],
+            multimodal_inputs: Default::default(),
+            sampling: SamplingParams::default(),
+            max_und_tokens: max_tokens,
+            include_stop_token: false,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 0,
+            cache: Default::default(),
+            generated_token_ids: Vec::new(),
+            adapter: 0,
         }
+        .into()
+    }
+
+    /// An engine that answers each token request with as many tokens as it may generate and a
+    /// finish.
+    fn generating() -> (EngineClient, ScriptedEngine) {
+        scripted_client(1, |arrival| match arrival {
+            Arrival::Submitted(Request::Generation(request)) => {
+                let tokens = request.max_und_tokens;
+                (0..tokens)
+                    .map(|_| Event::TextToken {
+                        id: u32::from(b'a'),
+                        logprob: None,
+                    })
+                    .chain([Event::Finished {
+                        reason: FinishReason::MaxTokens,
+                        stop_reason: None,
+                        prompt_tokens: 4,
+                        completion_tokens: tokens,
+                    }])
+                    .collect()
+            }
+            Arrival::Submitted(Request::Diffusion(_)) | Arrival::TakenOver(_) => Vec::new(),
+        })
+    }
+
+    /// The positions the engine was told, in order.
+    fn positions(engine: &ScriptedEngine) -> Vec<u64> {
+        engine
+            .commands
+            .try_iter()
+            .filter_map(|command| match command.kind {
+                Some(wire::command::Kind::Consumed(consumed)) => Some(consumed.events),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A stream reports the position its consumer reached every half window and at its end,
+    /// the terminal event included, so the engine holds the request for no event nobody is
+    /// behind.
+    #[tokio::test]
+    async fn a_stream_reports_its_position_every_half_window_and_at_its_end() {
+        let (client, engine) = generating();
+        let tokens = EVENT_WINDOW as usize;
+        let (mut stream, scheduler) = client.submit(request(tokens)).await.unwrap();
+        assert_eq!(scheduler, Some(0));
+        while stream.recv().await.is_some() {}
+        drop(stream);
+        drop(client);
+        // The window's two halves, then the terminal event.
+        assert_eq!(
+            positions(&engine),
+            [REPORT_EVERY, 2 * REPORT_EVERY, tokens as u64 + 1]
+        );
+    }
+
+    /// A cancelled request's stream goes on reporting the positions its consumer reaches: the
+    /// engine owns the request's retirement and ignores a position it no longer files.
+    #[tokio::test]
+    async fn a_cancelled_stream_still_reports_its_position() {
+        let (client, engine) = generating();
+        let tokens = EVENT_WINDOW as usize;
+        let (mut stream, _) = client.submit(request(tokens)).await.unwrap();
+        assert!(stream.recv().await.is_some());
+        stream.cancel();
+        while stream.recv().await.is_some() {}
+        drop(stream);
+        drop(client);
+        let commands: Vec<_> = engine.commands.try_iter().filter_map(|c| c.kind).collect();
+        let cancelled = commands
+            .iter()
+            .position(|kind| matches!(kind, wire::command::Kind::Cancel(_)))
+            .expect("the request was cancelled");
+        assert!(
+            commands[cancelled..].iter().any(|kind| matches!(
+                kind,
+                wire::command::Kind::Consumed(consumed) if consumed.events == tokens as u64 + 1
+            )),
+            "{commands:?}"
+        );
+    }
+
+    /// An engine's report of what it serves leaves out none of what the request interface
+    /// requires, and states every page seed as a 32-byte key.
+    #[test]
+    fn an_engine_report_without_its_limits_capacity_or_whole_seeds_is_refused() {
+        let info = engine_info();
+        let reported = wire::EngineInfo {
+            limits: Some((&info.limits).into()),
+            capacity: Some(info.capacity),
+            prefix_seeds: vec![vec![1; 32]],
+            ..wire::EngineInfo::default()
+        };
+        let read = EngineInfo::try_from(reported.clone()).expect("a whole report");
+        assert_eq!(read.prefix_seeds, [[1; 32]]);
+        assert_eq!(
+            EngineInfo::try_from(wire::EngineInfo {
+                limits: None,
+                ..reported.clone()
+            }),
+            Err(InfoError::Limits)
+        );
+        assert_eq!(
+            EngineInfo::try_from(wire::EngineInfo {
+                capacity: None,
+                ..reported.clone()
+            }),
+            Err(InfoError::Capacity)
+        );
+        assert_eq!(
+            EngineInfo::try_from(wire::EngineInfo {
+                prefix_seeds: vec![vec![1; 31]],
+                ..reported
+            }),
+            Err(InfoError::Seed(31))
+        );
     }
 }

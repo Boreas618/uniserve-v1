@@ -375,19 +375,14 @@ impl Connection {
         Ok(self.recv_with(timeout)?.map(|(message, _)| message))
     }
 
-    /// Waits for the next message, however long that takes: the wait ends with a message or with
-    /// the connection's end, which the peer's close or a failure brings.
+    /// Waits for the next message, however long that takes: [`Connection::recv_next_with`]
+    /// without the descriptors, which are closed.
     ///
     /// # Errors
     ///
-    /// As [`Connection::try_recv`]; the terminal failure once the connection ended.
+    /// As [`Connection::recv_next_with`].
     pub fn recv_next<M: Message>(&mut self) -> io::Result<M> {
-        loop {
-            if let Some(message) = self.try_recv()? {
-                return Ok(message);
-            }
-            self.wait_on(None, Duration::MAX)?;
-        }
+        Ok(self.recv_next_with()?.0)
     }
 
     /// [`Connection::recv`], with the descriptors the frame carried.
@@ -414,6 +409,25 @@ impl Connection {
         }
     }
 
+    /// Waits with no deadline for the next message, with the descriptors its frame carried. The
+    /// wait ends with a message or with the connection: the peer's close, a failure, or a
+    /// [`Connection::shutdown`] through any handle of the socket, which is how the owner of a
+    /// thread that reads a connection on its behalf stops it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Connection::try_recv`]; a closed connection fails with
+    /// [`io::ErrorKind::UnexpectedEof`] once every frame that arrived whole before the close was
+    /// taken.
+    pub fn recv_next_with<M: Message>(&mut self) -> io::Result<(M, Vec<OwnedFd>)> {
+        loop {
+            if let Some(frame) = self.try_recv_with()? {
+                return Ok(frame);
+            }
+            self.wait_on(None, None)?;
+        }
+    }
+
     /// Blocks until something happens the owner can act on, or `timeout` passes: bytes arrive, a
     /// queued frame is written, or the local wake fires (a wake already pending ends the wait at
     /// once). It does not say which, so the caller checks every source of progress afterwards.
@@ -427,7 +441,7 @@ impl Connection {
     /// The terminal failure once the connection failed or the peer closed it: at once when that
     /// is known, and otherwise when it is observed without new bytes arriving first.
     pub fn wait(&mut self, timeout: Duration) -> io::Result<()> {
-        self.wait_on(None, timeout).map(drop)
+        self.wait_on(None, Some(timeout)).map(drop)
     }
 
     /// [`Connection::wait`], which also ends once `interrupt` becomes readable or reaches its
@@ -439,22 +453,24 @@ impl Connection {
     ///
     /// As [`Connection::wait`].
     pub fn wait_or(&mut self, interrupt: BorrowedFd<'_>, timeout: Duration) -> io::Result<bool> {
-        self.wait_on(Some(interrupt), timeout)
+        self.wait_on(Some(interrupt), Some(timeout))
     }
 
-    /// The wait of [`Connection::wait`] and [`Connection::wait_or`]; whether `interrupt` ended
-    /// it.
+    /// The wait of [`Connection::wait`], [`Connection::wait_or`] and the receives without a
+    /// deadline, for at most `timeout` (`None`: no deadline); whether
+    /// `interrupt` ended it.
     fn wait_on(
         &mut self,
         interrupt: Option<BorrowedFd<'_>>,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> io::Result<bool> {
         self.failed()?;
         if self.local.take() {
             return Ok(false);
         }
 
-        let deadline = Instant::now().checked_add(timeout);
+        // A timeout too long to be a point in time is no deadline.
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
         let received = self.inbox.len();
         let queued = self.outbox.len();
         loop {

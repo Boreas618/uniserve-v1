@@ -267,7 +267,7 @@ fn socket_of(descriptor: OwnedFd) -> io::Result<Io> {
 
 /// Serves one accepted connection until the client closes it, the server stops
 /// serving, or the connection ends it.
-async fn serve_connection(
+pub(crate) async fn serve_connection(
     io: Io,
     server: Server,
     accepting: CancellationToken,

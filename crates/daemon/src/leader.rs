@@ -173,6 +173,9 @@ pub(crate) struct EpochTarget {
     pub(crate) config: Box<ServerArgs>,
     /// The epoch the target serves.
     pub(crate) epoch: u64,
+    /// Whether the requests in flight at the switch continue with the state they reached
+    /// where the target computes otherwise (`in_flight = keep`).
+    pub(crate) keep: bool,
 }
 
 /// Records what replica `replica`'s engine reports into the deployment's
@@ -1425,6 +1428,8 @@ pub enum ServingState {
     Failed,
     /// An engine is being replaced, and requests wait for the next.
     Holding,
+    /// The successor daemon of a hot restart serves the requests.
+    HandedOver,
     /// No engine will serve.
     Closed,
 }
@@ -1440,6 +1445,7 @@ impl ServingState {
             Self::Stopped => "stopped",
             Self::Failed => "failed",
             Self::Holding => "holding",
+            Self::HandedOver => "handed_over",
             Self::Closed => "closed",
         }
     }
@@ -1585,6 +1591,16 @@ pub enum WeightsInFlight {
     Abort,
 }
 
+impl From<WeightsInFlight> for wire::WeightsInFlight {
+    fn from(in_flight: WeightsInFlight) -> Self {
+        match in_flight {
+            WeightsInFlight::Keep => Self::Keep,
+            WeightsInFlight::Recompute => Self::Recompute,
+            WeightsInFlight::Abort => Self::Abort,
+        }
+    }
+}
+
 /// The deployment `config` describes, refused as a request when it does not resolve: its
 /// deployment file does not read or does not place.
 pub(crate) fn deployment(config: &ServerArgs) -> Result<crate::epoch::Epoch, UpdateError> {
@@ -1620,11 +1636,8 @@ pub enum UpdateError {
 pub(crate) fn configurable(
     served: &proto::config::EngineConfig,
     updated: &proto::config::EngineConfig,
-    capacity: Option<&wire::BatchCapacity>,
+    capacity: &wire::BatchCapacity,
 ) -> bool {
-    let Some(capacity) = capacity else {
-        return false;
-    };
     let limits = |config: &proto::config::EngineConfig| {
         (
             config.scheduler.max_batch,
@@ -2149,6 +2162,7 @@ impl Replica {
             targets,
             config,
             epoch,
+            keep,
         } = target;
         let config = *config;
         let Some(registry) = self.registry.upgrade() else {
@@ -2298,13 +2312,22 @@ impl Replica {
         }
         // Requests go to `serving`; each of `replicas` (`serving` first) has its
         // hold serve its own engine of `clients`, and one past the last a
-        // client of another, to which it migrates what it holds.
+        // client of another, to which it migrates what it holds. With `keeps`,
+        // the requests that leave each hold's engine continue with the state
+        // they reached where the next engine computes otherwise.
         let route = |replicas: &[Arc<Replica>],
                      serving: &[Arc<Replica>],
-                     clients: &[Option<Arc<EngineClient>>]| {
+                     clients: &[Option<Arc<EngineClient>>],
+                     keeps: bool| {
             for (index, replica) in replicas.iter().enumerate() {
                 replica.following.store(true, Ordering::SeqCst);
                 if let Some(client) = routed_client(clients, index) {
+                    if keeps
+                        && let Some(previous) = replica.hold.client()
+                        && let Some(kept) = crate::engine::hold::Kept::between(&previous, &client)
+                    {
+                        replica.hold.keep(kept);
+                    }
                     replica.hold.serve(client);
                 }
             }
@@ -2313,7 +2336,7 @@ impl Replica {
         let target_clients: Vec<_> = clients.iter().cloned().map(Some).collect();
         let mut everyone = routed.clone();
         everyone.extend(previous.iter().skip(routed.len()).cloned());
-        route(&everyone, &routed, &target_clients);
+        route(&everyone, &routed, &target_clients, keep);
         for (replica, client) in routed.iter().zip(&clients) {
             tokio::spawn(watch_engine(Arc::clone(replica), Arc::downgrade(client)));
         }
@@ -2417,7 +2440,7 @@ impl Replica {
                 }
                 let mut everyone = previous.clone();
                 everyone.extend(routed.iter().skip(previous.len()).cloned());
-                route(&everyone, &previous, &serving_again);
+                route(&everyone, &previous, &serving_again, false);
                 warn!(
                     epoch,
                     "the update returns the deployment to the previous epoch"
@@ -2458,7 +2481,7 @@ impl Replica {
             }
             let mut everyone = previous.clone();
             everyone.extend(routed.iter().skip(previous.len()).cloned());
-            route(&everyone, &previous, &serving_again);
+            route(&everyone, &previous, &serving_again, false);
         }
         for replica in previous.iter().chain(&routed) {
             replica.following.store(false, Ordering::SeqCst);
@@ -3246,6 +3269,7 @@ impl Replica {
                 EngineState::Failed(reason) => (ServingState::Failed, Some(reason)),
             },
             HoldState::Holding => (ServingState::Holding, None),
+            HoldState::HandedOver => (ServingState::HandedOver, None),
             HoldState::Closed(reason) => (ServingState::Closed, Some(reason)),
         };
         ReplicaStatus {
@@ -3430,7 +3454,7 @@ impl Replica {
 
         let paused = !hold.pause();
         let started = Instant::now();
-        let results = client.update_weights(model_path, in_flight).await;
+        let results = client.update_weights(model_path, in_flight.into()).await;
         if paused {
             hold.resume();
         }
@@ -3692,13 +3716,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::api::events::Events as _;
     use proto::request::SamplingParams;
     use proto::request::{Event, GenerationRequest, Request};
 
     use super::{EngineState, Leader, keeps_standby};
     use crate::test_support::{
-        SERVED_MODEL, STALL, configured_tokenizer, engine_of, fake_client, leader_over,
-        letter_fake, post_json, router, send, send_streamed, sse_documents, test_model, text_fake,
+        SERVED_MODEL, configured_tokenizer, engine_of, fake_client, leader_over, letter_fake,
+        post_json, router, send, send_streamed, sse_documents, test_model, text_fake,
     };
     use testkit::{FakeExecutor, Fixture};
 
@@ -3756,14 +3781,9 @@ mod tests {
         (status, document)
     }
 
-    /// Waits until the process-wide metrics `reached`, which `what` names.
-    async fn metrics_reach(what: &str, reached: impl Fn() -> bool) {
-        let deadline = tokio::time::Instant::now() + STALL;
+    /// Waits until the metrics `reached`.
+    async fn metrics_reach(reached: impl Fn() -> bool) {
         while !reached() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the metrics never reached {what}"
-            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -3902,7 +3922,7 @@ mod tests {
         }
         assert_ne!(serving[0], serving[1]);
         for stream in &mut streams {
-            while let Some(event) = stream.next().await {
+            while let Some(event) = stream.recv().await {
                 if let Event::Finished { reason, .. } = event {
                     assert_eq!(reason, proto::request::FinishReason::Eos);
                     break;
@@ -3921,7 +3941,7 @@ mod tests {
         let (mut stream, replica) = engine.submit(text_request()).await.unwrap();
         assert_eq!(replica.replica, 1);
         let mut finished = false;
-        while let Some(event) = stream.next().await {
+        while let Some(event) = stream.recv().await {
             if let Event::Finished { reason, .. } = event {
                 assert_eq!(reason, proto::request::FinishReason::Eos);
                 finished = true;
@@ -4166,10 +4186,8 @@ mod tests {
 
         let request = &engine.metrics().request;
         let labels = request_labels(engine_model, 0);
-        metrics_reach("the abort", || {
-            outcomes(&engine, engine_model, 0, crate::metrics::Outcome::Abort) == 1
-        })
-        .await;
+        metrics_reach(|| outcomes(&engine, engine_model, 0, crate::metrics::Outcome::Abort) == 1)
+            .await;
         let latency = request.e2e_request_latency_seconds.get_or_create(&labels);
         assert_eq!(
             prometheus_client::metrics::histogram::Histogram::count(&latency),
@@ -4207,11 +4225,7 @@ mod tests {
         };
         let within = [config(64, Some(4096), 64), config(128, Some(8192), 128)];
         for updated in &within {
-            assert!(
-                configurable(&served, updated, Some(&capacity)),
-                "{updated:?}"
-            );
-            assert!(!configurable(&served, updated, None), "{updated:?}");
+            assert!(configurable(&served, updated, &capacity), "{updated:?}");
         }
         let mut captured_otherwise = within[0].clone();
         captured_otherwise.cuda_graph.decode_batch_sizes =
@@ -4224,19 +4238,12 @@ mod tests {
             captured_otherwise,
         ];
         for updated in &beyond {
-            assert!(
-                !configurable(&served, updated, Some(&capacity)),
-                "{updated:?}"
-            );
+            assert!(!configurable(&served, updated, &capacity), "{updated:?}");
         }
         // A step's tokens the served configuration states cannot return to the
         // engine's default in place.
         let stated = config(128, Some(4096), 128);
-        assert!(!configurable(
-            &stated,
-            &config(128, None, 128),
-            Some(&capacity)
-        ));
+        assert!(!configurable(&stated, &config(128, None, 128), &capacity));
     }
 
     /// The device strings of `ranks` local ranks of a default deployment's device kind.

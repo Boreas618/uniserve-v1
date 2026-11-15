@@ -35,16 +35,18 @@
 //! video request the identity that keys its stored trajectories
 //! (`Trajectory::id`) when it is first submitted.
 
+use std::num::{NonZeroU32, NonZeroU64};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
 use proto::request::{
-    DiffusionRequest, Event, GenerationRequest, MigrationCause, Request, RequestId, Trajectory,
+    CacheResume, DiffusionRequest, Event, GenerationRequest, MigrationCause, Request, RequestId,
+    Trajectory,
 };
-#[cfg(test)]
-use tokio::sync::mpsc;
 
+use crate::api::events::Events;
 use crate::engine::client::{EventStream, StreamCancelCause, SubmitError};
 use crate::engine::hold::{Kept, RequestHold};
 
@@ -82,19 +84,18 @@ impl Migrator {
         mut request: Request,
     ) -> Result<(RequestEvents, Option<u32>), SubmitError> {
         let resumable = match &mut request {
-            Request::Generation(generation) => Some(Resumable::Generation(generation.clone())),
+            Request::Generation(generation) => Resumable::Generation(generation.clone()),
             Request::Diffusion(diffusion) => {
                 if diffusion.trajectory.id.is_none() {
-                    diffusion.trajectory.id =
-                        std::num::NonZeroU64::new(uuid::Uuid::new_v4().as_u64_pair().0);
+                    diffusion.trajectory.id = Some(trajectory_identity());
                 }
-                Some(Resumable::Diffusion(diffusion.clone()))
+                Resumable::Diffusion(diffusion.clone())
             }
         };
         let (stream, scheduler) = self.hold.submit(request).await?;
         let events = RequestEvents {
             stream,
-            request: resumable,
+            request: Some(resumable),
             hold: Some(Arc::clone(&self.hold)),
             max_migrations: self.max_migrations,
             losses: 0,
@@ -103,9 +104,18 @@ impl Migrator {
             scheduled: false,
             migrated_at: None,
             open: true,
-            on_finish: None,
         };
         Ok((events, scheduler))
+    }
+}
+
+/// A new identity of a video request's stored trajectories: a random one, so
+/// that no two requests of any daemon key their trajectories alike.
+fn trajectory_identity() -> NonZeroU64 {
+    loop {
+        if let Some(identity) = NonZeroU64::new(uuid::Uuid::new_v4().as_u64_pair().0) {
+            return identity;
+        }
     }
 }
 
@@ -114,7 +124,6 @@ impl Migrator {
 pub(crate) use crate::api::events::Next as Step;
 
 /// A request a migration submits again, as last submitted.
-#[derive(Clone)]
 enum Resumable {
     /// A token request, with the tokens it generated before.
     Generation(Box<GenerationRequest>),
@@ -123,76 +132,84 @@ enum Resumable {
 }
 
 impl Resumable {
-    /// The request `migration` submits again: a token request with the
-    /// tokens it generated, a video request naming the trajectory steps its
-    /// engine stored and its record of where they lie
-    /// (`Migration::denoised_steps`, zero for none). `kept` is the state an epoch change keeps of the
-    /// requests in flight (`in_flight = keep`), which the request continues
-    /// with when the epoch that serves next computes other numerics.
-    fn continuation(&self, migration: &Migration, kept: Option<Kept>) -> Request {
-        let Migration {
-            cause,
-            denoised_steps,
-            stored_layout,
-        } = migration;
-        let (cause, denoised_steps) = (*cause, *denoised_steps);
+    /// Makes this request the continuation `migration` submits, and returns
+    /// it: a token request with the tokens it generated, its private pages
+    /// named by `provenance` unless an earlier migration named them already;
+    /// a video request naming the trajectory steps its engine stored and its
+    /// record of where they lie. `kept` is the state an epoch change keeps of
+    /// the requests in flight (`in_flight = keep`), which the request
+    /// continues with when the epoch that serves next computes other
+    /// numerics. The next migration continues from what this one submits.
+    fn resume(
+        &mut self,
+        migration: &Migration,
+        kept: Option<Kept>,
+        provenance: CacheResume,
+    ) -> Request {
+        let cause = migration.cause;
         match self {
             Self::Generation(request) => {
-                let mut continuation = request.as_ref().clone();
                 // Its prompt's log-probabilities were reported where it began.
-                continuation.sampling.return_prompt_logprobs = false;
-                continuation.sampling.n_prompt_logprobs = 0;
+                request.sampling.return_prompt_logprobs = false;
+                request.sampling.n_prompt_logprobs = 0;
+                request.cache.resume.get_or_insert(provenance);
                 // It reads the state it reached and publishes later pages
                 // only to its private continuation: they are neither epoch's.
-                if let Some(seeds) = kept.as_ref().and_then(|kept| kept.prefix_seeds.as_ref()) {
-                    continuation.cache.state_seeds = seeds.clone();
-                    continuation.cache.write = false;
+                if let Some(seeds) = kept.and_then(|kept| kept.prefix_seeds) {
+                    request.cache.state_seeds = seeds;
+                    request.cache.write = false;
                 }
                 tracing::info!(
                     ?cause,
                     generated = request.generated_token_ids.len(),
                     "a request migrated to the engine that serves next"
                 );
-                Request::Generation(Box::new(continuation))
+                Request::Generation(request.clone())
             }
             Self::Diffusion(request) => {
-                let mut continuation = request.clone();
-                stored(
-                    &mut continuation.trajectory,
-                    denoised_steps,
-                    stored_layout,
-                    kept,
-                );
+                if let Some(stored) = &migration.stored {
+                    stored.name_in(&mut request.trajectory, kept);
+                }
                 tracing::info!(
                     ?cause,
-                    denoised_steps = continuation.trajectory.denoised_steps,
-                    stored = denoised_steps > 0,
+                    denoised_steps = request.trajectory.denoised_steps,
+                    stored = migration.stored.is_some(),
                     "a video request migrated to the engine that serves next"
                 );
-                Request::Diffusion(continuation)
+                Request::Diffusion(request.clone())
             }
+        }
+    }
+
+    /// The request as last submitted.
+    fn request(&self) -> Request {
+        match self {
+            Self::Generation(generation) => Request::Generation(generation.clone()),
+            Self::Diffusion(diffusion) => Request::Diffusion(diffusion.clone()),
         }
     }
 }
 
-/// Names in `trajectory` the `denoised_steps` of it an engine stored at a
-/// step boundary, keyed by what that engine computes, and its record of
-/// where they lie (`stored_layout`): the next engine reads them when it
-/// computes the same, or when an epoch change keeps the state the request
-/// reached (`kept`), whatever its parallel configuration, from where the
-/// record says the pages lie. A request the engine stored nothing of names
-/// the trajectory it named before, which is the same at that step whenever
-/// it is read.
-fn stored(
-    trajectory: &mut Trajectory,
-    denoised_steps: u32,
-    stored_layout: &[u8],
-    kept: Option<Kept>,
-) {
-    if denoised_steps > 0 {
-        trajectory.denoised_steps = denoised_steps;
+/// The steps of a video request's trajectory an engine stored when it ended
+/// the request at a step boundary, and its record of where they lie.
+struct Stored {
+    steps: NonZeroU32,
+    /// Where the engine put the stored trajectory's pages and how each
+    /// stored rank laid its part out (`Trajectory::stored_layout`); opaque to
+    /// the daemon.
+    layout: Vec<u8>,
+}
+
+impl Stored {
+    /// Names these steps in `trajectory`, keyed by what the engine that
+    /// stored them computes: the next engine reads them when it computes the
+    /// same, or when an epoch change keeps the state the request reached
+    /// (`kept`), whatever its parallel configuration, from where the record
+    /// says the pages lie.
+    fn name_in(&self, trajectory: &mut Trajectory, kept: Option<Kept>) {
+        trajectory.denoised_steps = self.steps.get();
         trajectory.state_seed = kept.and_then(|kept| kept.latent_seed);
-        trajectory.stored_layout = stored_layout.to_vec();
+        trajectory.stored_layout.clone_from(&self.layout);
     }
 }
 
@@ -200,34 +217,48 @@ fn stored(
 /// (`Event::Migratable`).
 struct Migration {
     cause: MigrationCause,
-    /// The trajectory steps a video request's engine stored; zero for none.
-    denoised_steps: u32,
-    /// Where the engine put the stored trajectory's pages and how each
-    /// stored rank laid its part out (`Trajectory::stored_layout`).
-    stored_layout: Vec<u8>,
+    /// The trajectory steps a video request's engine stored; `None` when it
+    /// stored none, and the request names the trajectory it named before,
+    /// which is the same at that step whenever it is read.
+    stored: Option<Stored>,
+}
+
+impl Migration {
+    /// The migration an `Event::Migratable` states: its cause, and the steps
+    /// it stored (none at zero, as the request interface states none).
+    fn of(cause: MigrationCause, denoised_steps: u32, stored_layout: Vec<u8>) -> Self {
+        Self {
+            cause,
+            stored: NonZeroU32::new(denoised_steps).map(|steps| Stored {
+                steps,
+                layout: stored_layout,
+            }),
+        }
+    }
 }
 
 /// One request's events across the engines that serve it.
 ///
-/// It offers what an `EventStream` offers. An `Event::Migratable` never
-/// reaches its consumer: the stream submits the request again and goes on
-/// with the next engine's events, or ends with an `Event::Error` when the
-/// request does not migrate. Dropping it before its terminal event cancels
-/// the request on the engine that serves it.
+/// It offers what an `EventStream` offers, as the API server's [`Events`]. An
+/// `Event::Migratable` never reaches its consumer: the stream submits the
+/// request again and goes on with the next engine's events, or ends with an
+/// `Event::Error` when the request does not migrate. Dropping it before its
+/// terminal event cancels the request on the engine that serves it.
 pub struct RequestEvents {
     /// The events of the engine that serves the request now.
     stream: EventStream,
     /// The request as last submitted, with the tokens it generated before
     /// or the trajectory steps an engine stored; `None` for a request that
-    /// does not resume.
+    /// does not resume, and once the request ended or was cancelled.
     request: Option<Resumable>,
-    /// The hold the request migrates through; `None` for a stream no
-    /// engine feeds.
+    /// The hold the request migrates through; `None` for a request this
+    /// process took over, which the engine that serves it admitted.
     hold: Option<Arc<RequestHold>>,
     max_migrations: u32,
     /// Migrations caused by losses so far.
     losses: u32,
-    /// A migration `try_recv` met, which the next `recv` carries out.
+    /// A migration `poll_step` met, which the next `recv` or
+    /// `migrate_pending` carries out.
     pending: Option<Migration>,
     /// Whether the stream resumed on another engine, whose scheduling event
     /// repeats one the consumer received. A migration that happened *before*
@@ -245,32 +276,13 @@ pub struct RequestEvents {
     migrated_at: Option<Instant>,
     /// Whether the request may still be cancelled.
     open: bool,
-    on_finish: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl RequestEvents {
-    /// The events `events` delivers, which no engine feeds.
-    #[cfg(test)]
-    pub(crate) fn detached(events: mpsc::UnboundedReceiver<Event>) -> Self {
-        Self {
-            stream: EventStream::detached(events),
-            request: None,
-            hold: None,
-            max_migrations: 0,
-            losses: 0,
-            pending: None,
-            resumed: false,
-            scheduled: false,
-            migrated_at: None,
-            open: true,
-            on_finish: None,
-        }
-    }
-
     /// The events of a request this process takes over from another: the
     /// engine's stream `stream`, which goes on after the position the
-    /// previous consumer reached (design §7.5.1), and no hold, because the
-    /// request is already admitted and migrated by the engine itself.
+    /// previous consumer reached, and no hold, because the request is already
+    /// admitted and migrated by the engine itself.
     pub(crate) fn taken_over(stream: EventStream, consumed: u64) -> Self {
         Self {
             stream,
@@ -283,12 +295,12 @@ impl RequestEvents {
             scheduled: consumed > 0,
             migrated_at: None,
             open: true,
-            on_finish: None,
         }
     }
 
-    /// Receives the next event; `None` once the request ended.
-    pub async fn recv(&mut self) -> Option<Event> {
+    /// Receives the next event, carrying out any migration on the way;
+    /// `None` once the request ended.
+    async fn next_event(&mut self) -> Option<Event> {
         loop {
             if let Some(migration) = self.pending.take() {
                 match self.migrate(migration).await {
@@ -296,149 +308,16 @@ impl RequestEvents {
                     Err(event) => return self.deliver(Some(event)),
                 }
             }
-            let event = self.stream.recv().await;
-            match event {
+            match self.stream.recv().await {
                 Some(Event::Migratable {
                     cause,
                     denoised_steps,
                     stored_layout,
-                }) => {
-                    self.pending = Some(Migration {
-                        cause,
-                        denoised_steps,
-                        stored_layout,
-                    })
-                }
+                }) => self.pending = Some(Migration::of(cause, denoised_steps, stored_layout)),
                 Some(event) if self.skips(&event) => {}
                 event => return self.deliver(event),
             }
         }
-    }
-
-    /// Receives the next event; the same as [`Self::recv`].
-    pub async fn next(&mut self) -> Option<Event> {
-        self.recv().await
-    }
-
-    /// Advances the request's events one step, registering `cx`'s waker.
-    ///
-    /// The same stream [`Self::recv`] offers, without awaiting it: a response
-    /// driven from a poll loop (a handoffable stream, design §7.5.1) needs one
-    /// step at a time and must not hold a future across the pause.
-    pub(crate) fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Step> {
-        loop {
-            if self.pending.is_some() {
-                return Poll::Ready(Step::Migrate);
-            }
-            let event = ready!(self.stream.poll_recv(cx));
-            match event {
-                Some(Event::Migratable {
-                    cause,
-                    denoised_steps,
-                    stored_layout,
-                }) => {
-                    self.pending = Some(Migration {
-                        cause,
-                        denoised_steps,
-                        stored_layout,
-                    });
-                    return Poll::Ready(Step::Migrate);
-                }
-                Some(event) if self.skips(&event) => {}
-                Some(event) => {
-                    self.observe(&event);
-                    return Poll::Ready(Step::Event(event));
-                }
-                None => {
-                    self.finish();
-                    return Poll::Ready(Step::Ended);
-                }
-            }
-        }
-    }
-
-    /// Carries out the migration the last [`Self::poll_step`] reported, after
-    /// which the events go on from the engine that serves the request now.
-    ///
-    /// # Errors
-    ///
-    /// Returns the terminal event the consumer receives instead.
-    pub(crate) async fn migrate_pending(&mut self) -> Result<(), Event> {
-        let Some(migration) = self.pending.take() else {
-            return Ok(());
-        };
-        self.migrate(migration).await
-    }
-
-    /// The request's identity in the engine that serves it, which a
-    /// successor takes its event stream over by; `None` once the request
-    /// ended or was handed over.
-    pub(crate) fn engine_request_id(&self) -> Option<RequestId> {
-        self.open.then(|| self.stream.id())
-    }
-
-    /// The request's engine events its consumer took in all, and the public
-    /// tokens they carried: the position a successor takes the stream over
-    /// from (`Command::Takeover`).
-    pub(crate) fn progress(&self) -> (u64, u64) {
-        (
-            self.stream.consumed(),
-            self.request
-                .as_ref()
-                .and_then(|request| match request {
-                    Resumable::Generation(generation) => {
-                        Some(generation.generated_token_ids.len() as u64)
-                    }
-                    Resumable::Diffusion(_) => None,
-                })
-                .unwrap_or_default(),
-        )
-    }
-
-    /// The request as submitted, encoded as JSON for the handoff state's
-    /// record of what this process's pipeline processed.
-    pub(crate) fn submitted(&self) -> Option<Vec<u8>> {
-        let resumable = self.request.as_ref()?;
-        let request = match resumable {
-            Resumable::Generation(generation) => {
-                Request::Generation(Box::new(generation.as_ref().clone()))
-            }
-            Resumable::Diffusion(diffusion) => Request::Diffusion(diffusion.clone()),
-        };
-        serde_json::to_vec(&request).ok()
-    }
-
-    /// Ends this process's consumption of the request's events without
-    /// cancelling it: the engine's next consumer takes the stream over
-    /// (design §7.5.1). The stream's owner reports the progress it reached
-    /// before this call.
-    pub(crate) fn hand_over(&mut self) {
-        self.open = false;
-        self.request = None;
-        self.stream.hand_over();
-        if let Some(on_finish) = self.on_finish.take() {
-            on_finish();
-        }
-    }
-
-    /// Accepts every text token received from the engine that serves now as
-    /// completing no stop string; see `EventStream::acknowledge_consumed_prefix`.
-    pub fn acknowledge_consumed_prefix(&mut self) {
-        self.stream.acknowledge_consumed_prefix();
-    }
-
-    /// Cancels the request.
-    pub fn cancel(&mut self) {
-        self.cancel_at_consumed_prefix(StreamCancelCause::DroppedStream);
-    }
-
-    /// Closes generation after the tokens received; see
-    /// `EventStream::cancel_at_consumed_prefix`. A request whose migration is
-    /// pending is not submitted again.
-    pub fn cancel_at_consumed_prefix(&mut self, cause: StreamCancelCause) {
-        self.open = false;
-        self.request = None;
-        self.stream.cancel_at_consumed_prefix(cause);
     }
 
     /// Whether `event` repeats what the consumer received from an engine
@@ -486,10 +365,18 @@ impl RequestEvents {
         }
     }
 
+    /// Closes generation after the tokens received, as
+    /// `EventStream::cancel_at_consumed_prefix` does; a request whose
+    /// migration is pending is not submitted again.
+    fn close(&mut self, cause: StreamCancelCause) {
+        self.open = false;
+        self.request = None;
+        self.stream.cancel_at_consumed_prefix(cause);
+    }
+
     /// Submits the request again, with its generated tokens or the
-    /// trajectory steps the engine stored (`Migration::denoised_steps`,
-    /// zero for none), to the engine that serves next, and goes on with
-    /// that engine's events.
+    /// trajectory steps the engine stored, to the engine that serves next,
+    /// and goes on with that engine's events.
     ///
     /// # Errors
     ///
@@ -510,7 +397,7 @@ impl RequestEvents {
                 "the request was cancelled while it migrated".to_owned(),
             ));
         }
-        let (Some(request), Some(hold)) = (&self.request, &self.hold) else {
+        let (Some(request), Some(hold)) = (&mut self.request, &self.hold) else {
             return Err(failed(
                 "the request's engine stopped serving it, and it does not migrate".to_owned(),
             ));
@@ -524,12 +411,9 @@ impl RequestEvents {
             }
             self.losses += 1;
         }
-        let hold = Arc::clone(hold);
         // A request an epoch change moves to an epoch computing other
         // numerics continues with the state it reached (`in_flight = keep`).
-        let previous_epoch = (cause == MigrationCause::Drain)
-            .then(|| self.stream.epoch())
-            .flatten();
+        let previous_epoch = (cause == MigrationCause::Drain).then(|| self.stream.epoch());
         // Admission resolves the current owner first. After a daemon handoff
         // that owner supplies both the engine and the continuation's state.
         // The request waits as every held submission does (`RequestHold`): until
@@ -541,24 +425,11 @@ impl RequestEvents {
             .ready(previous_epoch)
             .await
             .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
-        let mut continuation = request.continuation(&migration, kept);
-        if let Request::Generation(generation) = &mut continuation {
-            generation.cache.resume = generation.cache.resume.or(self.stream.cache_resume());
-        }
+        let continuation = request.resume(&migration, kept, self.stream.cache_resume());
         let (stream, _scheduler) = client
-            .submit(continuation.clone())
+            .submit(continuation)
             .await
             .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
-        // The next migration submits the request as submitted now.
-        match (&continuation, &mut self.request) {
-            (Request::Generation(submitted), Some(Resumable::Generation(request))) => {
-                request.cache = submitted.cache.clone();
-            }
-            (Request::Diffusion(submitted), Some(Resumable::Diffusion(request))) => {
-                *request = submitted.clone();
-            }
-            _ => {}
-        }
         // The previous engine's stream ended with its migratable event.
         self.stream = stream;
         // Whether the next engine's scheduling repeats one the consumer read
@@ -570,69 +441,89 @@ impl RequestEvents {
         Ok(())
     }
 
-    /// Ends the stream on its side and runs its callback once.
+    /// Ends the stream on its side.
     fn finish(&mut self) {
         self.open = false;
         self.request = None;
-        if let Some(on_finish) = self.on_finish.take() {
-            on_finish();
-        }
     }
 }
 
-impl Drop for RequestEvents {
-    /// Runs a callback that has not run; the engine's stream cancels a
-    /// request that has not ended as it drops.
-    fn drop(&mut self) {
-        if let Some(on_finish) = self.on_finish.take() {
-            on_finish();
-        }
-    }
-}
-
-impl crate::api::events::Events for RequestEvents {
+impl Events for RequestEvents {
     fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Step> {
-        RequestEvents::poll_step(self, cx)
+        loop {
+            if self.pending.is_some() {
+                return Poll::Ready(Step::Migrate);
+            }
+            match ready!(self.stream.poll_recv(cx)) {
+                Some(Event::Migratable {
+                    cause,
+                    denoised_steps,
+                    stored_layout,
+                }) => {
+                    self.pending = Some(Migration::of(cause, denoised_steps, stored_layout));
+                    return Poll::Ready(Step::Migrate);
+                }
+                Some(event) if self.skips(&event) => {}
+                Some(event) => {
+                    self.observe(&event);
+                    return Poll::Ready(Step::Event(event));
+                }
+                None => {
+                    self.finish();
+                    return Poll::Ready(Step::Ended);
+                }
+            }
+        }
     }
 
-    fn recv(
-        &mut self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Event>> + Send + '_>> {
-        Box::pin(RequestEvents::recv(self))
+    fn recv(&mut self) -> Pin<Box<dyn Future<Output = Option<Event>> + Send + '_>> {
+        Box::pin(self.next_event())
     }
 
-    fn migrate_pending(
-        &mut self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Event>> + Send + '_>> {
-        Box::pin(RequestEvents::migrate_pending(self))
+    fn migrate_pending(&mut self) -> Pin<Box<dyn Future<Output = Result<(), Event>> + Send + '_>> {
+        Box::pin(async move {
+            match self.pending.take() {
+                Some(migration) => self.migrate(migration).await,
+                None => Ok(()),
+            }
+        })
     }
 
     fn acknowledge_consumed_prefix(&mut self) {
-        RequestEvents::acknowledge_consumed_prefix(self);
+        self.stream.acknowledge_consumed_prefix();
     }
 
     fn stop_at_consumed_prefix(&mut self) {
-        self.cancel_at_consumed_prefix(StreamCancelCause::StopStringMatched);
+        self.close(StreamCancelCause::StopStringMatched);
     }
 
     fn cancel(&mut self) {
-        RequestEvents::cancel(self);
+        self.close(StreamCancelCause::DroppedStream);
     }
 
     fn hand_over(&mut self) {
-        RequestEvents::hand_over(self);
+        self.open = false;
+        self.request = None;
+        self.stream.hand_over();
     }
 
     fn engine_request_id(&self) -> Option<RequestId> {
-        RequestEvents::engine_request_id(self)
+        self.open.then(|| self.stream.id())
     }
 
     fn progress(&self) -> (u64, u64) {
-        RequestEvents::progress(self)
+        let tokens = match &self.request {
+            Some(Resumable::Generation(generation)) => generation.generated_token_ids.len() as u64,
+            Some(Resumable::Diffusion(_)) | None => 0,
+        };
+        (self.stream.consumed(), tokens)
     }
 
     fn submitted(&self) -> Option<Vec<u8>> {
-        RequestEvents::submitted(self)
+        // The record is the request interface's own message, the one the
+        // handoff schema names (`uniserve.request.Request`).
+        let request = self.request.as_ref()?.request();
+        Some(prost::Message::encode_to_vec(&request.to_wire()))
     }
 }
 
@@ -640,11 +531,11 @@ impl crate::api::events::Events for RequestEvents {
 mod tests {
     use std::time::Duration;
 
-    use proto::request::{DiffusionSamplingParams, GenerationRequest, SamplingParams, Trajectory};
+    use proto::request::{DiffusionSamplingParams, SamplingParams};
 
     use super::*;
     use crate::engine::client::EngineClient;
-    use crate::test_support::{SERVED_MODEL, letter_fake};
+    use crate::test_support::{Arrival, SERVED_MODEL, letter_fake, scripted_client};
 
     /// A text request of a four-token prompt that generates `max_tokens`
     /// tokens.
@@ -663,6 +554,54 @@ mod tests {
             generated_token_ids: Vec::new(),
             adapter: 0,
         }
+    }
+
+    /// A video request of a two-token prompt, whose trajectory is `trajectory`.
+    fn video(trajectory: Trajectory) -> DiffusionRequest {
+        DiffusionRequest {
+            request_id: Default::default(),
+            prompt_token_ids: vec![1, 2],
+            conditioning: Vec::new(),
+            conditions: Vec::new(),
+            media: Vec::new(),
+            priority: 0,
+            sampling: DiffusionSamplingParams {
+                num_frames: 25,
+                video_units: 1,
+                seed: 3,
+                width: 64,
+                height: 32,
+                condition_rows: 0,
+            },
+            trajectory,
+            encoder_inputs: None,
+        }
+    }
+
+    /// The migratable end an engine states for `cause`, storing `steps`
+    /// trajectory steps laid out as `layout`.
+    fn migratable(cause: MigrationCause, steps: u32, layout: &[u8]) -> Event {
+        Event::Migratable {
+            cause,
+            denoised_steps: steps,
+            stored_layout: layout.to_vec(),
+        }
+    }
+
+    /// A finish of `completion_tokens` tokens.
+    fn finished(completion_tokens: usize) -> Event {
+        Event::Finished {
+            reason: proto::request::FinishReason::MaxTokens,
+            stop_reason: None,
+            prompt_tokens: 4,
+            completion_tokens,
+        }
+    }
+
+    /// An engine of epoch `epoch` that ends every request it is given as
+    /// migratable for `cause`, storing nothing.
+    fn migrating(epoch: u64, cause: MigrationCause) -> Arc<EngineClient> {
+        Arc::new(scripted_client(epoch, move |_| vec![migratable(cause, 0, &[])]).0)
     }
 
     /// A client of one scheduler over a fake whose text never ends, so a
@@ -684,13 +623,6 @@ mod tests {
         (Arc::new(client), commands)
     }
 
-    /// Receives the next event within ten seconds.
-    async fn next(events: &mut RequestEvents) -> Option<Event> {
-        tokio::time::timeout(Duration::from_secs(10), events.recv())
-            .await
-            .expect("an event within ten seconds")
-    }
-
     /// A request whose engine drains goes on on the engine that serves next:
     /// its consumer reads every token it generates, one scheduling event,
     /// and a finish that charges its whole usage.
@@ -707,7 +639,7 @@ mod tests {
 
         let (mut tokens, mut scheduled) = (0, 0);
         while tokens < 5 {
-            match next(&mut events).await {
+            match events.recv().await {
                 Some(Event::TextToken { .. }) => tokens += 1,
                 Some(Event::Scheduled { .. }) => scheduled += 1,
                 Some(_) => {}
@@ -727,7 +659,7 @@ mod tests {
             .unwrap();
 
         let finished = loop {
-            match next(&mut events).await {
+            match events.recv().await {
                 Some(Event::TextToken { .. }) => tokens += 1,
                 Some(Event::Scheduled { .. }) => scheduled += 1,
                 Some(event @ Event::Finished { .. }) => break event,
@@ -751,63 +683,42 @@ mod tests {
         );
     }
 
-    /// The events of a request that resumes from `generated` tokens, fed by
-    /// `events` and migrating through `hold`.
-    fn resumable(
-        events: mpsc::UnboundedReceiver<Event>,
-        hold: Arc<RequestHold>,
-        max_migrations: u32,
-    ) -> RequestEvents {
-        RequestEvents {
-            stream: EventStream::detached(events),
-            request: Some(Resumable::Generation(Box::new(request(8)))),
-            hold: Some(hold),
-            max_migrations,
-            losses: 0,
-            pending: None,
-            resumed: false,
-            scheduled: false,
-            migrated_at: None,
-            open: true,
-            on_finish: None,
-        }
-    }
-
     /// A request whose engine was lost before it sent any scheduling reads
     /// the next engine's scheduling: the repeat a migration removes is one
     /// the consumer already read, and a consumer that read none has no output
     /// to put a generated token in.
-    #[test]
-    fn a_resumed_stream_keeps_the_scheduling_its_consumer_never_read() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        drop(tx);
-        let mut events = RequestEvents {
-            stream: EventStream::detached(rx),
-            request: None,
-            hold: None,
-            max_migrations: 0,
-            losses: 1,
-            pending: None,
-            resumed: true,
-            scheduled: false,
-            migrated_at: None,
-            open: true,
-            on_finish: None,
-        };
+    #[tokio::test]
+    async fn a_resumed_stream_keeps_the_scheduling_its_consumer_never_read() {
+        let hold = Arc::new(RequestHold::new());
+        hold.serve(migrating(1, MigrationCause::Loss));
+        let migrator = Migrator::new(Arc::clone(&hold), 1);
+        let (mut events, _) = migrator
+            .submit(Request::Generation(Box::new(request(1))))
+            .await
+            .unwrap();
+
         let scheduling = || Event::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
             cached_tokens: 0,
         };
+        let (next, _) = scripted_client(1, move |_| {
+            vec![
+                scheduling(),
+                Event::TextToken {
+                    id: u32::from(b'a'),
+                    logprob: None,
+                },
+                finished(1),
+            ]
+        });
+        hold.serve(Arc::new(next));
         assert!(
-            !events.skips(&scheduling()),
+            matches!(events.recv().await, Some(Event::Scheduled { .. })),
             "the next engine's scheduling is the first the consumer reads, not a repeat"
         );
-        events.observe(&scheduling());
-        assert!(
-            events.skips(&scheduling()),
-            "a second scheduling is the repeat a migration removes"
-        );
+        assert!(matches!(events.recv().await, Some(Event::TextToken { .. })));
+        assert!(matches!(events.recv().await, Some(Event::Finished { .. })));
     }
 
     /// A request whose engine was lost waits in the hold for as long as the
@@ -818,14 +729,13 @@ mod tests {
     #[tokio::test]
     async fn a_lost_engines_request_waits_through_a_slow_relaunch() {
         let hold = Arc::new(RequestHold::new());
-        let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(Event::Migratable {
-            cause: MigrationCause::Loss,
-            denoised_steps: 0,
-            stored_layout: Vec::new(),
-        })
-        .unwrap();
-        let mut events = resumable(rx, Arc::clone(&hold), 3);
+        hold.serve(migrating(1, MigrationCause::Loss));
+        let migrator = Migrator::new(Arc::clone(&hold), 3);
+        let (mut events, _) = migrator
+            .submit(Request::Generation(Box::new(request(8))))
+            .await
+            .unwrap();
+        hold.hold();
 
         // Ten minutes pass on the paused clock with no engine serving: longer
         // than any engine's start.
@@ -842,13 +752,10 @@ mod tests {
 
         tokio::time::resume();
         hold.serve(client());
-        let (first, mut events) = tokio::time::timeout(Duration::from_secs(10), waiting)
-            .await
-            .expect("the request continues once an engine serves")
-            .unwrap();
+        let (first, mut events) = waiting.await.unwrap();
         let mut tokens = usize::from(matches!(first, Some(Event::TextToken { .. })));
         let finished = loop {
-            match next(&mut events).await {
+            match events.recv().await {
                 Some(Event::TextToken { .. }) => tokens += 1,
                 Some(event @ Event::Finished { .. }) => break event,
                 Some(event) if event.is_terminal() => panic!("{event:?}"),
@@ -870,20 +777,17 @@ mod tests {
     }
 
     /// A request survives `max_migrations` migrations caused by losses and
-    /// fails on the next; a drain is not counted.
+    /// fails on the next.
     #[tokio::test]
     async fn losses_beyond_the_limit_fail_the_request() {
         let hold = Arc::new(RequestHold::new());
-        hold.close("no engine serves");
-        let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(Event::Migratable {
-            cause: MigrationCause::Loss,
-            denoised_steps: 0,
-            stored_layout: Vec::new(),
-        })
-        .unwrap();
-        let mut events = resumable(rx, hold, 0);
-        match next(&mut events).await {
+        hold.serve(migrating(1, MigrationCause::Loss));
+        let migrator = Migrator::new(Arc::clone(&hold), 0);
+        let (mut events, _) = migrator
+            .submit(Request::Generation(Box::new(request(8))))
+            .await
+            .unwrap();
+        match events.recv().await {
             Some(Event::Error { message }) => {
                 assert!(message.contains("lost 1 times"), "{message}")
             }
@@ -891,99 +795,89 @@ mod tests {
         }
     }
 
+    /// The continuation of a video request the engine of epoch 1 ends with
+    /// `migration`, migrating to an engine that records it, under a hold that
+    /// keeps `kept`.
+    async fn continuation(
+        trajectory: Trajectory,
+        migration: Event,
+        kept: Option<Kept>,
+    ) -> (Trajectory, Trajectory) {
+        let hold = Arc::new(RequestHold::new());
+        let (first, first_engine) = scripted_client(1, move |_| vec![migration.clone()]);
+        hold.serve(Arc::new(first));
+        if let Some(kept) = kept {
+            hold.keep(kept);
+        }
+        let migrator = Migrator::new(Arc::clone(&hold), 1);
+        let (mut events, _) = migrator
+            .submit(Request::Diffusion(video(trajectory)))
+            .await
+            .unwrap();
+
+        let (next, next_engine) = scripted_client(2, |_| vec![finished(0)]);
+        hold.serve(Arc::new(next));
+        assert!(matches!(events.recv().await, Some(Event::Finished { .. })));
+        let submitted =
+            |engine: &crate::test_support::ScriptedEngine| match engine.submitted.recv().unwrap() {
+                Request::Diffusion(request) => request.trajectory,
+                Request::Generation(_) => panic!("a video request migrates as one"),
+            };
+        (submitted(&first_engine), submitted(&next_engine))
+    }
+
     /// A video request leaves its engine naming the trajectory steps the
-    /// engine stored and where they lie: it is submitted again with them
-    /// and its trajectory's identity, reading the stored trajectory under
-    /// the next epoch's own latent seed, or under the parked epoch's when an
-    /// epoch change keeps the state of the requests in flight. A migration
-    /// that stored nothing submits the request naming what it named before.
-    #[test]
-    fn a_video_request_migrates_with_the_steps_its_engine_stored() {
-        let video = DiffusionRequest {
-            request_id: Default::default(),
-            prompt_token_ids: vec![1, 2],
-            conditioning: Vec::new(),
-            conditions: Vec::new(),
-            media: Vec::new(),
-            priority: 0,
-            sampling: DiffusionSamplingParams {
-                num_frames: 25,
-                video_units: 1,
-                seed: 3,
-                width: 64,
-                height: 32,
-                condition_rows: 0,
-            },
-            trajectory: Trajectory {
-                id: std::num::NonZeroU64::new(7),
-                ..Trajectory::default()
-            },
-            encoder_inputs: None,
-        };
-        let trajectory = |request: Request| match request {
-            Request::Diffusion(request) => request.trajectory,
-            Request::Generation(_) => panic!("a video request migrates as one"),
-        };
-        let resumable = Resumable::Diffusion(video.clone());
-        let migration = |cause, denoised_steps, stored_layout: &[u8]| Migration {
-            cause,
-            denoised_steps,
-            stored_layout: stored_layout.to_vec(),
-        };
-        let drained = migration(MigrationCause::Drain, 3, b"pages");
-        let stored = trajectory(resumable.continuation(&drained, None));
+    /// engine stored and where they lie: it is submitted again with them and
+    /// its trajectory's identity, reading the stored trajectory under the next
+    /// epoch's own latent seed, or under the drained epoch's when an epoch
+    /// change keeps the state of the requests in flight. A migration that
+    /// stored nothing submits the request naming what it named before.
+    #[tokio::test]
+    async fn a_video_request_migrates_with_the_steps_its_engine_stored() {
+        let drained = migratable(MigrationCause::Drain, 3, b"pages");
+        let (first, next) = continuation(Trajectory::default(), drained.clone(), None).await;
+        assert!(first.id.is_some(), "the migrator names the trajectory");
         assert_eq!(
-            stored,
+            next,
             Trajectory {
-                id: std::num::NonZeroU64::new(7),
+                id: first.id,
                 denoised_steps: 3,
                 state_seed: None,
                 stored_layout: b"pages".to_vec(),
             }
         );
+
         let kept = Kept {
             epoch: 1,
             prefix_seeds: None,
             latent_seed: Some(11),
         };
-        assert_eq!(
-            trajectory(resumable.continuation(&drained, Some(kept))).state_seed,
-            Some(11)
-        );
+        let (_, next) = continuation(Trajectory::default(), drained, Some(kept)).await;
+        assert_eq!(next.state_seed, Some(11));
 
-        let named = Resumable::Diffusion(DiffusionRequest {
-            trajectory: Trajectory {
-                id: std::num::NonZeroU64::new(7),
-                denoised_steps: 3,
-                state_seed: Some(11),
-                stored_layout: b"pages".to_vec(),
-            },
-            encoder_inputs: None,
-            ..video
-        });
-        assert_eq!(
-            trajectory(named.continuation(&migration(MigrationCause::Loss, 0, &[]), None)),
-            Trajectory {
-                id: std::num::NonZeroU64::new(7),
-                denoised_steps: 3,
-                state_seed: Some(11),
-                stored_layout: b"pages".to_vec(),
-            }
-        );
+        let named = Trajectory {
+            id: NonZeroU64::new(7),
+            denoised_steps: 3,
+            state_seed: Some(11),
+            stored_layout: b"pages".to_vec(),
+        };
+        let lost = migratable(MigrationCause::Loss, 0, &[]);
+        let (first, next) = continuation(named.clone(), lost, None).await;
+        assert_eq!(first, named);
+        assert_eq!(next, named);
     }
 
-    /// A request that does not resume from its tokens fails when its engine
-    /// ends it as migratable.
+    /// A request this process took over, which the engine that serves it
+    /// admitted, fails when its engine ends it as migratable: it does not
+    /// migrate from here.
     #[tokio::test]
     async fn a_request_that_does_not_migrate_fails_on_a_migratable_end() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(Event::Migratable {
-            cause: MigrationCause::Drain,
-            denoised_steps: 0,
-            stored_layout: Vec::new(),
-        })
-        .unwrap();
-        let mut events = RequestEvents::detached(rx);
-        assert!(matches!(next(&mut events).await, Some(Event::Error { .. })));
+        let (client, _engine) = scripted_client(1, |arrival| match arrival {
+            Arrival::TakenOver(RequestId(5)) => vec![migratable(MigrationCause::Drain, 0, &[])],
+            Arrival::TakenOver(_) | Arrival::Submitted(_) => Vec::new(),
+        });
+        let stream = client.take_over(RequestId(5), 0).unwrap();
+        let mut events = RequestEvents::taken_over(stream, 0);
+        assert!(matches!(events.recv().await, Some(Event::Error { .. })));
     }
 }

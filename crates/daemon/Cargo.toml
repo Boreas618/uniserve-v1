@@ -91,6 +91,11 @@ prometheus-client = { workspace = true, features = ["test-util"] }
 # The paused clock of the tests that wait on a deadline (`tokio::time::pause`).
 tokio = { workspace = true, features = ["test-util"] }
 expect-test.workspace = true
+# The client side of the HTTP/1.1 connections the fixtures serve their requests over
+# (`test_support::send`): the requests go through the daemon's own connection.
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 # Test images with chunks placed where a test states them (an `eXIf` before or after the image
 # data, a header of a size no decoder would allocate).
 png.workspace = true

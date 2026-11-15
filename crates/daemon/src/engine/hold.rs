@@ -38,7 +38,7 @@ pub struct RequestHold {
     /// Whether submissions wait although an engine serves.
     paused: watch::Sender<bool>,
     /// The state the requests migrating out of an epoch continue with
-    /// (`Self::kept`).
+    /// (`Self::keep`).
     kept: std::sync::Mutex<Option<Kept>>,
 }
 
@@ -57,6 +57,25 @@ pub struct Kept {
     pub latent_seed: Option<u64>,
 }
 
+impl Kept {
+    /// What the requests leaving `previous`'s engine keep when `next`'s
+    /// engine serves them on: the state they reached, keyed by what
+    /// `previous` computes wherever `next` computes otherwise. `None` when the
+    /// two compute the same pages and trajectories, whose state `next` reads
+    /// as its own.
+    pub fn between(previous: &EngineClient, next: &EngineClient) -> Option<Self> {
+        let (before, after) = (previous.info(), next.info());
+        let prefix_seeds =
+            (before.prefix_seeds != after.prefix_seeds).then(|| before.prefix_seeds.clone());
+        let latent_seed = (before.latent_seed != after.latent_seed).then_some(before.latent_seed);
+        (prefix_seeds.is_some() || latent_seed.is_some()).then(|| Self {
+            epoch: previous.epoch(),
+            prefix_seeds,
+            latent_seed,
+        })
+    }
+}
+
 /// What a hold does with a submission now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HoldState {
@@ -64,6 +83,9 @@ pub enum HoldState {
     Engine(EngineState),
     /// It waits for an engine.
     Holding,
+    /// It goes to the engine the successor daemon of a hot restart serves
+    /// it with.
+    HandedOver,
     /// It fails: no engine will serve.
     Closed(String),
 }
@@ -97,6 +119,14 @@ impl RequestHold {
             .filter(|kept| kept.epoch == epoch)
     }
 
+    /// Has the requests that migrate out of `kept.epoch` from now on continue
+    /// with the state `kept` states: an epoch change whose requests in
+    /// flight keep the state they reached (`in_flight = keep`) states it as
+    /// the hold moves to the next epoch's engine.
+    pub fn keep(&self, kept: Kept) {
+        *::service::lock(&self.kept) = Some(kept);
+    }
+
     /// Holds later submissions until [`Self::resume`], whatever engine
     /// serves; the requests the engine serves go on. Returns whether the hold
     /// was paused already.
@@ -119,7 +149,7 @@ impl RequestHold {
         match &*self.serving.borrow() {
             Serving::Engine(client) => HoldState::Engine(client.state()),
             Serving::Holding => HoldState::Holding,
-            Serving::Remote(_) => HoldState::Holding,
+            Serving::Remote(_) => HoldState::HandedOver,
             Serving::Closed(reason) => HoldState::Closed(reason.clone()),
         }
     }
@@ -283,12 +313,12 @@ impl RequestHold {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use proto::request::{Event, GenerationRequest, SamplingParams};
 
     use super::*;
-    use crate::test_support::{SERVED_MODEL, fake_client, text_fake};
+    use crate::test_support::{
+        SERVED_MODEL, engine_info, fake_client, scripted_client_with, text_fake,
+    };
 
     /// A text request that generates until the fake's end of text.
     fn request() -> Request {
@@ -321,20 +351,20 @@ mod tests {
     /// to serve accepts it.
     #[tokio::test]
     async fn a_held_request_is_served_once_an_engine_is_ready() {
-        let hold = Arc::new(RequestHold::new());
-        let submission = tokio::spawn({
-            let hold = Arc::clone(&hold);
-            async move { hold.submit(request()).await }
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!submission.is_finished(), "a held request waits");
+        let hold = RequestHold::new();
+        let submission = hold.submit(request());
+        tokio::pin!(submission);
+        assert!(
+            futures::poll!(&mut submission).is_pending(),
+            "a held request waits"
+        );
         assert!(!hold.is_serving());
 
         hold.serve(client());
-        let (mut events, scheduler) = submission.await.unwrap().expect("the request is served");
+        let (mut events, scheduler) = submission.await.expect("the request is served");
         assert_eq!(scheduler, Some(0));
         let mut finished = false;
-        while let Some(event) = events.next().await {
+        while let Some(event) = events.recv().await {
             finished |= matches!(event, Event::Finished { .. });
         }
         assert!(finished, "the served request finishes");
@@ -343,16 +373,14 @@ mod tests {
     /// Closing the hold fails the requests it holds and every later one.
     #[tokio::test]
     async fn closing_the_hold_fails_held_and_later_requests() {
-        let hold = Arc::new(RequestHold::new());
-        let submission = tokio::spawn({
-            let hold = Arc::clone(&hold);
-            async move { hold.submit(request()).await }
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let hold = RequestHold::new();
+        let submission = hold.submit(request());
+        tokio::pin!(submission);
+        assert!(futures::poll!(&mut submission).is_pending());
 
         hold.close("no engine serves");
         let expected = SubmitError::Unavailable("no engine serves".to_owned());
-        assert_eq!(submission.await.unwrap().err(), Some(expected.clone()));
+        assert_eq!(submission.await.err(), Some(expected.clone()));
         assert_eq!(hold.submit(request()).await.err(), Some(expected));
     }
 
@@ -360,47 +388,81 @@ mod tests {
     /// that serves next.
     #[tokio::test]
     async fn a_withdrawn_engine_receives_no_request() {
-        let hold = Arc::new(RequestHold::new());
-        let first = client();
-        hold.serve(Arc::clone(&first));
+        let hold = RequestHold::new();
+        hold.serve(client());
         assert!(hold.is_serving());
 
         hold.hold();
-        let submission = tokio::spawn({
-            let hold = Arc::clone(&hold);
-            async move { hold.submit(request()).await }
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let submission = hold.submit(request());
+        tokio::pin!(submission);
         assert!(
-            !submission.is_finished(),
+            futures::poll!(&mut submission).is_pending(),
             "a withdrawn engine takes nothing"
         );
 
         hold.serve(client());
-        let (_events, scheduler) = submission.await.unwrap().expect("the next engine serves");
+        let (_events, scheduler) = submission.await.expect("the next engine serves");
         assert_eq!(scheduler, Some(0));
     }
 
     /// A paused hold keeps its engine but holds submissions until resumed.
     #[tokio::test]
     async fn a_paused_hold_holds_submissions_until_resumed() {
-        let hold = Arc::new(RequestHold::new());
+        let hold = RequestHold::new();
         hold.serve(client());
         assert!(!hold.pause(), "the hold was not paused before");
         assert!(hold.pause(), "a second pause finds it paused");
         assert!(!hold.is_serving());
         assert_eq!(hold.state(), HoldState::Engine(EngineState::Serving));
 
-        let submission = tokio::spawn({
-            let hold = Arc::clone(&hold);
-            async move { hold.submit(request()).await }
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!submission.is_finished(), "a paused hold holds requests");
+        let submission = hold.submit(request());
+        tokio::pin!(submission);
+        assert!(
+            futures::poll!(&mut submission).is_pending(),
+            "a paused hold holds requests"
+        );
 
         hold.resume();
-        let (_events, scheduler) = submission.await.unwrap().expect("the engine serves");
+        let (_events, scheduler) = submission.await.expect("the engine serves");
         assert_eq!(scheduler, Some(0));
         assert!(hold.is_serving());
+    }
+
+    /// Requests leaving an engine keep the state it computed where the next
+    /// engine computes other pages or trajectories, and nothing where both
+    /// compute the same; what an epoch keeps reaches only the requests that
+    /// leave that epoch.
+    #[test]
+    fn requests_keep_the_state_of_the_epoch_they_leave_where_the_next_differs() {
+        let engine = |epoch, seed: u8, latent_seed| {
+            let mut info = engine_info();
+            info.prefix_seeds = vec![[seed; 32]];
+            info.latent_seed = latent_seed;
+            scripted_client_with(epoch, info, |_| Vec::new()).0
+        };
+        let first = engine(1, 1, 5);
+        assert_eq!(Kept::between(&first, &engine(2, 1, 5)), None);
+        let kept = Kept::between(&first, &engine(2, 2, 5)).expect("the pages differ");
+        assert_eq!(
+            kept,
+            Kept {
+                epoch: 1,
+                prefix_seeds: Some(vec![[1; 32]]),
+                latent_seed: None,
+            }
+        );
+        assert_eq!(
+            Kept::between(&first, &engine(2, 1, 6)),
+            Some(Kept {
+                epoch: 1,
+                prefix_seeds: None,
+                latent_seed: Some(5),
+            })
+        );
+
+        let hold = RequestHold::new();
+        hold.keep(kept.clone());
+        assert_eq!(hold.kept(1), Some(kept));
+        assert_eq!(hold.kept(2), None);
     }
 }

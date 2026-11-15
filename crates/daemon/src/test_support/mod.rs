@@ -1,44 +1,52 @@
-//! Fixtures shared by the crate's tests, one each: the byte
-//! tokenizer, in-storage tokenizer loading, the engine over fakes below its
-//! schedulers, the video service, and the server's router.
+//! Fixtures shared by the crate's tests, one each: the byte tokenizer, in-storage tokenizer
+//! loading, the engine over fakes below its schedulers, an engine a test plays itself, the video
+//! service, the server's router and the connection requests are served over.
 //!
-//! Requests travel through the server's router (`http::router`) into a real
-//! `Leader`, whose client submits them over the request interface to the
-//! engine's own control thread and schedulers (`engine::serve`), run on a
-//! thread of this process over socket pairs; below the schedulers, the
-//! executors and the buffer pool are fakes (`testkit::engine`). The default
-//! fake serves text alone, so the engine refuses every video submission as an
-//! invalid request. The fake engine holds no rank: an operation on the ranks
-//! answers with no rank's result, and one on the KV cache's segments (sleep,
-//! wake, making room, a weight update) is refused, since the engine holds no
-//! session with a Storage Server whose segments it would change.
+//! Requests travel over an HTTP/1.1 connection the daemon's own connection code serves
+//! (`http::conn`) into the server's router (`http::router`) and a real `Leader`, whose client
+//! submits them over the request interface to the engine's own control thread and schedulers
+//! (`engine::serve`), run on a thread of this process over socket pairs; below the schedulers,
+//! the executors and the buffer pool are fakes (`testkit::engine`). The default fake serves text
+//! alone, so the engine refuses every video submission as an invalid request. The fake engine
+//! holds no rank: an operation on the ranks answers with no rank's result, and one on the KV
+//! cache's segments (sleep, wake, making room, a weight update) is refused, since the engine
+//! holds no session with a Storage Server whose segments it would change.
+//!
+//! A test that states an engine's every answer itself plays the engine over a socket pair
+//! ([`scripted_client`]).
 
 use std::collections::{BTreeSet, HashMap};
+use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::mpsc::{Receiver, Sender};
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
+use bytes::Bytes;
+use http_body_util::BodyExt as _;
 use proto::config::EngineArgs;
-use proto::request::wire;
+use proto::request::{Event, RequestId, wire};
+use service::Connection;
 use testkit::{FakeExecutor, Fixture};
 use tokio_util::sync::CancellationToken;
-use tower::ServiceExt as _;
 
 use crate::api::input::chat::HfChatRenderer;
 use crate::api::input::{Processor, RequestRenderer};
 use crate::api::model::{ModelConfig, SamplingDefaults};
 use crate::api::openai::video_jobs::VideoJobs;
 use crate::api::tokenizer::DynTokenizer;
-use crate::engine::client::EngineClient;
+use crate::engine::client::{EngineClient, EngineInfo, EngineState};
 use crate::leader::Leader;
 use crate::options::ChatTemplateContentFormat;
 use crate::options::{LoggingConfig, ServerArgs, ServerConfig, VideoJobConfig};
 
 /// Served model name the test engines serve under.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
+
+/// The chat template of the test chat models: the first message's content, as the prompt.
+const FIRST_MESSAGE: &str = include_str!("first_message.jinja");
 
 /// The application crate's byte tokenizer, which the serving tests decode
 /// with (see `crate::api::test_support::configured_tokenizer`).
@@ -104,10 +112,9 @@ pub(crate) fn harness_router(engine: impl Into<Arc<Leader>>) -> Router {
 /// Builds an engine for a model of `family` over the default fake
 /// ([`text_fake`]) of one scheduler.
 ///
-/// The tokenizer is [`configured_tokenizer`], whose
-/// `<|im_end|>` (ID 2) is the end-of-sequence token, and the chat template
-/// renders only the first message's content. A MiniMax H3 model serves the
-/// API's longest duration capacity, as a default video deployment does.
+/// The tokenizer is [`configured_tokenizer`], whose `<|im_end|>` (ID 2) is the end-of-sequence
+/// token, and the chat template renders only the first message's content. A video family serves
+/// the longest output the family declares, as a deployment that states none does.
 pub(crate) fn served_engine(family: processing::Family) -> Leader {
     engine_of(family, testkit::args(SERVED_MODEL), Fixture::new(text_fake))
 }
@@ -133,37 +140,6 @@ pub(crate) fn letter_fake(fake: FakeExecutor) -> FakeExecutor {
     fake.with_token(LETTER)
 }
 
-/// How long the packaged policy module may take to be built on first use.
-///
-/// The build runs `cargo` inside the test process, so it can wait on a package
-/// cache another cargo holds. Its own name is what says so: without a bound the
-/// fixture looks like a deadlock in the daemon.
-const POLICY_BUILD: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// Builds the packaged policy module a test engine's schedulers instantiate
-/// ([`testkit::packaged_module`]) under a bound, so a stalled build names
-/// itself; the engines' starts then load it built.
-///
-/// The build is blocking and its thread cannot be cancelled; the thread is left
-/// to finish rather than joined, which is what a test fixture can do and a
-/// service cannot.
-fn build_policy() {
-    let (built, module) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = built.send(testkit::packaged_module());
-    });
-    if module.recv_timeout(POLICY_BUILD).is_err() {
-        panic!(
-            "the arrival policy module was not built within {} s: a cargo build inside this \
-             process is waiting on a package cache or a wasm32 toolchain another process holds. \
-             Set SCHED_POLICY_WASM to a module built with `cargo build -p \
-             scheduling-policy-arrival --target wasm32-unknown-unknown --release` to run \
-             without the build.",
-            POLICY_BUILD.as_secs()
-        )
-    }
-}
-
 /// Builds an engine for a model of `family` over the engine of `launch` and
 /// `fixture` ([`fake_engine`]); see [`served_engine`].
 pub(crate) fn engine_of(
@@ -184,9 +160,9 @@ pub(crate) fn fake_client(launch: EngineArgs, fixture: Fixture) -> EngineClient 
 /// `fixture` (`testkit::fake_start`), with the engine's process link: the
 /// commands a test sends it as its daemon (`Drain`, `Promote`), and the reports
 /// it sends back. The engine runs its control thread on a thread of this
-/// process (`testkit::spawn`); the client welcomes it as this daemon's engine
-/// control does ([`crate::engine::control::welcome`]) and is made once its
-/// start ended, labelling its statistics with its model.
+/// process (`testkit::spawn`); the client welcomes it and waits for its start as this daemon's
+/// engine control does ([`crate::engine::control::welcome`],
+/// [`crate::engine::control::await_start`]), labelling its statistics with its model.
 ///
 /// The engine ends once the client and the commands are dropped: its daemon
 /// closed both of its interfaces.
@@ -195,46 +171,33 @@ pub(crate) fn fake_engine(
     fixture: Fixture,
 ) -> (
     EngineClient,
-    std::sync::mpsc::Sender<proto::process::Command>,
-    std::sync::mpsc::Receiver<proto::process::Report>,
+    Sender<proto::process::Command>,
+    Receiver<proto::process::Report>,
 ) {
-    build_policy();
-    let engine = launch.engine;
+    let (engine, epoch) = (launch.engine, launch.epoch);
     let model_name = launch.engine_config.model.model.clone();
     let max_model_len = launch.engine_config.model.max_model_len;
+    // The policy module the engine's schedulers instantiate is made on the test's own thread, so
+    // that a module that cannot be made fails the test rather than the engine's start.
+    testkit::packaged_module();
+
     let (mut reader, process, _) =
         testkit::spawn(launch, testkit::fake_start(fixture)).expect("start the test's engine");
 
     // The daemon's half of the handshake, then the state the start ends in.
     let mut writer = reader.writer().expect("a write half of the request link");
-    let hello: wire::Hello = reader
-        .recv(STALL)
-        .expect("the request link reads")
-        .expect("the engine says hello in time");
+    let (hello, _) = reader
+        .recv_next_with::<wire::Hello>()
+        .expect("the engine says hello");
     crate::engine::control::welcome(&mut writer, &hello, engine).expect("the engine is welcome");
-    let deadline = Instant::now() + STALL;
-    let (info, state) = loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !left.is_zero(),
-            "the test's engine did not end its start within {} s",
-            STALL.as_secs()
-        );
-        let frame: Option<wire::FromEngine> = reader.recv(left).expect("the request link reads");
-        if let Some(wire::FromEngine {
-            kind: Some(wire::from_engine::Kind::State(state)),
-        }) = frame
-            && let Some(started) =
-                crate::engine::control::start_state(state).expect("the engine starts")
-        {
-            break started;
-        }
-    };
+    let (info, state) =
+        crate::engine::control::await_start(&mut reader).expect("the engine starts");
 
     let (commands, reports) = process_link(process);
     let client = EngineClient::new(
         reader,
         writer,
+        epoch,
         info,
         state,
         crate::leader::stats_sink(
@@ -256,10 +219,10 @@ pub(crate) fn fake_engine(
 /// daemon's `Command` event, and each report the engine writes is received on
 /// the returned receiver. The interface closes once the sender is dropped.
 fn process_link(
-    connection: service::Connection,
+    connection: Connection,
 ) -> (
-    std::sync::mpsc::Sender<proto::process::Command>,
-    std::sync::mpsc::Receiver<proto::process::Report>,
+    Sender<proto::process::Command>,
+    Receiver<proto::process::Report>,
 ) {
     use proto::process::{Downstream, Event, Upstream, downstream, event, upstream};
 
@@ -291,21 +254,153 @@ fn process_link(
     std::thread::Builder::new()
         .name("process-reports".into())
         .spawn(move || {
-            loop {
-                match reader.recv::<Upstream>(STALL) {
-                    Ok(Some(Upstream {
-                        kind: Some(upstream::Kind::Report(report)),
-                    })) => {
-                        // A test that let go of the reports reads none of them.
-                        let _ = reports.send(report);
-                    }
-                    Ok(_) => {}
-                    Err(_) => return,
+            // The read ends with the interface, which either side closes.
+            while let Ok((upstream, _)) = reader.recv_next_with::<Upstream>() {
+                if let Some(upstream::Kind::Report(report)) = upstream.kind {
+                    // A test that let go of the reports reads none of them.
+                    let _ = reports.send(report);
                 }
             }
         })
         .expect("start the process interface's reader");
     (commands, reported)
+}
+
+/// What a test's engine is given to answer ([`scripted_client`]).
+pub(crate) enum Arrival<'a> {
+    /// A submitted request, which the engine accepts on scheduler 0 before its events.
+    Submitted(&'a proto::request::Request),
+    /// A takeover of the stream of the request it names, which needs no acceptance.
+    TakenOver(RequestId),
+}
+
+/// What a test's engine received ([`scripted_client`]); each receiver ends once the engine's
+/// connection closed.
+pub(crate) struct ScriptedEngine {
+    /// The requests submitted to it, in arrival order.
+    pub(crate) submitted: Receiver<proto::request::Request>,
+    /// The commands for its requests (consumed positions, acknowledgements, cancellations,
+    /// takeovers), in arrival order.
+    pub(crate) commands: Receiver<wire::Command>,
+}
+
+/// What a test's engine serves: [`GenerationLimits`](proto::request::GenerationLimits)'
+/// defaults on one scheduler, a batch capacity of one request, no page or trajectory seed, and
+/// statistics every second, which a test's engine never sends.
+pub(crate) fn engine_info() -> EngineInfo {
+    EngineInfo {
+        limits: proto::request::GenerationLimits::default(),
+        video_denoiser: Vec::new(),
+        schedulers: 1,
+        segments: Vec::new(),
+        capacity: wire::BatchCapacity {
+            max_batch: 1,
+            max_num_batched_tokens: 1,
+            max_running_requests: 1,
+        },
+        prefix_seeds: Vec::new(),
+        latent_seed: 0,
+        stats_period: std::time::Duration::from_secs(1),
+    }
+}
+
+/// A client of a serving engine of epoch `epoch` that the test plays over a socket pair, serving
+/// [`engine_info`]; see [`scripted_client_with`].
+pub(crate) fn scripted_client(
+    epoch: u64,
+    script: impl Fn(Arrival<'_>) -> Vec<Event> + Send + 'static,
+) -> (EngineClient, ScriptedEngine) {
+    scripted_client_with(epoch, engine_info(), script)
+}
+
+/// A client of a serving engine of epoch `epoch`, which serves `info`, that the test plays over a
+/// socket pair: for each arrival the engine writes the events `script` states for it, after the
+/// acceptance of a submitted request, and it hands what it received to the returned
+/// [`ScriptedEngine`]. The engine's thread ends with the connection, which the client closes as
+/// it drops.
+pub(crate) fn scripted_client_with(
+    epoch: u64,
+    info: EngineInfo,
+    script: impl Fn(Arrival<'_>) -> Vec<Event> + Send + 'static,
+) -> (EngineClient, ScriptedEngine) {
+    let (daemon, engine) = UnixStream::pair().expect("a socket pair");
+    let reader = Connection::new(daemon).expect("the daemon's end of the request link");
+    let writer = reader.writer().expect("a write half of the request link");
+    let mut engine = Connection::new(engine).expect("the engine's end of the request link");
+
+    let (submissions, submitted) = std::sync::mpsc::channel();
+    let (commanded, commands) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("scripted-engine".into())
+        .spawn(move || {
+            let write = |engine: &mut Connection, kind: wire::from_engine::Kind| {
+                engine.deliver(&wire::FromEngine { kind: Some(kind) })
+            };
+            let events = |engine: &mut Connection, id: RequestId, events: Vec<Event>| {
+                events.into_iter().try_for_each(|event| {
+                    write(engine, wire::from_engine::Kind::Event(event.to_wire(id).0))
+                })
+            };
+            // The read ends with the link, which the client closes as it drops.
+            while let Ok((frame, _)) = engine.recv_next_with::<wire::ToEngine>() {
+                let written = match frame.kind {
+                    Some(wire::to_engine::Kind::Submit(submit)) => {
+                        submit.requests.into_iter().try_for_each(|request| {
+                            let id = RequestId(request.id);
+                            let request = proto::request::Request::from_wire(request)
+                                .expect("the daemon submits a request the interface states");
+                            let accepted = wire::Accepted {
+                                request: id.0,
+                                scheduler: 0,
+                            };
+                            write(&mut engine, wire::from_engine::Kind::Accepted(accepted))?;
+                            events(&mut engine, id, script(Arrival::Submitted(&request)))?;
+                            let _ = submissions.send(request);
+                            Ok(())
+                        })
+                    }
+                    Some(wire::to_engine::Kind::Command(command)) => {
+                        let id = RequestId(command.request);
+                        let taken_over =
+                            matches!(command.kind, Some(wire::command::Kind::Takeover(_)));
+                        let _ = commanded.send(command);
+                        if taken_over {
+                            events(&mut engine, id, script(Arrival::TakenOver(id)))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    // A request's condition media and the engine commands play no part in a
+                    // script.
+                    Some(
+                        wire::to_engine::Kind::Engine(_) | wire::to_engine::Kind::ConditionPart(_),
+                    )
+                    | None => Ok(()),
+                };
+                if written.is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("start the scripted engine");
+
+    let client = EngineClient::new(
+        reader,
+        writer,
+        epoch,
+        info,
+        EngineState::Serving,
+        Box::new(|_| {}),
+        None,
+    )
+    .expect("a client");
+    (
+        client,
+        ScriptedEngine {
+            submitted,
+            commands,
+        },
+    )
 }
 
 /// The test model's facts.
@@ -330,7 +425,7 @@ pub(crate) fn engine_over(
     fixture: Fixture,
 ) -> Leader {
     let model_name = launch.engine_config.model.model.clone();
-    let client = std::sync::Arc::new(fake_client(launch, fixture));
+    let client = Arc::new(fake_client(launch, fixture));
     leader_over(model, tokenizer, model_name, vec![client])
 }
 
@@ -339,13 +434,13 @@ pub(crate) fn leader_over(
     model: ModelConfig,
     tokenizer: DynTokenizer,
     model_name: String,
-    clients: Vec<std::sync::Arc<EngineClient>>,
+    clients: Vec<Arc<EngineClient>>,
 ) -> Leader {
     let renderer = match model.video() {
         Some(_) => RequestRenderer::Video(test_video_service()),
         None => RequestRenderer::Chat(
             HfChatRenderer::new(
-                Some("{{ messages[0].content }}".to_string()),
+                Some(FIRST_MESSAGE.to_owned()),
                 HashMap::new(),
                 Some(ChatTemplateContentFormat::String),
             )
@@ -386,66 +481,54 @@ pub(crate) fn leader_over(
     .unwrap()
 }
 
-/// How long a fixture's request may wait for its response before it is a stall.
-///
-/// A handler that never responds, or a body that never ends, would otherwise
-/// hold the whole run open with nothing said: every step of a fixture is
-/// driven by the test and a simulated engine responds at once, so a wait that
-/// outlives this is a defect and must name itself.
-pub(crate) const STALL: std::time::Duration = std::time::Duration::from_secs(30);
+/// A response as a client reads it off an HTTP/1.1 connection.
+pub(crate) type Received = hyper::Response<hyper::body::Incoming>;
 
-/// Sends `request` through `router` and returns the status, the headers, and
-/// the body parsed as JSON (`Null` for an empty body).
+/// Sends `request` to `router` over a new HTTP/1.1 connection that the daemon's own connection
+/// code serves (`http::conn::serve_connection`), and returns the response as the client reads
+/// it, its body still streaming. The connection closes once the response is dropped.
+pub(crate) async fn exchange(router: &Router, mut request: Request<Body>) -> Received {
+    let (server, client) = tokio::net::UnixStream::pair().expect("a socket pair");
+    // The connection reads requests under the default server options' limits, as a daemon's.
+    let served = crate::http::conn::Server {
+        app: router.clone(),
+        limits: crate::http::conn::Limits::of(&ServerConfig::default()),
+        admitting: crate::http::handoff::Admissions::default(),
+    };
+    tokio::spawn(crate::http::conn::serve_connection(
+        tokio_util::either::Either::Right(server),
+        served,
+        CancellationToken::new(),
+    ));
+
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(client))
+            .await
+            .expect("an HTTP/1.1 connection");
+    tokio::spawn(connection);
+    // An HTTP/1.1 request names its host (RFC 9112 §3.2).
+    request
+        .headers_mut()
+        .entry(axum::http::header::HOST)
+        .or_insert(axum::http::HeaderValue::from_static("daemon"));
+    sender
+        .send_request(request)
+        .await
+        .expect("the connection answers")
+}
+
+/// Sends `request` to `router` over a connection ([`exchange`]) and returns the status, the
+/// headers, and the body parsed as JSON (`Null` for an empty body).
 pub(crate) async fn send(
     router: &Router,
     request: Request<Body>,
 ) -> (StatusCode, HeaderMap, serde_json::Value) {
-    let waited = format!("{} {}", request.method(), request.uri());
-    let response = match tokio::time::timeout(STALL, router.clone().oneshot(request)).await {
-        Ok(response) => response.unwrap(),
-        Err(_) => panic!("{waited} got no response within {} s", STALL.as_secs()),
-    };
-    read_response(response, &waited).await
-}
-
-/// The status, the headers, and the body parsed as JSON (`Null` for an empty
-/// body) that a connection writes for `response`, the router's answer to the
-/// request `waited` names.
-pub(crate) async fn read_response(
-    response: axum::response::Response,
-    waited: &str,
-) -> (StatusCode, HeaderMap, serde_json::Value) {
-    // A response written as one document carries its body beside the response, and a connection
-    // reads it from there: the status of a failure is the body's result, so it is read here too.
-    let document = response
-        .extensions()
-        .get::<crate::http::stream::HandedBody>()
-        .and_then(crate::http::stream::HandedBody::take)
-        .filter(|held| held.stream.head_held());
-    let (mut parts, body) = response.into_parts();
-    let bytes = if let Some(mut held) = document {
-        use crate::http::stream::Opened;
-        let opened = tokio::time::timeout(STALL, held.stream.opened()).await;
-        let opened = opened.unwrap_or_else(|_| {
-            panic!(
-                "{waited}'s document did not open within {} s",
-                STALL.as_secs()
-            )
-        });
-        match opened {
-            Opened::Frame(frame) => frame.to_vec(),
-            Opened::Failed(error, frames) => {
-                parts.status = axum::response::IntoResponse::into_response(error).status();
-                frames.concat()
-            }
-            Opened::Ended => Vec::new(),
-        }
-    } else {
-        match tokio::time::timeout(STALL, axum::body::to_bytes(body, usize::MAX)).await {
-            Ok(bytes) => bytes.unwrap().to_vec(),
-            Err(_) => panic!("{waited}'s body did not end within {} s", STALL.as_secs()),
-        }
-    };
+    let (parts, body) = exchange(router, request).await.into_parts();
+    let bytes = body
+        .collect()
+        .await
+        .expect("the response's body ends")
+        .to_bytes();
     let json = if bytes.is_empty() {
         serde_json::Value::Null
     } else {
@@ -467,25 +550,29 @@ pub(crate) fn sse_documents(text: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Sends `request`, whose response is a streamed body, through `router` and
-/// returns the body's frames as the connection reads them; dropping the
-/// handle is the client going away.
-pub(crate) async fn send_streamed(
-    router: &Router,
-    request: Request<Body>,
-) -> crate::http::stream::ResponseStream {
+/// A streamed response's body as its client reads it: dropping it closes the connection, which
+/// is the client going away.
+pub(crate) struct Streamed(hyper::body::Incoming);
+
+impl Streamed {
+    /// The body bytes the next read takes off the connection; `None` once the body ended.
+    pub(crate) async fn next_frame(&mut self) -> Option<Bytes> {
+        loop {
+            let frame = self.0.frame().await?.expect("the body streams");
+            if let Ok(data) = frame.into_data() {
+                return Some(data);
+            }
+        }
+    }
+}
+
+/// Sends `request`, whose response is a streamed body, to `router` over a connection
+/// ([`exchange`]), and returns the body as its client reads it.
+pub(crate) async fn send_streamed(router: &Router, request: Request<Body>) -> Streamed {
     let waited = format!("{} {}", request.method(), request.uri());
-    let response = match tokio::time::timeout(STALL, router.clone().oneshot(request)).await {
-        Ok(response) => response.unwrap(),
-        Err(_) => panic!("{waited} got no response within {} s", STALL.as_secs()),
-    };
+    let response = exchange(router, request).await;
     assert_eq!(response.status(), StatusCode::OK, "{waited}");
-    response
-        .extensions()
-        .get::<crate::http::stream::HandedBody>()
-        .and_then(crate::http::stream::HandedBody::take)
-        .unwrap_or_else(|| panic!("{waited} returned no streamed body"))
-        .stream
+    Streamed(response.into_body())
 }
 
 /// Builds a JSON `POST` request to `path`.
@@ -527,10 +614,7 @@ impl Engines {
     pub(crate) fn link(
         refusals: testkit::process::Refusals,
     ) -> (Self, crate::supervision::processes::ProcessLink) {
-        type Asked = (
-            proto::process::Request,
-            std::sync::mpsc::Sender<proto::process::Reply>,
-        );
+        type Asked = (proto::process::Request, Sender<proto::process::Reply>);
         let (requests, asked) = std::sync::mpsc::channel::<Asked>();
         let (exits, exited) = std::sync::mpsc::channel();
         let (greetings, greeted) = std::sync::mpsc::channel();
@@ -541,7 +625,7 @@ impl Engines {
         std::thread::spawn(move || {
             while let Ok((request, reply)) = asked.recv() {
                 if let Some(kind) = &request.kind {
-                    recorded.lock().unwrap().push(kind.clone());
+                    service::lock(&recorded).push(kind.clone());
                 }
                 let _ = reply.send(testkit::process::node_reply(&request, &refusals));
             }
@@ -580,14 +664,14 @@ impl Engines {
     }
 
     /// Starts every engine the leader spawned since the last call: each
-    /// connects, greets with `build` and reports that it parked, or that it
-    /// serves, as its launch file states. Returns whether one started.
+    /// connects on a connection of its own, greets with `build` and reports that it parked, or
+    /// that it serves, as its launch states. Returns whether one started.
     pub(crate) fn start_spawned(&mut self, build: &str) -> bool {
         let spawns = self.spawns();
         let new = &spawns[self.started.min(spawns.len())..];
         for spawn in new {
-            let launch: proto::config::EngineArgs =
-                serde_json::from_slice(&spawn.launch).expect("a launch file");
+            let launch: EngineArgs =
+                serde_json::from_slice(&spawn.launch).expect("a launch the interface states");
             let engine = if launch.parked() {
                 testkit::process::Engine::parked(spawn.generation)
             } else {
@@ -662,7 +746,7 @@ impl Engines {
 
     /// Every request the leader made of the nodes, in arrival order.
     pub(crate) fn requests(&self) -> Vec<proto::process::request::Kind> {
-        self.requests.lock().unwrap().clone()
+        service::lock(&self.requests).clone()
     }
 
     /// The spawns among them.
@@ -713,13 +797,13 @@ impl Engines {
 /// An updater over fresh epoch records whose engines and nodes are fakes
 /// nobody plays: the leaders the crate's tests build start no update, and
 /// `updates::tests` drives one.
-pub(crate) fn test_updater() -> std::sync::Arc<crate::updates::Updater> {
-    let epochs = std::sync::Arc::new(crate::epoch::Epochs::default());
+pub(crate) fn test_updater() -> Arc<crate::updates::Updater> {
+    let epochs = Arc::new(crate::epoch::Epochs::default());
     let (_engines, link) = Engines::link(testkit::process::Refusals::default());
     let processes = crate::supervision::processes::Processes::new(
         Arc::clone(&epochs),
         "deployment".to_owned(),
         link,
     );
-    std::sync::Arc::new(crate::updates::Updater::new(epochs, processes))
+    Arc::new(crate::updates::Updater::new(epochs, processes))
 }

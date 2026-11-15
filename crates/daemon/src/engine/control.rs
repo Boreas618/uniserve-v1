@@ -215,9 +215,8 @@ impl EngineControl {
             // A peer holds no scheduler, so it reports no statistics.
             let sink = sinks.next().unwrap_or_else(|| Box::new(|_| {}));
             clients.push(
-                EngineClient::new(reader, writer, info, state, sink, Some(control))?
+                EngineClient::new(reader, writer, epoch, info, state, sink, Some(control))?
                     .numbered(launch.engine)
-                    .in_epoch(epoch)
                     .on_host(&launch.host),
             );
         }
@@ -373,24 +372,18 @@ impl EngineControl {
         Ok(scheduler.with_peers(clients.collect()))
     }
 
-    /// Joins the one target engine `engine` of [`Self::join_target`]. The start has no bound: an
-    /// engine loads its ranks, resolves its modules and captures its graphs before it states that
-    /// it parked, and one that exits meanwhile closes its request link, which ends the wait.
+    /// Joins the one target engine `engine` of [`Self::join_target`].
+    ///
+    /// The start itself has no bound: an engine loads its ranks, resolves its modules and
+    /// captures its graphs before it states that it parked, and one that exits meanwhile closes
+    /// its request link, which ends the wait ([`await_start`]).
     fn join(&self, engine: u64, epoch: u64, stats: StatsSink) -> anyhow::Result<EngineClient> {
         let (mut reader, mut writer, hello) = self.accept(engine, None)?;
         welcome(&mut writer, &hello, engine)?;
-        loop {
-            let message: wire::FromEngine = reader.recv_next()?;
-            let Some(wire::from_engine::Kind::State(state)) = message.kind else {
-                continue;
-            };
-            let Some((info, known)) = start_state(state)? else {
-                continue;
-            };
-            tracing::info!(engine, build = %hello.build, "the update's target joined this daemon");
-            return EngineClient::new(reader, writer, info, known, stats, None)
-                .map(|client| client.numbered(engine).in_epoch(epoch));
-        }
+        let (info, known) = await_start(&mut reader)?;
+        tracing::info!(engine, build = %hello.build, "the update's target joined this daemon");
+        EngineClient::new(reader, writer, epoch, info, known, stats, None)
+            .map(|client| client.numbered(engine))
     }
 
     /// Takes over the engine `engine` a daemon this one replaced started,
@@ -435,12 +428,13 @@ impl EngineControl {
                 return EngineClient::new(
                     reader,
                     writer,
-                    info.into(),
+                    epoch,
+                    info.try_into()?,
                     EngineState::Serving,
                     stats,
                     control,
                 )
-                .map(|client| client.numbered(engine).in_epoch(epoch).on_host(&self.host));
+                .map(|client| client.numbered(engine).on_host(&self.host));
             }
         }
     }
@@ -850,7 +844,26 @@ pub(crate) fn start_state(state: wire::State) -> anyhow::Result<Option<(EngineIn
         _ => return Ok(None),
     };
     let info = state.info.context("the engine reported no info")?;
-    Ok(Some((info.into(), ended)))
+    Ok(Some((info.try_into()?, ended)))
+}
+
+/// Reads the request link `reader` of an engine this daemon welcomed until the engine states how
+/// its start ended, and returns that: the state, parked or serving, with what the engine serves.
+/// The read ends with that state or with the link.
+///
+/// # Errors
+///
+/// When the start failed, with the engine's reason; when the link fails or closes first; and as
+/// [`start_state`] refuses the state.
+pub(crate) fn await_start(reader: &mut Connection) -> anyhow::Result<(EngineInfo, EngineState)> {
+    loop {
+        let (frame, _) = reader.recv_next_with::<wire::FromEngine>()?;
+        if let Some(wire::from_engine::Kind::State(state)) = frame.kind
+            && let Some(started) = start_state(state)?
+        {
+            return Ok(started);
+        }
+    }
 }
 
 /// Reads the reply `id` on a control connection. The daemon's service answers every request on
@@ -910,7 +923,7 @@ fn await_started(
                             );
                             EngineState::Serving
                         };
-                        started[index] = Some((info.into(), state));
+                        started[index] = Some((info.try_into()?, state));
                         break;
                     }
                     Ok(wire::EngineState::Failed) => {
