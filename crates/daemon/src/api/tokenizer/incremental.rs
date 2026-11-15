@@ -1,13 +1,14 @@
 //! Stateful incremental decoding with stable-prefix emission.
 //!
-//! Each generated token is decoded together with a window of preceding
-//! tokens, and only the text past the window's previous decode is emitted.
-//! Decoding a window instead of single tokens lets a UTF-8 character split
-//! across tokens appear once its last byte arrives; until then the decode ends
-//! in U+FFFD and `push_token` holds it back. Emitted text accumulates in
-//! `output`, where the serving output stages match stop strings, and
-//! `next_chunk` streams it while withholding a trailing `min_bytes_to_buffer`
-//! bytes so a matched stop string can still be truncated by `flush`.
+//! Each generated token advances `fastokens`' decode stream ([`fastokens::decode_stream_step`]),
+//! which decodes a window of tokens and emits only the text past the window's previous decode, so
+//! a UTF-8 character split across tokens appears once its last byte arrives; until then the
+//! decode ends in U+FFFD and the stream emits nothing. The stream's state is held here rather
+//! than in `fastokens::DecodeStream`, which keeps it private, so a stream can be handed to a
+//! successor process ([`IncrementalDecoder::state`]). Emitted text accumulates in `output`, where
+//! the serving output stages match stop strings, and `next_chunk` streams it while withholding a
+//! trailing `min_bytes_to_buffer` bytes so a matched stop string can still be truncated by
+//! `flush`.
 
 use std::mem::take;
 use std::sync::Arc;
@@ -15,6 +16,9 @@ use std::sync::Arc;
 use proto::handoff::IncrementalDecode;
 
 use crate::api::tokenizer::{HuggingFaceTokenizer, Result};
+
+/// The replacement character a decode ends in while its last character is incomplete.
+const REPLACEMENT: char = '\u{FFFD}';
 
 /// Stateful incremental decoder built on the configured Hugging Face tokenizer with prefix-diffing.
 ///
@@ -28,14 +32,14 @@ pub struct IncrementalDecoder {
     tokenizer: Arc<HuggingFaceTokenizer>,
     skip_special_tokens: bool,
     min_bytes_to_buffer: usize,
-    /// Token window decoded on every push. It starts as the prompt, which
-    /// seeding may trim to a trailing suffix; each emit drops the tokens
-    /// before `prefix_index`, keeping the tokens that produced the emitted
-    /// text as left context for the next decode.
+    /// The stream's token window. It starts as the prompt, decode context
+    /// that is never output; each emit drops the tokens before
+    /// `prefix_index`, keeping the tokens that produced the emitted text as
+    /// left context for the next decode.
     ids: Vec<u32>,
-    /// Decode of the window at the last emit or seed (minus trailing U+FFFD
-    /// when the prompt ends in an incomplete character). Text past
-    /// `prefix.len()` in a later window decode is new.
+    /// Decode of the window's first `prefix_index` tokens at the last emit or
+    /// seed (without a trailing U+FFFD when the prompt ends in an incomplete
+    /// character). Text past `prefix.len()` in a later window decode is new.
     prefix: String,
     /// Number of leading window tokens the next emit drops.
     prefix_index: usize,
@@ -44,19 +48,10 @@ pub struct IncrementalDecoder {
     /// Byte offset in `cumulative_output` up to which `next_chunk` has
     /// returned text.
     output_index: usize,
-    /// Whether the one-shot prompt seed has run. Tracked explicitly (rather than
-    /// inferring it from `prefix.is_empty`) because a seeded `prefix` can be
-    /// empty, for example when the seeded tokens are all skipped special
-    /// tokens or the prompt decodes only to incomplete UTF-8 bytes; seeding
-    /// again on a later push would treat generated tokens already in the
-    /// window as prompt. Seeding runs on the first push, so this is also
-    /// whether any generated token has entered the window, which `flush`
-    /// needs to avoid emitting the unseeded prompt as output.
+    /// Whether the prompt seeded the window, which the first `push_token`
+    /// does: so also whether any generated token entered the window, which
+    /// `flush` needs to avoid emitting the prompt as output.
     prompt_seeded: bool,
-    /// Consecutive `push_token` calls that held back their decode (no longer
-    /// than `prefix`, or ending in U+FFFD). Bounds the buffered window: see
-    /// [`MAX_PENDING_TOKENS`].
-    pending_since_emit: usize,
 }
 
 impl IncrementalDecoder {
@@ -80,67 +75,19 @@ impl IncrementalDecoder {
             cumulative_output: String::new(),
             output_index: 0,
             prompt_seeded: false,
-            pending_since_emit: 0,
         }
     }
-}
 
-/// Shortest trailing prompt suffix, in tokens, that `seed_prefix` tries as
-/// decode context before it falls back to decoding the full prompt.
-const SAFE_SUFFIX_MIN: usize = 4;
-/// Longest trailing prompt suffix, in tokens, that `seed_prefix` tries.
-const SAFE_SUFFIX_MAX: usize = 6;
-
-/// Maximum number of consecutive non-emitting pushes before `push_token`
-/// forces an emit.
-///
-/// A push emits nothing while the window decode is no longer than `prefix` or
-/// ends in U+FFFD. An incomplete UTF-8 character in well-formed output
-/// resolves within a few tokens, well before this bound. The bound keeps the
-/// decode window from growing without limit when a trailing U+FFFD never
-/// resolves, and limits how long a U+FFFD that is part of the generated text
-/// is withheld while it ends the output. Pushes that add no visible text, such
-/// as special tokens removed by `skip_special_tokens`, also count toward the
-/// bound; when the forcing push adds no text either, the forced emit appends
-/// nothing and only slides the window.
-const MAX_PENDING_TOKENS: usize = 32;
-
-impl IncrementalDecoder {
-    /// Seeds `self.prefix` from the shortest trailing suffix whose decoded text
-    /// has no U+FFFD.
+    /// Seeds the stream with the prompt: its whole decode is the prefix generated text extends.
     ///
-    /// A clean decode means the suffix neither starts nor ends inside a
-    /// multi-byte UTF-8 character, so it can stand in for the full prompt as
-    /// left context. Only prompts longer than `SAFE_SUFFIX_MIN` tokens try
-    /// suffixes, and a suffix never spans the whole prompt. Without a clean
-    /// suffix the full prompt is decoded and stays in the window as left
-    /// context.
-    fn seed_prefix(&mut self) -> Result<()> {
-        let prompt_len = self.ids.len();
-        if prompt_len > SAFE_SUFFIX_MIN {
-            let max_try = SAFE_SUFFIX_MAX.min(prompt_len - 1);
-            for suffix_len in SAFE_SUFFIX_MIN..=max_try {
-                let start = prompt_len - suffix_len;
-                let decoded = self
-                    .tokenizer
-                    .decode(&self.ids[start..], self.skip_special_tokens)?;
-                if !decoded.contains('\u{FFFD}') {
-                    self.prefix = decoded;
-                    self.ids.drain(..start);
-                    self.prefix_index = self.ids.len();
-                    return Ok(());
-                }
-            }
-        }
+    /// A prompt whose decode ends inside a multi-byte character keeps every token in the window
+    /// (`prefix_index` 0) with the incomplete character stripped from the prefix, so the
+    /// character completes with the generated tokens. `fastokens`' own seeding leaves such a
+    /// prefix empty, which would emit the whole prompt as the first generated text.
+    fn seed(&mut self) -> Result<()> {
         let decoded = self.tokenizer.decode(&self.ids, self.skip_special_tokens)?;
-        if decoded.ends_with('\u{FFFD}') {
-            // The prompt tail is an incomplete UTF-8 scalar. Strip the trailing
-            // replacement char(s) so `prefix.len` does not include them; a
-            // completing scalar of the same byte length would otherwise be
-            // masked by the `string.len <= prefix_len` guard in `push_token`.
-            // Keep every prompt id in the window (`prefix_index = 0`) so the
-            // incomplete tail can still combine with the generated tokens.
-            self.prefix = decoded.trim_end_matches('\u{FFFD}').to_string();
+        if decoded.ends_with(REPLACEMENT) {
+            self.prefix = decoded.trim_end_matches(REPLACEMENT).to_owned();
             self.prefix_index = 0;
         } else {
             self.prefix = decoded;
@@ -148,49 +95,39 @@ impl IncrementalDecoder {
         }
         Ok(())
     }
-}
 
-impl IncrementalDecoder {
     /// Pushes one generated token and returns how many bytes it appended to
     /// `output`.
     ///
-    /// Returns 0 when nothing is appended, as while new text is held back.
-    /// The first call also seeds the prompt context. Errors are tokenizer
-    /// decode failures, which only a decoder other than a single byte-level
-    /// step can report; an ID outside the vocabulary decodes to no text.
+    /// Returns 0 when nothing is appended: while the window's decode adds no
+    /// text, or ends in an incomplete character, the stream holds the token,
+    /// and `flush` emits whatever it still holds. The first call also seeds the
+    /// prompt context. Errors are the tokenizer's decode failures, and a decode
+    /// that no longer begins with the text already emitted, which `fastokens`
+    /// reports as a broken stream; an ID outside the vocabulary decodes to no
+    /// text.
     pub fn push_token(&mut self, token_id: u32) -> Result<usize> {
         if !self.prompt_seeded {
             self.prompt_seeded = true;
             if !self.ids.is_empty() {
-                self.seed_prefix()?;
+                self.seed()?;
             }
         }
 
-        self.ids.push(token_id);
-        let string = self.tokenizer.decode(&self.ids, self.skip_special_tokens)?;
-        let prefix_len = self.prefix.len();
-        // Normally hold back a decode that did not grow or still ends in an
-        // incomplete U+FFFD. But once `MAX_PENDING_TOKENS` non-emitting pushes have piled up,
-        // force the emit so the window stays bounded and a genuine trailing
-        // U+FFFD surfaces incrementally rather than only at flush.
-        let force = self.pending_since_emit >= MAX_PENDING_TOKENS;
-        if !force && (string.len() <= prefix_len || string.ends_with('\u{FFFD}')) {
-            self.pending_since_emit += 1;
+        let emitted = fastokens::decode_stream_step(
+            self.tokenizer.inner(),
+            vec![token_id],
+            self.skip_special_tokens,
+            &mut self.ids,
+            &mut self.prefix,
+            &mut self.prefix_index,
+        )
+        .map_err(|error| tokenizer_error!("decoding the stream failed: {error}"))?;
+        let Some(text) = emitted else {
             return Ok(0);
-        }
-
-        // Ensure we split at a utf-8 char boundary (clamps to string.len when
-        // prefix_len exceeds it, i.e. a forced emit on a shrunk decode).
-        let new_chunk = &string[string.floor_char_boundary(prefix_len)..];
-        self.cumulative_output.push_str(new_chunk);
-
-        // Slide the window: the tokens behind this emit become the context
-        // whose decode is the next `prefix`.
-        self.ids.drain(..self.prefix_index);
-        self.prefix = self.tokenizer.decode(&self.ids, self.skip_special_tokens)?;
-        self.prefix_index = self.ids.len();
-        self.pending_since_emit = 0;
-        Ok(new_chunk.len())
+        };
+        self.cumulative_output.push_str(&text);
+        Ok(text.len())
     }
 
     /// Returns emitted text that no earlier call has returned, excluding the
@@ -236,7 +173,6 @@ impl IncrementalDecoder {
             self.ids.clear();
             self.prefix.clear();
             self.prefix_index = 0;
-            self.pending_since_emit = 0;
             // Ensure we split at a utf-8 char boundary.
             self.cumulative_output
                 .push_str(&string[string.floor_char_boundary(prefix_len)..]);
@@ -272,7 +208,6 @@ impl IncrementalDecoder {
             cumulative_output: self.cumulative_output.clone(),
             output_index: self.output_index as u64,
             prompt_seeded: self.prompt_seeded,
-            pending_since_emit: self.pending_since_emit as u64,
             skip_special_tokens: self.skip_special_tokens,
             min_bytes_to_buffer: self.min_bytes_to_buffer as u64,
         }
@@ -291,7 +226,6 @@ impl IncrementalDecoder {
             cumulative_output: state.cumulative_output.clone(),
             output_index: state.output_index as usize,
             prompt_seeded: state.prompt_seeded,
-            pending_since_emit: state.pending_since_emit as usize,
         }
     }
 }
@@ -300,9 +234,7 @@ impl IncrementalDecoder {
 mod tests {
     /// A stream that ends before its first generated token, such as an
     /// image-only generation or a request whose first sampled token is EOS,
-    /// produced no text: the prompt is decode context, never output. Prompts
-    /// shorter and longer than the seed's trailing-suffix window are both
-    /// covered because prompt seeding treats them differently.
+    /// produced no text: the prompt is decode context, never output.
     #[test]
     fn flush_without_generated_tokens_emits_nothing() {
         let tokenizer = crate::api::test_support::configured_tokenizer();
@@ -315,5 +247,26 @@ mod tests {
             assert_eq!(last_chunk, None, "prompt {prompt:?}");
             assert_eq!(output, "", "prompt {prompt:?}");
         }
+    }
+
+    /// Generated text is the text past the prompt's decode, emitted token by
+    /// token; a stream handed to another decoder continues where it stopped.
+    #[test]
+    fn generated_text_follows_the_prompt_across_a_handoff() {
+        let tokenizer = crate::api::test_support::configured_tokenizer();
+        let ids = |text: &str| text.bytes().map(u32::from).collect::<Vec<u32>>();
+        let mut decoder = tokenizer.create_decode_stream(&ids("prompt "), false, 0);
+
+        for token in ids("he") {
+            decoder.push_token(token).unwrap();
+        }
+        let mut resumed =
+            super::IncrementalDecoder::resume(&decoder.state(), std::sync::Arc::clone(&tokenizer));
+        for token in ids("llo") {
+            resumed.push_token(token).unwrap();
+        }
+
+        assert_eq!(resumed.next_chunk().as_deref(), Some("hello"));
+        assert_eq!(resumed.flush(None).unwrap(), (None, "hello".to_owned()));
     }
 }

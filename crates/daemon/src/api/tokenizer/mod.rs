@@ -1,17 +1,15 @@
-//! Tokenizer abstraction, Hugging Face implementation, and incremental decoding.
+//! The checkpoint's tokenizer and incremental decoding.
 //!
-//! `HuggingFaceTokenizer` loads a model's `tokenizer.json` through `fastokens`
-//! with the tokens its `tokenizer_config.json` declares, as `transformers`
-//! loads a checkpoint (`HuggingFaceTokenizer::load`), and serves both directions of the text
-//! path: `input::processor`, `input::omni`, and the `model::omni` prompt
-//! builders encode prompts into token IDs (`input::sampling` also encodes
-//! bad words), and the output stages in `output::text` and
-//! `output::assembly` turn generated IDs back into streamed text through
-//! `IncrementalDecoder`.
+//! `HuggingFaceTokenizer` loads a checkpoint's tokenizer directory through `fastokens`, with
+//! the tokens its `tokenizer_config.json` declares, as `transformers` loads a checkpoint
+//! (`HuggingFaceTokenizer::load`), and serves both directions of the text path: input
+//! processing (`input::processor`, `input::sampling` and the families' request processing)
+//! encodes prompts into token IDs, and the output stages in `output::text` and
+//! `output::assembly` turn generated IDs back into streamed text through `IncrementalDecoder`,
+//! whose stream steps are `fastokens`' own.
 
 use std::sync::Arc;
 
-mod byte_level_decode;
 #[macro_use]
 mod error;
 mod hf;

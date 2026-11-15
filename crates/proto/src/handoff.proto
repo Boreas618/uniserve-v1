@@ -265,7 +265,8 @@ message Decode {
 message IncrementalDecode {
   // The token window the decoder decodes on every push.
   repeated uint32 ids = 1;
-  // The window's decode at the last emit or seed.
+  // The window's decode at the last emit or seed, which a decode of the
+  // window extends by the text it has not emitted.
   string prefix = 2;
   // Leading window tokens the next emit drops.
   uint64 prefix_index = 3;
@@ -273,10 +274,10 @@ message IncrementalDecode {
   string cumulative_output = 4;
   // The offset in `cumulative_output` up to which callers read text.
   uint64 output_index = 5;
-  // Whether the prompt seeded the window.
+  // Whether the prompt seeded the window: whether a generated token entered it.
   bool prompt_seeded = 6;
-  // Consecutive pushes that emitted nothing, bounded by the decoder.
-  uint64 pending_since_emit = 7;
+  reserved 7;
+  reserved "pending_since_emit";
   // The decoder's construction: whether special tokens are skipped, and how
   // many trailing bytes it withholds for stop-string matching.
   bool skip_special_tokens = 8;

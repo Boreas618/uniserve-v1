@@ -3,7 +3,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use fastokens::decoders::Decoder as FastokensDecoder;
 use fastokens::{NewToken, Tokenizer as FastokensTokenizer};
 use indexmap::IndexMap;
 use serde::Deserialize;
@@ -11,7 +10,6 @@ use thiserror_ext::AsReport as _;
 use tracing::info;
 
 use crate::api::tokenizer::Result;
-use crate::api::tokenizer::byte_level_decode::decode_byte_level as decode_tokens_byte_level;
 use crate::api::tokenizer::incremental::IncrementalDecoder;
 
 /// The tokenizer definition of a tokenizer directory, as `transformers` saves a tokenizer.
@@ -20,63 +18,12 @@ const TOKENIZER_FILE: &str = "tokenizer.json";
 /// The tokenizer metadata saved beside the definition.
 const TOKENIZER_CONFIG_FILE: &str = "tokenizer_config.json";
 
-/// Returns whether a tokenizer decoder consists of exactly one `ByteLevel`
-/// step, possibly nested inside `Sequence` steps.
-///
-/// The match is exhaustive over `fastokens::decoders::Decoder`, so a
-/// `fastokens` upgrade that adds decoder kinds fails to compile here until each
-/// new kind is classified for the byte-level fast path.
-fn is_byte_level_only(decoder: &FastokensDecoder) -> bool {
-    /// Counts `ByteLevel` steps across nested decoder sequences, or `None`
-    /// when any other step (such as a SentencePiece-style `Replace`,
-    /// `ByteFallback`, `Fuse`, or `Strip`) transforms the text.
-    fn byte_level_steps(decoder: &FastokensDecoder) -> Option<usize> {
-        match decoder {
-            FastokensDecoder::ByteLevel(_) => Some(1),
-            FastokensDecoder::Sequence(steps) => steps.iter().map(byte_level_steps).sum(),
-            FastokensDecoder::ByteFallback(_)
-            | FastokensDecoder::Replace(_)
-            | FastokensDecoder::Fuse
-            | FastokensDecoder::Strip { .. } => None,
-        }
-    }
-    byte_level_steps(decoder) == Some(1)
-}
-
-/// Decodes token IDs by looking up each vocabulary piece and unescaping the
-/// pieces with `decode_byte_level`.
-///
-/// The result matches `fastokens` decoding with the same byte-level decoder.
-/// IDs missing from the vocabulary contribute no text, as in Hugging Face
-/// `tokenizers` and vLLM: a model's vocabulary dimension can exceed its
-/// tokenizer vocabulary (Qwen3 checkpoints pad it), so sampling or
-/// a logprob candidate can produce an ID in that gap, and one such ID must
-/// not fail the whole response.
-fn decode_fastokens_byte_level(
-    tokenizer: &FastokensTokenizer,
-    token_ids: &[u32],
-    skip_special_tokens: bool,
-) -> String {
-    let tokens: Vec<&str> = token_ids
-        .iter()
-        .filter(|&&id| !(skip_special_tokens && tokenizer.is_special_token(id)))
-        .filter_map(|&id| tokenizer.id_to_token(id))
-        .collect();
-    decode_tokens_byte_level(tokens)
-}
-
 /// Tokenizer loaded from a Hugging Face tokenizer directory.
 ///
 /// One instance is shared through `DynTokenizer` by every request of a
 /// resolved model; all methods take `&self`.
 pub struct HuggingFaceTokenizer {
     tokenizer: Box<FastokensTokenizer>,
-    /// Whether the decoder is a single `ByteLevel` step, which routes `decode`
-    /// through `decode_fastokens_byte_level`.
-    byte_level: bool,
-    /// IDs of added tokens flagged `special`, sorted and deduplicated for the
-    /// binary search in `is_special_id`.
-    special_token_ids: Arc<[u32]>,
 }
 
 impl HuggingFaceTokenizer {
@@ -147,24 +94,16 @@ impl HuggingFaceTokenizer {
         Ok(Self::from_fastokens(tokenizer))
     }
 
-    /// Derives the special-token lookup tables of a loaded tokenizer.
+    /// Wraps a loaded tokenizer.
     fn from_fastokens(tokenizer: FastokensTokenizer) -> Self {
-        let mut special_token_ids: Vec<u32> = tokenizer
-            .added_tokens()
-            .into_iter()
-            .flat_map(|tokens| tokens.iter())
-            .filter(|token| token.special)
-            .map(|token| token.id)
-            .collect();
-        special_token_ids.sort_unstable();
-        special_token_ids.dedup();
-        let byte_level = tokenizer.decoder().is_some_and(is_byte_level_only);
-
         Self {
             tokenizer: Box::new(tokenizer),
-            byte_level,
-            special_token_ids: Arc::from(special_token_ids),
         }
+    }
+
+    /// The `fastokens` tokenizer, which the incremental decoder steps with.
+    pub(super) fn inner(&self) -> &FastokensTokenizer {
+        &self.tokenizer
     }
 
     /// Encodes one prompt string into token IDs.
@@ -174,24 +113,15 @@ impl HuggingFaceTokenizer {
             .map_err(|error| tokenizer_error!("encoding failed: {}", error.as_report()))
     }
 
-    /// Decodes token identifiers with optional special-token filtering.
+    /// Decodes token identifiers with optional special-token filtering, through
+    /// `fastokens`' decoder, which gives an ID outside the vocabulary no text as
+    /// Hugging Face `tokenizers` does.
     ///
-    /// IDs outside the vocabulary contribute no text. A tokenizer whose
-    /// decoder is a single byte-level step decodes through
-    /// `decode_fastokens_byte_level`, which cannot fail. Any other tokenizer
-    /// decodes through `fastokens`, which fails only when its decoder does.
+    /// Fails only when the tokenizer's decoder does.
     pub fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String> {
-        if self.byte_level {
-            Ok(decode_fastokens_byte_level(
-                &self.tokenizer,
-                token_ids,
-                skip_special_tokens,
-            ))
-        } else {
-            self.tokenizer
-                .decode(token_ids, skip_special_tokens)
-                .map_err(|error| tokenizer_error!("decoding failed: {}", error.as_report()))
-        }
+        self.tokenizer
+            .decode(token_ids, skip_special_tokens)
+            .map_err(|error| tokenizer_error!("decoding failed: {}", error.as_report()))
     }
 
     /// Resolves one vocabulary token to its identifier.
@@ -201,7 +131,7 @@ impl HuggingFaceTokenizer {
 
     /// Returns whether an identifier belongs to the special-token set.
     pub fn is_special_id(&self, token_id: u32) -> bool {
-        self.special_token_ids.binary_search(&token_id).is_ok()
+        self.tokenizer.is_special_token(token_id)
     }
 
     /// Creates a stateful incremental decoder primed with the given prompt tokens.
@@ -456,48 +386,6 @@ mod tests {
         std::fs::write(directory.path().join("tokenizer_config.json"), config)
             .expect("write tokenizer config");
         directory
-    }
-
-    fn byte_level_tokenizers() -> (
-        tempfile::TempDir,
-        HuggingFaceTokenizer,
-        fastokens::Tokenizer,
-    ) {
-        let directory = byte_level_directory("{}");
-        let configured =
-            HuggingFaceTokenizer::load(directory.path()).expect("load configured tokenizer");
-        let value = serde_json::from_str(BYTE_LEVEL_TOKENIZER).expect("parse tokenizer");
-        let provider = fastokens::Tokenizer::from_json(value).expect("load provider tokenizer");
-        (directory, configured, provider)
-    }
-
-    /// The byte-level fast path must reproduce `fastokens` decoding, with and
-    /// without special-token skipping. The cases cover the empty input, `Ġ`
-    /// (an escaped space), the special `<|endoftext|>` at several positions,
-    /// `｜`, which lies outside GPT-2's byte alphabet and passes through
-    /// unchanged, and IDs 999 and 1000, which the vocabulary lacks.
-    #[test]
-    fn configured_byte_level_decode_matches_provider() {
-        let (_directory, configured, provider) = byte_level_tokenizers();
-        let cases: &[&[u32]] = &[
-            &[],
-            &[1, 2, 3, 3, 4],
-            &[1, 2, 3, 3, 4, 8, 5, 4, 6, 3, 7],
-            &[0, 1, 2, 3, 3, 4, 0, 9, 0],
-            &[10, 1, 2, 3, 3, 4, 10],
-            &[999, 1, 2, 1000, 3, 3, 4, 999],
-        ];
-        for ids in cases {
-            for &skip_special_tokens in &[false, true] {
-                let expected = provider
-                    .decode(ids, skip_special_tokens)
-                    .expect("provider decode");
-                let actual = configured
-                    .decode(ids, skip_special_tokens)
-                    .expect("configured decode");
-                assert_eq!(actual, expected);
-            }
-        }
     }
 
     /// Models sample over a vocabulary dimension that can exceed the tokenizer
