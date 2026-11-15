@@ -129,10 +129,7 @@ impl ProcessCommands {
     /// waiting at most `timeout` for one.
     pub fn report(&self, timeout: Duration) -> Option<(u64, proto::process::Report)> {
         let deadline = Instant::now() + timeout;
-        let reports = self
-            .reports
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reports = ::service::lock(&self.reports);
         // A report, the deadline, or a service that stopped sending each end
         // the wait.
         match reports.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -415,10 +412,7 @@ impl Daemon {
     /// The updater's ends of this node's service: `None` on a member daemon,
     /// and once taken, `None` again: one owner reads them.
     pub(crate) fn process_link(&self) -> Option<processes::ProcessLink> {
-        self.link
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        ::service::lock(&self.link).take()
     }
 
     /// The updater of `deployment` over `epochs` and this node's service,
@@ -430,11 +424,7 @@ impl Daemon {
         deployment: String,
     ) -> Option<(Arc<crate::updates::Updater>, std::sync::mpsc::Receiver<()>)> {
         let link = self.process_link()?;
-        let awake = self
-            .awake
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()?;
+        let awake = ::service::lock(&self.awake).take()?;
         // The epoch records report the node's processes: the service writes
         // them into this table as they start and end, and the updater's
         // `Processes` adds what each launch is.

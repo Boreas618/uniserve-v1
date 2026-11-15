@@ -21,7 +21,8 @@
 //!
 //! Every process interface runs on one [`Connection`] over a Unix or TCP
 //! socket, framed by [`frame`], whose messages each protocol encodes
-//! ([`Message`]). [`lock`] is the one way a thread takes a mutex.
+//! ([`Message`]). [`lock`] is the one way a thread takes a mutex, and [`wait`],
+//! [`wait_while`] and [`wait_timeout`] the one way it waits on a condition variable.
 
 mod connection;
 mod directories;
@@ -42,21 +43,63 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// Locks `mutex`, keeping the state a panicking holder left.
+/// What a thread that finds a lock poisoned states as it panics too.
+const POISONED: &str = "a thread panicked while it held the lock";
+
+/// Locks `mutex`.
 ///
 /// Every build profile sets `panic = "abort"`, so a holder's panic ends the
-/// process before another thread observes the poisoned lock. Only test
-/// builds, which ignore that setting and unwind, reach the recovery; it
-/// returns the guard rather than raising a second panic in the thread that
-/// locks next.
-pub fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// process and no thread ever observes a poisoned lock. A test build unwinds
+/// instead; a thread that finds the lock poisoned there panics as well, so
+/// the state a panicking holder left is never used.
+#[expect(
+    clippy::expect_used,
+    reason = "a poisoned lock is unreachable under `panic = \"abort\"`"
+)]
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().expect(POISONED)
+}
+
+/// Waits on `condvar`, releasing `guard` until it is notified, as [`lock`]
+/// takes the lock.
+#[expect(
+    clippy::expect_used,
+    reason = "a poisoned lock is unreachable under `panic = \"abort\"`"
+)]
+pub fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    condvar.wait(guard).expect(POISONED)
+}
+
+/// Waits on `condvar` while `condition` holds, as [`wait`] does.
+#[expect(
+    clippy::expect_used,
+    reason = "a poisoned lock is unreachable under `panic = \"abort\"`"
+)]
+pub fn wait_while<'a, T>(
+    condvar: &Condvar,
+    guard: MutexGuard<'a, T>,
+    condition: impl FnMut(&mut T) -> bool,
+) -> MutexGuard<'a, T> {
+    condvar.wait_while(guard, condition).expect(POISONED)
+}
+
+/// Waits on `condvar` for at most `timeout`, as [`wait`] does; whether the
+/// wait timed out is the second value.
+#[expect(
+    clippy::expect_used,
+    reason = "a poisoned lock is unreachable under `panic = \"abort\"`"
+)]
+pub fn wait_timeout<'a, T>(
+    condvar: &Condvar,
+    guard: MutexGuard<'a, T>,
+    timeout: Duration,
+) -> (MutexGuard<'a, T>, bool) {
+    let (guard, waited) = condvar.wait_timeout(guard, timeout).expect(POISONED);
+    (guard, waited.timed_out())
 }
 
 /// Raises the soft limit on open descriptors to the hard limit. Descriptors cross processes in

@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use proto::request::ArtifactMedia;
@@ -251,9 +251,9 @@ impl VideoJobs {
         &self.settings
     }
 
-    /// Locks the job table and recovers it after poisoning.
+    /// Locks the job table.
     fn entries(&self) -> MutexGuard<'_, BTreeMap<String, RetainedJob>> {
-        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+        ::service::lock(&self.entries)
     }
 
     /// Adds a record and runs its generation task, `generation(token)`.
@@ -398,7 +398,7 @@ impl VideoJobs {
     /// store's generation tasks still make, goes to `relay`.
     pub fn hand_over(&self, relay: Relay) -> Vec<(VideoJob, Option<Arc<RetainedMedia>>)> {
         let entries = self.entries();
-        *self.relay.lock().unwrap_or_else(PoisonError::into_inner) = Some(relay);
+        *::service::lock(&self.relay) = Some(relay);
         entries
             .values()
             .map(|job| (job.record.clone(), job.media.clone()))
@@ -408,12 +408,7 @@ impl VideoJobs {
     /// Sends a job's change to the successor, once the store was handed
     /// over.
     fn relay(&self, record: &VideoJob, media: Option<&Arc<RetainedMedia>>) {
-        if let Some(relay) = self
-            .relay
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-        {
+        if let Some(relay) = ::service::lock(&self.relay).as_ref() {
             relay(record, media);
         }
     }

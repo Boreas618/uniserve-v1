@@ -41,7 +41,7 @@
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::Instant;
 
 use platform::{DeviceId, HostRegistration, PeerMapping, PrimaryContext, Protection};
@@ -165,7 +165,7 @@ struct State {
 
 impl Slot {
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        ::service::lock(&self.state)
     }
 
     /// The session, started when there is none. One session starts or
@@ -180,10 +180,7 @@ impl Slot {
             if !state.changing {
                 break;
             }
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
+            state = ::service::wait(&self.changed, state);
         }
         state.changing = true;
         drop(state);
@@ -360,7 +357,7 @@ impl Session {
         make: impl FnOnce() -> Result<T, String>,
     ) -> Result<Arc<Once<T>>, String> {
         let entry = {
-            let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut live = ::service::lock(&self.live);
             let live = live.as_mut().ok_or("the GPU's transfer session closed")?;
             Arc::clone(table(live).entry(id).or_default())
         };
@@ -486,7 +483,7 @@ impl Session {
     /// first.
     fn forget(&self, id: u64) {
         let taken = {
-            let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut live = ::service::lock(&self.live);
             live.as_mut().map(|live| {
                 (
                     live.nixl.remove(&id),
@@ -501,11 +498,7 @@ impl Session {
 
     /// Release everything the session made, then the context.
     fn close(&self) {
-        let live = self
-            .live
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let live = ::service::lock(&self.live).take();
         drop(live);
     }
 }

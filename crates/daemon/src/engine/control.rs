@@ -789,10 +789,7 @@ impl EngineControl {
         engine: u64,
         mut control: Option<&mut Connection>,
     ) -> anyhow::Result<(Connection, Connection, wire::Hello)> {
-        let mut incoming = self
-            .incoming
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut incoming = ::service::lock(&self.incoming);
         if let Some(connection) = incoming.remove(&engine) {
             return Ok(connection);
         }

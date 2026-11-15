@@ -17,7 +17,7 @@
 //! whose completion is unknown may still address them.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 
 use crate::worker::completion::{Completion, Outcome, Waker};
@@ -286,9 +286,9 @@ impl Drop for ThreadPool {
 /// its queue is empty.
 fn run_queue(pool: &Mutex<PoolState>, ready: &Condvar) {
     loop {
-        let mut state = ready
-            .wait_while(lock(pool), |state| state.queue.is_empty() && !state.closed)
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = service::wait_while(ready, lock(pool), |state| {
+            state.queue.is_empty() && !state.closed
+        });
         let Some(run) = state.queue.pop_front() else {
             return;
         };

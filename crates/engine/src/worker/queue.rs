@@ -151,10 +151,7 @@ impl Queue {
                 return None;
             }
 
-            state = self
-                .ready
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = service::wait(&self.ready, state);
         }
     }
 

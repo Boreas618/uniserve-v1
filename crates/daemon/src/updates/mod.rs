@@ -460,13 +460,9 @@ impl Updater {
         }
     }
 
-    /// The state, whether or not a panicking holder poisoned the lock: the
-    /// update is written under it and a poisoned lock must not end the daemon.
+    /// The state.
     fn lock(&self) -> MutexGuard<'_, State> {
-        match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        ::service::lock(&self.state)
     }
 }
 

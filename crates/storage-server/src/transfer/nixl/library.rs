@@ -15,7 +15,7 @@
 //! registration patch that build applies to the UCX backend.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::Mutex;
 
 use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
 
@@ -61,7 +61,7 @@ pub(crate) fn api() -> Result<&'static Api> {
 }
 
 fn load(path: &Path) -> Result<&'static Api> {
-    let mut loaded = LOADED.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut loaded = ::service::lock(&LOADED);
     if let Some(loaded) = *loaded {
         // Asking for the library by name, as an agent does, accepts
         // whichever path loaded it.

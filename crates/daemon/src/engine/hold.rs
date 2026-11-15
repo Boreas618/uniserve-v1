@@ -92,9 +92,7 @@ impl RequestHold {
     /// The state a request migrating out of epoch `epoch` continues with,
     /// if it keeps it.
     pub fn kept(&self, epoch: u64) -> Option<Kept> {
-        self.kept
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        ::service::lock(&self.kept)
             .clone()
             .filter(|kept| kept.epoch == epoch)
     }

@@ -354,10 +354,7 @@ impl Restarter {
         };
         let rebind = address(&options.admin_config) != address(&handoff[0].config.admin_config);
         let config = crate::options::printed(&options)?;
-        let processes = self
-            .daemon
-            .lock()
-            .map_err(|_| anyhow::anyhow!("the daemon's lock is poisoned"))?
+        let processes = ::service::lock(&self.daemon)
             .as_ref()
             .and_then(Daemon::address)
             .context("this daemon serves no process socket")?
@@ -385,19 +382,13 @@ impl Restarter {
 
         // From here the service is the successor's.
         let (service, service_descriptors) = {
-            let mut daemon = self
-                .daemon
-                .lock()
-                .map_err(|_| anyhow::anyhow!("the daemon's lock is poisoned"))?;
+            let mut daemon = ::service::lock(&self.daemon);
             daemon
                 .as_mut()
                 .context("the daemon's service is not running")?
                 .hand_over()?
         };
-        let (listener, listener_descriptor) = self
-            .listener
-            .lock()
-            .map_err(|_| anyhow::anyhow!("the listener's lock is poisoned"))?
+        let (listener, listener_descriptor) = ::service::lock(&self.listener)
             .take()
             .context("the HTTP listener was handed over already")?;
         let mut descriptors = vec![listener_descriptor];

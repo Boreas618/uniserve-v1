@@ -123,9 +123,7 @@ pub async fn serve(
     let daemon = Arc::new(std::sync::Mutex::new(Some(daemon)));
     let Some(address) = address else {
         info!(node_rank = config.node_rank, host = %config.host_identity, "serving this node's processes for the leader");
-        while daemon
-            .lock()
-            .map_err(|_| anyhow::anyhow!("the daemon's lock is poisoned"))?
+        while ::service::lock(&daemon)
             .as_ref()
             .is_some_and(Daemon::is_running)
         {
@@ -298,10 +296,7 @@ pub(crate) async fn finish(
 /// Stops this node's daemon, ending every process it supervises.
 async fn stop_daemon(daemon: Arc<std::sync::Mutex<Option<Daemon>>>) -> Result<()> {
     tokio::task::spawn_blocking(move || {
-        let daemon = daemon
-            .lock()
-            .map_err(|_| anyhow::anyhow!("the daemon's lock is poisoned"))?
-            .take();
+        let daemon = ::service::lock(&daemon).take();
         match daemon {
             Some(mut daemon) => daemon.stop(),
             None => Ok(()),

@@ -72,10 +72,7 @@ pub struct CountedHistogram {
 impl CountedHistogram {
     /// Add a span's counts.
     pub fn add(&self, histogram: &proto::report::FenceHistogram) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = ::service::lock(&self.inner);
         if inner.1.is_empty() {
             inner.1 = vec![0; proto::report::FENCE_BUCKETS_US.len() + 1];
         }
@@ -96,11 +93,7 @@ impl prometheus_client::encoding::EncodeMetric for CountedHistogram {
         &self,
         mut encoder: prometheus_client::encoding::MetricEncoder,
     ) -> Result<(), fmt::Error> {
-        let (sum_us, counts) = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let (sum_us, counts) = ::service::lock(&self.inner).clone();
         // Per-bucket counts with their upper bounds in seconds, the last
         // unbounded, as `prometheus_client`'s own histogram hands them over.
         let buckets: Vec<(f64, u64)> = proto::report::FENCE_BUCKETS_US

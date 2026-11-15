@@ -45,7 +45,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::storage::Client;
@@ -331,7 +331,7 @@ impl Network {
     pub(super) fn unexpose(&self, leases: Vec<Lease>) {
         for lease in leases {
             let host = self.host(&lease.endpoint);
-            let mut host = host.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut host = ::service::lock(&host);
             let Some(client) = &mut host.client else {
                 continue;
             };
@@ -345,9 +345,7 @@ impl Network {
     /// The host whose Storage Server listens at `endpoint`.
     fn host(&self, endpoint: &str) -> Arc<Mutex<Host>> {
         Arc::clone(
-            self.hosts
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+            ::service::lock(&self.hosts)
                 .entry(endpoint.to_owned())
                 .or_default(),
         )
@@ -364,7 +362,7 @@ impl Network {
         regions: Vec<Region>,
     ) -> Result<(String, u64, Vec<Registration>), String> {
         let host = self.host(endpoint);
-        let mut host = host.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut host = ::service::lock(&host);
         tracing::debug!(
             endpoint,
             deployment,

@@ -435,9 +435,7 @@ struct Shared {
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        ::service::lock(&self.state)
     }
 
     fn wake_main(&self) {

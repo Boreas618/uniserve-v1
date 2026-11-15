@@ -484,10 +484,7 @@ pub(crate) type ProcessTable = std::sync::Arc<std::sync::Mutex<Vec<crate::epoch:
 /// reported — and dropping the rows of processes that ended.
 fn publish(local: &Local, table: &ProcessTable) {
     let live = local.supervisor.live();
-    let mut rows = match table.lock() {
-        Ok(rows) => rows,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut rows = ::service::lock(table);
     rows.retain(|row| live.iter().any(|process| same_process(row, process)));
     for process in live {
         if let Some(row) = rows.iter_mut().find(|row| same_process(row, &process)) {

@@ -103,10 +103,7 @@ impl<C, T: Clone, E: ?Sized> Completion<C, T, E> {
             if let Some(outcome) = &state.outcome {
                 return outcome.clone();
             }
-            state = self
-                .ready
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = service::wait(&self.ready, state);
         }
     }
 
@@ -119,11 +116,7 @@ impl<C, T: Clone, E: ?Sized> Completion<C, T, E> {
             if left.is_zero() {
                 return None;
             }
-            state = self
-                .ready
-                .wait_timeout(state, left)
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
+            state = service::wait_timeout(&self.ready, state, left).0;
         }
         state.outcome.clone()
     }

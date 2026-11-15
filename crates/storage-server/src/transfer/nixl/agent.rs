@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_void};
 use std::ptr;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::capi::{self, AgentConfig, Api, Handle};
 use super::error::check;
@@ -381,7 +381,7 @@ impl std::fmt::Debug for Agent {
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        ::service::lock(&self.state)
     }
 
     /// Runs `call` with the agent's handle and a registration list holding
@@ -433,9 +433,16 @@ impl Shared {
 }
 
 impl Drop for Shared {
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned lock is unreachable under `panic = \"abort\"`"
+    )]
     fn drop(&mut self) {
         let api = self.api;
-        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let state = self
+            .state
+            .get_mut()
+            .expect("a thread panicked while it held the agent's state");
         for peer in state.peers.drain() {
             if let Ok(c_peer) = CString::new(peer) {
                 // SAFETY: a live agent and a NUL-terminated name.
