@@ -1,0 +1,23 @@
+# A revision of the serving gemm/cublas_lt package that a generation update
+# installs to exercise a recapture of the engine's graphs.
+#
+# `recapture` compiles `recapture/split_k.cu` in place of the serving package's
+# unit: a module that launches two kernels (the product into FP32 scratch, then the
+# alpha, the bias and the rounding) where the serving package hands the whole
+# product to cuBLASLt in one call. Installing it is a new revision of
+# `gemm`/`cublas_lt`, not a new backend, so the deployment's unchanged
+# configuration resolves it; because its launches are not the recorded ones, a
+# graph built over the previous module cannot be replayed as it stands. Its
+# arithmetic is the operator's, so a recaptured graph computes the same product
+# inside `ops::Tolerance::dot(k)`. The unit reads the serving manifest's
+# definitions and accumulates in FP32 alone, so the revision covers the FP32
+# accumulations only.
+
+package = "crates/ops/kernels/gemm/cublas_lt"
+
+[variants.recapture]
+add = { "src/split_k.cu" = "recapture/split_k.cu" }
+replace = [
+    { file = "package.toml", old = 'units = ["src/gemm.cpp"]', new = 'units = ["src/split_k.cu"]' },
+    { file = "package.toml", old = 'accumulate = ["f32", "bf16", "f16"]', new = 'accumulate = ["f32"]' },
+]

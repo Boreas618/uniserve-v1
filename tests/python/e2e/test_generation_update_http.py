@@ -18,8 +18,9 @@ which is what moves a newly installed revision into a generation update
 never on sleeps.
 
 The model is ``UNISERVE_QWEN3_MODEL``'s checkpoint; the module is skipped
-when it is unset. The packages are the tree's fixtures under
-``crates/ops/package-fixtures``, and each variable below names another:
+when it is unset. The packages are revisions of serving packages, each derived
+from its serving package by a mutation ``packages/`` declares
+(``build_server.derived_package``), and each variable below names another:
 
 - ``UNISERVE_REBIND_PACKAGE``: a package of an operator the slice
   launches every step, with the serving descriptor key and the same launch
@@ -59,7 +60,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests.python.e2e.build_server import POLICY_PACKAGE, repository
+from tests.python.e2e.build_server import (
+    POLICY_PACKAGE,
+    derived_package,
+    repository,
+)
 from tests.python.e2e.build_server import (
     build_server as running_build_server,
 )
@@ -130,21 +135,27 @@ COMMITTED = ["committed"]
 ROLLED_BACK = ["rolled_back"]
 
 
-#: The tree's package each variable stands for when it is unset: a kernel
-#: fixture, or the deployment's own policy package, whose second installation is
-#: the next revision of its backend.
-FIXTURE_PACKAGES = {
-    "UNISERVE_REBIND_PACKAGE": "crates/ops/package-fixtures/rms_norm_rebind",
-    "UNISERVE_RECAPTURE_PACKAGE": "crates/ops/package-fixtures/recapture",
-    "UNISERVE_POLICY_PACKAGE": POLICY_PACKAGE,
-    "UNISERVE_WRONG_PACKAGE": "crates/ops/package-fixtures/rms_norm_wrong",
+#: The derived revision each kernel package variable stands for when it is
+#: unset: a fixture of ``packages/`` and its variant.
+DERIVED = {
+    "UNISERVE_REBIND_PACKAGE": ("rms_norm", "rebind"),
+    "UNISERVE_RECAPTURE_PACKAGE": ("gemm", "recapture"),
+    "UNISERVE_WRONG_PACKAGE": ("rms_norm", "wrong"),
 }
 
 
-def _package(name: str) -> Path:
-    """The package directory `name` names, else the tree's fixture."""
+def _package(name: str, directory: Path) -> Path:
+    """The package directory `name` names, else its derived revision written
+    into `directory`, or the deployment's own policy package, whose second
+    installation is the next revision of its backend.
+    """  # noqa: D205
     value = os.environ.get(name)
-    path = Path(value) if value else repository() / FIXTURE_PACKAGES[name]
+    if value:
+        path = Path(value)
+    elif name in DERIVED:
+        path = derived_package(*DERIVED[name], directory)
+    else:
+        path = repository() / POLICY_PACKAGE
     if not path.is_dir():
         pytest.fail(f"{name}: {path} is not a package directory")
     return path
@@ -503,9 +514,9 @@ def assert_no_failures(step: str, traffic: Traffic) -> None:
 
 
 def test_a_kernel_package_is_swapped_by_rebind_while_requests_stream(
-    server: str, build_server, traffic: Traffic
+    server: str, build_server, traffic: Traffic, tmp_path: Path
 ) -> None:
-    package = _package("UNISERVE_REBIND_PACKAGE")
+    package = _package("UNISERVE_REBIND_PACKAGE", tmp_path)
     before = epoch_record(server)
     revision = install(build_server, package)
 
@@ -533,10 +544,10 @@ def test_a_kernel_package_is_swapped_by_rebind_while_requests_stream(
 
 
 def test_the_recapture_swap_and_the_policy_swap_keep_serving(
-    server: str, build_server, traffic: Traffic
+    server: str, build_server, traffic: Traffic, tmp_path: Path
 ) -> None:
-    package = _package("UNISERVE_RECAPTURE_PACKAGE")
-    policy = _package("UNISERVE_POLICY_PACKAGE")
+    package = _package("UNISERVE_RECAPTURE_PACKAGE", tmp_path)
+    policy = _package("UNISERVE_POLICY_PACKAGE", tmp_path)
     before = epoch_record(server)
     install(build_server, package)
     install(build_server, policy)
@@ -589,9 +600,9 @@ def test_a_rollback_restores_the_previous_generation(
 
 
 def test_a_wrong_kernel_is_refused_by_shadow_execution(
-    server: str, build_server, traffic: Traffic
+    server: str, build_server, traffic: Traffic, tmp_path: Path
 ) -> None:
-    package = _package("UNISERVE_WRONG_PACKAGE")
+    package = _package("UNISERVE_WRONG_PACKAGE", tmp_path)
     before = epoch_record(server)
     install(build_server, package)
 

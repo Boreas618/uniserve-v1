@@ -1,0 +1,25 @@
+# Revisions of the serving rms_norm/triton package that a generation update
+# installs: the serving package with its kernel's arithmetic changed in one place,
+# the same descriptors, the same kernel and the same launch.
+#
+# `rebind` is numerically equivalent: the mean square is scaled by the reciprocal of
+# the row width instead of divided by it, which differs from the serving kernel in
+# its last rounding step and stays inside the operator's tolerance, so installing it
+# is a pure rebind: a graph's node is re-pointed at the new module and nothing about
+# the launch, the grid or the descriptor changes.
+#
+# `wrong` applies the weight twice: a kernel that runs and produces a plausible
+# tensor whose values are far outside the operator's tolerance, without faulting,
+# which shadow execution must refuse.
+
+package = "crates/ops/kernels/rms_norm/triton"
+
+[variants.rebind]
+replace = [
+    { file = "src/rms_norm.py", old = "    variance = tl.sum(x * x, axis=0) / columns\n", new = "    variance = tl.sum(x * x, axis=0) * (1.0 / columns)\n" },
+]
+
+[variants.wrong]
+replace = [
+    { file = "src/rms_norm.py", old = "    y = x * tl.rsqrt(variance + eps) * w\n", new = "    y = x * tl.rsqrt(variance + eps) * w * w\n" },
+]

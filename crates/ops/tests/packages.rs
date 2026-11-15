@@ -31,21 +31,6 @@ fn kernel_packages() -> Vec<PathBuf> {
     packages
 }
 
-/// The package fixtures the delivery tests install: `package-fixtures/<name>/package.toml`.
-fn fixture_packages() -> Vec<PathBuf> {
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("package-fixtures");
-    let packages: Vec<PathBuf> = subdirectories(&fixtures)
-        .into_iter()
-        .filter(|fixture| fixture.join(Manifest::FILE).is_file())
-        .collect();
-    assert!(
-        !packages.is_empty(),
-        "{} holds no fixture",
-        fixtures.display()
-    );
-    packages
-}
-
 /// The subdirectories of `directory`, in name order.
 fn subdirectories(directory: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(directory)
@@ -178,7 +163,7 @@ fn every_element_type_is_one_ops_prints() {
 #[test]
 fn every_package_states_only_what_its_source_kind_does_not_fix() {
     let mut failures = Vec::new();
-    for package in kernel_packages().into_iter().chain(fixture_packages()) {
+    for package in kernel_packages() {
         let path = package.join(Manifest::FILE);
         let declared: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap())
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));

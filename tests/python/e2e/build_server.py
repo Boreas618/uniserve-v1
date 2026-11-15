@@ -23,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import tomllib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -65,6 +66,50 @@ ENGINE_PACKAGE = "crates/engine"
 def repository() -> Path:
     """The repository root: the workspace the policy package is built in."""
     return Path(__file__).resolve().parents[3]
+
+
+#: The revisions of serving packages a test installs, each derived from its
+#: serving package by a declared mutation (:func:`derived_package`).
+DERIVED_PACKAGES = Path(__file__).resolve().parent / "packages"
+
+
+def derived_package(fixture: str, variant: str, directory: Path) -> Path:
+    """A revision of a serving package, written into ``directory``.
+
+    ``packages/<fixture>.toml`` names the serving package and, for each
+    variant, the files the variant adds from the fixture's own directory
+    (``add``: a package path to a fixture path) and the exact texts it
+    replaces in the package's files (``replace``). The revision is the serving
+    package's tree with those changes, so it never holds a copy that drifts
+    from what serves.
+
+    Raises:
+        AssertionError: If a replaced text does not occur exactly once in the
+            serving package, which a change to the serving package can cause;
+            the error names the fixture, the file and the text.
+    """
+    declared = tomllib.loads((DERIVED_PACKAGES / f"{fixture}.toml").read_text())
+    mutation = declared["variants"][variant]
+    package = directory / f"{fixture}-{variant}"
+    shutil.copytree(
+        repository() / declared["package"],
+        package,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    for target, source in mutation.get("add", {}).items():
+        shutil.copyfile(DERIVED_PACKAGES / source, package / target)
+    for replaced in mutation.get("replace", []):
+        path = package / replaced["file"]
+        text = path.read_text()
+        found = text.count(replaced["old"])
+        if found != 1:
+            raise AssertionError(
+                f"{fixture} {variant}: {replaced['file']} of "
+                f"{declared['package']} holds {found} copies of "
+                f"{replaced['old']!r}, and the variant replaces one"
+            )
+        path.write_text(text.replace(replaced["old"], replaced["new"]))
+    return package
 
 
 def require_toolchain_environment() -> None:

@@ -65,7 +65,7 @@ These name the checkpoints and inputs of the host. Set the ones the host has; th
 | `UNISERVE_E2E_SET` | none | `PATH=VALUE` assignments every test deployment adds to its options |
 | `UNISERVE_E2E_TIME_SCALE` | `1` | The factor every wait of a test is stretched by |
 | `UNISERVE_MODULE_TARGET` | the served GPU's `sm_{major}{minor}a` | The target the Build Server builds kernels for |
-| `UNISERVE_REBIND_PACKAGE`, `UNISERVE_RECAPTURE_PACKAGE`, `UNISERVE_POLICY_PACKAGE`, `UNISERVE_WRONG_PACKAGE` | the kernel packages under `crates/ops/package-fixtures` and the deployment's own policy package `crates/scheduling/policies/arrival`, whose second installation is the next revision of its backend | The packages `test_generation_update_http.py` installs |
+| `UNISERVE_REBIND_PACKAGE`, `UNISERVE_RECAPTURE_PACKAGE`, `UNISERVE_POLICY_PACKAGE`, `UNISERVE_WRONG_PACKAGE` | revisions of the serving `rms_norm/triton` and `gemm/cublas_lt` packages, each derived from the serving package by a mutation `tests/python/e2e/packages` declares, and the deployment's own policy package `crates/scheduling/policies/arrival`, whose second installation is the next revision of its backend | The packages `test_generation_update_http.py` installs |
 | `SANITIZER_LOGS`, `COMPUTE_SANITIZER` | the run's `memcheck/`, `compute-sanitizer` | Where memcheck writes and which sanitizer runs (`just test-python-sanitizer`) |
 
 `tools/gpu_e2e.sh` sets `UNISERVE_RUN_GPU_E2E`, `UNISERVE_BINARY` and `UNISERVE_MEMCHECK_TARGET` itself. A case's lease sets `UNISERVE_WORLD_DEVICES` to the GPUs it holds, comma-separated, and every test takes its devices from it (`http_helpers.granted_devices`); `cuda:N` ranks in a test's deployment index those GPUs.
