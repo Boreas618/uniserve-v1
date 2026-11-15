@@ -522,6 +522,7 @@ impl Event {
                 cause: match cause {
                     MigrationCause::Drain => wire::MigrationCause::Drain,
                     MigrationCause::Loss => wire::MigrationCause::Loss,
+                    MigrationCause::Transfer => wire::MigrationCause::Transfer,
                 } as i32,
                 denoised_steps: *denoised_steps,
                 stored_layout: stored_layout.clone(),
@@ -618,6 +619,7 @@ impl Event {
                 cause: match known::<wire::MigrationCause>(migratable.cause, "migration cause")? {
                     wire::MigrationCause::Drain => MigrationCause::Drain,
                     wire::MigrationCause::Loss => MigrationCause::Loss,
+                    wire::MigrationCause::Transfer => MigrationCause::Transfer,
                 },
                 denoised_steps: migratable.denoised_steps,
                 stored_layout: migratable.stored_layout,

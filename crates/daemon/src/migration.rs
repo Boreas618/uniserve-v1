@@ -24,7 +24,11 @@
 //! stop-string matcher and response assembly keep their state.
 //!
 //! A migration caused by a drain is not counted. A request survives
-//! `max_migrations` migrations caused by losses and fails on the next one.
+//! `max_migrations` migrations caused by losses of its workers or by failed
+//! transfers between its worker groups, together, and fails on the next one:
+//! a failed transfer leaves the engine serving, and the request's next attempt
+//! may take the same path, so without the bound a copy that always fails
+//! would resubmit it forever.
 //!
 //! The random stream of a migrated request continues as it began: every
 //! request carries a seed from entry, its own or one drawn for it
@@ -54,13 +58,13 @@ use crate::engine::hold::{Kept, RequestHold};
 /// engines.
 pub struct Migrator {
     hold: Arc<RequestHold>,
-    /// Migrations caused by losses a request survives.
+    /// Migrations caused by losses or failed transfers a request survives.
     max_migrations: u32,
 }
 
 impl Migrator {
     /// A migrator that submits through `hold`, under which a request survives
-    /// `max_migrations` migrations caused by losses.
+    /// `max_migrations` migrations caused by losses or failed transfers.
     pub fn new(hold: Arc<RequestHold>, max_migrations: u32) -> Self {
         Self {
             hold,
@@ -98,7 +102,7 @@ impl Migrator {
             request: Some(resumable),
             hold: Some(Arc::clone(&self.hold)),
             max_migrations: self.max_migrations,
-            losses: 0,
+            counted: 0,
             pending: None,
             resumed: false,
             scheduled: false,
@@ -258,8 +262,9 @@ pub struct RequestEvents {
     /// process took over, which the engine that serves it admitted.
     hold: Option<Arc<RequestHold>>,
     max_migrations: u32,
-    /// Migrations caused by losses so far.
-    losses: u32,
+    /// Migrations counted against `max_migrations` so far: those caused by
+    /// losses and by failed transfers.
+    counted: u32,
     /// A migration `poll_step` met, which the next `recv` or
     /// `migrate_pending` carries out.
     pending: Option<Migration>,
@@ -292,7 +297,7 @@ impl RequestEvents {
             request: None,
             hold: None,
             max_migrations: 0,
-            losses: 0,
+            counted: 0,
             pending: None,
             resumed: consumed > 0,
             scheduled: consumed > 0,
@@ -405,14 +410,16 @@ impl RequestEvents {
                 "the request's engine stopped serving it, and it does not migrate".to_owned(),
             ));
         };
-        if cause == MigrationCause::Loss {
-            if self.losses >= self.max_migrations {
+        // A loss and a failed transfer are failures the next attempt may meet
+        // again; a drain is the deployment's own decision.
+        if matches!(cause, MigrationCause::Loss | MigrationCause::Transfer) {
+            if self.counted >= self.max_migrations {
                 return Err(failed(format!(
-                    "the request's workers were lost {} times",
-                    self.losses + 1
+                    "the request's workers were lost or its transfers failed {} times",
+                    self.counted + 1
                 )));
             }
-            self.losses += 1;
+            self.counted += 1;
         }
         // A request an epoch change moves to an epoch computing other
         // numerics continues with the state it reached (`in_flight = keep`).
@@ -779,22 +786,24 @@ mod tests {
         );
     }
 
-    /// A request survives `max_migrations` migrations caused by losses and
-    /// fails on the next.
+    /// A request survives `max_migrations` migrations caused by losses or
+    /// failed transfers, together, and fails on the next.
     #[tokio::test]
-    async fn losses_beyond_the_limit_fail_the_request() {
-        let hold = Arc::new(RequestHold::new());
-        hold.serve(migrating(1, MigrationCause::Loss));
-        let migrator = Migrator::new(Arc::clone(&hold), 0);
-        let (mut events, _) = migrator
-            .submit(Request::Generation(Box::new(request(8))))
-            .await
-            .unwrap();
-        match events.recv().await {
-            Some(Event::Error { message }) => {
-                assert!(message.contains("lost 1 times"), "{message}")
+    async fn losses_and_failed_transfers_beyond_the_limit_fail_the_request() {
+        for cause in [MigrationCause::Loss, MigrationCause::Transfer] {
+            let hold = Arc::new(RequestHold::new());
+            hold.serve(migrating(1, cause));
+            let migrator = Migrator::new(Arc::clone(&hold), 0);
+            let (mut events, _) = migrator
+                .submit(Request::Generation(Box::new(request(8))))
+                .await
+                .unwrap();
+            match events.recv().await {
+                Some(Event::Error { message }) => {
+                    assert!(message.contains("failed 1 times"), "{cause:?}: {message}")
+                }
+                other => panic!("expected the {cause:?} to fail the request, got {other:?}"),
             }
-            other => panic!("expected the loss to fail the request, got {other:?}"),
         }
     }
 

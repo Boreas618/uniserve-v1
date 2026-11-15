@@ -1287,7 +1287,8 @@ impl Scheduler {
     /// request's attachment to the decode group, with its slot there, and the request runs;
     /// `Failed` leaves the owner attached to the prefill group, holding blocks no device block
     /// table holds, so it is detached with no stamp and the request ends as migratable with the
-    /// cause `Loss`. Other answers of the owner (the commits of its last chunk) change nothing.
+    /// cause `Transfer`, which the daemon counts against the request's migrations. Other answers
+    /// of the owner (the commits of its last chunk) change nothing.
     fn transfer_answered(
         &mut self,
         id: RequestId,
@@ -1310,7 +1311,7 @@ impl Scheduler {
                     owner,
                     after: Vec::new(),
                 });
-                self.finish(id, migratable(MigrationCause::Loss));
+                self.finish(id, migratable(MigrationCause::Transfer));
             }
             _ => {}
         }
@@ -2378,7 +2379,7 @@ mod tests {
         assert!(matches!(
             events(&outputs)[..],
             [Event::Migratable {
-                cause: MigrationCause::Loss,
+                cause: MigrationCause::Transfer,
                 denoised_steps: 0,
                 ..
             }]

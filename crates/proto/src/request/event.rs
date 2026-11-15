@@ -164,6 +164,11 @@ pub enum MigrationCause {
     Drain,
     /// The workers that held the request were lost.
     Loss,
+    /// A transfer of the request's blocks between its worker groups failed: a prefill-to-decode
+    /// transfer or a crossing of a product between processes. Its groups serve on, and a video
+    /// request's trajectory is stored; the migration counts against the request's limit as a
+    /// loss does.
+    Transfer,
 }
 
 impl Event {

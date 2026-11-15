@@ -1232,6 +1232,13 @@ enum MigrationCause {
   MIGRATION_CAUSE_DRAIN = 0;
   // The workers that held the request were lost.
   MIGRATION_CAUSE_LOSS = 1;
+  // A transfer of the request's blocks between its worker groups failed: a
+  // prefill-to-decode transfer or a crossing of a product between processes.
+  // Its groups serve on, and a video request's trajectory is stored; the
+  // engine does not try the copy again, and the daemon counts the migration
+  // against the request's limit as it counts a loss, since the request's
+  // next attempt may take the same path.
+  MIGRATION_CAUSE_TRANSFER = 2;
 }
 
 message Scheduled {

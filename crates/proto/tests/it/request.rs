@@ -219,6 +219,11 @@ fn events_come_back_from_their_messages_unchanged() {
             denoised_steps: 3,
             stored_layout: vec![1, 2, 3],
         },
+        Event::Migratable {
+            cause: MigrationCause::Transfer,
+            denoised_steps: 0,
+            stored_layout: Vec::new(),
+        },
     ];
     for event in events {
         let (message, media) = event.to_wire(RequestId(8));

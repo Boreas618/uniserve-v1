@@ -967,6 +967,10 @@ pub struct FabricExport {
 /// bytes of every unit once, and two ranks of one layout name the same
 /// fields at the same bytes per unit, so a unit copies between them field
 /// by field, from the run of one holding the unit to the run of the other.
+/// A field is named by what a unit holds, never by its region: a crossing
+/// (`crate::runtime::Request::Replicate`) copies a unit from one region into
+/// another (one rank's product buffer into another's), reading for each
+/// field the destination's runs name the source's run of that field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitRun {
     pub field: String,

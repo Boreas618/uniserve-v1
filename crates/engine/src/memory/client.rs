@@ -1009,20 +1009,7 @@ impl StorageClient {
         }
         state.taken.extend(keys.iter().copied());
 
-        let runs = keys
-            .iter()
-            .zip(0..)
-            .map(|(key, part)| UnitRun {
-                field: region.to_owned(),
-                key: *key,
-                location: Location::Device { gpu },
-                first: part * units,
-                count: units,
-                offset: 0,
-                bytes: unit_bytes,
-            })
-            .collect();
-        Ok((storage, runs))
+        Ok((storage, part_runs(&keys, gpu, units, unit_bytes)))
     }
 
     /// Gives back the parts of a storage [`Self::region_storage`] took whose runs are `runs`,
@@ -1046,6 +1033,32 @@ impl StorageClient {
         }
         self.release_keys(&mut state, &given, "giving back a region's storage")
     }
+}
+
+/// The one field of a unit of a device region whose units exist once (a media rank's product
+/// buffer, [`StorageClient::region_storage`]): the unit's bytes. Every such region names it
+/// alike, whichever region and rank it is, because the Storage Server copies a crossing's units
+/// between two of them field by field, reading the source rank's run of each field the
+/// destination rank's runs name (`storage::protocol::UnitRun`).
+const PRODUCT_FIELD: &str = "products";
+
+/// Where the units of a region whose units exist once lie in the parts of its storage, retained
+/// under `keys` on the GPU whose UUID is `gpu`: a run per part, in order, of the units' one field
+/// ([`PRODUCT_FIELD`]), each part holding `units` units of `unit_bytes` from its first byte and
+/// the parts' units following one another in the region's numbering.
+fn part_runs(keys: &[Key], gpu: [u8; 16], units: u32, unit_bytes: u64) -> Vec<UnitRun> {
+    keys.iter()
+        .zip(0..)
+        .map(|(key, part)| UnitRun {
+            field: PRODUCT_FIELD.to_owned(),
+            key: *key,
+            location: Location::Device { gpu },
+            first: part * units,
+            count: units,
+            offset: 0,
+            bytes: unit_bytes,
+        })
+        .collect()
 }
 
 /// The buffer pool's statement of `runs`: each run of a field of the rank's units, with the GPU
@@ -1365,4 +1378,35 @@ fn segment_name(name: &str, part: &SegmentPart) -> String {
 /// A Storage Server failure while the rank was doing `what`.
 fn storage_error(what: &str, error: storage::Error) -> Error {
     Error::transport_source(what, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The product buffers of two ranks of two processes, the one a conditioning is written in
+    /// and the one a crossing copies it into, each retained under keys of its own region, state
+    /// their units' one field alike at the same bytes per unit: the Storage Server finds every
+    /// field the destination's runs name among the source's runs, and copies a crossing's units
+    /// between them (`storage::protocol::UnitRun`). Each part's run holds its own units, the
+    /// parts' units following one another from unit 0.
+    #[test]
+    fn the_product_buffers_of_two_ranks_state_one_field_a_crossing_copies() {
+        let written = part_runs(&[Key([1; 32]), Key([2; 32])], [10; 16], 6, 256);
+        let receiving = part_runs(&[Key([3; 32]), Key([4; 32])], [11; 16], 6, 256);
+
+        let fields = |runs: &[UnitRun]| -> BTreeSet<(String, u64)> {
+            runs.iter()
+                .map(|run| (run.field.clone(), run.bytes))
+                .collect()
+        };
+        assert_eq!(fields(&written), fields(&receiving));
+        assert_eq!(fields(&receiving).len(), 1, "a product unit is one field");
+
+        let units: Vec<(Key, u32, u32)> = receiving
+            .iter()
+            .map(|run| (run.key, run.first, run.count))
+            .collect();
+        assert_eq!(units, [(Key([3; 32]), 0, 6), (Key([4; 32]), 6, 6)]);
+    }
 }

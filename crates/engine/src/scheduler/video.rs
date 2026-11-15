@@ -301,26 +301,26 @@ impl Request {
     }
 
     /// Whether a video request stores its trajectory before it leaves (SD §3.8, §7.3
-    /// "Preemption"; `S/preemption/media.rs:150-175`): a drain preempted it (its terminal is
-    /// `Migratable { cause: Drain }`), the daemon gave it a trajectory identity, it completed at
-    /// least one denoising step, and it is attached to the group that denoises it, whose slot
-    /// holds the trajectory. A lost group's trajectory is gone with it, and step 0 is the
-    /// request's noise, which any engine draws again.
+    /// "Preemption"; `S/preemption/media.rs:150-175`): a drain or a failed crossing preempted it
+    /// (its terminal is `Migratable` with the cause `Drain` or `Transfer`), the daemon gave it a
+    /// trajectory identity, it completed at least one denoising step, and it is attached to the
+    /// group that denoises it, whose slot holds the trajectory. A lost group's trajectory is gone
+    /// with it, and step 0 is the request's noise, which any engine draws again.
     pub(super) fn stores_trajectory(&self) -> bool {
         let Some(video) = self.video() else {
             return false;
         };
-        let drained = matches!(
+        let preempted = matches!(
             self.terminal,
             Some(Event::Migratable {
-                cause: MigrationCause::Drain,
+                cause: MigrationCause::Drain | MigrationCause::Transfer,
                 ..
             })
         );
         let attached = self.placement[Phase::Denoise.index()]
             .and_then(|group| self.slot_on(group))
             .is_some();
-        drained
+        preempted
             && video.trajectory.id.is_some()
             && self.completed[Phase::Denoise.index()] > 0
             && attached
@@ -990,8 +990,10 @@ impl Scheduler {
     /// Applies the answer to a crossing of request `id` (SD §3.5): `Replicated`, the calls that
     /// read the result in the group go on; `Full`, it is asked again once the receiving region's
     /// `available` shows the units, the request short there meanwhile (SD §3.6); `Failed`, the
-    /// request ends as migratable, its trajectory saved where it completed a step, and the
-    /// daemon resubmits it (SD §3.6); `Refused` with the cause `key`, its conditioning is a
+    /// request ends as migratable with the cause `Transfer`, its trajectory saved where it
+    /// completed a step, and the daemon resubmits it, counting the migration against the
+    /// request's limit: the engine does not cross again, since a second copy over the same path
+    /// has no reason to succeed (SD §3.6); `Refused` with the cause `key`, its conditioning is a
     /// cached block an epoch on trial may not copy into another memory (BP §9, R8), which it
     /// gives up to encode its own.
     pub(super) fn crossing_answered(
@@ -1030,7 +1032,7 @@ impl Scheduler {
                     self.preempt(id, index);
                 }
             }
-            Completion::Failed => self.finish(id, migratable(MigrationCause::Drain)),
+            Completion::Failed => self.finish(id, migratable(MigrationCause::Transfer)),
             Completion::Refused { cause: Cause::Key } => self.encode_again(id, owner, class, at),
             _ => {}
         }
@@ -1970,9 +1972,9 @@ mod tests {
         );
     }
 
-    /// A request a drain preempted after a completed step stores its trajectory under the key of
-    /// that step, and a resumed request restores the steps it names under the seed that stored
-    /// them (SD §3.8, §4.3, §7.3).
+    /// A request a drain or a failed crossing preempted after a completed step stores its
+    /// trajectory under the key of that step, and a resumed request restores the steps it names
+    /// under the seed that stored them (SD §3.8, §4.3, §7.3).
     #[test]
     fn a_drained_request_stores_its_step_and_resumes_from_it() {
         let groups = groups(&[(A, &phases()[..])]);
@@ -1995,6 +1997,7 @@ mod tests {
             stored.trajectory_key(5),
             Some(Key(latent_content(5, 77, 2)))
         );
+        assert!(drained(2, MigrationCause::Transfer, &on(A)).stores_trajectory());
         assert!(!drained(2, MigrationCause::Loss, &on(A)).stores_trajectory());
         assert!(!drained(0, MigrationCause::Drain, &on(A)).stores_trajectory());
         assert!(!drained(2, MigrationCause::Drain, &[]).stores_trajectory());
@@ -2379,9 +2382,10 @@ mod tests {
         assert!(scheduler.reads_where_written(OwnerId(10), (class, units[1]), A));
     }
 
-    /// A crossing that fails ends its request as migratable, which the daemon resubmits, with no
-    /// retry inside the engine (SD §3.6); one the receiving region had no room for is asked again
-    /// once the request is no longer short there.
+    /// A crossing that fails ends its request as migratable with the cause `Transfer`, which the
+    /// daemon resubmits and counts against the request's migrations, with no retry inside the
+    /// engine (SD §3.6); one the receiving region had no room for is asked again once the request
+    /// is no longer short there.
     #[test]
     fn a_failed_crossing_ends_its_request_as_migratable_and_a_full_one_is_asked_again() {
         let (mut scheduler, stamped, outputs) = two_processes();
@@ -2415,7 +2419,7 @@ mod tests {
                     && matches!(
                         event,
                         Event::Migratable {
-                            cause: MigrationCause::Drain,
+                            cause: MigrationCause::Transfer,
                             ..
                         }
                     )

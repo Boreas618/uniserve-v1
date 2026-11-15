@@ -232,7 +232,7 @@ fn a_prefill_then_its_transfer_then_its_decodes_on_another_group() {
 }
 
 /// A transfer that fails leaves the owner attached to the prefill group, holding blocks no
-/// device block table holds: the request ends as `Migratable { Loss }` for the daemon to
+/// device block table holds: the request ends as `Migratable { Transfer }` for the daemon to
 /// resubmit, its owner is detached with no stamp, and the buffer pool holds nothing of it (SD
 /// §3.5 "Prefill to decode transfer", §7.6; `specs/buffer-pool.md` §12.4).
 #[test]
@@ -250,7 +250,7 @@ fn a_failed_transfer_ends_as_migratable_and_detaches_its_owner_with_no_stamp() {
     assert!(matches!(
         harness.terminal(id),
         Some(Event::Migratable {
-            cause: MigrationCause::Loss,
+            cause: MigrationCause::Transfer,
             ..
         })
     ));
