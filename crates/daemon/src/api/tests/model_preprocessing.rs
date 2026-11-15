@@ -467,10 +467,9 @@ fn the_profile_declares_the_tool_call_format() {
 
             let parser = lowering.parser.unwrap();
             assert_eq!(
-                parser.kind,
-                proto::handoff::parser::Kind::ParserKindJson as i32
+                (parser.reasoning.as_str(), parser.tool_calls.as_str()),
+                ("think", "json")
             );
-            assert!(parser.parse_tools && parser.parse_reasoning);
             let tools: serde_json::Value = serde_json::from_str(&parser.tools).unwrap();
             assert_eq!(tools[0]["function"]["name"], "weather");
         }
@@ -487,7 +486,7 @@ fn the_profile_declares_the_tool_call_format() {
     )
     .unwrap();
     let parser = lowering.parser.unwrap();
-    assert!(!parser.parse_tools);
+    assert!(parser.tool_calls.is_empty());
     assert!(parser.tools.is_empty());
 }
 
@@ -530,11 +529,7 @@ fn tool_calling_follows_the_familys_declared_format() {
     )
     .unwrap();
     let parser = lowering.parser.unwrap();
-    assert_eq!(
-        parser.kind,
-        proto::handoff::parser::Kind::ParserKindXml as i32
-    );
-    assert!(parser.parse_tools);
+    assert_eq!(parser.tool_calls, "xml");
 }
 
 /// What an agent harness sends turn after turn is lowered as it sends it: tool
@@ -598,7 +593,7 @@ fn a_harness_conversation_grows_by_its_new_turns() {
     let (second_turn, _) = turn(second);
 
     assert_eq!(first_turn.max_und_tokens, 64);
-    assert!(first_lowering.parser.unwrap().parse_tools);
+    assert!(!first_lowering.parser.unwrap().tool_calls.is_empty());
     assert!(first_lowering.response.unwrap().include_usage);
     assert!(first_turn.cache.isolation_key.is_some());
     assert_eq!(

@@ -21,10 +21,7 @@ use crate::api::model::ModelConfig;
 use crate::api::model::assets::model_files::ModelSource;
 use crate::api::model::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::api::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
-use processing::{
-    Family, ImageFamily, ImageProcessor, ReasoningFormat, Registry, Serving, ToolCallFormat,
-    VideoFamily,
-};
+use processing::{Family, ImageFamily, ImageProcessor, Registry, Serving, VideoFamily};
 use proto::handoff;
 use proto::request::{
     CachePolicy, GenerationFeatures, GenerationLimits, GenerationRequest, RequestId,
@@ -554,23 +551,20 @@ impl Processor {
         let Some(profile) = self.config.chat() else {
             return handoff::Parser::default();
         };
-        // The kind names the tool-call format; a family that writes none has its reasoning
-        // parsed under the first kind, which then parses no tool call.
-        let kind = match (profile.reasoning, profile.tool_calls) {
-            (None, None) => handoff::parser::Kind::ParserKindNone,
-            (_, Some(ToolCallFormat::Xml)) => handoff::parser::Kind::ParserKindXml,
-            (_, Some(ToolCallFormat::Json)) | (Some(ReasoningFormat::Think), None) => {
-                handoff::parser::Kind::ParserKindJson
-            }
-        };
+        let reasoning = profile.reasoning.filter(|_| self.parse_reasoning);
         let tools = request
             .callable_tools()
             .filter(|_| profile.tool_calls.is_some());
 
         handoff::Parser {
-            kind: kind as i32,
-            parse_reasoning: self.parse_reasoning && profile.reasoning.is_some(),
-            parse_tools: tools.is_some(),
+            reasoning: reasoning
+                .map(|format| format.name().to_owned())
+                .unwrap_or_default(),
+            tool_calls: profile
+                .tool_calls
+                .filter(|_| tools.is_some())
+                .map(|format| format.name().to_owned())
+                .unwrap_or_default(),
             // A request's tools serialize as it stated them.
             tools: tools
                 .and_then(|tools| serde_json::to_string(tools).ok())

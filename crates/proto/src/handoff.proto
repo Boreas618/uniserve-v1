@@ -186,30 +186,22 @@ message TextDecode {
   uint32 min_tokens = 4;
 }
 
-// The output parsers of a request: the formats its model family's chat
-// profile names, and which of them the request's output is read with.
+// The output parsers of a request: the formats of its model family's chat
+// profile its output is read with, each by the name the request-processing
+// vocabulary gives it (`processing::ReasoningFormat::name`,
+// `processing::ToolCallFormat::name`), which this schema does not enumerate.
 message Parser {
-  // The formats the request's output may be written in. Reasoning has one
-  // format, `<think>` and `</think>` around it; a kind names the tool-call
-  // format beside it.
-  enum Kind {
-    // Neither reasoning nor tool calls are parsed.
-    PARSER_KIND_NONE = 0;
-    // Tool calls as one JSON object between `<tool_call>` and `</tool_call>`.
-    PARSER_KIND_JSON = 1;
-    // Tool calls as `<function=NAME>` and `<parameter=ARG>` tags between
-    // `<tool_call>` and `</tool_call>`.
-    PARSER_KIND_XML = 2;
-  }
-
-  Kind kind = 1;
-  // Whether reasoning is parsed.
-  bool parse_reasoning = 2;
-  // Whether tool calls are parsed.
-  bool parse_tools = 3;
-  // The request's tool definitions, as the JSON array the request stated: a
-  // parser that types a call's values by its tool's schema reads them. Empty
-  // when tool calls are not parsed.
+  reserved 1, 2, 3;
+  reserved "kind", "parse_reasoning", "parse_tools";
+  // The reasoning format the output's reasoning is parsed in; empty when
+  // reasoning is not parsed.
+  string reasoning = 5;
+  // The tool-call format the output's tool calls are parsed in; empty when
+  // tool calls are not parsed.
+  string tool_calls = 6;
+  // The request's tool definitions, as the JSON array the client stated them
+  // in: a parser that types a call's values by its tool's schema reads them.
+  // Empty when tool calls are not parsed.
   string tools = 4;
 }
 

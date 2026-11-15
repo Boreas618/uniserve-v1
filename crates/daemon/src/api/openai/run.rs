@@ -837,9 +837,8 @@ mod tests {
     /// function and parameter tags.
     fn lookup_parser() -> handoff::Parser {
         handoff::Parser {
-            kind: handoff::parser::Kind::ParserKindXml as i32,
-            parse_reasoning: false,
-            parse_tools: true,
+            reasoning: String::new(),
+            tool_calls: "xml".to_owned(),
             tools: serde_json::json!([{
                 "type": "function",
                 "function": {

@@ -37,10 +37,16 @@ fn qwen3(
     tokenizer: DynTokenizer,
     reasoning: bool,
 ) -> Result<ChatParser, Box<dyn std::error::Error + Send + Sync>> {
+    let named = |parsed: bool, name: &str| {
+        if parsed {
+            name.to_owned()
+        } else {
+            String::new()
+        }
+    };
     let parser = handoff::Parser {
-        kind: handoff::parser::Kind::ParserKindJson as i32,
-        parse_reasoning: reasoning,
-        parse_tools: tools,
+        reasoning: named(reasoning, "think"),
+        tool_calls: named(tools, "json"),
         tools: String::new(),
     };
     Ok(ChatParser::new(&parser, tokenizer)?)
@@ -216,9 +222,8 @@ fn disabled_reasoning_parsing_streams_delimiters_as_content() -> TestResult {
 #[test]
 fn function_and_parameter_tags_become_typed_tool_calls() -> TestResult {
     let parser = handoff::Parser {
-        kind: handoff::parser::Kind::ParserKindXml as i32,
-        parse_reasoning: true,
-        parse_tools: true,
+        reasoning: "think".to_owned(),
+        tool_calls: "xml".to_owned(),
         tools: serde_json::json!([{
             "type": "function",
             "function": {

@@ -57,55 +57,57 @@ pub struct ChatParser {
 }
 
 impl ChatParser {
-    /// The parsers `parser` states for a request: the `<think>` reasoning parser when
-    /// reasoning is parsed, and the parser of the kind's tool-call format when tool calls
-    /// are.
+    /// The parsers `parser` states for a request: the parser of its reasoning format when
+    /// reasoning is parsed, and the parser of its tool-call format when tool calls are.
     ///
     /// # Errors
     ///
-    /// Returns `Error::ParserInitialization` when the tokenizer lacks a reasoning delimiter
-    /// as one token, or the request's tools are not the JSON array a request states.
+    /// Returns `Error::ParserInitialization` when a format's name is no format's, the
+    /// tokenizer lacks a reasoning delimiter as one token, or the request's tools are not the
+    /// JSON array a request states.
     pub fn new(parser: &handoff::Parser, tokenizer: DynTokenizer) -> Result<Self> {
-        let kind = handoff::parser::Kind::try_from(parser.kind)
-            .unwrap_or(handoff::parser::Kind::ParserKindNone);
+        let unknown = |kind: &'static str, name: &str| Error::ParserInitialization {
+            kind,
+            name: name.to_owned(),
+            error: format!("no {kind} format is named {name:?}").into(),
+        };
 
-        let reasoning = match kind {
-            handoff::parser::Kind::ParserKindNone => None,
-            handoff::parser::Kind::ParserKindJson | handoff::parser::Kind::ParserKindXml
-                if parser.parse_reasoning =>
-            {
-                let format = ReasoningFormat::Think;
+        let reasoning = match parser.reasoning.as_str() {
+            "" => None,
+            name => {
+                let format =
+                    ReasoningFormat::named(name).ok_or_else(|| unknown("reasoning", name))?;
                 let (start, end) = format.delimiters();
                 let reasoning = DelimitedReasoningParser::new(tokenizer, start, end, false)
                     .map_err(|error| Error::ParserInitialization {
                         kind: "reasoning",
-                        name: format!("{format:?}"),
+                        name: format.name().to_owned(),
                         error: Box::new(error),
                     })?;
                 Some(reasoning)
             }
-            _ => None,
         };
 
-        let tools: Option<Box<dyn ToolParser>> = match kind {
-            _ if !parser.parse_tools => None,
-            handoff::parser::Kind::ParserKindNone => None,
-            handoff::parser::Kind::ParserKindJson => Some(Box::new(JsonToolParser::new())),
-            handoff::parser::Kind::ParserKindXml => {
-                // The tools travel as the JSON array the request stated them in.
-                let tools = if parser.tools.is_empty() {
-                    Vec::new()
-                } else {
-                    serde_json::from_str(&parser.tools).map_err(|error| {
-                        Error::ParserInitialization {
-                            kind: "tool",
-                            name: format!("{:?}", ToolCallFormat::Xml),
-                            error: Box::new(error),
-                        }
-                    })?
-                };
-                Some(Box::new(XmlToolParser::new(tools)))
-            }
+        let tools: Option<Box<dyn ToolParser>> = match parser.tool_calls.as_str() {
+            "" => None,
+            name => match ToolCallFormat::named(name).ok_or_else(|| unknown("tool", name))? {
+                ToolCallFormat::Json => Some(Box::new(JsonToolParser::new())),
+                ToolCallFormat::Xml => {
+                    // The tools travel as the JSON array the request stated them in.
+                    let tools = if parser.tools.is_empty() {
+                        Vec::new()
+                    } else {
+                        serde_json::from_str(&parser.tools).map_err(|error| {
+                            Error::ParserInitialization {
+                                kind: "tool",
+                                name: ToolCallFormat::Xml.name().to_owned(),
+                                error: Box::new(error),
+                            }
+                        })?
+                    };
+                    Some(Box::new(XmlToolParser::new(tools)))
+                }
+            },
         };
 
         Ok(Self {
