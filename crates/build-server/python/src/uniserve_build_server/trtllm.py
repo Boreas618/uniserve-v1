@@ -184,6 +184,21 @@ ROUTED_GEMM = LaunchCode(
 )
 
 
+def headers(request: Request, library: str) -> list[str]:
+    """The headers a pinned trtllm-gen library publishes, by their paths in it.
+
+    They are its manifest's files under ``include/``: the library's kernel
+    table and, for the batched-GEMM library, the export headers its launch
+    code includes, which declare the table's struct and the enumerations of
+    its options.
+    """
+    try:
+        files = fetch.manifest(fetch.pin(library), request.cache)
+    except fetch.FetchError as error:
+        raise SystemExit(f"reading the {library} manifest: {error}") from error
+    return sorted(name for name in files if name.startswith("include/"))
+
+
 def stage(
     request: Request, library: str, staged: pathlib.Path, names: Iterable[str]
 ) -> None:
@@ -674,32 +689,6 @@ def publish(
 #: The batched-GEMM library's kernel table.
 BMM_TABLE = "include/flashinferMetaInfo.h"
 
-#: The export headers of the batched-GEMM library the launch code includes,
-#: which also declare the table's struct and the enumerations its options
-#: take.
-EXPORT_HEADERS = [
-    f"include/trtllmGen_bmm_export/{name}"
-    for name in (
-        "BatchedGemmEnums.h",
-        "BatchedGemmInterface.h",
-        "BatchedGemmOptions.h",
-        "Enums.h",
-        "GemmGatedActOptions.h",
-        "GemmOptions.h",
-        "KernelParams.h",
-        "KernelParamsDecl.h",
-        "KernelTraits.h",
-        "TmaDescriptor.h",
-        "trtllm/gen/CommonUtils.h",
-        "trtllm/gen/CudaArchDecl.h",
-        "trtllm/gen/CudaKernelLauncher.h",
-        "trtllm/gen/DtypeDecl.h",
-        "trtllm/gen/MmaDecl.h",
-        "trtllm/gen/SfLayoutDecl.h",
-        "trtllm/gen/SparsityDecl.h",
-    )
-]
-
 
 def filtered_header(original: str, kernels: Sequence[Kernel]) -> str:
     """The library's table, filtered to the kernels this module published."""
@@ -797,8 +786,8 @@ def build_routed_gemm(
 
     Steps:
 
-    1. stage the `trtllm-gen-bmm` library's table and export headers, each
-       verified against the pin;
+    1. stage the `trtllm-gen-bmm` library's headers (:func:`headers`: its
+       table and export headers), each verified against the pin;
     2. select the kernels (:func:`select`) by the options the manifest's
        `[parameters.selected]` states and the descriptor's MMA tile and
        cluster, on the target's architecture families;
@@ -815,10 +804,13 @@ def build_routed_gemm(
     """
     library = ROUTED_GEMM.library
     with cuda.scratch(request) as staging:
-        stage(request, library, staging, [BMM_TABLE, *EXPORT_HEADERS])
+        published = headers(request, library)
+        stage(request, library, staging, published)
         header = (staging / BMM_TABLE).read_text()
         declarations = "\n".join(
-            (staging / name).read_text() for name in EXPORT_HEADERS
+            (staging / name).read_text()
+            for name in published
+            if name != BMM_TABLE
         )
         enums = enumerations([declarations])
         options = {
