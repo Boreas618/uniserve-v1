@@ -79,12 +79,6 @@ const BODY_CHUNK: usize = 64 << 10;
 /// the wait (`server_config.shutdown_timeout`). A closed `admitting` ends them
 /// there too, for the other reason a daemon takes no new request: it is
 /// handing the deployment over (design §7.5.1 step 1).
-#[expect(
-    clippy::large_futures,
-    reason = "the connection future holds its 64 KiB read chunk across a socket read and is \
-              polled in place inside the connection's spawned task; boxing each await would add \
-              an allocation per request or per read"
-)]
 pub(crate) async fn serve(
     mut listener: Listener,
     app: Router,
@@ -133,12 +127,6 @@ pub(crate) async fn serve(
 /// body's framing, and serves the next request on the connection when it is
 /// kept alive. `http.read_ahead` are request bytes the predecessor read and
 /// the successor reads as its own.
-#[expect(
-    clippy::large_futures,
-    reason = "the connection future holds its 64 KiB read chunk across a socket read and is \
-              polled in place inside the connection's spawned task; boxing each await would add \
-              an allocation per request or per read"
-)]
 pub(crate) async fn adopt(
     descriptor: OwnedFd,
     http: proto::handoff::Http,
@@ -149,7 +137,8 @@ pub(crate) async fn adopt(
     finished: impl FnOnce(),
 ) -> anyhow::Result<()> {
     let io = socket_of(descriptor).context("taking over a handed connection")?;
-    let mut connection = Connection::new(io, app, CancellationToken::new(), admitting);
+    let mut connection = Connection::new(io, app, CancellationToken::new(), admitting)
+        .context("reading the handed connection's receive buffer")?;
     connection.buffer = BytesMut::from(http.read_ahead.as_slice());
     // The counters continue the record the pause made.
     connection.written = http.written;
@@ -283,19 +272,14 @@ fn socket_of(descriptor: OwnedFd) -> io::Result<Io> {
 
 /// Serves one accepted connection until the client closes it, the server stops
 /// serving, or the connection ends it.
-#[expect(
-    clippy::large_futures,
-    reason = "the connection future holds its 64 KiB read chunk across a socket read and is \
-              polled in place inside the connection's spawned task; boxing each await would add \
-              an allocation per request or per read"
-)]
 async fn serve_connection(
     io: Io,
     app: Router,
     accepting: CancellationToken,
     admitting: Admissions,
 ) -> anyhow::Result<()> {
-    let mut connection = Connection::new(io, app, accepting, admitting);
+    let mut connection = Connection::new(io, app, accepting, admitting)
+        .context("reading the connection's receive buffer")?;
     connection.run().await
 }
 
@@ -323,11 +307,24 @@ struct Connection {
     written: u64,
     /// Body frames of the response being written.
     frames: u64,
+    /// The most bytes one read takes: the socket's receive buffer
+    /// (`service::receive_buffer_bytes`).
+    read_bytes: usize,
 }
 
 impl Connection {
-    fn new(io: Io, app: Router, accepting: CancellationToken, admitting: Admissions) -> Self {
-        Self {
+    fn new(
+        io: Io,
+        app: Router,
+        accepting: CancellationToken,
+        admitting: Admissions,
+    ) -> io::Result<Self> {
+        let socket = match &io {
+            Either::Left(stream) => stream.as_fd(),
+            Either::Right(stream) => stream.as_fd(),
+        };
+        let read_bytes = service::receive_buffer_bytes(socket)?;
+        Ok(Self {
             io,
             app,
             accepting,
@@ -337,16 +334,11 @@ impl Connection {
             pending: BytesMut::new(),
             written: 0,
             frames: 0,
-        }
+            read_bytes,
+        })
     }
 
     /// Serves requests on the connection until it ends.
-    #[expect(
-        clippy::large_futures,
-        reason = "the connection future holds its 64 KiB read chunk across a socket read and is \
-                  polled in place inside the connection's spawned task; boxing each await would add \
-                  an allocation per request or per read"
-    )]
     async fn run(&mut self) -> anyhow::Result<()> {
         loop {
             // A server that is shutting down, or handing the deployment
@@ -413,12 +405,6 @@ impl Connection {
     /// body already ended, or the socket still owes bytes), and a handler that
     /// parked on those bytes must not be left waiting on a notify that has
     /// already been spent.
-    #[expect(
-        clippy::large_futures,
-        reason = "the connection future holds its 64 KiB read chunk across a socket read and is \
-                  polled in place inside the connection's spawned task; boxing each await would add \
-                  an allocation per request or per read"
-    )]
     async fn call(
         &mut self,
         request: Request<Body>,
@@ -457,12 +443,6 @@ impl Connection {
     ///
     /// The bytes the head does not consume stay in [`Self::buffer`] for the
     /// request's body or the next request.
-    #[expect(
-        clippy::large_futures,
-        reason = "the connection future holds its 64 KiB read chunk across a socket read and is \
-                  polled in place inside the connection's spawned task; boxing each await would add \
-                  an allocation per request or per read"
-    )]
     async fn read_head(&mut self) -> anyhow::Result<Option<Head>> {
         loop {
             if let Some(end) = find_head_end(&self.buffer) {
@@ -495,18 +475,15 @@ impl Connection {
         if self.peer_closed {
             return Ok(false);
         }
-        // As much as a connection of the workspace reads from its socket at a time.
-        let mut chunk = [0_u8; service::READ_CHUNK];
+        // Room for as much as one read from the socket takes.
+        self.buffer.reserve(self.read_bytes);
         loop {
-            match self.io.read(&mut chunk).await {
+            match self.io.read_buf(&mut self.buffer).await {
                 Ok(0) => {
                     self.peer_closed = true;
                     return Ok(false);
                 }
-                Ok(read) => {
-                    self.buffer.extend_from_slice(&chunk[..read]);
-                    return Ok(true);
-                }
+                Ok(_) => return Ok(true),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error).context("reading from a connection"),
             }
@@ -539,9 +516,8 @@ impl Connection {
             if !body_ended || !self.buffer.is_empty() {
                 return std::future::pending().await;
             }
-            // Room for one read as large as a connection of the workspace
-            // reads at a time.
-            self.buffer.reserve(service::READ_CHUNK);
+            // Room for as much as one read from the socket takes.
+            self.buffer.reserve(self.read_bytes);
             match self.io.read_buf(&mut self.buffer).await {
                 Ok(0) => {
                     debug!("a client closed its connection while its request was served");
@@ -566,12 +542,6 @@ impl Connection {
     /// polled: returning lets the connection poll the handler first, so a body
     /// the buffer already carries cannot leave the handler parked behind a
     /// socket that owes nothing.
-    #[expect(
-        clippy::large_futures,
-        reason = "the connection future holds its 64 KiB read chunk across a socket read and is \
-                  polled in place inside the connection's spawned task; boxing each await would add \
-                  an allocation per request or per read"
-    )]
     async fn pump(&mut self, body: &mut RequestBody) -> anyhow::Result<()> {
         loop {
             let fed = body.de_frame(&mut self.buffer)?;

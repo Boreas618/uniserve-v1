@@ -842,8 +842,8 @@ impl Response {
 fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
     let mut artifact_transfer: Option<MediaReceiver> = None;
     loop {
-        let message = match reader.try_recv::<wire::FromEngine>() {
-            Ok(Some(message)) => message,
+        let (message, mut descriptors) = match reader.try_recv_with::<wire::FromEngine>() {
+            Ok(Some(received)) => received,
             Ok(None) => {
                 if reader.wait(READ_INTERVAL).is_err() {
                     break;
@@ -885,8 +885,8 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                             }
                         }
                     }
-                    (Some(wire::event::Kind::Artifact(artifact)), None) => reader
-                        .take_descriptor()
+                    (Some(wire::event::Kind::Artifact(artifact)), None) => descriptors
+                        .pop()
                         .and_then(|descriptor| {
                             MappedMedia::map(descriptor, artifact.bytes)
                                 .inspect_err(|error| {

@@ -1795,8 +1795,8 @@ pub enum ServerMessage {
 
 /// The payload of a frame of the Storage Server's protocol: `message` in MessagePack with named
 /// fields, so a reader of another version skips a field it does not know and its own fields
-/// default when absent. Each such frame is a descriptor frame (`service::frame`): the messages
-/// carry the descriptors of the storage they name.
+/// default when absent. Each such frame (`service::frame`) carries the descriptors of the
+/// storage its message names.
 ///
 /// # Errors
 ///
@@ -1817,8 +1817,6 @@ pub fn decode<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result
 }
 
 impl service::Message for ClientMessage {
-    const FRAMING: service::Framing = service::Framing::Descriptors;
-
     fn encode(&self) -> std::io::Result<Vec<u8>> {
         encode(self)
     }
@@ -1829,8 +1827,6 @@ impl service::Message for ClientMessage {
 }
 
 impl service::Message for ServerMessage {
-    const FRAMING: service::Framing = service::Framing::Descriptors;
-
     fn encode(&self) -> std::io::Result<Vec<u8>> {
         encode(self)
     }

@@ -45,15 +45,17 @@ fn a_frame_carries_its_descriptor_and_the_receiver_maps_the_bytes() {
     drop(shared);
     sender.send(&announce("none")).unwrap();
 
-    let first: wire::Artifact = receiver.recv(Duration::from_secs(5)).unwrap().unwrap();
+    let (first, mut descriptors): (wire::Artifact, _) =
+        receiver.recv_with(Duration::from_secs(5)).unwrap().unwrap();
     assert_eq!(first.content_type, "video/mp4");
-    let descriptor = receiver.take_descriptor().expect("the frame's descriptor");
+    let descriptor = descriptors.pop().expect("the frame's descriptor");
     let mapped = MappedMedia::map(descriptor, first.bytes).unwrap();
     assert_eq!(mapped.bytes(), bytes);
 
-    let second: wire::Artifact = receiver.recv(Duration::from_secs(5)).unwrap().unwrap();
+    let (second, descriptors): (wire::Artifact, _) =
+        receiver.recv_with(Duration::from_secs(5)).unwrap().unwrap();
     assert_eq!(second.content_type, "none");
-    assert!(receiver.take_descriptor().is_none());
+    assert!(descriptors.is_empty());
 
     // A mapping is never longer than the object it maps.
     assert!(MappedMedia::map(storage(b"short"), 64).is_err());

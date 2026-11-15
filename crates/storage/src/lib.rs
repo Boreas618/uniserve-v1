@@ -9,7 +9,7 @@
 //! again.
 //!
 //! - [`protocol`]: the messages, versioned independently of the build, each a
-//!   descriptor frame with its file descriptors on the workspace's one
+//!   frame with its file descriptors on the workspace's one
 //!   connection (`service::Connection`).
 //! - [`queue`]: the queue pair in shared memory between a scheduler and the
 //!   buffer pool.

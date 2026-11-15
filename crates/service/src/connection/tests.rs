@@ -4,13 +4,11 @@ use super::*;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A message of length-prefixed frames: its text, which must be UTF-8.
+/// A message: its text, which must be UTF-8.
 #[derive(Clone, Debug, PartialEq)]
 struct Line(String);
 
 impl Message for Line {
-    const FRAMING: Framing = Framing::Length;
-
     fn encode(&self) -> io::Result<Vec<u8>> {
         Ok(self.0.clone().into_bytes())
     }
@@ -22,30 +20,24 @@ impl Message for Line {
     }
 }
 
-/// A message of descriptor frames: its text.
-#[derive(Clone, Debug, PartialEq)]
-struct Note(String);
-
-impl Message for Note {
-    const FRAMING: Framing = Framing::Descriptors;
-
-    fn encode(&self) -> io::Result<Vec<u8>> {
-        Ok(self.0.clone().into_bytes())
-    }
-
-    fn decode(payload: &[u8]) -> io::Result<Self> {
-        Line::decode(payload).map(|line| Self(line.0))
-    }
-}
-
 /// `length` bytes of text.
 fn line(length: usize) -> Line {
     Line("m".repeat(length))
 }
 
+/// The bytes of a frame that carries `payload` and no descriptor, as the frame layout states
+/// them: the payload's length and a descriptor count of zero, little-endian, then the payload.
+fn frame_carrying(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+    frame.extend_from_slice(&0_u32.to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
 /// The bytes of the frame that carries `message`.
 fn frame_of(message: &Line) -> Vec<u8> {
-    frame::length_prefixed(&message.encode().unwrap()).unwrap()
+    frame_carrying(&message.encode().unwrap())
 }
 
 /// A temporary file holding `text`, as a descriptor to pass.
@@ -191,8 +183,7 @@ fn completed_messages_survive_a_truncated_last_frame() {
 #[test]
 fn a_frame_decodes_only_as_the_message_it_carries() {
     let (mut connection, mut peer) = with_raw_peer();
-    peer.write_all(&frame::length_prefixed(&[0xff, 0xfe]).unwrap())
-        .unwrap();
+    peer.write_all(&frame_carrying(&[0xff, 0xfe])).unwrap();
     let error = receive::<Line>(&mut connection).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidData);
 }
@@ -377,7 +368,6 @@ fn a_frame_beyond_its_messages_bound_is_refused() {
     struct Short;
 
     impl Message for Short {
-        const FRAMING: Framing = Framing::Length;
         const MAX_BYTES: usize = 8;
 
         fn encode(&self) -> io::Result<Vec<u8>> {
@@ -390,7 +380,8 @@ fn a_frame_beyond_its_messages_bound_is_refused() {
     }
 
     let (mut connection, mut peer) = with_raw_peer();
-    peer.write_all(&frame_of(&line(9))[..6]).unwrap();
+    peer.write_all(&frame_of(&line(9))[..frame::HEADER_BYTES])
+        .unwrap();
     let error = receive::<Short>(&mut connection).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidData);
 }
@@ -423,10 +414,10 @@ fn a_hangup_reports_the_peers_close_and_nothing_else() {
     }
 }
 
-/// A descriptor frame hands its receiver exactly its own descriptors, more than one send carries,
-/// in order; the frame after it carries none.
+/// A frame hands its receiver exactly its own descriptors, more than one send carries, in order;
+/// the frame after it carries none, and a receive that does not take descriptors closes them.
 #[test]
-fn descriptor_frames_carry_their_descriptors_in_order_beyond_one_send() {
+fn frames_carry_their_descriptors_in_order_beyond_one_send() {
     let (left, right) = UnixStream::pair().unwrap();
     let mut sender = Connection::new(left).unwrap();
     let mut receiver = Connection::new(right).unwrap();
@@ -435,50 +426,38 @@ fn descriptor_frames_carry_their_descriptors_in_order_beyond_one_send() {
         .map(|index| file(&index.to_string()))
         .collect();
     let borrowed: Vec<BorrowedFd<'_>> = files.iter().map(AsFd::as_fd).collect();
-    sender.send_with(&Note("with".into()), &borrowed).unwrap();
-    sender.send(&Note("after".into())).unwrap();
+    sender.send_with(&Line("with".into()), &borrowed).unwrap();
+    sender.send(&Line("after".into())).unwrap();
+    sender
+        .send_with(&Line("unread".into()), &borrowed[..1])
+        .unwrap();
+    sender.send(&Line("last".into())).unwrap();
     sender.flush().unwrap();
 
-    let (first, descriptors) = receiver.recv_with::<Note>(TIMEOUT).unwrap().unwrap();
-    assert_eq!(first, Note("with".into()));
+    let (first, descriptors) = receiver.recv_with::<Line>(TIMEOUT).unwrap().unwrap();
+    assert_eq!(first, Line("with".into()));
     assert_eq!(descriptors.len(), MAX_DESCRIPTORS_PLUS);
     for (index, descriptor) in descriptors.into_iter().enumerate() {
         assert_eq!(read(descriptor), index.to_string());
     }
-    let (second, descriptors) = receiver.recv_with::<Note>(TIMEOUT).unwrap().unwrap();
-    assert_eq!((second, descriptors.len()), (Note("after".into()), 0));
+    let (second, descriptors) = receiver.recv_with::<Line>(TIMEOUT).unwrap().unwrap();
+    assert_eq!((second, descriptors.len()), (Line("after".into()), 0));
+
+    // A frame received without its descriptors leaves none for the frame after it.
+    assert_eq!(
+        receive::<Line>(&mut receiver).unwrap(),
+        Line("unread".into())
+    );
+    let (last, descriptors) = receiver.recv_with::<Line>(TIMEOUT).unwrap().unwrap();
+    assert_eq!((last, descriptors.len()), (Line("last".into()), 0));
 }
 
 /// More descriptors than one send carries, so a frame's travel on carrier bytes too.
 const MAX_DESCRIPTORS_PLUS: usize = frame::MAX_DESCRIPTORS + 7;
 
-/// A length-prefixed frame's descriptor waits for its receiver after the message that announces
-/// it, and the frame after it brings none; TCP carries no descriptor.
+/// TCP carries no descriptor: a send that would is refused before anything is sent.
 #[test]
-fn a_length_prefixed_frames_descriptor_is_taken_after_its_message() {
-    let (left, right) = UnixStream::pair().unwrap();
-    let mut sender = Connection::new(left).unwrap();
-    let mut receiver = Connection::new(right).unwrap();
-
-    let shared = file("shared bytes");
-    sender
-        .send_with(&Line("announce".into()), &[shared.as_fd()])
-        .unwrap();
-    drop(shared);
-    sender.send(&Line("plain".into())).unwrap();
-
-    assert_eq!(
-        receive::<Line>(&mut receiver).unwrap(),
-        Line("announce".into())
-    );
-    let descriptor = receiver.take_descriptor().expect("the frame's descriptor");
-    assert_eq!(read(descriptor), "shared bytes");
-    assert_eq!(
-        receive::<Line>(&mut receiver).unwrap(),
-        Line("plain".into())
-    );
-    assert!(receiver.take_descriptor().is_none());
-
+fn tcp_refuses_descriptors() {
     let (mut tcp, _peer) = with_raw_peer();
     let refused = tcp
         .send_with(&Line("x".into()), &[file("x").as_fd()])
@@ -486,12 +465,13 @@ fn a_length_prefixed_frames_descriptor_is_taken_after_its_message() {
     assert_eq!(refused.kind(), ErrorKind::InvalidInput);
 }
 
-/// A connection handed to another process goes on with the bytes it had received; one with a
-/// descriptor not yet taken is not handed over, since the descriptor would not cross.
+/// A connection handed to another process goes on with the bytes it had received; one holding
+/// descriptors of a frame that has not arrived whole is not handed over, since the descriptors
+/// would not cross.
 #[test]
 fn a_handed_over_connection_goes_on_with_what_it_received() {
     let (left, right) = UnixStream::pair().unwrap();
-    let mut sender = Connection::new(left).unwrap();
+    let mut sender = Connection::new(left.try_clone().unwrap()).unwrap();
     let mut receiver = Connection::new(right).unwrap();
 
     sender.send(&Line("first".into())).unwrap();
@@ -507,13 +487,17 @@ fn a_handed_over_connection_goes_on_with_what_it_received() {
         Line("second".into())
     );
 
+    // The head of a frame that states one descriptor and five payload bytes, with its
+    // descriptor and two of the bytes.
     let shared = file("held");
-    sender
-        .send_with(&Line("announce".into()), &[shared.as_fd()])
-        .unwrap();
+    let mut head = Vec::new();
+    head.extend_from_slice(&5_u32.to_le_bytes());
+    head.extend_from_slice(&1_u32.to_le_bytes());
+    head.extend_from_slice(b"he");
+    frame::send_with_descriptors(left.as_fd(), &head, &[shared.as_fd()]).unwrap();
     assert_eq!(
-        receive::<Line>(&mut resumed).unwrap(),
-        Line("announce".into())
+        resumed.recv::<Line>(Duration::from_millis(100)).unwrap(),
+        None
     );
     let refused = resumed.hand_over().err().expect("a held descriptor stays");
     assert_eq!(refused.kind(), ErrorKind::WouldBlock);
@@ -526,7 +510,7 @@ fn a_closed_peer_ends_a_receive() {
     drop(left);
     let mut receiver = Connection::new(right).unwrap();
     let started = Instant::now();
-    let error = receiver.recv::<Note>(Duration::from_secs(30)).unwrap_err();
+    let error = receiver.recv::<Line>(Duration::from_secs(30)).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
     assert!(started.elapsed() < Duration::from_secs(30));
 }

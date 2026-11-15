@@ -35,8 +35,6 @@ const REGISTERS: usize = 7;
 struct Frame(Vec<u8>);
 
 impl service::Message for Frame {
-    const FRAMING: service::Framing = service::Framing::Descriptors;
-
     fn encode(&self) -> std::io::Result<Vec<u8>> {
         Ok(self.0.clone())
     }

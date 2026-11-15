@@ -1,7 +1,7 @@
 //! The Build Server's protocol and its client (design section 6.3).
 //!
 //! A connection to the Build Server is the workspace's one connection
-//! (`service::Connection`) carrying Protobuf messages in descriptor frames:
+//! (`service::Connection`) carrying Protobuf messages, one frame each:
 //! the client sends one [`wire::Request`], the server responds with
 //! [`wire::ServerMessage`] frames until the one that responds to the request.
 //! AOT builds report themselves as [`Progress`] frames while `prepare` runs;
@@ -387,7 +387,7 @@ pub fn connect(socket: &Path) -> Result<Connection> {
     Ok(Connection::new(UnixStream::connect(socket)?)?)
 }
 
-/// The messages of the protocol on the workspace's one connection: each a descriptor frame
+/// The messages of the protocol on the workspace's one connection: each a frame
 /// (`service::frame`) whose payload is the message's Protobuf encoding, with the descriptors the
 /// message names riding on it, so a receiver that reads a frame never gets another frame's
 /// descriptors.
@@ -395,7 +395,6 @@ macro_rules! messages {
     ($($message:ty),* $(,)?) => {
         $(
             impl service::Message for $message {
-                const FRAMING: service::Framing = service::Framing::Descriptors;
 
                 fn encode(&self) -> io::Result<Vec<u8>> {
                     Ok(Message::encode_to_vec(self))

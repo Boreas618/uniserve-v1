@@ -18,7 +18,7 @@
 //! Each connection opens with a hello exchange that agrees the version of the
 //! engine interface it speaks ([`ENGINE_INTERFACE_VERSION`], [`speaks`]). The
 //! workspace's one connection (`service::Connection`) carries the messages,
-//! one length-prefixed frame each, over a Unix socket on one node or TCP
+//! one frame each, over a Unix socket on one node or TCP
 //! between nodes: every envelope of the interfaces implements
 //! `service::Message` here.
 
@@ -114,18 +114,24 @@ pub const fn speaks(version: u32) -> bool {
     ENGINE_INTERFACE_OLDEST <= version && version <= ENGINE_INTERFACE_VERSION
 }
 
-/// The longest frame a peer of the interfaces may send: their messages are
-/// small, and a longer length is a corrupt stream.
-const MAX_FRAME: usize = 64 << 20;
+/// The longest hello or welcome a peer may send: one states versions, a build and the identity
+/// of the peer, a few hundred bytes, and a longer one is a corrupt stream.
+const HANDSHAKE_BYTES: usize = 64 << 10;
+
+/// The longest other message a peer of the interfaces may send. The largest are a submission,
+/// which carries a request as the daemon's HTTP server admitted it (its body limit is 64 MiB),
+/// and a launch, which carries a deployment's configuration; media cross by descriptor or in
+/// parts. A longer length is a corrupt stream.
+const MESSAGE_BYTES: usize = 64 << 20;
 
 /// Implements the workspace's connection codec for each envelope of the
-/// interfaces: its Protobuf encoding in one length-prefixed frame.
+/// interfaces: its Protobuf encoding as one frame's payload, of at most
+/// `$bytes` bytes.
 macro_rules! envelopes {
-    ($($message:ty),* $(,)?) => {
+    ($bytes:expr => $($message:ty),* $(,)?) => {
         $(
             impl service::Message for $message {
-                const FRAMING: service::Framing = service::Framing::Length;
-                const MAX_BYTES: usize = MAX_FRAME;
+                const MAX_BYTES: usize = $bytes;
 
                 fn encode(&self) -> std::io::Result<Vec<u8>> {
                     Ok(prost::Message::encode_to_vec(self))
@@ -145,14 +151,19 @@ macro_rules! envelopes {
 }
 
 envelopes!(
+    HANDSHAKE_BYTES =>
     process::Hello,
     process::Welcome,
+    request::wire::Hello,
+    request::wire::Welcome,
+);
+
+envelopes!(
+    MESSAGE_BYTES =>
     process::Upstream,
     process::Downstream,
     process::ToMember,
     process::FromMember,
-    request::wire::Hello,
-    request::wire::Welcome,
     request::wire::ToEngine,
     request::wire::FromEngine,
     request::wire::Artifact,

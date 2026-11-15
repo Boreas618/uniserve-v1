@@ -1,12 +1,11 @@
 //! The one connection every process interface of the workspace runs on, over a Unix socket on
 //! the host or TCP between hosts, and the listener that accepts it.
 //!
-//! A [`Connection`] carries the frames of [`crate::frame`]: the daemon's interfaces with the
-//! engine and the hot-restart handoff, and the engines' peer link, carry length-prefixed frames;
-//! the Storage Server's and the Build Server's connections carry descriptor frames. The codec and
-//! the frame layout are each protocol's: its envelope types implement [`Message`], which encodes a
-//! message into a frame's payload and names the layout its frames take. One connection carries
-//! the messages of one protocol.
+//! A [`Connection`] carries the frames of [`crate::frame`], the one frame layout of every
+//! protocol: the daemon's interfaces with the engine and the hot-restart handoff, the engines'
+//! peer link, and the Storage Server's and the Build Server's connections. The codec is each
+//! protocol's: its envelope types implement [`Message`], which encodes a message into a frame's
+//! payload. One connection carries the messages of one protocol.
 //!
 //! An address is written `unix:<path>` for a Unix socket and `<host>:<port>` for TCP. A
 //! connection is non-blocking and makes progress only when called: [`Connection::send`] queues a
@@ -21,13 +20,11 @@
 //!
 //! A closed connection is terminal. Frames that arrived whole before the close are still
 //! delivered; every call after them fails with `UnexpectedEof`. A TCP connection probes its peer
-//! ([`DEAD_PEER_SECS`]), so a peer whose host died closes the connection like one that exited.
+//! ([`Liveness`]), so a peer whose host died closes the connection like one that exited.
 //!
 //! Over a Unix socket a frame carries descriptors beside it ([`Connection::send_with`]): they
 //! travel with the frame's first byte and the receiver gets its own descriptors of the same open
-//! files. A descriptor frame hands the receiver exactly its own descriptors
-//! ([`Connection::try_recv_with`]); a length-prefixed frame states none, so its receiver takes
-//! the descriptor after the message that announces it ([`Connection::take_descriptor`]).
+//! files, exactly those of the frame they came with ([`Connection::try_recv_with`]).
 
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read as _, Write as _};
@@ -43,35 +40,37 @@ use crate::frame::{self, Segment};
 /// The prefix of a Unix socket address; the rest is the socket's path.
 const UNIX_PREFIX: &str = "unix:";
 
-/// Bytes one receive reads at most.
-pub const READ_CHUNK: usize = 64 * 1024;
-
-/// Seconds after which a TCP connection whose peer stopped answering fails.
+/// How a TCP connection notices a peer whose host stopped answering.
 ///
-/// A host that dies sends no close: without this bound a connection to it would stay open for as
-/// long as nothing is sent on it (the system default, two hours, is no bound in practice). The
-/// value is chosen, not derived.
-pub const DEAD_PEER_SECS: libc::c_int = 60;
-
-/// The layout of a protocol's frames ([`crate::frame`]).
+/// A host that dies sends no close: without a bound a connection to it would stay open for as long
+/// as nothing is sent on it (the kernel's keepalive default, two hours, is no bound in practice).
+/// An idle connection is probed after half of `bound` and fails when `probes` probes, spread over
+/// the other half, go unanswered; data sent and left unacknowledged fails it after the whole
+/// `bound` (TCP keepalive and `TCP_USER_TIMEOUT`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Framing {
-    /// A `u32` payload length, then the payload; descriptors ride on the first byte and the
-    /// message that announces them says how many.
-    Length,
-    /// A header of the payload's length and its descriptor count, the payload, and the carrier
-    /// bytes of further descriptors.
-    Descriptors,
+pub struct Liveness {
+    /// The time after which a connection whose peer stopped answering fails.
+    pub bound: Duration,
+    /// The keepalive probes an idle connection sends before it fails.
+    pub probes: u32,
 }
 
-/// An envelope of one protocol: how it becomes a frame's payload and back, and the layout of its
-/// frames. Every message one connection carries in either direction has the same framing.
-pub trait Message: Sized {
-    /// The layout this protocol's frames take.
-    const FRAMING: Framing;
+impl Liveness {
+    /// The workspace's policy for every TCP connection: a host that died is noticed within a
+    /// minute, inside the deployment's own failure bounds (a member's join, an engine's
+    /// watchdog), while a host whose processes are busy for seconds is not taken for dead.
+    pub const DEAD_PEER: Self = Self {
+        bound: Duration::from_secs(60),
+        probes: 3,
+    };
+}
 
-    /// The longest payload a peer may send; a longer one is a corrupt stream, refused before it
-    /// is buffered whole.
+/// An envelope of one protocol: how it becomes a frame's payload and back. Every message one
+/// connection carries in either direction belongs to the same protocol.
+pub trait Message: Sized {
+    /// The longest payload a peer may send of this message; a longer one is a corrupt stream,
+    /// refused before it is buffered whole. The frame header's own limit unless the protocol
+    /// states a tighter one for the message.
     const MAX_BYTES: usize = u32::MAX as usize;
 
     /// The message as a frame's payload.
@@ -136,13 +135,17 @@ pub struct Connection {
     socket: Socket,
     /// Bytes received and not yet taken as frames.
     inbox: Vec<u8>,
-    /// Descriptors received and not yet given to a frame or taken, in arrival order.
+    /// Descriptors received and not yet given to a frame, in arrival order.
     descriptors: VecDeque<OwnedFd>,
     /// Frames, or parts of frames, not yet written.
     outbox: VecDeque<Segment>,
     /// The terminal failure, as its kind and description, reported once the frames that arrived
     /// whole before it were taken: the peer's close (`UnexpectedEof`) or the socket's error.
     failure: Option<(ErrorKind, String)>,
+    /// The buffer one receive reads into, allocated at the first receive as large as the
+    /// socket's receive buffer (`SO_RCVBUF`): one receive returns at most what the socket holds,
+    /// so a larger buffer reads nothing more and a smaller one splits what arrived.
+    chunk: Vec<u8>,
     local: LocalWake,
 }
 
@@ -177,7 +180,7 @@ impl Connection {
                 // Without Nagle a small frame is sent without waiting for earlier data to be
                 // acknowledged.
                 stream.set_nodelay(true)?;
-                keep_alive(stream)?;
+                keep_alive(stream, Liveness::DEAD_PEER)?;
                 stream.set_nonblocking(true)?;
             }
         }
@@ -187,6 +190,7 @@ impl Connection {
             descriptors: VecDeque::new(),
             outbox: VecDeque::new(),
             failure: None,
+            chunk: Vec::new(),
             local: LocalWake::new()?,
         })
     }
@@ -335,8 +339,8 @@ impl Connection {
     }
 
     /// The next message once it arrived whole, and `None` while it has not. Reads what the socket
-    /// holds and writes what is queued when no whole frame is buffered. A descriptor frame's
-    /// descriptors are closed; a length-prefixed frame's wait for [`Connection::take_descriptor`].
+    /// holds and writes what is queued when no whole frame is buffered. The descriptors the frame
+    /// carried are closed.
     ///
     /// # Errors
     ///
@@ -346,8 +350,7 @@ impl Connection {
         Ok(self.try_recv_with()?.map(|(message, _)| message))
     }
 
-    /// [`Connection::try_recv`], with the descriptors a descriptor frame carried; a
-    /// length-prefixed frame's are none.
+    /// [`Connection::try_recv`], with the descriptors the frame carried.
     ///
     /// # Errors
     ///
@@ -372,7 +375,7 @@ impl Connection {
         Ok(self.recv_with(timeout)?.map(|(message, _)| message))
     }
 
-    /// [`Connection::recv`], with the descriptors a descriptor frame carried.
+    /// [`Connection::recv`], with the descriptors the frame carried.
     ///
     /// # Errors
     ///
@@ -394,12 +397,6 @@ impl Connection {
             }
             self.wait(remaining.unwrap_or(Duration::MAX))?;
         }
-    }
-
-    /// The next descriptor a length-prefixed frame carried, taken after the message that
-    /// announces it; `None` when none arrived.
-    pub fn take_descriptor(&mut self) -> Option<OwnedFd> {
-        self.descriptors.pop_front()
     }
 
     /// Blocks until something happens the owner can act on, or `timeout` passes: bytes arrive, a
@@ -513,48 +510,25 @@ impl Connection {
     fn queue<M: Message>(&mut self, message: &M, descriptors: Vec<OwnedFd>) -> io::Result<()> {
         self.failed()?;
         let payload = message.encode()?;
-        match M::FRAMING {
-            Framing::Length => self
-                .outbox
-                .push_back(frame::length_segment(&payload, descriptors)?),
-            Framing::Descriptors => self
-                .outbox
-                .extend(frame::descriptor_frame(&payload, descriptors)?),
-        }
+        self.outbox.extend(frame::segments(&payload, descriptors)?);
         self.try_flush().map(drop)
     }
 
-    /// Takes one whole frame of `M`'s layout from the received bytes, decoded, with its
-    /// descriptors.
+    /// Takes one whole frame from the received bytes, decoded as `M`, with its descriptors.
     fn take<M: Message>(&mut self) -> io::Result<Option<(M, Vec<OwnedFd>)>> {
-        let oversized = |length: usize| {
-            io::Error::new(
+        if let Some(length) = frame::payload_bytes(&self.inbox)
+            && length > M::MAX_BYTES
+        {
+            return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 format!(
                     "a frame of {length} bytes exceeds the {} bytes a message takes",
                     M::MAX_BYTES
                 ),
-            )
-        };
-        let frame = match M::FRAMING {
-            Framing::Length => {
-                if let Some(length) = frame::peek_length(&self.inbox)
-                    && length > M::MAX_BYTES
-                {
-                    return Err(oversized(length));
-                }
-                frame::take_length_prefixed(&mut self.inbox).map(|payload| (payload, Vec::new()))
-            }
-            Framing::Descriptors => {
-                if let Some(length) = frame::descriptor_frame_bytes(&self.inbox)
-                    && length > M::MAX_BYTES.saturating_add(frame::HEADER_BYTES)
-                {
-                    return Err(oversized(length));
-                }
-                frame::take_descriptor_frame(&mut self.inbox, &mut self.descriptors)
-            }
-        };
-        let Some((payload, descriptors)) = frame else {
+            ));
+        }
+        let Some((payload, descriptors)) = frame::take(&mut self.inbox, &mut self.descriptors)
+        else {
             return Ok(None);
         };
         Ok(Some((M::decode(&payload)?, descriptors)))
@@ -566,11 +540,19 @@ impl Connection {
         if self.failure.is_some() {
             return;
         }
-        let mut chunk = vec![0_u8; READ_CHUNK];
+        if self.chunk.is_empty() {
+            match receive_buffer_bytes(self.socket.as_fd()) {
+                Ok(bytes) => self.chunk = vec![0_u8; bytes],
+                Err(error) => {
+                    self.fail(error, "reading the receive buffer's size");
+                    return;
+                }
+            }
+        }
         loop {
             match frame::receive_with_descriptors(
                 self.socket.as_fd(),
-                &mut chunk,
+                &mut self.chunk,
                 &mut self.descriptors,
             ) {
                 // A peer that answers and then exits closes the stream with its last frames
@@ -582,7 +564,7 @@ impl Connection {
                     ));
                     return;
                 }
-                Ok(count) => self.inbox.extend_from_slice(&chunk[..count]),
+                Ok(count) => self.inbox.extend_from_slice(&self.chunk[..count]),
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == ErrorKind::ConnectionReset => {
                     self.failure = Some((
@@ -968,42 +950,32 @@ fn wait_ready(descriptors: &mut [libc::pollfd], timeout: Option<Duration>) -> io
     }
 }
 
-/// Makes a TCP connection fail when its peer's host stops answering: an idle connection is probed
-/// after half of [`DEAD_PEER_SECS`] and fails when three probes, spread over the other half, go
-/// unanswered; sent data left unacknowledged fails it after the whole bound.
-fn keep_alive(stream: &TcpStream) -> io::Result<()> {
-    let set = |level: libc::c_int, option: libc::c_int, value: libc::c_int| {
-        // SAFETY: the descriptor is this live stream's, and the option value is a `c_int` whose
-        // address and size are passed together.
-        let result = unsafe {
-            libc::setsockopt(
-                stream.as_raw_fd(),
-                level,
-                option,
-                (&value as *const libc::c_int).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    };
-    let probes = 3;
-    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
-    set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, DEAD_PEER_SECS / 2)?;
-    set(
-        libc::IPPROTO_TCP,
-        libc::TCP_KEEPINTVL,
-        DEAD_PEER_SECS / 2 / probes,
-    )?;
-    set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, probes)?;
-    set(
-        libc::IPPROTO_TCP,
-        libc::TCP_USER_TIMEOUT,
-        DEAD_PEER_SECS * 1000,
-    )
+/// The most bytes one receive from `socket` returns: the size of its receive buffer
+/// (`SO_RCVBUF`), which the kernel never exceeds in one call. A reader's buffer of this size reads
+/// what the socket holds at once; a larger one reads nothing more and a smaller one splits it.
+///
+/// # Errors
+///
+/// What `getsockopt` fails with.
+pub fn receive_buffer_bytes(socket: BorrowedFd<'_>) -> io::Result<usize> {
+    let bytes = rustix::net::sockopt::socket_recv_buffer_size(socket)?;
+    Ok(bytes.max(1))
+}
+
+/// Makes a TCP connection fail when its peer's host stops answering, as `liveness` states: an
+/// idle connection is probed after half of the bound and fails when the probes, spread over the
+/// other half, go unanswered; sent data left unacknowledged fails it after the whole bound.
+fn keep_alive(stream: &TcpStream, liveness: Liveness) -> io::Result<()> {
+    use rustix::net::sockopt;
+
+    let half = liveness.bound / 2;
+    let user_timeout = u32::try_from(liveness.bound.as_millis()).unwrap_or(u32::MAX);
+    sockopt::set_socket_keepalive(stream, true)?;
+    sockopt::set_tcp_keepidle(stream, half)?;
+    sockopt::set_tcp_keepintvl(stream, half / liveness.probes.max(1))?;
+    sockopt::set_tcp_keepcnt(stream, liveness.probes)?;
+    sockopt::set_tcp_user_timeout(stream, user_timeout)?;
+    Ok(())
 }
 
 #[cfg(test)]

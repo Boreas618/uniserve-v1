@@ -1,22 +1,17 @@
-//! The framing every socket transport of the workspace writes and reads, and the passing of file
-//! descriptors beside the bytes.
+//! The one frame layout every socket transport of the workspace writes and reads, and the passing
+//! of file descriptors beside the bytes.
 //!
-//! Two frame layouts cross sockets, both little-endian:
+//! A frame is little-endian: an 8-byte header, the payload's length and the number of descriptors
+//! that travel with it (two `u32`), then the payload, then one carrier byte for every further
+//! [`MAX_DESCRIPTORS`] descriptors. Every protocol's frames take this layout, whatever codec its
+//! payload has (Protobuf for the process and request interfaces and the Build Server, MessagePack
+//! for the Storage Server and the engines' peer link); over TCP a frame carries no descriptor.
 //!
-//! - a **length-prefixed frame** is a `u32` payload length followed by the payload. The daemon's
-//!   process interface (Protobuf) and the engines' peer link (MessagePack) carry these; a
-//!   descriptor they pass rides on a frame's first byte;
-//! - a **descriptor frame** is an 8-byte header, the payload's length and the number of
-//!   descriptors that travel with it (two `u32`), the payload, and one carrier byte for every
-//!   further [`MAX_DESCRIPTORS`] descriptors. The host services' connections (the Storage Server,
-//!   MessagePack; the Build Server, Protobuf) carry these.
-//!
-//! Descriptors cross with `SCM_RIGHTS`, at most [`MAX_DESCRIPTORS`] per `sendmsg`: a descriptor
-//! frame's first chunk rides on its first byte and each later chunk on its own carrier byte
-//! ([`Segment`]). A receiver queues every descriptor it receives in arrival order
-//! ([`receive_with_descriptors`]) and hands a frame the number its header states once all of the
-//! frame's bytes, and therefore all of its descriptors, have arrived ([`take_descriptor_frame`]).
-//! Received descriptors are close-on-exec.
+//! Descriptors cross with `SCM_RIGHTS`, at most [`MAX_DESCRIPTORS`] per `sendmsg`: a frame's first
+//! chunk rides on its first byte and each later chunk on its own carrier byte ([`Segment`]). A
+//! receiver queues every descriptor it receives in arrival order ([`receive_with_descriptors`])
+//! and hands a frame the number its header states once all of the frame's bytes, and therefore
+//! all of its descriptors, have arrived ([`take`]). Received descriptors are close-on-exec.
 //!
 //! The codec is the caller's: this module moves bytes and descriptors only. The one connection
 //! over these frames is [`crate::Connection`].
@@ -31,77 +26,20 @@ use rustix::net::{
     SendAncillaryMessage, SendFlags,
 };
 
+/// `SCM_MAX_FD` of the Linux kernel (`include/net/scm.h`): the most descriptors one `sendmsg`
+/// carries in an `SCM_RIGHTS` message; more fail with `EINVAL` (unix(7)). The kernel exports it
+/// in no user-space header, and neither `libc` nor `rustix` binds it, so it is bound here; a test
+/// checks it against the running kernel.
+const SCM_MAX_FD: usize = 253;
+
 /// Descriptors one `sendmsg` carries: the kernel's `SCM_MAX_FD`.
-pub const MAX_DESCRIPTORS: usize = 253;
+pub const MAX_DESCRIPTORS: usize = SCM_MAX_FD;
 
-/// Bytes of a length-prefixed frame's length field.
-pub const LENGTH_BYTES: usize = 4;
-
-/// Bytes of a descriptor frame's header: the payload's length and its descriptor count.
+/// Bytes of a frame's header: the payload's length and its descriptor count.
 pub const HEADER_BYTES: usize = 8;
 
-/// `payload` as one length-prefixed frame.
-///
-/// # Errors
-///
-/// Fails with `InvalidInput` when the payload is longer than the length field states.
-pub fn length_prefixed(payload: &[u8]) -> io::Result<Vec<u8>> {
-    let length = u32::try_from(payload.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a frame exceeds 4 GiB"))?;
-    let mut frame = Vec::with_capacity(LENGTH_BYTES + payload.len());
-    frame.extend_from_slice(&length.to_le_bytes());
-    frame.extend_from_slice(payload);
-    Ok(frame)
-}
-
-/// `payload` as one length-prefixed frame to send, with `descriptors` riding on its first byte.
-///
-/// # Errors
-///
-/// Fails with `InvalidInput` when the payload is longer than the length field states, or the
-/// descriptors are more than one send carries.
-pub fn length_segment(payload: &[u8], descriptors: Vec<OwnedFd>) -> io::Result<Segment> {
-    if descriptors.len() > MAX_DESCRIPTORS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "a length-prefixed frame carries at most {MAX_DESCRIPTORS} descriptors, not {}",
-                descriptors.len()
-            ),
-        ));
-    }
-    Ok(Segment {
-        bytes: length_prefixed(payload)?,
-        sent: 0,
-        descriptors,
-    })
-}
-
-/// The payload length a length field states.
-pub fn stated_length(field: [u8; LENGTH_BYTES]) -> usize {
-    u32::from_le_bytes(field) as usize
-}
-
-/// The payload length of the length-prefixed frame `inbox` starts with, once its length field
-/// arrived.
-pub fn peek_length(inbox: &[u8]) -> Option<usize> {
-    let field = inbox.get(..LENGTH_BYTES)?;
-    Some(stated_length([field[0], field[1], field[2], field[3]]))
-}
-
-/// Takes the payload of the length-prefixed frame `inbox` starts with, once it arrived whole.
-pub fn take_length_prefixed(inbox: &mut Vec<u8>) -> Option<Vec<u8>> {
-    let length = peek_length(inbox)?;
-    if inbox.len() < LENGTH_BYTES + length {
-        return None;
-    }
-    let payload = inbox[LENGTH_BYTES..LENGTH_BYTES + length].to_vec();
-    inbox.drain(..LENGTH_BYTES + length);
-    Some(payload)
-}
-
-/// Part of an outgoing descriptor frame: bytes, how many of them were sent, and the descriptors
-/// that ride on their first byte.
+/// Part of an outgoing frame: bytes, how many of them were sent, and the descriptors that ride on
+/// their first byte.
 pub struct Segment {
     bytes: Vec<u8>,
     sent: usize,
@@ -135,13 +73,13 @@ impl Segment {
     }
 }
 
-/// `payload` and `descriptors` as the segments of one descriptor frame, in sending order.
+/// `payload` and `descriptors` as the segments of one frame, in sending order.
 ///
 /// # Errors
 ///
 /// Fails with `InvalidInput` when the payload or the descriptor count is longer than the header
 /// states.
-pub fn descriptor_frame(payload: &[u8], descriptors: Vec<OwnedFd>) -> io::Result<Vec<Segment>> {
+pub fn segments(payload: &[u8], descriptors: Vec<OwnedFd>) -> io::Result<Vec<Segment>> {
     let length = u32::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a frame exceeds 4 GiB"))?;
     let count = u32::try_from(descriptors.len())
@@ -167,22 +105,27 @@ pub fn descriptor_frame(payload: &[u8], descriptors: Vec<OwnedFd>) -> io::Result
     Ok(segments)
 }
 
-/// The bytes the descriptor frame `inbox` starts with occupies, once its header arrived: the
-/// header, the payload and the carrier bytes.
-pub fn descriptor_frame_bytes(inbox: &[u8]) -> Option<usize> {
-    let (length, count) = descriptor_header(inbox)?;
+/// The payload length of the frame `inbox` starts with, once its header arrived.
+pub fn payload_bytes(inbox: &[u8]) -> Option<usize> {
+    header(inbox).map(|(length, _)| length)
+}
+
+/// The bytes the frame `inbox` starts with occupies, once its header arrived: the header, the
+/// payload and the carrier bytes.
+pub fn frame_bytes(inbox: &[u8]) -> Option<usize> {
+    let (length, count) = header(inbox)?;
     let carriers = count.div_ceil(MAX_DESCRIPTORS).saturating_sub(1);
     Some(HEADER_BYTES + length + carriers)
 }
 
-/// Takes the payload and the descriptors of the descriptor frame `inbox` starts with, once all of
-/// its bytes and descriptors arrived.
-pub fn take_descriptor_frame(
+/// Takes the payload and the descriptors of the frame `inbox` starts with, once all of its bytes
+/// and descriptors arrived.
+pub fn take(
     inbox: &mut Vec<u8>,
     descriptors: &mut VecDeque<OwnedFd>,
 ) -> Option<(Vec<u8>, Vec<OwnedFd>)> {
-    let (length, count) = descriptor_header(inbox)?;
-    let total = descriptor_frame_bytes(inbox)?;
+    let (length, count) = header(inbox)?;
+    let total = frame_bytes(inbox)?;
     if inbox.len() < total || descriptors.len() < count {
         return None;
     }
@@ -191,8 +134,8 @@ pub fn take_descriptor_frame(
     Some((payload, descriptors.drain(..count).collect()))
 }
 
-/// The payload length and descriptor count a descriptor frame's header states.
-fn descriptor_header(inbox: &[u8]) -> Option<(usize, usize)> {
+/// The payload length and descriptor count a frame's header states.
+fn header(inbox: &[u8]) -> Option<(usize, usize)> {
     let header = inbox.get(..HEADER_BYTES)?;
     let word = |at: usize| {
         u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]) as usize
@@ -306,14 +249,14 @@ mod tests {
         text
     }
 
-    /// Receives until `inbox` holds one whole descriptor frame and answers it.
+    /// Receives until `inbox` holds one whole frame and answers it.
     fn receive_frame(
         socket: &UnixStream,
         inbox: &mut Vec<u8>,
         queued: &mut VecDeque<OwnedFd>,
     ) -> (Vec<u8>, Vec<OwnedFd>) {
         loop {
-            if let Some(frame) = take_descriptor_frame(inbox, queued) {
+            if let Some(frame) = take(inbox, queued) {
                 return frame;
             }
             let mut buffer = [0_u8; 7];
@@ -323,21 +266,20 @@ mod tests {
         }
     }
 
-    /// A descriptor frame carries more descriptors than one send takes, in order, and the frame
-    /// after it carries none: a receiver that reads in small pieces hands each frame its own.
+    /// A frame carries more descriptors than one send takes, in order, and the frame after it
+    /// carries none: a receiver that reads in small pieces hands each frame its own.
     #[test]
-    fn descriptor_frames_carry_their_descriptors_in_order_beyond_one_send() {
+    fn frames_carry_their_descriptors_in_order_beyond_one_send() {
         let (sender, receiver) = UnixStream::pair().unwrap();
         let texts: Vec<String> = (0..MAX_DESCRIPTORS + 2)
             .map(|index| format!("file {index}"))
             .collect();
         let sending = std::thread::spawn(move || {
             let descriptors = texts.iter().map(|text| file(text)).collect();
-            for payload_descriptors in [(b"first".as_slice(), descriptors), (b"second", Vec::new())]
+            for (payload, descriptors) in
+                [(b"first".as_slice(), descriptors), (b"second", Vec::new())]
             {
-                for mut segment in
-                    descriptor_frame(payload_descriptors.0, payload_descriptors.1).unwrap()
-                {
+                for mut segment in segments(payload, descriptors).unwrap() {
                     while !segment.sent() {
                         segment.send(sender.as_fd()).unwrap();
                     }
@@ -358,17 +300,25 @@ mod tests {
         sending.join().unwrap();
     }
 
-    /// A length-prefixed frame is taken only once it arrived whole, and leaves the bytes after it.
+    /// A frame is taken only once it arrived whole, and leaves the bytes after it.
     #[test]
-    fn a_length_prefixed_frame_is_taken_once_whole() {
-        let mut inbox = length_prefixed(b"payload").unwrap();
-        inbox.extend_from_slice(&length_prefixed(b"next").unwrap()[..3]);
-        assert_eq!(peek_length(&inbox), Some(7));
+    fn a_frame_is_taken_once_whole() {
+        let bytes = |payload: &[u8]| -> Vec<u8> {
+            segments(payload, Vec::new())
+                .unwrap()
+                .into_iter()
+                .flat_map(|segment| segment.bytes)
+                .collect()
+        };
+        let mut inbox = bytes(b"payload");
+        inbox.extend_from_slice(&bytes(b"next")[..3]);
+        assert_eq!(payload_bytes(&inbox), Some(7));
+        let mut queued = VecDeque::new();
         assert_eq!(
-            take_length_prefixed(&mut inbox).as_deref(),
-            Some(&b"payload"[..])
+            take(&mut inbox, &mut queued).map(|(payload, _)| payload),
+            Some(b"payload".to_vec())
         );
-        assert_eq!(take_length_prefixed(&mut inbox), None);
+        assert!(take(&mut inbox, &mut queued).is_none());
         assert_eq!(inbox.len(), 3);
     }
 
@@ -380,5 +330,27 @@ mod tests {
         let borrowed: Vec<BorrowedFd<'_>> = files.iter().map(AsFd::as_fd).collect();
         let refused = send_with_descriptors(sender.as_fd(), b"x", &borrowed).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The bound `SCM_MAX_FD` is the running kernel's: one `sendmsg` carries that many
+    /// descriptors, and the kernel refuses one more with `EINVAL`.
+    #[test]
+    fn the_kernel_carries_exactly_scm_max_fd_descriptors_per_send() {
+        let (sender, _receiver) = UnixStream::pair().unwrap();
+        let files: Vec<OwnedFd> = (0..=SCM_MAX_FD).map(|_| file("x")).collect();
+        let borrowed: Vec<BorrowedFd<'_>> = files.iter().map(AsFd::as_fd).collect();
+        let send = |count: usize| {
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(SCM_MAX_FD + 1))];
+            let mut control = SendAncillaryBuffer::new(&mut space);
+            assert!(control.push(SendAncillaryMessage::ScmRights(&borrowed[..count])));
+            rustix::net::sendmsg(
+                sender.as_fd(),
+                &[IoSlice::new(b"x")],
+                &mut control,
+                SendFlags::NOSIGNAL,
+            )
+        };
+        assert_eq!(send(SCM_MAX_FD), Ok(1));
+        assert_eq!(send(SCM_MAX_FD + 1), Err(rustix::io::Errno::INVAL));
     }
 }

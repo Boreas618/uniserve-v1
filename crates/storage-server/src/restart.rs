@@ -95,10 +95,8 @@ enum Message {
 }
 
 /// The handoff socket's messages are the Storage Server protocol's: MessagePack with named fields
-/// in descriptor frames, so a server hands over to a successor of another build.
+/// in the workspace's frames, so a server hands over to a successor of another build.
 impl service::Message for Message {
-    const FRAMING: service::Framing = service::Framing::Descriptors;
-
     fn encode(&self) -> io::Result<Vec<u8>> {
         ::storage::protocol::encode(self)
     }

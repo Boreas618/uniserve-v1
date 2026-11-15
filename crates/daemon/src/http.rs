@@ -339,12 +339,6 @@ const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(200);
 ///
 /// Fails when the listener cannot report its address or the server fails.
 #[allow(clippy::too_many_arguments)]
-#[expect(
-    clippy::large_futures,
-    reason = "an adopted connection's future holds its 64 KiB read chunk across a socket read \
-              and is polled in place inside its own spawned task, as every connection of \
-              `conn::serve` is"
-)]
 async fn serve_on(
     engine: &Arc<Leader>,
     admin: &Arc<admin::Admin>,

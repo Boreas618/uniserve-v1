@@ -1,6 +1,5 @@
 //! Round trips of the peer link's messages through their encoding, as the peer link carries them.
 
-use std::io::Write as _;
 use std::net::TcpListener;
 use std::time::Duration;
 
@@ -397,12 +396,14 @@ fn a_message_decodes_only_as_the_message_it_is() {
         .encode()
         .unwrap();
     cut.pop();
-    let frame = service::frame::length_prefixed(&cut).unwrap();
-
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut connection = Connection::connect(&listener.local_addr().unwrap().to_string()).unwrap();
-    let (mut peer, _) = listener.accept().unwrap();
-    peer.write_all(&frame).unwrap();
+    let (peer, _) = listener.accept().unwrap();
+    for mut segment in service::frame::segments(&cut, Vec::new()).unwrap() {
+        while !segment.sent() {
+            segment.send(std::os::fd::AsFd::as_fd(&peer)).unwrap();
+        }
+    }
 
     let received = connection.recv::<MainProcessResponse>(Duration::from_secs(5));
     assert!(

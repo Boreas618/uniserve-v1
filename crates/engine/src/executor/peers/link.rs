@@ -2,11 +2,11 @@
 //! workspace's one connection (`service::Connection`), and the scheduler node's listener.
 //!
 //! Each [`MainProcessRequest`], [`MainProcessResponse`], [`PeerRegistration`] and [`PeerAccepted`]
-//! is one length-prefixed frame (`service::frame`) whose payload is the message in MessagePack
+//! is one frame (`service::frame`) whose payload is the message in MessagePack
 //! (`rmp-serde`). The message types are the only definition of the protocol: the encoding is the
 //! one their `serde` derives describe, and both ends are built from this workspace
 //! ([`super::registration::VERSION`]), so no schema, generated code or version field accompanies
-//! it, and no bound beyond the length field's limits a message.
+//! it, and no bound beyond the frame header's limits a message.
 //!
 //! The encoding is positional: a struct is the array of its fields in declaration order, without
 //! their names. Every message type must therefore decode from a sequence, which rules out three
@@ -30,7 +30,6 @@ macro_rules! peer_messages {
     ($($message:ty),* $(,)?) => {
         $(
             impl service::Message for $message {
-                const FRAMING: service::Framing = service::Framing::Length;
 
                 fn encode(&self) -> io::Result<Vec<u8>> {
                     rmp_serde::to_vec(self).map_err(|error| {

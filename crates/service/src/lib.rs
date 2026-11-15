@@ -31,8 +31,8 @@ pub mod logging;
 pub mod shm;
 
 pub use connection::{
-    Connection, DEAD_PEER_SECS, Framing, Handed, Hangup, Listener, Message, READ_CHUNK, Socket,
-    Wake, Waker,
+    Connection, Handed, Hangup, Listener, Liveness, Message, Socket, Wake, Waker,
+    receive_buffer_bytes,
 };
 pub use directories::{cache_directory, data_directory};
 

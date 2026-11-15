@@ -677,11 +677,9 @@ async fn receive(
     }
 }
 
-/// The handoff socket's messages are MessagePack with named fields in descriptor frames, the
+/// The handoff socket's messages are MessagePack with named fields in the workspace's frames, the
 /// Storage Server protocol's codec, so a daemon hands over to a successor of another build.
 impl service::Message for Message {
-    const FRAMING: service::Framing = service::Framing::Descriptors;
-
     fn encode(&self) -> std::io::Result<Vec<u8>> {
         storage::protocol::encode(self)
     }
