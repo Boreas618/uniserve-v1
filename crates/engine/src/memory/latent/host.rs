@@ -31,8 +31,9 @@ use crate::memory::client::StorageClient;
 use crate::memory::host_pages;
 use crate::worker::{Error, Result};
 
-/// The version of the page encoding above: pages of another version are another layout.
-const PAGE_ENCODING: u32 = 1;
+/// The page encoding above, as the layout digest describes it beside the element type and the
+/// values of a page: pages encoded otherwise are described otherwise, and so are another layout.
+const PAGE_ENCODING: &str = "a trajectory row's values in the row's order, page after page";
 
 /// The units of the rank's part: every trajectory the rank can have saved at once, twice the
 /// trajectory pages of its rows.
@@ -95,7 +96,7 @@ impl BankPages {
 /// and the values of a page.
 fn layout(pages: &BankPages) -> [u8; 32] {
     let mut digest = ::storage::key::Digest::new(b"uniserve-latent-page-layout");
-    digest.number(u64::from(PAGE_ENCODING));
+    digest.text(PAGE_ENCODING);
     digest.text(ops::abi::name(pages.dtype));
     digest.number(u64::from(pages.page_values));
     digest.finish()

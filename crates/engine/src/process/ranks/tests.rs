@@ -228,10 +228,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
     // weights the process serves, which a meta start loads none of.
     let identities = service::lock(&ranks[0].text().unwrap().cache)
         .page_identities(&crate::process::binding::identity_of(&[]));
-    let seeds: Vec<storage::Key> = identities
-        .iter()
-        .map(|identity| storage::key::page_seed(identity))
-        .collect();
+    let seeds: Vec<storage::Key> = identities.iter().map(storage::key::page_seed).collect();
     assert_eq!(capacity.seeds, seeds);
     assert_eq!(capacity.seeds.len(), 1);
     assert_ne!(capacity.seeds[0], storage::Key([0; 32]));

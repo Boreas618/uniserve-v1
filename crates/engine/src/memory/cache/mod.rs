@@ -454,7 +454,7 @@ impl KvCacheMemory {
     }
 
     /// The cache as the rank reports it to the engine: its layout, units, plane runs and
-    /// segments. The rank adds its identities and endpoint.
+    /// segments.
     pub fn info(&self) -> PrefixCacheInfo {
         PrefixCacheInfo {
             plane_runs: self.planes.runs().to_vec(),
@@ -725,7 +725,7 @@ impl KvCacheMemory {
 
     /// The page identity of each cache group for weights of `fingerprint`
     /// (`PrefixCacheInfo::identities`).
-    pub(crate) fn page_identities(&self, fingerprint: &str) -> Vec<String> {
+    pub(crate) fn page_identities(&self, fingerprint: &str) -> Vec<storage::Key> {
         host::page_identities(&self.config.layout, fingerprint)
     }
 

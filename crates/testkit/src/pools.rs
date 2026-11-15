@@ -193,7 +193,10 @@ pub fn capacity(launch: &EngineArgs, cache: &CacheLayout) -> Capacity {
     )
     .expect("positive bounds");
 
-    let seed = storage::key::page_seed(&config.model.model);
+    // The page identity of a fake's model: its name, as the weights of a served model are.
+    let mut identity = storage::key::Digest::new(b"testkit-page-identity");
+    identity.text(&config.model.model);
+    let seed = storage::key::page_seed(&identity.key());
     Capacity {
         phases,
         slots,

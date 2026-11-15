@@ -39,8 +39,11 @@ use crate::memory::client::StorageClient;
 use crate::memory::host_pages::{self, HostPart};
 use crate::worker::{Error, Result};
 
-/// The version of the page encoding above: pages of another version are another content.
-const PAGE_ENCODING: u32 = 1;
+/// The page encoding above, as the layout and content digests describe it beside the group's
+/// shape: pages encoded otherwise are described otherwise, and so are another layout and
+/// another content.
+const PAGE_ENCODING: &str = "keys, then values, each field's planes in unit then column order; \
+                             then scales [2, planes] float32; then index keys";
 
 /// The bytes of one host page of `group` of a cache of `layout`.
 fn page_bytes(layout: &CacheLayout, group: &GroupLayout) -> u64 {
@@ -104,7 +107,7 @@ fn state_of(digest: &mut ::storage::key::Digest, layout: &CacheLayout, group: &G
 /// (`PageShape::layout`).
 fn layout_digest(layout: &CacheLayout, group: &GroupLayout) -> [u8; 32] {
     let mut digest = ::storage::key::Digest::new(b"uniserve-page-layout");
-    digest.number(u64::from(PAGE_ENCODING));
+    digest.text(PAGE_ENCODING);
     digest.number(u64::from(layout.quantized));
     digest.number(layout.plane_bytes);
     digest.number(u64::from(layout.columns));
@@ -125,7 +128,7 @@ fn layout_digest(layout: &CacheLayout, group: &GroupLayout) -> [u8; 32] {
 /// prompt computed by one model in two representations hold the same logical content.
 fn content_digest(layout: &CacheLayout, group: &GroupLayout) -> [u8; 32] {
     let mut digest = ::storage::key::Digest::new(b"uniserve-page-content-layout");
-    digest.number(u64::from(PAGE_ENCODING));
+    digest.text(PAGE_ENCODING);
     content_of(&mut digest, group);
     state_of(&mut digest, layout, group);
     digest.finish()
@@ -178,19 +181,21 @@ pub(crate) fn class_digests(
 }
 
 /// The page identity of each of `layout`'s groups for a model whose weights are `fingerprint`
-/// (`PrefixCacheInfo::identities`): the weights and the group's logical page content, as
-/// `|`-separated parts. The scheduler seeds the group's page keys at every tier from it
-/// (`storage::key::page_seed`), so a page computed by other weights or of another shape is
-/// another page. The representation is not part of it: the same page in another stored type has
-/// the same key, and the host regions of each representation stay apart by their layout
+/// (`PrefixCacheInfo::identities`): the digest of the weights' identity and the group's logical
+/// page content ([`content_digest`]). The scheduler seeds the group's page keys at every tier
+/// from it (`storage::key::page_seed`), so a page computed by other weights or of another shape
+/// is another page. The representation is not part of it: the same page in another stored type
+/// has the same key, and the host regions of each representation stay apart by their layout
 /// digest.
-pub(crate) fn page_identities(layout: &CacheLayout, fingerprint: &str) -> Vec<String> {
+pub(crate) fn page_identities(layout: &CacheLayout, fingerprint: &str) -> Vec<Key> {
     layout
         .groups
         .iter()
         .map(|group| {
-            let content = Key(content_digest(layout, group)).hex();
-            format!("{fingerprint}|page-content:{content}")
+            let mut identity = ::storage::key::Digest::new(b"uniserve-page-identity");
+            identity.text(fingerprint);
+            identity.bytes(&content_digest(layout, group));
+            identity.key()
         })
         .collect()
 }
@@ -556,7 +561,6 @@ mod tests {
         let fp8 = page_identities(&layout(PrefixCacheDtype::Float8E4m3Fn), "weights-a");
 
         assert_eq!(bf16.len(), 1);
-        assert!(bf16[0].starts_with("weights-a|page-content:"));
         assert_eq!(bf16, fp8);
 
         let other_weights = page_identities(&layout(PrefixCacheDtype::BFloat16), "weights-b");

@@ -4004,7 +4004,7 @@ pub(crate) fn capacities(
                 let seeds = cache
                     .page_identities(&identity)
                     .iter()
-                    .map(|identity| storage::key::page_seed(identity))
+                    .map(storage::key::page_seed)
                     .collect();
                 let model = text.model.as_ref();
                 let vision = text

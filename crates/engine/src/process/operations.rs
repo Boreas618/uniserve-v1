@@ -244,7 +244,7 @@ fn apply(schedulers: &[Sender<Message>], binding: &WeightBinding) -> Result<Vec<
             let pages: Vec<Key> = report
                 .identities
                 .iter()
-                .map(|identity| storage::key::page_seed(identity))
+                .map(storage::key::page_seed)
                 .collect();
             let latent = storage::key::latent_seed(
                 reports

@@ -1573,7 +1573,7 @@ fn weight_reports(reports: Vec<WeightsUpdated>) -> wire::operated::Reports {
                 group: report.group,
                 rank: report.rank,
                 identity: report.identity,
-                identities: report.identities,
+                identities: report.identities.iter().map(storage::Key::hex).collect(),
                 moved: report.moved as u64,
             })
             .collect(),

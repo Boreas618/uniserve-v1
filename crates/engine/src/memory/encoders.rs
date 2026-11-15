@@ -26,11 +26,16 @@ use crate::memory::buffers::BufferMemory;
 use crate::memory::client::StorageClient;
 use crate::worker::Result;
 
-/// The version of the unit encoding: an output's bytes, rows in order, in consecutive units.
-const PAGE_ENCODING: u32 = 1;
+/// The unit encoding, as the layout digest describes it beside the unit's bytes: units encoded
+/// otherwise are described otherwise, and so are another layout.
+const PAGE_ENCODING: &str = "an output's bytes, its rows in order, over consecutive units";
 
-/// The bytes of one unit of a rank's part. A stored output's last unit holds the remainder of its
-/// bytes, so the region's units exceed the outputs' bytes by less than a unit each.
+/// The bytes of one unit of a rank's part, which the region's statement (`Region::unit_bytes`),
+/// its layout digest and every rank's mapping read. A stored output's last unit holds the
+/// remainder of its bytes, so the region's units exceed the outputs' bytes by less than a unit
+/// each: the unit bounds that waste per output (an image's vision features take a few units, a
+/// video prompt's outputs some hundreds) while a region of every output an epoch can hold stays
+/// far within the units a session numbers.
 pub(crate) const PAGE_BYTES: u64 = 256 << 10;
 
 /// The units the region holds: the encoder outputs of every request whose outputs can be needed
@@ -53,15 +58,14 @@ pub(crate) fn pool_pages(largest: &[u64], request_slots: usize) -> u64 {
     crate::memory::host_pages::resuming_pages(request_slots as u64 * request)
 }
 
-/// The digest of the byte layout of the region's units: its domain, the unit encoding's version
-/// and the unit's bytes. Two epochs whose regions have one layout hold outputs alike, so the
-/// region's name carries it and an encoding of another version names another region.
+/// The digest of the byte layout of the region's units: the unit encoding and the unit's bytes.
+/// Two epochs whose regions have one layout hold outputs alike, so the region's name carries it
+/// and another encoding names another region.
 pub(crate) fn layout() -> [u8; 32] {
-    let mut key = [0; 32];
-    key[..16].copy_from_slice(b"encoder-pages\0\0\0");
-    key[16..20].copy_from_slice(&PAGE_ENCODING.to_le_bytes());
-    key[20..28].copy_from_slice(&PAGE_BYTES.to_le_bytes());
-    key
+    let mut digest = ::storage::key::Digest::new(b"uniserve-encoder-page-layout");
+    digest.text(PAGE_ENCODING);
+    digest.number(PAGE_BYTES);
+    digest.finish()
 }
 
 /// Maps the rank's part of the host encoder region `region`, its number and its name, into

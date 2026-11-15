@@ -48,18 +48,6 @@ pub struct PrefixCacheInfo {
     pub inherited_start: u32,
     #[serde(default)]
     pub inherited_units: u32,
-    /// The page identity of each cache group, in group order: `|`-separated
-    /// stages naming the weights that compute the group's pages and the
-    /// pages' layout. Pipeline stages union these stages; an unrelated
-    /// group or a downstream output head changes none of a group's keys. The
-    /// engine seeds the group's page keys from it at every cache level
-    /// (`storage::key::page_seed`); empty for a consumer without a model.
-    #[serde(default)]
-    pub identities: Vec<String>,
-    /// Where an engine on another host reaches the rank's host's Storage
-    /// Server (`StorageLaunch::tcp`); `None` on the engine's host.
-    #[serde(default)]
-    pub storage_endpoint: Option<String>,
 }
 
 /// One segment of a rank's KV cache planes: an allocation of whole units on

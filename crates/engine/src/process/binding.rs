@@ -2347,10 +2347,10 @@ pub(crate) struct WeightsUpdated {
     #[serde(default)]
     pub(crate) identity: Option<String>,
     /// The page identity of each of the rank's cache groups under the new
-    /// weights (`PrefixCacheInfo::identities`); empty for a rank that keeps
+    /// weights (`KvCacheMemory::page_identities`); empty for a rank that keeps
     /// no paged cache.
     #[serde(default)]
-    pub(crate) identities: Vec<String>,
+    pub(crate) identities: Vec<storage::Key>,
     /// The weights the update rewrote.
     #[serde(default)]
     pub(crate) moved: usize,

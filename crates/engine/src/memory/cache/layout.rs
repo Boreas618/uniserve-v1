@@ -602,8 +602,6 @@ impl CacheLayout {
             held_segments: 0,
             inherited_start: 0,
             inherited_units: 0,
-            identities: Vec::new(),
-            storage_endpoint: None,
         }
     }
 
