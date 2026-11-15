@@ -28,7 +28,7 @@
 // A group is one NVLink domain: every rank's window is peer-mapped, so DeepEP's
 // direct kernels run and its RDMA contexts are never requested.
 
-#include "../include/uniserve_expert_exchange.h"
+#include <uniserve_expert_exchange.h>
 
 #include <cuda.h>
 #include <cuda_bf16.h>

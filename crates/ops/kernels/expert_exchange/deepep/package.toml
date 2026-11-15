@@ -6,7 +6,7 @@
 # compiler: a descriptor fixes every template argument, so a serving host compiles
 # nothing. The kernels are built against the device communicator of the NCCL this
 # project pins, whose headers are the `nccl` pin (the `nvidia-nccl-cu13` 2.30.4 wheel;
-# `tools/check_nccl.sh` holds the serving process to the same library).
+# `crates/platform` refuses an older NCCL when it loads the serving process's).
 #
 # One native module per descriptor, with the entries of the operator's header. The
 # group is one NVLink domain, whose ranks may be threads of one process.

@@ -16,6 +16,5 @@ def spec(fields, parameters, target):
     compiler = fa4.DenseCompiler(fields, parameters, target)
     return {
         "name": fa4.NAME,
-        "entry": "uniserve_dense_attention",
         "compile": compiler,
     }

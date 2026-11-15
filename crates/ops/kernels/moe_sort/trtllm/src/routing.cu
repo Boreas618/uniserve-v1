@@ -37,7 +37,7 @@
 
 #include <cuda_runtime.h>
 
-#include "../include/uniserve_moe_sort.h"
+#include <uniserve_moe_sort.h>
 
 namespace {
 

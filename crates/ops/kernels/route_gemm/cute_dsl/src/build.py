@@ -50,7 +50,6 @@ def spec(fields, parameters, target):
     )
     return {
         "name": "route_gemm",
-        "entry": "uniserve_route_gemm",
         "compile": driver.kernel(
             kernel.wrapper,
             [

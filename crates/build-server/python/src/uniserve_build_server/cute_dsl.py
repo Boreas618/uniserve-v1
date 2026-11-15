@@ -17,7 +17,6 @@ A package's build module states ``spec(fields, parameters, target)``, one shape
 for every package:
 
 - ``name``: the exported launcher's name, which the entry unit calls;
-- ``entry``: the C entry symbol the module exports;
 - ``compile``: a callable that returns the compiled kernel. A kernel the DSL
   compiles directly states :func:`kernel`; a package whose kernel is selected
   and compiled by its vendor's own code states that code;
@@ -37,7 +36,6 @@ whose layout a ``static_assert`` fixes, so no launch signature is written to a
 from __future__ import annotations
 
 import importlib.metadata
-import json
 import pathlib
 import subprocess
 import tempfile
@@ -126,10 +124,10 @@ def build(request: Request, spec: Spec) -> None:
 
     cuda = request.toolchain.require_cuda()
     compiler = request.toolchain.require_host_compiler()
+    # The Build Server resolves a CuTe DSL source's entry unit (``[source]
+    # unit``, ``src/entry.cpp`` unless the manifest states another).
     if request.unit is None:
-        raise SystemExit(
-            "a CuTe DSL package names its entry unit in [source] unit"
-        )
+        raise SystemExit("the request names no entry unit")
     out = request.output
     # The export and the entry unit's object are the build's own intermediates:
     # they live in a directory of the build's workspace the module does not
@@ -174,12 +172,3 @@ def build(request: Request, spec: Spec) -> None:
             ],
             "linking module.so",
         )
-    print(
-        json.dumps(
-            {
-                "descriptor": request.descriptor,
-                "target": request.target.name,
-                "entry": stated["entry"],
-            }
-        )
-    )

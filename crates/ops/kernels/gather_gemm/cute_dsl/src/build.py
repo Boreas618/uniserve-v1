@@ -13,9 +13,6 @@ import gather_gemm as kernels
 from cutlass.cute.runtime import make_ptr
 from uniserve_build_server import cute_dsl as driver
 
-#: The gated activations the kernel class implements, by the operator's name.
-ACTIVATIONS = {"silu": "silu", "gelu_tanh": "gelu_tanh"}
-
 #: The element types the kernel serves, by the operator's name.
 DTYPES = {"bf16": cutlass.BFloat16}
 
@@ -38,7 +35,9 @@ def spec(fields, parameters, target):
     """The compilation of one gather_gemm descriptor."""
     tiler = shape_of(fields["tile"])
     cluster = shape_of(fields["cluster"])
-    activation = ACTIVATIONS[fields["activation"]]
+    # The kernel class names its gated activations as the operator does, and
+    # the manifest's `activation` dimension admits only the ones it implements.
+    activation = fields["activation"]
     element = DTYPES[fields["dtype"]]
     experts = int(fields["experts"])
     top = int(fields["top"])
@@ -57,7 +56,6 @@ def spec(fields, parameters, target):
     )
     return {
         "name": "gather_gemm",
-        "entry": "uniserve_gather_gemm",
         "compile": driver.kernel(
             kernel.wrapper,
             [

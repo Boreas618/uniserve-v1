@@ -62,7 +62,6 @@ def spec(fields, parameters, target):
     out_dtype = OUTPUTS[fields["output"]]
     return {
         "name": "nvfp4_gemm",
-        "entry": "uniserve_nvfp4_gemm",
         "compile": driver.kernel(
             kernels.Nvfp4GemmKernel(
                 tile_mn=TILE_MN,

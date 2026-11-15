@@ -33,7 +33,6 @@ kv_heads, mask, window, len.
 """
 
 import hashlib
-import json
 import pathlib
 import re
 import shutil
@@ -52,8 +51,6 @@ LIBRARY = "trtllm-gen-fmha"
 #: The artifact's generated kernel table.
 METADATA_HEADER = "include/flashInferMetaInfo.h"
 
-#: The entry the module exports, which the package's `[module.entries]` names.
-ENTRY = "uniserve_paged_attention"
 
 #: The compile defines the artifact's own build uses.
 DEFINES = [
@@ -253,15 +250,4 @@ def build(request, data, artifact):
             str(request.output / "module.so"),
         ],
         "linking module.so",
-    )
-
-    print(
-        json.dumps(
-            {
-                "descriptor": request.descriptor,
-                "target": str(target),
-                "entry": ENTRY,
-                "cubins": len(names),
-            }
-        )
     )

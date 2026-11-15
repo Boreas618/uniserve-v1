@@ -15,7 +15,6 @@ The Build Server compiles a descriptor by calling :func:`compile` with the
 compile request.
 """
 
-import json
 import pathlib
 import tempfile
 
@@ -25,8 +24,6 @@ from uniserve_build_server.request import Request
 #: The element types the combine kernel is instantiated for.
 DTYPES = {"bf16": "bf16", "fp16": "f16", "f32": "f32"}
 
-#: The entry the module exports, which the package's `[module.entries]` names.
-ENTRY = "uniserve_moe_unpermute"
 
 #: The translation units of the FlashInfer distribution this module links: the
 #: combine kernel and the TensorRT-LLM common library its checks call.
@@ -120,13 +117,3 @@ def compile(request: Request) -> None:
             ],
             "linking module.so",
         )
-
-    print(
-        json.dumps(
-            {
-                "descriptor": request.descriptor,
-                "target": str(target),
-                "entry": ENTRY,
-            }
-        )
-    )

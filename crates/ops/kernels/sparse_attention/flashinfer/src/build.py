@@ -12,14 +12,10 @@ parameters rather than its dimensions.
 
 from bsa_sm120 import NAME, BsaCompiler
 
-#: The entry the module exports, which the package's `[module.entries]` names.
-ENTRY = "uniserve_sparse_attention"
-
 
 def spec(fields, parameters, target):
     """The compilation of one sparse_attention sm120 descriptor."""
     return {
         "name": NAME,
-        "entry": ENTRY,
         "compile": BsaCompiler(fields, parameters, target).compile,
     }

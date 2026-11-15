@@ -24,7 +24,7 @@
 // `combined`: a rank writes it for layer `L + 1` only after that layer's dispatch
 // saw every peer, and a peer dispatches only after it finished reading layer `L`.
 
-#include "../include/uniserve_expert_exchange.h"
+#include <uniserve_expert_exchange.h>
 
 #include <cuda.h>
 #include <cuda_bf16.h>

@@ -10,7 +10,6 @@ The Build Server compiles a descriptor by calling :func:`compile` with the
 compile request.
 """
 
-import json
 import subprocess
 import sys
 
@@ -18,9 +17,6 @@ from uniserve_build_server.request import Request
 
 #: The translation units of the module: the entry and the routing kernels.
 SOURCES = ["src/entry.cpp", "src/routing.cu"]
-
-#: The entry the module exports, which the package's `[module.entries]` names.
-ENTRY = "uniserve_moe_sort"
 
 
 def compile(request: Request) -> None:
@@ -51,13 +47,3 @@ def compile(request: Request) -> None:
     built = subprocess.run(command, check=False)
     if built.returncode != 0:
         raise SystemExit(f"nvcc failed with {built.returncode}")
-
-    print(
-        json.dumps(
-            {
-                "descriptor": request.descriptor,
-                "target": str(request.target),
-                "entry": ENTRY,
-            }
-        )
-    )

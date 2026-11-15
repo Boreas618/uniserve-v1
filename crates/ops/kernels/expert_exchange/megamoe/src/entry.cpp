@@ -21,7 +21,7 @@
 // A rank with no tokens still launches over one masked row, because its experts serve
 // the tokens its peers route to them.
 
-#include "../include/uniserve_expert_exchange.h"
+#include <uniserve_expert_exchange.h>
 #include "mega.h"
 
 #include <cuda.h>

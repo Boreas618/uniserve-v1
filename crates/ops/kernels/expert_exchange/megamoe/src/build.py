@@ -9,7 +9,6 @@ is read: the target names the architecture, and the kernel's tuning is the
 table below.
 """
 
-import json
 import pathlib
 import subprocess
 import sys
@@ -17,16 +16,6 @@ import tempfile
 
 from uniserve_build_server import cute_dsl, fetch
 from uniserve_build_server.request import Request
-
-ENTRIES = [
-    "uniserve_expert_exchange_launch",
-    "uniserve_expert_exchange_create",
-    "uniserve_expert_exchange_step",
-    "uniserve_expert_exchange_suspend",
-    "uniserve_expert_exchange_restore",
-    "uniserve_expert_exchange_release",
-    "uniserve_expert_exchange_info",
-]
 
 #: The SMs the launch's clusters are sized for. A persistent cluster that does
 #: not fit on the device would wait for one that never starts, so this is the
@@ -198,6 +187,9 @@ def compile_kernel(request, shape, staging):
         cluster_shape_mnk=cluster,
         use_2cta_instrs=tiler[0] == 256,
         group_hint=knobs["group_hint"],
+        # The pool's token block is the epilogue's token tile. The pinned
+        # sources state it only as this class attribute, which their own
+        # runner reads the same way (`moe_nvfp4_swapab/mega_runner.py`).
         token_padding_block=SwapABSwigluFp4Epilogue._EpilogueTokenTileSize,
         sf_padding_block=SfPaddingBlock,
         load_balance_mode=knobs["load_balance_mode"],
@@ -412,12 +404,3 @@ def compile(request: Request) -> None:
             ],
             "linking module.so",
         )
-    print(
-        json.dumps(
-            {
-                "descriptor": request.descriptor,
-                "target": str(target),
-                "entries": ENTRIES,
-            }
-        )
-    )

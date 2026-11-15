@@ -12,7 +12,6 @@ The Build Server compiles a descriptor by calling :func:`compile` with the
 compile request.
 """
 
-import json
 import subprocess
 import sys
 
@@ -20,17 +19,6 @@ from uniserve_build_server.request import Request
 
 #: The translation unit of the module: every entry and the kernels.
 SOURCES = ["src/exchange.cu"]
-
-#: The entries the module exports, the ones `[module.entries]` names.
-ENTRIES = [
-    "uniserve_expert_exchange_launch",
-    "uniserve_expert_exchange_create",
-    "uniserve_expert_exchange_step",
-    "uniserve_expert_exchange_suspend",
-    "uniserve_expert_exchange_restore",
-    "uniserve_expert_exchange_release",
-    "uniserve_expert_exchange_info",
-]
 
 
 def compile(request: Request) -> None:
@@ -65,13 +53,3 @@ def compile(request: Request) -> None:
     built = subprocess.run(command, check=False)
     if built.returncode != 0:
         raise SystemExit(f"nvcc failed with {built.returncode}")
-
-    print(
-        json.dumps(
-            {
-                "descriptor": request.descriptor,
-                "target": str(request.target),
-                "entries": ENTRIES,
-            }
-        )
-    )

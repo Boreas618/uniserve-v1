@@ -9,7 +9,6 @@ The Build Server compiles a descriptor by calling :func:`compile` with the
 compile request.
 """
 
-import json
 import subprocess
 import sys
 
@@ -17,9 +16,6 @@ from uniserve_build_server.request import Request
 
 #: The translation unit of the module.
 SOURCE = "src/frame.cu"
-
-#: The entry the module exports, which the package's `[module.entries]` names.
-ENTRY = "uniserve_frame_moments"
 
 
 def compile(request: Request) -> None:
@@ -54,13 +50,3 @@ def compile(request: Request) -> None:
     built = subprocess.run(command, check=False)
     if built.returncode != 0:
         raise SystemExit(f"nvcc failed with {built.returncode}")
-
-    print(
-        json.dumps(
-            {
-                "descriptor": request.descriptor,
-                "target": str(request.target),
-                "entry": ENTRY,
-            }
-        )
-    )

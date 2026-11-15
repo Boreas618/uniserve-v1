@@ -39,7 +39,7 @@
 // computes every convolution here in FP32, which keeps the video VAE's precision
 // and lets the engine use its tensor cores for it.
 
-#include "../include/uniserve_conv.h"
+#include <uniserve_conv.h>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

@@ -9,7 +9,6 @@ sources (`uniserve_build_server.fetch`'s `deepep` and `nccl` pins): the
 compile includes them from their verified cache directories.
 """
 
-import json
 import pathlib
 import subprocess
 import sys
@@ -19,16 +18,6 @@ from uniserve_build_server import fetch
 from uniserve_build_server.request import Request
 
 SOURCES = ["src/exchange.cu"]
-
-ENTRIES = [
-    "uniserve_expert_exchange_launch",
-    "uniserve_expert_exchange_create",
-    "uniserve_expert_exchange_step",
-    "uniserve_expert_exchange_suspend",
-    "uniserve_expert_exchange_restore",
-    "uniserve_expert_exchange_release",
-    "uniserve_expert_exchange_info",
-]
 
 
 def constants(request):
@@ -51,8 +40,8 @@ def nccl_library():
     """The directory of a `libnccl.so.2` to name in the module's needed list.
 
     The module takes the serving process's NCCL at run time, which
-    `tools/check_nccl.sh` holds to the project's version; this one only states
-    the library's name to the linker.
+    `crates/platform` loads by soname and refuses when it is older than the
+    project's pin; this one only states the library's name to the linker.
     """
     site = pathlib.Path(sysconfig.get_paths()["purelib"])
     directory = site / "nvidia" / "nccl" / "lib"
@@ -114,13 +103,3 @@ def compile(request: Request) -> None:
     built = subprocess.run(command, check=False)
     if built.returncode != 0:
         raise SystemExit(f"nvcc failed with {built.returncode}")
-
-    print(
-        json.dumps(
-            {
-                "descriptor": request.descriptor,
-                "target": str(request.target),
-                "entries": ENTRIES,
-            }
-        )
-    )
