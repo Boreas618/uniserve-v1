@@ -491,6 +491,20 @@ impl WorkerGroupConfig {
         (own + deployment).min(1.0)
     }
 
+    /// The hosts `groups` place ranks on, each once, in the order of the first rank each holds,
+    /// with that rank's deployment rank: the hosts a deployment file names, as its reader placed
+    /// them.
+    pub fn hosts(groups: &[Self]) -> Vec<(&str, usize)> {
+        let ranks = groups.iter().flat_map(|group| group.ranks.iter());
+        let mut firsts: Vec<(&str, usize)> = Vec::new();
+        for (rank, placed) in ranks.enumerate() {
+            if !firsts.iter().any(|(host, _)| *host == placed.host) {
+                firsts.push((placed.host.as_str(), rank));
+            }
+        }
+        firsts
+    }
+
     /// The deployment rank of position 0 of each group, in the order the groups are stated.
     pub fn first_ranks(groups: &[Self]) -> Vec<usize> {
         groups
@@ -928,7 +942,9 @@ mod tests {
         }
     }
 
-    /// Every deployment the repository publishes for `--worker-groups` places.
+    /// Every deployment the repository publishes for `--worker-groups` places and validates with
+    /// each host it names as the engine's, as the node of that host reads it, and places no rank
+    /// on a CPU, which a node refuses: a main process serves CUDA devices.
     #[test]
     fn published_deployments_place() {
         let root = std::path::Path::new(crate::WORKSPACE).join("configs");
@@ -937,8 +953,26 @@ mod tests {
             for entry in std::fs::read_dir(model.unwrap().path()).unwrap() {
                 let path = entry.unwrap().path();
                 let text = std::fs::read_to_string(&path).unwrap();
-                WorkerGroupConfig::parse_file(&text, "localhost")
-                    .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
+                let place = |host: &str| {
+                    WorkerGroupConfig::parse_file(&text, host).unwrap_or_else(|error| {
+                        panic!("{} does not place on {host}: {error:#}", path.display())
+                    })
+                };
+                let local = place("localhost");
+                for (host, _) in WorkerGroupConfig::hosts(&local) {
+                    for group in place(host) {
+                        for rank in &group.ranks {
+                            assert!(
+                                !rank.device.starts_with(DeviceKind::Cpu.name()),
+                                "{}: worker group {} places rank {}/{} on a CPU",
+                                path.display(),
+                                group.id,
+                                rank.host,
+                                rank.device
+                            );
+                        }
+                    }
+                }
                 files += 1;
             }
         }

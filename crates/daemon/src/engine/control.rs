@@ -1602,18 +1602,8 @@ pub(crate) fn host_scopes(
 /// Fails when the engine host does not hold rank 0, or as [`local_devices`] fails.
 pub(crate) fn world_hosts(config: &proto::config::EngineConfig) -> anyhow::Result<Vec<HostRanks>> {
     let engine_host = config.parallel.engine_host.as_str();
-    let ranks = config
-        .parallel
-        .worker_groups
-        .iter()
-        .flat_map(|group| group.ranks.iter());
     // Each host with the deployment rank of the first rank it holds.
-    let mut firsts: Vec<(&str, usize)> = Vec::new();
-    for (rank, placed) in ranks.enumerate() {
-        if !firsts.iter().any(|(host, _)| *host == placed.host) {
-            firsts.push((placed.host.as_str(), rank));
-        }
-    }
+    let firsts = proto::config::WorkerGroupConfig::hosts(&config.parallel.worker_groups);
     let first_host = firsts.first().map(|(host, _)| *host);
     anyhow::ensure!(
         first_host == Some(engine_host),
