@@ -1277,27 +1277,6 @@ impl MainProcess {
                     done(move |main| main.configured(front, id, configured))
                 }));
             }
-            // The quotas are each node's daemon's, read over the claim it holds.
-            Kind::DescribeStorage(describe) => {
-                let error = "the quotas are read by each node's daemon over its claim, not by an \
-                             engine";
-                self.hooked(front, describe.id, Err(anyhow::anyhow!(error)));
-            }
-            // Nothing of a request's cache crosses to another epoch, which learns the buffer
-            // pool's cache by `List`.
-            Kind::DescribeRequests(describe) => {
-                let described = wire::RequestsDescribed {
-                    id: describe.id,
-                    error: "nothing of the cache is handed to another epoch".to_owned(),
-                    requests: Vec::new(),
-                };
-                self.send(front, from_engine::Kind::RequestsDescribed(described), None);
-            }
-            Kind::CacheWarm(warm) => {
-                let error = "nothing of the cache is handed to another epoch, which learns the \
-                             buffer pool's cache by `List`";
-                self.hooked(front, warm.id, Err(anyhow::anyhow!(error)));
-            }
         }
     }
 

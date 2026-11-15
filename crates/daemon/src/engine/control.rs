@@ -530,10 +530,9 @@ impl EngineControl {
         Ok((control, welcome.nodes))
     }
 
-    /// The quotas every node's Storage Server keeps for the deployment, one JSON report
-    /// per node: `{"host": ..., "quotas": [...], "host_storage": {...}, "transfers": [...]}`.
+    /// The quotas every node's Storage Server keeps for the deployment, one report per node.
     /// Each node's daemon reads them over its claim, so no engine is asked.
-    pub(crate) fn storage_reports(&self) -> anyhow::Result<Vec<String>> {
+    pub(crate) fn storage_reports(&self) -> anyhow::Result<Vec<NodeUsage>> {
         let (mut connection, nodes) = self.connect()?;
         let mut reports = Vec::with_capacity(nodes.len());
         for (index, node) in nodes.iter().enumerate() {
@@ -561,9 +560,14 @@ impl EngineControl {
             let Some(reply::Kind::Usage(report)) = reply.kind else {
                 anyhow::bail!("the daemon returned no quota");
             };
-            let mut report: serde_json::Value = serde_json::from_str(&report.usage)?;
-            report["host"] = serde_json::Value::String(host);
-            reports.push(report.to_string());
+            let usage: storage::protocol::Usage = storage::protocol::decode(&report.usage)
+                .with_context(|| format!("reading the quotas of {host}"))?;
+            reports.push(NodeUsage {
+                host,
+                quotas: usage.quotas,
+                host_storage: usage.host,
+                tasks: usage.tasks,
+            });
         }
         Ok(reports)
     }
@@ -1198,6 +1202,17 @@ pub fn prepare_epoch(
         "the epoch's modules are prepared at every host"
     );
     Ok(pinned)
+}
+
+/// What one node's Storage Server keeps for the deployment, as `GET /admin/config` reports it
+/// (`quotas`): the node's host identity, its quota of every GPU the deployment uses, what the host
+/// admits of new host storage, and what the deployment's tasks copied there by priority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct NodeUsage {
+    pub(crate) host: String,
+    pub(crate) quotas: Vec<storage::protocol::Quota>,
+    pub(crate) host_storage: storage::protocol::HostStorage,
+    pub(crate) tasks: Vec<storage::protocol::TaskTotal>,
 }
 
 /// Prepares the module set a node request names (`Request::PrepareModules`) at this node's Build Server,

@@ -154,8 +154,6 @@ type Responder = oneshot::Sender<Result<Response, String>>;
 enum Response {
     /// Each worker's JSON result (`Hooked`), or nothing (`Configured`).
     Results(Vec<String>),
-    /// The engine described the requests it was asked about (`RequestsDescribed`).
-    Prefixes,
 }
 
 impl Shared {
@@ -549,21 +547,6 @@ impl EngineClient {
             .unwrap_or_else(|_| Err("the engine ended before it responded".to_owned()))
     }
 
-    /// The quotas every node's Storage Server keeps for the
-    /// deployment, one JSON result per node: `{"host": ..., "quotas":
-    /// [...], "host_storage": {...}}`. No worker is asked: each node's daemon
-    /// reads them over its claim.
-    ///
-    /// # Errors
-    ///
-    /// Fails when a node's daemon cannot read them, or when the engine ends
-    /// first.
-    pub async fn describe_storage(&self) -> Result<Vec<String>, String> {
-        self.ask(|id| wire::engine_command::Kind::DescribeStorage(wire::DescribeStorage { id }))
-            .await
-            .map(Response::results)
-    }
-
     /// Runs the engine's operation `name` with the JSON `payload`, and
     /// returns each rank's JSON result.
     ///
@@ -822,7 +805,6 @@ impl Response {
     fn results(self) -> Vec<String> {
         match self {
             Self::Results(results) => results,
-            Self::Prefixes => Vec::new(),
         }
     }
 }
@@ -968,15 +950,6 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                         Ok(Response::Results(Vec::new()))
                     } else {
                         Err(configured.error)
-                    });
-                }
-            }
-            Some(from_engine::Kind::RequestsDescribed(described)) => {
-                if let Some(responder) = lock(&shared.responses).remove(&described.id) {
-                    let _ = responder.send(if described.error.is_empty() {
-                        Ok(Response::Prefixes)
-                    } else {
-                        Err(described.error)
                     });
                 }
             }

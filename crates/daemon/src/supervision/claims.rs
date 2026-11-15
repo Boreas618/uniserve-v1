@@ -308,26 +308,18 @@ impl ClaimHolder {
     /// The quotas this node's Storage Server keeps for `deployment`, one
     /// per GPU of the node it uses, what the host admits of new host
     /// storage, and what the deployment's tasks copied on the host by
-    /// priority, as JSON (`{"quotas": [...], "host_storage": {...},
-    /// "tasks": [...]}`), read over the claim this daemon holds.
+    /// priority, read over the claim this daemon holds.
     ///
     /// # Errors
     ///
     /// Fails when this daemon holds no claim of the deployment, or the
     /// server cannot be reached.
-    pub(crate) fn usage(&mut self, deployment: &str) -> anyhow::Result<String> {
+    pub(crate) fn usage(&mut self, deployment: &str) -> anyhow::Result<storage::protocol::Usage> {
         use anyhow::Context as _;
 
-        let usage = self
-            .held(deployment)?
+        self.held(deployment)?
             .usage()
-            .with_context(|| format!("reading the quotas of deployment {deployment}"))?;
-        Ok(serde_json::json!({
-            "quotas": usage.quotas,
-            "host_storage": usage.host,
-            "tasks": usage.tasks,
-        })
-        .to_string())
+            .with_context(|| format!("reading the quotas of deployment {deployment}"))
     }
 
     /// Hands every claim to this daemon's successor ([`ClaimHolder::adopt`]):

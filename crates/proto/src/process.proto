@@ -428,10 +428,11 @@ message ThrottleTransfers {
 message TransfersThrottled {}
 
 message UsageReport {
-  // The Storage Server's `Usage` response as JSON: `{"quotas": [...],
-  // "host_storage": {...}}` (the `storage` crate's `Quota` and
-  // `HostStorage`).
-  string usage = 1;
+  // The Storage Server's `Usage` response (`storage::protocol::Usage`) in the
+  // storage protocol's own encoding (`storage::protocol::encode`), relayed
+  // unchanged: the message has one definition, the storage protocol's, which
+  // the reading daemon decodes.
+  bytes usage = 1;
 }
 
 // What a daemon tells an engine, unasked.

@@ -694,38 +694,28 @@ impl Leader {
             .iter()
             .filter_map(|replica| replica.hold().client())
             .find(|client| matches!(client.state(), EngineState::Serving | EngineState::Parked));
-        // Each node's daemon reads its quotas over its claim; an engine this daemon did not launch
-        // (a simulated one) reads them itself.
+        // Each node's daemon reads its quotas over its claim.
         let control = replicas
             .iter()
             .find_map(|replica| replica.control.get().cloned());
-        let quotas = match client {
-            Some(client) => {
+        let quotas = match (client, control) {
+            (Some(_), Some(control)) => {
                 let read = async {
-                    match control {
-                        Some(control) => {
-                            tokio::task::spawn_blocking(move || control.storage_reports())
-                                .await
-                                .map_err(|error| error.to_string())?
-                                .map_err(|error| format!("{error:#}"))
-                        }
-                        None => client.describe_storage().await,
-                    }
+                    tokio::task::spawn_blocking(move || control.storage_reports())
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .map_err(|error| format!("{error:#}"))
                 };
                 match tokio::time::timeout(QUOTA_READ, read).await {
-                    Ok(Ok(nodes)) => serde_json::Value::Array(
-                        nodes
-                            .iter()
-                            .filter_map(|node| serde_json::from_str(node).ok())
-                            .collect(),
-                    ),
+                    Ok(Ok(nodes)) => serde_json::to_value(nodes)
+                        .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() })),
                     Ok(Err(error)) => serde_json::json!({ "error": error }),
                     Err(_) => serde_json::json!({
                         "error": format!("the quotas were not read within {QUOTA_READ:?}")
                     }),
                 }
             }
-            None => serde_json::Value::Null,
+            _ => serde_json::Value::Null,
         };
         // The bytes a change in progress moved: what every node's Transfer
         // Server copied for the deployment since it began, read with the

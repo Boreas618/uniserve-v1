@@ -227,7 +227,11 @@ impl Local {
                     Err(error) => reply.error = format!("{error:#}"),
                 }
             }
-            Some(request::Kind::Usage(query)) => match self.claims.usage(&query.deployment) {
+            Some(request::Kind::Usage(query)) => match self
+                .claims
+                .usage(&query.deployment)
+                .and_then(|usage| Ok(storage::protocol::encode(&usage)?))
+            {
                 Ok(usage) => reply.kind = Some(reply::Kind::Usage(UsageReport { usage })),
                 Err(error) => reply.error = format!("{error:#}"),
             },

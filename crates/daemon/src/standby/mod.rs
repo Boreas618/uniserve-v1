@@ -780,30 +780,18 @@ impl Phase {
 }
 
 /// What each host's devices can keep of a parked standby, as the hosts' Storage Server quotas of
-/// `deployment` state it: `reports` holds one JSON report per node, `{"host": ..., "quotas":
-/// [Quota...], "host_storage": HostStorage}` (`EngineControl::storage_reports`).
+/// `deployment` state it: `reports` holds one report per node (`EngineControl::storage_reports`).
 ///
 /// A standby keeps graph pools of the serving process's size beside it. A device is crowded when
 /// what its quota leaves unreserved is less than the graph pools the deployment reserves on it: a
 /// resident standby's would not fit. Suspended pools move to host storage, so they fit when the
-/// host's Storage Server admits every graph pool its devices reserve. A report that does not parse
-/// states nothing about its host, which then keeps no standby.
-pub fn rooms(reports: &[String], deployment: &str) -> BTreeMap<String, StandbyRoom> {
-    #[derive(serde::Deserialize)]
-    struct Report {
-        host: String,
-        quotas: Vec<storage::Quota>,
-        host_storage: storage::HostStorage,
-    }
+/// host's Storage Server admits every graph pool its devices reserve.
+pub(crate) fn rooms(
+    reports: &[crate::engine::control::NodeUsage],
+    deployment: &str,
+) -> BTreeMap<String, StandbyRoom> {
     let mut rooms = BTreeMap::new();
-    for text in reports {
-        let report: Report = match serde_json::from_str(text) {
-            Ok(report) => report,
-            Err(error) => {
-                tracing::warn!(%error, "a node's quota report does not parse");
-                continue;
-            }
-        };
+    for report in reports {
         let mut crowded = false;
         let mut graphs = 0_u64;
         for quota in report
@@ -822,7 +810,7 @@ pub fn rooms(reports: &[String], deployment: &str) -> BTreeMap<String, StandbyRo
             crowded |= quota.total.saturating_sub(reserved) < graph;
         }
         rooms.insert(
-            report.host,
+            report.host.clone(),
             StandbyRoom {
                 crowded,
                 fits_suspended: report.host_storage.room() >= graphs,

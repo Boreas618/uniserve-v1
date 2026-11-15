@@ -72,7 +72,7 @@ message EngineMismatch {
 
 // What travels from the engine process after the welcome.
 message FromEngine {
-  reserved 8;
+  reserved 8, 9;
   oneof kind {
     State state = 1;
     Accepted accepted = 2;
@@ -80,7 +80,6 @@ message FromEngine {
     Stats stats = 4;
     Hooked hooked = 5;
     Configured configured = 6;
-    RequestsDescribed requests_described = 9;
     // TCP artifact bytes, sent contiguously before their Artifact event.
     ArtifactPart artifact_part = 10;
     // The main process's counters for the frontend's `/metrics`.
@@ -318,7 +317,7 @@ message Takeover {
 
 // A command for the whole engine.
 message EngineCommand {
-  reserved 13;
+  reserved 13, 14, 16, 17;
   oneof kind {
     // Finish every request as aborted, close the workers and exit.
     Shutdown shutdown = 1;
@@ -340,50 +339,14 @@ message EngineCommand {
     // Rewrite the weights in place from another checkpoint of the same
     // model, once no request runs; answered with `Hooked`.
     UpdateWeights update_weights = 9;
-    // Read the quotas every node's Storage Server keeps for the
-    // deployment, each node's daemon over its claim, without asking a
-    // worker; answered with `Hooked`, one JSON result per node.
-    DescribeStorage describe_storage = 14;
-    // Accepted prefix lengths used to budget a successor's request state.
-    DescribeRequests describe_requests = 16;
-    // Pin, reserve, publish or release a round of prefix-cache transfers.
-    CacheWarm cache_warm = 17;
     // Install completed expert copies at the common drained step boundary.
     CommitExperts commit_experts = 18;
   }
 }
 
-message CacheWarm {
-  // Matches the Hooked answer; operation is manifest::cache::Operation JSON.
-  uint64 id = 1;
-  bytes operation = 2;
-}
-
 message CommitExperts {
   uint64 id = 1;
   map<string, ExpertOrder> order = 2;
-}
-
-message DescribeStorage {
-  // Matches the `Hooked` answer.
-  uint64 id = 1;
-}
-
-message DescribeRequests {
-  uint64 id = 1;
-}
-
-message RequestPrefix {
-  uint64 request_id = 1;
-  uint32 tokens = 2;
-  // Original continuation identity, preserved when request_id changes on migration.
-  CacheResume resume = 3;
-}
-
-message RequestsDescribed {
-  uint64 id = 1;
-  string error = 2;
-  repeated RequestPrefix requests = 3;
 }
 
 // A named operation of the data plane: an expert redistribution's stages, a
