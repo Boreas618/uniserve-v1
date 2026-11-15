@@ -633,9 +633,10 @@ impl NgramEmbeddingConfig {
                     .optional_count("make_ngram_vocab_size_divisible_by")?
                     .unwrap_or(1),
             ),
-            // vLLM assumes 512 shards when the field is absent
-            // (`refs/vllm/vllm/models/qwen4_exp/nvidia/ngram_embedding.py:393`).
-            parts: values.optional_count("split_ngram_parts")?.unwrap_or(512),
+            // The shards are a fact of the trained table, so a configuration must state them.
+            parts: values.count("split_ngram_parts")?,
+            // The release's n-gram tables were hashed with seed 1234, which NVIDIA's export of
+            // it states; the RadixArk and FP8 exports of the same release omit the field.
             seed: u64::from(values.optional_index("seed")?.unwrap_or(1234)),
         };
 
