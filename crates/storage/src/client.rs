@@ -406,15 +406,6 @@ impl Client {
         }
     }
 
-    /// See [`Request::Read`]: the bytes of `deployment`'s read-only host
-    /// tensor `key`.
-    pub fn read(&mut self, deployment: String, key: Key) -> Result<Vec<u8>> {
-        match self.request(&Request::Read { deployment, key }, &[])?.0 {
-            Response::Read { bytes } => Ok(bytes),
-            other => Err(unexpected("read", &other)),
-        }
-    }
-
     /// See [`Request::Quota`]. Returns the quotas of `gpu` the caller
     /// reserves against; a refusal is [`ErrorKind::Quota`], whose message
     /// names every reservation of the quota it would overrun.

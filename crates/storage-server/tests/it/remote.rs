@@ -22,7 +22,7 @@ use std::os::fd::AsFd;
 use std::path::Path;
 
 use ::storage::protocol::{Priority, TaskStatus};
-use ::storage::{Access, Client, Role, TensorRecord};
+use ::storage::{Access, Client, Role};
 
 use crate::server::{FORKING, Running, head, host, key, memfd, scope, tensor, worker};
 use crate::transfer::{
@@ -137,75 +137,6 @@ fn a_read_from_another_host_fails_when_that_host_cannot_expose_its_source() {
         }
     }
     assert_eq!(read(&destination, 0, 64), [0; 64]);
-}
-
-#[test]
-fn a_process_of_another_host_reads_a_small_read_only_tensor_of_bytes() {
-    let host = Running::with_transfer(|_| None);
-    let mut head = head(&host.socket);
-    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
-    let mut worker = worker(&host.socket, scope("text", 0), 1, claim);
-
-    // Text 16 bytes into its storage; an exclusive tensor; a read-only
-    // tensor of two dimensions; and one longer than a read responds with.
-    let text = sequence(100, 3);
-    let mut held = vec![0; 16];
-    held.extend_from_slice(&text);
-    let text_fd = memfd(&held);
-    let exclusive_fd = memfd(&[0; 64]);
-    let matrix_fd = memfd(&[0; 64]);
-    let long = ::storage::protocol::READ_BYTES + 1;
-    let long_fd = memfd(&vec![0; long as usize]);
-    let bytes = |key: u8, storage: u32, offset: u64, length: u64, access: Access| TensorRecord {
-        shape: vec![length],
-        offset,
-        ..tensor(crate::server::key(key), "manifest", storage, 0, access)
-    };
-    worker
-        .put(
-            vec![
-                bytes(1, 0, 16, text.len() as u64, Access::ReadOnly),
-                bytes(2, 1, 0, 64, Access::Exclusive),
-                TensorRecord {
-                    shape: vec![8, 8],
-                    strides: vec![8, 1],
-                    ..bytes(3, 2, 0, 64, Access::ReadOnly)
-                },
-                bytes(4, 3, 0, long, Access::ReadOnly),
-            ],
-            &[
-                (crate::server::host(held.len() as u64), text_fd.as_fd()),
-                (crate::server::host(64), exclusive_fd.as_fd()),
-                (crate::server::host(64), matrix_fd.as_fd()),
-                (crate::server::host(long), long_fd.as_fd()),
-            ],
-        )
-        .unwrap();
-
-    let mut peer =
-        Client::connect_peer(&endpoint(&host.socket), std::time::Duration::from_secs(10)).unwrap();
-    assert_eq!(peer.read("model".into(), key(1)).unwrap(), text);
-    assert_eq!(head.read("model".into(), key(1)).unwrap(), text);
-    assert_eq!(worker.read("model".into(), key(1)).unwrap(), text);
-    assert!(worker.read("other".into(), key(1)).is_err());
-    assert!(head.read("other".into(), key(1)).is_err());
-    for (deployment, key, reason) in [
-        ("other", key(1), "no host tensor other retains"),
-        (
-            "model",
-            key(2),
-            "not a read-only one-dimensional tensor of bytes",
-        ),
-        (
-            "model",
-            key(3),
-            "not a read-only one-dimensional tensor of bytes",
-        ),
-        ("model", key(4), "more than the"),
-    ] {
-        let error = peer.read(deployment.into(), key).unwrap_err().to_string();
-        assert!(error.contains(reason), "{error}");
-    }
 }
 
 /// READs between two hosts' GPUs and from host storage: the GPU tests.

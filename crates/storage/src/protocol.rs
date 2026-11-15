@@ -154,12 +154,6 @@ pub const VERSION: u32 = 26
 /// clients accept: the one before [`VERSION`].
 pub const OLDEST: u32 = VERSION - 1;
 
-/// The most bytes a [`Request::Read`] responds with: a weight manifest of the
-/// largest models the library serves fits many times over, and a reply of
-/// this size holds the server's loop for a few milliseconds on a host's
-/// network.
-pub const READ_BYTES: u64 = 64 << 20;
-
 /// A content address: the 32-byte digest of everything that determines a
 /// tensor's bytes, computed by the client.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1055,13 +1049,6 @@ pub enum Request {
     },
     /// Every tensor, storage and claim the server holds.
     List,
-    /// From a process of another host ([`Role::Peer`]): the bytes of the
-    /// copy of `key` in host storage that a scope of `deployment` retains
-    /// read-only, a one-dimensional tensor of `uint8` elements (such as a
-    /// weight manifest) of at most [`READ_BYTES`] bytes. Responded with
-    /// [`Response::Read`]; refused when the deployment retains no such tensor,
-    /// or a longer one.
-    Read { deployment: String, key: Key },
     /// Release every tensor and buffer pool of `deployment` and forget its
     /// claim: the deployment is no longer served. Refused while its head is
     /// connected.
@@ -1391,11 +1378,6 @@ pub enum Response {
     Released,
     Rekeyed,
     Listing(Listing),
-    /// The bytes a [`Request::Read`] asked for.
-    Read {
-        #[serde(with = "serde_bytes")]
-        bytes: Vec<u8>,
-    },
     Retired {
         released: u64,
     },

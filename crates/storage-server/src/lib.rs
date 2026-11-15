@@ -775,23 +775,6 @@ impl Server {
                 Response::Listing(self.listing()),
                 Vec::new(),
             )),
-            (Request::Read { deployment, key }, Role::Peer) => self
-                .read_bytes(deployment, key)
-                .map(|bytes| Handling::Response(Response::Read { bytes }, Vec::new())),
-            (
-                Request::Read { deployment, key },
-                Role::Head {
-                    deployment: owner, ..
-                },
-            ) if deployment == &owner => self
-                .read_bytes(deployment, key)
-                .map(|bytes| Handling::Response(Response::Read { bytes }, Vec::new())),
-            (Request::Read { deployment, key }, Role::Worker { scope, .. })
-                if deployment == &scope.deployment =>
-            {
-                self.read_bytes(deployment, key)
-                    .map(|bytes| Handling::Response(Response::Read { bytes }, Vec::new()))
-            }
             (Request::Status, _) => match &self.readiness {
                 Some(readiness) => Ok(Handling::Response(
                     Response::Status(Box::new(readiness.clone())),
@@ -2171,71 +2154,6 @@ impl Server {
         }
     }
 
-    /// See [`Request::Read`].
-    fn read_bytes(&self, deployment: &str, key: &Key) -> Result<Vec<u8>, (ErrorKind, String)> {
-        let host = [Location::Host { numa_node: None }];
-        let tensor = self
-            .copies_of(key, &host)
-            .into_iter()
-            .filter_map(|id| self.tensors.get(&id))
-            .find(|tensor| {
-                tensor
-                    .retainers
-                    .iter()
-                    .any(|retainer| retainer.scope.deployment == deployment)
-            })
-            .ok_or_else(|| invalid(&format!("{key:?} is no host tensor {deployment} retains")))?;
-        // The bytes do not change while they are read, and the server
-        // interprets no element type but bytes.
-        let bytes = match (
-            tensor.access,
-            tensor.dtype.as_str(),
-            tensor.shape.as_slice(),
-        ) {
-            (Access::ReadOnly, "uint8", &[bytes]) if tensor.strides == [1] => bytes,
-            _ => {
-                return Err(invalid(&format!(
-                    "{} is not a read-only one-dimensional tensor of bytes",
-                    tensor.name
-                )));
-            }
-        };
-        if bytes > ::storage::protocol::READ_BYTES {
-            return Err(invalid(&format!(
-                "{} holds {bytes} bytes, more than the {} a read responds with",
-                tensor.name,
-                ::storage::protocol::READ_BYTES
-            )));
-        }
-        let entry = self
-            .storages
-            .get(&tensor.storage)
-            .ok_or_else(|| invalid(&format!("{} has no storage", tensor.name)))?;
-        let mut read = vec![0; bytes as usize];
-        let mut done = 0;
-        while done < read.len() {
-            let count = rustix::io::pread(
-                &entry._descriptor,
-                &mut read[done..],
-                tensor.offset + done as u64,
-            )
-            .map_err(|error| {
-                (
-                    ErrorKind::Resource,
-                    format!("reading {}: {error}", tensor.name),
-                )
-            })?;
-            if count == 0 {
-                return Err(invalid(&format!(
-                    "{} reaches past the end of its storage",
-                    tensor.name
-                )));
-            }
-            done += count;
-        }
-        Ok(read)
-    }
-
     /// See [`Request::List`].
     fn listing(&self) -> Listing {
         let mut device = BTreeMap::<([u8; 16], Retainer), u64>::new();
@@ -2524,7 +2442,6 @@ fn request_name(request: &Request) -> &'static str {
         Request::Release { .. } => "release",
         Request::Rekey { .. } => "rekey",
         Request::List => "list",
-        Request::Read { .. } => "read",
         Request::Retire { .. } => "retire",
         Request::Restart { .. } => "restart",
         Request::Status => "status",
