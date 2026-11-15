@@ -48,6 +48,15 @@
 #ifndef UNISERVE_TILE_TOKENS
 #error "UNISERVE_TILE_TOKENS is not defined"
 #endif
+#ifndef UNISERVE_TILE_COLUMNS
+#error "UNISERVE_TILE_COLUMNS is not defined"
+#endif
+#ifndef UNISERVE_CLUSTER_ROWS
+#error "UNISERVE_CLUSTER_ROWS is not defined"
+#endif
+#ifndef UNISERVE_CLUSTER_COLUMNS
+#error "UNISERVE_CLUSTER_COLUMNS is not defined"
+#endif
 
 namespace uniserve::trtllm::routed {
 namespace {
@@ -58,7 +67,11 @@ constexpr int32_t kHidden = UNISERVE_HIDDEN;
 constexpr int32_t kIntermediate = UNISERVE_INTERMEDIATE;
 constexpr int32_t kExperts = UNISERVE_EXPERTS;
 constexpr int32_t kTop = UNISERVE_TOP;
+// The MMA tactic the module's cubins were selected for: the descriptor's tile and cluster.
 constexpr int32_t kTileTokens = UNISERVE_TILE_TOKENS;
+constexpr int32_t kTileColumns = UNISERVE_TILE_COLUMNS;
+constexpr int32_t kClusterRows = UNISERVE_CLUSTER_ROWS;
+constexpr int32_t kClusterColumns = UNISERVE_CLUSTER_COLUMNS;
 
 // The weights' block scales: the module serves the library's variants whose *weight* scales are
 // the plain `[experts, rows, columns/16]` table. The 8x4-tiled variants are a different shard
@@ -127,12 +140,19 @@ int launch(Call* call, void* stream) {
   if (!compiled_for<Product>(call)) {
     return refuse_geometry(call);
   }
-  // The tiles the descriptor states are the ones the published cubins carry; a module whose tactic
-  // is another row/column tile is another module, and this is the refusal that says so rather than
-  // a launch into a shape mismatch.
-  if (call->tile_m != 128 || call->tile_n <= 0 || call->cluster_m <= 0 || call->cluster_n <= 0) {
-    return refuse(call, "the compiled tile is 128 rows by the descriptor's columns at a positive "
-                        "cluster; the call states another");
+  // The tile and cluster the descriptor states are the ones the published cubins carry; a call of
+  // another tactic belongs to another module, and this is the refusal that says so rather than a
+  // launch into a shape mismatch.
+  if (call->tile_m != kTileTokens || call->tile_n != kTileColumns ||
+      call->cluster_m != kClusterRows || call->cluster_n != kClusterColumns) {
+    char message[512];
+    std::snprintf(message, sizeof(message),
+                  "this module's cubins are tile %dx%d, cluster %dx%d, and the call states tile "
+                  "%lldx%lld, cluster %lldx%lld",
+                  kTileTokens, kTileColumns, kClusterRows, kClusterColumns,
+                  static_cast<long long>(call->tile_m), static_cast<long long>(call->tile_n),
+                  static_cast<long long>(call->cluster_m), static_cast<long long>(call->cluster_n));
+    return refuse(call, message);
   }
 
   Problem const problem{
