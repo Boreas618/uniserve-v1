@@ -238,19 +238,23 @@ fn apply(schedulers: &[Sender<Message>], binding: &WeightBinding) -> Result<Vec<
     } else {
         binding.encoder_identities()?
     };
-    let seeds = reports.first().map(|report| {
-        let pages: Vec<Key> = report
-            .identities
-            .iter()
-            .map(|identity| storage::key::page_seed(identity))
-            .collect();
-        let latent = storage::key::latent_seed(
-            reports
+    let seeds = reports
+        .first()
+        .map(|report| {
+            let pages: Vec<Key> = report
+                .identities
                 .iter()
-                .filter_map(|report| report.identity.as_deref()),
-        );
-        (pages, latent, encoders)
-    });
+                .map(|identity| storage::key::page_seed(identity))
+                .collect();
+            let latent = storage::key::latent_seed(
+                reports
+                    .iter()
+                    .filter_map(|report| report.identity.as_deref()),
+            )
+            .ok_or_else(|| anyhow::anyhow!("no rank states the identity of its new weights"))?;
+            anyhow::Ok((pages, latent, encoders))
+        })
+        .transpose()?;
 
     let flushed = ask(schedulers, |reply| {
         Message::Flush(seeds.clone(), WeightsInFlight::Keep, reply)

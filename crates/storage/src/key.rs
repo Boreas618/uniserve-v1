@@ -72,12 +72,7 @@ impl Digest {
 /// The page seed of a cache group whose pages are computed and laid out as
 /// `identity` states: the group's upstream stage identities and its
 /// page layout, as the ranks report them (`PrefixCacheInfo::identities`).
-/// The zero key for an empty identity, which a protocol consumer without a
-/// model reports: its pages are keyed by their tokens alone.
 pub fn page_seed(identity: &str) -> Key {
-    if identity.is_empty() {
-        return Key([0; 32]);
-    }
     let mut digest = Digest::new(b"uniserve-page-seed");
     digest.text(identity);
     digest.key()
@@ -175,18 +170,21 @@ pub fn encoder_page(content: &[u8; 32], page: u32) -> Key {
 /// identities of the weights its ranks compute a trajectory and its
 /// conditioning with: the first eight bytes of the digest of the distinct
 /// identities in order, so that ranks holding the same weights count once.
-/// Zero when no rank reports one.
-pub fn latent_seed<'a>(identities: impl IntoIterator<Item = &'a str>) -> u64 {
+/// `None` without an identity: a trajectory follows from the weights that
+/// compute it, so no seed stands for weights no rank states.
+pub fn latent_seed<'a>(identities: impl IntoIterator<Item = &'a str>) -> Option<u64> {
     let distinct: std::collections::BTreeSet<&str> = identities.into_iter().collect();
     if distinct.is_empty() {
-        return 0;
+        return None;
     }
     let mut digest = Digest::new(b"uniserve-latent-seed");
     for identity in distinct {
         digest.text(identity);
     }
     let digest = digest.finish();
-    u64::from_le_bytes(digest[..8].try_into().unwrap_or_default())
+    let mut leading = [0_u8; 8];
+    leading.copy_from_slice(&digest[..8]);
+    Some(u64::from_le_bytes(leading))
 }
 
 /// The digest of what a trajectory's values are after `steps` steps: what
@@ -243,8 +241,6 @@ mod tests {
         assert_ne!(keys, chain(&page_seed("model|page-content:2"), None, pages));
         assert_ne!(keys, chain(&seed, Some(7), pages));
         assert_ne!(chain(&seed, Some(7), pages), chain(&seed, Some(8), pages));
-        // A consumer without a model keys its pages by their tokens alone.
-        assert_eq!(page_seed(""), Key([0; 32]));
     }
 
     #[test]
@@ -264,7 +260,7 @@ mod tests {
 
     #[test]
     fn a_latent_seed_names_the_distinct_identities() {
-        assert_eq!(latent_seed([]), 0);
+        assert_eq!(latent_seed([]), None);
         assert_eq!(latent_seed(["a", "b"]), latent_seed(["b", "a", "a"]));
         assert_ne!(latent_seed(["a"]), latent_seed(["b"]));
     }

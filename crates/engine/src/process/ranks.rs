@@ -4037,7 +4037,8 @@ pub(crate) fn capacities(
         .iter()
         .map(|(_, _, names)| binding::identity_of_names(names))
         .collect();
-    let latent = storage::key::latent_seed(identities.iter().map(String::as_str));
+    let latent = storage::key::latent_seed(identities.iter().map(String::as_str))
+        .ok_or_else(|| anyhow::anyhow!("no rank of the deployment states its weights' identity"))?;
 
     let mut stated: Vec<(GroupId, Capacity)> = Vec::new();
     for rank in ranks {
