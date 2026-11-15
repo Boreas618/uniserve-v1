@@ -7,11 +7,13 @@ with the call structure of ``crates/ops/src/conv.rs``, and compares the output
 with ``torch.nn.functional``'s convolution in FP64.
 
 The tolerance is the operator's: ``conv.rs::tolerance`` declares
-``Tolerance::dot(taps, F32, output)``, whose relative bound is
-``2 gamma_n sqrt(n) + u_out`` over all ``n`` products, the statistical bound
-for a sum of mixed-sign products, held against the output's largest
-magnitude. A ``bf16`` convolution keeps the same bound with ``u_out`` of its
-own element type. ``tf32`` is a permission for an FP32 convolution only, so
+``Tolerance::dot(n, F32, output)``, whose relative bound is
+``2 gamma_n sqrt(n) + u_out`` over the ``n`` products one output element
+sums (its group's input channels times the filter taps that reach it), the
+statistical bound for a sum of mixed-sign products, held against the output's
+largest magnitude. The bias is added to that FP32 sum and the result rounded
+once, so a ``bf16`` convolution keeps the same bound with ``u_out`` of its own
+element type. ``tf32`` is a permission for an FP32 convolution only, so
 these calls withhold it: a convolution cuDNN may run on TF32 tensor cores
 does not meet the FP32 bound, which the operator's tolerance does not
 account for.
@@ -127,11 +129,27 @@ def entry(kernel_module, dtype):
     return function
 
 
-def bound(taps, output):
-    """The operator's relative bound over `taps` products into `output`."""
-    terms = taps * UNIT_ROUNDOFF["f32"]
+def bound(products, output):
+    """The operator's relative bound over `products` products into `output`."""
+    terms = products * UNIT_ROUNDOFF["f32"]
     gamma = terms / (1.0 - terms)
-    return 2.0 * gamma * math.sqrt(taps) + UNIT_ROUNDOFF[output]
+    return 2.0 * gamma * math.sqrt(products) + UNIT_ROUNDOFF[output]
+
+
+def reduction(op, channels, kernel, stride, dilation):
+    """The products one output element sums, as `conv.rs::tolerance` counts
+    them: every input channel of its group (one group here) times the filter
+    taps that reach it. A convolution's output reads its whole window; a
+    transposed one's reads the taps that land on its position, ``ceil(t /
+    (s / gcd(s, d)))`` along an axis.
+    """  # noqa: D205
+    taps = 1
+    for extent, step, spacing in zip(kernel, stride, dilation, strict=True):
+        if op == "conv_transpose1d":
+            taps *= math.ceil(extent / (step // math.gcd(step, spacing)))
+        else:
+            taps *= extent
+    return channels * taps
 
 
 def triplet(value, unit=1):
@@ -238,16 +256,16 @@ def compare(function, op, dtype, channels_last, extents, shape, device):
         f"the entry refused the call: {call.error.decode(errors='replace')}"
     )
 
-    taps = math.prod(kernel) * channels
+    products = reduction(op, channels, kernel, stride, dilation)
     difference = (out.double() - expected).abs()
     # A NaN anywhere makes a maximum NaN, which hides every other error and
     # passes a `>` comparison: it counts as an infinite error.
     worst = difference.nan_to_num(nan=float("inf")).max().item()
-    relative = bound(taps, dtype)
+    relative = bound(products, dtype)
     largest = expected.abs().max().item()
     assert worst <= relative * largest, (
         f"{op} {dtype}, in {tuple(x.shape)} filter {tuple(weight.shape)} out "
-        f"{tuple(expected.shape)}, {taps} taps: max |out - exact| = "
+        f"{tuple(expected.shape)}, {products} products: max |out - exact| = "
         f"{worst:.6g} exceeds the operator's bound {relative:.3g} of the "
         f"largest value {largest:.6g}"
     )

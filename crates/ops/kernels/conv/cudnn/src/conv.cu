@@ -48,6 +48,20 @@
 // `UNISERVE_CONV_WEIGHT` and `UNISERVE_CONV_OUTPUT` as cuDNN's data types of the
 // descriptor's fields. cuDNN computes every convolution here in FP32, which keeps
 // the video VAE's precision and lets the engine use its tensor cores for it.
+//
+// **The bias is added to the FP32 sum, and the output is rounded once.** The bias kernel reads the
+// convolution's sum in FP32, adds the bias in FP32 and writes the result in the output's element
+// type. An FP32 output holds that sum itself. A 16-bit output cannot: cuDNN rounding the sum into
+// it and the bias added to the rounded value would round twice, which errs by up to a whole unit in
+// the last place where the operator's contract allows half of one. So a biased call into a 16-bit
+// output computes over FP32 storage - its 16-bit operands widened into FP32 buffers from the
+// stream's pool, cuDNN's FP32 graph writing the sum into another - and the bias kernel rounds the
+// biased sum into the output. The widening is exact, and so are the products of widened 16-bit
+// values, in FP32 and in TF32 alike, so the sum is the one the 16-bit operands define. cuDNN has no
+// narrower way to that sum for every pass: with cuDNN 9.12 on sm_100 the backward-data pass has no
+// engine that reads 16-bit operands into an FP32 result or fuses the pointwise bias epilogue, and
+// the engines it takes apply an operation's `beta` blend, of a bias written into the output first,
+// after rounding.
 
 #include <uniserve_conv.h>
 
@@ -83,6 +97,13 @@ static_assert(computed(UNISERVE_CONV_INPUT) && computed(UNISERVE_CONV_WEIGHT) &&
 // Whether this module's input element type is FP32, the only precision whose
 // convolution has a TF32 choice to make.
 constexpr bool kFp32Inputs = UNISERVE_CONV_INPUT == CUDNN_DATA_FLOAT;
+
+/// Whether a call computes over FP32 storage: a biased call into an output narrower than FP32,
+/// whose bias is added to the FP32 sum before the one rounding into the output. Its graph is
+/// cuDNN's FP32 convolution, over its operands widened to FP32 and into an FP32 buffer.
+bool staged(const uniserve_conv_call& call) {
+  return call.bias != nullptr && UNISERVE_CONV_OUTPUT != CUDNN_DATA_FLOAT;
+}
 
 /// The alignment every tensor of this program is handed to cuDNN with.
 ///
@@ -131,11 +152,13 @@ cudnnHandle_t handle_of(int32_t device, char* error, int32_t* status) {
   return handle;
 }
 
-/// One shape's executable: its finalized execution descriptor and the
-/// workspace it asks for.
+/// One shape's executable: its finalized execution descriptor, the
+/// workspace it asks for, and whether it computes over FP32 storage
+/// (`staged`).
 struct Executable {
   cudnnBackendDescriptor_t descriptor = nullptr;
   size_t workspace = 0;
+  bool staged = false;
 };
 
 /// The executable of a shape, from the process's cache or from cuDNN's heuristic.
@@ -220,9 +243,12 @@ Executable executable_of(const uniserve_conv_call& call, const std::string& key,
   };
 
   const bool transposed = call.transposed != 0;
-  const cudnnDataType_t x_type = UNISERVE_CONV_INPUT;
-  const cudnnDataType_t w_type = UNISERVE_CONV_WEIGHT;
-  const cudnnDataType_t y_type = UNISERVE_CONV_OUTPUT;
+  // The tensors the convolution reads and writes: the call's own, or for a staged call FP32
+  // buffers of their shapes and orders - the widened operands, and the sum the bias kernel rounds
+  // into the output.
+  const cudnnDataType_t x_type = staged(call) ? CUDNN_DATA_FLOAT : UNISERVE_CONV_INPUT;
+  const cudnnDataType_t w_type = staged(call) ? CUDNN_DATA_FLOAT : UNISERVE_CONV_WEIGHT;
+  const cudnnDataType_t y_type = staged(call) ? CUDNN_DATA_FLOAT : UNISERVE_CONV_OUTPUT;
 
   int64_t x_dims[5];
   int64_t x_strides[5];
@@ -434,8 +460,9 @@ Executable executable_of(const uniserve_conv_call& call, const std::string& key,
   // engine that converts its inputs to a narrower type before computing, which no call admits: the
   // narrowest product an FP32 call may declare is TF32's, and a 16-bit call's products are exact.
   // `CUDNN_NUMERICAL_NOTE_TENSOR_CORE` marks a tensor-core engine, which reads FP32 operands as
-  // TF32, so an FP32 call takes one only when it grants `tf32`. An engine whose notes cannot be
-  // read states nothing the call can rely on and is not taken.
+  // TF32, so an FP32 call takes one only when it grants `tf32`; a staged call of 16-bit inputs
+  // reads them widened, which TF32 holds exactly, so it may. An engine whose notes cannot be read
+  // states nothing the call can rely on and is not taken.
   const bool exact_fp32 = kFp32Inputs && call.tf32 == 0;
   auto keeps_numerics = [exact_fp32](cudnnBackendDescriptor_t config) {
     // As with the list, the engine is read into a descriptor made here.
@@ -588,6 +615,7 @@ Executable executable_of(const uniserve_conv_call& call, const std::string& key,
 
   Executable made;
   made.descriptor = executable;
+  made.staged = staged(call);
   int64_t workspace = 0;
   if (cudnnBackendGetAttribute(executable, CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
                                CUDNN_TYPE_INT64, 1, nullptr, &workspace) == CUDNN_STATUS_SUCCESS &&
@@ -599,40 +627,72 @@ Executable executable_of(const uniserve_conv_call& call, const std::string& key,
   return made;
 }
 
-/// Adds a bias to a dense output, one element per thread. `channel_stride` is the elements between
-/// two channels of one position: the spatial extent of `[n, k, d, h, w]` storage, 1 of channels-last
-/// storage, where the channel is the fastest axis.
+/// Copies a dense 16-bit operand into an FP32 buffer, one element per thread, keeping its order:
+/// every 16-bit value is exact in FP32.
 template <typename Element>
-__global__ void bias_kernel(Element* y, const Element* bias, int64_t elements, int64_t channels,
-                            int64_t channel_stride) {
+__global__ void widen_kernel(float* wide, const Element* narrow, int64_t elements) {
+  const int64_t at = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (at >= elements) {
+    return;
+  }
+  wide[at] = static_cast<float>(narrow[at]);
+}
+
+/// The kernel that widens a 16-bit operand of element type `dtype` into `wide`.
+void widen(float* wide, const void* narrow, int64_t elements, cudnnDataType_t dtype,
+           cudaStream_t stream) {
+  const int64_t threads = 256;
+  const int64_t blocks = (elements + threads - 1) / threads;
+  switch (dtype) {
+    case CUDNN_DATA_HALF:
+      widen_kernel<<<blocks, threads, 0, stream>>>(wide, static_cast<const __half*>(narrow),
+                                                   elements);
+      break;
+    case CUDNN_DATA_BFLOAT16:
+      widen_kernel<<<blocks, threads, 0, stream>>>(
+          wide, static_cast<const __nv_bfloat16*>(narrow), elements);
+      break;
+    default:
+      break;
+  }
+}
+
+/// Writes `sum + bias` into a dense output, one element per thread: the convolution's FP32 sum
+/// plus its channel's bias, added in FP32 and rounded once into the output's element type. `sum`
+/// is the output itself when the output is FP32 and the FP32 buffer of a staged call otherwise,
+/// in the output's order. `channel_stride` is the elements between two channels of one position:
+/// the spatial extent of `[n, k, d, h, w]` storage, 1 of channels-last storage, where the channel
+/// is the fastest axis.
+template <typename Element>
+__global__ void bias_kernel(Element* y, const float* sum, const Element* bias, int64_t elements,
+                            int64_t channels, int64_t channel_stride) {
   const int64_t at = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (at >= elements) {
     return;
   }
   const int64_t channel = (at / channel_stride) % channels;
-  const float bias_value = static_cast<float>(bias[channel]);
-  y[at] = static_cast<Element>(static_cast<float>(y[at]) + bias_value);
+  y[at] = static_cast<Element>(sum[at] + static_cast<float>(bias[channel]));
 }
 
-/// The kernel that adds the bias of the module's element type.
-void add_bias(void* y, const void* bias, int64_t elements, int64_t channels,
+/// The kernel that adds the bias of the module's element type to the FP32 `sum`.
+void add_bias(void* y, const float* sum, const void* bias, int64_t elements, int64_t channels,
               int64_t channel_stride, cudnnDataType_t dtype, cudaStream_t stream) {
   const int64_t threads = 256;
   const int64_t blocks = (elements + threads - 1) / threads;
   switch (dtype) {
     case CUDNN_DATA_FLOAT:
-      bias_kernel<<<blocks, threads, 0, stream>>>(static_cast<float*>(y),
+      bias_kernel<<<blocks, threads, 0, stream>>>(static_cast<float*>(y), sum,
                                                   static_cast<const float*>(bias), elements,
                                                   channels, channel_stride);
       break;
     case CUDNN_DATA_HALF:
-      bias_kernel<<<blocks, threads, 0, stream>>>(static_cast<__half*>(y),
+      bias_kernel<<<blocks, threads, 0, stream>>>(static_cast<__half*>(y), sum,
                                                   static_cast<const __half*>(bias), elements,
                                                   channels, channel_stride);
       break;
     case CUDNN_DATA_BFLOAT16:
       bias_kernel<<<blocks, threads, 0, stream>>>(
-          static_cast<__nv_bfloat16*>(y), static_cast<const __nv_bfloat16*>(bias), elements,
+          static_cast<__nv_bfloat16*>(y), sum, static_cast<const __nv_bfloat16*>(bias), elements,
           channels, channel_stride);
       break;
     default:
@@ -676,8 +736,10 @@ std::string executable_key(const uniserve_conv_call& call, int32_t device) {
   key += call.tf32 != 0 ? "_tf32" : "_exact";
   // ...and on the iteration order, because the two orders' tensor descriptors make different
   // executables over one engine: one cached for one order would give the other the wrong
-  // strides.
+  // strides...
   key += call.channels_last != 0 ? "_ndhwc" : "_ncdhw";
+  // ...and on the types of the tensors it reads and writes, which a staged call's are FP32.
+  key += staged(call) ? "_staged" : "_direct";
   key += "_device_";
   key += std::to_string(device);
   return key;
@@ -755,11 +817,65 @@ extern "C" int32_t uniserve_conv(const uniserve_conv_call* call, void* stream) {
     return status != 0 ? status
                        : refuse(error, "the convolution's executable could not be built");
   }
+  // The workspace and a staged call's FP32 buffers come from the stream's pool, so a captured
+  // graph records them like any other work, and all of them are returned to it on every exit.
+  const auto on_stream = reinterpret_cast<cudaStream_t>(stream);
+  auto elements_of = [](const int64_t* shape) {
+    int64_t elements = 1;
+    for (int32_t axis = 0; axis < kSpatial + 2; ++axis) {
+      elements *= shape[axis];
+    }
+    return elements;
+  };
+  const int64_t elements = elements_of(call->out_shape);
   void* workspace = nullptr;
+  void* wide_input = nullptr;
+  void* wide_weight = nullptr;
+  void* sum = nullptr;
+  auto release = [&]() {
+    for (void* buffer : {workspace, wide_input, wide_weight, sum}) {
+      if (buffer != nullptr) {
+        cudaFreeAsync(buffer, on_stream);
+      }
+    }
+  };
+  auto fp32_buffer = [&](void** buffer, int64_t count) {
+    return cudaMallocAsync(buffer, static_cast<size_t>(count) * sizeof(float), on_stream) ==
+           cudaSuccess;
+  };
   if (executable.workspace > 0 &&
-      cudaMallocAsync(&workspace, executable.workspace, reinterpret_cast<cudaStream_t>(stream)) !=
-          cudaSuccess) {
+      cudaMallocAsync(&workspace, executable.workspace, on_stream) != cudaSuccess) {
     return refuse(error, "a convolution's workspace could not be allocated");
+  }
+
+  // A staged call's operands, widened where they are 16-bit, and its sum.
+  const void* input = call->input;
+  const void* weight = call->weight;
+  if (executable.staged) {
+    const int64_t input_elements = elements_of(call->input_shape);
+    const int64_t weight_elements = elements_of(call->weight_shape);
+    const bool widen_input = UNISERVE_CONV_INPUT != CUDNN_DATA_FLOAT;
+    const bool widen_weight = UNISERVE_CONV_WEIGHT != CUDNN_DATA_FLOAT;
+    if ((widen_input && !fp32_buffer(&wide_input, input_elements)) ||
+        (widen_weight && !fp32_buffer(&wide_weight, weight_elements)) ||
+        !fp32_buffer(&sum, elements)) {
+      release();
+      return refuse(error, "a convolution's FP32 buffers could not be allocated");
+    }
+    if (widen_input) {
+      widen(static_cast<float*>(wide_input), call->input, input_elements, UNISERVE_CONV_INPUT,
+            on_stream);
+      input = wide_input;
+    }
+    if (widen_weight) {
+      widen(static_cast<float*>(wide_weight), call->weight, weight_elements,
+            UNISERVE_CONV_WEIGHT, on_stream);
+      weight = wide_weight;
+    }
+    if (cudaGetLastError() != cudaSuccess) {
+      release();
+      return refuse(error, "a convolution's operands could not be widened to FP32");
+    }
   }
 
   // The variant pack names this call's buffers by the operation graph's unique
@@ -771,9 +887,10 @@ extern "C" int32_t uniserve_conv(const uniserve_conv_call* call, void* stream) {
   const int64_t uids[3] = {kUidX, kUidW, kUidY};
   // **Each pointer is the tensor its descriptor describes.** The id `X` is the descriptor of the
   // layer's input and `Y` of its output, in both passes: a transposed pass reads `dy` from `X`'s
-  // descriptor and writes `dx` through `Y`'s, and the graph above is what names them so.
-  void* pointers[3] = {const_cast<void*>(call->input), const_cast<void*>(call->weight),
-                       const_cast<void*>(call->out)};
+  // descriptor and writes `dx` through `Y`'s, and the graph above is what names them so. A staged
+  // call's are its FP32 buffers.
+  void* pointers[3] = {const_cast<void*>(input), const_cast<void*>(weight),
+                       executable.staged ? sum : call->out};
   built = built &&
           cudnnBackendSetAttribute(variant, CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS,
                                    CUDNN_TYPE_VOID_PTR, 3, pointers) == CUDNN_STATUS_SUCCESS &&
@@ -786,35 +903,30 @@ extern "C" int32_t uniserve_conv(const uniserve_conv_call* call, void* stream) {
     if (variant != nullptr) {
       cudnnBackendDestroyDescriptor(variant);
     }
-    if (workspace != nullptr) {
-      cudaFreeAsync(workspace, reinterpret_cast<cudaStream_t>(stream));
-    }
+    release();
     return refuse(error, "a convolution's variant pack could not be built");
   }
   const cudnnStatus_t executed = cudnnBackendExecute(handle, executable.descriptor, variant);
   cudnnBackendDestroyDescriptor(variant);
   if (executed != CUDNN_STATUS_SUCCESS) {
-    if (workspace != nullptr) {
-      cudaFreeAsync(workspace, reinterpret_cast<cudaStream_t>(stream));
-    }
+    release();
     return refuse(error, "cudnnBackendExecute failed");
   }
 
+  // The bias joins the FP32 sum - the output itself when it is FP32, the staged buffer otherwise -
+  // and the result is rounded once into the output.
   if (call->bias != nullptr) {
     const int64_t channels = call->out_shape[1];
     const int64_t spatial = call->out_shape[2] * call->out_shape[3] * call->out_shape[4];
-    const int64_t elements = call->out_shape[0] * channels * spatial;
-    add_bias(call->out, call->bias, elements, channels, call->channels_last != 0 ? 1 : spatial,
-             UNISERVE_CONV_OUTPUT, reinterpret_cast<cudaStream_t>(stream));
+    const float* const fp32_sum =
+        executable.staged ? static_cast<const float*>(sum) : static_cast<const float*>(call->out);
+    add_bias(call->out, fp32_sum, call->bias, elements, channels,
+             call->channels_last != 0 ? 1 : spatial, UNISERVE_CONV_OUTPUT, on_stream);
     if (cudaGetLastError() != cudaSuccess) {
-      if (workspace != nullptr) {
-        cudaFreeAsync(workspace, reinterpret_cast<cudaStream_t>(stream));
-      }
+      release();
       return refuse(error, "a convolution's bias could not be added");
     }
   }
-  if (workspace != nullptr) {
-    cudaFreeAsync(workspace, reinterpret_cast<cudaStream_t>(stream));
-  }
+  release();
   return 0;
 }

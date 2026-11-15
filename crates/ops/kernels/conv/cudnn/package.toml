@@ -16,6 +16,13 @@
 # in `ops`, so both paddings are the layer's own. A grouped transposed convolution is
 # not described by that pass in this layout and the module refuses it.
 #
+# A bias is added to the convolution's FP32 sum, and the result is rounded once into
+# the output. An FP32 output holds that sum and takes the bias in place. A biased call
+# into a 16-bit output runs cuDNN's FP32 convolution over its operands widened to FP32
+# (exactly) into an FP32 buffer from the stream's pool, and the bias kernel rounds the
+# biased sum into the output: cuDNN rounding the sum into the output first would round
+# twice.
+#
 # The descriptor carries the element types only: the rank, the direction, the geometry,
 # the strides, the padding, the dilation, the groups, the bias, the TF32 permission and
 # the storage order travel in the call structure the entry reads, so one compilation

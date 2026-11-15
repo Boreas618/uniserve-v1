@@ -66,6 +66,10 @@ pub struct Descriptor {
     pub dilation: [u32; 3],
     /// How many channel groups the filter is split into.
     pub groups: u32,
+    /// The input channels each output element sums over: the input's channel count over the
+    /// groups, in either direction. With the taps that reach an output it is the reduction length
+    /// the operator's bound is stated for ([`Conv::tolerance`]).
+    pub group_channels: u32,
     /// Whether the operation has a bias term.
     pub bias: bool,
     /// The precision the products of FP32 inputs may be formed in.
@@ -86,8 +90,9 @@ impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Only what selects a compiled module is in the key. The filter's window (kernel, stride,
         // padding, dilation, groups), the bias, the precision and the rank travel in the call
-        // structure (`Call`), which the entry reads: a convolution of a different window, or with a
-        // bias, or in the transposed direction, launches the same module.
+        // structure (`Call`), which the entry reads, and the channels in its shapes: a convolution
+        // of a different window or width, or with a bias, or in the transposed direction, launches
+        // the same module.
         // A key that named them would compile one module per clip length and per filter shape.
         Key::new()
             .field("input", abi::name(self.input))
@@ -100,11 +105,12 @@ impl fmt::Display for Descriptor {
 impl Descriptor {
     /// The descriptor of the convolution `args` states: the operands' element types, the filter's
     /// taps along each spatial axis from the filter's extents, the spatial rank from the input's
-    /// axes (`[n, c, l]` is one, `[n, c, d, h, w]` three), a bias exactly when the call has one,
-    /// and channels-last storage when a three-dimensional input is stored that way. What the
-    /// operands cannot say is the caller's: the direction, the window (`stride`, `padding`,
-    /// `dilation` per spatial axis, 1, 0 and 1 on an axis the rank leaves unused), the channel
-    /// groups and the precision the products may be formed in.
+    /// axes (`[n, c, l]` is one, `[n, c, d, h, w]` three), the channels of one group from the
+    /// input's, a bias exactly when the call has one, and channels-last storage when a
+    /// three-dimensional input is stored that way. What the operands cannot say is the caller's:
+    /// the direction, the window (`stride`, `padding`, `dilation` per spatial axis, 1, 0 and 1 on
+    /// an axis the rank leaves unused), the channel groups and the precision the products may be
+    /// formed in.
     ///
     /// This is the one place a convolution's descriptor is made: the tensor library's
     /// convolutions on this backend and `nn`'s convolutions take it from here, so one call has
@@ -113,7 +119,7 @@ impl Descriptor {
     /// # Errors
     ///
     /// [`Error::Argument`] for an input of other than one or three spatial axes, a filter of
-    /// another rank than the input, or a tap count beyond 32 bits.
+    /// another rank than the input, no groups, or a tap or channel count beyond 32 bits.
     pub fn of(
         args: &Args,
         transposed: bool,
@@ -142,6 +148,19 @@ impl Descriptor {
             })?;
         }
 
+        // Each output channel reads the input channels of its own group, whichever way the filter
+        // is stored: `[k, c/groups, …]` forward and `[c, k/groups, …]` transposed.
+        let channels = args.input.dim(1);
+        let group_channels = channels
+            .checked_div(u64::from(groups))
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or_else(|| {
+                Error::argument(
+                    "convolution",
+                    format!("{channels} input channels in {groups} groups"),
+                )
+            })?;
+
         Ok(Self {
             input: args.input.dtype,
             weight: args.weight.dtype,
@@ -151,6 +170,7 @@ impl Descriptor {
             padding,
             dilation,
             groups,
+            group_channels,
             bias: args.bias.is_some(),
             precision,
             channels_last: rank == 3 && is_channels_last(&args.input),
@@ -317,6 +337,18 @@ impl Op for Conv {
         }
         let channels = args.input.dim(1);
         let channels_per_group = channels / u64::from(descriptor.groups);
+        // The descriptor's channels are the reduction its bound is stated for, so they are the
+        // input's.
+        if channels_per_group != u64::from(descriptor.group_channels) {
+            return Err(Error::argument(
+                operator,
+                format!(
+                    "the descriptor sums {} input channels per group, the input has {channels} in \
+                     {} groups",
+                    descriptor.group_channels, descriptor.groups
+                ),
+            ));
+        }
         // A filter holds one kernel axis per spatial axis: a 1-d one is `[out, in, k]`, as a checkpoint
         // stores it, and the call structure's five slots pad it with ones below.
         let (first, second) = match descriptor.transposed {
@@ -440,25 +472,39 @@ impl Op for Conv {
     }
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        // Each output sums the taps of its input channel that reach it, in FP32, rounded once into
-        // the output; the bound is the statistical one for a sum of mixed-sign products. A
+        // Each output element sums, in FP32, the products of every input channel of its group with
+        // the filter taps that reach it, adds its bias, and rounds once into the output; the bound
+        // is the statistical one for a sum of mixed-sign products over that many products. A
         // convolution's output reads every tap of its window along each spatial axis, whatever the
-        // stride, and a transposed one's reads the `kernel / stride` taps that overlap it.
+        // stride. A transposed one's reads the taps that land on its position: tap `j` of input
+        // `i` lands on `i·s + j·d − p`, and the taps landing on one position are `s / gcd(s, d)`
+        // apart, so at most `⌈t / (s / gcd(s, d))⌉` of them.
         let taps: u64 = (0..descriptor.rank as usize)
             .map(|axis| {
                 let kernel = u64::from(descriptor.kernel[axis]);
+                let stride = u64::from(descriptor.stride[axis].max(1));
+                let dilation = u64::from(descriptor.dilation[axis].max(1));
                 match descriptor.transposed {
                     false => kernel,
-                    true => kernel.div_ceil(u64::from(descriptor.stride[axis].max(1))),
+                    true => kernel.div_ceil(stride / gcd(stride, dilation)),
                 }
             })
             .product();
-        Tolerance::dot(taps, DType::F32, descriptor.output)
+        let products = u64::from(descriptor.group_channels) * taps;
+        Tolerance::dot(products, DType::F32, descriptor.output)
     }
 }
 
 fn to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| Error::argument(Conv::NAME, "an extent above i64::MAX"))
+}
+
+/// The greatest common divisor of two positive integers, by Euclid's algorithm.
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }
 
 #[cfg(test)]
@@ -480,6 +526,7 @@ mod tests {
             padding: [1, 1, 1],
             dilation: [1, 1, 1],
             groups: 1,
+            group_channels: 4,
             bias: false,
             precision: ProductPrecision::Exact,
             channels_last,
@@ -683,6 +730,7 @@ mod tests {
                 padding: [0, 1, 1],
                 dilation: [1, 1, 1],
                 groups: 1,
+                group_channels: 4,
                 bias: false,
                 precision: ProductPrecision::Exact,
                 channels_last: false,
@@ -707,8 +755,13 @@ mod tests {
         );
         let transposed = transposed.unwrap();
         assert_eq!(
-            (transposed.kernel, transposed.rank, transposed.bias),
-            ([3, 1, 1], 1, true)
+            (
+                transposed.kernel,
+                transposed.rank,
+                transposed.group_channels,
+                transposed.bias
+            ),
+            ([3, 1, 1], 1, 3, true)
         );
         assert!(transposed.transposed && !transposed.channels_last);
         assert_eq!(transposed.precision, ProductPrecision::Tf32);
@@ -733,5 +786,49 @@ mod tests {
             out: packed(&[1, 6, 6, 6]),
         };
         assert!(Descriptor::of(&flat, false, unit, 1, ProductPrecision::Exact).is_err());
+    }
+
+    /// The bound is the dot product's over every product one output element sums: the input
+    /// channels of its group times the filter taps that reach it.
+    #[test]
+    fn the_bound_counts_every_product_an_output_sums() {
+        let bound = |products| Tolerance::dot(products, DType::F32, DType::BF16);
+
+        // 2048 channels over 7 taps.
+        let wide = Descriptor {
+            kernel: [7, 1, 1],
+            padding: [3, 0, 0],
+            group_channels: 2048,
+            rank: 1,
+            ..descriptor(false)
+        };
+        assert_eq!(Conv::tolerance(&wide), bound(2048 * 7));
+
+        // 64 channels in 4 groups over a 3x3x3 window: 16 channels of 27 taps.
+        let grouped = Descriptor {
+            groups: 4,
+            group_channels: 16,
+            ..descriptor(false)
+        };
+        assert_eq!(Conv::tolerance(&grouped), bound(16 * 27));
+
+        // A transposed upsampling by 4 with 8 taps lands every fourth tap on an output position...
+        let upsampling = Descriptor {
+            kernel: [8, 1, 1],
+            stride: [4, 1, 1],
+            padding: [2, 0, 0],
+            group_channels: 512,
+            rank: 1,
+            transposed: true,
+            ..descriptor(false)
+        };
+        assert_eq!(Conv::tolerance(&upsampling), bound(512 * 2));
+
+        // ...and with taps 2 apart, every second one: `j·2 ≡ o + p (mod 4)` has two solutions in 4.
+        let dilated = Descriptor {
+            dilation: [2, 1, 1],
+            ..upsampling
+        };
+        assert_eq!(Conv::tolerance(&dilated), bound(512 * 4));
     }
 }
