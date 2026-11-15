@@ -5,32 +5,75 @@ use std::ffi::{CStr, CString, c_void};
 use std::ptr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::capi::{self, AgentConfig, Api, Handle};
+use ::storage::settings::Transports;
+
+use super::capi::{self, Api, Handle};
 use super::check;
 use super::regions::{Access, Region, Registration, Span};
 use super::{Error, Result};
 
-/// The UCX backend's plugin name.
+/// The UCX backend's plugin name: the backend NIXL reaches other hosts' RDMA ports with.
 const UCX: &CStr = c"UCX";
 
-/// The UCX configuration the backend's context takes (NIXL's
-/// `engine_config`, comma-separated UCX settings without their `UCX_`
-/// prefix), over UCX's defaults and environment:
-///
-/// - `REG_NONBLOCK_MEM_TYPES=` pins host storage when it is registered. By
-///   default UCX registers it for on-demand paging, whose page faults on
-///   the first READs hold a link between hosts to a few GB/s (79 GB/s
-///   pinned, 4 GB/s on demand, between two GB200 hosts), and which defers
-///   the refusal of a registration the mapping cannot grant to a READ that
-///   never completes.
-/// - `RCACHE_ENABLE=n` keeps every registration out of UCX's registration
-///   cache. The cache keeps a released registration, and learns that its
-///   storage was unmapped only through UCX's storage hooks, which a direct
-///   system call bypasses: a later registration at the same address would
-///   then get the stale one, and READs into it would land in storage the
-///   process no longer maps. Each [`Registration`] registers once and
-///   deregisters before its storage is unmapped, so the cache saves nothing.
-const ENGINE_CONFIG: &CStr = c"RCACHE_ENABLE=n,REG_NONBLOCK_MEM_TYPES=";
+/// How an agent's UCX backend reaches other hosts: the transports it takes and the RDMA ports
+/// it may open ([`super::ports::usable`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Backend {
+    pub(crate) transports: Transports,
+    /// The usable RDMA ports, as UCX names them (`mlx5_0:1`); at least one.
+    pub(crate) ports: Vec<String>,
+}
+
+impl Backend {
+    /// The backend over this host's usable RDMA ports with `transports`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the kernel states no RDMA device or no usable port.
+    pub(crate) fn of_host(transports: Transports) -> Result<Self> {
+        let class = super::ports::CLASS;
+        let ports = super::ports::usable(std::path::Path::new(class)).map_err(|error| {
+            Error::NixlArgument(format!("reading the host's RDMA ports in {class}: {error}"))
+        })?;
+        if ports.is_empty() {
+            return Err(Error::NixlArgument(
+                "the host has no usable RDMA port (an active link that holds an address)"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self { transports, ports })
+    }
+
+    /// The UCX settings the backend's context takes (NIXL's `engine_config`, comma-separated UCX
+    /// settings without their `UCX_` prefix), over UCX's defaults:
+    ///
+    /// - `NET_DEVICES` names the usable ports alone, since UCX fails to start when it cannot open
+    ///   a device it found.
+    /// - `TLS=rc,cuda_copy` for [`Transports::Rdma`]: RDMA between processes and CUDA copies
+    ///   within one.
+    /// - `REG_NONBLOCK_MEM_TYPES=` pins host storage when it is registered. By default UCX
+    ///   registers it for on-demand paging, whose page faults on the first READs hold a link
+    ///   between hosts to a fraction of its rate, and which defers the refusal of a registration
+    ///   the mapping cannot grant to a READ that never completes.
+    /// - `RCACHE_ENABLE=n` keeps every registration out of UCX's registration cache. The cache
+    ///   keeps a released registration, and learns that its storage was unmapped only through
+    ///   UCX's storage hooks, which the Transfer Server's direct system calls bypass: a later
+    ///   registration at the same address would then get the stale one, and READs into it would
+    ///   land in storage the process no longer maps. Each [`Registration`] registers once and
+    ///   deregisters before its storage is unmapped, so the cache saves nothing.
+    fn engine_config(&self) -> Result<CString> {
+        let mut settings = vec![
+            "RCACHE_ENABLE=n".to_owned(),
+            "REG_NONBLOCK_MEM_TYPES=".to_owned(),
+            format!("NET_DEVICES={}", self.ports.join(",")),
+        ];
+        if self.transports == Transports::Rdma {
+            settings.push("TLS=rc,cuda_copy".to_owned());
+        }
+        CString::new(settings.join(","))
+            .map_err(|_| Error::NixlArgument("a port's name holds no NUL byte".to_owned()))
+    }
+}
 
 /// One process's NIXL agent with a UCX backend.
 ///
@@ -71,47 +114,34 @@ unsafe impl Send for State {}
 
 impl Agent {
     /// Creates an agent called `name`, which names it to its peers and must
-    /// differ from theirs, with a UCX backend as NIXL configures one by
-    /// default. The `UCX_*` environment variables apply: `UCX_NET_DEVICES`
-    /// limits UCX to the host's usable RDMA ports, since UCX fails to start
-    /// when it cannot open a device it found. Loads NIXL's C API library
+    /// differ from theirs, with a UCX backend as `backend` states. Loads NIXL's C API library
     /// from the loader's default search path on first use.
+    ///
+    /// The agent takes NIXL's default configuration with a progress thread
+    /// (`nixl_capi_create_agent`): no listener, since metadata travels over the caller's
+    /// channel, and no synchronization of its own, since every call on it is serialized here.
     ///
     /// # Errors
     ///
     /// Fails when the library cannot be loaded, the UCX plugin is missing,
     /// or UCX cannot start.
-    pub(crate) fn new(name: &str) -> Result<Self> {
+    pub(crate) fn new(name: &str, backend: &Backend) -> Result<Self> {
         let api = super::library::api()?;
         let c_name = CString::new(name)
             .map_err(|_| Error::NixlArgument("an agent's name holds no NUL byte".to_owned()))?;
+        let engine_config = backend.engine_config()?;
 
-        // A progress thread; no listener, since metadata travels over the
-        // caller's channel; NIXL's defaults otherwise (one UCX worker, the
-        // progress thread polling without delay).
-        let config = AgentConfig {
-            enable_prog_thread: true,
-            enable_listen_thread: false,
-            listen_port: 8888,
-            thread_sync: capi::THREAD_SYNC_NONE,
-            num_workers: 1,
-            pthr_delay_us: 0,
-            lthr_delay_us: 100_000,
-            capture_telemetry: false,
-        };
         let mut agent = ptr::null_mut();
-        // SAFETY: the name and configuration outlive the call, which writes
-        // the new agent's handle on success.
+        // SAFETY: the name outlives the call, which writes the new agent's handle on success.
         check("creating an agent", unsafe {
-            (api.create_configured_agent)(c_name.as_ptr(), &config, &mut agent)
+            (api.create_agent)(c_name.as_ptr(), &mut agent)
         })?;
 
-        // The plugin's default parameters (every device UCX finds, one
-        // worker, and peer error handling, under which a peer's failure
-        // fails the transfers with it rather than this process), with
-        // pinned registrations outside UCX's cache (`ENGINE_CONFIG`).
-        let backend = Self::create_backend(api, agent);
-        let backend = match backend {
+        // The plugin's default parameters (one worker, and peer error handling, under which a
+        // peer's failure fails the transfers with it rather than this process), with the
+        // backend's UCX settings.
+        let created = Self::create_backend(api, agent, &engine_config);
+        let backend = match created {
             Ok(backend) => backend,
             Err(error) => {
                 // SAFETY: the agent created above, which nothing else holds.
@@ -134,8 +164,8 @@ impl Agent {
     }
 
     /// Creates `agent`'s UCX backend with the plugin's default parameters
-    /// and [`ENGINE_CONFIG`].
-    fn create_backend(api: &Api, agent: Handle) -> Result<Handle> {
+    /// and the UCX settings `engine_config` ([`Backend::engine_config`]).
+    fn create_backend(api: &Api, agent: Handle, engine_config: &CStr) -> Result<Handle> {
         let mut storages = ptr::null_mut();
         let mut parameters = ptr::null_mut();
         // SAFETY: a live agent; the call writes two lists this function
@@ -149,7 +179,7 @@ impl Agent {
             (api.params_add)(
                 parameters,
                 c"engine_config".as_ptr(),
-                ENGINE_CONFIG.as_ptr(),
+                engine_config.as_ptr(),
             )
         });
         let mut backend = ptr::null_mut();
@@ -538,6 +568,26 @@ impl Transfer {
             }
         }
         Ok(self.complete)
+    }
+
+    /// Waits until every byte of the transfer has arrived, as the host observes it: until
+    /// `expected`, when the transfer's bytes are due at its path's rate, and then until its
+    /// status reports it complete.
+    ///
+    /// NIXL 1.5.1's C API offers no blocking wait for a transfer and no descriptor that becomes
+    /// readable when one completes: its status call ([`Transfer::poll`]) is the only observation,
+    /// so the wait polls it, yielding the processor between calls, from the moment the bytes are
+    /// due.
+    ///
+    /// # Errors
+    ///
+    /// As [`Transfer::poll`].
+    pub(crate) fn wait(mut self, expected: std::time::Instant) -> Result<()> {
+        std::thread::sleep(expected.saturating_duration_since(std::time::Instant::now()));
+        while !self.poll()? {
+            std::thread::yield_now();
+        }
+        Ok(())
     }
 }
 

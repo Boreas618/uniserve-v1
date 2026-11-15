@@ -56,6 +56,9 @@ pub struct ServerSettings {
     /// and copies on every GPU the driver shows; otherwise it copies host storage alone and loads
     /// no driver. Default true.
     pub transfer_gpus: bool,
+    /// The transports the Transfer Server's NIXL agent takes for READs between hosts, over the
+    /// host's usable RDMA ports. Default `selected`.
+    pub nixl_transports: Transports,
     /// How long a buffer pool's transfer of a request between worker groups may take, in
     /// seconds, before it is stopped and answered as failed. Default 60.
     pub transfer_deadline_s: u64,
@@ -88,6 +91,7 @@ impl Default for ServerSettings {
             host_reserve_gib: 10,
             transfer_chunk_us: 1000,
             transfer_gpus: true,
+            nixl_transports: Transports::Selected,
             transfer_deadline_s: 60,
             put_deadline_s: 60,
             buffer_pool_trace: None,
@@ -123,6 +127,20 @@ impl ServerSettings {
     pub fn shoot_down(&self) -> Duration {
         Duration::from_secs(self.shoot_down_s)
     }
+}
+
+/// The transports the Transfer Server's NIXL agent (UCX backend) takes between hosts. Either
+/// way UCX reaches other hosts through the host's usable RDMA ports alone: those whose link is
+/// active and which hold an address (a GID).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transports {
+    /// The transports UCX selects by itself.
+    Selected,
+    /// RDMA between processes (UCX's `rc`) and CUDA copies within one (`cuda_copy`): the bytes of
+    /// a READ cross the network adapter even between two processes of one host, as between two
+    /// hosts.
+    Rdma,
 }
 
 impl Settings {

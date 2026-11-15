@@ -37,6 +37,7 @@ pub(crate) fn transfer_child(gpus: bool) -> Children {
         transfer: Some(storage_server::transfer::Options {
             chunk: Duration::from_millis(1),
             serves_peers: false,
+            transports: ::storage::ServerSettings::default().nixl_transports,
             gpus,
         }),
     }

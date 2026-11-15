@@ -78,6 +78,7 @@ use ::storage::protocol::{
     Allocation, ContextBytes, Event, Item, Link, LinkEnd, Move, Priority, Registration, Request,
     Response, Role, TaskFailure, TaskStatus,
 };
+use ::storage::settings::Transports;
 use platform::DeviceId;
 use rustix::event::{PollFd, PollFlags, poll};
 
@@ -98,6 +99,8 @@ pub struct Options {
     /// Whether the server serves other hosts (it accepts them on a TCP endpoint), whose READs
     /// of this host need the NIXL agent from the start.
     pub serves_peers: bool,
+    /// The transports the NIXL agent takes between hosts.
+    pub transports: Transports,
     /// Whether to copy on the host's GPUs: the CUDA driver must load then, and every GPU it
     /// shows is used (none when it shows none); otherwise only host storage is copied, and no
     /// driver is loaded.
@@ -136,7 +139,7 @@ pub fn run(channel: service::Connection, options: &Options) -> Result<(), Error>
             wake: Arc::clone(&wake),
         },
     ));
-    let network = Arc::new(Network::new());
+    let network = Arc::new(Network::new(options.transports));
     // A server that serves other hosts starts its agent now, beside the first tasks, so the first
     // READ from or of this host does not wait for UCX to come up (several seconds) inside a
     // request's bounded wait. Otherwise the agent starts at the first task that needs it, and a

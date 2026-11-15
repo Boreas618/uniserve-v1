@@ -2,9 +2,10 @@
 //! Transfer Server posts, from storage another host's Transfer Server
 //! registered with its own agent.
 //!
-//! The process has one NIXL agent with the UCX backend, created at its first
-//! use ([`Network::agent`]), so a host whose tasks never cross hosts never
-//! loads NIXL. The agent serves both ends of a READ:
+//! The process has one NIXL agent with the UCX backend, over the host's
+//! usable RDMA ports with the transports the server's settings state, created
+//! at its first use ([`Network::agent`]), so a host whose tasks never cross
+//! hosts never loads NIXL. The agent serves both ends of a READ:
 //!
 //! - **Source.** The server has the Transfer Server register allocations a
 //!   peer asked it to expose ([`Event::Register`]): host storage with the
@@ -38,6 +39,11 @@
 //! exposed for each task, not remembered between tasks: a region's
 //! allocation, and its registration, may change between two tasks.
 //!
+//! The connection to another host's Storage Server stays open between tasks.
+//! A server that ended or restarted since closed it, which a read of the
+//! connection shows: the next task finds it closed and connects afresh. A
+//! request on a connection that fails fails its task.
+//!
 //! [`Event::Register`]: ::storage::protocol::Event::Register
 //! [`Event::Deregister`]: ::storage::protocol::Event::Deregister
 //! [`Request::Expose`]: ::storage::protocol::Request::Expose
@@ -48,6 +54,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ::storage::Client;
 use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registration, TaskFailure};
+use ::storage::settings::Transports;
 use platform::DeviceId;
 
 use super::contexts::Hold;
@@ -58,6 +65,8 @@ use super::threads::{End, Piece, Runner, ThreadKey};
 /// The process's NIXL agent and its connections to other hosts' Storage
 /// Servers.
 pub(super) struct Network {
+    /// The transports the agent takes.
+    transports: Transports,
     /// The agent, or why it could not start, once something needed it.
     agent: OnceLock<Result<nixl::Agent, String>>,
     /// Other hosts' Storage Servers by endpoint, each locked by the helper
@@ -139,8 +148,10 @@ fn copy(message: String) -> Failed {
 }
 
 impl Network {
-    pub(super) fn new() -> Self {
+    /// No agent yet; the agent takes `transports` once it starts.
+    pub(super) fn new(transports: Transports) -> Self {
         Self {
+            transports,
             agent: OnceLock::new(),
             hosts: Mutex::new(HashMap::new()),
         }
@@ -152,7 +163,9 @@ impl Network {
         self.agent
             .get_or_init(|| {
                 let name = agent_name().map_err(|error| format!("naming a NIXL agent: {error}"))?;
-                let agent = nixl::Agent::new(&name)
+                let backend = nixl::Backend::of_host(self.transports)
+                    .map_err(|error| format!("starting a NIXL agent: {error}"))?;
+                let agent = nixl::Agent::new(&name, &backend)
                     .map_err(|error| format!("starting a NIXL agent: {error}"))?;
                 tracing::info!(agent = name, "started the NIXL agent");
                 Ok(agent)
@@ -414,34 +427,32 @@ impl Network {
 }
 
 impl Host {
-    /// One exposure on the connection to the server at `endpoint`, opened
-    /// when there is none. A connection that fails is opened afresh once:
-    /// the server may have ended and started again since the last task.
+    /// One exposure on the connection to the server at `endpoint`: the open
+    /// connection while the server keeps it, a new one otherwise.
     fn expose(
         &mut self,
         endpoint: &str,
         deployment: &str,
         regions: Vec<Region>,
     ) -> ::storage::Result<(u64, Vec<u8>, Vec<Registration>)> {
-        let mut retry = self.client.is_some();
-        loop {
-            let client = match &mut self.client {
-                Some(client) => client,
-                None => self.client.insert(Client::connect_peer(endpoint)?),
-            };
-            match client.expose(deployment.to_owned(), regions.clone()) {
-                Err(error @ (::storage::Error::Io(_) | ::storage::Error::Protocol(_))) => {
-                    self.client = None;
-                    if !retry {
-                        return Err(error);
-                    }
-                    retry = false;
-                }
-                // The server's response, an exposure or a refusal, leaves the
-                // connection usable.
-                responded => return responded,
-            }
+        // A server that ended or restarted since the last task closed the
+        // connection: reading what it sent shows the end.
+        if let Some(client) = &mut self.client
+            && client.pump().is_err()
+        {
+            self.client = None;
         }
+        let client = match &mut self.client {
+            Some(client) => client,
+            None => self.client.insert(Client::connect_peer(endpoint)?),
+        };
+        let responded = client.expose(deployment.to_owned(), regions);
+        // The server's response, an exposure or a refusal, leaves the
+        // connection usable; a failed connection is not used again.
+        if let Err(::storage::Error::Io(_) | ::storage::Error::Protocol(_)) = &responded {
+            self.client = None;
+        }
+        responded
     }
 }
 

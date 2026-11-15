@@ -286,6 +286,7 @@ impl Children {
             transfer: Some(crate::transfer::Options {
                 chunk: settings.server.transfer_chunk(),
                 serves_peers: settings.server.tcp.is_some(),
+                transports: settings.server.nixl_transports,
                 gpus: settings.server.transfer_gpus,
             }),
         }

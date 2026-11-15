@@ -7,10 +7,10 @@
 //! declares it: each C enum is an `int`, each handle an opaque pointer the
 //! library allocates and frees, and every function returns a status. A
 //! library of another release whose entry points differ in arguments would
-//! be misread, so the build that provides the library is pinned with these
-//! bindings (see `docs/nixl.md` for sources, patches and build commands).
+//! be misread, so the NIXL package that provides the library is the release
+//! these bindings state ([`super::RELEASE`], `docs/nixl.md`).
 
-use std::ffi::{c_char, c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_void};
 
 use libloading::os::unix::Library;
 
@@ -43,24 +43,6 @@ pub(crate) const MEM_VRAM: MemType = 1;
 pub(crate) type XferOp = c_int;
 pub(crate) const XFER_OP_READ: XferOp = 0;
 
-/// `nixl_capi_thread_sync_t`: the agent leaves synchronization to its
-/// caller, which serializes every call on the agent ([`super::Agent`]).
-pub(crate) type ThreadSync = c_int;
-pub(crate) const THREAD_SYNC_NONE: ThreadSync = 0;
-
-/// `nixl_capi_agent_config_t`.
-#[repr(C)]
-pub(crate) struct AgentConfig {
-    pub(crate) enable_prog_thread: bool,
-    pub(crate) enable_listen_thread: bool,
-    pub(crate) listen_port: c_int,
-    pub(crate) thread_sync: ThreadSync,
-    pub(crate) num_workers: c_uint,
-    pub(crate) pthr_delay_us: u64,
-    pub(crate) lthr_delay_us: u64,
-    pub(crate) capture_telemetry: bool,
-}
-
 /// Every handle type of the C API (`nixl_capi_agent_t`,
 /// `nixl_capi_reg_dlist_t`, ...): a pointer to a structure the library
 /// owns.
@@ -69,8 +51,7 @@ pub(crate) type Handle = *mut c_void;
 /// The entry points, resolved once from the loaded library, which stays
 /// loaded for the process's life.
 pub(crate) struct Api {
-    pub(crate) create_configured_agent:
-        unsafe extern "C" fn(*const c_char, *const AgentConfig, *mut Handle) -> Status,
+    pub(crate) create_agent: unsafe extern "C" fn(*const c_char, *mut Handle) -> Status,
     pub(crate) destroy_agent: unsafe extern "C" fn(Handle) -> Status,
     pub(crate) get_local_md: unsafe extern "C" fn(Handle, *mut *mut c_void, *mut usize) -> Status,
     pub(crate) load_remote_md:
@@ -125,7 +106,7 @@ impl Api {
     /// missing.
     pub(crate) fn resolve(library: &Library) -> Result<Self, String> {
         Ok(Self {
-            create_configured_agent: entry!(library, "nixl_capi_create_configured_agent"),
+            create_agent: entry!(library, "nixl_capi_create_agent"),
             destroy_agent: entry!(library, "nixl_capi_destroy_agent"),
             get_local_md: entry!(library, "nixl_capi_get_local_md"),
             load_remote_md: entry!(library, "nixl_capi_load_remote_md"),

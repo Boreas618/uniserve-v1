@@ -4,24 +4,23 @@
 //!
 //! Two Storage Servers of this host stand for two hosts: each runs on a
 //! thread of the test process with a socket and a TCP endpoint of its own,
-//! and its own Transfer Server (the real one, run by this test binary as
-//! `transfer::stand_in_transfer_server`), with its own NIXL agent. The
-//! servers reach each other only by their endpoints, as hosts do.
+//! and its own Transfer Server (the real one, run from the tests' helper
+//! executable), with its own NIXL agent. The servers reach each other only by
+//! their endpoints, as hosts do.
 //!
 //! The failure test needs no GPU and no NIXL: every failure happens before
-//! a READ. The READ tests need a CUDA device, an RDMA adapter and NIXL:
-//! their Transfer Servers see this process's GPUs, and UCX is limited to
-//! RDMA between processes (`rc`) and copies within one (`cuda_copy`), so
-//! the bytes cross the network adapter as they do between hosts, not CUDA
-//! IPC or shared memory. The NIXL package's C API must be on the loader's default
-//! search path, and `UCX_NET_DEVICES` limits UCX to the host's usable
-//! RDMA ports where UCX cannot open some device. Run them with
-//! `cargo test -p storage-server --test it remote -- --ignored`.
+//! a READ. The READ tests need a CUDA device, a usable RDMA port and the NIXL
+//! package (`docs/nixl.md`): their Transfer Servers copy on this process's
+//! GPUs, and their agents take RDMA alone (`nixl_transports = "rdma"`: `rc`
+//! between processes, `cuda_copy` within one), so the bytes cross the network
+//! adapter as they do between hosts, not CUDA IPC or shared memory. Run them
+//! with `cargo test -p storage-server --test it remote -- --ignored`.
 
 use std::os::fd::AsFd;
 use std::path::Path;
 
 use ::storage::protocol::{ErrorKind, Priority, TaskFailure, TaskStatus};
+use ::storage::settings::Transports;
 use ::storage::{Access, Claimant, Client, Role};
 
 use crate::server::{Running, head, host, key, memfd, scope, tensor, transfer_child, worker};
@@ -32,7 +31,11 @@ use crate::transfer::{
 /// A server whose Transfer Server sees this process's GPUs and READs from
 /// another server through the network adapters only.
 fn rdma_host() -> Running {
-    let server = Running::with_children(Some(transfer_child(true)));
+    let mut children = transfer_child(true);
+    if let Some(options) = &mut children.transfer {
+        options.transports = Transports::Rdma;
+    }
+    let server = Running::with_children(Some(children));
     transfer_pid(&server.socket, None);
     server
 }
@@ -169,7 +172,7 @@ mod device {
     const BYTES: usize = 256 << 20;
 
     #[test]
-    #[ignore = "requires a CUDA device, an RDMA adapter and NIXL"]
+    #[ignore = "requires a CUDA device, a usable RDMA port and NIXL"]
     fn a_read_from_another_host_moves_device_and_host_storage_into_device_storage() {
         let source_host = rdma_host();
         let destination_host = rdma_host();
@@ -328,7 +331,7 @@ mod device {
     }
 
     #[test]
-    #[ignore = "requires a CUDA device, an RDMA adapter and NIXL"]
+    #[ignore = "requires a CUDA device, a usable RDMA port and NIXL"]
     fn a_source_host_whose_transfer_server_restarted_is_read_again() {
         let source_host = rdma_host();
         let destination_host = rdma_host();
@@ -413,7 +416,7 @@ mod device {
     /// no allocation) is READ through NIXL, which measures that link. Both
     /// arrive whole.
     #[test]
-    #[ignore = "requires a CUDA device whose allocations export fabric handles (IMEX), an RDMA adapter and NIXL"]
+    #[ignore = "requires a CUDA device whose allocations export fabric handles (IMEX), a usable RDMA port and NIXL"]
     fn a_source_is_copied_over_the_fabric_when_its_recorded_handle_imports_and_read_otherwise() {
         let source_host = rdma_host();
         let destination_host = rdma_host();
@@ -552,7 +555,7 @@ mod device {
     /// host storage and from device storage READ through NIXL, and from
     /// device storage copied over the NVLink fabric.
     #[test]
-    #[ignore = "requires a CUDA device whose allocations export fabric handles (IMEX), an RDMA adapter and NIXL"]
+    #[ignore = "requires a CUDA device whose allocations export fabric handles (IMEX), a usable RDMA port and NIXL"]
     fn a_strided_span_from_another_host_copies_each_row_to_its_pitch() {
         let source_host = rdma_host();
         let destination_host = rdma_host();

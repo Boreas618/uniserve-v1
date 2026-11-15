@@ -1004,18 +1004,14 @@ fn post(network: &Network, piece: &Piece) -> Result<nixl::Transfer, String> {
     Ok(transfer)
 }
 
-/// Poll `transfer` until it completed, as the host observes it; returns
-/// why it failed when it did. A READ that failed (another host or the
-/// network failed) fails its task, not the process: no CUDA context took
-/// part in it.
-fn finish(mut transfer: nixl::Transfer) -> Option<String> {
-    let failure = loop {
-        match transfer.poll() {
-            Ok(true) => break None,
-            Ok(false) => std::thread::sleep(POLL),
-            Err(error) => break Some(format!("a READ from another host failed: {error}")),
-        }
-    };
+/// Wait until `transfer` completed, as the host observes it; returns why it
+/// failed when it did. A READ that failed (another host or the network
+/// failed) fails its task, not the process: no CUDA context took part in it.
+fn finish(transfer: nixl::Transfer) -> Option<String> {
+    let failure = transfer
+        .wait(Instant::now())
+        .err()
+        .map(|error| format!("a READ from another host failed: {error}"));
     tracing::debug!(failure, "a READ ended");
     failure
 }

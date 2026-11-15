@@ -1,7 +1,7 @@
 //! A Storage Server's settings as the process interface carries them: the claim a node's daemon
 //! receives states the settings of the Storage Server it starts (`process::Claim::storage`).
 
-use crate::process::{MooncakeConnector, MooncakeTransport, StorageSettings};
+use crate::process::{MooncakeConnector, MooncakeTransport, NixlTransports, StorageSettings};
 
 impl From<&storage::Settings> for StorageSettings {
     fn from(settings: &storage::Settings) -> Self {
@@ -26,6 +26,11 @@ impl From<&storage::Settings> for StorageSettings {
             child_restart_max_s: server.child_restart_max_s,
             transfer_gpus: server.transfer_gpus,
             shoot_down_s: server.shoot_down_s,
+            nixl_transports: match server.nixl_transports {
+                storage::settings::Transports::Selected => NixlTransports::Selected,
+                storage::settings::Transports::Rdma => NixlTransports::Rdma,
+            }
+            .into(),
             connector: settings
                 .connector
                 .as_ref()
@@ -81,6 +86,16 @@ impl TryFrom<&StorageSettings> for storage::Settings {
                 segment_gib: connector.segment_gib,
             }),
         };
+        let nixl_transports = match NixlTransports::try_from(message.nixl_transports) {
+            Ok(NixlTransports::Selected) => storage::settings::Transports::Selected,
+            Ok(NixlTransports::Rdma) => storage::settings::Transports::Rdma,
+            Err(_) => {
+                return Err(format!(
+                    "{} names no NIXL transports",
+                    message.nixl_transports
+                ));
+            }
+        };
         Ok(Self {
             server: storage::ServerSettings {
                 tcp,
@@ -93,6 +108,7 @@ impl TryFrom<&StorageSettings> for storage::Settings {
                 child_restart_max_s: message.child_restart_max_s,
                 transfer_gpus: message.transfer_gpus,
                 shoot_down_s: message.shoot_down_s,
+                nixl_transports,
             },
             connector,
         })
@@ -109,6 +125,7 @@ mod tests {
         let settings = storage::Settings {
             server: storage::ServerSettings {
                 tcp: Some("0.0.0.0:0".parse().unwrap()),
+                nixl_transports: storage::settings::Transports::Rdma,
                 ..storage::ServerSettings::default()
             },
             connector: Some(storage::connector::Settings {

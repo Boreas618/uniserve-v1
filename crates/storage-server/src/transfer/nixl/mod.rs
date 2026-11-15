@@ -26,9 +26,10 @@
 mod agent;
 mod capi;
 mod library;
+mod ports;
 mod regions;
 
-pub(crate) use agent::{Agent, Transfer};
+pub(crate) use agent::{Agent, Backend, Transfer};
 pub(crate) use regions::{Access, Region, Registration, Segment, Span};
 
 pub(crate) use crate::Error;
