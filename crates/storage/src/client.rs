@@ -527,12 +527,35 @@ impl Client {
         }
     }
 
-    /// See [`Request::Endpoint`]: the `host:port` other hosts reach the
-    /// server at; `None` when it accepts local connections only.
-    pub fn endpoint(&mut self) -> Result<Option<String>> {
-        match self.request(&Request::Endpoint, &[])?.0 {
-            Response::Endpoint { tcp } => Ok(tcp),
-            other => Err(unexpected("endpoint", &other)),
+    /// See [`Request::Status`]: the server's readiness record.
+    pub fn status(&mut self) -> Result<crate::settings::Readiness> {
+        match self.request(&Request::Status, &[])?.0 {
+            Response::Status(readiness) => Ok(*readiness),
+            other => Err(unexpected("status", &other)),
+        }
+    }
+
+    /// See [`Request::Stop`]: stops the server and waits until it ended, which it states by
+    /// closing this connection last; `timeout` bounds the wait.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the server refuses the stop, or has not ended within `timeout`.
+    pub fn stop(mut self, timeout: Duration) -> Result<()> {
+        match self.request(&Request::Stop, &[])?.0 {
+            Response::Stopping => {}
+            other => return Err(unexpected("stop", &other)),
+        }
+        // Nothing more is asked: the server's close of this connection is its end.
+        match self.connection.recv::<ServerMessage>(timeout) {
+            Ok(None) => Err(Error::Protocol(format!(
+                "the server did not end within {timeout:?} of its stop"
+            ))),
+            Ok(Some(_)) => Err(Error::Protocol(
+                "the server sent a message after its stop".to_owned(),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -925,10 +948,10 @@ impl ClaimClient {
         self.client.usage(Vec::new())
     }
 
-    /// The `host:port` other hosts reach the server at; `None` when it
-    /// accepts local connections only.
-    pub fn endpoint(&mut self) -> Result<Option<String>> {
-        self.client.endpoint()
+    /// The server's readiness record ([`Request::Status`]): its endpoints, among them the TCP
+    /// endpoint other hosts reach it at when it accepts them, and its settings.
+    pub fn status(&mut self) -> Result<crate::settings::Readiness> {
+        self.client.status()
     }
 
     /// Passes the claim to another process ([`ClaimClient::resume`]): its

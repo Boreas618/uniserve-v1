@@ -136,6 +136,9 @@ struct Prepare {
     /// The daemon's process socket, which the successor serves from the
     /// handoff on and its engines and workers connect to.
     processes: String,
+    /// The daemon's instance directory, whose sockets the successor binds over and which it
+    /// owns once the handover completed.
+    instance: std::path::PathBuf,
     /// Whether the configuration listens on another address than the
     /// daemon's listener: the successor binds it before the handover.
     rebind: bool,
@@ -199,6 +202,8 @@ pub(crate) struct Restarter {
     pub(crate) daemon: Arc<std::sync::Mutex<Option<Daemon>>>,
     /// A duplicate of the HTTP listener, and what the successor needs of it.
     listener: std::sync::Mutex<Option<(ListenerHandoff, OwnedFd)>>,
+    /// The daemon's instance directory, which the successor goes on with.
+    instance: std::path::PathBuf,
     stated: Stated,
     /// Cancelled once the successor serves: this daemon stops accepting.
     pub(crate) accepting: CancellationToken,
@@ -238,6 +243,7 @@ impl Restarter {
     pub(crate) fn new(
         daemon: Arc<std::sync::Mutex<Option<Daemon>>>,
         listener: &mut Listener,
+        instance: &std::path::Path,
         stated: Stated,
         accepting: CancellationToken,
     ) -> anyhow::Result<Self> {
@@ -248,6 +254,7 @@ impl Restarter {
                     .hand_over()
                     .context("duplicating the HTTP listener")?,
             )),
+            instance: instance.to_owned(),
             stated,
             accepting,
             handoff_sent: Arc::new(AtomicBool::new(false)),
@@ -366,6 +373,7 @@ impl Restarter {
                 stated: self.stated.paths(),
                 api_key: options.server_config.api_key.clone(),
                 processes,
+                instance: self.instance.clone(),
                 rebind,
                 engine_versions: handoff
                     .iter()
@@ -753,7 +761,7 @@ async fn prepared_successor(
     let executable = std::env::current_exe().context("finding this daemon's executable")?;
     let restarted = tokio::task::spawn_blocking(move || {
         restart_storage_server(
-            &storage::default_socket(),
+            &storage::default_socket()?,
             &executable,
             STORAGE_RESTART_TIMEOUT,
         )
@@ -783,7 +791,7 @@ async fn prepared_successor(
         None
     };
     let control = EngineControl::new(
-        &config.request_socket(),
+        &config.request_socket(&prepare.instance),
         prepare.processes.clone(),
         config.host_identity.clone(),
         config.served_model_name().to_owned(),
@@ -985,6 +993,18 @@ async fn prepared_successor(
     if let Some(request) = then {
         crate::http::admin::apply_after_restart(&admin, &leader, request);
     }
+    // The handover completed: the predecessor's instance directory is this daemon's now, and
+    // its admin sockets are bound over in it.
+    let instance = service::Instance::resume(prepare.instance.clone());
+    let admins = crate::http::admin::Listeners::bind(&config.admin_config, instance.path())?;
+    let mut ready = crate::http::Ready::new(None, instance.path());
+    {
+        let endpoints = ready.endpoints();
+        endpoints.client = Some(listener.endpoint()?);
+        (endpoints.admin, endpoints.harness) = admins.endpoints();
+    }
+    ready.add_storage();
+    admin.set_readiness(ready.record(service::State::Serving));
     let video_jobs = Arc::new(VideoJobs::new(
         config.video_job_config.clone(),
         shutdown.child_token(),
@@ -1098,12 +1118,17 @@ async fn prepared_successor(
         Arc::clone(&leader),
         admin,
         listener,
+        admins,
+        instance.path(),
         video_jobs,
         Arc::clone(&daemon),
         &shutdown,
     )
     .await;
     let handoff_sent = served.as_ref().is_ok_and(|handoff_sent| *handoff_sent);
+    if handoff_sent {
+        instance.hand_over();
+    }
     if handoff_sent {
         // A second hot restart may finish this daemon's HTTP requests while
         // its predecessor still has streams. Keep forwarding their admission
@@ -1179,7 +1204,7 @@ fn restart_storage_server(
 ) -> anyhow::Result<Option<u32>> {
     use storage::protocol::VERSION;
 
-    if !service::serving(socket) {
+    if service::host::running::<storage::Settings>(socket)?.is_none() {
         return Ok(None);
     }
     let reach = || {
@@ -1283,6 +1308,8 @@ mod tests {
         restarts: Arc<Mutex<Vec<Option<String>>>>,
         /// The successors started, stopped with the server.
         successors: Arc<Mutex<Vec<std::process::Child>>>,
+        /// The lock that makes the stand-in the socket's owner, with its published record.
+        _lock: service::host::SocketLock,
         _directory: tempfile::TempDir,
     }
 
@@ -1290,12 +1317,26 @@ mod tests {
         fn start(speaks: u32, successor: &'static [&'static str], takes_over: bool) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("storage.sock");
-            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            // The stand-in owns its socket as a Storage Server does, so the daemon finds it
+            // serving.
+            let (listener, starting) = service::host::bind::<storage::Settings>(&socket)
+                .unwrap()
+                .owned(&socket)
+                .unwrap();
+            let lock = starting
+                .finish(&service::Readiness::of_process(
+                    service::State::Serving,
+                    None,
+                    service::Endpoints::default(),
+                    storage::Settings::default(),
+                ))
+                .unwrap();
             let version = Arc::new(AtomicU32::new(speaks));
             let restarts = Arc::new(Mutex::new(Vec::new()));
             let successors = Arc::new(Mutex::new(Vec::new()));
             let server = Self {
                 socket,
+                _lock: lock,
                 restarts: Arc::clone(&restarts),
                 successors: Arc::clone(&successors),
                 _directory: directory,

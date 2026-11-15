@@ -71,8 +71,6 @@ fn a_claim_crosses_to_a_successor_with_its_connection() {
 
     let usage = successor.usage().unwrap();
     assert!(usage.quotas.is_empty(), "{:?}", usage.quotas);
-    assert_eq!(
-        successor.endpoint().unwrap().as_deref(),
-        Some(server.tcp.as_str())
-    );
+    let peer = successor.status().unwrap().endpoints.peer;
+    assert_eq!(peer.map(|peer| peer.to_string()), Some(server.tcp.clone()));
 }

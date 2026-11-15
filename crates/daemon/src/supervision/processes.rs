@@ -94,8 +94,6 @@ pub(crate) struct Processes {
     epochs: Arc<Epochs>,
     /// The deployment's name, which every claim states.
     deployment: String,
-    /// The Storage Server arguments of the deployment's KV storage connector.
-    server_arguments: Vec<String>,
     link: ProcessLink,
     /// The launches by launch generation. The generation is unique across the
     /// deployment's engine group, so a number names one launch.
@@ -118,16 +116,10 @@ pub(crate) struct Processes {
 
 impl Processes {
     /// The engine processes of `deployment`, commanded through `link`.
-    pub(crate) fn new(
-        epochs: Arc<Epochs>,
-        deployment: String,
-        server_arguments: Vec<String>,
-        link: ProcessLink,
-    ) -> Self {
+    pub(crate) fn new(epochs: Arc<Epochs>, deployment: String, link: ProcessLink) -> Self {
         Self {
             epochs,
             deployment,
-            server_arguments,
             link,
             launches: BTreeMap::new(),
             engines: BTreeMap::new(),
@@ -299,7 +291,8 @@ impl Processes {
             host: host.to_owned(),
             deployment: self.deployment.clone(),
             scopes: scopes.to_vec(),
-            server_arguments: self.server_arguments.clone(),
+            // The node's daemon states the deployment's Storage Server settings.
+            storage: None,
             epoch,
             retire: retire.to_vec(),
         }))?;
@@ -498,12 +491,7 @@ mod tests {
     fn processes() -> (Arc<Epochs>, Engines, Processes) {
         let epochs = Arc::new(Epochs::new());
         let (engines, link) = Engines::link(Refusals::default());
-        let processes = Processes::new(
-            Arc::clone(&epochs),
-            "deployment".to_owned(),
-            Vec::new(),
-            link,
-        );
+        let processes = Processes::new(Arc::clone(&epochs), "deployment".to_owned(), link);
         (epochs, engines, processes)
     }
 

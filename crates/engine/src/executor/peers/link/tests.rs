@@ -397,7 +397,8 @@ fn a_message_decodes_only_as_the_message_it_is() {
         .unwrap();
     cut.pop();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut connection = Connection::connect(&listener.local_addr().unwrap().to_string()).unwrap();
+    let mut connection =
+        Connection::connect(&service::Endpoint::tcp(listener.local_addr().unwrap())).unwrap();
     let (peer, _) = listener.accept().unwrap();
     for mut segment in service::frame::segments(&cut, Vec::new()).unwrap() {
         while !segment.sent() {

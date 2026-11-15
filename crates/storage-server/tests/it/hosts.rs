@@ -199,6 +199,7 @@ fn network_server(
         Some(Launch {
             program: "env".into(),
             arguments,
+            input: None,
         })
     };
     // The server forks the Transfer Server; no test's dropped connection

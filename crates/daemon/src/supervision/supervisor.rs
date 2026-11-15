@@ -287,17 +287,15 @@ impl Supervisor {
             launch.build_server = socket.display().to_string();
         }
         let executable = engine_executable(&launch)?;
-        let file = crate::engine::launch::write(
-            &crate::options::runtime_directory(),
-            spawn.generation,
-            &launch,
-        )
-        .map_err(|error| {
-            format!(
-                "writing the launch file of engine {}: {error}",
-                spawn.generation
-            )
-        })?;
+        let directory = service::RuntimeDirectory::of_user()
+            .map_err(|error| format!("finding the user's runtime directory: {error}"))?;
+        let file = crate::engine::launch::write(directory.path(), spawn.generation, &launch)
+            .map_err(|error| {
+                format!(
+                    "writing the launch file of engine {}: {error}",
+                    spawn.generation
+                )
+            })?;
         Ok((executable, file))
     }
 

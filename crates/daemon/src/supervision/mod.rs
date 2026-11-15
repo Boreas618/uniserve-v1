@@ -57,10 +57,9 @@ pub struct DaemonOptions {
     pub node_rank: u32,
     /// This node's host identity, as rank layouts name it.
     pub host: String,
-    /// The leader's `host:port` the members join at; the leader binds it
-    /// for as long as it serves, so nodes may also join the running
-    /// deployment. Required with several nodes.
-    pub dist_init_addr: Option<String>,
+    /// The leader's join endpoint: on the leader, the host its members reach it at; on a
+    /// member, the endpoint the leader bound. Required with several nodes.
+    pub dist_init_addr: Option<::service::Endpoint>,
     /// The leader's process socket, which engines connect to.
     pub socket: PathBuf,
     /// The `uniserve` executable that starts this node's Storage Server
@@ -75,11 +74,10 @@ pub struct DaemonOptions {
     /// This node's Build Server, which the engines the node starts resolve their
     /// modules from (`build_config`).
     pub build_server: build_server::command::Settings,
-    /// The arguments of `storage-server serve` that the deployment's
-    /// configuration states: its Mooncake connector (`kv_cache_config.mooncake`),
-    /// none without one. The leader gives them to every claim of the
-    /// deployment, so the Storage Server a node starts for it runs the connector.
-    pub storage_server: Vec<String>,
+    /// The settings of the Storage Server of every node the deployment serves on
+    /// (`ServerArgs::storage_settings`). The leader gives them to every claim of the
+    /// deployment, so the Storage Server a node starts for it serves with them.
+    pub storage: storage::Settings,
 }
 
 /// Reads the ordinals of this host's idle devices from the driver.
@@ -179,15 +177,46 @@ pub struct Daemon {
 type Served = anyhow::Result<Option<(ServiceHandoff, Vec<OwnedFd>)>>;
 
 impl Daemon {
-    /// Starts this node's daemon. The leader binds its process socket and
-    /// its members' address and waits until every member below `nnodes`
-    /// joined; a member joins the leader. Returns once the service runs.
+    /// Binds the leader's join listener for the endpoint `dist_init_addr` states: its port on
+    /// every interface (port 0 picks one). Returns the listener and the endpoint members join at,
+    /// the stated host with the bound port, which the leader's readiness record states.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the endpoint is no TCP endpoint or its port cannot be bound.
+    pub fn bind_join(
+        dist_init_addr: &::service::Endpoint,
+    ) -> anyhow::Result<(Listener, ::service::Endpoint)> {
+        let ::service::Endpoint::Tcp { host, port } = dist_init_addr else {
+            anyhow::bail!("the leader's join endpoint {dist_init_addr} is no TCP endpoint");
+        };
+        let listener = Listener::bind(&::service::Endpoint::Tcp {
+            host: std::net::Ipv4Addr::UNSPECIFIED.to_string(),
+            port: *port,
+        })
+        .with_context(|| format!("binding the leader's join endpoint {dist_init_addr}"))?;
+        let bound = listener
+            .endpoint()
+            .port()
+            .context("a TCP listener has a port")?;
+        Ok((
+            listener,
+            ::service::Endpoint::Tcp {
+                host: host.clone(),
+                port: bound,
+            },
+        ))
+    }
+
+    /// Starts this node's daemon. The leader binds its process socket and, given the join
+    /// listener its caller bound (`join`, [`Daemon::bind_join`]), waits until every member below
+    /// `nnodes` joined there; a member joins the leader. Returns once the service runs.
     ///
     /// # Errors
     ///
     /// Fails when a socket cannot be bound, a member does not join in time,
     /// or the leader cannot be reached or refuses this member.
-    pub fn start(options: DaemonOptions) -> anyhow::Result<Self> {
+    pub fn start(options: DaemonOptions, join: Option<Listener>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             options.nnodes >= 1 && options.node_rank < options.nnodes,
             "node rank {} lies outside {} nodes",
@@ -209,15 +238,18 @@ impl Daemon {
         };
 
         let (served, thread, link, requests, awake, table) = if options.node_rank == 0 {
-            let (joins, members) = join_members(&options)?;
+            let (joins, members) = join_members(&options, join)?;
             let leader_address = leader_address(&options, &members);
             // Engines may run on any joined node. A deployment with a
             // network address exposes process control on that interface;
             // single-host deployments retain their Unix socket.
             let (address, socket) = match leader_address {
-                Some(ip) => (std::net::SocketAddr::new(ip, 0).to_string(), None),
+                Some(ip) => (
+                    ::service::Endpoint::tcp(std::net::SocketAddr::new(ip, 0)),
+                    None,
+                ),
                 None => (
-                    format!("unix:{}", options.socket.display()),
+                    ::service::Endpoint::unix(&options.socket),
                     Some(options.socket.clone()),
                 ),
             };
@@ -229,7 +261,7 @@ impl Daemon {
             let _ = std::fs::remove_file(&options.socket);
             let listener = Listener::bind(&address)
                 .with_context(|| format!("binding the process socket {address}"))?;
-            let address = listener.address().to_owned();
+            let address = listener.endpoint().to_string();
             // While nodes may join, their processes reach this node's
             // Storage Server too: their Transfer Servers read its storage.
             let local = local(&options, leader_address, joins.is_some())?;
@@ -430,8 +462,7 @@ impl Daemon {
         if let Some(table) = &self.table {
             epochs.attach_processes(Arc::clone(table));
         }
-        let processes =
-            processes::Processes::new(Arc::clone(&epochs), deployment, Vec::new(), link);
+        let processes = processes::Processes::new(Arc::clone(&epochs), deployment, link);
         Some((
             Arc::new(crate::updates::Updater::new(epochs, processes)),
             awake,
@@ -527,34 +558,31 @@ fn local(
             options.executable.clone(),
             remote_pages,
             address,
-            options.storage_server.clone(),
+            options.storage.clone(),
         ),
         address,
         options.devices,
     ))
 }
 
-/// The leader's address its members join at, bound when the deployment
-/// names one (`dist_init_addr`), and the members that joined before the
-/// leader serves: every node rank below `nnodes` (other than the leader's)
-/// within the join timeout. The address stays bound while the leader
-/// serves, so a node may join the running deployment later (`Joins`).
+/// The members that joined before the leader serves, at the join listener the caller bound
+/// (`join`, [`Daemon::bind_join`]) when the deployment names a join endpoint
+/// (`dist_init_addr`): every node rank below `nnodes` (other than the leader's) within the join
+/// timeout. The listener stays bound while the leader serves, so a node may join the running
+/// deployment later (`Joins`).
 fn join_members(
     options: &DaemonOptions,
+    join: Option<Listener>,
 ) -> anyhow::Result<(Option<service::Joins>, Vec<service::Membership>)> {
-    let Some(address) = options.dist_init_addr.as_deref() else {
+    let Some(listener) = join else {
+        anyhow::ensure!(
+            options.nnodes == 1,
+            "a leader of {} nodes needs its join listener",
+            options.nnodes
+        );
         return Ok((None, Vec::new()));
     };
-    let bind = format!(
-        "0.0.0.0:{}",
-        address
-            .rsplit_once(':')
-            .map(|(_, port)| port)
-            .context("the leader's address names no port")?
-    );
-    let listener =
-        Listener::bind(&bind).with_context(|| format!("binding the leader's address {bind}"))?;
-    tracing::info!(address = %listener.address(), nodes = options.nnodes, "awaiting the deployment's other nodes");
+    tracing::info!(endpoint = %listener.endpoint(), nodes = options.nnodes, "awaiting the deployment's other nodes");
 
     let mut joins = service::Joins::new(listener);
     let deadline = Instant::now() + options.join_timeout;
@@ -590,9 +618,10 @@ fn leader_address(options: &DaemonOptions, members: &[service::Membership]) -> O
         .and_then(|member| member.connection.local_addr())
         .map(|address| address.ip())
         .or_else(|| {
-            options
-                .dist_init_addr
-                .as_deref()?
+            let ::service::Endpoint::Tcp { host, port } = options.dist_init_addr.as_ref()? else {
+                return None;
+            };
+            (host.as_str(), *port)
                 .to_socket_addrs()
                 .ok()?
                 .map(|address| address.ip())
@@ -605,7 +634,7 @@ fn leader_address(options: &DaemonOptions, members: &[service::Membership]) -> O
 fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
     let address = options
         .dist_init_addr
-        .as_deref()
+        .as_ref()
         .context("a member needs the leader's address")?;
     let deadline = Instant::now() + options.join_timeout;
     let mut connection = loop {
@@ -688,21 +717,25 @@ mod tests {
     fn resumed_service(network: bool) {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("process.sock");
-        let mut daemon = Daemon::start(DaemonOptions {
-            nnodes: 1,
-            node_rank: 0,
-            host: "localhost".to_owned(),
-            dist_init_addr: network.then(|| "127.0.0.1:0".to_owned()),
-            socket: socket.clone(),
-            executable: PathBuf::from("uniserve"),
-            join_timeout: Duration::from_secs(5),
-            devices: || Ok(Vec::new()),
-            build_server: build_server::command::Settings::default(),
-            storage_server: Vec::new(),
-        })
+        let join = network.then(|| Daemon::bind_join(&"127.0.0.1:0".parse().unwrap()).unwrap());
+        let mut daemon = Daemon::start(
+            DaemonOptions {
+                nnodes: 1,
+                node_rank: 0,
+                host: "localhost".to_owned(),
+                dist_init_addr: join.as_ref().map(|(_, endpoint)| endpoint.clone()),
+                socket: socket.clone(),
+                executable: PathBuf::from("uniserve"),
+                join_timeout: Duration::from_secs(5),
+                devices: || Ok(Vec::new()),
+                build_server: build_server::command::Settings::default(),
+                storage: storage::Settings::default(),
+            },
+            join.map(|(listener, _)| listener),
+        )
         .unwrap();
         let address = daemon.address().unwrap().to_owned();
-        let mut engine = Connection::connect(&address).unwrap();
+        let mut engine = Connection::connect(&address.parse().unwrap()).unwrap();
         engine
             .deliver(&Hello {
                 major: proto::ENGINE_INTERFACE_VERSION,

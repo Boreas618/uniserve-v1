@@ -70,11 +70,31 @@ pub use store::{ModulePath, Root, Store};
 pub use target::Target;
 pub use toolchain::Toolchains;
 
-/// The socket of this host's Build Server for the calling user:
-/// `build-server.sock` in the user's service directory
-/// ([`service::runtime_directory`]).
-pub fn default_socket() -> std::path::PathBuf {
-    service::runtime_directory().join("build-server.sock")
+/// The socket of this host's Build Server for the calling user: `build-server.sock` in the
+/// user's runtime directory ([`service::RuntimeDirectory`]), where the running server also
+/// publishes its readiness record (`service::host::running`).
+///
+/// # Errors
+///
+/// Fails when the user has no runtime directory.
+pub fn default_socket() -> std::io::Result<std::path::PathBuf> {
+    Ok(service::RuntimeDirectory::of_user()?.socket("build-server"))
+}
+
+/// A Build Server's readiness record: its socket (`build`).
+pub type Readiness = service::Readiness;
+
+/// The readiness record of a Build Server of this process serving on `socket`.
+pub fn readiness(socket: &std::path::Path) -> Readiness {
+    service::Readiness::of_process(
+        service::State::Serving,
+        None,
+        service::Endpoints {
+            build: Some(service::Endpoint::unix(socket)),
+            ..service::Endpoints::default()
+        },
+        (),
+    )
 }
 
 use std::path::PathBuf;

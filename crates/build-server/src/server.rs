@@ -205,7 +205,7 @@ impl BuildServer {
     }
 
     /// Serves on `listener`, the socket `lock` makes this server the owner of
-    /// ([`service::bind`], which the caller ran, so the socket accepts
+    /// ([`service::host::bind`], which the caller ran, so the socket accepts
     /// connections before this is called), until `stop` becomes readable or is
     /// closed; the lock removes the socket on the way out.
     ///
@@ -217,7 +217,7 @@ impl BuildServer {
     pub fn serve_on(
         self: Arc<Self>,
         listener: std::os::unix::net::UnixListener,
-        lock: service::SocketLock,
+        lock: service::host::SocketLock,
         stop: &impl AsRawFd,
     ) -> Result<()> {
         listener.set_nonblocking(true)?;

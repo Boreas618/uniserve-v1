@@ -355,7 +355,10 @@ impl Leader {
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
         let local = crate::engine::control::BuildServer {
             host: control.host().to_owned(),
-            socket: target.build_config.socket(),
+            socket: target
+                .build_config
+                .socket()
+                .map_err(|error| UpdateError::Refused(format!("{error}")))?,
             targets: Vec::new(),
         };
         crate::leader::fix_modules(local, Some(control), hosts, named).await
@@ -617,7 +620,7 @@ impl Leader {
                 record,
                 launches,
                 environment: crate::engine::control::main_process_environment(),
-                requests: target.request_socket().to_string_lossy().into_owned(),
+                requests: control.request_address().to_owned(),
                 keeps: options.previous_epoch,
                 recompute: request.in_flight == InFlight::Recompute,
                 drain: Duration::from_secs_f64(options.drain_s),

@@ -29,18 +29,14 @@ impl Deployment {
     /// A deployment whose member's host is served by the Build Server `settings` names.
     fn with_member_build_server(settings: build_server::command::Settings) -> Self {
         let directory = tempfile::tempdir().unwrap();
-        // A free port for the leader's address: the leader binds it on every
-        // interface once this probe released it.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // The leader's join listener, bound on a port the kernel picks; the member joins at the
+        // endpoint it bound.
+        let (join, endpoint) = Daemon::bind_join(&"127.0.0.1:0".parse().unwrap()).unwrap();
         let options = |node_rank: u32, host: &str| DaemonOptions {
             nnodes: 2,
             node_rank,
             host: host.to_owned(),
-            dist_init_addr: Some(format!("127.0.0.1:{port}")),
+            dist_init_addr: Some(endpoint.clone()),
             socket: directory.path().join(format!("{host}.sock")),
             executable: "uniserve".into(),
             join_timeout: TIMEOUT,
@@ -50,16 +46,16 @@ impl Deployment {
             } else {
                 build_server::command::Settings::default()
             },
-            storage_server: Vec::new(),
+            storage: storage::Settings::default(),
         };
 
         // The leader's start returns once every member joined, and a
         // member's once it joined, so they start together.
         let leader = std::thread::spawn({
             let options = options(0, "leader");
-            move || Daemon::start(options).unwrap()
+            move || Daemon::start(options, Some(join)).unwrap()
         });
-        let member = Daemon::start(options(1, "member")).unwrap();
+        let member = Daemon::start(options(1, "member"), None).unwrap();
         let leader = leader.join().unwrap();
         assert_eq!(member.address(), None, "only the leader serves engines");
         Self {
@@ -144,34 +140,30 @@ fn the_members_processes_end_with_the_leader() {
 #[test]
 fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() {
     let directory = tempfile::tempdir().unwrap();
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let (join, endpoint) = Daemon::bind_join(&"127.0.0.1:0".parse().unwrap()).unwrap();
     let options = |nnodes: u32, node_rank: u32, host: &str| DaemonOptions {
         nnodes,
         node_rank,
         host: host.to_owned(),
-        dist_init_addr: Some(format!("127.0.0.1:{port}")),
+        dist_init_addr: Some(endpoint.clone()),
         socket: directory.path().join(format!("{host}.sock")),
         executable: "uniserve".into(),
         join_timeout: TIMEOUT,
         devices: || Ok(Vec::new()),
         build_server: build_server::command::Settings::default(),
-        storage_server: Vec::new(),
+        storage: storage::Settings::default(),
     };
 
     // A leader of one node that names its address serves at once.
-    let leader = Daemon::start(options(1, 0, "leader")).unwrap();
+    let leader = Daemon::start(options(1, 0, "leader"), Some(join)).unwrap();
     let address = leader.address().unwrap().to_owned();
     let (mut serving, welcome) = Engine::hello(&address, proto::ENGINE_INTERFACE_VERSION);
     assert_eq!(welcome.nodes.len(), 1);
 
     // A node joins while an engine is served; a second node of the same
     // rank is refused.
-    let member = Daemon::start(options(2, 1, "member")).unwrap();
-    let error = Daemon::start(options(2, 1, "again")).err().unwrap();
+    let member = Daemon::start(options(2, 1, "member"), None).unwrap();
+    let error = Daemon::start(options(2, 1, "again"), None).err().unwrap();
     assert!(
         format!("{error:#}").contains("node rank 1 is taken"),
         "{error:#}"

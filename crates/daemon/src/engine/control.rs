@@ -80,7 +80,7 @@ pub(crate) fn main_process_environment() -> std::collections::HashMap<String, St
         .collect()
 }
 
-/// How long a Build Server this daemon starts may take to listen: it
+/// How long a Build Server this daemon starts may take to serve: it
 /// discovers its toolchains, which imports the compilers of its Python
 /// environment, and loads every installed package first.
 const BUILD_SERVER_START: std::time::Duration = std::time::Duration::from_secs(120);
@@ -88,19 +88,22 @@ const BUILD_SERVER_START: std::time::Duration = std::time::Duration::from_secs(1
 /// Makes sure this host's Build Server serves on the socket `settings`
 /// names, and returns that socket: when none serves, the Build Server is
 /// started with `settings` as a host service of this executable
-/// (`service::ensure`), which outlives this daemon.
+/// (`service::host::start`), which outlives this daemon.
 ///
 /// # Errors
 ///
 /// Fails when no Build Server serves and none can be started.
 pub fn ensure_build_server(settings: &build_server::command::Settings) -> anyhow::Result<PathBuf> {
-    let socket = settings.socket();
+    let socket = settings
+        .socket()
+        .context("finding this host's Build Server socket")?;
     let executable = std::env::current_exe().context("locating this executable")?;
-    ::service::ensure(
+    ::service::host::start::<()>(
         &executable,
         "build-server",
         &socket,
         &settings.arguments(),
+        None,
         BUILD_SERVER_START,
     )
     .context("starting this host's Build Server")?;
@@ -145,15 +148,15 @@ impl EngineControl {
     ) -> anyhow::Result<Self> {
         // A socket a stopped daemon left behind is replaced.
         let _ = std::fs::remove_file(socket);
-        let address = if processes.starts_with("unix:") {
-            format!("unix:{}", socket.display())
-        } else {
-            let endpoint: std::net::SocketAddr = processes.parse()?;
-            std::net::SocketAddr::new(endpoint.ip(), 0).to_string()
+        // The request socket is reached as the process socket is: a Unix socket on one host, the
+        // same interface's TCP endpoint, on a port the kernel picks, across hosts.
+        let endpoint = match processes.parse::<service::Endpoint>()? {
+            service::Endpoint::Unix(_) => service::Endpoint::unix(socket),
+            service::Endpoint::Tcp { host, .. } => service::Endpoint::Tcp { host, port: 0 },
         };
-        let requests = Listener::bind(&address)
-            .with_context(|| format!("binding the request socket {}", socket.display()))?;
-        let request_address = requests.address().to_owned();
+        let requests = Listener::bind(&endpoint)
+            .with_context(|| format!("binding the request socket {endpoint}"))?;
+        let request_address = requests.endpoint().to_string();
         Ok(Self {
             requests,
             request_address,
@@ -502,7 +505,11 @@ impl EngineControl {
     /// `engine` as `executable` on this node; returns the control connection
     /// the process lives under.
     fn connect(&self) -> anyhow::Result<(Connection, Vec<process::Node>)> {
-        let mut control = Connection::connect(&self.processes)
+        let mut control = self
+            .processes
+            .parse()
+            .map_err(std::io::Error::from)
+            .and_then(|endpoint| Connection::connect(&endpoint))
             .with_context(|| format!("connecting to the daemon at {}", self.processes))?;
         control.deliver(&process::Hello {
             major: proto::ENGINE_INTERFACE_VERSION,
@@ -1998,10 +2005,10 @@ mod tests {
     fn a_closed_control_connection_is_not_an_engine_exit() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("processes.sock");
-        let address = format!("unix:{}", path.display());
-        let listener = Listener::bind(&address).unwrap();
+        let endpoint = service::Endpoint::unix(&path);
+        let listener = Listener::bind(&endpoint).unwrap();
         // The predecessor's client end, whose accepted side closed with its service.
-        let mut control = Connection::connect(&address).unwrap();
+        let mut control = Connection::connect(&endpoint).unwrap();
         drop(listener.try_accept().expect("the accepted connection"));
         drop(listener);
 

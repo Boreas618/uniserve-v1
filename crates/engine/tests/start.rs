@@ -58,7 +58,13 @@ fn build_server(directory: &Path) -> (PathBuf, std::os::unix::net::UnixStream) {
     };
     let socket = directory.join("build-server.sock");
     // The socket is bound before the server serves, so a client connects at once.
-    let (listener, lock) = service::bind(&socket).unwrap().unwrap();
+    let (listener, starting) = service::host::bind::<()>(&socket)
+        .unwrap()
+        .owned(&socket)
+        .unwrap();
+    let lock = starting
+        .finish(&build_server::readiness(&socket))
+        .unwrap();
     let server = Arc::new(build_server::server::BuildServer::open(&config).unwrap());
     let (stop, stopped) = std::os::unix::net::UnixStream::pair().unwrap();
     std::thread::spawn(move || {
@@ -181,8 +187,8 @@ fn started(
     storage: &StorageServer,
     inherited: &[RawFd],
 ) -> Daemon {
-    let requests_socket = Listener::bind(&launch.requests).unwrap();
-    let processes_socket = Listener::bind(&launch.processes).unwrap();
+    let requests_socket = Listener::bind(&launch.requests.parse().unwrap()).unwrap();
+    let processes_socket = Listener::bind(&launch.processes.parse().unwrap()).unwrap();
     let launch_file = directory.join("launch.json");
     std::fs::write(&launch_file, serde_json::to_vec(launch).unwrap()).unwrap();
 

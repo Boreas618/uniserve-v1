@@ -5,22 +5,24 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# A host service: one server per host and serving user on a Unix socket in
-# the user's runtime directory, owned by a lock, started detached from its
-# starter when absent. The Storage Server and the Build Server are both
-# host services. The framing and the one connection every process interface
-# runs on are here too. This crate depends on no workspace crate and links no
-# CUDA.
+# What every process shares: the runtime and instance directories, typed
+# endpoints and the readiness record that reports them (JSON lines), the host
+# services (one server per host and serving user on a Unix socket in the
+# user's runtime directory, owned by a lock, started detached from its starter
+# when absent), the framing and the one connection every process interface
+# runs on. This crate depends on no workspace crate and links no CUDA.
 [dependencies]
 libc.workspace = true
 rustix = { workspace = true, features = ["net"] }
+serde.workspace = true
+serde_json.workspace = true
 signal-hook-registry.workspace = true
+# Instance directories are created under a name `mkdtemp(3)` picks.
+tempfile.workspace = true
+thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

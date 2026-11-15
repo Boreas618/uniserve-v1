@@ -137,19 +137,28 @@ pub fn run(launch_file: &Path, registry: &nn::family::Registry) -> Result<()> {
         .map_err(anyhow::Error::new)
         .and_then(|text| serde_json::from_slice(&text).map_err(anyhow::Error::new))
         .with_context(|| format!("reading the launch file {}", launch_file.display()))?;
-    let mut requests = Connection::connect(&launch.requests)
+    let mut requests = launch
+        .requests
+        .parse()
+        .map_err(std::io::Error::from)
+        .and_then(|endpoint| Connection::connect(&endpoint))
         .with_context(|| format!("connecting to the daemon's requests at {}", launch.requests))?;
     connect(&mut requests, &launch)?;
 
     // What fails before the control thread runs is said on the request interface: the daemon
     // waits for the state a start ends in, and a connection that closes says only that it went.
     let claimed = check(&launch).and_then(|()| {
-        let mut process = Connection::connect(&launch.processes).with_context(|| {
-            format!(
-                "connecting to the daemon's processes at {}",
-                launch.processes
-            )
-        })?;
+        let mut process = launch
+            .processes
+            .parse()
+            .map_err(std::io::Error::from)
+            .and_then(|endpoint| Connection::connect(&endpoint))
+            .with_context(|| {
+                format!(
+                    "connecting to the daemon's processes at {}",
+                    launch.processes
+                )
+            })?;
         let (storage, filed) = daemon::claim(&mut process, &launch)?;
         Ok((process, storage, filed))
     });

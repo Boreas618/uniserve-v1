@@ -63,8 +63,8 @@ fn a_frame_carries_its_descriptor_and_the_receiver_maps_the_bytes() {
 
 #[test]
 fn a_network_artifact_preserves_its_bytes_across_parts() {
-    let listener = Listener::bind("127.0.0.1:0").unwrap();
-    let mut sender = Connection::connect(listener.address()).unwrap();
+    let listener = Listener::bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut sender = Connection::connect(listener.endpoint()).unwrap();
     let mut receiver = listener.try_accept().unwrap().unwrap();
     let mut responses = receiver.writer().unwrap();
     let bytes: Vec<_> = (0..4096).map(|index| (index % 251) as u8).collect();

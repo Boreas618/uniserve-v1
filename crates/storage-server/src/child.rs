@@ -9,9 +9,10 @@
 //! connection closes (failing the tasks it held) is the owner's business.
 
 use std::ffi::OsString;
+use std::io::Write as _;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// How long the server waits before starting a child that ended again, so a
@@ -24,6 +25,9 @@ pub(super) const RESTART_DELAY: Duration = Duration::from_secs(5);
 pub struct Launch {
     pub program: PathBuf,
     pub arguments: Vec<OsString>,
+    /// The settings document the child reads on its standard input, which is closed after it;
+    /// `None` gives the child no input.
+    pub input: Option<String>,
 }
 
 /// One child process the server keeps running.
@@ -65,7 +69,20 @@ impl Process {
         self.restart = None;
         let started = Command::new(&launch.program)
             .args(&launch.arguments)
+            .stdin(if launch.input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .spawn()
+            .and_then(|mut child| {
+                // The document is small: the child reads it whole before anything else, and the
+                // pipe takes it without blocking.
+                if let (Some(input), Some(mut stdin)) = (&launch.input, child.stdin.take()) {
+                    stdin.write_all(input.as_bytes())?;
+                }
+                Ok(child)
+            })
             .and_then(|child| {
                 let pid = rustix::process::Pid::from_child(&child);
                 let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())?;

@@ -21,7 +21,7 @@
 use std::os::fd::AsFd;
 use std::path::Path;
 
-use ::storage::protocol::{Priority, Request, Response, TaskStatus};
+use ::storage::protocol::{Priority, TaskStatus};
 use ::storage::{Access, Client, Role, TensorRecord};
 
 use crate::server::{FORKING, Running, head, host, key, memfd, scope, tensor, worker};
@@ -49,9 +49,9 @@ fn rdma_host() -> Running {
 /// The endpoint other hosts reach the server on `socket` at.
 fn endpoint(socket: &Path) -> String {
     let mut operator = Client::connect(socket, Role::Operator).unwrap();
-    match operator.call(&Request::Endpoint, &[]).unwrap().0 {
-        Response::Endpoint { tcp: Some(tcp) } => tcp,
-        other => panic!("the server names no endpoint: {other:?}"),
+    match operator.status().unwrap().endpoints.peer {
+        Some(peer) => peer.to_string(),
+        None => panic!("the server names no endpoint"),
     }
 }
 

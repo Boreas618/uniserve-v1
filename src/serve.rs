@@ -13,7 +13,7 @@
 
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use tracing::info;
 
 use crate::cli::LogLevels;
@@ -39,14 +39,23 @@ pub(crate) fn run(
         })?;
         return Ok(ExitCode::SUCCESS);
     }
+    let ready = args
+        .ready_fd
+        // SAFETY: the caller passed this descriptor for the readiness record; nothing else in this
+        // process owns it, and no thread has started yet.
+        .map(|fd| unsafe { service::ReadyFd::inherit(fd) })
+        .transpose()
+        .context("taking the readiness descriptor")?;
     let resolved = args.resolve(matches)?;
-    runtime.block_on(serve(resolved))?;
+    runtime.block_on(serve(resolved, ready))?;
     Ok(ExitCode::SUCCESS)
 }
 
-/// Serves the resolved configuration until Ctrl-C or SIGTERM.
+/// Serves the resolved configuration until Ctrl-C or SIGTERM, reporting its readiness to
+/// `ready`.
 async fn serve(
     (config, stated): (daemon::options::ServerArgs, daemon::options::Stated),
+    ready: Option<service::ReadyFd>,
 ) -> Result<()> {
     // A model-less leader serves its admin API until a deployment is
     // configured. Followers join the leader without loading a model.
@@ -62,6 +71,7 @@ async fn serve(
             config.build_config,
             crate::served()?,
             crate::idle_devices,
+            ready,
             crate::shutdown_signal(),
         )
         .await;
@@ -74,6 +84,7 @@ async fn serve(
         stated,
         crate::served()?,
         crate::idle_devices,
+        ready,
         crate::shutdown_signal(),
     )
     .await

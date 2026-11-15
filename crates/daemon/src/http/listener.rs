@@ -28,7 +28,7 @@ use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio_util::either::Either;
 use tracing::trace;
 
-use crate::options::{AdminConfig, ServerConfig};
+use crate::options::AdminConfig;
 
 /// Runtime listener type used by the OpenAI-compatible HTTP server, which is
 /// either a TCP listener or a Unix-domain listener.
@@ -91,16 +91,6 @@ pub(crate) struct BindAddress<'a> {
     pub(crate) host: &'a str,
     pub(crate) port: u16,
     pub(crate) uds: Option<&'a str>,
-}
-
-impl<'a> From<&'a ServerConfig> for BindAddress<'a> {
-    fn from(server: &'a ServerConfig) -> Self {
-        Self {
-            host: &server.host,
-            port: server.port,
-            uds: server.uds.as_deref(),
-        }
-    }
 }
 
 impl<'a> From<&'a AdminConfig> for BindAddress<'a> {
@@ -230,6 +220,24 @@ impl Listener {
         }
     }
 
+    /// The endpoint the listener is bound at, with the port a TCP listener picked.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the socket's address cannot be read, or a Unix socket has no path.
+    pub(crate) fn endpoint(&self) -> Result<service::Endpoint> {
+        match self {
+            Self::Tcp(listener) => Ok(service::Endpoint::tcp(listener.local_addr()?)),
+            Self::Unix { listener, .. } => listener
+                .local_addr()?
+                .as_pathname()
+                .map(service::Endpoint::unix)
+                .ok_or_else(|| {
+                    std::io::Error::new(ErrorKind::InvalidInput, "an unnamed Unix socket")
+                }),
+        }
+    }
+
     /// Returns a log-friendly local address string for either TCP or Unix
     /// sockets.
     pub(crate) fn local_addr(&self) -> Result<String> {
@@ -309,13 +317,13 @@ impl axum::serve::Listener for Listener {
 #[cfg(test)]
 mod tests {
     use super::Listener;
-    use crate::options::ServerConfig;
+    use crate::options::AdminConfig;
 
-    /// The server options of a Unix-domain socket at `path`.
-    fn uds(path: &std::path::Path) -> ServerConfig {
-        ServerConfig {
+    /// The listener options of a Unix-domain socket at `path`.
+    fn uds(path: &std::path::Path) -> AdminConfig {
+        AdminConfig {
             uds: Some(path.to_str().unwrap().to_owned()),
-            ..ServerConfig::default()
+            ..AdminConfig::default()
         }
     }
 

@@ -139,9 +139,9 @@ pub(crate) fn claim(
                 scopes: ranks
                     .map(|(group, rank)| proto::process::Scope { group, rank })
                     .collect(),
-                // A server the daemon starts for this claim takes the deployment's connector
-                // settings; the engine states none of its own.
-                server_arguments: Vec::new(),
+                // A server the daemon starts for this claim takes the deployment's settings; the
+                // engine states none of its own.
+                storage: None,
                 epoch: launch.epoch,
                 retire: Vec::new(),
             })),
@@ -209,7 +209,10 @@ pub(crate) fn claim(
 /// When the connection cannot be made, or the daemon refuses this engine or does not welcome it
 /// in time.
 pub(crate) fn attach(address: &str, engine: u64) -> Result<Connection> {
-    let mut connection = Connection::connect(address)
+    let mut connection = address
+        .parse()
+        .map_err(std::io::Error::from)
+        .and_then(|endpoint| Connection::connect(&endpoint))
         .with_context(|| format!("connecting to the attaching daemon at {address}"))?;
     hello(&mut connection, engine, ATTACH_TIMEOUT)?;
     Ok(connection)

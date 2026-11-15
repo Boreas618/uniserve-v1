@@ -712,7 +712,8 @@ impl Leader {
     /// `config` must have passed [`ServerArgs::validate`]; `stated` holds the
     /// option paths the operator set; `daemon` is this node's daemon's
     /// process socket, through which the engine process and every worker
-    /// start. The engine's start blocks until every rank has loaded the
+    /// start, and `instance` the daemon's instance directory, where the engines' request socket
+    /// lies. The engine's start blocks until every rank has loaded the
     /// model, so it runs on the blocking pool.
     ///
     /// # Errors
@@ -728,12 +729,13 @@ impl Leader {
         config: &ServerArgs,
         stated: &Stated,
         daemon: String,
+        instance: &std::path::Path,
         updates: Arc<crate::updates::Updater>,
     ) -> anyhow::Result<Self> {
         let prepared = Self::prepare(families, config, stated).await?;
         info!(parallel = ?prepared.engine.parallel, "starting the engine process");
         let control = Arc::new(EngineControl::new(
-            &config.request_socket(),
+            &config.request_socket(instance),
             daemon,
             config.host_identity.clone(),
             config.served_model_name().to_owned(),
@@ -748,7 +750,7 @@ impl Leader {
         // epoch runs.
         let local = crate::engine::control::BuildServer {
             host: control.host().to_owned(),
-            socket: config.build_config.socket(),
+            socket: config.build_config.socket()?,
             targets: Vec::new(),
         };
         let hosts = epoch_hosts(&prepared.engine)?;

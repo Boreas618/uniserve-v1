@@ -65,11 +65,16 @@ fn accept(listener: &Listener) -> Connection {
     }
 }
 
+/// The loopback TCP endpoint whose port a listener picks.
+fn loopback() -> Endpoint {
+    Endpoint::tcp("127.0.0.1:0".parse().unwrap())
+}
+
 /// A connection and the raw stream of its peer, over loopback TCP.
 fn with_raw_peer() -> (Connection, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    let connection = Connection::connect(&address).unwrap();
+    let endpoint = Endpoint::tcp(listener.local_addr().unwrap());
+    let connection = Connection::connect(&endpoint).unwrap();
     let (peer, _) = listener.accept().unwrap();
     peer.set_read_timeout(Some(TIMEOUT)).unwrap();
     (connection, peer)
@@ -103,13 +108,10 @@ fn restrict_send_buffer(connection: &Connection) {
 
 /// A Unix and a TCP listener in `directory`.
 fn listeners(directory: &tempfile::TempDir) -> [Listener; 2] {
-    let unix = format!(
-        "unix:{}",
-        directory.path().join("connection.sock").display()
-    );
+    let unix = Endpoint::unix(directory.path().join("connection.sock"));
     [
         Listener::bind(&unix).unwrap(),
-        Listener::bind("127.0.0.1:0").unwrap(),
+        Listener::bind(&loopback()).unwrap(),
     ]
 }
 
@@ -117,12 +119,12 @@ fn listeners(directory: &tempfile::TempDir) -> [Listener; 2] {
 fn messages_cross_unix_and_tcp_connections_in_both_directions() {
     let directory = tempfile::tempdir().unwrap();
     for listener in listeners(&directory) {
-        let mut near = Connection::connect(listener.address()).unwrap();
+        let mut near = Connection::connect(listener.endpoint()).unwrap();
         let mut far = accept(&listener);
 
         // Only a TCP connection has addresses, and each end's local address is the other's peer
         // address.
-        let tcp = !listener.address().starts_with(UNIX_PREFIX);
+        let tcp = listener.endpoint().port().is_some();
         assert_eq!(near.local_addr().is_some(), tcp);
         assert_eq!(near.local_addr(), far.peer_addr());
         assert_eq!(near.peer_addr(), far.local_addr());
@@ -140,19 +142,19 @@ fn messages_cross_unix_and_tcp_connections_in_both_directions() {
 fn a_unix_listener_removes_its_path_unless_handed_over() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("connection.sock");
-    let address = format!("unix:{}", path.display());
+    let endpoint = Endpoint::unix(&path);
 
-    let listener = Listener::bind(&address).unwrap();
+    let listener = Listener::bind(&endpoint).unwrap();
     assert!(path.exists());
-    assert!(Listener::bind(&address).is_err());
+    assert!(Listener::bind(&endpoint).is_err());
     drop(listener);
     assert!(!path.exists());
 
-    let (descriptor, unix, bound) = Listener::bind(&address).unwrap().hand_over();
+    let (descriptor, bound) = Listener::bind(&endpoint).unwrap().hand_over();
     assert!(path.exists());
-    let resumed = Listener::resume(descriptor, unix, bound).unwrap();
-    assert_eq!(resumed.address(), address);
-    let mut near = Connection::connect(&address).unwrap();
+    let resumed = Listener::resume(descriptor, &bound).unwrap();
+    assert_eq!(resumed.endpoint(), &endpoint);
+    let mut near = Connection::connect(&endpoint).unwrap();
     let mut far = accept(&resumed);
     near.send(&Line("resumed".into())).unwrap();
     assert_eq!(receive::<Line>(&mut far).unwrap(), Line("resumed".into()));
@@ -342,8 +344,8 @@ fn a_large_message_is_written_across_waits() {
 /// it.
 #[test]
 fn a_message_above_64_mib_crosses_a_tcp_connection_intact() {
-    let listener = Listener::bind("127.0.0.1:0").unwrap();
-    let mut near = Connection::connect(listener.address()).unwrap();
+    let listener = Listener::bind(&loopback()).unwrap();
+    let mut near = Connection::connect(listener.endpoint()).unwrap();
     let mut far = accept(&listener);
     let large = line(72 << 20);
 
@@ -392,7 +394,7 @@ fn a_frame_beyond_its_messages_bound_is_refused() {
 fn a_hangup_reports_the_peers_close_and_nothing_else() {
     let directory = tempfile::tempdir().unwrap();
     for listener in listeners(&directory) {
-        let connection = Connection::connect(listener.address()).unwrap();
+        let connection = Connection::connect(listener.endpoint()).unwrap();
         let mut peer = accept(&listener);
         let hangup = connection.hangup().unwrap();
         let (cancel, canceller) = UnixStream::pair().unwrap();

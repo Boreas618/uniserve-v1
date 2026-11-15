@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(config.model.as_deref(), Some("/models/flag"));
         assert_eq!(config.max_running_requests.get(), 1);
         assert_eq!(config.scheduler_config.policy, SchedulingPolicy::Fcfs);
-        assert_eq!(config.server_config.port, 8000);
+        assert_eq!(config.admin_config.port, 0);
     }
 
     /// A `--set` value is a TOML value, JSON, or text; lists also take
@@ -402,8 +402,6 @@ mod tests {
             "server_config.request_timeout=2m",
             "--set",
             "flashinfer_config.workspace_size=1GiB",
-            "--set",
-            "server_config.host=0.0.0.0",
         ])
         .unwrap();
         assert_eq!(
@@ -426,7 +424,6 @@ mod tests {
             Some(Duration::from_secs(120))
         );
         assert_eq!(config.flashinfer_config.workspace_size, 1 << 30);
-        assert_eq!(config.server_config.host, "0.0.0.0");
     }
 
     /// An unknown option, a value its option does not take, a path through
@@ -523,7 +520,7 @@ mod tests {
             assert!(stated.contains(path), "{path} was stated");
         }
         assert!(stated.contains_within("video_config"));
-        assert!(!stated.contains("server_config.host"));
+        assert!(!stated.contains("admin_config.host"));
         assert!(!stated.contains_within("cuda_graph_config"));
     }
 
@@ -922,7 +919,7 @@ mod tests {
     fn listeners_and_video_capacities_are_checked() {
         assert!(lowered(&["m", "--port", "0"]).is_ok());
         assert!(lowered(&["m", "--host", " "]).is_err());
-        assert!(lowered(&["m", "--set", "server_config.uds=\"\""]).is_err());
+        assert!(lowered(&["m", "--set", "admin_config.uds=\"\""]).is_err());
         for (seconds, valid) in [("4", true), ("15.5", true), ("0", false), ("-1", false)] {
             let set = format!("video_config.max_seconds={seconds}");
             assert_eq!(lowered(&["m", "--set", &set]).is_ok(), valid, "{seconds} s");
@@ -959,38 +956,44 @@ mod tests {
         }
     }
 
-    /// A deployment with a Mooncake connector starts its Storage Servers with
-    /// the connector's settings on their command line; one without states none.
+    /// A deployment states the settings of its Storage Servers: its `storage_config`, with the
+    /// Mooncake connector `kv_cache_config.mooncake` states, and a TCP endpoint on every
+    /// interface when other nodes may join it and it states none.
     #[test]
-    fn a_mooncake_connector_is_stated_to_the_storage_server() {
+    fn a_deployment_states_its_storage_servers_settings() {
         let (plain, _) = resolved(&["m"]).unwrap();
-        assert!(
-            plain
-                .daemon_options(|| Ok(Vec::new()))
-                .storage_server
-                .is_empty()
-        );
+        assert_eq!(plain.storage_settings(), storage::Settings::default());
 
         let (config, _) = resolved(&[
             "m",
+            "--dist-init-addr",
+            "10.0.0.2:5000",
             "--set",
             "kv_cache_config.mooncake.master=\"10.0.0.1:50051\"",
             "--set",
-            "kv_cache_config.mooncake.global_segment_gib=4",
+            "kv_cache_config.mooncake.segment_gib=4",
             "--set",
-            "kv_cache_config.mooncake.library=\"/opt/mooncake/libmooncake_store.so\"",
+            "storage_config.host_reserve_gib=4",
         ])
         .unwrap();
-        let arguments = config.daemon_options(|| Ok(Vec::new())).storage_server;
-        let value = |flag: &str| {
-            let at = arguments.iter().position(|argument| argument == flag);
-            at.and_then(|at| arguments.get(at + 1)).map(String::as_str)
-        };
-        assert_eq!(value("--mooncake-master"), Some("10.0.0.1:50051"));
-        assert_eq!(value("--mooncake-segment-bytes"), Some("4294967296"));
+        let settings = config.storage_settings();
+        let connector = settings.connector.unwrap();
+        assert_eq!(connector.master.to_string(), "10.0.0.1:50051");
+        assert_eq!(connector.segment_bytes(), 4 << 30);
+        assert_eq!(settings.server.host_reserve_gib, 4);
         assert_eq!(
-            value("--mooncake-library"),
-            Some("/opt/mooncake/libmooncake_store.so")
+            settings.server.tcp.map(|tcp| tcp.to_string()).as_deref(),
+            Some("0.0.0.0:0")
+        );
+
+        // A library location is no setting: Mooncake is opened from the loader's search path.
+        assert!(
+            resolved(&[
+                "m",
+                "--set",
+                "kv_cache_config.mooncake={ master = \"10.0.0.1:50051\", library = \"/x.so\" }",
+            ])
+            .is_err()
         );
     }
 }

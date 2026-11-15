@@ -143,9 +143,13 @@ pub struct BuildArgs {
 #[derive(Debug, Clone, clap::Args)]
 pub struct ServeArgs {
     /// Leave the starter's session, log beside the socket, and return to the
-    /// starter once listening.
+    /// starter once serving, printing the server's readiness record.
     #[arg(long)]
     pub daemon: bool,
+    /// The inherited descriptor the server writes its readiness record to
+    /// (`service::Readiness`, one JSON line) once it serves.
+    #[arg(long, value_name = "FD")]
+    pub ready_fd: Option<i32>,
     #[command(flatten)]
     pub settings: Settings,
 }
@@ -251,7 +255,11 @@ fn peak_memory(text: &str) -> std::result::Result<(ToolchainKind, u64), String> 
 impl Settings {
     /// The socket these settings name, made absolute, or this user's default
     /// socket.
-    pub fn socket(&self) -> PathBuf {
+    ///
+    /// # Errors
+    ///
+    /// Fails when no socket is named and the user has no runtime directory.
+    pub fn socket(&self) -> std::io::Result<PathBuf> {
         socket_or_default(self.socket.clone())
     }
 
@@ -394,7 +402,7 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
     match args.command {
         Command::Serve(serve) => run_serve(*serve, host, levels),
         Command::Install { socket, package } => {
-            let mut client = Client::connect(&socket_or_default(socket))?;
+            let mut client = Client::connect(&socket_or_default(socket)?)?;
             let installed = client.install(&absolute(package))?;
             println!(
                 "{} {} revision {}",
@@ -403,7 +411,7 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
             Ok(())
         }
         Command::List { socket } => {
-            let mut client = Client::connect(&socket_or_default(socket))?;
+            let mut client = Client::connect(&socket_or_default(socket)?)?;
             for (package, modules) in client.list()? {
                 println!(
                     "{} {} revision {}",
@@ -426,7 +434,7 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
             target,
             key,
         } => {
-            let mut client = Client::connect(&socket_or_default(socket))?;
+            let mut client = Client::connect(&socket_or_default(socket)?)?;
             let module = client.resolve(
                 &op,
                 &proto::module::PackageRevision {
@@ -568,30 +576,41 @@ fn run_serve(
     host: HostTargets<'_>,
     levels: &service::logging::Levels,
 ) -> Result<()> {
-    let socket = serve.settings.socket();
+    let socket = serve.settings.socket()?;
+    let inherited = serve
+        .ready_fd
+        // SAFETY: the starter passed this descriptor for the readiness record; nothing else in
+        // this process owns it.
+        .map(|fd| unsafe { service::ReadyFd::inherit(fd) })
+        .transpose()?;
 
     // Forked before any thread exists.
-    let ready = if serve.daemon {
-        Some(service::detach(&socket)?)
+    let mut ready = if serve.daemon {
+        Some(service::host::detach(&socket, inherited)?)
     } else {
-        None
+        inherited
     };
     service::logging::init("BuildServer", levels, service::logging::Output::Stderr);
     // A stop signal makes this descriptor readable, which ends the serving.
     let (stop, _flag) = service::stop_signals()?;
 
-    let Some((listener, lock)) = service::bind(&socket)? else {
-        tracing::info!(socket = %socket.display(), "another build server serves this socket");
-        if let Some(ready) = ready {
-            ready.signal();
+    let (listener, starting) = match service::host::bind::<()>(&socket)? {
+        service::host::Bound::Owner { listener, starting } => (listener, starting),
+        service::host::Bound::Serving(record) => {
+            tracing::info!(socket = %socket.display(), pid = record.pid, "another build server serves this socket");
+            if let Some(ready) = &mut ready {
+                ready.report(&record)?;
+            }
+            return Ok(());
         }
-        return Ok(());
     };
 
     let config = serve.settings.config(serve.settings.targets(host)?)?;
     let server = std::sync::Arc::new(BuildServer::open(&config)?);
-    if let Some(ready) = ready {
-        ready.signal();
+    let record = crate::readiness(&socket);
+    let lock = starting.finish(&record)?;
+    if let Some(mut ready) = ready {
+        ready.report(&record)?;
     }
     tracing::info!(socket = %socket.display(), "build server serving");
     let served = server.serve_on(listener, lock, &stop);
@@ -600,8 +619,8 @@ fn run_serve(
 }
 
 /// `socket`, made absolute, or this user's default socket.
-fn socket_or_default(socket: Option<PathBuf>) -> PathBuf {
-    socket.map(absolute).unwrap_or_else(default_socket)
+fn socket_or_default(socket: Option<PathBuf>) -> std::io::Result<PathBuf> {
+    socket.map_or_else(default_socket, |socket| Ok(absolute(socket)))
 }
 
 /// A path made absolute against the directory the command was started in:

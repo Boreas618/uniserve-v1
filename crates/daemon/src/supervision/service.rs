@@ -1355,16 +1355,13 @@ fn route(
             ..Reply::default()
         });
     }
-    // A claim that states no Storage Server arguments takes the deployment's
-    // (its Mooncake connector), here or on the member it goes to: the server a
-    // node starts for the claim then runs the deployment's connector.
+    // A claim that states no Storage Server settings takes the deployment's, here or on the
+    // member it goes to: the server a node starts for the claim then serves with them.
     let stated;
     let request = match &request.kind {
-        Some(request::Kind::Claim(claim))
-            if claim.server_arguments.is_empty() && !local.claims.server_arguments().is_empty() =>
-        {
+        Some(request::Kind::Claim(claim)) if claim.storage.is_none() => {
             let mut claim = claim.clone();
-            claim.server_arguments = local.claims.server_arguments().to_vec();
+            claim.storage = Some(local.claims.settings().into());
             stated = Request {
                 id: request.id,
                 kind: Some(request::Kind::Claim(claim)),
@@ -1525,15 +1522,11 @@ pub(crate) fn serve_member(
 pub(crate) enum ServiceHandoff {
     Leader {
         host: String,
-        /// The process socket: its address and whether it is a Unix
-        /// socket; its descriptor comes first.
-        listener: (String, bool),
-        /// The members' address, when the deployment names one: its
-        /// address and whether it is a Unix socket; its descriptor follows
-        /// the process socket's. A node whose hello is still awaited joins
-        /// again.
-        #[serde(default)]
-        joins: Option<(String, bool)>,
+        /// The process socket's endpoint; its descriptor comes first.
+        listener: ::service::Endpoint,
+        /// The members' endpoint, when the deployment names one; its descriptor follows the
+        /// process socket's. A node whose hello is still awaited joins again.
+        joins: Option<::service::Endpoint>,
         /// Each engine connection, by its identity, after the listener.
         engines: Vec<(u64, bool, ConnectionHandoff)>,
         next_engine: u64,
@@ -1640,12 +1633,12 @@ impl LeaderService {
             // successor's own service publishes into it.
             processes: _,
         } = self;
-        let (listener_descriptor, unix, address) = listener.hand_over();
+        let (listener_descriptor, endpoint) = listener.hand_over();
         let mut descriptors = vec![listener_descriptor];
         let joins = joins.map(|joins| {
-            let (descriptor, unix, address) = joins.listener.hand_over();
+            let (descriptor, endpoint) = joins.listener.hand_over();
             descriptors.push(descriptor);
-            (address, unix)
+            endpoint
         });
         let mut engine_handoffs = Vec::with_capacity(engines.len());
         for (id, engine) in engines {
@@ -1678,7 +1671,7 @@ impl LeaderService {
         Ok((
             ServiceHandoff::Leader {
                 host,
-                listener: (address, unix),
+                listener: endpoint,
                 joins,
                 engines: engine_handoffs,
                 next_engine,
@@ -1733,7 +1726,7 @@ pub(crate) fn resume(
     match handoff {
         ServiceHandoff::Leader {
             host: leader_host,
-            listener: (address, unix),
+            listener: endpoint,
             joins,
             engines,
             next_engine,
@@ -1743,11 +1736,9 @@ pub(crate) fn resume(
             stops,
             local,
         } => {
-            let listener = Listener::resume(next()?, unix, address)?;
+            let listener = Listener::resume(next()?, &endpoint)?;
             let joins = joins
-                .map(|(address, unix)| {
-                    anyhow::Ok(Joins::new(Listener::resume(next()?, unix, address)?))
-                })
+                .map(|endpoint| anyhow::Ok(Joins::new(Listener::resume(next()?, &endpoint)?)))
                 .transpose()?;
             let mut adopted_engines = HashMap::new();
             for (id, welcomed, connection) in engines {

@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use proto::process::{Claim, Claimed, WeightsKept};
 
-/// Longest a Storage Server this daemon starts takes to listen.
+/// Longest a Storage Server this daemon starts takes to serve.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The claims this node's daemon holds, by deployment.
@@ -38,10 +38,10 @@ pub(crate) struct ClaimHolder {
     remote_pages: bool,
     /// This node's address other nodes reach, which names that listener.
     address: Option<std::net::IpAddr>,
-    /// The arguments of `storage-server serve` that the deployment's
-    /// configuration states (its Mooncake connector, `kv_cache_config.mooncake`),
-    /// which a claim that states none of its own takes ([`Self::server_arguments`]).
-    server_arguments: Vec<String>,
+    /// The settings of the node's Storage Server the deployment states
+    /// (`storage_config` and its Mooncake connector, `kv_cache_config.mooncake`),
+    /// which a claim that states none of its own takes ([`Self::settings`]).
+    settings: storage::Settings,
     /// Each deployment's claim, with the `host:port` other nodes reach the
     /// server at (empty when they cannot), as its engines are told.
     claims: HashMap<String, (storage::ClaimClient, String)>,
@@ -54,8 +54,7 @@ pub(crate) struct ClaimHolder {
 pub(crate) struct Handoff {
     executable: std::path::PathBuf,
     remote_pages: bool,
-    #[serde(default)]
-    server_arguments: Vec<String>,
+    settings: storage::Settings,
     claims: Vec<(storage::ClaimHandoff, String)>,
 }
 
@@ -64,22 +63,22 @@ impl ClaimHolder {
         executable: std::path::PathBuf,
         remote_pages: bool,
         address: Option<std::net::IpAddr>,
-        server_arguments: Vec<String>,
+        settings: storage::Settings,
     ) -> Self {
         Self {
             executable,
             remote_pages,
             address,
-            server_arguments,
+            settings,
             claims: HashMap::new(),
         }
     }
 
-    /// The arguments of `storage-server serve` the deployment's configuration
-    /// states, which the leader gives every claim that states none, so that the
-    /// Storage Server a node starts for it runs the deployment's connector.
-    pub(crate) fn server_arguments(&self) -> &[String] {
-        &self.server_arguments
+    /// The settings of the node's Storage Server the deployment states, which the leader gives
+    /// every claim that states none, so that the Storage Server a node starts for it serves with
+    /// them.
+    pub(crate) fn settings(&self) -> &storage::Settings {
+        &self.settings
     }
 
     /// Claims `claim`'s deployment for its epoch at this node's Storage
@@ -95,7 +94,8 @@ impl ClaimHolder {
     pub(crate) fn claim(&mut self, claim: &Claim) -> anyhow::Result<Claimed> {
         use anyhow::Context as _;
 
-        let socket = storage::default_socket();
+        let socket =
+            storage::default_socket().context("finding this node's Storage Server socket")?;
         let scopes: Vec<storage::Scope> = claim
             .scopes
             .iter()
@@ -109,32 +109,39 @@ impl ClaimHolder {
         let (client, tcp) = match self.claims.entry(claim.deployment.clone()) {
             Entry::Occupied(held) => held.into_mut(),
             Entry::Vacant(vacant) => {
-                let mut arguments = claim.server_arguments.clone();
-                if self.remote_pages {
-                    arguments.extend(["--tcp".to_owned(), "0.0.0.0:0".to_owned()]);
-                }
-                service::ensure(
+                let settings = match &claim.storage {
+                    Some(stated) => storage::Settings::try_from(stated)
+                        .map_err(anyhow::Error::msg)
+                        .context("reading the claim's Storage Server settings")?,
+                    None => self.settings.clone(),
+                };
+                let document = settings
+                    .document()
+                    .context("writing the Storage Server's settings")?;
+                // The server serves with the settings the deployment states: one this daemon
+                // starts reads them, and one that serves already states its own, which must be
+                // these.
+                let record: storage::Readiness = service::host::start(
                     &self.executable,
-                    "storage-server",
+                    storage::SERVICE,
                     &socket,
-                    &arguments,
+                    &["--settings".to_owned(), "-".to_owned()],
+                    Some(document.as_bytes()),
                     START_TIMEOUT,
                 )
                 .context("starting this node's storage server")?;
+                storage::settings::Mismatch::check(&record, &settings)?;
 
-                let mut client = storage::ClaimClient::connect(&socket, &claim.deployment)
+                let client = storage::ClaimClient::connect(&socket, &claim.deployment)
                     .with_context(|| {
                         format!("connecting to the storage server at {}", socket.display())
                     })?;
 
-                // A server another process started may accept no other node.
-                let tcp = match client.endpoint()? {
-                    Some(bound) if self.remote_pages => bound
-                        .rsplit_once(':')
-                        .and_then(|(_, port)| port.parse::<u16>().ok())
-                        .zip(self.address)
-                        .map(|(port, address)| std::net::SocketAddr::new(address, port).to_string())
-                        .unwrap_or_default(),
+                // Other nodes reach the server at this node's address, on the port it bound.
+                let tcp = match (record.endpoints.peer, self.address) {
+                    (Some(peer), Some(address)) if self.remote_pages => {
+                        peer.with_host(address).to_string()
+                    }
                     _ => String::new(),
                 };
                 vacant.insert((client, tcp))
@@ -334,7 +341,7 @@ impl ClaimHolder {
         let handoff = Handoff {
             executable: self.executable.clone(),
             remote_pages: self.remote_pages,
-            server_arguments: self.server_arguments.clone(),
+            settings: self.settings.clone(),
             claims,
         };
         Ok((handoff, descriptors))
@@ -351,7 +358,7 @@ impl ClaimHolder {
             handoff.executable,
             handoff.remote_pages,
             address,
-            handoff.server_arguments,
+            handoff.settings,
         );
         for ((claim, tcp), descriptor) in handoff.claims.into_iter().zip(descriptors) {
             let deployment = claim.deployment.clone();

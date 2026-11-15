@@ -39,8 +39,8 @@ pub use args::{Stated, overridden, printed, resolve_text};
 pub use proto::config::{
     ChatConfig, ChatTemplateContentFormat, CudaGraphConfig, DEFAULT_FENCE_MODULES, DeviceConfig,
     FlashInferConfig, ImageFetchConfig, ImageSize, KvCacheConfig, LoadConfig, LoggingConfig,
-    MediaConfig, MigrationConfig, MoeConfig, MooncakeConfig, ProfilingConfig, ReasoningParser,
-    SchedulerConfig, ServerConfig, SpeculativeConfig, VideoConfig, VideoJobConfig, WorkerConfig,
+    MediaConfig, MigrationConfig, MoeConfig, ProfilingConfig, ReasoningParser, SchedulerConfig,
+    ServerConfig, SpeculativeConfig, VideoConfig, VideoJobConfig, WorkerConfig,
 };
 use proto::config::{positive, values};
 
@@ -245,17 +245,26 @@ pub struct ServerArgs {
     /// joins the leader's.
     #[arg(long, default_value_t = ServerArgs::default().node_rank)]
     pub node_rank: u32,
-    /// The leader's `host:port`, which the other nodes' daemons join at and
-    /// the leader binds; required with several nodes.
+    /// The leader's join endpoint (`host:port`): on the leader, the host its
+    /// members reach it at and the port it binds on every interface (port 0
+    /// picks one, which its readiness record states as `join`); on a member,
+    /// the endpoint the leader's readiness record states. Required with
+    /// several nodes.
     #[arg(long, value_name = "HOST:PORT")]
-    pub dist_init_addr: Option<String>,
+    pub dist_init_addr: Option<service::Endpoint>,
     #[arg(skip)]
     pub server_config: ServerConfig,
-    /// The daemon's own HTTP server (`admin_config`): the address this node's
-    /// admin API listens on (design §7.7). The application's server is
-    /// `server_config`'s, which the frontend reads.
+    /// The daemon's listeners (`admin_config`): the client API's address and
+    /// the admin API's Unix sockets. How the HTTP server answers is
+    /// `server_config`'s.
     #[arg(skip)]
     pub admin_config: AdminConfig,
+    /// The settings of the Storage Server of every host the deployment
+    /// serves on (`storage_config`): a daemon that starts a host's server
+    /// starts it with them, and one that finds a server serving with others
+    /// refuses to share it.
+    #[arg(skip)]
+    pub storage_config: storage::ServerSettings,
     #[arg(skip)]
     pub load_config: LoadConfig,
     #[arg(skip)]
@@ -317,6 +326,13 @@ pub struct ServerArgs {
     #[serde(skip)]
     #[arg(long)]
     pub port: Option<u16>,
+    /// The inherited descriptor the daemon writes its readiness record to
+    /// (`service::Readiness`, one JSON line per state): once its listeners
+    /// are bound (`listening`, with their endpoints) and once it serves
+    /// (`serving`).
+    #[serde(skip)]
+    #[arg(long, value_name = "FD")]
+    pub ready_fd: Option<i32>,
     /// The descriptor of the handoff socket to the daemon this one succeeds,
     /// whose deployment it takes over, as `POST /admin/restart` starts its
     /// successor (`daemon::restart`); every other argument is ignored.
@@ -355,6 +371,7 @@ impl Default for ServerArgs {
             dist_init_addr: None,
             server_config: ServerConfig::default(),
             admin_config: AdminConfig::default(),
+            storage_config: storage::ServerSettings::default(),
             load_config: LoadConfig::default(),
             kv_cache_config: KvCacheConfig::default(),
             scheduler_config: SchedulerConfig::default(),
@@ -377,6 +394,7 @@ impl Default for ServerArgs {
             set: Vec::new(),
             host: None,
             port: None,
+            ready_fd: None,
             predecessor: None,
         }
     }
@@ -385,25 +403,27 @@ impl Default for ServerArgs {
 /// The daemon's listeners (`admin_config`): the address its HTTP server
 /// serves the client API on, and the two Unix sockets that serve the admin
 /// API apart from it, one for the operator and one for a harness. Access to
-/// the admin API is those sockets' file permissions.
+/// the admin API is those sockets' file permissions. The daemon binds every
+/// listener when it starts and states their endpoints in its readiness
+/// record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdminConfig {
     /// TCP address the server listens on.
     pub host: String,
-    /// TCP port the server listens on.
+    /// TCP port the server listens on; 0, the default, picks a free one.
     pub port: u16,
     /// Unix domain socket to listen on instead of TCP; a stale socket file
     /// is replaced and the socket file is removed at shutdown.
     pub uds: Option<String>,
     /// The Unix socket the operator's admin API listens on, created with
-    /// mode `0600`; unset places it in the daemon's runtime directory
-    /// (`admin-<port>.sock`).
+    /// mode `0600`; unset places it in the daemon's instance directory
+    /// (`admin.sock`).
     pub admin_uds: Option<String>,
     /// The Unix socket the harness's subset of the admin API listens on,
     /// created with mode `0660`, so that the operator grants a harness
     /// access through the socket's group; unset places it in the daemon's
-    /// runtime directory (`harness-<port>.sock`).
+    /// instance directory (`harness.sock`).
     pub harness_uds: Option<String>,
     /// The option paths a harness may set through `PUT /admin/config` on the
     /// harness listener, beside the package selections it may always set.
@@ -411,20 +431,19 @@ pub struct AdminConfig {
 }
 
 impl AdminConfig {
-    /// The Unix socket the operator's admin API listens on.
-    pub fn admin_socket(&self) -> PathBuf {
-        self.admin_uds.as_ref().map_or_else(
-            || runtime_directory().join(format!("admin-{}.sock", self.port)),
-            PathBuf::from,
-        )
+    /// The Unix socket the operator's admin API listens on, in `instance` unless stated.
+    pub fn admin_socket(&self, instance: &Path) -> PathBuf {
+        self.admin_uds
+            .as_ref()
+            .map_or_else(|| instance.join("admin.sock"), PathBuf::from)
     }
 
-    /// The Unix socket the harness's subset of the admin API listens on.
-    pub fn harness_socket(&self) -> PathBuf {
-        self.harness_uds.as_ref().map_or_else(
-            || runtime_directory().join(format!("harness-{}.sock", self.port)),
-            PathBuf::from,
-        )
+    /// The Unix socket the harness's subset of the admin API listens on, in `instance` unless
+    /// stated.
+    pub fn harness_socket(&self, instance: &Path) -> PathBuf {
+        self.harness_uds
+            .as_ref()
+            .map_or_else(|| instance.join("harness.sock"), PathBuf::from)
     }
 }
 
@@ -432,7 +451,7 @@ impl Default for AdminConfig {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".to_owned(),
-            port: 8000,
+            port: 0,
             uds: None,
             admin_uds: None,
             harness_uds: None,
@@ -827,17 +846,6 @@ impl ServerArgs {
                  states its own rank layout"
             );
         }
-        let server = &self.server_config;
-        match &server.uds {
-            Some(path) => anyhow::ensure!(
-                !path.trim().is_empty(),
-                "`server_config.uds` must not be empty"
-            ),
-            None => anyhow::ensure!(
-                !server.host.trim().is_empty(),
-                "`server_config.host` must not be empty"
-            ),
-        }
         // The daemon binds `admin_config`'s address, so an empty one fails
         // here rather than at the bind.
         let admin = &self.admin_config;
@@ -861,8 +869,14 @@ impl ServerArgs {
             );
         }
         anyhow::ensure!(
-            admin.admin_socket() != admin.harness_socket(),
+            admin.admin_uds.is_none() || admin.admin_uds != admin.harness_uds,
             "`admin_config.admin_uds` and `admin_config.harness_uds` name one socket"
+        );
+        anyhow::ensure!(
+            self.dist_init_addr
+                .as_ref()
+                .is_none_or(|endpoint| endpoint.port().is_some()),
+            "`dist_init_addr` is the leader's TCP endpoint (`host:port`)"
         );
         // The model holds the capacity to its own bounds when its processor
         // is bound; a duration that is no positive number admits nothing.
@@ -881,65 +895,54 @@ impl ServerArgs {
     }
 
     /// The leader's request socket, which its engine processes connect back
-    /// to: this process's own, in the user's runtime directory.
-    pub fn request_socket(&self) -> PathBuf {
-        runtime_directory().join(format!("requests-{}.sock", std::process::id()))
+    /// to: this process's own, in the daemon's instance directory `instance`. A hot restart's
+    /// successor serves in its predecessor's instance beside it, so each daemon process names
+    /// its own.
+    pub fn request_socket(&self, instance: &Path) -> PathBuf {
+        instance.join(format!("requests.{}.sock", std::process::id()))
     }
 
-    /// The options of this node's daemon. The leader's process socket is
-    /// this process's own, in the user's runtime directory; `executable`
-    /// starts the node's Storage Server when it has none.
-    pub fn daemon_options(&self, devices: crate::supervision::DeviceProbe) -> DaemonOptions {
-        let directory = runtime_directory();
+    /// The options of this node's daemon. The leader's process socket lies in the daemon's
+    /// instance directory `instance`; `executable` starts the node's Storage Server when it has
+    /// none, with the deployment's [`ServerArgs::storage_settings`].
+    pub fn daemon_options(
+        &self,
+        devices: crate::supervision::DeviceProbe,
+        instance: &Path,
+    ) -> DaemonOptions {
         DaemonOptions {
             nnodes: self.nnodes.get(),
             node_rank: self.node_rank,
             host: self.host_identity.clone(),
             dist_init_addr: self.dist_init_addr.clone(),
-            socket: directory.join(format!("process-{}.sock", std::process::id())),
+            socket: instance.join("process.sock"),
             // The host services are commands of this executable.
             executable: std::env::current_exe().unwrap_or_else(|_| "uniserve".into()),
             join_timeout: crate::supervision::JOIN_TIMEOUT,
             devices,
             build_server: self.build_config.clone(),
-            storage_server: self.storage_server_arguments(),
+            storage: self.storage_settings(),
         }
     }
 
-    /// The arguments of `storage-server serve` the deployment's configuration
-    /// states: its Mooncake connector (`kv_cache_config.mooncake`), whose
-    /// library is `MOONCAKE_STORE_LIBRARY` when the configuration names none;
-    /// none without a connector.
-    fn storage_server_arguments(&self) -> Vec<String> {
-        let Some(mooncake) = &self.kv_cache_config.mooncake else {
-            return Vec::new();
-        };
-        let library = mooncake.library.clone().or_else(|| {
-            std::env::var_os("MOONCAKE_STORE_LIBRARY")
-                .filter(|library| !library.is_empty())
-                .map(PathBuf::from)
-        });
-        storage::connector::Settings {
-            master: mooncake.master.clone(),
-            metadata: mooncake.metadata_server.clone(),
-            protocol: mooncake.protocol.clone(),
-            device: mooncake.device.clone(),
-            hostname: None,
-            segment_bytes: mooncake.global_segment_gib << 30,
-            library,
+    /// The settings of the Storage Server of every host the deployment serves on: its
+    /// `storage_config`, with the Mooncake connector `kv_cache_config.mooncake` states. A
+    /// deployment that other nodes may join (`dist_init_addr`) has its servers accept other
+    /// hosts on every interface, on a port each picks, unless `storage_config.tcp` states an
+    /// endpoint: the other nodes' Transfer Servers read their storage.
+    pub fn storage_settings(&self) -> storage::Settings {
+        let mut server = self.storage_config.clone();
+        if server.tcp.is_none() && self.dist_init_addr.is_some() {
+            server.tcp = Some(service::Endpoint::Tcp {
+                host: std::net::Ipv4Addr::UNSPECIFIED.to_string(),
+                port: 0,
+            });
         }
-        .arguments()
+        storage::Settings {
+            server,
+            connector: self.kv_cache_config.mooncake.clone(),
+        }
     }
-}
-
-/// The user's runtime directory, where this node's sockets lie beside its
-/// Storage Server's.
-/// The directory this daemon keeps its runtime files in: its sockets, and the
-/// launch and build-config files its main processes read.
-pub(crate) fn runtime_directory() -> PathBuf {
-    storage::default_socket()
-        .parent()
-        .map_or_else(std::env::temp_dir, Path::to_path_buf)
 }
 
 /// Returns the bearer token the server requires, if any.

@@ -14,7 +14,11 @@ use crate::support::{Engine, TIMEOUT, alive, eventually, launch, single_node, sl
 /// Starts a single-node daemon on `host` whose process socket lies in
 /// `directory`.
 fn start(directory: &tempfile::TempDir, host: &str) -> Daemon {
-    Daemon::start(single_node(host, directory.path().join("process.sock"))).unwrap()
+    Daemon::start(
+        single_node(host, directory.path().join("process.sock")),
+        None,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -281,7 +285,7 @@ fn daemon_host() {
     let Some(socket) = std::env::var_os(DAEMON_SOCKET) else {
         return;
     };
-    let _daemon = Daemon::start(single_node("node", socket.into())).unwrap();
+    let _daemon = Daemon::start(single_node("node", socket.into()), None).unwrap();
     loop {
         std::thread::sleep(Duration::from_secs(60));
     }

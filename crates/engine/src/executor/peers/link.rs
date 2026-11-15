@@ -77,7 +77,7 @@ impl Listener {
     pub fn bind(addresses: &[&str]) -> io::Result<Self> {
         let listeners = addresses
             .iter()
-            .map(|address| service::Listener::bind(address))
+            .map(|address| service::Listener::bind(&address.parse()?))
             .collect::<io::Result<Vec<_>>>()?;
         Ok(Self::over(listeners))
     }
@@ -127,7 +127,7 @@ impl Listener {
     fn over(listeners: Vec<service::Listener>) -> Self {
         let addresses = listeners
             .iter()
-            .map(|listener| listener.address().to_owned())
+            .map(|listener| listener.endpoint().to_string())
             .collect();
         Self {
             listeners,

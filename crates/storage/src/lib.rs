@@ -3,7 +3,8 @@
 //!
 //! Each host runs one Storage Server per serving user
 //! (`uniserve storage-server`, the `storage-server` crate), a host service
-//! (the `service` crate) listening on [`default_socket`]. It keeps model weights, the device prefix
+//! (the `service` crate) listening on [`default_socket`], started with the
+//! [`Settings`] a deployment states. It keeps model weights, the device prefix
 //! cache, the buffer pool and the latent buffers of every worker on the host,
 //! so that a restarted worker maps the retained storage instead of loading it
 //! again.
@@ -16,6 +17,8 @@
 //! - [`runtime`]: the requests and completions that travel on a queue pair.
 //! - [`Client`]: one connection, used synchronously by workers and
 //!   asynchronously by the head.
+//! - [`settings`]: the settings a server serves with, which a deployment
+//!   states and a server reports in its readiness record.
 //! - [`connector`]: the settings of the Mooncake connector a server runs,
 //!   which keeps committed pages in the KV storage (L3).
 //! - [`manifest`]: what retained state's bytes are (the parts of logical
@@ -36,16 +39,26 @@ pub mod manifest;
 pub mod protocol;
 pub mod queue;
 pub mod runtime;
+pub mod settings;
 
 pub use client::{ClaimClient, ClaimHandoff, Client};
 pub use error::{Error, Result};
 pub use queue::QueuePair;
+pub use settings::{Readiness, ServerSettings, Settings};
 
-/// The socket of this host's Storage Server for the calling user:
-/// `storage-server.sock` in the user's service directory
-/// ([`service::runtime_directory`]).
-pub fn default_socket() -> std::path::PathBuf {
-    service::runtime_directory().join("storage-server.sock")
+/// The host service name of the Storage Server: its command and the name of its socket and the
+/// files beside it in the user's runtime directory.
+pub const SERVICE: &str = "storage-server";
+
+/// The socket of this host's Storage Server for the calling user: `storage-server.sock` in the
+/// user's runtime directory ([`service::RuntimeDirectory`]), where the running server also
+/// publishes its readiness record (`service::host::running`).
+///
+/// # Errors
+///
+/// Fails when the user has no runtime directory.
+pub fn default_socket() -> std::io::Result<std::path::PathBuf> {
+    Ok(service::RuntimeDirectory::of_user()?.socket(SERVICE))
 }
 pub use protocol::{
     Access, Claim, HostStorage, Item, Key, Listing, Location, Mode, Quota, Reservation, Role,

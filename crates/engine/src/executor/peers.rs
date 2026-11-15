@@ -259,9 +259,15 @@ pub fn accept(
 ///
 /// When no connection is made in time, or the scheduler node does not accept the registration.
 pub fn register(address: &str, rank: u32, engine: u64, timeout: Duration) -> Result<Connection> {
+    let endpoint: service::Endpoint = address.parse().map_err(|error| {
+        Error::transport_source(
+            format!("the scheduler node's peer listener {address}"),
+            std::io::Error::from(error),
+        )
+    })?;
     let deadline = Instant::now() + timeout;
     let mut channel = loop {
-        match Connection::connect(address) {
+        match Connection::connect(&endpoint) {
             Ok(channel) => break channel,
             Err(error) if Instant::now() >= deadline => {
                 return Err(Error::transport_source(

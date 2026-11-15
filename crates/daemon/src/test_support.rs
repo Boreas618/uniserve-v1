@@ -733,7 +733,6 @@ pub(crate) fn test_updater() -> std::sync::Arc<crate::updates::Updater> {
     let processes = crate::supervision::processes::Processes::new(
         Arc::clone(&epochs),
         "deployment".to_owned(),
-        Vec::new(),
         link,
     );
     std::sync::Arc::new(crate::updates::Updater::new(epochs, processes))

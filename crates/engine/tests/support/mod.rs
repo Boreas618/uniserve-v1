@@ -30,7 +30,18 @@ impl StorageServer {
     pub(crate) fn start() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("storage.sock");
-        let (listener, lock) = service::bind(&socket).unwrap().unwrap();
+        let (listener, starting) = service::host::bind::<storage::Settings>(&socket)
+            .unwrap()
+            .owned(&socket)
+            .unwrap();
+        let lock = starting
+            .finish(&service::Readiness::of_process(
+                service::State::Serving,
+                None,
+                service::Endpoints::default(),
+                storage::Settings::default(),
+            ))
+            .unwrap();
 
         let mut ends = [0; 2];
         // SAFETY: pipe2 fills the two descriptors it creates.

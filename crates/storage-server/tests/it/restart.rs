@@ -72,7 +72,18 @@ fn submit(pair: &mut QueuePair, version: u32, number: u64, request: &Request) {
 fn a_successor_goes_on_from_an_image_of_the_format_before_its_own() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("storage.sock");
-    let (listener, lock) = service::bind(&socket).unwrap().unwrap();
+    let (listener, starting) = service::host::bind::<::storage::Settings>(&socket)
+        .unwrap()
+        .owned(&socket)
+        .unwrap();
+    let lock = starting
+        .finish(&service::Readiness::of_process(
+            service::State::Serving,
+            None,
+            service::Endpoints::default(),
+            ::storage::Settings::default(),
+        ))
+        .unwrap();
     let pidfd = rustix::process::pidfd_open(
         rustix::process::getpid(),
         rustix::process::PidfdFlags::empty(),

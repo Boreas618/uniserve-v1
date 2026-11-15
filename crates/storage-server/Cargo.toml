@@ -25,6 +25,8 @@ serde.workspace = true
 service.workspace = true
 storage.workspace = true
 thiserror.workspace = true
+# The connector's settings document on its standard input.
+toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

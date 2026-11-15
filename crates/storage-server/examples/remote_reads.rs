@@ -68,9 +68,7 @@ use std::os::unix::fs::FileExt as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ::storage::protocol::{
-    Event, FabricHandle, LinkEnd, Priority, Region, Request, Response, Span, TaskStatus,
-};
+use ::storage::protocol::{Event, FabricHandle, LinkEnd, Priority, Region, Span, TaskStatus};
 use ::storage::{Access, Client, Key, Location, Role, Scope, StorageRecord, TensorRecord};
 use anyhow::{Context, bail, ensure};
 use clap::Parser as _;
@@ -529,9 +527,9 @@ fn hold(options: &Options) -> anyhow::Result<()> {
         Some(Ok(Some(ShareableHandle::Fabric(handle)))) => Some(handle),
         _ => None,
     };
-    let endpoint = match head.call(&Request::Endpoint, &[])?.0 {
-        Response::Endpoint { tcp: Some(tcp) } => tcp,
-        other => bail!("the server accepts no other host ({other:?}): start it with --tcp"),
+    let endpoint = match head.status()?.endpoints.peer {
+        Some(peer) => peer.to_string(),
+        None => bail!("the server accepts no other host: state its `server.tcp` setting"),
     };
     emit(
         "holding",

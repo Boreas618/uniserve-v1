@@ -81,13 +81,20 @@ impl Running {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("storage.sock");
         let transfer = transfer(&socket);
-        let (listener, lock) = service::bind(&socket).unwrap().unwrap();
+        let (listener, starting) = service::host::bind::<::storage::Settings>(&socket)
+            .unwrap()
+            .owned(&socket)
+            .unwrap();
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = tcp.local_addr().unwrap().to_string();
+        let record = readiness(&socket, Some(&address));
+        let lock = starting.finish(&record).unwrap();
         Self::on_thread(directory, socket, address, move || {
             let mut server = Server::new(listener, host_reserve, None, transfer).unwrap();
             configure(&mut server);
             server.listen_tcp(tcp).unwrap();
+            // A server states what `serve` publishes for it.
+            server.set_readiness(record);
             (server, lock)
         })
     }
@@ -99,10 +106,12 @@ impl Running {
         socket: PathBuf,
         resumed: (Server, OwnedFd),
     ) -> Self {
-        let (server, lock) = resumed;
+        let (mut server, lock) = resumed;
         let held = socket.clone();
+        let tcp = server.tcp_endpoint().map(|tcp| tcp.to_string());
+        server.set_readiness(readiness(&socket, tcp.as_deref()));
         Self::on_thread(directory, socket, String::new(), move || {
-            (server, service::SocketLock::resume(lock, held))
+            (server, service::host::SocketLock::resume(lock, held))
         })
     }
 
@@ -138,6 +147,20 @@ impl Running {
             _directory: directory,
         }
     }
+}
+
+/// The readiness record of a test's server on `socket`, accepting other hosts at `tcp`.
+fn readiness(socket: &Path, tcp: Option<&str>) -> ::storage::Readiness {
+    service::Readiness::of_process(
+        service::State::Serving,
+        None,
+        service::Endpoints {
+            storage: Some(service::Endpoint::unix(socket)),
+            peer: tcp.map(|tcp| tcp.parse().unwrap()),
+            ..service::Endpoints::default()
+        },
+        ::storage::Settings::default(),
+    )
 }
 
 impl Drop for Running {

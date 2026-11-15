@@ -74,28 +74,40 @@ struct Node {
     families: processing::Registry,
     /// Reads this host's idle devices, for each deployment's daemon.
     devices: crate::supervision::DeviceProbe,
+    /// The node's instance directory, where each deployment's daemon keeps its sockets.
+    instance: std::path::PathBuf,
 }
 
 /// Serves the client API on `admin`'s address and the admin API on its two
 /// Unix sockets, and the deployments the first `PUT /admin/config` brings up,
 /// until `shutdown` is cancelled; the deployment serving then is brought down
-/// and its storage released.
+/// and its storage released. The node creates its instance directory, binds every listener and
+/// reports them to `ready` before it serves.
 ///
 /// # Errors
 ///
-/// Fails when a listener cannot be bound or the server fails.
+/// Fails when the instance directory or a listener cannot be made, or the server fails.
 pub async fn node(
     admin: AdminConfig,
     server: ServerConfig,
     build_config: build_server::command::Settings,
     families: processing::Registry,
     devices: crate::supervision::DeviceProbe,
+    ready: Option<service::ReadyFd>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let instance = super::create_instance()?;
+    let mut ready = super::Ready::new(ready, instance.path());
     let listener = Listener::bind(&admin)
         .await
         .context("failed to bind the admin API's listener")?;
     let address = listener.local_addr()?;
+    let admins = super::admin::Listeners::bind(&admin, instance.path())?;
+    {
+        let endpoints = ready.endpoints();
+        endpoints.client = Some(listener.endpoint()?);
+        (endpoints.admin, endpoints.harness) = admins.endpoints();
+    }
     let node = Arc::new(Node {
         serving: Mutex::new(Serving::Idle),
         last_error: Mutex::new(None),
@@ -104,40 +116,27 @@ pub async fn node(
         build_config,
         families,
         devices,
+        instance: instance.path().to_owned(),
     });
     // The operator's socket takes the node's own verbs and, once a
     // deployment serves, its admin routes; the harness's socket only a
     // serving deployment's harness routes.
-    for (path, mode, routes) in [
-        (
-            admin.admin_socket(),
-            0o600,
-            Router::new()
-                .route("/admin/config", put(deploy).get(idle_config))
-                .route("/admin/node", get(node_status))
-                .fallback(dispatch_admin)
-                .with_state(Arc::clone(&node)),
-        ),
-        (
-            admin.harness_socket(),
-            0o660,
-            Router::new()
-                .fallback(dispatch_harness)
-                .with_state(Arc::clone(&node)),
-        ),
-    ] {
-        let socket = Listener::bind_over(&path, mode)
-            .with_context(|| format!("failed to bind the admin socket {}", path.display()))?;
-        let stopped = shutdown.clone();
-        tokio::spawn(async move {
-            let served = axum::serve(socket, routes)
-                .with_graceful_shutdown(async move { stopped.cancelled().await })
-                .await;
-            if let Err(error) = served {
-                warn!(%error, "an admin listener ended");
-            }
-        });
-    }
+    super::admin::serve_routes(
+        admins,
+        Router::new()
+            .route("/admin/config", put(deploy).get(idle_config))
+            .route("/admin/node", get(node_status))
+            .fallback(dispatch_admin)
+            .with_state(Arc::clone(&node)),
+        Router::new()
+            .fallback(dispatch_harness)
+            .with_state(Arc::clone(&node)),
+        &shutdown,
+    );
+    // The node answers on every endpoint from here on: its own routes until a deployment
+    // serves.
+    ready.report(service::State::Listening);
+    ready.report(service::State::Serving);
     let mut app = Router::new()
         .fallback(dispatch)
         .with_state(Arc::clone(&node));
@@ -312,8 +311,16 @@ async fn serve_deployment(
     token: &CancellationToken,
 ) -> Result<()> {
     let name = config.served_model_name().to_owned();
-    let options = config.daemon_options(node.devices);
-    let daemon = tokio::task::spawn_blocking(move || Daemon::start(options))
+    let mut options = config.daemon_options(node.devices, &node.instance);
+    let join = match &config.dist_init_addr {
+        Some(endpoint) => {
+            let (listener, bound) = Daemon::bind_join(endpoint)?;
+            options.dist_init_addr = Some(bound);
+            Some(listener)
+        }
+        None => None,
+    };
+    let daemon = tokio::task::spawn_blocking(move || Daemon::start(options, join))
         .await
         .context("the daemon's start did not complete")?
         .context("failed to start the deployment's daemon")?;
@@ -330,7 +337,7 @@ async fn serve_deployment(
         .context("starting the updater's thread")?;
     let served = async {
         let engine = tokio::select! {
-            engine = Leader::start(&node.families, config, stated, address, updates) => {
+            engine = Leader::start(&node.families, config, stated, address, &node.instance, updates) => {
                 Arc::new(engine?)
             }
             () = token.cancelled() => return Ok(()),

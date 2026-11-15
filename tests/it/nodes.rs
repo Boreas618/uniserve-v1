@@ -17,12 +17,10 @@ impl Drop for Follower {
 #[test]
 fn a_follower_joins_without_a_model() {
     let directory = tempfile::tempdir().unwrap();
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let address = format!("127.0.0.1:{port}");
+    // The leader's join listener is bound first, on a port the kernel picks, and the follower is
+    // given the endpoint it bound.
+    let (join, endpoint) = Daemon::bind_join(&"127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = endpoint.to_string();
     let _follower = Follower(
         Command::new(env!("CARGO_BIN_EXE_uniserve"))
             .args([
@@ -42,18 +40,21 @@ fn a_follower_joins_without_a_model() {
     );
     // Startup returns only after the required follower has joined. Neither
     // node starts a model or needs a GPU to establish membership.
-    let leader = Daemon::start(DaemonOptions {
-        nnodes: 2,
-        node_rank: 0,
-        host: "leader".into(),
-        dist_init_addr: Some(address),
-        socket: directory.path().join("leader.sock"),
-        executable: env!("CARGO_BIN_EXE_uniserve").into(),
-        join_timeout: Duration::from_secs(10),
-        devices: || Ok(Vec::new()),
-        build_server: build_server::command::Settings::default(),
-        storage_server: Vec::new(),
-    })
+    let leader = Daemon::start(
+        DaemonOptions {
+            nnodes: 2,
+            node_rank: 0,
+            host: "leader".into(),
+            dist_init_addr: Some(endpoint),
+            socket: directory.path().join("leader.sock"),
+            executable: env!("CARGO_BIN_EXE_uniserve").into(),
+            join_timeout: Duration::from_secs(10),
+            devices: || Ok(Vec::new()),
+            build_server: build_server::command::Settings::default(),
+            storage: Default::default(),
+        },
+        Some(join),
+    )
     .unwrap();
     assert!(leader.address().is_some());
 }

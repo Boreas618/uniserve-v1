@@ -3935,13 +3935,12 @@ mod tests {
         let stored = Completion::Stored { keys: Vec::new() };
         assert_eq!(policy(&session, &store(Tier::Host), &stored), None);
         let kv = KvCacheConfig {
-            mooncake: Some(proto::config::MooncakeConfig {
-                master: "master:1".to_owned(),
-                metadata_server: "P2PHANDSHAKE".to_owned(),
-                protocol: "tcp".to_owned(),
+            mooncake: Some(storage::connector::Settings {
+                master: "master:1".parse().unwrap(),
+                metadata: storage::connector::Metadata::P2pHandshake,
+                transport: storage::connector::Transport::Tcp,
                 device: String::new(),
-                global_segment_gib: 0,
-                library: None,
+                segment_gib: 0,
             }),
             ..KvCacheConfig::default()
         };

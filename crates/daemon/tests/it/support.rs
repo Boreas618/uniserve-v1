@@ -29,7 +29,7 @@ pub(crate) fn single_node(host: &str, socket: PathBuf) -> DaemonOptions {
         join_timeout: TIMEOUT,
         devices: || Ok(Vec::new()),
         build_server: build_server::command::Settings::default(),
-        storage_server: Vec::new(),
+        storage: storage::Settings::default(),
     }
 }
 
@@ -77,7 +77,7 @@ impl Engine {
     fn dial(address: &str, major: u32) -> Self {
         let deadline = Instant::now() + TIMEOUT;
         let mut connection = loop {
-            match Connection::connect(address) {
+            match Connection::connect(&address.parse().unwrap()) {
                 Ok(connection) => break connection,
                 Err(error) => {
                     assert!(
@@ -292,9 +292,11 @@ impl BuildServerStandIn {
     pub(crate) fn serve(socket: PathBuf, held: bool, raise: u32) -> Self {
         use build_server::protocol::wire;
 
-        let (listener, lock) = service::bind(&socket)
+        let (listener, starting) = service::host::bind::<()>(&socket)
             .unwrap()
+            .owned(&socket)
             .expect("no server owns the stand-in's socket");
+        let lock = starting.finish(&build_server::readiness(&socket)).unwrap();
         let (asked_sender, asked) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {

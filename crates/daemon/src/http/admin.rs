@@ -116,6 +116,8 @@ pub(crate) struct Admin {
     /// The node's epoch records: the same instance the leader keeps, so the
     /// admin reports and moves the records the updater itself does.
     epochs: Arc<crate::epoch::Epochs>,
+    /// The daemon's readiness record once it serves, which `GET /admin/status` reports.
+    readiness: Mutex<Option<service::Readiness>>,
 }
 
 fn now() -> f64 {
@@ -153,7 +155,13 @@ impl Admin {
             retire,
             handoff_sent: AtomicBool::new(false),
             epochs,
+            readiness: Mutex::new(None),
         })
+    }
+
+    /// The daemon's readiness record, which `GET /admin/status` reports from now on.
+    pub(crate) fn set_readiness(&self, readiness: service::Readiness) {
+        *service::lock(&self.readiness) = Some(readiness);
     }
 
     /// The node's epoch records, which the admin reports and the generation
@@ -399,36 +407,81 @@ const ADMIN_MODE: u32 = 0o600;
 /// how the operator grants a harness access.
 const HARNESS_MODE: u32 = 0o660;
 
-/// Serves the admin API of `state` on the operator's and the harness's Unix
-/// sockets (`config`) until `shutdown` is cancelled. The sockets are bound
-/// before this returns; the two servers run on tasks of their own.
-///
-/// # Errors
-///
-/// Fails when a socket cannot be bound at its path.
-pub(crate) fn serve(
-    config: &crate::options::AdminConfig,
-    state: AdminState,
-    shutdown: &CancellationToken,
-) -> anyhow::Result<()> {
-    use anyhow::Context as _;
+/// The operator's and the harness's admin sockets, bound when the daemon starts and served once
+/// its engine serves ([`serve`]).
+pub(crate) struct Listeners {
+    admin: super::listener::Listener,
+    harness: super::listener::Listener,
+    paths: (std::path::PathBuf, std::path::PathBuf),
+}
 
-    for (path, mode, routes, name) in [
+impl Listeners {
+    /// Binds the admin sockets `config` states, or `admin.sock` and `harness.sock` in the
+    /// daemon's instance directory `instance`, each taking its path over from whoever holds it
+    /// (a hot restart's predecessor): the operator's with mode `0600`, the harness's with
+    /// `0660`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a socket cannot be bound at its path.
+    pub(crate) fn bind(
+        config: &crate::options::AdminConfig,
+        instance: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+
+        let paths = (
+            config.admin_socket(instance),
+            config.harness_socket(instance),
+        );
+        let bind = |path: &std::path::Path, mode, name| {
+            super::listener::Listener::bind_over(path, mode)
+                .with_context(|| format!("binding the {name} socket {}", path.display()))
+        };
+        Ok(Self {
+            admin: bind(&paths.0, ADMIN_MODE, "admin")?,
+            harness: bind(&paths.1, HARNESS_MODE, "harness")?,
+            paths,
+        })
+    }
+
+    /// The operator's and the harness's endpoints, as the readiness record states them.
+    pub(crate) fn endpoints(&self) -> (Option<service::Endpoint>, Option<service::Endpoint>) {
         (
-            config.admin_socket(),
-            ADMIN_MODE,
-            router(state.clone()),
-            "admin",
-        ),
-        (
-            config.harness_socket(),
-            HARNESS_MODE,
-            harness_router(state),
-            "harness",
-        ),
+            Some(service::Endpoint::unix(&self.paths.0)),
+            Some(service::Endpoint::unix(&self.paths.1)),
+        )
+    }
+}
+
+/// Serves the admin API of `state` on the operator's and the harness's sockets until `shutdown`
+/// is cancelled; the two servers run on tasks of their own.
+pub(crate) fn serve(listeners: Listeners, state: AdminState, shutdown: &CancellationToken) {
+    serve_routes(
+        listeners,
+        router(state.clone()),
+        harness_router(state),
+        shutdown,
+    );
+}
+
+/// Serves `admin` on the operator's socket and `harness` on the harness's until `shutdown` is
+/// cancelled, each on a task of its own.
+pub(crate) fn serve_routes(
+    listeners: Listeners,
+    admin: Router,
+    harness: Router,
+    shutdown: &CancellationToken,
+) {
+    let Listeners {
+        admin: admin_listener,
+        harness: harness_listener,
+        paths,
+    } = listeners;
+    for (listener, path, routes, name) in [
+        (admin_listener, paths.0, admin, "admin"),
+        (harness_listener, paths.1, harness, "harness"),
     ] {
-        let listener = super::listener::Listener::bind_over(&path, mode)
-            .with_context(|| format!("binding the {name} socket {}", path.display()))?;
         tracing::info!(socket = %path.display(), "serving the {name} API");
         let stopped = shutdown.clone();
         tokio::spawn(async move {
@@ -440,7 +493,6 @@ pub(crate) fn serve(
             }
         });
     }
-    Ok(())
 }
 
 /// The harness's routes: the verbs of an update and what it reads to decide
@@ -491,6 +543,7 @@ async fn status(State(state): State<AdminState>) -> Json<serde_json::Value> {
         "operation": service::lock(&admin.running).clone(),
         "last_operation": service::lock(&admin.last).clone(),
         "next_event": admin.next_event.load(Ordering::Relaxed),
+        "readiness": service::lock(&admin.readiness).clone(),
     }))
 }
 

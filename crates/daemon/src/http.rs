@@ -1,8 +1,10 @@
 //! The HTTP server: router assembly, the listener, and graceful shutdown.
 //!
-//! [`serve`] starts this node's daemon and, on the leader, the [`Leader`],
-//! binds the configured TCP or Unix-domain listener, and serves the router
-//! of the tasks the engine serves until shutdown. Each API module builds its own routes over the engine
+//! [`serve`] creates this daemon's instance directory, binds every listener
+//! the node has (the leader's client API, admin sockets and join listener),
+//! reports them in its readiness record, starts this node's daemon and, on the
+//! leader, the [`Leader`], and serves the router of the tasks the engine
+//! serves until shutdown. Each API module builds its own routes over the engine
 //! (`crate::api::openai`); this module registers them by task, as vLLM registers
 //! its routers by `supported_tasks`, and wraps them in the middleware of
 //! `middleware`.
@@ -69,41 +71,149 @@ const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 /// this module declares: a library the module adds is added here.
 pub const LOG_TARGETS: &[&str] = &["axum", "hyper", "hyper_util", "h2", "tower_http", "reqwest"];
 
-/// Runs this node of the deployment until `shutdown` is cancelled.
-///
-/// Every node starts its daemon first, which supervises the node's worker
-/// processes; the leader's waits until every other node's daemon joined. A
-/// node other than the leader then runs only its daemon, until `shutdown`
-/// or until the leader's connection closes.
-///
-/// The leader serves the HTTP API. Its listener is bound once the engine has
-/// started, so the port accepts connections only when the server can respond to
-/// them. Cancellation before the engine has started stops the start and
-/// returns `Ok(())` without binding a listener. Once it has started, the
-/// server shuts down as `serve_on` describes, and the engine is shut down
-/// on every path, which finishes any request still running as aborted, so a
-/// stream that outlived the shutdown budget ends then. The daemon stops
-/// last, ending whatever process the engine left.
+/// What a daemon reports of itself ([`service::Readiness`]): to the descriptor its caller passed
+/// (`--ready-fd`), once its listeners are bound and once it serves, and on its status route.
+pub(crate) struct Ready {
+    /// The caller's descriptor, until the daemon serves.
+    fd: Option<service::ReadyFd>,
+    instance: std::path::PathBuf,
+    endpoints: service::Endpoints,
+}
+
+impl Ready {
+    /// The reports of a daemon whose instance directory is `instance`, to `fd` when its caller
+    /// passed one.
+    pub(crate) fn new(fd: Option<service::ReadyFd>, instance: &std::path::Path) -> Self {
+        Self {
+            fd,
+            instance: instance.to_owned(),
+            endpoints: service::Endpoints::default(),
+        }
+    }
+
+    /// The endpoints the daemon reports from now on.
+    pub(crate) fn endpoints(&mut self) -> &mut service::Endpoints {
+        &mut self.endpoints
+    }
+
+    /// The record of `state`.
+    pub(crate) fn record(&self, state: service::State) -> service::Readiness {
+        service::Readiness::of_process(
+            state,
+            Some(self.instance.clone()),
+            self.endpoints.clone(),
+            (),
+        )
+    }
+
+    /// Reports `state`; the descriptor closes once the daemon serves. A caller that is gone
+    /// loses nothing the daemon needs.
+    pub(crate) fn report(&mut self, state: service::State) {
+        let record = self.record(state);
+        info!(state = ?state, endpoints = ?record.endpoints, instance = %self.instance.display(), "readiness");
+        if let Some(fd) = &mut self.fd
+            && let Err(error) = fd.report(&record)
+        {
+            warn!(%error, "the caller did not take the readiness record");
+        }
+        if state == service::State::Serving {
+            self.fd = None;
+        }
+    }
+
+    /// Adds the endpoints of the host's Storage Server the deployment uses, as the server
+    /// published them, once a claim started it.
+    pub(crate) fn add_storage(&mut self) {
+        let running = storage::default_socket()
+            .and_then(|socket| service::host::running::<storage::Settings>(&socket));
+        match running {
+            Ok(Some(record)) => {
+                self.endpoints.storage = record.endpoints.storage;
+                self.endpoints.peer = record.endpoints.peer;
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "the host's Storage Server's record is unreadable"),
+        }
+    }
+}
+
+/// The instance directory of a daemon of this process, in the user's runtime directory.
 ///
 /// # Errors
 ///
-/// Fails when the configuration is invalid, the daemon cannot start or
-/// fails, the engine cannot start, the listener cannot be bound or report
-/// its address, the server fails, or the engine shutdown fails.
+/// Fails when the user has no runtime directory or the directory cannot be created.
+pub(crate) fn create_instance() -> Result<service::Instance> {
+    let runtime =
+        service::RuntimeDirectory::of_user().context("finding the user's runtime directory")?;
+    service::Instance::create(&runtime, "daemon")
+        .context("creating the daemon's instance directory")
+}
+
+/// Runs this node of the deployment until `shutdown` is cancelled.
+///
+/// The daemon first creates its instance directory and binds every listener it has: on the
+/// leader the client API and the two admin sockets, and the join listener when other nodes may
+/// join (`dist_init_addr`, port 0 allowed). It reports them in its readiness record (`ready`,
+/// [`service::State::Listening`]), so a caller learns the endpoints before the slow start.
+/// Every node then starts its daemon, which supervises the node's worker processes; the
+/// leader's waits until every other node's daemon joined. A node other than the leader then
+/// runs only its daemon, until `shutdown` or until the leader's connection closes.
+///
+/// The leader serves the HTTP API once the engine has started: connections that arrive earlier
+/// wait in the listeners' backlog, and the readiness record that states
+/// [`service::State::Serving`] follows the engine's start. Cancellation before the engine has
+/// started stops the start and returns `Ok(())`. Once it has started, the server shuts down as
+/// `serve_on` describes, and the engine is shut down on every path, which finishes any request
+/// still running as aborted, so a stream that outlived the shutdown budget ends then. The daemon
+/// stops last, ending whatever process the engine left, and the instance directory goes with
+/// it unless a hot restart's successor took it over.
+///
+/// # Errors
+///
+/// Fails when the configuration is invalid, the instance directory or a listener cannot be
+/// made, the daemon cannot start or fails, the engine cannot start, the server fails, or the
+/// engine shutdown fails.
 pub async fn serve(
     config: ServerArgs,
     stated: Stated,
     families: processing::Registry,
     devices: crate::supervision::DeviceProbe,
+    ready: Option<service::ReadyFd>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     config
         .validate(&stated)
         .context("invalid serving configuration")?;
 
+    let instance = create_instance()?;
+    let mut ready = Ready::new(ready, instance.path());
+    // Every listener is bound before the slow start, and reported.
+    let join = match &config.dist_init_addr {
+        Some(endpoint) if config.leads() => Some(Daemon::bind_join(endpoint)?),
+        _ => None,
+    };
+    let bound = if config.leads() {
+        let listener = Listener::bind(&config.admin_config)
+            .await
+            .context("failed to bind the daemon's listener")?;
+        let admins = admin::Listeners::bind(&config.admin_config, instance.path())?;
+        let endpoints = ready.endpoints();
+        endpoints.client = Some(listener.endpoint()?);
+        (endpoints.admin, endpoints.harness) = admins.endpoints();
+        Some((listener, admins))
+    } else {
+        None
+    };
+    let mut options = config.daemon_options(devices, instance.path());
+    if let Some((_, endpoint)) = &join {
+        ready.endpoints().join = Some(endpoint.clone());
+        options.dist_init_addr = Some(endpoint.clone());
+    }
+    ready.report(service::State::Listening);
+
     // The leader's start waits for the other nodes to join, which blocks.
-    let options = config.daemon_options(devices);
-    let starting = tokio::task::spawn_blocking(move || Daemon::start(options));
+    let join = join.map(|(listener, _)| listener);
+    let starting = tokio::task::spawn_blocking(move || Daemon::start(options, join));
     let daemon = tokio::select! {
         daemon = starting => daemon
             .context("the daemon's start did not complete")?
@@ -121,7 +231,8 @@ pub async fn serve(
         config.served_model_name().to_owned(),
     );
     let daemon = Arc::new(std::sync::Mutex::new(Some(daemon)));
-    let Some(address) = address else {
+    let (Some(address), Some((listener, admins))) = (address, bound) else {
+        ready.report(service::State::Serving);
         info!(node_rank = config.node_rank, host = %config.host_identity, "serving this node's processes for the leader");
         while ::service::lock(&daemon)
             .as_ref()
@@ -140,7 +251,7 @@ pub async fn serve(
     Daemon::advance_updates(Arc::clone(&updates), awake)
         .context("starting the updater's thread")?;
     let engine = tokio::select! {
-        engine = Leader::start(&families, &config, &stated, address, updates) => {
+        engine = Leader::start(&families, &config, &stated, address, instance.path(), updates) => {
             engine.map(Arc::new)
         }
         () = shutdown.cancelled() => return stop_daemon(daemon).await,
@@ -164,10 +275,10 @@ pub async fn serve(
         format!("serving {}", engine.served_model_name()),
     );
     admin.watch(&engine);
+    ready.add_storage();
+    admin.set_readiness(ready.record(service::State::Serving));
+    ready.report(service::State::Serving);
     let served = async {
-        let listener = Listener::bind(&config.admin_config)
-            .await
-            .context("failed to bind the daemon's listener")?;
         let jobs = Arc::new(VideoJobs::new(
             config.video_job_config.clone(),
             shutdown.child_token(),
@@ -178,6 +289,8 @@ pub async fn serve(
             Arc::clone(&engine),
             admin,
             listener,
+            admins,
+            instance.path(),
             jobs,
             Arc::clone(&daemon),
             &shutdown,
@@ -186,6 +299,10 @@ pub async fn serve(
     }
     .await;
     let handoff_sent = served.as_ref().is_ok_and(|handoff_sent| *handoff_sent);
+    // A successor that took the deployment over owns the instance directory from then on.
+    if handoff_sent {
+        instance.hand_over();
+    }
     finish(
         &config,
         &engine,
@@ -197,11 +314,11 @@ pub async fn serve(
     .await
 }
 
-/// Serves the leader `engine` on `listener` with `admin` and `jobs` until
-/// `shutdown` is cancelled, or until a hot restart's successor serves and
-/// this daemon finished the requests it took; returns whether the
-/// deployment was handed over. `daemon` is this node's daemon's service,
-/// which a hot restart hands over.
+/// Serves the leader `engine` on `listener` and the admin API on `admins` with `admin` and
+/// `jobs` until `shutdown` is cancelled, or until a hot restart's successor serves and this
+/// daemon finished the requests it took; returns whether the deployment was handed over.
+/// `daemon` is this node's daemon's service and `instance` its instance directory, which a hot
+/// restart hands over.
 ///
 /// # Errors
 ///
@@ -213,6 +330,8 @@ pub(crate) async fn serve_leader(
     engine: Arc<Leader>,
     admin: Arc<admin::Admin>,
     mut listener: Listener,
+    admins: admin::Listeners,
+    instance: &std::path::Path,
     jobs: Arc<VideoJobs>,
     daemon: Arc<std::sync::Mutex<Option<Daemon>>>,
     shutdown: &CancellationToken,
@@ -221,6 +340,7 @@ pub(crate) async fn serve_leader(
     let restarter = Arc::new(crate::restart::Restarter::new(
         daemon,
         &mut listener,
+        instance,
         stated.clone(),
         accepting.clone(),
     )?);
@@ -231,6 +351,7 @@ pub(crate) async fn serve_leader(
         &engine,
         &admin,
         listener,
+        admins,
         config,
         shutdown,
         &accepting,
@@ -309,7 +430,7 @@ async fn stop_daemon(daemon: Arc<std::sync::Mutex<Option<Daemon>>>) -> Result<()
 /// Releases `deployment`'s weights and caches at this host's Storage
 /// Server, whose claim this daemon held until it stopped.
 fn retire_deployment(deployment: &str) -> Result<()> {
-    let socket = storage::default_socket();
+    let socket = storage::default_socket().context("finding this host's Storage Server socket")?;
     let mut operator = storage::Client::connect(&socket, storage::Role::Operator)
         .with_context(|| format!("connecting to the storage server at {}", socket.display()))?;
     let released = operator
@@ -343,6 +464,7 @@ async fn serve_on(
     engine: &Arc<Leader>,
     admin: &Arc<admin::Admin>,
     listener: Listener,
+    admins: admin::Listeners,
     config: &ServerArgs,
     shutdown: &CancellationToken,
     accepting: &CancellationToken,
@@ -360,7 +482,7 @@ async fn serve_on(
     );
     // The admin API has listeners of its own, apart from the client API.
     admin::serve(
-        &config.admin_config,
+        admins,
         admin::AdminState {
             leader: Arc::clone(engine),
             admin: Arc::clone(admin),
@@ -368,7 +490,7 @@ async fn serve_on(
             restarter: restarter.clone(),
         },
         shutdown,
-    )?;
+    );
     info!(%bind_address, model = engine.served_model_name(), "starting HTTP server");
 
     // The daemon admits requests until its handoff's pause starts: from then
@@ -1271,10 +1393,10 @@ mod tests {
     /// Binds a loopback listener on an ephemeral port and returns it with
     /// its address.
     async fn loopback() -> (Listener, String) {
-        let listener = Listener::bind(&ServerConfig {
+        let listener = Listener::bind(&crate::options::AdminConfig {
             host: "127.0.0.1".to_owned(),
             port: 0,
-            ..ServerConfig::default()
+            ..crate::options::AdminConfig::default()
         })
         .await
         .unwrap();
@@ -1310,8 +1432,14 @@ mod tests {
                 config.video_job_config.clone(),
                 shutdown.child_token(),
             ));
+            // The test's admin sockets are named, so they lie in its directory.
+            let instance = std::path::Path::new(config.admin_config.admin_uds.as_deref().unwrap())
+                .parent()
+                .unwrap()
+                .to_owned();
+            let admins = admin::Listeners::bind(&config.admin_config, &instance)?;
             serve_on(
-                &engine, &admin, listener, &config, &shutdown, &shutdown, jobs, None,
+                &engine, &admin, listener, admins, &config, &shutdown, &shutdown, jobs, None,
             )
             .await
         })

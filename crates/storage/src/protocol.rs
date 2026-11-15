@@ -667,7 +667,7 @@ pub enum Region {
     /// through NIXL: `region`, a retained tensor or a host region's part of
     /// the caller's deployment, as a client of that host names it, at the
     /// Storage Server listening at `endpoint` (that server's
-    /// [`Request::Endpoint`]). Offsets count as they do in `region`. Only a
+    /// [`Request::Status`], `peer`). Offsets count as they do in `region`. Only a
     /// span's source lies on another host, since the destination's host
     /// posts the READ. That host's server checks the region and its
     /// Transfer Server registers it once the task runs, so a region of
@@ -1074,8 +1074,14 @@ pub enum Request {
     /// the server then exits. Responded with the successor's process id
     /// once it started.
     Restart { executable: Option<String> },
-    /// Where the server accepts connections from other hosts.
-    Endpoint,
+    /// The server's readiness record: its endpoints (its socket, and the TCP endpoint other
+    /// hosts connect to when it accepts them) and the settings it serves with. Responded with
+    /// [`Response::Status`].
+    Status,
+    /// Stop the server, as SIGTERM does: it responds with [`Response::Stopping`], stops serving,
+    /// ends its children and closes every connection, the operator's last, so the operator's
+    /// client sees its connection close once the server ended. An operator's request.
+    Stop,
     /// The connector ran task `task` of an [`Event::Upload`] or an
     /// [`Event::Download`]: one result per page of the task.
     Finished { task: u64, results: Vec<bool> },
@@ -1397,11 +1403,10 @@ pub enum Response {
     Restarting {
         pid: u32,
     },
-    /// The `host:port` other hosts connect to; `None` when the server
-    /// accepts local connections only.
-    Endpoint {
-        tcp: Option<String>,
-    },
+    /// What a [`Request::Status`] asks.
+    Status(Box<crate::settings::Readiness>),
+    /// The server stops ([`Request::Stop`]).
+    Stopping,
     Finished,
     /// What a [`Request::Quota`] or a [`Request::Usage`] names.
     Usage(Usage),

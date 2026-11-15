@@ -275,9 +275,10 @@ message Claim {
   // The `(worker group, rank)` scopes `epoch` keeps on the node; the epoch's
   // retention of every other scope of the deployment ends.
   repeated Scope scopes = 3;
-  // Arguments a server the daemon starts is given beyond its socket: the
-  // deployment's Mooncake connector settings.
-  repeated string server_arguments = 4;
+  // The settings of the node's Storage Server the deployment states: a server
+  // the daemon starts serves with them, and a server already serving with
+  // others is refused. Unset, the leader's daemon states the deployment's.
+  StorageSettings storage = 4;
   // The epoch whose scopes these are: the daemon's identity of the
   // processes that execute one configuration of the deployment.
   uint64 epoch = 5;
@@ -289,6 +290,41 @@ message Claim {
 message Scope {
   string group = 1;
   uint32 rank = 2;
+}
+
+// A Storage Server's settings (`storage::Settings`), each in its canonical
+// form.
+message StorageSettings {
+  // The TCP endpoint the server accepts other hosts on (`host:port`); empty
+  // for local connections only.
+  string tcp = 1;
+  uint64 host_reserve_gib = 2;
+  uint64 transfer_chunk_us = 3;
+  uint64 transfer_deadline_s = 4;
+  uint64 put_deadline_s = 5;
+  // NIXL's C API library; empty for the loader's search path.
+  string nixl_library = 6;
+  // The directory of the buffer pools' traces; empty for none.
+  string buffer_pool_trace = 7;
+  bool buffer_pool_check = 8;
+  // The Mooncake connector the server runs; none when unset.
+  MooncakeConnector connector = 9;
+}
+
+// A Mooncake connector's settings (`storage::connector::Settings`).
+message MooncakeConnector {
+  // The master's endpoint (`host:port`).
+  string master = 1;
+  // `P2PHANDSHAKE`, or the metadata server's URL.
+  string metadata = 2;
+  MooncakeTransport transport = 3;
+  string device = 4;
+  uint64 segment_gib = 5;
+}
+
+enum MooncakeTransport {
+  MOONCAKE_TRANSPORT_TCP = 0;
+  MOONCAKE_TRANSPORT_RDMA = 1;
 }
 
 message Claimed {

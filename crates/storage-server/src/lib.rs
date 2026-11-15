@@ -261,6 +261,12 @@ pub struct Server {
     /// The sessions of engine epochs with the deployments' buffer pools,
     /// and the pools' thread.
     sessions: sessions::Sessions,
+    /// The readiness record the server published, which [`Request::Status`] answers; `None`
+    /// until the server serves.
+    readiness: Option<::storage::Readiness>,
+    /// The operator whose [`Request::Stop`] stops the server: the loop ends once its response
+    /// is written.
+    stopping: Option<ClientId>,
 }
 
 impl Server {
@@ -295,7 +301,23 @@ impl Server {
             relaunch: Vec::new(),
             restart: None,
             sessions: sessions::Sessions::new()?,
+            readiness: None,
+            stopping: None,
         })
+    }
+
+    /// The readiness record the server published, which a [`Request::Status`] answers from now
+    /// on, and which a restart in place's successor is given the settings of.
+    pub fn set_readiness(&mut self, readiness: ::storage::Readiness) {
+        self.readiness = Some(readiness);
+    }
+
+    /// The TCP endpoint other hosts reach the server at, as it is bound; `None` when it accepts
+    /// local connections only.
+    pub fn tcp_endpoint(&self) -> Option<service::Endpoint> {
+        self.tcp
+            .as_ref()
+            .and_then(|(_, address)| address.parse().ok())
     }
 
     /// How long a transfer between worker groups and a put to the remote
@@ -314,13 +336,17 @@ impl Server {
         self.sessions.watch_pools(trace, check);
     }
 
-    /// Also accept connections from other hosts on `listener`, which carry
-    /// no descriptors. Returns the bound address.
-    pub fn listen_tcp(&mut self, listener: TcpListener) -> io::Result<String> {
+    /// Also accept connections from other hosts on `listener`, which carry no descriptors.
+    /// Returns the endpoint it is bound at.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the listener's address cannot be read or it cannot be made non-blocking.
+    pub fn listen_tcp(&mut self, listener: TcpListener) -> io::Result<service::Endpoint> {
         listener.set_nonblocking(true)?;
-        let address = listener.local_addr()?.to_string();
-        self.tcp = Some((listener, address.clone()));
-        Ok(address)
+        let bound = service::Endpoint::tcp(listener.local_addr()?);
+        self.tcp = Some((listener, bound.to_string()));
+        Ok(bound)
     }
 
     /// Serve until `stop` reads true. `stop` is checked after every wake;
@@ -335,11 +361,19 @@ impl Server {
         wake: BorrowedFd<'_>,
         stop: &dyn Fn() -> bool,
     ) -> io::Result<Option<restart::Pending>> {
-        while !stop() {
+        while !stop() && self.stopping.is_none() {
             self.turn(wake)?;
             if self.restart.is_some() && self.quiescent() && self.agree() {
                 return Ok(self.restart.take());
             }
+        }
+        // The operator that stopped the server reads its response before the server's end
+        // closes its connection.
+        if let Some(operator) = self.stopping
+            && let Some(client) = self.clients.get_mut(&operator)
+            && let Err(error) = client.connection.flush()
+        {
+            tracing::warn!(%error, "the stopping operator did not take its response");
         }
         Ok(None)
     }
@@ -758,12 +792,18 @@ impl Server {
                 self.read_bytes(deployment, key)
                     .map(|bytes| Handling::Response(Response::Read { bytes }, Vec::new()))
             }
-            (Request::Endpoint, _) => Ok(Handling::Response(
-                Response::Endpoint {
-                    tcp: self.tcp.as_ref().map(|(_, address)| address.clone()),
-                },
-                Vec::new(),
-            )),
+            (Request::Status, _) => match &self.readiness {
+                Some(readiness) => Ok(Handling::Response(
+                    Response::Status(Box::new(readiness.clone())),
+                    Vec::new(),
+                )),
+                None => Err(resource(io::Error::other("the server does not serve yet"))),
+            },
+            (Request::Stop, Role::Operator) => {
+                tracing::info!("stopping at an operator's request");
+                self.stopping = Some(id);
+                Ok(Handling::Response(Response::Stopping, Vec::new()))
+            }
             (Request::Claim { .. }, Role::Head { .. }) if client.pidfd.is_none() => Err(invalid(
                 "a deployment is claimed at its host's server, not from another host",
             )),
@@ -2487,7 +2527,8 @@ fn request_name(request: &Request) -> &'static str {
         Request::Read { .. } => "read",
         Request::Retire { .. } => "retire",
         Request::Restart { .. } => "restart",
-        Request::Endpoint => "endpoint",
+        Request::Status => "status",
+        Request::Stop => "stop",
         Request::Finished { .. } => "finished",
         Request::Quota { .. } => "reserve",
         Request::Usage { .. } => "quota",

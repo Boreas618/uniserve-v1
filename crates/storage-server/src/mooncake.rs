@@ -106,22 +106,26 @@ struct Shared {
 /// `socket`, and run the server's tasks until the server closes the
 /// connection.
 pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
-    let hostname = settings
-        .hostname
-        .as_deref()
-        .ok_or_else(|| Error::Settings("the connector needs this host's name".into()))?;
-    if let Some(library) = &settings.library {
-        mooncake_store::load_library(library)?;
-    }
+    let hostname = host_name()?;
+    // Mooncake Store's C API is opened by its soname from the loader's default search path,
+    // where the Mooncake package installs it, before any store exists; the binding's own lookup
+    // is never asked.
+    mooncake_store::load_library(::storage::connector::LIBRARY).map_err(|error| {
+        Error::Settings(format!(
+            "Mooncake Store's C API ({}) is not on the loader's default search path, where the \
+             Mooncake package built with WITH_STORE_C_SHARED installs it: {error}",
+            ::storage::connector::LIBRARY
+        ))
+    })?;
     let store = MooncakeStore::new()?;
     store.setup(
-        hostname,
-        &settings.metadata,
-        settings.segment_bytes,
+        &hostname,
+        &settings.metadata.to_string(),
+        settings.segment_bytes(),
         LOCAL_BUFFER_BYTES,
-        &settings.protocol,
+        settings.transport.name(),
         &settings.device,
-        &settings.master,
+        &settings.master.to_string(),
     )?;
     tracing::info!(master = %settings.master, "connected to Mooncake");
 
@@ -370,4 +374,20 @@ fn unmap(store: &MooncakeStore, mapped: Mapping) {
 fn drain(reader: &OwnedFd) {
     let mut buffer = [0_u8; 64];
     while matches!(rustix::io::read(reader, &mut buffer), Ok(read) if read > 0) {}
+}
+
+/// This host's name, as `gethostname(2)` gives it: the name other Mooncake clients reach this
+/// host's transfer engine by.
+fn host_name() -> Result<String, Error> {
+    let mut name = [0_u8; 256];
+    // SAFETY: gethostname writes at most `name.len()` bytes into `name`.
+    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let length = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    String::from_utf8(name[..length].to_vec())
+        .map_err(|_| Error::Settings("this host's name is not UTF-8".into()))
 }

@@ -1124,9 +1124,10 @@ mod tests {
 
         // The frontend's own options: a `Host` change.
         let host_frontend: Vec<Case> = vec![
-            ("server_config.port", |config: &mut ServerArgs| {
-                config.server_config.port = 8001
-            }),
+            (
+                "server_config.request_id_headers",
+                |config: &mut ServerArgs| config.server_config.request_id_headers = true,
+            ),
             ("chat_config", |config: &mut ServerArgs| {
                 config.chat_config.template = Some("{{messages}}".to_owned())
             }),

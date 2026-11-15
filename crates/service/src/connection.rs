@@ -7,8 +7,8 @@
 //! protocol's: its envelope types implement [`Message`], which encodes a message into a frame's
 //! payload. One connection carries the messages of one protocol.
 //!
-//! An address is written `unix:<path>` for a Unix socket and `<host>:<port>` for TCP. A
-//! connection is non-blocking and makes progress only when called: [`Connection::send`] queues a
+//! A connection's peer and a listener's address are an [`Endpoint`]: a Unix socket of this host
+//! or a TCP endpoint. A connection is non-blocking and makes progress only when called: [`Connection::send`] queues a
 //! frame and writes what the socket takes, and every receive and wait reads what arrived and
 //! writes what is queued, so a frame larger than the kernel's send buffer finishes across later
 //! calls and two ends that send at once never wait on each other. [`Connection::flush`] waits
@@ -35,10 +35,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::Endpoint;
 use crate::frame::{self, Segment};
-
-/// The prefix of a Unix socket address; the rest is the socket's path.
-const UNIX_PREFIX: &str = "unix:";
 
 /// How a TCP connection notices a peer whose host stopped answering.
 ///
@@ -150,18 +148,20 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Connects to `address`: `unix:<path>` or `<host>:<port>`.
+    /// Connects to `endpoint`.
     ///
     /// # Errors
     ///
-    /// Fails when nothing listens at the address, or the socket cannot be configured.
-    pub fn connect(address: &str) -> io::Result<Self> {
+    /// Fails when nothing listens at the endpoint, or the socket cannot be configured.
+    pub fn connect(endpoint: &Endpoint) -> io::Result<Self> {
         let failed = |error: io::Error| {
-            io::Error::new(error.kind(), format!("connecting to {address}: {error}"))
+            io::Error::new(error.kind(), format!("connecting to {endpoint}: {error}"))
         };
-        let socket = match address.strip_prefix(UNIX_PREFIX) {
-            Some(path) => Socket::Unix(UnixStream::connect(path).map_err(failed)?),
-            None => Socket::Tcp(TcpStream::connect(address).map_err(failed)?),
+        let socket = match endpoint {
+            Endpoint::Unix(path) => Socket::Unix(UnixStream::connect(path).map_err(failed)?),
+            Endpoint::Tcp { host, port } => {
+                Socket::Tcp(TcpStream::connect((host.as_str(), *port)).map_err(failed)?)
+            }
         };
         Self::new(socket)
     }
@@ -625,8 +625,8 @@ impl AsRawFd for Connection {
 /// listener closes, unless it was handed over to another process.
 pub struct Listener {
     socket: Listening,
-    /// The address peers connect to, with the port a TCP listener picked.
-    address: String,
+    /// The endpoint peers connect to, with the port a TCP listener picked.
+    endpoint: Endpoint,
 }
 
 /// A bound, listening socket of either kind.
@@ -650,20 +650,22 @@ impl Drop for UnixPath {
 }
 
 impl Listener {
-    /// Listens at `address`: `unix:<path>` or `<host>:<port>`, where port 0 picks a free one.
+    /// Listens at `endpoint`, where TCP port 0 picks a free port.
     ///
     /// # Errors
     ///
-    /// Fails when the address cannot be bound, for example a Unix socket path that exists.
-    pub fn bind(address: &str) -> io::Result<Self> {
+    /// Fails when the endpoint cannot be bound, for example a Unix socket path that exists.
+    pub fn bind(endpoint: &Endpoint) -> io::Result<Self> {
         let failed =
-            |error: io::Error| io::Error::new(error.kind(), format!("binding {address}: {error}"));
-        let socket = match address.strip_prefix(UNIX_PREFIX) {
-            Some(path) => {
+            |error: io::Error| io::Error::new(error.kind(), format!("binding {endpoint}: {error}"));
+        let socket = match endpoint {
+            Endpoint::Unix(path) => {
                 let listener = UnixListener::bind(path).map_err(failed)?;
-                Listening::Unix(listener, UnixPath(Some(PathBuf::from(path))))
+                Listening::Unix(listener, UnixPath(Some(path.clone())))
             }
-            None => Listening::Tcp(TcpListener::bind(address).map_err(failed)?),
+            Endpoint::Tcp { host, port } => {
+                Listening::Tcp(TcpListener::bind((host.as_str(), *port)).map_err(failed)?)
+            }
         };
         Self::listening(socket)
     }
@@ -680,38 +682,35 @@ impl Listener {
     }
 
     /// Goes on with a listening socket another process handed over ([`Listener::hand_over`]),
-    /// bound at `address`.
+    /// bound at `endpoint`.
     ///
     /// # Errors
     ///
     /// Fails when the socket cannot be made non-blocking.
-    pub fn resume(descriptor: OwnedFd, unix: bool, address: String) -> io::Result<Self> {
-        let socket = if unix {
-            let path = address.strip_prefix(UNIX_PREFIX).unwrap_or(&address);
-            Listening::Unix(
-                UnixListener::from(descriptor),
-                UnixPath(Some(PathBuf::from(path))),
-            )
-        } else {
-            Listening::Tcp(TcpListener::from(descriptor))
+    pub fn resume(descriptor: OwnedFd, endpoint: &Endpoint) -> io::Result<Self> {
+        let socket = match endpoint {
+            Endpoint::Unix(path) => {
+                Listening::Unix(UnixListener::from(descriptor), UnixPath(Some(path.clone())))
+            }
+            Endpoint::Tcp { .. } => Listening::Tcp(TcpListener::from(descriptor)),
         };
         Self::listening(socket)
     }
 
-    /// The address the listener is bound at, with the port it picked.
-    pub fn address(&self) -> &str {
-        &self.address
+    /// The endpoint the listener is bound at, with the port it picked.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
     }
 
-    /// The listening socket, whether it is a Unix socket, and its address, for another process to
-    /// go on with ([`Listener::resume`]); the socket's path stays.
-    pub fn hand_over(self) -> (OwnedFd, bool, String) {
+    /// The listening socket and its endpoint, for another process to go on with
+    /// ([`Listener::resume`]); the socket's path stays.
+    pub fn hand_over(self) -> (OwnedFd, Endpoint) {
         match self.socket {
             Listening::Unix(listener, mut path) => {
                 path.0 = None;
-                (OwnedFd::from(listener), true, self.address)
+                (OwnedFd::from(listener), self.endpoint)
             }
-            Listening::Tcp(listener) => (OwnedFd::from(listener), false, self.address),
+            Listening::Tcp(listener) => (OwnedFd::from(listener), self.endpoint),
         }
     }
 
@@ -751,20 +750,19 @@ impl Listener {
         }
     }
 
-    /// `socket`, non-blocking, with the address peers reach it at.
+    /// `socket`, non-blocking, with the endpoint peers reach it at.
     fn listening(socket: Listening) -> io::Result<Self> {
-        let address = match &socket {
+        let endpoint = match &socket {
             Listening::Unix(listener, path) => {
                 listener.set_nonblocking(true)?;
-                let path = path.0.as_deref().unwrap_or(std::path::Path::new(""));
-                format!("{UNIX_PREFIX}{}", path.display())
+                Endpoint::Unix(path.0.clone().unwrap_or_default())
             }
             Listening::Tcp(listener) => {
                 listener.set_nonblocking(true)?;
-                listener.local_addr()?.to_string()
+                Endpoint::tcp(listener.local_addr()?)
             }
         };
-        Ok(Self { socket, address })
+        Ok(Self { socket, endpoint })
     }
 }
 
@@ -919,7 +917,10 @@ fn pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
 /// Polls `descriptors` once until one is ready or `timeout` passes (forever for `None`), keeping
 /// the deadline across signals. Returns after any completed poll, ready or timed out: callers
 /// check their own state rather than `revents`.
-fn wait_ready(descriptors: &mut [libc::pollfd], timeout: Option<Duration>) -> io::Result<()> {
+pub(crate) fn wait_ready(
+    descriptors: &mut [libc::pollfd],
+    timeout: Option<Duration>,
+) -> io::Result<()> {
     let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
     loop {
         // Rounded up to whole milliseconds, so the poll does not return before the deadline.

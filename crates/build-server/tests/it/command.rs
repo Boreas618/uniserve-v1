@@ -48,7 +48,7 @@ fn serve_takes_the_roots_the_targets_and_the_limits() {
     ]);
     assert!(!serve.daemon);
     assert_eq!(
-        serve.settings.socket(),
+        serve.settings.socket().expect("a named socket"),
         PathBuf::from("/run/uniserve/build-server.sock")
     );
 
@@ -189,7 +189,15 @@ triton = 12884901888
 #[test]
 fn serve_needs_no_flag() {
     let serve = serve(&[]);
-    assert_eq!(serve.settings.socket(), build_server::default_socket());
+    // The socket is this user's default one, in the user's runtime directory; a process
+    // without a runtime directory has no default socket and is refused.
+    match (serve.settings.socket(), build_server::default_socket()) {
+        (Ok(socket), Ok(default)) => assert_eq!(socket, default),
+        (socket, default) => assert!(
+            socket.is_err() && default.is_err(),
+            "a default socket without a runtime directory"
+        ),
+    }
 
     let config = serve.settings.config(Vec::new()).unwrap();
     assert!(
@@ -232,7 +240,7 @@ fn the_command_makes_every_path_absolute_before_the_server_sees_it() {
     let typed_in = std::env::current_dir().unwrap();
 
     assert_eq!(
-        serve.settings.socket(),
+        serve.settings.socket().expect("a named socket"),
         typed_in.join("relative/build-server.sock")
     );
     let config = serve.settings.config(Vec::new()).unwrap();

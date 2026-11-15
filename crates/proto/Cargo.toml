@@ -23,6 +23,9 @@ serde_with.workspace = true
 # The workspace's one connection, whose codec the interfaces' envelopes implement.
 service.workspace = true
 sha2.workspace = true
+# The settings of the host services a deployment states: the Mooncake connector of its Storage
+# Servers (`kv_cache_config.mooncake`).
+storage.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 

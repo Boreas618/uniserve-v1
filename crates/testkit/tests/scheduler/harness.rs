@@ -41,8 +41,8 @@ use engine::batch::{
 };
 use engine::scheduler::{Message, Output, Scheduler, policy};
 use proto::config::{
-    BlockConfig, KvCacheConfig, MooncakeConfig, SchedulerConfig, WorkerGroupConfig, WorkerGroupId,
-    WorkerGroupRole, WorkerRank,
+    BlockConfig, KvCacheConfig, SchedulerConfig, WorkerGroupConfig, WorkerGroupId, WorkerGroupRole,
+    WorkerRank,
 };
 use proto::report::SchedulerStats;
 use proto::request::{
@@ -726,13 +726,12 @@ impl Deployment {
                     .and_then(NonZeroU32::new),
                 host_tier: self.host_units > 0,
                 state_interval: self.state_interval,
-                mooncake: self.remote.then(|| MooncakeConfig {
-                    master: "localhost:50051".to_owned(),
-                    metadata_server: "P2PHANDSHAKE".to_owned(),
-                    protocol: "tcp".to_owned(),
+                mooncake: self.remote.then(|| storage::connector::Settings {
+                    master: "localhost:50051".parse().unwrap(),
+                    metadata: storage::connector::Metadata::P2pHandshake,
+                    transport: storage::connector::Transport::Tcp,
                     device: String::new(),
-                    global_segment_gib: 0,
-                    library: None,
+                    segment_gib: 0,
                 }),
                 peers: if self.peers {
                     vec!["peer-1:7600".to_owned()]

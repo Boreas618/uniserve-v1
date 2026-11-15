@@ -280,10 +280,20 @@ impl Server {
         };
         let (ours, theirs) = UnixStream::pair()?;
         let descriptor = theirs.as_raw_fd();
+        // The successor serves with this server's settings, which it reads on its standard input.
+        let settings = self
+            .readiness
+            .as_ref()
+            .map(|readiness| readiness.settings.document())
+            .transpose()
+            .map_err(io::Error::other)?
+            .unwrap_or_default();
         let mut command = std::process::Command::new(&executable);
         command
             .args(&self.relaunch)
-            .args(["--predecessor", &PREDECESSOR_DESCRIPTOR.to_string()]);
+            .args(["--settings", "-"])
+            .args(["--predecessor", &PREDECESSOR_DESCRIPTOR.to_string()])
+            .stdin(std::process::Stdio::piped());
         // SAFETY: the closure runs in the forked child before exec and calls
         // only `dup2`, which is async-signal-safe; `theirs` stays open in
         // this process until the spawn returned.
@@ -295,8 +305,11 @@ impl Server {
                 Ok(())
             });
         }
-        let successor = command.spawn()?;
+        let mut successor = command.spawn()?;
         drop(theirs);
+        if let Some(mut stdin) = successor.stdin.take() {
+            std::io::Write::write_all(&mut stdin, settings.as_bytes())?;
+        }
         let pid = successor.id();
         tracing::info!(pid, executable = %executable.display(), "started the successor server");
         // The buffer pools start no work from now on, and their tasks end.
@@ -753,6 +766,8 @@ impl Server {
             relaunch: handoff.relaunch,
             restart: None,
             sessions,
+            readiness: None,
+            stopping: None,
         };
         tracing::info!(
             clients = server.clients.len(),
@@ -828,12 +843,16 @@ pub fn relaunch_arguments(arguments: Vec<OsString>) -> Vec<String> {
         .skip(1)
         .map(|argument| argument.into_string().unwrap_or_default());
     while let Some(argument) = arguments.next() {
+        // A successor neither detaches nor reports to the predecessor's starter, and reads its
+        // settings from the predecessor rather than from where the predecessor read them.
         match argument.as_str() {
             "--daemon" => {}
-            "--predecessor" => {
+            "--predecessor" | "--ready-fd" | "--settings" => {
                 arguments.next();
             }
-            _ if argument.starts_with("--predecessor=") => {}
+            _ if ["--predecessor=", "--ready-fd=", "--settings="]
+                .iter()
+                .any(|prefix| argument.starts_with(prefix)) => {}
             _ => kept.push(argument),
         }
     }
@@ -875,7 +894,17 @@ mod tests {
     fn a_successor_serves_what_the_server_held() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("storage.sock");
-        let (listener, lock) = service::bind(&path).unwrap().unwrap();
+        let (listener, starting) = service::host::bind::<::storage::Settings>(&path)
+            .unwrap()
+            .owned(&path)
+            .unwrap();
+        let lock = starting
+            .finish(&crate::serve::readiness(
+                &path,
+                None,
+                &::storage::Settings::default(),
+            ))
+            .unwrap();
         let server = Server::new(listener, 0, None, None).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let (thread, waker) = running(server, Arc::clone(&stop));
@@ -998,7 +1027,7 @@ mod tests {
         let _ = std::process::Command::new("kill")
             .arg(pid.to_string())
             .status();
-        let _lock = service::SocketLock::resume(lock, path.clone());
+        let _lock = service::host::SocketLock::resume(lock, path.clone());
         let stop = Arc::new(AtomicBool::new(false));
         let (thread, waker) = running(resumed, Arc::clone(&stop));
 
@@ -1089,7 +1118,17 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("storage.sock");
-        let (listener, lock) = service::bind(&path).unwrap().unwrap();
+        let (listener, starting) = service::host::bind::<::storage::Settings>(&path)
+            .unwrap()
+            .owned(&path)
+            .unwrap();
+        let lock = starting
+            .finish(&crate::serve::readiness(
+                &path,
+                None,
+                &::storage::Settings::default(),
+            ))
+            .unwrap();
         let server = Server::new(listener, 0, None, None).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let (thread, waker) = running(server, Arc::clone(&stop));
@@ -1212,7 +1251,7 @@ mod tests {
         let _ = std::process::Command::new("kill")
             .arg(pid.to_string())
             .status();
-        let _lock = service::SocketLock::resume(lock, path.clone());
+        let _lock = service::host::SocketLock::resume(lock, path.clone());
         let stop = Arc::new(AtomicBool::new(false));
         let (thread, waker) = running(resumed, Arc::clone(&stop));
 
@@ -1261,8 +1300,11 @@ mod tests {
             "--daemon",
             "--predecessor",
             "3",
-            "--host-reserve-gib",
-            "8",
+            "--settings",
+            "-",
+            "--ready-fd=4",
+            "--log-level",
+            "debug",
         ]
         .map(OsString::from)
         .to_vec();
@@ -1273,8 +1315,8 @@ mod tests {
                 "serve",
                 "--socket",
                 "/tmp/s.sock",
-                "--host-reserve-gib",
-                "8"
+                "--log-level",
+                "debug"
             ]
         );
     }

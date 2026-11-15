@@ -42,17 +42,11 @@ pub const fn positive(count: usize) -> NonZeroUsize {
     }
 }
 
-/// The HTTP server (`server_config`).
+/// How the HTTP server answers (`server_config`); where it listens is the daemon's
+/// `admin_config`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
-    /// TCP address the server listens on.
-    pub host: String,
-    /// TCP port the server listens on.
-    pub port: u16,
-    /// Unix domain socket to listen on instead of TCP; a stale socket file
-    /// is replaced and the socket file is removed at shutdown.
-    pub uds: Option<String>,
     /// Bearer token every route but `/health` and `/metrics` requires;
     /// `UNISERVE_API_KEY` supplies it when unset or blank. Never printed.
     #[serde(skip_serializing)]
@@ -75,9 +69,6 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".to_owned(),
-            port: 8000,
-            uds: None,
             api_key: None,
             request_timeout: None,
             max_concurrent_requests: None,
@@ -151,9 +142,9 @@ pub struct KvCacheConfig {
     /// there, in place of `host_ratio` (as SGLang's `--hicache-size`).
     pub host_gib: Option<NonZeroU64>,
     /// Keep every page of the host KV cache in Mooncake, the KV storage,
-    /// through the Storage Servers this deployment starts, and prefetch long
-    /// hits back. Applies with `host_tier`; none when unset.
-    pub mooncake: Option<MooncakeConfig>,
+    /// through the Mooncake connector of each host's Storage Server, and
+    /// prefetch long hits back. Applies with `host_tier`; none when unset.
+    pub mooncake: Option<storage::connector::Settings>,
     /// The pages of the largest block size between the aligned boundaries
     /// a long prompt offloads its sliding windows before; the engine's
     /// default when unset.
@@ -188,43 +179,6 @@ impl Default for KvCacheConfig {
             state_interval: None,
             peers: Vec::new(),
         }
-    }
-}
-
-/// Mooncake, the KV storage (`kv_cache_config.mooncake`): the
-/// settings of each Storage Server's Mooncake client.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MooncakeConfig {
-    /// Mooncake's master, `host:port`.
-    pub master: String,
-    /// The transfer engine's metadata server: `P2PHANDSHAKE`, or an
-    /// `http://`, `etcd://` or `redis://` URL.
-    #[serde(default = "MooncakeConfig::default_metadata_server")]
-    pub metadata_server: String,
-    /// The transfer protocol: `tcp` or `rdma`.
-    #[serde(default = "MooncakeConfig::default_protocol")]
-    pub protocol: String,
-    /// The RDMA devices; selected automatically when empty.
-    #[serde(default)]
-    pub device: String,
-    /// Host storage each host contributes to Mooncake's pool, in GiB; zero
-    /// makes the hosts clients of segments others provide.
-    #[serde(default)]
-    pub global_segment_gib: u64,
-    /// `libmooncake_store.so`; `MOONCAKE_STORE_LIBRARY` or the loader's
-    /// search path when unset.
-    #[serde(default)]
-    pub library: Option<PathBuf>,
-}
-
-impl MooncakeConfig {
-    fn default_metadata_server() -> String {
-        "P2PHANDSHAKE".into()
-    }
-
-    fn default_protocol() -> String {
-        "tcp".into()
     }
 }
 
