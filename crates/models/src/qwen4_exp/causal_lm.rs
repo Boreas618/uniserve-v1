@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn an_order_names_every_layer_by_its_expert_module() {
-        let config = crate::qwen4_exp::config::fixtures::flash_next();
+        let config = crate::qwen4_exp::fixtures::flash_next();
         let config =
             Config::parse(&Fields::of("config.json", &config).expect("an object")).expect("parsed");
 
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn a_rank_of_four_holds_one_key_value_head_and_the_index_keys() {
-        let config = crate::qwen4_exp::config::fixtures::flash_next();
+        let config = crate::qwen4_exp::fixtures::flash_next();
         let config =
             Config::parse(&Fields::of("config.json", &config).expect("an object")).expect("parsed");
 

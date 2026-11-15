@@ -27,6 +27,8 @@ pub mod causal_lm;
 pub mod config;
 pub mod decoder;
 pub mod family;
+#[cfg(test)]
+pub(crate) mod fixtures;
 pub mod mtp;
 pub mod positions;
 pub mod vision;

@@ -33,6 +33,8 @@ pub mod causal_lm;
 pub mod config;
 pub mod decoder;
 pub mod family;
+#[cfg(test)]
+pub(crate) mod fixtures;
 pub mod hyper_connection;
 pub mod mtp;
 pub mod ngram;

@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn a_text_batch_turns_by_the_default_spectrum_of_an_mrope() {
-        let config = crate::qwen3::config::fixtures::hybrid();
+        let config = crate::qwen3::fixtures::hybrid();
         let config =
             Config::parse(&Fields::of("config.json", &config).expect("an object")).expect("parsed");
 
@@ -502,7 +502,7 @@ mod tests {
 
     #[test]
     fn an_order_names_the_routed_layers_by_their_expert_modules() {
-        let config = crate::qwen3::config::fixtures::moe();
+        let config = crate::qwen3::fixtures::moe();
         let config =
             Config::parse(&Fields::of("config.json", &config).expect("an object")).expect("parsed");
 
