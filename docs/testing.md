@@ -17,7 +17,7 @@ The numerical checks of the kernel packages under `crates/ops/kernels` live in `
 The HTTP tests under `tests/python/e2e` start real servers on the host's GPUs. `just test-python-gpu` runs every test marked `e2e and gpu`; `just test-python-sanitizer` runs those marked `missing_state` with every main process under compute-sanitizer's memcheck. Both call `tools/gpu_e2e.sh`, which the nightly workflows call as well:
 
 - it builds the release `uniserve` executable and `uniserve-manager` once, and every process of every test deployment runs that one build; each test module's Build Server compiles kernels with its toolchain environment, whose program `uniserve-build-server` must be on the search path (`uv sync --locked --project crates/build-server/python` creates the environment);
-- its serving processes take the NVIDIA driver, NCCL and CUPTI from the host's default loader path: the host provides the releases the [README](../README.md#requirements) names, and a process refuses an older one by name;
+- its serving processes take the NVIDIA driver, NCCL and CUPTI from the host's default loader path, and FFmpeg as the build found it through pkg-config: the host provides the releases the [README](../README.md#requirements) names, and a process refuses an older driver, NCCL or CUPTI by name;
 - it runs pytest with one worker per GPU (pytest-xdist), and each case leases the GPUs it serves on, so independent cases run beside one another on different GPUs while a case that observes host-wide state runs alone; the cases of a module that serves one deployment for all of them stay on one worker;
 - it writes pytest's temporary directory, which holds every server's log, and a JUnit report to `artifacts/e2e/<UTC time>/`.
 
@@ -31,7 +31,6 @@ These name the checkpoints and inputs of the host. Set the ones the host has; th
 
 | Variable | What it names | Tests |
 | --- | --- | --- |
-| `UNISERVE_FFMPEG_DIR` | The shared FFmpeg 8.1.2 + libx264 prefix every build links (`crates/media/native/build.sh` builds one, see `crates/media/README.md`); required to build | all |
 | `UNISERVE_QWEN3_MODEL` | A Qwen3-MoE BF16 checkpoint directory (`Qwen/Qwen3-30B-A3B`) | every Qwen3 module |
 | `UNISERVE_QWEN3_UPDATED_MODEL` | Another directory with the same checkpoint files and other weight values, such as a copy whose shards are renormalized, for weight updates | `test_epoch_changes_http.py`, `test_live_updates_http.py` |
 | `UNISERVE_H3_MODEL` | A FastH3 checkpoint directory (`FastVideo/FastVideo-FastH3-8-Step-V2`; the [FastH3 guide](minimax_h3/minimax_h3.md) lists the supported ones) | the FastH3 modules |
@@ -67,12 +66,11 @@ A two-host case runs on this host and a second one when `UNISERVE_H3_FOLLOWER` n
 
 ### A build shared by several hosts
 
-Hosts that mount the same checkout can run different modules at once from one build: build on one host (`tools/gpu_e2e.sh` builds when it runs there, or `cargo build --release -p uniserve --bin uniserve -p manager --bin uniserve-manager`), and on the others name the executable with `UNISERVE_BINARY`, which makes `tools/gpu_e2e.sh` build nothing. The executable records the FFmpeg prefix it was linked against as its run path, so that prefix must lie on the shared filesystem too. Each host still needs the Rust toolchain with its dependencies fetched (`cargo fetch --locked`), because a module's Build Server builds the scheduling policy for `wasm32-unknown-unknown` offline, and the Build Server's environment.
+Hosts that mount the same checkout can run different modules at once from one build: build on one host (`tools/gpu_e2e.sh` builds when it runs there, or `cargo build --release -p uniserve --bin uniserve -p manager --bin uniserve-manager`), and on the others name the executable with `UNISERVE_BINARY`, which makes `tools/gpu_e2e.sh` build nothing. An executable built with the media crate's `vendored` feature records the FFmpeg installation in its target directory as its run path, so that target directory must lie on the shared filesystem too; one built against a host's FFmpeg needs that FFmpeg on every host. Each host still needs the Rust toolchain with its dependencies fetched (`cargo fetch --locked`), because a module's Build Server builds the scheduling policy for `wasm32-unknown-unknown` offline, and the Build Server's environment.
 
 ### Example
 
 ```bash
-export UNISERVE_FFMPEG_DIR=/opt/ffmpeg-8.1.2
 export UNISERVE_QWEN3_MODEL=/models/Qwen3-30B-A3B
 export UNISERVE_H3_MODEL=/models/FastVideo-FastH3-8-Step-V2
 just test-python-gpu

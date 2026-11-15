@@ -100,6 +100,9 @@ impl Container {
 pub struct VideoStream {
     /// The codec, as FFmpeg names it (`h264`, `hevc`).
     pub codec: String,
+    /// The coded pixel format, as FFmpeg names it (`yuv420p`); empty when
+    /// unknown.
+    pub pixel_format: String,
     /// The coded width.
     pub width: u32,
     /// The coded height.
@@ -116,12 +119,20 @@ pub struct VideoStream {
 }
 
 /// An audio stream, as its container declares it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioStream {
+    /// The codec, as FFmpeg names it (`aac`, `mp3`).
+    pub codec: String,
     /// The declared sample rate.
     pub rate: u32,
     /// The declared channel count.
     pub channels: u32,
+    /// The average bit rate, as the container states it or the demuxer
+    /// measures it from the stream's packets; `None` when unknown.
+    pub bit_rate: Option<u64>,
+    /// The stream's duration as the container states it; `None` when
+    /// unknown.
+    pub duration: Option<Duration>,
 }
 
 /// Reads `encoded`'s container and streams through the demuxers `formats`
@@ -144,6 +155,7 @@ pub fn probe_container(encoded: &[u8], formats: &[&str], timeout: Duration) -> R
         format_name: probed.format_name,
         video: probed.video.map(|video| VideoStream {
             codec: video.codec,
+            pixel_format: video.pixel_format,
             width: video.width,
             height: video.height,
             sample_aspect: ratio(video.sample_aspect),
@@ -151,9 +163,13 @@ pub fn probe_container(encoded: &[u8], formats: &[&str], timeout: Duration) -> R
             rotation: video.rotation,
             frames: video.frames,
         }),
-        audio: probed
-            .audio
-            .map(|(rate, channels)| AudioStream { rate, channels }),
+        audio: probed.audio.map(|audio| AudioStream {
+            codec: audio.codec,
+            rate: audio.rate,
+            channels: audio.channels,
+            bit_rate: audio.bit_rate,
+            duration: audio.duration_us.map(Duration::from_micros),
+        }),
     })
 }
 

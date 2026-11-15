@@ -1588,7 +1588,7 @@ mod tests {
     }
 
     fn runner() -> Arc<media::MediaRunner> {
-        Arc::new(media::MediaRunner::new(media::MediaConfig::from_env()))
+        Arc::new(media::MediaRunner::new())
     }
 
     /// The tables of rank `rank`, holding nothing.

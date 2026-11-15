@@ -232,6 +232,7 @@ fn audio_stream(
     }
     let stream = container
         .audio
+        .as_ref()
         .ok_or_else(|| "the media has no audio stream".to_owned())?;
     if stream.rate == 0 {
         return Err("the audio stream has no sample rate".to_owned());
@@ -576,6 +577,7 @@ mod tests {
     fn h264() -> VideoStream {
         VideoStream {
             codec: "h264".to_owned(),
+            pixel_format: "yuv420p".to_owned(),
             width: 320,
             height: 180,
             sample_aspect: Some((1, 1)),
@@ -587,8 +589,11 @@ mod tests {
 
     fn aac(channels: u32) -> AudioStream {
         AudioStream {
+            codec: "aac".to_owned(),
             rate: 44100,
             channels,
+            bit_rate: None,
+            duration: None,
         }
     }
 
@@ -711,7 +716,7 @@ mod tests {
             None,
             Some(AudioStream {
                 rate: 48000,
-                channels: 2,
+                ..aac(2)
             }),
         );
         assert_eq!(audio_stream(&wav, true).unwrap().sample_rate, 48000);
@@ -721,10 +726,7 @@ mod tests {
         assert!(audio_stream(&container("flac", None, Some(aac(2))), true).is_err());
         assert!(audio_stream(&container("wav", None, Some(aac(6))), true).is_err());
         assert!(audio_stream(&container("wav", None, None), true).is_err());
-        let silent = AudioStream {
-            rate: 0,
-            channels: 2,
-        };
+        let silent = AudioStream { rate: 0, ..aac(2) };
         assert!(audio_stream(&container("wav", None, Some(silent)), true).is_err());
     }
 

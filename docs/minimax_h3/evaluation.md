@@ -79,12 +79,11 @@ No measurement of these suites is recorded.
 
 Every output is 24 fps with a stereo 32-kHz soundtrack. A point states the output's `size`, `fps`, `audio_sample_rate` and `audio_channels` in its `video` table, and each manifest row states its `num_frames`, which must be a count the model generates; UniServe receives exactly that shape in its `/v1/videos` body and derives the task from the row's `input_references`. A baseline point also states the requested target its native MiniMax-H3 form names: SGLang and vLLM-Omni an `aspect_ratio` (`16:9`, or `auto` where the canvas follows the keyframe or the default) and a `duration_seconds` (5, 8 or 15) that resolve to the stated shape, FastVideo the `duration_seconds`.
 
-Each point sends one unmeasured warmup at seed 42, then its measured requests one at a time. The manifests in `uniserve_eval/workloads/minimax_h3/` hold every request; each row's `metadata.condition_media` gives every reference file's path under `UNISERVE_MINIMAX_H3_INPUTS`, its source URL and its SHA-256. Reference media decode with FFmpeg 8.1.2.
+Each point sends one unmeasured warmup at seed 42, then its measured requests one at a time. The manifests in `uniserve_eval/workloads/minimax_h3/` hold every request; each row's `metadata.condition_media` gives every reference file's path under `UNISERVE_MINIMAX_H3_INPUTS`, its source URL and its SHA-256. Reference media decode through the FFmpeg 8.1 libraries the `uniserve` executable links.
 
 ```bash
 export UNISERVE_MINIMAX_H3_MODEL=/workspace/models/MiniMax-H3
 export UNISERVE_MINIMAX_H3_INPUTS=/workspace/uniserve/artifacts/minimax_h3/inputs
-export UNISERVE_MINIMAX_H3_FFMPEG=/workspace/tools/ffmpeg-8.1.2/bin
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml plan gb200-4-w3
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-4-w3
 ```
@@ -164,7 +163,7 @@ passes says the ordering requirement is gone.
 
 The automatic checks are the two this document defines for every video point and nothing more: MP4 validity (size, frame count, frame rate and stereo 32-kHz soundtrack against the stated shape, and the shape the server reports generating, which the `video` task validates) and the performance metrics the profile marks as protected, each checked to be finite and positive. The set adds no gate, tolerance or metric; the confirmation is the person's judgement of the six videos.
 
-The four servers place four GPUs each, with `configs/minimax_h3/ulysses4.toml` for the two transformer partitions and `configs/minimax_h3/ulysses4-reference.toml` for the two reference partitions, and use port 18083 one server at a time. `--reuse-deployment` keeps a checkpoint loaded across its consecutive points, so the four checkpoints load once each. The profile reads `UNISERVE_FAST_H3_MODEL` from the [FastH3 post](#fasth3-post) and `UNISERVE_MINIMAX_H3_MODEL`, `UNISERVE_MINIMAX_H3_OMNIREF`, `UNISERVE_MINIMAX_H3_INPUTS` and `UNISERVE_MINIMAX_H3_FFMPEG` from [MiniMax-H3 workloads](#minimax-h3-workloads):
+The four servers place four GPUs each, with `configs/minimax_h3/ulysses4.toml` for the two transformer partitions and `configs/minimax_h3/ulysses4-reference.toml` for the two reference partitions, and use port 18083 one server at a time. `--reuse-deployment` keeps a checkpoint loaded across its consecutive points, so the four checkpoints load once each. The profile reads `UNISERVE_FAST_H3_MODEL` from the [FastH3 post](#fasth3-post) and `UNISERVE_MINIMAX_H3_MODEL`, `UNISERVE_MINIMAX_H3_OMNIREF` and `UNISERVE_MINIMAX_H3_INPUTS` from [MiniMax-H3 workloads](#minimax-h3-workloads):
 
 ```bash
 .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml plan check-h3

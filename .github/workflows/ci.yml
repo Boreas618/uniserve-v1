@@ -17,11 +17,13 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: ./.github/actions/ffmpeg
+      # The runner has no FFmpeg 8.1, so the media crate builds the pinned FFmpeg 8.1.2 and
+      # libx264 from source (its `vendored` feature), which assembles x86-64 kernels with nasm.
+      - run: sudo apt-get update && sudo apt-get install -y nasm
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo bench --workspace --no-run
+      - run: cargo clippy --workspace --all-targets --features media/vendored -- -D warnings
+      - run: cargo test --workspace --features media/vendored
+      - run: cargo bench --workspace --no-run --features media/vendored
 
   python:
     runs-on: ubuntu-latest

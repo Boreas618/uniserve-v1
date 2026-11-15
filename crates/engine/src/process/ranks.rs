@@ -3107,16 +3107,7 @@ fn encoder_memory(
 fn open_video_ranks(ranks: &mut [LoadedRank], layout: &Open, opened: &Opened) -> Result<()> {
     let first = ranks.first().context("this process loaded no rank")?;
     let pool = Arc::new(first.model_runner.media_pool()?);
-    // A deployment that names no reference-video decoder takes the media crate's: the one the
-    // linked FFmpeg installation ships.
-    let media = Arc::new(media::MediaRunner::new(
-        match &first.model_runner.engine_config().media.ffmpeg {
-            Some(ffmpeg) => media::MediaConfig {
-                ffmpeg: ffmpeg.clone(),
-            },
-            None => media::MediaConfig::from_env(),
-        },
-    ));
+    let media = Arc::new(media::MediaRunner::new());
     let numbers: Vec<u8> = opened.regions.iter().map(|(number, _)| *number).collect();
     // The rank that maps the host regions' parts: the process's first, which every epoch of
     // the deployment on this host holds.

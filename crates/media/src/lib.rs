@@ -21,7 +21,8 @@
 //! audio track is decoded to planar float at its native rate, trimmed,
 //! duplicated to stereo, and brought to the model's rate with torchaudio's
 //! bandlimited sinc interpolation ([`read::read_audio`]); a reference video is
-//! decoded by one external `ffmpeg` process ([`read::read_video`]). Every
+//! decoded, resampled to the model's frame rate and scaled through the linked
+//! FFmpeg libraries ([`read::read_video`]). Every
 //! reader checks that it produced exactly the extent its transform states and
 //! fails with [`Error::Invalid`] otherwise, so media that decodes differently
 //! from what the server probed fails the request instead of misaligning its
@@ -29,43 +30,40 @@
 //! so the extent a request's transform states is the extent its readers
 //! produce.
 //!
-//! The three host resamplers reproduce the reference implementations'
-//! mathematics: Pillow's LANCZOS resize ([`resample::lanczos_resize`]),
+//! The three host resamplers implement the mathematics of the libraries that
+//! define them: Pillow's LANCZOS resize ([`resample::lanczos_resize`]),
 //! torchvision's antialiased bicubic resize ([`resample::bicubic_antialias_u8`]
 //! and [`resample::bicubic_antialias_f32`]), and torchaudio's sinc resample
 //! ([`resample::sinc_resample`]).
 //!
 //! Encoding, muxing and the libav* reading calls go through one C shim over
-//! FFmpeg 8.1.2's headers (`src/ffi/shim.c`), built against a shared FFmpeg
-//! runtime with libx264. The shim keeps FFmpeg's ABI out of the Rust side: the
-//! crate declares only its own small C interface in [`ffi`]. The serving
-//! options are: libx264 with `preset=ultrafast` and
-//! `tune=zerolatency` at 8 threads, yuv420p through swscale's bilinear filter,
-//! AAC with `aac_coder=fast` at 144 kb/s, and the MP4 muxer.
+//! the FFmpeg 8.1 headers (`src/ffi/shim.c`), linked against the shared FFmpeg
+//! libraries with libx264 that the build script finds (`build.rs`). The
+//! shim keeps FFmpeg's ABI out of the Rust side: the crate declares only its
+//! own small C interface in [`ffi`]. The output encoders are declared once,
+//! in [`codec::VIDEO_ENCODER`] and [`codec::AUDIO_ENCODER`]: libx264 with
+//! `preset=ultrafast` and `tune=zerolatency` at 8 slice threads, fed yuv420p
+//! through swscale's bilinear filter, AAC with `aac_coder=fast` at 144 kb/s,
+//! and the MP4 muxer.
 //!
 //! [`MediaRunner`] is the side the main process calls: one value holding the
-//! configured reference-video executable and the MP4 assemblies of the
-//! requests it is assembling, with every operation safe to run on a blocking
-//! pool thread.
+//! MP4 assemblies of the requests it is assembling, with every operation safe
+//! to run on a blocking pool thread.
 
 pub mod codec;
-pub mod config;
 pub mod error;
 mod ffi;
 pub mod mux;
 pub mod probe;
 pub mod read;
-#[cfg(test)]
-mod reference;
 pub mod resample;
 pub mod runner;
 
 pub use codec::{
-    AUDIO_CODEC, AUDIO_FRAME_SAMPLES, ENCODER_THREADS, Rgb24Frames, VIDEO_CODEC, audio_samples,
+    AUDIO_ENCODER, AUDIO_FRAME_SAMPLES, Encoder, Rgb24Frames, VIDEO_ENCODER, audio_samples,
     encode_audio_track, encode_video_unit, encoded_unit_bytes, encoded_video_bytes, frame_unit,
     read_unit, require_codecs,
 };
-pub use config::MediaConfig;
 pub use error::{Error, Result};
 pub use mux::{Container, MuxSession};
 pub use read::{

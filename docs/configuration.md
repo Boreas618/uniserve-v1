@@ -398,7 +398,8 @@ The [FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity) explains how t
 | `directory` | Unset | Directory `file://` condition media resolves under; `file://` is refused when unset |
 | `allow_remote` | `true` | Fetch `http(s)://` condition media |
 | `max_request_bytes` | `"256MiB"` | Condition media one request may carry in total; the video routes' body limit follows it |
-| `ffmpeg` | unset | Executable that decodes reference videos; unset, `UNISERVE_FFMPEG` of the engine's environment, else the `bin/ffmpeg` of the FFmpeg installation the engine executable links, else `ffmpeg` on the search path |
+
+Reference videos are decoded through the FFmpeg libraries the engine executable links, with no external program.
 
 ### `video_job_config`
 

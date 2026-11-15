@@ -1,12 +1,22 @@
-"""Generates the resampler reference fixtures from the `.venv` implementations.
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "numpy==2.5.1",
+#     "pillow==12.3.0",
+#     "torch==2.13.0",
+#     "torchaudio==2.11.0",
+#     "torchvision==0.28.0",
+# ]
+# ///
+"""Generates the resampler fixtures the media crate's tests compare with.
 
-This is a code generator, not a test: it runs the reference implementations
-(Pillow 12.3, torchaudio 2.11, torchvision 0.28 / torch 2.13) once on small
-fixed inputs and writes their outputs beside the inputs, for the Rust tests to
-compare against.
-
-Usage: `$UNISERVE_REFERENCE_PYTHON crates/media/tests/fixtures/resample/generate.py <directory>`,
-which the tests run.
+This is a code generator, not a test: it runs the libraries whose mathematics
+the crate's resamplers implement (Pillow's LANCZOS resize, torchvision's
+antialiased bicubic resize of uint8 images, torch's antialiased bicubic
+interpolation of float32 images and torchaudio's bandlimited sinc resample) on
+small fixed inputs, at the versions the script's metadata pins, and writes
+their outputs beside the inputs. The outputs are checked in beside this
+script; regenerate them with `uv run generate.py .` from this directory.
 
 Each kind has a directory with a `cases.txt` (one case per line) and, per case,
 `<name>.in` and `<name>.out` raw files:
@@ -20,13 +30,11 @@ Each kind has a directory with a `cases.txt` (one case per line) and, per case,
 from __future__ import annotations
 
 import os
-import struct
 import sys
 
 import numpy as np
 import torch
 import torchaudio
-import torchvision
 from PIL import Image
 from torchvision.transforms import v2 as vision
 
@@ -39,18 +47,24 @@ def pattern(channels: int, height: int, width: int) -> np.ndarray:
     for y in range(height):
         for x in range(width):
             for c in range(channels):
-                pixels[c, y, x] = (x * 7 + y * 13 + c * 29 + (x * y) % 5 * 11) % 256
+                pixels[c, y, x] = (
+                    x * 7 + y * 13 + c * 29 + (x * y) % 5 * 11
+                ) % 256
     return pixels
 
 
-def write_case(kind: str, name: str, case: str, source: bytes, expected: bytes) -> None:
+def write_case(
+    kind: str, name: str, case: str, source: bytes, expected: bytes
+) -> None:
     directory = os.path.join(ROOT, kind)
     os.makedirs(directory, exist_ok=True)
     with open(os.path.join(directory, f"{name}.in"), "wb") as file:
         file.write(source)
     with open(os.path.join(directory, f"{name}.out"), "wb") as file:
         file.write(expected)
-    with open(os.path.join(directory, "cases.txt"), "a", encoding="ascii") as file:
+    with open(
+        os.path.join(directory, "cases.txt"), "a", encoding="ascii"
+    ) as file:
         file.write(case + "\n")
 
 
@@ -76,9 +90,13 @@ def lanczos_cases() -> None:
     }
     for name, (channels, height, width, out_height, out_width) in cases.items():
         pixels = pattern(channels, height, width)
-        image = Image.frombytes("RGB", (width, height), pixels.transpose(1, 2, 0).tobytes())
+        image = Image.frombytes(
+            "RGB", (width, height), pixels.transpose(1, 2, 0).tobytes()
+        )
         source = pixels.transpose(1, 2, 0).tobytes()
-        expected = image.resize((out_width, out_height), Image.Resampling.LANCZOS)
+        expected = image.resize(
+            (out_width, out_height), Image.Resampling.LANCZOS
+        )
         write_case(
             "lanczos",
             name,
@@ -89,7 +107,7 @@ def lanczos_cases() -> None:
 
 
 def bicubic_cases() -> None:
-    """torchvision's antialiased bicubic resize of a uint8 CHW tensor."""
+    """Torchvision's antialiased bicubic resize of a uint8 CHW tensor."""
     cases = {
         "upscale": (3, 5, 7, 11, 13),
         "downscale": (3, 16, 9, 5, 3),
@@ -116,7 +134,7 @@ def bicubic_cases() -> None:
 
 
 def bicubic_f32_cases() -> None:
-    """torch's antialiased bicubic resize of a float32 CHW tensor."""
+    """Torch's antialiased bicubic resize of a float32 CHW tensor."""
     cases = {
         "upscale": (3, 5, 7, 11, 13),
         "downscale": (3, 16, 9, 5, 3),
@@ -144,7 +162,7 @@ def bicubic_f32_cases() -> None:
 
 
 def sinc_cases() -> None:
-    """torchaudio's bandlimited sinc resample of planar float32 audio."""
+    """Torchaudio's bandlimited sinc resample of planar float32 audio."""
     cases = {
         # mono, speech-rate down to the audio model's rate
         "mono_down": (1, 44100, 16000, 100),

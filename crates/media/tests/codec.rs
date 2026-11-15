@@ -1,191 +1,77 @@
-//! MP4 output of the encoders and the container assembly, checked with the
-//! FFmpeg runtime the crate links.
+//! MP4 output of the encoders and the container assembly, read back through
+//! the crate's own probe and decoders.
 //!
 //! These tests drive the crate's public boundary only: media units are
 //! encoded on their own, several units are assembled with a soundtrack into a
-//! request's MP4, and the result is probed and decoded by the external
-//! `ffprobe`/`ffmpeg` binaries. They assert what the media output must be:
-//! codec, canvas, frame count, frame rate, per-unit content, a stereo AAC
+//! request's MP4, and the result is probed ([`media::probe::probe_container`]),
+//! its frames decoded ([`media::read_video`]) and its soundtrack decoded
+//! ([`media::probe::decoded_track`]) through the FFmpeg libraries the crate
+//! links. They assert what the media output must be: codec, pixel format,
+//! canvas, frame count, frame rate, per-unit content in order, a stereo AAC
 //! track covering the video's duration, and the refusals of malformed
 //! assemblies.
-//!
-//! The tools are those of the installation the crate is built against (its
-//! build requires `UNISERVE_FFMPEG_DIR`, and the provisioned runtime ships
-//! `bin/ffmpeg` and `bin/ffprobe`), so every build that compiles these tests
-//! can run them and they need no environment at run time.
 
 // Always true in an integration test crate; it makes clippy treat the helpers
 // below as test code, where a failed unwrap is the test's failure report.
 #![cfg(test)]
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::io::Write as _;
+use std::time::Duration;
 
+use media::probe::{AudioStream, VideoStream, decoded_track, probe_container};
 use media::{
-    Container, Error, MediaConfig, MediaRunner, MuxSession, Rgb24Frames, audio_samples,
-    encode_audio_track, encode_video_unit, require_codecs,
+    Container, Error, MediaRunner, MuxSession, Rgb24Frames, VideoClip, audio_samples,
+    encode_audio_track, encode_video_unit, read_video, require_codecs,
 };
 
 const FRAME_RATE: u32 = 24;
 const AUDIO_RATE: u32 = 32_000;
 
-/// The `ffprobe` these tests read media back with: `UNISERVE_FFPROBE`, else the one of the runtime
-/// the crate links.
-fn ffprobe() -> PathBuf {
-    std::env::var_os("UNISERVE_FFPROBE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("UNISERVE_MEDIA_RUNTIME"))
-                .join("bin")
-                .join("ffprobe")
-        })
+/// The MP4 demuxer, by its FFmpeg name.
+const MP4: &[&str] = &["mov"];
+
+/// How long a probe of these small files may take.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The video stream of an MP4 the crate wrote.
+fn video_stream(payload: &[u8]) -> VideoStream {
+    probe_container(payload, MP4, PROBE_TIMEOUT)
+        .expect("the MP4 probes")
+        .video
+        .expect("the MP4 has a video stream")
 }
 
-/// The `ffmpeg` these tests decode media with: the one a deployment resolves.
-fn ffmpeg() -> PathBuf {
-    MediaConfig::from_env().ffmpeg
+/// The audio stream of an MP4 the crate wrote.
+fn audio_stream(payload: &[u8]) -> AudioStream {
+    probe_container(payload, MP4, PROBE_TIMEOUT)
+        .expect("the MP4 probes")
+        .audio
+        .expect("the MP4 has an audio stream")
 }
 
-/// A scratch file of this test binary's own, under cargo's test temp
-/// directory, removed when the test ends.
-struct Scratch {
-    path: PathBuf,
+/// Every video frame of an MP4 of `frames` frames at `width` x `height` and
+/// [`FRAME_RATE`], decoded to packed RGB24 at its own rate and canvas: a frame
+/// off the stream's timeline would be repeated or dropped by the resampling.
+fn decoded_frames(payload: &[u8], frames: u32, width: u32, height: u32) -> Vec<u8> {
+    let mut file = tempfile::tempfile().expect("a scratch file");
+    file.write_all(payload).expect("writing the MP4");
+    let clip = VideoClip {
+        frame_rate: FRAME_RATE,
+        canvas: (width, height),
+        frames,
+        vae_frames: frames,
+        start_frame: 0,
+    };
+    let mut pixels = vec![0u8; frames as usize * width as usize * height as usize * 3];
+    read_video(&file, &clip, &mut pixels).expect("the frames decode");
+    pixels
 }
 
-impl Scratch {
-    fn new(name: &str, bytes: &[u8]) -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let directory = Path::new(env!("CARGO_TARGET_TMPDIR"));
-        std::fs::create_dir_all(directory).expect("the test temp directory");
-        let path = directory.join(format!("{name}-{}-{unique}.mp4", std::process::id()));
-        std::fs::write(&path, bytes).expect("writing a scratch media file");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// Runs a media tool and returns its standard output, failing with the tool's
-/// message on a failed exit.
-fn run(program: &Path, arguments: &[&str]) -> Vec<u8> {
-    let output = Command::new(program)
-        .args(arguments)
-        .output()
-        .unwrap_or_else(|error| panic!("running {}: {error}", program.display()));
-    assert!(
-        output.status.success(),
-        "{} {:?} failed: {}",
-        program.display(),
-        arguments,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    output.stdout
-}
-
-/// The `key=value` entries of one stream, as `ffprobe` prints them.
-fn stream_entries(file: &Path, stream: &str, entries: &str) -> BTreeMap<String, String> {
-    let output = run(
-        &ffprobe(),
-        &[
-            "-v",
-            "error",
-            "-select_streams",
-            stream,
-            "-show_entries",
-            &format!("stream={entries}"),
-            "-of",
-            "default=noprint_wrappers=1",
-            file.to_str().expect("a UTF-8 scratch path"),
-        ],
-    );
-    let text = String::from_utf8(output).expect("ffprobe writes UTF-8");
-    text.lines()
-        .filter_map(|line| line.split_once('='))
-        .map(|(key, value)| (key.to_owned(), value.to_owned()))
-        .collect()
-}
-
-/// Presentation times, in seconds, of the decoded video frames.
-fn frame_times(file: &Path) -> Vec<f64> {
-    let output = run(
-        &ffprobe(),
-        &[
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "frame=pts_time",
-            "-of",
-            "csv=p=0",
-            file.to_str().expect("a UTF-8 scratch path"),
-        ],
-    );
-    let text = String::from_utf8(output).expect("ffprobe writes UTF-8");
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
-        // `csv=p=0` prints one line per frame and adds a field for each
-        // side-data entry the frame carries, which can leave a trailing empty
-        // column; the presentation time is the first field.
-        .map(|line| {
-            line.split(',')
-                .next()
-                .expect("a line has a first field")
-                .trim()
-                .parse::<f64>()
-                .expect("ffprobe prints a frame's presentation time")
-        })
-        .collect()
-}
-
-/// Decodes every video frame as packed RGB24.
-fn decode_rgb24(file: &Path) -> Vec<u8> {
-    run(
-        &ffmpeg(),
-        &[
-            "-v",
-            "error",
-            "-i",
-            file.to_str().expect("a UTF-8 scratch path"),
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
-        ],
-    )
-}
-
-/// Decoded samples of a file's first audio stream.
-fn decoded_samples(file: &Path) -> usize {
-    let output = run(
-        &ffmpeg(),
-        &[
-            "-v",
-            "error",
-            "-i",
-            file.to_str().expect("a UTF-8 scratch path"),
-            "-f",
-            "s16le",
-            "-acodec",
-            "pcm_s16le",
-            "-ac",
-            "2",
-            "pipe:1",
-        ],
-    );
-    output.len() / 4
+/// Decoded samples of each channel of the MP4's first audio stream.
+fn decoded_samples(payload: &[u8]) -> usize {
+    decoded_track(payload)
+        .expect("the soundtrack decodes")
+        .samples
 }
 
 /// `frames` frames of one flat gray level at `width` x `height`.
@@ -231,37 +117,20 @@ fn the_serving_encoders_are_available() {
 fn each_canvas_encodes_to_a_valid_h264_mp4() {
     for (width, height, frames) in [(64u32, 48u32, 3usize), (96, 64, 4), (48, 80, 2)] {
         let payload = encode(width, height, frames, 90);
-        let file = Scratch::new("canvas", &payload);
-        let video = stream_entries(
-            file.path(),
-            "v:0",
-            "codec_name,width,height,avg_frame_rate,nb_frames,pix_fmt",
+        let video = video_stream(&payload);
+        assert_eq!(video.codec, "h264");
+        assert_eq!(video.pixel_format, "yuv420p");
+        assert_eq!((video.width, video.height), (width, height));
+        assert_eq!(video.frame_rate, Some((FRAME_RATE, 1)));
+        assert_eq!(video.frames, frames as u64);
+        // Every frame decodes once at the stream's own rate, at the level it
+        // was encoded at.
+        let pixels = decoded_frames(&payload, frames as u32, width, height);
+        let level = pixels.iter().map(|byte| u64::from(*byte)).sum::<u64>() / pixels.len() as u64;
+        assert!(
+            level.abs_diff(90) <= 3,
+            "the frames decoded at level {level}"
         );
-        assert_eq!(video.get("codec_name").map(String::as_str), Some("h264"));
-        assert_eq!(video.get("pix_fmt").map(String::as_str), Some("yuv420p"));
-        let expected_width = width.to_string();
-        let expected_height = height.to_string();
-        assert_eq!(
-            video.get("width").map(String::as_str),
-            Some(expected_width.as_str())
-        );
-        assert_eq!(
-            video.get("height").map(String::as_str),
-            Some(expected_height.as_str())
-        );
-        assert_eq!(
-            video.get("avg_frame_rate").map(String::as_str),
-            Some("24/1")
-        );
-        let expected_frames = frames.to_string();
-        assert_eq!(
-            video.get("nb_frames").map(String::as_str),
-            Some(expected_frames.as_str())
-        );
-        let times = frame_times(file.path());
-        assert_eq!(times.len(), frames);
-        assert!(times.windows(2).all(|pair| pair[1] > pair[0]));
-        assert!((times[frames - 1] - (frames - 1) as f64 / f64::from(FRAME_RATE)).abs() < 1e-6);
     }
 }
 
@@ -287,37 +156,23 @@ fn units_play_back_in_order_on_one_timeline() {
     }
     assert!(offset > 0, "the units advance the container's timeline");
     let payload = container.finish(&track).expect("the assembly finalizes");
-    let file = Scratch::new("assembled", &payload);
 
-    let video = stream_entries(
-        file.path(),
-        "v:0",
-        "codec_name,width,height,avg_frame_rate,nb_frames,pix_fmt",
-    );
-    assert_eq!(video.get("codec_name").map(String::as_str), Some("h264"));
-    assert_eq!(video.get("pix_fmt").map(String::as_str), Some("yuv420p"));
-    assert_eq!(video.get("width").map(String::as_str), Some("64"));
-    assert_eq!(video.get("height").map(String::as_str), Some("48"));
-    assert_eq!(
-        video.get("avg_frame_rate").map(String::as_str),
-        Some("24/1")
-    );
+    let video = video_stream(&payload);
+    assert_eq!(video.codec, "h264");
+    assert_eq!(video.pixel_format, "yuv420p");
+    assert_eq!((video.width, video.height), (64, 48));
+    assert_eq!(video.frame_rate, Some((FRAME_RATE, 1)));
     // The frame count of the assembled timeline is the sum of the units'.
-    assert_eq!(video.get("nb_frames").map(String::as_str), Some("39"));
+    assert_eq!(video.frames, 39);
 
-    let audio = stream_entries(file.path(), "a:0", "codec_name,channels,sample_rate");
-    assert_eq!(audio.get("codec_name").map(String::as_str), Some("aac"));
-    assert_eq!(audio.get("channels").map(String::as_str), Some("2"));
-    assert_eq!(audio.get("sample_rate").map(String::as_str), Some("32000"));
+    let audio = audio_stream(&payload);
+    assert_eq!(audio.codec, "aac");
+    assert_eq!(audio.channels, 2);
+    assert_eq!(audio.rate, AUDIO_RATE);
 
-    // The units keep their order and content on one monotonic timeline that
-    // ends at the last frame's presentation time.
-    let times = frame_times(file.path());
-    assert_eq!(times.len(), 39);
-    assert!(times.windows(2).all(|pair| pair[1] > pair[0]));
-    assert!((times[38] - 38.0 / f64::from(FRAME_RATE)).abs() < 1e-6);
-
-    let pixels = decode_rgb24(file.path());
+    // The units keep their order and content on one timeline at the frame
+    // rate: decoded at that rate, every frame appears once, in order.
+    let pixels = decoded_frames(&payload, 39, 64, 48);
     let frame_bytes = 48 * 64 * 3;
     assert_eq!(pixels.len(), 39 * frame_bytes);
     let levels: Vec<i32> = pixels
@@ -340,7 +195,7 @@ fn units_play_back_in_order_on_one_timeline() {
 
     // The AAC track covers the video's duration: 52 000 samples plus at most
     // two frames of encoder padding.
-    let decoded = decoded_samples(file.path());
+    let decoded = decoded_samples(&payload);
     assert!(
         (samples..samples + 2 * media::AUDIO_FRAME_SAMPLES).contains(&decoded),
         "the soundtrack decoded to {decoded} samples, {samples} were encoded"
@@ -352,40 +207,30 @@ fn the_soundtrack_is_aac_stereo_at_the_model_rate_and_lasts_its_samples() {
     let samples = 52_000;
     let track =
         encode_audio_track(&noise(samples), samples, AUDIO_RATE).expect("a soundtrack encodes");
-    let file = Scratch::new("soundtrack", &track);
-    let audio = stream_entries(
-        file.path(),
-        "a:0",
-        "codec_name,channels,sample_rate,bit_rate,duration",
-    );
-    assert_eq!(audio.get("codec_name").map(String::as_str), Some("aac"));
-    assert_eq!(audio.get("channels").map(String::as_str), Some("2"));
-    assert_eq!(audio.get("sample_rate").map(String::as_str), Some("32000"));
+    let audio = audio_stream(&track);
+    assert_eq!(audio.codec, "aac");
+    assert_eq!(audio.channels, 2);
+    assert_eq!(audio.rate, AUDIO_RATE);
     // 144 kb/s is the encoder's configured average. An MP4 records the
     // measured average instead, so the check uses a full-scale track, whose
     // measured average approaches the target (a tone compresses far below
     // it).
-    let bit_rate: f64 = audio
-        .get("bit_rate")
-        .expect("ffprobe reports a bit rate")
-        .parse()
-        .expect("a numeric bit rate");
+    let bit_rate = audio.bit_rate.expect("the MP4 states a bit rate");
     assert!(
-        (120_000.0..=150_000.0).contains(&bit_rate),
+        (120_000..=150_000).contains(&bit_rate),
         "the soundtrack's measured bit rate is {bit_rate}"
     );
-    let duration: f64 = audio
-        .get("duration")
-        .expect("ffprobe reports a duration")
-        .parse()
-        .expect("a numeric duration");
+    let duration = audio
+        .duration
+        .expect("the MP4 states a duration")
+        .as_secs_f64();
     let expected = samples as f64 / f64::from(AUDIO_RATE);
     assert!(
         (duration - expected).abs()
             <= 2.0 * media::AUDIO_FRAME_SAMPLES as f64 / f64::from(AUDIO_RATE),
         "the soundtrack lasts {duration} s, its samples last {expected} s"
     );
-    let decoded = decoded_samples(file.path());
+    let decoded = decoded_samples(&track);
     assert!((samples..samples + 2 * media::AUDIO_FRAME_SAMPLES).contains(&decoded));
 }
 
@@ -397,11 +242,10 @@ fn audio_tracks_are_cut_or_padded_to_the_video_duration() {
     for (name, pcm) in [("long", long), ("short", short)] {
         let track =
             encode_audio_track(&pcm, samples, AUDIO_RATE).expect("the track is cut or padded");
-        let file = Scratch::new(name, &track);
-        let audio = stream_entries(file.path(), "a:0", "codec_name,channels,sample_rate");
-        assert_eq!(audio.get("codec_name").map(String::as_str), Some("aac"));
-        assert_eq!(audio.get("channels").map(String::as_str), Some("2"));
-        let decoded = decoded_samples(file.path());
+        let audio = audio_stream(&track);
+        assert_eq!(audio.codec, "aac");
+        assert_eq!(audio.channels, 2);
+        let decoded = decoded_samples(&track);
         assert!(
             (samples..samples + 2 * media::AUDIO_FRAME_SAMPLES).contains(&decoded),
             "the {name} soundtrack decoded to {decoded} samples"
@@ -466,14 +310,13 @@ fn a_session_assembles_a_complete_request_and_refuses_the_rest() {
         Err(Error::Invalid(_))
     ));
     let payload = session.finish().expect("the complete assembly");
-    let file = Scratch::new("session", &payload);
-    let video = stream_entries(file.path(), "v:0", "codec_name,nb_frames");
-    assert_eq!(video.get("codec_name").map(String::as_str), Some("h264"));
-    assert_eq!(video.get("nb_frames").map(String::as_str), Some("10"));
+    let video = video_stream(&payload);
+    assert_eq!(video.codec, "h264");
+    assert_eq!(video.frames, 10);
     // The soundtrack is in the file because the request set it.
-    let audio = stream_entries(file.path(), "a:0", "codec_name,channels");
-    assert_eq!(audio.get("codec_name").map(String::as_str), Some("aac"));
-    assert_eq!(audio.get("channels").map(String::as_str), Some("2"));
+    let audio = audio_stream(&payload);
+    assert_eq!(audio.codec, "aac");
+    assert_eq!(audio.channels, 2);
 
     // No call follows finalization.
     assert!(matches!(session.append(&[]), Err(Error::Invalid(_))));
@@ -492,7 +335,7 @@ fn a_session_assembles_a_complete_request_and_refuses_the_rest() {
 
 #[test]
 fn a_runner_holds_the_assembly_of_a_named_request_only() {
-    let runner = MediaRunner::new(MediaConfig::default());
+    let runner = MediaRunner::new();
     assert!(matches!(
         runner.append_units(7, &[]),
         Err(Error::Invalid(_))

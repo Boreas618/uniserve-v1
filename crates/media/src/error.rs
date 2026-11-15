@@ -1,7 +1,5 @@
 //! Failures of media codecs, containers and media reading.
 
-use std::path::PathBuf;
-
 /// A media operation's failure.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -20,7 +18,7 @@ pub enum Error {
     #[error("media output requires the codec {0}, which the FFmpeg runtime does not provide")]
     MissingCodec(String),
 
-    /// A codec or reference-video process failed at the operating system.
+    /// Reading a condition's media failed at the operating system.
     #[error("{context}: {source}")]
     Io {
         /// What the operation was doing.
@@ -28,15 +26,6 @@ pub enum Error {
         /// The operating system's failure.
         #[source]
         source: std::io::Error,
-    },
-
-    /// The reference video's FFmpeg process exited in failure.
-    #[error("decoding a reference video with {ffmpeg} failed: {message}")]
-    ReferenceVideo {
-        /// The executable that failed.
-        ffmpeg: PathBuf,
-        /// Its standard error, trimmed.
-        message: String,
     },
 }
 

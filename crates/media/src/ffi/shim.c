@@ -1,39 +1,46 @@
 /*
- * The FFmpeg 8.1.2 shim of the media crate.
+ * The FFmpeg shim of the media crate, written for the FFmpeg 8.1 libraries
+ * whose versions `build.rs` states.
  *
- * It includes the installed libav* headers and exposes a small, stable C
- * interface of the crate's own: encode one media unit and one audio track,
- * assemble an MP4 from encoded units, decode an audio track to planar float,
- * and inspect an encoded file. Rust declares only these functions, so the
- * crate follows FFmpeg's ABI without mirroring its structs.
+ * It includes the libav* headers and exposes a small C interface of the
+ * crate's own: encode one media unit and one audio track, assemble an MP4 from
+ * encoded units, decode an audio track to planar float, decode a reference
+ * video's clip to RGB24, and inspect an encoded file. Rust declares only these
+ * functions, so the crate follows FFmpeg's ABI without mirroring its structs.
  *
- * The serving options are:
+ * The encode contract:
  *
- * | stream | options |
- * | --- | --- |
- * | H.264 | libx264, yuv420p, rgb24 converted with swscale's bilinear filter, 8 threads, preset ultrafast, tune zerolatency |
- * | AAC | aac, stereo, aac_coder=fast, 144 kb/s, 8 threads, planar float input |
- * | container | MP4, one video stream per unit template, one audio stream |
+ * - Each encoder is the one its `UsvEncoder` names, opened from the encoder's
+ *   own option defaults (`avcodec_alloc_context3` with the encoder applies
+ *   them) with the stated private options, bit rate and thread count. The
+ *   threads are slice threads: libx264 reads slice threading as its
+ *   sliced-threads mode and codes every frame as one slice per thread.
+ * - Video frames arrive as RGB24 and are converted to yuv420p by swscale's
+ *   bilinear filter, with both frames' color space and range unspecified, in
+ *   a scaler whose thread count is set before its first frame and which
+ *   `sws_scale_frame` drives.
+ * - Packets are rebased from the encoder's time base to the time base the MP4
+ *   muxer gave the track when it wrote the header, and the encoders write
+ *   global headers when the container asks for them.
  *
- * Six settings that are not FFmpeg's AVCodecContext defaults are set here
- * explicitly, because they are what the reference sees: `bit_rate = 0`,
- * `gop_size = -1` and `max_b_frames = -1` (libx264's own codec defaults,
- * libavcodec/libx264.c `x264_defaults`, which `avcodec_alloc_context3`
- * applies on top of the option table's 200 kb/s, 12 and 0; a negative value
- * tells libx264 to keep the preset's), `thread_type = FF_THREAD_SLICE`
- * (PyAV's CodecContext), and the muxer's global-header flag. The rgb24 to
- * yuv420p conversion uses the dynamic swscale mode PyAV's VideoReformatter
- * uses: a context whose thread count is set before its first frame, driven
- * by `sws_scale_frame`. A nonzero failure code leaves a message in a
- * thread-local buffer that `usv_error` returns; `USV_INVALID` marks a failure
- * of the media rather than of the codec (a unit without video, a track
- * without audio).
+ * Every input is read through a custom I/O context over memory or a file
+ * descriptor, and a demuxer's request to open another file or URL is refused:
+ * media never makes the process read anything but its own bytes.
+ *
+ * A nonzero failure code leaves a message in a thread-local buffer that
+ * `usv_error` returns; `USV_INVALID` marks a failure of the media rather than
+ * of the codec (a unit without video, a track without audio).
  */
 
 #include <libavcodec/avcodec.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
+#include <libavutil/bprint.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/dict.h>
 #include <libavutil/display.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
@@ -44,25 +51,39 @@
 #include <libswscale/swscale.h>
 
 #include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define USV_OK 0
 #define USV_ERROR (-1)
 /* A failure of the media itself rather than of the codec: a unit without a
  * video stream, a track without audio. Rust reports these as invalid-input
- * errors, the same way the Python boundary raised ValueError for them. */
+ * errors. */
 #define USV_INVALID (-2)
 /* A serving encoder the runtime does not provide; the message is its name. */
 #define USV_MISSING_CODEC (-3)
 
+/* The buffer of every custom I/O context: FFmpeg's own default I/O block. */
 #define IO_BLOCK 32768
-#define VIDEO_THREADS 8
-#define AUDIO_BIT_RATE 144000
-#define AUDIO_FRAME_SAMPLES 1024
+
+/* One encoder as the crate declares it (`codec::VIDEO_ENCODER` and
+ * `codec::AUDIO_ENCODER` on the Rust side, which lays out the same struct). */
+typedef struct {
+    /* The encoder, as FFmpeg names it. */
+    const char *name;
+    /* Its private options: `key=value` pairs separated by `:`. */
+    const char *options;
+    /* Slice threads. */
+    int threads;
+    /* Bits per second; 0 leaves the rate to the encoder's own rate control. */
+    int64_t bit_rate;
+} UsvEncoder;
 
 static _Thread_local char usv_error_message[512];
 
@@ -239,6 +260,8 @@ static void close_output_memory(AVFormatContext **output) {
     *output = NULL;
 }
 
+/* ---- AVIO over memory and over a file ------------------------------------ */
+
 typedef struct {
     const uint8_t *data;
     size_t size;
@@ -283,10 +306,66 @@ static int64_t seek_memory(void *opaque, int64_t offset, int whence) {
     return wanted;
 }
 
-static void close_input_memory(AVFormatContext **input);
+/* Reads a file through its descriptor at the reader's own position, with
+ * `pread`: the descriptor's offset, which another holder of the same open file
+ * description may use, is never moved. */
+typedef struct {
+    int fd;
+    int64_t size;
+    int64_t position;
+} FileReader;
 
-/* Refuses every nested open a demuxer asks for: media read from memory never
- * names another file or URL it may follow. */
+static int read_file(void *opaque, uint8_t *target, int size) {
+    FileReader *reader = opaque;
+    if (reader->position >= reader->size) {
+        return AVERROR_EOF;
+    }
+    for (;;) {
+        ssize_t count = pread(reader->fd, target, (size_t)size, (off_t)reader->position);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0) {
+            return AVERROR(errno);
+        }
+        if (count == 0) {
+            return AVERROR_EOF;
+        }
+        reader->position += count;
+        return (int)count;
+    }
+}
+
+static int64_t seek_file(void *opaque, int64_t offset, int whence) {
+    FileReader *reader = opaque;
+    int64_t base = 0;
+    switch (whence & ~AVSEEK_FORCE) {
+        case SEEK_SET:
+            base = 0;
+            break;
+        case SEEK_CUR:
+            base = reader->position;
+            break;
+        case SEEK_END:
+            base = reader->size;
+            break;
+        case AVSEEK_SIZE:
+            return reader->size;
+        default:
+            return AVERROR(EINVAL);
+    }
+    int64_t wanted = base + offset;
+    if (wanted < 0 || wanted > reader->size) {
+        return AVERROR(EINVAL);
+    }
+    reader->position = wanted;
+    return wanted;
+}
+
+static void close_input(AVFormatContext **input);
+
+/* Refuses every nested open a demuxer asks for: media read from memory or a
+ * descriptor never names another file or URL the process may follow. */
 static int refuse_nested_open(struct AVFormatContext *context, AVIOContext **pb,
                               const char *url, int flags, AVDictionary **options) {
     (void)context;
@@ -297,24 +376,18 @@ static int refuse_nested_open(struct AVFormatContext *context, AVIOContext **pb,
     return AVERROR(EPERM);
 }
 
-/* Opens an input over `data`, read only through the demuxers `formats` names
- * (all of them when NULL), with `interrupt` checked during blocking reads
- * (none when NULL); the reader keeps the pointer, so `data` must outlive the
- * context. */
-static int open_input_memory_with(const uint8_t *data, size_t size,
-                                  AVFormatContext **input, MemoryReader *reader,
-                                  const char *formats,
-                                  const AVIOInterruptCB *interrupt) {
-    reader->data = data;
-    reader->size = size;
-    reader->position = 0;
-
+/* Opens an input read through `read` and `seek` over `opaque`, through the
+ * demuxers `formats` names (all of them when NULL), with `interrupt` checked
+ * during blocking reads (none when NULL). The context keeps `opaque`, which
+ * must outlive it. */
+static int open_input(void *opaque, int (*read)(void *, uint8_t *, int),
+                      int64_t (*seek)(void *, int64_t, int), AVFormatContext **input,
+                      const char *formats, const AVIOInterruptCB *interrupt) {
     uint8_t *io_buffer = av_malloc(IO_BLOCK);
     if (!io_buffer) {
         return fail("out of memory allocating a demuxer I/O buffer");
     }
-    AVIOContext *io = avio_alloc_context(io_buffer, IO_BLOCK, 0, reader,
-                                         read_packet, NULL, seek_memory);
+    AVIOContext *io = avio_alloc_context(io_buffer, IO_BLOCK, 0, opaque, read, NULL, seek);
     if (!io) {
         av_free(io_buffer);
         return fail("out of memory allocating a demuxer I/O context");
@@ -327,6 +400,7 @@ static int open_input_memory_with(const uint8_t *data, size_t size,
     }
     context->pb = io;
     context->flags |= AVFMT_FLAG_CUSTOM_IO;
+    context->io_open = refuse_nested_open;
     if (formats) {
         context->format_whitelist = av_strdup(formats);
         if (!context->format_whitelist) {
@@ -335,7 +409,6 @@ static int open_input_memory_with(const uint8_t *data, size_t size,
             avio_context_free(&io);
             return fail("out of memory naming a demuxer whitelist");
         }
-        context->io_open = refuse_nested_open;
     }
     if (interrupt) {
         context->interrupt_callback = *interrupt;
@@ -350,21 +423,45 @@ static int open_input_memory_with(const uint8_t *data, size_t size,
     }
     code = avformat_find_stream_info(context, NULL);
     if (code < 0) {
-        close_input_memory(&context);
+        close_input(&context);
         return fail_averror("reading an encoded media stream's headers", code);
     }
     *input = context;
     return USV_OK;
 }
 
-/* Opens an input over `data` through any demuxer; see
- * `open_input_memory_with`. */
+/* Opens an input over `data` through the demuxers `formats` names; see
+ * `open_input`. The reader keeps the pointer, so `data` must outlive the
+ * context. */
+static int open_input_memory_with(const uint8_t *data, size_t size,
+                                  AVFormatContext **input, MemoryReader *reader,
+                                  const char *formats,
+                                  const AVIOInterruptCB *interrupt) {
+    reader->data = data;
+    reader->size = size;
+    reader->position = 0;
+    return open_input(reader, read_packet, seek_memory, input, formats, interrupt);
+}
+
+/* Opens an input over `data` through any demuxer. */
 static int open_input_memory(const uint8_t *data, size_t size,
                              AVFormatContext **input, MemoryReader *reader) {
     return open_input_memory_with(data, size, input, reader, NULL, NULL);
 }
 
-static void close_input_memory(AVFormatContext **input) {
+/* Opens an input over the whole file `fd` reads, through any demuxer. */
+static int open_input_file(int fd, AVFormatContext **input, FileReader *reader) {
+    struct stat facts;
+    if (fstat(fd, &facts) != 0) {
+        return fail("reading a media file's size: %s", strerror(errno));
+    }
+    reader->fd = fd;
+    reader->size = (int64_t)facts.st_size;
+    reader->position = 0;
+    return open_input(reader, read_file, seek_file, input, NULL, NULL);
+}
+
+static void close_input(AVFormatContext **input) {
     AVFormatContext *context = *input;
     if (!context) {
         return;
@@ -377,64 +474,108 @@ static void close_input_memory(AVFormatContext **input) {
     *input = NULL;
 }
 
-/* ---- codec availability -------------------------------------------------- */
+/* ---- encoders ------------------------------------------------------------ */
 
-int usv_require_codecs(void) {
-    /* Both codecs must be present and must open as encoders in this runtime
-     * with the serving options; a build that lists but cannot open one fails
-     * here, by name, instead of on the first request. */
-    const AVCodec *video = avcodec_find_encoder_by_name("libx264");
-    if (!video) {
-        return fail_missing_codec("libx264");
+/* Allocates a context of `settings`' encoder, carrying the encoder's own
+ * option defaults. */
+static int encoder_alloc(const UsvEncoder *settings, const AVCodec **codec,
+                         AVCodecContext **context) {
+    *codec = avcodec_find_encoder_by_name(settings->name);
+    if (!*codec) {
+        return fail_missing_codec(settings->name);
     }
-    const AVCodec *audio = avcodec_find_encoder_by_name("aac");
-    if (!audio) {
-        return fail_missing_codec("aac");
-    }
-
-    AVCodecContext *context = avcodec_alloc_context3(video);
-    if (!context) {
-        return fail("out of memory opening libx264");
-    }
-    context->width = 16;
-    context->height = 16;
-    context->pix_fmt = AV_PIX_FMT_YUV420P;
-    context->time_base = (AVRational){1, 25};
-    context->framerate = (AVRational){25, 1};
-    context->thread_count = VIDEO_THREADS;
-    context->thread_type = FF_THREAD_SLICE;
-    context->bit_rate = 0;
-    context->gop_size = -1;
-    context->max_b_frames = -1;
-    AVDictionary *options = NULL;
-    av_dict_set(&options, "preset", "ultrafast", 0);
-    av_dict_set(&options, "tune", "zerolatency", 0);
-    int code = avcodec_open2(context, video, &options);
-    av_dict_free(&options);
-    avcodec_free_context(&context);
-    if (code < 0) {
-        return fail_averror("opening libx264", code);
-    }
-
-    context = avcodec_alloc_context3(audio);
-    if (!context) {
-        return fail("out of memory opening the aac encoder");
-    }
-    context->sample_fmt = AV_SAMPLE_FMT_FLTP;
-    context->sample_rate = 48000;
-    av_channel_layout_default(&context->ch_layout, 2);
-    context->bit_rate = AUDIO_BIT_RATE;
-    context->time_base = (AVRational){1, 48000};
-    context->thread_count = VIDEO_THREADS;
-    context->thread_type = FF_THREAD_SLICE;
-    av_dict_set(&options, "aac_coder", "fast", 0);
-    code = avcodec_open2(context, audio, &options);
-    av_dict_free(&options);
-    avcodec_free_context(&context);
-    if (code < 0) {
-        return fail_averror("opening the aac encoder", code);
+    *context = avcodec_alloc_context3(*codec);
+    if (!*context) {
+        return fail("out of memory allocating the %s encoder", settings->name);
     }
     return USV_OK;
+}
+
+/* Opens `context`, whose stream parameters the caller set, with `settings`'
+ * threads, bit rate and private options; `global_header` asks for the codec
+ * headers in the stream parameters rather than in the packets. */
+static int encoder_open(const UsvEncoder *settings, const AVCodec *codec,
+                        AVCodecContext *context, int global_header) {
+    context->thread_count = settings->threads;
+    context->thread_type = FF_THREAD_SLICE;
+    context->bit_rate = settings->bit_rate;
+    if (global_header) {
+        context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+    AVDictionary *options = NULL;
+    int code = av_dict_parse_string(&options, settings->options, "=", ":", 0);
+    if (code < 0) {
+        av_dict_free(&options);
+        return fail_averror("reading an encoder's options", code);
+    }
+    code = avcodec_open2(context, codec, &options);
+    /* An option the encoder does not take is left in the dictionary, and an
+     * encoder that silently ignored a stated option would not be the one the
+     * crate declares. */
+    const AVDictionaryEntry *unused = av_dict_iterate(options, NULL);
+    if (code >= 0 && unused) {
+        code = fail("the %s encoder does not take the option %s", settings->name, unused->key);
+        av_dict_free(&options);
+        return code;
+    }
+    av_dict_free(&options);
+    if (code < 0) {
+        return fail_averror(settings->name, code);
+    }
+    return USV_OK;
+}
+
+/* Opens `settings`' encoder for yuv420p frames of `width` x `height` at
+ * `frame_rate`. */
+static int open_video_encoder(const UsvEncoder *settings, int width, int height,
+                              int frame_rate, int global_header,
+                              const AVCodec **codec, AVCodecContext **context) {
+    if (width <= 0 || height <= 0 || frame_rate <= 0) {
+        return fail("video dimensions and frame rate must be positive");
+    }
+    int code = encoder_alloc(settings, codec, context);
+    if (code != USV_OK) {
+        return code;
+    }
+    (*context)->width = width;
+    (*context)->height = height;
+    (*context)->pix_fmt = AV_PIX_FMT_YUV420P;
+    (*context)->time_base = (AVRational){1, frame_rate};
+    (*context)->framerate = (AVRational){frame_rate, 1};
+    return encoder_open(settings, *codec, *context, global_header);
+}
+
+/* Opens `settings`' encoder for stereo planar float samples at `rate`. */
+static int open_audio_encoder(const UsvEncoder *settings, int rate, int global_header,
+                              const AVCodec **codec, AVCodecContext **context) {
+    if (rate <= 0) {
+        return fail("an audio rate must be positive");
+    }
+    int code = encoder_alloc(settings, codec, context);
+    if (code != USV_OK) {
+        return code;
+    }
+    (*context)->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    (*context)->sample_rate = rate;
+    av_channel_layout_default(&(*context)->ch_layout, 2);
+    (*context)->time_base = (AVRational){1, rate};
+    return encoder_open(settings, *codec, *context, global_header);
+}
+
+/* Opens both serving encoders as the encodes below open them, for an MP4, so
+ * that a runtime that lacks one, or cannot open it with the declared options,
+ * fails here by name instead of on the first request. */
+int usv_require_codecs(const UsvEncoder *video, const UsvEncoder *audio) {
+    const AVCodec *codec = NULL;
+    AVCodecContext *context = NULL;
+    int code = open_video_encoder(video, 16, 16, 25, 1, &codec, &context);
+    avcodec_free_context(&context);
+    if (code != USV_OK) {
+        return code;
+    }
+    code = open_audio_encoder(audio, 48000, 1, &codec, &context);
+    avcodec_free_context(&context);
+    return code;
 }
 
 /* ---- video units --------------------------------------------------------- */
@@ -482,65 +623,27 @@ static int video_encoder_stream(VideoEncoder *encoder) {
     if (code < 0) {
         return fail_averror("writing the video stream's parameters", code);
     }
-    /* PyAV's OutputStream sets the stream's average frame rate from the
-     * codec context; the muxer writes the sample durations from it. */
+    /* The muxer writes the sample durations from the stream's average frame
+     * rate. */
     stream->avg_frame_rate = context->framerate;
     encoder->stream = stream;
     return USV_OK;
 }
 
-static int video_encoder_open(VideoEncoder *encoder, int width, int height,
-                              int frame_rate) {
-    if (width <= 0 || height <= 0 || frame_rate <= 0) {
-        return fail("video dimensions and frame rate must be positive");
-    }
+static int video_encoder_open(VideoEncoder *encoder, const UsvEncoder *settings,
+                              int width, int height, int frame_rate) {
     encoder->width = width;
     encoder->height = height;
     encoder->frame_rate = frame_rate;
-    encoder->codec = avcodec_find_encoder_by_name("libx264");
-    if (!encoder->codec) {
-        return fail_missing_codec("libx264");
-    }
-    AVCodecContext *context = avcodec_alloc_context3(encoder->codec);
-    if (!context) {
-        return fail("out of memory allocating the libx264 encoder");
-    }
-    encoder->context = context;
-
     int code = open_output_memory(&encoder->output, &encoder->buffer);
     if (code != USV_OK) {
         return code;
     }
-
-    context->width = width;
-    context->height = height;
-    context->pix_fmt = AV_PIX_FMT_YUV420P;
-    context->time_base = (AVRational){1, frame_rate};
-    context->framerate = (AVRational){frame_rate, 1};
-    context->thread_count = VIDEO_THREADS;
-    /* PyAV's CodecContext sets slice threading on every context it wraps.
-     * libx264 reads it as its sliced-threads switch (libx264.c), so the
-     * reference and this shim give x264 the same threading mode. */
-    context->thread_type = FF_THREAD_SLICE;
-    /* The serving encoder's rate control and keyframe spacing (libx264.c
-     * reads a negative value as "keep the preset's"). */
-    context->bit_rate = 0;
-    context->gop_size = -1;
-    context->max_b_frames = -1;
-    if (encoder->output->oformat->flags & AVFMT_GLOBALHEADER) {
-        context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    }
-
-    AVDictionary *options = NULL;
-    av_dict_set(&options, "preset", "ultrafast", 0);
-    av_dict_set(&options, "tune", "zerolatency", 0);
-    code = avcodec_open2(context, encoder->codec, &options);
-    if (code < 0) {
-        av_dict_free(&options);
-        return fail_averror("opening libx264", code);
-    }
-    if (options) {
-        av_dict_free(&options);
+    code = open_video_encoder(settings, width, height, frame_rate,
+                              encoder->output->oformat->flags & AVFMT_GLOBALHEADER,
+                              &encoder->codec, &encoder->context);
+    if (code != USV_OK) {
+        return code;
     }
 
     encoder->frame = av_frame_alloc();
@@ -557,16 +660,15 @@ static int video_encoder_open(VideoEncoder *encoder, int width, int height,
         return fail_averror("allocating a video frame", code);
     }
 
-    /* The rgb24 to yuv420p conversion, in the mode PyAV's VideoReformatter
-     * uses: a dynamic context whose thread count and flags are set before
-     * the first frame, converted by sws_scale_frame. Setting them on a
-     * context from sws_getContext would come too late: that call already
-     * initialized the context with automatic threading. */
+    /* The rgb24 to yuv420p conversion: a dynamic context whose thread count
+     * and flags are set before the first frame, converted by sws_scale_frame.
+     * Setting them on a context from sws_getContext would come too late: that
+     * call already initialized the context with automatic threading. */
     encoder->scaler = sws_alloc_context();
     if (!encoder->scaler) {
         return fail("creating the rgb24 to yuv420p scaler failed");
     }
-    if (av_opt_set_int(encoder->scaler, "threads", VIDEO_THREADS, 0) < 0) {
+    if (av_opt_set_int(encoder->scaler, "threads", settings->threads, 0) < 0) {
         return fail("setting the scaler's thread count failed");
     }
     encoder->scaler->flags = SWS_BILINEAR;
@@ -600,8 +702,7 @@ static int video_encoder_write_packets(VideoEncoder *encoder) {
         encoder->packet->stream_index = encoder->stream->index;
         /* The encoder emits in its own time base; the muxer may have chosen
          * another one when it wrote the header (movenc gives the video track a
-         * 12288 tick timescale), so the packet is rebased before it is muxed,
-         * as PyAV does for every packet it appends to an output container. */
+         * 12288 tick timescale), so the packet is rebased before it is muxed. */
         av_packet_rescale_ts(encoder->packet, encoder->context->time_base,
                              encoder->stream->time_base);
         code = av_interleaved_write_frame(encoder->output, encoder->packet);
@@ -634,15 +735,15 @@ static int video_encoder_send(VideoEncoder *encoder, const uint8_t *rgb24,
     return video_encoder_write_packets(encoder);
 }
 
-int usv_encode_video_unit(const uint8_t *rgb24, int frames, int width,
-                          int height, int frame_rate, uint8_t **data,
-                          size_t *size) {
+int usv_encode_video_unit(const UsvEncoder *settings, const uint8_t *rgb24,
+                          int frames, int width, int height, int frame_rate,
+                          uint8_t **data, size_t *size) {
     if (!rgb24 || frames < 1) {
         return fail("a media unit needs at least one frame");
     }
     VideoEncoder encoder;
     memset(&encoder, 0, sizeof(encoder));
-    int code = video_encoder_open(&encoder, width, height, frame_rate);
+    int code = video_encoder_open(&encoder, settings, width, height, frame_rate);
     if (code != USV_OK) {
         video_encoder_free(&encoder);
         return code;
@@ -704,50 +805,22 @@ static void audio_encoder_free(AudioEncoder *encoder) {
     buffer_free(&encoder->buffer);
 }
 
-static int audio_encoder_open(AudioEncoder *encoder, int rate) {
-    if (rate <= 0) {
-        return fail("an audio rate must be positive");
-    }
+static int audio_encoder_open(AudioEncoder *encoder, const UsvEncoder *settings, int rate) {
     encoder->rate = rate;
-    const AVCodec *codec = avcodec_find_encoder_by_name("aac");
-    if (!codec) {
-        return fail_missing_codec("aac");
-    }
-    AVCodecContext *context = avcodec_alloc_context3(codec);
-    if (!context) {
-        return fail("out of memory allocating the AAC encoder");
-    }
-    encoder->context = context;
-
     int code = open_output_memory(&encoder->output, &encoder->buffer);
     if (code != USV_OK) {
         return code;
     }
-
-    context->sample_fmt = AV_SAMPLE_FMT_FLTP;
-    context->sample_rate = rate;
-    av_channel_layout_default(&context->ch_layout, 2);
-    context->bit_rate = AUDIO_BIT_RATE;
-    context->time_base = (AVRational){1, rate};
-    context->thread_count = VIDEO_THREADS;
-    /* PyAV's CodecContext sets slice threading on every context it wraps. */
-    context->thread_type = FF_THREAD_SLICE;
-    if (encoder->output->oformat->flags & AVFMT_GLOBALHEADER) {
-        context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    const AVCodec *codec = NULL;
+    code = open_audio_encoder(settings, rate,
+                              encoder->output->oformat->flags & AVFMT_GLOBALHEADER,
+                              &codec, &encoder->context);
+    if (code != USV_OK) {
+        return code;
     }
-
-    AVDictionary *options = NULL;
-    av_dict_set(&options, "aac_coder", "fast", 0);
-    code = avcodec_open2(context, codec, &options);
-    if (code < 0) {
-        av_dict_free(&options);
-        return fail_averror("opening the AAC encoder", code);
-    }
-    if (options) {
-        av_dict_free(&options);
-    }
+    AVCodecContext *context = encoder->context;
     if (context->frame_size <= 0) {
-        return fail("the AAC encoder declared no frame size");
+        return fail("the %s encoder declared no frame size", settings->name);
     }
 
     AVStream *stream = avformat_new_stream(encoder->output, NULL);
@@ -804,8 +877,8 @@ static int audio_encoder_write_packets(AudioEncoder *encoder) {
 }
 
 /* Sends `samples` interleaved int16 stereo samples at `offset`. The encoder
- * frames hold `frame_size` samples; PyAV's s16p input is converted to the
- * encoder's planar float by the factor 1/32768, which is exact. */
+ * frames hold `frame_size` samples; each int16 sample becomes the encoder's
+ * planar float by the factor 1/32768, which is exact. */
 static int audio_encoder_send(AudioEncoder *encoder, const int16_t *pcm,
                               int64_t offset, int samples) {
     int code = av_frame_make_writable(encoder->frame);
@@ -834,14 +907,14 @@ static int audio_encoder_send(AudioEncoder *encoder, const int16_t *pcm,
     return audio_encoder_write_packets(encoder);
 }
 
-int usv_encode_audio_track(const int16_t *pcm, int samples, int rate,
-                           uint8_t **data, size_t *size) {
+int usv_encode_audio_track(const UsvEncoder *settings, const int16_t *pcm,
+                           int samples, int rate, uint8_t **data, size_t *size) {
     if (samples < 1 || !pcm) {
         return fail("an audio track needs at least one sample");
     }
     AudioEncoder encoder;
     memset(&encoder, 0, sizeof(encoder));
-    int code = audio_encoder_open(&encoder, rate);
+    int code = audio_encoder_open(&encoder, settings, rate);
     if (code != USV_OK) {
         audio_encoder_free(&encoder);
         return code;
@@ -891,15 +964,13 @@ struct UsvMuxer {
     Buffer buffer;
 };
 
-/* Adds an output stream whose parameters match `input`'s stream `index`,
- * the way PyAV's add_stream_from_template does for a template that has a codec
- * context: a new stream with the template's codec, the template's parameters
+/* Adds an output stream whose parameters match `input`'s stream `index`: a
+ * new stream with the template's codec, the template's parameters
  * round-tripped through a codec context (so the output stream holds that
  * codec's parameters), the codec tag reset for remuxing, and the template's
- * time base on the stream and the context. It does not copy the template's
- * start time, duration, disposition, metadata or stream id: those belong to
- * the attachment/data path without a codec context, and the muxer numbers the
- * tracks and derives the rest. */
+ * time base on the stream and the context. The template's start time,
+ * duration, disposition, metadata and stream id are not copied: the muxer
+ * numbers the tracks and derives the rest. */
 static int muxer_template_stream(UsvMuxer *muxer, AVFormatContext *input,
                                  int index, AVStream **stream) {
     AVStream *source = input->streams[index];
@@ -932,13 +1003,25 @@ static int muxer_template_stream(UsvMuxer *muxer, AVFormatContext *input,
     return USV_OK;
 }
 
-/* The reference takes the FIRST stream of a type in stream-index order
- * (`container.streams.video[0]`, `.audio[0]`), never the stream a quality
- * search would prefer, so a file with several tracks of one type is read and
- * muxed the same way here. */
+/* The first stream of `type` in stream-index order, never the stream a
+ * quality search would prefer: a file with several tracks of one type is read
+ * and muxed by its first one. */
 static int first_stream_of_type(AVFormatContext *input, enum AVMediaType type) {
     for (unsigned i = 0; i < input->nb_streams; i++) {
         if (input->streams[i]->codecpar->codec_type == type) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* The first video stream that is not cover art: the stream a condition video's
+ * probe describes and its decode reads. */
+static int first_video_stream(AVFormatContext *input) {
+    for (unsigned i = 0; i < input->nb_streams; i++) {
+        const AVStream *stream = input->streams[i];
+        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+            !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
             return (int)i;
         }
     }
@@ -972,7 +1055,7 @@ int usv_mux_open(const uint8_t *first_unit, size_t first_size,
         code = USV_ERROR;
         goto fail;
     }
-    close_input_memory(&unit);
+    close_input(&unit);
 
     code = open_input_memory(audio_template, audio_size, &track, &reader);
     if (code != USV_OK) {
@@ -987,7 +1070,7 @@ int usv_mux_open(const uint8_t *first_unit, size_t first_size,
         code = USV_ERROR;
         goto fail;
     }
-    close_input_memory(&track);
+    close_input(&track);
 
     code = avformat_write_header(muxer->output, NULL);
     if (code < 0) {
@@ -998,8 +1081,8 @@ int usv_mux_open(const uint8_t *first_unit, size_t first_size,
     return USV_OK;
 
 fail:
-    close_input_memory(&unit);
-    close_input_memory(&track);
+    close_input(&unit);
+    close_input(&track);
     if (muxer->output) {
         close_output_memory(&muxer->output);
     }
@@ -1033,8 +1116,8 @@ static int mux_stream(UsvMuxer *muxer, AVFormatContext *input, int index,
             av_packet_unref(packet);
             continue;
         }
-        /* The reference drops a packet without a decode timestamp, which is
-         * the demuxer's flush packet: it has no timeline position to shift. */
+        /* A packet without a decode timestamp is the demuxer's flush packet:
+         * it has no timeline position to shift, and is not muxed. */
         if (packet->dts == AV_NOPTS_VALUE) {
             av_packet_unref(packet);
             continue;
@@ -1073,7 +1156,7 @@ int usv_mux_append(UsvMuxer *muxer, const uint8_t *unit, size_t size,
     }
     int index = first_stream_of_type(input, AVMEDIA_TYPE_VIDEO);
     if (index < 0) {
-        close_input_memory(&input);
+        close_input(&input);
         return fail_invalid("an encoded media unit has no video");
     }
     /* Every unit of one request is encoded at the request's canvas; a unit of
@@ -1085,13 +1168,13 @@ int usv_mux_append(UsvMuxer *muxer, const uint8_t *unit, size_t size,
     int expected_width = muxer->video->codecpar->width;
     int expected_height = muxer->video->codecpar->height;
     if (width != expected_width || height != expected_height) {
-        close_input_memory(&input);
+        close_input(&input);
         return fail_invalid(
             "an encoded media unit is %dx%d, the request's canvas is %dx%d",
             width, height, expected_width, expected_height);
     }
     code = mux_stream(muxer, input, index, muxer->video, offset, next);
-    close_input_memory(&input);
+    close_input(&input);
     return code;
 }
 
@@ -1105,11 +1188,11 @@ int usv_mux_finish(UsvMuxer *muxer, const uint8_t *audio, size_t size,
     }
     int index = first_stream_of_type(input, AVMEDIA_TYPE_AUDIO);
     if (index < 0) {
-        close_input_memory(&input);
+        close_input(&input);
         return fail_invalid("an encoded audio track has no audio");
     }
     code = mux_stream(muxer, input, index, muxer->audio, 0, NULL);
-    close_input_memory(&input);
+    close_input(&input);
     if (code != USV_OK) {
         return code;
     }
@@ -1155,12 +1238,11 @@ static int append_channel_planes(Buffer *planes, int channels,
 }
 
 /* Decodes the first audio stream of `data` to planar float at the stream's
- * declared rate and channel layout, the format conversion PyAV's resampler
- * performs before the reference resamples the track: its output is the
- * decoder context's rate and layout (from the stream's codecpar), and every
- * decoded frame is converted from that frame's own rate, format and layout.
- * The distinction matters for HE-AAC, whose frames decode at twice the
- * declared rate while the reference keeps the declared one. */
+ * declared rate and channel layout: the output is the decoder context's rate
+ * and layout (from the stream's codecpar), and every decoded frame is
+ * converted from that frame's own rate, format and layout. The distinction
+ * matters for HE-AAC, whose frames decode at twice the declared rate while
+ * the track keeps the declared one. */
 int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
                      float **planar, int64_t *samples) {
     MemoryReader reader;
@@ -1175,7 +1257,7 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
                                  : avcodec_find_decoder(
                                        input->streams[index]->codecpar->codec_id);
     if (index < 0 || !decoder) {
-        close_input_memory(&input);
+        close_input(&input);
         return fail_invalid("an audio condition carries no audio stream");
     }
     AVCodecContext *context = avcodec_alloc_context3(decoder);
@@ -1215,7 +1297,7 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
     input_open = 1;
 
     /* The output parameters are the stream's declared ones, which is what
-     * PyAV's AudioResampler is created with and what read_audio expects. */
+     * read_audio expects. */
     out_rate = context->sample_rate;
     av_channel_layout_copy(&out_layout, &context->ch_layout);
     out_channels = out_layout.nb_channels;
@@ -1438,7 +1520,7 @@ done:
     av_packet_free(&packet);
     av_frame_free(&frame);
     avcodec_free_context(&context);
-    close_input_memory(&input);
+    close_input(&input);
     return code;
 }
 
@@ -1450,6 +1532,7 @@ typedef struct {
     char format_name[128];
     int has_video;
     char video_codec[32];
+    char pixel_format[32];
     int width;
     int height;
     int sample_aspect_num;
@@ -1462,8 +1545,14 @@ typedef struct {
     double rotation;
     int64_t frames;
     int has_audio;
+    char audio_codec[32];
     int audio_rate;
     int audio_channels;
+    /* Bits per second as the container states or the demuxer measures it; 0
+     * when unknown. */
+    int64_t audio_bit_rate;
+    /* Microseconds; -1 when unknown. */
+    int64_t audio_duration;
 } UsvProbe;
 
 /* Interrupts a blocking read once the probe's deadline, in microseconds of
@@ -1480,10 +1569,12 @@ static void copy_name(char *target, size_t capacity, const char *text) {
 
 /* Probes `data` through the demuxers `formats` names, within `timeout_ms`.
  *
- * The video stream's frame count is the number of its packets a decoder
- * outputs: packets an edit list marks discard are not counted. Its rotation is
- * the display matrix's, or the legacy `rotate` tag's, counterclockwise in
- * degrees. Nothing is decoded. */
+ * The video stream is the first one that is not cover art
+ * (`first_video_stream`). Its frame count is the number of its packets a
+ * decoder outputs: packets an edit list marks discard are not counted. Its
+ * rotation is its display matrix's, counterclockwise in degrees: the matrix
+ * the decoder attaches to every frame and the reference-video decoder applies.
+ * Nothing is decoded. */
 int usv_probe_media(const uint8_t *data, size_t size, const char *formats,
                     int64_t timeout_ms, UsvProbe *probe) {
     memset(probe, 0, sizeof(*probe));
@@ -1497,21 +1588,21 @@ int usv_probe_media(const uint8_t *data, size_t size, const char *formats,
     }
     copy_name(probe->format_name, sizeof(probe->format_name), input->iformat->name);
 
-    int video = -1;
-    for (unsigned i = 0; i < input->nb_streams; i++) {
-        AVStream *stream = input->streams[i];
-        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
-            !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
-            video = (int)i;
-            break;
-        }
-    }
+    int video = first_video_stream(input);
     int audio = first_stream_of_type(input, AVMEDIA_TYPE_AUDIO);
     if (audio >= 0) {
         AVCodecParameters *parameters = input->streams[audio]->codecpar;
+        AVStream *stream = input->streams[audio];
         probe->has_audio = 1;
+        copy_name(probe->audio_codec, sizeof(probe->audio_codec),
+                  avcodec_get_name(parameters->codec_id));
         probe->audio_rate = parameters->sample_rate;
         probe->audio_channels = parameters->ch_layout.nb_channels;
+        probe->audio_bit_rate = parameters->bit_rate;
+        probe->audio_duration = stream->duration == AV_NOPTS_VALUE
+                                    ? -1
+                                    : av_rescale_q(stream->duration, stream->time_base,
+                                                   AV_TIME_BASE_Q);
     }
     if (video >= 0) {
         AVStream *stream = input->streams[video];
@@ -1519,6 +1610,8 @@ int usv_probe_media(const uint8_t *data, size_t size, const char *formats,
         probe->has_video = 1;
         copy_name(probe->video_codec, sizeof(probe->video_codec),
                   avcodec_get_name(parameters->codec_id));
+        copy_name(probe->pixel_format, sizeof(probe->pixel_format),
+                  av_get_pix_fmt_name((enum AVPixelFormat)parameters->format));
         probe->width = parameters->width;
         probe->height = parameters->height;
         AVRational aspect = av_guess_sample_aspect_ratio(input, stream, NULL);
@@ -1534,21 +1627,11 @@ int usv_probe_media(const uint8_t *data, size_t size, const char *formats,
         if (matrix && matrix->size >= 9 * sizeof(int32_t)) {
             probe->has_rotation = 1;
             probe->rotation = av_display_rotation_get((const int32_t *)matrix->data);
-        } else {
-            const AVDictionaryEntry *tag = av_dict_get(stream->metadata, "rotate", NULL, 0);
-            if (tag) {
-                char *end = NULL;
-                double rotation = strtod(tag->value, &end);
-                if (end != tag->value) {
-                    probe->has_rotation = 1;
-                    probe->rotation = rotation;
-                }
-            }
         }
 
         AVPacket *packet = av_packet_alloc();
         if (!packet) {
-            close_input_memory(&input);
+            close_input(&input);
             return fail("out of memory allocating a demuxer packet");
         }
         for (;;) {
@@ -1558,7 +1641,7 @@ int usv_probe_media(const uint8_t *data, size_t size, const char *formats,
             }
             if (status < 0) {
                 av_packet_free(&packet);
-                close_input_memory(&input);
+                close_input(&input);
                 return fail_averror("reading the media's packets", status);
             }
             if (packet->stream_index == video && !(packet->flags & AV_PKT_FLAG_DISCARD)) {
@@ -1568,6 +1651,453 @@ int usv_probe_media(const uint8_t *data, size_t size, const char *formats,
         }
         av_packet_free(&packet);
     }
-    close_input_memory(&input);
+    close_input(&input);
+    return USV_OK;
+}
+
+/* ---- reference video decoding -------------------------------------------- */
+
+/* A reference video's decode: the demuxer and decoder of its first video
+ * stream that is not cover art, and the filter graph that turns the decoded
+ * frames into the clip's RGB24 frames.
+ *
+ * The decode follows FFmpeg's command-line tool reading the file into
+ * `-vf fps=R,trim=start_frame=S,scale=W:H:flags=lanczos,setsar=1` with
+ * `-pix_fmt rgb24`, the specification of a reference video's frames:
+ *
+ * - Timestamps start at the file: the container's start time is subtracted
+ *   from every packet, and a format without timestamps has its frames dated
+ *   by their durations from zero.
+ * - A frame's timestamp is its best-effort timestamp; the end of the stream,
+ *   where `fps` stops, is the last frame's timestamp plus its estimated
+ *   duration (`frame_duration`).
+ * - The graph is configured from the first decoded frame (its pixel format,
+ *   size, sample aspect, color space and range), and a display matrix on that
+ *   frame puts it upright first (`append_rotation`).
+ *
+ * Each output frame goes straight into the caller's buffer, and the decode
+ * stops once the clip's frames are there. */
+typedef struct {
+    AVFormatContext *input;
+    FileReader file;
+    AVCodecContext *decoder;
+    AVFilterGraph *graph;
+    AVFilterContext *source;
+    AVFilterContext *sink;
+    AVPacket *packet;
+    AVFrame *frame;
+    AVFrame *filtered;
+    int stream;
+    /* Whether the format carries no timestamps (AVFMT_NOTIMESTAMPS). */
+    int timestamps_unreliable;
+    /* Added to every packet timestamp: the container's start time, negated,
+     * in the stream's time base. */
+    int64_t offset;
+    /* The decoded frame properties the graph was configured with. */
+    int width;
+    int height;
+    int format;
+    int color_space;
+    int color_range;
+    /* The previous frame's timestamp and estimated duration, in the stream's
+     * time base; the timestamp is AV_NOPTS_VALUE before the first frame. */
+    int64_t last_pts;
+    int64_t last_duration;
+    /* The clip. */
+    int frame_rate;
+    int start_frame;
+    int frames;
+    int canvas_width;
+    int canvas_height;
+    uint8_t *rgb24;
+    /* Clip frames written so far. */
+    int decoded;
+} VideoReader;
+
+static void video_reader_free(VideoReader *reader) {
+    avfilter_graph_free(&reader->graph);
+    av_frame_free(&reader->filtered);
+    av_frame_free(&reader->frame);
+    av_packet_free(&reader->packet);
+    avcodec_free_context(&reader->decoder);
+    close_input(&reader->input);
+}
+
+/* Appends to `chain` the filters that put a frame upright by its display
+ * matrix, each followed by a comma, as FFmpeg's command-line tool inserts
+ * them before a stream's filters (autorotation in `fftools/ffmpeg_filter.c`,
+ * the angle rounded as `get_rotation` in `fftools/cmdutils.c` rounds it): a
+ * transpose for a quarter turn, flips for a half turn or a mirrored matrix,
+ * and a free rotation for any other whole angle. */
+static void append_rotation(AVBPrint *chain, const int32_t *matrix) {
+    /* The clockwise angle in whole degrees, brought into [0, 360). */
+    double theta = -round(av_display_rotation_get(matrix));
+    theta -= 360 * floor(theta / 360 + 0.9 / 360);
+
+    if (fabs(theta - 90) < 1.0) {
+        av_bprintf(chain, "transpose=%s,", matrix[3] > 0 ? "cclock_flip" : "clock");
+    } else if (fabs(theta - 180) < 1.0) {
+        if (matrix[0] < 0) {
+            av_bprintf(chain, "hflip,");
+        }
+        if (matrix[4] < 0) {
+            av_bprintf(chain, "vflip,");
+        }
+    } else if (fabs(theta - 270) < 1.0) {
+        av_bprintf(chain, "transpose=%s,", matrix[3] < 0 ? "clock_flip" : "cclock");
+    } else if (fabs(theta) > 1.0) {
+        av_bprintf(chain, "rotate=%f*PI/180,", theta);
+    } else if (fabs(theta) < 1.0 && matrix[4] < 0) {
+        av_bprintf(chain, "vflip,");
+    }
+}
+
+/* Configures the reader's graph for frames like `frame`. */
+static int video_reader_open_graph(VideoReader *reader, const AVFrame *frame) {
+    reader->graph = avfilter_graph_alloc();
+    if (!reader->graph) {
+        return fail("out of memory allocating a filter graph");
+    }
+    reader->source = avfilter_graph_alloc_filter(reader->graph,
+                                                 avfilter_get_by_name("buffer"), "in");
+    reader->sink = avfilter_graph_alloc_filter(reader->graph,
+                                               avfilter_get_by_name("buffersink"), "out");
+    AVBufferSrcParameters *parameters = av_buffersrc_parameters_alloc();
+    if (!reader->source || !reader->sink || !parameters) {
+        av_free(parameters);
+        return fail("out of memory allocating a filter graph's ends");
+    }
+    parameters->format = frame->format;
+    parameters->width = frame->width;
+    parameters->height = frame->height;
+    parameters->sample_aspect_ratio = frame->sample_aspect_ratio.den > 0
+                                          ? frame->sample_aspect_ratio
+                                          : (AVRational){0, 1};
+    parameters->time_base = reader->input->streams[reader->stream]->time_base;
+    parameters->color_space = frame->colorspace;
+    parameters->color_range = frame->color_range;
+    parameters->alpha_mode = frame->alpha_mode;
+    int code = av_buffersrc_parameters_set(reader->source, parameters);
+    av_free(parameters);
+    if (code < 0) {
+        return fail_averror("describing a reference video's frames", code);
+    }
+    code = avfilter_init_dict(reader->source, NULL);
+    if (code >= 0) {
+        code = avfilter_init_dict(reader->sink, NULL);
+    }
+    if (code < 0) {
+        return fail_averror("opening a filter graph's ends", code);
+    }
+
+    AVBPrint chain;
+    av_bprint_init(&chain, 0, AV_BPRINT_SIZE_UNLIMITED);
+    const AVFrameSideData *matrix = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX);
+    if (matrix && matrix->size >= 9 * sizeof(int32_t)) {
+        append_rotation(&chain, (const int32_t *)matrix->data);
+    }
+    av_bprintf(&chain,
+               "fps=%d,trim=start_frame=%d,scale=%d:%d:flags=lanczos,setsar=1,"
+               "format=pix_fmts=rgb24",
+               reader->frame_rate, reader->start_frame, reader->canvas_width,
+               reader->canvas_height);
+    if (!av_bprint_is_complete(&chain)) {
+        av_bprint_finalize(&chain, NULL);
+        return fail("out of memory describing a reference video's filters");
+    }
+
+    AVFilterInOut *outputs = avfilter_inout_alloc();
+    AVFilterInOut *inputs = avfilter_inout_alloc();
+    if (!outputs || !inputs) {
+        avfilter_inout_free(&outputs);
+        avfilter_inout_free(&inputs);
+        av_bprint_finalize(&chain, NULL);
+        return fail("out of memory linking a filter graph");
+    }
+    outputs->name = av_strdup("in");
+    outputs->filter_ctx = reader->source;
+    outputs->pad_idx = 0;
+    outputs->next = NULL;
+    inputs->name = av_strdup("out");
+    inputs->filter_ctx = reader->sink;
+    inputs->pad_idx = 0;
+    inputs->next = NULL;
+    code = avfilter_graph_parse_ptr(reader->graph, chain.str, &inputs, &outputs, NULL);
+    avfilter_inout_free(&outputs);
+    avfilter_inout_free(&inputs);
+    av_bprint_finalize(&chain, NULL);
+    if (code < 0) {
+        return fail_averror("building a reference video's filters", code);
+    }
+    code = avfilter_graph_config(reader->graph, NULL);
+    if (code < 0) {
+        return fail_averror("configuring a reference video's filters", code);
+    }
+
+    reader->width = frame->width;
+    reader->height = frame->height;
+    reader->format = frame->format;
+    reader->color_space = frame->colorspace;
+    reader->color_range = frame->color_range;
+    return USV_OK;
+}
+
+/* Copies every frame the graph holds into the clip, until the clip is full. */
+static int video_reader_drain(VideoReader *reader) {
+    size_t row_bytes = (size_t)reader->canvas_width * 3;
+    size_t frame_bytes = row_bytes * (size_t)reader->canvas_height;
+    while (reader->decoded < reader->frames) {
+        int code = av_buffersink_get_frame(reader->sink, reader->filtered);
+        if (code == AVERROR(EAGAIN) || code == AVERROR_EOF) {
+            return USV_OK;
+        }
+        if (code < 0) {
+            return fail_averror("filtering a reference video's frame", code);
+        }
+        AVFrame *out = reader->filtered;
+        if (out->format != AV_PIX_FMT_RGB24 || out->width != reader->canvas_width ||
+            out->height != reader->canvas_height) {
+            av_frame_unref(out);
+            return fail("a reference video's filters produced a frame other than the clip's");
+        }
+        uint8_t *target = reader->rgb24 + (size_t)reader->decoded * frame_bytes;
+        for (int row = 0; row < out->height; row++) {
+            memcpy(target + (size_t)row * row_bytes,
+                   out->data[0] + (ptrdiff_t)row * out->linesize[0], row_bytes);
+        }
+        av_frame_unref(out);
+        reader->decoded++;
+    }
+    return USV_OK;
+}
+
+/* The duration of the decoded `frame`, in the stream's time base, as FFmpeg's
+ * command-line tool estimates it (`video_duration_estimate` in
+ * `fftools/ffmpeg_dec.c`): the container's duration when it is reliable, else
+ * the distance from the previous frame, else the codec's frame period, else
+ * the stream's average frame period, else the previous estimate. */
+static int64_t frame_duration(const VideoReader *reader, const AVFrame *frame) {
+    const int64_t ts_diff = (frame->pts != AV_NOPTS_VALUE && reader->last_pts != AV_NOPTS_VALUE)
+                                ? frame->pts - reader->last_pts
+                                : -1;
+    /* A container states a duration of 1 when it knows none. */
+    const int duration_unreliable = frame->duration == 1 && ts_diff > 2 * frame->duration;
+    if (frame->duration > 0 && !reader->timestamps_unreliable && !duration_unreliable) {
+        return frame->duration;
+    }
+
+    const AVStream *stream = reader->input->streams[reader->stream];
+    int64_t codec_duration = 0;
+    if (reader->decoder->framerate.num && reader->decoder->framerate.den) {
+        AVRational field_rate = av_mul_q(reader->decoder->framerate, (AVRational){2, 1});
+        codec_duration = av_rescale_q(frame->repeat_pict + 2, av_inv_q(field_rate),
+                                      stream->time_base);
+    }
+    if (codec_duration > 0 && reader->timestamps_unreliable) {
+        return codec_duration;
+    }
+    if (ts_diff > 0) {
+        return ts_diff;
+    }
+    if (frame->duration > 0) {
+        return frame->duration;
+    }
+    if (codec_duration > 0) {
+        return codec_duration;
+    }
+    if (stream->avg_frame_rate.num && stream->avg_frame_rate.den) {
+        int64_t period = av_rescale_q(1, av_inv_q(stream->avg_frame_rate), stream->time_base);
+        if (period > 0) {
+            return period;
+        }
+    }
+    return reader->last_duration > 1 ? reader->last_duration : 1;
+}
+
+/* Dates the decoded frame, hands it to the graph (configured from the first
+ * frame) and collects what the graph produced. */
+static int video_reader_push(VideoReader *reader) {
+    AVFrame *frame = reader->frame;
+    frame->pts = frame->best_effort_timestamp;
+    if (frame->pts == AV_NOPTS_VALUE) {
+        frame->pts = reader->last_pts == AV_NOPTS_VALUE ? 0
+                                                        : reader->last_pts + reader->last_duration;
+    }
+    reader->last_duration = frame_duration(reader, frame);
+    reader->last_pts = frame->pts;
+
+    if (!reader->graph) {
+        int code = video_reader_open_graph(reader, frame);
+        if (code != USV_OK) {
+            av_frame_unref(frame);
+            return code;
+        }
+    } else if (frame->width != reader->width || frame->height != reader->height ||
+               frame->format != reader->format || (int)frame->colorspace != reader->color_space ||
+               (int)frame->color_range != reader->color_range) {
+        av_frame_unref(frame);
+        return fail_invalid("a reference video changes its frame size or format mid-stream");
+    }
+    int code = av_buffersrc_add_frame_flags(reader->source, frame, AV_BUFFERSRC_FLAG_PUSH);
+    av_frame_unref(frame);
+    if (code < 0) {
+        return fail_averror("filtering a reference video's frame", code);
+    }
+    return video_reader_drain(reader);
+}
+
+/* Decodes `packet` (NULL to flush the decoder) and pushes every frame the
+ * decoder returns, until the clip is full. */
+static int video_reader_decode(VideoReader *reader, AVPacket *packet) {
+    for (;;) {
+        int sent = avcodec_send_packet(reader->decoder, packet);
+        if (sent < 0 && sent != AVERROR(EAGAIN) && sent != AVERROR_EOF) {
+            return fail_averror("decoding a reference video's packet", sent);
+        }
+        for (;;) {
+            int code = avcodec_receive_frame(reader->decoder, reader->frame);
+            if (code == AVERROR(EAGAIN) || code == AVERROR_EOF) {
+                break;
+            }
+            if (code < 0) {
+                return fail_averror("receiving a reference video's frame", code);
+            }
+            code = video_reader_push(reader);
+            if (code != USV_OK) {
+                return code;
+            }
+            if (reader->decoded == reader->frames) {
+                return USV_OK;
+            }
+        }
+        /* A decoder whose output was full refuses the packet; with the output
+         * drained it takes it now. */
+        if (sent != AVERROR(EAGAIN)) {
+            return USV_OK;
+        }
+    }
+}
+
+/* Decodes the clip of the reference video the descriptor `fd` reads into
+ * `rgb24`: `frames` RGB24 frames of `width` x `height`, frame-major, of the
+ * video resampled to `frame_rate` frames per second with its first
+ * `start_frame` resampled frames skipped. `size` is the buffer's length and
+ * must hold exactly the clip. `decoded` receives the clip frames the video
+ * produced, fewer than `frames` when it ends first. The descriptor's offset
+ * is not moved. */
+int usv_decode_video(int fd, int frame_rate, int start_frame, int frames, int width,
+                     int height, uint8_t *rgb24, size_t size, int *decoded) {
+    *decoded = 0;
+    if (frame_rate <= 0 || start_frame < 0 || frames <= 0 || width <= 0 || height <= 0) {
+        return fail_invalid("a reference video's clip needs a positive rate, extent and frames");
+    }
+    if (size / 3 / (size_t)width / (size_t)height != (size_t)frames ||
+        size != (size_t)frames * (size_t)width * (size_t)height * 3) {
+        return fail_invalid("a reference video's rows disagree with its clip");
+    }
+
+    VideoReader reader;
+    memset(&reader, 0, sizeof(reader));
+    reader.frame_rate = frame_rate;
+    reader.start_frame = start_frame;
+    reader.frames = frames;
+    reader.canvas_width = width;
+    reader.canvas_height = height;
+    reader.rgb24 = rgb24;
+    reader.last_pts = AV_NOPTS_VALUE;
+
+    int code = open_input_file(fd, &reader.input, &reader.file);
+    if (code != USV_OK) {
+        return code;
+    }
+    reader.stream = first_video_stream(reader.input);
+    if (reader.stream < 0) {
+        video_reader_free(&reader);
+        return fail_invalid("a reference video has no video stream");
+    }
+    AVStream *stream = reader.input->streams[reader.stream];
+    const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
+    if (!codec) {
+        video_reader_free(&reader);
+        return fail_invalid("a reference video's codec %s has no decoder",
+                            avcodec_get_name(stream->codecpar->codec_id));
+    }
+    reader.decoder = avcodec_alloc_context3(codec);
+    reader.packet = av_packet_alloc();
+    reader.frame = av_frame_alloc();
+    reader.filtered = av_frame_alloc();
+    if (!reader.decoder || !reader.packet || !reader.frame || !reader.filtered) {
+        video_reader_free(&reader);
+        return fail("out of memory allocating a reference video's decoder");
+    }
+    code = avcodec_parameters_to_context(reader.decoder, stream->codecpar);
+    if (code < 0) {
+        video_reader_free(&reader);
+        return fail_averror("reading a reference video's stream parameters", code);
+    }
+    reader.decoder->pkt_timebase = stream->time_base;
+    /* The decoder's own choice of threads, as the command-line tool leaves
+     * it; the decoded frames are the same for any thread count. */
+    reader.decoder->thread_count = 0;
+    code = avcodec_open2(reader.decoder, codec, NULL);
+    if (code < 0) {
+        video_reader_free(&reader);
+        return fail_averror("opening a reference video's decoder", code);
+    }
+    reader.timestamps_unreliable = (reader.input->iformat->flags & AVFMT_NOTIMESTAMPS) != 0;
+    reader.offset = reader.input->start_time == AV_NOPTS_VALUE
+                        ? 0
+                        : av_rescale_q(-reader.input->start_time, AV_TIME_BASE_Q,
+                                       stream->time_base);
+
+    while (reader.decoded < reader.frames) {
+        int status = av_read_frame(reader.input, reader.packet);
+        if (status == AVERROR_EOF) {
+            break;
+        }
+        if (status < 0) {
+            video_reader_free(&reader);
+            return fail_averror("reading a reference video", status);
+        }
+        if (reader.packet->stream_index != reader.stream || reader.packet->size == 0) {
+            av_packet_unref(reader.packet);
+            continue;
+        }
+        if (reader.timestamps_unreliable) {
+            reader.packet->pts = AV_NOPTS_VALUE;
+            reader.packet->dts = AV_NOPTS_VALUE;
+        } else {
+            if (reader.packet->pts != AV_NOPTS_VALUE) {
+                reader.packet->pts += reader.offset;
+            }
+            if (reader.packet->dts != AV_NOPTS_VALUE) {
+                reader.packet->dts += reader.offset;
+            }
+        }
+        code = video_reader_decode(&reader, reader.packet);
+        av_packet_unref(reader.packet);
+        if (code != USV_OK) {
+            video_reader_free(&reader);
+            return code;
+        }
+    }
+
+    if (reader.decoded < reader.frames) {
+        code = video_reader_decode(&reader, NULL);
+        if (code == USV_OK && reader.graph && reader.decoded < reader.frames) {
+            /* The stream ends one estimated duration after its last frame,
+             * which is where `fps` emits its last frames. */
+            int closed = av_buffersrc_close(reader.source, reader.last_pts + reader.last_duration,
+                                            AV_BUFFERSRC_FLAG_PUSH);
+            code = closed < 0 ? fail_averror("ending a reference video's filters", closed)
+                              : video_reader_drain(&reader);
+        }
+        if (code != USV_OK) {
+            video_reader_free(&reader);
+            return code;
+        }
+    }
+    *decoded = reader.decoded;
+    video_reader_free(&reader);
     return USV_OK;
 }

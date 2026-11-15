@@ -1,4 +1,4 @@
-//! The safe Rust side of the FFmpeg 8.1.2 shim.
+//! The safe Rust side of the FFmpeg shim (`ffi/shim.c`).
 //!
 //! Every function here copies what the shim produced into owned Rust values
 //! and frees the shim's allocation, so no libav* pointer survives a call. The
@@ -6,9 +6,33 @@
 //! buffer, which becomes [`Error::Codec`].
 
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::os::fd::AsRawFd as _;
 use std::ptr;
 
+use crate::codec::Encoder;
 use crate::{Error, Result};
+
+/// An encoder as the shim's `UsvEncoder` lays it out.
+#[repr(C)]
+struct RawEncoder {
+    name: *const c_char,
+    options: *const c_char,
+    threads: c_int,
+    bit_rate: i64,
+}
+
+impl RawEncoder {
+    /// The shim's view of `encoder`; its strings are static, so the view
+    /// stays valid for any call.
+    fn new(encoder: &Encoder) -> Self {
+        Self {
+            name: encoder.name.as_ptr(),
+            options: encoder.options.as_ptr(),
+            threads: c_int::try_from(encoder.threads).unwrap_or(c_int::MAX),
+            bit_rate: i64::from(encoder.bit_rate),
+        }
+    }
+}
 
 /// One MP4 assembly owned by the shim.
 #[repr(C)]
@@ -37,6 +61,7 @@ struct RawProbe {
     format_name: [c_char; 128],
     has_video: c_int,
     video_codec: [c_char; 32],
+    pixel_format: [c_char; 32],
     width: c_int,
     height: c_int,
     sample_aspect_num: c_int,
@@ -49,8 +74,11 @@ struct RawProbe {
     rotation: f64,
     frames: i64,
     has_audio: c_int,
+    audio_codec: [c_char; 32],
     audio_rate: c_int,
     audio_channels: c_int,
+    audio_bit_rate: i64,
+    audio_duration: i64,
 }
 
 /// One media file's container and streams, as libavformat reads them.
@@ -59,13 +87,25 @@ pub(crate) struct Probed {
     pub(crate) format_name: String,
     /// The first video stream that is not cover art.
     pub(crate) video: Option<ProbedVideo>,
-    /// The first audio stream's declared `(rate, channels)`.
-    pub(crate) audio: Option<(u32, u32)>,
+    /// The first audio stream.
+    pub(crate) audio: Option<ProbedAudio>,
+}
+
+/// A probed audio stream.
+pub(crate) struct ProbedAudio {
+    pub(crate) codec: String,
+    pub(crate) rate: u32,
+    pub(crate) channels: u32,
+    /// Bits per second; `None` when unknown.
+    pub(crate) bit_rate: Option<u64>,
+    /// Microseconds; `None` when unknown.
+    pub(crate) duration_us: Option<u64>,
 }
 
 /// A probed video stream.
 pub(crate) struct ProbedVideo {
     pub(crate) codec: String,
+    pub(crate) pixel_format: String,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) sample_aspect: (i32, i32),
@@ -85,8 +125,9 @@ unsafe extern "C" {
     ) -> c_int;
     fn usv_error() -> *const c_char;
     fn usv_free(pointer: *mut c_void);
-    fn usv_require_codecs() -> c_int;
+    fn usv_require_codecs(video: *const RawEncoder, audio: *const RawEncoder) -> c_int;
     fn usv_encode_video_unit(
+        settings: *const RawEncoder,
         rgb24: *const u8,
         frames: c_int,
         width: c_int,
@@ -96,6 +137,7 @@ unsafe extern "C" {
         size: *mut usize,
     ) -> c_int;
     fn usv_encode_audio_track(
+        settings: *const RawEncoder,
         pcm: *const i16,
         samples: c_int,
         rate: c_int,
@@ -132,6 +174,17 @@ unsafe extern "C" {
         planar: *mut *mut f32,
         samples: *mut i64,
     ) -> c_int;
+    fn usv_decode_video(
+        fd: c_int,
+        frame_rate: c_int,
+        start_frame: c_int,
+        frames: c_int,
+        width: c_int,
+        height: c_int,
+        rgb24: *mut u8,
+        size: usize,
+        decoded: *mut c_int,
+    ) -> c_int;
 }
 
 /// The shim's message for the failure it just reported on this thread.
@@ -146,8 +199,7 @@ fn last_error() -> String {
 ///
 /// The shim reports a failure of the media itself (a unit without a video
 /// stream, a track without audio) with its own code, which is an invalid
-/// input here, as those failures were `ValueError` at the Python boundary
-/// this crate replaces.
+/// input here.
 fn check(code: c_int) -> Result<()> {
     const INVALID: c_int = -2;
     const MISSING_CODEC: c_int = -3;
@@ -180,14 +232,16 @@ unsafe fn take_bytes(data: *mut u8, size: usize) -> Vec<u8> {
     bytes
 }
 
-/// Verifies that the FFmpeg runtime provides the serving encoders.
-pub(crate) fn require_codecs() -> Result<()> {
-    // SAFETY: the shim has no preconditions and reports its own failures.
-    check(unsafe { usv_require_codecs() })
+/// Verifies that the FFmpeg runtime provides and opens both encoders.
+pub(crate) fn require_codecs(video: &Encoder, audio: &Encoder) -> Result<()> {
+    let (video, audio) = (RawEncoder::new(video), RawEncoder::new(audio));
+    // SAFETY: both descriptions point at static strings that outlive the call.
+    check(unsafe { usv_require_codecs(&video, &audio) })
 }
 
-/// Encodes `frames` RGB24 frames into a self-contained MP4.
+/// Encodes `frames` RGB24 frames into a self-contained MP4 with `encoder`.
 pub(crate) fn encode_video_unit(
+    encoder: &Encoder,
     rgb24: &[u8],
     frames: u32,
     height: u32,
@@ -196,13 +250,15 @@ pub(crate) fn encode_video_unit(
 ) -> Result<Vec<u8>> {
     let frame_bytes = rgb24.len() / frames.max(1) as usize;
     debug_assert_eq!(frame_bytes, height as usize * width as usize * 3);
+    let settings = RawEncoder::new(encoder);
     let mut data: *mut u8 = ptr::null_mut();
     let mut size: usize = 0;
     // SAFETY: `rgb24` holds `frames` frames of `width * height * 3` bytes,
-    // checked by the caller; the shim writes its own allocation into
-    // `data`/`size` on success.
+    // checked by the caller, and the encoder's strings are static; the shim
+    // writes its own allocation into `data`/`size` on success.
     let code = unsafe {
         usv_encode_video_unit(
+            &settings,
             rgb24.as_ptr(),
             frames as c_int,
             width as c_int,
@@ -217,14 +273,23 @@ pub(crate) fn encode_video_unit(
     Ok(unsafe { take_bytes(data, size) })
 }
 
-/// Encodes interleaved stereo int16 samples into a self-contained AAC MP4.
-pub(crate) fn encode_audio_track(pcm: &[i16], samples: u32, rate: u32) -> Result<Vec<u8>> {
+/// Encodes interleaved stereo int16 samples into a self-contained MP4 with
+/// `encoder`.
+pub(crate) fn encode_audio_track(
+    encoder: &Encoder,
+    pcm: &[i16],
+    samples: u32,
+    rate: u32,
+) -> Result<Vec<u8>> {
+    let settings = RawEncoder::new(encoder);
     let mut data: *mut u8 = ptr::null_mut();
     let mut size: usize = 0;
-    // SAFETY: `pcm` holds `samples` interleaved stereo pairs; the shim writes
-    // its own allocation into `data`/`size` on success.
+    // SAFETY: `pcm` holds `samples` interleaved stereo pairs and the
+    // encoder's strings are static; the shim writes its own allocation into
+    // `data`/`size` on success.
     let code = unsafe {
         usv_encode_audio_track(
+            &settings,
             pcm.as_ptr(),
             samples as c_int,
             rate as c_int,
@@ -406,6 +471,7 @@ pub(crate) fn probe_media(data: &[u8], formats: &str, timeout_ms: i64) -> Result
         format_name: field(&raw.format_name),
         video: (raw.has_video != 0).then(|| ProbedVideo {
             codec: field(&raw.video_codec),
+            pixel_format: field(&raw.pixel_format),
             width: unsigned(raw.width),
             height: unsigned(raw.height),
             sample_aspect: (raw.sample_aspect_num, raw.sample_aspect_den),
@@ -414,7 +480,51 @@ pub(crate) fn probe_media(data: &[u8], formats: &str, timeout_ms: i64) -> Result
             rotation: (raw.has_rotation != 0).then_some(raw.rotation),
             frames: u64::try_from(raw.frames).unwrap_or(0),
         }),
-        audio: (raw.has_audio != 0)
-            .then(|| (unsigned(raw.audio_rate), unsigned(raw.audio_channels))),
+        audio: (raw.has_audio != 0).then(|| ProbedAudio {
+            codec: field(&raw.audio_codec),
+            rate: unsigned(raw.audio_rate),
+            channels: unsigned(raw.audio_channels),
+            bit_rate: u64::try_from(raw.audio_bit_rate)
+                .ok()
+                .filter(|&rate| rate > 0),
+            duration_us: u64::try_from(raw.audio_duration).ok(),
+        }),
     })
+}
+
+/// Decodes `clip` of the reference video `source` holds into `rgb24`, which
+/// must be exactly the clip's RGB24 frames. Returns the clip frames the video
+/// produced, fewer than the clip's when the video ends first. The file's
+/// offset is not moved.
+pub(crate) fn decode_video(
+    source: &std::fs::File,
+    clip: &crate::read::VideoClip,
+    rgb24: &mut [u8],
+) -> Result<u32> {
+    let int = |value: u32, what: &str| {
+        c_int::try_from(value).map_err(|_| {
+            Error::Invalid(format!(
+                "a reference video's {what} of {value} is out of range"
+            ))
+        })
+    };
+    let mut decoded: c_int = 0;
+    // SAFETY: the descriptor stays open for the call; `rgb24` is writable for
+    // its length, which the shim checks against the clip before writing; the
+    // shim writes one count into `decoded`.
+    let code = unsafe {
+        usv_decode_video(
+            source.as_raw_fd(),
+            int(clip.frame_rate, "frame rate")?,
+            int(clip.start_frame, "start frame")?,
+            int(clip.frames, "frame count")?,
+            int(clip.canvas.0, "width")?,
+            int(clip.canvas.1, "height")?,
+            rgb24.as_mut_ptr(),
+            rgb24.len(),
+            &mut decoded,
+        )
+    };
+    check(code)?;
+    Ok(u32::try_from(decoded).unwrap_or(0))
 }

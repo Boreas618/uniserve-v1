@@ -1,8 +1,10 @@
 name: Nightly GPU end-to-end
 
-# The GPU end-to-end tests (`just test-python-gpu`) on the self-hosted GPU runner. The runner's
-# environment states the host's facts: `UNISERVE_FFMPEG_DIR` and the checkpoints and inputs
-# docs/testing.md lists; a test whose asset the runner does not name is reported skipped.
+# The GPU end-to-end tests (`just test-python-gpu`) on the self-hosted GPU runner. The runner
+# host provides the native libraries the README's requirements name (FFmpeg 8.1 through
+# pkg-config, the driver, NCCL and CUPTI on the default loader path), and its environment names
+# the checkpoints and inputs docs/testing.md lists; a test whose asset the runner does not name is
+# reported skipped.
 
 on:
   schedule:

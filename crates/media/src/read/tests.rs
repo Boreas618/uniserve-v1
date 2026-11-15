@@ -1,20 +1,9 @@
-//! The condition readers against the reference implementations' outputs, and
-//! their refusals of transforms the media cannot satisfy.
-//!
-//! The reference fixtures are generated once per test process by
-//! `tests/fixtures/read/generate.py` in the interpreter
-//! `UNISERVE_REFERENCE_PYTHON` names: the images and tracks as the reference
-//! stack decodes them (Pillow 12.3, PyAV/libavcodec 8.1.2, torchaudio 2.11)
-//! and the reference video as the external `ffmpeg` command decodes it. Each
-//! kind's `cases.txt` names its cases and their transforms; every case's expected
-//! bytes are beside its media. The comparisons are ignored by default and fail
-//! when requested without the interpreter.
-//!
-//! The refusals need no reference: they read media made here (a PNG, a PCM WAV
-//! and an MP4 this crate encodes) and always run.
+//! The condition readers' refusals of transforms and products the media
+//! cannot satisfy. They read media made here (a PNG, a PCM WAV and an MP4 this
+//! crate encodes); the readers' agreement with the libraries whose contracts
+//! they implement is tested against checked-in fixtures in `tests/read.rs`.
 
 use std::io::Write as _;
-use std::path::PathBuf;
 
 use crate::Error;
 
@@ -22,425 +11,6 @@ use super::{
     AudioTransform, ConditionProducts, ConditionRead, ConditionSource, ImageTransform, VideoClip,
     read_audio, read_conditions, read_image, read_video,
 };
-
-/// The reading fixtures, generated once per test process.
-fn fixtures() -> PathBuf {
-    static GENERATED: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    GENERATED
-        .get_or_init(|| crate::reference::generate("tests/fixtures/read/generate.py"))
-        .path()
-        .to_path_buf()
-}
-
-/// One image case: its transform and the reference's RGB24 rows.
-struct ImageCase {
-    name: String,
-    media: Vec<u8>,
-    transform: ImageTransform,
-    tolerance: u8,
-    expected: Vec<u8>,
-}
-
-/// One audio case: its transform and the reference's `[samples, 2]` floats.
-struct AudioCase {
-    name: String,
-    media: Vec<u8>,
-    transform: AudioTransform,
-    expected: Vec<f32>,
-}
-
-/// One reference video case: its clip and the reference's RGB24 frames.
-struct VideoCase {
-    name: String,
-    file: PathBuf,
-    clip: VideoClip,
-    expected: Vec<u8>,
-}
-
-/// Reads a kind's manifest and its cases' media and expected output.
-fn image_cases() -> Vec<ImageCase> {
-    let directory = fixtures().join("images");
-    let manifest = std::fs::read_to_string(directory.join("cases.txt")).unwrap();
-    let mut cases = Vec::new();
-    for line in manifest.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let name = fields[0].to_owned();
-        let values: Vec<u32> = fields[2..]
-            .iter()
-            .map(|value| value.parse().unwrap())
-            .collect();
-        cases.push(ImageCase {
-            media: std::fs::read(directory.join(fields[1])).unwrap(),
-            transform: ImageTransform {
-                resized: (values[0], values[1]),
-                window: (values[2], values[3], values[4], values[5]),
-            },
-            tolerance: values[6] as u8,
-            expected: std::fs::read(directory.join(format!("{name}.out"))).unwrap(),
-            name,
-        });
-    }
-    assert!(!cases.is_empty(), "the image fixtures are missing");
-    cases
-}
-
-fn audio_cases() -> Vec<AudioCase> {
-    let directory = fixtures().join("audio");
-    let manifest = std::fs::read_to_string(directory.join("cases.txt")).unwrap();
-    let mut cases = Vec::new();
-    for line in manifest.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let name = fields[0].to_owned();
-        let values: Vec<usize> = fields[2..]
-            .iter()
-            .map(|value| value.parse().unwrap())
-            .collect();
-        cases.push(AudioCase {
-            media: std::fs::read(directory.join(fields[1])).unwrap(),
-            transform: AudioTransform {
-                native_rate: values[0] as u32,
-                start: values[1],
-                source_samples: values[2],
-                samples: values[3],
-                rate: values[4] as u32,
-            },
-            expected: floats(&std::fs::read(directory.join(format!("{name}.out"))).unwrap()),
-            name,
-        });
-    }
-    assert!(!cases.is_empty(), "the audio fixtures are missing");
-    cases
-}
-
-fn video_cases() -> Vec<VideoCase> {
-    let directory = fixtures().join("video");
-    let manifest = std::fs::read_to_string(directory.join("cases.txt")).unwrap();
-    let mut cases = Vec::new();
-    for line in manifest.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let name = fields[0].to_owned();
-        let values: Vec<u32> = fields[2..]
-            .iter()
-            .map(|value| value.parse().unwrap())
-            .collect();
-        cases.push(VideoCase {
-            file: directory.join(fields[1]),
-            clip: VideoClip {
-                frame_rate: values[0],
-                canvas: (values[1], values[2]),
-                frames: values[3],
-                // These clips' pixel rows cover every frame they decode.
-                vae_frames: values[3],
-                start_frame: values[4],
-            },
-            expected: std::fs::read(directory.join(format!("{name}.out"))).unwrap(),
-            name,
-        });
-    }
-    assert!(!cases.is_empty(), "the video fixtures are missing");
-    cases
-}
-
-/// The float32 samples of little-endian bytes.
-fn floats(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|chunk| f32::from_le_bytes(*chunk))
-        .collect()
-}
-
-/// The external `ffmpeg` reference videos are decoded with: the one a deployment resolves.
-fn ffmpeg() -> PathBuf {
-    crate::MediaConfig::from_env().ffmpeg
-}
-
-/// The largest per-channel difference between two RGB24 buffers.
-fn difference(actual: &[u8], expected: &[u8]) -> u8 {
-    assert_eq!(actual.len(), expected.len());
-    actual
-        .iter()
-        .zip(expected)
-        .map(|(actual, expected)| actual.abs_diff(*expected))
-        .max()
-        .unwrap_or(0)
-}
-
-#[test]
-#[ignore = "requires UNISERVE_REFERENCE_PYTHON: an interpreter with numpy, Pillow, torch and torchaudio"]
-fn images_decode_and_fit_like_pillow() {
-    for case in image_cases() {
-        let (left, top, width, height) = case.transform.window;
-        assert!(
-            (left + width, top + height) <= case.transform.resized,
-            "image case {} keeps a window outside its raster",
-            case.name
-        );
-        let mut actual = vec![0u8; width as usize * height as usize * 3];
-        read_image(&case.media, &case.transform, &mut actual)
-            .unwrap_or_else(|error| panic!("image case {} failed: {error}", case.name));
-        assert_eq!(
-            actual.len(),
-            case.expected.len(),
-            "image case {} produced another extent",
-            case.name
-        );
-        if case.tolerance == 0 {
-            assert_eq!(
-                actual, case.expected,
-                "image case {} differs from Pillow",
-                case.name
-            );
-        } else {
-            let difference = difference(&actual, &case.expected);
-            assert!(
-                difference <= case.tolerance,
-                "image case {} differs from Pillow by {difference} (> {}) per channel",
-                case.name,
-                case.tolerance
-            );
-        }
-    }
-}
-
-#[test]
-#[ignore = "requires UNISERVE_REFERENCE_PYTHON: an interpreter with numpy, Pillow, torch and torchaudio"]
-fn audio_decodes_and_resamples_like_the_reference() {
-    for case in audio_cases() {
-        let mut actual = vec![0.0f32; case.transform.samples * 2];
-        read_audio(&case.media, &case.transform, &mut actual)
-            .unwrap_or_else(|error| panic!("audio case {} failed: {error}", case.name));
-        assert_eq!(
-            actual.len(),
-            case.expected.len(),
-            "audio case {} produced another extent",
-            case.name
-        );
-        const TOLERANCE: f32 = 1e-5;
-        let difference = actual
-            .iter()
-            .zip(&case.expected)
-            .map(|(actual, expected)| (actual - expected).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            difference <= TOLERANCE,
-            "audio case {} differs from the reference by {difference}",
-            case.name
-        );
-    }
-}
-
-#[test]
-#[ignore = "requires UNISERVE_REFERENCE_PYTHON: an interpreter with numpy, Pillow, torch and torchaudio"]
-fn reference_videos_decode_like_the_reference_command() {
-    let ffmpeg = ffmpeg();
-    for case in video_cases() {
-        let file = std::fs::File::open(&case.file).unwrap();
-        let mut actual = vec![0u8; case.expected.len()];
-        read_video(&ffmpeg, &file, &case.clip, &mut actual)
-            .unwrap_or_else(|error| panic!("video case {} failed: {error}", case.name));
-        // swscale's LANCZOS and the entropy decoder are deterministic for one
-        // build; another build may round a sample differently.
-        let difference = difference(&actual, &case.expected);
-        assert!(
-            difference <= 2,
-            "video case {} differs from the reference by {difference} per channel",
-            case.name
-        );
-    }
-}
-
-#[test]
-#[ignore = "requires UNISERVE_REFERENCE_PYTHON: an interpreter with numpy, Pillow, torch and torchaudio"]
-fn conditions_fill_both_products_from_an_image_and_a_track() {
-    let image = &image_cases()[0];
-    let audio = &audio_cases()[0];
-    let image_rows = image.transform.window.2 as usize * image.transform.window.3 as usize;
-    let audio_rows = audio.transform.samples;
-    let mut pixels = vec![0u8; image_rows * 3];
-    let mut samples = vec![0.0f32; audio_rows * 2];
-    let conditions = [
-        ConditionRead {
-            source: ConditionSource::Bytes(&image.media),
-            image: Some(image.transform),
-            video: None,
-            audio: None,
-            pixels: 0..image_rows,
-            samples: 0..0,
-        },
-        ConditionRead {
-            source: ConditionSource::Bytes(&audio.media),
-            image: None,
-            video: None,
-            audio: Some(audio.transform),
-            pixels: 0..0,
-            samples: 0..audio_rows,
-        },
-    ];
-    read_conditions(
-        &ffmpeg(),
-        &conditions,
-        &mut ConditionProducts {
-            pixels: Some(&mut pixels),
-            samples: Some(&mut samples),
-        },
-    )
-    .unwrap();
-    assert_eq!(pixels, image.expected);
-    // The resampler reproduces torchaudio's mathematics, not its float32
-    // rounding: the reader's own acceptance is a per-sample bound.
-    let difference = samples
-        .iter()
-        .zip(&audio.expected)
-        .map(|(actual, expected)| (actual - expected).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        difference <= 1e-5,
-        "the condition's soundtrack differs from the reference by {difference}"
-    );
-}
-
-#[test]
-#[ignore = "requires UNISERVE_REFERENCE_PYTHON: an interpreter with numpy, Pillow, torch and torchaudio"]
-fn conditions_take_a_reference_video_and_an_image_into_one_product() {
-    let video = &video_cases()[0];
-    let image = &image_cases()[1];
-    let video_rows =
-        video.clip.frames as usize * video.clip.canvas.0 as usize * video.clip.canvas.1 as usize;
-    let image_rows = image.transform.window.2 as usize * image.transform.window.3 as usize;
-    let file = std::fs::File::open(&video.file).unwrap();
-    let mut pixels = vec![0u8; (video_rows + image_rows) * 3];
-    let conditions = [
-        ConditionRead {
-            source: ConditionSource::File(&file),
-            image: None,
-            video: Some(video.clip),
-            audio: None,
-            pixels: 0..video_rows,
-            samples: 0..0,
-        },
-        ConditionRead {
-            source: ConditionSource::Bytes(&image.media),
-            image: Some(image.transform),
-            video: None,
-            audio: None,
-            pixels: video_rows..video_rows + image_rows,
-            samples: 0..0,
-        },
-    ];
-    let decoded = read_conditions(
-        &ffmpeg(),
-        &conditions,
-        &mut ConditionProducts {
-            pixels: Some(&mut pixels),
-            samples: None,
-        },
-    )
-    .unwrap();
-    assert_eq!(pixels[..video_rows * 3], video.expected[..]);
-    assert_eq!(pixels[video_rows * 3..], image.expected[..]);
-    let video_decoded = decoded[0].as_ref().unwrap();
-    assert_eq!(video_decoded.clip, video.clip);
-    assert_eq!(video_decoded.pixels, video.expected);
-    assert!(decoded[1].is_none());
-}
-
-#[test]
-#[ignore = "requires UNISERVE_REFERENCE_PYTHON: an interpreter with numpy, Pillow, torch and torchaudio"]
-fn conditions_take_a_reference_videos_encoded_prefix_and_return_every_frame() {
-    // The `native` case decodes five frames; a model may consume fewer of
-    // them and still pack patches from the rest.
-    let case = &video_cases()[1];
-    assert_eq!(case.clip.frames, 5);
-    let mut clip = case.clip;
-    clip.vae_frames = 3;
-    let area = clip.canvas.0 as usize * clip.canvas.1 as usize;
-    let rows = clip.vae_frames as usize * area;
-    let file = std::fs::File::open(&case.file).unwrap();
-    let mut pixels = vec![0u8; rows * 3];
-    let decoded = read_conditions(
-        &ffmpeg(),
-        &[ConditionRead {
-            source: ConditionSource::File(&file),
-            image: None,
-            video: Some(clip),
-            audio: None,
-            pixels: 0..rows,
-            samples: 0..0,
-        }],
-        &mut ConditionProducts {
-            pixels: Some(&mut pixels),
-            samples: None,
-        },
-    )
-    .unwrap();
-    assert_eq!(pixels[..], case.expected[..rows * 3]);
-    let decoded = decoded[0].as_ref().unwrap();
-    assert_eq!(decoded.clip, clip);
-    assert_eq!(decoded.pixels, case.expected);
-    assert_eq!(decoded.pixels.len(), case.clip.frames as usize * area * 3);
-}
-
-#[test]
-#[ignore = "requires UNISERVE_REFERENCE_PYTHON: an interpreter with numpy, Pillow, torch and torchaudio"]
-fn conditions_read_a_reference_videos_soundtrack_from_its_file() {
-    // The video and its soundtrack come from one file: the frames decode on a
-    // thread while the track decodes on this one.
-    let case = &video_cases()[2];
-    let directory = fixtures().join("video");
-    let values: Vec<usize> = std::fs::read_to_string(directory.join("soundtrack.audio.txt"))
-        .unwrap()
-        .split_whitespace()
-        .map(|value| value.parse().unwrap())
-        .collect();
-    let transform = AudioTransform {
-        native_rate: values[0] as u32,
-        start: values[1],
-        source_samples: values[2],
-        samples: values[3],
-        rate: values[4] as u32,
-    };
-    let expected = floats(&std::fs::read(directory.join("soundtrack.audio")).unwrap());
-    let area = case.clip.canvas.0 as usize * case.clip.canvas.1 as usize;
-    let rows = case.clip.vae_frames as usize * area;
-    let file = std::fs::File::open(&case.file).unwrap();
-    let mut pixels = vec![0u8; rows * 3];
-    let mut samples = vec![0.0f32; transform.samples * 2];
-    let decoded = read_conditions(
-        &ffmpeg(),
-        &[ConditionRead {
-            source: ConditionSource::File(&file),
-            image: None,
-            video: Some(case.clip),
-            audio: Some(transform),
-            pixels: 0..rows,
-            samples: 0..transform.samples,
-        }],
-        &mut ConditionProducts {
-            pixels: Some(&mut pixels),
-            samples: Some(&mut samples),
-        },
-    )
-    .unwrap();
-    let frames_difference = difference(&pixels, &case.expected);
-    assert!(
-        frames_difference <= 2,
-        "the soundtrack clip's frames differ by {frames_difference} per channel"
-    );
-    let samples_difference = samples
-        .iter()
-        .zip(&expected)
-        .map(|(actual, expected)| (actual - expected).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        samples_difference <= 1e-5,
-        "the soundtrack differs from the reference by {samples_difference}"
-    );
-    let video = decoded[0].as_ref().unwrap();
-    assert_eq!(video.clip, case.clip);
-    assert_eq!(video.pixels, case.expected);
-}
 
 /// A `width` x `height` RGB gradient, encoded here as a PNG.
 fn synthetic_png(width: u32, height: u32) -> Vec<u8> {
@@ -594,30 +164,30 @@ fn audio_refuses_a_track_at_another_rate_or_with_fewer_samples() {
 fn reference_videos_refuse_a_clip_the_video_does_not_hold() {
     let file = synthetic_video();
     let mut out = vec![0u8; clip_bytes(&VIDEO)];
-    read_video(&ffmpeg(), &file, &VIDEO, &mut out).expect("the clip decodes");
+    read_video(&file, &VIDEO, &mut out).expect("the clip decodes");
 
     // The video holds fewer frames after the start than the clip asks for.
     let mut beyond = VIDEO;
     beyond.start_frame = 2;
     assert!(matches!(
-        read_video(&ffmpeg(), &file, &beyond, &mut out),
+        read_video(&file, &beyond, &mut out),
         Err(Error::Invalid(_))
     ));
     // A clip whose rows disagree with the decoded frames is refused.
     let mut wider = VIDEO;
     wider.canvas = (VIDEO.canvas.0 + 1, VIDEO.canvas.1);
     assert!(matches!(
-        read_video(&ffmpeg(), &file, &wider, &mut out),
+        read_video(&file, &wider, &mut out),
         Err(Error::Invalid(_))
     ));
-    // A source that is not a video fails through FFmpeg's own error.
+    // A source that is not a video fails in FFmpeg's demuxer.
     let mut bogus = tempfile::tempfile().expect("a scratch file");
     bogus
         .write_all(b"this is not a video")
         .expect("writing the scratch file");
     assert!(matches!(
-        read_video(&ffmpeg(), &bogus, &VIDEO, &mut out),
-        Err(Error::ReferenceVideo { .. })
+        read_video(&bogus, &VIDEO, &mut out),
+        Err(Error::Codec(_))
     ));
 }
 
@@ -630,7 +200,6 @@ fn conditions_refuse_an_encoded_prefix_longer_than_the_decoded_clip() {
     let mut pixels = vec![0u8; rows * 3];
     assert!(matches!(
         read_conditions(
-            &ffmpeg(),
             &[ConditionRead {
                 source: ConditionSource::File(&file),
                 image: None,
@@ -681,7 +250,7 @@ fn readers_refuse_a_transform_the_host_cannot_address() {
     clip.vae_frames = 1;
     let mut no_frames = Vec::new();
     assert!(matches!(
-        read_video(&ffmpeg(), &file, &clip, &mut no_frames),
+        read_video(&file, &clip, &mut no_frames),
         Err(Error::Invalid(_))
     ));
 
@@ -690,7 +259,6 @@ fn readers_refuse_a_transform_the_host_cannot_address() {
     let rows = clip.vae_frames as usize;
     assert!(matches!(
         read_conditions(
-            &ffmpeg(),
             &[ConditionRead {
                 source: ConditionSource::File(&file),
                 image: None,
@@ -714,7 +282,6 @@ fn conditions_refuse_rows_that_do_not_fill_their_products() {
     let rows = IMAGE_ROWS;
     let read = |conditions: &[ConditionRead<'_>], pixels: Option<&mut [u8]>| {
         read_conditions(
-            &ffmpeg(),
             conditions,
             &mut ConditionProducts {
                 pixels,

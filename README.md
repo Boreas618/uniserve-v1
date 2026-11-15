@@ -15,6 +15,7 @@ The executable serves two model families, Qwen3-MoE (chat) and MiniMax-H3 (video
 | CUDA | CUDA 13 toolkit and a driver of CUDA 13.0 or later (`libcuda.so.1`, `libnvidia-ml.so.1`) |
 | NCCL | `libnccl.so.2` of release 2.30.4 or later on the default loader path |
 | CUPTI | `libcupti.so.13` of release 13.4.92 or later on the default loader path |
+| FFmpeg | FFmpeg 8.1 with libx264, as shared libraries that pkg-config and the loader find |
 | Python | Python 3.12 |
 | Rust | Stable Rust toolchain with edition 2024 support |
 
@@ -27,14 +28,17 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
-FFMPEG_SOURCE=<FFmpeg 8.1.2 source> crates/media/native/build.sh /opt/ffmpeg-8.1.2
-export UNISERVE_FFMPEG_DIR=/opt/ffmpeg-8.1.2
-
 uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The executable links a shared FFmpeg 8.1.2 with libx264, which `crates/media/native/build.sh` builds from the FFmpeg source into the prefix it is given (it needs gcc, make, nasm, pkg-config, zlib and patchelf; [the media crate](crates/media/README.md) describes the runtime), and every build finds it through `UNISERVE_FFMPEG_DIR`. The sync builds the `uniserve` executable. The NVIDIA driver, NCCL and CUPTI come from the host: the serving processes open them at run time by their sonames from the default loader path, as NVIDIA's distribution packages install them (`/etc/ld.so.conf.d` registers any other directory that holds them), and refuse a library older than the release the table above names with an error that names it, before they use it. The Build Server keeps an environment of its own, which `uv sync --locked --python /usr/bin/python3.12 --project crates/build-server/python` creates; it compiles the kernel packages with that environment and the host's CUDA toolkit. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
+The sync builds the `uniserve` executable. The native libraries come from the host, where the standard mechanisms find them, and nothing points the build or the processes at them:
+
+- The NVIDIA driver, NCCL and CUPTI are opened at run time by their sonames from the default loader path, as NVIDIA's distribution packages install them (`/etc/ld.so.conf.d` registers any other directory that holds them). A process refuses a library older than the release the table above names with an error that names it, before it uses it.
+- FFmpeg 8.1 is found at build time through pkg-config, at exactly the library versions of that release: a distribution package, or an installation prefix whose `lib/pkgconfig` the build's `PKG_CONFIG_PATH` names and whose `lib` the loader configuration (`/etc/ld.so.conf.d`, then `ldconfig`) registers. A host whose distribution lacks FFmpeg 8.1 builds the FFmpeg 8.1.2 release and libx264 into such a prefix with their own build systems, configured as [the media crate](crates/media/README.md) configures them.
+- A build that runs from its target directory, such as a development or CI build, can instead build the pinned FFmpeg 8.1.2 and libx264 from source with `--features media/vendored` (it needs curl, tar, xz, make, a C compiler and, on x86-64, nasm). Its executables find those libraries through their run path into the target directory.
+
+The Build Server keeps an environment of its own, which `uv sync --locked --python /usr/bin/python3.12 --project crates/build-server/python` creates; it compiles the kernel packages with that environment and the host's CUDA toolkit. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
 
 For RDMA transfers between hosts, install the pinned UCX and NIXL builds described in [NIXL transfers](docs/nixl.md).
 
@@ -178,7 +182,6 @@ just test-python-gpu
 `test-python-fast` runs without a CUDA device. The HTTP tests under `tests/python/e2e` start real servers on the host's GPUs; `test-python-gpu` builds the release executable once and runs them one case per free GPU, and a plain `pytest` skips them unless `UNISERVE_RUN_GPU_E2E=1`. The host's checkpoints come from the environment, and a test whose checkpoint is unset is skipped, naming the variable. [Testing](docs/testing.md) lists the variables; the FastH3 tests, for example, load a complete checkpoint on four GPUs:
 
 ```bash
-export UNISERVE_FFMPEG_DIR=/opt/ffmpeg-8.1.2
 UNISERVE_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2 \
   tools/gpu_e2e.sh -m "e2e and gpu" tests/python/e2e/test_h3_parallel_http.py
 ```

@@ -1,22 +1,37 @@
-"""Generates the condition-reading fixtures from the reference implementations.
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "av==18.1.0",
+#     "numpy==2.5.1",
+#     "pillow==12.3.0",
+#     "torch==2.13.0",
+#     "torchaudio==2.11.0",
+# ]
+# ///
+"""Generates the condition-reading fixtures the media crate's tests read.
 
 This is a code generator, not a test: it writes small condition media (PNG,
-JPEG with an EXIF orientation, WAV tracks, one tiny H.264 reference video) and
-the reference outputs the readers must produce, computed by the `.venv`
-Python readers the crate's readers replace (transcribed below, call for
-call) and by the environment's FFmpeg for the reference video.
+JPEG with an EXIF orientation, WAV tracks, two tiny H.264 reference videos) and
+the outputs the readers must produce, computed by the libraries whose
+contracts the readers implement:
 
-The reference versions are Pillow 12.3.0, PyAV with libavcodec 8.1.2, torch
-2.13.0, torchvision 0.28.0 and torchaudio 2.11.0 (the read-only `.venv` this
-port replaces), and the provisioned FFmpeg 8.1.2 with libx264 for the reference
-video and its expected frames.
+- images: Pillow's decode with its EXIF orientation applied
+  (`ImageOps.exif_transpose`), RGB conversion, LANCZOS resize and crop;
+- audio: PyAV's decode of the first audio stream to planar float at the
+  stream's declared rate and layout, then torchaudio's `Resample`;
+- reference videos: FFmpeg's command-line tool, which encodes the clips with
+  libx264 and AAC and defines a reference video's frames by the filter chain
+  `fps=R,trim=start_frame=S,scale=W:H:flags=lanczos,setsar=1` into RGB24.
 
-Usage: `$UNISERVE_REFERENCE_PYTHON crates/media/tests/fixtures/read/generate.py <directory>`, which
-the tests run; `UNISERVE_FFMPEG` or `UNISERVE_FFMPEG_DIR` names the FFmpeg with libx264.
+The library versions are the ones the script's metadata pins; the `ffmpeg`
+program on the search path must be FFmpeg 8.1 with libx264, the release the
+crate links. The outputs are checked in beside this script; regenerate them
+with `uv run generate.py .` from this directory.
 
 Manifests (one case per line, one `<name>.out` per case beside the media):
 
-- `images/cases.txt`: `name file resized_w resized_h left top width height tolerance`
+- `images/cases.txt`:
+  `name file resized_w resized_h left top width height tolerance`
   (the expected bytes are RGB24 rows; `tolerance` is the per-channel bound of a
   lossy decoder, zero for a lossless input).
 - `audio/cases.txt`: `name file native_rate start source_samples samples rate`
@@ -38,17 +53,8 @@ import torchaudio
 from PIL import Image, ImageOps
 
 ROOT = sys.argv[1]
-# The FFmpeg with libx264 the reference video is encoded and decoded with.
-FFMPEG = os.environ.get("UNISERVE_FFMPEG") or os.path.join(
-    os.environ["UNISERVE_FFMPEG_DIR"], "bin", "ffmpeg"
-)
-# A shared FFmpeg links the runtime of its prefix.
-ENVIRONMENT = dict(os.environ)
-if os.environ.get("UNISERVE_FFMPEG_DIR"):
-    _PREVIOUS = ENVIRONMENT.get("LD_LIBRARY_PATH")
-    ENVIRONMENT["LD_LIBRARY_PATH"] = os.path.join(os.environ["UNISERVE_FFMPEG_DIR"], "lib") + (
-        ":" + _PREVIOUS if _PREVIOUS else ""
-    )
+# FFmpeg 8.1 with libx264, from the search path.
+FFMPEG = "ffmpeg"
 
 
 def pattern(channels: int, height: int, width: int) -> np.ndarray:
@@ -56,7 +62,9 @@ def pattern(channels: int, height: int, width: int) -> np.ndarray:
     for y in range(height):
         for x in range(width):
             for c in range(channels):
-                pixels[y, x, c] = (x * 9 + y * 17 + c * 41 + (x * y) % 7 * 13) % 256
+                pixels[y, x, c] = (
+                    x * 9 + y * 17 + c * 41 + (x * y) % 7 * 13
+                ) % 256
     return pixels
 
 
@@ -72,12 +80,16 @@ def write(kind: str, name: str, case: str, expected: bytes) -> None:
     directory = os.path.join(ROOT, kind)
     with open(os.path.join(directory, f"{name}.out"), "wb") as file:
         file.write(expected)
-    with open(os.path.join(directory, "cases.txt"), "a", encoding="ascii") as file:
+    with open(
+        os.path.join(directory, "cases.txt"), "a", encoding="ascii"
+    ) as file:
         file.write(case + "\n")
 
 
-def reference_image(path: str, resized: tuple[int, int], window: tuple[int, int, int, int]) -> bytes:
-    """`uniserve.media.reader.read_image`: decode, orient, LANCZOS, crop."""
+def reference_image(
+    path: str, resized: tuple[int, int], window: tuple[int, int, int, int]
+) -> bytes:
+    """Pillow's decode, EXIF orientation, RGB conversion, resize and crop."""
     image = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
     if image.size != resized:
         image = image.resize(resized, Image.Resampling.LANCZOS)
@@ -121,9 +133,18 @@ def image_cases() -> None:
 
 
 def reference_audio(
-    path: str, native: int, start: int, source_samples: int, samples: int, rate: int
+    path: str,
+    native: int,
+    start: int,
+    source_samples: int,
+    samples: int,
+    rate: int,
 ) -> bytes:
-    """`uniserve.media.reader.read_audio`, call for call."""
+    """PyAV's decode, the kept window and torchaudio's resample to `rate`.
+
+    The track decodes to planar float at its declared rate, and a mono track
+    is duplicated to stereo before the resample.
+    """
     import av
 
     container = av.open(path, mode="r")
@@ -137,10 +158,12 @@ def reference_audio(
         chunks = []
         for frame in container.decode(stream):
             chunks.extend(
-                torch.from_numpy(part.to_ndarray()) for part in resampler.resample(frame)
+                torch.from_numpy(part.to_ndarray())
+                for part in resampler.resample(frame)
             )
         chunks.extend(
-            torch.from_numpy(part.to_ndarray()) for part in resampler.resample(None)
+            torch.from_numpy(part.to_ndarray())
+            for part in resampler.resample(None)
         )
     waveform = torch.cat(chunks, dim=-1).to(torch.float32)
     waveform = waveform[:, start : start + source_samples]
@@ -170,20 +193,33 @@ def write_wav(path: str, rate: int, channels: int, samples: int) -> None:
 def audio_cases() -> None:
     directory = os.path.join(ROOT, "audio")
     cases = [
-        # (name, rate, channels, length, native, start, source_samples, rate_out)
+        # (name, rate, channels, length, native, start, source_samples,
+        #  rate_out)
         ("stereo", 44100, 2, 1000, 44100, 100, 800, 16000),
         ("mono", 22050, 1, 500, 22050, 0, 500, 44100),
         ("noop", 48000, 2, 400, 48000, 50, 300, 48000),
     ]
-    for name, rate, channels, length, native, start, source_samples, rate_out in cases:
+    for (
+        name,
+        rate,
+        channels,
+        length,
+        native,
+        start,
+        source_samples,
+        rate_out,
+    ) in cases:
         path = os.path.join(directory, f"{name}.wav")
         write_wav(path, rate, channels, length)
         samples = int(np.ceil(rate_out * source_samples / native))
-        expected = reference_audio(path, native, start, source_samples, samples, rate_out)
+        expected = reference_audio(
+            path, native, start, source_samples, samples, rate_out
+        )
         write(
             "audio",
             name,
-            f"{name} {os.path.basename(path)} {native} {start} {source_samples} "
+            f"{name} {os.path.basename(path)} {native} {start} "
+            f"{source_samples} "
             f"{samples} {rate_out}",
             expected,
         )
@@ -192,8 +228,6 @@ def audio_cases() -> None:
 def video_cases() -> None:
     directory = os.path.join(ROOT, "video")
     path = os.path.join(directory, "clip.mp4")
-    # The provisioned FFmpeg carries libx264; the environment's static build
-    # has no H.264 encoder.
     subprocess.run(
         [
             FFMPEG,
@@ -217,7 +251,6 @@ def video_cases() -> None:
             path,
         ],
         check=True,
-        env=ENVIRONMENT,
     )
     # A reference video that carries a soundtrack: its audio is decoded from
     # the same file the frames come from.
@@ -258,7 +291,6 @@ def video_cases() -> None:
             soundtrack,
         ],
         check=True,
-        env=ENVIRONMENT,
     )
     # Five frames at the model's 10 fps hold half a second, 22050 native
     # samples, which resample to 8000 at the model's 16 kHz.
@@ -266,7 +298,9 @@ def video_cases() -> None:
     audio = reference_audio(soundtrack, *audio_transform)
     with open(os.path.join(directory, "soundtrack.audio"), "wb") as file:
         file.write(audio)
-    with open(os.path.join(directory, "soundtrack.audio.txt"), "w", encoding="ascii") as file:
+    with open(
+        os.path.join(directory, "soundtrack.audio.txt"), "w", encoding="ascii"
+    ) as file:
         file.write(" ".join(str(value) for value in audio_transform) + "\n")
 
     cases = [
@@ -302,13 +336,13 @@ def video_cases() -> None:
             ],
             check=True,
             capture_output=True,
-            env=ENVIRONMENT,
         ).stdout
         assert len(expected) == frames * width * height * 3, len(expected)
         write(
             "video",
             name,
-            f"{name} {os.path.basename(source)} {frame_rate} {width} {height} {frames} {start_frame}",
+            f"{name} {os.path.basename(source)} {frame_rate} {width} {height} "
+            f"{frames} {start_frame}",
             expected,
         )
 

@@ -41,6 +41,9 @@ anyhow.workspace = true
 clap.workspace = true
 daemon.workspace = true
 libc.workspace = true
+# The FFmpeg libraries the daemon links through the media crate; `build.rs` reads their
+# directories from its `links` metadata for the executable's run path.
+media.workspace = true
 mimalloc.workspace = true
 # The request-processing side of the families, which the daemon serves.
 processing.workspace = true

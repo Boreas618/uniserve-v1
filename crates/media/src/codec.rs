@@ -1,24 +1,55 @@
 //! Output codecs: one media unit's H.264 stream and one request's AAC track.
 //!
 //! A media unit is `frames` RGB24 frames of `height` x `width`, encoded by a
-//! fresh libx264 session so that its first frame is a keyframe, then muxed
-//! into a self-contained MP4. The soundtrack is one AAC MP4 over the video's
-//! duration. Both use the serving options the crate documentation lists.
+//! fresh session of [`VIDEO_ENCODER`] so that its first frame is a keyframe,
+//! then muxed into a self-contained MP4. The soundtrack is one MP4 of
+//! [`AUDIO_ENCODER`] over the video's duration.
 
-/// The video codec every served container uses.
-pub const VIDEO_CODEC: &str = "libx264";
+use std::ffi::CStr;
 
-/// The audio codec every served container uses.
-pub const AUDIO_CODEC: &str = "aac";
+/// One output encoder: which FFmpeg encoder, with which private options, slice
+/// threads and bit rate. Its context starts from the encoder's own option
+/// defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Encoder {
+    /// The encoder, as FFmpeg names it.
+    pub name: &'static CStr,
+    /// Its private options: `key=value` pairs separated by `:`, FFmpeg's
+    /// option-string syntax. Every option must be one the encoder takes.
+    pub options: &'static CStr,
+    /// Slice threads: an encoder that codes slices in parallel codes every
+    /// frame as this many slices.
+    pub threads: u32,
+    /// Bits per second; 0 leaves the rate to the encoder's own rate control.
+    pub bit_rate: u32,
+}
 
-/// Threads one serving encoder session uses.
+/// The video encoder of every served container: libx264 at
+/// `preset=ultrafast` and `tune=zerolatency` (baseline CAVLC without B-frames)
+/// under its own rate control, with eight slice threads.
 ///
 /// Several ranks encode at once on one host, so a session must not size its
-/// thread pool to the machine. Eight threads encode a unit as fast as an
-/// unbounded pool at this preset, and the worker's bound on an encoded unit's
-/// bytes budgets one slice header per thread per frame, so it follows this
-/// value.
-pub const ENCODER_THREADS: u32 = 8;
+/// thread pool to the machine; eight threads encode a unit as fast as an
+/// unbounded pool at this preset. The thread count is part of the output
+/// format, since every frame is coded as one slice per thread, and the bound
+/// on an encoded unit's bytes ([`encoded_video_bytes`]) budgets one slice
+/// header per thread per frame.
+pub const VIDEO_ENCODER: Encoder = Encoder {
+    name: c"libx264",
+    options: c"preset=ultrafast:tune=zerolatency",
+    threads: 8,
+    bit_rate: 0,
+};
+
+/// The audio encoder of every served container: FFmpeg's AAC encoder with its
+/// fast coder at 144 kb/s. It codes on the calling thread; it has no slice
+/// threads.
+pub const AUDIO_ENCODER: Encoder = Encoder {
+    name: c"aac",
+    options: c"aac_coder=fast",
+    threads: 1,
+    bit_rate: 144_000,
+};
 
 /// Samples of one planar AAC frame.
 pub const AUDIO_FRAME_SAMPLES: usize = 1024;
@@ -50,14 +81,17 @@ impl Rgb24Frames<'_> {
     }
 }
 
-/// Verifies that the linked FFmpeg runtime provides the serving encoders.
+/// Verifies that the linked FFmpeg runtime provides [`VIDEO_ENCODER`] and
+/// [`AUDIO_ENCODER`] and opens both with their declared options, as the
+/// encodes open them.
 ///
 /// # Errors
 ///
-/// [`crate::Error::MissingCodec`] naming a serving encoder the runtime does
-/// not provide, [`crate::Error::Codec`] when a provided encoder cannot open.
+/// [`crate::Error::MissingCodec`] naming an encoder the runtime does not
+/// provide, [`crate::Error::Codec`] when a provided encoder cannot open or
+/// does not take one of its options.
 pub fn require_codecs() -> crate::Result<()> {
-    crate::ffi::require_codecs()
+    crate::ffi::require_codecs(&VIDEO_ENCODER, &AUDIO_ENCODER)
 }
 
 /// Encodes one media unit into a self-contained MP4 starting at a keyframe.
@@ -93,6 +127,7 @@ pub fn encode_video_unit(frames: Rgb24Frames<'_>, frame_rate: u32) -> crate::Res
     }
     let count = count as u32;
     crate::ffi::encode_video_unit(
+        &VIDEO_ENCODER,
         frames.pixels,
         count,
         frames.height,
@@ -101,7 +136,8 @@ pub fn encode_video_unit(frames: Rgb24Frames<'_>, frame_rate: u32) -> crate::Res
     )
 }
 
-/// Encodes interleaved int16 stereo PCM as a self-contained AAC MP4.
+/// Encodes interleaved int16 stereo PCM as a self-contained MP4 of
+/// [`AUDIO_ENCODER`].
 ///
 /// The track is truncated or zero-padded to `samples` (the video's duration at
 /// `rate`), encoded in planar frames of [`AUDIO_FRAME_SAMPLES`] samples, the
@@ -127,19 +163,19 @@ pub fn encode_audio_track(pcm: &[i16], samples: usize, rate: u32) -> crate::Resu
     // are silence, and captured samples past that duration are dropped.
     let available = pcm.len() / 2;
     if available >= samples {
-        crate::ffi::encode_audio_track(&pcm[..samples * 2], samples as u32, rate)
+        crate::ffi::encode_audio_track(&AUDIO_ENCODER, &pcm[..samples * 2], samples as u32, rate)
     } else {
         let mut padded = Vec::with_capacity(samples * 2);
         padded.extend_from_slice(pcm);
         padded.resize(samples * 2, 0);
-        crate::ffi::encode_audio_track(&padded, samples as u32, rate)
+        crate::ffi::encode_audio_track(&AUDIO_ENCODER, &padded, samples as u32, rate)
     }
 }
 
-/// An upper bound on the MP4 bytes of one media unit.
+/// An upper bound on the MP4 bytes of one media unit of [`VIDEO_ENCODER`].
 ///
-/// The serving encoder is libx264, yuv420p, `preset=ultrafast`,
-/// `tune=zerolatency`. That preset uses baseline CAVLC. A padded 16x16
+/// The encoder is libx264, yuv420p, `preset=ultrafast`, `tune=zerolatency`.
+/// That preset uses baseline CAVLC. A padded 16x16
 /// macroblock has at most 27 residual blocks (including the separate DC
 /// blocks), each with up to 16 coefficients. Baseline level codes occupy at
 /// most 28 bits; x264 re-encodes CAVLC overflows at a higher QP. Per-block
@@ -156,7 +192,8 @@ pub fn encoded_video_bytes(frames: u32, height: u32, width: u32) -> usize {
     let residual_bits: usize = 27 * (16 + 16 * 28 + 9 + 15 * 11);
     let macroblock_bytes = (residual_bits + 1536).div_ceil(8);
     let escaped_bytes = (3 * macroblock_bytes).div_ceil(2);
-    (1 << 16) + frames as usize * (blocks * escaped_bytes + 8 * 1024 + 64)
+    let slice_headers = VIDEO_ENCODER.threads as usize * 1024;
+    (1 << 16) + frames as usize * (blocks * escaped_bytes + slice_headers + 64)
 }
 
 /// Bytes of one `encoded_units` row: the length prefix and the largest

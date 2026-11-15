@@ -16,6 +16,9 @@ crossbeam-channel.workspace = true
 engine.workspace = true
 # The host's monotonic clock, which the buffer pool's task deadlines are stated in.
 libc.workspace = true
+# The FFmpeg libraries the engine links through the media crate; `build.rs` reads their
+# directories from its `links` metadata for the test executables' run path.
+media.workspace = true
 # The connections of a fake engine's request and process interfaces.
 service.workspace = true
 storage.workspace = true

@@ -14,40 +14,35 @@
 //! concurrently.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::Result;
 use crate::codec::{self, Rgb24Frames};
-use crate::config::MediaConfig;
 use crate::mux::MuxSession;
 use crate::read::{ConditionProducts, ConditionRead, DecodedVideo};
 
 /// The main process's media runner: encoders, muxers and readers.
 ///
-/// It holds the request MP4 assemblies under assembly and the configured
-/// reference-video executable. Every method blocks for its work's duration
-/// and is safe to call from several blocking-pool threads at once; calls for
-/// one request are the caller's to serialize.
+/// It holds the request MP4 assemblies under assembly. Every method blocks
+/// for its work's duration and is safe to call from several blocking-pool
+/// threads at once; calls for one request are the caller's to serialize.
+#[derive(Default)]
 pub struct MediaRunner {
-    config: MediaConfig,
     sessions: Mutex<BTreeMap<u64, Arc<Mutex<MuxSession>>>>,
 }
 
 impl MediaRunner {
-    /// A runner whose reference videos are decoded by `config.ffmpeg`.
-    pub fn new(config: MediaConfig) -> Self {
-        Self {
-            config,
-            sessions: Mutex::new(BTreeMap::new()),
-        }
+    /// A runner with no assembly open.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Verifies that the linked FFmpeg runtime provides the serving encoders.
+    /// Verifies that the linked FFmpeg runtime provides and opens the serving
+    /// encoders.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Codec`] naming the missing encoder.
+    /// The errors of [`codec::require_codecs`].
     pub fn require_codecs(&self) -> Result<()> {
         codec::require_codecs()
     }
@@ -170,7 +165,7 @@ impl MediaRunner {
         conditions: &[ConditionRead<'_>],
         products: &mut ConditionProducts<'_>,
     ) -> Result<Vec<Option<DecodedVideo>>> {
-        crate::read::read_conditions(Path::new(&self.config.ffmpeg), conditions, products)
+        crate::read::read_conditions(conditions, products)
     }
 
     /// The assembly of `request`, shared so that its own calls serialize while

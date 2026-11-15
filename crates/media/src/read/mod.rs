@@ -2,8 +2,9 @@
 //!
 //! The server fetches every condition's bytes and decides how each is prepared
 //! (its image or audio transform, or its video clip); the main process reads
-//! the bytes and calls these decoders with those values. They apply the reference conditioning's operations in its order, so
-//! their results equal the reference's own:
+//! the bytes and calls these decoders with those values. Each applies its
+//! conditioning's operations in their order, so its result is the result of
+//! the upstream libraries that define them:
 //!
 //! - [`read_image`]: decoding with the EXIF orientation applied and RGB
 //!   conversion (diffusers' `load_image`), then a LANCZOS resize and the
@@ -12,7 +13,8 @@
 //! - [`read_audio`]: decoding to planar float at the track's native rate and
 //!   channel layout, the transform's native samples kept, a mono track duplicated
 //!   to stereo, and one torchaudio resample to the model's rate.
-//! - [`read_video`]: one external FFmpeg pass over a reference video.
+//! - [`read_video`]: FFmpeg's decode, `fps`, `trim` and LANCZOS scale of a
+//!   reference video, through the linked libraries.
 //!
 //! Every function checks that it produced exactly the extent its transform or
 //! clip states and fails with [`crate::Error::Invalid`] otherwise, so media that decodes differently
@@ -29,11 +31,8 @@
 //! eight EXIF cases included.
 
 use std::borrow::Cow;
-use std::io::{Seek as _, SeekFrom};
 use std::ops::Range;
 use std::os::unix::fs::FileExt as _;
-use std::path::Path;
-use std::process::{Command, Stdio};
 
 use crate::ffi;
 use crate::{Error, Result};
@@ -99,8 +98,8 @@ pub struct DecodedVideo {
 pub enum ConditionSource<'a> {
     /// Encoded bytes of an image or of an audio container.
     Bytes(&'a [u8]),
-    /// An open, seekable file holding a reference video; the external `ffmpeg`
-    /// process reads it.
+    /// An open, seekable file holding a reference video, read without moving
+    /// its offset.
     File(&'a std::fs::File),
 }
 
@@ -350,89 +349,40 @@ pub fn read_audio(source: &[u8], transform: &AudioTransform, out: &mut [f32]) ->
     Ok(())
 }
 
-/// Decodes a reference video's kept frames with one FFmpeg pass.
+/// Decodes a reference video's kept frames through the linked FFmpeg
+/// libraries.
 ///
-/// The frames are resampled to the clip's frame rate, the start frames
-/// skipped, then scaled per frame with LANCZOS to the clip's canvas (the scale
-/// follows the trim, so it never sees a skipped frame). Writes
-/// `[clip.frames, height, width, 3]` uint8 RGB: every decoded frame, of which
-/// the first `vae_frames` fill the condition's pixel rows.
+/// The video's first stream that is not cover art is decoded, put upright by
+/// its display matrix, resampled to the clip's frame rate (FFmpeg's `fps`
+/// filter), its first `start_frame` resampled frames skipped, and each kept
+/// frame scaled with LANCZOS to the clip's canvas (the scale follows the trim,
+/// so it never sees a skipped frame) and converted to RGB24: the frames
+/// FFmpeg's command-line tool produces from the file with
+/// `-vf fps=R,trim=start_frame=S,scale=W:H:flags=lanczos,setsar=1 -pix_fmt rgb24`.
+/// Writes `[clip.frames, height, width, 3]` uint8 RGB: every decoded frame, of
+/// which the first `vae_frames` fill the condition's pixel rows. The file is
+/// read from its start without moving its offset.
 ///
 /// # Errors
 ///
-/// [`crate::Error::ReferenceVideo`] when the process exits in failure;
-/// [`crate::Error::Invalid`] when the clip's extent cannot be addressed or it
-/// decodes to another frame count; [`crate::Error::Io`] when the process
-/// cannot be started.
-pub fn read_video(
-    ffmpeg: &Path,
-    source: &std::fs::File,
-    clip: &VideoClip,
-    out: &mut [u8],
-) -> Result<()> {
-    let (width, height) = clip.canvas;
-    let (frame_bytes, expected) = clip_bytes(clip)?;
-    let filters = format!(
-        "fps={},trim=start_frame={},scale={width}:{height}:flags=lanczos,setsar=1",
-        clip.frame_rate, clip.start_frame
-    );
-    // The shared-memory object or file is a seekable file FFmpeg reads
-    // directly; it is the child's standard input, which the `fd:` demuxer
-    // reads without a pipe in between.
-    let mut input = source
-        .try_clone()
-        .map_err(|error| Error::io("opening a reference video", error))?;
-    // `fd:` reads from the current position; a fresh open (the reference's
-    // `/dev/shm/<name>`) starts at zero.
-    input
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| Error::io("positioning a reference video", error))?;
-    let process = Command::new(ffmpeg)
-        .args([
-            "-v",
-            "error",
-            "-i",
-            "fd:",
-            "-map",
-            "0:v:0",
-            "-an",
-            "-vf",
-            &filters,
-            "-frames:v",
-            &clip.frames.to_string(),
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
-        ])
-        .stdin(Stdio::from(input))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| Error::io(format!("starting {}", ffmpeg.display()), error))?;
-    let output = process
-        .wait_with_output()
-        .map_err(|error| Error::io("decoding a reference video", error))?;
-    if !output.status.success() {
-        return Err(Error::ReferenceVideo {
-            ffmpeg: ffmpeg.to_path_buf(),
-            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        });
-    }
-    if output.stdout.len() != expected {
-        return Err(Error::Invalid(format!(
-            "a reference video decoded to {} frames, its clip states {}",
-            output.stdout.len() / frame_bytes.max(1),
-            clip.frames
-        )));
-    }
+/// [`crate::Error::Invalid`] when the clip's extent cannot be addressed, `out`
+/// has another length, the video has no video stream or changes its frame
+/// size mid-stream, or it decodes to fewer frames than the clip states;
+/// [`crate::Error::Codec`] when the video cannot be demuxed or decoded.
+pub fn read_video(source: &std::fs::File, clip: &VideoClip, out: &mut [u8]) -> Result<()> {
+    let (_, expected) = clip_bytes(clip)?;
     if out.len() != expected {
         return Err(Error::Invalid(
             "a reference video's rows disagree with its clip".to_owned(),
         ));
     }
-    out.copy_from_slice(&output.stdout);
+    let decoded = ffi::decode_video(source, clip, out)?;
+    if decoded != clip.frames {
+        return Err(Error::Invalid(format!(
+            "a reference video decoded to {decoded} frames, its clip states {}",
+            clip.frames
+        )));
+    }
     Ok(())
 }
 
@@ -453,9 +403,8 @@ fn extents(condition: &ConditionRead<'_>) -> (usize, usize) {
 /// seekable file a reference video came from (which also carries its
 /// soundtrack).
 ///
-/// The file is read at offset zero without moving its offset: a reference
-/// video's FFmpeg process shares that file description, and its reading
-/// position must not move under it.
+/// The file is read from offset zero without moving its offset, which other
+/// holders of the same open file description may rely on.
 fn encoded_bytes<'a>(source: &'a ConditionSource<'_>) -> Result<Cow<'a, [u8]>> {
     match source {
         ConditionSource::Bytes(bytes) => Ok(Cow::Borrowed(bytes)),
@@ -519,7 +468,7 @@ fn rows_of<'a, T>(
 /// Decodes every condition into its rows of the products.
 ///
 /// Every condition decodes on a thread of its own, the conditions being independent: each reference
-/// video's FFmpeg decode, each image and each audio track. A video's first `vae_frames` frames fill
+/// video, each image and each audio track. A video's first `vae_frames` frames fill
 /// its pixel rows once they arrive; all `frames` frames are returned, because the vision packer
 /// reads the frames past the product.
 ///
@@ -529,7 +478,6 @@ fn rows_of<'a, T>(
 /// unfilled, decode to another extent, or a video's `vae_frames` exceeds its
 /// `frames`; the readers' own errors otherwise.
 pub fn read_conditions(
-    ffmpeg: &Path,
     conditions: &[ConditionRead<'_>],
     products: &mut ConditionProducts<'_>,
 ) -> Result<Vec<Option<DecodedVideo>>> {
@@ -630,8 +578,8 @@ pub fn read_conditions(
     }
 
     std::thread::scope(|scope| -> Result<Vec<Option<DecodedVideo>>> {
-        // Start every reference video first, so its FFmpeg pass runs beside
-        // the library's decoders.
+        // Start every reference video first: a video's decode is the longest,
+        // and it runs beside the image and audio decoders.
         let mut videos = Vec::with_capacity(conditions.len());
         for condition in conditions {
             if let Some(clip) = condition.video {
@@ -643,7 +591,7 @@ pub fn read_conditions(
                 let total = clip_bytes(&clip)?.1;
                 videos.push(Some(scope.spawn(move || {
                     let mut frames = vec![0u8; total];
-                    read_video(ffmpeg, file, &clip, &mut frames)?;
+                    read_video(file, &clip, &mut frames)?;
                     Ok(frames)
                 })));
             } else {

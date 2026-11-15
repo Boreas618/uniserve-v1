@@ -5,6 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+# The FFmpeg libraries the shim links; dependents read their directories as `DEP_FFMPEG_LIB`.
+links = "ffmpeg"
+
+[features]
+# Build the pinned FFmpeg 8.1.2 and libx264 from their release sources into the build's output
+# directory instead of finding FFmpeg 8.1 through pkg-config (the `vendored` module of `build.rs`).
+vendored = []
 
 [dependencies]
 image.workspace = true
@@ -13,6 +20,8 @@ tracing.workspace = true
 
 [build-dependencies]
 cc = "1.2"
+pkg-config = "0.3.33"
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

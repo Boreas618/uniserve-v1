@@ -10,13 +10,14 @@
 # executable, and exports the executable as `UNISERVE_BINARY`; when the environment names it, as a
 # host sharing another host's build does, it uses it and builds nothing. A deployment's main
 # processes run the engine package (`crates/engine`), which each test module's Build Server
-# installs and builds with cargo from the installed snapshot of the workspace: that build reads
-# `UNISERVE_FFMPEG_DIR` and `LIBCLANG_PATH` from this environment, and cargo keeps what it
-# compiled between runs. Each Build Server compiles kernels with its toolchain environment, whose
-# program `uniserve-build-server` must be on the search path. The serving processes open the
-# driver, NCCL and CUPTI from the host's default loader path and refuse a release older than the
-# one they require. The script sets the gate `UNISERVE_RUN_GPU_E2E=1` and runs pytest with one
-# worker per GPU (pytest-xdist); each case leases the GPUs it serves on
+# installs and builds with cargo from the installed snapshot of the workspace: that build finds
+# FFmpeg 8.1 through pkg-config (`crates/media/README.md`) and reads `LIBCLANG_PATH` from this
+# environment, and cargo keeps what it compiled between runs. Each Build Server compiles kernels
+# with its toolchain environment, whose program `uniserve-build-server` must be on the search
+# path. The serving processes open the driver, NCCL and CUPTI from the host's default loader path
+# and refuse a release older than the one they require. The script sets the gate
+# `UNISERVE_RUN_GPU_E2E=1` and runs pytest with one worker per GPU (pytest-xdist); each case
+# leases the GPUs it serves on
 # (`tests/python/e2e/conftest.py`). pytest's temporary directory, which holds every server's log,
 # and the JUnit report go to `artifacts/e2e/<UTC time>/` unless `UNISERVE_E2E_ARTIFACTS` names
 # another directory.
@@ -28,8 +29,8 @@
 #
 # Host facts come from the environment: the checkpoints and inputs the tests name
 # (docs/testing.md lists them; a case whose asset is unset is skipped, naming the variable),
-# `UNISERVE_FFMPEG_DIR` for the build, `UNISERVE_E2E_DEVICES` to restrict the GPUs, and
-# `UNISERVE_E2E_WORKERS` for another worker count. `PYTHON` and `CARGO` name the interpreter
+# `UNISERVE_E2E_DEVICES` to restrict the GPUs, and `UNISERVE_E2E_WORKERS` for another worker
+# count. `PYTHON` and `CARGO` name the interpreter
 # command and cargo, as in the justfile; `MAX_JOBS` caps the Build Server's kernel compilations
 # (16 when unset).
 set -euo pipefail
