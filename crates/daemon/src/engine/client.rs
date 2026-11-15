@@ -166,9 +166,7 @@ struct Shared {
     requests: Mutex<HashMap<RequestId, Pending>>,
     state: watch::Sender<EngineState>,
     next_id: AtomicU64,
-    /// The hooks and configure commands awaiting their response, by
-    /// identity: a hook's response is each worker's result, a configure's
-    /// none.
+    /// The engine commands awaiting their answer, by identity.
     responses: Mutex<HashMap<u64, Responder>>,
     /// The epoch the engine executes, which its statistics are recorded
     /// under; 0 for an engine this daemon did not start.
@@ -180,7 +178,7 @@ struct Shared {
 type Responder = oneshot::Sender<Result<Response, String>>;
 
 /// What the engine responded to a command with: the reports of an `Operated` answer, `None` for
-/// a command that reports nothing and for a `Configured` answer.
+/// a command that reports nothing.
 type Response = Option<wire::operated::Reports>;
 
 impl Shared {
@@ -1166,22 +1164,13 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                     });
                 }
             }
-            Some(from_engine::Kind::Configured(configured)) => {
-                if let Some(responder) = lock(&shared.responses).remove(&configured.id) {
-                    let _ = responder.send(if configured.error.is_empty() {
-                        Ok(None)
-                    } else {
-                        Err(configured.error)
-                    });
-                }
-            }
             None => {}
         }
     }
     if !matches!(*shared.state.borrow(), EngineState::Failed(_)) {
         shared.state.send_replace(EngineState::Stopped);
     }
-    // A hook or configure the lost engine did not respond to fails.
+    // A command the lost engine did not answer fails.
     lock(&shared.responses).clear();
     // Every request still in flight leaves with the lost engine as
     // migratable: the daemon submits one that resumes from its generated

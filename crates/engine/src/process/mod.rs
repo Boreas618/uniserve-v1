@@ -48,7 +48,7 @@ mod requests;
 mod start;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -59,13 +59,13 @@ use crate::process::binding::WeightsUpdated;
 use crate::worker::watchdog::Watchdog;
 use anyhow::{Context as _, Result, bail};
 use crossbeam_channel::{Receiver, Select, Sender};
-use proto::config::{EngineArgs, EngineConfig, SchedulerConfig};
+use proto::config::EngineArgs;
 use proto::module::{ModuleSlot, Packages};
 use proto::process::command;
 use proto::request::wire::{self, engine_command, from_engine};
 use proto::request::{ArtifactMedia, RequestId};
 use scheduling::Parameters;
-use scheduling::limits::Limits;
+
 use scheduling::view::Snapshot;
 use service::Connection;
 
@@ -1417,21 +1417,6 @@ impl MainProcess {
                     })
                 }));
             }
-            Kind::Configure(configure) => {
-                let id = configure.id;
-                let (Some(engine), Some(scheduling)) = (self.engine.as_ref(), configure.scheduling)
-                else {
-                    let error = "the engine is starting, or the command states no limits";
-                    return self.configured(front, id, Err(anyhow::anyhow!(error)));
-                };
-                let schedulers = engine.inboxes();
-                let limits =
-                    scheduling_limits(&self.launch.engine_config, &engine.ceilings, &scheduling);
-                self.work(Box::new(move || {
-                    let configured = operations::configure(&schedulers, &limits);
-                    done(move |main| main.configured(front, id, configured))
-                }));
-            }
         }
     }
 
@@ -1625,19 +1610,6 @@ impl MainProcess {
         };
         self.send(front, from_engine::Kind::Operated(operated), None);
     }
-
-    /// Answers the `Configure` `id` of front `front`.
-    fn configured(&mut self, front: usize, id: u64, configured: Result<()>) {
-        let error = configured
-            .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_default();
-        self.send(
-            front,
-            from_engine::Kind::Configured(wire::Configured { id, error }),
-            None,
-        );
-    }
 }
 
 /// Why an operation is refused while the engine starts.
@@ -1733,36 +1705,4 @@ fn device_bytes(devices: &[wire::DeviceBytes]) -> Result<BTreeMap<[u8; 16], u64>
             Ok((gpu, device.bytes))
         })
         .collect()
-}
-
-/// The scheduling limits a `Configure` states (`Scheduling`), each one it leaves out the epoch's
-/// configuration `config` resolves: the batch, the running requests and the prefill chunk the
-/// configuration states, the token budget it states or else the one the workers' captures under
-/// `ceilings` bound a step to (`start::step_budget`), and an unbounded waiting queue. A
-/// reconfigure carries no graph catalog.
-fn scheduling_limits(
-    config: &EngineConfig,
-    ceilings: &Limits,
-    scheduling: &wire::Scheduling,
-) -> SchedulerConfig {
-    let max_batch = match scheduling.max_batch {
-        0 => config.scheduler.max_batch.get(),
-        batch => batch as usize,
-    };
-    let tokens = scheduling.max_num_batched_tokens.map_or_else(
-        || start::step_budget(config, ceilings),
-        |tokens| tokens as usize,
-    );
-
-    let mut limits = SchedulerConfig::of(config, max_batch, tokens, Vec::new());
-    if scheduling.max_running_requests > 0 {
-        limits.max_running_requests = scheduling.max_running_requests as usize;
-    }
-    limits.max_queued_requests = scheduling
-        .max_queued_requests
-        .and_then(|requests| NonZeroUsize::new(usize::try_from(requests).unwrap_or(usize::MAX)));
-    if let Some(chunk) = scheduling.chunked_prefill_size {
-        limits.chunked_prefill_size = NonZeroUsize::new(chunk as usize);
-    }
-    limits
 }

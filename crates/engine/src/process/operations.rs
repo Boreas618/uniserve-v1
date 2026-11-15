@@ -33,7 +33,7 @@ use crate::executor::peers::messages::{DataOperation, FencesSwitched, RankOperat
 use crate::process::binding::{Replacement, WeightsUpdated};
 use anyhow::{Context as _, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender};
-use proto::config::SchedulerConfig;
+
 use proto::request::wire::WeightsInFlight;
 use service::lock;
 use storage::Key;
@@ -695,20 +695,6 @@ fn switch_fences(enabled: bool, off: &[String]) -> Result<FencesSwitched> {
         enabled,
         off: switched.unwrap_or_default(),
     })
-}
-
-/// Applies `config`'s scheduling limits in place on every scheduler (`Configure`,
-/// `specs/updates.md` §1): each takes them from its next step on, or refuses a limit above what
-/// its workers were started for and keeps its own.
-///
-/// # Errors
-///
-/// A scheduler that stopped or refused.
-pub(crate) fn configure(schedulers: &[Sender<Message>], config: &SchedulerConfig) -> Result<()> {
-    let configured = ask(schedulers, |reply| {
-        Message::Configure(config.clone(), reply)
-    })?;
-    every(configured, "the scheduling limits")
 }
 
 #[cfg(test)]
