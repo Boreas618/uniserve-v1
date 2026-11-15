@@ -151,9 +151,6 @@ pub struct MoE {
     /// `[experts]` U32: the slot of each expert, by which the top-k writes each route's weight
     /// row.
     map: Tensor,
-    /// A router's per-expert scale, multiplied into the route weights. No served checkpoint
-    /// states one, so [`MoE::load`] reads none.
-    scale: Option<Tensor>,
     /// Experts the router selects over.
     count: u32,
     top: u32,
@@ -300,7 +297,6 @@ impl MoE {
             router,
             experts: stacks,
             map,
-            scale: None,
             count: experts,
             top,
             intermediate,
@@ -617,7 +613,7 @@ impl MoE {
             &self.router.forward(x)?,
             self.top,
             self.renormalize,
-            self.scale.as_ref(),
+            None,
             Some(&self.map),
         )
     }
