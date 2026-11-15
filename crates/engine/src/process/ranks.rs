@@ -721,9 +721,10 @@ fn load_rank(
         .finish()
         .context("publishing the granules of the epoch's packed weights")?;
 
-    // Steps 11-15: the division of the GPU's quota into the pools, the request slots and the
-    // cache's units; on a rank that encodes images, also its vision runner's region, its region
-    // of encoder outputs and its causal runner's feature buffer.
+    // Steps 11-15: the division of the GPU's quota into the pools, the expert transport of a union
+    // member as its package states it, the request slots and the cache's units; on a rank that
+    // encodes images, also its vision runner's region, its region of encoder outputs and its
+    // causal runner's feature buffer.
     let (graph, scratch) = model_runner.pools(
         device,
         (&meta_config, service::lock(&meta_cache).config()),
@@ -735,6 +736,8 @@ fn load_rank(
         let features = CausalLmRunner::image_bytes(&meta_config, model.as_ref())?;
         regions.push(("image features", features));
     }
+    let transport = model_runner.transport_bytes(device, model.as_ref(), &kernels)?;
+    regions.push(("expert transport", transport));
     let (slots, (units, first), states) =
         model_runner.divide(&client, device, &host, model.as_ref(), &layout, &regions)?;
 

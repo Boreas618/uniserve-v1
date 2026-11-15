@@ -23,6 +23,7 @@ suspend = "uniserve_expert_exchange_suspend"
 restore = "uniserve_expert_exchange_restore"
 release = "uniserve_expert_exchange_release"
 info = "uniserve_expert_exchange_info"
+footprint = "uniserve_expert_exchange_footprint"
 
 [source]
 kind = "cuda"

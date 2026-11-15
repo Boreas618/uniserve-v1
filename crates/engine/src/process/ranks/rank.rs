@@ -644,25 +644,18 @@ impl ModelRunner {
         if self.union.is_none() {
             return Ok(None);
         }
-        let (shape, encoded) = self.transport_shape(device, model)?;
-        // An encoded block runs in the exchange's one fused launch.
-        let mode = if encoded {
-            ops::moe::exchange::Mode::Fused
-        } else {
-            ops::moe::exchange::Mode::Dispatch
-        };
+        let (shape, mode) = self.transport_shape(device, model)?;
         let beside = self.engine_config().moe.beside_rows.get();
         Ok(Some(Member::new(group, shape, mode, join, beside)?))
     }
 
-    /// The shape of the transport a member of an expert union creates on `device`.
-    ///
-    /// Returns the shape and whether the experts are read packed.
+    /// The shape of the transport a member of an expert union creates on `device`, and the mode
+    /// of the module that creates it: an encoded block runs in the exchange's one fused launch.
     fn transport_shape(
         &self,
         device: DeviceId,
         model: &dyn TextModel,
-    ) -> Result<(ops::moe::exchange::TransportShape, bool)> {
+    ) -> Result<(ops::moe::exchange::TransportShape, ops::moe::exchange::Mode)> {
         let experts = model
             .experts()
             .context("an expert union exchanges routed experts, and this model has none")?;
@@ -681,16 +674,31 @@ impl ModelRunner {
                 .context("reading the multiprocessors the exchange is compiled for")?,
             attention_ranks: self.mapping.attention_ranks,
         };
-        Ok((shape, experts.encoded))
+        let mode = if experts.encoded {
+            ops::moe::exchange::Mode::Fused
+        } else {
+            ops::moe::exchange::Mode::Dispatch
+        };
+        Ok((shape, mode))
     }
 
-    /// What this rank's expert transport takes of its device, for the division.
-    fn transport_bytes(&self, device: DeviceId, model: &dyn TextModel) -> Result<u64> {
+    /// What this rank's expert transport takes of its device, for the division: what the
+    /// exchange package of `kernels` states for the transport's shape.
+    pub(crate) fn transport_bytes(
+        &self,
+        device: DeviceId,
+        model: &dyn TextModel,
+        kernels: &ops::Generation,
+    ) -> Result<u64> {
         if self.union.is_none() {
             return Ok(0);
         }
-        let (shape, encoded) = self.transport_shape(device, model)?;
-        Ok(shape.device_bytes(encoded))
+        let (shape, mode) = self.transport_shape(device, model)?;
+        let kernel = kernels
+            .op::<ops::moe::ExpertExchange>(&shape.descriptor(mode))
+            .context("the expert exchange's kernel")?;
+        ops::moe::exchange::Transport::footprint(kernel, &shape)
+            .context("the expert transport's footprint")
     }
 
     /// The expert union this rank is a member of: its members and this rank's place among them;

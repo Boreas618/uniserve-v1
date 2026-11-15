@@ -15,8 +15,9 @@
 //! an execution resource, so the worker creates it through the package's own lifecycle entries
 //! ([`Transport`]), keeps it across a standby's suspend and restore, and sets its borrowed handle
 //! ([`ExchangeTransport`]) on the execution context of the forwards that exchange; the context
-//! states it in each launch, so a model never holds it. `ops` launches over a handle and never
-//! sizes one.
+//! states it in each launch, so a model never holds it. Before the transport exists, the package
+//! states what it will take of the device ([`Transport::footprint`]), which the worker divides the
+//! device's memory with. `ops` launches over a handle and never sizes one.
 //!
 //! # The step's capacity
 //!
@@ -379,44 +380,24 @@ impl TransportShape {
         }
     }
 
-    /// What a fused backend holds beside its rows: its counters and its window's granule.
-    const FUSED_FIXED_BYTES: u64 = 64 << 20;
-    /// What any other backend holds beside its rows. A device communicator takes this: creating
-    /// deepep's took about 1.6 GB of the device with 32 MB of rows, and alltoall takes none of it,
-    /// but the process learns which backend it runs only when the epoch's programs arrive.
-    const FIXED_BYTES: u64 = 2 << 30;
-
-    /// The device bytes a rank's transport holds at most, for the capacity sizing.
-    ///
-    /// The sizing fits the cache before the process holds a program, so this cannot ask a package:
-    /// it is a bound the worker compares with what the transport took when it is created. A
-    /// backend whose experts run in the exchange (`fused`) holds its staged rows; any other holds
-    /// the rows received and computed beside a window of the rows in flight.
-    #[must_use]
-    pub fn device_bytes(&self, fused: bool) -> u64 {
-        let ranks = u64::from(self.ranks);
-        let tokens = u64::from(self.max_tokens);
-        let hidden = u64::from(self.hidden);
-        let top = u64::from(self.top);
-        let rows = ranks * tokens;
-        if fused {
-            // Every route of every rank may land here, with a tile of padding per local expert.
-            // The kernel stages each one encoded, gated, and as a row of the combine's wire type.
-            let local = u64::from(self.experts)
-                / u64::from(self.ranks.saturating_sub(self.attention_ranks).max(1));
-            let pool = rows * top + local * 64;
-            let staged = pool * (3 * hidden + u64::from(self.intermediate));
-            // Each route's partial row comes back in the shared window with its scales, and the
-            // rows this rank sends sit beside them, encoded.
-            let shared = tokens * top * hidden * 9 / 4;
-            let sent = tokens * (hidden / 2 + hidden / 16 + top * 12);
-            staged + shared + sent + Self::FUSED_FIXED_BYTES
-        } else {
-            let element = abi::bytes(self.dtype).unwrap_or(2);
-            let received = rows * (2 * hidden * element + top * 24);
-            let window = (rows + ranks) * (hidden * element + 256);
-            received + window + Self::FIXED_BYTES
-        }
+    /// The lifecycle call of a transport of this shape, before it exists, over `group`.
+    fn lifecycle(&self, group: *const HostGroup) -> Result<Lifecycle> {
+        Ok(Lifecycle {
+            transport: std::ptr::null_mut(),
+            group,
+            ranks: i64::from(self.ranks),
+            rank: i64::from(self.rank),
+            experts: i64::from(self.experts),
+            hidden: i64::from(self.hidden),
+            max_tokens: i64::from(self.max_tokens),
+            top: i64::from(self.top),
+            dtype: abi::code(self.dtype)?,
+            device: i64::from(self.device),
+            intermediate: i64::from(self.intermediate),
+            capacity: 0,
+            attention_ranks: i64::from(self.attention_ranks),
+            error: [0; 512],
+        })
     }
 }
 
@@ -481,6 +462,7 @@ const _: () = assert!(std::mem::offset_of!(Info, error) == INFO_LAYOUT.error);
 
 type LifecycleEntry = unsafe extern "C" fn(*mut Lifecycle, *mut c_void) -> i32;
 type InfoEntry = unsafe extern "C" fn(*mut Info, *mut c_void) -> i32;
+type FootprintEntry = unsafe extern "C" fn(*mut Lifecycle, *mut i64) -> i32;
 
 impl TransportShape {
     /// The element type and extents of each region a transport of this shape lays out, in the
@@ -560,22 +542,7 @@ impl Transport {
                 kernel.native_symbol::<InfoEntry>("uniserve_expert_exchange_info")?,
             )
         };
-        let mut call = Lifecycle {
-            transport: std::ptr::null_mut(),
-            group,
-            ranks: i64::from(shape.ranks),
-            rank: i64::from(shape.rank),
-            experts: i64::from(shape.experts),
-            hidden: i64::from(shape.hidden),
-            max_tokens: i64::from(shape.max_tokens),
-            top: i64::from(shape.top),
-            dtype: abi::code(shape.dtype)?,
-            device: i64::from(shape.device),
-            intermediate: i64::from(shape.intermediate),
-            capacity: 0,
-            attention_ranks: i64::from(shape.attention_ranks),
-            error: [0; 512],
-        };
+        let mut call = shape.lifecycle(group)?;
         let handle = stream.raw() as *mut std::ffi::c_void;
         // The entry allocates the transport's device memory and exchanges its handles on the
         // device the calling thread holds current, as the CUDA runtime it calls reads it
@@ -595,6 +562,34 @@ impl Transport {
             step,
             info,
             shape,
+        })
+    }
+
+    /// The device bytes a transport of `shape` takes once `kernel`'s package creates it, as the
+    /// package states them: what a rank divides its device's memory with before the transport
+    /// exists. `kernel` is the module of the shape's descriptor in the mode that creates the
+    /// transport ([`TransportShape::descriptor`]).
+    ///
+    /// The entry issues no device work and reaches no peer, so it runs on any thread.
+    ///
+    /// # Errors
+    ///
+    /// A module that exports no footprint entry, the package's refusal of the shape, or a
+    /// negative statement.
+    pub fn footprint(kernel: &Kernel, shape: &TransportShape) -> Result<u64> {
+        // SAFETY: the symbol is the package's entry of the signature the header declares for it.
+        let footprint = unsafe {
+            kernel.native_symbol::<FootprintEntry>("uniserve_expert_exchange_footprint")?
+        };
+        let mut call = shape.lifecycle(std::ptr::null())?;
+        let mut bytes = 0_i64;
+        // SAFETY: `call` has the layout the header declares, and the entry writes one `i64`.
+        let status = unsafe { footprint(&mut call, &mut bytes) };
+        check(status, "footprint", &call.error)?;
+        u64::try_from(bytes).map_err(|_| Error::Native {
+            entry: "uniserve_expert_exchange_footprint".to_owned(),
+            status,
+            message: Some(format!("the package stated {bytes} bytes")),
         })
     }
 
@@ -829,23 +824,6 @@ mod tests {
     /// The multiprocessors of the device the tests' descriptors state.
     const MULTIPROCESSORS: u32 = 148;
 
-    /// A shape of the deployment the bound was measured on.
-    fn measured(max_tokens: u32, ranks: u32, attention_ranks: u32) -> TransportShape {
-        TransportShape {
-            ranks,
-            rank: 0,
-            experts: 128,
-            hidden: 2048,
-            intermediate: 768,
-            max_tokens,
-            top: 8,
-            dtype: DType::BF16,
-            device: 0,
-            multiprocessors: MULTIPROCESSORS,
-            attention_ranks,
-        }
-    }
-
     /// A dispatch whose views meet its descriptor passes `check` before any transport exists, as
     /// a profile run calls it; the transport is required only by a launch.
     #[test]
@@ -881,27 +859,6 @@ mod tests {
         // The argument rules still hold without a transport: a group of another size is refused.
         let other = ExchangeArgs { ranks: 4, ..args };
         assert!(ExpertExchange::check(&descriptor, &other).is_err());
-    }
-
-    #[test]
-    fn the_transport_bound_holds_what_the_backends_were_measured_to_take() {
-        // The fused kernel's local and shared workspaces as it states them, by rows and ranks.
-        for (tokens, ranks, local, shared) in [
-            (128, 2, 10_877_312_u64, 4_720_256_u64),
-            (512, 2, 71_539_712, 18_876_032),
-            (4096, 2, 405_283_200, 150_996_608),
-            (16384, 2, 1_549_547_904, 603_981_440),
-            (512, 8, 196_771_328, 18_875_648),
-            (16384, 8, 6_108_804_608, 603_981_056),
-        ] {
-            let bound = measured(tokens, ranks, 0).device_bytes(true);
-            assert!(
-                bound >= local + shared,
-                "{tokens} rows of {ranks} ranks: {bound}"
-            );
-        }
-        // Creating deepep's transport took 1.65 GB of the device at 512 rows over three ranks.
-        assert!(measured(512, 3, 1).device_bytes(false) >= 1_654_652_928);
     }
 
     use super::*;

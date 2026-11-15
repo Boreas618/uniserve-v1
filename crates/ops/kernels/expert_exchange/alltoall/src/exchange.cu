@@ -175,6 +175,19 @@ CUmemAllocationProp allocation_prop(int device, CUmemAllocationHandleType kind) 
   return prop;
 }
 
+/// The bytes of one rank's window over a workspace of `bytes` on `device`: whole recommended
+/// allocation granules of the fabric storage the window is created as, which are also the
+/// alignment of the addresses the windows are mapped at.
+CUresult window_bytes(int64_t device, size_t bytes, size_t* window, size_t* granularity) {
+  CUmemAllocationProp prop = allocation_prop(static_cast<int>(device), CU_MEM_HANDLE_TYPE_FABRIC);
+  const CUresult status =
+      cuMemGetAllocationGranularity(granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED);
+  if (status == CUDA_SUCCESS) {
+    *window = aligned(bytes, *granularity);
+  }
+  return status;
+}
+
 /// A shareable handle as it crosses the group, whichever kind it is.
 struct Shared {
   unsigned char bytes[64];
@@ -191,14 +204,12 @@ int32_t map_storage(Transport& transport, const UniserveGroup* group, char* erro
   CUresult status = CUDA_SUCCESS;
 
   size_t granularity = 0;
-  CUmemAllocationProp prop = allocation_prop(static_cast<int>(transport.device),
-                                             CU_MEM_HANDLE_TYPE_FABRIC);
-  status = cuMemGetAllocationGranularity(&granularity, &prop,
-                                         CU_MEM_ALLOC_GRANULARITY_RECOMMENDED);
+  status = window_bytes(transport.device, transport.layout.bytes, &transport.window, &granularity);
   if (status != CUDA_SUCCESS) {
     return driver_refusal(error, "cuMemGetAllocationGranularity", status);
   }
-  transport.window = aligned(transport.layout.bytes, granularity);
+  CUmemAllocationProp prop = allocation_prop(static_cast<int>(transport.device),
+                                             CU_MEM_HANDLE_TYPE_FABRIC);
 
   // Fabric first; a driver or a container without it answers at the allocation.
   CUmemAllocationHandleType kind = CU_MEM_HANDLE_TYPE_FABRIC;
@@ -609,15 +620,8 @@ int blocks_of(int64_t rows) {
   return static_cast<int>(rows < kMaxBlocks ? rows : kMaxBlocks);
 }
 
-}  // namespace
-
-extern "C" int32_t uniserve_expert_exchange_create(uniserve_exchange_lifecycle* call,
-                                                   void* stream) {
-  (void)stream;
-  if (call == nullptr) {
-    return 1;
-  }
-  call->transport = nullptr;
+/// Refuses a lifecycle call whose shape the transport cannot hold; zero for one it can.
+int32_t check_shape(uniserve_exchange_lifecycle* call) {
   const int64_t row = row_bytes(call->dtype, call->hidden);
   if (row <= 0 || row % 16 != 0 || call->hidden <= 0 || call->top <= 0 || call->max_tokens <= 0) {
     return refuse(call->error,
@@ -630,6 +634,22 @@ extern "C" int32_t uniserve_expert_exchange_create(uniserve_exchange_lifecycle* 
                   "expert_exchange serves at most 64 ranks and 32 routes per token, over a "
                   "vocabulary the ranks divide evenly");
   }
+  return 0;
+}
+
+}  // namespace
+
+extern "C" int32_t uniserve_expert_exchange_create(uniserve_exchange_lifecycle* call,
+                                                   void* stream) {
+  (void)stream;
+  if (call == nullptr) {
+    return 1;
+  }
+  call->transport = nullptr;
+  if (check_shape(call) != 0) {
+    return 1;
+  }
+  const int64_t row = row_bytes(call->dtype, call->hidden);
   if (call->group == nullptr) {
     return refuse(call->error, "expert_exchange's create needs the group's channel");
   }
@@ -657,6 +677,24 @@ extern "C" int32_t uniserve_expert_exchange_create(uniserve_exchange_lifecycle* 
     return mapped;
   }
   call->transport = transport;
+  return 0;
+}
+
+extern "C" int32_t uniserve_expert_exchange_footprint(uniserve_exchange_lifecycle* call,
+                                                      int64_t* bytes) {
+  if (call == nullptr || bytes == nullptr || check_shape(call) != 0) {
+    return 1;
+  }
+  // A rank creates its own window alone: it maps its peers' windows, which they create.
+  const Layout layout =
+      layout_of(call->ranks, call->max_tokens, row_bytes(call->dtype, call->hidden), call->top);
+  size_t window = 0;
+  size_t granularity = 0;
+  const CUresult status = window_bytes(call->device, layout.bytes, &window, &granularity);
+  if (status != CUDA_SUCCESS) {
+    return driver_refusal(call->error, "cuMemGetAllocationGranularity", status);
+  }
+  *bytes = static_cast<int64_t>(window);
   return 0;
 }
 

@@ -37,6 +37,7 @@
 #include <nccl_device.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -182,6 +183,44 @@ int64_t buffer_bytes() {
   return std::max<int64_t>(dispatch_recv.get_num_bytes(), combine_recv.get_num_bytes());
 }
 
+/// The bytes of this rank's window in the NCCL symmetric allocation: DeepEP's workspace, then
+/// its buffer, in whole 16-byte vectors.
+size_t window_bytes() {
+  const size_t workspace_bytes = layout::WorkspaceLayout::get_num_bytes();
+  return (workspace_bytes + static_cast<size_t>(buffer_bytes()) + 15) / 16 * 16;
+}
+
+/// One device allocation of a transport beside its window: the field it fills and its bytes.
+struct Allocation {
+  void** where;
+  size_t bytes;
+};
+
+/// The device allocations of `transport` beside its window, sized once for the largest step.
+std::array<Allocation, 11> allocations(Transport& transport) {
+  constexpr size_t rows = kReceived;
+  return {{
+      {reinterpret_cast<void**>(&transport.routes), sizeof(topk_idx_t) * kMaxTokens * kTop},
+      {reinterpret_cast<void**>(&transport.received), sizeof(topk_idx_t) * rows * kTop},
+      {reinterpret_cast<void**>(&transport.slots), sizeof(int) * kMaxTokens * kTop},
+      {reinterpret_cast<void**>(&transport.rank_sums), sizeof(int) * kRanks},
+      {reinterpret_cast<void**>(&transport.expert_sums), sizeof(int) * (kLocalExperts + 1)},
+      {reinterpret_cast<void**>(&transport.metadata), sizeof(int) * rows * (kTop + 2)},
+      {&transport.states, rows * kHiddenBytes},
+      {reinterpret_cast<void**>(&transport.ids), sizeof(int32_t) * rows * kTop},
+      {reinterpret_cast<void**>(&transport.weights), sizeof(float) * rows * kTop},
+      {&transport.combined, rows * kHiddenBytes},
+      {reinterpret_cast<void**>(&transport.live), sizeof(int32_t)},
+  }};
+}
+
+/// What creating the transport takes of the device beyond its window and its allocations: NCCL's
+/// communicator and device communicator, and NCCL's rounding of the window to its allocation
+/// granule. NCCL sizes them itself, from its configuration and the topology it finds, so this is
+/// a measured bound: creating the transport over three ranks at 512 rows took 1.65 GB of the
+/// device with NCCL 2.30.4, of which 32 MB were the window and the allocations.
+constexpr int64_t kCommunicatorBytes = 2ll << 30;
+
 /// Launches `kernel` with DeepEP's launch attributes.
 template <typename Kernel, typename... Arguments>
 cudaError_t launch(Kernel kernel, int blocks, int threads, int shared, int cluster,
@@ -283,13 +322,11 @@ int32_t open(Transport& transport, const uniserve_exchange_lifecycle* call, char
                   "span several");
   }
   const size_t workspace_bytes = layout::WorkspaceLayout::get_num_bytes();
-  const size_t window_bytes =
-      (workspace_bytes + static_cast<size_t>(buffer_bytes()) + 15) / 16 * 16;
-  status = ncclMemAlloc(&transport.raw_window, window_bytes);
+  status = ncclMemAlloc(&transport.raw_window, window_bytes());
   if (status != ncclSuccess) {
     return nccl_refusal(error, "ncclMemAlloc", status);
   }
-  status = ncclCommWindowRegister(transport.comm, transport.raw_window, window_bytes,
+  status = ncclCommWindowRegister(transport.comm, transport.raw_window, window_bytes(),
                                   &transport.window, NCCL_WIN_DEFAULT);
   if (status != ncclSuccess) {
     return nccl_refusal(error, "ncclCommWindowRegister", status);
@@ -312,25 +349,7 @@ int32_t open(Transport& transport, const uniserve_exchange_lifecycle* call, char
   }
   std::memset(transport.host_workspace, 0, workspace_bytes);
 
-  struct Allocation {
-    void** where;
-    size_t bytes;
-  };
-  const size_t rows = kReceived;
-  const Allocation allocations[] = {
-      {reinterpret_cast<void**>(&transport.routes), sizeof(topk_idx_t) * kMaxTokens * kTop},
-      {reinterpret_cast<void**>(&transport.received), sizeof(topk_idx_t) * rows * kTop},
-      {reinterpret_cast<void**>(&transport.slots), sizeof(int) * kMaxTokens * kTop},
-      {reinterpret_cast<void**>(&transport.rank_sums), sizeof(int) * kRanks},
-      {reinterpret_cast<void**>(&transport.expert_sums), sizeof(int) * (kLocalExperts + 1)},
-      {reinterpret_cast<void**>(&transport.metadata), sizeof(int) * rows * (kTop + 2)},
-      {&transport.states, rows * kHiddenBytes},
-      {reinterpret_cast<void**>(&transport.ids), sizeof(int32_t) * rows * kTop},
-      {reinterpret_cast<void**>(&transport.weights), sizeof(float) * rows * kTop},
-      {&transport.combined, rows * kHiddenBytes},
-      {reinterpret_cast<void**>(&transport.live), sizeof(int32_t)},
-  };
-  for (const Allocation& allocation : allocations) {
+  for (const Allocation& allocation : allocations(transport)) {
     cuda = cudaMalloc(allocation.where, allocation.bytes);
     if (cuda != cudaSuccess) {
       return cuda_refusal(error, "the transport's storage", cuda);
@@ -359,6 +378,18 @@ int32_t open(Transport& transport, const uniserve_exchange_lifecycle* call, char
   return 0;
 }
 
+/// Refuses a lifecycle call of another group or shape than the module's; zero for its own.
+int32_t check_shape(uniserve_exchange_lifecycle* call) {
+  if (call->ranks != kRanks || call->attention_ranks != kAttentionRanks ||
+      call->hidden != kHidden || call->top != kTop || call->experts != kExperts ||
+      call->max_tokens != kMaxTokens || call->dtype != UNISERVE_DTYPE_BF16) {
+    return refuse(call->error,
+                  "expert_exchange's deepep module was compiled for another group or another "
+                  "shape: its descriptor fixes them");
+  }
+  return 0;
+}
+
 }  // namespace
 
 extern "C" int32_t uniserve_expert_exchange_create(uniserve_exchange_lifecycle* call,
@@ -371,12 +402,8 @@ extern "C" int32_t uniserve_expert_exchange_create(uniserve_exchange_lifecycle* 
   if (call->group == nullptr) {
     return refuse(call->error, "expert_exchange's create needs the group's channel");
   }
-  if (call->ranks != kRanks || call->attention_ranks != kAttentionRanks ||
-      call->hidden != kHidden || call->top != kTop || call->experts != kExperts ||
-      call->max_tokens != kMaxTokens || call->dtype != UNISERVE_DTYPE_BF16) {
-    return refuse(call->error,
-                  "expert_exchange's deepep module was compiled for another group or another "
-                  "shape: its descriptor fixes them");
+  if (check_shape(call) != 0) {
+    return 1;
   }
   auto* transport = static_cast<Transport*>(std::calloc(1, sizeof(Transport)));
   if (transport == nullptr) {
@@ -390,6 +417,21 @@ extern "C" int32_t uniserve_expert_exchange_create(uniserve_exchange_lifecycle* 
     return opened;
   }
   call->transport = transport;
+  return 0;
+}
+
+extern "C" int32_t uniserve_expert_exchange_footprint(uniserve_exchange_lifecycle* call,
+                                                      int64_t* bytes) {
+  if (call == nullptr || bytes == nullptr || check_shape(call) != 0) {
+    return 1;
+  }
+  // The sizes of the allocations do not depend on the record they fill.
+  Transport sized{};
+  size_t allocated = window_bytes();
+  for (const Allocation& allocation : allocations(sized)) {
+    allocated += allocation.bytes;
+  }
+  *bytes = static_cast<int64_t>(allocated) + kCommunicatorBytes;
   return 0;
 }
 

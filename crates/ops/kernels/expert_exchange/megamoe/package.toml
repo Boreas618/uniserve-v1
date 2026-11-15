@@ -35,6 +35,7 @@ suspend = "uniserve_expert_exchange_suspend"
 restore = "uniserve_expert_exchange_restore"
 release = "uniserve_expert_exchange_release"
 info = "uniserve_expert_exchange_info"
+footprint = "uniserve_expert_exchange_footprint"
 
 # `src/build.py` is the whole compilation (`compile(request)`), not a `spec` the
 # shared CuTe DSL driver compiles, so the source kind is `cuda`; `[toolchain]`

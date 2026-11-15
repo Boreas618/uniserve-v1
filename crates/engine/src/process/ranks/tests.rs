@@ -1572,7 +1572,6 @@ fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
             text.model.as_ref(),
             &layout,
             &[("graph pool", graph), ("scratch pool", scratch)],
-            0,
         )
         .unwrap();
     assert_eq!(slots, 128);

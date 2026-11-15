@@ -120,21 +120,40 @@ struct Record {
   int64_t kind;
 };
 
-/// Creates this rank's window and maps every rank's: a fabric handle where the driver
-/// has one, and a file descriptor between the ranks of one process otherwise.
-int32_t map_windows(Transport& transport, const UniserveGroup* group, char* error) {
+/// The fabric storage a window is created as, on `device`.
+CUmemAllocationProp window_prop(int64_t device) {
   CUmemAllocationProp prop{};
   prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
   prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  prop.location.id = static_cast<int>(transport.device);
+  prop.location.id = static_cast<int>(device);
   prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+  return prop;
+}
+
+/// The bytes of one rank's window on `device`: whole recommended allocation granules of its
+/// storage, which are also the alignment of the addresses the windows are mapped at.
+CUresult window_bytes(int64_t device, size_t* window, size_t* granularity) {
+  const CUmemAllocationProp prop = window_prop(device);
+  const CUresult status =
+      cuMemGetAllocationGranularity(granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED);
+  if (status == CUDA_SUCCESS) {
+    *window = aligned(layout_of().bytes, *granularity);
+  }
+  return status;
+}
+
+/// The one masked BF16 row a rank with no tokens launches over, in bytes.
+constexpr size_t kIdleBytes = static_cast<size_t>(kHidden) * 2;
+
+/// Creates this rank's window and maps every rank's: a fabric handle where the driver
+/// has one, and a file descriptor between the ranks of one process otherwise.
+int32_t map_windows(Transport& transport, const UniserveGroup* group, char* error) {
+  CUmemAllocationProp prop = window_prop(transport.device);
   size_t granularity = 0;
-  CUresult status =
-      cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED);
+  CUresult status = window_bytes(transport.device, &transport.window, &granularity);
   if (status != CUDA_SUCCESS) {
     return driver_refusal(error, "cuMemGetAllocationGranularity", status);
   }
-  transport.window = aligned(transport.layout.bytes, granularity);
   CUmemAllocationHandleType kind = CU_MEM_HANDLE_TYPE_FABRIC;
   Shared mine{};
   status = cuMemCreate(&transport.own, transport.window, &prop, 0);
@@ -220,6 +239,18 @@ mega_Kernel_Module_t& module() {
   return handle;
 }
 
+/// Refuses a lifecycle call of another shape than the module's; zero for its own.
+int32_t check_shape(uniserve_exchange_lifecycle* call) {
+  if (call->ranks != kRanks || call->attention_ranks != 0 || call->hidden != kHidden ||
+      call->top != kTop || call->experts != kExperts || call->max_tokens != kMaxTokens ||
+      call->intermediate != kIntermediate || call->dtype != UNISERVE_DTYPE_BF16) {
+    return refuse(call->error,
+                  "expert_exchange's megamoe module was compiled for another group or another "
+                  "shape: its descriptor fixes them");
+  }
+  return 0;
+}
+
 }  // namespace
 
 extern "C" int32_t uniserve_expert_exchange_create(uniserve_exchange_lifecycle* call,
@@ -232,12 +263,8 @@ extern "C" int32_t uniserve_expert_exchange_create(uniserve_exchange_lifecycle* 
   if (call->group == nullptr) {
     return refuse(call->error, "expert_exchange's create needs the group's channel");
   }
-  if (call->ranks != kRanks || call->attention_ranks != 0 || call->hidden != kHidden ||
-      call->top != kTop || call->experts != kExperts || call->max_tokens != kMaxTokens ||
-      call->intermediate != kIntermediate || call->dtype != UNISERVE_DTYPE_BF16) {
-    return refuse(call->error,
-                  "expert_exchange's megamoe module was compiled for another group or another "
-                  "shape: its descriptor fixes them");
+  if (check_shape(call) != 0) {
+    return 1;
   }
   auto* transport = static_cast<Transport*>(std::calloc(1, sizeof(Transport)));
   if (transport == nullptr) {
@@ -253,7 +280,7 @@ extern "C" int32_t uniserve_expert_exchange_create(uniserve_exchange_lifecycle* 
       cuda = cudaMemset(transport->local_workspace, 0, kLocalWorkspace);
     }
     if (cuda == cudaSuccess) {
-      cuda = cudaMalloc(&transport->idle_output, static_cast<size_t>(kHidden) * 2);
+      cuda = cudaMalloc(&transport->idle_output, kIdleBytes);
     }
     if (cuda == cudaSuccess) {
       cuda = cudaDeviceSynchronize();
@@ -278,6 +305,22 @@ extern "C" int32_t uniserve_expert_exchange_create(uniserve_exchange_lifecycle* 
     return refuse(call->error, "expert_exchange's ranks did not meet after loading the kernel");
   }
   call->transport = transport;
+  return 0;
+}
+
+extern "C" int32_t uniserve_expert_exchange_footprint(uniserve_exchange_lifecycle* call,
+                                                      int64_t* bytes) {
+  if (call == nullptr || bytes == nullptr || check_shape(call) != 0) {
+    return 1;
+  }
+  // A rank creates its own window alone: it maps its peers' windows, which they create.
+  size_t window = 0;
+  size_t granularity = 0;
+  const CUresult status = window_bytes(call->device, &window, &granularity);
+  if (status != CUDA_SUCCESS) {
+    return driver_refusal(call->error, "cuMemGetAllocationGranularity", status);
+  }
+  *bytes = static_cast<int64_t>(window + kLocalWorkspace + kIdleBytes);
   return 0;
 }
 

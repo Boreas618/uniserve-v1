@@ -6,7 +6,7 @@
 // package exports.
 //
 // Every backend of the operator includes this header unchanged, so the executor
-// drives any backend through the same seven entries.
+// drives any backend through the same eight entries.
 
 #pragma once
 
@@ -173,4 +173,11 @@ extern "C" int32_t uniserve_expert_exchange_restore(uniserve_exchange_lifecycle*
 extern "C" int32_t uniserve_expert_exchange_release(uniserve_exchange_lifecycle* call,
                                                     void* stream);
 extern "C" int32_t uniserve_expert_exchange_info(uniserve_exchange_info* call, void* stream);
+
+// The device bytes a transport of the call's shape (every lifecycle field but `transport`,
+// `group` and `capacity`) takes once `create` makes it, written to `bytes`: the executor divides
+// the device's memory with it before any transport exists. It issues no device work and reaches
+// no peer.
+extern "C" int32_t uniserve_expert_exchange_footprint(uniserve_exchange_lifecycle* call,
+                                                      int64_t* bytes);
 extern "C" int32_t uniserve_expert_exchange_launch(uniserve_exchange_call* call, void* stream);

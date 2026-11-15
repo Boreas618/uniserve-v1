@@ -323,7 +323,8 @@ impl ModelRunner {
     /// `regions` are the `(name, bytes)` of the rank's regions that do not grow with the request
     /// slots, made at its start: its graph and scratch pools ([`Self::pools`]) and, on a rank that
     /// encodes images, its region of encoder outputs (which the resident pool holds) and its
-    /// causal runner's feature buffer. The expert transport of a union member joins them.
+    /// causal runner's feature buffer, and the expert transport of a union member
+    /// ([`ModelRunner::transport_bytes`]).
     ///
     /// The request slots are the deployment's running requests, or as many as what the GPU's
     /// quota holds now leaves once the weights are mapped and those regions and the cache's
@@ -371,33 +372,19 @@ impl ModelRunner {
         let granularity = granularity(device)?;
         let (share, _) = self.fractions()?;
         let unreserved = unreserved(client, device, share)?;
-        let transport = self.transport_bytes(device, model)?;
 
-        self.divide_unreserved(
-            unreserved,
-            granularity,
-            host,
-            model,
-            layout,
-            regions,
-            transport,
-        )
+        self.divide_unreserved(unreserved, granularity, host, model, layout, regions)
     }
 
     /// [`Self::divide`] over the bytes the GPU's quota leaves the rank, `(now, alone)` as
     /// [`unreserved`] states them, for a device of allocation granules of `granularity` bytes:
-    /// the fixed `regions` (the graph and scratch pools, and on a rank that encodes images its
-    /// encoder outputs and image features) and the expert `transport` bytes are taken out, then the
-    /// request slots', and the cache's planes take the rest.
+    /// the fixed `regions` (the graph and scratch pools, the expert transport, and on a rank that
+    /// encodes images its encoder outputs and image features) are taken out, then the request
+    /// slots', and the cache's planes take the rest.
     ///
     /// # Errors
     ///
     /// As [`Self::divide`], but for the measurements.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the division's figures come from the quota, the device, the host group, the \
-                  model, the layout, the pools and the expert union"
-    )]
     #[expect(
         clippy::type_complexity,
         reason = "the request slots, and the units and first units of each of the two regions"
@@ -410,18 +397,15 @@ impl ModelRunner {
         model: &dyn TextModel,
         layout: &Arc<CacheLayout>,
         regions: &[(&'static str, u64)],
-        transport: u64,
     ) -> Result<(u32, (u32, u32), (u32, u32))> {
         // The pools, the slots and the cache's tables are made at the start, so they fit what
         // the quota holds now; the planes and the state region are numbered for what it holds
         // the epoch alone.
-        let mut pools = regions.to_vec();
-        pools.push(("expert transport", transport));
         let least = fewest_units(layout);
         let state_bytes = layout.state_bytes();
         let left = division::remainder(
             now,
-            &pools,
+            regions,
             u64::from(least),
             &[("cache's fewest units", layout.unit_bytes)],
         )?;
@@ -436,8 +420,9 @@ impl ModelRunner {
         let slots = u32::try_from(slots).context("a negative count of request slots was agreed")?;
 
         let storage = self.slot_storage(model, layout, slots)?;
-        let regions: Vec<(&str, u64)> = pools
-            .into_iter()
+        let regions: Vec<(&str, u64)> = regions
+            .iter()
+            .copied()
             .chain([("request slots", storage)])
             .collect();
         let remainder = division::remainder(now, &regions, 0, &[])?;
