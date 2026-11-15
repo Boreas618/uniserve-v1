@@ -41,6 +41,7 @@ def spec(request):
                 mma_inst_shape_k=MMA_INST_SHAPE_K,
                 acc_dtype=cutlass.Float32,
                 out_dtype=out_dtype,
+                tmem_columns=request.target.tensor_memory_columns,
             ).launch,
             # The operator packs the activation, the weight, both scale
             # matrices, the alpha and the output, then the three extents, which

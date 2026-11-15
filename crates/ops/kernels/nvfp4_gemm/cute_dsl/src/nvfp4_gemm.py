@@ -69,10 +69,19 @@ class Nvfp4GemmKernel:
 
     ``tile_mn`` is the CTA's product tile, ``self.mma_inst_shape_k`` the tensor-core
     instruction's contraction step, ``acc_dtype`` the epilogue's arithmetic and
-    ``out_dtype`` what the tile is written as.
+    ``out_dtype`` what the tile is written as. ``tmem_columns`` is the target's
+    tensor-memory columns, which the accumulator takes whole (one CTA per
+    multiprocessor); the A/B stages are a fixed four.
     """
 
-    def __init__(self, tile_mn, mma_inst_shape_k, acc_dtype, out_dtype):
+    def __init__(
+        self,
+        tile_mn,
+        mma_inst_shape_k,
+        acc_dtype,
+        out_dtype,
+        tmem_columns,
+    ):
         self.tile_mn = tile_mn
         self.mma_inst_shape_k = mma_inst_shape_k
         self.acc_dtype = acc_dtype
@@ -81,8 +90,7 @@ class Nvfp4GemmKernel:
         self.sf_dtype = cutlass.Float8E4M3FN
         self.sf_vec_size = 16
         self.threads_per_cta = 128
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
-        self.num_tmem_alloc_cols = 512
+        self.num_tmem_alloc_cols = tmem_columns
 
         # set stages for ab_pipeline and acc_pipeline
         self.num_acc_stage = 1

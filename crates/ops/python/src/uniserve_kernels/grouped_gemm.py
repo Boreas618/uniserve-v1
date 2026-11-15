@@ -67,15 +67,21 @@ class GroupedGemm:
 
     ``mma_tiler_mn`` is the MMA tile (M, N): M 128 runs one-CTA MMA, M 256
     two-CTA MMA over a cluster pair, and the MoE sort's routing tile equals M.
-    ``cluster_shape_mn`` is the cluster. A subclass states its warp roles
-    (``epilog_warp_id``, ``mma_warp_id``, ``sched_warp_id`` and its own) and
-    ``threads_per_cta`` before calling :meth:`_make_barriers`.
+    ``cluster_shape_mn`` is the cluster. ``smem_capacity`` is the shared
+    memory one block may use on the target, in bytes, which the stages fill,
+    and ``tmem_columns`` the target's tensor-memory columns, which the
+    accumulators take whole (one CTA per multiprocessor). A subclass states
+    its warp roles (``epilog_warp_id``, ``mma_warp_id``, ``sched_warp_id``
+    and its own) and ``threads_per_cta`` before calling
+    :meth:`_make_barriers`.
     """
 
     def __init__(
         self,
         mma_tiler_mn: tuple[int, int],
         cluster_shape_mn: tuple[int, int],
+        smem_capacity: int,
+        tmem_columns: int,
     ):
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -91,8 +97,8 @@ class GroupedGemm:
 
         self.occupancy = 1
         self.threads_per_warp = 32
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
-        self.num_tmem_alloc_cols = 512
+        self.num_smem_capacity = smem_capacity
+        self.num_tmem_alloc_cols = tmem_columns
 
     def _make_barriers(self):
         """The named barriers of the CTA, the epilogue, the tensor-memory

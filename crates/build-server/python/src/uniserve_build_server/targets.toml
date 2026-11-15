@@ -21,6 +21,9 @@
 # - `shared_memory`: the largest shared memory one block may opt into, in bytes.
 # - `tensor_memory`: whether the architecture has tensor memory and the
 #   matrix instructions that read it (`tcgen05`).
+# - `tensor_memory_columns`: the 32-bit columns of tensor memory one
+#   multiprocessor has (each of its 128 lanes), stated for a target with
+#   tensor memory only.
 # - `warpgroup_mma`: whether the architecture has the asynchronous warpgroup
 #   matrix instructions (`wgmma`), which only Hopper's specific instruction set
 #   carries.
@@ -48,6 +51,7 @@ families = ["sm_100a", "sm_100f"]
 warp_size = 32
 shared_memory = 232448
 tensor_memory = true
+tensor_memory_columns = 512
 warpgroup_mma = false
 dependent_launch = true
 fp8 = true
@@ -60,6 +64,7 @@ families = ["sm_100f"]
 warp_size = 32
 shared_memory = 232448
 tensor_memory = true
+tensor_memory_columns = 512
 warpgroup_mma = false
 dependent_launch = true
 fp8 = true

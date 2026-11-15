@@ -26,6 +26,8 @@ def spec(request):
     kernel = kernels.RouteGroupedGemmKernel(
         mma_tiler_mn=tiler,
         cluster_shape_mn=tuple(request.field("cluster")),
+        smem_capacity=request.target.shared_memory,
+        tmem_columns=request.target.tensor_memory_columns,
     )
     # The row counts, both widths and the expert count are the call's runtime
     # words: the kernel's grids derive from the tile count at launch, so the

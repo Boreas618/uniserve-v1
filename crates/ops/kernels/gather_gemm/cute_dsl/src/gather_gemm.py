@@ -86,7 +86,8 @@ class GatherGroupedGemmKernel(GroupedGemm):
     ``activation`` is
     ``"silu"`` (``silu(gate) * up``) or ``"gelu_tanh"``
     (``gelu_tanh(gate) * up``). ``topk`` converts the expanded
-    (token, route) ids of ``token_id_mapping`` to token rows.
+    (token, route) ids of ``token_id_mapping`` to token rows. The target's
+    capacities are :class:`GroupedGemm`'s.
     """
 
     def __init__(
@@ -95,10 +96,14 @@ class GatherGroupedGemmKernel(GroupedGemm):
         cluster_shape_mn: tuple[int, int],
         topk: int,
         activation: str,
+        smem_capacity: int,
+        tmem_columns: int,
     ):
         if activation not in ("silu", "gelu_tanh"):
             raise ValueError(f"unsupported gated activation {activation!r}")
-        super().__init__(mma_tiler_mn, cluster_shape_mn)
+        super().__init__(
+            mma_tiler_mn, cluster_shape_mn, smem_capacity, tmem_columns
+        )
         self.activation = activation
         self.topk = topk
         # Each output column combines one up and one gate accumulator column.

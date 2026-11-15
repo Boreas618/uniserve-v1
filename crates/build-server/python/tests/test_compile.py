@@ -58,6 +58,7 @@ def request(package: pathlib.Path, output: pathlib.Path, **changes) -> dict:
             "warp_size": target.warp_size,
             "shared_memory": target.shared_memory,
             "tensor_memory": target.tensor_memory,
+            "tensor_memory_columns": target.tensor_memory_columns,
             "warpgroup_mma": target.warpgroup_mma,
             "dependent_launch": target.dependent_launch,
             "fp8": target.fp8,

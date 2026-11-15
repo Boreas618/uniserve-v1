@@ -30,6 +30,8 @@ def spec(request):
         cluster_shape_mn=tuple(request.field("cluster")),
         topk=request.field("top"),
         activation=request.field("activation"),
+        smem_capacity=request.target.shared_memory,
+        tmem_columns=request.target.tensor_memory_columns,
     )
     # The token count, the permuted rows, both widths and the expert count are
     # the call's runtime words: the kernel's grids derive from the tile count

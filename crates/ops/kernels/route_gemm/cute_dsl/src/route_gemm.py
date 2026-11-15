@@ -72,15 +72,20 @@ class RouteGroupedGemmKernel(GroupedGemm):
 
     ``mma_tiler_mn`` is the MMA tile (M, N): M 128 runs one-CTA MMA, M 256
     two-CTA MMA over a cluster pair, and the MoE sort's routing tile equals
-    M; N is 128 or 256 and divides the output width.
+    M; N is 128 or 256 and divides the output width. The target's capacities
+    are :class:`GroupedGemm`'s.
     """
 
     def __init__(
         self,
         mma_tiler_mn: tuple[int, int],
         cluster_shape_mn: tuple[int, int],
+        smem_capacity: int,
+        tmem_columns: int,
     ):
-        super().__init__(mma_tiler_mn, cluster_shape_mn)
+        super().__init__(
+            mma_tiler_mn, cluster_shape_mn, smem_capacity, tmem_columns
+        )
 
         self.epilog_warp_id = (0, 1, 2, 3)
         self.mma_warp_id = 4

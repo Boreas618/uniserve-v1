@@ -58,6 +58,10 @@ pub struct Facts {
     /// Whether the architecture has tensor memory and the matrix
     /// instructions that read it (`tcgen05`).
     pub tensor_memory: bool,
+    /// The 32-bit columns of tensor memory one multiprocessor has (each of
+    /// its 128 lanes), for a target that has tensor memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tensor_memory_columns: Option<u32>,
     /// Whether the architecture has the asynchronous warpgroup matrix
     /// instructions (`wgmma`).
     pub warpgroup_mma: bool,
@@ -267,6 +271,11 @@ mod tests {
                 specific, 1,
                 "capability {} has one specific target",
                 facts.capability
+            );
+            assert_eq!(
+                facts.tensor_memory_columns.is_some(),
+                facts.tensor_memory,
+                "{name} states the columns of the tensor memory it has, and only then"
             );
         }
         assert_eq!(Target::arch((10, 0)).unwrap(), Target::new("sm_100a"));

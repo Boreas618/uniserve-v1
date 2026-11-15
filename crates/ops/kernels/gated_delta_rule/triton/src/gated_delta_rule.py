@@ -431,10 +431,6 @@ def _gated_delta_rule_kernel(
         tl.store(state_ptr + bank, state)
 
 
-#: The 32-bit tensor-memory columns of one sm_100 multiprocessor, which a program's products share.
-TENSOR_MEMORY = 512
-
-
 def derive(fields, parameters, target):
     """The doubling levels of a chunk's triangular inverse, ``levels``, for the launch table.
 
@@ -458,11 +454,13 @@ def derive(fields, parameters, target):
     # A chunk's products hold their accumulators in tensor memory: two chunk-square sites (the key
     # and query scores, the inverse's doubling) and four `block`-wide ones (the state's reads, the
     # new values, their scores and the state's update).
+    # They share the target's tensor-memory columns of one multiprocessor.
     columns = 2 * chunk + 4 * block
-    if chunk > 1 and target.tensor_memory and columns > TENSOR_MEMORY:
+    capacity = target.tensor_memory_columns
+    if chunk > 1 and capacity is not None and columns > capacity:
         raise SystemExit(
             f"a chunk of {chunk} over {block} value columns needs {columns} tensor-memory "
-            f"columns of {TENSOR_MEMORY}"
+            f"columns of {capacity}"
         )
 
     return {"levels": chunk.bit_length() - 1}

@@ -72,6 +72,9 @@ class Target:
     dependent_launch: bool
     #: Whether the tensor cores take FP8 operands.
     fp8: bool
+    #: The 32-bit columns of tensor memory one multiprocessor has, for a
+    #: target with tensor memory (``None`` otherwise).
+    tensor_memory_columns: int | None = None
 
     def __str__(self) -> str:
         return self.name
