@@ -619,6 +619,18 @@ impl DenoiserSplit {
         layers: Split::WHOLE,
     };
 
+    /// This rank's split of each collective axis of the denoiser's forward, indexed by
+    /// [`ULYSSES_AXIS`], [`GATHER_AXIS`], [`TENSOR_AXIS`] and [`LAYER_AXIS`]: the places an
+    /// execution context states as the forward's axes.
+    pub const fn axes(&self) -> [Split; 4] {
+        let mut axes = [Split::WHOLE; 4];
+        axes[ULYSSES_AXIS] = self.ulysses.split;
+        axes[GATHER_AXIS] = self.gather;
+        axes[TENSOR_AXIS] = self.tensor;
+        axes[LAYER_AXIS] = self.layers;
+        axes
+    }
+
     /// The places of the sequence split (the Ulysses degree times the all-gather degree) and
     /// this rank's, the Ulysses place varying fastest: the interval of the packed rows the rank
     /// holds.

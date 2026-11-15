@@ -306,6 +306,93 @@ pub struct KvCache {
 }
 
 impl KvCache {
+    /// The cache group of `shape`'s layers over `pages` pages of `page_size` tokens, its planes
+    /// in `dtype`, each tensor taken from `tensor` by its extents and element type.
+    ///
+    /// Each layer holds a key and a value plane `[pages, page_size, kv_heads, head_dim]` of
+    /// `dtype`, a U8 initialization flag per page of each, an F32 scale per page of each when
+    /// `dtype` is FP8, and, when `shape` keeps index keys, `[pages, page_size / ratio, width]`
+    /// index keys of `dtype`. `block_tables` (`[rows, max_pages]` U32) and `workspace`
+    /// (`[bytes]` U8) are the group's as the caller sized them. `tensor` decides where the memory
+    /// lies (zeroed host tensors, meta tensors, a pool's storage) and is called once per tensor,
+    /// layer after layer, in the order of the fields of [`KvPlanes`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] for an FP8 cache that keeps index keys: those are written in the
+    /// type the model computes in, which the planes' type does not state. [`Error::Shape`] for
+    /// index keys whose ratio does not divide the page. What `tensor` returns.
+    pub fn allocate(
+        shape: crate::family::CacheShape,
+        dtype: DType,
+        pages: usize,
+        page_size: u32,
+        block_tables: Tensor,
+        workspace: Tensor,
+        mut tensor: impl FnMut(Shape, DType) -> Result<Tensor>,
+    ) -> Result<Self> {
+        let scaled = dtype == DType::F8E4M3;
+        if scaled && shape.index_keys.is_some() {
+            return Err(Error::Unsupported(
+                "an FP8 cache keeps its index keys in the type the model computes in, which the \
+                 planes' type does not state"
+                    .to_owned(),
+            ));
+        }
+        if let Some(keys) = shape.index_keys
+            && (keys.ratio == 0 || !page_size.is_multiple_of(keys.ratio))
+        {
+            return Err(Error::shape(
+                "KvCache",
+                format!(
+                    "index keys of one per {} tokens do not divide a page of {page_size}",
+                    keys.ratio
+                ),
+            ));
+        }
+
+        let plane = Shape::from((
+            pages,
+            page_size as usize,
+            shape.kv_heads as usize,
+            shape.head_dim as usize,
+        ));
+        let flags = Shape::from((pages, 1, 1, 1));
+        let mut layers = Vec::with_capacity(shape.layers as usize);
+
+        for _ in 0..shape.layers {
+            layers.push(KvPlanes {
+                key: tensor(plane.clone(), dtype)?,
+                value: tensor(plane.clone(), dtype)?,
+                key_initialized: tensor(flags.clone(), DType::U8)?,
+                value_initialized: tensor(flags.clone(), DType::U8)?,
+                key_scale: scaled
+                    .then(|| tensor(flags.clone(), DType::F32))
+                    .transpose()?,
+                value_scale: scaled
+                    .then(|| tensor(flags.clone(), DType::F32))
+                    .transpose()?,
+                index_keys: match shape.index_keys {
+                    Some(keys) => {
+                        let groups = (page_size / keys.ratio) as usize;
+                        Some(tensor(
+                            Shape::from((pages, groups, keys.width as usize)),
+                            dtype,
+                        )?)
+                    }
+                    None => None,
+                },
+            });
+        }
+
+        Ok(Self {
+            block_tables,
+            page_size,
+            layers,
+            workspace,
+        })
+    }
+
     /// The planes of `layer`.
     ///
     /// # Errors
@@ -367,6 +454,43 @@ pub struct RecurrentState {
     /// The slots of a deployment whose verifications copy no state ([`VerifySlots`]); `None`
     /// for a deployment that keeps one slot per request, with or without a trail.
     pub verify: Option<VerifySlots>,
+}
+
+impl RecurrentState {
+    /// One kind of buffer of every recurrent layer of `runs` (live, checkpoint or trail), in
+    /// the order [`Self::live`] holds them: the layers of the first run, then of the second,
+    /// each the layer's fields in its run's order, `[rows(field), …]` in the field's element
+    /// type and extents. `tensor` decides where the memory lies and is called once per buffer
+    /// in that order.
+    ///
+    /// `rows` states each field's leading extent: the request slots of a live or checkpoint
+    /// buffer, the further slots a request owns of a stepwise field
+    /// ([`crate::family::StateField::stepwise`]), or the tokens of a trail.
+    ///
+    /// # Errors
+    ///
+    /// What `tensor` returns.
+    pub fn buffers(
+        runs: &[crate::family::StateShape],
+        rows: impl Fn(&crate::family::StateField) -> usize,
+        mut tensor: impl FnMut(Shape, DType) -> Result<Tensor>,
+    ) -> Result<Vec<Vec<Tensor>>> {
+        let layers = runs
+            .iter()
+            .flat_map(|run| (0..run.layers).map(move |_| run.fields.as_slice()));
+
+        layers
+            .map(|fields| {
+                fields
+                    .iter()
+                    .map(|field| {
+                        let dims = [&[rows(field)][..], field.dims.as_slice()].concat();
+                        tensor(Shape::from(dims), field.dtype)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
 }
 
 /// The slots a request's rows read and write when acceptance copies no state (vLLM's
