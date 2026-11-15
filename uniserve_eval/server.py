@@ -392,7 +392,7 @@ def _service_pids(services: Path) -> list[int]:
     """Return the processes that serve a socket inside `services`.
 
     A host service runs as `<executable> <service> serve --socket <path>`
-    (`service::ensure`), so a service of this directory is a process whose
+    (`service::host::start`), so a service of this directory is a process whose
     command line holds `serve` and a path inside it.
     """
     prefix = f"{services}/".encode()

@@ -3,9 +3,9 @@
 //! Its subcommands:
 //!
 //! - `serve`: runs this host's Build Server until it is stopped. With
-//!   `--daemon` it leaves its starter's session first (`service::detach`),
+//!   `--daemon` it leaves its starter's session first (`service::host::detach`),
 //!   which is how a daemon starts the Build Server of a host that has none
-//!   (`service::ensure`).
+//!   (`service::host::start`).
 //! - `install <package>`: installs one package on the upstream
 //!   Build Server and prints its revision. Only the upstream accepts it;
 //!   another server names where the upstream is.
@@ -264,7 +264,7 @@ impl Settings {
     }
 
     /// The `serve` flags that state these settings, but the socket: a starter
-    /// passes them after `--socket` and `--daemon` (`service::ensure`).
+    /// passes them after `--socket` and `--daemon` (`service::host::start`).
     pub fn arguments(&self) -> Vec<String> {
         let mut arguments = Vec::new();
         let mut push = |flag: &str, value: String| {
