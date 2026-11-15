@@ -953,7 +953,7 @@ mod tests {
         };
         let served = profiled(proto::config::ProfilingConfig {
             fence_probes: true,
-            fence_modules: vec!["*.Transformer".to_owned()],
+            fence_modules: Some(vec!["*.Transformer".to_owned()]),
             fence_probes_off: Vec::new(),
             graph_pc_sampling: false,
         });
@@ -974,7 +974,7 @@ mod tests {
                 ..served.profiling.clone()
             },
             proto::config::ProfilingConfig {
-                fence_modules: vec!["*.TransformerLayer".to_owned()],
+                fence_modules: Some(vec!["*.TransformerLayer".to_owned()]),
                 ..served.profiling.clone()
             },
         ] {

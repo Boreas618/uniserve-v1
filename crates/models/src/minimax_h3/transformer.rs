@@ -54,7 +54,7 @@ use crate::minimax_h3::config::{DenoiserConfig, TransformerConfig};
 use crate::minimax_h3::{Error, Result};
 
 /// The profiler classes of the stack and of one of its blocks.
-const TRANSFORMER: &str = "Transformer";
+pub(crate) const TRANSFORMER: &str = "Transformer";
 const TRANSFORMER_BLOCK: &str = "TransformerBlock";
 
 /// The coordinate axes of a packed row's rotary position: time, height and width.

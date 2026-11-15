@@ -97,6 +97,7 @@ mod tests {
                     serving: chat,
                 },
                 model: Model::Text(&Unopened),
+                step_stack: "TextTransformer",
             },
             Family {
                 request: processing::Family {
@@ -106,6 +107,7 @@ mod tests {
                     serving: chat,
                 },
                 model: Model::Video(&Unopened),
+                step_stack: "VideoTransformer",
             },
         ])
         .unwrap()

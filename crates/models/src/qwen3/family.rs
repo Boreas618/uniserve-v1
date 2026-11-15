@@ -29,12 +29,14 @@ use crate::qwen3::config::Config;
 pub const FAMILY: Family = Family {
     request: processing::qwen::QWEN3,
     model: Model::Text(&Qwen3),
+    step_stack: crate::qwen3::causal_lm::TRANSFORMER,
 };
 
 /// The `Qwen3_5MoeForConditionalGeneration` registration.
 pub const HYBRID_FAMILY: Family = Family {
     request: processing::qwen::QWEN3_5_MOE,
     model: Model::Text(&Qwen3),
+    step_stack: crate::qwen3::causal_lm::TRANSFORMER,
 };
 
 /// The family: how a checkpoint opens.

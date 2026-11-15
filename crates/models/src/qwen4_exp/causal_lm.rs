@@ -49,7 +49,7 @@ use crate::qwen4_exp::ngram::{PleLayer, int};
 use crate::qwen4_exp::{Error, Result};
 
 /// The profiler class of the whole decoder stack, at path `model`.
-const TRANSFORMER: &str = "models.qwen4_exp.transformer.Transformer";
+pub(crate) const TRANSFORMER: &str = "models.qwen4_exp.transformer.Transformer";
 
 /// The module path the language model's modules sit under.
 const LANGUAGE_MODEL: &str = "model.language_model";

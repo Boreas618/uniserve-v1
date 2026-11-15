@@ -52,6 +52,10 @@ pub struct Family {
     pub request: processing::Family,
     /// What execution loads of a checkpoint.
     pub model: Model,
+    /// The profiler class of the module a step runs once, the decoder or denoiser stack
+    /// ([`crate::profiler::range`]): the class the always-on fence probes cover when the
+    /// deployment names none (`profiling_config.fence_modules`).
+    pub step_stack: &'static str,
 }
 
 impl Family {
@@ -855,6 +859,7 @@ mod tests {
             }),
         },
         model: Model::Text(&Unopened),
+        step_stack: "ChatTransformer",
     };
 
     /// A checkpoint resolves to the numerical family whose request side claims its class.

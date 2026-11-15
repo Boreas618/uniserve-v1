@@ -36,9 +36,9 @@ use processing::Serving;
 
 pub use args::{Stated, overridden, printed, resolve_text};
 pub use proto::config::{
-    ChatConfig, ChatTemplateContentFormat, CudaGraphConfig, DEFAULT_FENCE_MODULES, DeviceConfig,
-    ImageFetchConfig, KvCacheConfig, LoadConfig, LoggingConfig, MediaConfig, MigrationConfig,
-    MoeConfig, ProfilingConfig, ReasoningParser, SchedulerConfig, ServerConfig,
+    ChatConfig, ChatTemplateContentFormat, CudaGraphConfig, DeviceConfig, ImageFetchConfig,
+    KvCacheConfig, LoadConfig, LoggingConfig, MediaConfig, MigrationConfig, MoeConfig,
+    ProfilingConfig, ReasoningParser, SchedulerConfig, ServerConfig,
     SpeculativeConfig, VideoConfig, VideoJobConfig, WorkerConfig,
 };
 use proto::config::{positive, values};

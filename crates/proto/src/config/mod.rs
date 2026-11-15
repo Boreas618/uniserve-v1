@@ -619,8 +619,9 @@ pub struct ProfilingConfig {
     pub fence_probes: bool,
     /// Name patterns (`*` matches any run) of the module classes whose
     /// instances carry probes in the CUDA graphs an epoch captures; a change
-    /// takes a new epoch. Empty for no probe.
-    pub fence_modules: Vec<String>,
+    /// takes a new epoch. Empty for no probe; the model family's step stack
+    /// (the decoder or denoiser stack, one instance per step) when unset.
+    pub fence_modules: Option<Vec<String>>,
     /// Name patterns (`*` matches any run) of the probed module classes whose
     /// probes are off while `fence_probes` is on: the classes whose
     /// probes cost more than the always-on budget. Changed in place, at the
@@ -639,24 +640,12 @@ impl Default for ProfilingConfig {
     fn default() -> Self {
         Self {
             fence_probes: true,
-            fence_modules: DEFAULT_FENCE_MODULES
-                .iter()
-                .map(|&pattern| pattern.to_owned())
-                .collect(),
+            fence_modules: None,
             fence_probes_off: Vec::new(),
             graph_pc_sampling: false,
         }
     }
 }
-
-/// The module classes probed by default: each model's decoder or denoiser
-/// stack, one instance per step. Qwen3 names its stack's class
-/// `models.qwen3.transformer.Transformer` and MiniMax-H3 its denoiser's
-/// `Transformer`, so the pattern has no separator before the class name.
-/// Each probe costs a kernel launch in every replay, about a microsecond on
-/// GB200 even when switched off, so probing every layer exceeds the
-/// always-on budget (`docs/profiling.md`).
-pub const DEFAULT_FENCE_MODULES: [&str; 1] = ["*Transformer"];
 
 /// The shape a chat template takes message `content` in.
 ///

@@ -618,7 +618,7 @@ pub(crate) fn start(
     // captures and instantiates, so they precede the warm-up's captures, whose executables are
     // current at the tracing mode's renewal count of their instantiation.
     if !meta {
-        instrument(launch, model_runner.devices())?;
+        instrument(launch, &model_runner)?;
     }
     let registers = |group: GroupId| head.completed_registers(group, &pairs);
     let (route, workers) = spawn(&mut ranks, (&open, &opened), &registers, remotes.clone())?;
@@ -850,7 +850,7 @@ fn start_peer(
 
     // What attaches to the graphs precedes the workers and the warm-up, as on the scheduler node.
     if launch.engine_config.device.device != DeviceKind::Meta {
-        instrument(launch, model_runner.devices())?;
+        instrument(launch, model_runner)?;
     }
     // A peer holds no queue pair: its ended sequences reach the scheduler node over its link.
     let (route, workers) = spawn(
@@ -1080,8 +1080,9 @@ fn weight_binding(
     Ok(Arc::new(WeightBinding::new(served, target, remotes)))
 }
 
-/// Installs what the deployment's always-on profiling captures into every graph of `devices`:
-/// the range markers of the classes `profiling_config.fence_modules` names, and PC sampling
+/// Installs what the deployment's always-on profiling captures into every graph of the devices
+/// `model_runner` serves: the range markers of the classes `profiling_config.fence_modules` names,
+/// or of the family's step stack when it names none ([`ModelRunner::step_stack`]), and PC sampling
 /// when `graph_pc_sampling` keeps it on, which CUPTI attributes to a graph only when enabled
 /// before its capture; otherwise the counters' record of each graph launch as a whole, in which
 /// the executables are then instantiated ([`crate::profiling::counters::record_whole_graphs`]).
@@ -1091,12 +1092,17 @@ fn weight_binding(
 /// # Errors
 ///
 /// When a device cannot load the markers' kernels or enable sampling.
-fn instrument(launch: &EngineArgs, devices: &[DeviceId]) -> Result<()> {
+fn instrument(launch: &EngineArgs, model_runner: &ModelRunner) -> Result<()> {
     let profiling = &launch.engine_config.profiling;
-    if !profiling.fence_modules.is_empty() {
+    let devices = model_runner.devices();
+    let modules = profiling
+        .fence_modules
+        .clone()
+        .unwrap_or_else(|| vec![model_runner.step_stack().to_owned()]);
+    if !modules.is_empty() {
         crate::profiling::markers::Markers::install(
             devices,
-            profiling.fence_modules.clone(),
+            modules,
             profiling.fence_probes,
             &profiling.fence_probes_off,
         )

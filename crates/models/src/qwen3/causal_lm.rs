@@ -62,7 +62,7 @@ use crate::qwen3::vision::VisionTower;
 use crate::qwen3::{Error, Result};
 
 /// The profiler class of the whole decoder stack, at path `model`.
-const TRANSFORMER: &str = "models.qwen3.transformer.Transformer";
+pub(crate) const TRANSFORMER: &str = "models.qwen3.transformer.Transformer";
 
 /// A Qwen3 causal language model.
 pub struct Qwen3ForCausalLm {

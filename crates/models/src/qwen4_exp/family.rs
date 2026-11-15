@@ -27,6 +27,7 @@ use crate::qwen4_exp::config::Config;
 pub const FAMILY: Family = Family {
     request: processing::qwen::QWEN4_EXP,
     model: Model::Text(&Qwen4Exp),
+    step_stack: crate::qwen4_exp::causal_lm::TRANSFORMER,
 };
 
 /// The family: how a checkpoint opens.

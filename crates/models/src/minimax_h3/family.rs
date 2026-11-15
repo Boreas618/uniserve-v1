@@ -52,6 +52,7 @@ use crate::qwen3::Qwen3VlModel;
 pub const FAMILY: Family = Family {
     request: processing::minimax_h3::FAMILY,
     model: Model::Video(&MinimaxH3Family),
+    step_stack: crate::minimax_h3::transformer::TRANSFORMER,
 };
 
 /// The release a FastH3 adapter is fused into.

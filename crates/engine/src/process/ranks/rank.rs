@@ -686,6 +686,11 @@ impl ModelRunner {
         &self.devices
     }
 
+    /// The profiler class of the module the family runs once per step ([`Family::step_stack`]).
+    pub(crate) fn step_stack(&self) -> &'static str {
+        self.family.step_stack
+    }
+
     /// The bucket catalog this rank captures.
     pub(crate) fn buckets(&self) -> &Buckets {
         &self.buckets
