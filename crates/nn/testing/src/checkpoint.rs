@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+use nn::checkpoint::Library;
 use nn::{Checkpoint, DType, Device, Tensor};
 use safetensors::Dtype as FormatDtype;
 use safetensors::tensor::TensorView;
@@ -22,12 +23,6 @@ use tempfile::TempDir;
 
 /// One tensor a test writes: its name, element type, extents and little-endian bytes.
 pub type Stored<N> = (N, DType, Vec<usize>, Vec<u8>);
-
-/// The file a checkpoint of one shard holds its tensors in.
-const SINGLE_SHARD: &str = "model.safetensors";
-
-/// The index that names each tensor's shard in a checkpoint of several.
-const SHARD_INDEX: &str = "model.safetensors.index.json";
 
 /// The format's name for `dtype`: every element type `nn::Checkpoint` reads, each the format
 /// type it reads as that element type.
@@ -83,7 +78,11 @@ pub fn write_file<N: AsRef<str>>(path: &Path, metadata: &[(&str, &str)], tensors
 pub fn write_checkpoint<N: AsRef<str>>(directory: &Path, shards: &[&[Stored<N>]]) {
     match shards {
         [] => panic!("a checkpoint of {} holds no shard", directory.display()),
-        [shard] => write_file(&directory.join(SINGLE_SHARD), &[], shard),
+        [shard] => write_file(
+            &directory.join(Library::Transformers.single_shard()),
+            &[],
+            shard,
+        ),
         shards => {
             let mut weight_map = BTreeMap::new();
 
@@ -97,7 +96,7 @@ pub fn write_checkpoint<N: AsRef<str>>(directory: &Path, shards: &[&[Stored<N>]]
             }
 
             let index = serde_json::json!({ "metadata": {}, "weight_map": weight_map });
-            let path = directory.join(SHARD_INDEX);
+            let path = directory.join(Library::Transformers.shard_index());
             std::fs::write(&path, index.to_string())
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         }

@@ -316,6 +316,19 @@ impl Library {
         }
     }
 
+    /// The file a shard set of one shard holds its tensors in under this library's names:
+    /// `model.safetensors` or `diffusion_pytorch_model.safetensors`.
+    pub fn single_shard(self) -> String {
+        format!("{}.safetensors", self.stem())
+    }
+
+    /// The index that names each tensor's shard in a shard set of several under this
+    /// library's names: `model.safetensors.index.json` or
+    /// `diffusion_pytorch_model.safetensors.index.json`.
+    pub fn shard_index(self) -> String {
+        format!("{}.safetensors.index.json", self.stem())
+    }
+
     /// The shard files the directory `directory` declares under this library's names, in order
     /// of first mention in its index.
     ///
@@ -324,8 +337,8 @@ impl Library {
     /// When the directory holds neither the single shard's name nor the index's, or both, or its
     /// index does not parse or names no file.
     fn shards(self, directory: &Path) -> Result<Vec<PathBuf>> {
-        let single = directory.join(format!("{}.safetensors", self.stem()));
-        let index = directory.join(format!("{}.safetensors.index.json", self.stem()));
+        let single = directory.join(self.single_shard());
+        let index = directory.join(self.shard_index());
 
         match (single.is_file(), index.is_file()) {
             (true, false) => Ok(vec![single]),
