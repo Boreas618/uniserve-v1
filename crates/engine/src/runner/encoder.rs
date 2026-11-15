@@ -785,7 +785,7 @@ mod tests {
                         keys: vec![Key([2; 32])],
                     },
                     Completion::Pinned {
-                        runs: vec![run],
+                        blocks: vec![vec![run]],
                         host: 0,
                     },
                 ),

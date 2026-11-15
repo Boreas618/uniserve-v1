@@ -433,8 +433,8 @@ fn a_repeated_request_finds_its_conditioning_and_makes_no_text_encoding() {
     let pinned = harness.answers().into_iter().any(|answer| {
         matches!(
             answer,
-            (Request::Pin { keys, .. }, Completion::Pinned { runs, .. })
-                if keys == [committed] && runs.len() == 1
+            (Request::Pin { keys, .. }, Completion::Pinned { blocks, .. })
+                if keys == [committed] && blocks.len() == 1
         )
     });
     assert!(pinned, "its admission pins the conditioning");

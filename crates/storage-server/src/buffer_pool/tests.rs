@@ -485,7 +485,7 @@ fn a_commit_takes_effect_at_its_stamp_and_shares_the_block() {
     assert_eq!(
         fixture.pin(2, 0, &[7]),
         Some(Completion::Pinned {
-            runs: Vec::new(),
+            blocks: Vec::new(),
             host: 0
         })
     );
@@ -502,7 +502,7 @@ fn a_commit_takes_effect_at_its_stamp_and_shares_the_block() {
     assert_eq!(
         fixture.pin(2, 0, &[7]),
         Some(Completion::Pinned {
-            runs: vec![(UNITS, unit, 1)],
+            blocks: vec![vec![(UNITS, unit, 1)]],
             host: 0
         })
     );
@@ -533,7 +533,7 @@ fn a_key_that_is_cached_keeps_its_block() {
     assert_eq!(
         fixture.pin(3, 0, &[7]),
         Some(Completion::Pinned {
-            runs: vec![(UNITS, first, 1)],
+            blocks: vec![vec![(UNITS, first, 1)]],
             host: 0
         })
     );
@@ -572,7 +572,7 @@ fn a_commit_outlives_the_release_of_its_block() {
     assert_eq!(
         fixture.pin(2, 0, &[7]),
         Some(Completion::Pinned {
-            runs: vec![(UNITS, unit, 1)],
+            blocks: vec![vec![(UNITS, unit, 1)]],
             host: 0
         })
     );
@@ -588,7 +588,7 @@ fn an_allocation_evicts_unpinned_blocks_in_the_installed_order() {
     assert_eq!(
         fixture.pin(5, 0, &[2]),
         Some(Completion::Pinned {
-            runs: vec![(UNITS, units[1], 1)],
+            blocks: vec![vec![(UNITS, units[1], 1)]],
             host: 0
         })
     );
@@ -815,7 +815,7 @@ fn a_store_and_a_load_move_a_key_between_the_device_and_the_host() {
     assert_eq!(
         fixture.pin(2, 0, &[7]),
         Some(Completion::Pinned {
-            runs: Vec::new(),
+            blocks: Vec::new(),
             host: 1
         })
     );
@@ -837,7 +837,10 @@ fn a_store_and_a_load_move_a_key_between_the_device_and_the_host() {
     assert_eq!(fixture.finish(load, true), Some(Completion::Loaded));
     assert_eq!(
         fixture.pin(2, 1, &[7]),
-        Some(Completion::Pinned { runs: to, host: 0 })
+        Some(Completion::Pinned {
+            blocks: vec![to],
+            host: 0
+        })
     );
     assert_eq!(
         fixture.ask(Request::Evict { keys: vec![key(7)] }),
@@ -1853,7 +1856,7 @@ fn a_copy_made_on_trial_is_visible_to_its_epoch_alone_until_the_update_is_commit
     assert_eq!(
         fixture.pin(1, 0, &[7]),
         Some(Completion::Pinned {
-            runs: Vec::new(),
+            blocks: Vec::new(),
             host: 0
         })
     );
@@ -1861,7 +1864,7 @@ fn a_copy_made_on_trial_is_visible_to_its_epoch_alone_until_the_update_is_commit
     fixture.pool.commit_update(2);
     assert_eq!(fixture.listing().len(), 1);
     assert!(
-        matches!(fixture.pin(1, 0, &[7]), Some(Completion::Pinned { runs, .. }) if runs.len() == 1)
+        matches!(fixture.pin(1, 0, &[7]), Some(Completion::Pinned { blocks, .. }) if blocks.len() == 1)
     );
 }
 
@@ -2441,7 +2444,7 @@ fn a_crossing_that_names_what_does_not_fit_is_refused_and_changes_nothing() {
     };
     let pinned = fixture.submit(trial, pin);
     assert!(
-        matches!(fixture.answer(pinned), Some(Completion::Pinned { runs, .. }) if runs.len() == 1)
+        matches!(fixture.answer(pinned), Some(Completion::Pinned { blocks, .. }) if blocks.len() == 1)
     );
     let crossing = fixture.submit(trial, replicate(1, KV, 0, UNITS, GroupId(1), Vec::new()));
     assert_eq!(fixture.answer(crossing), refused(Cause::Key));
@@ -2619,6 +2622,71 @@ fn a_crossing_takes_a_run_in_the_receiving_region_of_a_memory_where_the_block_ha
     assert_eq!((fixture.free(3), fixture.free(4)), (4, 4));
 }
 
+/// A committed block a crossing copied into another process holds a run in each memory: a pin
+/// of it states the one block with both of its runs, and the key after it, which nothing caches,
+/// is not counted as pinned. The runs of one block are never counted against another's key.
+#[test]
+fn a_pin_states_a_block_held_in_two_memories_with_both_of_its_runs() {
+    // The writer caches products in process a; the reader receives them in process b.
+    let writer = stated(0, "process a", 2, vec![vec![0], vec![3]]);
+    let reader = storage::runtime::Group {
+        receives: vec![Vec::new(), vec![4]],
+        ..stated(1, "process b", 2, vec![vec![0], Vec::new()])
+    };
+    let mut fixture = Fixture {
+        pool: processes(vec![writer, reader]),
+        number: 0,
+    };
+    fixture.attach(1, GroupId(0));
+    let allocate = Request::Allocate {
+        owner: OwnerId(1),
+        class: 1,
+        at: 0,
+        count: 1,
+        units: 3,
+    };
+    let allocated = Completion::Allocated {
+        runs: vec![(3, 0, 3)],
+        evicted: Vec::new(),
+    };
+    assert_eq!(fixture.ask(allocate), Some(allocated));
+    let commit = Request::Commit {
+        owner: OwnerId(1),
+        class: 1,
+        at: 0,
+        key: key(8),
+        tokens: 0,
+        after: Vec::new(),
+    };
+    assert_eq!(fixture.ask(commit), Some(Completion::Committed));
+
+    let crossing = fixture.submit(QUEUE, replicate(1, 1, 0, 3, GroupId(1), Vec::new()));
+    fixture.pool.ended((QUEUE, crossing), true);
+    fixture.checked();
+    assert_eq!(
+        fixture.answer(crossing),
+        Some(Completion::Replicated {
+            runs: vec![(4, 0, 3)],
+            evicted: Vec::new(),
+        })
+    );
+
+    fixture.attach(2, GroupId(0));
+    let pin = Request::Pin {
+        owner: OwnerId(2),
+        class: 1,
+        at: 0,
+        keys: vec![key(8), key(9)],
+    };
+    assert_eq!(
+        fixture.ask(pin),
+        Some(Completion::Pinned {
+            blocks: vec![vec![(3, 0, 3), (4, 0, 3)]],
+            host: 0,
+        })
+    );
+}
+
 #[test]
 fn a_crossing_names_the_keys_taking_its_receiving_run_evicted() {
     // The writer backs products in process a; the reader receives them in process b's buffer,
@@ -2784,7 +2852,7 @@ fn a_host_copy_on_other_host_parts_is_neither_offered_nor_loaded_nor_restored() 
     fixture.attach(3, DECODE);
     let offered = |host| {
         Some(Completion::Pinned {
-            runs: Vec::new(),
+            blocks: Vec::new(),
             host,
         })
     };

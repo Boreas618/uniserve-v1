@@ -218,7 +218,7 @@ impl Scheduler {
                 R::Pin {
                     owner, class, keys, ..
                 },
-                Completion::Pinned { runs, host },
+                Completion::Pinned { blocks, host },
                 None,
             ) => {
                 // A returned admission's pins left with its owner's `Detach`.
@@ -228,11 +228,8 @@ impl Scheduler {
                 else {
                     return;
                 };
-                // A block has a run in each region of its class in the group.
-                let per_block = self
-                    .group(group)
-                    .map_or(1, |found| found.regions(*class).len().max(1));
-                let (held, rest) = keys.split_at((runs.len() / per_block).min(keys.len()));
+                // The answer states one block per leading key it pinned.
+                let (held, rest) = keys.split_at(blocks.len().min(keys.len()));
                 for key in held {
                     self.hold(key, (*class, 0), bit(group), 1, now);
                 }
@@ -1311,7 +1308,7 @@ mod tests {
             keys: keys.to_vec(),
         };
         let pinned = |blocks: u32| Completion::Pinned {
-            runs: (0..blocks).map(|block| (4, block + 1, 1)).collect(),
+            blocks: (0..blocks).map(|block| vec![(4, block + 1, 1)]).collect(),
             host: 0,
         };
         exchange(&mut bench, pin(&[key(3), key(1)]), &pinned(2));
@@ -1367,7 +1364,7 @@ mod tests {
             keys: keys.clone(),
         };
         let pinned = Completion::Pinned {
-            runs: vec![(4, 1, 1); keys.len()],
+            blocks: vec![vec![(4, 1, 1)]; keys.len()],
             host: 0,
         };
         exchange(&mut bench, pin, &pinned);
@@ -1521,7 +1518,7 @@ mod tests {
             keys: vec![key(1)],
         };
         let pinned = Completion::Pinned {
-            runs: vec![(4, 1, 1)],
+            blocks: vec![vec![(4, 1, 1)]],
             host: 0,
         };
         exchange(&mut bench, pin, &pinned);
@@ -1587,7 +1584,7 @@ mod tests {
             keys: keys[..3].to_vec(),
         };
         let pinned = Completion::Pinned {
-            runs: vec![(4, 1, 1)],
+            blocks: vec![vec![(4, 1, 1)]],
             host: 1,
         };
         exchange(&mut bench, pin, &pinned);
@@ -1694,7 +1691,7 @@ mod tests {
             keys: vec![key(1)],
         };
         let pinned = Completion::Pinned {
-            runs: vec![(4, 1, 1)],
+            blocks: vec![vec![(4, 1, 1)]],
             host: 0,
         };
         exchange(&mut bench, pin, &pinned);

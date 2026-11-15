@@ -383,10 +383,11 @@ impl BlockTables {
     /// 0, which addresses nothing, or a slot other than the one the completion states or the
     /// owner's entries are kept under; an owner attached twice; a slot another owner attached
     /// to the group holds; a position that holds an entry already, other than the entry a
-    /// `Replicated` names again; runs that do not divide into the request's blocks, a
-    /// `Replicated` of no run, or a block with two runs in the rank's regions; a load or a clone
-    /// whose destination the rank maps and whose source it does not; a copy that names a region
-    /// whose unit size the table was not given.
+    /// `Replicated` names again; runs that do not divide into the request's blocks, a `Pinned`
+    /// of more blocks than keys or of a block with no run, a `Replicated` of no run, or a block
+    /// with two runs in the rank's regions; a load or a clone whose destination the rank maps and
+    /// whose source it does not; a copy that names a region whose unit size the table was not
+    /// given.
     pub(crate) fn map(
         &mut self,
         slot: u32,
@@ -445,20 +446,26 @@ impl BlockTables {
                     at,
                     keys,
                 },
-                Completion::Pinned { runs, .. },
+                Completion::Pinned { blocks, .. },
             ) => {
-                // The leading keys that were pinned, one run each: a cached block has one run.
-                if runs.len() > keys.len() {
+                // The leading keys that were pinned, a block each with every run it holds, which
+                // the rank keeps as it keeps an allocated block's.
+                if blocks.len() > keys.len() {
                     return Err(Error::Invalid(format!(
-                        "`Pinned` states {} runs for {} keys",
-                        runs.len(),
+                        "`Pinned` states {} blocks for {} keys",
+                        blocks.len(),
                         keys.len()
                     )));
                 }
 
                 let mut entries = Vec::new();
-                for (index, run) in runs.iter().enumerate() {
-                    let reached = self.reached(std::slice::from_ref(run))?;
+                for (index, block) in blocks.iter().enumerate() {
+                    if block.is_empty() {
+                        return Err(Error::Invalid(format!(
+                            "`Pinned` states block {index} with no run"
+                        )));
+                    }
+                    let reached = self.reached(block)?;
                     if !reached.is_empty() {
                         entries.push((*class, position(*at, index)?, reached, false));
                     }
@@ -1550,7 +1557,7 @@ mod tests {
             keys: keys(3),
         };
         let pinned = Completion::Pinned {
-            runs: vec![(DEVICE, 20, 1), (DEVICE, 21, 1)],
+            blocks: vec![vec![(DEVICE, 20, 1)], vec![(DEVICE, 21, 1)]],
             host: 1,
         };
         tables.map(1, RequestId(1), &pin, &pinned).unwrap();
@@ -1762,7 +1769,7 @@ mod tests {
             keys: keys(1),
         };
         let pinned = Completion::Pinned {
-            runs: vec![(DEVICE, 20, 1)],
+            blocks: vec![vec![(DEVICE, 20, 1)]],
             host: 0,
         };
         tables.map(2, RequestId(3), &pin, &pinned).unwrap();
@@ -1977,6 +1984,60 @@ mod tests {
         assert_eq!(entries(&tables, 1, 6), []);
     }
 
+    /// A cached block of a product backed by both ranks of the process is pinned with both of
+    /// its runs: the entry keeps both, as an allocated block's does, the device table and the
+    /// kernels address the rank's own, and the next key's position stays vacant. A completion
+    /// that states more blocks than the pin named keys is refused, and so is a block with no run.
+    #[test]
+    fn a_pinned_block_of_several_memories_keeps_every_run() {
+        let mut pinning = tables().with_peers(&[OTHER_PRODUCTS]);
+        attach(&mut pinning, 1, 1);
+        pinning.take_changes();
+
+        let pin = Request::Pin {
+            owner: OwnerId(1),
+            class: 5,
+            at: 0,
+            keys: keys(2),
+        };
+        let pinned = Completion::Pinned {
+            blocks: vec![vec![(PRODUCTS, 4, 3), (OTHER_PRODUCTS, 12, 3)]],
+            host: 0,
+        };
+        pinning.map(1, RequestId(1), &pin, &pinned).unwrap();
+        assert_eq!(
+            pinning.runs(1, 5, 0),
+            [(PRODUCTS, 4, 3), (OTHER_PRODUCTS, 12, 3)]
+        );
+        assert_eq!(pinning.run(1, 5, 0), Some((PRODUCTS, 4, 3)));
+        assert!(!pinning.writable(1, 5, 0));
+        assert_eq!(pinning.runs(1, 5, 1), []);
+
+        let mut refusing = tables().with_peers(&[OTHER_PRODUCTS]);
+        attach(&mut refusing, 1, 1);
+        let one_key = Request::Pin {
+            owner: OwnerId(1),
+            class: 5,
+            at: 0,
+            keys: keys(1),
+        };
+        let two_blocks = Completion::Pinned {
+            blocks: vec![vec![(PRODUCTS, 4, 3)], vec![(PRODUCTS, 7, 3)]],
+            host: 0,
+        };
+        assert!(
+            refusing
+                .map(1, RequestId(1), &one_key, &two_blocks)
+                .is_err()
+        );
+        let no_run = Completion::Pinned {
+            blocks: vec![vec![]],
+            host: 0,
+        };
+        assert!(refusing.map(1, RequestId(2), &one_key, &no_run).is_err());
+        assert_eq!(refusing.runs(1, 5, 0), []);
+    }
+
     #[test]
     fn a_rank_keeps_every_run_its_process_maps_and_runs_the_copies_of_its_own_memory() {
         // This rank's product buffer and the one of the other rank of its process.
@@ -2014,7 +2075,7 @@ mod tests {
             keys: keys(1),
         };
         let pinned = Completion::Pinned {
-            runs: vec![(OTHER_PRODUCTS, 12, 2)],
+            blocks: vec![vec![(OTHER_PRODUCTS, 12, 2)]],
             host: 0,
         };
         tables.map(1, RequestId(2), &pin, &pinned).unwrap();

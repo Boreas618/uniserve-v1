@@ -256,7 +256,7 @@ fn filled(mut tables: BlockTables, blocks: &[(u8, u32, &[Run], bool)], ranks: u3
                     keys: vec![Key([id as u8; 32]); runs.len()],
                 },
                 Completion::Pinned {
-                    runs: runs.to_vec(),
+                    blocks: runs.iter().map(|run| vec![*run]).collect(),
                     host: 0,
                 },
             ),

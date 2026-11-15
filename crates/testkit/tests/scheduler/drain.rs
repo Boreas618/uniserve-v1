@@ -276,8 +276,8 @@ fn a_migrated_request_continues_its_budget_and_usage_from_its_committed_blocks()
         .answers()
         .into_iter()
         .find_map(|answer| match answer {
-            (Request::Pin { keys, .. }, Completion::Pinned { runs, .. }) => {
-                Some((keys.len(), runs.len()))
+            (Request::Pin { keys, .. }, Completion::Pinned { blocks, .. }) => {
+                Some((keys.len(), blocks.len()))
             }
             _ => None,
         });

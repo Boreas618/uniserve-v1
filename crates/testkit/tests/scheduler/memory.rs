@@ -394,7 +394,7 @@ fn window_with_a_hole() -> (Harness, Vec<Key>, Vec<Key>) {
     let teacher = harness.submit(sharing(2, 1, 9, 2));
     harness.run_until(10, |harness| {
         harness.answers().into_iter().any(|answer| match answer {
-            (Request::Pin { class: 1, .. }, Completion::Pinned { runs, .. }) => runs.len() == 1,
+            (Request::Pin { class: 1, .. }, Completion::Pinned { blocks, .. }) => blocks.len() == 1,
             _ => false,
         })
     });

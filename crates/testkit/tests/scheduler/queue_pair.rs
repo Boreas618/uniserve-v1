@@ -774,8 +774,8 @@ fn a_commit_followed_by_its_requests_detach_still_commits() {
     let reader = harness.submit(reader);
     harness.settle(100);
     let pinned = harness.answers().into_iter().any(|answer| match answer {
-        (Request::Pin { keys, .. }, Completion::Pinned { runs, .. }) => {
-            keys.first() == Some(&key) && runs.len() == 1
+        (Request::Pin { keys, .. }, Completion::Pinned { blocks, .. }) => {
+            keys.first() == Some(&key) && blocks.len() == 1
         }
         _ => false,
     });
@@ -1118,8 +1118,8 @@ fn a_full_to_a_store_leaves_its_blocks_on_the_device() {
         .answers()
         .into_iter()
         .find_map(|answer| match answer {
-            (Request::Pin { keys, .. }, Completion::Pinned { runs, .. }) => {
-                Some((keys.len(), runs.len()))
+            (Request::Pin { keys, .. }, Completion::Pinned { blocks, .. }) => {
+                Some((keys.len(), blocks.len()))
             }
             _ => None,
         });
@@ -1241,8 +1241,8 @@ fn a_shallower_hit_than_cache_expected_costs_one_more_round() {
         .answers()
         .into_iter()
         .find_map(|answer| match answer {
-            (Request::Pin { keys, .. }, Completion::Pinned { runs, .. }) => {
-                Some((keys.len(), runs.len()))
+            (Request::Pin { keys, .. }, Completion::Pinned { blocks, .. }) => {
+                Some((keys.len(), blocks.len()))
             }
             _ => None,
         });

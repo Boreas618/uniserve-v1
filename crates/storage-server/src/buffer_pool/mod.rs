@@ -1100,7 +1100,9 @@ impl BufferPool {
         };
         let host = keys[blocks.len()..].iter().take_while(on_host).count() as u32;
 
-        let runs = blocks.iter().flat_map(|block| block.stated()).collect();
+        // Each block with every run it holds: one in each memory a product's
+        // block lies in.
+        let stated = blocks.iter().map(|block| block.stated()).collect();
         // A pin holds the block: it is no longer evictable.
         blocks.iter().for_each(|block| self.touch(block));
         if let Some(found) = self.owners.get_mut(&(client, owner)) {
@@ -1108,7 +1110,10 @@ impl BufferPool {
                 found.tables[usize::from(class)].insert(position, Held::Shared(block));
             }
         }
-        Ok(Some(Completion::Pinned { runs, host }))
+        Ok(Some(Completion::Pinned {
+            blocks: stated,
+            host,
+        }))
     }
 
     fn release(

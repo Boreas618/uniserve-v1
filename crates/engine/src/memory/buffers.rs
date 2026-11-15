@@ -1416,7 +1416,7 @@ mod tests {
             keys: vec![Key([1; 32])],
         };
         let pinned = Completion::Pinned {
-            runs: vec![(OTHER_PRODUCTS, 8, 2)],
+            blocks: vec![vec![(OTHER_PRODUCTS, 8, 2)]],
             host: 0,
         };
         let mut tables =
@@ -1459,7 +1459,7 @@ mod tests {
             keys: vec![Key([1; 32])],
         };
         let pinned = Completion::Pinned {
-            runs: vec![(PRODUCTS, 4, 2)],
+            blocks: vec![vec![(PRODUCTS, 4, 2)]],
             host: 0,
         };
         tables.map(1, RequestId(1), &pin, &pinned).unwrap();

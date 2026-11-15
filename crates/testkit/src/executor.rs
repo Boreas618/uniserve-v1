@@ -579,10 +579,10 @@ impl State {
                 Request::Pin {
                     owner, class, at, ..
                 },
-                Completion::Pinned { runs, .. },
+                Completion::Pinned { blocks, .. },
             ) => {
-                let entries = runs.iter().zip(*at..);
-                let entries = entries.map(|(run, at)| (*class, at, vec![*run], false));
+                let entries = blocks.iter().zip(*at..);
+                let entries = entries.map(|(runs, at)| (*class, at, runs.clone(), false));
                 Some((*owner, id, entries.collect()))
             }
             // The crossing's runs, read-only: the block is valid in the group's memories.
@@ -1133,7 +1133,7 @@ mod tests {
             keys: vec![Key([1; 32])],
         };
         let pinned = Completion::Pinned {
-            runs: vec![(0, 7, 1)],
+            blocks: vec![vec![(0, 7, 1)]],
             host: 0,
         };
         mapped(fake, 3, pin, pinned);

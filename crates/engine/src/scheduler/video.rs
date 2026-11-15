@@ -1649,8 +1649,8 @@ mod tests {
         assert!(asks.contains(&pin) && !asks.contains(&allocate), "{asks:?}");
 
         // A `Pin` that finds nothing allocates the block at once.
-        let found = |runs: u32| Completion::Pinned {
-            runs: (0..runs).map(|unit| (4, unit, 1)).collect(),
+        let found = |blocks: u32| Completion::Pinned {
+            blocks: (0..blocks).map(|unit| vec![(4, unit, 1)]).collect(),
             host: 0,
         };
         assert_eq!(scheduler.filled(id, &pin, &found(0)), [allocate]);

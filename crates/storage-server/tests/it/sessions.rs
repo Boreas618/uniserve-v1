@@ -300,7 +300,7 @@ pub(crate) fn serve_a_session(server: &Running) {
         keys: vec![key(7)],
     };
     let none = Completion::Pinned {
-        runs: Vec::new(),
+        blocks: Vec::new(),
         host: 0,
     };
     assert_eq!(decode.ask(pin), none);
@@ -1421,12 +1421,12 @@ fn what_an_epoch_on_trial_commits_is_its_own_until_its_head_publishes_it() {
     let prefill = &mut serving_schedulers[0];
     prefill.ask(attach);
     let none = Completion::Pinned {
-        runs: Vec::new(),
+        blocks: Vec::new(),
         host: 0,
     };
     assert_eq!(prefill.ask(pin.clone()), none);
     daemon.publish(vec![1]).unwrap();
-    assert!(matches!(prefill.ask(pin), Completion::Pinned { runs, .. } if runs.len() == 1));
+    assert!(matches!(prefill.ask(pin), Completion::Pinned { blocks, .. } if blocks.len() == 1));
 }
 
 /// A segment of the KV region's memory space.

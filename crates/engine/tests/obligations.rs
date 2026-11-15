@@ -231,7 +231,7 @@ fn pin(id: u64, owner: u64, slot: u32, at: u32, keys: u8, units: &[u32]) -> Hand
         keys: (0..keys).map(key).collect(),
     };
     let pinned = Completion::Pinned {
-        runs: blocks(units),
+        blocks: blocks(units).into_iter().map(|run| vec![run]).collect(),
         host: u32::from(keys) - units.len() as u32,
     };
     map(slot, id, request, pinned)
@@ -749,9 +749,13 @@ impl Expected {
                 Request::Pin {
                     owner, class, at, ..
                 },
-                Completion::Pinned { runs, .. },
+                Completion::Pinned { blocks, .. },
             ) => {
-                for (index, run) in (0..).zip(runs) {
+                for (index, block) in (0..).zip(blocks) {
+                    // The model's ranks hold every class in one memory: a block of one run.
+                    let [run] = block.as_slice() else {
+                        panic!("a pinned block of the model states {} runs", block.len());
+                    };
                     self.give(owner.0, slot, (*class, at + index, *run, false));
                 }
             }

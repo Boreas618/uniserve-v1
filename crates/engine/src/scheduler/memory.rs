@@ -1707,12 +1707,8 @@ impl Scheduler {
             }
             // A copy holds nothing yet: the answer to its `Finish` is its result.
             (_, Completion::Copy { .. }) => return follow,
-            (_, Completion::Pinned { runs, .. }) => {
-                let regions = self
-                    .group(group)
-                    .map_or(1, |group| group.regions(class).len());
-                runs.len() / regions.max(1)
-            }
+            // The answer states one block per leading key it pinned.
+            (_, Completion::Pinned { blocks, .. }) => blocks.len(),
             // A load's copy that found its keys cached meanwhile holds them all the same,
             // read-only; a `Commit` answered `Duplicate` leaves its block private, held as it was,
             // and states nothing more of the tables.
@@ -1733,7 +1729,10 @@ impl Scheduler {
         // read from the cached block's one run when it crosses to another process.
         if let Some((index, _)) = self.encoding_at(request, class, at) {
             let pinned = match completion {
-                Completion::Pinned { runs, .. } => runs.first().map(|run| run.0),
+                Completion::Pinned { blocks, .. } => blocks
+                    .first()
+                    .and_then(|runs| runs.first())
+                    .map(|run| run.0),
                 _ => None,
             };
             if held == 0 {
@@ -2977,9 +2976,9 @@ mod tests {
         }
     }
 
-    fn pinned(runs: u32) -> Completion {
+    fn pinned(blocks: u32) -> Completion {
         Completion::Pinned {
-            runs: (0..runs).map(|unit| (4, unit + 1, 1)).collect(),
+            blocks: (0..blocks).map(|unit| vec![(4, unit + 1, 1)]).collect(),
             host: 0,
         }
     }
@@ -3217,7 +3216,7 @@ mod tests {
             (id, keys, asks)
         };
         let held = |blocks: u32, host: u32| Completion::Pinned {
-            runs: (0..blocks).map(|unit| (4, unit + 1, 1)).collect(),
+            blocks: (0..blocks).map(|unit| vec![(4, unit + 1, 1)]).collect(),
             host,
         };
 

@@ -458,11 +458,15 @@ pub enum Completion {
         runs: Vec<Run>,
         evicted: Vec<Key>,
     },
-    /// The runs of the pinned blocks in position order; `host` counts the
-    /// further leading keys that have a host copy the owner's group can
-    /// load: one that holds every host part the group copies the class with.
+    /// The pinned blocks in position order, one per leading key the pin
+    /// found, each with every run it holds: a block of a class held in
+    /// several memories (a product backed by ranks of several processes)
+    /// states one run per memory, so the runs of one block are never
+    /// counted against another's key. `host` counts the further leading
+    /// keys that have a host copy the owner's group can load: one that
+    /// holds every host part the group copies the class with.
     Pinned {
-        runs: Vec<Run>,
+        blocks: Vec<Vec<Run>>,
         host: u32,
     },
     Committed,
@@ -1059,9 +1063,12 @@ impl Completion {
                 writer.runs(runs);
                 writer.keys(evicted);
             }
-            Self::Pinned { runs, host } => {
+            Self::Pinned { blocks, host } => {
                 writer.byte(5);
-                writer.runs(runs);
+                writer.word(blocks.len() as u32);
+                for runs in blocks {
+                    writer.runs(runs);
+                }
                 writer.word(*host);
             }
             Self::Committed => writer.byte(6),
@@ -1182,8 +1189,11 @@ impl Completion {
                 runs: reader.runs()?,
                 evicted: reader.keys()?,
             },
+            // Each block states at least its run count.
             5 => Self::Pinned {
-                runs: reader.runs()?,
+                blocks: (0..reader.length(4)?)
+                    .map(|_| reader.runs())
+                    .collect::<Result<_>>()?,
                 host: reader.word()?,
             },
             6 => Self::Committed,
@@ -1400,7 +1410,7 @@ mod tests {
                 evicted: vec![key(1)],
             },
             Completion::Pinned {
-                runs: vec![(0, 2, 1)],
+                blocks: vec![vec![(0, 2, 1)], vec![(0, 4, 1), (1, 9, 1)]],
                 host: 3,
             },
             Completion::Committed,
