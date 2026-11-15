@@ -993,17 +993,6 @@ fn single_thread() -> LaunchConfig {
     LaunchConfig::new([1, 1, 1], [1, 1, 1])
 }
 
-/// The host's `CLOCK_MONOTONIC`, nanoseconds: BPF's `ktime_get_ns`.
-pub(crate) fn monotonic() -> u64 {
-    let mut now = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: clock_gettime writes one timespec.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
-    now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
-}
-
 /// The host's `CLOCK_REALTIME`, nanoseconds.
 pub(crate) fn realtime() -> u64 {
     std::time::SystemTime::now()

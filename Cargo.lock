@@ -4214,6 +4214,7 @@ dependencies = [
  "crossbeam-utils",
  "libc",
  "rmp-serde",
+ "rustix",
  "serde",
  "serde_bytes",
  "serde_json",

@@ -42,7 +42,7 @@ use proto::profile::{
 
 use super::artifact::{ClockRow, Message, Writer, send};
 use super::collectors::{self, Collectors};
-use super::markers::{Markers, monotonic, realtime};
+use super::markers::{Markers, realtime};
 use crate::worker::{Error, Result};
 use service::lock;
 
@@ -507,7 +507,9 @@ fn metadata(
 fn clocks(rows: &Sender<Message>, device: DeviceId, source: &'static str) {
     let before = realtime();
     let cupti = platform::cupti::timestamp().ok();
-    let monotonic = monotonic();
+    // The buffer pool's protocol clock, which the scheduler states its instants in: BPF's
+    // `ktime_get_ns`.
+    let monotonic = storage::runtime::monotonic_nanos();
     let after = realtime();
     send(
         rows,

@@ -2408,26 +2408,17 @@ impl Scheduler {
 }
 
 /// The scheduler's one reading of the host's clocks, taken once per process, from which every
-/// instant is placed: an `Instant`, the host's monotonic clock in nanoseconds at that instant,
-/// and the wall clock in seconds since the Unix epoch. An instant maps to the same value however
-/// the wall clock moves after.
+/// instant is placed: an `Instant`, the buffer pool's protocol clock in nanoseconds at that
+/// instant (`storage::runtime::monotonic_nanos`), and the wall clock in seconds since the Unix
+/// epoch. An instant maps to the same value however the wall clock moves after.
 fn clocks() -> (Instant, u64, f64) {
     static ORIGIN: OnceLock<(Instant, u64, f64)> = OnceLock::new();
     *ORIGIN.get_or_init(|| {
-        let mut now = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: `now` is a valid, writable `timespec` for the duration of the call, and
-        // `CLOCK_MONOTONIC` is a clock every Linux host has.
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
-        let seconds = u64::try_from(now.tv_sec).unwrap_or(0);
-        let nanos = u64::try_from(now.tv_nsec).unwrap_or(0);
+        let monotonic = storage::runtime::monotonic_nanos();
         let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        let monotonic = seconds.saturating_mul(1_000_000_000).saturating_add(nanos);
         (Instant::now(), monotonic, wall)
     })
 }

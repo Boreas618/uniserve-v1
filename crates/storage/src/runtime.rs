@@ -31,6 +31,22 @@ use crate::{Error, Key, Result, Segment};
 /// speak, the one version either accepts.
 pub const VERSION: u32 = 7;
 
+/// The clock every instant of this interface is stated in: the host's
+/// monotonic clock (`CLOCK_MONOTONIC`), in nanoseconds since an unspecified
+/// start the host fixes at boot.
+///
+/// An instant one process states, such as a [`Request::Prefetch`]'s deadline
+/// or a cached block's last use the scheduler tells its policy, is compared
+/// with another process's reading of this clock, so every party of the
+/// buffer pool reads it here and no other way. It never steps backwards and
+/// does not follow changes of the wall clock.
+pub fn monotonic_nanos() -> u64 {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let seconds = u64::try_from(now.tv_sec).unwrap_or(0);
+    let nanos = u64::try_from(now.tv_nsec).unwrap_or(0);
+    seconds.saturating_mul(1_000_000_000).saturating_add(nanos)
+}
+
 /// A request's number on its queue pair, drawn by the scheduler from a
 /// counter and never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
