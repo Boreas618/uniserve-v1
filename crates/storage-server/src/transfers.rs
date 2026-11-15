@@ -674,37 +674,16 @@ impl Server {
         for (allocation, resolved) in needed {
             self.give(transfer_server, allocation, &resolved);
         }
-        let task = self.transfers.next_task;
-        self.transfers.next_task += 1;
-        self.transfers.insert(
-            task,
-            Task {
-                owner,
-                deployment: deployment.to_owned(),
-                update,
-                priority,
-                bytes,
-                copied: 0,
-                cancelled: false,
-            },
-        );
-        tracing::info!(
-            task,
-            spans = moves.len(),
+        let task = Task {
+            owner,
+            deployment: deployment.to_owned(),
+            update,
+            priority,
             bytes,
-            ?priority,
-            "forwarding a transfer task"
-        );
-        self.events.push((
-            transfer_server,
-            Event::Task {
-                task,
-                priority,
-                moves,
-            },
-            Vec::new(),
-        ));
-        Ok(task)
+            copied: 0,
+            cancelled: false,
+        };
+        Ok(self.forward_task(transfer_server, task, moves))
     }
 
     /// Have the Transfer Server copy the whole of storage `source` into
@@ -752,30 +731,43 @@ impl Server {
         self.give(transfer_server, from.allocation.clone(), &from);
         self.give(transfer_server, to.allocation.clone(), &to);
 
-        let task = self.transfers.next_task;
+        let task = Task {
+            owner: Owner::Move { number, index },
+            deployment: deployment.to_owned(),
+            update: None,
+            priority: Priority::Background,
+            bytes,
+            copied: 0,
+            cancelled: false,
+        };
+        self.forward_task(transfer_server, task, moves);
+        Ok(())
+    }
+
+    /// Numbers `task`, keeps it, and hands its moves to the Transfer Server, whose client is
+    /// `transfer_server`, once the request being handled gets its response. Returns its number.
+    fn forward_task(&mut self, transfer_server: ClientId, task: Task, moves: Vec<Move>) -> u64 {
+        let number = self.transfers.next_task;
         self.transfers.next_task += 1;
-        self.transfers.insert(
-            task,
-            Task {
-                owner: Owner::Move { number, index },
-                deployment: deployment.to_owned(),
-                update: None,
-                priority: Priority::Background,
-                bytes,
-                copied: 0,
-                cancelled: false,
-            },
+        let priority = task.priority;
+        tracing::info!(
+            task = number,
+            spans = moves.len(),
+            bytes = task.bytes,
+            ?priority,
+            "forwarding a transfer task"
         );
+        self.transfers.insert(number, task);
         self.events.push((
             transfer_server,
             Event::Task {
-                task,
-                priority: Priority::Background,
+                task: number,
+                priority,
                 moves,
             },
             Vec::new(),
         ));
-        Ok(())
+        number
     }
 
     /// Give the Transfer Server `allocation` with its descriptor, unless it
