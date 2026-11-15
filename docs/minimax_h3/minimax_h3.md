@@ -6,7 +6,7 @@ UniServe serves the MiniMax-H3 video-and-audio models: the base MiniMax-H3 check
 
 - Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA Hopper or Blackwell GPUs. Four local GPUs are the standard setup. FastH3 is validated on H200, GB200 and RTX PRO 6000 Blackwell Server Edition; the base checkpoint and OmniRef on four GB200. OmniRef's 128-row sparse-attention tiles have kernels on data-center Blackwell (SM100), Hopper (SM90) and SM120 GPUs, and the server refuses OmniRef on any other GPU at startup.
 - FFmpeg 8.1 with libx264 for keyframe and reference requests: the server probes condition media and the worker decodes reference videos through the FFmpeg libraries the executables link ([the media crate](../../crates/media/README.md) states how a host provides them).
-- Shared memory and pinned host storage for the deployment's processes, as the container command below provisions.
+- Shared memory and page-locked host storage for the deployment's processes: no locked-memory limit (`ulimit -l unlimited`), and in a container a shared-memory size that holds them, such as Docker's `--shm-size=4g --ulimit memlock=-1` for a four-GPU deployment.
 
 ## Install
 
@@ -204,22 +204,6 @@ Startup prepares, and with graphs captures, every layout a request reaches: each
 A base denoiser counts one condition row per token: a five-second reference video with its soundtrack occupies about 38,000 rows, a 16:9 reference image at a 2048-pixel short edge about 7,300 and one at its own 2560×1440 size 3,600. OmniRef packs each condition into whole 128-row tiles: an image or audio track takes `ceil(rows / 128)` tiles, and a video's token grid of latent frames × height/32 × width/32 takes `ceil(frames / 4) × ceil(height / 32 / 4) × ceil(width / 32 / 8)`. The official video-plus-audio request therefore occupies 38,124 rows on the base reference denoiser and 47,104 on OmniRef. The deployment's text capacity, condition capacity and seconds, and the storage they need, bound a request's packed sequence (prompt, conditions and generated rows).
 
 The latent encoder's ranks (`temporal_units`) encode a request's condition units in rounds. Each round goes to the ranks that hold none of the request's calls: while the text encoder's ranks encode the prompt, the latent encoder's other ranks take the units round after round from the moment the media is read, and the text encoder's ranks join once the prompt is encoded. The text encoding is submitted when its vision features exist, so it never waits in a worker's queue ahead of those rounds. A reference image is split into bands of whole 32-pixel patch rows that fill one round, the round's units divided among the request's reference images, so a lone image's tiles are encoded on every rank of the round; a round here is what the latent encoder covers while the prompt is encoded, the ranks it does not share with the text encoder, or all of its ranks when it shares every one; more images than one round holds encode whole, and when only images remain for a final partial round that can share it evenly, they split into the bands that fill it (nine images on four ranks: two rounds of whole images, then the ninth in four bands). The bands assemble the single-rank encoding exactly. Keyframes and reference-video windows remain one unit each. With graphs, startup captures the encoding of one 256-pixel still-frame tile, which keyframe and reference-image tiles replay; reference-video windows encode eagerly.
-
-## Build and run with Docker
-
-```bash
-docker build -f docs/minimax_h3/Dockerfile -t uniserve-h3 .
-
-docker run --rm --gpus all --shm-size=4g --ulimit memlock=-1 -p 8000:8000 \
-  -v "$H3_MODEL:/models/h3:ro" \
-  uniserve-h3 serve /models/h3 \
-    --config configs/minimax_h3/ulysses4.toml \
-    --served-model-name FastH3 \
-    --host 0.0.0.0 \
-    --max-running-requests 2
-```
-
-The image compiles the native kernels for Hopper, data-center Blackwell and RTX PRO 6000 Blackwell. Mount `/root/.cache` and `/root/.triton` to keep the Triton and FlashInfer kernels the first startup compiles.
 
 ## Generate a video
 

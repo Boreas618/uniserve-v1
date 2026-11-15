@@ -39,7 +39,7 @@ The sync builds the `uniserve` executable. The native libraries come from the ho
 - FFmpeg 8.1 is found at build time through pkg-config, at exactly the library versions of that release: a distribution package, or an installation prefix whose `lib/pkgconfig` the build's `PKG_CONFIG_PATH` names and whose `lib` the loader configuration (`/etc/ld.so.conf.d`, then `ldconfig`) registers. A host whose distribution lacks FFmpeg 8.1 builds the FFmpeg 8.1.2 release and libx264 into such a prefix with their own build systems, configured as [the media crate](crates/media/README.md) configures them.
 - A build that runs from its target directory, such as a development or CI build, can instead build the pinned FFmpeg 8.1.2 and libx264 from source with `--features media/vendored` (it needs curl, tar, xz, make, a C compiler and, on x86-64, nasm). Its executables find those libraries through their run path into the target directory.
 
-The Build Server keeps an environment of its own, which `uv sync --locked --python /usr/bin/python3.12 --project crates/build-server/python` creates; it compiles the kernel packages with that environment and the host's CUDA toolkit. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
+The Build Server keeps an environment of its own, which `uv sync --locked --python /usr/bin/python3.12 --project crates/build-server/python` creates; it compiles the kernel packages with that environment and the host's CUDA toolkit. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages.
 
 For RDMA transfers between hosts, install the pinned UCX and NIXL builds described in [NIXL transfers](docs/nixl.md).
 
@@ -226,7 +226,7 @@ docs/architecture.md    Processes, the rank planes and the request path
 docs/configuration.md   The serving option tree, configuration files and deployment files
 docs/admin.md           The admin API: a node's status, event log, deployment and configuration
 docs/profiling.md       Timeline and native profiling
-docs/minimax_h3/        H3 serving and evaluation guides, container files
+docs/minimax_h3/        H3 serving and evaluation guides
 docs/qwen3_moe/         Qwen3-MoE serving and its GSM8K quality confirmation
 ```
 
