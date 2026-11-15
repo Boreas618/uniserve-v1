@@ -1238,7 +1238,7 @@ mod tests {
     /// conditioned task places the condition encoders too, and two networks are refused.
     #[test]
     fn a_tasks_stages_are_its_network_and_what_every_task_returns() {
-        let config = crate::minimax_h3::config::tests_support::released_config();
+        let config = crate::minimax_h3::fixtures::released_config();
 
         let plain = stages(&config, &[VideoTask::TextToVideoAudio], None).unwrap();
         assert!(plain.contains(Stage::Transformer) && plain.contains(Stage::VideoPostprocessor));
@@ -1324,7 +1324,7 @@ mod tests {
     /// for a task without conditions.
     #[test]
     fn a_task_reserves_the_condition_rows_of_its_largest_request() {
-        let config = crate::minimax_h3::config::tests_support::released_config();
+        let config = crate::minimax_h3::fixtures::released_config();
         let capacity = |task| condition_capacity(&config, task).unwrap();
 
         assert_eq!(capacity(VideoTask::TextToVideoAudio), 64);

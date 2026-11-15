@@ -157,11 +157,11 @@ impl Splicer for VideoPostprocessor {
 mod tests {
     use super::*;
     use crate::minimax_h3::VideoVaeConfig;
-    use crate::minimax_h3::config::tests_support;
+    use crate::minimax_h3::fixtures;
     use nn::Device;
 
     fn clips() -> TemporalClips {
-        let config = VideoVaeConfig::parse(&tests_support::video_vae()).expect("the sidecar");
+        let config = VideoVaeConfig::parse(&fixtures::video_vae()).expect("the sidecar");
         video_vae::temporal_clips(&config)
     }
 

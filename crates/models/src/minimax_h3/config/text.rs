@@ -49,7 +49,7 @@ mod tests {
 
     #[test]
     fn the_released_text_encoder_holds_the_retained_layers() {
-        let released = crate::minimax_h3::config::tests_support::text_encoder();
+        let released = crate::minimax_h3::fixtures::text_encoder();
         let config = text_encoder(&released).unwrap();
         assert!(config.text.num_hidden_layers >= RETAINED_LAYERS);
 

@@ -572,7 +572,7 @@ mod tests {
     }
 
     fn transformer() -> Map<String, Value> {
-        crate::minimax_h3::config::tests_support::transformer()
+        crate::minimax_h3::fixtures::transformer()
             .as_object()
             .unwrap()
             .clone()

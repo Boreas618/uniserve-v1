@@ -1207,10 +1207,10 @@ impl VideoEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::minimax_h3::config::tests_support;
+    use crate::minimax_h3::fixtures;
 
     fn config() -> VideoVaeConfig {
-        VideoVaeConfig::parse(&tests_support::video_vae()).expect("the released sidecar")
+        VideoVaeConfig::parse(&fixtures::video_vae()).expect("the released sidecar")
     }
 
     /// The elements of a CPU tensor, widened to FP32, in row-major order.

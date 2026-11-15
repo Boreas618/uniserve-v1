@@ -238,7 +238,7 @@ mod tests {
     use nn::quantization::ModeloptManifest;
 
     use super::*;
-    use crate::minimax_h3::config::tests_support::{dmd_export, read, release};
+    use crate::minimax_h3::fixtures::{dmd_export, read, release};
 
     /// A dense FastH3 export's configuration.
     fn dense() -> Config {

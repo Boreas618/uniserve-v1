@@ -36,6 +36,8 @@ pub mod audio_vae;
 pub mod config;
 pub mod denoiser;
 pub mod family;
+#[cfg(test)]
+pub(crate) mod fixtures;
 pub mod modulation;
 pub mod packing;
 pub mod refiner;
