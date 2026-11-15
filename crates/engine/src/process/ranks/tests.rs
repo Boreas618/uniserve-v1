@@ -670,7 +670,7 @@ fn a_parallel_group_takes_its_block_s_ranks_in_their_stated_order() {
     group.ranks = (0..4)
         .map(|device| WorkerRank {
             host: "localhost".to_owned(),
-            device: format!("cuda:{device}"),
+            device: proto::config::RankDevice::cuda(device as u32),
         })
         .collect();
     let transformer = group.blocks.get_mut("transformer").unwrap();
@@ -719,7 +719,7 @@ fn a_denoiser_block_forms_a_group_along_each_axis_of_its_partition() {
         group.ranks = (0..4)
             .map(|device| WorkerRank {
                 host: "localhost".to_owned(),
-                device: format!("cuda:{device}"),
+                device: proto::config::RankDevice::cuda(device as u32),
             })
             .collect();
         let transformer = group.blocks.get_mut("transformer").unwrap();
@@ -788,7 +788,7 @@ fn every_denoising_rank_encodes_the_conditions_of_its_requests() {
     group.ranks = (0..2)
         .map(|device| WorkerRank {
             host: "localhost".to_owned(),
-            device: format!("cuda:{device}"),
+            device: proto::config::RankDevice::cuda(device as u32),
         })
         .collect();
     let transformer = group.blocks.get_mut("transformer").unwrap();
@@ -847,7 +847,7 @@ fn split_launch() -> EngineArgs {
         replicas: 1,
         ranks: vec![WorkerRank {
             host: "localhost".to_owned(),
-            device: device.to_owned(),
+            device: device.parse().unwrap(),
         }],
         blocks,
         queue_depth: 2,
@@ -887,7 +887,7 @@ fn a_group_of_no_phase_spawns_a_worker_that_serves_nothing() {
     let mut launch = split_launch();
     let mut encoder = launch.engine_config.parallel.worker_groups[0].clone();
     encoder.id = WorkerGroupId("latent_encoder".to_owned());
-    encoder.ranks[0].device = "cuda:2".to_owned();
+    encoder.ranks[0].device = proto::config::RankDevice::cuda(2);
     encoder.blocks =
         BTreeMap::from([("latent_encoder".to_owned(), BlockConfig::parallel(vec![0]))]);
     launch.engine_config.parallel.worker_groups.push(encoder);
@@ -1735,7 +1735,7 @@ fn a_dedicated_expert_rank_maps_no_kv_region() {
     let mut launch = launch();
     let rank = |device: &str| WorkerRank {
         host: "localhost".to_owned(),
-        device: device.to_owned(),
+        device: device.parse().unwrap(),
     };
     let attention = WorkerGroupConfig {
         id: WorkerGroupId("attention".to_owned()),
@@ -1809,7 +1809,7 @@ fn a_dedicated_expert_rank_maps_no_kv_region() {
 fn a_host_numbers_its_text_ranks_by_their_places_in_the_deployment() {
     let placed = |host: &str, device: &str| WorkerRank {
         host: host.to_owned(),
-        device: device.to_owned(),
+        device: device.parse().unwrap(),
     };
     let group = |id: &str, ranks: Vec<WorkerRank>| WorkerGroupConfig {
         id: WorkerGroupId(id.to_owned()),
@@ -2036,7 +2036,7 @@ fn parallel_launch(devices: u32, degrees: impl FnOnce(&mut BlockConfig)) -> Engi
         .rev()
         .map(|device| WorkerRank {
             host: "localhost".to_owned(),
-            device: format!("cuda:{device}"),
+            device: proto::config::RankDevice::cuda(device),
         })
         .collect();
     let mut block = BlockConfig::parallel((0..devices as usize).rev().collect());
@@ -2235,7 +2235,7 @@ fn a_text_group_splits_its_model_along_one_axis_and_every_group_alike() {
             .iter()
             .map(|device| WorkerRank {
                 host: "localhost".to_owned(),
-                device: (*device).to_owned(),
+                device: device.parse().unwrap(),
             })
             .collect(),
         queue_depth: 2,
@@ -2376,7 +2376,7 @@ fn expert_parallelism_places_whole_experts_on_a_tensor_group_and_shares_them_in_
         replicas: 1,
         ranks: vec![WorkerRank {
             host: "localhost".to_owned(),
-            device: format!("cuda:{index}"),
+            device: proto::config::RankDevice::cuda(index as u32),
         }],
         blocks: WorkerGroupConfig::single_block(proto::config::DEFAULT_BLOCK, 1),
         queue_depth: 2,

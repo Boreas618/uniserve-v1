@@ -1237,7 +1237,7 @@ mod tests {
         }
         let rank = WorkerRank {
             host: "localhost".to_owned(),
-            device: "cpu".to_owned(),
+            device: "cpu".parse().unwrap(),
         };
         WorkerGroupConfig {
             id: WorkerGroupId(format!("video-{}", id.0)),
@@ -2119,7 +2119,7 @@ mod tests {
 
         let rank = |host: &str| WorkerRank {
             host: host.to_owned(),
-            device: "cpu".to_owned(),
+            device: "cpu".parse().unwrap(),
         };
         let mut model = config(A);
         model.ranks = vec![rank("a"), rank("b")];

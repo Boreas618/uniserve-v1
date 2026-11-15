@@ -790,7 +790,7 @@ fn an_epoch_update_covers_every_node_of_both_epochs() {
         .enumerate()
         .map(|(rank, host)| proto::config::WorkerRank {
             host: (*host).to_owned(),
-            device: format!("cuda:{}", rank % 2),
+            device: proto::config::RankDevice::cuda(rank as u32 % 2),
         })
         .collect();
     let nodes = vec![

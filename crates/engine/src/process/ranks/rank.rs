@@ -820,8 +820,7 @@ pub(crate) fn placed_ranks(launch: &EngineArgs) -> Result<Vec<(u32, usize, usize
                 u32::try_from(first + position).context("a rank past what the protocol numbers")?;
             let device = rank
                 .device
-                .strip_prefix("cuda:")
-                .and_then(|ordinal| ordinal.parse::<u32>().ok())
+                .cuda_ordinal()
                 .filter(|ordinal| launch.devices.contains(ordinal))
                 .and_then(|ordinal| i32::try_from(ordinal).ok());
             let Some(device) = device else {

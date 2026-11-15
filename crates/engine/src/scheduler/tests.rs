@@ -1033,7 +1033,7 @@ fn the_startup_checks_refuse_a_deployment_its_workers_cannot_serve() {
             .insert(block.to_owned(), BlockConfig::parallel(vec![0]));
         config.ranks = vec![WorkerRank {
             host: host.to_owned(),
-            device: "cpu".to_owned(),
+            device: "cpu".parse().unwrap(),
         }];
         config
     };

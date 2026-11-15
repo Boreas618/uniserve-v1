@@ -4075,7 +4075,7 @@ mod tests {
                     .parallel
                     .worker_groups
                     .iter()
-                    .flat_map(|group| group.ranks.iter().map(|rank| rank.device.clone()))
+                    .flat_map(|group| group.ranks.iter().map(|rank| rank.device.to_string()))
                     .collect()
             })
             .collect();
@@ -4120,7 +4120,7 @@ mod tests {
                     .parallel
                     .worker_groups
                     .iter()
-                    .flat_map(|group| group.ranks.iter().map(|rank| rank.device.clone()))
+                    .flat_map(|group| group.ranks.iter().map(|rank| rank.device.to_string()))
                     .collect()
             })
             .collect();

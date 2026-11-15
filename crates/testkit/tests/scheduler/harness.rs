@@ -641,7 +641,7 @@ impl Deployment {
             .map_or(1, |&(_, count)| count);
         let rank = WorkerRank {
             host: "localhost".to_owned(),
-            device: "cpu".to_owned(),
+            device: "cpu".parse().unwrap(),
         };
         WorkerGroupConfig {
             id: WorkerGroupId(format!("group-{index}")),

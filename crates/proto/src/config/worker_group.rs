@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::{BlockConfig, DeviceKind};
+use super::{BlockConfig, DeviceKind, RankDevice};
 
 /// The block used when a deployment does not partition a model by capability.
 pub const DEFAULT_BLOCK: &str = "model";
@@ -66,8 +66,8 @@ pub struct WorkerRank {
     /// Host identity: the daemon of the node with this host identity starts
     /// the rank.
     pub host: String,
-    /// Device string, such as `cuda:0` for a GPU rank or `cpu` for a CPU worker.
-    pub device: String,
+    /// The rank's device on its host, such as `cuda:0` for a GPU rank or `cpu` for a CPU worker.
+    pub device: RankDevice,
 }
 
 /// The numerical work a worker group owns in a deployment.
@@ -193,7 +193,7 @@ impl WorkerGroupConfig {
                 } else {
                     rank.host.clone()
                 },
-                device: rank.device.clone(),
+                device: rank.device,
             })
             .collect();
         anyhow::ensure!(
@@ -256,7 +256,7 @@ mod ranks {
     ) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(ranks.iter().map(|rank| {
             if rank.host.is_empty() {
-                rank.device.clone()
+                rank.device.to_string()
             } else {
                 format!("{}/{}", rank.host, rank.device)
             }
@@ -308,13 +308,17 @@ mod ranks {
         if devices.iter().any(String::is_empty) {
             return Err(invalid("the device is empty"));
         }
-        Ok(devices
+        devices
             .into_iter()
-            .map(|device| WorkerRank {
-                host: host.to_owned(),
-                device,
+            .map(|device| {
+                Ok(WorkerRank {
+                    host: host.to_owned(),
+                    device: device
+                        .parse()
+                        .map_err(|error: anyhow::Error| invalid(&error.to_string()))?,
+                })
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -373,14 +377,11 @@ impl WorkerGroupConfig {
         anyhow::ensure!(!ranks.is_empty(), "worker requires rank members");
         let mut devices = BTreeSet::new();
         for rank in ranks {
-            anyhow::ensure!(
-                !rank.host.is_empty() && !rank.device.is_empty(),
-                "rank requires host and device"
-            );
+            anyhow::ensure!(!rank.host.is_empty(), "rank requires a host");
             // Within a group a `(host, device)` pair names one rank, except
             // `cpu`, which several ranks on one host may share.
             anyhow::ensure!(
-                devices.insert((&rank.host, &rank.device)) || rank.device == "cpu",
+                devices.insert((&rank.host, rank.device)) || rank.device.is_shared(),
                 "worker repeats a physical device"
             );
         }
@@ -735,7 +736,7 @@ mod tests {
     fn rank(host: &str, device: &str) -> WorkerRank {
         WorkerRank {
             host: host.into(),
-            device: device.into(),
+            device: device.parse().unwrap(),
         }
     }
 
@@ -760,7 +761,11 @@ mod tests {
             .map(|group| {
                 (
                     group.id.to_string(),
-                    group.ranks.iter().map(|rank| rank.device.clone()).collect(),
+                    group
+                        .ranks
+                        .iter()
+                        .map(|rank| rank.device.to_string())
+                        .collect(),
                 )
             })
             .collect()
@@ -963,7 +968,7 @@ mod tests {
                     for group in place(host) {
                         for rank in &group.ranks {
                             assert!(
-                                !rank.device.starts_with(DeviceKind::Cpu.name()),
+                                rank.device.kind != DeviceKind::Cpu,
                                 "{}: worker group {} places rank {}/{} on a CPU",
                                 path.display(),
                                 group.id,

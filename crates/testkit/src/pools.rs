@@ -61,7 +61,10 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
     );
     for (index, group) in groups.iter_mut().enumerate() {
         for rank in &mut group.ranks {
-            rank.device = format!("cpu:{index}");
+            rank.device = proto::config::RankDevice {
+                kind: proto::config::DeviceKind::Cpu,
+                index: Some(index as u32),
+            };
         }
     }
 

@@ -429,7 +429,7 @@ mod tests {
                 .iter()
                 .map(|host| WorkerRank {
                     host: (*host).to_owned(),
-                    device: "cpu".to_owned(),
+                    device: "cpu".parse().unwrap(),
                 })
                 .collect(),
             blocks: BTreeMap::new(),

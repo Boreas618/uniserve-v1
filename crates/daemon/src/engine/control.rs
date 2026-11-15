@@ -1704,22 +1704,12 @@ fn local_devices(host: &str, config: &proto::config::EngineConfig) -> anyhow::Re
             if rank.host != host {
                 continue;
             }
-            let ordinal = rank
-                .device
-                .strip_prefix("cuda:")
-                .with_context(|| {
-                    format!(
-                        "host {host} runs a rank on {:?}: an engine serves CUDA devices",
-                        rank.device
-                    )
-                })?
-                .parse::<u32>()
-                .with_context(|| {
-                    format!(
-                        "the device ordinal of rank {:?} does not parse",
-                        rank.device
-                    )
-                })?;
+            let ordinal = rank.device.cuda_ordinal().with_context(|| {
+                format!(
+                    "host {host} runs a rank on {}: an engine serves CUDA devices",
+                    rank.device
+                )
+            })?;
             if !devices.contains(&ordinal) {
                 devices.push(ordinal);
             }

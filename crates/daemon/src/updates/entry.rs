@@ -1036,8 +1036,8 @@ mod tests {
             let ranks = &resolved.parallel.worker_groups[0].ranks;
             assert_eq!(ranks.len(), 2);
             assert!(ranks.iter().all(|rank| rank.host == host));
-            assert_eq!(ranks[0].device, "cuda:0");
-            assert_eq!(ranks[1].device, "cuda:1");
+            assert_eq!(ranks[0].device, proto::config::RankDevice::cuda(0));
+            assert_eq!(ranks[1].device, proto::config::RankDevice::cuda(1));
         }
     }
 
@@ -1060,9 +1060,9 @@ mod tests {
         assert!(same(
             &|target| target.kv_cache.host_tier = !target.kv_cache.host_tier
         ));
-        assert!(!same(
-            &|target| target.parallel.worker_groups[0].ranks[0].device = "cuda:3".to_owned()
-        ));
+        assert!(!same(&|target| target.parallel.worker_groups[0].ranks[0]
+            .device =
+            proto::config::RankDevice::cuda(3)));
         assert!(!same(
             &|target| target.max_running_requests = std::num::NonZeroUsize::new(3).unwrap()
         ));

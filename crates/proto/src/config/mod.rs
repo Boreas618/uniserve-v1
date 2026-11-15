@@ -359,7 +359,9 @@ pub struct SpeculativeConfig {
 }
 
 /// The kind of device the command line's shorthand places every rank on (`device_config.device`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceKind {
     /// A CUDA GPU: each host numbers its ranks' GPUs from zero.
@@ -382,12 +384,22 @@ impl DeviceKind {
         }
     }
 
-    /// The device string of the rank with index `local` among its host's ranks of this kind:
-    /// `cuda:<local>` for a GPU, the kind's name alone for the devices a host's ranks share.
-    pub fn rank_device(self, local: u32) -> String {
+    /// The kind [`Self::name`] names; `None` for a name of no kind.
+    pub fn of_name(name: &str) -> Option<Self> {
+        [Self::Cuda, Self::Cpu, Self::Meta]
+            .into_iter()
+            .find(|kind| kind.name() == name)
+    }
+
+    /// The device of the rank with index `local` among its host's ranks of this kind: GPU
+    /// `local` of the host for a GPU, the kind alone for the devices a host's ranks share.
+    pub fn rank_device(self, local: u32) -> RankDevice {
         match self {
-            Self::Cuda => format!("cuda:{local}"),
-            Self::Cpu | Self::Meta => self.name().to_owned(),
+            Self::Cuda => RankDevice::cuda(local),
+            Self::Cpu | Self::Meta => RankDevice {
+                kind: self,
+                index: None,
+            },
         }
     }
 }
@@ -395,6 +407,90 @@ impl DeviceKind {
 impl fmt::Display for DeviceKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.name())
+    }
+}
+
+/// The device one rank runs on: its kind and, for a device its host numbers, the device's index
+/// on the rank's host. A deployment file and a launch write it `KIND[:INDEX]`: `cuda:0`, `cpu`.
+///
+/// A CUDA device always states its ordinal on the host. The host's CPU and the meta device are
+/// shared by the host's ranks and state no index, or one that only tells the memories of ranks
+/// apart (a host of one scheduler's ranks per index, as a GPU per scheduler would).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RankDevice {
+    pub kind: DeviceKind,
+    pub index: Option<u32>,
+}
+
+impl RankDevice {
+    /// The CUDA device of ordinal `ordinal` on the rank's host.
+    pub const fn cuda(ordinal: u32) -> Self {
+        Self {
+            kind: DeviceKind::Cuda,
+            index: Some(ordinal),
+        }
+    }
+
+    /// The ordinal of a CUDA device on its host; `None` for a device of another kind.
+    pub fn cuda_ordinal(&self) -> Option<u32> {
+        match self.kind {
+            DeviceKind::Cuda => self.index,
+            DeviceKind::Cpu | DeviceKind::Meta => None,
+        }
+    }
+
+    /// Whether several ranks of a group may name this device on one host: the host's CPU, which
+    /// every rank of the host shares. Every other device is one rank's.
+    pub fn is_shared(&self) -> bool {
+        self.kind == DeviceKind::Cpu && self.index.is_none()
+    }
+}
+
+impl fmt::Display for RankDevice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.index {
+            Some(index) => write!(formatter, "{}:{index}", self.kind),
+            None => write!(formatter, "{}", self.kind),
+        }
+    }
+}
+
+impl FromStr for RankDevice {
+    type Err = anyhow::Error;
+
+    /// Parses `KIND[:INDEX]`, refusing an unknown kind, an index that is no integer, and a CUDA
+    /// device that states no ordinal.
+    fn from_str(text: &str) -> anyhow::Result<Self> {
+        let (name, index) = match text.split_once(':') {
+            Some((name, index)) => {
+                let index = index.parse::<u32>().map_err(|_| {
+                    anyhow::anyhow!("device {text:?}: the index after `:` is no integer")
+                })?;
+                (name, Some(index))
+            }
+            None => (text, None),
+        };
+        let kind = DeviceKind::of_name(name).ok_or_else(|| {
+            anyhow::anyhow!("device {text:?}: {name:?} is no device kind (cuda, cpu or meta)")
+        })?;
+        anyhow::ensure!(
+            kind != DeviceKind::Cuda || index.is_some(),
+            "device {text:?}: a CUDA device states its ordinal, `cuda:<ordinal>`"
+        );
+        Ok(Self { kind, index })
+    }
+}
+
+impl Serialize for RankDevice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for RankDevice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
     }
 }
 

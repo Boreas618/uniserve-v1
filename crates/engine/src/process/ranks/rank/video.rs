@@ -1949,7 +1949,7 @@ mod tests {
         ]);
         let rank = proto::config::WorkerRank {
             host: "localhost".to_owned(),
-            device: "cuda:0".to_owned(),
+            device: proto::config::RankDevice::cuda(0),
         };
         let group = WorkerGroupConfig {
             id: WorkerGroupId("model".to_owned()),

@@ -111,7 +111,7 @@ fn a_release_is_reported_once_per_host_its_ranks_gave_memory_back_on() {
             .iter()
             .map(|host| WorkerRank {
                 host: (*host).to_owned(),
-                device: "cuda:0".to_owned(),
+                device: proto::config::RankDevice::cuda(0),
             })
             .collect(),
         blocks: BTreeMap::new(),
