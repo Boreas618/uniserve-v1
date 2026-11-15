@@ -62,9 +62,7 @@ fn build_server(directory: &Path) -> (PathBuf, std::os::unix::net::UnixStream) {
         .unwrap()
         .owned(&socket)
         .unwrap();
-    let lock = starting
-        .finish(&build_server::readiness(&socket))
-        .unwrap();
+    let lock = starting.finish(&build_server::readiness(&socket)).unwrap();
     let server = Arc::new(build_server::server::BuildServer::open(&config).unwrap());
     let (stop, stopped) = std::os::unix::net::UnixStream::pair().unwrap();
     std::thread::spawn(move || {

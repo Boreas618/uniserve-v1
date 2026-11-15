@@ -278,7 +278,7 @@ fn a_store_build_names_its_keys_target_and_package_tree() {
             &service::logging::Levels::new(None),
         )
         .expect_err("the build is refused")
-            .to_string()
+        .to_string()
     };
 
     let nothing = build(&[]);
