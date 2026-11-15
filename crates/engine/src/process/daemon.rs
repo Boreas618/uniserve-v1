@@ -18,6 +18,7 @@
 //! lifetime, when one passes.
 
 use std::num::NonZeroU32;
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -28,6 +29,7 @@ use proto::config::EngineArgs;
 use proto::process::{downstream, request, upstream};
 use proto::request::ArtifactMedia;
 use proto::request::wire;
+use proto::{MappedMedia, MediaReceiver};
 use service::{Connection, Message};
 
 use super::Input;
@@ -226,15 +228,25 @@ fn hello(connection: &mut Connection, engine: u64) -> Result<NonZeroU32> {
 ///
 /// The connection's failure or the daemon's close, and a frame that does not decode.
 fn next<M: Message>(connection: &mut Connection) -> std::io::Result<M> {
+    next_with(connection).map(|(message, _)| message)
+}
+
+/// [`next`], with the descriptors the message's frame carried.
+///
+/// # Errors
+///
+/// As [`next`].
+fn next_with<M: Message>(connection: &mut Connection) -> std::io::Result<(M, Vec<OwnedFd>)> {
     loop {
-        if let Some(message) = connection.recv(Duration::MAX)? {
-            return Ok(message);
+        if let Some(frame) = connection.recv_with(Duration::MAX)? {
+            return Ok(frame);
         }
     }
 }
 
 /// Starts the reader thread `name` of `connection`, which blocks on the connection and hands each
-/// message to `deliver` until `deliver` says the control thread is gone, the daemon closes the
+/// message, with the descriptors its frame carried, to `deliver` until `deliver` says to stop
+/// (the control thread is gone, or the message cannot be taken), the daemon closes the
 /// connection, or a frame does not decode; `closed` then tells the control thread the connection
 /// ended.
 ///
@@ -244,17 +256,17 @@ fn next<M: Message>(connection: &mut Connection) -> std::io::Result<M> {
 fn read<M: Message>(
     name: String,
     mut connection: Connection,
-    mut deliver: impl FnMut(M) -> bool + Send + 'static,
+    mut deliver: impl FnMut(M, Vec<OwnedFd>) -> bool + Send + 'static,
     closed: impl FnOnce() + Send + 'static,
 ) -> Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name(name.clone())
         .spawn(move || {
             loop {
-                match next::<M>(&mut connection) {
-                    Ok(message) => {
-                        if !deliver(message) {
-                            return;
+                match next_with::<M>(&mut connection) {
+                    Ok((message, descriptors)) => {
+                        if !deliver(message, descriptors) {
+                            break;
                         }
                     }
                     // The daemon closed the connection.
@@ -271,8 +283,13 @@ fn read<M: Message>(
 }
 
 /// Starts the reader thread of front `front`, which hands every frame of `connection` to the
-/// control thread as [`Input::Frame`] and ends with [`Input::FrontClosed`] once the daemon closed
-/// it or a frame does not decode.
+/// control thread as [`Input::Frame`], with the media that came with it, and ends with
+/// [`Input::FrontClosed`] once the daemon closed it or a frame or a medium does not decode.
+///
+/// A `Submit` from a front on this host carries its requests' condition media as descriptors; a
+/// front on another host sends them as parts ahead of it (`condition_part`), which the reader
+/// writes into memory files of this process's own. Either way the frame reaches the control
+/// thread with its media in the order the requests' conditions state them.
 ///
 /// # Errors
 ///
@@ -283,14 +300,66 @@ pub(crate) fn read_requests(
     inbox: Sender<Input>,
 ) -> Result<JoinHandle<()>> {
     let closing = inbox.clone();
+    // The medium arriving in parts, and those that arrived whole, for the next frame.
+    let mut receiving: Option<MediaReceiver> = None;
+    let mut arrived: Vec<Arc<MappedMedia>> = Vec::new();
     read(
         format!("front-{front}"),
         connection,
-        move |frame: wire::ToEngine| inbox.send(Input::Frame(front, frame)).is_ok(),
+        move |frame: wire::ToEngine, descriptors| {
+            let received = match &frame.kind {
+                Some(wire::to_engine::Kind::ConditionPart(part)) => {
+                    receive_part(&mut receiving, &mut arrived, part).map(|()| None)
+                }
+                _ => descriptors
+                    .into_iter()
+                    .map(|descriptor| MappedMedia::whole(descriptor).map(Arc::new))
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .map(|passed| {
+                        let mut media = std::mem::take(&mut arrived);
+                        media.extend(passed);
+                        Some(media)
+                    }),
+            };
+            match received {
+                Ok(Some(media)) => inbox
+                    .send(Input::Frame(front, Box::new(frame), media))
+                    .is_ok(),
+                Ok(None) => true,
+                Err(error) => {
+                    tracing::warn!(%error, front, "a medium from a daemon front does not map");
+                    false
+                }
+            }
+        },
         move || {
             let _ = closing.send(Input::FrontClosed(front));
         },
     )
+}
+
+/// Writes `part` of a condition's medium into the medium arriving (`receiving`), starting one when
+/// none is, and moves the medium to `arrived` once its last part came.
+///
+/// # Errors
+///
+/// A part that changes or exceeds its medium's length, or a memory file the kernel refuses.
+fn receive_part(
+    receiving: &mut Option<MediaReceiver>,
+    arrived: &mut Vec<Arc<MappedMedia>>,
+    part: &wire::MediaPart,
+) -> std::io::Result<()> {
+    let medium = match receiving {
+        Some(medium) => medium,
+        None => receiving.insert(MediaReceiver::new(part.size)?),
+    };
+    medium.append(part.size, &part.data)?;
+    if medium.complete()
+        && let Some(medium) = receiving.take()
+    {
+        arrived.push(Arc::new(medium.finish(part.size)?));
+    }
+    Ok(())
 }
 
 /// Starts the reader thread of the process interface, which hands every command of `connection`
@@ -308,7 +377,8 @@ pub(crate) fn read_commands(
     read(
         "commands".to_owned(),
         connection,
-        move |message: proto::process::Downstream| match message.kind {
+        // The process interface passes no descriptor to the engine.
+        move |message: proto::process::Downstream, _| match message.kind {
             Some(downstream::Kind::Event(proto::process::Event {
                 kind: Some(proto::process::event::Kind::Command(command)),
             })) => inbox.send(Input::Command(Some(command))).is_ok(),
@@ -371,9 +441,9 @@ pub(crate) fn queue(
         return connection.send_with(&frame, &[descriptor]);
     }
     let bytes = media.bytes();
-    for data in bytes.chunks(proto::ARTIFACT_PART_BYTES) {
+    for data in bytes.chunks(proto::media::PART_BYTES) {
         connection.deliver(&wire::FromEngine {
-            kind: Some(wire::from_engine::Kind::ArtifactPart(wire::ArtifactPart {
+            kind: Some(wire::from_engine::Kind::ArtifactPart(wire::MediaPart {
                 size: bytes.len() as u64,
                 data: data.to_vec(),
             })),
@@ -394,4 +464,92 @@ pub(crate) fn report(
     process.deliver(&proto::process::Upstream {
         kind: Some(upstream::Kind::Report(report)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixStream;
+
+    use service::Listener;
+
+    use super::*;
+
+    /// A `Submit` whose request states `conditions` conditions.
+    fn submit(conditions: usize) -> wire::ToEngine {
+        let request = wire::Request {
+            id: 7,
+            priority: 0,
+            kind: Some(wire::request::Kind::Diffusion(wire::DiffusionRequest {
+                conditions: vec![wire::ConditionExtent::default(); conditions],
+                ..wire::DiffusionRequest::default()
+            })),
+        };
+        wire::ToEngine {
+            kind: Some(wire::to_engine::Kind::Submit(wire::Submit {
+                requests: vec![request],
+            })),
+        }
+    }
+
+    /// The media of the first frame front 0's reader hands the control thread, a submission.
+    fn media_of(inbox: &crossbeam_channel::Receiver<Input>) -> Vec<Arc<MappedMedia>> {
+        match inbox.recv_timeout(Duration::from_secs(10)) {
+            Ok(Input::Frame(0, frame, media)) => {
+                assert!(matches!(frame.kind, Some(wire::to_engine::Kind::Submit(_))));
+                media
+            }
+            _ => panic!("the reader hands the control thread the submission"),
+        }
+    }
+
+    /// A front on this host passes each condition's sealed memory file beside the `Submit`, and
+    /// the control thread receives the submission with a mapping of each, in order.
+    #[test]
+    fn a_local_front_s_condition_media_come_with_their_submission() {
+        let (daemon, engine) = UnixStream::pair().unwrap();
+        let mut daemon = Connection::new(daemon).unwrap();
+        let (sender, inbox) = crossbeam_channel::unbounded();
+        read_requests(0, Connection::new(engine).unwrap(), sender).unwrap();
+
+        let first = MappedMedia::copy(b"first condition").unwrap();
+        let second = MappedMedia::copy(b"second").unwrap();
+        let descriptors = [first.descriptor().unwrap(), second.descriptor().unwrap()];
+        daemon.send_with(&submit(2), &descriptors).unwrap();
+        daemon.flush().unwrap();
+
+        let media = media_of(&inbox);
+        assert_eq!(media.len(), 2);
+        assert_eq!(media[0].bytes(), b"first condition");
+        assert_eq!(media[1].bytes(), b"second");
+    }
+
+    /// A front on another host sends each condition's medium as parts ahead of the `Submit`, and
+    /// the control thread receives the submission with each medium whole, in order.
+    #[test]
+    fn a_remote_front_s_condition_media_arrive_in_parts_before_their_submission() {
+        let listener = Listener::bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut daemon = Connection::connect(listener.endpoint()).unwrap();
+        let engine = listener.try_accept().unwrap().unwrap();
+        let (sender, inbox) = crossbeam_channel::unbounded();
+        read_requests(0, engine, sender).unwrap();
+
+        for medium in [b"0123456789".as_slice(), b"abc".as_slice()] {
+            for data in medium.chunks(4) {
+                daemon
+                    .deliver(&wire::ToEngine {
+                        kind: Some(wire::to_engine::Kind::ConditionPart(wire::MediaPart {
+                            size: medium.len() as u64,
+                            data: data.to_vec(),
+                        })),
+                    })
+                    .unwrap();
+            }
+        }
+        daemon.deliver(&submit(2)).unwrap();
+
+        let media = media_of(&inbox);
+        assert_eq!(media.len(), 2);
+        assert_eq!(media[0].bytes(), b"0123456789");
+        assert_eq!(media[1].bytes(), b"abc");
+    }
 }

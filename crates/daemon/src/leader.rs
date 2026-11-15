@@ -1338,7 +1338,7 @@ impl Leader {
                     request_id: request_id.clone(),
                     feature: "video_generation",
                 })?;
-        let (request, processed, media) = video
+        let (request, processed) = video
             .process(&request_id, &request, self.processor.config().max_model_len)
             .await?;
         let prompt_tokens = request.prompt_token_ids.len();
@@ -1350,11 +1350,6 @@ impl Leader {
             prompt_tokens,
             Box::new(events),
         );
-        // The workers read the condition media while the request runs, which
-        // ends with its event stream.
-        let output: RequestOutputStream = Box::pin(output.inspect(move |_| {
-            let _ = &media;
-        }));
         Ok((processed, self.stats(request_id, started, core, output)))
     }
 

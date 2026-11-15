@@ -317,6 +317,7 @@ fn dealt(
             request: RequestId(1),
             slot: SLOT,
             conditioning: Vec::new(),
+            media: Vec::new(),
             step: 0,
             steps: 0,
             seed: 0,

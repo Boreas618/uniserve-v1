@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::{DiffusionSamplingParams, RequestId, TokenLogprob};
+use crate::media::MappedMedia;
 
 /// Terminal cause for one generation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,7 +230,8 @@ pub struct ArtifactEvent {
     pub media: Arc<dyn ArtifactMedia>,
 }
 
-/// A video request. Final media bytes are returned through shared storage.
+/// A video request: its conditions' media travel beside it, and its final media return as an
+/// artifact ([`ArtifactEvent`]).
 ///
 /// What the request asks of the model (its conditions and where its prompt
 /// presents them) travels opaque in `conditioning` to the workers; the
@@ -242,13 +244,19 @@ pub struct DiffusionRequest {
     /// and the prompt), tokenized.
     pub prompt_token_ids: Vec<u32>,
     /// The request's conditions as its model planned them
-    /// (`crate::video::Conditions`, JSON), which the workers decode.
+    /// (`crate::video::Conditions`, encoded as `VideoConditions`), which the workers decode.
     pub conditioning: Vec<u8>,
     /// The sizes of each condition, in request order; empty for a task
-    /// without conditions. The submitter keeps each condition's media
-    /// published, under the locator the conditioning names, until the
-    /// request ends.
+    /// without conditions.
     pub conditions: Vec<ConditionExtent>,
+    /// Each condition's fetched media, in request order, one per entry of
+    /// [`Self::conditions`]: sealed anonymous memory files, which the request
+    /// interface carries beside the request's `Submit` (as descriptors to an
+    /// engine on this host, in parts to one on another) and which the media
+    /// reader decodes. They are held for as long as the request is, and are
+    /// not part of its serialized record.
+    #[serde(skip)]
+    pub media: Vec<Arc<MappedMedia>>,
     /// Scheduler priority.
     pub priority: i32,
     /// Effective diffusion controls and model-preprocessed media unit count.

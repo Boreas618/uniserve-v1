@@ -19,8 +19,9 @@
 //! [`Capacity`] is what a worker group's workers serve, stated once they are ready, with the cache
 //! groups it names ([`cache`]) and a media group's pipeline, whose products a request's phases
 //! write and read (`nn::pipeline`); [`philox`] holds the counter-based draws a sampled row's
-//! random value comes from, and [`media`] the generated media a batch's output names by a
-//! shared-memory handle.
+//! random value comes from. A media read's row carries its request's condition media and a
+//! muxing call's output its generated artifact ([`MediaOutput`]), each a sealed memory file the
+//! process shares.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -31,6 +32,7 @@ pub use scheduling::Phase;
 use serde::{Deserialize, Serialize};
 use storage::runtime::GroupId;
 
+use proto::MappedMedia;
 use proto::report::ForwardStats;
 use proto::request::{RequestId, TokenLogprob};
 
@@ -80,7 +82,6 @@ macro_rules! ensure_valid {
 
 pub mod cache;
 pub mod capacity;
-pub(crate) mod media;
 pub mod philox;
 
 pub use capacity::Capacity;
@@ -272,37 +273,72 @@ pub struct TimingCounters {
     pub host_us: u64,
 }
 
-/// Transport handle for a completed media artifact.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactHandle {
-    /// Artifact stored in a POSIX shared-memory object.
-    PosixShm {
-        /// Shared-memory object name without a path separator.
-        name: String,
-    },
-}
+/// One materialized media artifact: a sealed anonymous memory file the media host wrote and
+/// mapped (`proto::MappedMedia`), which the scheduler hands to the daemon, which maps the same file
+/// through its descriptor. Within the process the artifact is shared, never copied; the peer link
+/// carries its bytes, which the receiving process writes into a memory file of its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaOutput(#[serde(with = "medium_bytes")] pub Arc<MappedMedia>);
 
-impl ArtifactHandle {
-    /// Validates the transport-specific artifact identifier.
-    pub fn validate(&self) -> ValidationResult<()> {
-        match self {
-            Self::PosixShm { name } => ensure_valid!(
-                !name.is_empty() && !name.contains('/'),
-                "POSIX shared-memory artifact name is invalid"
-            ),
-        }
-        Ok(())
+/// The serde form of a medium (`proto::MappedMedia`): its bytes as one byte string, which the peer
+/// link's MessagePack carries as binary, read back into a sealed memory file of the receiver's.
+mod medium_bytes {
+    use std::sync::Arc;
+
+    use proto::MappedMedia;
+    use proto::request::ArtifactMedia as _;
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        medium: &Arc<MappedMedia>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(medium.bytes())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Arc<MappedMedia>, D::Error> {
+        let bytes = serde_bytes::ByteBuf::deserialize(deserializer)?;
+        MappedMedia::copy(&bytes)
+            .map(Arc::new)
+            .map_err(D::Error::custom)
     }
 }
 
-/// Metadata describing one materialized media artifact.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MediaOutput {
-    /// Transport descriptor for the materialized artifact.
-    pub handle: ArtifactHandle,
-    /// Artifact length in bytes.
-    pub bytes: u64,
+/// The serde form of a row's condition media ([`MediaRow::media`]): each medium as one byte
+/// string, as [`medium_bytes`] states it.
+mod media_bytes {
+    use std::sync::Arc;
+
+    use proto::MappedMedia;
+    use proto::request::ArtifactMedia as _;
+    use serde::de::Error as _;
+    use serde::ser::SerializeSeq as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        media: &[Arc<MappedMedia>],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(media.len()))?;
+        for medium in media {
+            sequence.serialize_element(serde_bytes::Bytes::new(medium.bytes()))?;
+        }
+        sequence.end()
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Arc<MappedMedia>>, D::Error> {
+        let media: Vec<serde_bytes::ByteBuf> = Deserialize::deserialize(deserializer)?;
+        media
+            .iter()
+            .map(|bytes| MappedMedia::copy(bytes).map(Arc::new))
+            .collect::<std::io::Result<_>>()
+            .map_err(D::Error::custom)
+    }
 }
 
 /// The serde form of a media row's image: the encoded file as one byte string, which the peer
@@ -944,6 +980,11 @@ pub struct MediaRow {
     pub slot: u32,
     /// The request's conditioning, as the model family prepared it.
     pub conditioning: Vec<u8>,
+    /// The fetched media of the request's conditions, in condition order, on a media read's row
+    /// alone (empty on every other row): what the reader decodes. The peer link carries their
+    /// bytes.
+    #[serde(with = "media_bytes")]
+    pub media: Vec<Arc<MappedMedia>>,
     /// The zero-based diffusion step this call is.
     pub step: u32,
     /// The steps the request's schedule runs in total.
@@ -1276,13 +1317,6 @@ impl CallOutput {
             self.token_logprobs.is_empty() || self.token_logprobs.len() == self.tokens.len(),
             "a call output's token log-probabilities do not align with its tokens"
         );
-        if let Some(output) = &self.media_output {
-            output.handle.validate()?;
-            ensure_valid!(
-                output.bytes > 0,
-                "a media output's byte length must be positive"
-            );
-        }
         Ok(())
     }
 }
@@ -1402,6 +1436,7 @@ mod tests {
             request: RequestId(3),
             slot: 1,
             conditioning: Vec::new(),
+            media: Vec::new(),
             step: 0,
             steps: 8,
             seed: 1,

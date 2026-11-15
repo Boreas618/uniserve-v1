@@ -1,7 +1,6 @@
 //! Video requests: a model-agnostic request, the processor a video family binds, and the engine
 //! input it processes a request into.
 
-use proto::MediaLocator;
 use proto::video::{Canvas, Condition, ConditionMedia, ConditionRole, ConditionVision};
 use serde_json::{Map, Value};
 
@@ -132,11 +131,11 @@ pub struct ConditionInput {
 }
 
 impl ConditionInput {
-    /// The condition with its media published at `source`.
-    pub fn at(self, source: MediaLocator) -> Condition {
+    /// The condition whose fetched media are `bytes` long, which travel beside the request.
+    pub fn of_length(self, bytes: u64) -> Condition {
         Condition {
             role: self.role,
-            source,
+            bytes,
             media: self.media,
             vision: self.vision,
             latent_units: self.latent_units,

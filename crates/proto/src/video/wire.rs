@@ -1,7 +1,6 @@
 //! The Protobuf form of a video request's conditions (`request.proto`'s `VideoConditions` and the
 //! messages it holds), and the one conversion between it and the types of this module.
 
-use crate::MediaLocator;
 use crate::request::wire;
 
 use super::{
@@ -76,10 +75,7 @@ impl From<&Condition> for wire::VideoCondition {
         };
         Self {
             role: role as i32,
-            source: Some(wire::MediaSource {
-                name: condition.source.name.clone(),
-                bytes: condition.source.bytes,
-            }),
+            bytes: condition.bytes,
             media: Some(media),
             vision: condition
                 .vision
@@ -113,9 +109,6 @@ impl TryFrom<wire::VideoCondition> for Condition {
                 return Err(ConditionsError::Role(condition.role));
             }
         };
-        let source = condition
-            .source
-            .ok_or(ConditionsError::Missing("media source"))?;
         let media = match condition.media.ok_or(ConditionsError::Missing("media"))? {
             Media::Image(fit) => ConditionMedia::Image(fit.try_into()?),
             Media::Video(video) => ConditionMedia::Video {
@@ -144,10 +137,7 @@ impl TryFrom<wire::VideoCondition> for Condition {
             .transpose()?;
         Ok(Self {
             role,
-            source: MediaLocator {
-                name: source.name,
-                bytes: source.bytes,
-            },
+            bytes: condition.bytes,
             media,
             vision,
             latent_units: condition.latent_units,

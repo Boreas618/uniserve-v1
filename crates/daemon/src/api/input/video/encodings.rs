@@ -21,7 +21,7 @@ fn condition_key(condition: &Condition, content: &[u8; 32]) -> Result<[u8; 32], 
     }
     let inputs = serde_json::to_vec(&ConditionInputs {
         role: &condition.role,
-        bytes: condition.source.bytes,
+        bytes: condition.bytes,
         media: &condition.media,
         vision: &condition.vision,
         latent_units: &condition.latent_units,

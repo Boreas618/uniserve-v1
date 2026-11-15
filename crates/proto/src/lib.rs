@@ -25,7 +25,7 @@
 
 pub mod catalog;
 pub mod config;
-mod media;
+pub mod media;
 pub mod module;
 pub mod profile;
 pub mod report;
@@ -35,8 +35,7 @@ mod storage_settings;
 pub mod tensor;
 pub mod video;
 
-pub use media::{MappedMedia, MediaLocator, MediaReceiver, MediaSource};
-pub use shared_memory::SharedMemory;
+pub use media::{MappedMedia, MediaReceiver};
 
 /// The messages of the process interface (`process.proto`).
 #[allow(clippy::all, reason = "code generated from the schema")]
@@ -94,14 +93,6 @@ const HANDSHAKE_BYTES: usize = 64 << 10;
 /// and a launch, which carries a deployment's configuration; media cross by descriptor or in
 /// parts. A longer length is a corrupt stream.
 const MESSAGE_BYTES: usize = 64 << 20;
-
-/// The artifact bytes one `ArtifactPart` frame of the request interface carries to a daemon front
-/// on another host, which cannot map the artifact's shared memory: an artifact crosses in parts of
-/// this size, each written whole before the next is encoded, so neither end holds more than one
-/// part beside the artifact's storage. A part is a frame well inside [`MESSAGE_BYTES`].
-pub const ARTIFACT_PART_BYTES: usize = 1 << 20;
-
-const _: () = assert!(ARTIFACT_PART_BYTES < MESSAGE_BYTES);
 
 impl std::fmt::Display for process::Refusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -212,7 +203,7 @@ envelopes!(
     request::wire::ToEngine,
     request::wire::FromEngine,
     request::wire::Artifact,
-    request::wire::ArtifactPart,
+    request::wire::MediaPart,
 );
 
 /// The command-line option that names a supervised process's lifeline: the

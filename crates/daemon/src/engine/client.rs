@@ -10,13 +10,14 @@
 //! every request still in flight ends with an error event.
 
 use std::collections::HashMap;
+use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use proto::report::SchedulerStats;
 use proto::request::wire::{self, from_engine, to_engine};
-use proto::request::{Event, GenerationLimits, Request, RequestId};
+use proto::request::{ArtifactMedia as _, Event, GenerationLimits, Request, RequestId};
 use proto::{MappedMedia, MediaReceiver};
 use service::{Connection, lock};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -171,6 +172,53 @@ impl Shared {
     fn send(&self, kind: to_engine::Kind) {
         if let Err(error) = self.write(kind) {
             tracing::debug!(%error, "the engine's connection refused a frame");
+        }
+    }
+
+    /// Submits `request` with the media of its conditions, waiting until the
+    /// socket took all of it; a closed connection is the reader's to report.
+    ///
+    /// An engine on this host maps each medium's memory file, whose
+    /// descriptors ride the `Submit` frame itself in condition order. An
+    /// engine on another host takes each medium as bounded parts ahead of the
+    /// frame, each part written whole before the next is encoded, so a medium
+    /// is never held twice.
+    fn submit(&self, request: &Request) {
+        let media = match request {
+            Request::Diffusion(diffusion) => diffusion.media.as_slice(),
+            Request::Generation(_) => &[],
+        };
+        let frame = wire::ToEngine {
+            kind: Some(to_engine::Kind::Submit(wire::Submit {
+                requests: vec![request.to_wire()],
+            })),
+        };
+
+        let mut writer = lock(&self.writer);
+        let sent = if writer.peer_addr().is_none() {
+            let descriptors: Vec<BorrowedFd<'_>> = media
+                .iter()
+                .filter_map(|medium| medium.descriptor())
+                .collect();
+            writer.send_with(&frame, &descriptors)
+        } else {
+            media
+                .iter()
+                .try_for_each(|medium| {
+                    let bytes = medium.bytes();
+                    bytes.chunks(proto::media::PART_BYTES).try_for_each(|data| {
+                        writer.deliver(&wire::ToEngine {
+                            kind: Some(to_engine::Kind::ConditionPart(wire::MediaPart {
+                                size: bytes.len() as u64,
+                                data: data.to_vec(),
+                            })),
+                        })
+                    })
+                })
+                .and_then(|()| writer.send(&frame))
+        };
+        if let Err(error) = sent.and_then(|()| writer.flush()) {
+            tracing::debug!(%error, "the engine's connection refused a submission");
         }
     }
 
@@ -377,9 +425,7 @@ impl EngineClient {
             open: true,
             on_finish: None,
         };
-        self.shared.send(to_engine::Kind::Submit(wire::Submit {
-            requests: vec![request.to_wire()],
-        }));
+        self.shared.submit(&request);
         // A closed connection drops the acceptance with the request, whose
         // stream then holds the connection's error event.
         let scheduler = match acceptance.await {

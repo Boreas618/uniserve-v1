@@ -1,98 +1,32 @@
-//! Media bytes between the processes of a node: published as named POSIX
-//! shared-memory objects ([`MediaSource`]), and passed by descriptor and
-//! mapped read-only ([`MappedMedia`]).
+//! Media bytes between the processes of a node and its peers: anonymous memory files
+//! ([`crate::shared_memory::anonymous`]) mapped read-only ([`MappedMedia`]).
 //!
-//! A video request's condition media travel from the daemon to the workers
-//! by name: the daemon publishes each and keeps it until the request ends,
-//! and a worker's media reader opens it by its [`MediaLocator`]. A worker's
-//! generated media travel to the engine the same way, and an artifact from
-//! the engine to the daemon by descriptor beside its event.
+//! A medium has no name. Over a Unix socket it crosses as a descriptor beside the frame that
+//! states it; over a connection to another host it crosses as bounded parts ahead of that frame
+//! (`MediaPart`, at most [`PART_BYTES`] each), which the receiver writes into a memory file of its
+//! own ([`MediaReceiver`]). The kernel frees a medium once its last descriptor and mapping are
+//! gone, so nothing outlives a process that ends, however it ends.
+//!
+//! A video request's condition media travel from the daemon to the engine beside the request's
+//! `Submit`, one per condition in request order, and the engine's media reader decodes them; a
+//! request's generated artifact travels from the engine to the daemon beside its event.
 
 use std::io::{self, Write as _};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
-use serde::{Deserialize, Serialize};
-
 use crate::request::ArtifactMedia;
-use crate::shared_memory::SharedMemory;
 
-/// Where published media lies: a POSIX shared-memory object, by its name
-/// without the leading `/`, and the byte count published in it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MediaLocator {
-    /// The object's name without its leading `/`.
-    pub name: String,
-    /// The published bytes.
-    pub bytes: u64,
-}
+/// The most bytes of a medium one part carries to a process on another host: a part is written
+/// whole before the next is encoded, so it bounds what either side holds of a medium beside its
+/// memory file, and the time one frame takes on the connection while other frames wait.
+pub const PART_BYTES: usize = 1 << 20;
 
-/// Media bytes this process published, under a fresh name, as a POSIX
-/// shared-memory object for other processes on this host to read.
-///
-/// The daemon publishes each fetched condition this way; the worker's media
-/// reader opens the object by name, reads it and never unlinks it. The
-/// publisher keeps the name: dropping the value unlinks it, and the kernel
-/// frees the storage once no reader still maps it. The daemon holds a
-/// request's exports until the request's events end.
-#[derive(Debug)]
-pub struct MediaSource {
-    storage: SharedMemory,
-}
+// A part is a frame well inside the longest message a connection takes.
+const _: () = assert!(PART_BYTES < crate::MESSAGE_BYTES);
 
-impl MediaSource {
-    /// Copies `bytes` into a new shared-memory object.
-    ///
-    /// The object is created exclusively, readable and writable by its owner
-    /// only, and physically reserved to exactly `bytes.len()` bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error when `bytes` is empty or storage allocation or
-    /// writing fails; no object is left behind.
-    pub fn publish(bytes: &[u8]) -> io::Result<Self> {
-        if bytes.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "published media must not be empty",
-            ));
-        }
-        let (storage, mut file) = SharedMemory::create(bytes.len())?;
-        file.write_all(bytes)?;
-        Ok(Self { storage })
-    }
-
-    /// The object's name without its leading `/` and its byte count.
-    pub fn locator(&self) -> MediaLocator {
-        MediaLocator {
-            name: self.storage.name().to_owned(),
-            bytes: self.storage.size() as u64,
-        }
-    }
-
-    /// Hand the named object to its receiving process. The receiver must
-    /// claim it with `SharedMedia::open`, which unlinks it on receipt.
-    /// Dropping this publisher afterwards leaves the name available.
-    pub fn into_locator(self) -> MediaLocator {
-        MediaLocator {
-            bytes: self.storage.size() as u64,
-            name: self.storage.into_name(),
-        }
-    }
-}
-
-impl PartialEq for MediaSource {
-    /// Two exports are equal when they name the same object.
-    fn eq(&self, other: &Self) -> bool {
-        self.storage.name() == other.storage.name()
-    }
-}
-
-impl Eq for MediaSource {}
-
-/// An artifact arriving in bounded network frames. Bytes go directly into
-/// anonymous shared memory ([`crate::shared_memory::anonymous`]), without keeping a second
-/// complete payload in a Vec, and the finished artifact is consumed by its descriptor. Dropping
-/// an incomplete transfer releases its storage.
+/// A medium arriving in parts ([`PART_BYTES`]). Bytes go directly into an anonymous memory file,
+/// without keeping a second complete payload in a `Vec`, and the finished medium is mapped from
+/// it. Dropping an incomplete transfer releases its storage.
 pub struct MediaReceiver {
     file: std::fs::File,
     size: u64,
@@ -100,12 +34,12 @@ pub struct MediaReceiver {
 }
 
 impl MediaReceiver {
-    /// Reserve the artifact's declared length before accepting any parts.
+    /// Reserve the medium's declared length before accepting any parts.
     pub fn new(size: u64) -> io::Result<Self> {
         let length = usize::try_from(size).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "artifact size exceeds address space",
+                "a medium's size exceeds the address space",
             )
         })?;
         let file = crate::shared_memory::anonymous(length)?;
@@ -121,7 +55,7 @@ impl MediaReceiver {
         if size != self.size || data.len() as u64 > self.size - self.written {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "artifact parts exceed or change their declared length",
+                "a medium's parts exceed or change their declared length",
             ));
         }
         self.file.write_all(data)?;
@@ -129,22 +63,32 @@ impl MediaReceiver {
         Ok(())
     }
 
-    /// Publish the complete artifact as an immutable mapping. A truncated
-    /// transfer or an event declaring another size is an error.
+    /// Whether every byte of the declared length arrived.
+    pub fn complete(&self) -> bool {
+        self.written == self.size
+    }
+
+    /// Seal the complete medium and publish it as an immutable mapping. A truncated transfer or
+    /// a frame declaring another size is an error.
     pub fn finish(self, size: u64) -> io::Result<MappedMedia> {
         if size != self.size || self.written != self.size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "artifact transfer is incomplete or its event changes the length",
+                "a medium's transfer is incomplete or its frame changes the length",
             ));
         }
+        crate::shared_memory::seal(&self.file)?;
         MappedMedia::map(self.file.into(), size)
     }
 }
 
-/// The first `bytes` bytes of a shared-memory object another process
-/// published and passed by descriptor, mapped read-only for as long as this
-/// value lives.
+/// The first `bytes` bytes of an anonymous memory file, mapped read-only for as long as this
+/// value lives: a medium this process copied ([`MappedMedia::copy`]), received in parts, or was
+/// passed by descriptor.
+///
+/// Every medium is sealed against writes and size changes before it is mapped, and a mapping
+/// refuses a file that is not: no process can change the bytes a mapping reads, whoever passed
+/// the descriptor.
 #[derive(Debug)]
 pub struct MappedMedia {
     address: *mut libc::c_void,
@@ -152,41 +96,63 @@ pub struct MappedMedia {
     descriptor: OwnedFd,
 }
 
-// SAFETY: the pointer refers to a `PROT_READ` mapping of an object its
-// publisher no longer writes (the request interface's rule for an
-// artifact) and that stays mapped until this value drops, so moving it across
-// threads cannot race.
+// SAFETY: the pointer refers to a `PROT_READ` mapping of a file sealed against writes and size
+// changes (`MappedMedia::map` refuses another), which stays mapped until this value drops, so
+// moving it across threads cannot race.
 unsafe impl Send for MappedMedia {}
-// SAFETY: as for Send above; shared references only read the immutable
-// mapping.
+// SAFETY: as for Send above; shared references only read the immutable mapping.
 unsafe impl Sync for MappedMedia {}
 
 impl MappedMedia {
-    /// Maps the first `bytes` bytes of the object `descriptor` names.
+    /// Copies `bytes` into a new anonymous memory file, seals it and maps it: a medium this
+    /// process produced, to read or to hand to another process.
     ///
     /// # Errors
     ///
-    /// Fails when `bytes` is zero, the object is shorter, or the mapping
-    /// fails.
-    pub fn map(descriptor: OwnedFd, bytes: u64) -> std::io::Result<Self> {
-        let invalid = |message: &str| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_owned())
-        };
-        let bytes = usize::try_from(bytes).map_err(|_| invalid("the artifact is too large"))?;
+    /// Fails when `bytes` is empty, or when the kernel refuses the file, its storage, its seals
+    /// or the mapping; no file is left behind.
+    pub fn copy(bytes: &[u8]) -> io::Result<Self> {
+        let mut file = crate::shared_memory::anonymous(bytes.len())?;
+        file.write_all(bytes)?;
+        crate::shared_memory::seal(&file)?;
+        Self::map(file.into(), bytes.len() as u64)
+    }
+
+    /// Maps the whole of the sealed memory file `descriptor` names, which another process passed
+    /// beside a frame: the file's length is the medium's.
+    ///
+    /// # Errors
+    ///
+    /// As [`MappedMedia::map`].
+    pub fn whole(descriptor: OwnedFd) -> io::Result<Self> {
+        let length = file_length(&descriptor)?;
+        Self::map(descriptor, length)
+    }
+
+    /// Maps the first `bytes` bytes of the sealed memory file `descriptor` names.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `bytes` is zero, the file is shorter or not sealed against writes and size
+    /// changes, or the mapping fails.
+    pub fn map(descriptor: OwnedFd, bytes: u64) -> io::Result<Self> {
+        let invalid =
+            |message: &str| io::Error::new(io::ErrorKind::InvalidData, message.to_owned());
+        let bytes = usize::try_from(bytes).map_err(|_| invalid("the medium is too large"))?;
         if bytes == 0 {
-            return Err(invalid("an artifact is never empty"));
+            return Err(invalid("a medium is never empty"));
         }
-        // SAFETY: an all-zero `stat` is a valid value for the call to fill.
-        let mut status: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: the descriptor is open and `status` a valid out-pointer.
-        if unsafe { libc::fstat(descriptor.as_raw_fd(), &mut status) } != 0 {
-            return Err(std::io::Error::last_os_error());
+        if (file_length(&descriptor)?) < bytes as u64 {
+            return Err(invalid("the medium's file is shorter than its bytes"));
         }
-        if (status.st_size as u64) < bytes as u64 {
-            return Err(invalid("the artifact's object is shorter than its bytes"));
+        if !crate::shared_memory::sealed(&descriptor)? {
+            return Err(invalid(
+                "the medium's file is not sealed against writes and size changes",
+            ));
         }
-        // SAFETY: the descriptor names a readable object of at least `bytes`
-        // bytes; the mapping is read-only and private to this value.
+
+        // SAFETY: the descriptor names a readable file of at least `bytes` bytes; the mapping is
+        // read-only and private to this value.
         let address = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -198,7 +164,7 @@ impl MappedMedia {
             )
         };
         if address == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
+            return Err(io::Error::last_os_error());
         }
         Ok(Self {
             address,
@@ -208,10 +174,22 @@ impl MappedMedia {
     }
 }
 
+/// The length of the file `descriptor` names.
+fn file_length(descriptor: &OwnedFd) -> io::Result<u64> {
+    // SAFETY: an all-zero `stat` is a valid value for the call to fill.
+    let mut status: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the descriptor is open and `status` a valid out-pointer.
+    if unsafe { libc::fstat(descriptor.as_raw_fd(), &mut status) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    u64::try_from(status.st_size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "a file of negative length"))
+}
+
 impl ArtifactMedia for MappedMedia {
     fn bytes(&self) -> &[u8] {
-        // SAFETY: the mapping covers `bytes` readable bytes until drop, and
-        // nobody writes them.
+        // SAFETY: the mapping covers `bytes` readable bytes until drop, and its file is sealed
+        // against writes.
         unsafe { std::slice::from_raw_parts(self.address.cast::<u8>(), self.bytes) }
     }
 
@@ -220,10 +198,19 @@ impl ArtifactMedia for MappedMedia {
     }
 }
 
+/// Two media are equal when they hold the same bytes.
+impl PartialEq for MappedMedia {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes() == other.bytes()
+    }
+}
+
+impl Eq for MappedMedia {}
+
 impl Drop for MappedMedia {
     fn drop(&mut self) {
-        // SAFETY: the address and length are this value's own mapping, which
-        // nothing borrows past its lifetime.
+        // SAFETY: the address and length are this value's own mapping, which nothing borrows
+        // past its lifetime.
         unsafe {
             libc::munmap(self.address, self.bytes);
         }
@@ -232,38 +219,45 @@ impl Drop for MappedMedia {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
-
     use super::*;
 
-    /// An export is readable by name while it lives and unlinked once
-    /// it drops.
+    /// A copied medium reads back its bytes, and another process's mapping of its descriptor,
+    /// which a frame carried, reads the same.
     #[test]
-    fn a_published_source_is_readable_until_dropped() {
-        let source = MediaSource::publish(b"condition bytes").unwrap();
-        let locator = source.locator();
-        assert_eq!(locator.bytes, 15);
-        let path = CString::new(format!("/{}", locator.name)).unwrap();
+    fn a_copied_medium_maps_whole_from_its_descriptor() {
+        let medium = MappedMedia::copy(b"condition bytes").unwrap();
+        assert_eq!(medium.bytes(), b"condition bytes");
 
-        // SAFETY: path is a valid NUL-terminated POSIX shm name.
-        let descriptor = unsafe { libc::shm_open(path.as_ptr(), libc::O_RDONLY, 0) };
-        assert!(descriptor >= 0);
-        let mut read = vec![0_u8; 15];
-        // SAFETY: descriptor is open and `read` holds 15 writable bytes.
-        let count = unsafe { libc::read(descriptor, read.as_mut_ptr().cast(), 15) };
-        // SAFETY: descriptor is open.
-        unsafe { libc::close(descriptor) };
-        assert_eq!(count, 15);
-        assert_eq!(read, b"condition bytes");
+        let passed = medium.descriptor().unwrap().try_clone_to_owned().unwrap();
+        let received = MappedMedia::whole(passed).unwrap();
+        assert_eq!(received, medium);
+    }
 
-        drop(source);
-        // SAFETY: path is a valid NUL-terminated POSIX shm name.
-        let reopened = unsafe { libc::shm_open(path.as_ptr(), libc::O_RDONLY, 0) };
-        assert!(reopened < 0, "the name outlived its publisher");
+    /// A file anyone could still write is refused: a mapping reads bytes no process changes.
+    #[test]
+    fn an_unsealed_file_is_refused() {
+        let mut file = crate::shared_memory::anonymous(5).unwrap();
+        file.write_all(b"bytes").unwrap();
+        assert!(MappedMedia::whole(file.into()).is_err());
+    }
+
+    /// A medium's parts are written into a file of the receiver's own and mapped once complete.
+    #[test]
+    fn a_medium_arrives_in_parts() {
+        let mut receiver = MediaReceiver::new(10).unwrap();
+        receiver.append(10, b"first").unwrap();
+        assert!(!receiver.complete());
+        receiver.append(10, b"after").unwrap();
+        assert!(receiver.complete());
+        assert!(receiver.append(10, b"x").is_err());
+
+        let medium = receiver.finish(10).unwrap();
+        assert_eq!(medium.bytes(), b"firstafter");
     }
 
     #[test]
-    fn empty_media_is_refused() {
-        assert!(MediaSource::publish(b"").is_err());
+    fn empty_media_are_refused() {
+        assert!(MappedMedia::copy(b"").is_err());
+        assert!(MediaReceiver::new(0).is_err());
     }
 }

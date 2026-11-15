@@ -1,7 +1,6 @@
 //! A frame carries a descriptor to the other end of a Unix connection, which
 //! maps the bytes it names.
 
-use std::io::Write as _;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -10,18 +9,10 @@ use proto::request::{ArtifactMedia as _, wire};
 use proto::{MappedMedia, MediaReceiver};
 use service::{Connection, Listener};
 
-/// An anonymous shared-memory file holding `bytes`.
+/// A descriptor of a sealed medium holding `bytes`, as a process that produced it passes it.
 fn storage(bytes: &[u8]) -> OwnedFd {
-    let name = c"artifact";
-    // SAFETY: memfd_create takes a NUL-terminated name and flags.
-    let descriptor = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-    assert!(descriptor >= 0);
-    // SAFETY: memfd_create returned this descriptor for this test to own.
-    let mut file = std::fs::File::from(unsafe {
-        <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(descriptor)
-    });
-    file.write_all(bytes).unwrap();
-    file.into()
+    let medium = MappedMedia::copy(bytes).unwrap();
+    medium.descriptor().unwrap().try_clone_to_owned().unwrap()
 }
 
 #[test]
@@ -70,7 +61,7 @@ fn a_network_artifact_preserves_its_bytes_across_parts() {
     let bytes: Vec<_> = (0..4096).map(|index| (index % 251) as u8).collect();
     for data in bytes.chunks(137) {
         sender
-            .send(&wire::ArtifactPart {
+            .send(&wire::MediaPart {
                 size: bytes.len() as u64,
                 data: data.to_vec(),
             })
@@ -79,7 +70,7 @@ fn a_network_artifact_preserves_its_bytes_across_parts() {
     let mut transfer = MediaReceiver::new(bytes.len() as u64).unwrap();
     let mut received = 0;
     while received < bytes.len() {
-        let part: wire::ArtifactPart = receiver.recv(Duration::from_secs(5)).unwrap().unwrap();
+        let part: wire::MediaPart = receiver.recv(Duration::from_secs(5)).unwrap().unwrap();
         transfer.append(part.size, &part.data).unwrap();
         received += part.data.len();
     }

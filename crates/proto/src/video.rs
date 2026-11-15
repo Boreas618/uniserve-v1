@@ -1,7 +1,8 @@
 //! The conditions of a video request, as they travel from request processing to the workers.
 //!
-//! A video model's request processing prepares each condition of a request (`processing`): what its
-//! fetched bytes are ([`MediaLocator`]), what the media reader decodes them into
+//! A video model's request processing prepares each condition of a request (`processing`): the
+//! length of its fetched media ([`Condition::bytes`]; the media themselves travel beside the
+//! request, one memory file per condition, `crate::media`), what the media reader decodes them into
 //! ([`ConditionMedia`]), what the text encoder's vision tower reads of it ([`ConditionVision`])
 //! and the denoiser rows its latent encoders write. The engine carries a request's
 //! [`Conditions`] encoded as their Protobuf message (`request.proto`'s `VideoConditions`,
@@ -16,8 +17,6 @@
 mod wire;
 
 use serde::{Deserialize, Serialize};
-
-use crate::MediaLocator;
 
 pub use wire::ConditionsError;
 
@@ -177,8 +176,9 @@ pub struct ConditionVision {
 pub struct Condition {
     /// Keyframe anchor or reference.
     pub role: ConditionRole,
-    /// The fetched media bytes.
-    pub source: MediaLocator,
+    /// The length of the fetched media, which travel beside the request: the media reader reads
+    /// this many bytes of the condition's memory file.
+    pub bytes: u64,
     /// What the media reader decodes them into.
     pub media: ConditionMedia,
     /// What the conditioner reads, for a condition it reads.
@@ -227,8 +227,8 @@ impl Condition {
     /// increasing order and an image's samples none; every extent is
     /// positive.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.source.name.is_empty() || self.source.name.contains('/') || self.source.bytes == 0 {
-            return Err("a condition's media locator is invalid");
+        if self.bytes == 0 {
+            return Err("a condition's media are never empty");
         }
         if self.role.is_keyframe() && !matches!(self.media, ConditionMedia::Image(_)) {
             return Err("a keyframe is one still image");
@@ -400,10 +400,7 @@ mod tests {
             width: 1024,
             height: 768,
         };
-        let source = |index: u32| MediaLocator {
-            name: format!("uniserve-media-7-{index}"),
-            bytes: 1_000 + u64::from(index),
-        };
+        let bytes = |index: u32| 1_000 + u64::from(index);
         let soundtrack = AudioClip {
             sample_rate: 44_100,
             start_sample: 22_050,
@@ -413,7 +410,7 @@ mod tests {
         vec![
             Condition {
                 role: ConditionRole::LastFrame,
-                source: source(0),
+                bytes: bytes(0),
                 media: ConditionMedia::Image(ImageFit {
                     resized: Canvas {
                         width: 1365,
@@ -429,7 +426,7 @@ mod tests {
             },
             Condition {
                 role: ConditionRole::Reference,
-                source: source(1),
+                bytes: bytes(1),
                 media: ConditionMedia::Image(ImageFit {
                     resized: Canvas {
                         width: 2048,
@@ -456,7 +453,7 @@ mod tests {
             },
             Condition {
                 role: ConditionRole::Reference,
-                source: source(2),
+                bytes: bytes(2),
                 media: ConditionMedia::Video {
                     clip: VideoClip {
                         canvas,
@@ -476,7 +473,7 @@ mod tests {
             },
             Condition {
                 role: ConditionRole::Reference,
-                source: source(3),
+                bytes: bytes(3),
                 media: ConditionMedia::Audio(soundtrack),
                 vision: None,
                 latent_units: Vec::new(),
@@ -522,10 +519,7 @@ mod tests {
         };
         Condition {
             role,
-            source: MediaLocator {
-                name: "uniserve-media-1".to_owned(),
-                bytes: 10,
-            },
+            bytes: 10,
             media: ConditionMedia::Image(ImageFit {
                 resized: canvas,
                 left: 0,

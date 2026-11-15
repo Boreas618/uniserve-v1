@@ -127,6 +127,8 @@ fn requests_come_back_from_their_messages_unchanged() {
                 video_units: vec![[3; 32], [4; 32]],
                 audio: Some([5; 32]),
             })),
+            // The media travel beside the request's frame, not in it.
+            media: Vec::new(),
         }),
     ];
     for request in requests {

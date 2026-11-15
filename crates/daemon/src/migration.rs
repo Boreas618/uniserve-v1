@@ -907,6 +907,7 @@ mod tests {
             prompt_token_ids: vec![1, 2],
             conditioning: Vec::new(),
             conditions: Vec::new(),
+            media: Vec::new(),
             priority: 0,
             sampling: DiffusionSamplingParams {
                 num_frames: 25,

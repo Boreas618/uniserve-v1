@@ -38,12 +38,10 @@
 
 use std::fmt;
 use std::ops::Range;
-use std::sync::Arc;
 use std::time::Instant;
 
-use crate::batch::media::{SharedMedia, SharedMediaError};
 use crate::batch::{
-    ArtifactHandle, Batch, BatchId, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase,
+    Batch, BatchId, BatchOutput, CallOutput, CallStatus, ErrorCode, MediaOutput, Phase,
 };
 use proto::config::WorkerGroupRole;
 use proto::request::{
@@ -81,9 +79,6 @@ enum Failure {
     },
     /// The request's final muxing call, call `row` of batch `batch`, published no artifact.
     Unpublished { batch: BatchId, row: usize },
-    /// The artifact the request's final muxing call published could not be opened, for the
-    /// stated reason.
-    Artifact(String),
 }
 
 impl fmt::Display for Failure {
@@ -115,12 +110,6 @@ impl fmt::Display for Failure {
                 "the final muxing call {}.{row} published no artifact",
                 batch.0
             ),
-            Self::Artifact(reason) => {
-                write!(
-                    formatter,
-                    "the request's artifact cannot be opened: {reason}"
-                )
-            }
         }
     }
 }
@@ -346,36 +335,21 @@ impl Scheduler {
             return;
         }
 
-        let Some(published) = call.media_output else {
+        let Some(MediaOutput(medium)) = call.media_output else {
             let unpublished = Failure::Unpublished {
                 batch: batch.id,
                 row,
             };
             return self.fail_request(id, &unpublished);
         };
-        match open_artifact(&published) {
-            Ok(media) => {
-                let artifact = ArtifactEvent {
-                    media_kind: MediaKind::Video,
-                    content_type: "video/mp4".to_owned(),
-                    media,
-                };
-                self.send(id, Event::Artifact(artifact));
-                self.finish(id, self.finished(id, FinishReason::Completed, None));
-            }
-            // The client's message carries the failed step and its cause, and the call fails
-            // (`S/execution/results.rs:57-72`).
-            Err(error) => {
-                let message = format!("{:#}", anyhow::Error::new(error));
-                self.send(
-                    id,
-                    Event::ArtifactUnavailable {
-                        message: message.clone(),
-                    },
-                );
-                self.fail_request(id, &Failure::Artifact(message));
-            }
-        }
+        // The media host's sealed memory file is the artifact: the daemon maps the same file.
+        let artifact = ArtifactEvent {
+            media_kind: MediaKind::Video,
+            content_type: "video/mp4".to_owned(),
+            media: medium,
+        };
+        self.send(id, Event::Artifact(artifact));
+        self.finish(id, self.finished(id, FinishReason::Completed, None));
     }
 
     /// Appends the tokens a call committed, in order, and sends each one the request publishes;
@@ -1697,19 +1671,6 @@ fn requested_candidates(entries: &mut Vec<TokenLogprob>, count: u32) {
         }
     }
     entries.truncate(kept);
-}
-
-/// Opens the artifact a final muxing call published: the scheduler is the one opener of the
-/// name, which it unlinks, and it maps the bytes.
-fn open_artifact(
-    published: &crate::batch::MediaOutput,
-) -> Result<Arc<SharedMedia>, SharedMediaError> {
-    let ArtifactHandle::PosixShm { name } = &published.handle;
-    // SAFETY: the media host wrote the object's bytes before it relinquished the object and never
-    // writes or resizes it after, which `SharedMedia::open` requires; the scheduler opens each
-    // published name once, from the one output that names it.
-    let media = unsafe { SharedMedia::open(name, published.bytes)? };
-    Ok(Arc::new(media))
 }
 
 /// A count as the `u32` the request's counters hold, saturated.

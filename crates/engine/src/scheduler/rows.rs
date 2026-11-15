@@ -500,6 +500,12 @@ impl Scheduler {
             request: request.id,
             slot,
             conditioning: input.conditioning.clone(),
+            // The reader decodes the condition media; no other call reads them.
+            media: if phase == Phase::MediaRead {
+                input.media.clone()
+            } else {
+                Vec::new()
+            },
             step,
             steps,
             seed: input.sampling.seed,
@@ -799,6 +805,7 @@ fn image_row(
         request: request.id,
         slot,
         conditioning: Vec::new(),
+        media: Vec::new(),
         step: 0,
         steps: 0,
         seed: 0,
@@ -1839,6 +1846,7 @@ mod tests {
                 ..proto::video::Conditions::default()
             }
             .encode(),
+            media: Vec::new(),
             conditions: vec![ConditionExtent {
                 pixel_bytes: 300,
                 audio_samples: 10,

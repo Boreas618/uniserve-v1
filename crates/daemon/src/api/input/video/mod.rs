@@ -21,9 +21,10 @@
 //! 4. The processor processes the request from the probed media with the checkpoint's tokenizer
 //!    ([`VideoProcessor::process`]): its size and frames, how each reference is decoded and encoded,
 //!    the prompt as the text encoder encodes it, and the denoiser rows the references take.
-//! 5. Each reference's media is published to shared memory for the worker's media reader, and the
-//!    request becomes one `DiffusionRequest` describing every condition and stating the rows they
-//!    take, by which the engine finds the smallest graph that holds them.
+//! 5. Each reference's media is copied into a sealed anonymous memory file, which the request holds
+//!    and the request interface carries beside it to the engine's media reader, and the request
+//!    becomes one `DiffusionRequest` describing every condition and stating the rows they take, by
+//!    which the engine finds the smallest graph that holds them.
 //!
 //! Stages 1 to 3 wait only on I/O and run on the async runtime; stages 4 and 5 are CPU work and
 //! run on the blocking pool.
@@ -39,9 +40,9 @@ pub mod probe;
 use std::sync::Arc;
 
 use processing::{InputError, Length, Reference, ReferenceKind, VideoProcessor, VideoSpec};
+use proto::MappedMedia;
 use proto::request::{DiffusionRequest, DiffusionSamplingParams, RequestId, Trajectory};
 use proto::video::{Canvas, Conditions};
-use proto::{MediaLocator, MediaSource};
 use serde_json::{Value, json};
 
 use crate::api::input::ServeError;
@@ -139,15 +140,6 @@ impl ProcessedVideo {
     }
 }
 
-/// The reference media of one processed request, published to shared memory.
-///
-/// The workers read each by name while the request runs, so whoever submits the request holds
-/// them until it ends; dropping them unlinks the names.
-#[derive(Debug)]
-pub struct PublishedMedia {
-    _sources: Vec<MediaSource>,
-}
-
 /// Processes the video requests of one deployment.
 ///
 /// One instance is shared by all requests; [`VideoService::process`] takes `&self` and runs
@@ -208,21 +200,21 @@ impl VideoService {
     /// it generates.
     ///
     /// The request-only rules run before any fetch. The processed prompt must fit the prompt
-    /// capacity (`--max-model-len`). Each reference's fetched media is then copied to shared
-    /// memory, which the request holds until the engine retires it. the daemon's submission stamps the
-    /// engine's identifier on the request.
+    /// capacity (`--max-model-len`). Each reference's fetched media is then copied into a sealed
+    /// memory file, which the request holds for as long as it lives. The daemon's submission
+    /// stamps the engine's identifier on the request.
     ///
     /// # Errors
     ///
     /// Returns `ServeError::Video` naming the parameter at fault, or failing when processing's
-    /// own resources or the shared-memory allocation fail, and
-    /// `ServeError::ContextLengthExceeded` for a prompt longer than the prompt capacity.
+    /// own resources or the memory file fail, and `ServeError::ContextLengthExceeded` for a
+    /// prompt longer than the prompt capacity.
     pub async fn process(
         &self,
         request_id: &str,
         request: &VideoGenerationRequest,
         max_prompt_tokens: u32,
-    ) -> Result<(DiffusionRequest, ProcessedVideo, PublishedMedia), ServeError> {
+    ) -> Result<(DiffusionRequest, ProcessedVideo), ServeError> {
         let spec = request.spec()?;
         self.processor.check(&spec)?;
 
@@ -267,27 +259,22 @@ impl VideoService {
     }
 }
 
-/// The engine request of `input`, its references' media published to shared memory.
+/// The engine request of `input`, holding each reference's media in a sealed memory file.
 fn submission(
     input: processing::VideoInput,
     media: &[FetchedMedia],
-) -> Result<(DiffusionRequest, ProcessedVideo, PublishedMedia), ServeError> {
-    // Each reference's media reaches the worker's media reader through shared memory on this
-    // host.
-    let mut sources = Vec::with_capacity(media.len());
+) -> Result<(DiffusionRequest, ProcessedVideo), ServeError> {
+    // Each reference's media reaches the engine's media reader beside the request.
+    let mut copies = Vec::with_capacity(media.len());
     let mut conditions = Vec::with_capacity(media.len());
     for (index, (condition, fetched)) in input.conditions.into_iter().zip(media).enumerate() {
-        let source = MediaSource::publish(&fetched.bytes).map_err(|error| {
+        let copy = MappedMedia::copy(&fetched.bytes).map_err(|error| {
             InputError::Internal(format!(
-                "publishing input_references[{index}] for the worker failed: {error}"
+                "holding input_references[{index}] for the engine failed: {error}"
             ))
         })?;
-        let locator = source.locator();
-        conditions.push(condition.at(MediaLocator {
-            name: locator.name,
-            bytes: locator.bytes,
-        }));
-        sources.push(source);
+        conditions.push(condition.of_length(fetched.bytes.len() as u64));
+        copies.push(Arc::new(copy));
     }
     let conditions = Conditions {
         conditions,
@@ -336,13 +323,14 @@ fn submission(
         // The migrator gives the request its trajectory's identity when it first submits it.
         trajectory: Trajectory::default(),
         encoder_inputs: Some(Box::new(encoder_inputs)),
+        media: copies,
     };
     let video = ProcessedVideo {
         size: input.size,
         num_frames: input.num_frames,
         fps: input.fps,
     };
-    Ok((request, video, PublishedMedia { _sources: sources }))
+    Ok((request, video))
 }
 
 #[cfg(test)]
@@ -444,7 +432,7 @@ mod tests {
         };
         let mut inputs = Vec::new();
         for (prompt, height) in [("a fox", 90), ("a fox", 90), ("a bear", 90), ("a fox", 91)] {
-            let (resolved, _, _media) = service
+            let (resolved, _) = service
                 .process("encoding", &input(prompt, height), 1 << 16)
                 .await
                 .unwrap();

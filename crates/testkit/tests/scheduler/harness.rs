@@ -1615,6 +1615,7 @@ pub(crate) fn video(id: u64, units: u32) -> DiffusionRequest {
         }
         .encode(),
         conditions: Vec::new(),
+        media: Vec::new(),
         priority: 0,
         sampling: DiffusionSamplingParams {
             num_frames: FRAMES,

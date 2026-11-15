@@ -854,6 +854,7 @@ pub(crate) mod tests {
             request: CallRequest(1),
             slot: 1,
             conditioning: Vec::new(),
+            media: Vec::new(),
             step: 0,
             steps: 0,
             seed: 0,

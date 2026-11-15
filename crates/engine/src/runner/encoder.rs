@@ -815,6 +815,7 @@ mod tests {
             request: RequestId(request),
             slot,
             conditioning: Vec::new(),
+            media: Vec::new(),
             step: 0,
             steps: 0,
             seed: 0,

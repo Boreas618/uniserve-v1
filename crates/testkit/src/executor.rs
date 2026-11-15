@@ -38,7 +38,6 @@
 //!   slot holds writable.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::io::Write as _;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crossbeam_channel::Sender;
@@ -917,26 +916,12 @@ fn completed(tokens: Vec<u32>, seen: u32) -> CallOutput {
     }
 }
 
-/// Publishes `bytes` as a POSIX shared-memory object, as a worker's media host relinquishes an
-/// artifact for the scheduler to take.
+/// Copies `bytes` into a sealed memory file, as a worker's media host holds an artifact for the
+/// scheduler to hand on.
 fn publish(bytes: &[u8]) -> Result<engine::batch::MediaOutput, String> {
-    let storage = || -> std::io::Result<String> {
-        let mut storage = tempfile::Builder::new()
-            .prefix("uniserve-fake-video-")
-            .tempfile_in("/dev/shm")?;
-        storage.write_all(bytes)?;
-        let (_file, path) = storage.keep().map_err(|error| error.error)?;
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_owned)
-            .ok_or_else(|| std::io::Error::other("the shared-memory object has no printable name"))
-    };
-    let name = storage().map_err(|error| format!("publishing the artifact: {error}"))?;
-
-    Ok(engine::batch::MediaOutput {
-        handle: engine::batch::ArtifactHandle::PosixShm { name },
-        bytes: bytes.len() as u64,
-    })
+    let medium = proto::MappedMedia::copy(bytes)
+        .map_err(|error| format!("holding the artifact: {error}"))?;
+    Ok(engine::batch::MediaOutput(std::sync::Arc::new(medium)))
 }
 
 /// A call that failed with `code`; only an input error states its reason.

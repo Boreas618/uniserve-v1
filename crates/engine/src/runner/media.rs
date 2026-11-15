@@ -36,7 +36,7 @@
 //!
 //! | Phase | Reads | Writes |
 //! | --- | --- | --- |
-//! | `MediaRead` | the request's condition media, published in shared memory | condition pixels, condition samples and vision pixels, those the request's conditions call for, in that order |
+//! | `MediaRead` | the request's condition media, the sealed memory files its row carries | condition pixels, condition samples and vision pixels, those the request's conditions call for, in that order |
 //! | `VideoEncode` | the frames of the units of its round that its process's ranks decoded, from the video units block's run on the rank that decoded each | each such unit's encoding into its own encoded units block, in the runs of that block the process maps |
 //! | `AudioEncode` | the video's duration of the decoded track | nothing: the encoded track joins the request's assembly |
 //! | `Mux`, handing rounds over | the encoded units blocks of the next rounds' units, as far as each framed unit reaches | nothing: the units join the assembly |
@@ -319,12 +319,14 @@ impl MediaHost {
         let work: Box<dyn Fn() -> Result<Produced> + Send + Sync> = match phase {
             Phase::MediaRead => {
                 let conditioning = conditions_of(row)?;
+                let sources = row.media.clone();
                 let format = self.config.format;
                 let rates = (self.config.frame_rate, self.config.audio_rate);
                 let threads = self.config.threads;
 
                 Box::new(move || {
-                    let regions = read_conditions(&media, rates, &conditioning, &format, threads)?;
+                    let regions =
+                        read_conditions(&media, rates, &conditioning, &sources, &format, threads)?;
                     Ok((regions, None))
                 })
             }
@@ -1107,21 +1109,15 @@ fn discarding(
     produced
 }
 
-/// Publishes `request`'s `artifact` in shared memory for the process that receives the call's
-/// output, which claims and unlinks it.
+/// Copies `request`'s `artifact` into a sealed memory file for the call's output, which the
+/// scheduler hands to the daemon.
 fn publish(request: u64, artifact: &[u8]) -> Result<MediaOutput> {
-    let locator = proto::MediaSource::publish(artifact)
-        .map_err(|error| {
-            Error::Invalid(format!(
-                "request {request}'s artifact could not be published: {error}"
-            ))
-        })?
-        .into_locator();
-
-    Ok(MediaOutput {
-        handle: crate::batch::ArtifactHandle::PosixShm { name: locator.name },
-        bytes: locator.bytes,
-    })
+    let medium = proto::MappedMedia::copy(artifact).map_err(|error| {
+        Error::Invalid(format!(
+            "request {request}'s artifact could not be held: {error}"
+        ))
+    })?;
+    Ok(MediaOutput(Arc::new(medium)))
 }
 
 /// Each unit of `frames` frames at `height` by `width`, taken from `input` one after another,
@@ -1235,25 +1231,45 @@ fn floats(bytes: &mut [u8]) -> Result<&mut [f32]> {
     })
 }
 
-/// The bytes one condition's media was published as, read from shared memory.
-fn published_bytes(source: &proto::MediaLocator) -> Result<Vec<u8>> {
-    use std::os::unix::fs::FileExt as _;
+/// The bytes of each condition of `conditioning`, the first [`proto::video::Condition::bytes`] of
+/// its medium in `sources`, the media the request's row carries in condition order.
+///
+/// # Errors
+///
+/// A row that carries another count of media than the request states conditions, or a medium
+/// shorter than its condition states.
+fn condition_bytes<'a>(
+    conditioning: &proto::video::Conditions,
+    sources: &'a [Arc<proto::MappedMedia>],
+) -> Result<Vec<&'a [u8]>> {
+    use proto::request::ArtifactMedia as _;
 
-    let read = |error: std::io::Error| {
-        Error::Invalid(format!(
-            "reading the published media {:?} of {} byte(s): {error}",
-            source.name, source.bytes
-        ))
-    };
-    let file = proto::SharedMemory::open(&source.name, false).map_err(read)?;
-    let length = host_bytes(source.bytes)?;
-    let mut bytes = vec![0_u8; length];
-    file.read_exact_at(&mut bytes, 0).map_err(read)?;
-    Ok(bytes)
+    if sources.len() != conditioning.conditions.len() {
+        return Err(Error::Invalid(format!(
+            "a media read carries {} media for {} conditions",
+            sources.len(),
+            conditioning.conditions.len()
+        )));
+    }
+    conditioning
+        .conditions
+        .iter()
+        .zip(sources)
+        .map(|(condition, medium)| {
+            let length = host_bytes(condition.bytes)?;
+            medium.bytes().get(..length).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "a condition states {length} bytes of media, and its medium holds {}",
+                    medium.bytes().len()
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Decodes one request's conditions and lays them out as the model's encoders read them: the
-/// bytes of each product a read writes, as [`extents`] states them.
+/// bytes of each product a read writes, as [`extents`] states them. `sources` are the request's
+/// condition media, in condition order.
 ///
 /// `crates/media` decodes the bytes into RGB frames and stereo PCM at their planned extents;
 /// the model's format then lays them out. A reference video's frames past its encoded prefix are
@@ -1262,35 +1278,31 @@ fn read_conditions(
     media: &media::MediaRunner,
     (frame_rate, audio_rate): (u32, u32),
     conditioning: &proto::video::Conditions,
+    sources: &[Arc<proto::MappedMedia>],
     format: &MediaFormat,
     threads: NonZeroUsize,
 ) -> Result<Vec<Vec<u8>>> {
     use media::read::{
         AudioTransform, ConditionProducts, ConditionSource, ImageTransform, VideoClip,
     };
+    use proto::request::ArtifactMedia as _;
     use proto::video::ConditionMedia;
 
     let conditions = &conditioning.conditions;
-    let bytes = conditions
-        .iter()
-        .map(|condition| published_bytes(&condition.source))
-        .collect::<Result<Vec<_>>>()?;
+    let bytes = condition_bytes(conditioning, sources)?;
 
-    // A reference video is read by an external process, which takes a file: the shared memory
-    // object the frontend published is one.
+    // A reference video is decoded from a file, which its medium's memory file is.
     let files = conditions
         .iter()
-        .map(|condition| match condition.media {
-            ConditionMedia::Video { .. } => {
-                proto::SharedMemory::open(&condition.source.name, false)
-                    .map(Some)
-                    .map_err(|error| {
-                        Error::Invalid(format!(
-                            "opening the published media {:?}: {error}",
-                            condition.source.name
-                        ))
-                    })
-            }
+        .zip(sources)
+        .map(|(condition, medium)| match condition.media {
+            ConditionMedia::Video { .. } => medium
+                .descriptor()
+                .map(|descriptor| descriptor.try_clone_to_owned().map(std::fs::File::from))
+                .transpose()
+                .map_err(|error| {
+                    Error::Invalid(format!("opening a reference video's medium: {error}"))
+                }),
             _ => Ok(None),
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1336,7 +1348,7 @@ fn read_conditions(
         let samples = audio.map_or(0, |track| track.samples);
         let source = match files[index].as_ref() {
             Some(file) => ConditionSource::File(file),
-            None => ConditionSource::Bytes(&bytes[index]),
+            None => ConditionSource::Bytes(bytes[index]),
         };
 
         reads.push(media::read::ConditionRead {
@@ -1612,6 +1624,7 @@ mod tests {
             request: REQUEST,
             slot: SLOT,
             conditioning: Vec::new(),
+            media: Vec::new(),
             step: 0,
             steps: 4,
             seed: 1,
@@ -1742,14 +1755,52 @@ mod tests {
         produced
     }
 
-    /// The bytes of a published artifact, claimed from shared memory.
+    /// The bytes of an artifact a call output carries.
     fn claimed(artifact: &MediaOutput) -> Vec<u8> {
-        let crate::batch::ArtifactHandle::PosixShm { name } = &artifact.handle;
+        use proto::request::ArtifactMedia as _;
 
-        // SAFETY: the media host published the object and writes it no more.
-        let media =
-            unsafe { crate::batch::media::SharedMedia::open(name, artifact.bytes) }.unwrap();
-        media.as_bytes().to_vec()
+        artifact.0.bytes().to_vec()
+    }
+
+    /// The conditions of an audio reference `bytes` long each.
+    fn audio_conditions(bytes: &[u64]) -> proto::video::Conditions {
+        let conditions = bytes
+            .iter()
+            .map(|&bytes| proto::video::Condition {
+                role: proto::video::ConditionRole::Reference,
+                bytes,
+                media: proto::video::ConditionMedia::Audio(proto::video::AudioClip {
+                    sample_rate: 48_000,
+                    start_sample: 0,
+                    source_samples: 480,
+                    samples: 480,
+                }),
+                vision: None,
+                latent_units: Vec::new(),
+                audio_rows: 1,
+            })
+            .collect();
+        proto::video::Conditions {
+            conditions,
+            ..proto::video::Conditions::default()
+        }
+    }
+
+    /// A media read takes each condition's bytes from the medium its row carries for it, as long
+    /// as the condition states; a row of another count of media, or a medium shorter than its
+    /// condition, is refused.
+    #[test]
+    fn a_read_takes_each_condition_s_bytes_from_its_own_medium() {
+        let media = [
+            Arc::new(proto::MappedMedia::copy(b"first medium").unwrap()),
+            Arc::new(proto::MappedMedia::copy(b"second").unwrap()),
+        ];
+
+        let bytes = condition_bytes(&audio_conditions(&[5, 6]), &media).unwrap();
+        assert_eq!(bytes, [b"first".as_slice(), b"second".as_slice()]);
+
+        assert!(condition_bytes(&audio_conditions(&[5]), &media).is_err());
+        assert!(condition_bytes(&audio_conditions(&[5, 7]), &media).is_err());
     }
 
     #[test]

@@ -1323,6 +1323,7 @@ mod tests {
                 ..proto::video::Conditions::default()
             }
             .encode(),
+            media: Vec::new(),
             conditions,
             priority: 0,
             sampling: DiffusionSamplingParams {

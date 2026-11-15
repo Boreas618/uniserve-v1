@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::Sender;
+use proto::MappedMedia;
 use proto::request::wire::{self, from_engine};
 use proto::request::{
     ArtifactMedia, CachePolicy, Event, FinishReason, GenerationRequest, MigrationCause,
@@ -156,15 +157,28 @@ fn routed(
 
 impl MainProcess {
     /// Takes the requests of one submission, in order: each waits at the gate while admissions
-    /// are paused, and is otherwise admitted ([`Self::admit`]).
-    pub(super) fn submit(&mut self, front: usize, submit: wire::Submit) {
+    /// are paused, and is otherwise admitted ([`Self::admit`]). `media` are the condition media
+    /// that came with the submission, request by request in condition order: each video request
+    /// takes as many as it states conditions.
+    pub(super) fn submit(
+        &mut self,
+        front: usize,
+        submit: wire::Submit,
+        media: Vec<Arc<MappedMedia>>,
+    ) {
+        let mut media = media.into_iter();
         for request in submit.requests {
+            let conditions = match &request.kind {
+                Some(wire::request::Kind::Diffusion(diffusion)) => diffusion.conditions.len(),
+                _ => 0,
+            };
+            let taken: Vec<_> = media.by_ref().take(conditions).collect();
             // A request that arrives while others wait at the gate waits behind them, so the
             // gate releases in arrival order.
             if self.paused && self.lifecycle == Lifecycle::Serving {
-                self.held.push_back((front, request));
+                self.held.push_back((front, request, taken));
             } else {
-                self.admit(front, request);
+                self.admit(front, request, taken);
             }
         }
     }
@@ -172,16 +186,16 @@ impl MainProcess {
     /// Admits every request the gate held, in arrival order.
     pub(super) fn release(&mut self) {
         while !self.paused
-            && let Some((front, request)) = self.held.pop_front()
+            && let Some((front, request, media)) = self.held.pop_front()
         {
-            self.admit(front, request);
+            self.admit(front, request, media);
         }
     }
 
     /// Ends every request the gate holds with a refusal the daemon resubmits elsewhere: the
     /// engine stopped serving before the gate opened.
     pub(super) fn refuse_held(&mut self, reason: &str) {
-        for (front, request) in std::mem::take(&mut self.held) {
+        for (front, request, _) in std::mem::take(&mut self.held) {
             self.reject(
                 front,
                 request.id,
@@ -191,9 +205,10 @@ impl MainProcess {
         }
     }
 
-    /// Admits one request: refused while the engine does not serve or when it does not
-    /// convert, routed, accepted, and handed to its scheduler.
-    fn admit(&mut self, front: usize, request: wire::Request) {
+    /// Admits one request with the media of its conditions: refused while the engine does not
+    /// serve, when it does not convert or when its media do not match its conditions; routed,
+    /// accepted, and handed to its scheduler.
+    fn admit(&mut self, front: usize, request: wire::Request, media: Vec<Arc<MappedMedia>>) {
         let id = request.id;
         if let Some(refusal) = self.lifecycle.refusal() {
             return self.reject(front, id, RejectionKind::Overloaded, refusal.to_owned());
@@ -208,6 +223,21 @@ impl MainProcess {
                 return self.reject(front, id, RejectionKind::Invalid, error.to_string());
             }
         };
+        match &mut input {
+            proto::request::Request::Diffusion(diffusion)
+                if diffusion.conditions.len() == media.len() =>
+            {
+                diffusion.media = media;
+            }
+            proto::request::Request::Generation(_) if media.is_empty() => {}
+            _ => {
+                let message = format!(
+                    "request {id} came with {} media, one per condition it states",
+                    media.len()
+                );
+                return self.reject(front, id, RejectionKind::Invalid, message);
+            }
+        }
 
         if let proto::request::Request::Generation(generation) = &mut input {
             // An adapter's tensors load into their slot, and no kernel package of this epoch
@@ -373,14 +403,18 @@ impl MainProcess {
             return;
         }
 
-        let Some(at) = self.held.iter().position(|(_, request)| request.id == id.0) else {
+        let Some(at) = self
+            .held
+            .iter()
+            .position(|(_, request, _)| request.id == id.0)
+        else {
             tracing::debug!(
                 request = id.0,
                 "a command names a request this engine does not hold"
             );
             return;
         };
-        let Some((front, _)) = self.held.remove(at) else {
+        let Some((front, ..)) = self.held.remove(at) else {
             return;
         };
         let finished = Event::Finished {
@@ -469,7 +503,7 @@ impl MainProcess {
         };
         let held = std::mem::take(&mut self.held)
             .into_iter()
-            .map(|(front, request)| (RequestId(request.id), front));
+            .map(|(front, request, _)| (RequestId(request.id), front));
         let streams = std::mem::take(&mut self.streams)
             .into_iter()
             .map(|(id, stream)| (id, stream.front));

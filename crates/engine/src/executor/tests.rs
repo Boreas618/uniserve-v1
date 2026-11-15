@@ -203,6 +203,7 @@ pub(crate) fn host_batch(id: u64, group: GroupId, phase: Phase, variant: Variant
         request: RequestId(9),
         slot: 1,
         conditioning: Vec::new(),
+        media: Vec::new(),
         step: 0,
         steps: 1,
         seed: 0,

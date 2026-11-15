@@ -623,6 +623,8 @@ fn artifact_descriptor(
     let mut file = proto::shared_memory::anonymous(media.len())
         .context("creating shared memory for a video artifact")?;
     std::io::Write::write_all(&mut file, media)?;
+    // The successor maps it as a medium, which is sealed against writes and size changes.
+    proto::shared_memory::seal(&file).context("sealing a video artifact")?;
     Ok(OwnedFd::from(file))
 }
 

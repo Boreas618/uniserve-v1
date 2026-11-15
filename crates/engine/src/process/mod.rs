@@ -90,8 +90,9 @@ type Job = Box<dyn FnOnce() -> Input + Send>;
 
 /// What reaches the control thread's inbox.
 pub(crate) enum Input {
-    /// A frame of the request interface from front `.0`.
-    Frame(usize, wire::ToEngine),
+    /// A frame of the request interface from front `.0`, with the condition media that came with
+    /// it (`Submit`), in the order its requests' conditions state them.
+    Frame(usize, Box<wire::ToEngine>, Vec<Arc<proto::MappedMedia>>),
     /// Front `.0` closed.
     FrontClosed(usize),
     /// A command of the process interface; `None` once the daemon closed it.
@@ -296,8 +297,9 @@ pub(crate) struct MainProcess {
     /// The started epoch; `None` while starting.
     engine: Option<Engine>,
     streams: HashMap<RequestId, RequestStream>,
-    /// The requests the pause gate holds, in arrival order, each with its front.
-    held: VecDeque<(usize, wire::Request)>,
+    /// The requests the pause gate holds, in arrival order, each with its front and the media of
+    /// its conditions.
+    held: VecDeque<(usize, wire::Request, Vec<Arc<proto::MappedMedia>>)>,
     paused: bool,
     /// Whether requests carried from another epoch compute their state again
     /// (`Promote.recompute`).
@@ -463,15 +465,17 @@ impl MainProcess {
     /// Applies one input of the inbox.
     fn input(&mut self, input: Input) {
         match input {
-            Input::Frame(front, frame) => match frame.kind {
-                Some(wire::to_engine::Kind::Submit(submit)) => self.submit(front, submit),
+            Input::Frame(front, frame, media) => match frame.kind {
+                Some(wire::to_engine::Kind::Submit(submit)) => self.submit(front, submit, media),
                 Some(wire::to_engine::Kind::Command(command)) => {
                     self.request_command(front, command);
                 }
                 Some(wire::to_engine::Kind::Engine(command)) => {
                     self.engine_command(front, command);
                 }
-                None => {}
+                // A condition's parts are the front's reader's, which hands the medium on with
+                // the `Submit` that follows them.
+                Some(wire::to_engine::Kind::ConditionPart(_)) | None => {}
             },
             Input::FrontClosed(front) => {
                 tracing::warn!(

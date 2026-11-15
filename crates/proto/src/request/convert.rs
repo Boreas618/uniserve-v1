@@ -366,7 +366,8 @@ impl TryFrom<wire::DiffusionRequest> for DiffusionRequest {
     type Error = WireError;
 
     /// The request without its identity and priority, which the enclosing
-    /// [`wire::Request`] states.
+    /// [`wire::Request`] states, and without its condition media, which travel beside the frame
+    /// and which its receiver attaches ([`DiffusionRequest::media`]).
     fn try_from(request: wire::DiffusionRequest) -> Result<Self, WireError> {
         let sampling = present(request.sampling, "diffusion sampling")?;
         Ok(Self {
@@ -421,6 +422,7 @@ impl TryFrom<wire::DiffusionRequest> for DiffusionRequest {
                     }))
                 })
                 .transpose()?,
+            media: Vec::new(),
         })
     }
 }

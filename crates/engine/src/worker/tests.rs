@@ -1584,6 +1584,7 @@ fn a_batch_a_rank_runs_alone_is_passed_by_the_others_and_ends_on_every_rank() {
         request: RequestId(1),
         slot: 1,
         conditioning: Vec::new(),
+        media: Vec::new(),
         step: 0,
         steps: 1,
         seed: 0,

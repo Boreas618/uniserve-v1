@@ -261,6 +261,7 @@ fn batch(variant: Variant, step: u32, results: Vec<u32>, reads: u32) -> Batch {
             request: RequestId(1),
             slot: SLOT,
             conditioning: conditioning.encode(),
+            media: Vec::new(),
             step,
             steps: 2,
             seed: 7,
