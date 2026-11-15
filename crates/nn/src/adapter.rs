@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 
 use tensor::DType;
 
-use crate::checkpoint::{Checkpoint, FileIdentity, TensorLocation};
+use crate::checkpoint::{Checkpoint, FileIdentity, Source, TensorLocation};
 use crate::error::{Error, Result};
 use crate::weights::{dim, last, numel};
 
@@ -143,7 +143,7 @@ impl Adapter {
     pub fn open(path: &Path) -> Result<Self> {
         let file = adapter_file(path)?;
         let root = file.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let shards = Checkpoint::from_shards(&root, vec![file.clone()])?;
+        let shards = Checkpoint::from_shards(&Source::Local(root), vec![file.clone()])?;
         let refuse = |problem: String| Error::Checkpoint {
             path: file.clone(),
             problem,

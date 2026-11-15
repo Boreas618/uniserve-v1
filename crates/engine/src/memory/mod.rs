@@ -97,22 +97,19 @@ pub(crate) unsafe fn lend(
 mod fixtures {
     use std::path::Path;
 
-    use nn::FileIdentity;
+    use nn::{FileIdentity, Source};
 
-    /// The identity of a checkpoint file named after `name` under `directory`, as a Hugging
-    /// Face cache stores one: a file under `blobs/` is identified by its name alone, so the
-    /// identity does not depend on when the file was written, and two calls of one name give
-    /// one identity.
+    /// The identity of the checkpoint file `name` of a Hugging Face snapshot at `directory`: a
+    /// snapshot's file is identified by its repository, its commit and its path, so the identity
+    /// does not depend on when the file was written, and two calls of one name give one
+    /// identity.
     pub(crate) fn identity(directory: &Path, name: &str) -> FileIdentity {
-        let blobs = directory.join("blobs");
-        std::fs::create_dir_all(&blobs).unwrap();
+        let snapshot = Source::snapshot(
+            "owner/model",
+            "0123456789abcdef0123456789abcdef01234567",
+            directory.to_path_buf(),
+        );
 
-        // A blob's name is a 64-digit hexadecimal content hash; the fixture derives one from
-        // the name it is given.
-        let digest: String = name.bytes().map(|byte| format!("{byte:02x}")).collect();
-        let path = blobs.join(format!("{digest:0<64.64}"));
-        std::fs::write(&path, name).unwrap();
-
-        FileIdentity::of(&path).unwrap()
+        snapshot.identity(&directory.join(name)).unwrap()
     }
 }

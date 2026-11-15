@@ -89,7 +89,7 @@ pub use capability::{
     PatchFormat, PixelNorm, RecurrentState, Splice, Splicer, Step, TokenBatch, VerifySlots,
     VideoRequest, Vision,
 };
-pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, TensorLocation};
+pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Snapshot, Source, TensorLocation};
 pub use collective::Split;
 pub use error::{Error, Result};
 pub use proto::module::Phase;

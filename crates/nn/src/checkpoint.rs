@@ -19,21 +19,20 @@
 //! ## File identity
 //!
 //! Retained weights are keyed by the identity of the files they were read from, so a
-//! checkpoint edited after it was loaded cannot silently serve the old retained bytes. The rule is:
+//! checkpoint edited after it was loaded cannot serve the old retained bytes. The caller states
+//! where a checkpoint's files come from ([`Source`]), and that statement decides the identity:
 //!
-//! - a file of a Hugging Face cache is a link to a blob named by a digest of its contents (SHA-256
-//!   for a large file, the git blob SHA-1 otherwise), and the cache writes a blob once, so the blob's
-//!   name is the file's identity;
-//! - any other file's identity is its device, inode, modification time and status-change time;
-//! - a file whose status-change time is younger than one second may still be written again under the
-//!   same clock tick, so its identity is unique to this read and matches no later load.
+//! - a file of a Hugging Face snapshot is named by the repository, the commit the snapshot holds
+//!   and the file's path within it, because a commit's files never change;
+//! - a local file is named by its status: device, inode, modification and status-change times,
+//!   a link followed. Rewriting the file changes its times, at the filesystem's timestamp
+//!   granularity, so a load after the rewrite is keyed apart from the bytes retained before it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::Mmap;
 use safetensors::Dtype as FormatDtype;
@@ -45,43 +44,135 @@ use tensor::{DType, Shape};
 use crate::adapter::{Adapter, Fusion};
 use crate::error::{Error, Result};
 
-/// How long after its last write a file's identity is trusted to stay the same.
-///
-/// The kernel's clock tick is coarser than this on some filesystems, so a younger file may be
-/// rewritten under the same `ctime`; such a file gets an identity unique to this read.
-const SETTLED_NS: u128 = 1_000_000_000;
-
 /// The bytes of a shard before its header's JSON body: the body's length, as a `u64`.
 const HEADER_PREFIX: u64 = 8;
+
+/// Where a directory of checkpoint files comes from, as the caller resolved it: the statement
+/// that decides each file's [`FileIdentity`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// A directory of the local filesystem, as a deployment names it.
+    Local(PathBuf),
+    /// A directory of a Hugging Face snapshot: a repository's files at one commit.
+    Snapshot(Snapshot),
+}
+
+/// A directory of a Hugging Face repository's snapshot at one commit, as the asset resolver
+/// fetched it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    /// The repository id, `<owner>/<name>`.
+    repository: String,
+    /// The commit the snapshot holds.
+    revision: String,
+    /// Where the directory lies on this host.
+    directory: PathBuf,
+    /// The directory's path within the snapshot, empty for the snapshot's root.
+    within: PathBuf,
+}
+
+impl Snapshot {
+    /// The repository id, `<owner>/<name>`.
+    pub fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    /// The commit the snapshot holds.
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+}
+
+impl Source {
+    /// The root of the snapshot of `repository` at the commit `revision`, which lies at
+    /// `directory`.
+    pub fn snapshot(
+        repository: impl Into<String>,
+        revision: impl Into<String>,
+        directory: impl Into<PathBuf>,
+    ) -> Self {
+        Self::Snapshot(Snapshot {
+            repository: repository.into(),
+            revision: revision.into(),
+            directory: directory.into(),
+            within: PathBuf::new(),
+        })
+    }
+
+    /// Where the directory lies on this host.
+    pub fn directory(&self) -> &Path {
+        match self {
+            Self::Local(directory) => directory,
+            Self::Snapshot(snapshot) => &snapshot.directory,
+        }
+    }
+
+    /// The directory `name` below this one, from the same place.
+    pub fn join(&self, name: impl AsRef<Path>) -> Self {
+        let name = name.as_ref();
+        match self {
+            Self::Local(directory) => Self::Local(directory.join(name)),
+            Self::Snapshot(snapshot) => Self::Snapshot(Snapshot {
+                directory: snapshot.directory.join(name),
+                within: snapshot.within.join(name),
+                ..snapshot.clone()
+            }),
+        }
+    }
+
+    /// The identity of `file`, a file of this directory or of a directory below it.
+    ///
+    /// # Errors
+    ///
+    /// When a local file's status cannot be read, or `file` lies outside a snapshot's directory.
+    pub fn identity(&self, file: &Path) -> Result<FileIdentity> {
+        match self {
+            Self::Local(_) => FileIdentity::of(file),
+            Self::Snapshot(snapshot) => {
+                let relative =
+                    file.strip_prefix(&snapshot.directory)
+                        .map_err(|_| Error::Checkpoint {
+                            path: file.to_path_buf(),
+                            problem: format!(
+                                "lies outside the snapshot directory {} it is read from",
+                                snapshot.directory.display()
+                            ),
+                        })?;
+                Ok(FileIdentity(format!(
+                    "{}@{}/{}",
+                    snapshot.repository,
+                    snapshot.revision,
+                    snapshot.within.join(relative).display()
+                )))
+            }
+        }
+    }
+}
 
 /// The identity of one checkpoint file, as retained weights are keyed by it.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct FileIdentity(String);
 
 impl FileIdentity {
-    /// The identity of `path`, a link followed.
+    /// The identity of the local file `path`: its device, inode, modification and status-change
+    /// times, a link followed.
+    ///
+    /// # Errors
+    ///
+    /// When the file's status cannot be read.
     pub fn of(path: &Path) -> Result<Self> {
         let resolved = std::fs::canonicalize(path).map_err(|source| Error::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        if is_hf_blob(&resolved) {
-            let name = resolved.file_name().unwrap_or_default().to_string_lossy();
-            return Ok(Self(format!("blob:{name}")));
-        }
         let status = std::fs::metadata(&resolved).map_err(|source| Error::Io {
             path: resolved.clone(),
             source,
         })?;
+
+        // Each time in nanoseconds since the epoch: its seconds and its nanosecond remainder.
         let mtime = status.mtime() as i128 * 1_000_000_000 + i128::from(status.mtime_nsec());
         let ctime = status.ctime() as i128 * 1_000_000_000 + i128::from(status.ctime_nsec());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|age| age.as_nanos() as i128)
-            .unwrap_or(0);
-        if now - ctime < SETTLED_NS as i128 {
-            return Ok(Self::unsettled(&resolved));
-        }
         Ok(Self(format!(
             "{}:{}:{}:{}",
             status.dev(),
@@ -89,29 +180,6 @@ impl FileIdentity {
             mtime,
             ctime
         )))
-    }
-
-    /// An identity that matches no later load of `path`, for a file whose write may not be settled.
-    fn unsettled(path: &Path) -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        // The reading process and the moment of the read together name one read of one path; the
-        // counter separates two reads that land in the same nanosecond.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|age| age.as_nanos())
-            .unwrap_or(0);
-        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in path.as_os_str().as_encoded_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        Self(format!(
-            "unsettled:{:016x}{:08x}{:016x}",
-            nanos as u64,
-            std::process::id(),
-            hash ^ count
-        ))
     }
 
     /// The identity of a value produced from the files `base` and `adapter` names together: an
@@ -130,23 +198,6 @@ impl std::fmt::Display for FileIdentity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
     }
-}
-
-/// Whether `path` is a blob of a Hugging Face cache: a `blobs` directory entry named by a digest.
-fn is_hf_blob(path: &Path) -> bool {
-    let in_blobs = path
-        .parent()
-        .and_then(Path::file_name)
-        .is_some_and(|parent| parent == "blobs");
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_default();
-    let hex = !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-    in_blobs && hex && (name.len() == 64 || name.len() == 40)
 }
 
 /// One mapped safetensors shard.
@@ -203,7 +254,8 @@ pub struct TensorLocation {
 /// root with a shard set of its own is flat and behaves as it always has, and a root without one is
 /// read as the stages its subdirectories hold.
 pub struct Checkpoint {
-    root: PathBuf,
+    /// The directory this checkpoint was opened at, and where its files come from.
+    source: Source,
     /// Every root this checkpoint's tensors came from, in precedence order; one entry unless it was
     /// opened over several roots ([`Checkpoint::open_roots`]). A missing tensor names them, because
     /// a union that spans an export and a base is where "not found" costs the most to chase.
@@ -219,24 +271,30 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    /// Open the checkpoint at `root`.
+    /// Open the checkpoint in the local directory `root`.
     ///
     /// A `model.safetensors.index.json` names each tensor's shard; without one every
     /// `*.safetensors` file of the directory is read and its tensors are taken from its header.
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_at(Source::Local(root.to_path_buf()))
+    }
+
+    /// Open the checkpoint at `source`, a directory whose files' identities it states.
+    fn open_at(source: Source) -> Result<Self> {
+        let root = source.directory();
         let index = root.join("model.safetensors.index.json");
         let paths = if index.is_file() {
             shards_from_index(&index)?
         } else if let Some(paths) = shards_in(root)? {
             paths
         } else {
-            return Self::pipeline(root);
+            return Self::pipeline(source);
         };
-        Self::from_shards(root, paths)
+        Self::from_shards(&source, paths)
     }
 
-    /// Open the shard set `paths` as one flat checkpoint rooted at `root`.
-    pub(crate) fn from_shards(root: &Path, paths: Vec<PathBuf>) -> Result<Self> {
+    /// Open the shard set `paths`, files of the directory `source`, as one flat checkpoint.
+    pub(crate) fn from_shards(source: &Source, paths: Vec<PathBuf>) -> Result<Self> {
         let mut files = Vec::with_capacity(paths.len());
         let mut locations = BTreeMap::new();
         for path in paths {
@@ -252,7 +310,7 @@ impl Checkpoint {
                 path: path.clone(),
                 source,
             })?;
-            let identity = FileIdentity::of(&path)?;
+            let identity = source.identity(&path)?;
             let (length, stated) =
                 SafeTensors::read_metadata(&map).map_err(|problem| Error::Checkpoint {
                     path: path.clone(),
@@ -300,8 +358,8 @@ impl Checkpoint {
         }
 
         Ok(Self {
-            root: root.to_path_buf(),
-            roots: vec![root.to_path_buf()],
+            source: source.clone(),
+            roots: vec![source.directory().to_path_buf()],
             files,
             tensors: locations,
             stages: BTreeMap::new(),
@@ -364,7 +422,8 @@ impl Checkpoint {
     }
 
     /// Open a pipeline root: one stage per subdirectory that holds a shard set.
-    fn pipeline(root: &Path) -> Result<Self> {
+    fn pipeline(source: Source) -> Result<Self> {
+        let root = source.directory();
         let entries = std::fs::read_dir(root).map_err(|source| Error::Io {
             path: root.to_path_buf(),
             source,
@@ -386,7 +445,7 @@ impl Checkpoint {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            stages.insert(name, Self::open(&path)?);
+            stages.insert(name.clone(), Self::open_at(source.join(&name))?);
         }
         if stages.is_empty() {
             return Err(Error::Checkpoint {
@@ -395,8 +454,8 @@ impl Checkpoint {
             });
         }
         Ok(Self {
-            root: root.to_path_buf(),
             roots: vec![root.to_path_buf()],
+            source,
             files: Vec::new(),
             tensors: BTreeMap::new(),
             stages,
@@ -411,7 +470,7 @@ impl Checkpoint {
     /// A pipeline's stages are opened under it, so a model's `load()` can reach each stage
     /// without a second copy of the path being threaded through the engine.
     pub fn root(&self) -> &Path {
-        &self.root
+        self.source.directory()
     }
 
     /// Every directory this checkpoint spans, the first root's first.
@@ -495,12 +554,12 @@ impl Checkpoint {
         match found.as_slice() {
             [(dtype, _)] => Ok(*dtype),
             [] => Err(Error::Checkpoint {
-                path: self.root.clone(),
+                path: self.root().to_path_buf(),
                 problem: "holds no floating-point tensor, so no element type describes its weights"
                     .to_owned(),
             }),
             several => Err(Error::Checkpoint {
-                path: self.root.clone(),
+                path: self.root().to_path_buf(),
                 problem: format!(
                     "stores {} floating-point types ({}), and the consumer that asked takes one \
                      element type for the whole checkpoint; each weight still loads in its own \
@@ -610,7 +669,7 @@ impl Checkpoint {
                 .collect::<Vec<_>>()
                 .join(", ");
             Error::Checkpoint {
-                path: self.root.clone(),
+                path: self.root().to_path_buf(),
                 problem: format!(
                     "no root holds a tensor `{name}`; searched, in precedence order: {tried}"
                 ),
@@ -692,7 +751,7 @@ impl Checkpoint {
     pub fn attach(mut self, stage: Option<&str>, adapter: Adapter) -> Result<Self> {
         if let Some(name) = stage {
             let held = self.stages.remove(name).ok_or_else(|| Error::Checkpoint {
-                path: self.root.clone(),
+                path: self.root().to_path_buf(),
                 problem: format!("an adapter edits the stage `{name}`, which is not here"),
             })?;
             let adapted = held.attach(None, adapter)?;
@@ -701,7 +760,7 @@ impl Checkpoint {
         }
         if self.adapter.is_some() || !self.stages.is_empty() {
             return Err(Error::Checkpoint {
-                path: self.root.clone(),
+                path: self.root().to_path_buf(),
                 problem: "an adapter is fused into one shard set that holds none yet".to_owned(),
             });
         }

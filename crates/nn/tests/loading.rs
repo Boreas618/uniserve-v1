@@ -15,8 +15,8 @@ use std::path::Path;
 use nn::quantization::{ModeloptManifest, Nvfp4Names, UNIFIED_EXPORT, ValueLayout};
 use nn::weights::PartBlock;
 use nn::{
-    Checkpoint, CpuWeights, DType, Device, MetaWeights, Shape, Tensor, WeightKey, WeightLayout,
-    WeightLoader, WeightSource,
+    Checkpoint, CpuWeights, DType, Device, MetaWeights, Shape, Source, Tensor, WeightKey,
+    WeightLayout, WeightLoader, WeightSource,
 };
 use ops::fp4::ScaleLayout;
 use support::{encode, f32_bytes, shard, values};
@@ -121,12 +121,48 @@ fn a_checkpoint_is_read_through_its_index() {
     assert!(checkpoint.tensor("lm_head.weight").is_some());
     assert!(checkpoint.tensor("absent").is_none());
 
-    // A file's identity is its device, inode and times, or the blob name of a cache; two files
-    // of one checkpoint have different identities.
+    // Two files of one checkpoint have different identities.
     let first_identity = checkpoint.identity("model.embed_tokens.weight").unwrap();
     let second_identity = checkpoint.identity("lm_head.weight").unwrap();
     assert_ne!(first_identity, second_identity);
-    assert!(first_identity.as_str().contains(':') || first_identity.as_str().starts_with("blob:"));
+}
+
+/// A file is identified by where its caller states it comes from: a snapshot's file by the
+/// repository, the commit and its path in the snapshot, whatever directory holds it; a local file
+/// by its status, so two copies are two files and one file read twice is one.
+#[test]
+fn a_file_is_identified_by_the_source_its_caller_states() {
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    for directory in [&first, &second] {
+        bf16_shard(directory.path(), &[("weight", vec![2], vec![1.0, 2.0])]);
+    }
+    let identity = |source: Source| {
+        source
+            .identity(&source.directory().join("model.safetensors"))
+            .unwrap()
+    };
+    let snapshot = |revision: &str, directory: &Path| {
+        Source::snapshot("owner/model", revision, directory.to_path_buf())
+    };
+
+    // Two copies of one commit's snapshot hold the same files; another commit holds others, the
+    // same bytes notwithstanding.
+    assert_eq!(
+        identity(snapshot("a1b2", first.path())),
+        identity(snapshot("a1b2", second.path()))
+    );
+    assert_ne!(
+        identity(snapshot("a1b2", first.path())),
+        identity(snapshot("c3d4", first.path()))
+    );
+
+    // A local file just written is one file however often it is read, and its copy another.
+    let local = |directory: &Path| Source::Local(directory.to_path_buf());
+    assert_eq!(identity(local(first.path())), identity(local(first.path())));
+    assert_ne!(
+        identity(local(first.path())),
+        identity(local(second.path()))
+    );
 }
 
 #[test]
