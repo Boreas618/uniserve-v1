@@ -46,7 +46,8 @@ mod updates;
     about = "Manage UniServe deployments through their nodes' admin API"
 )]
 struct Cli {
-    /// A node's admin API: its Unix socket (`unix:/run/user/1000/admin-8000.sock`),
+    /// A node's admin API: its Unix socket, as its daemon's readiness record states it
+    /// (`unix:/run/user/1000/uniserve/daemon.Ab12Cd/admin.sock`),
     /// or the base URL the socket is forwarded at; repeated for several,
     /// before the command.
     #[arg(long = "node", required = true)]

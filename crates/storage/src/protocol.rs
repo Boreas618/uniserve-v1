@@ -1545,7 +1545,7 @@ pub struct BufferPoolListing {
     pub copies: Vec<CopyListing>,
     /// The checks of the pool's tables after an input that found them
     /// inconsistent, while the server checks them
-    /// (`storage-server serve --buffer-pool-check`).
+    /// (the server's `buffer_pool_check` setting).
     pub check_failures: u64,
 }
 
