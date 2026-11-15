@@ -143,9 +143,9 @@ impl Scheduler {
         id
     }
 
-    /// The next completion, within ten seconds.
+    /// The next completion, within the tests' patience.
     pub(crate) fn next(&mut self) -> (RequestId, Completion) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::PATIENCE;
         let mut record = Vec::new();
         loop {
             let seen = self.pair.signals();
@@ -188,7 +188,7 @@ impl Scheduler {
             let register = self.pair.register((first + offset) as usize);
             register.load(Ordering::Acquire)
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::PATIENCE;
         loop {
             let seen = self.pair.signals();
             if (read(0), read(1), read(2)) == words {
@@ -976,7 +976,7 @@ fn an_engine_s_session_closes_once_its_processes_are_out() {
     // Once it has exited, the session closes and the owner is detached.
     drop(child.stdin.take());
     assert!(child.wait().unwrap().success());
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::PATIENCE;
     while attached(&server.socket) != (0, None) {
         assert!(Instant::now() < deadline, "the session did not close");
         std::thread::sleep(Duration::from_millis(5));

@@ -1170,7 +1170,7 @@ fn a_server_serves_its_own_protocol_version_alone() {
     use ::storage::protocol::{Refusal, Request, Response, VERSION};
 
     let server = Running::start();
-    let timeout = std::time::Duration::from_secs(30);
+    let timeout = crate::PATIENCE;
     let connect = |version: u32| {
         let stream = std::os::unix::net::UnixStream::connect(&server.socket).unwrap();
         let mut connection = service::Connection::new(stream).unwrap();
