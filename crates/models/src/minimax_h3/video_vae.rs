@@ -62,7 +62,7 @@ use nn::modules::{
     LinearConfig, Mlp, MlpConfig, Parallel, Precision, QkNorm, QkvBias, QkvLinearConfig, QkvNames,
     ResnetBlock3d, ResnetBlock3dConfig, Rotary, RotaryConfig, Spectrum,
 };
-use nn::vae::{self, TemporalClips};
+use nn::vae::{self, TemporalClips, Tiling};
 use nn::{
     Clip, DType, Decoder, Device, LatentShape, PixelNorm, Result, Splice, Split, Tensor, VarBuilder,
 };
@@ -78,19 +78,6 @@ pub const PIXEL_NORM: PixelNorm = PixelNorm {
     mean: [0.485, 0.456, 0.406],
     std: [0.229, 0.224, 0.225],
 };
-
-/// The seed the encoder samples every condition's posterior under.
-///
-/// It is the checkpoint's recipe and not the request's (the reference's
-/// `MINIMAX_H3_KEYFRAME_ENCODE_SEED`): the posterior's noise is its own stream from element
-/// zero, so a condition always encodes to the same latent, whatever the request's seed draws.
-pub const POSTERIOR_SEED: u64 = 42;
-
-/// The extent of one tile, in pixels (the reference's `vae_tile_size`).
-const TILE_SIZE: usize = 256;
-
-/// The fewest pixels two neighbouring tiles share (the reference's `vae_tile_overlap_min`).
-const TILE_OVERLAP_MIN: usize = 64;
 
 /// The element type of the decoder's projections, of the rows they read and write, and of the
 /// raster (module documentation).
@@ -192,13 +179,23 @@ pub fn token_positions(frames: u32, height: u32, width: u32, suffix: u32) -> Res
     Ok(Tensor::cat(&[voxels, trailing], 1)?)
 }
 
-/// One axis of `pixels` pixels split into the checkpoint's tiles, each tile's range in units
-/// of `unit` pixels: pixels for a decoded raster, latent cells for a latent one.
+/// One axis of `pixels` pixels split into the deployment's tiles `tiling`, each tile's range in
+/// units of `unit` pixels: pixels for a decoded raster, latent cells for a latent one.
 ///
 /// The split is the reference's `split_tiles` (`klvae.py:222-250`) on the grid of the spatial
 /// compression, so every tile and every seam is whole latent cells.
-fn tile_ranges(pixels: usize, spatial: usize, unit: usize) -> Result<Vec<Range<usize>>> {
-    let tiles = vae::split_tiles(pixels, TILE_SIZE, TILE_OVERLAP_MIN, spatial)?;
+fn tile_ranges(
+    pixels: usize,
+    spatial: usize,
+    unit: usize,
+    tiling: Tiling,
+) -> Result<Vec<Range<usize>>> {
+    let tiles = vae::split_tiles(
+        pixels,
+        tiling.tile as usize,
+        tiling.overlap as usize,
+        spatial,
+    )?;
 
     Ok(tiles
         .into_iter()
@@ -473,13 +470,16 @@ pub struct VideoDecoder {
     proj_out: Linear,
     pos_embed: Rotary,
     config: VideoVaeConfig,
+    /// The spatial tiles a clip is decoded in.
+    tiling: Tiling,
     /// The path the decoder was loaded under: its profiler range's.
     path: String,
 }
 
 impl VideoDecoder {
     /// The decoder at `vb`, the root of the checkpoint's `vae` stage: `post_quant_conv` and
-    /// `decoder.{proj_in, register_tokens, transformer_blocks.<i>, norm_out, proj_out}`.
+    /// `decoder.{proj_in, register_tokens, transformer_blocks.<i>, norm_out, proj_out}`, which
+    /// decodes a clip in the deployment's spatial tiles `tiling`.
     ///
     /// The projections are read in FP16 and everything else in FP32 (module documentation).
     /// The latent statistics and the rotary frequencies are constants the config states,
@@ -489,7 +489,7 @@ impl VideoDecoder {
     ///
     /// A config with no layer or with statistics of another count than its channels, or a
     /// tensor the checkpoint lacks or holds at another extent.
-    pub fn load(config: &VideoVaeConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
+    pub fn load(config: &VideoVaeConfig, tiling: Tiling, vb: VarBuilder<'_, '_>) -> Result<Self> {
         let channels = config.latent_channels;
         if config.decoder_num_layers == 0 {
             return Err(ID.config("the video decoder has no transformer block"));
@@ -554,6 +554,7 @@ impl VideoDecoder {
             )?,
             pos_embed: Rotary::load(&rotary_config(config), decoder.pp("pos_embed"))?,
             config: config.clone(),
+            tiling,
             path: decoder.path().to_owned(),
         })
     }
@@ -578,8 +579,8 @@ impl VideoDecoder {
 
         // The clip's tiles, in pixels: every tile is one extent, so one tile's positions and
         // one sequence length serve them all.
-        let rows = tile_ranges(height as usize * spatial, spatial, 1)?;
-        let columns = tile_ranges(width as usize * spatial, spatial, 1)?;
+        let rows = tile_ranges(height as usize * spatial, spatial, 1, self.tiling)?;
+        let columns = tile_ranges(width as usize * spatial, spatial, 1, self.tiling)?;
         let tiles = rows.len() * columns.len();
         let tile = [
             frames as usize,
@@ -774,8 +775,8 @@ impl Decoder for VideoDecoder {
         } = layout.video;
         let (height, width) = (height as usize, width as usize);
 
-        let rows = tile_ranges(height * spatial, spatial, spatial)?;
-        let columns = tile_ranges(width * spatial, spatial, spatial)?;
+        let rows = tile_ranges(height * spatial, spatial, spatial, self.tiling)?;
+        let columns = tile_ranges(width * spatial, spatial, spatial, self.tiling)?;
 
         Ok(Some(vae::tile_voxels(
             &rows,
@@ -903,6 +904,10 @@ pub struct VideoEncoder {
     spatial: usize,
     temporal: usize,
     padding: Padding,
+    /// The spatial tiles a clip is encoded in.
+    tiling: Tiling,
+    /// The seed every condition's posterior is sampled under.
+    seed: u64,
     /// The path the encoder was loaded under: its profiler range's.
     path: String,
 }
@@ -959,13 +964,19 @@ fn check_stages(config: &VideoVaeConfig) -> Result<()> {
 impl VideoEncoder {
     /// The encoder at `vb`, the root of the checkpoint's `vae` stage: `encoder.{conv_in,
     /// down_blocks.<i>.{resnets.<j>, downsamplers.0.conv}, norm_out, conv_out}` and
-    /// `quant_conv`, every tensor read in FP32.
+    /// `quant_conv`, every tensor read in FP32, which encodes a clip in the deployment's spatial
+    /// tiles `tiling` and samples every condition's posterior under the deployment's `seed`.
     ///
     /// # Errors
     ///
     /// Stages that do not form an encoder of the latent space, or a tensor the checkpoint
     /// lacks or holds at another extent.
-    pub fn load(config: &VideoVaeConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
+    pub fn load(
+        config: &VideoVaeConfig,
+        tiling: Tiling,
+        seed: u64,
+        vb: VarBuilder<'_, '_>,
+    ) -> Result<Self> {
         check_stages(config)?;
 
         let vb = vb.to_dtype(DType::F32);
@@ -1062,6 +1073,8 @@ impl VideoEncoder {
             spatial: config.spatial_compression() as usize,
             temporal: config.temporal_compression() as usize,
             padding,
+            tiling,
+            seed,
             path: encoder.path().to_owned(),
         })
     }
@@ -1090,11 +1103,12 @@ impl VideoEncoder {
     /// FP32 normalized by [`PIXEL_NORM`] (one frame for a still), to
     /// `[latent_channels, latent_frames, height / 16, width / 16]` in FP32.
     ///
-    /// Each clip of the frame rule ([`FRAMES`]) is encoded alone, in the checkpoint's tiles:
+    /// Each clip of the frame rule ([`FRAMES`]) is encoded alone, in the deployment's tiles:
     /// a tile's moments are projected by `quant_conv` (the reference's `encode`,
     /// `klvae.py:1319-1321`, which its tiled encode calls per tile, `klvae.py:392-447`) and
     /// the projected tiles are stitched ([`nn::vae::tiled_encode`]). The posterior of the
-    /// whole condition is sampled under [`POSTERIOR_SEED`] as
+    /// whole condition is sampled under the deployment's seed, its own noise stream from element
+    /// zero so a condition always encodes to the same latent, as
     /// `mean + exp(0.5 · clamp(logvar, −30, 20)) · noise` rounded through FP16 (the
     /// reference's `DiagonalGaussianDistribution.sample` and `use_fp16_latent`,
     /// `klvae.py:71-92`), and the sample is normalized per channel, `(sample − mean) / std`.
@@ -1133,8 +1147,8 @@ impl VideoEncoder {
         }
 
         // The tiles of the raster, in latent cells.
-        let rows = tile_ranges(height, spatial, spatial)?;
-        let columns = tile_ranges(width, spatial, spatial)?;
+        let rows = tile_ranges(height, spatial, spatial, self.tiling)?;
+        let columns = tile_ranges(width, spatial, spatial, self.tiling)?;
 
         let mut clips = Vec::new();
         for span in FRAMES.clips(frames as u32) {
@@ -1179,7 +1193,7 @@ impl VideoEncoder {
 
         // The sample, rounded through FP16 as a step of its own, then the latent space's
         // normalization in FP32.
-        let noise = functional::philox_normal_like(&mean, POSTERIOR_SEED, 0, 0, 0)?;
+        let noise = functional::philox_normal_like(&mean, self.seed, 0, 0, 0)?;
         let sample = ((noise * std)? + mean)?
             .to_dtype(DType::F16)?
             .to_dtype(DType::F32)?;
@@ -1292,10 +1306,16 @@ mod tests {
 
     #[test]
     fn a_raster_splits_into_uniform_tiles_whose_seams_take_the_slack() {
+        // The reference runtime's tiles: 256 pixels, neighbours sharing at least 64.
+        let tiling = Tiling {
+            tile: 256,
+            overlap: 64,
+        };
+
         // 768 by 1344 pixels are 48 by 84 latent cells: four tile rows and seven columns of
         // sixteen cells, with seams of 6, 5, 5 cells down and 5, 5, 5, 5, 4, 4 across.
-        let rows = tile_ranges(768, 16, 16).expect("rows");
-        let columns = tile_ranges(1344, 16, 16).expect("columns");
+        let rows = tile_ranges(768, 16, 16, tiling).expect("rows");
+        let columns = tile_ranges(1344, 16, 16, tiling).expect("columns");
         assert_eq!((rows.len(), columns.len()), (4, 7));
         assert!(rows.iter().chain(&columns).all(|tile| tile.len() == 16));
 
@@ -1310,13 +1330,13 @@ mod tests {
         assert_eq!((rows[3].end, columns[6].end), (48, 84));
 
         // A raster inside one tile is one tile with no seam, in pixels and in cells alike.
-        let pixels = tile_ranges(256, 16, 1).expect("one tile");
+        let pixels = tile_ranges(256, 16, 1, tiling).expect("one tile");
         assert_eq!((pixels.len(), pixels[0].clone()), (1, 0..256));
-        let cells = tile_ranges(192, 16, 16).expect("one tile");
+        let cells = tile_ranges(192, 16, 16, tiling).expect("one tile");
         assert_eq!((cells.len(), cells[0].clone()), (1, 0..12));
 
         // A raster that is not whole latent cells is refused.
-        assert!(tile_ranges(264, 16, 16).is_err());
+        assert!(tile_ranges(264, 16, 16, tiling).is_err());
     }
 
     #[test]

@@ -55,6 +55,7 @@ use anyhow::{Context as _, Result, bail};
 use nn::VideoRequest;
 use nn::family::{VideoCheckpoint, VideoModel, VideoPlacement};
 use nn::pipeline::{Pipeline, Product};
+use nn::vae::Tiling;
 use ops::Generation;
 use platform::{Communicator, DeviceId, Stream};
 use proto::config::{
@@ -67,6 +68,17 @@ use tensor::DType;
 use super::ModelRunner;
 use super::memory::{Peaks, granularity, unreserved};
 use super::text::Keys;
+
+/// The tiles a deployment's VAEs encode and decode a raster in: 256-pixel tiles whose neighbours
+/// share at least 64 pixels, the reference runtime's tiling.
+const VAE_TILING: Tiling = Tiling {
+    tile: 256,
+    overlap: 64,
+};
+
+/// The seed a deployment's condition encoder samples every condition's posterior under, the
+/// reference runtime's.
+const POSTERIOR_SEED: u64 = 42;
 
 /// The runners of a media rank that compute on the device, by the region of the graph pool
 /// each replays in. The media host computes nothing there.
@@ -310,6 +322,8 @@ impl ModelRunner {
             tensor,
             dtype: self.dtype(),
             capacity: self.video_serving()?.capacity()?,
+            tiling: VAE_TILING,
+            posterior_seed: POSTERIOR_SEED,
         };
         Ok(checkpoint.load(&opened, &mut loader, &placement)?)
     }

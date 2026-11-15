@@ -38,6 +38,16 @@ use crate::capability::Splice;
 use crate::collective;
 use crate::error::{Error, Result};
 
+/// How a VAE splits each spatial axis of a raster into tiles ([`split_tiles`]): a deployment's
+/// choice, which trades the memory a tile's forward takes for the seams the blend hides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tiling {
+    /// The extent of one tile along an axis, in pixels.
+    pub tile: u32,
+    /// The fewest pixels two neighbouring tiles share, in pixels.
+    pub overlap: u32,
+}
+
 /// One axis of `length` samples split into overlapping tiles of `tile` samples with at least
 /// `overlap` shared, on a grid of `alignment` samples: each tile's range, in order.
 ///

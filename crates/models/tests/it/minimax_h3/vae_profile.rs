@@ -18,6 +18,7 @@
 use models::minimax_h3::audio_vae::{AudioDecoder, AudioEncoder, padded_samples};
 use models::minimax_h3::video_vae::{self, VideoDecoder, VideoEncoder};
 use models::minimax_h3::{AudioVaeConfig, VideoVaeConfig};
+use nn::vae::Tiling;
 use nn::{Checkpoint, Clip, DType, Decoder, LatentShape, MetaWeights, PipelineIndex, WeightLoader};
 use nn_testing::{meta, record, report};
 use processing::minimax_h3::{
@@ -26,6 +27,13 @@ use processing::minimax_h3::{
 use proto::video::Layout;
 
 use crate::releases::{FASTH3_4_STEP_NVFP4, MINIMAX_H3};
+
+/// The tiles the profiled deployments encode and decode in: 256 pixels, neighbours sharing at
+/// least 64, the reference runtime's.
+const TILING: Tiling = Tiling {
+    tile: 256,
+    overlap: 64,
+};
 
 /// The stage `name` of the base release, opened by its headers where its pipeline index
 /// declares it.
@@ -115,7 +123,7 @@ fn the_video_decoder_profiles_one_clip_at_a_small_and_a_large_resolution() {
     let (checkpoint, config) = video_stage();
     let store = MetaWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
-    let decoder = VideoDecoder::load(&config, loader.root()).unwrap();
+    let decoder = VideoDecoder::load(&config, TILING, loader.root()).unwrap();
 
     profile_decoder("MiniMax-H3", &decoder, &config);
 }
@@ -136,7 +144,7 @@ fn the_nvfp4_export_s_video_decoder_profiles_one_clip_at_a_small_and_a_large_res
     let store = MetaWeights::new();
     let mut loader = WeightLoader::new(checkpoint.stage("vae").unwrap(), &store, None);
     loader.declare(&config.quantization).unwrap();
-    let decoder = VideoDecoder::load(&config, loader.root()).unwrap();
+    let decoder = VideoDecoder::load(&config, TILING, loader.root()).unwrap();
 
     profile_decoder("FastH3 4-step NVFP4", &decoder, &config);
 }
@@ -147,7 +155,7 @@ fn the_video_encoder_profiles_a_still_and_a_clip() {
     let (checkpoint, config) = video_stage();
     let store = MetaWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
-    let encoder = VideoEncoder::load(&config, loader.root()).unwrap();
+    let encoder = VideoEncoder::load(&config, TILING, 42, loader.root()).unwrap();
     let [(small_width, small_height), (large_width, large_height)] = served_resolutions();
 
     // A keyframe at the smallest resolution, and a reference video of the fewest frames the

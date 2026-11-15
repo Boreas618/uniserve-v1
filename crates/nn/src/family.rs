@@ -44,6 +44,7 @@ use crate::capability::{
     CausalLm, ConditionShape, Decoder, Denoiser, Drafter, Encoder, MediaFormat, Splicer, Vision,
 };
 use crate::collective::Split;
+use crate::vae::Tiling;
 use crate::{Checkpoint, ConditionRole, Result, Sources, WeightLoader};
 
 /// One model family a build serves: what execution loads of its checkpoints, beside how they
@@ -463,6 +464,12 @@ pub struct VideoPlacement {
     pub dtype: DType,
     /// The rows execution sizes the denoiser's layouts for.
     pub capacity: LayoutCapacity,
+    /// The spatial tiles the VAEs encode and decode a raster in.
+    pub tiling: Tiling,
+    /// The seed the condition encoder samples a condition's posterior under: the deployment's
+    /// and not the request's, so a condition encodes to the same latent whatever a request's
+    /// seed draws.
+    pub posterior_seed: u64,
 }
 
 /// The rows a deployment sizes its denoiser's layouts for, which execution chooses from what it

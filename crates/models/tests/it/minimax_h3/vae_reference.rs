@@ -23,6 +23,7 @@ use models::minimax_h3::video_vae::{self, TransformerBlock, VideoDecoder, VideoE
 use models::minimax_h3::{AudioVaeConfig, VideoVaeConfig};
 use nn::functional::{self, Padding, ProductPrecision};
 use nn::modules::{ResnetBlock3d, ResnetBlock3dConfig, Rotary};
+use nn::vae::Tiling;
 use nn::{Checkpoint, Clip, CpuWeights, DType, Decoder, Device, LatentShape, Tensor, WeightLoader};
 use nn_testing::{Fixture, assert_close, checkpoint, decode, sequence, tensor, values};
 use proto::video::Layout;
@@ -32,6 +33,17 @@ const UNIT_ROUNDOFF: f32 = f32::EPSILON / 2.0;
 
 /// The spacing of FP16 values relative to their magnitude: one part in 2¹⁰.
 const F16_SPACING: f32 = 1.0 / 1024.0;
+
+/// The reference runtime's tiles, which the fixtures were computed with: 256 pixels, neighbours
+/// sharing at least 64 (its `vae_tile_size` and `vae_tile_overlap_min`).
+const TILING: Tiling = Tiling {
+    tile: 256,
+    overlap: 64,
+};
+
+/// The seed the reference runtime samples a condition's posterior under (its
+/// `MINIMAX_H3_KEYFRAME_ENCODE_SEED`), which the fixtures were computed with.
+const POSTERIOR_SEED: u64 = 42;
 
 /// The bound of a path of `stages` rounded stages whose longest reduction has `terms` terms
 /// (module documentation).
@@ -157,7 +169,8 @@ fn the_video_encoder_computes_the_references_moments() {
     let checkpoint = fixture("video_encoder");
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
-    let encoder = VideoEncoder::load(&video_config(), loader.root()).unwrap();
+    let encoder =
+        VideoEncoder::load(&video_config(), TILING, POSTERIOR_SEED, loader.root()).unwrap();
 
     // Five frames of 32 by 32 pixels: two latent frames of two by two cells.
     let pixels = stored(&checkpoint, "input");
@@ -181,7 +194,7 @@ fn a_condition_is_the_posteriors_seeded_sample_normalized() {
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let config = video_config();
-    let encoder = VideoEncoder::load(&config, loader.root()).unwrap();
+    let encoder = VideoEncoder::load(&config, TILING, POSTERIOR_SEED, loader.root()).unwrap();
 
     // One clip of five frames inside one tile: `[3, 5, 32, 32]` to `[2, 2, 2, 2]`.
     let pixels = stored(&checkpoint, "input").squeeze(0).unwrap();
@@ -195,8 +208,7 @@ fn a_condition_is_the_posteriors_seeded_sample_normalized() {
     let moments = values(&stored(&checkpoint, "moments"));
     let (mean, logvar) = moments.split_at(16);
     let like = Tensor::zeros((2, 2, 2, 2), DType::F32, &Device::Cpu).unwrap();
-    let noise =
-        values(&functional::philox_normal_like(&like, video_vae::POSTERIOR_SEED, 0, 0, 0).unwrap());
+    let noise = values(&functional::philox_normal_like(&like, POSTERIOR_SEED, 0, 0, 0).unwrap());
     assert!(noise.iter().any(|sample| *sample != 0.0));
 
     let sample: Vec<f32> = (0..16)
@@ -407,7 +419,7 @@ fn a_tiled_decode_is_each_tiles_own_decode_outside_the_seam() {
     let checkpoint = checkpoint(directory.path(), DType::F32, &decoder_tensors(&config));
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
-    let decoder = VideoDecoder::load(&config, loader.root()).unwrap();
+    let decoder = VideoDecoder::load(&config, TILING, loader.root()).unwrap();
 
     assert_eq!(decoder.element_type(), DType::F16);
     assert_eq!(decoder.latent_type(), DType::F32);

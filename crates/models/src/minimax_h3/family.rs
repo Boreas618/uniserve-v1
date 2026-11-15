@@ -476,7 +476,12 @@ impl MinimaxH3 {
                 let audio = loader.reborrow(checkpoint.stage(Component::AudioVae.name())?)?;
 
                 Some((
-                    VideoEncoder::load(&config.video_vae, video.root())?,
+                    VideoEncoder::load(
+                        &config.video_vae,
+                        placement.tiling,
+                        placement.posterior_seed,
+                        video.root(),
+                    )?,
                     AudioEncoder::load(&config.audio_vae, audio.root())?,
                 ))
             } else {
@@ -519,6 +524,7 @@ impl MinimaxH3 {
 
             model.video_decoder = Some(Arc::new(VideoDecoder::load(
                 &config.video_vae,
+                placement.tiling,
                 stage.root(),
             )?));
         }

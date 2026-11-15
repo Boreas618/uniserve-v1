@@ -22,6 +22,7 @@ use nn::family::{
     ConditionMedia, DenoiserSplit, LayoutCapacity, Model, Projection, SequenceSplit, VideoModel,
     VideoPlacement,
 };
+use nn::vae::Tiling;
 use nn::{
     Clip, ConditionShape, Conditioning, DType, MetaWeights, Split, VideoRequest, WeightLoader,
 };
@@ -74,6 +75,11 @@ fn load_under(
         denoiser: sequence,
         tensor: Split::WHOLE,
         dtype: DType::BF16,
+        tiling: Tiling {
+            tile: 256,
+            overlap: 64,
+        },
+        posterior_seed: 42,
     };
     let store = MetaWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None);
