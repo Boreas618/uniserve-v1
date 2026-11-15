@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use daemon::DaemonOptions;
@@ -122,8 +123,9 @@ impl Engine {
         self.reply(id)
     }
 
-    /// Sends one request and returns its id.
-    fn send(&mut self, kind: request::Kind) -> u64 {
+    /// Sends one request and returns its id, without waiting for its answer
+    /// ([`Engine::reply`]).
+    pub(crate) fn send(&mut self, kind: request::Kind) -> u64 {
         let id = self.next;
         self.next += 1;
         self.connection
@@ -138,7 +140,7 @@ impl Engine {
     }
 
     /// The answer to request `id`, keeping the exits that arrive before it.
-    fn reply(&mut self, id: u64) -> Reply {
+    pub(crate) fn reply(&mut self, id: u64) -> Reply {
         loop {
             match self.receive() {
                 downstream::Kind::Reply(reply) => {
@@ -271,4 +273,120 @@ pub(crate) fn eventually(mut condition: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(20));
     }
     condition()
+}
+
+/// A stand-in for a host's Build Server, the host service a daemon prepares an epoch's module set
+/// at: it serves `prepare` at its socket and answers every slot with the package revision the
+/// request fixed for it, raised by `raise`, as a Build Server that holds every module answers.
+pub(crate) struct BuildServerStandIn {
+    socket: PathBuf,
+    /// One token per `prepare` that arrived.
+    asked: Receiver<()>,
+    /// One token lets one held `prepare` answer.
+    release: Sender<()>,
+}
+
+impl BuildServerStandIn {
+    /// Serves at `socket`, owning it as a Build Server does; with `held`, each `prepare` answers
+    /// only once [`Self::release`] lets it, as one building the engine's executable does.
+    pub(crate) fn serve(socket: PathBuf, held: bool, raise: u32) -> Self {
+        use build_server::protocol::wire;
+
+        let (listener, lock) = service::bind(&socket)
+            .unwrap()
+            .expect("no server owns the stand-in's socket");
+        let (asked_sender, asked) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _lock = lock;
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    return;
+                };
+                let mut connection = Connection::new(stream).unwrap();
+                // A daemon probes whether a server listens with a connection that sends nothing.
+                let Ok(Some(request)) = connection.recv::<wire::Request>(TIMEOUT) else {
+                    continue;
+                };
+                let Some(wire::request::Request::Prepare(prepare)) = request.request else {
+                    continue;
+                };
+                let _ = asked_sender.send(());
+                if held && released.recv().is_err() {
+                    return;
+                }
+                let packages = prepare
+                    .packages
+                    .into_iter()
+                    .map(|requested| wire::SlotPackage {
+                        op: requested.op,
+                        phase: requested.phase,
+                        part: requested.part,
+                        package: match requested.selector {
+                            Some(wire::package_request::Selector::Package(mut revision)) => {
+                                revision.revision += raise;
+                                Some(revision)
+                            }
+                            _ => None,
+                        },
+                    })
+                    .collect();
+                let _ = connection.deliver(&wire::ServerMessage {
+                    message: Some(wire::server_message::Message::Prepared(
+                        wire::PrepareResponse { packages },
+                    )),
+                });
+            }
+        });
+        Self {
+            socket,
+            asked,
+            release,
+        }
+    }
+
+    /// The settings of a daemon whose host this Build Server serves.
+    pub(crate) fn settings(&self) -> build_server::command::Settings {
+        build_server::command::Settings {
+            socket: Some(self.socket.clone()),
+            ..build_server::command::Settings::default()
+        }
+    }
+
+    /// Its socket.
+    pub(crate) fn socket(&self) -> PathBuf {
+        self.socket.clone()
+    }
+
+    /// Waits until a `prepare` arrived.
+    pub(crate) fn asked(&self) {
+        self.asked
+            .recv_timeout(TIMEOUT)
+            .expect("the Build Server was asked to prepare");
+    }
+
+    /// Lets one held `prepare` answer.
+    pub(crate) fn release(&self) {
+        self.release.send(()).unwrap();
+    }
+}
+
+/// The module set of an epoch: the engine package, a scheduling policy and one kernel package,
+/// each at a fixed revision.
+pub(crate) fn module_set() -> proto::module::ModuleSet {
+    let package = |backend: &str, revision| proto::module::PackageRevision {
+        backend: backend.to_owned(),
+        revision,
+        arguments: toml::Table::new(),
+    };
+    proto::module::ModuleSet {
+        engine: package("uniserve", 3),
+        policy: package("fcfs", 2),
+        kernels: [(
+            proto::module::ModuleSlot::all("rms_norm"),
+            package("triton", 4),
+        )]
+        .into_iter()
+        .collect(),
+    }
 }

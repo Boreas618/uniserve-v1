@@ -188,17 +188,21 @@ pub(crate) fn request_counts() -> (u64, u64) {
 }
 
 /// How long the Build Servers may take to fix and build a module set: a cold
-/// store builds every module the set names.
+/// store builds every module the set names, on every host at once.
 const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 /// How often a wait on the Build Servers says it still waits.
 const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Fixes the module set `named` states: every interface's revision as the
-/// leader host's Build Server selects it through `cover`
+/// Fixes the module set `named` states: every interface's revision as
+/// `local`, this daemon's own host's Build Server, selects it through `cover`
 /// ([`crate::engine::control::with_store_modules`]), then every module built
-/// at every host's Build Server ([`crate::engine::control::prepare_epoch`]),
-/// so an engine started from the set finds each module it resolves.
+/// at the Build Server of every host in `hosts`, the hosts the epoch's
+/// processes run on, before any of them is spawned
+/// ([`crate::engine::control::prepare_epoch`]): `local` at its socket, and
+/// every other host through its daemon, which `nodes` reaches. A main process
+/// a node starts from the set then reads its engine from that node's store,
+/// and a spawn builds nothing.
 ///
 /// This is the one place a deployment's packages are selected: when a
 /// configuration is applied, at startup and at every later apply. The set it
@@ -208,20 +212,29 @@ const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
 /// # Errors
 ///
 /// `UpdateError::Refused` when a Build Server holds no package, or not the
-/// revision, the deployment names, or cannot build a module;
-/// `UpdateError::Failed` when no Build Server responds in time.
+/// revision, the deployment names, or cannot build a module, and when a host
+/// of `hosts` cannot prepare: no daemon runs there, it is lost, or its Build
+/// Server prepares other modules than `local`; `UpdateError::Failed` when the
+/// Build Servers do not respond in time.
 pub(crate) async fn fix_modules(
-    servers: Vec<crate::engine::control::BuildServer>,
-    leader: String,
+    local: crate::engine::control::BuildServer,
+    nodes: Option<Arc<EngineControl>>,
+    hosts: Vec<String>,
     named: crate::epoch::ModuleSet,
 ) -> Result<crate::epoch::ModuleSet, UpdateError> {
     // The client's waits have no deadline of their own, so the blocking task
-    // records which one it is in and the deadline here names it.
+    // records which one each host is in and the deadline here names it.
     let steps = crate::engine::control::PrepareSteps::new();
     let recorded = steps.clone();
     let mut fixing = tokio::task::spawn_blocking(move || {
-        let complete = crate::engine::control::with_store_modules(&servers, &leader, &named)?;
-        crate::engine::control::prepare_epoch(&servers, &leader, &complete, &[], &recorded)
+        let complete = crate::engine::control::with_store_modules(&local, &named)?;
+        crate::engine::control::prepare_epoch(
+            &local,
+            nodes.as_deref(),
+            &hosts,
+            &complete,
+            &recorded,
+        )
     });
     let started = tokio::time::Instant::now();
     let deadline = started + PREPARE_TIMEOUT;
@@ -263,6 +276,26 @@ pub(crate) fn named_modules(config: &ServerArgs, video: bool) -> crate::epoch::M
         named.kernels.clear();
     }
     named
+}
+
+/// The hosts the processes of an epoch of `config` run on, each once, in the order its replicas
+/// and their worlds name them: every replica's scheduler node and its peers'
+/// ([`crate::engine::control::world_hosts`]). Each prepares the epoch's module set before any of
+/// them is spawned ([`fix_modules`]).
+///
+/// # Errors
+///
+/// Fails when the worker groups do not form equal replicas or a replica's ranks cannot be placed.
+pub(crate) fn epoch_hosts(config: &proto::config::EngineConfig) -> anyhow::Result<Vec<String>> {
+    let mut hosts: Vec<String> = Vec::new();
+    for replica in replica_configs(config)? {
+        for placed in crate::engine::control::world_hosts(&replica)? {
+            if !hosts.contains(&placed.host) {
+                hosts.push(placed.host);
+            }
+        }
+    }
+    Ok(hosts)
 }
 
 /// The engine configuration of each data-parallel replica of `config`: independent replicas each
@@ -659,20 +692,18 @@ impl Leader {
 
         // The epoch's whole module set is fixed before any engine starts: the
         // engine, policy and kernel revisions the Build Server's `cover`
-        // selects, each module built. Every launch file states it, so an
-        // engine resolves what its profile runs name and serves, and a
-        // relaunch and a standby run exactly what their epoch runs.
-        let servers = vec![crate::engine::control::BuildServer {
+        // selects, each module built at every host the epoch runs on. Every
+        // launch file states it, so an engine resolves what its profile runs
+        // name and serves, and a relaunch and a standby run exactly what their
+        // epoch runs.
+        let local = crate::engine::control::BuildServer {
             host: control.host().to_owned(),
             socket: config.build_config.socket(),
             targets: Vec::new(),
-        }];
-        let leader_host = config
-            .engine_host
-            .clone()
-            .unwrap_or_else(|| control.host().to_owned());
+        };
+        let hosts = epoch_hosts(&prepared.engine)?;
         let named = named_modules(config, prepared.model_config.video().is_some());
-        let modules = fix_modules(servers, leader_host, named)
+        let modules = fix_modules(local, Some(Arc::clone(&control)), hosts, named)
             .await
             .map_err(anyhow::Error::from)
             .context("fixing the deployment's module set")?;
@@ -1291,60 +1322,6 @@ impl Leader {
     /// update writes.
     pub(crate) fn epochs(&self) -> Arc<crate::epoch::Epochs> {
         Arc::clone(self.updates.epochs())
-    }
-
-    /// Where each host of the deployment builds an epoch's modules: the
-    /// Build Server socket the configuration names, or the Build Server's
-    /// default socket on that host. The targets are the Build Server's own:
-    /// the daemon does not query the devices of another host to name them.
-    pub(crate) fn build_servers(
-        &self,
-        config: &ServerArgs,
-    ) -> Vec<crate::engine::control::BuildServer> {
-        let socket = config.build_config.socket();
-        let mut servers = Vec::new();
-        for replica in self.replicas() {
-            let Some(control) = replica.control.get() else {
-                continue;
-            };
-            let host = control.host().to_owned();
-            if servers
-                .iter()
-                .any(|server: &crate::engine::control::BuildServer| server.host == host)
-            {
-                continue;
-            }
-            servers.push(crate::engine::control::BuildServer {
-                host,
-                socket: socket.clone(),
-                targets: Vec::new(),
-            });
-        }
-        servers
-    }
-
-    /// The host whose Build Server selects the epoch's revisions first,
-    /// which every other host is then asked for exactly: the epoch's engine
-    /// host when the configuration names one, and otherwise the first host
-    /// of the deployment.
-    pub(crate) fn build_leader_host(
-        &self,
-        config: &ServerArgs,
-        servers: &[crate::engine::control::BuildServer],
-    ) -> String {
-        config
-            .engine_host
-            .clone()
-            .or_else(|| servers.first().map(|server| server.host.clone()))
-            .or_else(|| {
-                self.replicas().first().and_then(|replica| {
-                    replica
-                        .control
-                        .get()
-                        .map(|control| control.host().to_owned())
-                })
-            })
-            .unwrap_or_default()
     }
 }
 

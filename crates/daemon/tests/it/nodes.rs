@@ -2,10 +2,13 @@
 //! joined over loopback. An engine connects to the leader only, and the
 //! leader routes what it asks for the member's node to the member.
 
+use daemon::engine::control::{BuildServer, EngineControl, PrepareSteps, prepare_epoch};
 use daemon::{Daemon, DaemonOptions};
-use proto::process::{Exit, NodesQuery, ThrottleTransfers, reply, request};
+use proto::process::{Exit, NodesQuery, PrepareModules, ThrottleTransfers, reply, request};
 
-use crate::support::{Engine, TIMEOUT, alive, eventually, launch, sleeper};
+use crate::support::{
+    BuildServerStandIn, Engine, TIMEOUT, alive, eventually, launch, module_set, sleeper,
+};
 
 /// A leader on host `leader` and a member on host `member`.
 struct Deployment {
@@ -20,6 +23,11 @@ struct Deployment {
 
 impl Deployment {
     fn start() -> Self {
+        Self::with_member_build_server(build_server::command::Settings::default())
+    }
+
+    /// A deployment whose member's host is served by the Build Server `settings` names.
+    fn with_member_build_server(settings: build_server::command::Settings) -> Self {
         let directory = tempfile::tempdir().unwrap();
         // A free port for the leader's address: the leader binds it on every
         // interface once this probe released it.
@@ -37,7 +45,11 @@ impl Deployment {
             executable: "uniserve".into(),
             join_timeout: TIMEOUT,
             devices: || Ok(Vec::new()),
-            build_server: build_server::command::Settings::default(),
+            build_server: if host == "member" {
+                settings.clone()
+            } else {
+                build_server::command::Settings::default()
+            },
             storage_server: Vec::new(),
         };
 
@@ -197,4 +209,134 @@ fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() 
     drop(serving);
     drop(member);
     drop(leader);
+}
+
+/// The leader has a node prepare an epoch's module set at the node's own Build Server, and the
+/// node answers with the set as that Build Server prepared it. While the Build Server builds, which
+/// takes minutes for a store that misses the engine's executable, the node serves its other
+/// requests: a spawn there is answered before the preparation is.
+#[test]
+fn a_node_prepares_the_module_set_at_its_build_server_and_serves_meanwhile() {
+    let directory = tempfile::tempdir().unwrap();
+    let modules =
+        BuildServerStandIn::serve(directory.path().join("member/build-server.sock"), true, 0);
+    let deployment = Deployment::with_member_build_server(modules.settings());
+    let mut engine = Engine::connect(&deployment.address);
+
+    let set = module_set();
+    let preparing = engine.send(request::Kind::PrepareModules(PrepareModules {
+        host: "member".into(),
+        modules: serde_json::to_vec(&set).unwrap(),
+    }));
+    modules.asked();
+    let pid = engine.spawn(sleeper("member", "group", 1, 0));
+    assert!(alive(pid), "the spawn answered while the node prepares");
+
+    modules.release();
+    let prepared = engine.reply(preparing);
+    assert_eq!(prepared.error, "");
+    let Some(reply::Kind::ModulesPrepared(prepared)) = prepared.kind else {
+        panic!("the preparation answered no module set: {prepared:?}");
+    };
+    let prepared: proto::module::ModuleSet = serde_json::from_slice(&prepared.modules).unwrap();
+    assert_eq!(prepared, set);
+    engine.stop("group");
+}
+
+/// A node whose daemon is lost while its Build Server prepares never answers: the leader fails
+/// the preparation at once, naming the node.
+#[test]
+fn a_preparation_fails_naming_its_node_when_the_node_is_lost() {
+    let directory = tempfile::tempdir().unwrap();
+    let modules =
+        BuildServerStandIn::serve(directory.path().join("member/build-server.sock"), true, 0);
+    let mut deployment = Deployment::with_member_build_server(modules.settings());
+    let mut engine = Engine::connect(&deployment.address);
+
+    let preparing = engine.send(request::Kind::PrepareModules(PrepareModules {
+        host: "member".into(),
+        modules: serde_json::to_vec(&module_set()).unwrap(),
+    }));
+    modules.asked();
+    drop(deployment.member.take());
+
+    let failed = engine.reply(preparing);
+    assert!(
+        failed.error.contains("node 1 (member)") && failed.kind.is_none(),
+        "{failed:?}"
+    );
+}
+
+/// An epoch's module set is prepared at the Build Server of every host the epoch runs on, the
+/// leader's own at its socket and the member's through the member's daemon, at once: each Build
+/// Server is asked before either answers. The set is the one the leader's Build Server prepared.
+#[test]
+fn an_epoch_is_prepared_at_every_host_it_runs_on_at_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let leader_modules =
+        BuildServerStandIn::serve(directory.path().join("leader/build-server.sock"), true, 0);
+    let member_modules =
+        BuildServerStandIn::serve(directory.path().join("member/build-server.sock"), true, 0);
+    let deployment = Deployment::with_member_build_server(member_modules.settings());
+    let control = EngineControl::new(
+        &directory.path().join("requests.sock"),
+        deployment.address.clone(),
+        "leader".into(),
+        "deployment".into(),
+        leader_modules.socket(),
+    )
+    .unwrap();
+    let local = BuildServer {
+        host: "leader".into(),
+        socket: leader_modules.socket(),
+        targets: Vec::new(),
+    };
+    let set = module_set();
+    let hosts = ["leader".to_owned(), "member".to_owned()];
+
+    let prepared = std::thread::scope(|scope| {
+        let preparing = scope
+            .spawn(|| prepare_epoch(&local, Some(&control), &hosts, &set, &PrepareSteps::new()));
+        leader_modules.asked();
+        member_modules.asked();
+        leader_modules.release();
+        member_modules.release();
+        preparing.join().unwrap()
+    });
+    assert_eq!(prepared.unwrap(), set);
+}
+
+/// A host whose Build Server prepares other modules than the leader's fails the epoch's
+/// preparation, naming the host: every host runs the revisions the epoch records.
+#[test]
+fn a_host_that_prepares_other_modules_fails_the_preparation() {
+    let directory = tempfile::tempdir().unwrap();
+    let leader_modules =
+        BuildServerStandIn::serve(directory.path().join("leader/build-server.sock"), false, 0);
+    let member_modules =
+        BuildServerStandIn::serve(directory.path().join("member/build-server.sock"), false, 1);
+    let deployment = Deployment::with_member_build_server(member_modules.settings());
+    let control = EngineControl::new(
+        &directory.path().join("requests.sock"),
+        deployment.address.clone(),
+        "leader".into(),
+        "deployment".into(),
+        leader_modules.socket(),
+    )
+    .unwrap();
+    let local = BuildServer {
+        host: "leader".into(),
+        socket: leader_modules.socket(),
+        targets: Vec::new(),
+    };
+
+    let refused = prepare_epoch(
+        &local,
+        Some(&control),
+        &["leader".to_owned(), "member".to_owned()],
+        &module_set(),
+        &PrepareSteps::new(),
+    )
+    .unwrap_err();
+    assert!(format!("{refused:#}").contains("member"), "{refused:#}");
 }

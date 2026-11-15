@@ -40,7 +40,10 @@ const TARGET_STATE_READ: Duration = Duration::from_secs(60);
 /// once the daemon started it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long the daemon takes to reply on the control connection.
+/// How long the daemon takes to reply on the control connection. A spawn is answered once the
+/// process started, which takes no build: every host of an epoch prepared the epoch's module set
+/// before any of its processes is spawned ([`prepare_epoch`]), so the node reads the engine's
+/// module from its store. A preparation has no such bound (`EngineControl::prepare_on`).
 const DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How often a wait rechecks the engine process while it starts.
@@ -646,6 +649,71 @@ impl EngineControl {
         Ok(hosts)
     }
 
+    /// Has the daemon of `host` prepare the module set `filled` at its own Build Server
+    /// (`Request::PrepareModules`), and returns the set as that Build Server prepared it.
+    ///
+    /// The wait has no deadline of its own: a store that misses the engine's executable builds it
+    /// for minutes. It ends with the node's reply, which the leader's service gives with a
+    /// failure when the node's daemon is lost first, or when this daemon's service ends; the
+    /// caller bounds the preparation as a whole (`leader::fix_modules`).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the daemon cannot be reached, when the node cannot prepare the set, with its
+    /// reason, and when its answer holds no module set.
+    pub(crate) fn prepare_on(
+        &self,
+        host: &str,
+        filled: &crate::epoch::ModuleSet,
+        steps: &PrepareSteps,
+    ) -> anyhow::Result<crate::epoch::ModuleSet> {
+        steps.at(host, "asking the host's daemon to prepare");
+        let modules = serde_json::to_vec(filled).context("encoding the module set")?;
+        let (mut control, _) = self.connect()?;
+        control.deliver(&process::Upstream {
+            kind: Some(upstream::Kind::Request(process::Request {
+                id: 1,
+                kind: Some(request::Kind::PrepareModules(process::PrepareModules {
+                    host: host.to_owned(),
+                    modules,
+                })),
+            })),
+        })?;
+        steps.at(
+            host,
+            "waiting for the host's daemon to prepare at its Build Server",
+        );
+        tracing::info!(
+            host,
+            "asking a host's daemon to prepare the epoch's modules at its Build Server"
+        );
+
+        // `Duration::MAX` is no deadline: the read ends with a reply or with the connection.
+        let reply = loop {
+            let Some(message) = control.recv::<process::Downstream>(Duration::MAX)? else {
+                continue;
+            };
+            if let Some(downstream::Kind::Reply(reply)) = message.kind
+                && reply.id == 1
+            {
+                break reply;
+            }
+        };
+        anyhow::ensure!(
+            reply.error.is_empty(),
+            "preparing the epoch's modules at {host}: {}",
+            reply.error
+        );
+        let Some(reply::Kind::ModulesPrepared(prepared)) = reply.kind else {
+            anyhow::bail!("the daemon of {host} answered the preparation with no module set");
+        };
+        let prepared = serde_json::from_slice(&prepared.modules)
+            .with_context(|| format!("reading the module set {host} prepared"))?;
+        steps.at(host, "prepared");
+        tracing::info!(host, "a host's daemon prepared the epoch's modules");
+        Ok(prepared)
+    }
+
     /// What an epoch update starts the world of one target replica with: the launch file of each of
     /// its engines, numbered `numbers` (the launch generations, the scheduler node's first), with
     /// the reservations it inherits ([`Self::world`]). The engines are started with
@@ -1002,46 +1070,28 @@ fn exited(control: &mut Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One host's Build Server and the targets that host's devices build for.
+/// One host's Build Server, as the daemon of that host reaches it, and the targets that host's
+/// devices build for.
 #[derive(Debug, Clone)]
 pub struct BuildServer {
     /// The host's identity in the deployment.
     pub host: String,
-    /// Its Build Server's socket.
+    /// Its Build Server's socket, on that host.
     pub socket: PathBuf,
-    /// The targets its devices compile for, which `prepare` builds the
-    /// epoch's modules for.
+    /// The targets its devices compile for, which `prepare` builds the epoch's modules for; empty
+    /// for the Build Server's own: no daemon queries another host's devices to name them.
     pub targets: Vec<build_server::Target>,
 }
 
-/// Selects the modules `filled` names at every host's Build Server:
+/// The step of each host's Build Server exchange the daemon is in.
 ///
-/// The leader host selects each slot's backend at its latest installed
-/// revision (`Selector::Latest`), which is the revision the epoch record
-/// pins. Every other host is then asked for exactly those modules
-/// (`Selector::Fixed`): the same revision names the same module on every
-/// host, so a follower that lacks it fails the call rather than choosing
-/// another.
-///
-/// The output is `filled` with each package's revision and the parameters
-/// the Build Server selected for it, which is what the epoch record keeps
-/// and what `Prepare` sends to the engines.
-///
-/// The step of the Build Server exchange the daemon is in.
-///
-/// The exchange waits twice in a way this crate cannot bound: the client opens
-/// its socket, and reads the response a Build Server may never send, with no
-/// deadline (`crates/build-server/src/protocol.rs`: `Connection::connect` and
-/// `Connection::receive`). Whoever times the call out reads the step recorded
-/// here, so a deadline names the wait rather than the phase.
+/// The exchange waits in ways this crate cannot bound: the client opens its socket, and reads the
+/// response a Build Server may never send, with no deadline (`crates/build-server/src/protocol.rs`:
+/// `Connection::connect` and `Connection::receive`), and another host's daemon answers a
+/// preparation once its Build Server did. Whoever times the preparation out reads the steps
+/// recorded here, so a deadline names the wait and the host rather than the phase.
 #[derive(Clone)]
-pub struct PrepareSteps(std::sync::Arc<std::sync::Mutex<PrepareStep>>);
-
-#[derive(Clone)]
-struct PrepareStep {
-    host: String,
-    what: &'static str,
-}
+pub struct PrepareSteps(std::sync::Arc<std::sync::Mutex<BTreeMap<String, &'static str>>>);
 
 impl Default for PrepareSteps {
     fn default() -> Self {
@@ -1052,76 +1102,146 @@ impl Default for PrepareSteps {
 impl PrepareSteps {
     /// A record of an exchange that has not reached a Build Server yet.
     pub fn new() -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(PrepareStep {
-            host: String::new(),
-            what: "about to reach its first Build Server",
-        })))
+        Self(std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())))
     }
 
-    /// Records that the exchange with `host` is waiting at `what`.
+    /// Records that the exchange with `host` is at `what`.
     fn at(&self, host: &str, what: &'static str) {
-        let mut step = self.0.lock().unwrap_or_else(|broken| broken.into_inner());
-        step.host = host.to_owned();
-        step.what = what;
+        let mut steps = self.0.lock().unwrap_or_else(|broken| broken.into_inner());
+        steps.insert(host.to_owned(), what);
     }
 
-    /// The wait the daemon was in, and the host it was in it with.
+    /// The step of every host the exchange reached, in host order.
     pub fn describe(&self) -> String {
-        let step = self.0.lock().unwrap_or_else(|broken| broken.into_inner());
-        if step.host.is_empty() {
-            step.what.to_owned()
-        } else {
-            format!("{} ({})", step.what, step.host)
+        let steps = self.0.lock().unwrap_or_else(|broken| broken.into_inner());
+        if steps.is_empty() {
+            return "about to reach its first Build Server".to_owned();
         }
+        steps
+            .iter()
+            .map(|(host, what)| format!("{what} ({host})"))
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 }
 
+/// Prepares the module set `filled`, whose revisions are fixed ([`with_store_modules`]), at the
+/// Build Server of every host in `hosts`, and returns it with the parameters each package runs
+/// with. The daemon calls it before it spawns any process of the epoch, at a start and at every
+/// apply, so that the main process a node later starts reads its engine's module from that node's
+/// store and a spawn builds nothing.
+///
+/// `local` is this daemon's own host's Build Server, which it reaches at its socket and which
+/// prepares in any case: its answer is the set the epoch records. Every other host of `hosts`
+/// prepares at its own Build Server through its daemon (`Request::PrepareModules`), which `nodes`, this
+/// daemon's engine control, reaches over the process socket. The hosts prepare at once, each for
+/// its own platform and devices, so the set is ready when the slowest host's store is. The same
+/// revision names the same module on every host, so a host whose Build Server lacks one fails the
+/// preparation rather than choosing another.
+///
 /// # Errors
 ///
-/// Fails when a host has no Build Server in `servers`, when a Build
-/// Server refuses or cannot build a module, and when a follower returns a
-/// package other than the one the leader pinned.
+/// Fails when a Build Server refuses or cannot build a module, when no daemon runs on a host of
+/// `hosts` or it is lost before it answers, when another host is named and no `nodes` reaches it,
+/// and when a host prepares other modules than this host's.
 pub fn prepare_epoch(
-    servers: &[BuildServer],
-    leader: &str,
+    local: &BuildServer,
+    nodes: Option<&EngineControl>,
+    hosts: &[String],
     filled: &crate::epoch::ModuleSet,
-    descriptors: &[build_server::Descriptors],
     steps: &PrepareSteps,
 ) -> anyhow::Result<crate::epoch::ModuleSet> {
-    let leader_server = servers
-        .iter()
-        .find(|server| server.host == leader)
-        .with_context(|| format!("no Build Server for the leader host {leader}"))?;
+    let mut others: Vec<&str> = Vec::new();
+    for host in hosts {
+        if *host != local.host && !others.contains(&host.as_str()) {
+            others.push(host);
+        }
+    }
     tracing::info!(
-        leader = %leader,
-        servers = servers.len(),
+        host = %local.host,
+        others = ?others,
         kernels = filled.kernels.len(),
         policy = %filled.policy.backend,
-        "resolving the epoch's modules at its Build Servers"
+        "preparing the epoch's modules at every host's Build Server"
     );
-    let pinned = prepare_at(leader_server, filled, descriptors, steps)?;
-    for server in servers {
-        if server.host == leader {
-            continue;
-        }
-        let selected = prepare_at(server, filled, descriptors, steps)?;
+
+    // Every other host prepares on a thread of its own while this one prepares here: a cold store
+    // builds the engine's executable for minutes on each host, and the hosts do not wait on one
+    // another.
+    let (pinned, remote) = std::thread::scope(|scope| {
+        let waits: Vec<_> = others
+            .iter()
+            .map(|&host| {
+                let wait = scope.spawn(move || {
+                    let nodes = nodes.with_context(|| {
+                        format!("no daemon of the deployment reaches host {host}")
+                    })?;
+                    nodes.prepare_on(host, filled, steps)
+                });
+                (host, wait)
+            })
+            .collect();
+        let pinned = prepare_at(local, filled, steps);
+        let remote: Vec<_> = waits
+            .into_iter()
+            .map(|(host, wait)| (host, wait.join()))
+            .collect();
+        (pinned, remote)
+    });
+    let pinned = pinned?;
+    for (host, prepared) in remote {
+        let prepared =
+            prepared.map_err(|_| anyhow::anyhow!("the preparation at {host} panicked"))??;
         anyhow::ensure!(
-            selected == pinned,
-            "the Build Server of {} selected other modules than the leader's",
-            server.host
+            prepared == pinned,
+            "the Build Server of {host} prepared other modules than the Build Server of {}",
+            local.host
         );
     }
     tracing::info!(
+        hosts = others.len() + 1,
         kernels = pinned.kernels.len(),
         policy = %pinned.policy.backend,
-        "the epoch's modules are resolved"
+        "the epoch's modules are prepared at every host"
     );
     Ok(pinned)
 }
 
-/// `filled` as a fixed module set: every package it names at the revision the leader's Build
-/// Server selects for it, and every installed kernel package of every operator at its selected
-/// revision.
+/// Prepares the module set a node request names (`Request::PrepareModules`) at this node's Build Server,
+/// which `settings` states and which is started when none serves there, and returns the set as
+/// that Build Server prepared it. A node's daemon runs it for the leader, off its service.
+///
+/// # Errors
+///
+/// The reason the reply states: the request's set does not read, this node's daemon states no
+/// Build Server, or the Build Server cannot be started or refuses or cannot build a module.
+pub(crate) fn prepare_node(
+    settings: Option<&build_server::command::Settings>,
+    prepare: &process::PrepareModules,
+) -> Result<process::ModulesPrepared, String> {
+    let filled: crate::epoch::ModuleSet = serde_json::from_slice(&prepare.modules)
+        .map_err(|error| format!("reading the module set to prepare: {error}"))?;
+    let settings =
+        settings.ok_or_else(|| "this node's daemon states no Build Server".to_owned())?;
+    let socket = ensure_build_server(settings)
+        .map_err(|error| format!("starting this node's Build Server: {error:#}"))?;
+    let server = BuildServer {
+        host: prepare.host.clone(),
+        socket,
+        targets: Vec::new(),
+    };
+    // Nobody times this node's preparation by its steps: the leader's own record names the wait
+    // for this node's reply.
+    let prepared =
+        prepare_at(&server, &filled, &PrepareSteps::new()).map_err(|error| format!("{error:#}"))?;
+    let modules = serde_json::to_vec(&prepared)
+        .map_err(|error| format!("encoding the prepared module set: {error}"))?;
+    Ok(process::ModulesPrepared { modules })
+}
+
+/// `filled` as a fixed module set: every package it names at the revision `server`, the leader
+/// daemon's own host's Build Server, selects for it, and every installed kernel package of every
+/// operator at its selected revision.
 ///
 /// This is the one selection of an apply. The daemon asks `cover` for each interface the
 /// deployment uses: the engine, the scheduling policy and every kernel operator of this build.
@@ -1130,26 +1250,22 @@ pub fn prepare_epoch(
 /// its part: for each descriptor key the engine later asks `cover` to select among exactly
 /// these revisions, so a package or a revision installed after this call is run by nobody until
 /// a configuration is applied again, and a later revision of one of them is a package change a
-/// configuration comparison sees.
+/// configuration comparison sees. Every other host is then asked for exactly these revisions
+/// ([`prepare_epoch`]).
 ///
 /// # Errors
 ///
-/// Fails when the leader's Build Server cannot be reached, or holds no package, or not the
-/// revision, the deployment names for an interface.
+/// Fails when the Build Server cannot be reached, or holds no package, or not the revision, the
+/// deployment names for an interface.
 pub fn with_store_modules(
-    servers: &[BuildServer],
-    leader: &str,
+    server: &BuildServer,
     filled: &crate::epoch::ModuleSet,
 ) -> anyhow::Result<crate::epoch::ModuleSet> {
-    let leader_server = servers
-        .iter()
-        .find(|server| server.host == leader)
-        .with_context(|| format!("no Build Server for the leader host {leader}"))?;
-    let mut client = build_server::Client::connect(&leader_server.socket).with_context(|| {
+    let mut client = build_server::Client::connect(&server.socket).with_context(|| {
         format!(
             "connecting to the Build Server of {} at {}",
-            leader_server.host,
-            leader_server.socket.display()
+            server.host,
+            server.socket.display()
         )
     })?;
 
@@ -1220,14 +1336,12 @@ fn fix_revision(
     Ok(())
 }
 
-/// Runs `prepare` at one host's Build Server for the module set `filled`,
-/// whose revisions are fixed, and returns it with the parameters each
-/// package runs with: its manifest's defaults under the deployment's
-/// arguments.
+/// Runs `prepare` at one host's Build Server, which this process reaches at its socket, for the
+/// module set `filled`, whose revisions are fixed, and returns it with the parameters each
+/// package runs with: its manifest's defaults under the deployment's arguments.
 fn prepare_at(
     server: &BuildServer,
     filled: &crate::epoch::ModuleSet,
-    descriptors: &[build_server::Descriptors],
     steps: &PrepareSteps,
 ) -> anyhow::Result<crate::epoch::ModuleSet> {
     let policy_slot = proto::module::ModuleSlot::all(POLICY_SLOT);
@@ -1250,15 +1364,15 @@ fn prepare_at(
     // The engine's one module is built here, on every host, before any node
     // starts an engine from it: a host whose store misses it builds the
     // executable for its own platform now, while nothing waits on a start.
-    let mut descriptors = descriptors.to_vec();
-    descriptors.push(build_server::Descriptors {
-        slot: engine_slot.clone(),
-        keys: vec![proto::module::SINGLE_KEY.to_owned()],
-    });
+    // The kernels' modules are built for the keys each engine's profile runs
+    // name, which an engine resolves when it starts.
     let request = build_server::PrepareRequest {
         targets: server.targets.clone(),
         packages: requests,
-        descriptors,
+        descriptors: vec![build_server::Descriptors {
+            slot: engine_slot.clone(),
+            keys: vec![proto::module::SINGLE_KEY.to_owned()],
+        }],
     };
     // Before the connect, not after it: a daemon that blocks opening the
     // socket names the host it was reaching from this line alone, and the
@@ -1346,6 +1460,7 @@ fn prepare_at(
         kernels.len(),
         filled.kernels.len()
     );
+    steps.at(&server.host, "prepared");
     Ok(crate::epoch::ModuleSet {
         engine,
         kernels,

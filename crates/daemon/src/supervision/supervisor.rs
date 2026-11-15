@@ -164,9 +164,11 @@ pub(crate) struct Supervisor {
 /// The executable an engine started from `launch` runs as: the module of the engine
 /// package the launch's module set names, at the Build Server the launch names.
 ///
-/// The module was built when the epoch's module set was fixed, so this is a read of the store;
-/// a store that lost it builds it again first. A module of a version of the engine interface
-/// this daemon does not speak ([`proto::speaks`]) is refused here, before a process starts.
+/// Every host of the epoch prepared the module set before any of its processes was spawned
+/// (`Request::PrepareModules`), so this is a read of the node's store, within the reply time of a spawn;
+/// a store that lost the module builds it again first. A module of a version of the engine
+/// interface this daemon does not speak ([`proto::speaks`]) is refused here, before a process
+/// starts.
 pub(crate) fn engine_executable(launch: &proto::config::EngineArgs) -> Result<PathBuf, String> {
     let engine = &launch.modules.engine;
     let named = format!(
@@ -269,6 +271,13 @@ impl Supervisor {
     pub(crate) fn with_build_server(mut self, settings: build_server::command::Settings) -> Self {
         self.build_server = Some(settings);
         self
+    }
+
+    /// This node's Build Server, which the engines started here resolve their modules from and
+    /// an epoch's module set is prepared at (`Request::PrepareModules`); `None` when the node states
+    /// none.
+    pub(crate) fn build_server(&self) -> Option<&build_server::command::Settings> {
+        self.build_server.as_ref()
     }
 
     /// The executable of the engine `spawn` starts and the launch file written for it,

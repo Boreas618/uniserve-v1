@@ -121,6 +121,7 @@ message Request {
     NodesQuery nodes = 9;
     DeviceQuery devices = 10;
     PublishEpochs publish_epochs = 11;
+    PrepareModules prepare_modules = 12;
   }
 }
 
@@ -140,6 +141,7 @@ message Reply {
     NodesKnown nodes = 10;
     DeviceInventory devices = 11;
     EpochsPublished epochs_published = 12;
+    ModulesPrepared modules_prepared = 13;
   }
 }
 
@@ -168,6 +170,29 @@ message PublishEpochs {
 }
 
 message EpochsPublished {}
+
+// Have a node's daemon prepare an epoch's module set at its own host's Build Server (`prepare`):
+// every package at the revision the set fixes, with each module the node's main process starts
+// from (the engine's executable for the node's platform) committed to the node's store. The
+// leader's daemon asks every host of an epoch before it spawns any of the epoch's processes, at a
+// start and at every apply, so a spawn reads its engine from the store and builds nothing. A node
+// prepares off its service: its other requests and its processes' exits are served while its Build
+// Server builds, which takes minutes for a store that misses the engine. The reply comes once
+// every module is committed, or with the Build Server's failure; a node whose daemon is lost first
+// fails it.
+message PrepareModules {
+  string host = 1;
+  // The module set, every revision fixed (`proto::module::ModuleSet` as JSON, as a launch file
+  // states it).
+  bytes modules = 2;
+}
+
+message ModulesPrepared {
+  // The module set as the node's Build Server prepared it (`proto::module::ModuleSet` as JSON):
+  // each package at its revision, with the parameters its manifest gives it under the
+  // deployment's arguments. Every host of an epoch answers the same set.
+  bytes modules = 1;
+}
 
 // Start one process of a worker group on a node, as a child of its daemon.
 message Spawn {

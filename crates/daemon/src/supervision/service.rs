@@ -84,9 +84,33 @@ pub(crate) struct Local {
     pub(crate) address: Option<IpAddr>,
     /// Reads this host's idle devices (`Request::Devices`).
     pub(crate) devices: super::DeviceProbe,
+    /// Where each preparation this node runs off its service sends its reply, with the connection
+    /// that asked (`Local::prepare`).
+    preparations: Sender<(u64, Reply)>,
+    /// The replies of the preparations that ended, which the service delivers (`Local::prepared`).
+    prepared: Receiver<(u64, Reply)>,
 }
 
 impl Local {
+    /// This node's local part: its supervisor and claims, its address other nodes reach (`None`
+    /// on a single node) and its device probe.
+    pub(crate) fn new(
+        supervisor: Supervisor,
+        claims: ClaimHolder,
+        address: Option<IpAddr>,
+        devices: super::DeviceProbe,
+    ) -> Self {
+        let (preparations, prepared) = std::sync::mpsc::channel();
+        Self {
+            supervisor,
+            claims,
+            address,
+            devices,
+            preparations,
+            prepared,
+        }
+    }
+
     /// Hands the supervisor's processes and the claims over: their state,
     /// and their descriptors appended to `descriptors`.
     fn hand_over(&mut self, descriptors: &mut Vec<OwnedFd>) -> anyhow::Result<LocalHandoff> {
@@ -125,22 +149,29 @@ impl Local {
                 && processes.len() == handoff.process_descriptors,
             "the service's handoff lacks descriptors"
         );
-        Ok(Self {
-            supervisor: Supervisor::adopt(host, handoff.processes, processes)?,
-            claims: ClaimHolder::adopt(handoff.address, handoff.claims, claims)?,
-            address: handoff.address,
+        Ok(Self::new(
+            Supervisor::adopt(host, handoff.processes, processes)?,
+            ClaimHolder::adopt(handoff.address, handoff.claims, claims)?,
+            handoff.address,
             devices,
-        })
+        ))
     }
 
     /// Replies to one request for this node on behalf of `engine`. `reporter` is
     /// the connection that asked, which a launch's exit report goes down.
-    fn reply(&mut self, engine: u64, reporter: u64, request: &Request) -> Reply {
+    ///
+    /// `None` for a preparation, which is answered once it ends: its reply then
+    /// comes from [`Local::prepared`].
+    fn reply(&mut self, engine: u64, reporter: u64, request: &Request) -> Option<Reply> {
         let mut reply = Reply {
             id: request.id,
             ..Reply::default()
         };
         match &request.kind {
+            Some(request::Kind::PrepareModules(prepare)) => {
+                self.prepare(reporter, request.id, prepare.clone());
+                return None;
+            }
             Some(request::Kind::Spawn(spawn)) => {
                 match self.supervisor.spawn(engine, reporter, spawn) {
                     Ok(pid) => reply.kind = Some(reply::Kind::Spawned(Spawned { pid })),
@@ -218,7 +249,50 @@ impl Local {
             },
             None => reply.error = "an empty request".to_owned(),
         }
-        reply
+        Some(reply)
+    }
+
+    /// Prepares the module set `prepare` names at this node's Build Server on a thread of its
+    /// own, which sends the reply to request `id` of the connection `reporter` to
+    /// [`Local::prepared`] once the Build Server answered: a store that misses the engine's
+    /// executable builds it for minutes, while the service goes on serving the node's other
+    /// requests and reporting its processes' exits.
+    ///
+    /// A preparation in flight when the service hands over to a successor sends its reply to no
+    /// one: the leader's wait for it ends with the deadline of the preparation as a whole.
+    fn prepare(&self, reporter: u64, id: u64, prepare: process::PrepareModules) {
+        let settings = self.supervisor.build_server().cloned();
+        let finished = self.preparations.clone();
+        let started = std::thread::Builder::new()
+            .name("prepare".into())
+            .spawn(move || {
+                let mut reply = Reply {
+                    id,
+                    ..Reply::default()
+                };
+                match crate::engine::control::prepare_node(settings.as_ref(), &prepare) {
+                    Ok(prepared) => reply.kind = Some(reply::Kind::ModulesPrepared(prepared)),
+                    Err(error) => reply.error = error,
+                }
+                // A service that ended reads no reply: its asker sees the connection close.
+                let _ = finished.send((reporter, reply));
+            });
+        if let Err(error) = started {
+            let _ = self.preparations.send((
+                reporter,
+                Reply {
+                    id,
+                    error: format!("starting this node's preparation: {error}"),
+                    kind: None,
+                },
+            ));
+        }
+    }
+
+    /// The replies of the preparations that ended since the last call, each with the connection
+    /// that asked.
+    fn prepared(&self) -> Vec<(u64, Reply)> {
+        self.prepared.try_iter().collect()
     }
 }
 
@@ -227,6 +301,12 @@ pub(crate) struct Membership {
     pub(crate) node_rank: u32,
     pub(crate) host: String,
     pub(crate) connection: Connection,
+    /// The requests forwarded to the member that it has not replied to, by the connection that
+    /// asked and the request's id: a member that is lost replies to none of them, so the leader
+    /// fails each with the node's loss. A successor daemon starts with none, and a request
+    /// forwarded before a hot restart ends at its asker's own deadline when its node is lost: no
+    /// preparation runs across a restart, which waits for the update in flight to end.
+    pub(crate) forwarded: Vec<(u64, u64)>,
 }
 
 /// The leader's address members join at, and the connections that have not
@@ -303,6 +383,7 @@ impl Joins {
                     node_rank: member.node_rank,
                     host: member.host,
                     connection,
+                    forwarded: Vec::new(),
                 });
             }
         }
@@ -990,40 +1071,45 @@ pub(crate) fn run_leader(
                             Some(from_member::Kind::Replied(Replied {
                                 engine,
                                 reply: Some(reply),
-                            })) => match stops.get_mut(&(engine, reply.id)) {
-                                // A stop gets its reply once every node stopped
-                                // the group.
-                                Some(stop) => {
-                                    if !reply.error.is_empty() {
-                                        stop.reply.error = reply.error;
-                                    }
-                                    stop.awaiting.retain(|&rank| rank != member.node_rank);
-                                    if !stop.awaiting.is_empty() {
+                            })) => {
+                                member
+                                    .forwarded
+                                    .retain(|&forwarded| forwarded != (engine, reply.id));
+                                match stops.get_mut(&(engine, reply.id)) {
+                                    // A stop gets its reply once every node stopped
+                                    // the group.
+                                    Some(stop) => {
+                                        if !reply.error.is_empty() {
+                                            stop.reply.error = reply.error;
+                                        }
+                                        stop.awaiting.retain(|&rank| rank != member.node_rank);
+                                        if !stop.awaiting.is_empty() {
+                                            continue;
+                                        }
+                                        let Some(stop) = stops.remove(&(engine, reply.id)) else {
+                                            continue;
+                                        };
+                                        deliver(
+                                            engine,
+                                            stop.reply,
+                                            &mut pending,
+                                            &mut engines,
+                                            &mut clients,
+                                        );
                                         continue;
                                     }
-                                    let Some(stop) = stops.remove(&(engine, reply.id)) else {
+                                    None => {
+                                        deliver(
+                                            engine,
+                                            reply,
+                                            &mut pending,
+                                            &mut engines,
+                                            &mut clients,
+                                        );
                                         continue;
-                                    };
-                                    deliver(
-                                        engine,
-                                        stop.reply,
-                                        &mut pending,
-                                        &mut engines,
-                                        &mut clients,
-                                    );
-                                    continue;
+                                    }
                                 }
-                                None => {
-                                    deliver(
-                                        engine,
-                                        reply,
-                                        &mut pending,
-                                        &mut engines,
-                                        &mut clients,
-                                    );
-                                    continue;
-                                }
-                            },
+                            }
                             Some(from_member::Kind::Exited(Exited {
                                 engine,
                                 exit: Some(exit),
@@ -1053,9 +1139,26 @@ pub(crate) fn run_leader(
             }
         }
 
-        // A lost node runs nothing more: requests for it fail from here on,
-        // and the stops that awaited it get their reply without it.
+        // A lost node runs nothing more: requests for it fail from here on, the
+        // requests it had not replied to fail now, naming it, and the stops that
+        // awaited it get their reply without it.
         if !lost.is_empty() {
+            for member in members
+                .iter()
+                .filter(|member| lost.contains(&member.node_rank))
+            {
+                for &(asker, id) in &member.forwarded {
+                    let failure = Reply {
+                        id,
+                        error: format!(
+                            "the daemon of node {} ({}) was lost before it replied",
+                            member.node_rank, member.host
+                        ),
+                        kind: None,
+                    };
+                    deliver(asker, failure, &mut pending, &mut engines, &mut clients);
+                }
+            }
             members.retain(|member| !lost.contains(&member.node_rank));
             nodes.retain(|node| !lost.contains(&node.node_rank));
             let mut settled = Vec::new();
@@ -1135,6 +1238,11 @@ pub(crate) fn run_leader(
         // This node's exits.
         for (reporter, exit) in local.supervisor.exits() {
             report_exit(reporter, exit, &exits, &wake, &mut engines, &mut clients);
+        }
+
+        // This node's preparations that ended.
+        for (reporter, reply) in local.prepared() {
+            deliver(reporter, reply, &mut pending, &mut engines, &mut clients);
         }
 
         let mut descriptors = vec![listener.as_raw_fd(), stop.wake.as_raw_fd()];
@@ -1235,6 +1343,7 @@ fn route(
         Some(request::Kind::ThrottleTransfers(throttle)) => Some(throttle.host.as_str()),
         Some(request::Kind::Devices(query)) => Some(query.host.as_str()),
         Some(request::Kind::PublishEpochs(publish)) => Some(publish.host.as_str()),
+        Some(request::Kind::PrepareModules(prepare)) => Some(prepare.host.as_str()),
         Some(request::Kind::Stop(_) | request::Kind::Nodes(_)) | None => None,
     };
     let forward = |member: &mut Membership| {
@@ -1257,17 +1366,20 @@ fn route(
                 .iter_mut()
                 .filter_map(|member| forward(member).then_some(member.node_rank))
                 .collect();
-            let reply = local.reply(owner, engine, request);
+            // Only a stop and an empty request name no node, and both are answered at once: the
+            // one request answered later, a preparation, names its node.
+            let reply = local.reply(owner, engine, request)?;
             if awaiting.is_empty() {
                 return Some(reply);
             }
             stops.insert((engine, request.id), PendingStop { reply, awaiting });
             None
         }
-        Some(target) if target == host => Some(local.reply(owner, engine, request)),
+        Some(target) if target == host => local.reply(owner, engine, request),
         Some(target) => match members.iter_mut().find(|member| member.host == target) {
             Some(member) => {
                 if forward(member) {
+                    member.forwarded.push((engine, request.id));
                     None
                 } else {
                     Some(failed(
@@ -1319,13 +1431,15 @@ pub(crate) fn serve_member(
                             request: Some(request),
                         })),
                 })) => {
-                    let reply = local.reply(owner, engine, &request);
-                    leader.deliver(&FromMember {
-                        kind: Some(from_member::Kind::Replied(Replied {
-                            engine,
-                            reply: Some(reply),
-                        })),
-                    })?;
+                    // A preparation is answered once it ends, below.
+                    if let Some(reply) = local.reply(owner, engine, &request) {
+                        leader.deliver(&FromMember {
+                            kind: Some(from_member::Kind::Replied(Replied {
+                                engine,
+                                reply: Some(reply),
+                            })),
+                        })?;
+                    }
                 }
                 Ok(Some(ToMember {
                     kind: Some(to_member::Kind::Released(engine)),
@@ -1344,6 +1458,16 @@ pub(crate) fn serve_member(
                 kind: Some(from_member::Kind::Exited(Exited {
                     engine,
                     exit: Some(exit),
+                })),
+            })?;
+        }
+        // The preparations that ended, whose replies go up as any other: the
+        // round's wait is short enough that a reply waits at most that long.
+        for (engine, reply) in local.prepared() {
+            leader.deliver(&FromMember {
+                kind: Some(from_member::Kind::Replied(Replied {
+                    engine,
+                    reply: Some(reply),
                 })),
             })?;
         }
@@ -1630,6 +1754,7 @@ pub(crate) fn resume(
                     node_rank,
                     host: member_host,
                     connection: connection.resume(next()?)?,
+                    forwarded: Vec::new(),
                 });
             }
             let mut rest: std::vec::IntoIter<OwnedFd> = descriptors.collect::<Vec<_>>().into_iter();

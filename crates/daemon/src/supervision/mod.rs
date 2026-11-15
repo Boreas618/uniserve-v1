@@ -530,19 +530,19 @@ fn local(
     address: Option<IpAddr>,
     remote_pages: bool,
 ) -> anyhow::Result<Local> {
-    Ok(Local {
-        supervisor: Supervisor::new(options.host.clone())
+    Ok(Local::new(
+        Supervisor::new(options.host.clone())
             .context("creating the daemon's lifeline")?
             .with_build_server(options.build_server.clone()),
-        claims: ClaimHolder::new(
+        ClaimHolder::new(
             options.executable.clone(),
             remote_pages,
             address,
             options.storage_server.clone(),
         ),
         address,
-        devices: options.devices,
-    })
+        options.devices,
+    ))
 }
 
 /// The leader's address its members join at, bound when the deployment

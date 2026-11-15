@@ -83,12 +83,13 @@ pub async fn record(
     let Some(named) = launches.first().map(|launch| launch.modules.clone()) else {
         return Ok(BTreeMap::new());
     };
-    let servers = vec![BuildServer {
+    // Every launch runs on this host: no other host prepares, and no daemon reaches one.
+    let local = BuildServer {
         host: config.host_identity.clone(),
         socket: socket.clone(),
         targets: Vec::new(),
-    }];
-    let modules = fix_modules(servers, config.host_identity.clone(), named)
+    };
+    let modules = fix_modules(local, None, Vec::new(), named)
         .await
         .map_err(anyhow::Error::from)?;
     tokio::task::spawn_blocking(move || {

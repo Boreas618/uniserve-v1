@@ -332,22 +332,33 @@ impl Leader {
         })
     }
 
-    /// Fixes the module set `target` runs: every interface's revision, as the
-    /// Build Servers' `cover` selects it, with every module built on every
-    /// host before anything starts from it.
+    /// Fixes the module set `target` runs: every interface's revision, as
+    /// this host's Build Server's `cover` selects it, with every module built
+    /// on every host `target`'s processes run on before anything starts from
+    /// it.
     async fn fix_modules(
         &self,
         target: &ServerArgs,
     ) -> Result<crate::epoch::ModuleSet, UpdateError> {
         let named = self.named_modules(target);
-        let servers = self.build_servers(target);
         // A daemon that starts no engine of its own has no Build Server to
-        // select at, and no engine to move.
-        if servers.is_empty() {
-            return Err(UpdateError::NoEngine);
-        }
-        let leader = self.build_leader_host(target, &servers);
-        crate::leader::fix_modules(servers, leader, named).await
+        // select at, no daemons of other hosts to reach, and no engine to move.
+        let control = Arc::clone(
+            self.replicas()[0]
+                .control
+                .get()
+                .ok_or(UpdateError::NoEngine)?,
+        );
+        let hosts = target
+            .engine_config()
+            .and_then(|engine| crate::leader::epoch_hosts(&engine))
+            .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+        let local = crate::engine::control::BuildServer {
+            host: control.host().to_owned(),
+            socket: target.build_config.socket(),
+            targets: Vec::new(),
+        };
+        crate::leader::fix_modules(local, Some(control), hosts, named).await
     }
 
     /// Starts an update in its generation form: the serving engines prepare

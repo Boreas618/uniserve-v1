@@ -29,7 +29,7 @@ Each write is an operation: it has an identity, runs on a task of its own, and e
 
 ## Updates
 
-An update moves a deployment to another set of modules while it serves, as a trial that is committed or rolled back. A deployment runs the package revisions its epoch names; installing a package at the Build Server selects nothing, and `PUT /admin/config` (apply) is what moves them. The daemon fixes the target's module set once, when the configuration is applied: it asks the Build Server's `cover` for the revision of the engine package, the scheduling policy and every kernel package, builds every module on every host, and compares the fixed set with what the serving epoch runs. A change then does the least it needs:
+An update moves a deployment to another set of modules while it serves, as a trial that is committed or rolled back. A deployment runs the package revisions its epoch names; installing a package at the Build Server selects nothing, and `PUT /admin/config` (apply) is what moves them. The daemon fixes the target's module set once, when the configuration is applied: it asks the Build Server's `cover` for the revision of the engine package, the scheduling policy and every kernel package, builds every module on every host the target runs on, and compares the fixed set with what the serving epoch runs. A change then does the least it needs:
 
 - **Nothing an engine executes** changed: the options the workers switch in place (`profiling_config.fence_probes`, `fence_probes_off`) take effect at the engines' next step (`in_place`); a target equal to the serving configuration changes nothing (`none`).
 - **The daemon's own options** changed (`server_config`, `admin_config`, `logging_config`, `chat_config`, `image_fetch_config`, `media_config`, `video_job_config`, `migration_config`, `mm_processor_kwargs`, `build_config`, `update_config`): the daemon restarts itself in place (`daemon`, below), and its successor applies the rest of the change in an operation of its own (`"then": "update"`).
@@ -71,7 +71,7 @@ An epoch update covers the whole deployment: every node, every main process and 
 
 ### Startup
 
-Starting is not an update. The daemon fixes the epoch's module set at the Build Server before any engine starts, and every engine starts from a launch file that states it: the engine resolves every module its profile runs name, captures its graphs and serves (`Serving`), or parks when its launch names the engine it succeeds (`Parked`).
+Starting is not an update. The daemon fixes the epoch's module set at the Build Server and has it built at the Build Server of every host the epoch runs on before any engine starts, and every engine starts from a launch file that states it: the engine resolves every module its profile runs name, captures its graphs and serves (`Serving`), or parks when its launch names the engine it succeeds (`Parked`).
 
 ### The standby
 
