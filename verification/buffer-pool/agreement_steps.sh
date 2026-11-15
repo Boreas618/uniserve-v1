@@ -15,9 +15,9 @@ cd "$(dirname "$0")"
 work=${AGREEMENT_WORK:-$(mktemp -d)}
 mkdir -p "$work/rust"
 
-if ! (cd ../.. && UNISERVE_POOL_STATES="$work/rust" cargo test --release -p storage-server --lib \
-        buffer_pool::enumeration -- --ignored --nocapture) > "$work/enumeration.log" 2>&1; then
-    echo "FAIL  the enumeration of the Rust buffer pool: $(grep -m1 -E 'panicked|^error' "$work/enumeration.log")"
+if ! (cd ../.. && cargo run --release -p storage-server --features verification \
+        --bin buffer-pool-verify -- enumerate --states "$work/rust") > "$work/enumeration.log" 2>&1; then
+    echo "FAIL  the enumeration of the Rust buffer pool: $(tail -1 "$work/enumeration.log")"
     exit 1
 fi
 

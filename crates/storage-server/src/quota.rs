@@ -242,9 +242,11 @@ impl Quotas {
         retained: impl IntoIterator<Item = Retained<'a>>,
         contexts: &[([u8; 16], u64)],
         gpus: &dyn Fn(&[u8; 16]) -> bool,
-        deployment: &dyn Fn(&str) -> bool,
+        deployment: &dyn Fn(Option<&str>) -> bool,
     ) -> Vec<Quota> {
-        let mut usage: BTreeMap<(String, [u8; 16]), BTreeMap<ReservationKey, u64>> =
+        // By deployment (`None` for the Transfer Server's quota of a GPU no deployment uses) and
+        // GPU.
+        let mut usage: BTreeMap<(Option<String>, [u8; 16]), BTreeMap<ReservationKey, u64>> =
             BTreeMap::new();
 
         // Each retained storage once per deployment that retains it.
@@ -268,7 +270,7 @@ impl Quotas {
                     .push(retainer);
             }
             for (name, retainers) in by_deployment {
-                if !deployment(name) {
+                if !deployment(Some(name)) {
                     continue;
                 }
                 let scopes: BTreeSet<&Scope> =
@@ -285,7 +287,7 @@ impl Quotas {
                     .collect();
                 let segment = record.segment.filter(|_| item == Item::CacheSegment);
                 *usage
-                    .entry((name.to_owned(), gpu))
+                    .entry((Some(name.to_owned()), gpu))
                     .or_default()
                     .entry((item, scope, epochs, segment))
                     .or_default() += record.bytes;
@@ -298,7 +300,7 @@ impl Quotas {
         let mut workers: BTreeMap<(String, [u8; 16], ReservationKey), u64> = BTreeMap::new();
         let mut transfer: BTreeMap<([u8; 16], Item), u64> = BTreeMap::new();
         for ((scope, epoch), items) in &self.lost {
-            if !deployment(&scope.deployment) {
+            if !deployment(Some(&scope.deployment)) {
                 continue;
             }
             for (&(gpu, item), &bytes) in items {
@@ -319,7 +321,7 @@ impl Quotas {
                 }
                 match reserver {
                     Reserver::Worker { scope, epoch } => {
-                        if !deployment(&scope.deployment) {
+                        if !deployment(Some(&scope.deployment)) {
                             continue;
                         }
                         let key = (item, Some(scope.clone()), vec![*epoch], None);
@@ -337,7 +339,7 @@ impl Quotas {
         }
         for ((name, gpu, key), bytes) in workers {
             *usage
-                .entry((name, gpu))
+                .entry((Some(name), gpu))
                 .or_default()
                 .entry(key)
                 .or_default() += bytes;
@@ -346,8 +348,8 @@ impl Quotas {
         // A deployment that stated a limit for a GPU has a quota there even
         // before it holds anything.
         for (name, gpu, _) in self.limits.keys() {
-            if gpus(gpu) && deployment(name) {
-                usage.entry((name.clone(), *gpu)).or_default();
+            if gpus(gpu) && deployment(Some(name)) {
+                usage.entry((Some(name.clone()), *gpu)).or_default();
             }
         }
 
@@ -355,13 +357,13 @@ impl Quotas {
         // GPU; a GPU no deployment uses has a quota of its own for them.
         let transfer_gpus: BTreeSet<[u8; 16]> = transfer.keys().map(|(gpu, _)| *gpu).collect();
         for gpu in transfer_gpus {
-            let mut names: Vec<String> = usage
+            let mut names: Vec<Option<String>> = usage
                 .keys()
                 .filter(|(_, of)| *of == gpu)
                 .map(|(name, _)| name.clone())
                 .collect();
-            if names.is_empty() && deployment("") {
-                names.push(String::new());
+            if names.is_empty() && deployment(None) {
+                names.push(None);
             }
             for name in names {
                 let reservations = usage.entry((name, gpu)).or_default();
@@ -382,7 +384,7 @@ impl Quotas {
                 limit: self
                     .limits
                     .iter()
-                    .filter(|((of, at, _), _)| *of == name && *at == gpu)
+                    .filter(|((of, at, _), _)| name.as_ref() == Some(of) && *at == gpu)
                     .map(|(_, limit)| *limit)
                     .min(),
                 deployment: name,

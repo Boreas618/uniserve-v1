@@ -46,7 +46,7 @@ fn deployment_gpus(nodes: &[serde_json::Value]) -> Vec<serde_json::Value> {
         let host = node["host"].as_str().unwrap_or_default();
         let quotas: Vec<storage::protocol::Quota> =
             serde_json::from_value(node["quotas"].clone()).unwrap_or_default();
-        for quota in quotas.iter().filter(|quota| !quota.deployment.is_empty()) {
+        for quota in quotas.iter().filter(|quota| quota.deployment.is_some()) {
             gpus.push(serde_json::json!({
                 "host": host,
                 "gpu": storage::protocol::gpu_name(&quota.gpu),

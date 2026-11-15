@@ -797,7 +797,7 @@ pub(crate) fn rooms(
         for quota in report
             .quotas
             .iter()
-            .filter(|quota| quota.deployment == deployment)
+            .filter(|quota| quota.deployment.as_deref() == Some(deployment))
         {
             let reserved: u64 = quota.reservations.iter().map(|entry| entry.bytes).sum();
             let graph: u64 = quota

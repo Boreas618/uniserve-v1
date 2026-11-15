@@ -1,7 +1,8 @@
 #!/bin/bash
 # The trace of a run of the Storage Server (specs/buffer-pool.md §18): each
-# deployment's trace in TRACE_DIR (written with `storage-server serve
-# --buffer-pool-trace TRACE_DIR`) is replayed on a new Rust buffer pool, with
+# deployment's trace in TRACE_DIR (written by a Storage Server whose settings
+# state `buffer_pool_trace = TRACE_DIR`) is replayed on a new Rust buffer pool
+# (`buffer-pool-verify replay`), with
 # every completion checked against the run's and the pool's check() run after
 # every input (a difference or an inconsistency fails), and every transition
 # between the states the pool passes through is checked against the design
@@ -19,10 +20,10 @@ trace=$(cd "$1" && pwd)
 work=${REPLAY_WORK:-$(mktemp -d)}
 mkdir -p "$work/states"
 
-if ! (cd "$here/../.." && UNISERVE_POOL_TRACE="$trace" UNISERVE_POOL_STATES="$work/states" \
-        cargo test --release -p storage-server --lib buffer_pool::trace -- --ignored --nocapture) \
+if ! (cd "$here/../.." && cargo run --release -p storage-server --features verification \
+        --bin buffer-pool-verify -- replay "$trace" --states "$work/states") \
         > "$work/replay.log" 2>&1; then
-    echo "FAIL  replay of $trace: $(grep -m1 -A1 -E 'panicked|^error' "$work/replay.log" | tr '\n' ' ' | cut -c1-600)"
+    echo "FAIL  replay of $trace: $(tail -1 "$work/replay.log" | cut -c1-600)"
     exit 1
 fi
 replayed=$(grep -E "^replayed " "$work/replay.log" | sed 's/^replayed //' | paste -sd ';' -)

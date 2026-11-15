@@ -2503,7 +2503,7 @@ mod tests {
         };
         let quota = |reservations| storage::Quota {
             gpu: [0; 16],
-            deployment: "model".into(),
+            deployment: Some("model".into()),
             total: 2 * 70 * GIB,
             limit: Some(70 * GIB),
             reservations,

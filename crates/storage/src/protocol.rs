@@ -453,8 +453,8 @@ impl Item {
 pub struct Quota {
     /// The GPU's UUID.
     pub gpu: [u8; 16],
-    /// The deployment; empty for a GPU only the Transfer Server reserves.
-    pub deployment: String,
+    /// The deployment; `None` for the quota of a GPU only the Transfer Server reserves.
+    pub deployment: Option<String>,
     /// The GPU's total storage, as the processes that use it state it; 0
     /// until one does.
     pub total: u64,
@@ -513,11 +513,7 @@ impl Quota {
             || "no limit".to_owned(),
             |limit| format!("a limit of {limit}"),
         );
-        let holder = if self.deployment.is_empty() {
-            "the Transfer Server"
-        } else {
-            self.deployment.as_str()
-        };
+        let holder = self.deployment.as_deref().unwrap_or("the Transfer Server");
         let mut lines = vec![format!(
             "GPU {} of {holder}: {} bytes reserved of {limit}",
             gpu_name(&self.gpu),

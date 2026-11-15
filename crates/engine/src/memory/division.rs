@@ -528,7 +528,7 @@ mod tests {
     fn quota(limit: u64, reservations: Vec<Reservation>) -> Quota {
         Quota {
             gpu: [0; 16],
-            deployment: "model".into(),
+            deployment: Some("model".into()),
             total: 2 * limit,
             limit: Some(limit),
             reservations,

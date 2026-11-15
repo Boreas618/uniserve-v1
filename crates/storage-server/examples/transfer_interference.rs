@@ -362,7 +362,7 @@ fn quota_json(quota: &Quota) -> String {
         .collect();
     format!(
         "{{\"deployment\":{},\"limit\":{limit},\"usage\":{usage},\"room\":{room},\"transfer_context\":{},\"reservations\":[{}]}}",
-        quoted(&quota.deployment),
+        quoted(quota.deployment.as_deref().unwrap_or("")),
         quota.transfer_context,
         reservations.join(",")
     )
@@ -700,7 +700,7 @@ fn run(options: &Options) -> anyhow::Result<()> {
                 quota.usage() + context(gpu_a) <= limit,
                 "the quota of deployment {} on GPU A has {} reserved of its limit {}: no room \
                  for the Transfer Server's context of {} bytes",
-                quota.deployment,
+                quota.deployment.as_deref().unwrap_or("the Transfer Server"),
                 quota.usage(),
                 limit,
                 context(gpu_a)

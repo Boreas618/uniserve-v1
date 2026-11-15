@@ -74,12 +74,7 @@ use storage::{Interest, QueueDescriptors, QueuePair, Signals};
 
 use crate::Server;
 use crate::buffer_pool::trace::{Input, Trace};
-use crate::buffer_pool::{BufferPool, ClientId, Encoding, QueueId};
-
-/// The longest a trace keeps what it recorded in its buffers, in
-/// nanoseconds, while the thread is busy; it writes out whenever the thread
-/// has nothing to do.
-const TRACE_FLUSH: u64 = 100_000_000;
+use crate::buffer_pool::{BufferPool, ClientId, Encoding, QueueId, Validity};
 
 /// The bytes of each ring of a queue pair. The largest record a ring takes
 /// is a little less; a scheduler keeps room for everything outstanding.
@@ -200,7 +195,6 @@ impl Thread {
                     limits,
                     notifier: thread_notifier,
                     trace: None,
-                    flushed: 0,
                 };
                 serve(&jobs, waker, pools);
             })?;
@@ -306,9 +300,6 @@ pub(crate) struct Pools {
     notifier: Notifier,
     /// The directory of the pools' traces, while the server records them.
     trace: Option<PathBuf>,
-    /// When the traces last wrote out their buffers, on the host's
-    /// monotonic clock.
-    flushed: u64,
 }
 
 /// One deployment's buffer pool and the queue pairs of its sessions.
@@ -570,7 +561,7 @@ impl Hosted {
         let mut notices = Vec::new();
         for task in self.pool.started() {
             self.watch.started(deployment, task);
-            notices.push(self.start(deployment, task));
+            notices.extend(self.start(deployment, task));
         }
         for task in self.pool.stopped() {
             let deployment = deployment.to_owned();
@@ -584,31 +575,26 @@ impl Hosted {
 
     /// The notice that starts a task: the epoch of its session, what it
     /// copies, by the names of regions and memories, and for a prefetch
-    /// its source.
-    fn start(&mut self, deployment: &str, task: (QueueId, RequestId)) -> Notice {
+    /// its source. None for a task whose session closed before it started, which ended with it.
+    fn start(&mut self, deployment: &str, task: (QueueId, RequestId)) -> Option<Notice> {
         let source = self.sources.remove(&task);
         let pool = &self.pool;
-        let epoch = pool.epoch(task.0.0).unwrap_or_default();
+        let epoch = pool.epoch(task.0.0)?;
         let named = |runs: Vec<storage::runtime::Run>| -> Vec<NamedRun> {
             runs.into_iter()
-                .map(|(region, first, count)| {
-                    let name = pool.region_name(region).unwrap_or_default();
-                    (name.to_owned(), first, count)
-                })
+                .map(|(region, first, count)| (pool.region_name(region).to_owned(), first, count))
                 .collect()
         };
-        // The memories and the host parts of a validity; none for a slot row,
-        // whose units exist once.
-        let memories = |bits: u64| -> Memories {
-            if bits == u64::MAX {
-                return (Vec::new(), Vec::new());
-            }
-            let set = (0..64).filter(|bit| bits & (1 << bit) != 0);
-            let names = set.clone().filter_map(|bit| pool.memory_name(bit));
-            let parts = set.filter_map(|bit| pool.host_part(bit));
+        // The memories and the host parts of a validity; none for a slot row, whose units exist
+        // once.
+        let memories = |valid: Validity| -> Memories {
+            let (names, parts) = pool.memory_names(valid);
             (
-                names.map(str::to_owned).collect(),
-                parts.map(|(host, part)| (host.to_owned(), part)).collect(),
+                names.into_iter().map(str::to_owned).collect(),
+                parts
+                    .into_iter()
+                    .map(|(host, part)| (host.to_owned(), part))
+                    .collect(),
             )
         };
         let copies: Vec<Copied> = pool
@@ -620,14 +606,14 @@ impl Hosted {
                     named(reads),
                     named(writes),
                     memories(from),
-                    memories(to),
+                    memories(Validity::In(to)),
                 )
             })
             .collect();
         let deployment = deployment.to_owned();
-        Box::new(move |server: &mut Server| {
+        Some(Box::new(move |server: &mut Server| {
             server.start_pool_task((deployment, epoch), task, source, copies);
-        })
+        }))
     }
 }
 
@@ -687,8 +673,9 @@ impl Pools {
         for notice in notices {
             self.notify(notice);
         }
-        if !busy || now.saturating_sub(self.flushed) > TRACE_FLUSH {
-            self.flushed = now;
+        // A trace writes out as its buffers fill, and the rest once the thread has nothing to do,
+        // so a turn that answers steps writes no more than a full buffer.
+        if !busy {
             for (deployment, hosted) in &mut self.deployments {
                 hosted.watch.flush(deployment);
             }
@@ -1062,12 +1049,8 @@ impl Pools {
 
         let pool = &hosted.pool;
         let parts = |key: &Key| -> Vec<HostPart> {
-            let bits = pool.held_on(key);
-            (0..64)
-                .filter(|bit| bits & (1 << bit) != 0)
-                .filter_map(|bit| pool.host_part(bit))
-                .map(|(host, part)| (host.to_owned(), part))
-                .collect()
+            let held = pool.held_on(key).into_iter();
+            held.map(|(host, part)| (host.to_owned(), part)).collect()
         };
         held.into_iter()
             .map(
@@ -1075,7 +1058,7 @@ impl Pools {
                     let copy = HostCopy {
                         key,
                         tokens,
-                        region: pool.region_name(region).unwrap_or_default().to_owned(),
+                        region: pool.region_name(region).to_owned(),
                         first,
                         count,
                         tensors,
@@ -1107,10 +1090,7 @@ impl Pools {
 
         let pool = &hosted.pool;
         runs.into_iter()
-            .map(|(region, first, count)| {
-                let name = pool.region_name(region).unwrap_or_default();
-                (name.to_owned(), first, count)
-            })
+            .map(|(region, first, count)| (pool.region_name(region).to_owned(), first, count))
             .collect()
     }
 

@@ -16,12 +16,17 @@ use storage::protocol::Segment;
 use storage::runtime::{GroupId, Open, Segments, Tier, VERSION};
 
 use super::{
-    BufferPool, Class, ClientId, Deferred, Group, MEMORIES, Region, disowned, insert_range,
-    remove_range,
+    BufferPool, Class, ClientId, Deferred, Group, Memories, Region, Validity, disowned,
+    insert_range, remove_range,
 };
 
-/// The most regions a pool numbers at once: a run names its region by a byte.
+/// The most regions a pool numbers at once: a run names its region by a byte (§11), and a
+/// region's number is reused once it holds no unit and no session names it.
 const REGIONS: usize = u8::MAX as usize;
+
+/// The most worker groups a session states: a key of a `Listing` names the groups that hold or
+/// can load it as the bits of a byte.
+const LISTED_GROUPS: u8 = u8::BITS as u8;
 
 /// How a region numbers the units of its memory space: the space, the
 /// bytes of a unit, and the first unit it may allocate with the limit of
@@ -239,16 +244,11 @@ impl BufferPool {
         units: u32,
         limit: u32,
     ) -> u8 {
-        // A region that holds no unit and that no session names leaves its
-        // number to a new one once every number is taken.
-        let reused = (self.regions.len() >= REGIONS)
-            .then(|| {
-                let named = self.named_by_sessions();
-                (0..self.regions.len()).find(|index| {
-                    self.regions[*index].units() == 0 && !named.contains(&(*index as u8))
-                })
-            })
-            .flatten();
+        // A region that holds no unit and that no session names leaves its number to a new one:
+        // the lowest such number, else the next.
+        let named = self.named_by_sessions();
+        let reused = (0..self.regions.len())
+            .find(|index| self.regions[*index].units() == 0 && !named.contains(&(*index as u8)));
         let id = reused.unwrap_or(self.regions.len()) as u8;
         let bytes = (unit_bytes, part_bytes);
         let mut region = Region::new(id, name, tier, space, bytes, reserved, 0, limit);
@@ -303,8 +303,8 @@ impl BufferPool {
     /// twice, a region stated again with another tier, space, unit size or
     /// reserved units, a segment that cannot join its space's table, an index
     /// that names no region of the right tier, a group of no scheduler's or
-    /// of two, more than [`MEMORIES`] device memories over the pool's
-    /// sessions, or more regions than a run can number.
+    /// of two, a group numbered at or past [`LISTED_GROUPS`], more than [`Memories::CAPACITY`]
+    /// memories and host parts in use at once, or more regions than a run can number.
     pub fn admit(&mut self, client: ClientId, open: &Open) -> Result<Vec<(u8, u32)>, String> {
         if self.sessions.contains_key(&client) {
             return Err(format!("session {client} is open"));
@@ -312,11 +312,7 @@ impl BufferPool {
         self.fits(open)?;
 
         // Every check passed: nothing below refuses.
-        for memory in stated_memories(open) {
-            if !self.memories.contains(&memory) {
-                self.memories.push(memory);
-            }
-        }
+        let mut reserved = self.memories_in_use();
         let named = self.named_by_sessions();
         let mut numbers = Vec::with_capacity(open.regions.len());
         for stated in &open.regions {
@@ -361,7 +357,7 @@ impl BufferPool {
                 stated.limit,
             );
             if !stated.memory.is_empty() {
-                let memory = self.bit(&(stated.memory.clone(), None));
+                let memory = self.number_memory((stated.memory.clone(), None), &mut reserved);
                 self.regions[usize::from(number)].memory = Some(memory);
             }
             numbers.push(number);
@@ -381,21 +377,26 @@ impl BufferPool {
                 .map(|list| list.iter().map(|region| number(*region)));
             numbered.map(Iterator::collect).collect()
         };
-        let groups = open.groups.iter().map(|group| {
-            let memory = self.bit(&(group.memory.clone(), None));
-            let parts = group.parts.iter().map(|parts| {
-                parts.iter().fold(0u64, |all, (host, part)| {
-                    all | 1 << self.bit(&(host.clone(), Some(*part)))
-                })
-            });
+        let mut groups = Vec::with_capacity(open.groups.len());
+        for group in &open.groups {
+            let memory = self.number_memory((group.memory.clone(), None), &mut reserved);
+            let mut parts = Vec::with_capacity(group.parts.len());
+            for stated in &group.parts {
+                let mut set = Memories::NONE;
+                for (host, part) in stated {
+                    set |= Memories::one(
+                        self.number_memory((host.clone(), Some(*part)), &mut reserved),
+                    );
+                }
+                parts.push(set);
+            }
             let found = Group {
                 receives: numbered(&group.receives),
-                parts: parts.collect(),
+                parts,
                 ..Group::new(memory, number(group.slots), numbered(&group.regions))
             };
-            (group.id, found)
-        });
-        let groups: Vec<_> = groups.collect();
+            groups.push((group.id, found));
+        }
         self.open(
             client,
             open.epoch,
@@ -437,11 +438,57 @@ impl BufferPool {
         space
     }
 
-    /// The number of a memory's bit in a block's validity; the memories a
-    /// session states are numbered when it is admitted.
-    fn bit(&self, memory: &(String, Option<u32>)) -> u8 {
-        let found = self.memories.iter().position(|known| known == memory);
-        found.unwrap_or_default() as u8
+    /// The number of a memory a session states: the number the memory has while it is in use, or
+    /// a number no memory in use holds, or the next. `reserved` holds the numbers in use
+    /// ([`Self::memories_in_use`]) and those this admission numbered so far, and gains the
+    /// number given. [`Self::fits`] refused a layout whose memories the numbers cannot hold.
+    pub(super) fn number_memory(
+        &mut self,
+        memory: (String, Option<u32>),
+        reserved: &mut Memories,
+    ) -> u8 {
+        let named = self.memories.iter().position(|known| *known == memory);
+        let number = match named {
+            Some(number) => number,
+            None => {
+                let free = (0..self.memories.len())
+                    .find(|number| !reserved.meets(Memories::one(*number as u8)));
+                match free {
+                    Some(number) => {
+                        self.memories[number] = memory;
+                        number
+                    }
+                    None => {
+                        self.memories.push(memory);
+                        self.memories.len() - 1
+                    }
+                }
+            }
+        };
+        let number = number as u8;
+        *reserved |= Memories::one(number);
+        number
+    }
+
+    /// The memories in use: those an open session's group addresses or copies with, those a
+    /// region lies in, and those a block is valid in or a copy writes. A memory's number is
+    /// reused only once none of them names it, so a block is never valid in a memory that came
+    /// to hold its number later.
+    pub(super) fn memories_in_use(&self) -> Memories {
+        let groups = self.groups.values().map(|group| {
+            let parts: Memories = group.parts.iter().copied().collect();
+            parts | Memories::one(group.memory)
+        });
+        let regions = self
+            .regions
+            .iter()
+            .filter_map(|region| region.memory.map(Memories::one));
+        let blocks = self
+            .blocks()
+            .into_iter()
+            .filter_map(|(block, ..)| block.valid.get().memories());
+        let copies = self.copies.values().flatten().map(|copy| copy.memory);
+        groups.chain(regions).chain(blocks).chain(copies).collect()
     }
 
     /// Whether a memory space's table holds a segment as stated.
@@ -586,7 +633,8 @@ impl BufferPool {
                 .get(usize::from(index))
                 .map(|region| region.tier)
         };
-        if open.classes.len() >= usize::from(super::SLOT) {
+        // A request names a class by a byte.
+        if open.classes.len() > usize::from(u8::MAX) + 1 {
             return Err(format!("{} classes are too many", open.classes.len()));
         }
         if !open.classes.is_empty() && usize::from(open.trajectory) >= open.classes.len() {
@@ -615,6 +663,12 @@ impl BufferPool {
             if !ids.insert(group.id) {
                 return Err(format!("group {} is stated twice", group.id.0));
             }
+            if group.id.0 >= LISTED_GROUPS {
+                return Err(format!(
+                    "group {} is numbered past the {LISTED_GROUPS} groups a session states",
+                    group.id.0
+                ));
+            }
             let device = group.regions.iter().flatten();
             let device = device.chain(group.receives.iter().flatten());
             if group.regions.len() > open.classes.len()
@@ -630,18 +684,21 @@ impl BufferPool {
                 ));
             }
         }
-        let mut memories: Vec<&(String, Option<u32>)> = self.memories.iter().collect();
-        let stated = stated_memories(open);
-        for memory in &stated {
-            if !memories.contains(&memory) {
-                memories.push(memory);
+        // The memories in use keep their numbers; a memory the layout states that is not among
+        // them takes one more.
+        let in_use = self.memories_in_use();
+        let mut needed = in_use.count() as usize;
+        for memory in stated_memories(open) {
+            let named = self.memories.iter().position(|known| *known == memory);
+            if !named.is_some_and(|number| in_use.meets(Memories::one(number as u8))) {
+                needed += 1;
             }
         }
-        if memories.len() > MEMORIES {
+        if needed > Memories::CAPACITY {
             return Err(format!(
-                "the deployment's sessions state {} memories and host parts, more than \
-                 {MEMORIES}",
-                memories.len()
+                "the deployment's sessions would state {needed} memories and host parts in use, \
+                 more than {}",
+                Memories::CAPACITY
             ));
         }
         let mut scheduled = HashSet::new();
@@ -674,29 +731,37 @@ impl BufferPool {
         self.sessions.get(&client).copied()
     }
 
-    /// The name of a region, by its number.
-    pub fn region_name(&self, region: u8) -> Option<&str> {
-        let found = self.regions.get(usize::from(region))?;
-        Some(&found.name)
+    /// The name of a region, by a number the pool gave it: a region keeps its place among the
+    /// pool's regions for the pool's life, so every number a run or a completion states names
+    /// one.
+    pub fn region_name(&self, region: u8) -> &str {
+        &self.regions[usize::from(region)].name
     }
 
-    /// The name of the device memory, or of the memory of a main process,
-    /// of a bit of a block's validity, by the bit's position; `None` for a
-    /// host part's bit.
-    pub fn memory_name(&self, bit: u32) -> Option<&str> {
-        match self.memories.get(bit as usize)? {
+    /// The name of the device memory, or of the memory of a main process, numbered `memory`;
+    /// `None` for a host part.
+    fn memory_name(&self, memory: u8) -> Option<&str> {
+        match self.memories.get(usize::from(memory))? {
             (name, None) => Some(name),
             (_, Some(_)) => None,
         }
     }
 
-    /// The host and the part index of a host part's bit of a block's
-    /// validity, by the bit's position; `None` for a memory's bit.
-    pub fn host_part(&self, bit: u32) -> Option<(&str, u32)> {
-        match self.memories.get(bit as usize)? {
+    /// The host and the part index of the host part numbered `memory`; `None` for a memory.
+    pub(super) fn host_part(&self, memory: u8) -> Option<(&str, u32)> {
+        match self.memories.get(usize::from(memory))? {
             (host, Some(part)) => Some((host, *part)),
             (_, None) => None,
         }
+    }
+
+    /// The memories and the host parts of `valid` by their names, as a listing and a task state
+    /// them: none of either for a slot row, which is valid wherever its region is mapped.
+    pub(crate) fn memory_names(&self, valid: Validity) -> (Vec<&str>, Vec<(&str, u32)>) {
+        let set = valid.memories().unwrap_or(Memories::NONE);
+        let names = set.iter().filter_map(|memory| self.memory_name(memory));
+        let parts = set.iter().filter_map(|memory| self.host_part(memory));
+        (names.collect(), parts.collect())
     }
 
     /// The regions a session names: its groups' slot rows and device

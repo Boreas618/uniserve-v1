@@ -4246,6 +4246,7 @@ dependencies = [
  "serde_json",
  "service",
  "storage",
+ "storage-server",
  "tempfile",
  "thiserror 2.0.18",
  "toml",

@@ -5,7 +5,7 @@
 use storage::protocol::Key;
 use storage::runtime::{Cause, Completion, GroupId, OwnerId, Request, RequestId, Source, Tier};
 
-use super::{BufferPool, Class, Group, QueueId};
+use super::{BufferPool, Class, Group, Memories, QueueId, Validity};
 
 /// The KV class: one unit per block, host copies of one unit.
 const KV: u8 = 0;
@@ -32,16 +32,16 @@ const DECODE: GroupId = GroupId(1);
 /// The host part both groups copy with unless a test says otherwise, as its
 /// bit in a block's validity: part 0 on the one host, after the two groups'
 /// memories.
-const PART: u64 = 1 << 2;
+const PART: Memories = Memories::one(2);
 /// Part 0 on a second host.
-const OTHER_PART: u64 = 1 << 3;
+const OTHER_PART: Memories = Memories::one(3);
 
 /// A group whose ranks address the memory of bit `memory`, with its slot
 /// rows in `slots`, its device regions per class, and `parts` the host
 /// parts it copies every class with a host region with.
-fn group(memory: u8, slots: u8, regions: Vec<Vec<u8>>, parts: u64) -> Group {
+fn group(memory: u8, slots: u8, regions: Vec<Vec<u8>>, parts: Memories) -> Group {
     Group {
-        parts: vec![parts, parts, 0, parts],
+        parts: vec![parts, parts, Memories::NONE, parts],
         ..Group::new(memory, slots, regions)
     }
 }
@@ -97,13 +97,8 @@ impl Fixture {
 
     /// As [`Self::new`], the prefill group copying with the host parts
     /// `prefill` and the decode group with `decode`.
-    fn with_parts(prefill: u64, decode: u64) -> Self {
+    fn with_parts(prefill: Memories, decode: Memories) -> Self {
         Self::built(prefill, decode, 4, 2)
-    }
-
-    /// As [`Self::new`], with `units` KV units (1 to `units`).
-    fn with_units(units: u32) -> Self {
-        Self::built(PART, PART, units, 2)
     }
 
     /// As [`Self::new`], with `host` host KV units.
@@ -111,7 +106,7 @@ impl Fixture {
         Self::built(PART, PART, 4, host)
     }
 
-    fn built(prefill: u64, decode: u64, units: u32, host: u32) -> Self {
+    fn built(prefill: Memories, decode: Memories, units: u32, host: u32) -> Self {
         let mut pool = BufferPool::new((1_000, 1_000));
         for space in 0..8 {
             pool.grant(space, 0, 1 << 20);
@@ -137,6 +132,17 @@ impl Fixture {
             ENCODERS
         );
 
+        // The memories as admission numbers them: the groups' device memories, then the host
+        // parts, which `PART` and `OTHER_PART` name.
+        let mut reserved = Memories::NONE;
+        for memory in [
+            ("prefill".to_owned(), None),
+            ("decode".to_owned(), None),
+            ("host".to_owned(), Some(0)),
+            ("other host".to_owned(), Some(0)),
+        ] {
+            pool.number_memory(memory, &mut reserved);
+        }
         let regions = || vec![vec![UNITS], Vec::new(), vec![5, 6], vec![5]];
         pool.open(
             SERVING,
@@ -879,7 +885,7 @@ fn a_store_reads_no_block_of_another_layout_s_region() {
         2,
         false,
         classes(),
-        vec![(GroupId(0), group(0, 2, regions, 1))],
+        vec![(GroupId(0), group(0, 2, regions, Memories::one(0)))],
     );
 
     let store = |group| Request::Store {
@@ -1784,8 +1790,8 @@ fn a_store_to_the_remote_store_is_answered_when_the_connector_has_put_the_keys()
             Some(key(7)),
             vec![(HOST, 0, 1)],
             vec![(HOST, 0, 1)],
-            PART,
-            0
+            Validity::In(PART),
+            Memories::NONE
         )]
     );
     fixture.pool.done((QUEUE, put), 0);
@@ -1920,9 +1926,9 @@ fn a_state_names_each_owner_under_its_session_and_each_epoch_with_its_trial() {
         (trial, OwnerId(1)),
         ((3, 0), OwnerId(1)),
     ];
-    let mut names = super::trace::SessionNames::default();
+    let mut names = super::replay::SessionNames::default();
     names.update(&fixture.pool);
-    let state = super::trace::stated(&fixture.pool, &names, &owners, 0);
+    let state = super::replay::stated(&fixture.pool, &names, &owners, 0);
     let named: Vec<&str> = state
         .lines()
         .filter(|line| line.starts_with("owner "))
@@ -2007,10 +2013,10 @@ fn a_state_marks_the_units_an_owner_holds_in_another_class() {
         taken.push(format!("{}:{}", runs[0].0, runs[0].1));
     }
 
-    let mut names = super::trace::SessionNames::default();
+    let mut names = super::replay::SessionNames::default();
     names.update(&fixture.pool);
-    let state = super::trace::stated(&fixture.pool, &names, &[(queue, OwnerId(1))], 0);
-    let marked = super::trace::classes(&fixture.pool, &names);
+    let state = super::replay::stated(&fixture.pool, &names, &[(queue, OwnerId(1))], 0);
+    let marked = super::replay::classes(&fixture.pool, &names);
     let owner = state
         .lines()
         .find(|line| line.starts_with("owner e2.1 "))
@@ -2038,7 +2044,7 @@ fn a_state_marks_the_units_an_owner_holds_in_another_class() {
 #[test]
 fn a_standby_session_of_one_epoch_keeps_a_name_of_its_own() {
     let mut fixture = Fixture::new();
-    let mut names = super::trace::SessionNames::default();
+    let mut names = super::replay::SessionNames::default();
     names.update(&fixture.pool);
     // The standby: the serving session's epoch, one group over the same
     // memory and KV region, with the decode group's slot rows.
@@ -2061,10 +2067,10 @@ fn a_standby_session_of_one_epoch_keeps_a_name_of_its_own() {
     );
     let owners = [(QUEUE, OwnerId(1)), (standby, OwnerId(1))];
 
-    let layout = super::trace::layout(&fixture.pool, &names);
+    let layout = super::replay::layout(&fixture.pool, &names);
     assert!(layout.contains("layout group e1.g0 "), "{layout}");
     assert!(layout.contains("layout group e1-2.g0 "), "{layout}");
-    let state = super::trace::stated(&fixture.pool, &names, &owners, 0);
+    let state = super::replay::stated(&fixture.pool, &names, &owners, 0);
     let standby_owner = |state: &str| {
         state
             .lines()
@@ -2084,7 +2090,7 @@ fn a_standby_session_of_one_epoch_keeps_a_name_of_its_own() {
     fixture.pool.end(SERVING);
     fixture.checked();
     names.update(&fixture.pool);
-    let state = super::trace::stated(&fixture.pool, &names, &owners, 0);
+    let state = super::replay::stated(&fixture.pool, &names, &owners, 0);
     assert!(standby_owner(&state), "{state}");
     let epochs: Vec<&str> = state
         .lines()
@@ -2352,7 +2358,13 @@ fn a_crossing_waits_for_its_stamps_and_its_task_and_makes_the_block_valid_where_
     let run = vec![(UNITS, unit, 1)];
     assert_eq!(
         fixture.pool.work((QUEUE, crossing)),
-        [(None, run.clone(), run.clone(), 1 << 0, 1 << 1)]
+        [(
+            None,
+            run.clone(),
+            run.clone(),
+            Validity::In(Memories::one(0)),
+            Memories::one(1)
+        )]
     );
     assert_eq!(fixture.ask(transfer), refused);
     fixture.pool.ended((QUEUE, crossing), true);
@@ -2490,6 +2502,13 @@ fn a_detached_owner_s_crossing_holds_its_block_until_its_task_ends() {
 /// `process b`), and a host KV region (5). The classes are KV blocks with host copies and
 /// products; the groups are `groups`. Admitted as the Storage Server admits an engine's layout.
 fn processes(groups: Vec<storage::runtime::Group>) -> BufferPool {
+    let mut pool = BufferPool::new((1_000, 1_000));
+    pool.admit(SERVING, &processes_layout(groups)).unwrap();
+    pool
+}
+
+/// The layout [`processes`] admits.
+fn processes_layout(groups: Vec<storage::runtime::Group>) -> storage::runtime::Open {
     use storage::runtime::{Open, Region};
 
     let region = |name: &str, tier, unit_bytes, reserved, units, memory: &str| Region {
@@ -2513,7 +2532,7 @@ fn processes(groups: Vec<storage::runtime::Group>) -> BufferPool {
         source: None,
     };
     let schedulers = vec![groups.iter().map(|group| group.id).collect()];
-    let open = Open {
+    Open {
         version: storage::runtime::VERSION,
         epoch: 1,
         trial: false,
@@ -2530,10 +2549,7 @@ fn processes(groups: Vec<storage::runtime::Group>) -> BufferPool {
         groups,
         schedulers,
         peers: Vec::new(),
-    };
-    let mut pool = BufferPool::new((1_000, 1_000));
-    pool.admit(SERVING, &open).unwrap();
-    pool
+    }
 }
 
 /// A group of [`processes`]' layout.
@@ -2599,7 +2615,13 @@ fn a_crossing_takes_a_run_in_the_receiving_region_of_a_memory_where_the_block_ha
     fixture.checked();
     assert_eq!(
         fixture.pool.work((QUEUE, crossing)),
-        [(None, vec![(3, 0, 3)], vec![(4, 0, 3)], 1 << 0, 1 << 1)]
+        [(
+            None,
+            vec![(3, 0, 3)],
+            vec![(4, 0, 3)],
+            Validity::In(Memories::one(0)),
+            Memories::one(1)
+        )]
     );
     fixture.pool.ended((QUEUE, crossing), true);
     fixture.checked();
@@ -2767,7 +2789,13 @@ fn a_product_backed_in_two_processes_is_valid_where_the_crossing_names_its_writt
     let crossing = fixture.submit(QUEUE, replicate(1, 1, 0, 4, GroupId(1), Vec::new()));
     assert_eq!(
         fixture.pool.work((QUEUE, crossing)),
-        [(None, vec![(4, 0, 2)], vec![(3, 0, 2)], 1 << 1, 1 << 0)]
+        [(
+            None,
+            vec![(4, 0, 2)],
+            vec![(3, 0, 2)],
+            Validity::In(Memories::one(1)),
+            Memories::one(0)
+        )]
     );
     fixture.pool.ended((QUEUE, crossing), true);
     fixture.checked();
@@ -2915,77 +2943,25 @@ fn a_pool_made_again_from_its_image_carries_a_waiting_crossing() {
     assert_eq!(fixture.free(UNITS), 4);
 }
 
-/// With `--buffer-pool-check` the check runs after every input, on the path of the answers a
-/// scheduler's steps wait for, so its time grows in proportion to the blocks and pins the pool
-/// holds, not with their product: four times the cached blocks, each also pinned by a second
-/// owner, take about four times as long to check, far from the sixteen times that looking up
-/// each pin among all the blocks takes.
+/// A deployment's sessions state at most 64 memories in use at once, not over the pool's life:
+/// a session whose memories no session states any more and no block is valid in leaves their
+/// numbers to the memories of the sessions that come after it, while a layout that would state
+/// more than 64 at once is refused.
 #[test]
-fn the_check_takes_time_in_proportion_to_the_blocks_and_pins() {
-    let checked_in = |blocks: u32| {
-        let mut fixture = Fixture::with_units(blocks);
-        fixture.attach(1, PREFILL);
-        fixture.attach(2, PREFILL);
-        let named = |index: u32| {
-            let mut bytes = [0; 32];
-            bytes[..4].copy_from_slice(&index.to_le_bytes());
-            Key(bytes)
+fn memories_no_session_uses_any_more_leave_their_numbers_to_later_sessions() {
+    let mut pool = processes(vec![stated(0, "process a", 1, vec![vec![0], vec![3]])]);
+    pool.end(SERVING);
+    for epoch in 2..70 {
+        let client = epoch as u32;
+        let open = storage::runtime::Open {
+            epoch,
+            ..processes_layout(vec![stated(0, &format!("gpu {epoch}"), 1, vec![vec![0]])])
         };
+        pool.admit(client, &open).unwrap();
+        pool.end(client);
+    }
 
-        // The pool is filled without a check after each request: only the full pool's check is
-        // timed.
-        let take = |fixture: &mut Fixture, request| {
-            fixture.number += 1;
-            let id = RequestId(fixture.number);
-            fixture.pool.take(QUEUE, id, request);
-            fixture.answer(id)
-        };
-        let allocate = Request::Allocate {
-            owner: OwnerId(1),
-            class: KV,
-            at: 0,
-            count: blocks,
-            units: 0,
-        };
-        assert!(matches!(
-            take(&mut fixture, allocate),
-            Some(Completion::Allocated { .. })
-        ));
-        for at in 0..blocks {
-            let commit = Request::Commit {
-                owner: OwnerId(1),
-                class: KV,
-                at,
-                key: named(at),
-                tokens: 64,
-                after: Vec::new(),
-            };
-            assert_eq!(take(&mut fixture, commit), Some(Completion::Committed));
-        }
-        let pin = Request::Pin {
-            owner: OwnerId(2),
-            class: KV,
-            at: 0,
-            keys: (0..blocks).map(named).collect(),
-        };
-        assert!(matches!(
-            take(&mut fixture, pin),
-            Some(Completion::Pinned { .. })
-        ));
-
-        (0..5)
-            .map(|_| {
-                let started = std::time::Instant::now();
-                fixture.checked();
-                started.elapsed()
-            })
-            .min()
-            .unwrap()
-    };
-
-    let (small, large) = (checked_in(1_000), checked_in(4_000));
-    assert!(
-        large < small * 8,
-        "checking 1000 pinned blocks took {small:?} and 4000 took {large:?}"
-    );
+    let mut many = processes_layout(vec![stated(0, "gpu 0", 1, vec![vec![0]])]);
+    many.groups[0].parts = vec![(0..64).map(|part| ("host".to_owned(), part)).collect()];
+    assert!(pool.admit(100, &many).is_err());
 }

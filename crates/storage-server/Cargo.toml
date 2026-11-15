@@ -34,7 +34,14 @@ tracing.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# The integration tests replay the traces their servers record (`buffer_pool::replay`).
+storage-server = { path = ".", features = ["verification"] }
 tempfile.workspace = true
+
+[features]
+# The checks of the buffer pool against its design model (`buffer_pool::replay`,
+# `buffer_pool::enumeration`, the `buffer-pool-verify` command): verification, not serving.
+verification = []
 
 # The integration tests' helper executable: the `storage-server` command, which a test's server
 # runs its children and a restart's successor from, and the client processes a test's server
@@ -42,6 +49,15 @@ tempfile.workspace = true
 [[bin]]
 name = "storage-server-helper"
 path = "tests/helper/main.rs"
+test = false
+doc = false
+bench = false
+
+# The checks of the buffer pool against its design model (`verification/buffer-pool`).
+[[bin]]
+name = "buffer-pool-verify"
+path = "src/bin/buffer-pool-verify.rs"
+required-features = ["verification"]
 test = false
 doc = false
 bench = false

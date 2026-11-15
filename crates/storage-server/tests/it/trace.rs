@@ -4,16 +4,14 @@
 //! produces the same completions.
 
 use ::storage::runtime::{Completion, RequestId};
-use storage_server::buffer_pool::trace::{files, replay};
+use storage_server::buffer_pool::replay::replay;
+use storage_server::buffer_pool::trace::files;
 
 use crate::server::Running;
 use crate::sessions::serve_a_session;
 
-/// The integration test of the buffer pool's sessions, run with the trace
-/// and the check on, replays with every completion equal, and the replay
-/// catches a completion altered in the run's records. With
-/// `UNISERVE_POOL_TRACE` naming a directory, the run's trace is kept there
-/// for `verification/buffer-pool/replay.sh`.
+/// The integration test of the buffer pool's sessions, recorded, replays with every completion
+/// equal, and the replay catches a completion altered in the run's records.
 #[test]
 fn a_recorded_run_replays_with_every_completion_equal_and_an_altered_one_is_caught() {
     let directory = tempfile::tempdir().unwrap();
@@ -24,18 +22,11 @@ fn a_recorded_run_replays_with_every_completion_equal_and_an_altered_one_is_caug
         serve_a_session(&server);
     }
     let (inputs, completions) = files(&trace, "model");
-    if let Ok(kept) = std::env::var("UNISERVE_POOL_TRACE") {
-        let kept = std::path::Path::new(&kept);
-        std::fs::create_dir_all(kept).unwrap();
-        for file in [&inputs, &completions] {
-            std::fs::copy(file, kept.join(file.file_name().unwrap())).unwrap();
-        }
-    }
 
-    // The open, the requests of both schedulers, the `completed` words, the
-    // clock and the close.
+    // Every request the scenario submitted on its two schedulers' queue pairs is an input of the
+    // trace: seven asked or submitted and one written to the queue pair by hand.
     let replayed = replay(&inputs, None).unwrap();
-    assert!(replayed >= 12, "{replayed} inputs replayed");
+    assert_eq!(replayed.requests, 8, "{replayed:?}");
 
     // The first scheduler's first answer, its owner's slot row, altered.
     let record = |slot| {

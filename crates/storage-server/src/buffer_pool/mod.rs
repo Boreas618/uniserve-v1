@@ -39,6 +39,10 @@ mod sessions;
 mod state;
 mod tasks;
 pub mod trace;
+// The replay of traces and the enumeration of small configurations check the pool against the
+// design model: verification, built for the tests and with the `verification` feature.
+#[cfg(any(test, feature = "verification"))]
+pub mod replay;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -64,17 +68,157 @@ pub type QueueId = (ClientId, u16);
 /// task produces it, or the cause of a refusal (R1).
 type Taken = Result<Option<Completion>, Cause>;
 
-/// The class of a slot row's block.
-const SLOT: u8 = u8::MAX;
+/// A set of the memories a deployment's sessions state (device memories, the memories of the
+/// main processes that hold product buffers, and host parts), each by its number in
+/// [`BufferPool::memories`]: what a copy writes, the host parts a group copies with, and where
+/// a block's content is valid ([`Validity`]). It is one 64-bit word, the validity mask of the
+/// design (`specs/buffer-pool.md` §21, decision 10), so a deployment states at most
+/// [`Memories::CAPACITY`] memories, and `Open` refuses a layout that would state more.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Memories(u64);
 
-/// The validity of a slot row: memory of the ranks' own processes, which
-/// every memory that maps its region reads.
-const EVERYWHERE: u64 = u64::MAX;
+impl Memories {
+    /// The most memories a set holds.
+    const CAPACITY: usize = u64::BITS as usize;
 
-/// The most memories a deployment's sessions state, device memories, the
-/// memories of the main processes that hold product buffers, and host parts
-/// together: one bit each in a block's validity.
-const MEMORIES: usize = 64;
+    /// No memory.
+    const NONE: Self = Self(0);
+
+    /// Every memory a set can hold.
+    const ALL: Self = Self(u64::MAX);
+
+    /// The memory numbered `memory`, below [`Self::CAPACITY`].
+    const fn one(memory: u8) -> Self {
+        Self(1 << memory)
+    }
+
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The number of memories in the set.
+    const fn count(self) -> u32 {
+        self.0.count_ones()
+    }
+
+    /// Whether the two sets share a memory.
+    const fn meets(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    /// Whether every memory of `other` is in this set.
+    const fn holds(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// The memories of this set that `other` lacks.
+    const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// The memories in the set, by ascending number.
+    fn iter(self) -> impl Iterator<Item = u8> {
+        (0..u64::BITS as u8).filter(move |memory| self.0 & 1 << memory != 0)
+    }
+
+    /// Each memory of the set as a set of its own, by ascending number.
+    fn each(self) -> impl Iterator<Item = Self> {
+        self.iter().map(Self::one)
+    }
+}
+
+impl std::ops::BitOr for Memories {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitOrAssign for Memories {
+    fn bitor_assign(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
+impl std::ops::BitAnd for Memories {
+    type Output = Self;
+
+    fn bitand(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+}
+
+impl FromIterator<Memories> for Memories {
+    fn from_iter<I: IntoIterator<Item = Self>>(sets: I) -> Self {
+        sets.into_iter().fold(Self::NONE, |all, set| all | set)
+    }
+}
+
+/// Where a block's content is valid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Validity {
+    /// In every memory that maps its region: a slot row, which lies in memory of the ranks' own
+    /// processes.
+    Everywhere,
+    /// In these memories: a device block in device memories and the memories of main
+    /// processes, a host block in host parts.
+    In(Memories),
+}
+
+impl Validity {
+    /// Valid in no memory: a block before the copy or the batch that writes it.
+    const NOWHERE: Self = Self::In(Memories::NONE);
+
+    /// Whether the content is valid in a memory of `memories`.
+    fn meets(self, memories: Memories) -> bool {
+        match self {
+            Self::Everywhere => !memories.is_empty(),
+            Self::In(valid) => valid.meets(memories),
+        }
+    }
+
+    /// Whether the content is valid in every memory of `memories`.
+    fn holds(self, memories: Memories) -> bool {
+        match self {
+            Self::Everywhere => true,
+            Self::In(valid) => valid.holds(memories),
+        }
+    }
+
+    /// The memories of `memories` the content is not valid in.
+    fn lacking(self, memories: Memories) -> Memories {
+        match self {
+            Self::Everywhere => Memories::NONE,
+            Self::In(valid) => memories.without(valid),
+        }
+    }
+
+    /// The validity within `memories`: where the content is valid among them.
+    fn within(self, memories: Memories) -> Self {
+        match self {
+            Self::Everywhere => Self::In(memories),
+            Self::In(valid) => Self::In(valid & memories),
+        }
+    }
+
+    /// The validity once the content is also valid in `memories`.
+    fn and(self, memories: Memories) -> Self {
+        match self {
+            Self::Everywhere => Self::Everywhere,
+            Self::In(valid) => Self::In(valid | memories),
+        }
+    }
+
+    /// The memories it is valid in, `None` for a slot row's, valid wherever its region is mapped.
+    fn memories(self) -> Option<Memories> {
+        match self {
+            Self::Everywhere => None,
+            Self::In(valid) => Some(valid),
+        }
+    }
+}
 
 /// What a block's units count as in the capacity words of their regions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -95,7 +239,8 @@ enum Counted {
 /// memory a `Replicate` brought it to.
 #[derive(Serialize, Deserialize)]
 struct Block {
-    class: u8,
+    /// The session class it is a block of; `None` for a slot row.
+    class: Option<u8>,
     /// The runs, the first the one it was allocated with: a cached block is
     /// found in its entry by the region of its first run. A `Replicate`
     /// appends a run in a receiving region while others hold the block.
@@ -106,7 +251,7 @@ struct Block {
     /// memory and by a `Replicate`; host parts for a host block, from the
     /// end of the copy that wrote it, grown by a store that fills the parts
     /// it lacks.
-    valid: Cell<u64>,
+    valid: Cell<Validity>,
     /// The key it is cached under, while an entry of the cache holds it.
     /// What follows is the counting's: an image leaves it out, and the pool
     /// made of the image finds it again from the holders.
@@ -123,9 +268,9 @@ struct Block {
 }
 
 impl Block {
-    /// A block of `runs` of a class, valid in the memories `valid`, with
-    /// `owned` references that make it private.
-    fn new(class: u8, runs: Vec<Run>, valid: u64, owned: u32) -> Self {
+    /// A block of `runs` of a class, valid as `valid` states, with `owned` references that make
+    /// it private.
+    fn new(class: Option<u8>, runs: Vec<Run>, valid: Validity, owned: u32) -> Self {
         Self {
             class,
             runs: RefCell::new(runs),
@@ -331,9 +476,8 @@ struct Group<B = Rc<Block>> {
     /// one in each memory its ranks read the class in and none of its
     /// `regions` lies in.
     receives: Vec<Vec<u8>>,
-    /// Per class, the host parts its ranks copy with, as bits of a block's
-    /// validity; 0 for a class without a host region.
-    parts: Vec<u64>,
+    /// Per class, the host parts its ranks copy with; none for a class without a host region.
+    parts: Vec<Memories>,
     /// The last batch whose end its workers have seen, as last read.
     completed: u64,
     /// What waits on it, in order of stamp.
@@ -398,11 +542,10 @@ enum Target {
 /// connector. It holds what it reads and what it writes until it has ended.
 #[derive(Serialize, Deserialize)]
 struct Copy<B = Rc<Block>> {
-    /// The memories it writes, as bits of a block's validity: the device
-    /// memory a clone, a load, a transfer or a crossing writes; the host
-    /// parts a store, a save or a prefetch writes; 0 for a restore, which
+    /// The memories it writes: the device memory a clone, a load, a transfer or a crossing
+    /// writes; the host parts a store, a save or a prefetch writes; none for a restore, which
     /// writes the slot row, and a put.
-    memory: u64,
+    memory: Memories,
     reads: Vec<B>,
     /// The block it writes. A put to the remote store writes no block: this
     /// is the host block it reads.
@@ -410,9 +553,27 @@ struct Copy<B = Rc<Block>> {
     to: Target,
     /// Whether it fills one more memory of a block that others may read.
     fill: bool,
-    /// A task's deadline, in nanoseconds of the host's monotonic clock; none
-    /// for a copy a worker runs, which its scheduler gives up.
-    deadline: Option<u64>,
+    /// A task's deadline; none for a copy a worker runs, which its scheduler gives up.
+    deadline: Option<Deadline>,
+}
+
+/// When a task's copies stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Deadline {
+    /// At this time, in nanoseconds of the host's monotonic clock.
+    At(u64),
+    /// The task passed its deadline and was told to stop: it has no further one.
+    Passed,
+}
+
+impl Deadline {
+    /// The time of a deadline not yet passed.
+    fn at(self) -> Option<u64> {
+        match self {
+            Self::At(time) => Some(time),
+            Self::Passed => None,
+        }
+    }
 }
 
 /// The buffer pool of one deployment on one host.
@@ -424,7 +585,7 @@ pub struct BufferPool {
     spaces: Vec<String>,
     /// The memories the sessions stated, by their bit in a block's
     /// validity: a device memory or a main process's memory by its name, a
-    /// host part by its host and its part index; at most [`MEMORIES`].
+    /// host part by its host and its part index; at most [`Memories::CAPACITY`].
     memories: Vec<(String, Option<u32>)>,
     /// Per memory space, the byte ranges in no region: the deployment's free quota there.
     quota: Vec<BTreeMap<u64, u64>>,
@@ -533,7 +694,7 @@ impl BufferPool {
         if let Ok(block) = Rc::try_unwrap(block) {
             for run in block.runs.into_inner() {
                 let region = &mut self.regions[usize::from(run.region())];
-                if block.class == SLOT {
+                if block.class.is_none() {
                     region.give_row(run);
                 } else {
                     region.give(run);
@@ -726,59 +887,57 @@ impl BufferPool {
         (self.trial.get(epoch) != Some(&false)).then_some(*epoch)
     }
 
-    /// A group's bit in a block's validity.
-    fn memory(&self, client: ClientId, group: GroupId) -> u64 {
+    /// A group's device memory.
+    fn memory(&self, client: ClientId, group: GroupId) -> Memories {
         self.groups
             .get(&(client, group))
-            .map_or(0, |found| 1 << found.memory)
+            .map_or(Memories::NONE, |found| Memories::one(found.memory))
     }
 
     /// The memory in which a block's run in `region` lies, for a group whose
     /// memory is `own`: the region's memory when its units exist once, the
     /// group's when they exist in every memory that maps the region.
-    fn lies_in(&self, region: u8, own: u64) -> u64 {
+    fn lies_in(&self, region: u8, own: Memories) -> Memories {
         let found = self.regions.get(usize::from(region));
         match found.and_then(|region| region.memory) {
-            Some(memory) => 1 << memory,
+            Some(memory) => Memories::one(memory),
             None => own,
         }
     }
 
     /// The memories in which runs in `regions` lie, for a group whose
     /// memory is `own`.
-    fn spread(&self, regions: &[u8], own: u64) -> u64 {
+    fn spread(&self, regions: &[u8], own: Memories) -> Memories {
         regions
             .iter()
-            .fold(0, |all, region| all | self.lies_in(*region, own))
+            .map(|region| self.lies_in(*region, own))
+            .collect()
     }
 
     /// The host parts a group copies a class with.
-    fn parts(&self, client: ClientId, group: GroupId, class: u8) -> u64 {
+    fn parts(&self, client: ClientId, group: GroupId, class: u8) -> Memories {
         let found = self.groups.get(&(client, group));
         let parts = found.and_then(|found| found.parts.get(usize::from(class)).copied());
-        parts.unwrap_or(0)
+        parts.unwrap_or(Memories::NONE)
     }
 
-    /// The host parts `written`, bits of a block's validity, as a copy's
-    /// answer names them (`Completion::Copy::parts`): a bit for each host
-    /// part the group copies the class with, in the order of their hosts'
+    /// The host parts `written` as a copy's answer names them (`Completion::Copy::parts`): a
+    /// bit for each host part the group copies the class with, in the order of their hosts'
     /// names and then their part indices, set where `written` holds it.
-    fn stated_parts(&self, client: ClientId, group: GroupId, class: u8, written: u64) -> u64 {
-        let parts = self.parts(client, group, class);
-        let mut bits: Vec<u32> = (0..u64::BITS).filter(|bit| parts & 1 << bit != 0).collect();
-        // A bit no session named (a pool opened without a layout) orders by its number.
-        bits.sort_by_key(|bit| (self.memories.get(*bit as usize), *bit));
+    fn stated_parts(&self, client: ClientId, group: GroupId, class: u8, written: Memories) -> u64 {
+        let mut parts: Vec<u8> = self.parts(client, group, class).iter().collect();
+        // Every part a group states is a memory its session named at admission.
+        parts.sort_by_key(|part| &self.memories[usize::from(*part)]);
         (0..)
-            .zip(bits)
-            .filter(|(_, bit)| written & 1 << bit != 0)
+            .zip(parts)
+            .filter(|(_, part)| written.meets(Memories::one(*part)))
             .fold(0, |all, (index, _)| all | 1 << index)
     }
 
     /// R11: whether a group's owners may load or restore a host copy: it
     /// holds every host part the group copies the class with.
     fn loadable(&self, client: ClientId, group: GroupId, class: u8, host: &Block) -> bool {
-        let parts = self.parts(client, group, class);
-        host.valid.get() & parts == parts
+        host.valid.get().holds(self.parts(client, group, class))
     }
 
     /// The one device region of a group for a class whose blocks have one run.
@@ -809,7 +968,7 @@ impl BufferPool {
             .map_or(0, |(classes, _)| classes.len());
         let tables = (0..classes).map(|_| BTreeMap::new()).collect();
         // The owner's slot makes the row private.
-        let block = Rc::new(Block::new(SLOT, vec![run], EVERYWHERE, 1));
+        let block = Rc::new(Block::new(None, vec![run], Validity::Everywhere, 1));
         self.owners.insert(
             (client, owner),
             Owner {
@@ -972,7 +1131,7 @@ impl BufferPool {
         count: u32,
         size: u32,
         keys: &[Key],
-        valid: u64,
+        valid: Validity,
     ) -> Vec<Rc<Block>> {
         for key in keys {
             self.evict_in(key, region);
@@ -983,7 +1142,7 @@ impl BufferPool {
                 break;
             };
             // The copy that writes it makes it private ([`Self::hold_copies`]).
-            blocks.push(Rc::new(Block::new(class, vec![run], valid, 0)));
+            blocks.push(Rc::new(Block::new(Some(class), vec![run], valid, 0)));
         }
         blocks
     }
@@ -1033,10 +1192,14 @@ impl BufferPool {
         // names the run its writer wrote: which process's runs a dealt call
         // wrote is the scheduler's knowledge (A9).
         let spread = self.spread(&regions, self.memory(client, group));
-        let valid = if spread.count_ones() == 1 { spread } else { 0 };
+        let valid = Validity::In(if spread.count() == 1 {
+            spread
+        } else {
+            Memories::NONE
+        });
         // Each is private by the owner's entry.
         let mut blocks: Vec<Block> = (0..count)
-            .map(|_| Block::new(class, Vec::new(), valid, 1))
+            .map(|_| Block::new(Some(class), Vec::new(), valid, 1))
             .collect();
         for (region, keys) in regions.iter().zip(&evictions) {
             for key in keys {
@@ -1072,7 +1235,7 @@ impl BufferPool {
         let entry = self.cache.get(key).filter(|entry| entry.class == class)?;
         let found = entry.device.iter().find(|(block, maker)| {
             block.region() == region
-                && block.valid.get() & memory != 0
+                && block.valid.get().meets(memory)
                 && self.visible(*maker, client)
         });
         found.map(|(block, _)| block)
@@ -1422,12 +1585,13 @@ impl BufferPool {
     }
 
     fn list(&self, client: ClientId) -> Completion {
-        // The session's groups: each one's number, the bit of its memory and its own bit.
-        let groups: Vec<(GroupId, u64, u8)> = self
+        // The session's groups: each one's number, its memory and its own bit, which admission
+        // keeps within a byte (`LISTED_GROUPS`).
+        let groups: Vec<(GroupId, Memories, u8)> = self
             .groups
             .iter()
-            .filter(|((of, group), _)| *of == client && group.0 < 8)
-            .map(|((_, group), found)| (*group, 1 << found.memory, 1 << group.0))
+            .filter(|((of, _), _)| *of == client)
+            .map(|((_, group), found)| (*group, Memories::one(found.memory), 1 << group.0))
             .collect();
 
         let mut keys: Vec<(Key, u8, u16, u8, u8, u8)> = Vec::new();
@@ -1436,10 +1600,10 @@ impl BufferPool {
                 .device
                 .iter()
                 .filter(|(_, maker)| self.visible(*maker, client));
-            let valid = device.fold(0, |all, (block, _)| all | block.valid.get());
+            let device: Vec<Validity> = device.map(|(block, _)| block.valid.get()).collect();
             let held = groups
                 .iter()
-                .filter(|(_, memory, _)| valid & memory != 0)
+                .filter(|(_, memory, _)| device.iter().any(|valid| valid.meets(*memory)))
                 .fold(0, |all, (_, _, bit)| all | bit);
             let host = entry
                 .host
@@ -1558,7 +1722,7 @@ fn remove_range(ranges: &mut BTreeMap<u64, u64>, offset: u64, bytes: u64) -> boo
     true
 }
 
-#[cfg(test)]
-mod enumeration;
+#[cfg(any(test, feature = "verification"))]
+pub mod enumeration;
 #[cfg(test)]
 mod tests;

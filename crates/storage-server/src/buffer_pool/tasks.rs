@@ -17,12 +17,9 @@ use storage::runtime::{Cause, Completion, GroupId, OwnerId, RequestId, Stamps};
 use super::region::Run;
 
 use super::{
-    Block, BufferPool, ClientId, Copy, Deferred, EVERYWHERE, Encoding, Entry, Held, QueueId, SLOT,
-    Taken, Target,
+    Block, BufferPool, ClientId, Copy, Deadline, Deferred, Encoding, Entry, Held, Memories,
+    QueueId, Taken, Target, Validity,
 };
-
-/// The deadline of a task that was told to stop: it has no further one.
-const STOPPING: u64 = u64::MAX;
 
 /// Runs of units as a completion states them.
 pub(super) type Runs = Vec<storage::runtime::Run>;
@@ -40,8 +37,8 @@ impl BufferPool {
     }
 
     /// What a task copies: per copy, the key it is for if any, the runs it
-    /// reads and writes, the memories that hold the content it reads and
-    /// the memories it writes, as bits of a block's validity. A transfer's
+    /// reads and writes, where the content it reads is valid and the
+    /// memories it writes. A transfer's
     /// copies have no key and read and write the same runs, from a memory
     /// of the owner's group into the target group's, and its last copy
     /// takes the slot row in the target group. A crossing's copies have no
@@ -50,7 +47,10 @@ impl BufferPool {
     /// block's runs that lie in one memory of the reading group. A
     /// prefetch's copies read nothing and write the host parts of the group
     /// that asked; a put's read and write the host block it puts.
-    pub fn work(&self, task: (QueueId, RequestId)) -> Vec<(Option<Key>, Runs, Runs, u64, u64)> {
+    pub fn work(
+        &self,
+        task: (QueueId, RequestId),
+    ) -> Vec<(Option<Key>, Runs, Runs, Validity, Memories)> {
         let copies = self.copies.get(&task).map_or(&[][..], Vec::as_slice);
         let stated = |copy: &Copy| {
             let key = match copy.to {
@@ -65,9 +65,9 @@ impl BufferPool {
                 // A run of a region each memory holds lies in every memory
                 // that holds the block; a run of a region whose units exist
                 // once lies in that region's memory.
-                let source = self.lies_in(from, u64::MAX) & block.valid.get();
+                let source = block.valid.get().within(self.lies_in(from, Memories::ALL));
                 let written =
-                    |run: &&Run| self.lies_in(run.region(), copy.memory) & copy.memory != 0;
+                    |run: &&Run| self.lies_in(run.region(), copy.memory).meets(copy.memory);
                 let writes = runs.iter().filter(written).map(Run::stated).collect();
                 return (
                     key,
@@ -78,7 +78,7 @@ impl BufferPool {
                 );
             }
             let reads = read.map_or_else(Vec::new, |block| block.stated());
-            let memories = read.map_or(0, |block| block.valid.get());
+            let memories = read.map_or(Validity::NOWHERE, |block| block.valid.get());
             (key, reads, copy.write.stated(), memories, copy.memory)
         };
         copies.iter().map(stated).collect()
@@ -90,8 +90,7 @@ impl BufferPool {
     pub fn next_deadline(&self) -> Option<u64> {
         self.copies
             .values()
-            .filter_map(|copies| copies.first()?.deadline)
-            .filter(|deadline| *deadline != STOPPING)
+            .filter_map(|copies| copies.first()?.deadline?.at())
             .min()
     }
 
@@ -169,7 +168,7 @@ impl BufferPool {
                 .iter()
                 .flat_map(|table| table.values().map(Held::block))
         };
-        if held().any(|block| block.valid.get() & target == 0 && self.filling(block, target)) {
+        if held().any(|block| !block.valid.get().meets(target) && self.filling(block, target)) {
             return false;
         }
 
@@ -185,11 +184,11 @@ impl BufferPool {
             return true;
         };
 
-        let deadline = Some(self.now.saturating_add(self.limits.0));
+        let deadline = Some(Deadline::At(self.now.saturating_add(self.limits.0)));
         let mut copies: Vec<Copy> = Vec::new();
         let mut kept = vec![old];
         for block in blocks {
-            let copied = block.valid.get() & target == 0
+            let copied = !block.valid.get().meets(target)
                 && !copies.iter().any(|copy| Rc::ptr_eq(&copy.write, &block));
             if copied {
                 let reads = vec![Rc::clone(&block)];
@@ -208,10 +207,10 @@ impl BufferPool {
         }
         // The slot's row: it reads the row of the source group, and holds
         // the blocks the task does not copy.
-        let slot = Rc::new(Block::new(SLOT, vec![row], EVERYWHERE, 0));
+        let slot = Rc::new(Block::new(None, vec![row], Validity::Everywhere, 0));
         let to = Target::Group { owner, to };
         copies.push(Copy {
-            memory: 0,
+            memory: Memories::NONE,
             reads: kept,
             write: slot,
             to,
@@ -265,9 +264,9 @@ impl BufferPool {
                     .any(|copy| copy.fill && Rc::ptr_eq(&copy.write, block))
                 {
                     block.valid.set(if frozen {
-                        block.valid.get() | target
+                        block.valid.get().and(target)
                     } else {
-                        target
+                        Validity::In(target)
                     });
                 }
                 runs.extend(
@@ -318,17 +317,17 @@ impl BufferPool {
 
     /// The memories a group reads a class in: those of its regions and of
     /// its receiving regions of the class.
-    fn reading(&self, client: ClientId, group: GroupId, class: u8) -> u64 {
+    fn reading(&self, client: ClientId, group: GroupId, class: u8) -> Memories {
         let Some(found) = self.groups.get(&(client, group)) else {
-            return 0;
+            return Memories::NONE;
         };
-        let own = 1 << found.memory;
+        let own = Memories::one(found.memory);
         let lists = [&found.regions, &found.receives];
         let regions = lists
             .into_iter()
             .filter_map(|lists| lists.get(usize::from(class)))
             .flatten();
-        regions.fold(0, |all, region| all | self.lies_in(*region, own))
+        regions.map(|region| self.lies_in(*region, own)).collect()
     }
 
     /// A block's runs that a group reads the class in: those in its regions
@@ -399,7 +398,7 @@ impl BufferPool {
                 .cloned()
                 .unwrap_or_default(),
         );
-        let reader_memory = 1 << reader.memory;
+        let reader_memory = Memories::one(reader.memory);
         if !block.regions().contains(&from) || regions.is_empty() && receives.is_empty() {
             return Err(Cause::Class);
         }
@@ -430,18 +429,18 @@ impl BufferPool {
         let written = written.and_then(|found| found.regions.get(usize::from(class)));
         let written = written.cloned().unwrap_or_default();
         let mut valid = block.valid.get();
-        if private && written.contains(&from) && self.spread(&written, own).count_ones() > 1 {
-            valid |= self.lies_in(from, own);
+        if private && written.contains(&from) && self.spread(&written, own).count() > 1 {
+            valid = valid.and(self.lies_in(from, own));
         }
         // R11: the run read lies in a memory that holds the block.
-        if self.lies_in(from, own) & valid == 0 {
+        if !valid.meets(self.lies_in(from, own)) {
             return Err(Cause::Class);
         }
 
         // R5: the memories the group reads the class in that do not hold the
         // block; in each, the block's run there or a run to take in the
         // receiving region there, of the bytes of the run it is read from.
-        let targets = self.reading(client, group, class) & !valid;
+        let targets = valid.lacking(self.reading(client, group, class));
         let bytes = {
             let runs = block.runs.borrow();
             let source = runs.iter().find(|run| run.region() == from);
@@ -449,10 +448,7 @@ impl BufferPool {
             u64::from(units) * self.regions[usize::from(from)].unit_bytes
         };
         let mut taken: Vec<(u8, u32, Vec<Key>)> = Vec::new();
-        for memory in (0..64)
-            .map(|bit| 1u64 << bit)
-            .filter(|bit| targets & bit != 0)
-        {
+        for memory in targets.each() {
             let has_run = block
                 .regions()
                 .iter()
@@ -494,7 +490,7 @@ impl BufferPool {
             }
             self.touch(&block);
         }
-        if targets == 0 {
+        if targets.is_empty() {
             let runs = self.read_runs(client, group, class, &block);
             return Ok(Some(Completion::Replicated { runs, evicted }));
         }
@@ -544,9 +540,7 @@ impl BufferPool {
         };
         let client = queue.0;
         let reading = self.reading(client, to, class);
-        let filled = (0..64)
-            .map(|bit| 1u64 << bit)
-            .any(|memory| reading & memory != 0 && self.filling(&block, memory));
+        let filled = reading.each().any(|memory| self.filling(&block, memory));
         if filled {
             return Some(Deferred::Replicate {
                 queue,
@@ -566,8 +560,8 @@ impl BufferPool {
             .get(&(client, owner))
             .and_then(|found| found.tables[usize::from(class)].get(&at))
             .is_some_and(|held| Rc::ptr_eq(held.block(), &block));
-        let targets = reading & !block.valid.get();
-        if !held || targets == 0 {
+        let targets = block.valid.get().lacking(reading);
+        if !held || targets.is_empty() {
             let evicted = self.answers.remove(&(queue, request)).unwrap_or_default();
             let completion = if held {
                 Completion::Replicated {
@@ -582,7 +576,7 @@ impl BufferPool {
             return None;
         }
 
-        let deadline = Some(self.now.saturating_add(self.limits.0));
+        let deadline = Some(Deadline::At(self.now.saturating_add(self.limits.0)));
         let target = Target::Memory {
             owner,
             class,
@@ -590,9 +584,8 @@ impl BufferPool {
             group: to,
             from,
         };
-        let copies = (0..64)
-            .map(|bit| 1u64 << bit)
-            .filter(|memory| targets & memory != 0)
+        let copies = targets
+            .each()
             .map(|memory| Copy {
                 memory,
                 reads: vec![Rc::clone(&block)],
@@ -629,7 +622,9 @@ impl BufferPool {
         };
         if ok {
             for copy in copies {
-                copy.write.valid.set(copy.write.valid.get() | copy.memory);
+                copy.write
+                    .valid
+                    .set(copy.write.valid.get().and(copy.memory));
             }
         }
         let held = self
@@ -730,7 +725,7 @@ impl BufferPool {
         }
         drop(held);
         let count = u32::try_from(wanted.len()).unwrap_or(u32::MAX);
-        let blocks = self.obtain(region, class, count, size, &evicted, 0);
+        let blocks = self.obtain(region, class, count, size, &evicted, Validity::NOWHERE);
 
         // Each block is valid on the group's parts once the connector wrote it.
         let copies: Vec<Copy> = wanted
@@ -745,7 +740,7 @@ impl BufferPool {
                     remote: false,
                 },
                 fill: false,
-                deadline: Some(deadline),
+                deadline: Some(Deadline::At(deadline)),
             })
             .collect();
         if copies.is_empty() {
@@ -778,7 +773,7 @@ impl BufferPool {
             return Vec::new();
         }
         let first = self.copies.get(&task).and_then(|copies| copies.first());
-        let Some(class) = first.map(|copy| copy.write.class) else {
+        let Some(class) = first.and_then(|copy| copy.write.class) else {
             return Vec::new();
         };
         let Ok(found) = self.class(task.0.0, class) else {
@@ -835,7 +830,12 @@ impl BufferPool {
         loop {
             if let Some(run) = self.regions[usize::from(region)].take(units) {
                 // The copy that writes it makes it private (`Self::restage`).
-                return Some(Rc::new(Block::new(class, vec![run], 0, 0)));
+                return Some(Rc::new(Block::new(
+                    Some(class),
+                    vec![run],
+                    Validity::NOWHERE,
+                    0,
+                )));
             }
             let lowest = self
                 .cache
@@ -892,7 +892,7 @@ impl BufferPool {
     /// copies of the named keys that have one every epoch may use (R8) and
     /// that the remote store does not hold.
     pub(super) fn put(&mut self, queue: QueueId, id: RequestId, keys: &[Key]) -> Taken {
-        let deadline = Some(self.now.saturating_add(self.limits.1));
+        let deadline = Some(Deadline::At(self.now.saturating_add(self.limits.1)));
         let mut copies: Vec<Copy> = Vec::new();
         for key in keys {
             let Some(Entry {
@@ -914,7 +914,7 @@ impl BufferPool {
                 remote: true,
             };
             copies.push(Copy {
-                memory: 0,
+                memory: Memories::NONE,
                 reads: vec![Rc::clone(host)],
                 write: Rc::clone(host),
                 to,
@@ -961,15 +961,14 @@ impl BufferPool {
             let class = copy.write.class;
             // A prefetched copy is taken as written in the encoding of the class the prefetch
             // names, or in its converted-load source's when it lies in the source region
-            // ([`Self::peer_copies`]); a session that no longer states the class caches nothing
-            // of it.
-            let written = self.class(task.0.0, class).ok().map(|found| {
+            // ([`Self::peer_copies`]), with that class; a session that no longer states the
+            // class caches nothing of it.
+            let written = class.and_then(|class| {
+                let found = self.class(task.0.0, class).ok()?;
                 let region = copy.write.region();
                 let staged = found.source.filter(|(source, _)| *source == region);
-                (
-                    found.tensors,
-                    staged.map_or(found.encoding, |(_, encoding)| encoding),
-                )
+                let encoding = staged.map_or(found.encoding, |(_, encoding)| encoding);
+                Some((class, (found.tensors, encoding)))
             });
             let done = match self.cache.get_mut(&key) {
                 // The remote store holds the content of the key's host copy.
@@ -984,41 +983,44 @@ impl BufferPool {
                 None if remote => false,
                 // What the remote store and the peers hold is what every epoch
                 // may use, on the host parts the connector wrote.
-                Some(entry) if entry.host.is_none() && entry.class == class => match written {
-                    Some(encoding) => {
-                        entry.host = Some((Rc::clone(&copy.write), None, encoding));
-                        copy.write.cached.set(Some(key));
-                        copy.write.valid.set(copy.memory);
-                        true
+                Some(entry) if entry.host.is_none() && Some(entry.class) == class => {
+                    match written {
+                        Some((_, encoding)) => {
+                            entry.host = Some((Rc::clone(&copy.write), None, encoding));
+                            copy.write.cached.set(Some(key));
+                            copy.write.valid.set(Validity::In(copy.memory));
+                            true
+                        }
+                        None => false,
                     }
-                    None => false,
-                },
+                }
                 // R4: the key gained a host copy meanwhile and keeps it; it is
                 // found where it holds the parts the prefetch was for.
                 Some(entry) => {
                     let host = entry.host.as_ref();
                     let maker = host.and_then(|(_, maker, _)| *maker);
-                    let holds = host
-                        .is_some_and(|(block, ..)| block.valid.get() & copy.memory == copy.memory);
-                    entry.class == class && self.visible(maker, task.0.0) && holds
+                    let holds =
+                        host.is_some_and(|(block, ..)| block.valid.get().holds(copy.memory));
+                    Some(entry.class) == class && self.visible(maker, task.0.0) && holds
                 }
-                None if written.is_none() => false,
-                None => {
-                    let host = written.map(|encoding| (Rc::clone(&copy.write), None, encoding));
-                    copy.write.cached.set(Some(key));
-                    copy.write.valid.set(copy.memory);
-                    self.cache.insert(
-                        key,
-                        Entry {
-                            class,
-                            device: Vec::new(),
-                            host,
-                            tokens,
-                            remote: false,
-                        },
-                    );
-                    true
-                }
+                None => match written {
+                    None => false,
+                    Some((class, encoding)) => {
+                        copy.write.cached.set(Some(key));
+                        copy.write.valid.set(Validity::In(copy.memory));
+                        self.cache.insert(
+                            key,
+                            Entry {
+                                class,
+                                device: Vec::new(),
+                                host: Some((Rc::clone(&copy.write), None, encoding)),
+                                tokens,
+                                remote: false,
+                            },
+                        );
+                        true
+                    }
+                },
             };
             if let Some(keys) = self.answers.get_mut(&task).filter(|_| done) {
                 keys.push(key);
@@ -1102,7 +1104,7 @@ impl BufferPool {
         let late = |copies: &Vec<Copy>| {
             copies
                 .first()
-                .and_then(|copy| copy.deadline)
+                .and_then(|copy| copy.deadline?.at())
                 .filter(|deadline| *deadline <= now)
         };
         let mut due: Vec<(u64, (QueueId, RequestId))> = self
@@ -1118,7 +1120,7 @@ impl BufferPool {
                 continue;
             };
             for copy in copies.iter_mut() {
-                copy.deadline = Some(STOPPING);
+                copy.deadline = Some(Deadline::Passed);
             }
             let target = copies.first().map(|copy| copy.to);
             let completion = match target {

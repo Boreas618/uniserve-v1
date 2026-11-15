@@ -15,9 +15,8 @@ use std::rc::Rc;
 use storage::protocol::{
     BlockCount, BlockState, BufferPoolListing, CopyListing, GroupListing, Key, Waiting,
 };
-use storage::runtime::Tier;
 
-use super::{Block, BufferPool, ClientId, Copy, Counted, Deferred, Held, QueueId, SLOT, Target};
+use super::{Block, BufferPool, ClientId, Copy, Counted, Deferred, Held, QueueId, Target};
 
 /// Per block, by its address: the key an entry caches it under.
 type CachedBy = HashMap<*const Block, Key>;
@@ -229,7 +228,7 @@ fn written_in_place(copy: &Copy) -> bool {
 
 impl BufferPool {
     /// The number of blocks in each observed state, per region and class.
-    pub fn counts(&self) -> BTreeMap<(u8, u8, BlockState), u32> {
+    pub fn counts(&self) -> BTreeMap<(u8, Option<u8>, BlockState), u32> {
         let mut counts = BTreeMap::new();
         for (block, observed, _) in self.blocks() {
             *counts
@@ -249,8 +248,7 @@ impl BufferPool {
             .counts()
             .into_iter()
             .map(|((region, class, state), blocks)| {
-                let region = self.region_name(region).unwrap_or_default().to_owned();
-                let class = (class != SLOT).then_some(class);
+                let region = self.region_name(region).to_owned();
                 BlockCount {
                     region,
                     class,
@@ -269,7 +267,8 @@ impl BufferPool {
             .groups
             .iter()
             .map(|((client, group), found)| GroupListing {
-                epoch: self.epoch(*client).unwrap_or_default(),
+                // A group lives while its session is open: `close` removes it.
+                epoch: self.sessions[client],
                 group: group.0,
                 completed: found.completed,
                 waiting: found
@@ -288,7 +287,7 @@ impl BufferPool {
                 scheduler: queue.1,
                 request: request.0,
                 copies: copies.len() as u32,
-                deadline: copies.first().and_then(|copy| copy.deadline),
+                deadline: copies.first().and_then(|copy| copy.deadline?.at()),
             })
             .collect();
         copies.sort_by_key(|copy| (copy.epoch, copy.scheduler, copy.request));
@@ -298,13 +297,6 @@ impl BufferPool {
             groups,
             copies,
         }
-    }
-
-    /// What `Open` states of a region: its tier, the bytes of a unit, and
-    /// its units.
-    pub fn extent(&self, region: u8) -> Option<(Tier, u64, u32)> {
-        let found = self.regions.get(usize::from(region))?;
-        Some((found.tier, found.unit_bytes, found.units()))
     }
 
     /// The capacity words of a region for a queue pair: `available`, the
@@ -559,7 +551,7 @@ impl BufferPool {
                             block.stated().first().copied()
                         ));
                     }
-                    if spread.count_ones() == 1 && block.valid.get() & spread == 0 {
+                    if spread.count() == 1 && !block.valid.get().meets(spread) {
                         return Err(format!(
                             "owner {} holds block {:?}, which is not valid in its group",
                             owner.0,
@@ -572,7 +564,8 @@ impl BufferPool {
 
         // P1: a copy fills only memory in which its block is not valid.
         for copy in self.copies.values().flatten() {
-            if copy.fill && copy.write.class != SLOT && copy.write.valid.get() & copy.memory != 0 {
+            if copy.fill && copy.write.class.is_some() && copy.write.valid.get().meets(copy.memory)
+            {
                 return Err(format!(
                     "a copy fills valid memory of block {:?}",
                     copy.write.stated().first().copied()

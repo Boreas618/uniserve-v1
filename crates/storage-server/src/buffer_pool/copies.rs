@@ -13,8 +13,8 @@ use storage::protocol::Key;
 use storage::runtime::{Cause, Completion, GroupId, OwnerId, RequestId, Stamps, Tier};
 
 use super::{
-    Block, BufferPool, ClientId, Copy, Deferred, Encoding, Entry, Held, QueueId, SLOT, Taken,
-    Target,
+    Block, BufferPool, ClientId, Copy, Deferred, Encoding, Entry, Held, Memories, QueueId, Taken,
+    Target, Validity,
 };
 
 impl BufferPool {
@@ -146,7 +146,7 @@ impl BufferPool {
         let Some(evicted) = self.room(queue, region, 1, size) else {
             return Ok(Some(Completion::Full { region }));
         };
-        let mut blocks = self.obtain(region, class, 1, size, &evicted, 0);
+        let mut blocks = self.obtain(region, class, 1, size, &evicted, Validity::NOWHERE);
         let write = blocks.pop().ok_or(Cause::Size)?;
 
         let (from, to) = (source.stated(), write.stated());
@@ -180,11 +180,11 @@ impl BufferPool {
 
     /// Whether something fills one of the memories `memory` of the block: a
     /// load, a transfer or a crossing on the device, a store on the host.
-    pub(super) fn filling(&self, block: &Rc<Block>, memory: u64) -> bool {
+    pub(super) fn filling(&self, block: &Rc<Block>, memory: Memories) -> bool {
         let copies = self.copies.values().flatten();
         copies
             .into_iter()
-            .any(|copy| copy.fill && copy.memory & memory != 0 && Rc::ptr_eq(&copy.write, block))
+            .any(|copy| copy.fill && copy.memory.meets(memory) && Rc::ptr_eq(&copy.write, block))
     }
 
     pub(super) fn load(
@@ -226,7 +226,7 @@ impl BufferPool {
                 .find(|(block, _)| block.region() == region);
             let fills = match device {
                 Some((block, maker))
-                    if block.valid.get() & memory == 0 && *maker == self.made_by(client) =>
+                    if !block.valid.get().meets(memory) && *maker == self.made_by(client) =>
                 {
                     // One memory of a block is filled by one copy at a time.
                     if self.filling(block, memory) {
@@ -235,7 +235,7 @@ impl BufferPool {
                     Some(Rc::clone(block))
                 }
                 Some((block, maker))
-                    if block.valid.get() & memory != 0 && self.visible(*maker, client) =>
+                    if block.valid.get().meets(memory) && self.visible(*maker, client) =>
                 {
                     break;
                 }
@@ -284,7 +284,7 @@ impl BufferPool {
             return Ok(Some(Completion::Full { region }));
         };
         let mut blocks = self
-            .obtain(region, class, new, size, &evicted, 0)
+            .obtain(region, class, new, size, &evicted, Validity::NOWHERE)
             .into_iter();
 
         let (mut from, mut to, mut copies) = (Vec::new(), Vec::new(), Vec::new());
@@ -367,7 +367,7 @@ impl BufferPool {
             };
             let device = entry.device.iter().find(|(block, maker)| {
                 own.contains(&block.region())
-                    && block.valid.get() & memory != 0
+                    && block.valid.get().meets(memory)
                     && self.visible(*maker, client)
             });
             let Some((block, _)) = device else { continue };
@@ -377,8 +377,8 @@ impl BufferPool {
                 Some((host, made, _)) => {
                     // R5: the copy fills only the parts that do not hold the
                     // key, and one copy at a time fills a host block.
-                    let lacking = parts & !host.valid.get();
-                    if lacking == 0 || *made != maker || self.filling(host, u64::MAX) {
+                    let lacking = host.valid.get().lacking(parts);
+                    if lacking.is_empty() || *made != maker || self.filling(host, Memories::ALL) {
                         continue;
                     }
                     Some((Rc::clone(host), lacking))
@@ -391,13 +391,22 @@ impl BufferPool {
                     Err(_) => continue,
                 },
             };
-            sources.push((*key, Rc::clone(block), region, units, host.ok_or(parts)));
+            sources.push((
+                *key,
+                Rc::clone(block),
+                region,
+                units,
+                host.ok_or(parts),
+                entry.class,
+            ));
         }
-        let Some(&(_, _, region, size, _)) = sources.first() else {
+        let Some(&(_, _, region, size, _, class)) = sources.first() else {
             return Ok(Some(Completion::Stored { keys: Vec::new() }));
         };
-        // One request stores blocks of one host region and size.
-        sources.retain(|(_, _, other, units, _)| *other == region && *units == size);
+        // One request stores blocks of one class, host region and size.
+        sources.retain(|(_, _, other, units, _, of)| {
+            *other == region && *units == size && *of == class
+        });
 
         // New host blocks for the keys without one, all or none; each is
         // valid on the group's parts once its copy ended.
@@ -405,15 +414,14 @@ impl BufferPool {
         let Some(evicted) = self.room(queue, region, new, size) else {
             return Ok(Some(Completion::Full { region }));
         };
-        let class = sources[0].1.class;
         let mut blocks = self
-            .obtain(region, class, new, size, &evicted, 0)
+            .obtain(region, class, new, size, &evicted, Validity::NOWHERE)
             .into_iter();
 
         let (mut from, mut to, mut copies) = (Vec::new(), Vec::new(), Vec::new());
         let mut written = Vec::new();
         let stated: Vec<Key> = sources.iter().map(|source| source.0).collect();
-        for (key, device, _, _, host) in sources {
+        for (key, device, _, _, host, _) in sources {
             let (write, memory, fill) = match host {
                 Ok((host, lacking)) => (host, lacking, true),
                 Err(parts) => match blocks.next() {
@@ -482,7 +490,7 @@ impl BufferPool {
         // Valid on the host parts the group copies trajectories with, which
         // one rank of each of its processes writes, once the copy ended.
         let parts = self.parts(client, group, trajectory);
-        let mut blocks = self.obtain(region, trajectory, 1, units, &evicted, 0);
+        let mut blocks = self.obtain(region, trajectory, 1, units, &evicted, Validity::NOWHERE);
         let write = blocks.pop().ok_or(Cause::Size)?;
 
         let (from, to) = (slot.stated(), write.stated());
@@ -543,7 +551,7 @@ impl BufferPool {
         let (from, to) = (host.stated(), slot.stated());
         let target = Target::Slot { owner };
         let copy = Copy {
-            memory: 0,
+            memory: Memories::NONE,
             reads: vec![host],
             write: slot,
             to: target,
@@ -619,13 +627,13 @@ impl BufferPool {
                         let (held, completion) = match key {
                             // A clone: a private block with the cached content.
                             None => {
-                                copy.write.valid.set(memory);
+                                copy.write.valid.set(Validity::In(memory));
                                 (Held::Private(Rc::clone(&copy.write)), Completion::Cloned)
                             }
                             Some(key) => self.loaded(
                                 client,
                                 &copy,
-                                key,
+                                (key, class),
                                 memory,
                                 completion == Completion::Duplicate,
                             ),
@@ -656,8 +664,8 @@ impl BufferPool {
         &mut self,
         client: ClientId,
         copy: &Copy,
-        key: Key,
-        memory: u64,
+        (key, class): (Key, u8),
+        memory: Memories,
         duplicate: bool,
     ) -> (Held, Completion) {
         let answer = if duplicate {
@@ -667,14 +675,13 @@ impl BufferPool {
         };
         if copy.fill {
             // The group's memory of the shared block holds its content.
-            copy.write.valid.set(copy.write.valid.get() | memory);
+            copy.write.valid.set(copy.write.valid.get().and(memory));
             return (Held::Shared(Rc::clone(&copy.write)), answer);
         }
 
-        copy.write.valid.set(memory);
+        copy.write.valid.set(Validity::In(memory));
         let region = copy.write.region();
         let maker = self.made_by(client);
-        let class = copy.write.class;
         let entry = self.cache.entry(key).or_insert(Entry {
             class,
             device: Vec::new(),
@@ -699,19 +706,29 @@ impl BufferPool {
     /// meanwhile (R4), in which case the block just written is released. A
     /// store that filled the key's host copy adds the parts it wrote.
     fn stored(&mut self, client: ClientId, copy: &Copy, key: Key) -> Completion {
-        let class = copy.write.class;
         // A save reads its owner's slot.
-        let answer = if copy.reads.first().is_some_and(|block| block.class == SLOT) {
+        let answer = if copy
+            .reads
+            .first()
+            .is_some_and(|block| block.class.is_none())
+        {
             Completion::Saved
         } else {
             Completion::Stored { keys: Vec::new() }
         };
         if copy.fill {
-            copy.write.valid.set(copy.write.valid.get() | copy.memory);
+            copy.write
+                .valid
+                .set(copy.write.valid.get().and(copy.memory));
             return answer;
         }
-        // A copy ends while its session is open, which states its class.
-        let Ok(found) = self.class(client, class) else {
+        // A copy ends while its session is open, which states the class of the host block it
+        // wrote.
+        let Some((class, found)) = copy
+            .write
+            .class
+            .and_then(|class| Some((class, self.class(client, class).ok()?)))
+        else {
             return Completion::Done;
         };
         let written = (found.tensors, found.encoding);
@@ -726,7 +743,7 @@ impl BufferPool {
         if entry.host.is_none() {
             entry.host = Some((Rc::clone(&copy.write), maker, written));
             copy.write.cached.set(Some(key));
-            copy.write.valid.set(copy.memory);
+            copy.write.valid.set(Validity::In(copy.memory));
         }
         answer
     }

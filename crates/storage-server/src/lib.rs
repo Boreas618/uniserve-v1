@@ -1397,7 +1397,7 @@ impl Server {
             self.retained(),
             &self.transfer_contexts(),
             &|gpu| gpus.is_empty() || gpus.contains(gpu),
-            &|name| deployment.is_none_or(|deployment| deployment == name),
+            &|name| deployment.is_none_or(|deployment| name == Some(deployment)),
         );
         for quota in &mut quotas {
             quota.host_link_bytes_per_second = self.host_link(quota.gpu);

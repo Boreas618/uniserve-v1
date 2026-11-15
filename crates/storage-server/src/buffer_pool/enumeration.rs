@@ -3,8 +3,9 @@
 //! the design model so that it can be compared with the states of the
 //! model's buffer pool (`verification/buffer-pool/agreement.sh`), and every
 //! transition with the input that made it, so that it can be compared with
-//! the model's steps (`agreement_steps.sh`). The pool is driven by the
-//! inputs the buffer pool's thread records ([`super::trace`]).
+//! the model's steps (`agreement_steps.sh`), both through
+//! `buffer-pool-verify enumerate`. The pool is driven by the inputs the
+//! buffer pool's thread records ([`super::trace`]).
 //!
 //! The configurations are those of `MC_Pool` there, one per [`Shape`]: one
 //! key and one position, one or two owners, a prefill group and for
@@ -17,14 +18,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
+use std::path::Path;
 
 use storage::protocol::Key;
 use storage::runtime::{GroupId, OwnerId, Request, RequestId, Source, Stamps, Tier};
 
-use super::trace::{
-    Input, SessionNames, apply, classes, copies_asked, layout, stated, stated_input,
-};
-use super::{BufferPool, Class, Copy, Group, Target};
+use super::replay::{SessionNames, apply, classes, copies_asked, layout, stated, stated_input};
+use super::trace::Input;
+use super::{BufferPool, Class, Copy, Group, Memories, Target};
 
 const KV: u8 = 0;
 const TRAJECTORY: u8 = 1;
@@ -65,7 +66,7 @@ struct Shape {
     crossings: bool,
     /// The host parts each group copies with, as bits of a block's validity
     /// after the groups' memories (the model's `GroupParts`).
-    parts: [u64; 2],
+    parts: [&'static [u8]; 2],
     /// Whether the shape is an update's: owner 1 of the serving session's
     /// group and owner 1 of a target session of another layout, on trial,
     /// whose update is committed, or whose engine is lost and whose update
@@ -86,7 +87,7 @@ const SHAPES: [Shape; 7] = [
         transfers: false,
         tiers: false,
         crossings: false,
-        parts: [1 << 1, 0],
+        parts: [&[1], &[]],
         trial: false,
     },
     Shape {
@@ -100,7 +101,7 @@ const SHAPES: [Shape; 7] = [
         transfers: false,
         tiers: false,
         crossings: false,
-        parts: [1 << 1, 0],
+        parts: [&[1], &[]],
         trial: false,
     },
     Shape {
@@ -114,7 +115,7 @@ const SHAPES: [Shape; 7] = [
         transfers: true,
         tiers: false,
         crossings: false,
-        parts: [1 << 2, 1 << 2],
+        parts: [&[2], &[2]],
         trial: false,
     },
     Shape {
@@ -128,7 +129,7 @@ const SHAPES: [Shape; 7] = [
         transfers: false,
         tiers: true,
         crossings: false,
-        parts: [1 << 1, 0],
+        parts: [&[1], &[]],
         trial: false,
     },
     // Two memories, the decode group's reading what owners of the prefill
@@ -146,7 +147,7 @@ const SHAPES: [Shape; 7] = [
         transfers: true,
         tiers: false,
         crossings: true,
-        parts: [1 << 2, 1 << 2],
+        parts: [&[2], &[2]],
         trial: false,
     },
     // Two host parts: the prefill group's ranks on one host, the decode
@@ -163,7 +164,7 @@ const SHAPES: [Shape; 7] = [
         transfers: false,
         tiers: false,
         crossings: false,
-        parts: [1 << 2, 1 << 2 | 1 << 3],
+        parts: [&[2], &[2, 3]],
         trial: false,
     },
     // An update: the serving session's group and a target session's, of
@@ -183,7 +184,7 @@ const SHAPES: [Shape; 7] = [
         transfers: false,
         tiers: false,
         crossings: false,
-        parts: [1 << 2, 1 << 2],
+        parts: [&[2], &[2]],
         trial: true,
     },
 ];
@@ -226,6 +227,25 @@ enum Step {
     Ended(usize, bool),
 }
 
+/// Numbers the memories of a shape as admission numbers a layout's: the device memories of its
+/// `memories` groups first, then its host parts, so that each is the number the shape states.
+fn name_memories(pool: &mut BufferPool, shape: &Shape, memories: u8) {
+    let mut reserved = Memories::NONE;
+    for memory in 0..memories {
+        assert_eq!(
+            pool.number_memory((format!("g{memory}"), None), &mut reserved),
+            memory
+        );
+    }
+    let parts: BTreeSet<u8> = shape.parts.iter().copied().flatten().copied().collect();
+    for part in parts {
+        assert_eq!(
+            pool.number_memory(("host".to_owned(), Some(u32::from(part))), &mut reserved),
+            part
+        );
+    }
+}
+
 fn key() -> Key {
     Key([1; 32])
 }
@@ -248,7 +268,7 @@ struct Driver {
 impl Driver {
     /// The regions are the KV units, then each group's slot rows, then the
     /// host units; units and rows are numbered from 1, host units from 0.
-    fn new(shape: Shape) -> Self {
+    fn new(shape: Shape) -> Result<Self, String> {
         if shape.trial {
             return Self::update(shape);
         }
@@ -305,9 +325,13 @@ impl Driver {
             shape.host_units,
             shape.host_units,
         );
+        name_memories(&mut pool, &shape, shape.groups);
         // Each group copies both classes with the host parts the shape states.
         let groups = (0..shape.groups).map(|group| {
-            let parts = shape.parts[usize::from(group)];
+            let parts: Memories = shape.parts[usize::from(group)]
+                .iter()
+                .map(|part| Memories::one(*part))
+                .collect();
             let found = Group {
                 parts: vec![parts, parts],
                 ..Group::new(group, group + 1, vec![vec![UNITS], Vec::new()])
@@ -329,9 +353,9 @@ impl Driver {
                 region,
                 keys: vec![key()],
             });
-            driver.act(&victims);
+            driver.act(&victims)?;
         }
-        driver
+        Ok(driver)
     }
 
     /// The shape `trial`: the serving session (epoch 1) with its group in
@@ -340,7 +364,7 @@ impl Driver {
     /// memory of its own, with region 2 over region 0's memory space and
     /// units of the same size, its one unit over region 0's last unit and
     /// empty at first, and slot rows in region 3; host region 4.
-    fn update(shape: Shape) -> Self {
+    fn update(shape: Shape) -> Result<Self, String> {
         let host = 4;
         let classes = || {
             vec![
@@ -405,8 +429,12 @@ impl Driver {
             shape.rows + 1,
         );
         pool.open_region("host", Tier::Host, 3, (64, 64), 0, 0, 0);
+        name_memories(&mut pool, &shape, 2);
         let group = |memory: u8, slots: u8, units: u8| {
-            let parts = shape.parts[usize::from(memory)];
+            let parts: Memories = shape.parts[usize::from(memory)]
+                .iter()
+                .map(|part| Memories::one(*part))
+                .collect();
             Group {
                 parts: vec![parts, parts],
                 ..Group::new(memory, slots, vec![vec![units], Vec::new()])
@@ -441,9 +469,9 @@ impl Driver {
                     keys: vec![key()],
                 },
             );
-            driver.act(&victims);
+            driver.act(&victims)?;
         }
-        driver
+        Ok(driver)
     }
 
     /// Whether the target's session is open.
@@ -464,14 +492,14 @@ impl Driver {
     /// A second driver in the same state: the enumeration branches from a
     /// state without replaying the steps that led to it, by making the
     /// pool again from its image.
-    fn duplicate(&self) -> Self {
-        let image = rmp_serde::to_vec(&self.pool).unwrap();
-        Self {
+    fn duplicate(&self) -> Result<Self, String> {
+        let image = rmp_serde::to_vec(&self.pool).map_err(|error| error.to_string())?;
+        Ok(Self {
             shape: self.shape,
-            pool: rmp_serde::from_slice(&image).unwrap(),
+            pool: rmp_serde::from_slice(&image).map_err(|error| error.to_string())?,
             number: self.number,
             copies: self.copies,
-        }
+        })
     }
 
     /// A request on the queue pair, under the next number, as the buffer
@@ -490,13 +518,14 @@ impl Driver {
 
     /// Acts on an input as the buffer pool's thread does, and counts the
     /// copies its completions ask for.
-    fn act(&mut self, input: &Input) {
-        apply(&mut self.pool, input).unwrap();
+    fn act(&mut self, input: &Input) -> Result<(), String> {
+        apply(&mut self.pool, input)?;
         for (_, _, completion) in self.pool.completions() {
             self.copies += copies_asked(&completion);
         }
         self.pool.started();
         self.pool.stopped();
+        Ok(())
     }
 
     /// The copies in flight by the request that started each: those an
@@ -631,7 +660,7 @@ impl Driver {
 
     /// Takes a step: the input it is in this state, acted on as the buffer
     /// pool's thread acts on it. Returns the input.
-    fn apply(&mut self, step: Step) -> Input {
+    fn apply(&mut self, step: Step) -> Result<Input, String> {
         // An owner's request goes on its session's queue pair, under its
         // number there.
         let named = match step {
@@ -768,9 +797,9 @@ impl Driver {
         self.acted(input)
     }
 
-    fn acted(&mut self, input: Input) -> Input {
-        self.act(&input);
-        input
+    fn acted(&mut self, input: Input) -> Result<Input, String> {
+        self.act(&input)?;
+        Ok(input)
     }
 
     /// The state in the terms of the design model, one line per fact.
@@ -805,111 +834,172 @@ impl Driver {
 /// A transition the model does not allow, made by hand: a commit takes
 /// effect while the stamp it waits for is not reached (R3). The step check
 /// of `verification/buffer-pool/agreement_steps.sh` is to report it.
-fn forged() -> String {
-    let mut driver = Driver::new(SHAPES[0]);
-    driver.apply(Step::Attach(1, 0));
-    driver.apply(Step::Allocate(1));
+fn forged() -> Result<String, String> {
+    let mut driver = Driver::new(SHAPES[0])?;
+    driver.apply(Step::Attach(1, 0))?;
+    driver.apply(Step::Allocate(1))?;
     let before = driver.state();
 
     // The commit waits for the stamp 1 of the group; it is made due with
     // `completed` at 1 and left with `completed` at 0.
-    let commit = driver.apply(Step::Commit(1, 1));
+    let commit = driver.apply(Step::Commit(1, 1))?;
     let group = (SESSION, GroupId(0));
-    driver.pool.groups.get_mut(&group).unwrap().completed = MAX_COMPLETED;
+    let completed = |driver: &mut Driver, value| match driver.pool.groups.get_mut(&group) {
+        Some(found) => {
+            found.completed = value;
+            Ok(())
+        }
+        None => Err("the forged transition's group is not open".to_owned()),
+    };
+    completed(&mut driver, MAX_COMPLETED)?;
     driver.pool.settle();
-    driver.pool.groups.get_mut(&group).unwrap().completed = 0;
+    completed(&mut driver, 0)?;
     driver.pool.settle_counts();
     driver.pool.completions();
-    format!(
+    Ok(format!(
         "{}state 0\n{before}\n\nstate 1\n{}\n\nstep 0 1 {}\n",
         layout(&driver.pool, &SessionNames::default()),
         driver.state(),
         stated_input(&driver.pool, &SessionNames::default(), &commit)
-    )
+    ))
 }
 
-/// L1: every sequence of steps keeps the invariants. With
-/// `UNISERVE_POOL_STATES` set to a directory, each shape's states and the
-/// transitions between them are written there for the comparison with the
-/// model's states (`<shape>.txt`), and with the input of each transition
-/// and the layout for the comparison with the model's steps
-/// (`<shape>.steps`, and the transition of [`forged`] as `forged.steps`).
-#[test]
-#[ignore = "enumerates every request sequence of seven small configurations; run by verification/buffer-pool/agreement.sh"]
-fn every_request_sequence_keeps_the_invariants() {
-    let directory = std::env::var("UNISERVE_POOL_STATES").ok();
-    for shape in SHAPES {
-        let start = Driver::new(shape);
-        let layout = layout(&start.pool, &SessionNames::default());
-        let mut index = BTreeMap::from([(start.identity(), 0usize)]);
-        let mut frontier = VecDeque::from([(0usize, start)]);
-        let mut transitions = BTreeSet::new();
-        let mut steps = BTreeSet::new();
+/// What the enumeration of one configuration reached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reached {
+    /// The configuration, by the name of its `MC_Pool` configuration (`core` is `MC_PoolCore`).
+    pub shape: &'static str,
+    /// The distinct states reached.
+    pub states: usize,
+    /// The distinct transitions between two states.
+    pub transitions: usize,
+}
 
-        while let Some((source, from)) = frontier.pop_front() {
-            for step in from.steps() {
-                let mut driver = from.duplicate();
-                let input = driver.apply(step);
-                if let Err(inconsistency) = driver.pool.check() {
-                    panic!(
-                        "{}: {inconsistency} after {step:?} from\n{}",
-                        shape.name,
-                        from.state()
-                    );
-                }
+/// The names of the configurations, in the order [`enumerate`] takes them.
+pub fn shapes() -> impl Iterator<Item = &'static str> {
+    SHAPES.iter().map(|shape| shape.name)
+}
 
-                let known = index.len();
-                let target = *index.entry(driver.identity()).or_insert(known);
-                if target == known {
-                    frontier.push_back((target, driver));
-                }
-                if target != source {
-                    transitions.insert((source, target));
-                    steps.insert((
-                        source,
-                        target,
-                        stated_input(&from.pool, &SessionNames::default(), &input),
-                    ));
-                }
-            }
-        }
-
-        if let Some(directory) = &directory {
-            let mut states: Vec<(&String, &usize)> = index.iter().collect();
-            states.sort_unstable_by_key(|(_, number)| **number);
-            let (mut text, mut with_inputs) = (String::new(), layout.clone());
-            for (state, number) in states {
-                let stated: Vec<&str> = state
-                    .lines()
-                    .filter(|line| !line.starts_with('#'))
-                    .collect();
-                let _ = writeln!(text, "state {number}\n{}\n", stated.join("\n"));
-                let lines: Vec<&str> = state.lines().filter(|line| !line.is_empty()).collect();
-                let _ = writeln!(with_inputs, "state {number}\n{}\n", lines.join("\n"));
-            }
-            for (source, target) in &transitions {
-                let _ = writeln!(text, "step {source} {target}");
-            }
-            for (source, target, input) in &steps {
-                let _ = writeln!(with_inputs, "step {source} {target} {input}");
-            }
-            std::fs::write(format!("{directory}/{}.txt", shape.name), text).unwrap();
-            std::fs::write(format!("{directory}/{}.steps", shape.name), with_inputs).unwrap();
-        }
-        println!(
-            "{}: {} states, {} transitions",
-            shape.name,
-            index.len(),
-            transitions.len()
-        );
-        assert!(
-            index.len() > 100,
-            "{}: only {} states were reached",
-            shape.name,
-            index.len()
-        );
+/// L1 (`specs/buffer-pool.md` §19): every request sequence of the configurations `names` (every
+/// configuration when empty) keeps the pool's invariants, and reaches the model's bounds: a
+/// configuration whose sequences make copies reaches a state that made as many as its bound
+/// (`MaxCopies`). With `states` a directory, each configuration's states and the transitions
+/// between them are written there for the comparison with the model's states (`<shape>.txt`),
+/// and with the input of each transition and the layout for the comparison with the model's
+/// steps (`<shape>.steps`, and a transition the model does not allow as `forged.steps`).
+///
+/// # Errors
+///
+/// The first inconsistency, with the step and the state it arose from; a configuration that
+/// does not reach its bound; a name of no configuration; or a file that cannot be written.
+pub fn enumerate(names: &[String], states: Option<&Path>) -> Result<Vec<Reached>, String> {
+    if let Some(unknown) = names
+        .iter()
+        .find(|name| !shapes().any(|shape| shape == *name))
+    {
+        return Err(format!("no configuration is named {unknown}"));
     }
-    if let Some(directory) = &directory {
-        std::fs::write(format!("{directory}/forged.steps"), forged()).unwrap();
+    let chosen = SHAPES
+        .iter()
+        .filter(|shape| names.is_empty() || names.iter().any(|name| name == shape.name));
+    let mut reached = Vec::new();
+    for shape in chosen {
+        reached.push(enumerate_shape(*shape, states)?);
+    }
+    if let Some(directory) = states {
+        let path = directory.join("forged.steps");
+        std::fs::write(&path, forged()?).map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    Ok(reached)
+}
+
+/// Every request sequence of one configuration ([`enumerate`]).
+fn enumerate_shape(shape: Shape, directory: Option<&Path>) -> Result<Reached, String> {
+    let start = Driver::new(shape)?;
+    let layout = layout(&start.pool, &SessionNames::default());
+    let mut index = BTreeMap::from([(start.identity(), 0usize)]);
+    let mut frontier = VecDeque::from([(0usize, start)]);
+    let mut transitions = BTreeSet::new();
+    let mut steps = BTreeSet::new();
+    let mut most_copies = 0;
+
+    while let Some((source, from)) = frontier.pop_front() {
+        for step in from.steps() {
+            let mut driver = from.duplicate()?;
+            let input = driver.apply(step)?;
+            if let Err(inconsistency) = driver.pool.check() {
+                return Err(format!(
+                    "{}: {inconsistency} after {step:?} from\n{}",
+                    shape.name,
+                    from.state()
+                ));
+            }
+            most_copies = most_copies.max(driver.copies);
+
+            let known = index.len();
+            let target = *index.entry(driver.identity()).or_insert(known);
+            if target == known {
+                frontier.push_back((target, driver));
+            }
+            if target != source {
+                transitions.insert((source, target));
+                steps.insert((
+                    source,
+                    target,
+                    stated_input(&from.pool, &SessionNames::default(), &input),
+                ));
+            }
+        }
+    }
+    if most_copies < shape.copies {
+        return Err(format!(
+            "{}: the sequences made at most {most_copies} copies, short of the bound {}",
+            shape.name, shape.copies
+        ));
+    }
+
+    if let Some(directory) = directory {
+        let mut states: Vec<(&String, &usize)> = index.iter().collect();
+        states.sort_unstable_by_key(|(_, number)| **number);
+        let (mut text, mut with_inputs) = (String::new(), layout);
+        for (state, number) in states {
+            let stated: Vec<&str> = state
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .collect();
+            let _ = writeln!(text, "state {number}\n{}\n", stated.join("\n"));
+            let lines: Vec<&str> = state.lines().filter(|line| !line.is_empty()).collect();
+            let _ = writeln!(with_inputs, "state {number}\n{}\n", lines.join("\n"));
+        }
+        for (source, target) in &transitions {
+            let _ = writeln!(text, "step {source} {target}");
+        }
+        for (source, target, input) in &steps {
+            let _ = writeln!(with_inputs, "step {source} {target} {input}");
+        }
+        for (extension, contents) in [("txt", text), ("steps", with_inputs)] {
+            let path = directory.join(format!("{}.{extension}", shape.name));
+            std::fs::write(&path, contents)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+    }
+    Ok(Reached {
+        shape: shape.name,
+        states: index.len(),
+        transitions: transitions.len(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enumerate;
+
+    /// L1 on the smallest configuration, on every build of the tests: every request sequence of
+    /// `core` keeps the invariants. `buffer-pool-verify enumerate` takes every configuration.
+    #[test]
+    fn every_request_sequence_of_the_core_configuration_keeps_the_invariants() {
+        let reached = enumerate(&["core".to_owned()], None).unwrap();
+        assert_eq!(reached.len(), 1);
+        assert!(reached[0].transitions > 0, "{reached:?}");
     }
 }

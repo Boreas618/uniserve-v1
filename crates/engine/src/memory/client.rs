@@ -489,10 +489,10 @@ impl StorageClient {
     fn of_deployment(&self, gpu: [u8; 16], quotas: Vec<Quota>) -> Quota {
         quotas
             .into_iter()
-            .find(|quota| quota.deployment == self.deployment)
+            .find(|quota| quota.deployment.as_ref() == Some(&self.deployment))
             .unwrap_or(Quota {
                 gpu,
-                deployment: self.deployment.clone(),
+                deployment: Some(self.deployment.clone()),
                 total: 0,
                 limit: None,
                 reservations: Vec::new(),

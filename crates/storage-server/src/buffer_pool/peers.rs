@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use storage::protocol::Key;
 
-use super::{BufferPool, Encoding, Entry};
+use super::{BufferPool, Encoding, Entry, Memories};
 
 impl BufferPool {
     /// Holds for `peer` the host copies of `keys` that every epoch may use:
@@ -46,12 +46,13 @@ impl BufferPool {
         held
     }
 
-    /// The host parts, as bits of a block's validity, that hold the host
-    /// copy of `key`: none for a key without one, and for a copy of groups
-    /// that state no host parts.
-    pub fn held_on(&self, key: &Key) -> u64 {
+    /// The host parts that hold the host copy of `key`, by host and part index: none for a key
+    /// without one, and for a copy of groups that state no host parts.
+    pub fn held_on(&self, key: &Key) -> Vec<(&str, u32)> {
         let host = self.cache.get(key).and_then(|entry| entry.host.as_ref());
-        host.map_or(0, |(block, ..)| block.valid.get())
+        let valid = host.and_then(|(block, ..)| block.valid.get().memories());
+        let parts = valid.unwrap_or(Memories::NONE).iter();
+        parts.filter_map(|part| self.host_part(part)).collect()
     }
 
     /// Ends every hold of `peer`; a block whose last holder this was is

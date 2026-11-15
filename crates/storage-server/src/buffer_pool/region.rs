@@ -420,7 +420,9 @@ impl Region {
     }
 }
 
-#[cfg(test)]
+// The enumeration's identity of a state tells apart states that differ in the order of the rows
+// given back, which the next row taken follows.
+#[cfg(any(test, feature = "verification"))]
 impl Region {
     /// The rows given back and not taken again, the last one last.
     pub(super) fn returned(&self) -> &[u32] {
