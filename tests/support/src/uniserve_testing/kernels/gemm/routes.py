@@ -1,19 +1,46 @@
 """A valid expert sort, built on the host, as the grouped GEMM checks state it.
 
 The grouped products (`gather_gemm`, `route_gemm`) read the tables `moe_sort`
-writes: routes grouped by expert, each expert's rows cut into tiles of
-`TILE_ROWS`, `tile_to_expert` and `tile_to_limit` describing the tiles,
-`permuted_to_expanded` the map from a permuted row to its route
-`token · top + slot`, padded to whole tiles, and the count of live tiles.
-Building the sort here, rather than assuming one, is what lets a case hold an
-expert with no routes and a last tile that is only partly filled: the two
-places a product that ignores `tile_to_limit` writes outside its tile.
+writes (``crates/ops/src/moe/sort.rs``): routes grouped by expert, each
+expert's rows cut into tiles of `TILE_ROWS`; `tile_to_expert` and
+`tile_to_limit` describing the tiles, the limit being the permuted row one
+past a tile's last live row; `permuted_to_expanded`, the route
+`token · top + slot` of each permuted row, padded to whole tiles with `-1`;
+`expanded_to_permuted`, each route's permuted row, `-1` for a route no expert
+holds; and the count of live tiles. The combine (`moe_unpermute`) finds a
+route's product at its `expanded_to_permuted` row, so that map is how a check
+reads a product's rows as the engine does.
+
+Building the sort here, rather than assuming one, is what lets a case hold the
+two shapes a product must read from the tables instead of assuming: an expert
+with no routes, after which a tile's index is no longer its expert's, and
+tiles whose live rows end before their last row.
 """
+
+from typing import NamedTuple
 
 import torch
 
 #: The descriptors' M tile: the rows of one tile of a sorted expert.
 TILE_ROWS = 128
+
+
+class Sort(NamedTuple):
+    """The tables `moe_sort` writes for one batch's routes, as host lists."""
+
+    #: `[tiles]`: the expert each tile's rows belong to.
+    tile_to_expert: list[int]
+    #: `[tiles]`: the permuted row one past each tile's last live row,
+    #: counted from the first permuted row of the whole sort.
+    tile_to_limit: list[int]
+    #: `[tokens · top]`: each route's permuted row, `-1` for a route no
+    #: expert holds.
+    expanded_to_permuted: list[int]
+    #: `[tiles · TILE_ROWS]`: each permuted row's route, `-1` on a tile's
+    #: padding.
+    permuted_to_expanded: list[int]
+    #: The tiles that hold live rows.
+    live_tiles: int
 
 
 def routed(tokens, experts, top, emptied):
@@ -42,23 +69,39 @@ def tiles_of(routes, experts):
     return per_expert
 
 
-def sort_metadata(per_expert, top):
-    """`tile_to_expert`, `tile_to_limit`, `permuted_to_expanded` and the live
-    tile count, as `moe_sort` writes them.
+def sort_metadata(per_expert, tokens, top):
+    """The :class:`Sort` of `tokens` tokens' `top` routes grouped as
+    `per_expert` (:func:`tiles_of`), as `moe_sort` writes it: the experts'
+    tiles follow each other in expert order, an expert without routes owns
+    none.
     """  # noqa: D205
     tile_to_expert, tile_to_limit, permuted_to_expanded = [], [], []
+    expanded_to_permuted = [-1] * (tokens * top)
     for expert, members in enumerate(per_expert):
         for start in range(0, len(members), TILE_ROWS):
             chunk = members[start : start + TILE_ROWS]
+            first = len(permuted_to_expanded)
             tile_to_expert.append(expert)
-            tile_to_limit.append(len(chunk))
-            permuted_to_expanded.extend(
-                token * top + slot for token, slot in chunk
-            )
-            # The sort pads every tile to whole rows; the map names each.
-            permuted_to_expanded.extend([0] * (TILE_ROWS - len(chunk)))
+            # A row index, not a count: the products compare a permuted row
+            # with it.
+            tile_to_limit.append(first + len(chunk))
+            for place, (token, slot) in enumerate(chunk):
+                expanded_to_permuted[token * top + slot] = first + place
+                permuted_to_expanded.append(token * top + slot)
+            # The sort pads every tile to whole rows and names no route there.
+            permuted_to_expanded.extend([-1] * (TILE_ROWS - len(chunk)))
     if not tile_to_expert:
         tile_to_expert, tile_to_limit = [-1], [0]
-        permuted_to_expanded = [0] * TILE_ROWS
-    live = sum(1 for limit in tile_to_limit if limit > 0)
-    return tile_to_expert, tile_to_limit, permuted_to_expanded, live
+        permuted_to_expanded = [-1] * TILE_ROWS
+    live = sum(
+        1
+        for tile, limit in enumerate(tile_to_limit)
+        if limit > tile * TILE_ROWS
+    )
+    return Sort(
+        tile_to_expert,
+        tile_to_limit,
+        expanded_to_permuted,
+        permuted_to_expanded,
+        live,
+    )

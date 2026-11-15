@@ -1,4 +1,4 @@
-"""The `route_gemm` module's FC2 product, scattered to the routes it sorts.
+"""The `route_gemm` module's FC2 product, stored at the permuted rows it reads.
 
 The module (resolved at the session's Build Server for the session's device)
 is compiled for one descriptor, below, so every case runs its shapes. It is
@@ -6,19 +6,28 @@ called with the operator's `RouteCall` (``crates/ops/src/moe/grouped.rs``),
 which states the multiprocessors of the session's device as the operator
 does, over a valid sort built on the host
 (:mod:`uniserve_testing.kernels.gemm.routes`) that holds an expert with no
-routes and a partly filled last tile.
+routes and partly filled tiles.
 
-The operator's product is a scatter as well as a multiply::
+The contract (``RouteGemmArgs::out``, ``nn::functional::route_gemm``): `out`
+is `[permuted rows, hidden]`, row `p` of it the product of the sort's
+permuted row `p`, unweighted, so the combine (`moe_unpermute`, which reads
+the permuted layout) finds route `r = t · top + k` of expert `e` at
+`p = expanded_to_permuted[r]`::
 
-    out[t · top + k] = W[ids[t, k]] · rows[p]
-        for the permuted row p whose map entry names route t · top + k
+    out[p] = W[e] · rows[p]
 
-so every live route's row must be written exactly once (the sort built here
-names each once, and a route whose permuted row was lost would leave its row
-at the NaN the output starts as), the dead route's row is written by no tile,
-and the module writes nothing into its inputs. Rows are compared with
+Those rows are the defined ones: a tile's rows past its `tile_to_limit` are
+the sort's padding and a route no expert holds has no row, so no reader
+reads either and the check does not. The reference is that formula over the
+routes themselves, in FP32, independent of the tile tables, and the module
+writes nothing into its inputs.
+
+The comparison is the operator's bound (``RouteGemm::tolerance``):
 `Tolerance::dot(intermediate, f32, bf16)`, the reduction being the FC2
-contraction; there is no activation, so no envelope term.
+contraction, whose relative term is held against the output's largest
+magnitude because a dot product's element can cancel below its own terms,
+with the absolute term `2 γ (8² · 2)` of the activation envelope
+(``tolerance::VALUE_ENVELOPE``) that its input, a gated product, is held to.
 """
 
 import ctypes
@@ -84,15 +93,42 @@ def gamma(reduction, unit):
 
 
 def bound(intermediate):
-    """`Tolerance::dot(intermediate, f32, bf16)`: FC2 applies no activation."""
-    return (
-        2.0 * gamma(intermediate, 2.0**-24) * math.sqrt(intermediate) + 2.0**-8
+    """`RouteGemm`'s tolerance: `dot(intermediate, f32, bf16)` with the
+    activation's envelope; answers the relative term, which multiplies the
+    output's largest magnitude, and the absolute term.
+    """  # noqa: D205
+    accumulate = 2.0**-24
+    bf16_roundoff = 2.0**-8
+    relative = (
+        2.0 * gamma(intermediate, accumulate) * math.sqrt(intermediate)
+        + bf16_roundoff
     )
+    absolute = 2.0 * gamma(intermediate, accumulate) * (8.0 * 8.0 * 2.0)
+    return relative, absolute
+
+
+def reference(rows, weights, routed, expanded_to_permuted):
+    """Every route's product in FP32, `[tokens · top, hidden]` in route order
+    (`t · top + k`), from the routes alone: route `r` of expert `e` multiplies
+    `W[e]` by the row the sort placed it at, `rows[expanded_to_permuted[r]]`;
+    zero for a route no expert holds.
+    """  # noqa: D205
+    experts = routed.reshape(-1).to(rows.device)
+    expected = torch.zeros(
+        experts.numel(), HIDDEN, dtype=torch.float32, device=rows.device
+    )
+    for expert in range(EXPERTS):
+        route = (experts == expert).nonzero().squeeze(1)
+        if route.numel() == 0:
+            continue
+        x = rows[expanded_to_permuted[route]].float()
+        expected[route] = x @ weights[expert].float().t()
+    return expected
 
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("captured", capture.MODES)
-def test_every_route_receives_its_product_once_within_the_operators_bound(
+def test_each_route_s_row_holds_its_product_within_the_operators_bound(
     torch_device, kernel_module, captured
 ):
     library = ctypes.CDLL(
@@ -108,10 +144,15 @@ def test_every_route_receives_its_product_once_within_the_operators_bound(
     assert any(not members for members in per_expert), (
         "the case was built with an empty expert in mind and has none"
     )
-    tile_expert, tile_limit, map_rows, live_tiles = routes.sort_metadata(
-        per_expert, TOP
+    sort = routes.sort_metadata(per_expert, TOKENS, TOP)
+    assert any(
+        0 < limit - tile * routes.TILE_ROWS < routes.TILE_ROWS
+        for tile, limit in enumerate(sort.tile_to_limit)
+    ), (
+        "no tile is partly filled, so the case does not exercise a tile's "
+        "`tile_to_limit`"
     )
-    permuted_rows = len(map_rows)
+    permuted_rows = len(sort.permuted_to_expanded)
     rows = (
         torch.randn(
             permuted_rows,
@@ -131,9 +172,9 @@ def test_every_route_receives_its_product_once_within_the_operators_bound(
         )
         * 0.05
     ).to(torch.bfloat16)
-    expanded = TOKENS * TOP
+    # The operator's output is the permuted height: one row per row of `rows`.
     out = torch.full(
-        (expanded, HIDDEN),
+        (permuted_rows, HIDDEN),
         float("nan"),
         dtype=torch.bfloat16,
         device=torch_device,
@@ -144,10 +185,10 @@ def test_every_route_receives_its_product_once_within_the_operators_bound(
         return torch.tensor(values, dtype=torch.int32, device=torch_device)
 
     # The tables stay alive in these names until after the call.
-    tile_to_expert = table(tile_expert)
-    tile_to_limit = table(tile_limit)
-    permuted_to_expanded = table(map_rows)
-    live_table = table([live_tiles])
+    tile_to_expert = table(sort.tile_to_expert)
+    tile_to_limit = table(sort.tile_to_limit)
+    permuted_to_expanded = table(sort.permuted_to_expanded)
+    live_table = table([sort.live_tiles])
     call = Call(
         rows=rows.data_ptr(),
         weights=weights.data_ptr(),
@@ -169,59 +210,32 @@ def test_every_route_receives_its_product_once_within_the_operators_bound(
     capture.call(entry, call, torch_device, captured)
     assert torch.equal(rows, rows_before) and torch.equal(
         weights, weights_before
-    ), "the module wrote into its inputs; FC2 scatters only into `out`"
+    ), "the module wrote into its inputs; FC2 stores only into `out`"
 
-    # The reference, tile by tile: each live tile's rows multiplied by its
-    # expert's `[hidden, intermediate]` block, scattered to the routes its map
-    # entries name.
-    expected = torch.full(
-        (expanded, HIDDEN),
-        float("nan"),
-        dtype=torch.float32,
-        device=torch_device,
-    )
-    covered = torch.zeros(expanded, dtype=torch.bool, device=torch_device)
-    for tile, (expert, limit) in enumerate(zip(tile_expert, tile_limit)):
-        if limit == 0:
-            continue
-        first = tile * routes.TILE_ROWS
-        entries = torch.tensor(
-            map_rows[first : first + limit], dtype=torch.int64
-        ).to(torch_device)
-        assert not bool(covered[entries].any()), (
-            f"tile {tile} names a route another tile already names, so the "
-            "metadata built here is not a sort"
-        )
-        expected[entries] = (
-            rows[first : first + limit].float() @ weights[expert].t().float()
-        )
-        covered[entries] = True
-    live_routes = (routed.reshape(-1) >= 0).to(torch_device)
-    assert torch.equal(covered, live_routes), (
-        f"{int((covered != live_routes).sum())} routes are named by the "
-        "permuted rows other than once each live route, so the metadata built "
-        "here is not a sort"
-    )
+    # The defined rows, read as the combine reads them: each held route's
+    # product at its permuted row. Every other row of `out` is padding or no
+    # route's, and no reader reads it.
+    held = (routed.reshape(-1) >= 0).to(torch_device)
+    assert bool(held.any()), "the routes name no expert: the case is empty"
+    expanded_to_permuted = table(sort.expanded_to_permuted).long()
+    got = out[expanded_to_permuted[held]].float()
+    want = reference(rows, weights, routed, expanded_to_permuted)[held]
 
-    unwritten = out[~live_routes]
-    written = int((~torch.isnan(unwritten)).sum())
-    assert written == 0, (
-        f"the dead route's row was written: {written} of "
-        f"{unwritten.numel()} values"
-    )
-    got = out[live_routes].float()
-    want = expected[live_routes]
-    relative = bound(INTERMEDIATE)
+    relative, absolute = bound(INTERMEDIATE)
+    peak = float(want.abs().max())
+    allowed = absolute + relative * peak
     error = (got - want).abs()
-    # `~(error <= allowed)`: a NaN difference (a route no tile wrote) is not
-    # `> allowed` either.
-    outside = ~(error <= relative * want.abs())
+    # `~(error <= allowed)`: `out` starts as NaN so that a route's row the
+    # module left unwritten shows, and `NaN > allowed` is false.
+    outside = ~(error <= allowed)
     position = int(outside.reshape(-1).nonzero()[0]) if outside.any() else 0
     assert not bool(outside.any()), (
-        f"{int(outside.sum())} of {error.numel()} products over "
-        f"{permuted_rows} permuted rows in {live_tiles} tiles are outside rtol "
-        f"{relative:.3e}; max |out - reference| = "
-        f"{float(torch.nan_to_num(error).max()):.6g}; first at {position}: "
-        f"{float(got.reshape(-1)[position])} vs "
+        f"{int(outside.sum())} of {error.numel()} products of "
+        f"{int(held.sum())} routes over {permuted_rows} permuted rows in "
+        f"{sort.live_tiles} tiles are outside atol {absolute:.3e} + rtol "
+        f"{relative:.3e} of the largest |reference| {peak:.6g}; max "
+        f"|out - reference| = "
+        f"{float(torch.nan_to_num(error, nan=math.inf).max()):.6g}; first at "
+        f"{position}: {float(got.reshape(-1)[position])} vs "
         f"{float(want.reshape(-1)[position])}"
     )

@@ -7,18 +7,24 @@ operator's `moe::grouped::GatherCall` (``crates/ops/src/moe/grouped.rs``, the
 generated header's ``uniserve_gather_call``), which states the multiprocessors
 of the session's device as the operator does, over a valid sort built on the
 host (:mod:`uniserve_testing.kernels.gemm.routes`) that holds an expert with
-no routes and a partly filled last tile.
+no routes and partly filled tiles.
 
-The reference is the operator's text: for a live tile's row `p` with map entry
-`r`, `out[p] = act(gate) · up` where `up = W[e, :I] · x` and
+The contract (``GatherGemmArgs::out``, ``nn::functional::gather_gemm``): `out`
+is `[permuted rows, I]` in the sort's permuted order, and the row of route
+`r = t · top + k` of expert `e`, the permuted row `expanded_to_permuted[r]`
+where the combine reads it, is `act(gate) · up` with `up = W[e, :I] · x` and
 `gate = W[e, I:] · x` (each expert's rows hold its up block then its gate
-block) and `x` is row `r / top` of the hidden states. The comparison is the
-operator's bound, `Tolerance::dot(hidden, f32, bf16)` carried through the
-activation, whose absolute term is `2 γ (8² · 2)` (`ACTIVATION_ENVELOPE`).
+block), `x` row `t` of the hidden states. Those rows are the defined ones: a
+tile's rows past its `tile_to_limit` are the sort's padding, which the
+operator leaves unspecified (its package stores whole tiles), and a route no
+expert holds has no row, so the check reads neither. The reference is that
+formula over the routes themselves, in FP32, independent of the tile tables.
 
-Rows the metadata does not name are the padding the sort added so the tiles
-are whole, and the operator writes only the rows its map holds: they must keep
-the NaN the output starts as.
+The comparison is the operator's bound (``GatherGemm::tolerance``):
+`Tolerance::dot(hidden, f32, bf16)`, whose relative term is held against the
+output's largest magnitude because a dot product's element can cancel below
+its own terms, with the activation envelope's absolute term `2 γ (8² · 2)`
+(``tolerance::VALUE_ENVELOPE``).
 """
 
 import ctypes
@@ -87,7 +93,8 @@ def gamma(reduction, unit):
 
 def bound(hidden):
     """`GatherGemm`'s tolerance: `dot(hidden, f32, bf16)` with the
-    activation's envelope; answers the relative and the absolute term.
+    activation's envelope; answers the relative term, which multiplies the
+    output's largest magnitude, and the absolute term.
     """  # noqa: D205
     accumulate = 2.0**-24
     bf16_roundoff = 2.0**-8
@@ -98,23 +105,27 @@ def bound(hidden):
     return relative, absolute
 
 
-def reference(hidden, weights, tile_expert, tile_limit, map_rows):
-    """The gated product the metadata names, in FP32, tile by tile."""
+def reference(hidden, weights, routed):
+    """Every route's gated product in FP32, `[tokens · top, intermediate]` in
+    route order (`t · top + k`), from the routes alone: zero for a route no
+    expert holds.
+    """  # noqa: D205
+    experts = routed.reshape(-1).to(hidden.device)
     expected = torch.zeros(
-        len(map_rows), INTERMEDIATE, dtype=torch.float32, device=hidden.device
+        experts.numel(),
+        INTERMEDIATE,
+        dtype=torch.float32,
+        device=hidden.device,
     )
-    for tile, (expert, limit) in enumerate(zip(tile_expert, tile_limit)):
-        if limit == 0:
+    for expert in range(EXPERTS):
+        route = (experts == expert).nonzero().squeeze(1)
+        if route.numel() == 0:
             continue
-        first = tile * routes.TILE_ROWS
-        expanded = torch.tensor(
-            map_rows[first : first + limit], dtype=torch.int64
-        ).to(hidden.device)
-        x = hidden[torch.div(expanded, TOP, rounding_mode="floor")].float()
+        x = hidden[torch.div(route, TOP, rounding_mode="floor")].float()
         weight = weights[expert].float()
         up = x @ weight[:INTERMEDIATE].t()
         gate = x @ weight[INTERMEDIATE:].t()
-        expected[first : first + limit] = torch.nn.functional.silu(gate) * up
+        expected[route] = torch.nn.functional.silu(gate) * up
     return expected
 
 
@@ -131,9 +142,8 @@ def test_the_gated_product_writes_the_live_rows_within_the_operators_bound(
     entry.restype = ctypes.c_int32
 
     torch.manual_seed(0)
-    per_expert = routes.tiles_of(
-        routes.routed(TOKENS, EXPERTS, TOP, EMPTIED), EXPERTS
-    )
+    routed = routes.routed(TOKENS, EXPERTS, TOP, EMPTIED)
+    per_expert = routes.tiles_of(routed, EXPERTS)
     assert any(not members for members in per_expert), (
         "the case was built with an empty expert in mind and has none"
     )
@@ -151,10 +161,11 @@ def test_the_gated_product_writes_the_live_rows_within_the_operators_bound(
         )
         * 0.05
     ).to(torch.bfloat16)
-    tile_expert, tile_limit, map_rows, live_tiles = routes.sort_metadata(
-        per_expert, TOP
-    )
-    assert any(0 < limit < routes.TILE_ROWS for limit in tile_limit), (
+    sort = routes.sort_metadata(per_expert, TOKENS, TOP)
+    assert any(
+        0 < limit - tile * routes.TILE_ROWS < routes.TILE_ROWS
+        for tile, limit in enumerate(sort.tile_to_limit)
+    ), (
         "no tile is partly filled, so the case does not exercise a tile's "
         "`tile_to_limit`"
     )
@@ -163,11 +174,11 @@ def test_the_gated_product_writes_the_live_rows_within_the_operators_bound(
         return torch.tensor(values, dtype=torch.int32, device=torch_device)
 
     # The tables stay alive in these names until after the call.
-    tile_to_expert = table(tile_expert)
-    tile_to_limit = table(tile_limit)
-    permuted_to_expanded = table(map_rows)
-    live_table = table([live_tiles])
-    permuted_rows = len(map_rows)
+    tile_to_expert = table(sort.tile_to_expert)
+    tile_to_limit = table(sort.tile_to_limit)
+    permuted_to_expanded = table(sort.permuted_to_expanded)
+    live_table = table([sort.live_tiles])
+    permuted_rows = len(sort.permuted_to_expanded)
     out = torch.full(
         (permuted_rows, INTERMEDIATE),
         float("nan"),
@@ -196,34 +207,29 @@ def test_the_gated_product_writes_the_live_rows_within_the_operators_bound(
     )
     capture.call(entry, call, torch_device, captured)
 
-    # The rows the metadata names are a tile's first `limit` rows; the rest of
-    # each tile is the sort's padding, which every tile carries at its own end.
-    live = torch.zeros(permuted_rows, dtype=torch.bool, device=torch_device)
-    for tile, limit in enumerate(tile_limit):
-        start = tile * routes.TILE_ROWS
-        live[start : start + limit] = True
-    assert bool(live.any()), "the metadata names no rows: the case is empty"
-    padding = out[~live]
-    written = int((~torch.isnan(padding)).sum())
-    assert written == 0, (
-        f"a padding row was written: {written} of {padding.numel()} values "
-        "inside the tiles past their `tile_to_limit`"
-    )
+    # The defined rows, read as the combine reads them: each held route's
+    # product at its permuted row. Every other row of `out` is a tile's
+    # padding, which the operator leaves unspecified, or no route's.
+    held = (routed.reshape(-1) >= 0).to(torch_device)
+    assert bool(held.any()), "the routes name no expert: the case is empty"
+    route_rows = table(sort.expanded_to_permuted).long()[held]
+    got = out[route_rows].float()
+    want = reference(hidden, weights, routed)[held]
 
-    expected = reference(hidden, weights, tile_expert, tile_limit, map_rows)
-    got = out[live].float()
-    want = expected[live]
     relative, absolute = bound(HIDDEN)
+    peak = float(want.abs().max())
+    allowed = absolute + relative * peak
     error = (got - want).abs()
-    # `~(error <= allowed)`: `out` starts as NaN so that an unwritten row
-    # shows, and `NaN > allowed` is false.
-    outside = ~(error <= absolute + relative * want.abs())
+    # `~(error <= allowed)`: `out` starts as NaN so that a route's row the
+    # module left unwritten shows, and `NaN > allowed` is false.
+    outside = ~(error <= allowed)
     position = int(outside.reshape(-1).nonzero()[0]) if outside.any() else 0
     assert not bool(outside.any()), (
         f"{int(outside.sum())} of {error.numel()} gated products of "
-        f"{int(live.sum())} live rows in {live_tiles} tiles are outside rtol "
-        f"{relative:.3e} atol {absolute:.3e}; max |out - reference| = "
-        f"{float(torch.nan_to_num(error).max()):.6g}; first at {position}: "
-        f"{float(got.reshape(-1)[position])} vs "
+        f"{int(held.sum())} routes in {sort.live_tiles} tiles are outside "
+        f"atol {absolute:.3e} + rtol {relative:.3e} of the largest "
+        f"|reference| {peak:.6g}; max |out - reference| = "
+        f"{float(torch.nan_to_num(error, nan=math.inf).max()):.6g}; first at "
+        f"{position}: {float(got.reshape(-1)[position])} vs "
         f"{float(want.reshape(-1)[position])}"
     )
