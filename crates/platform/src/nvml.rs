@@ -2,68 +2,36 @@
 //! and which processes a device lists.
 //!
 //! NVML is a management library and creates no CUDA context, so a process
-//! that holds no context, such as the Storage Server, queries it too.
+//! that holds no context, such as the Storage Server, queries it too. It ships
+//! with the driver and is opened by its soname; a session refuses an NVML whose
+//! CUDA driver version is older than the `cuda.h` the crate's bindings are
+//! generated from.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, OnceLock};
 
 use libloading::Library;
 
+use crate::sys::nvml as sys;
 use crate::{DeviceId, DeviceUuid, Error, Result};
 
 const LIBNVML: &str = "libnvidia-ml.so.1";
 
-type NvmlReturn = i32;
+/// What a refused NVML is told to install: NVML ships with the driver.
+const NVML_PACKAGE: &str = "the NVIDIA driver of CUDA 13.0 or later";
+
+type NvmlReturn = sys::nvmlReturn_t;
 type NvmlDevice = *mut c_void;
-
-/// `nvmlReturn_t.NVML_SUCCESS`, compared with the header by
-/// `tests::the_nvml_constants_are_the_headers`.
-const NVML_SUCCESS: NvmlReturn = 0;
-/// `nvmlReturn_t.NVML_ERROR_INSUFFICIENT_SIZE`, the status a process query
-/// answers when the caller's array is too short.
-const NVML_ERROR_INSUFFICIENT_SIZE: NvmlReturn = 7;
-/// `NVML_VALUE_NOT_AVAILABLE`: `usedGpuMemory` when the driver cannot attribute
-/// storage to the process.
-///
-/// The header spells it `#define NVML_VALUE_NOT_AVAILABLE (-1)`, a macro rather
-/// than an enumerator, and the field it fills is unsigned, so the crate keeps it
-/// as `u64::MAX` — the same bits. The header check does not table it: the reader
-/// takes a `#define`'s value only when it starts with a digit or a minus, and
-/// this one starts with a parenthesis.
-const NVML_VALUE_NOT_AVAILABLE: u64 = u64::MAX;
-
-/// `nvmlProcessInfo_t` (v2), returned by the `_v3` process queries; its layout
-/// is compared with `nvml.h` by
-/// `tests::the_nvml_structures_are_sized_by_the_headers`.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct ProcessInfo {
-    pid: u32,
-    used_gpu_storage: u64,
-    gpu_instance_id: u32,
-    compute_instance_id: u32,
-}
-
-/// `nvmlMemory_v2_t`, whose layout is compared with `nvml.h` by
-/// `tests::the_nvml_structures_are_sized_by_the_headers`.
-#[repr(C)]
-#[derive(Default)]
-struct RawMemory {
-    version: u32,
-    total: u64,
-    reserved: u64,
-    free: u64,
-    used: u64,
-}
+type ProcessInfo = sys::nvmlProcessInfo_t;
 
 /// `NVML_STRUCT_VERSION(Memory, 2)`: the struct size with the version in the
-/// top byte.
-///
-/// This is the encoding `nvml.h` defines as a macro over `sizeof`, not an
-/// enumerator and not a number a header can state, so the header check cannot
-/// compare it; it is checked by the shape of [`RawMemory`] instead, which is
-/// what the size is computed from.
-const NVML_MEMORY_V2: u32 = size_of::<RawMemory>() as u32 | (2 << 24);
+/// top byte, as `nvml.h` defines the macro over `sizeof(nvmlMemory_v2_t)` (a
+/// macro over `sizeof` has no value bindgen can generate).
+const NVML_MEMORY_V2: u32 = size_of::<sys::nvmlMemory_v2_t>() as u32 | (2 << 24);
+
+/// `usedGpuMemory` when the driver cannot attribute storage to the process:
+/// the header's `NVML_VALUE_NOT_AVAILABLE` (`-1`) as the unsigned field holds it.
+const NVML_VALUE_NOT_AVAILABLE: u64 = sys::NVML_VALUE_NOT_AVAILABLE as u64;
 
 /// The signature of NVML's `_v3` process queries.
 type ProcessQuery = unsafe extern "C" fn(NvmlDevice, *mut u32, *mut ProcessInfo) -> NvmlReturn;
@@ -72,10 +40,11 @@ struct Api {
     init: unsafe extern "C" fn() -> NvmlReturn,
     shutdown: unsafe extern "C" fn() -> NvmlReturn,
     error_string: unsafe extern "C" fn(NvmlReturn) -> *const c_char,
+    cuda_driver_version: unsafe extern "C" fn(*mut i32) -> NvmlReturn,
     device_by_uuid: unsafe extern "C" fn(*const c_char, *mut NvmlDevice) -> NvmlReturn,
     compute_processes: ProcessQuery,
     graphics_processes: ProcessQuery,
-    memory_info: unsafe extern "C" fn(NvmlDevice, *mut RawMemory) -> NvmlReturn,
+    memory_info: unsafe extern "C" fn(NvmlDevice, *mut sys::nvmlMemory_v2_t) -> NvmlReturn,
     // Declared last: the library outlives every copied function pointer.
     _library: Library,
 }
@@ -95,6 +64,7 @@ fn api() -> Result<&'static Api> {
                 init: symbol(&library, "nvmlInit_v2")?,
                 shutdown: symbol(&library, "nvmlShutdown")?,
                 error_string: symbol(&library, "nvmlErrorString")?,
+                cuda_driver_version: symbol(&library, "nvmlSystemGetCudaDriverVersion_v2")?,
                 device_by_uuid: symbol(&library, "nvmlDeviceGetHandleByUUID")?,
                 compute_processes: symbol(&library, "nvmlDeviceGetComputeRunningProcesses_v3")?,
                 graphics_processes: symbol(&library, "nvmlDeviceGetGraphicsRunningProcesses_v3")?,
@@ -122,7 +92,7 @@ unsafe fn symbol<T: Copy>(library: &Library, name: &'static str) -> Result<T> {
 
 impl Api {
     fn check(&self, status: NvmlReturn, call: &'static str) -> Result<()> {
-        if status == NVML_SUCCESS {
+        if status == sys::NVML_SUCCESS {
             return Ok(());
         }
         // SAFETY: NVML returns a static, NUL-terminated description for every
@@ -139,10 +109,28 @@ impl Api {
         };
         Err(Error::Nvml {
             call,
-            code: status,
+            // `nvmlReturn_t` is a C enum; the error carries the value NVML documents.
+            code: status as i32,
             message,
         })
     }
+}
+
+/// Refuses an NVML whose CUDA driver version is older than the `cuda.h` the
+/// crate's bindings are generated from. NVML ships with the driver, so the
+/// version it reports is the driver's (a CUDA version code, as
+/// `cuDriverGetVersion` states it).
+fn require_version(version: i32) -> Result<()> {
+    let required = crate::sys::cuda::CUDA_VERSION as i32;
+    if version >= required {
+        return Ok(());
+    }
+    Err(Error::Version {
+        library: LIBNVML,
+        found: crate::driver::cuda_release(version),
+        required: crate::driver::cuda_release(required),
+        package: NVML_PACKAGE,
+    })
 }
 
 /// Device storage reported by NVML, in bytes.
@@ -167,11 +155,28 @@ pub struct Nvml {
 }
 
 impl Nvml {
+    /// Starts a session.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Load`] without the driver's NVML, and [`Error::Version`] when
+    /// the CUDA driver version NVML reports is older than the `cuda.h` the
+    /// crate's bindings are generated from.
     pub fn init() -> Result<Self> {
         let api = api()?;
         // SAFETY: nvmlInit takes no arguments and is reference counted.
         api.check(unsafe { (api.init)() }, "nvmlInit_v2")?;
-        Ok(Self { api })
+        // The session exists from here on, so a refusal below shuts it down on the way out.
+        let session = Self { api };
+
+        let mut version = 0;
+        api.check(
+            // SAFETY: NVML writes one int to the local `version`.
+            unsafe { (api.cuda_driver_version)(&mut version) },
+            "nvmlSystemGetCudaDriverVersion_v2",
+        )?;
+        require_version(version)?;
+        Ok(session)
     }
 
     fn device(&self, device: DeviceId) -> Result<NvmlDevice> {
@@ -211,7 +216,7 @@ impl Nvml {
         let usage: Vec<u64> = processes
             .iter()
             .filter(|process| process.pid == pid)
-            .map(|process| process.used_gpu_storage)
+            .map(|process| process.usedGpuMemory)
             .collect();
         if usage.is_empty() || usage.contains(&NVML_VALUE_NOT_AVAILABLE) {
             return Err(Error::ProcessNotFound { pid, device });
@@ -259,7 +264,7 @@ impl Nvml {
             // SAFETY: the buffer holds `count` entries; NVML writes at most
             // that many and stores the number written (or needed) in count.
             let status = unsafe { query(handle, &mut count, processes.as_mut_ptr()) };
-            if status == NVML_ERROR_INSUFFICIENT_SIZE {
+            if status == sys::NVML_ERROR_INSUFFICIENT_SIZE {
                 processes.resize(count as usize + 4, ProcessInfo::default());
                 continue;
             }
@@ -272,9 +277,9 @@ impl Nvml {
     /// Total, reserved, free and used storage of `device`.
     pub fn memory_info(&self, device: DeviceId) -> Result<NvmlMemory> {
         let handle = self.device(device)?;
-        let mut storage = RawMemory {
+        let mut storage = sys::nvmlMemory_v2_t {
             version: NVML_MEMORY_V2,
-            ..RawMemory::default()
+            ..Default::default()
         };
         self.api.check(
             // SAFETY: NVML fills the local struct, whose version field names its
@@ -300,68 +305,29 @@ impl Drop for Nvml {
 
 #[cfg(test)]
 mod tests {
-    /// The two structures this crate mirrors are laid out as `nvml.h` lays
-    /// them out: a field in the wrong place would return a plausible but wrong
-    /// byte count rather than an error, which no test reading a number can tell
-    /// from a real one.
+    use super::*;
+
+    /// An NVML of a driver older than the bindings is refused by name with the
+    /// package to install; the bindings' release and later ones are accepted.
     #[test]
-    #[ignore = "requires nvml.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
-    fn the_nvml_structures_are_sized_by_the_headers() {
-        use crate::header::struct_size;
-        crate::header::require("nvml.h");
-        for (name, size) in [
-            ("nvmlMemory_v2_t", std::mem::size_of::<super::RawMemory>()),
-            (
-                "nvmlProcessInfo_t",
-                std::mem::size_of::<super::ProcessInfo>(),
+    fn an_nvml_older_than_the_bindings_is_refused() {
+        assert!(require_version(crate::sys::cuda::CUDA_VERSION as i32).is_ok());
+
+        let error = require_version(12090).expect_err("CUDA 12.9 predates the bindings");
+        let text = error.to_string();
+        assert!(
+            matches!(
+                error,
+                Error::Version {
+                    library: LIBNVML,
+                    ..
+                }
             ),
-        ] {
-            let header = struct_size("nvml.h", name).unwrap_or_else(|| {
-                panic!("nvml.h does not declare {name} in a form the scanner lays out")
-            });
-            assert_eq!(
-                header, size,
-                "{name}: nvml.h lays it out in {header} bytes, this crate in {size}"
-            );
-        }
-    }
-
-    /// Every entry point this crate binds is declared by `nvml.h`, with the
-    /// version suffix it binds: a wrong suffix is a load failure at start-up,
-    /// and this says which name is wrong before a machine does.
-    #[test]
-    #[ignore = "requires nvml.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
-    fn every_nvml_entry_point_is_declared_by_the_header() {
-        crate::header::require("nvml.h");
-        for name in [
-            "nvmlInit_v2",
-            "nvmlShutdown",
-            "nvmlErrorString",
-            "nvmlDeviceGetHandleByUUID",
-            "nvmlDeviceGetComputeRunningProcesses_v3",
-            "nvmlDeviceGetGraphicsRunningProcesses_v3",
-            "nvmlDeviceGetMemoryInfo_v2",
-        ] {
-            assert_eq!(
-                crate::header::declares("nvml.h", name),
-                Some(true),
-                "nvml.h does not declare {name}, which this crate binds"
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires nvml.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
-    fn the_nvml_constants_are_the_headers() {
-        crate::header::assert_constants(
-            "nvml.h",
-            &[
-                ("NVML_SUCCESS", super::NVML_SUCCESS as i64),
-                (
-                    "NVML_ERROR_INSUFFICIENT_SIZE",
-                    super::NVML_ERROR_INSUFFICIENT_SIZE as i64,
-                ),
-            ],
+            "{text}"
+        );
+        assert!(
+            text.contains("CUDA 12.9") && text.contains(NVML_PACKAGE),
+            "{text}"
         );
     }
 }

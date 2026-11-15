@@ -8,10 +8,10 @@
 //! (`1`, `true`, `yes` or `on`) and a timeline session changes it while the process serves
 //! ([`set_enabled`]).
 //!
-//! NVTX reaches a tool through the injection library named in `NVTX_INJECTION64_PATH` when the
-//! process makes its first NVTX call: the process names CUPTI there as it starts
-//! ([`super::counters::inject`]) unless a profiler (Nsight Systems) named its own, so a timeline
-//! session's CUPTI records the ranges.
+//! NVTX reaches a tool through its injection when the process makes its first NVTX call: the
+//! `uniserve-engine` executable registers the CUPTI the process loads as NVTX's static injection
+//! ([`platform::cupti::initialize_nvtx_injection`]), which a profiler that names its own injection
+//! library (Nsight Systems) overrides, so a timeline session's CUPTI records the ranges.
 
 use std::ffi::CStr;
 use std::sync::OnceLock;

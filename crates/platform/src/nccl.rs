@@ -4,14 +4,10 @@ mod ffi;
 
 use std::ffi::c_void;
 
-use ffi::{Handle, RawConfig, RawUniqueId, api};
+use ffi::{Handle, api};
 
+use crate::sys::nccl as sys;
 use crate::{DeviceId, DevicePtr, DeviceRange, Error, PrimaryContext, Result, Stream};
-
-/// `NCCL_SPLIT_NOCOLOR`: the colour a rank that does not join a split passes,
-/// `#define NCCL_SPLIT_NOCOLOR -1` in `nccl.h`, compared there by
-/// `tests::the_nccl_constants_are_the_headers`.
-const NCCL_SPLIT_NOCOLOR: i32 = -1;
 
 /// `graphUsageMode` 1: the communicator's collectives are captured into CUDA graphs, at most one
 /// such graph is in flight at a time, and its eager collectives are ordered behind that graph by
@@ -46,10 +42,18 @@ impl std::fmt::Debug for UniqueId {
 impl UniqueId {
     pub fn new() -> Result<Self> {
         let api = api()?;
-        let mut id = RawUniqueId { bytes: [0; 128] };
+        let mut id = sys::ncclUniqueId::default();
         // SAFETY: NCCL writes the 128-byte id.
         api.check(unsafe { (api.get_unique_id)(&mut id) }, "ncclGetUniqueId")?;
-        Ok(Self(id.bytes))
+        // `c_char` is signed on some targets; the token's bytes are the same either way.
+        Ok(Self(id.internal.map(|byte| byte.to_ne_bytes()[0])))
+    }
+
+    /// The token as NCCL's ABI passes it.
+    fn raw(&self) -> sys::ncclUniqueId {
+        sys::ncclUniqueId {
+            internal: self.0.map(|byte| std::ffi::c_char::from_ne_bytes([byte])),
+        }
     }
 }
 
@@ -57,11 +61,11 @@ impl UniqueId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum ReduceOp {
-    Sum = 0,
-    Prod = 1,
-    Max = 2,
-    Min = 3,
-    Avg = 4,
+    Sum = sys::ncclSum as i32,
+    Prod = sys::ncclProd as i32,
+    Max = sys::ncclMax as i32,
+    Min = sys::ncclMin as i32,
+    Avg = sys::ncclAvg as i32,
 }
 
 /// One rank's NCCL communicator.
@@ -118,8 +122,7 @@ impl Communicator {
     ///
     /// The communicator takes NCCL's default configuration, which `NCCL_*`
     /// environment variables tune, except its graph usage mode
-    /// ([`GRAPH_USAGE_ONE_GRAPH`]); a library older than 2.14, which has no
-    /// `ncclCommInitRankConfig`, gives it the default. Its collectives run as NCCL kernels on
+    /// ([`GRAPH_USAGE_ONE_GRAPH`]). Its collectives run as NCCL kernels on
     /// SMs: NCCL's copy-engine (zero-CTA) algorithms apply only to buffers
     /// registered as symmetric windows, and this type registers none.
     pub fn init(device: DeviceId, size: i32, rank: i32, id: &UniqueId) -> Result<Self> {
@@ -133,22 +136,12 @@ impl Communicator {
         let _guard = context.enter()?;
 
         let mut raw = std::ptr::null_mut();
-        let token = RawUniqueId { bytes: id.0 };
-        let (status, entry) = match &api.comm_init_rank_config {
-            Ok(init) => {
-                let mut config = RawConfig::initializer();
-                config.graph_usage_mode = GRAPH_USAGE_ONE_GRAPH;
-                // SAFETY: NCCL reads the config, which outlives the call, and writes one handle.
-                let status = unsafe { init(&mut raw, size, token, rank, &mut config) };
-                (status, "ncclCommInitRankConfig")
-            }
-            // SAFETY: NCCL writes one communicator handle.
-            Err(_) => (
-                unsafe { (api.comm_init_rank)(&mut raw, size, token, rank) },
-                "ncclCommInitRank",
-            ),
-        };
-        if let Err(error) = api.check(status, entry) {
+        let mut config = sys::ncclConfig_t::initializer();
+        config.graphUsageMode = GRAPH_USAGE_ONE_GRAPH;
+        // SAFETY: NCCL reads the config, which outlives the call, and writes one handle.
+        let status =
+            unsafe { (api.comm_init_rank_config)(&mut raw, size, id.raw(), rank, &mut config) };
+        if let Err(error) = api.check(status, "ncclCommInitRankConfig") {
             if !raw.is_null() {
                 // SAFETY: a partially initialized communicator is owned here.
                 let _ = unsafe { (api.comm_abort)(raw) };
@@ -282,48 +275,9 @@ impl Communicator {
         let _guard = self.context.enter()?;
 
         let api = api()?;
-        // `ncclAlltoAll` is a late addition to NCCL (2.28), and what it does is a group of paired
-        // sends and receives, so a library without the symbol moves the same bytes the same way.
-        let Ok(all_to_all) = api.all_to_all.clone() else {
-            let block = elements_bytes(count, dtype)?;
-            // SAFETY: group calls take no arguments and nest per thread.
-            api.check(unsafe { (api.group_start)() }, "ncclGroupStart")?;
-            let mut posted = Ok(());
-            for peer in 0..self.size {
-                let offset = block * peer as usize;
-                // SAFETY: as in `all_reduce`, block `peer` of both buffers holds `count` elements.
-                let sent = unsafe {
-                    (api.send)(
-                        pointer(send.ptr().offset(offset)?),
-                        count,
-                        dtype,
-                        peer,
-                        self.raw,
-                        stream.handle(),
-                    )
-                };
-                // SAFETY: as above.
-                let received = unsafe {
-                    (api.recv)(
-                        pointer(recv.ptr().offset(offset)?),
-                        count,
-                        dtype,
-                        peer,
-                        self.raw,
-                        stream.handle(),
-                    )
-                };
-                posted = posted
-                    .and(api.check(sent, "ncclSend"))
-                    .and(api.check(received, "ncclRecv"));
-            }
-            // SAFETY: balances the start above on the same thread.
-            let ended = api.check(unsafe { (api.group_end)() }, "ncclGroupEnd");
-            return posted.and(ended);
-        };
         // SAFETY: as in `all_reduce`, with `size * count` elements in both.
         let status = unsafe {
-            all_to_all(
+            (api.all_to_all)(
                 pointer(send.ptr()),
                 pointer(recv.ptr()),
                 count,
@@ -496,15 +450,15 @@ impl Communicator {
                     .ok_or_else(|| Error::invalid("a split needs the ranks of its subgroup"))?;
                 (smallest, position as i32)
             }
-            None => (NCCL_SPLIT_NOCOLOR, 0),
+            None => (sys::NCCL_SPLIT_NOCOLOR, 0),
         };
         let api = api()?;
-        let split = api.comm_split.clone()?;
         let _guard = self.context.enter()?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: the parent is live; NCCL writes the child handle (NULL when
         // this rank does not join) and reads no config because none is given.
-        let status = unsafe { split(self.raw, color, key, &mut raw, std::ptr::null_mut()) };
+        let status =
+            unsafe { (api.comm_split)(self.raw, color, key, &mut raw, std::ptr::null_mut()) };
         api.check(status, "ncclCommSplit")?;
         if raw.is_null() {
             return Ok(None);
@@ -539,15 +493,13 @@ impl Communicator {
 /// reads it, to check a range's room before NCCL addresses it. A code `nccl.h` does not define is
 /// refused rather than passed on.
 fn width(dtype: i32) -> Result<usize> {
-    match dtype {
-        // ncclInt8, ncclUint8, ncclFloat8e4m3, ncclFloat8e5m2
-        0 | 1 | 10 | 11 => Ok(1),
-        // ncclFloat16, ncclBfloat16
-        6 | 9 => Ok(2),
-        // ncclInt32, ncclUint32, ncclFloat32
-        2 | 3 | 7 => Ok(4),
-        // ncclInt64, ncclUint64, ncclFloat64
-        4 | 5 | 8 => Ok(8),
+    let code = sys::ncclDataType_t::try_from(dtype)
+        .map_err(|_| Error::invalid(format!("{dtype} is no ncclDataType_t code of nccl.h")))?;
+    match code {
+        sys::ncclInt8 | sys::ncclUint8 | sys::ncclFloat8e4m3 | sys::ncclFloat8e5m2 => Ok(1),
+        sys::ncclFloat16 | sys::ncclBfloat16 => Ok(2),
+        sys::ncclInt32 | sys::ncclUint32 | sys::ncclFloat32 => Ok(4),
+        sys::ncclInt64 | sys::ncclUint64 | sys::ncclFloat64 => Ok(8),
         _ => Err(Error::invalid(format!(
             "{dtype} is no ncclDataType_t code of nccl.h"
         ))),
@@ -605,7 +557,7 @@ pub fn group<R>(submit: impl FnOnce() -> Result<R>) -> Result<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::Communicator;
+    use super::{Communicator, sys};
 
     /// The main process moves a communicator to the thread that drives its
     /// device; it never shares one between threads at once.
@@ -615,131 +567,40 @@ mod tests {
         movable::<Communicator>();
     }
 
-    /// `ncclUniqueId` is a 128-byte opaque token in `nccl.h`, and this crate
-    /// passes it to NCCL by value and compares it between ranks, so its size is
-    /// part of the interface: a larger `UniqueId` would be a different
-    /// rendezvous value than the other ranks hold.
-    ///
-    /// `ncclConfig_t` is laid out by `ffi::RawConfig` and compared by
-    /// `the_nccl_config_is_laid_out_as_the_header`.
-    /// Every entry point this crate requires is declared by `nccl.h`.
-    ///
-    /// The four it binds only when the library has them — `ncclCommSplit`,
-    /// `ncclAlltoAll`, `ncclCommSuspend`, `ncclCommResume` — are not asserted:
-    /// they are newer than some `nccl.h` a host ships, which is why the crate
-    /// treats their absence as a supported library rather than a broken one.
-    #[test]
-    #[ignore = "requires nccl.h (UNISERVE_CUDA_HEADERS naming the NCCL include directory)"]
-    fn every_required_nccl_entry_point_is_declared_by_the_header() {
-        crate::header::require("nccl.h");
-        for name in [
-            "ncclGetErrorString",
-            "ncclGetUniqueId",
-            "ncclCommInitRank",
-            "ncclCommDestroy",
-            "ncclCommAbort",
-            "ncclAllReduce",
-            "ncclReduceScatter",
-            "ncclAllGather",
-            "ncclBroadcast",
-            "ncclSend",
-            "ncclRecv",
-            "ncclGroupStart",
-            "ncclGroupEnd",
-        ] {
-            assert_eq!(
-                crate::header::declares("nccl.h", name),
-                Some(true),
-                "nccl.h does not declare {name}, which this crate binds"
-            );
-        }
-    }
-
     /// A range's room is checked at the width `nccl.h` gives each type code,
     /// and a code it does not define is refused before NCCL sees it.
     #[test]
     fn a_type_code_has_the_width_nccl_gives_it() {
-        // ncclInt8, ncclFloat16, ncclBfloat16, ncclFloat32, ncclInt64, ncclFloat8e4m3.
-        for (code, width) in [(0, 1), (6, 2), (9, 2), (7, 4), (4, 8), (10, 1)] {
-            assert_eq!(super::width(code).unwrap(), width, "code {code}");
+        for (code, width) in [
+            (sys::ncclInt8, 1),
+            (sys::ncclFloat16, 2),
+            (sys::ncclBfloat16, 2),
+            (sys::ncclFloat32, 4),
+            (sys::ncclInt64, 8),
+            (sys::ncclFloat8e4m3, 1),
+        ] {
+            assert_eq!(super::width(code as i32).unwrap(), width, "code {code}");
         }
         assert!(super::width(-1).is_err());
-        assert!(super::width(12).is_err());
-        assert_eq!(super::ranks_bytes(3, 7, 4).unwrap(), 48);
-    }
-
-    /// The unique id is the 128 bytes NCCL's ABI fixes, whatever header is
-    /// at hand.
-    #[test]
-    fn the_unique_id_is_the_abis_128_bytes() {
-        assert_eq!(std::mem::size_of::<super::UniqueId>(), 128);
-    }
-
-    #[test]
-    #[ignore = "requires nccl.h (UNISERVE_CUDA_HEADERS naming the NCCL include directory)"]
-    fn the_nccl_structures_are_sized_by_the_headers() {
-        crate::header::require("nccl.h");
-        let ours = std::mem::size_of::<super::UniqueId>();
-        let header = crate::header::struct_size("nccl.h", "ncclUniqueId")
-            .expect("nccl.h declares ncclUniqueId in a form the scanner lays out");
+        assert!(super::width(sys::ncclNumTypes as i32).is_err());
         assert_eq!(
-            header, ours,
-            "nccl.h lays ncclUniqueId out in {header} bytes, this crate in {ours}"
+            super::ranks_bytes(3, sys::ncclFloat32 as i32, 4).unwrap(),
+            48
         );
     }
 
-    /// The one constant this crate takes from every `nccl.h` is compared with
-    /// it: a split is only correct if the "not in this group" colour is the
-    /// header's.
+    /// The rendezvous token every rank exchanges is the header's
+    /// `ncclUniqueId`, byte for byte: another size would be another token
+    /// than the other ranks hold.
     #[test]
-    #[ignore = "requires nccl.h (UNISERVE_CUDA_HEADERS naming the NCCL include directory)"]
-    fn the_nccl_constants_are_the_headers() {
-        crate::header::assert_constants(
-            "nccl.h",
-            &[("NCCL_SPLIT_NOCOLOR", super::NCCL_SPLIT_NOCOLOR as i64)],
-        );
-    }
-
-    /// The graph usage mode, the one config attribute this crate sets, sits
-    /// where the 2.30 `ncclConfig_t` puts it: NCCL reads a config by the
-    /// header's layout, so a field out of place would set another attribute.
-    #[test]
-    fn the_graph_usage_mode_is_at_its_config_offset() {
+    fn the_unique_id_is_the_headers_token() {
         assert_eq!(
-            std::mem::offset_of!(super::ffi::RawConfig, graph_usage_mode),
-            80,
-            "graphUsageMode follows sixteen bytes of header, four ints, a pointer, two ints, a \
-             pointer and six ints"
+            std::mem::size_of::<super::UniqueId>(),
+            sys::NCCL_UNIQUE_ID_BYTES as usize
         );
-    }
-
-    /// NCCL reads a config by the header's layout up to the size it states, so
-    /// the total size and the magic NCCL checks are compared with a 2.30
-    /// `nccl.h`, the release whose config the crate lays out.
-    #[test]
-    #[ignore = "requires nccl.h of release 2.30 or later (UNISERVE_CUDA_HEADERS naming the NCCL include directory)"]
-    fn the_nccl_config_is_laid_out_as_the_header() {
-        crate::header::require("nccl.h");
-        let ours = std::mem::size_of::<super::ffi::RawConfig>();
-        // An older header lays out an older config, which NCCL reads by the version it states.
-        let version = crate::header::value("nccl.h", "NCCL_VERSION_CODE")
-            .expect("nccl.h defines NCCL_VERSION_CODE");
-        assert!(
-            version >= 23000,
-            "nccl.h is release {version}, older than the 2.30 config the crate's {ours} bytes \
-             lay out"
-        );
-        // NCCL refuses a config whose magic is not the header's.
         assert_eq!(
-            crate::header::value("nccl.h", "NCCL_API_MAGIC"),
-            Some(i64::from(super::ffi::NCCL_API_MAGIC)),
-            "nccl.h and the crate disagree on NCCL_API_MAGIC"
-        );
-        let header = crate::header::struct_size("nccl.h", "ncclConfig_t")
-            .expect("nccl.h declares ncclConfig_t in a form the scanner lays out");
-        assert_eq!(
-            header, ours,
-            "nccl.h lays ncclConfig_t out in {header} bytes, this crate in {ours}"
+            std::mem::size_of::<super::UniqueId>(),
+            std::mem::size_of::<sys::ncclUniqueId>()
         );
     }
 }

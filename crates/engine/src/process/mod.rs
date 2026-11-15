@@ -127,17 +127,12 @@ fn kernels_of(packages: &Packages) -> Packages {
 /// it down or its epoch fails. Its checkpoint is served by the family of `registry` that claims
 /// the class it declares.
 ///
-/// Must be called while no other thread reads the environment: the profiling counters' injection
-/// sets variables before the first NVTX call.
-///
 /// # Errors
 ///
 /// When the launch file cannot be read or is refused, or the daemon refuses the process or its
 /// claim. A process whose epoch fails or loses a peer exits with status 1 without its orderly
 /// close: a device or a collective may hold every rank.
 pub fn run(launch_file: &Path, registry: &nn::family::Registry) -> Result<()> {
-    crate::profiling::counters::inject();
-
     let launch: EngineArgs = std::fs::read(launch_file)
         .map_err(anyhow::Error::new)
         .and_then(|text| serde_json::from_slice(&text).map_err(anyhow::Error::new))

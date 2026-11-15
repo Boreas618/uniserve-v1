@@ -12,12 +12,8 @@
 
 use std::ffi::c_void;
 
-use crate::driver::{
-    self, CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION,
-    CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, CU_LAUNCH_ATTRIBUTE_COOPERATIVE,
-    CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION, ClusterDim, Handle, LaunchAttribute,
-    LaunchAttributeValue,
-};
+use crate::driver::{self, Handle};
+use crate::sys::cuda as sys;
 use crate::{Device, Error, Result, Stream};
 
 /// A kernel of a loaded [`crate::Library`], resolved in its device's primary
@@ -86,60 +82,61 @@ impl Function {
 
         let driver = driver::driver()?;
         let _context = stream.enter()?;
-        let mut attributes = [empty_attribute(); 3];
+        let mut attributes = [sys::CUlaunchAttribute::default(); 3];
         let mut count = 0;
         if let Some(cluster) = config.cluster {
-            attributes[count] = LaunchAttribute {
-                id: CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION,
-                pad: [0; 4],
-                value: LaunchAttributeValue {
-                    cluster: ClusterDim {
+            attributes[count] = attribute(
+                sys::CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION,
+                sys::CUlaunchAttributeValue {
+                    clusterDim: sys::CUlaunchAttributeValue_union__bindgen_ty_1 {
                         x: cluster.dims[0],
                         y: cluster.dims[1],
                         z: cluster.dims[2],
                     },
                 },
-            };
+            );
             count += 1;
             // A cluster's scheduling preference only applies with a cluster
             // dimension, so it is set beside one.
             if cluster.scheduling != ClusterScheduling::Default {
-                attributes[count] = LaunchAttribute {
-                    id: CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE,
-                    pad: [0; 4],
-                    value: LaunchAttributeValue {
-                        cluster_scheduling: cluster.scheduling as i32,
+                attributes[count] = attribute(
+                    sys::CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE,
+                    sys::CUlaunchAttributeValue {
+                        clusterSchedulingPolicyPreference: cluster.scheduling
+                            as sys::CUclusterSchedulingPolicy,
                     },
-                };
+                );
                 count += 1;
             }
         }
         if config.pdl {
-            attributes[count] = LaunchAttribute {
-                id: CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
-                pad: [0; 4],
-                value: LaunchAttributeValue {
-                    programmatic_stream_serialization: 1,
+            attributes[count] = attribute(
+                sys::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
+                sys::CUlaunchAttributeValue {
+                    programmaticStreamSerializationAllowed: 1,
                 },
-            };
+            );
             count += 1;
         }
         if config.cooperative {
-            attributes[count] = LaunchAttribute {
-                id: CU_LAUNCH_ATTRIBUTE_COOPERATIVE,
-                pad: [0; 4],
-                value: LaunchAttributeValue { cooperative: 1 },
-            };
+            attributes[count] = attribute(
+                sys::CU_LAUNCH_ATTRIBUTE_COOPERATIVE,
+                sys::CUlaunchAttributeValue { cooperative: 1 },
+            );
             count += 1;
         }
 
-        let config = driver::LaunchConfig {
-            grid_dim: config.grid,
-            block_dim: config.block,
-            shared_mem_bytes: config.shared_memory,
-            stream: stream.handle(),
+        let config = sys::CUlaunchConfig {
+            gridDimX: config.grid[0],
+            gridDimY: config.grid[1],
+            gridDimZ: config.grid[2],
+            blockDimX: config.block[0],
+            blockDimY: config.block[1],
+            blockDimZ: config.block[2],
+            sharedMemBytes: config.shared_memory,
+            hStream: stream.handle().cast(),
             attrs: attributes.as_mut_ptr(),
-            num_attrs: count as u32,
+            numAttrs: count as u32,
         };
         driver.check(
             // SAFETY: forwarded from the caller; the attribute array and the
@@ -192,7 +189,9 @@ impl Function {
         driver.check(
             // SAFETY: the function is live while its library is; the value is
             // passed by value.
-            unsafe { (driver.func_set_attribute)(self.raw, attribute as i32, value) },
+            unsafe {
+                (driver.func_set_attribute)(self.raw, attribute as sys::CUfunction_attribute, value)
+            },
             "cuFuncSetAttribute",
         )
     }
@@ -234,7 +233,7 @@ pub(crate) fn param_at(function: Handle, index: usize) -> Result<Option<ParamInf
     // SAFETY: the function is live while its library is; the driver writes
     // the parameter's layout to the two locals.
     let status = unsafe { (driver.func_get_param_info)(function, index, &mut offset, &mut size) };
-    if status == driver::CUDA_ERROR_INVALID_VALUE {
+    if status == sys::CUDA_ERROR_INVALID_VALUE {
         return Ok(None);
     }
     driver.check(status, "cuFuncGetParamInfo")?;
@@ -313,44 +312,47 @@ impl Cluster {
 /// `CUclusterSchedulingPolicy`: how the device places clusters on the
 /// multiprocessors.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
 pub enum ClusterScheduling {
     /// `CU_CLUSTER_SCHEDULING_POLICY_DEFAULT`: the driver's choice.
     #[default]
-    Default,
+    Default = sys::CU_CLUSTER_SCHEDULING_POLICY_DEFAULT,
     /// `CU_CLUSTER_SCHEDULING_POLICY_SPREAD`: spread clusters over the GPCs.
-    Spread,
+    Spread = sys::CU_CLUSTER_SCHEDULING_POLICY_SPREAD,
     /// `CU_CLUSTER_SCHEDULING_POLICY_LOAD_BALANCING`: pack clusters to fill
     /// multiprocessors.
-    LoadBalancing,
+    LoadBalancing = sys::CU_CLUSTER_SCHEDULING_POLICY_LOAD_BALANCING,
 }
 
-/// A function attribute `cuFuncSetAttribute` sets, with the numeric values of
-/// `CUfunction_attribute`.
+/// A function attribute `cuFuncSetAttribute` sets (`CUfunction_attribute`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum FunctionAttribute {
     /// The largest dynamic shared-memory size, in bytes, the function may be
     /// launched with.
-    MaxDynamicSharedMemory = 8,
+    MaxDynamicSharedMemory = sys::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
     /// Requires every launch of the function to be a cluster launch.
-    ClusterSizeMustBeSet = 10,
+    ClusterSizeMustBeSet = sys::CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET,
     /// The cluster width the function requires, in blocks.
-    RequiredClusterWidth = 11,
+    RequiredClusterWidth = sys::CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH,
     /// The cluster height the function requires, in blocks.
-    RequiredClusterHeight = 12,
+    RequiredClusterHeight = sys::CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT,
     /// The cluster depth the function requires, in blocks.
-    RequiredClusterDepth = 13,
+    RequiredClusterDepth = sys::CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH,
     /// Allows clusters larger than eight blocks where the architecture
     /// permits.
-    NonPortableClusterSizeAllowed = 14,
+    NonPortableClusterSizeAllowed = sys::CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
 }
 
-/// An attribute slot the launch may leave unused.
-fn empty_attribute() -> LaunchAttribute {
-    LaunchAttribute {
-        id: 0,
-        pad: [0; 4],
-        value: LaunchAttributeValue { pad: [0; 64] },
+/// One launch attribute: its id and the member of the value union the id names.
+fn attribute(
+    id: sys::CUlaunchAttributeID,
+    value: sys::CUlaunchAttributeValue,
+) -> sys::CUlaunchAttribute {
+    sys::CUlaunchAttribute {
+        id,
+        value,
+        ..Default::default()
     }
 }
 

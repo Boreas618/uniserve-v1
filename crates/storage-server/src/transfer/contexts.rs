@@ -416,10 +416,13 @@ impl Session {
                 let map = HostMap::new(mapped.descriptor(), length, mapped.writable())
                     .map_err(|error| format!("mapping host storage: {error}"))?;
                 let pointer = map.address() as *mut u8;
+                let read_only = !mapped.writable()
+                    && HostRegistration::read_only_supported(self.device)
+                        .map_err(|error| format!("querying host registration: {error}"))?;
                 // SAFETY: `map` maps the whole range and is kept beside the
                 // registration, which is undone first.
                 let registered = unsafe {
-                    if !mapped.writable() {
+                    if read_only {
                         HostRegistration::read_only(self.device, pointer, length)
                     } else {
                         HostRegistration::new(self.device, pointer, length)

@@ -101,13 +101,17 @@ impl HostMapping {
         };
         let pointer = mapping.address as *mut u8;
 
+        // A read-only mapping registers for reads alone where the device supports it; elsewhere
+        // (GB200 reports no support) a plain registration is the only one it takes, and the
+        // engine's devices still only read it, since it maps no write access.
+        let read_only = !writable && HostRegistration::read_only_supported(device)?;
         // SAFETY: the range is this mapping, which outlives the registration: `Drop` ends the
         // registration before it unmaps the range.
         let registration = unsafe {
-            if writable {
-                HostRegistration::new(device, pointer, bytes)
-            } else {
+            if read_only {
                 HostRegistration::read_only(device, pointer, bytes)
+            } else {
+                HostRegistration::new(device, pointer, bytes)
             }
         }?;
         mapping.registration = Some(registration);

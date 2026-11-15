@@ -21,22 +21,15 @@
 //! [`subscriber::subscribe`] then fails with [`Error::Cupti`] (code 39) and
 //! none of these collectors is available.
 //!
-//! Nothing here calls `cuptiFinalize`: after CUPTI recorded a serving
-//! worker's activity, it left the device work submitted afterwards waiting
-//! forever (CUPTI 2025.3.0 of the CUDA 13.0 toolkit, replaying CUDA graphs).
-//! A collector that stops disables what it enabled; the library stays
-//! loaded.
+//! The subscription lasts as long as the process: the collectors share it,
+//! so none ends it, and a collector that stops disables what it enabled.
 //!
-//! The process loads the CUPTI its environment names ([`library`]): the one
-//! NVTX loaded as its injection library, else the `nvidia-cuda-cupti`
-//! package of the Python environment `VIRTUAL_ENV` states ([`packaged`]),
-//! the release the project pins, else the CUPTI beside the CUDA runtime it
-//! loaded: CUPTI belongs to a CUDA release, and both the toolkit and the
-//! environment's CUDA packages keep `libcupti.so.N` beside `libcudart.so.N`.
-//! The loader's own `libcupti.so` comes last; on a host with the CUDA 13.0
-//! toolkit that is its CUPTI 2025.3.0, which faults and stalls the CUDA graph
-//! replays it records, and which the subscription therefore refuses
-//! ([`subscriber::subscribe`]).
+//! The process loads the CUPTI of CUDA 13 by the soname its package installs
+//! on the loader's default search path ([`library`]), and refuses one older
+//! than [`MINIMUM_VERSION`] with [`Error::Version`]. The same library is
+//! NVTX's injection: [`initialize_nvtx_injection`] is the entry an executable
+//! that emits NVTX ranges registers with NVTX, so the ranges reach this CUPTI
+//! without the process naming a library in its environment.
 
 pub mod activity;
 pub mod blocking;
@@ -48,131 +41,62 @@ pub mod records;
 pub mod subscriber;
 pub mod timeline;
 
-use std::ffi::{CStr, c_char, c_void};
-use std::path::{Path, PathBuf};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::{Arc, OnceLock};
 
 use libloading::Library;
 
+use crate::sys::cupti as sys;
 use crate::{Error, Result};
 
-/// The CUPTI library of the loader's search path, for a process that
-/// loaded no CUDA runtime.
-const LIBCUPTI: &str = "libcupti.so";
+/// CUPTI of CUDA 13, by its soname.
+const LIBCUPTI: &str = "libcupti.so.13";
 
-/// The CUPTI library this process loads: the CUPTI the process named as its
-/// NVTX injection library (`NVTX_INJECTION64_PATH`), which NVTX already
-/// loaded; else the CUPTI of the Python environment `VIRTUAL_ENV` states
-/// ([`packaged`]); else `libcupti.so.N` in the directory of the
-/// `libcudart.so.N` the process loaded, when that file exists; else
-/// `LIBCUPTI`. Resolved once, at the first load.
+/// The oldest CUPTI the process accepts, by the `CUPTI_API_VERSION` the
+/// loaded library reports: release 13.4.92 (130401).
+///
+/// The bindings are generated from the CUPTI headers of CUDA 13.0
+/// ([`sys::CUPTI_API_VERSION`]), whose entry points and records later
+/// releases keep, but the earlier releases of CUDA 13 fail the work CUPTI
+/// records. CUDA 13.0's own CUPTI (2025.3.0, 130000) faults inside
+/// `cuGraphLaunch` once graph launches traced by node fill the device buffers
+/// it pre-allocates, and stalls a serving worker that replays CUDA graphs
+/// while kernels are recorded. Release 13.0.85 (130001) has the device write
+/// software kernel timestamps into host records its worker thread may already
+/// have freed, which on GB200 faults the device front end (Xid 31). Release
+/// 13.4.92 records every kernel, copy and fill of 1,024 launches of a
+/// 1,000-kernel graph with its timestamps.
+pub const MINIMUM_VERSION: u32 = 130_401;
+
+/// What a refused CUPTI is told to install.
+const CUPTI_PACKAGE: &str = "CUPTI 13.4.92 or later (NVIDIA's cuda-cupti package of CUDA 13)";
+
+/// The CUPTI library this process loads, by soname.
 pub fn library() -> &'static str {
-    static LIBRARY: OnceLock<String> = OnceLock::new();
-    LIBRARY.get_or_init(|| {
-        injected()
-            .or_else(|| packaged().map(|path| path.to_string_lossy().into_owned()))
-            .or_else(beside_runtime)
-            .unwrap_or_else(|| LIBCUPTI.to_owned())
-    })
+    LIBCUPTI
 }
 
-/// The CUPTI `NVTX_INJECTION64_PATH` names, if it names an existing
-/// `libcupti.so*` (a profiler's own injection library is not CUPTI).
-fn injected() -> Option<String> {
-    let path = std::env::var("NVTX_INJECTION64_PATH").ok()?;
-    let named = Path::new(&path);
-    let file = named.file_name()?.to_string_lossy();
-    (file.starts_with("libcupti.so") && named.is_file()).then_some(path)
-}
-
-/// `libcupti.so.N` of the NVIDIA CUDA packages of the Python environment
-/// `VIRTUAL_ENV` states, if it has one: the `nvidia-cuda-cupti` release the
-/// project pins (`pyproject.toml`). The process runs no Python; the file is
-/// only a library.
-pub fn packaged() -> Option<PathBuf> {
-    let prefix = std::env::var_os("VIRTUAL_ENV")?;
-    packaged_in(Path::new(&prefix))
-}
-
-/// `libcupti.so.N` of the NVIDIA CUDA packages of the Python environment at
-/// `prefix`: `<prefix>/lib/pythonX.Y/site-packages/nvidia/cuN/lib`.
-fn packaged_in(prefix: &Path) -> Option<PathBuf> {
-    for entry in std::fs::read_dir(prefix.join("lib")).ok()?.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with("python") {
-            continue;
-        }
-        let nvidia = entry.path().join("site-packages").join("nvidia");
-        for package in std::fs::read_dir(&nvidia).into_iter().flatten().flatten() {
-            if !package.file_name().to_string_lossy().starts_with("cu") {
-                continue;
-            }
-            let lib = package.path().join("lib");
-            for library in std::fs::read_dir(&lib).into_iter().flatten().flatten() {
-                if library
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("libcupti.so.")
-                {
-                    return Some(library.path());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// `libcupti.so.N` beside the first `libcudart.so.N` among the objects the
-/// process loaded, if it exists.
-fn beside_runtime() -> Option<String> {
-    unsafe extern "C" fn visit(
-        info: *mut libc::dl_phdr_info,
-        _size: usize,
-        found: *mut c_void,
-    ) -> libc::c_int {
-        // SAFETY: the loader passes a valid entry, whose name is a C string
-        // or null, and `found` is the caller's `Option<String>`.
-        let (name, found) = unsafe { ((*info).dlpi_name, &mut *found.cast::<Option<String>>()) };
-        if name.is_null() {
-            return 0;
-        }
-        // SAFETY: as above.
-        let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
-        let Some((directory, file)) = name.rsplit_once('/') else {
-            return 0;
-        };
-        let Some(version) = file.strip_prefix("libcudart.so.") else {
-            return 0;
-        };
-        let major = version.split('.').next().unwrap_or(version);
-        *found = Some(format!("{directory}/libcupti.so.{major}"));
-        1
-    }
-
-    let mut found: Option<String> = None;
-    // SAFETY: the callback only reads the loader's entries and writes the
-    // local, which outlives the call.
-    unsafe { libc::dl_iterate_phdr(Some(visit), (&raw mut found).cast()) };
-    found.filter(|path| std::path::Path::new(path).is_file())
-}
-
-pub(crate) type CuptiResult = i32;
-pub(crate) type Callback = unsafe extern "C" fn(*mut c_void, i32, u32, *const c_void);
+pub(crate) type CuptiResult = sys::CUptiResult;
+pub(crate) type Callback = unsafe extern "C" fn(*mut c_void, u32, u32, *const c_void);
 pub(crate) type BufferRequested = unsafe extern "C" fn(*mut *mut u8, *mut usize, *mut usize);
 pub(crate) type BufferCompleted = unsafe extern "C" fn(*mut c_void, u32, *mut u8, usize, usize);
+/// A profiling entry point, which takes its parameter struct.
+pub(crate) type Entry = unsafe extern "C" fn(*mut c_void) -> CuptiResult;
 
-/// Declares the CUPTI table: one typed field per entry point. The profiling
-/// entry points are lazy (`Result`s), so that a CUPTI without them still
-/// serves the callback and activity APIs and fails only the collector that
-/// needs them.
+/// Declares the CUPTI table: one typed field per entry point, every one
+/// resolved at load (each is an entry point of every release from
+/// [`MINIMUM_VERSION`] on).
 macro_rules! cupti_table {
     (
-        eager { $($field:ident = $symbol:literal: fn($($arg:ty),* $(,)?);)* }
-        lazy { $($lazy:ident = $lazy_symbol:literal: fn($($lazy_arg:ty),* $(,)?);)* }
+        api { $($field:ident = $symbol:literal: fn($($arg:ty),* $(,)?);)* }
+        profiling { $($entry:ident = $entry_symbol:literal;)* }
     ) => {
-        /// The `libcupti.so` entry points this crate calls.
+        /// The `libcupti.so.13` entry points this crate calls.
         pub(crate) struct Cupti {
             $(pub(crate) $field: unsafe extern "C" fn($($arg),*) -> CuptiResult,)*
-            $(pub(crate) $lazy: Result<unsafe extern "C" fn($($lazy_arg),*) -> CuptiResult>,)*
+            $(pub(crate) $entry: Entry,)*
+            /// `InitializeInjectionNvtx2`, NVTX's injection entry.
+            nvtx_injection: unsafe extern "C" fn(*const c_void) -> c_int,
             // Declared last: the library outlives every copied function pointer.
             _library: Library,
         }
@@ -184,7 +108,8 @@ macro_rules! cupti_table {
                 unsafe {
                     Ok(Self {
                         $($field: symbol(&library, $symbol)?,)*
-                        $($lazy: symbol(&library, $lazy_symbol),)*
+                        $($entry: symbol(&library, $entry_symbol)?,)*
+                        nvtx_injection: symbol(&library, "InitializeInjectionNvtx2")?,
                         _library: library,
                     })
                 }
@@ -194,14 +119,15 @@ macro_rules! cupti_table {
 }
 
 cupti_table! {
-    eager {
+    api {
         subscribe = "cuptiSubscribe": fn(*mut *mut c_void, Callback, *mut c_void);
-        enable_callback = "cuptiEnableCallback": fn(u32, *mut c_void, i32, u32);
-        enable_domain = "cuptiEnableDomain": fn(u32, *mut c_void, i32);
+        enable_callback = "cuptiEnableCallback": fn(u32, *mut c_void, u32, u32);
+        enable_domain = "cuptiEnableDomain": fn(u32, *mut c_void, u32);
         register_buffers = "cuptiActivityRegisterCallbacks": fn(BufferRequested, BufferCompleted);
         activity_enable = "cuptiActivityEnable": fn(u32);
         activity_disable = "cuptiActivityDisable": fn(u32);
         flush_all = "cuptiActivityFlushAll": fn(u32);
+        flush_period = "cuptiActivityFlushPeriod": fn(u32);
         next_record = "cuptiActivityGetNextRecord": fn(*mut u8, usize, *mut *mut u8);
         stream_id = "cuptiGetStreamIdEx": fn(*mut c_void, *mut c_void, u8, *mut u32);
         context_id = "cuptiGetContextId": fn(*mut c_void, *mut u32);
@@ -209,48 +135,48 @@ cupti_table! {
         timestamp = "cuptiGetTimestamp": fn(*mut u64);
         version = "cuptiGetVersion": fn(*mut u32);
     }
-    lazy {
-        profiler_initialize = "cuptiProfilerInitialize": fn(*mut c_void);
-        chip_name = "cuptiDeviceGetChipName": fn(*mut c_void);
-        counter_availability = "cuptiProfilerGetCounterAvailability": fn(*mut c_void);
-        host_initialize = "cuptiProfilerHostInitialize": fn(*mut c_void);
-        host_deinitialize = "cuptiProfilerHostDeinitialize": fn(*mut c_void);
-        host_add_metrics = "cuptiProfilerHostConfigAddMetrics": fn(*mut c_void);
-        host_config_size = "cuptiProfilerHostGetConfigImageSize": fn(*mut c_void);
-        host_config = "cuptiProfilerHostGetConfigImage": fn(*mut c_void);
-        host_passes = "cuptiProfilerHostGetNumOfPasses": fn(*mut c_void);
-        host_evaluate = "cuptiProfilerHostEvaluateToGpuValues": fn(*mut c_void);
-        range_enable = "cuptiRangeProfilerEnable": fn(*mut c_void);
-        range_disable = "cuptiRangeProfilerDisable": fn(*mut c_void);
-        range_set_config = "cuptiRangeProfilerSetConfig": fn(*mut c_void);
-        range_start = "cuptiRangeProfilerStart": fn(*mut c_void);
-        range_stop = "cuptiRangeProfilerStop": fn(*mut c_void);
-        range_push = "cuptiRangeProfilerPushRange": fn(*mut c_void);
-        range_pop = "cuptiRangeProfilerPopRange": fn(*mut c_void);
-        range_decode = "cuptiRangeProfilerDecodeData": fn(*mut c_void);
-        range_data_size = "cuptiRangeProfilerGetCounterDataSize": fn(*mut c_void);
-        range_data_initialize = "cuptiRangeProfilerCounterDataImageInitialize": fn(*mut c_void);
-        range_data_info = "cuptiRangeProfilerGetCounterDataInfo": fn(*mut c_void);
-        range_info = "cuptiRangeProfilerCounterDataGetRangeInfo": fn(*mut c_void);
-        pm_enable = "cuptiPmSamplingEnable": fn(*mut c_void);
-        pm_disable = "cuptiPmSamplingDisable": fn(*mut c_void);
-        pm_set_config = "cuptiPmSamplingSetConfig": fn(*mut c_void);
-        pm_start = "cuptiPmSamplingStart": fn(*mut c_void);
-        pm_stop = "cuptiPmSamplingStop": fn(*mut c_void);
-        pm_decode = "cuptiPmSamplingDecodeData": fn(*mut c_void);
-        pm_availability = "cuptiPmSamplingGetCounterAvailability": fn(*mut c_void);
-        pm_data_size = "cuptiPmSamplingGetCounterDataSize": fn(*mut c_void);
-        pm_data_initialize = "cuptiPmSamplingCounterDataImageInitialize": fn(*mut c_void);
-        pm_data_info = "cuptiPmSamplingGetCounterDataInfo": fn(*mut c_void);
-        pm_sample_info = "cuptiPmSamplingCounterDataGetSampleInfo": fn(*mut c_void);
-        pc_enable = "cuptiPCSamplingEnable": fn(*mut c_void);
-        pc_disable = "cuptiPCSamplingDisable": fn(*mut c_void);
-        pc_configure = "cuptiPCSamplingSetConfigurationAttribute": fn(*mut c_void);
-        pc_start = "cuptiPCSamplingStart": fn(*mut c_void);
-        pc_stop = "cuptiPCSamplingStop": fn(*mut c_void);
-        pc_get_data = "cuptiPCSamplingGetData": fn(*mut c_void);
-        pc_stall_count = "cuptiPCSamplingGetNumStallReasons": fn(*mut c_void);
-        pc_stall_reasons = "cuptiPCSamplingGetStallReasons": fn(*mut c_void);
+    profiling {
+        profiler_initialize = "cuptiProfilerInitialize";
+        chip_name = "cuptiDeviceGetChipName";
+        counter_availability = "cuptiProfilerGetCounterAvailability";
+        host_initialize = "cuptiProfilerHostInitialize";
+        host_deinitialize = "cuptiProfilerHostDeinitialize";
+        host_add_metrics = "cuptiProfilerHostConfigAddMetrics";
+        host_config_size = "cuptiProfilerHostGetConfigImageSize";
+        host_config = "cuptiProfilerHostGetConfigImage";
+        host_passes = "cuptiProfilerHostGetNumOfPasses";
+        host_evaluate = "cuptiProfilerHostEvaluateToGpuValues";
+        range_enable = "cuptiRangeProfilerEnable";
+        range_disable = "cuptiRangeProfilerDisable";
+        range_set_config = "cuptiRangeProfilerSetConfig";
+        range_start = "cuptiRangeProfilerStart";
+        range_stop = "cuptiRangeProfilerStop";
+        range_push = "cuptiRangeProfilerPushRange";
+        range_pop = "cuptiRangeProfilerPopRange";
+        range_decode = "cuptiRangeProfilerDecodeData";
+        range_data_size = "cuptiRangeProfilerGetCounterDataSize";
+        range_data_initialize = "cuptiRangeProfilerCounterDataImageInitialize";
+        range_data_info = "cuptiRangeProfilerGetCounterDataInfo";
+        range_info = "cuptiRangeProfilerCounterDataGetRangeInfo";
+        pm_enable = "cuptiPmSamplingEnable";
+        pm_disable = "cuptiPmSamplingDisable";
+        pm_set_config = "cuptiPmSamplingSetConfig";
+        pm_start = "cuptiPmSamplingStart";
+        pm_stop = "cuptiPmSamplingStop";
+        pm_decode = "cuptiPmSamplingDecodeData";
+        pm_availability = "cuptiPmSamplingGetCounterAvailability";
+        pm_data_size = "cuptiPmSamplingGetCounterDataSize";
+        pm_data_initialize = "cuptiPmSamplingCounterDataImageInitialize";
+        pm_data_info = "cuptiPmSamplingGetCounterDataInfo";
+        pm_sample_info = "cuptiPmSamplingCounterDataGetSampleInfo";
+        pc_enable = "cuptiPCSamplingEnable";
+        pc_disable = "cuptiPCSamplingDisable";
+        pc_configure = "cuptiPCSamplingSetConfigurationAttribute";
+        pc_start = "cuptiPCSamplingStart";
+        pc_stop = "cuptiPCSamplingStop";
+        pc_get_data = "cuptiPCSamplingGetData";
+        pc_stall_count = "cuptiPCSamplingGetNumStallReasons";
+        pc_stall_reasons = "cuptiPCSamplingGetStallReasons";
     }
 }
 
@@ -262,19 +188,63 @@ unsafe impl Sync for Cupti {}
 
 static CUPTI: OnceLock<Result<Cupti>> = OnceLock::new();
 
-/// The process's CUPTI table, loading the library on first use.
+/// The process's CUPTI table, loading the library and checking its version on
+/// first use. A failed load is cached and returned to every caller.
 pub(crate) fn cupti() -> Result<&'static Cupti> {
     CUPTI
         .get_or_init(|| {
             // SAFETY: loading libcupti runs only CUPTI's own initializers.
-            let library = unsafe { Library::new(library()) }.map_err(|source| Error::Load {
-                library: library(),
+            let library = unsafe { Library::new(LIBCUPTI) }.map_err(|source| Error::Load {
+                library: LIBCUPTI,
                 source: Arc::new(source),
             })?;
-            Cupti::resolve(library)
+            let cupti = Cupti::resolve(library)?;
+
+            let mut version = 0;
+            // SAFETY: CUPTI writes one value.
+            check(unsafe { (cupti.version)(&mut version) }, "cuptiGetVersion")?;
+            require_version(version)?;
+            Ok(cupti)
         })
         .as_ref()
         .map_err(Clone::clone)
+}
+
+/// Refuses a CUPTI whose `CUPTI_API_VERSION` is older than
+/// [`MINIMUM_VERSION`].
+fn require_version(version: u32) -> Result<()> {
+    if version >= MINIMUM_VERSION {
+        return Ok(());
+    }
+    Err(Error::Version {
+        library: LIBCUPTI,
+        found: format!("CUPTI API version {version}"),
+        required: format!("CUPTI API version {MINIMUM_VERSION}"),
+        package: CUPTI_PACKAGE,
+    })
+}
+
+/// NVTX's injection entry (`InitializeInjectionNvtx2`) for the CUPTI this
+/// process loads: NVTX calls it at the process's first NVTX call with its
+/// export table, and from then on hands its marks and ranges to CUPTI, which
+/// records them in the timeline's activity records.
+///
+/// An executable that emits NVTX ranges registers this entry with NVTX's
+/// static injection (the `InitializeInjectionNvtx2_fnptr` symbol of NVTX's
+/// load sequence), which NVTX consults after a library named in its
+/// environment, so a profiler that injects its own library keeps the marks.
+/// Answers 0, NVTX's failure, when CUPTI is missing or refused; NVTX then
+/// emits nothing.
+///
+/// # Safety
+///
+/// Called only by NVTX's loader, with the export table function it passes.
+pub unsafe extern "C" fn initialize_nvtx_injection(get_export_table: *const c_void) -> c_int {
+    match cupti() {
+        // SAFETY: forwarded from NVTX's loader, which passes its export table.
+        Ok(cupti) => unsafe { (cupti.nvtx_injection)(get_export_table) },
+        Err(_) => 0,
+    }
 }
 
 /// # Safety
@@ -284,38 +254,48 @@ unsafe fn symbol<T: Copy>(loaded: &Library, name: &'static str) -> Result<T> {
     unsafe { loaded.get::<T>(name.as_bytes()) }
         .map(|symbol| *symbol)
         .map_err(|source| Error::Symbol {
-            library: library(),
+            library: LIBCUPTI,
             symbol: name,
             source: Arc::new(source),
         })
 }
 
 pub(crate) fn check(code: CuptiResult, call: &'static str) -> Result<()> {
-    if code == 0 {
+    if code == sys::CUPTI_SUCCESS {
         Ok(())
     } else {
-        Err(Error::Cupti { call, code })
+        // `CUptiResult` is a C enum; the error carries the value CUPTI documents.
+        Err(Error::Cupti {
+            call,
+            code: code as i32,
+        })
     }
 }
 
-/// Calls a lazy entry point with its parameter struct: fails when CUPTI
-/// lacks the entry point or the call fails.
+/// Driver calls as `(callback id, name)` pairs: each id is the generated
+/// `CUPTI_DRIVER_TRACE_CBID_<name>` of the call's name, so a call the headers
+/// do not declare fails to compile and the name a collector reports is the
+/// call's own.
+macro_rules! driver_calls {
+    ($($call:ident),* $(,)?) => {
+        &[$((
+            paste::paste!(crate::sys::cupti::[<CUPTI_DRIVER_TRACE_CBID_ $call>]),
+            stringify!($call),
+        )),*]
+    };
+}
+pub(crate) use driver_calls;
+
+/// Calls a profiling entry point with its parameter struct.
 ///
 /// # Safety
 /// `params` is the entry point's parameter struct, with every field the
 /// call reads set.
-pub(crate) unsafe fn call<P>(
-    entry: &Result<unsafe extern "C" fn(*mut c_void) -> CuptiResult>,
-    name: &'static str,
-    params: &mut P,
-) -> Result<()> {
-    let entry = entry.as_ref().map_err(Clone::clone)?;
+pub(crate) unsafe fn call<P>(entry: &Entry, name: &'static str, params: &mut P) -> Result<()> {
     // SAFETY: forwarded from the caller.
     check(unsafe { entry((params as *mut P).cast()) }, name)
 }
 
-/// CUPTI's current timestamp, in nanoseconds: the clock of every activity
-/// record, PM sample and API record CUPTI and this crate produce.
 pub fn timestamp() -> Result<u64> {
     let cupti = cupti()?;
     let mut now = 0;
@@ -378,14 +358,9 @@ pub(crate) mod tests {
     /// CUPTI is process-wide: its device tests run one at a time.
     pub(crate) static SERIAL: Mutex<()> = Mutex::new(());
 
-    /// A kernel whose every thread counts to its second parameter and stores
-    /// the count through its first.
-    const SPIN: &str = ".version 8.0\n.target sm_90\n.address_size 64\n\
-        .visible .entry spin(.param .u64 out, .param .u32 n) {\n\
-        .reg .u64 %rd<2>; .reg .u32 %r<3>; .reg .pred %p;\n\
-        ld.param.u64 %rd1, [out]; ld.param.u32 %r1, [n]; mov.u32 %r2, 0;\n\
-        LOOP: add.u32 %r2, %r2, 1; setp.lt.u32 %p, %r2, %r1; @%p bra LOOP;\n\
-        st.global.u32 [%rd1], %r2; ret; }\n";
+    /// The spin kernel's PTX (`spin.ptx`): every thread counts to its second
+    /// parameter and stores the count through its first.
+    const SPIN: &[u8] = include_bytes!("spin.ptx");
 
     /// The spin kernel of `stream`'s device, and the word it stores into.
     pub(crate) struct Spin {
@@ -396,7 +371,7 @@ pub(crate) mod tests {
 
     impl Spin {
         pub(crate) fn load(stream: &Stream) -> Result<Self> {
-            let library = Library::load(&Device::new(stream.device())?, SPIN.as_bytes())?;
+            let library = Library::load(&Device::new(stream.device())?, SPIN)?;
             let function = library.kernel("spin")?;
             Ok(Self {
                 _library: library,
@@ -429,19 +404,28 @@ pub(crate) mod tests {
         record(capture.end()?)
     }
 
+    /// A CUPTI older than the minimum — CUDA 13.0's own, which faults the
+    /// graph replays it records — is refused by name with the package to
+    /// install; the minimum and later releases are accepted.
     #[test]
-    fn the_environments_cupti_is_found_beside_its_packages() {
-        let prefix = tempfile::tempdir().unwrap();
-        let lib = prefix
-            .path()
-            .join("lib/python3.12/site-packages/nvidia/cu13/lib");
-        std::fs::create_dir_all(&lib).unwrap();
-        assert_eq!(super::packaged_in(prefix.path()), None);
+    fn a_cupti_older_than_the_minimum_is_refused() {
+        assert!(super::require_version(super::MINIMUM_VERSION).is_ok());
 
-        std::fs::write(lib.join("libcupti.so.13"), b"").unwrap();
-        assert_eq!(
-            super::packaged_in(prefix.path()),
-            Some(lib.join("libcupti.so.13"))
+        let error = super::require_version(130_000).expect_err("CUDA 13.0's CUPTI is refused");
+        let text = error.to_string();
+        assert!(
+            matches!(
+                error,
+                crate::Error::Version {
+                    library: super::LIBCUPTI,
+                    ..
+                }
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("130000") && text.contains(super::CUPTI_PACKAGE),
+            "{text}"
         );
     }
 }

@@ -9,7 +9,8 @@
 
 use std::ffi::c_void;
 
-use crate::driver::{self, TensorMap as RawTensorMap};
+use crate::driver;
+use crate::sys::cuda as sys;
 use crate::{Device, Error, Result};
 
 /// The largest tensor rank a tensor map describes.
@@ -22,12 +23,12 @@ const MAX_RANK: usize = 5;
 /// as rank two with a trailing dimension of one.
 const MIN_RANK: usize = 2;
 
-/// A tensor map (`CUtensorMap`), 64-byte aligned as the driver requires, and
+/// A tensor map (`CUtensorMap`), aligned as `cuda.h` declares it, and
 /// filled by [`TensorMap::encode_tiled`].
-#[repr(C, align(64))]
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
 pub struct TensorMap {
-    raw: RawTensorMap,
+    raw: sys::CUtensorMap,
 }
 
 // SAFETY: the tensor map is plain data: bytes the driver wrote and the kernel
@@ -52,7 +53,7 @@ impl TensorMap {
     pub fn encode_tiled(device: &Device, spec: &TensorMapSpec<'_>) -> Result<Self> {
         let rank = spec.check()?;
 
-        let mut raw = RawTensorMap { opaque: [0; 16] };
+        let mut raw = sys::CUtensorMap { opaque: [0; 16] };
         let driver = driver::driver()?;
         let _context = device.enter()?;
         driver.check(
@@ -75,10 +76,10 @@ impl TensorMap {
                     },
                     spec.box_dim.as_ptr(),
                     spec.element_strides.as_ptr(),
-                    spec.interleave as i32,
-                    spec.swizzle as i32,
-                    spec.l2_promotion as i32,
-                    spec.oob_fill as i32,
+                    spec.interleave as sys::CUtensorMapInterleave,
+                    spec.swizzle as sys::CUtensorMapSwizzle,
+                    spec.l2_promotion as sys::CUtensorMapL2promotion,
+                    spec.oob_fill as sys::CUtensorMapFloatOOBfill,
                 )
             },
             "cuTensorMapEncodeTiled",
@@ -171,110 +172,63 @@ impl TensorMapSpec<'_> {
 /// `CUtensorMapInterleave`: the interleaved layout of the tensor in global
 /// memory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum Interleave {
     #[default]
-    None = 0,
-    B16 = 1,
-    B32 = 2,
+    None = sys::CU_TENSOR_MAP_INTERLEAVE_NONE,
+    B16 = sys::CU_TENSOR_MAP_INTERLEAVE_16B,
+    B32 = sys::CU_TENSOR_MAP_INTERLEAVE_32B,
 }
 
 /// `CUtensorMapSwizzle`: how the shared-memory destination of a box is
 /// swizzled to avoid bank conflicts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum Swizzle {
     #[default]
-    None = 0,
+    None = sys::CU_TENSOR_MAP_SWIZZLE_NONE,
     /// Swizzle 16-byte chunks within a 32-byte span.
-    B32 = 1,
+    B32 = sys::CU_TENSOR_MAP_SWIZZLE_32B,
     /// Swizzle 16-byte chunks within a 64-byte span.
-    B64 = 2,
+    B64 = sys::CU_TENSOR_MAP_SWIZZLE_64B,
     /// Swizzle 16-byte chunks within a 128-byte span.
-    B128 = 3,
+    B128 = sys::CU_TENSOR_MAP_SWIZZLE_128B,
     /// Swizzle 32-byte chunks within a 128-byte span.
-    B128Atom32 = 4,
+    B128Atom32 = sys::CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B,
     /// Swizzle 32-byte chunks within a 128-byte span, swapping the lower and
     /// upper 8 bytes of every alternate row's 16-byte chunk.
-    B128Atom32Flip8 = 5,
+    B128Atom32Flip8 = sys::CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B,
     /// Swizzle 64-byte chunks within a 128-byte span.
-    B128Atom64 = 6,
+    B128Atom64 = sys::CU_TENSOR_MAP_SWIZZLE_128B_ATOM_64B,
 }
 
 /// `CUtensorMapL2promotion`: the L2 promotion applied to the tensor's
 /// accesses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum L2Promotion {
     #[default]
-    None = 0,
-    B64 = 1,
-    B128 = 2,
-    B256 = 3,
+    None = sys::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+    B64 = sys::CU_TENSOR_MAP_L2_PROMOTION_L2_64B,
+    B128 = sys::CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+    B256 = sys::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
 }
 
 /// `CUtensorMapFloatOOBfill`: what a TMA read outside the tensor returns.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum OobFill {
     /// Zero in the element's format.
     #[default]
-    None = 0,
+    None = sys::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
     /// The special NaN that requests zero-fill in a following operation,
     /// which avoids a separate predicate; floating-point types only.
-    NanRequestZeroFma = 1,
+    NanRequestZeroFma = sys::CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The discriminants of the description's enums are `cuda.h`'s
-    /// `CUtensorMap*` codes, passed to the driver unchanged: a wrong one is a
-    /// refused encode or a differently swizzled read, never a compile error.
-    #[test]
-    #[ignore = "requires cuda.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
-    fn the_description_codes_are_the_headers() {
-        crate::header::assert_constants(
-            "cuda.h",
-            &[
-                ("CU_TENSOR_MAP_INTERLEAVE_NONE", Interleave::None as i64),
-                ("CU_TENSOR_MAP_INTERLEAVE_16B", Interleave::B16 as i64),
-                ("CU_TENSOR_MAP_INTERLEAVE_32B", Interleave::B32 as i64),
-                ("CU_TENSOR_MAP_SWIZZLE_NONE", Swizzle::None as i64),
-                ("CU_TENSOR_MAP_SWIZZLE_32B", Swizzle::B32 as i64),
-                ("CU_TENSOR_MAP_SWIZZLE_64B", Swizzle::B64 as i64),
-                ("CU_TENSOR_MAP_SWIZZLE_128B", Swizzle::B128 as i64),
-                (
-                    "CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B",
-                    Swizzle::B128Atom32 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B",
-                    Swizzle::B128Atom32Flip8 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_SWIZZLE_128B_ATOM_64B",
-                    Swizzle::B128Atom64 as i64,
-                ),
-                ("CU_TENSOR_MAP_L2_PROMOTION_NONE", L2Promotion::None as i64),
-                ("CU_TENSOR_MAP_L2_PROMOTION_L2_64B", L2Promotion::B64 as i64),
-                (
-                    "CU_TENSOR_MAP_L2_PROMOTION_L2_128B",
-                    L2Promotion::B128 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_L2_PROMOTION_L2_256B",
-                    L2Promotion::B256 as i64,
-                ),
-                ("CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE", OobFill::None as i64),
-                (
-                    "CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA",
-                    OobFill::NanRequestZeroFma as i64,
-                ),
-            ],
-        );
-    }
 
     /// A description whose arrays do not match its rank is the caller's
     /// mistake, named before the driver sees it; the checks below therefore

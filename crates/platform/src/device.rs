@@ -4,6 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::driver::driver;
+use crate::sys::cuda as sys;
 use crate::{DeviceGuard, PrimaryContext, Result, Stream};
 
 /// A CUDA device ordinal as numbered by the driver in this process (after
@@ -19,22 +20,26 @@ impl fmt::Display for DeviceId {
 
 /// The `CUdevice_attribute` values the worker queries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum DeviceAttribute {
     /// Largest row pitch, in bytes, accepted by pitched copies.
-    MaxPitch = 11,
-    MultiprocessorCount = 16,
-    ComputeCapabilityMajor = 75,
-    ComputeCapabilityMinor = 76,
-    VirtualMemoryManagementSupported = 102,
+    MaxPitch = sys::CU_DEVICE_ATTRIBUTE_MAX_PITCH,
+    MultiprocessorCount = sys::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+    ComputeCapabilityMajor = sys::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+    ComputeCapabilityMinor = sys::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+    VirtualMemoryManagementSupported = sys::CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
     /// Whether host storage registers for reads alone
     /// (`CU_MEMHOSTREGISTER_READ_ONLY`, [`crate::HostRegistration::read_only`]).
-    ReadOnlyHostRegisterSupported = 113,
-    HandleTypePosixFileDescriptorSupported = 103,
-    HandleTypeFabricSupported = 128,
+    ReadOnlyHostRegisterSupported = sys::CU_DEVICE_ATTRIBUTE_READ_ONLY_HOST_REGISTER_SUPPORTED,
+    HandleTypePosixFileDescriptorSupported =
+        sys::CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED,
+    HandleTypeFabricSupported = sys::CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+    /// Whether kernels launch in thread block clusters (`cuLaunchKernelEx` with a cluster
+    /// dimension).
+    ClusterLaunch = sys::CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH,
     /// The host NUMA node closest to the device, or -1 when the host has no
     /// NUMA affinity for it.
-    HostNumaId = 134,
+    HostNumaId = sys::CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID,
 }
 
 /// Device storage reported by `cuMemGetInfo`, in bytes.
@@ -179,7 +184,13 @@ impl DeviceId {
         driver.check(
             // SAFETY: the driver writes one int to the local `value` for a valid
             // attribute and device.
-            unsafe { (driver.device_get_attribute)(&mut value, attribute as i32, device) },
+            unsafe {
+                (driver.device_get_attribute)(
+                    &mut value,
+                    attribute as sys::CUdevice_attribute,
+                    device,
+                )
+            },
             "cuDeviceGetAttribute",
         )?;
         Ok(value)
@@ -197,13 +208,14 @@ impl DeviceId {
     pub fn uuid(self) -> Result<DeviceUuid> {
         let driver = driver()?;
         let device = self.handle()?;
-        let mut bytes = [0; 16];
+        let mut uuid = sys::CUuuid::default();
         driver.check(
-            // SAFETY: the driver writes the 16-byte CUuuid to the local `bytes`.
-            unsafe { (driver.device_get_uuid)(&mut bytes, device) },
+            // SAFETY: the driver writes the 16-byte CUuuid to the local `uuid`.
+            unsafe { (driver.device_get_uuid)(&mut uuid, device) },
             "cuDeviceGetUuid_v2",
         )?;
-        Ok(DeviceUuid(bytes))
+        // `c_char` is signed on some targets; the identifier's bytes are the same either way.
+        Ok(DeviceUuid(uuid.bytes.map(|byte| byte.to_ne_bytes()[0])))
     }
 
     /// Whether this device can directly address storage resident on `peer`.

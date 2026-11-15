@@ -5,10 +5,8 @@ use std::sync::Arc;
 use crate::allocator::DevicePtr;
 use crate::driver::{ContextScope, Handle, driver, in_context};
 use crate::event::Event;
+use crate::sys::cuda as sys;
 use crate::{DeviceId, Error, PrimaryContext, Result};
-
-pub(crate) const CU_STREAM_NON_BLOCKING: u32 = 1;
-const CU_EVENT_WAIT_EXTERNAL: u32 = 1;
 
 /// What keeps a stream's (and its events') CUDA context alive.
 #[derive(Clone)]
@@ -46,13 +44,6 @@ pub enum WaitValue {
     /// (`CU_STREAM_WAIT_VALUE_AND`).
     AnyBitSet,
 }
-
-/// `CU_STREAM_WAIT_VALUE_GEQ`.
-pub(crate) const CU_STREAM_WAIT_VALUE_GEQ: u32 = 0x0;
-/// `CU_STREAM_WAIT_VALUE_EQ`.
-pub(crate) const CU_STREAM_WAIT_VALUE_EQ: u32 = 0x1;
-/// `CU_STREAM_WAIT_VALUE_AND`.
-pub(crate) const CU_STREAM_WAIT_VALUE_AND: u32 = 0x2;
 
 /// A handle to a CUDA stream this process created, or to one borrowed from
 /// another owner.
@@ -136,7 +127,11 @@ impl Stream {
             // SAFETY: the driver writes a stream handle in the current context.
             driver.check(
                 unsafe {
-                    (driver.stream_create_with_priority)(&mut raw, CU_STREAM_NON_BLOCKING, priority)
+                    (driver.stream_create_with_priority)(
+                        &mut raw,
+                        sys::CU_STREAM_NON_BLOCKING,
+                        priority,
+                    )
                 },
                 "cuStreamCreateWithPriority",
             )
@@ -163,7 +158,11 @@ impl Stream {
             // SAFETY: the driver writes a stream handle in self's context.
             driver.check(
                 unsafe {
-                    (driver.stream_create_with_priority)(&mut raw, CU_STREAM_NON_BLOCKING, priority)
+                    (driver.stream_create_with_priority)(
+                        &mut raw,
+                        sys::CU_STREAM_NON_BLOCKING,
+                        priority,
+                    )
                 },
                 "cuStreamCreateWithPriority",
             )
@@ -272,7 +271,7 @@ impl Stream {
             return Ok(());
         };
         let flags = if event.flags().external && self.capture_status()? != CaptureStatus::None {
-            CU_EVENT_WAIT_EXTERNAL
+            sys::CU_EVENT_WAIT_EXTERNAL
         } else {
             0
         };
@@ -326,9 +325,9 @@ impl Stream {
     /// the same graph blocks on its first replay, and every replay after it.
     pub fn wait_value32(&self, address: DevicePtr, value: u32, kind: WaitValue) -> Result<()> {
         let flags = match kind {
-            WaitValue::AtLeast => CU_STREAM_WAIT_VALUE_GEQ,
-            WaitValue::Equal => CU_STREAM_WAIT_VALUE_EQ,
-            WaitValue::AnyBitSet => CU_STREAM_WAIT_VALUE_AND,
+            WaitValue::AtLeast => sys::CU_STREAM_WAIT_VALUE_GEQ,
+            WaitValue::Equal => sys::CU_STREAM_WAIT_VALUE_EQ,
+            WaitValue::AnyBitSet => sys::CU_STREAM_WAIT_VALUE_AND,
         };
 
         let driver = driver()?;
@@ -366,7 +365,7 @@ impl Stream {
         // SAFETY: the stream is live. On success the driver owns `data` and
         // `invoke` consumes it exactly once after preceding work completes.
         let status = unsafe { (driver.launch_host_func)(self.raw, invoke::<F>, data.cast()) };
-        if status != crate::driver::CUDA_SUCCESS {
+        if status != sys::CUDA_SUCCESS {
             // SAFETY: a rejected launch did not transfer ownership.
             drop(unsafe { Box::from_raw(data) });
         }

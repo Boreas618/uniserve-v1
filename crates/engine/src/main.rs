@@ -30,6 +30,19 @@ use service::logging;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// NVTX's static injection: the strong definition of the weak
+/// `InitializeInjectionNvtx2_fnptr` the NVTX loader compiled into this
+/// executable declares, which NVTX calls at the process's first NVTX call to
+/// hand its ranges to the CUPTI the process loads. NVTX consults it after a
+/// library named in its environment, so a profiler that injects its own
+/// (Nsight Systems) keeps the ranges.
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+static InitializeInjectionNvtx2_fnptr: unsafe extern "C" fn(
+    *const std::ffi::c_void,
+) -> std::ffi::c_int = platform::cupti::initialize_nvtx_injection;
+
 /// The model families this executable loads. A model is added with its module
 /// of `models` and one entry here, and its request-processing side in
 /// `processing::FAMILIES`, which the daemon serves.

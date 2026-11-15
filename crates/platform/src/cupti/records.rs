@@ -16,24 +16,26 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
 
+use crate::sys::cupti as sys;
+
 /// `CUPTI_ACTIVITY_KIND_MEMCPY`.
-pub const MEMCPY: u32 = 1;
+pub const MEMCPY: u32 = sys::CUPTI_ACTIVITY_KIND_MEMCPY;
 /// `CUPTI_ACTIVITY_KIND_MEMSET`.
-pub const MEMSET: u32 = 2;
+pub const MEMSET: u32 = sys::CUPTI_ACTIVITY_KIND_MEMSET;
 /// `CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL`.
-pub const CONCURRENT_KERNEL: u32 = 10;
+pub const CONCURRENT_KERNEL: u32 = sys::CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL;
 /// `CUPTI_ACTIVITY_KIND_MARKER`.
-pub const MARKER: u32 = 12;
+pub const MARKER: u32 = sys::CUPTI_ACTIVITY_KIND_MARKER;
 /// `CUPTI_ACTIVITY_KIND_MARKER_DATA`.
-pub const MARKER_DATA: u32 = 13;
+pub const MARKER_DATA: u32 = sys::CUPTI_ACTIVITY_KIND_MARKER_DATA;
 /// `CUPTI_ACTIVITY_KIND_MEMCPY2`: a peer copy.
-pub const MEMCPY2: u32 = 22;
+pub const MEMCPY2: u32 = sys::CUPTI_ACTIVITY_KIND_MEMCPY2;
 /// `CUPTI_ACTIVITY_KIND_NVLINK`.
-pub const NVLINK: u32 = 40;
+pub const NVLINK: u32 = sys::CUPTI_ACTIVITY_KIND_NVLINK;
 /// `CUPTI_ACTIVITY_KIND_PCIE`.
-pub const PCIE: u32 = 46;
+pub const PCIE: u32 = sys::CUPTI_ACTIVITY_KIND_PCIE;
 /// `CUPTI_ACTIVITY_KIND_MEMORY2`.
-pub const STORAGE2: u32 = 49;
+pub const STORAGE2: u32 = sys::CUPTI_ACTIVITY_KIND_MEMORY2;
 /// `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`.
 pub const GRAPH_TRACE: u32 = super::subscriber::GRAPH_TRACE;
 

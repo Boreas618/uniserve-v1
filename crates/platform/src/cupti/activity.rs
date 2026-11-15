@@ -82,14 +82,10 @@ const TRANSFER: Fields = Fields {
 
 /// The enabled `CUpti_ActivityKind`s and their records' fields.
 const KINDS: &[(u32, Fields)] = &[
-    // CONCURRENT_KERNEL
-    (10, KERNEL),
-    // MEMCPY
-    (1, TRANSFER),
-    // MEMCPY2
-    (22, TRANSFER),
-    // MEMSET
-    (2, TRANSFER),
+    (super::records::CONCURRENT_KERNEL, KERNEL),
+    (super::records::MEMCPY, TRANSFER),
+    (super::records::MEMCPY2, TRANSFER),
+    (super::records::MEMSET, TRANSFER),
 ];
 
 /// `CUpti_ActivityGraphTrace2`.

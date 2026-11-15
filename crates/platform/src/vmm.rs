@@ -6,16 +6,10 @@ use std::ffi::c_void;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
-use crate::driver::{
-    CU_MEM_ACCESS_FLAGS_PROT_READ, CU_MEM_ACCESS_FLAGS_PROT_READWRITE, CU_MEM_LOCATION_TYPE_DEVICE,
-    MemAccessDesc, MemAllocationProp, MemLocation, driver, in_context, reserve_addresses,
-};
+use crate::driver::{driver, in_context, reserve_addresses};
 use crate::memory::DeviceAllocation;
+use crate::sys::cuda as sys;
 use crate::{DeviceGuard, DeviceId, Error, PrimaryContext, Result, lock, reclaim};
-
-pub(crate) const CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR: i32 = 1;
-const CU_MEM_HANDLE_TYPE_FABRIC: i32 = 8;
-const CU_MEM_ALLOC_GRANULARITY_MINIMUM: i32 = 0;
 
 /// How a physical allocation is shared with other processes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,10 +23,10 @@ pub enum HandleType {
 }
 
 impl HandleType {
-    pub(crate) fn raw(self) -> i32 {
+    pub(crate) fn raw(self) -> sys::CUmemAllocationHandleType {
         match self {
-            Self::Fabric => CU_MEM_HANDLE_TYPE_FABRIC,
-            Self::Descriptor => CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+            Self::Fabric => sys::CU_MEM_HANDLE_TYPE_FABRIC,
+            Self::Descriptor => sys::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
         }
     }
 
@@ -64,7 +58,7 @@ impl HandleType {
     /// The minimum size and alignment of allocations of this type on `device`.
     pub fn granularity(self, device: DeviceId) -> Result<usize> {
         let driver = driver()?;
-        let properties = MemAllocationProp::device(device.handle()?, self.raw());
+        let properties = sys::CUmemAllocationProp::device(device.handle()?, self.raw());
         let mut granularity = 0;
         driver.check(
             // SAFETY: the driver reads the local `properties` and writes one size_t
@@ -73,7 +67,7 @@ impl HandleType {
                 (driver.mem_get_allocation_granularity)(
                     &mut granularity,
                     &properties,
-                    CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+                    sys::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
                 )
             },
             "cuMemGetAllocationGranularity",
@@ -93,7 +87,8 @@ fn fabric_usable(device: DeviceId) -> Result<bool> {
         return Ok(false);
     };
     let driver = driver()?;
-    let properties = MemAllocationProp::device(device.handle()?, CU_MEM_HANDLE_TYPE_FABRIC);
+    let properties =
+        sys::CUmemAllocationProp::device(device.handle()?, sys::CU_MEM_HANDLE_TYPE_FABRIC);
     let mut handle = 0;
 
     // SAFETY: the driver reads the properties and writes one handle.
@@ -116,10 +111,10 @@ pub enum Protection {
 }
 
 impl Protection {
-    pub(crate) fn flags(self) -> i32 {
+    pub(crate) fn flags(self) -> sys::CUmemAccess_flags {
         match self {
-            Self::ReadOnly => CU_MEM_ACCESS_FLAGS_PROT_READ,
-            Self::ReadWrite => CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+            Self::ReadOnly => sys::CU_MEM_ACCESS_FLAGS_PROT_READ,
+            Self::ReadWrite => sys::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
         }
     }
 }
@@ -154,7 +149,7 @@ impl ShareableHandle {
                         (driver.mem_export_to_shareable_handle)(
                             bytes.as_mut_ptr().cast(),
                             handle,
-                            CU_MEM_HANDLE_TYPE_FABRIC,
+                            sys::CU_MEM_HANDLE_TYPE_FABRIC,
                             0,
                         )
                     },
@@ -170,7 +165,7 @@ impl ShareableHandle {
                         (driver.mem_export_to_shareable_handle)(
                             (&raw mut fd).cast(),
                             handle,
-                            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+                            sys::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
                             0,
                         )
                     },
@@ -193,7 +188,7 @@ impl ShareableHandle {
                 (driver.mem_import_from_shareable_handle)(
                     &mut handle,
                     bytes.as_ptr().cast_mut().cast(),
-                    CU_MEM_HANDLE_TYPE_FABRIC,
+                    sys::CU_MEM_HANDLE_TYPE_FABRIC,
                 )
             },
             // A POSIX descriptor travels by value in the pointer argument.
@@ -202,7 +197,7 @@ impl ShareableHandle {
                 (driver.mem_import_from_shareable_handle)(
                     &mut handle,
                     fd.as_raw_fd() as isize as *mut c_void,
-                    CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+                    sys::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
                 )
             },
         };
@@ -242,7 +237,11 @@ impl VirtualRange {
     }
 
     /// Creates a physical allocation owned by this range and returns its handle.
-    pub(crate) fn create(&mut self, bytes: usize, properties: &MemAllocationProp) -> Result<u64> {
+    pub(crate) fn create(
+        &mut self,
+        bytes: usize,
+        properties: &sys::CUmemAllocationProp,
+    ) -> Result<u64> {
         let driver = driver()?;
         let mut handle = 0;
         driver.check(
@@ -287,13 +286,10 @@ impl VirtualRange {
         let descriptors = devices
             .iter()
             .map(|device| {
-                Ok(MemAccessDesc {
-                    location: MemLocation {
-                        kind: CU_MEM_LOCATION_TYPE_DEVICE,
-                        id: device.handle()?,
-                    },
-                    flags: protection.flags(),
-                })
+                Ok(sys::CUmemAccessDesc::device(
+                    device.handle()?,
+                    protection.flags(),
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -796,11 +792,11 @@ impl SegmentedMapping {
         // segment is a multiple of its granularity.
         let fabric = HandleType::probe(self.device)? == HandleType::Fabric
             && bytes.is_multiple_of(HandleType::Fabric.granularity(self.device)?);
-        let mut handle_types = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+        let mut handle_types = sys::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
         if fabric {
-            handle_types |= CU_MEM_HANDLE_TYPE_FABRIC;
+            handle_types |= sys::CU_MEM_HANDLE_TYPE_FABRIC;
         }
-        let properties = MemAllocationProp::device(self.device.handle()?, handle_types);
+        let properties = sys::CUmemAllocationProp::device(self.device.handle()?, handle_types);
         let driver = driver()?;
         let mut handle = 0;
         driver.check(
@@ -1043,13 +1039,10 @@ impl SegmentedMapping {
             .access
             .iter()
             .map(|device| {
-                Ok(MemAccessDesc {
-                    location: MemLocation {
-                        kind: CU_MEM_LOCATION_TYPE_DEVICE,
-                        id: device.handle()?,
-                    },
-                    flags: protection.flags(),
-                })
+                Ok(sys::CUmemAccessDesc::device(
+                    device.handle()?,
+                    protection.flags(),
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
         let driver = driver()?;

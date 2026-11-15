@@ -1,9 +1,9 @@
-//! Typed failures of the runtime-loaded CUDA, NVML, NCCL, cuBLASLt and cuDNN
-//! libraries.
+//! Typed failures of the runtime-loaded CUDA driver, NVML, NCCL and CUPTI libraries.
 
 use std::sync::Arc;
 
 use crate::DeviceId;
+use crate::sys::cuda as sys;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -22,8 +22,21 @@ pub enum Error {
         source: Arc<libloading::Error>,
     },
 
-    /// A loaded library does not export a required entry point, typically
-    /// because it predates the API.
+    /// A loaded library reports a version older than the one this crate requires: the release
+    /// its generated bindings are written for, or the first release whose behaviour the crate
+    /// depends on. The library is opened by its soname from the loader's default search path, so
+    /// the remedy is installing `package` there.
+    #[error(
+        "{library} is {found}, older than the {required} this build requires; install {package}"
+    )]
+    Version {
+        library: &'static str,
+        found: String,
+        required: String,
+        package: &'static str,
+    },
+
+    /// A loaded library does not export a required entry point.
     #[error("{library} does not export {symbol}: {source}")]
     Symbol {
         library: &'static str,
@@ -81,15 +94,6 @@ pub enum Error {
     #[error("{call} failed with CUPTI result {code}")]
     Cupti { call: &'static str, code: i32 },
 
-    /// The process loaded a CUPTI release the subscription refuses
-    /// (`cupti::subscriber::subscribe`), by its `CUPTI_API_VERSION`.
-    #[error(
-        "{library} is CUPTI API version {version}, which faults and stalls the CUDA graph \
-         replays it records; name a later CUPTI in NVTX_INJECTION64_PATH, or state a Python \
-         environment with the `nvidia-cuda-cupti` package in VIRTUAL_ENV"
-    )]
-    CuptiRefused { library: &'static str, version: u32 },
-
     /// The operation is not issued on a stream that is being captured into a
     /// CUDA graph.
     #[error("{call} is not permitted on a capturing stream")]
@@ -130,31 +134,27 @@ pub enum Error {
     ExitHandler,
 }
 
-/// `CUDA_ERROR_OUT_OF_MEMORY`: the call could not allocate enough storage or
-/// other resources.
-const CUDA_ERROR_OUT_OF_MEMORY: i32 = 2;
-
 /// Driver results after which the process cannot continue using CUDA.
 ///
 /// The driver documents each as leaving the process in an inconsistent
 /// state in which further CUDA work returns the same error, or its context
 /// as unusable (`CUDA_ERROR_ASSERT`). An uncorrectable ECC error is included
 /// because the storage the process computes with can no longer be trusted.
-const UNRECOVERABLE_DRIVER_RESULTS: &[i32] = &[
-    214, // CUDA_ERROR_ECC_UNCORRECTABLE
-    226, // CUDA_ERROR_CONTAINED
-    700, // CUDA_ERROR_ILLEGAL_ADDRESS
-    702, // CUDA_ERROR_LAUNCH_TIMEOUT
-    710, // CUDA_ERROR_ASSERT
-    714, // CUDA_ERROR_HARDWARE_STACK_ERROR
-    715, // CUDA_ERROR_ILLEGAL_INSTRUCTION
-    716, // CUDA_ERROR_MISALIGNED_ADDRESS
-    717, // CUDA_ERROR_INVALID_ADDRESS_SPACE
-    718, // CUDA_ERROR_INVALID_PC
-    719, // CUDA_ERROR_LAUNCH_FAILED
-    721, // CUDA_ERROR_TENSOR_MEMORY_LEAK
-    810, // CUDA_ERROR_MPS_CLIENT_TERMINATED
-    911, // CUDA_ERROR_EXTERNAL_DEVICE
+const UNRECOVERABLE_DRIVER_RESULTS: &[sys::CUresult] = &[
+    sys::CUDA_ERROR_ECC_UNCORRECTABLE,
+    sys::CUDA_ERROR_CONTAINED,
+    sys::CUDA_ERROR_ILLEGAL_ADDRESS,
+    sys::CUDA_ERROR_LAUNCH_TIMEOUT,
+    sys::CUDA_ERROR_ASSERT,
+    sys::CUDA_ERROR_HARDWARE_STACK_ERROR,
+    sys::CUDA_ERROR_ILLEGAL_INSTRUCTION,
+    sys::CUDA_ERROR_MISALIGNED_ADDRESS,
+    sys::CUDA_ERROR_INVALID_ADDRESS_SPACE,
+    sys::CUDA_ERROR_INVALID_PC,
+    sys::CUDA_ERROR_LAUNCH_FAILED,
+    sys::CUDA_ERROR_TENSOR_MEMORY_LEAK,
+    sys::CUDA_ERROR_MPS_CLIENT_TERMINATED,
+    sys::CUDA_ERROR_EXTERNAL_DEVICE,
 ];
 
 impl Error {
@@ -166,7 +166,7 @@ impl Error {
     /// call; the process and its contexts remain usable.
     pub fn is_out_of_memory(&self) -> bool {
         match self {
-            Self::Driver { code, .. } => *code == CUDA_ERROR_OUT_OF_MEMORY,
+            Self::Driver { code, .. } => *code == sys::CUDA_ERROR_OUT_OF_MEMORY as i32,
             Self::Reclaim { first, .. } => first.is_out_of_memory(),
             _ => false,
         }
@@ -176,7 +176,9 @@ impl Error {
     /// continue using CUDA and must be restarted.
     pub fn is_unrecoverable(&self) -> bool {
         match self {
-            Self::Driver { code, .. } => UNRECOVERABLE_DRIVER_RESULTS.contains(code),
+            Self::Driver { code, .. } => UNRECOVERABLE_DRIVER_RESULTS
+                .iter()
+                .any(|&result| result as i32 == *code),
             Self::Reclaim { first, .. } => first.is_unrecoverable(),
             _ => false,
         }

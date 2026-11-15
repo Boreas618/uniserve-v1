@@ -25,9 +25,8 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use crate::driver::driver;
+use crate::sys::cuda as sys;
 use crate::{Error, Result, lock};
-
-const CU_STREAM_CAPTURE_MODE_RELAXED: i32 = 2;
 
 type Release = Box<dyn FnOnce() -> Result<()> + Send>;
 
@@ -61,7 +60,7 @@ fn reclaimer() -> Option<&'static Sender<Message>> {
                 .name("cuda-reclaim".into())
                 .spawn(move || {
                     if let Ok(driver) = driver() {
-                        let mut mode = CU_STREAM_CAPTURE_MODE_RELAXED;
+                        let mut mode = sys::CU_STREAM_CAPTURE_MODE_RELAXED;
                         // SAFETY: sets this thread's capture interaction mode;
                         // the driver writes back the previous mode.
                         let _ = unsafe { (driver.thread_exchange_capture_mode)(&mut mode) };

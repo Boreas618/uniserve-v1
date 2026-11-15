@@ -9,9 +9,15 @@ publish = false
 [dependencies]
 libc.workspace = true
 libloading.workspace = true
+# Joins a driver call's name to its generated CUPTI callback id, so the id and the name the
+# collectors report are one token (`cupti::blocking`, `cupti::range_profiler`).
+paste = "1.0.15"
 thiserror.workspace = true
 
 [dev-dependencies]
+# The generator of the committed bindings under `src/sys/` (`examples/bindings.rs`).
+bindgen = "0.72.1"
+pkg-config = "0.3.33"
 tempfile.workspace = true
 
 [lints]

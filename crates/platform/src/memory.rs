@@ -2,13 +2,10 @@
 
 use std::ptr::NonNull;
 
-use crate::driver::{MemAllocationProp, driver, in_context};
-use crate::vmm::{CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, Protection, VirtualRange};
+use crate::driver::{driver, in_context};
+use crate::sys::cuda as sys;
+use crate::vmm::{Protection, VirtualRange};
 use crate::{DeviceId, Error, HandleType, PrimaryContext, Result, ShareableHandle, reclaim};
-
-const CU_MEMHOSTALLOC_PORTABLE: u32 = 1;
-const CU_MEMHOSTREGISTER_PORTABLE: u32 = 1;
-const CU_MEMHOSTREGISTER_READ_ONLY: u32 = 8;
 
 /// Device storage owned by the worker.
 ///
@@ -138,9 +135,9 @@ impl DeviceAllocation {
         let mut range = VirtualRange::new(context.clone());
         let mut handle_types = handle_type.raw();
         if retainable {
-            handle_types |= CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+            handle_types |= sys::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
         }
-        let properties = MemAllocationProp::device(device.handle()?, handle_types);
+        let properties = sys::CUmemAllocationProp::device(device.handle()?, handle_types);
         let handle = range.create(rounded, &properties)?;
         range.reserve(rounded, granularity)?;
         range.map(0, rounded, handle)?;
@@ -291,7 +288,7 @@ impl PinnedBuffer {
         driver.check(
             // SAFETY: the driver writes the base of a new host allocation to the
             // local `pointer`.
-            unsafe { (driver.mem_host_alloc)(&mut pointer, bytes, CU_MEMHOSTALLOC_PORTABLE) },
+            unsafe { (driver.mem_host_alloc)(&mut pointer, bytes, sys::CU_MEMHOSTALLOC_PORTABLE) },
             "cuMemHostAlloc",
         )?;
         let pointer = NonNull::new(pointer.cast::<u8>())
@@ -387,28 +384,32 @@ impl HostRegistration {
     /// unregistered or dropped.
     pub unsafe fn new(device: DeviceId, pointer: *mut u8, bytes: usize) -> Result<Self> {
         // SAFETY: forwarded from the caller.
-        unsafe { Self::register(device, pointer, bytes, CU_MEMHOSTREGISTER_PORTABLE) }
+        unsafe { Self::register(device, pointer, bytes, sys::CU_MEMHOSTREGISTER_PORTABLE) }
     }
 
     /// Registers `[pointer, pointer + bytes)` in `device`'s primary context
-    /// as storage devices only read, such as a read-only mapping of retained
-    /// host storage: with `CU_MEMHOSTREGISTER_READ_ONLY` where the device
-    /// supports it (`ReadOnlyHostRegisterSupported`), as a plain
-    /// registration where it does not (GB200 reports 0 and refuses the
-    /// flag, and a read-only mapping registers there only without it). The
-    /// caller's devices read the range alone either way.
+    /// as storage devices only read (`CU_MEMHOSTREGISTER_READ_ONLY`), such as
+    /// a read-only mapping of retained host storage.
+    ///
+    /// The flag is a device capability
+    /// ([`HostRegistration::read_only_supported`]); a device without it
+    /// refuses the registration with the driver's error. A caller that holds
+    /// a read-only mapping decides what to do on such a device — a plain
+    /// [`HostRegistration::new`] is the only registration a read-only
+    /// mapping then takes — rather than this call deciding for it.
     ///
     /// # Safety
     /// As for [`HostRegistration::new`].
     pub unsafe fn read_only(device: DeviceId, pointer: *mut u8, bytes: usize) -> Result<Self> {
-        let supported = device.attribute(crate::DeviceAttribute::ReadOnlyHostRegisterSupported)?;
-        let flags = if supported != 0 {
-            CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_READ_ONLY
-        } else {
-            CU_MEMHOSTREGISTER_PORTABLE
-        };
+        let flags = sys::CU_MEMHOSTREGISTER_PORTABLE | sys::CU_MEMHOSTREGISTER_READ_ONLY;
         // SAFETY: forwarded from the caller.
         unsafe { Self::register(device, pointer, bytes, flags) }
+    }
+
+    /// Whether `device` registers host storage for reads alone
+    /// ([`HostRegistration::read_only`]); GB200 reports that it does not.
+    pub fn read_only_supported(device: DeviceId) -> Result<bool> {
+        Ok(device.attribute(crate::DeviceAttribute::ReadOnlyHostRegisterSupported)? != 0)
     }
 
     /// # Safety

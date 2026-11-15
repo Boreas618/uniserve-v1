@@ -21,28 +21,10 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use crate::driver::{
-    self, CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC, GraphEdgeData, Handle,
-    KernelNodeParams as RawKernelNodeParams,
-};
+use crate::driver::{self, Handle};
 use crate::launch::Function;
+use crate::sys::cuda as sys;
 use crate::{Device, DeviceGuard, DeviceId, Error, PrimaryContext, Result, Stream, reclaim};
-
-/// `CU_STREAM_CAPTURE_STATUS_ACTIVE`.
-const CU_STREAM_CAPTURE_STATUS_ACTIVE: i32 = 1;
-
-/// `CU_GRAPH_NODE_TYPE_KERNEL`.
-const CU_GRAPH_NODE_TYPE_KERNEL: i32 = 0;
-/// `CU_GRAPH_NODE_TYPE_MEMCPY`.
-const CU_GRAPH_NODE_TYPE_MEMCPY: i32 = 1;
-/// `CU_GRAPH_NODE_TYPE_MEMSET`.
-const CU_GRAPH_NODE_TYPE_MEMSET: i32 = 2;
-/// `CU_GRAPH_NODE_TYPE_HOST`.
-const CU_GRAPH_NODE_TYPE_HOST: i32 = 3;
-/// `CU_GRAPH_NODE_TYPE_GRAPH`.
-const CU_GRAPH_NODE_TYPE_GRAPH: i32 = 4;
-/// `CU_GRAPH_NODE_TYPE_EMPTY`.
-const CU_GRAPH_NODE_TYPE_EMPTY: i32 = 5;
 
 /// What a template graph, its executable and its nodes share: the `CUgraph`,
 /// the context it belongs to, and the device.
@@ -196,16 +178,7 @@ impl Graph {
 
         let driver = driver::driver()?;
         let _context = self.core.context.enter()?;
-        let mut raw = RawKernelNodeParams {
-            func: std::ptr::null_mut(),
-            grid_dim: [0; 3],
-            block_dim: [0; 3],
-            shared_mem_bytes: 0,
-            kernel_params: std::ptr::null_mut(),
-            extra: std::ptr::null_mut(),
-            kern: std::ptr::null_mut(),
-            ctx: std::ptr::null_mut(),
-        };
+        let mut raw = sys::CUDA_KERNEL_NODE_PARAMS::default();
         driver.check(
             // SAFETY: the node is a live kernel node of this graph; the driver
             // fills `raw` with the node's own parameter storage.
@@ -216,7 +189,7 @@ impl Graph {
         // Each parameter's size comes from the kernel's signature: the node's
         // array carries no count, so the walk ends where the driver does.
         let mut sizes = Vec::new();
-        while let Some(parameter) = crate::launch::param_at(raw.func, sizes.len())? {
+        while let Some(parameter) = crate::launch::param_at(raw.func.cast(), sizes.len())? {
             sizes.push((parameter.offset(), parameter.size()));
         }
 
@@ -226,8 +199,8 @@ impl Graph {
             // signature, and its packed form lays the values out at the
             // offsets just read; each value is `size` bytes there.
             let source: *const c_void = unsafe {
-                if !raw.kernel_params.is_null() {
-                    *raw.kernel_params.add(index)
+                if !raw.kernelParams.is_null() {
+                    *raw.kernelParams.add(index)
                 } else {
                     (raw.extra as *const u8).add(offset).cast()
                 }
@@ -244,10 +217,10 @@ impl Graph {
         }
 
         Ok(OwnedKernelNodeParams {
-            function: Function::new(raw.func, Device::new(self.core.device)?),
-            grid: raw.grid_dim,
-            block: raw.block_dim,
-            shared_memory: raw.shared_mem_bytes,
+            function: Function::new(raw.func.cast(), Device::new(self.core.device)?),
+            grid: [raw.gridDimX, raw.gridDimY, raw.gridDimZ],
+            block: [raw.blockDimX, raw.blockDimY, raw.blockDimZ],
+            shared_memory: raw.sharedMemBytes,
             parameters,
         })
     }
@@ -308,12 +281,12 @@ impl GraphNode {
             "cuGraphNodeGetType",
         )?;
         Ok(match kind {
-            CU_GRAPH_NODE_TYPE_KERNEL => GraphNodeKind::Kernel,
-            CU_GRAPH_NODE_TYPE_MEMCPY => GraphNodeKind::Memcpy,
-            CU_GRAPH_NODE_TYPE_MEMSET => GraphNodeKind::Memset,
-            CU_GRAPH_NODE_TYPE_HOST => GraphNodeKind::Host,
-            CU_GRAPH_NODE_TYPE_GRAPH => GraphNodeKind::Graph,
-            CU_GRAPH_NODE_TYPE_EMPTY => GraphNodeKind::Empty,
+            sys::CU_GRAPH_NODE_TYPE_KERNEL => GraphNodeKind::Kernel,
+            sys::CU_GRAPH_NODE_TYPE_MEMCPY => GraphNodeKind::Memcpy,
+            sys::CU_GRAPH_NODE_TYPE_MEMSET => GraphNodeKind::Memset,
+            sys::CU_GRAPH_NODE_TYPE_HOST => GraphNodeKind::Host,
+            sys::CU_GRAPH_NODE_TYPE_GRAPH => GraphNodeKind::Graph,
+            sys::CU_GRAPH_NODE_TYPE_EMPTY => GraphNodeKind::Empty,
             other => GraphNodeKind::Other(other),
         })
     }
@@ -335,7 +308,7 @@ pub enum GraphNodeKind {
     /// A node that only orders its dependencies.
     Empty,
     /// A kind this binding does not name, as the driver's number.
-    Other(i32),
+    Other(u32),
 }
 
 /// The parameters a rebind may change in one kernel node.
@@ -476,21 +449,23 @@ impl GraphExec {
             unsafe { (driver.graph_node_get_type)(node.raw, &mut kind) },
             "cuGraphNodeGetType",
         )?;
-        if kind != CU_GRAPH_NODE_TYPE_KERNEL {
+        if kind != sys::CU_GRAPH_NODE_TYPE_KERNEL {
             return Err(Error::invalid(format!(
                 "the node is of type {kind}, not a kernel node"
             )));
         }
 
-        let raw = RawKernelNodeParams {
-            func: params.function.raw(),
-            grid_dim: params.grid,
-            block_dim: params.block,
-            shared_mem_bytes: params.shared_memory,
-            kernel_params: params.parameters.as_ptr().cast_mut(),
-            extra: std::ptr::null_mut(),
-            kern: std::ptr::null_mut(),
-            ctx: std::ptr::null_mut(),
+        let raw = sys::CUDA_KERNEL_NODE_PARAMS {
+            func: params.function.raw().cast(),
+            gridDimX: params.grid[0],
+            gridDimY: params.grid[1],
+            gridDimZ: params.grid[2],
+            blockDimX: params.block[0],
+            blockDimY: params.block[1],
+            blockDimZ: params.block[2],
+            sharedMemBytes: params.shared_memory,
+            kernelParams: params.parameters.as_ptr().cast_mut(),
+            ..Default::default()
         };
         driver.check(
             // SAFETY: the executable and node are live and belong together;
@@ -596,11 +571,11 @@ pub enum CaptureMode {
 }
 
 impl CaptureMode {
-    fn raw(self) -> i32 {
+    fn raw(self) -> sys::CUstreamCaptureMode {
         match self {
-            Self::Global => 0,
-            Self::ThreadLocal => 1,
-            Self::Relaxed => 2,
+            Self::Global => sys::CU_STREAM_CAPTURE_MODE_GLOBAL,
+            Self::ThreadLocal => sys::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            Self::Relaxed => sys::CU_STREAM_CAPTURE_MODE_RELAXED,
         }
     }
 }
@@ -620,7 +595,7 @@ impl Capture {
 
         let (status, graph, frontier) = capture_info(stream)?;
         let frontier: Vec<Handle> = frontier.into_iter().map(|(node, _)| node).collect();
-        if status != CU_STREAM_CAPTURE_STATUS_ACTIVE {
+        if status != sys::CU_STREAM_CAPTURE_STATUS_ACTIVE {
             return Err(Error::invalid(format!(
                 "the stream's capture is in status {status} right after it began"
             )));
@@ -663,7 +638,7 @@ impl Capture {
     /// structure change and its bucket is recaptured.
     pub fn record_walk(&mut self) -> Result<Vec<WalkedNode>> {
         let (status, _, frontier) = capture_info(&self.stream)?;
-        if status != CU_STREAM_CAPTURE_STATUS_ACTIVE {
+        if status != sys::CU_STREAM_CAPTURE_STATUS_ACTIVE {
             return Err(Error::invalid(format!(
                 "the capture is in status {status}; no node can be recorded"
             )));
@@ -785,7 +760,7 @@ impl Drop for Capture {
 }
 
 /// The nodes the next operation will depend on, each with what its edge says.
-type Frontier = Vec<(Handle, GraphEdgeData)>;
+type Frontier = Vec<(Handle, sys::CUgraphEdgeData)>;
 
 /// The stream's capture status, the graph being captured, and the dependency
 /// set of the next node, with what each of those edges says
@@ -796,13 +771,13 @@ type Frontier = Vec<(Handle, GraphEdgeData)>;
 /// edge data when one of them carries non-default data
 /// (`CUDA_ERROR_LOSSY_QUERY`), and the frontier edge of a programmatic
 /// dependent launch is exactly such an edge.
-fn capture_info(stream: &Stream) -> Result<(i32, Handle, Frontier)> {
+fn capture_info(stream: &Stream) -> Result<(sys::CUstreamCaptureStatus, Handle, Frontier)> {
     let driver = driver::driver()?;
     let mut status = 0;
     let mut id = 0u64;
     let mut graph: Handle = std::ptr::null_mut();
     let mut dependencies: *const Handle = std::ptr::null();
-    let mut edge_data: *const GraphEdgeData = std::ptr::null();
+    let mut edge_data: *const sys::CUgraphEdgeData = std::ptr::null();
     let mut count = 0usize;
     driver.check(
         // SAFETY: the stream is live; each pointer addresses a local the
@@ -862,12 +837,12 @@ fn capture_info(stream: &Stream) -> Result<(i32, Handle, Frontier)> {
 /// there is no way to ask for the count of a graph whose edges carry data. The
 /// driver fills what fits and answers how many it wrote, so one call with room
 /// for eight is most nodes and the loop is bounded by the real out-degree.
-fn dependent_edges(node: Handle) -> Result<Vec<(Handle, GraphEdgeData)>> {
+fn dependent_edges(node: Handle) -> Result<Vec<(Handle, sys::CUgraphEdgeData)>> {
     let driver = driver::driver()?;
     let mut capacity = 8usize;
     loop {
         let mut nodes = vec![std::ptr::null_mut(); capacity];
-        let mut data = vec![GraphEdgeData::default(); capacity];
+        let mut data = vec![sys::CUgraphEdgeData::default(); capacity];
         let mut count = capacity;
         driver.check(
             // SAFETY: both arrays hold `capacity` entries and the driver writes
@@ -924,12 +899,14 @@ impl EdgeKind {
     /// dependency kind itself, or the default kind with the upstream node's
     /// programmatic port - so both are read, and a comparison of two captures
     /// does not depend on which encoding the driver used in each.
-    fn of(data: &GraphEdgeData) -> Result<Self> {
-        let programmatic_port = data.from_port == CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC;
-        match data.kind {
-            driver::CU_GRAPH_DEPENDENCY_TYPE_DEFAULT if !programmatic_port => Ok(Self::Completion),
-            driver::CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC
-            | driver::CU_GRAPH_DEPENDENCY_TYPE_DEFAULT => Ok(Self::Programmatic),
+    fn of(data: &sys::CUgraphEdgeData) -> Result<Self> {
+        let programmatic_port =
+            u32::from(data.from_port) == sys::CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC;
+        match u32::from(data.type_) {
+            sys::CU_GRAPH_DEPENDENCY_TYPE_DEFAULT if !programmatic_port => Ok(Self::Completion),
+            sys::CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC | sys::CU_GRAPH_DEPENDENCY_TYPE_DEFAULT => {
+                Ok(Self::Programmatic)
+            }
             other => Err(Error::invalid(format!(
                 "a graph edge states dependency kind {other}, which this walk does not know"
             ))),

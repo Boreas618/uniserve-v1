@@ -20,53 +20,54 @@
 //! [`BlockingWatch::start`] enables them again.
 
 use std::cell::Cell;
-use std::ffi::c_void;
+
 use std::marker::PhantomData;
 
 use super::subscriber::{self, API_ENTER, DRIVER_DOMAIN};
 use crate::Result;
+use crate::sys::cupti::CUpti_CallbackData as CallbackData;
 
-/// The watched driver calls: `CUpti_driver_api_trace_cbid` and name. Every
+/// The watched driver calls, by name and generated callback id. Every
 /// call here returns only once the device work it waits for completed.
-const WATCHED: &[(u32, &str)] = &[
-    (17, "cuCtxSynchronize"),
-    (800, "cuCtxSynchronize_v2"),
-    (121, "cuEventSynchronize"),
-    (126, "cuStreamSynchronize"),
-    (440, "cuStreamSynchronize_ptsz"),
-    (38, "cuMemFreeHost"),
-    (245, "cuMemFree_v2"),
-    (552, "cuMemUnmap"),
-    (43, "cuMemcpyHtoD"),
-    (45, "cuMemcpyDtoH"),
-    (47, "cuMemcpyDtoD"),
-    (49, "cuMemcpyDtoA"),
-    (51, "cuMemcpyAtoD"),
-    (53, "cuMemcpyHtoA"),
-    (54, "cuMemcpyAtoH"),
-    (55, "cuMemcpyAtoA"),
-    (56, "cuMemcpy2D"),
-    (57, "cuMemcpy2DUnaligned"),
-    (58, "cuMemcpy3D"),
-    (248, "cuMemcpy_v2"),
-    (276, "cuMemcpyHtoD_v2"),
-    (278, "cuMemcpyDtoH_v2"),
-    (280, "cuMemcpyDtoD_v2"),
-    (282, "cuMemcpyAtoH_v2"),
-    (284, "cuMemcpyAtoD_v2"),
-    (285, "cuMemcpyDtoA_v2"),
-    (286, "cuMemcpyAtoA_v2"),
-    (287, "cuMemcpy2D_v2"),
-    (288, "cuMemcpy2DUnaligned_v2"),
-    (290, "cuMemcpy3D_v2"),
-    (292, "cuMemcpyHtoA_v2"),
-    (305, "cuMemcpy"),
-    (318, "cuMemcpyPeer"),
-    (320, "cuMemcpy3DPeer"),
-    (397, "cuMemcpyHtoD_v2_ptds"),
-    (398, "cuMemcpyDtoH_v2_ptds"),
-    (399, "cuMemcpyDtoD_v2_ptds"),
-    (408, "cuMemcpy_ptds"),
+const WATCHED: &[(u32, &str)] = super::driver_calls![
+    cuCtxSynchronize,
+    cuCtxSynchronize_v2,
+    cuEventSynchronize,
+    cuStreamSynchronize,
+    cuStreamSynchronize_ptsz,
+    cuMemFreeHost,
+    cuMemFree_v2,
+    cuMemUnmap,
+    cuMemcpyHtoD,
+    cuMemcpyDtoH,
+    cuMemcpyDtoD,
+    cuMemcpyDtoA,
+    cuMemcpyAtoD,
+    cuMemcpyHtoA,
+    cuMemcpyAtoH,
+    cuMemcpyAtoA,
+    cuMemcpy2D,
+    cuMemcpy2DUnaligned,
+    cuMemcpy3D,
+    cuMemcpy_v2,
+    cuMemcpyHtoD_v2,
+    cuMemcpyDtoH_v2,
+    cuMemcpyDtoD_v2,
+    cuMemcpyAtoH_v2,
+    cuMemcpyAtoD_v2,
+    cuMemcpyDtoA_v2,
+    cuMemcpyAtoA_v2,
+    cuMemcpy2D_v2,
+    cuMemcpy2DUnaligned_v2,
+    cuMemcpy3D_v2,
+    cuMemcpyHtoA_v2,
+    cuMemcpy,
+    cuMemcpyPeer,
+    cuMemcpy3DPeer,
+    cuMemcpyHtoD_v2_ptds,
+    cuMemcpyDtoH_v2_ptds,
+    cuMemcpyDtoD_v2_ptds,
+    cuMemcpy_ptds,
 ];
 
 thread_local! {
@@ -116,12 +117,12 @@ impl Drop for BlockingWatch {
 ///
 /// # Safety
 /// `data` is the `CUpti_CallbackData` of a driver API callback.
-pub(super) unsafe fn on_driver_call(cbid: u32, data: *const c_void) {
+pub(super) unsafe fn on_driver_call(cbid: u32, data: *const CallbackData) {
     if DEPTH.get() == 0 {
         return;
     }
-    // SAFETY: the callback data's first field is the `CUpti_ApiCallbackSite`.
-    if unsafe { *data.cast::<i32>() } != API_ENTER {
+    // SAFETY: CUPTI passes the call's callback data, valid during the callback.
+    if unsafe { (*data).callbackSite } != API_ENTER {
         return;
     }
     if let Some(index) = WATCHED.iter().position(|&(watched, _)| watched == cbid) {

@@ -19,27 +19,9 @@ use platform::cupti::blocking::BlockingWatch;
 
 use service::lock;
 
-/// Names the CUPTI of the Python environment `VIRTUAL_ENV` states ([`platform::cupti::packaged`])
-/// as the process's NVTX injection library, unless the environment names one already. NVTX reaches
-/// CUPTI only through that library, and the process then loads the same one
-/// ([`platform::cupti::library`]).
-///
-/// Called once at the process's start, before it starts any thread.
-pub(crate) fn inject() {
-    if std::env::var_os("NVTX_INJECTION64_PATH").is_some() {
-        return;
-    }
-    let Some(library) = platform::cupti::packaged() else {
-        return;
-    };
-    // SAFETY: the process's entry calls this before it starts any thread, so no other thread reads
-    // the environment.
-    unsafe { std::env::set_var("NVTX_INJECTION64_PATH", library) };
-}
-
 /// Subscribe the process to CUPTI; a failure (another CUPTI client holds the subscription, or the
-/// process loaded a CUPTI release the subscription refuses) is logged, and the process serves
-/// without CUPTI.
+/// process found no CUPTI, or one older than the release it requires) is logged, and the process
+/// serves without CUPTI.
 pub(crate) fn subscribe() {
     match platform::cupti::subscriber::subscribe() {
         Ok(()) => tracing::info!("CUPTI is subscribed ({})", platform::cupti::library()),

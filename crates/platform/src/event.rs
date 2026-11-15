@@ -3,13 +3,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::driver::{CUDA_ERROR_NOT_READY, Handle, RawIpcEventHandle, driver, in_context};
+use crate::driver::{Handle, driver, in_context};
 use crate::stream::{CaptureStatus, Retention};
+use crate::sys::cuda as sys;
 use crate::{DeviceId, Error, PrimaryContext, Result, Stream, lock};
-
-const CU_EVENT_DISABLE_TIMING: u32 = 2;
-const CU_EVENT_INTERPROCESS: u32 = 4;
-const CU_EVENT_RECORD_EXTERNAL: u32 = 1;
 
 /// Creation flags of an [`Event`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -37,6 +34,15 @@ pub struct EventFlags {
 /// The 64-byte interprocess handle of an event (`CUipcEventHandle`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IpcEventHandle(pub [u8; 64]);
+
+impl IpcEventHandle {
+    /// The token as the driver's ABI passes it.
+    fn raw(&self) -> sys::CUipcEventHandle {
+        sys::CUipcEventHandle {
+            reserved: self.0.map(|byte| std::ffi::c_char::from_ne_bytes([byte])),
+        }
+    }
+}
 
 /// One driver event and the context it was created in.
 pub(crate) struct EventHandle {
@@ -119,10 +125,10 @@ impl Event {
     fn driver_flags(&self) -> u32 {
         let mut flags = 0;
         if !self.flags.timing {
-            flags |= CU_EVENT_DISABLE_TIMING;
+            flags |= sys::CU_EVENT_DISABLE_TIMING;
         }
         if self.flags.interprocess {
-            flags |= CU_EVENT_INTERPROCESS;
+            flags |= sys::CU_EVENT_INTERPROCESS;
         }
         flags
     }
@@ -140,7 +146,7 @@ impl Event {
         let driver = driver()?;
         let record_flags = if self.flags.external && stream.capture_status()? != CaptureStatus::None
         {
-            CU_EVENT_RECORD_EXTERNAL
+            sys::CU_EVENT_RECORD_EXTERNAL
         } else {
             0
         };
@@ -194,7 +200,7 @@ impl Event {
         let driver = driver()?;
         // SAFETY: the handle is live while the Arc is held.
         let status = unsafe { (driver.event_query)(handle.raw) };
-        if status == CUDA_ERROR_NOT_READY {
+        if status == sys::CUDA_ERROR_NOT_READY {
             return Ok(false);
         }
         driver.check(status, "cuEventQuery")?;
@@ -236,7 +242,7 @@ impl Event {
     /// so exporters record on one context only.
     pub fn ipc_handle(&self) -> Result<IpcEventHandle> {
         let handle = self.current().ok_or(Error::NotRecorded)?;
-        let mut exported = RawIpcEventHandle { reserved: [0; 64] };
+        let mut exported = sys::CUipcEventHandle::default();
         in_context(handle.context, |driver| {
             // SAFETY: the handle is live; the driver writes 64 bytes.
             driver.check(
@@ -244,7 +250,10 @@ impl Event {
                 "cuIpcGetEventHandle",
             )
         })?;
-        Ok(IpcEventHandle(exported.reserved))
+        // `c_char` is signed on some targets; the token's bytes are the same either way.
+        Ok(IpcEventHandle(
+            exported.reserved.map(|byte| byte.to_ne_bytes()[0]),
+        ))
     }
 
     /// Opens another process's interprocess event in `device`'s primary
@@ -257,9 +266,7 @@ impl Event {
         let mut raw = std::ptr::null_mut();
         in_context(context.raw(), |driver| {
             // SAFETY: the driver writes an event handle in the current context.
-            let status = unsafe {
-                (driver.ipc_open_event_handle)(&mut raw, RawIpcEventHandle { reserved: handle.0 })
-            };
+            let status = unsafe { (driver.ipc_open_event_handle)(&mut raw, handle.raw()) };
             driver.check(status, "cuIpcOpenEventHandle")
         })?;
 

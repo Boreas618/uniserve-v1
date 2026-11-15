@@ -28,14 +28,10 @@
 use std::sync::Arc;
 
 use crate::allocator::{Block, Budget, PoolKind};
-use crate::driver::{
-    CU_MEM_ACCESS_FLAGS_PROT_READWRITE, CU_MEM_LOCATION_TYPE_DEVICE, MemAccessDesc,
-    MemAllocationProp, MemLocation, in_context, reserve_addresses,
-};
+use crate::driver::{in_context, reserve_addresses};
+use crate::sys::cuda as sys;
 use crate::vmm::{HandleType, Protection};
 use crate::{DeviceId, Error, PinnedBuffer, PrimaryContext, Result, Stream, reclaim};
-
-const CU_MEM_ALLOC_GRANULARITY_RECOMMENDED: i32 = 1;
 
 /// One chunk of the pool: `bytes` at `offset` of the reservation.
 struct Chunk {
@@ -122,7 +118,7 @@ impl VirtualPool {
             }
         }
         let (address, reserved, granularity) = in_context(context.raw(), |driver| {
-            let properties = MemAllocationProp::device(ordinal, handle_type.raw());
+            let properties = sys::CUmemAllocationProp::device(ordinal, handle_type.raw());
             let mut granularity = 0;
             driver.check(
                 // SAFETY: the driver reads the local properties and writes one
@@ -131,7 +127,7 @@ impl VirtualPool {
                     (driver.mem_get_allocation_granularity)(
                         &mut granularity,
                         &properties,
-                        CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+                        sys::CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
                     )
                 },
                 "cuMemGetAllocationGranularity",
@@ -399,16 +395,10 @@ impl VirtualPool {
     /// (`cuMemSetAccess`), at its unchanged address.
     fn set_access(&self, offset: u64, bytes: usize, protection: Protection) -> Result<()> {
         let address = self.address + offset;
-        let access: Vec<MemAccessDesc> = self
+        let access: Vec<sys::CUmemAccessDesc> = self
             .access
             .iter()
-            .map(|&id| MemAccessDesc {
-                location: MemLocation {
-                    kind: CU_MEM_LOCATION_TYPE_DEVICE,
-                    id,
-                },
-                flags: protection.flags(),
-            })
+            .map(|&id| sys::CUmemAccessDesc::device(id, protection.flags()))
             .collect();
         in_context(self.context.raw(), |driver| {
             // SAFETY: the range is mapped by this pool; the descriptors are live
@@ -432,7 +422,7 @@ impl VirtualPool {
         let ordinal = self.device.handle()?;
         let address = self.address + offset;
         let mapped = in_context(self.context.raw(), |driver| {
-            let properties = MemAllocationProp::device(ordinal, self.handle_type.raw());
+            let properties = sys::CUmemAllocationProp::device(ordinal, self.handle_type.raw());
             let mut handle = 0;
             driver.check(
                 // SAFETY: the driver reads the local properties and writes one
@@ -450,15 +440,11 @@ impl VirtualPool {
                 let _ = unsafe { (driver.mem_release)(handle) };
                 return Err(error);
             }
-            let access: Vec<MemAccessDesc> = self
+            let access: Vec<sys::CUmemAccessDesc> = self
                 .access
                 .iter()
-                .map(|&id| MemAccessDesc {
-                    location: MemLocation {
-                        kind: CU_MEM_LOCATION_TYPE_DEVICE,
-                        id,
-                    },
-                    flags: CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+                .map(|&id| {
+                    sys::CUmemAccessDesc::device(id, sys::CU_MEM_ACCESS_FLAGS_PROT_READWRITE)
                 })
                 .collect();
             // SAFETY: the range was mapped above; the descriptors are live.

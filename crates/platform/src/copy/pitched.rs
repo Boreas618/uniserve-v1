@@ -2,9 +2,8 @@
 //! as one `cuMemcpy3DBatchAsync` call.
 
 use super::{SourceOrder, require_batch_stream};
-use crate::driver::{
-    CU_MEMCPY_OPERAND_TYPE_POINTER, Handle, MemLocation, Memcpy3DBatchOp, Memcpy3DOperand, driver,
-};
+use crate::driver::{Handle, driver};
+use crate::sys::cuda as sys;
 use crate::{Error, Result, Stream};
 
 /// One pitched copy of `depth` layers of `height` rows of `width` bytes.
@@ -50,15 +49,19 @@ impl Pitched {
         Ok(())
     }
 
-    fn operand(&self, pointer: u64, pitch: usize, layer: usize) -> Memcpy3DOperand {
+    fn operand(&self, pointer: u64, pitch: usize, layer: usize) -> sys::CUmemcpy3DOperand {
         // For pointer operands the driver measures rows in bytes (the element
         // of an untyped pointer is one byte) and layers in rows.
-        Memcpy3DOperand {
-            kind: CU_MEMCPY_OPERAND_TYPE_POINTER,
-            pointer,
-            row_length: if self.height > 1 { pitch } else { self.width },
-            layer_height: if self.depth > 1 { layer } else { self.height },
-            hint: MemLocation::default(),
+        sys::CUmemcpy3DOperand {
+            type_: sys::CU_MEMCPY_OPERAND_TYPE_POINTER,
+            op: sys::CUmemcpy3DOperand_st__bindgen_ty_1 {
+                ptr: sys::CUmemcpy3DOperand_st__bindgen_ty_1__bindgen_ty_1 {
+                    ptr: pointer,
+                    rowLength: if self.height > 1 { pitch } else { self.width },
+                    layerHeight: if self.depth > 1 { layer } else { self.height },
+                    locHint: sys::CUmemLocation::default(),
+                },
+            },
         }
     }
 }
@@ -127,19 +130,23 @@ unsafe fn submit_pitched_batch(
     stream: &Stream,
 ) -> Result<()> {
     let driver = driver()?;
-    let copy = driver.memcpy_3d_batch_async.clone()?;
+    let copy = driver.memcpy_3d_batch_async;
 
-    let mut operations: Vec<Memcpy3DBatchOp> = copies
+    let mut operations: Vec<sys::CUDA_MEMCPY3D_BATCH_OP> = copies
         .iter()
-        .map(|copy| Memcpy3DBatchOp {
-            source: copy.operand(copy.source, copy.source_pitch, copy.source_layer),
-            destination: copy.operand(
+        .map(|copy| sys::CUDA_MEMCPY3D_BATCH_OP {
+            src: copy.operand(copy.source, copy.source_pitch, copy.source_layer),
+            dst: copy.operand(
                 copy.destination,
                 copy.destination_pitch,
                 copy.destination_layer,
             ),
-            extent: [copy.width, copy.height, copy.depth],
-            source_order: order.raw(),
+            extent: sys::CUextent3D {
+                width: copy.width,
+                height: copy.height,
+                depth: copy.depth,
+            },
+            srcAccessOrder: order.raw(),
             flags: 0,
         })
         .collect();

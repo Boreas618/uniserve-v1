@@ -22,18 +22,18 @@
 //! since the last batch travel with it. Dropping the timeline stops it and
 //! delivers what remains.
 //!
-//! NVTX marks reach CUPTI only when the process loaded CUPTI as its NVTX
-//! injection library at its first NVTX call: `NVTX_INJECTION64_PATH` names
-//! [`super::library`] in the environment the process starts with (verified
-//! with `nvidia-cuda-cupti` 13.0.85: without it no mark is recorded).
+//! NVTX marks reach CUPTI only when CUPTI is NVTX's injection at the process's
+//! first NVTX call: an executable that emits NVTX ranges registers
+//! [`super::initialize_nvtx_injection`] with NVTX for that.
 
 use std::cell::{Cell, RefCell};
-use std::ffi::{c_char, c_void};
+use std::ffi::c_char;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::records::{self, Api, Names, Record};
 use super::subscriber::{self, API_ENTER, DRIVER_DOMAIN, RUNTIME_DOMAIN};
+use crate::sys::cupti as sys;
 use crate::{Error, Result, lock};
 
 /// How a CUDA graph's launch is recorded.
@@ -83,7 +83,7 @@ static APIS: AtomicBool = AtomicBool::new(false);
 
 /// An API call that returned, whose name is interned at the next delivery.
 struct Returned {
-    domain: i32,
+    domain: u32,
     cbid: u32,
     name: usize,
     start: u64,
@@ -99,7 +99,7 @@ static RETURNED: Mutex<Vec<Returned>> = Mutex::new(Vec::new());
 thread_local! {
     /// The calling thread's API calls entered and not yet returned:
     /// domain, callback id, entry time and correlation id.
-    static ENTERED: RefCell<Vec<(i32, u32, u64, u32)>> = const { RefCell::new(Vec::new()) };
+    static ENTERED: RefCell<Vec<(u32, u32, u64, u32)>> = const { RefCell::new(Vec::new()) };
     /// The calling thread's Linux thread id, once read.
     static THREAD: Cell<u32> = const { Cell::new(0) };
 }
@@ -113,7 +113,7 @@ pub fn flush() {
 /// The process's timeline recording; stops on drop. One records at a time.
 pub struct Timeline {
     kinds: Vec<u32>,
-    domains: Vec<i32>,
+    domains: Vec<u32>,
 }
 
 impl Timeline {
@@ -190,22 +190,16 @@ impl Drop for Timeline {
 ///
 /// # Safety
 /// `data` is the `CUpti_CallbackData` of a runtime or driver API callback.
-pub(super) unsafe fn on_api(domain: i32, cbid: u32, data: *const c_void) {
+pub(super) unsafe fn on_api(domain: u32, cbid: u32, data: *const sys::CUpti_CallbackData) {
     if !APIS.load(Ordering::Acquire) {
         return;
     }
     let Ok(now) = super::timestamp() else {
         return;
     };
-    let data = data.cast::<u8>();
-    // SAFETY: `CUpti_CallbackData`: the site at 0, the function's name at 8,
-    // a pointer to its return value at 24, the correlation id at 64.
-    let (site, correlation) = unsafe {
-        (
-            data.cast::<i32>().read_unaligned(),
-            data.add(64).cast::<u32>().read_unaligned(),
-        )
-    };
+    // SAFETY: CUPTI passes the call's callback data, valid during the callback.
+    let data = unsafe { &*data };
+    let (site, correlation) = (data.callbackSite, data.correlationId);
     if site == API_ENTER {
         ENTERED.with(|entered| entered.borrow_mut().push((domain, cbid, now, correlation)));
         return;
@@ -221,19 +215,15 @@ pub(super) unsafe fn on_api(domain: i32, cbid: u32, data: *const c_void) {
         // The call was entered before the recording started.
         return;
     };
-    // SAFETY: as above; the return value is a `CUresult` or `cudaError_t`,
-    // both 4 bytes, written before the exit callback.
-    let (name, result) = unsafe {
-        let name = data.add(8).cast::<*const c_char>().read_unaligned();
-        let value = data.add(24).cast::<*const i32>().read_unaligned();
-        (
-            name,
-            if value.is_null() {
-                0
-            } else {
-                value.read_unaligned()
-            },
-        )
+    // The return value is a `CUresult` or `cudaError_t`, both 4 bytes, written
+    // before the exit callback.
+    let name = data.functionName;
+    let value = data.functionReturnValue.cast::<i32>();
+    let result = if value.is_null() {
+        0
+    } else {
+        // SAFETY: CUPTI points the exit callback at the call's return value.
+        unsafe { value.read_unaligned() }
     };
     let thread = THREAD.with(|thread| {
         if thread.get() == 0 {
@@ -298,7 +288,8 @@ impl Delivery {
             // SAFETY: CUPTI's function names are static strings.
             let name = unsafe { recording.names.intern_c(call.name as *const c_char) };
             self.records.push(Record::Api(Api {
-                domain: call.domain,
+                // A `CUpti_CallbackDomain`, 1 or 2, as the record states it.
+                domain: call.domain as i32,
                 cbid: call.cbid,
                 name,
                 start: call.start,
@@ -367,7 +358,8 @@ mod tests {
             .iter()
             .find_map(|record| match record {
                 Record::Api(api)
-                    if api.correlation == fill.correlation && api.domain == DRIVER_DOMAIN =>
+                    if api.correlation == fill.correlation
+                        && api.domain == DRIVER_DOMAIN as i32 =>
                 {
                     Some(api)
                 }
@@ -386,6 +378,7 @@ mod tests {
     fn retained_graphs_record_nodes_whole_and_nodes_without_losing_timestamps() -> Result<()> {
         use crate::cupti::check;
         use crate::cupti::tests::{Spin, with_captured_graph};
+        use std::ffi::c_void;
         use std::sync::atomic::AtomicUsize;
 
         let _serial = lock(&crate::cupti::tests::SERIAL);
@@ -394,7 +387,8 @@ mod tests {
         // fails after hundreds of launches instead of millions.
         // SAFETY: the process's CUPTI is already loaded by the subscriber.
         let library = unsafe { libloading::Library::new(super::super::library()).unwrap() };
-        type SetAttribute = unsafe extern "C" fn(i32, *mut usize, *mut c_void) -> i32;
+        type SetAttribute =
+            unsafe extern "C" fn(sys::CUpti_ActivityAttribute, *mut usize, *mut c_void) -> u32;
         // SAFETY: this is the CUPTI header's cuptiActivitySetAttribute ABI.
         let set = unsafe {
             library
@@ -404,8 +398,14 @@ mod tests {
         let mut size = std::mem::size_of::<usize>();
         let mut limit = 4usize;
         check(
-            // SAFETY: attribute 2 takes a size_t; both pointers are live.
-            unsafe { set(2, &mut size, (&raw mut limit).cast()) },
+            // SAFETY: the pool limit takes a size_t; both pointers are live.
+            unsafe {
+                set(
+                    sys::CUPTI_ACTIVITY_ATTR_DEVICE_BUFFER_POOL_LIMIT,
+                    &mut size,
+                    (&raw mut limit).cast(),
+                )
+            },
             "cuptiActivitySetAttribute",
         )?;
         let stream = Stream::new(DeviceId(0))?;
@@ -470,7 +470,13 @@ mod tests {
         limit = 250;
         check(
             // SAFETY: restore the size_t attribute through live pointers.
-            unsafe { set(2, &mut size, (&raw mut limit).cast()) },
+            unsafe {
+                set(
+                    sys::CUPTI_ACTIVITY_ATTR_DEVICE_BUFFER_POOL_LIMIT,
+                    &mut size,
+                    (&raw mut limit).cast(),
+                )
+            },
             "cuptiActivitySetAttribute",
         )?;
         result

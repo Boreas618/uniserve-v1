@@ -40,6 +40,7 @@ use std::sync::{Mutex, MutexGuard};
 use super::metrics::{Availability, Counters, Profiler};
 use super::subscriber::{self, API_ENTER, DRIVER_DOMAIN};
 use super::{call, cupti, struct_size};
+use crate::sys::cupti as sys;
 use crate::{Error, Result, lock};
 
 /// What delimits the ranges.
@@ -53,28 +54,28 @@ pub enum Ranges {
 
 /// `CUPTI_UserRange`: ranges are pushed and popped, here by the caller or
 /// around each launch.
-const USER_RANGE: u32 = 2;
+const USER_RANGE: sys::CUpti_ProfilerRange = sys::CUPTI_UserRange;
 
 /// `CUPTI_UserReplay`: the caller replays, which a one-pass configuration
 /// never needs.
-const USER_REPLAY: u32 = 3;
+const USER_REPLAY: sys::CUpti_ProfilerReplayMode = sys::CUPTI_UserReplay;
 
 /// The driver calls that launch a kernel or a CUDA graph
 /// (`CUpti_driver_api_trace_cbid`), each the range of a
 /// [`Ranges::Launches`] profiler. Host functions launch no kernel.
-const LAUNCHES: &[(u32, &str)] = &[
-    (115, "cuLaunch"),
-    (116, "cuLaunchGrid"),
-    (117, "cuLaunchGridAsync"),
-    (307, "cuLaunchKernel"),
-    (442, "cuLaunchKernel_ptsz"),
-    (477, "cuLaunchCooperativeKernel"),
-    (478, "cuLaunchCooperativeKernel_ptsz"),
-    (480, "cuLaunchCooperativeKernelMultiDevice"),
-    (514, "cuGraphLaunch"),
-    (515, "cuGraphLaunch_ptsz"),
-    (652, "cuLaunchKernelEx"),
-    (653, "cuLaunchKernelEx_ptsz"),
+const LAUNCHES: &[(u32, &str)] = super::driver_calls![
+    cuLaunch,
+    cuLaunchGrid,
+    cuLaunchGridAsync,
+    cuLaunchKernel,
+    cuLaunchKernel_ptsz,
+    cuLaunchCooperativeKernel,
+    cuLaunchCooperativeKernel_ptsz,
+    cuLaunchCooperativeKernelMultiDevice,
+    cuGraphLaunch,
+    cuGraphLaunch_ptsz,
+    cuLaunchKernelEx,
+    cuLaunchKernelEx_ptsz,
 ];
 
 /// The started [`Ranges::Launches`] profiler, whose ranges the launch
@@ -149,18 +150,16 @@ fn pop_range(object: *mut c_void) -> Result<()> {
 ///
 /// # Safety
 /// `data` is the `CUpti_CallbackData` of a driver API callback.
-pub(super) unsafe fn on_launch(cbid: u32, data: *const c_void) {
+pub(super) unsafe fn on_launch(cbid: u32, data: *const sys::CUpti_CallbackData) {
     if !LAUNCHES.iter().any(|&(launch, _)| launch == cbid) {
         return;
     }
-    let data = data.cast::<u8>();
-    // SAFETY: `CUpti_CallbackData`: the site at 0, the call's context at 40,
-    // its correlation id at 64.
+    // SAFETY: CUPTI passes the call's callback data, valid during the callback.
     let (site, context, correlation) = unsafe {
         (
-            data.cast::<i32>().read_unaligned(),
-            data.add(40).cast::<usize>().read_unaligned(),
-            data.add(64).cast::<u32>().read_unaligned(),
+            (*data).callbackSite,
+            (*data).context as usize,
+            (*data).correlationId,
         )
     };
     OPEN.with(|open| {

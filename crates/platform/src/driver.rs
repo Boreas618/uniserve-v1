@@ -1,9 +1,14 @@
 //! The `libcuda.so.1` symbol table, resolved once per process.
 //!
-//! Every entry point is resolved when the table is first needed, and `cuInit`
-//! runs once. Entry points marked lazy are stored as `Result`s: a driver that
-//! predates them still serves every other call and reports
-//! [`Error::Symbol`] only when the lazy API is used.
+//! The NVIDIA driver package installs the driver under its stable system soname, which is opened
+//! by that name; no toolkit or user path is involved. Every entry point is resolved when the table
+//! is first needed and `cuInit` runs once. A driver whose CUDA version (`cuDriverGetVersion`) is
+//! older than the `cuda.h` the bindings are generated from ([`sys::CUDA_VERSION`]) is refused with
+//! [`Error::Version`]: every entry point of the table is one that release provides, so none is
+//! optional.
+//!
+//! The structures and constants handed to the driver are the generated ones of
+//! [`crate::sys::cuda`]; this module only adds their constructors.
 
 use std::ffi::{CStr, c_char, c_void};
 use std::marker::PhantomData;
@@ -12,225 +17,57 @@ use std::sync::{Arc, OnceLock};
 
 use libloading::Library;
 
+use crate::sys::cuda as sys;
 use crate::{Error, Result};
 
 pub(crate) type Handle = *mut c_void;
-pub(crate) type CuResult = i32;
+pub(crate) type CuResult = sys::CUresult;
 pub(crate) type HostFn = unsafe extern "C" fn(Handle);
 
 pub(crate) const LIBCUDA: &str = "libcuda.so.1";
 
-pub(crate) const CUDA_SUCCESS: CuResult = 0;
-pub(crate) const CUDA_ERROR_NOT_READY: CuResult = 600;
-/// `CUDA_ERROR_INVALID_VALUE`, which `cuFuncGetParamInfo` answers past the
-/// last parameter of a kernel's signature.
-pub(crate) const CUDA_ERROR_INVALID_VALUE: CuResult = 1;
+/// What a refused driver is told to install: the NVIDIA driver of the CUDA release the bindings
+/// are generated from, or a later one.
+const DRIVER_PACKAGE: &str = "the NVIDIA driver of CUDA 13.0 or later";
 
-/// `CUipcEventHandle`: an opaque 64-byte token passed by value.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct RawIpcEventHandle {
-    pub(crate) reserved: [u8; 64],
-}
-
-/// `CUmemLocation`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct MemLocation {
-    pub(crate) kind: i32,
-    pub(crate) id: i32,
-}
-
-pub(crate) const CU_MEM_LOCATION_TYPE_DEVICE: i32 = 1;
-
-/// `CUmemAllocationProp` (v1). `win32_metadata` and `flags` stay zero on Linux.
-#[repr(C)]
-pub(crate) struct MemAllocationProp {
-    pub(crate) kind: i32,
-    pub(crate) requested_handle_types: i32,
-    pub(crate) location: MemLocation,
-    pub(crate) win32_metadata: Handle,
-    pub(crate) flags: [u8; 8],
-}
-
-pub(crate) const CU_MEM_ALLOCATION_TYPE_PINNED: i32 = 1;
-
-impl MemAllocationProp {
-    /// Device-resident physical storage exportable as `handle_types`.
-    pub(crate) fn device(ordinal: i32, handle_types: i32) -> Self {
+impl sys::CUmemLocation {
+    /// The storage of the device `ordinal`.
+    pub(crate) fn device(ordinal: i32) -> Self {
         Self {
-            kind: CU_MEM_ALLOCATION_TYPE_PINNED,
-            requested_handle_types: handle_types,
-            location: MemLocation {
-                kind: CU_MEM_LOCATION_TYPE_DEVICE,
-                id: ordinal,
-            },
-            win32_metadata: std::ptr::null_mut(),
-            flags: [0; 8],
+            type_: sys::CU_MEM_LOCATION_TYPE_DEVICE,
+            id: ordinal,
         }
     }
 }
 
-/// `CUmemAccessDesc`.
-#[repr(C)]
-pub(crate) struct MemAccessDesc {
-    pub(crate) location: MemLocation,
-    pub(crate) flags: i32,
+impl sys::CUmemAllocationProp {
+    /// Device-resident physical storage of the device `ordinal`, exportable as `handle_types`.
+    /// The Windows metadata and the allocation flags stay zero.
+    pub(crate) fn device(ordinal: i32, handle_types: sys::CUmemAllocationHandleType) -> Self {
+        Self {
+            type_: sys::CU_MEM_ALLOCATION_TYPE_PINNED,
+            requestedHandleTypes: handle_types,
+            location: sys::CUmemLocation::device(ordinal),
+            ..Self::default()
+        }
+    }
 }
 
-pub(crate) const CU_MEM_ACCESS_FLAGS_PROT_READ: i32 = 1;
-pub(crate) const CU_MEM_ACCESS_FLAGS_PROT_READWRITE: i32 = 3;
-
-/// `CUmemcpyAttributes` (v1).
-#[repr(C)]
-pub(crate) struct MemcpyAttributes {
-    pub(crate) source_order: i32,
-    pub(crate) source_hint: MemLocation,
-    pub(crate) destination_hint: MemLocation,
-    pub(crate) flags: u32,
-}
-
-/// The pointer arm of `CUmemcpy3DOperand`. The union's array arm
-/// (`CUarray` + `CUoffset3D`) has the same 32-byte size and 8-byte alignment.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Memcpy3DOperand {
-    pub(crate) kind: i32,
-    pub(crate) pointer: u64,
-    pub(crate) row_length: usize,
-    pub(crate) layer_height: usize,
-    pub(crate) hint: MemLocation,
-}
-
-pub(crate) const CU_MEMCPY_OPERAND_TYPE_POINTER: i32 = 1;
-
-/// `CUDA_MEMCPY3D_BATCH_OP` (v1).
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Memcpy3DBatchOp {
-    pub(crate) source: Memcpy3DOperand,
-    pub(crate) destination: Memcpy3DOperand,
-    pub(crate) extent: [usize; 3],
-    pub(crate) source_order: i32,
-    pub(crate) flags: u32,
-}
-
-/// `CUlaunchAttribute`: an attribute of one launch (`cuLaunchKernelEx`) or of
-/// one graph kernel node. The C struct pads the 4-byte id to 8 bytes, then
-/// carries the 64-byte value union.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct LaunchAttribute {
-    pub(crate) id: i32,
-    pub(crate) pad: [u8; 4],
-    pub(crate) value: LaunchAttributeValue,
-}
-
-/// `CUlaunchAttributeValue`: the driver reads the member named by the
-/// attribute's id. The union's C alignment is 8, from the pointers it holds.
-#[repr(C, align(8))]
-#[derive(Clone, Copy)]
-pub(crate) union LaunchAttributeValue {
-    pub(crate) pad: [u8; 64],
-    pub(crate) cooperative: i32,
-    pub(crate) cluster: ClusterDim,
-    pub(crate) cluster_scheduling: i32,
-    pub(crate) programmatic_stream_serialization: i32,
-}
-
-/// The `clusterDim` member of [`LaunchAttributeValue`]: blocks per cluster.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ClusterDim {
-    pub(crate) x: u32,
-    pub(crate) y: u32,
-    pub(crate) z: u32,
-}
-
-/// `CUlaunchAttributeID`, of the values this crate sets.
-pub(crate) const CU_LAUNCH_ATTRIBUTE_COOPERATIVE: i32 = 2;
-pub(crate) const CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION: i32 = 4;
-pub(crate) const CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE: i32 = 5;
-pub(crate) const CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: i32 = 6;
-
-/// `CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC`: the edge activates at the
-/// upstream kernel's programmatic trigger point, before it finishes. Its two
-/// siblings are not used here: `..._PORT_DEFAULT` (0) is what every edge
-/// states when it waits for completion, and `..._PORT_LAUNCH_ORDER` (2) lets a
-/// downstream node be launched as soon as its upstream node is.
-pub(crate) const CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC: u8 = 1;
-/// `CU_GRAPH_DEPENDENCY_TYPE_DEFAULT`: an ordinary dependency.
-pub(crate) const CU_GRAPH_DEPENDENCY_TYPE_DEFAULT: u8 = 0;
-/// `CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC`: the downstream node synchronizes
-/// itself with the upstream one.
-pub(crate) const CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC: u8 = 1;
-
-/// `CUgraphEdgeData`: what one edge between two graph nodes says.
-///
-/// The driver refuses a query that reads a graph's edges without this array
-/// (`CUDA_ERROR_LOSSY_QUERY`) as soon as one edge carries non-default data,
-/// which a programmatic dependent launch does - so an owner that walks a
-/// captured graph reads the data or cannot walk it at all.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct GraphEdgeData {
-    /// When, in the upstream node, the dependency is triggered.
-    pub(crate) from_port: u8,
-    /// Which part of the downstream node depends on it; no node type defines a
-    /// non-zero value, so it is zero.
-    pub(crate) to_port: u8,
-    /// A `CUgraphDependencyType`.
-    pub(crate) kind: u8,
-    /// Unused and zeroed; the driver requires zero.
-    pub(crate) reserved: [u8; 5],
-}
-
-/// `CUlaunchConfig`: the full configuration of one `cuLaunchKernelEx`.
-#[repr(C)]
-pub(crate) struct LaunchConfig {
-    pub(crate) grid_dim: [u32; 3],
-    pub(crate) block_dim: [u32; 3],
-    pub(crate) shared_mem_bytes: u32,
-    pub(crate) stream: Handle,
-    pub(crate) attrs: *mut LaunchAttribute,
-    pub(crate) num_attrs: u32,
-}
-
-/// `CUDA_KERNEL_NODE_PARAMS`: the parameters of a graph kernel node, as
-/// `cuGraphExecKernelNodeSetParams` replaces them.
-///
-/// The struct has no field for launch attributes: which cluster, programmatic
-/// dependency and cooperative launch a node uses is fixed when the graph is
-/// captured, and changing any of them is a recapture.
-#[repr(C)]
-pub(crate) struct KernelNodeParams {
-    pub(crate) func: Handle,
-    pub(crate) grid_dim: [u32; 3],
-    pub(crate) block_dim: [u32; 3],
-    pub(crate) shared_mem_bytes: u32,
-    pub(crate) kernel_params: *mut *mut c_void,
-    pub(crate) extra: *mut *mut c_void,
-    pub(crate) kern: Handle,
-    pub(crate) ctx: Handle,
-}
-
-/// `CUtensorMap`: the 128-byte tensor descriptor a TMA kernel reads, which
-/// `cuTensorMapEncodeTiled` fills. It must be 64-byte aligned.
-#[repr(C, align(64))]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TensorMap {
-    pub(crate) opaque: [u64; 16],
+impl sys::CUmemAccessDesc {
+    /// The device `ordinal`'s access to a mapping, with `CU_MEM_ACCESS_FLAGS_PROT_*` `flags`.
+    pub(crate) fn device(ordinal: i32, flags: sys::CUmemAccess_flags) -> Self {
+        Self {
+            location: sys::CUmemLocation::device(ordinal),
+            flags,
+        }
+    }
 }
 
 /// Declares the driver table: one typed field per entry point.
 macro_rules! driver_table {
-    (
-        eager { $($field:ident = $symbol:literal: fn($($arg:ty),* $(,)?);)* }
-        lazy { $($lazy:ident = $lazy_symbol:literal: fn($($lazy_arg:ty),* $(,)?);)* }
-    ) => {
+    ($($field:ident = $symbol:literal: fn($($arg:ty),* $(,)?);)*) => {
         pub(crate) struct Driver {
             $(pub(crate) $field: unsafe extern "C" fn($($arg),*) -> CuResult,)*
-            $(pub(crate) $lazy: Result<unsafe extern "C" fn($($lazy_arg),*) -> CuResult>,)*
             // Declared last: the library outlives every copied function pointer.
             _library: Library,
         }
@@ -242,7 +79,6 @@ macro_rules! driver_table {
                 unsafe {
                     Ok(Self {
                         $($field: symbol(&library, $symbol)?,)*
-                        $($lazy: symbol(&library, $lazy_symbol),)*
                         _library: library,
                     })
                 }
@@ -252,125 +88,132 @@ macro_rules! driver_table {
 }
 
 driver_table! {
-    eager {
-        init = "cuInit": fn(u32);
-        device_get = "cuDeviceGet": fn(*mut i32, i32);
-        device_get_count = "cuDeviceGetCount": fn(*mut i32);
-        device_get_attribute = "cuDeviceGetAttribute": fn(*mut i32, i32, i32);
-        device_get_uuid = "cuDeviceGetUuid_v2": fn(*mut [u8; 16], i32);
-        device_can_access_peer = "cuDeviceCanAccessPeer": fn(*mut i32, i32, i32);
-        get_error_name = "cuGetErrorName": fn(CuResult, *mut *const c_char);
-        get_error_string = "cuGetErrorString": fn(CuResult, *mut *const c_char);
-        primary_ctx_retain = "cuDevicePrimaryCtxRetain": fn(*mut Handle, i32);
-        primary_ctx_release = "cuDevicePrimaryCtxRelease_v2": fn(i32);
-        primary_ctx_get_state = "cuDevicePrimaryCtxGetState": fn(i32, *mut u32, *mut i32);
-        primary_ctx_reset = "cuDevicePrimaryCtxReset_v2": fn(i32);
-        ctx_push = "cuCtxPushCurrent_v2": fn(Handle);
-        ctx_pop = "cuCtxPopCurrent_v2": fn(*mut Handle);
-        thread_exchange_capture_mode = "cuThreadExchangeStreamCaptureMode": fn(*mut i32);
-        profiler_start = "cuProfilerStart": fn();
-        profiler_stop = "cuProfilerStop": fn();
+    init = "cuInit": fn(u32);
+    driver_get_version = "cuDriverGetVersion": fn(*mut i32);
+    device_get = "cuDeviceGet": fn(*mut i32, i32);
+    device_get_count = "cuDeviceGetCount": fn(*mut i32);
+    device_get_attribute = "cuDeviceGetAttribute": fn(*mut i32, sys::CUdevice_attribute, i32);
+    device_get_uuid = "cuDeviceGetUuid_v2": fn(*mut sys::CUuuid, i32);
+    device_can_access_peer = "cuDeviceCanAccessPeer": fn(*mut i32, i32, i32);
+    get_error_name = "cuGetErrorName": fn(CuResult, *mut *const c_char);
+    get_error_string = "cuGetErrorString": fn(CuResult, *mut *const c_char);
+    primary_ctx_retain = "cuDevicePrimaryCtxRetain": fn(*mut Handle, i32);
+    primary_ctx_release = "cuDevicePrimaryCtxRelease_v2": fn(i32);
+    primary_ctx_get_state = "cuDevicePrimaryCtxGetState": fn(i32, *mut u32, *mut i32);
+    primary_ctx_reset = "cuDevicePrimaryCtxReset_v2": fn(i32);
+    ctx_push = "cuCtxPushCurrent_v2": fn(Handle);
+    ctx_pop = "cuCtxPopCurrent_v2": fn(*mut Handle);
+    thread_exchange_capture_mode = "cuThreadExchangeStreamCaptureMode": fn(
+        *mut sys::CUstreamCaptureMode,
+    );
+    profiler_start = "cuProfilerStart": fn();
+    profiler_stop = "cuProfilerStop": fn();
 
-        stream_create_with_priority = "cuStreamCreateWithPriority": fn(*mut Handle, u32, i32);
-        stream_get_priority = "cuStreamGetPriority": fn(Handle, *mut i32);
-        stream_is_capturing = "cuStreamIsCapturing": fn(Handle, *mut i32);
-        stream_query = "cuStreamQuery": fn(Handle);
-        stream_synchronize = "cuStreamSynchronize": fn(Handle);
-        stream_destroy = "cuStreamDestroy_v2": fn(Handle);
-        stream_wait_event = "cuStreamWaitEvent": fn(Handle, Handle, u32);
-        stream_write_value32 = "cuStreamWriteValue32_v2": fn(Handle, u64, u32, u32);
-        stream_wait_value32 = "cuStreamWaitValue32_v2": fn(Handle, u64, u32, u32);
-        launch_host_func = "cuLaunchHostFunc": fn(Handle, HostFn, Handle);
-        graph_launch = "cuGraphLaunch": fn(Handle, Handle);
-        graph_instantiate = "cuGraphInstantiateWithFlags": fn(*mut Handle, Handle, u64);
-        graph_exec_destroy = "cuGraphExecDestroy": fn(Handle);
+    stream_create_with_priority = "cuStreamCreateWithPriority": fn(*mut Handle, u32, i32);
+    stream_get_priority = "cuStreamGetPriority": fn(Handle, *mut i32);
+    stream_is_capturing = "cuStreamIsCapturing": fn(Handle, *mut sys::CUstreamCaptureStatus);
+    stream_query = "cuStreamQuery": fn(Handle);
+    stream_synchronize = "cuStreamSynchronize": fn(Handle);
+    stream_destroy = "cuStreamDestroy_v2": fn(Handle);
+    stream_wait_event = "cuStreamWaitEvent": fn(Handle, Handle, u32);
+    stream_write_value32 = "cuStreamWriteValue32_v2": fn(Handle, u64, u32, u32);
+    stream_wait_value32 = "cuStreamWaitValue32_v2": fn(Handle, u64, u32, u32);
+    launch_host_func = "cuLaunchHostFunc": fn(Handle, HostFn, Handle);
+    graph_launch = "cuGraphLaunch": fn(Handle, Handle);
+    graph_instantiate = "cuGraphInstantiateWithFlags": fn(*mut Handle, Handle, u64);
+    graph_exec_destroy = "cuGraphExecDestroy": fn(Handle);
 
-        event_create = "cuEventCreate": fn(*mut Handle, u32);
-        event_record_with_flags = "cuEventRecordWithFlags": fn(Handle, Handle, u32);
-        event_query = "cuEventQuery": fn(Handle);
-        event_synchronize = "cuEventSynchronize": fn(Handle);
-        event_elapsed_time = "cuEventElapsedTime_v2": fn(*mut f32, Handle, Handle);
-        event_destroy = "cuEventDestroy_v2": fn(Handle);
-        ipc_get_event_handle = "cuIpcGetEventHandle": fn(*mut RawIpcEventHandle, Handle);
-        ipc_open_event_handle = "cuIpcOpenEventHandle": fn(*mut Handle, RawIpcEventHandle);
+    event_create = "cuEventCreate": fn(*mut Handle, u32);
+    event_record_with_flags = "cuEventRecordWithFlags": fn(Handle, Handle, u32);
+    event_query = "cuEventQuery": fn(Handle);
+    event_synchronize = "cuEventSynchronize": fn(Handle);
+    event_elapsed_time = "cuEventElapsedTime_v2": fn(*mut f32, Handle, Handle);
+    event_destroy = "cuEventDestroy_v2": fn(Handle);
+    ipc_get_event_handle = "cuIpcGetEventHandle": fn(*mut sys::CUipcEventHandle, Handle);
+    ipc_open_event_handle = "cuIpcOpenEventHandle": fn(*mut Handle, sys::CUipcEventHandle);
 
-        mem_alloc = "cuMemAlloc_v2": fn(*mut u64, usize);
-        mem_free = "cuMemFree_v2": fn(u64);
-        mem_get_info = "cuMemGetInfo_v2": fn(*mut usize, *mut usize);
-        mem_host_alloc = "cuMemHostAlloc": fn(*mut Handle, usize, u32);
-        mem_free_host = "cuMemFreeHost": fn(Handle);
-        mem_host_register = "cuMemHostRegister_v2": fn(Handle, usize, u32);
-        mem_host_unregister = "cuMemHostUnregister": fn(Handle);
+    mem_alloc = "cuMemAlloc_v2": fn(*mut u64, usize);
+    mem_free = "cuMemFree_v2": fn(u64);
+    mem_get_info = "cuMemGetInfo_v2": fn(*mut usize, *mut usize);
+    mem_host_alloc = "cuMemHostAlloc": fn(*mut Handle, usize, u32);
+    mem_free_host = "cuMemFreeHost": fn(Handle);
+    mem_host_register = "cuMemHostRegister_v2": fn(Handle, usize, u32);
+    mem_host_unregister = "cuMemHostUnregister": fn(Handle);
 
-        mem_get_allocation_granularity = "cuMemGetAllocationGranularity": fn(
-            *mut usize, *const MemAllocationProp, i32,
-        );
-        mem_create = "cuMemCreate": fn(*mut u64, usize, *const MemAllocationProp, u64);
-        mem_release = "cuMemRelease": fn(u64);
-        mem_address_reserve = "cuMemAddressReserve": fn(*mut u64, usize, usize, u64, u64);
-        mem_address_free = "cuMemAddressFree": fn(u64, usize);
-        mem_map = "cuMemMap": fn(u64, usize, usize, u64, u64);
-        mem_unmap = "cuMemUnmap": fn(u64, usize);
-        mem_set_access = "cuMemSetAccess": fn(u64, usize, *const MemAccessDesc, usize);
-        mem_export_to_shareable_handle = "cuMemExportToShareableHandle": fn(Handle, u64, i32, u64);
-        mem_import_from_shareable_handle = "cuMemImportFromShareableHandle": fn(*mut u64, Handle, i32);
-        mem_retain_allocation_handle = "cuMemRetainAllocationHandle": fn(*mut u64, Handle);
+    mem_get_allocation_granularity = "cuMemGetAllocationGranularity": fn(
+        *mut usize, *const sys::CUmemAllocationProp, sys::CUmemAllocationGranularity_flags,
+    );
+    mem_create = "cuMemCreate": fn(*mut u64, usize, *const sys::CUmemAllocationProp, u64);
+    mem_release = "cuMemRelease": fn(u64);
+    mem_address_reserve = "cuMemAddressReserve": fn(*mut u64, usize, usize, u64, u64);
+    mem_address_free = "cuMemAddressFree": fn(u64, usize);
+    mem_map = "cuMemMap": fn(u64, usize, usize, u64, u64);
+    mem_unmap = "cuMemUnmap": fn(u64, usize);
+    mem_set_access = "cuMemSetAccess": fn(u64, usize, *const sys::CUmemAccessDesc, usize);
+    mem_export_to_shareable_handle = "cuMemExportToShareableHandle": fn(
+        Handle, u64, sys::CUmemAllocationHandleType, u64,
+    );
+    mem_import_from_shareable_handle = "cuMemImportFromShareableHandle": fn(
+        *mut u64, Handle, sys::CUmemAllocationHandleType,
+    );
+    mem_retain_allocation_handle = "cuMemRetainAllocationHandle": fn(*mut u64, Handle);
 
-        memcpy_async = "cuMemcpyAsync": fn(u64, u64, usize, Handle);
-        memset_d8_async = "cuMemsetD8Async": fn(u64, u8, usize, Handle);
-        memset_d16_async = "cuMemsetD16Async": fn(u64, u16, usize, Handle);
-        memset_d32_async = "cuMemsetD32Async": fn(u64, u32, usize, Handle);
-        memset_d2d8_async = "cuMemsetD2D8Async": fn(u64, usize, u8, usize, usize, Handle);
-        memset_d2d32_async = "cuMemsetD2D32Async": fn(u64, usize, u32, usize, usize, Handle);
+    memcpy_async = "cuMemcpyAsync": fn(u64, u64, usize, Handle);
+    memset_d8_async = "cuMemsetD8Async": fn(u64, u8, usize, Handle);
+    memset_d16_async = "cuMemsetD16Async": fn(u64, u16, usize, Handle);
+    memset_d32_async = "cuMemsetD32Async": fn(u64, u32, usize, Handle);
+    memset_d2d8_async = "cuMemsetD2D8Async": fn(u64, usize, u8, usize, usize, Handle);
+    memset_d2d32_async = "cuMemsetD2D32Async": fn(u64, usize, u32, usize, usize, Handle);
+    // The batch copies, in their CUDA 13 `_v2` form (no failure index).
+    memcpy_batch_async = "cuMemcpyBatchAsync_v2": fn(
+        *mut u64, *mut u64, *mut usize, usize, *mut sys::CUmemcpyAttributes, *mut usize, usize,
+        Handle,
+    );
+    memcpy_3d_batch_async = "cuMemcpy3DBatchAsync_v2": fn(
+        usize, *mut sys::CUDA_MEMCPY3D_BATCH_OP, u64, Handle,
+    );
 
-        library_load_data = "cuLibraryLoadData": fn(
-            *mut Handle, *const c_void, *mut i32, *mut *mut c_void, u32, *mut i32,
-            *mut *mut c_void, u32,
-        );
-        library_get_kernel = "cuLibraryGetKernel": fn(*mut Handle, Handle, *const c_char);
-        kernel_get_function = "cuKernelGetFunction": fn(*mut Handle, Handle);
-        library_unload = "cuLibraryUnload": fn(Handle);
+    library_load_data = "cuLibraryLoadData": fn(
+        *mut Handle, *const c_void, *mut i32, *mut *mut c_void, u32, *mut i32,
+        *mut *mut c_void, u32,
+    );
+    library_get_kernel = "cuLibraryGetKernel": fn(*mut Handle, Handle, *const c_char);
+    kernel_get_function = "cuKernelGetFunction": fn(*mut Handle, Handle);
+    library_unload = "cuLibraryUnload": fn(Handle);
 
-        launch_kernel_ex = "cuLaunchKernelEx": fn(
-            *const LaunchConfig, Handle, *mut *mut c_void, *mut *mut c_void,
-        );
-        func_set_attribute = "cuFuncSetAttribute": fn(Handle, i32, i32);
+    launch_kernel_ex = "cuLaunchKernelEx": fn(
+        *const sys::CUlaunchConfig, Handle, *mut *mut c_void, *mut *mut c_void,
+    );
+    func_set_attribute = "cuFuncSetAttribute": fn(Handle, sys::CUfunction_attribute, i32);
 
-        stream_begin_capture = "cuStreamBeginCapture_v2": fn(Handle, i32);
-        stream_end_capture = "cuStreamEndCapture": fn(Handle, *mut Handle);
-        stream_get_capture_info = "cuStreamGetCaptureInfo_v3": fn(
-            Handle, *mut i32, *mut u64, *mut Handle, *mut *const Handle, *mut *const GraphEdgeData,
-            *mut usize,
-        );
-        graph_destroy = "cuGraphDestroy": fn(Handle);
-        graph_get_nodes = "cuGraphGetNodes": fn(Handle, *mut Handle, *mut usize);
-        graph_get_root_nodes = "cuGraphGetRootNodes": fn(Handle, *mut Handle, *mut usize);
-        graph_node_get_dependent_nodes = "cuGraphNodeGetDependentNodes_v2": fn(
-            Handle, *mut Handle, *mut GraphEdgeData, *mut usize,
-        );
-        graph_node_get_type = "cuGraphNodeGetType": fn(Handle, *mut i32);
-        graph_kernel_node_get_params = "cuGraphKernelNodeGetParams_v2": fn(
-            Handle, *mut KernelNodeParams,
-        );
-        func_get_param_info = "cuFuncGetParamInfo": fn(
-            Handle, usize, *mut usize, *mut usize,
-        );
-        graph_exec_kernel_node_set_params = "cuGraphExecKernelNodeSetParams_v2": fn(
-            Handle, Handle, *const KernelNodeParams,
-        );
+    stream_begin_capture = "cuStreamBeginCapture_v2": fn(Handle, sys::CUstreamCaptureMode);
+    stream_end_capture = "cuStreamEndCapture": fn(Handle, *mut Handle);
+    stream_get_capture_info = "cuStreamGetCaptureInfo_v3": fn(
+        Handle, *mut sys::CUstreamCaptureStatus, *mut u64, *mut Handle, *mut *const Handle,
+        *mut *const sys::CUgraphEdgeData, *mut usize,
+    );
+    graph_destroy = "cuGraphDestroy": fn(Handle);
+    graph_get_nodes = "cuGraphGetNodes": fn(Handle, *mut Handle, *mut usize);
+    graph_get_root_nodes = "cuGraphGetRootNodes": fn(Handle, *mut Handle, *mut usize);
+    graph_node_get_dependent_nodes = "cuGraphNodeGetDependentNodes_v2": fn(
+        Handle, *mut Handle, *mut sys::CUgraphEdgeData, *mut usize,
+    );
+    graph_node_get_type = "cuGraphNodeGetType": fn(Handle, *mut sys::CUgraphNodeType);
+    graph_kernel_node_get_params = "cuGraphKernelNodeGetParams_v2": fn(
+        Handle, *mut sys::CUDA_KERNEL_NODE_PARAMS,
+    );
+    func_get_param_info = "cuFuncGetParamInfo": fn(
+        Handle, usize, *mut usize, *mut usize,
+    );
+    graph_exec_kernel_node_set_params = "cuGraphExecKernelNodeSetParams_v2": fn(
+        Handle, Handle, *const sys::CUDA_KERNEL_NODE_PARAMS,
+    );
 
-        tensor_map_encode_tiled = "cuTensorMapEncodeTiled": fn(
-            *mut TensorMap, i32, u32, *mut c_void, *const u64, *const u64, *const u32,
-            *const u32, i32, i32, i32, i32,
-        );
-    }
-    lazy {
-        // CUDA 12.8 batch APIs; the CUDA 13 `_v2` signatures have no failIdx.
-        memcpy_batch_async = "cuMemcpyBatchAsync_v2": fn(
-            *mut u64, *mut u64, *mut usize, usize, *mut MemcpyAttributes, *mut usize, usize, Handle,
-        );
-        memcpy_3d_batch_async = "cuMemcpy3DBatchAsync_v2": fn(usize, *mut Memcpy3DBatchOp, u64, Handle);
-    }
+    tensor_map_encode_tiled = "cuTensorMapEncodeTiled": fn(
+        *mut sys::CUtensorMap, i32, u32, *mut c_void, *const u64, *const u64, *const u32,
+        *const u32, sys::CUtensorMapInterleave, sys::CUtensorMapSwizzle,
+        sys::CUtensorMapL2promotion, sys::CUtensorMapFloatOOBfill,
+    );
 }
 
 /// Resolves one entry point of `libcuda.so.1`.
@@ -392,13 +235,11 @@ unsafe fn symbol<T: Copy>(library: &Library, name: &'static str) -> Result<T> {
 /// The process driver table, set by the first [`driver`] call.
 static DRIVER: OnceLock<Result<Driver>> = OnceLock::new();
 
-/// Returns the process driver table, loading it and running `cuInit` on first
-/// use. A failed load is cached and returned to every caller.
+/// Returns the process driver table, loading it, running `cuInit` and checking the driver's CUDA
+/// version on first use. A failed load is cached and returned to every caller.
 pub(crate) fn driver() -> Result<&'static Driver> {
     DRIVER
         .get_or_init(|| {
-            // The driver is installed under its stable system soname; no
-            // toolkit or user path is involved.
             // SAFETY: loading libcuda runs only the driver's own initializers.
             let library = unsafe { Library::new(LIBCUDA) }.map_err(|source| Error::Load {
                 library: LIBCUDA,
@@ -409,10 +250,39 @@ pub(crate) fn driver() -> Result<&'static Driver> {
             // SAFETY: cuInit takes flags by value and must be passed zero.
             let status = unsafe { (driver.init)(0) };
             driver.check(status, "cuInit")?;
+
+            let mut version = 0;
+            driver.check(
+                // SAFETY: the driver writes one int to the local `version`.
+                unsafe { (driver.driver_get_version)(&mut version) },
+                "cuDriverGetVersion",
+            )?;
+            require_version(version)?;
             Ok(driver)
         })
         .as_ref()
         .map_err(Clone::clone)
+}
+
+/// Refuses a driver whose CUDA version is older than the `cuda.h` the bindings are generated
+/// from. Both are CUDA version codes, `major * 1000 + minor * 10`, as `cuDriverGetVersion` and
+/// `CUDA_VERSION` state them.
+fn require_version(version: i32) -> Result<()> {
+    let required = sys::CUDA_VERSION as i32;
+    if version >= required {
+        return Ok(());
+    }
+    Err(Error::Version {
+        library: LIBCUDA,
+        found: cuda_release(version),
+        required: cuda_release(required),
+        package: DRIVER_PACKAGE,
+    })
+}
+
+/// A CUDA version code as its release, such as `CUDA 13.0` for 13000.
+pub(crate) fn cuda_release(code: i32) -> String {
+    format!("CUDA {}.{}", code / 1000, code % 1000 / 10)
 }
 
 /// Returns the process driver table if an earlier [`driver`] call loaded and
@@ -477,13 +347,14 @@ pub(crate) fn reserve_addresses(driver: &Driver, bytes: usize, alignment: usize)
 impl Driver {
     /// Converts a `CUresult` into a typed error naming the failed call.
     pub(crate) fn check(&self, status: CuResult, call: &'static str) -> Result<()> {
-        if status == CUDA_SUCCESS {
+        if status == sys::CUDA_SUCCESS {
             return Ok(());
         }
 
         Err(Error::Driver {
             call,
-            code: status,
+            // `CUresult` is a C enum; the error carries the value the driver documents.
+            code: status as i32,
             name: self.describe(self.get_error_name, status),
             message: self.describe(self.get_error_string, status),
         })
@@ -499,7 +370,7 @@ impl Driver {
         // string owned by libcuda, which is never unloaded (the table lives in
         // a process-wide static).
         unsafe {
-            if lookup(status, &mut text) != CUDA_SUCCESS || text.is_null() {
+            if lookup(status, &mut text) != sys::CUDA_SUCCESS || text.is_null() {
                 return "unrecognized CUDA status";
             }
             CStr::from_ptr(text)
@@ -552,96 +423,29 @@ pub(crate) fn in_context<T>(
 mod tests {
     use super::*;
 
-    /// Every driver constant this crate passes is compared with `cuda.h`: a
-    /// wrong one is a refused call or, worse, an attribute the driver reads as
-    /// a different attribute.
+    /// A driver older than the `cuda.h` the bindings are generated from is refused by name, with
+    /// both releases and the package to install; that release and later ones are accepted.
     #[test]
-    #[ignore = "requires cuda.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
-    fn the_driver_constants_are_the_headers() {
-        crate::header::assert_constants(
-            "cuda.h",
-            &[
-                ("CUDA_SUCCESS", CUDA_SUCCESS as i64),
-                ("CUDA_ERROR_INVALID_VALUE", CUDA_ERROR_INVALID_VALUE as i64),
-                ("CUDA_ERROR_NOT_READY", CUDA_ERROR_NOT_READY as i64),
-                (
-                    "CU_MEM_LOCATION_TYPE_DEVICE",
-                    CU_MEM_LOCATION_TYPE_DEVICE as i64,
-                ),
-                (
-                    "CU_MEM_ALLOCATION_TYPE_PINNED",
-                    CU_MEM_ALLOCATION_TYPE_PINNED as i64,
-                ),
-                (
-                    "CU_MEM_ACCESS_FLAGS_PROT_READ",
-                    CU_MEM_ACCESS_FLAGS_PROT_READ as i64,
-                ),
-                (
-                    "CU_MEM_ACCESS_FLAGS_PROT_READWRITE",
-                    CU_MEM_ACCESS_FLAGS_PROT_READWRITE as i64,
-                ),
-                (
-                    "CU_MEMCPY_OPERAND_TYPE_POINTER",
-                    CU_MEMCPY_OPERAND_TYPE_POINTER as i64,
-                ),
-                (
-                    "CU_LAUNCH_ATTRIBUTE_COOPERATIVE",
-                    CU_LAUNCH_ATTRIBUTE_COOPERATIVE as i64,
-                ),
-                (
-                    "CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION",
-                    CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION as i64,
-                ),
-                (
-                    "CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE",
-                    CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE as i64,
-                ),
-                (
-                    "CU_STREAM_WAIT_VALUE_GEQ",
-                    crate::stream::CU_STREAM_WAIT_VALUE_GEQ as i64,
-                ),
-                (
-                    "CU_STREAM_WAIT_VALUE_EQ",
-                    crate::stream::CU_STREAM_WAIT_VALUE_EQ as i64,
-                ),
-                (
-                    "CU_STREAM_WAIT_VALUE_AND",
-                    crate::stream::CU_STREAM_WAIT_VALUE_AND as i64,
-                ),
-                (
-                    "CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION",
-                    CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION as i64,
-                ),
-            ],
-        );
-    }
+    fn a_driver_older_than_the_bindings_is_refused() {
+        assert!(require_version(sys::CUDA_VERSION as i32).is_ok());
+        assert!(require_version(sys::CUDA_VERSION as i32 + 10).is_ok());
 
-    /// The structures this crate hands the driver are sized from the headers
-    /// too, where the header declares them in a form the scanner reads.
-    ///
-    /// The rest — the launch configuration, the node parameters, the attribute
-    /// union, the allocation property — carry unions and multi-line
-    /// documentation that the scanner does not read, so their layouts are the
-    /// device tests' business: a field in the wrong place there produces a
-    /// refused launch or a wrong grid, which the GPU tests see.
-    #[test]
-    #[ignore = "requires cuda.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
-    fn the_driver_structures_are_sized_by_the_headers() {
-        use crate::header::struct_size;
-        crate::header::require("cuda.h");
-        for (name, size) in [
-            ("CUipcEventHandle", std::mem::size_of::<RawIpcEventHandle>()),
-            ("CUmemLocation", std::mem::size_of::<MemLocation>()),
-            ("CUmemAccessDesc", std::mem::size_of::<MemAccessDesc>()),
-            ("CUtensorMap", std::mem::size_of::<TensorMap>()),
-        ] {
-            let header = struct_size("cuda.h", name).unwrap_or_else(|| {
-                panic!("cuda.h does not declare {name} in a form the scanner lays out")
-            });
-            assert_eq!(
-                header, size,
-                "{name}: cuda.h lays it out in {header} bytes, this crate in {size}"
-            );
-        }
+        let error = require_version(12080).expect_err("CUDA 12.8 predates the bindings");
+        let text = error.to_string();
+        assert!(
+            matches!(
+                error,
+                Error::Version {
+                    library: LIBCUDA,
+                    ..
+                }
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("CUDA 12.8") && text.contains("CUDA 13.0"),
+            "{text}"
+        );
+        assert!(text.contains(DRIVER_PACKAGE), "{text}");
     }
 }

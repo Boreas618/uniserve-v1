@@ -8,7 +8,8 @@
 
 mod pitched;
 
-use crate::driver::{MemLocation, MemcpyAttributes, driver};
+use crate::driver::driver;
+use crate::sys::cuda as sys;
 use crate::{Error, Result, Stream};
 
 pub use pitched::{Pitched, PitchedBatch};
@@ -25,10 +26,10 @@ pub enum SourceOrder {
 }
 
 impl SourceOrder {
-    fn raw(self) -> i32 {
+    fn raw(self) -> sys::CUmemcpySrcAccessOrder {
         match self {
-            Self::Stream => 1,
-            Self::DuringCall => 2,
+            Self::Stream => sys::CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+            Self::DuringCall => sys::CU_MEMCPY_SRC_ACCESS_ORDER_DURING_API_CALL,
         }
     }
 }
@@ -209,8 +210,7 @@ impl CopyBatch {
     /// With [`SourceOrder::DuringCall`] every source has been read when this
     /// returns.
     ///
-    /// Fails with [`Error::Capturing`] on a capturing stream and with
-    /// [`Error::Symbol`] on a driver older than CUDA 12.8.
+    /// Fails with [`Error::Capturing`] on a capturing stream.
     ///
     /// # Safety
     /// Every range stays valid until the stream reaches the copies; with
@@ -249,14 +249,12 @@ unsafe fn submit_batch(
     stream: &Stream,
 ) -> Result<()> {
     let driver = driver()?;
-    let copy = driver.memcpy_batch_async.clone()?;
+    let copy = driver.memcpy_batch_async;
 
     // One attribute applies to every entry (attrsIdxs[0] must be 0).
-    let mut attributes = MemcpyAttributes {
-        source_order: order.raw(),
-        source_hint: MemLocation::default(),
-        destination_hint: MemLocation::default(),
-        flags: 0,
+    let mut attributes = sys::CUmemcpyAttributes {
+        srcAccessOrder: order.raw(),
+        ..Default::default()
     };
     let mut first = 0_usize;
 

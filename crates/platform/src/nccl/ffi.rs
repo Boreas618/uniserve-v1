@@ -1,90 +1,60 @@
-//! NCCL's C ABI, resolved from the process's `libnccl.so.2`.
+//! NCCL's C ABI, resolved from `libnccl.so.2`.
 //!
-//! PyTorch loads its NCCL before the worker creates communicators, so opening
-//! the soname returns that same library; no package or user path is guessed.
+//! NVIDIA's NCCL package installs the library under its soname on the loader's default search
+//! path, and it is opened by that name. The bindings are generated from the `nccl.h` of the
+//! release [`sys::NCCL_VERSION_CODE`] names, which is also the oldest library accepted: an older
+//! one is refused with [`Error::Version`] at load. That release is the project's pin, and older
+//! ones are not merely missing attributes: NCCL 2.27.7 crashes on the first replay of a CUDA graph
+//! that holds a collective. Every entry point the crate calls exists in that release, so all are
+//! resolved at load.
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::{Arc, OnceLock};
 
 use libloading::Library;
 
+use crate::sys::nccl as sys;
 use crate::{Error, Result};
 
 pub(super) const LIBNCCL: &str = "libnccl.so.2";
 
+/// What a refused library is told to install.
+const NCCL_PACKAGE: &str = "NCCL 2.30.4 or later (NVIDIA's libnccl2 package)";
+
 pub(super) type Handle = *mut c_void;
-pub(super) type NcclResult = i32;
+pub(super) type NcclResult = sys::ncclResult_t;
 
-const NCCL_SUCCESS: NcclResult = 0;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(super) struct RawUniqueId {
-    pub(super) bytes: [u8; 128],
-}
-
-/// `NCCL_API_MAGIC` in `nccl.h`, which NCCL checks to know a config was initialized.
-pub(super) const NCCL_API_MAGIC: u32 = 0xcafe_beef;
-
-/// `NCCL_CONFIG_UNDEF_INT` in `nccl.h` (`INT_MIN`): an attribute left to NCCL's default.
+/// `NCCL_CONFIG_UNDEF_INT`: an attribute left to NCCL's default. The header defines it as
+/// `INT_MIN` of `<limits.h>`, which is `i32::MIN` for the 32-bit `int` of every target the
+/// crate builds for.
 const NCCL_CONFIG_UNDEF_INT: i32 = i32::MIN;
 
-/// `NCCL_VERSION(2, 30, 0)`: the release from which every attribute of [`RawConfig`] exists.
-/// NCCL reads a config's attributes as of the version it states, so an attribute newer than the
-/// stated version takes its default whatever value it holds; 2.29 is the first that reads
-/// `graphUsageMode` and 2.30 the first with `maxP2pPeers`, the last field laid out here.
-const NCCL_CONFIG_VERSION: u32 = 23000;
-
-/// `ncclConfig_t` as `nccl.h` lays it out from 2.30 (`ncclConfig_v22800`), compared with the
-/// header by `tests::the_nccl_config_is_laid_out_as_the_header`.
-#[repr(C)]
-pub(super) struct RawConfig {
-    size: usize,
-    magic: u32,
-    version: u32,
-    blocking: i32,
-    cga_cluster_size: i32,
-    min_ctas: i32,
-    max_ctas: i32,
-    net_name: *const c_char,
-    split_share: i32,
-    traffic_class: i32,
-    comm_name: *const c_char,
-    collnet_enable: i32,
-    cta_policy: i32,
-    shrink_share: i32,
-    nvls_ctas: i32,
-    n_channels_per_net_peer: i32,
-    nvlink_centric_sched: i32,
-    pub(super) graph_usage_mode: i32,
-    num_rma_ctx: i32,
-    max_p2p_peers: i32,
-}
-
-impl RawConfig {
-    /// `NCCL_CONFIG_INITIALIZER`: every attribute left to NCCL's default.
+impl sys::ncclConfig_t {
+    /// `NCCL_CONFIG_INITIALIZER`: every attribute left to NCCL's default, stating the size, magic
+    /// and version of the header the bindings are generated from. NCCL reads a config's attributes
+    /// as of the version it states.
     pub(super) fn initializer() -> Self {
         Self {
             size: std::mem::size_of::<Self>(),
-            magic: NCCL_API_MAGIC,
-            version: NCCL_CONFIG_VERSION,
+            magic: sys::NCCL_API_MAGIC,
+            version: sys::NCCL_VERSION_CODE,
             blocking: NCCL_CONFIG_UNDEF_INT,
-            cga_cluster_size: NCCL_CONFIG_UNDEF_INT,
-            min_ctas: NCCL_CONFIG_UNDEF_INT,
-            max_ctas: NCCL_CONFIG_UNDEF_INT,
-            net_name: std::ptr::null(),
-            split_share: NCCL_CONFIG_UNDEF_INT,
-            traffic_class: NCCL_CONFIG_UNDEF_INT,
-            comm_name: std::ptr::null(),
-            collnet_enable: NCCL_CONFIG_UNDEF_INT,
-            cta_policy: NCCL_CONFIG_UNDEF_INT,
-            shrink_share: NCCL_CONFIG_UNDEF_INT,
-            nvls_ctas: NCCL_CONFIG_UNDEF_INT,
-            n_channels_per_net_peer: NCCL_CONFIG_UNDEF_INT,
-            nvlink_centric_sched: NCCL_CONFIG_UNDEF_INT,
-            graph_usage_mode: NCCL_CONFIG_UNDEF_INT,
-            num_rma_ctx: NCCL_CONFIG_UNDEF_INT,
-            max_p2p_peers: NCCL_CONFIG_UNDEF_INT,
+            cgaClusterSize: NCCL_CONFIG_UNDEF_INT,
+            minCTAs: NCCL_CONFIG_UNDEF_INT,
+            maxCTAs: NCCL_CONFIG_UNDEF_INT,
+            netName: std::ptr::null(),
+            splitShare: NCCL_CONFIG_UNDEF_INT,
+            trafficClass: NCCL_CONFIG_UNDEF_INT,
+            commName: std::ptr::null(),
+            collnetEnable: NCCL_CONFIG_UNDEF_INT,
+            CTAPolicy: NCCL_CONFIG_UNDEF_INT,
+            shrinkShare: NCCL_CONFIG_UNDEF_INT,
+            nvlsCTAs: NCCL_CONFIG_UNDEF_INT,
+            nChannelsPerNetPeer: NCCL_CONFIG_UNDEF_INT,
+            nvlinkCentricSched: NCCL_CONFIG_UNDEF_INT,
+            graphUsageMode: NCCL_CONFIG_UNDEF_INT,
+            numRmaCtx: NCCL_CONFIG_UNDEF_INT,
+            maxP2pPeers: NCCL_CONFIG_UNDEF_INT,
         }
     }
 }
@@ -96,17 +66,19 @@ type PointToPoint = unsafe extern "C" fn(Handle, usize, i32, i32, Handle, Handle
 
 pub(super) struct Api {
     error_string: unsafe extern "C" fn(NcclResult) -> *const c_char,
-    pub(super) get_unique_id: unsafe extern "C" fn(*mut RawUniqueId) -> NcclResult,
-    pub(super) comm_init_rank:
-        unsafe extern "C" fn(*mut Handle, i32, RawUniqueId, i32) -> NcclResult,
-    /// `ncclCommInitRankConfig(comm, nranks, id, rank, config)`, an entry point of 2.14 and later.
-    pub(super) comm_init_rank_config: Result<
-        unsafe extern "C" fn(*mut Handle, i32, RawUniqueId, i32, *mut RawConfig) -> NcclResult,
-    >,
-    /// `ncclCommSplit(comm, color, key, newcomm, config)`, an entry point of
-    /// newer releases (2.18); a NULL config takes the defaults.
+    get_version: unsafe extern "C" fn(*mut i32) -> NcclResult,
+    pub(super) get_unique_id: unsafe extern "C" fn(*mut sys::ncclUniqueId) -> NcclResult,
+    /// `ncclCommInitRankConfig(comm, nranks, id, rank, config)`.
+    pub(super) comm_init_rank_config: unsafe extern "C" fn(
+        *mut Handle,
+        i32,
+        sys::ncclUniqueId,
+        i32,
+        *mut sys::ncclConfig_t,
+    ) -> NcclResult,
+    /// `ncclCommSplit(comm, color, key, newcomm, config)`; a NULL config takes the defaults.
     pub(super) comm_split:
-        Result<unsafe extern "C" fn(Handle, i32, i32, *mut Handle, *mut c_void) -> NcclResult>,
+        unsafe extern "C" fn(Handle, i32, i32, *mut Handle, *mut sys::ncclConfig_t) -> NcclResult,
     pub(super) comm_destroy: unsafe extern "C" fn(Handle) -> NcclResult,
     pub(super) comm_abort: unsafe extern "C" fn(Handle) -> NcclResult,
     pub(super) all_reduce: Reduction,
@@ -117,8 +89,7 @@ pub(super) struct Api {
     pub(super) recv: PointToPoint,
     pub(super) group_start: unsafe extern "C" fn() -> NcclResult,
     pub(super) group_end: unsafe extern "C" fn() -> NcclResult,
-    // An entry point of newer releases (2.28).
-    pub(super) all_to_all: Result<Collective>,
+    pub(super) all_to_all: Collective,
     // Declared last: the library outlives every copied function pointer.
     _library: Library,
 }
@@ -146,13 +117,13 @@ pub(super) fn api() -> Result<&'static Api> {
             source: Arc::new(source),
         })?;
         // SAFETY: each signature matches the `nccl.h` prototype of the symbol.
-        unsafe {
-            Ok(Api {
+        let api = unsafe {
+            Api {
                 error_string: symbol(&library, "ncclGetErrorString")?,
+                get_version: symbol(&library, "ncclGetVersion")?,
                 get_unique_id: symbol(&library, "ncclGetUniqueId")?,
-                comm_init_rank: symbol(&library, "ncclCommInitRank")?,
-                comm_init_rank_config: symbol(&library, "ncclCommInitRankConfig"),
-                comm_split: symbol(&library, "ncclCommSplit"),
+                comm_init_rank_config: symbol(&library, "ncclCommInitRankConfig")?,
+                comm_split: symbol(&library, "ncclCommSplit")?,
                 comm_destroy: symbol(&library, "ncclCommDestroy")?,
                 comm_abort: symbol(&library, "ncclCommAbort")?,
                 all_reduce: symbol(&library, "ncclAllReduce")?,
@@ -162,18 +133,44 @@ pub(super) fn api() -> Result<&'static Api> {
                 recv: symbol(&library, "ncclRecv")?,
                 group_start: symbol(&library, "ncclGroupStart")?,
                 group_end: symbol(&library, "ncclGroupEnd")?,
-                all_to_all: symbol(&library, "ncclAlltoAll"),
+                all_to_all: symbol(&library, "ncclAlltoAll")?,
                 _library: library,
-            })
-        }
+            }
+        };
+
+        let mut version = 0;
+        // SAFETY: NCCL writes one int to the local `version`.
+        api.check(unsafe { (api.get_version)(&mut version) }, "ncclGetVersion")?;
+        require_version(version)?;
+        Ok(api)
     })
     .as_ref()
     .map_err(Clone::clone)
 }
 
+/// Refuses an NCCL older than the `nccl.h` the bindings are generated from. Both are NCCL version
+/// codes, `major * 10000 + minor * 100 + patch` from release 2.9 on.
+fn require_version(version: i32) -> Result<()> {
+    let required = sys::NCCL_VERSION_CODE as i32;
+    if version >= required {
+        return Ok(());
+    }
+    Err(Error::Version {
+        library: LIBNCCL,
+        found: release(version),
+        required: release(required),
+        package: NCCL_PACKAGE,
+    })
+}
+
+/// An NCCL version code as its release, such as `NCCL 2.30.4` for 23004.
+fn release(code: i32) -> String {
+    format!("NCCL {}.{}.{}", code / 10000, code / 100 % 100, code % 100)
+}
+
 impl Api {
     pub(super) fn check(&self, status: NcclResult, call: &'static str) -> Result<()> {
-        if status == NCCL_SUCCESS {
+        if status == sys::ncclSuccess {
             return Ok(());
         }
         // SAFETY: NCCL returns a static, NUL-terminated description for every
@@ -190,8 +187,52 @@ impl Api {
         };
         Err(Error::Nccl {
             call,
-            code: status,
+            // `ncclResult_t` is a C enum; the error carries the value NCCL documents.
+            code: status as i32,
             message,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An NCCL older than the generated header — the host's 2.27.7, which crashes on the first
+    /// replay of a graph that holds a collective — is refused by name with the package to
+    /// install; the header's release and later ones are accepted.
+    #[test]
+    fn an_nccl_older_than_the_bindings_is_refused() {
+        assert!(require_version(sys::NCCL_VERSION_CODE as i32).is_ok());
+        assert!(require_version(23100).is_ok());
+
+        let error = require_version(22707).expect_err("2.27.7 predates the bindings");
+        let text = error.to_string();
+        assert!(
+            matches!(
+                error,
+                Error::Version {
+                    library: LIBNCCL,
+                    ..
+                }
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("NCCL 2.27.7") && text.contains("NCCL 2.30.4"),
+            "{text}"
+        );
+        assert!(text.contains(NCCL_PACKAGE), "{text}");
+    }
+
+    /// The initializer states the generated header's size, magic and version, which NCCL checks
+    /// before it reads any attribute.
+    #[test]
+    fn the_config_initializer_states_the_headers_version() {
+        let config = sys::ncclConfig_t::initializer();
+        assert_eq!(config.size, std::mem::size_of::<sys::ncclConfig_t>());
+        assert_eq!(config.magic, sys::NCCL_API_MAGIC);
+        assert_eq!(config.version, sys::NCCL_VERSION_CODE);
+        assert_eq!(config.graphUsageMode, NCCL_CONFIG_UNDEF_INT);
     }
 }

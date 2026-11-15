@@ -739,11 +739,11 @@ fn prepare(
     context: Option<&PrimaryContext>,
 ) -> std::result::Result<Prepared, String> {
     let self_device = context.map(PrimaryContext::device);
-    // A refused CUPTI release names its remedy; any other failure to subscribe is most likely a
+    // A missing or refused CUPTI names its remedy; any other failure to subscribe is most likely a
     // profiler holding CUPTI's one subscription.
     let cupti = || {
         platform::cupti::subscriber::subscribe().map_err(|error| match error {
-            platform::Error::CuptiRefused { .. } => error.to_string(),
+            platform::Error::Version { .. } | platform::Error::Load { .. } => error.to_string(),
             _ => {
                 format!("the process holds no CUPTI subscription (a profiler may hold it): {error}")
             }

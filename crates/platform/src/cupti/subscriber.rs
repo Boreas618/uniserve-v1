@@ -8,55 +8,37 @@
 //! the dispatch below. Enabling is reference-counted per callback and per
 //! activity kind, so collectors that share one start and stop independently.
 //!
-//! Activity buffers are delivered as CUPTI completes them; a flush thread
-//! asks CUPTI every [`FLUSH_PERIOD`] to deliver every buffer whose records
-//! completed (`cuptiActivityFlushAll` without forcing, which issues no CUDA
-//! synchronization) while some activity kind is enabled.
+//! Activity buffers are delivered as CUPTI completes them; CUPTI's own worker
+//! thread delivers every buffer whose records completed every
+//! [`FLUSH_PERIOD`] (`cuptiActivityFlushPeriod`), which issues no CUDA
+//! synchronization, and a collector that needs the records of operations in
+//! flight forces a flush ([`flush`]).
 
 use std::alloc::Layout;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use super::{check, cupti};
+use crate::sys::cupti as sys;
 use crate::{Error, Result, lock};
 
-/// How often the flush thread has CUPTI deliver the buffers whose records
+/// How often CUPTI's worker thread delivers the buffers whose records
 /// completed.
 pub const FLUSH_PERIOD: Duration = Duration::from_millis(100);
 
 /// `CUPTI_CB_DOMAIN_DRIVER_API`.
-pub(crate) const DRIVER_DOMAIN: i32 = 1;
+pub(crate) const DRIVER_DOMAIN: sys::CUpti_CallbackDomain = sys::CUPTI_CB_DOMAIN_DRIVER_API;
 /// `CUPTI_CB_DOMAIN_RUNTIME_API`.
-pub(crate) const RUNTIME_DOMAIN: i32 = 2;
+pub(crate) const RUNTIME_DOMAIN: sys::CUpti_CallbackDomain = sys::CUPTI_CB_DOMAIN_RUNTIME_API;
 
 /// `CUPTI_API_ENTER`.
-pub(crate) const API_ENTER: i32 = 0;
+pub(crate) const API_ENTER: sys::CUpti_ApiCallbackSite = sys::CUPTI_API_ENTER;
 
 /// `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`.
-pub(crate) const GRAPH_TRACE: u32 = 51;
-
-/// `CUPTI_ACTIVITY_FLAG_FLUSH_FORCED`.
-const FLUSH_FORCED: u32 = 1;
-
-/// The `CUPTI_API_VERSION` of the CUDA 13.0 release's CUPTI (the toolkit's
-/// `libcupti.so.2025.3.0`), which [`subscribe`] refuses.
-///
-/// On GB200 with driver 580.82.07 it faults inside `cuGraphLaunch` as soon
-/// as graph launches traced by node have filled the device buffers it
-/// pre-allocates (`CUPTI_ACTIVITY_ATTR_DEVICE_BUFFER_PRE_ALLOCATE_VALUE`),
-/// although the records of the earlier launches were delivered: launches of
-/// a 1,000-kernel graph fault at the 312th launch with the default 3 buffers
-/// of 3.2 MB, at the 606th with 6 buffers and at the 608th with 6.4 MB
-/// buffers, whatever the pool limit. CUPTI's release notes for CUDA 13.0
-/// Update 1 list a fixed segmentation fault in initializing that device
-/// buffer. The same release stalled a serving worker that replayed CUDA
-/// graphs while kernels were recorded. Releases 13.0.85 (API version 130001)
-/// and 13.4.92 (130401) record every kernel of 1,024 such launches with its
-/// timestamps through a pool of 4 buffers.
-const REFUSED_VERSION: u32 = 130_000;
+pub(crate) const GRAPH_TRACE: sys::CUpti_ActivityKind = sys::CUPTI_ACTIVITY_KIND_GRAPH_TRACE;
 
 /// Each activity buffer CUPTI fills: 1 MiB (about 4,800 kernel records),
 /// aligned as CUPTI requires. While a stream runs without pause, the buffer
@@ -81,9 +63,9 @@ struct Enabled {
     /// Activity kinds.
     kinds: HashMap<u32, u32>,
     /// Single callbacks, by domain and callback id.
-    callbacks: HashMap<(i32, u32), u32>,
+    callbacks: HashMap<(sys::CUpti_CallbackDomain, u32), u32>,
     /// Whole callback domains.
-    domains: HashMap<i32, u32>,
+    domains: HashMap<sys::CUpti_CallbackDomain, u32>,
 }
 
 static ENABLED: Mutex<Option<Enabled>> = Mutex::new(None);
@@ -92,26 +74,20 @@ static ENABLED: Mutex<Option<Enabled>> = Mutex::new(None);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Subscribe the process to CUPTI, once: the callback API with the dispatch
-/// below, the activity buffer callbacks and the flush thread. Later calls
-/// return the first one's outcome.
+/// below, the activity buffer callbacks and CUPTI's delivery period. Later
+/// calls return the first one's outcome.
 ///
 /// # Errors
 ///
-/// Fails when `libcupti.so` is missing, when the loaded CUPTI is the release
-/// [`REFUSED_VERSION`] names ([`Error::CuptiRefused`]), or when another CUPTI
-/// client (a profiler that injected CUPTI) holds the process's subscription,
-/// with [`Error::Cupti`] code `CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED`.
+/// Fails when `libcupti.so.13` is missing ([`Error::Load`]), when the loaded
+/// CUPTI is older than [`super::MINIMUM_VERSION`] ([`Error::Version`]), or
+/// when another CUPTI client (a profiler that injected CUPTI) holds the
+/// process's subscription, with [`Error::Cupti`] code
+/// `CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED`.
 pub fn subscribe() -> Result<()> {
     SUBSCRIPTION
         .get_or_init(|| {
             let cupti = cupti()?;
-            let version = super::version()?;
-            if version == REFUSED_VERSION {
-                return Err(Error::CuptiRefused {
-                    library: super::library(),
-                    version,
-                });
-            }
             let mut handle = std::ptr::null_mut();
             check(
                 // SAFETY: CUPTI writes the subscriber handle; the dispatch
@@ -129,13 +105,11 @@ pub fn subscribe() -> Result<()> {
                 unsafe { (cupti.register_buffers)(on_buffer_requested, on_buffer_completed) },
                 "cuptiActivityRegisterCallbacks",
             )?;
-            std::thread::Builder::new()
-                .name("cupti-flush".into())
-                .spawn(flush_loop)
-                .map_err(|source| Error::Thread {
-                    name: "cupti-flush",
-                    source: Arc::new(source),
-                })?;
+            check(
+                // SAFETY: takes the period in milliseconds by value.
+                unsafe { (cupti.flush_period)(FLUSH_PERIOD.as_millis() as u32) },
+                "cuptiActivityFlushPeriod",
+            )?;
             Ok(subscription)
         })
         .as_ref()
@@ -198,7 +172,7 @@ pub(crate) fn disable_kind(kind: u32) {
 }
 
 /// Enable the callback `cbid` of `domain` for one more collector.
-pub(crate) fn enable_callback(domain: i32, cbid: u32) -> Result<()> {
+pub(crate) fn enable_callback(domain: sys::CUpti_CallbackDomain, cbid: u32) -> Result<()> {
     let (cupti, subscriber) = (cupti()?, handle()?);
     let mut enabled = lock(&ENABLED);
     let enabled = enabled
@@ -217,7 +191,7 @@ pub(crate) fn enable_callback(domain: i32, cbid: u32) -> Result<()> {
 }
 
 /// Release one collector's enabling of the callback `cbid` of `domain`.
-pub(crate) fn disable_callback(domain: i32, cbid: u32) {
+pub(crate) fn disable_callback(domain: sys::CUpti_CallbackDomain, cbid: u32) {
     let (Ok(cupti), Ok(subscriber)) = (cupti(), handle()) else {
         return;
     };
@@ -237,7 +211,7 @@ pub(crate) fn disable_callback(domain: i32, cbid: u32) {
 }
 
 /// Enable every callback of `domain` for one more collector.
-pub(crate) fn enable_domain(domain: i32) -> Result<()> {
+pub(crate) fn enable_domain(domain: sys::CUpti_CallbackDomain) -> Result<()> {
     let (cupti, subscriber) = (cupti()?, handle()?);
     let mut enabled = lock(&ENABLED);
     let enabled = enabled
@@ -258,7 +232,7 @@ pub(crate) fn enable_domain(domain: i32) -> Result<()> {
 /// Release one collector's enabling of `domain`. The last disables the
 /// domain and enables again the single callbacks other collectors hold in
 /// it.
-pub(crate) fn disable_domain(domain: i32) {
+pub(crate) fn disable_domain(domain: sys::CUpti_CallbackDomain) {
     let (Ok(cupti), Ok(subscriber)) = (cupti(), handle()) else {
         return;
     };
@@ -288,9 +262,14 @@ pub(crate) fn disable_domain(domain: i32) {
 /// delivers the records of operations in flight, whose end is unknown.
 pub(crate) fn flush(forced: bool) {
     if let Ok(cupti) = cupti() {
+        let flags = if forced {
+            sys::CUPTI_ACTIVITY_FLAG_FLUSH_FORCED
+        } else {
+            0
+        };
         // SAFETY: the buffer callbacks stay registered for the process's
         // life.
-        let _ = unsafe { (cupti.flush_all)(if forced { FLUSH_FORCED } else { 0 }) };
+        let _ = unsafe { (cupti.flush_all)(flags) };
     }
 }
 
@@ -300,28 +279,21 @@ pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::AcqRel)
 }
 
-/// The flush thread's loop: deliver completed buffers while some activity
-/// kind is enabled.
-fn flush_loop() {
-    loop {
-        std::thread::sleep(FLUSH_PERIOD);
-        let active = lock(&ENABLED)
-            .as_ref()
-            .is_some_and(|enabled| enabled.kinds.values().any(|&count| count > 0));
-        if active {
-            flush(false);
-        }
-    }
-}
-
 /// The CUPTI callback: hands each callback to the collectors that use it.
 /// Every collector's part only touches atomics, thread locals and its own
 /// locks, and the range profiler's launch ranges also push and pop a CUPTI
 /// range.
-unsafe extern "C" fn dispatch(_userdata: *mut c_void, domain: i32, cbid: u32, data: *const c_void) {
+unsafe extern "C" fn dispatch(
+    _userdata: *mut c_void,
+    domain: sys::CUpti_CallbackDomain,
+    cbid: u32,
+    data: *const c_void,
+) {
     if data.is_null() {
         return;
     }
+    // Both API domains supply `CUpti_CallbackData`; no other domain is enabled.
+    let data = data.cast::<sys::CUpti_CallbackData>();
     if domain == DRIVER_DOMAIN {
         // SAFETY: CUPTI supplies CUpti_CallbackData for this API domain.
         unsafe {

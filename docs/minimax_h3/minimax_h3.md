@@ -163,12 +163,7 @@ One replica across every GPU gives the lowest latency; replicas serve more reque
 
 The GB200 measurements ran with `NCCL_NVLS_ENABLE=0`. On H200, OmniRef serves reference requests as one Ulysses8 replica on one eight-GPU host (`ulysses8-reference.toml`) with `--mem-fraction-static 0.92`, with the capacities of [OmniRef on H200](evaluation.md#omniref-on-h200).
 
-A deployment of several ranks needs the NCCL this project pins (`nvidia-nccl-cu13` in `pyproject.toml`): the serving process opens `libnccl.so.2` by name, and system NCCL 2.27.7 crashes on the first replay of a graph that holds a collective. Check it before the server starts, and put the directory it prints on the loader's path. `UNISERVE_NCCL_DIR` names the directory, and otherwise the project environment's copy answers:
-
-```bash
-nccl=$(tools/check_nccl.sh) || exit 1
-export LD_LIBRARY_PATH=$nccl:$LD_LIBRARY_PATH
-```
+A deployment of several ranks needs NCCL 2.30.4 or later on the loader's default search path (NVIDIA's `libnccl2` package): the serving process opens `libnccl.so.2` by its soname and refuses an older release with an error naming it, since NCCL 2.27.7 crashes on the first replay of a graph that holds a collective.
 
 ### Two hosts
 

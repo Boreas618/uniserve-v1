@@ -19,20 +19,21 @@ use std::ffi::{c_char, c_void};
 use super::metrics::{Availability, Counters, Profiler};
 use super::{call, cupti, struct_size};
 use crate::Result;
+use crate::sys::cupti as sys;
 
 /// `CUPTI_PM_SAMPLING_TRIGGER_MODE_GPU_TIME_INTERVAL`: the interval is in
 /// nanoseconds of a fixed-frequency source.
-const TIME_INTERVAL: u32 = 1;
+const TIME_INTERVAL: u32 = sys::CUPTI_PM_SAMPLING_TRIGGER_MODE_GPU_TIME_INTERVAL;
 
 /// `CUPTI_PM_SAMPLING_HARDWARE_BUFFER_APPEND_MODE_KEEP_LATEST`: a full
 /// hardware buffer overwrites its oldest records. Keeping the oldest
 /// instead fails every decode once the buffer overflowed
 /// (`CUPTI_ERROR_OUT_OF_MEMORY`), losing every later sample.
-const KEEP_LATEST: u32 = 1;
+const KEEP_LATEST: u32 = sys::CUPTI_PM_SAMPLING_HARDWARE_BUFFER_APPEND_MODE_KEEP_LATEST;
 
 /// `CUPTI_PM_SAMPLING_DECODE_STOP_REASON_COUNTER_DATA_FULL`: the decode
 /// filled the counter data image before it decoded every record.
-const COUNTER_DATA_FULL: u32 = 1;
+const COUNTER_DATA_FULL: u32 = sys::CUPTI_PM_SAMPLING_DECODE_STOP_REASON_COUNTER_DATA_FULL;
 
 #[repr(C)]
 struct EnableParams {

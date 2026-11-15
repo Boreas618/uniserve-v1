@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock};
 
 use crate::driver::{Handle, driver, in_context};
-use crate::stream::CU_STREAM_NON_BLOCKING;
+use crate::sys::cuda as sys;
 use crate::{DeviceId, Error, Result};
 
 /// A retained reference to a device's primary context.
@@ -127,7 +127,7 @@ impl PrimaryContext {
             // SAFETY: the driver writes one stream handle in the context this
             // call made current.
             let status = unsafe {
-                (driver.stream_create_with_priority)(&mut raw, CU_STREAM_NON_BLOCKING, 0)
+                (driver.stream_create_with_priority)(&mut raw, sys::CU_STREAM_NON_BLOCKING, 0)
             };
             // The name says this call is the probe's own, not an application's stream being
             // created: a sticky context refuses every creation, so a line reading
