@@ -12,6 +12,10 @@
 //! thread keeps a write half of each and writes frames to it ([`send`], [`report`]). The handshakes
 //! run before the readers start: [`connect`] on the request interface, [`claim`] on the process
 //! interface, and [`attach`] for a further front.
+//!
+//! No wait on a daemon has a bound of its own: a daemon answers or closes the connection, and the
+//! daemon that started this process bounds its own waits on it and ends it, as the owner of its
+//! lifetime, when one passes.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -24,28 +28,9 @@ use proto::config::EngineArgs;
 use proto::process::{downstream, request, upstream};
 use proto::request::ArtifactMedia;
 use proto::request::wire;
-use service::Connection;
+use service::{Connection, Message};
 
 use super::Input;
-
-/// How long the daemon may take to welcome this engine on either interface, which it does at
-/// once: the bound fails a wrong address instead of hanging the process.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// How long the daemon may take to reply to the storage claim: starting the node's Storage
-/// Server is the slow part, and it is the daemon's to do.
-const CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// How long an attaching daemon has to welcome this engine: the daemon's own connect bound, so a
-/// hot restart that hangs is reported on the daemon's side.
-const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long a reader thread waits on its socket before it looks again: a read wakes as soon as a
-/// frame arrives or the connection closes, so this bounds nothing but a lost wake.
-const READ_WAIT: Duration = Duration::from_secs(60);
-
-/// The most artifact bytes one frame carries to a front on another host.
-const ARTIFACT_PART: usize = 1 << 20;
 
 /// The request id of the storage claim, the one request this process sends on the process
 /// interface.
@@ -56,9 +41,9 @@ const CLAIM: u64 = 1;
 ///
 /// # Errors
 ///
-/// When the daemon closes, refuses this engine, or does not welcome it within a minute.
+/// When the daemon closes or refuses this engine.
 pub fn connect(connection: &mut Connection, launch: &EngineArgs) -> Result<NonZeroU32> {
-    let window = hello(connection, launch.engine, HANDSHAKE_TIMEOUT)?;
+    let window = hello(connection, launch.engine)?;
 
     // `Starting` goes out before the rank load, which takes minutes, so the daemon reads a
     // process that is alive rather than one that vanished after its hello.
@@ -83,8 +68,8 @@ pub fn connect(connection: &mut Connection, launch: &EngineArgs) -> Result<NonZe
 ///
 /// # Errors
 ///
-/// When the launch states engine 0, the daemon refuses the process or its claim, lists no node,
-/// or does not answer in time.
+/// When the launch states engine 0, the daemon closes the interface or refuses the process or its
+/// claim, or lists no node.
 pub(crate) fn claim(
     process: &mut Connection,
     launch: &EngineArgs,
@@ -111,9 +96,8 @@ pub(crate) fn claim(
             },
         )),
     })?;
-    let welcome: proto::process::Welcome = process
-        .recv(HANDSHAKE_TIMEOUT)?
-        .context("the daemon did not welcome this engine's process interface")?;
+    let welcome: proto::process::Welcome =
+        next(process).context("the daemon did not welcome this engine's process interface")?;
     if let Some(refusal) = welcome.refusal {
         return Err(anyhow::Error::new(refusal)
             .context("the daemon refused this engine's process interface"));
@@ -150,10 +134,9 @@ pub(crate) fn claim(
 
     let mut filed = Vec::new();
     let claimed = loop {
+        // Starting the node's Storage Server for the claim is the daemon's, with its own bound.
         let message: proto::process::Downstream =
-            process.recv(CLAIM_TIMEOUT)?.with_context(|| {
-                format!("the daemon did not answer the claim within {CLAIM_TIMEOUT:?}")
-            })?;
+            next(process).context("the daemon did not answer the claim")?;
         match message.kind {
             Some(downstream::Kind::Reply(reply)) if reply.id == CLAIM => {
                 if !reply.error.is_empty() {
@@ -206,20 +189,19 @@ pub(crate) fn claim(
 ///
 /// # Errors
 ///
-/// When the connection cannot be made, or the daemon refuses this engine or does not welcome it
-/// in time.
+/// When the connection cannot be made, or the daemon closes it or refuses this engine.
 pub(crate) fn attach(address: &str, engine: u64) -> Result<(Connection, NonZeroU32)> {
     let mut connection = address
         .parse()
         .map_err(std::io::Error::from)
         .and_then(|endpoint| Connection::connect(&endpoint))
         .with_context(|| format!("connecting to the attaching daemon at {address}"))?;
-    let window = hello(&mut connection, engine, ATTACH_TIMEOUT)?;
+    let window = hello(&mut connection, engine)?;
     Ok((connection, window))
 }
 
 /// The hello of the request interface and the daemon's welcome.
-fn hello(connection: &mut Connection, engine: u64, timeout: Duration) -> Result<NonZeroU32> {
+fn hello(connection: &mut Connection, engine: u64) -> Result<NonZeroU32> {
     connection.deliver(&wire::Hello {
         major: proto::ENGINE_INTERFACE_VERSION,
         build: proto::BUILD.to_owned(),
@@ -228,8 +210,7 @@ fn hello(connection: &mut Connection, engine: u64, timeout: Duration) -> Result<
         // the same engine number.
         interface: proto::process::Interface::Requests as i32,
     })?;
-    let welcome: wire::Welcome = connection
-        .recv(timeout)?
+    let welcome: wire::Welcome = next(connection)
         .context("the daemon closed the request interface before it welcomed this engine")?;
     if let Some(refusal) = welcome.refusal {
         return Err(anyhow::Error::new(refusal).context("the daemon refused this engine"));
@@ -237,6 +218,56 @@ fn hello(connection: &mut Connection, engine: u64, timeout: Duration) -> Result<
     // The daemon states how far ahead of its reports it takes a request's events.
     NonZeroU32::new(welcome.event_window)
         .context("the daemon's welcome states no event window, which is positive")
+}
+
+/// The next message of `connection`, for as long as the daemon keeps it open.
+///
+/// # Errors
+///
+/// The connection's failure or the daemon's close, and a frame that does not decode.
+fn next<M: Message>(connection: &mut Connection) -> std::io::Result<M> {
+    loop {
+        if let Some(message) = connection.recv(Duration::MAX)? {
+            return Ok(message);
+        }
+    }
+}
+
+/// Starts the reader thread `name` of `connection`, which blocks on the connection and hands each
+/// message to `deliver` until `deliver` says the control thread is gone, the daemon closes the
+/// connection, or a frame does not decode; `closed` then tells the control thread the connection
+/// ended.
+///
+/// # Errors
+///
+/// When the thread cannot start.
+fn read<M: Message>(
+    name: String,
+    mut connection: Connection,
+    mut deliver: impl FnMut(M) -> bool + Send + 'static,
+    closed: impl FnOnce() + Send + 'static,
+) -> Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(name.clone())
+        .spawn(move || {
+            loop {
+                match next::<M>(&mut connection) {
+                    Ok(message) => {
+                        if !deliver(message) {
+                            return;
+                        }
+                    }
+                    // The daemon closed the connection.
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(error) => {
+                        tracing::warn!(%error, reader = name, "reading a daemon connection failed");
+                        break;
+                    }
+                }
+            }
+            closed();
+        })
+        .context("starting a daemon connection's reader")
 }
 
 /// Starts the reader thread of front `front`, which hands every frame of `connection` to the
@@ -248,38 +279,18 @@ fn hello(connection: &mut Connection, engine: u64, timeout: Duration) -> Result<
 /// When the thread cannot start.
 pub(crate) fn read_requests(
     front: usize,
-    mut connection: Connection,
+    connection: Connection,
     inbox: Sender<Input>,
 ) -> Result<JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name(format!("front-{front}"))
-        .spawn(move || {
-            loop {
-                match connection.try_recv::<wire::ToEngine>() {
-                    Ok(Some(frame)) => {
-                        if inbox.send(Input::Frame(front, frame)).is_err() {
-                            return;
-                        }
-                    }
-                    Ok(None) => match connection.wait(READ_WAIT) {
-                        Ok(()) => {}
-                        // The daemon closed the front.
-                        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                        Err(error) => {
-                            tracing::warn!(%error, front, "waiting on a daemon front failed");
-                            break;
-                        }
-                    },
-                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(error) => {
-                        tracing::warn!(%error, front, "reading a daemon front failed");
-                        break;
-                    }
-                }
-            }
-            let _ = inbox.send(Input::FrontClosed(front));
-        })
-        .context("starting a daemon front's reader")
+    let closing = inbox.clone();
+    read(
+        format!("front-{front}"),
+        connection,
+        move |frame: wire::ToEngine| inbox.send(Input::Frame(front, frame)).is_ok(),
+        move || {
+            let _ = closing.send(Input::FrontClosed(front));
+        },
+    )
 }
 
 /// Starts the reader thread of the process interface, which hands every command of `connection`
@@ -290,47 +301,29 @@ pub(crate) fn read_requests(
 ///
 /// When the thread cannot start.
 pub(crate) fn read_commands(
-    mut connection: Connection,
+    connection: Connection,
     inbox: Sender<Input>,
 ) -> Result<JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("commands".to_owned())
-        .spawn(move || {
-            loop {
-                match connection.try_recv::<proto::process::Downstream>() {
-                    Ok(Some(message)) => match message.kind {
-                        Some(downstream::Kind::Event(proto::process::Event {
-                            kind: Some(proto::process::event::Kind::Command(command)),
-                        })) => {
-                            if inbox.send(Input::Command(Some(command))).is_err() {
-                                return;
-                            }
-                        }
-                        // An exit names a group this process does not supervise, and this
-                        // process sends no request after its claim.
-                        Some(other) => {
-                            tracing::debug!(message = ?other, "a frame no engine takes");
-                        }
-                        None => {}
-                    },
-                    Ok(None) => match connection.wait(READ_WAIT) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                        Err(error) => {
-                            tracing::warn!(%error, "waiting on the process interface failed");
-                            break;
-                        }
-                    },
-                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(error) => {
-                        tracing::warn!(%error, "reading the process interface failed");
-                        break;
-                    }
-                }
+    let closing = inbox.clone();
+    read(
+        "commands".to_owned(),
+        connection,
+        move |message: proto::process::Downstream| match message.kind {
+            Some(downstream::Kind::Event(proto::process::Event {
+                kind: Some(proto::process::event::Kind::Command(command)),
+            })) => inbox.send(Input::Command(Some(command))).is_ok(),
+            // An exit names a group this process does not supervise, and this process sends no
+            // request after its claim.
+            Some(other) => {
+                tracing::debug!(message = ?other, "a frame no engine takes");
+                true
             }
-            let _ = inbox.send(Input::Command(None));
-        })
-        .context("starting the process interface's reader")
+            None => true,
+        },
+        move || {
+            let _ = closing.send(Input::Command(None));
+        },
+    )
 }
 
 /// Sends one frame of the request interface on a front, with the artifact bytes it travels
@@ -378,7 +371,7 @@ pub(crate) fn queue(
         return connection.send_with(&frame, &[descriptor]);
     }
     let bytes = media.bytes();
-    for data in bytes.chunks(ARTIFACT_PART) {
+    for data in bytes.chunks(proto::ARTIFACT_PART_BYTES) {
         connection.deliver(&wire::FromEngine {
             kind: Some(wire::from_engine::Kind::ArtifactPart(wire::ArtifactPart {
                 size: bytes.len() as u64,

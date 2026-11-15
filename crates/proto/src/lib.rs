@@ -95,6 +95,14 @@ const HANDSHAKE_BYTES: usize = 64 << 10;
 /// parts. A longer length is a corrupt stream.
 const MESSAGE_BYTES: usize = 64 << 20;
 
+/// The artifact bytes one `ArtifactPart` frame of the request interface carries to a daemon front
+/// on another host, which cannot map the artifact's shared memory: an artifact crosses in parts of
+/// this size, each written whole before the next is encoded, so neither end holds more than one
+/// part beside the artifact's storage. A part is a frame well inside [`MESSAGE_BYTES`].
+pub const ARTIFACT_PART_BYTES: usize = 1 << 20;
+
+const _: () = assert!(ARTIFACT_PART_BYTES < MESSAGE_BYTES);
+
 impl std::fmt::Display for process::Refusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use process::refusal::Reason;

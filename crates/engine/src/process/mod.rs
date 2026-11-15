@@ -1212,11 +1212,23 @@ impl MainProcess {
                 self.ending.get_or_insert(Ok(()));
             }
             Kind::Attach(attach) => {
+                // The attach waits on another daemon, which welcomes this engine or closes the
+                // connection; it waits on a thread of its own, so that no operation waits behind
+                // it.
                 let engine = self.launch.engine;
-                self.work(Box::new(move || {
-                    let attached = daemon::attach(&attach.requests, engine);
-                    done(move |main| main.attached(&attach.requests, attached))
-                }));
+                let inbox = self.inbox.0.clone();
+                let attaching =
+                    std::thread::Builder::new()
+                        .name("attach".to_owned())
+                        .spawn(move || {
+                            let attached = daemon::attach(&attach.requests, engine);
+                            let _ = inbox.send(done(move |main| {
+                                main.attached(&attach.requests, attached);
+                            }));
+                        });
+                if let Err(error) = attaching {
+                    tracing::warn!(%error, "an attach did not start");
+                }
             }
             Kind::PrepareExperts(prepare) => {
                 let orders = prepare
