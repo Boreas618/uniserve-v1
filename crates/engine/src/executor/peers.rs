@@ -528,13 +528,14 @@ impl Drop for Remote {
     }
 }
 
-/// The JSON of the value a peer's data plane operation returned, once its answer arrived.
+/// The value a peer's data plane operation returned, in the link's encoding, once its answer
+/// arrived.
 ///
 /// # Errors
 ///
 /// The peer's failure of the operation, an answer of another kind, or a link lost before the
 /// answer.
-pub(crate) fn operated(rank: u32, answer: &Answer) -> Result<String> {
+pub(crate) fn operated(rank: u32, answer: &Answer) -> Result<Vec<u8>> {
     let answered = answer
         .recv()
         .map_err(|_| Error::State("the peer link ended before it answered"))?;
@@ -728,7 +729,7 @@ fn fault(error: Error) -> Arc<Fault> {
 
 /// What a peer runs a data plane's operation with: the operation's value as JSON, or its
 /// failure in words. It runs on the peer's operations thread, one operation at a time.
-pub type Operate = Box<dyn FnMut(DataOperation) -> std::result::Result<String, String> + Send>;
+pub type Operate = Box<dyn FnMut(DataOperation) -> std::result::Result<Vec<u8>, String> + Send>;
 
 /// One job of this process's ranks the responder waits for, in the order it was handed: the
 /// request's `message_id`, the group whose ended sequence its response states (none for a
@@ -1528,7 +1529,7 @@ mod tests {
             let operate: Operate = Box::new(move |operation| {
                 lock(&log).push(operation.clone());
                 match operation {
-                    DataOperation::Prepared { generation } => Ok(generation.to_string()),
+                    DataOperation::Prepared { generation } => Ok(generation.to_le_bytes().to_vec()),
                     _ => Err("this peer refuses the operation".to_owned()),
                 }
             });
@@ -1563,11 +1564,11 @@ mod tests {
             .collect();
 
         // Each reply comes back under its own request, a refusal as the operation's error.
-        let replies: Vec<std::result::Result<String, String>> = answers
+        let replies: Vec<std::result::Result<Vec<u8>, String>> = answers
             .iter()
             .map(|answer| operated(1, answer).map_err(|error| error.to_string()))
             .collect();
-        assert_eq!(replies[0], Ok("3".to_owned()));
+        assert_eq!(replies[0], Ok(3_u64.to_le_bytes().to_vec()));
         assert!(
             replies[1]
                 .as_ref()
@@ -1575,8 +1576,8 @@ mod tests {
             "{:?}",
             replies[1]
         );
-        assert_eq!(replies[2], Ok("1".to_owned()));
-        assert_eq!(replies[3], Ok("2".to_owned()));
+        assert_eq!(replies[2], Ok(1_u64.to_le_bytes().to_vec()));
+        assert_eq!(replies[3], Ok(2_u64.to_le_bytes().to_vec()));
         assert_eq!(*lock(&operated_log), sent);
 
         remote.close();

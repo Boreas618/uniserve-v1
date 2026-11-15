@@ -53,6 +53,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::executor::peers::messages::{RankOperation, RankReports};
 use crate::executor::peers::{LOST_EXIT, Liveness};
 use crate::process::binding::WeightsUpdated;
 use crate::worker::watchdog::Watchdog;
@@ -1209,18 +1210,71 @@ impl MainProcess {
                     done(move |main| main.attached(&attach.requests, attached))
                 }));
             }
-            Kind::Hook(hook) => {
-                let Some(binding) = self
-                    .engine
-                    .as_ref()
-                    .map(|engine| Arc::clone(&engine.binding))
-                else {
-                    return self.hooked(front, hook.id, Err(starting()));
+            Kind::PrepareExperts(prepare) => {
+                let orders = prepare
+                    .order
+                    .into_iter()
+                    .map(|(module, order)| (module, order.experts))
+                    .collect();
+                self.on_ranks(
+                    front,
+                    prepare.id,
+                    Ok(RankOperation::PrepareExperts { orders }),
+                );
+            }
+            Kind::StartExperts(start) => {
+                self.on_ranks(front, start.id, Ok(RankOperation::StartExperts));
+            }
+            Kind::CheckExperts(check) => {
+                self.on_ranks(front, check.id, Ok(RankOperation::CheckExperts));
+            }
+            Kind::AbortExperts(abort) => {
+                self.on_ranks(front, abort.id, Ok(RankOperation::AbortExperts));
+            }
+            Kind::LoadAdapter(load) => {
+                let operation = RankOperation::LoadAdapter {
+                    slot: load.slot,
+                    path: PathBuf::from(load.path),
                 };
-                self.work(Box::new(move || {
-                    let results = operations::hook(&binding, &hook.name, &hook.payload);
-                    done(move |main| main.hooked(front, hook.id, results))
-                }));
+                self.on_ranks(front, load.id, Ok(operation));
+            }
+            Kind::UnloadAdapter(unload) => {
+                let operation = RankOperation::UnloadAdapter { slot: unload.slot };
+                self.on_ranks(front, unload.id, Ok(operation));
+            }
+            Kind::StartProfile(start) => {
+                let operation = start
+                    .session
+                    .as_ref()
+                    .ok_or_else(|| "a profiling start states no session".to_owned())
+                    .and_then(proto::profile::SessionStart::try_from)
+                    .map(|session| RankOperation::StartProfile(Box::new(session)));
+                self.on_ranks(front, start.id, operation);
+            }
+            Kind::StopProfile(stop) => {
+                let operation = RankOperation::StopProfile {
+                    session: stop.session,
+                    reason: stop.reason,
+                };
+                self.on_ranks(front, stop.id, Ok(operation));
+            }
+            Kind::ReleaseProfile(release) => {
+                let operation =
+                    proto::profile::Collector::from_wire(release.collector).map(|collector| {
+                        RankOperation::ReleaseProfile {
+                            session: release.session,
+                            collector,
+                            reason: release.reason,
+                        }
+                    });
+                self.on_ranks(front, release.id, operation);
+            }
+            Kind::SwitchFences(switch) => {
+                let operation = RankOperation::SwitchFences {
+                    enabled: switch.enabled,
+                    off: switch.off,
+                };
+                self.on_ranks(front, switch.id, Ok(operation));
             }
             Kind::ResizeCache(resize) => self.resize_cache(front, &resize),
             Kind::UpdateWeights(update) => self.update_weights(front, update),
@@ -1231,17 +1285,17 @@ impl MainProcess {
                     .map(|(module, order)| (module, order.experts))
                     .collect();
                 if let Some(refusal) = self.lifecycle.boundary_refusal() {
-                    return self.hooked(front, commit.id, Err(anyhow::anyhow!(refusal)));
+                    return self.operated(front, commit.id, Err(anyhow::anyhow!(refusal)));
                 }
                 let Some(engine) = self.engine.as_ref() else {
-                    return self.hooked(front, commit.id, Err(starting()));
+                    return self.operated(front, commit.id, Err(starting()));
                 };
                 let schedulers = engine.inboxes();
                 let binding = Arc::clone(&engine.binding);
                 self.serial(Box::new(move || {
-                    let results = operations::commit_experts(&schedulers, &binding, &order)
-                        .and_then(|reports| reported(&reports));
-                    done(move |main| main.hooked(front, commit.id, results))
+                    let reports = operations::commit_experts(&schedulers, &binding, &order)
+                        .map(|reports| Some(weight_reports(reports)));
+                    done(move |main| main.operated(front, commit.id, reports))
                 }));
             }
             Kind::FlushCache(_) => {
@@ -1278,6 +1332,32 @@ impl MainProcess {
                 }));
             }
         }
+    }
+
+    /// Runs `operation`, an operation the daemon commands on every rank, beside the batches, and
+    /// answers command `id` of front `front` with every rank's reports; an operation the command
+    /// could not state is refused, and so is one while the engine starts.
+    fn on_ranks(
+        &mut self,
+        front: usize,
+        id: u64,
+        operation: std::result::Result<RankOperation, String>,
+    ) {
+        let operation = match operation {
+            Ok(operation) => operation,
+            Err(refusal) => return self.operated(front, id, Err(anyhow::anyhow!(refusal))),
+        };
+        let Some(binding) = self
+            .engine
+            .as_ref()
+            .map(|engine| Arc::clone(&engine.binding))
+        else {
+            return self.operated(front, id, Err(starting()));
+        };
+        self.work(Box::new(move || {
+            let reports = operations::on_ranks(&binding, &operation).map(rank_reports);
+            done(move |main| main.operated(front, id, reports))
+        }));
     }
 
     /// An attach ended: the daemon at `address` is a further front, told what this engine is.
@@ -1324,40 +1404,41 @@ impl MainProcess {
             Ok(wire::CacheChange::Sleep | wire::CacheChange::Wake)
         ) && let Some(refusal) = self.lifecycle.boundary_refusal()
         {
-            return self.hooked(front, id, Err(anyhow::anyhow!(refusal)));
+            return self.operated(front, id, Err(anyhow::anyhow!(refusal)));
         }
         let (schedulers, head, binding) = match self.segment_parts() {
             Ok(parts) => parts,
-            Err(error) => return self.hooked(front, id, Err(error)),
+            Err(error) => return self.operated(front, id, Err(error)),
         };
 
+        // A change of the cache reports nothing beyond its success.
         let job: Job = match change {
             Ok(wire::CacheChange::Sleep) => Box::new(move || {
                 let slept = operations::sleep(&schedulers, &head, &binding);
-                done(move |main| main.hooked(front, id, slept.map(|()| Vec::new())))
+                done(move |main| main.operated(front, id, slept.map(|()| None)))
             }),
             Ok(wire::CacheChange::Wake) => Box::new(move || {
                 let woken = operations::wake(&schedulers, &head, &binding);
-                done(move |main| main.hooked(front, id, woken.map(|_| Vec::new())))
+                done(move |main| main.operated(front, id, woken.map(|_| None)))
             }),
             Ok(wire::CacheChange::Grow) => Box::new(move || {
                 let grown = epoch::grow(&schedulers, &head, &binding);
-                done(move |main| main.hooked(front, id, grown.map(|_| Vec::new())))
+                done(move |main| main.operated(front, id, grown.map(|_| None)))
             }),
             Ok(wire::CacheChange::MakeRoom) => {
                 let room = resize.room_bytes;
                 let devices = match device_bytes(&resize.device_bytes) {
                     Ok(devices) => devices,
-                    Err(error) => return self.hooked(front, id, Err(error)),
+                    Err(error) => return self.operated(front, id, Err(error)),
                 };
                 Box::new(move || {
                     let made = operations::make_room(&schedulers, &head, &binding, room, &devices);
-                    done(move |main| main.hooked(front, id, made.map(|()| Vec::new())))
+                    done(move |main| main.operated(front, id, made.map(|()| None)))
                 })
             }
             Ok(wire::CacheChange::Unspecified) | Err(_) => {
                 let error = anyhow::anyhow!("a cache change that states no change");
-                return self.hooked(front, id, Err(error));
+                return self.operated(front, id, Err(error));
             }
         };
         self.serial(job);
@@ -1370,14 +1451,14 @@ impl MainProcess {
         let id = update.id;
         let Ok(in_flight) = wire::WeightsInFlight::try_from(update.in_flight) else {
             let error = anyhow::anyhow!("unknown in-flight choice {}", update.in_flight);
-            return self.hooked(front, id, Err(error));
+            return self.operated(front, id, Err(error));
         };
         if let Some(refusal) = self.lifecycle.boundary_refusal() {
-            return self.hooked(front, id, Err(anyhow::anyhow!(refusal)));
+            return self.operated(front, id, Err(anyhow::anyhow!(refusal)));
         }
         let (schedulers, head, binding) = match self.segment_parts() {
             Ok(parts) => parts,
-            Err(error) => return self.hooked(front, id, Err(error)),
+            Err(error) => return self.operated(front, id, Err(error)),
         };
 
         // The same model from another checkpoint: the experts keep the order they serve in.
@@ -1388,8 +1469,8 @@ impl MainProcess {
         self.serial(Box::new(move || {
             let updated =
                 operations::update_weights(&schedulers, &head, &binding, target, in_flight)
-                    .and_then(|reports| reported(&reports));
-            done(move |main| main.hooked(front, id, updated))
+                    .map(|reports| Some(weight_reports(reports)));
+            done(move |main| main.operated(front, id, updated))
         }));
     }
 
@@ -1420,20 +1501,25 @@ impl MainProcess {
 
     /// Answers the engine command `id` of front `front` with `Hooked`: each rank's result, or why
     /// the command failed.
-    fn hooked(&mut self, front: usize, id: u64, results: Result<Vec<String>>) {
-        let hooked = match results {
-            Ok(results) => wire::Hooked {
+    fn operated(
+        &mut self,
+        front: usize,
+        id: u64,
+        reports: Result<Option<wire::operated::Reports>>,
+    ) {
+        let operated = match reports {
+            Ok(reports) => wire::Operated {
                 id,
-                results,
                 error: String::new(),
+                reports,
             },
-            Err(error) => wire::Hooked {
+            Err(error) => wire::Operated {
                 id,
-                results: Vec::new(),
                 error: format!("{error:#}"),
+                reports: None,
             },
         };
-        self.send(front, from_engine::Kind::Hooked(hooked), None);
+        self.send(front, from_engine::Kind::Operated(operated), None);
     }
 
     /// Answers the `Configure` `id` of front `front`.
@@ -1455,16 +1541,75 @@ fn starting() -> anyhow::Error {
     anyhow::anyhow!("the engine is starting and holds nothing to operate on yet")
 }
 
-/// Each rank's report of a change of its weights, as the JSON text a `Hooked` result is.
-///
-/// # Errors
-///
-/// A report that does not encode.
-fn reported(reports: &[WeightsUpdated]) -> Result<Vec<String>> {
-    reports
-        .iter()
-        .map(|report| serde_json::to_string(report).context("encoding a rank's report"))
-        .collect()
+/// Each rank's report of a change of its weights, as an `Operated` answer states them.
+fn weight_reports(reports: Vec<WeightsUpdated>) -> wire::operated::Reports {
+    wire::operated::Reports::WeightReports(wire::WeightReports {
+        ranks: reports
+            .into_iter()
+            .map(|report| wire::WeightReport {
+                group: report.group,
+                rank: report.rank,
+                identity: report.identity,
+                identities: report.identities,
+                moved: report.moved as u64,
+            })
+            .collect(),
+    })
+}
+
+/// Every rank's reports of an operation the daemon commands on every rank, as an `Operated`
+/// answer states them: none for an operation that reports nothing.
+fn rank_reports(reports: RankReports) -> Option<wire::operated::Reports> {
+    use wire::operated::Reports;
+
+    Some(match reports {
+        RankReports::None => return None,
+        RankReports::ExpertAllocations(ranks) => {
+            Reports::ExpertAllocations(wire::ExpertAllocations {
+                ranks: ranks
+                    .into_iter()
+                    .map(|allocation| wire::ExpertAllocation {
+                        order: allocation
+                            .orders
+                            .into_iter()
+                            .map(|(module, experts)| (module, wire::ExpertOrder { experts }))
+                            .collect(),
+                        gpu: allocation.gpu.to_vec(),
+                        bytes: allocation.bytes,
+                    })
+                    .collect(),
+            })
+        }
+        RankReports::ExpertCopies(ready) => Reports::ExpertCopies(wire::ExpertCopies { ready }),
+        RankReports::Adapters(ranks) => Reports::AdapterReports(wire::AdapterReports {
+            ranks: ranks
+                .into_iter()
+                .map(|report| wire::AdapterReport {
+                    slot: report.slot,
+                    tensors: report.tensors,
+                })
+                .collect(),
+        }),
+        RankReports::ProfileStarts(ranks) => Reports::ProfileStarts(wire::ProfileStarts {
+            ranks: ranks.iter().map(wire::ProfileStart::from).collect(),
+        }),
+        RankReports::ProfileStops(ranks) => Reports::ProfileStops(wire::ProfileStops {
+            ranks: ranks.iter().map(wire::ProfileStop::from).collect(),
+        }),
+        RankReports::ProfileReleases(ranks) => Reports::ProfileReleases(wire::ProfileReleases {
+            ranks: ranks.iter().map(wire::ProfileRelease::from).collect(),
+        }),
+        RankReports::Fences(processes) => Reports::FenceSwitches(wire::FenceSwitches {
+            processes: processes
+                .into_iter()
+                .map(|switched| wire::FencesSwitched {
+                    probes: switched.probes,
+                    enabled: switched.enabled,
+                    off: switched.off,
+                })
+                .collect(),
+        }),
+    })
 }
 
 /// The bytes a `MakeRoom` states for each GPU it names, by the GPU's identity.

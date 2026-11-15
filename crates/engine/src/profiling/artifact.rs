@@ -210,7 +210,7 @@ pub(crate) struct ClockRow {
 /// The writer of one session's file.
 pub(crate) struct Writer {
     sender: Sender<Message>,
-    thread: Option<JoinHandle<Result<serde_json::Value>>>,
+    thread: Option<JoinHandle<Result<proto::profile::FileReport>>>,
     bytes: Arc<AtomicU64>,
 }
 
@@ -285,12 +285,12 @@ impl Writer {
 
     /// Writes what remains, checkpoints the file and closes it, once every clone of
     /// [`Writer::rows`] is dropped. Returns what the finished file holds, as the session's
-    /// response states it: its `path`, its `bytes` and its `rows` by table.
+    /// report states it: its path, its bytes and its rows by table.
     ///
     /// # Errors
     ///
     /// Fails with the first error the file met.
-    pub(crate) fn finish(mut self) -> Result<serde_json::Value> {
+    pub(crate) fn finish(mut self) -> Result<proto::profile::FileReport> {
         drop(self.sender);
         match self.thread.take().map(JoinHandle::join) {
             Some(Ok(finished)) => finished,
@@ -332,7 +332,7 @@ impl File {
         mut self,
         receiver: &Receiver<Message>,
         bytes: &AtomicU64,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<proto::profile::FileReport> {
         let mut failed: Option<Error> = None;
         loop {
             let first = match receiver.recv_timeout(COMMIT_PERIOD) {
@@ -372,11 +372,11 @@ impl File {
             .map_err(|(_, error)| sqlite(&path, &error))?;
         let bytes_now = size(&path);
         bytes.store(bytes_now, Ordering::Release);
-        Ok(serde_json::json!({
-            "path": path,
-            "bytes": bytes_now,
-            "rows": self.rows,
-        }))
+        Ok(proto::profile::FileReport::Written {
+            path,
+            bytes: bytes_now,
+            rows: self.rows.clone(),
+        })
     }
 
     fn transaction(&mut self, write: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
@@ -873,10 +873,17 @@ mod tests {
             },
         );
         drop(rows);
-        let finished = writer.finish().unwrap();
-        assert_eq!(finished["rows"]["kernel"], 1);
-        assert_eq!(finished["path"], path.to_str().unwrap());
-        assert!(finished["bytes"].as_u64().unwrap() > 0);
+        let proto::profile::FileReport::Written {
+            path: finished,
+            bytes,
+            rows,
+        } = writer.finish().unwrap()
+        else {
+            panic!("the file was not finished");
+        };
+        assert_eq!(rows["kernel"], 1);
+        assert_eq!(finished, path);
+        assert!(bytes > 0);
         // One file: the write-ahead log was checkpointed into it.
         assert!(!directory.path().join("rank0.sqlite-wal").exists());
 

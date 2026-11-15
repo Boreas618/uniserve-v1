@@ -6,6 +6,23 @@ use std::time::Duration;
 use proto::request::wire;
 use serde::{Deserialize, Serialize};
 
+/// The order of every named layer's experts, as the request interface states it.
+fn wire_orders(
+    orders: &BTreeMap<String, Vec<u32>>,
+) -> std::collections::HashMap<String, wire::ExpertOrder> {
+    orders
+        .iter()
+        .map(|(module, experts)| {
+            (
+                module.clone(),
+                wire::ExpertOrder {
+                    experts: experts.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
 use crate::engine::client::EngineClient;
 use crate::leader::{Leader, Replica, UpdateError};
 
@@ -18,12 +35,34 @@ pub struct Rebalance {
 }
 
 /// One rank's prepared allocation for a new expert order: the orders it took, the GPU it
-/// allocated on and the bytes it reserves there (the `uniserve.prepare_experts` report).
-#[derive(Deserialize, Serialize)]
+/// allocated on and the bytes it reserves there (the `PrepareExperts` report).
+#[derive(Serialize)]
 struct Allocation {
     orders: BTreeMap<String, Vec<u32>>,
     gpu: storage::manifest::Gpu,
     bytes: u64,
+}
+
+impl TryFrom<wire::ExpertAllocation> for Allocation {
+    type Error = String;
+
+    fn try_from(allocation: wire::ExpertAllocation) -> Result<Self, Self::Error> {
+        let gpu = allocation.gpu.as_slice().try_into().map_err(|_| {
+            format!(
+                "a rank allocated on a GPU named by {} bytes, not a UUID's 16",
+                allocation.gpu.len()
+            )
+        })?;
+        Ok(Self {
+            orders: allocation
+                .order
+                .into_iter()
+                .map(|(module, order)| (module, order.experts))
+                .collect(),
+            gpu,
+            bytes: allocation.bytes,
+        })
+    }
 }
 
 impl Leader {
@@ -70,7 +109,7 @@ async fn rebalance(
         Err(error) => {
             // A rank may have prepared before another rejected its order.
             // Abort releases only incoming allocations; live routing is intact.
-            if let Err(cleanup) = client.hook("uniserve.abort_experts", "{}").await {
+            if let Err(cleanup) = client.abort_experts().await {
                 return Err(UpdateError::Failed(anyhow::anyhow!(
                     "{error}; releasing expert preparation failed: {cleanup}"
                 )));
@@ -132,12 +171,11 @@ async fn prepare(
     client: &EngineClient,
     orders: &BTreeMap<String, Vec<u32>>,
 ) -> Result<Vec<Allocation>, String> {
-    let payload = serde_json::to_string(orders).map_err(|error| error.to_string())?;
     let allocations = client
-        .hook("uniserve.prepare_experts", &payload)
+        .prepare_experts(wire_orders(orders))
         .await?
-        .iter()
-        .map(|report| serde_json::from_str::<Allocation>(report).map_err(|error| error.to_string()))
+        .into_iter()
+        .map(Allocation::try_from)
         .collect::<Result<Vec<_>, _>>()?;
     let names: BTreeSet<_> = allocations
         .iter()
@@ -151,14 +189,9 @@ async fn prepare(
         *devices.entry(allocation.gpu).or_default() += allocation.bytes;
     }
     client.reserve_storage(0, &devices).await?;
-    client.hook("uniserve.start_experts", "{}").await?;
+    client.start_experts().await?;
     loop {
-        let ready = client
-            .hook("uniserve.experts_ready", "{}")
-            .await?
-            .iter()
-            .map(|report| serde_json::from_str::<bool>(report).map_err(|error| error.to_string()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let ready = client.check_experts().await?;
         if ready.iter().all(|ready| *ready) {
             return Ok(allocations);
         }

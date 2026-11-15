@@ -166,7 +166,7 @@ pub(crate) use self::queue::Queue;
 pub use self::sequences::Sequences;
 use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::profiling;
-use crate::profiling::session::{Change, Session};
+use crate::profiling::session::{Change, ProfileAnswer, Session};
 use crate::runner::Runner;
 use crate::runner::buckets::Bucket;
 use crate::runner::graphs::Preparation;
@@ -255,7 +255,7 @@ pub(crate) enum Job {
     /// sent to `response`.
     Profile {
         change: Change,
-        response: Sender<serde_json::Value>,
+        response: Sender<ProfileAnswer>,
     },
     /// Call `operation` with the runners, once the device has passed everything they issued.
     Control {
@@ -729,7 +729,7 @@ impl Worker {
     /// # Errors
     ///
     /// When the session refuses the change, the worker has no device, or the queue is closed.
-    pub(crate) fn profile(&self, change: Change) -> Result<serde_json::Value> {
+    pub(crate) fn profile(&self, change: Change) -> Result<ProfileAnswer> {
         let (response, responded) = crossbeam_channel::bounded(1);
         let submission = self.queue.submit(Job::Profile { change, response })?;
 

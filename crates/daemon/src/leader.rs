@@ -528,22 +528,30 @@ impl Leader {
         }
     }
 
-    pub async fn sleep(&self) -> Result<Vec<String>, UpdateError> {
+    /// Has every replica's engine sleep ([`Replica::sleep`]).
+    ///
+    /// # Errors
+    ///
+    /// The first replica's failure.
+    pub async fn sleep(&self) -> Result<(), UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
-        let mut results = Vec::new();
         for replica in self.replicas() {
-            results.extend(replica.sleep().await?);
+            replica.sleep().await?;
         }
-        Ok(results)
+        Ok(())
     }
 
-    pub async fn wake(&self) -> Result<Vec<String>, UpdateError> {
+    /// Has every replica's engine wake ([`Replica::wake`]).
+    ///
+    /// # Errors
+    ///
+    /// The first replica's failure.
+    pub async fn wake(&self) -> Result<(), UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
-        let mut results = Vec::new();
         for replica in self.replicas() {
-            results.extend(replica.wake().await?);
+            replica.wake().await?;
         }
-        Ok(results)
+        Ok(())
     }
 
     /// The LoRA adapter named `name` the workers hold, which a request
@@ -579,12 +587,17 @@ impl Leader {
     /// reason a worker gave.
     pub async fn load_adapter(
         &self,
-        mut body: serde_json::Value,
-    ) -> Result<Vec<String>, UpdateError> {
+        body: serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>, UpdateError> {
         let name = body["lora_name"]
             .as_str()
             .filter(|name| !name.is_empty())
             .ok_or_else(|| UpdateError::Refused("load_lora_adapter names no lora_name".to_owned()))?
+            .to_owned();
+        let path = body["lora_path"]
+            .as_str()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| UpdateError::Refused("load_lora_adapter names no lora_path".to_owned()))?
             .to_owned();
         if name == self.served_model_name {
             return Err(UpdateError::Refused(format!(
@@ -610,17 +623,15 @@ impl Leader {
                 .find(|slot| adapters.values().all(|adapter| adapter.slot != *slot))
                 .unwrap_or(u32::MAX)
         };
-        body["adapter"] = slot.into();
-        let payload = body.to_string();
         let mut results = Vec::new();
         for client in &clients {
-            match client.hook("load_lora_adapter", &payload).await {
-                Ok(loaded) => results.extend(loaded),
+            match client.load_adapter(slot, &path).await {
+                Ok(loaded) => results.extend(loaded.iter().map(adapter_report)),
                 Err(error) => {
                     // The name becomes public only after every replica loads.
                     // Release any partial loads before returning the failure.
                     for client in &clients {
-                        if let Err(cleanup) = client.hook("unload_lora_adapter", &payload).await {
+                        if let Err(cleanup) = client.unload_adapter(slot).await {
                             warn!(%cleanup, adapter = name, "could not release a partial adapter load");
                         }
                     }
@@ -636,7 +647,7 @@ impl Leader {
             Adapter {
                 slot,
                 identity,
-                payload,
+                path,
             },
         );
         info!(adapter = name, slot, "loaded the adapter");
@@ -652,8 +663,8 @@ impl Leader {
     /// with the reason a worker gave, after which the adapter remains unavailable to requests.
     pub async fn unload_adapter(
         &self,
-        mut body: serde_json::Value,
-    ) -> Result<Vec<String>, UpdateError> {
+        body: serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>, UpdateError> {
         let name = body["lora_name"].as_str().unwrap_or_default().to_owned();
         let _deployment = self.replicas.replacing.lock().await;
         let replicas = self.replicas();
@@ -666,12 +677,11 @@ impl Leader {
         let adapter = service::lock(&self.replicas.adapters)
             .remove(&name)
             .ok_or_else(|| UpdateError::Refused(format!("no adapter {name:?} is loaded")))?;
-        body["adapter"] = adapter.slot.into();
         let mut results = Vec::new();
         let mut failures = Vec::new();
         for client in clients {
-            match client.hook("unload_lora_adapter", &body.to_string()).await {
-                Ok(unloaded) => results.extend(unloaded),
+            match client.unload_adapter(adapter.slot).await {
+                Ok(unloaded) => results.extend(unloaded.iter().map(adapter_report)),
                 Err(error) => failures.push(error),
             }
         }
@@ -690,7 +700,7 @@ impl Leader {
         &self,
         model_path: &str,
         in_flight: WeightsInFlight,
-    ) -> Result<Vec<String>, UpdateError> {
+    ) -> Result<Vec<wire::WeightReport>, UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
         let mut results = Vec::new();
         for replica in self.replicas() {
@@ -3085,17 +3095,17 @@ impl Replica {
     ///
     /// Fails when no engine serves, or with the reason the engine did not
     /// sleep; requests wait until a wake all the same.
-    pub(crate) async fn sleep(&self) -> Result<Vec<String>, UpdateError> {
+    pub(crate) async fn sleep(&self) -> Result<(), UpdateError> {
         let _replacing = self.replacing.lock().await;
         let hold = self.hold();
         let client = hold.client().ok_or(UpdateError::NoEngine)?;
         if self.asleep.swap(true, Ordering::AcqRel) {
-            return Ok(Vec::new());
+            return Ok(());
         }
         if !hold.pause() {
             self.sleep_paused.store(true, Ordering::Release);
         }
-        let results = client
+        client
             .resize_cache(wire::CacheChange::Sleep)
             .await
             .map_err(|error| {
@@ -3104,7 +3114,7 @@ impl Replica {
                 ))
             })?;
         info!("the engine sleeps: its KV cache and graph storage are given back");
-        Ok(results)
+        Ok(())
     }
 
     /// Restores what [`Self::sleep`] gave back, and lets the requests it
@@ -3114,11 +3124,11 @@ impl Replica {
     ///
     /// Fails when no engine serves, or with the reason the engine did not
     /// wake; requests keep waiting then.
-    pub(crate) async fn wake(&self) -> Result<Vec<String>, UpdateError> {
+    pub(crate) async fn wake(&self) -> Result<(), UpdateError> {
         let _replacing = self.replacing.lock().await;
         let hold = self.hold();
         let client = hold.client().ok_or(UpdateError::NoEngine)?;
-        let results = client
+        client
             .resize_cache(wire::CacheChange::Wake)
             .await
             .map_err(|error| {
@@ -3129,24 +3139,29 @@ impl Replica {
             hold.resume();
         }
         info!("the engine woke");
-        Ok(results)
+        Ok(())
     }
 
-    /// Runs the engine's operation `name` with the JSON `payload`, and
-    /// returns each rank's JSON result.
+    /// Runs `operation`, `what` for its failure, on the serving engine's client while no engine
+    /// replaces it.
     ///
     /// # Errors
     ///
-    /// Fails when no engine serves, or with the reason a worker gave.
-    pub(crate) async fn hook(&self, name: &str, payload: &str) -> Result<Vec<String>, UpdateError> {
+    /// Fails when no engine serves, or with the reason the engine gave.
+    pub(crate) async fn operate<T, F, Done>(
+        &self,
+        what: &str,
+        operation: F,
+    ) -> Result<T, UpdateError>
+    where
+        F: FnOnce(Arc<EngineClient>) -> Done,
+        Done: std::future::Future<Output = Result<T, String>>,
+    {
         let _replacing = self.replacing.lock().await;
         let client = self.hold().client().ok_or(UpdateError::NoEngine)?;
-        let results = client
-            .hook(name, payload)
+        operation(client)
             .await
-            .map_err(|error| UpdateError::Failed(anyhow::anyhow!("worker hook {name}: {error}")))?;
-        info!(hook = name, workers = results.len(), "ran the worker hook");
-        Ok(results)
+            .map_err(|error| UpdateError::Failed(anyhow::anyhow!("{what}: {error}")))
     }
 
     /// Rewrites the engine's weights in place from the checkpoint at
@@ -3169,7 +3184,7 @@ impl Replica {
         self: &Arc<Self>,
         model_path: &str,
         in_flight: WeightsInFlight,
-    ) -> Result<Vec<String>, UpdateError> {
+    ) -> Result<Vec<wire::WeightReport>, UpdateError> {
         let _replacing = self.replacing.lock().await;
         let hold = self.hold();
         let client = hold.client().ok_or(UpdateError::NoEngine)?;
@@ -3258,9 +3273,17 @@ pub(crate) struct Adapter {
     /// loaded into the same slot before included: its name and a load's
     /// random identity.
     pub(crate) identity: String,
-    /// The load's JSON payload, with which a new engine's workers load it
-    /// again.
-    pub(crate) payload: String,
+    /// The adapter's directory (`lora_path`), from which a new engine's workers load it again.
+    pub(crate) path: String,
+}
+
+/// One rank's report of an adapter's slot, as the admin API answers it: the slot, and the tensors
+/// a load mapped there.
+fn adapter_report(report: &wire::AdapterReport) -> serde_json::Value {
+    match report.tensors {
+        Some(tensors) => serde_json::json!({ "adapter": report.slot, "tensors": tensors }),
+        None => serde_json::json!({ "adapter": report.slot }),
+    }
 }
 
 /// Loads every adapter of `replica` into `client`'s workers, as an engine
@@ -3273,7 +3296,7 @@ pub(crate) async fn reload_adapters(replica: &Replica, client: &EngineClient) {
         .map(|(name, adapter)| (name.clone(), adapter.clone()))
         .collect();
     for (name, adapter) in adapters {
-        match client.hook("load_lora_adapter", &adapter.payload).await {
+        match client.load_adapter(adapter.slot, &adapter.path).await {
             Ok(_) => info!(
                 adapter = name,
                 slot = adapter.slot,

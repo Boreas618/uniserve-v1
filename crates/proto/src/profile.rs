@@ -1,11 +1,16 @@
 //! The vocabulary of profiling sessions (`POST /admin/profile`) between the
 //! leader daemon and the workers of the epoch that executes.
 //!
-//! The daemon validates a session's request, gives it an identity and hands
-//! it to every worker as the payload of the worker hook
-//! `uniserve.profile_start`, JSON-encoded; workers of another build read the
-//! fields they know, and every field has a default.
+//! The daemon validates a session's request, gives it an identity and starts
+//! it on every worker with the engine command `StartProfile`, which carries
+//! the [`SessionStart`] as the request interface's `ProfileSession`; each rank
+//! answers the start, the end and a collector's release with its report
+//! ([`RankStart`], [`RankStop`], [`RankRelease`]). The conversions between
+//! these values and the request interface's messages are in `wire`.
 
+mod wire;
+
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
@@ -340,13 +345,96 @@ impl SessionRequest {
 
 /// What the daemon hands a worker to start a session.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct SessionStart {
     /// The session's identity.
     pub session: u64,
     /// The epoch the session belongs to.
     pub epoch: u64,
     pub request: SessionRequest,
+}
+
+/// One rank's answer to a session's start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankStart {
+    pub rank: u32,
+    /// Whether the session records the rank.
+    pub selected: bool,
+    /// Why the rank refused the session: its GPU's quota cannot fit the device storage the
+    /// session's collectors hold. `None` when it did not.
+    pub refused: Option<String>,
+    /// The device storage, in bytes, the rank's collectors measured they hold on its GPU while
+    /// the session runs (a range_metrics pass); 0 on a rank the session does not record.
+    pub device_storage: u64,
+    /// The rank's file; `None` when the session does not record the rank.
+    pub path: Option<PathBuf>,
+    /// Each collector's state on the rank (`prepared`, or why it cannot run), by the collector's
+    /// name.
+    pub collectors: BTreeMap<String, String>,
+}
+
+impl RankStart {
+    /// The answer of rank `rank`, which the session does not record.
+    pub fn unselected(rank: u32) -> Self {
+        Self {
+            rank,
+            selected: false,
+            refused: None,
+            device_storage: 0,
+            path: None,
+            collectors: BTreeMap::new(),
+        }
+    }
+}
+
+/// One rank's answer to a session's end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankStop {
+    pub rank: u32,
+    pub session: u64,
+    /// Whether the session recorded the rank; a rank of no session or of another answers `false`
+    /// and nothing else.
+    pub selected: bool,
+    /// The steps the rank's window recorded.
+    pub steps: u64,
+    /// Why the session ended.
+    pub reason: String,
+    /// What the rank's file holds; `None` for a rank that recorded no file.
+    pub file: Option<FileReport>,
+}
+
+impl RankStop {
+    /// The answer of rank `rank`, which session `session` does not record.
+    pub fn unselected(rank: u32, session: u64) -> Self {
+        Self {
+            rank,
+            session,
+            selected: false,
+            steps: 0,
+            reason: String::new(),
+            file: None,
+        }
+    }
+}
+
+/// A rank's profile file as its session's end left it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileReport {
+    /// The file is whole: where it lies, its bytes and its rows by table.
+    Written {
+        path: PathBuf,
+        bytes: u64,
+        rows: BTreeMap<String, u64>,
+    },
+    /// The file could not be finished, for this reason.
+    Failed { error: String },
+}
+
+/// Whether one rank ran the collector a release turned off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankRelease {
+    pub rank: u32,
+    pub released: bool,
 }
 
 #[cfg(test)]

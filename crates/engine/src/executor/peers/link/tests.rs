@@ -9,8 +9,8 @@ use service::{Connection, Message};
 use crate::batch::cache::CacheGroupKind;
 use crate::batch::{self, Capacity, ErrorCode, TimingCounters};
 use crate::executor::peers::messages::{
-    DataOperation, MainProcessRequest, MainProcessResponse, MainProcessResponseError, ResponseKind,
-    Stall, decode_requests,
+    DataOperation, MainProcessRequest, MainProcessResponse, MainProcessResponseError,
+    RankOperation, ResponseKind, Stall, decode_requests,
 };
 
 /// Returns `message` as a receiver decodes it from the payload a sender encoded.
@@ -188,10 +188,10 @@ fn operations() -> Vec<DataOperation> {
         DataOperation::ServingOrder,
         DataOperation::Prepared { generation: 4 },
         DataOperation::Uncompared,
-        DataOperation::Hook {
-            name: "load_lora_adapter".to_owned(),
-            payload: r#"{"adapter": 1, "lora_path": "/adapters/a"}"#.to_owned(),
-        },
+        DataOperation::Rank(RankOperation::LoadAdapter {
+            slot: 1,
+            path: "/adapters/a".into(),
+        }),
     ]
 }
 
@@ -281,7 +281,7 @@ fn response_fixtures() -> Vec<MainProcessResponse> {
         MainProcessResponse::result(batch::BatchOutput::default(), &stamped(), 14),
         MainProcessResponse::Operated {
             message_id: Some(18),
-            reply: "[3]".to_owned(),
+            reply: rmp_serde::to_vec(&[3_u32]).unwrap(),
         },
         MainProcessResponse::Error {
             message_id: Some(17),

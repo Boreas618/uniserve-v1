@@ -25,10 +25,15 @@
 //! - **A generation's switch, commit and rollback**, in the order of every group's jobs on
 //!   every rank ([`MainProcessRequest::Switch`]).
 //! - **The data plane's operations** on the peer's ranks ([`MainProcessRequest::Data`],
-//!   [`DataOperation`]), each answered with the JSON of what the operation returns.
+//!   [`DataOperation`]), each answered with what the operation returns, in the link's own
+//!   encoding ([`MainProcessResponse::Operated`]); among them the operations the daemon commands
+//!   on every rank beside the batches ([`RankOperation`]), answered with their typed reports
+//!   ([`RankReports`]).
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
+use proto::profile::{Collector, RankRelease, RankStart, RankStop, SessionStart};
 use serde::{Deserialize, Serialize};
 use storage::protocol::UnitRun;
 use storage::runtime::{Completion, GroupId, Open, Opened, Request, RequestId, Segments};
@@ -237,11 +242,11 @@ impl MainProcessRequest {
 
 /// One operation of the data plane (`crate::process::data_plane::DataPlane`) on a peer's
 /// ranks, with the arguments of the method that runs it there. The answer
-/// ([`MainProcessResponse::Operated`]) is the JSON of the method's value.
+/// ([`MainProcessResponse::Operated`]) is the method's value in the link's encoding.
 ///
 /// A weight load's replacement stays in the process that loaded it: the peer keeps its own
 /// from [`Self::Pair`] to the [`Self::Stage`] or [`Self::Discard`] that ends it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataOperation {
     /// Releases the segments of device region `region` (the buffer pool's number: a KV region or
@@ -315,10 +320,115 @@ pub enum DataOperation {
     /// in flight, each with the reason: those their preparation added and those the shadow
     /// batches that reached them could not compare. Asked once the shadow pass ended.
     Uncompared,
-    /// Runs the operation the daemon names `name` with the JSON `payload` beside the batches:
-    /// an expert redistribution's stages, a LoRA adapter's load and unload, a profiling
-    /// session's changes, the fence probes' switch. Answers each rank's result.
-    Hook { name: String, payload: String },
+    /// Runs an operation the daemon commands on every rank beside the batches. Answers the
+    /// peer's ranks' [`RankReports`].
+    Rank(RankOperation),
+}
+
+/// An operation the daemon commands on every rank of the engine beside the batches (the request
+/// interface's data-plane engine commands): the main process runs it on its own ranks and relays
+/// it to every peer's ([`DataOperation::Rank`]). None changes what a batch reads: an expert
+/// redistribution copies into new storage, and its change of the served weights is a commit at a
+/// boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RankOperation {
+    /// Prepares the copies that put each named routed-expert layer's experts in its order.
+    /// Answers [`RankReports::ExpertAllocations`].
+    PrepareExperts { orders: BTreeMap<String, Vec<u32>> },
+    /// Starts the prepared copies beside the batches. Answers [`RankReports::None`].
+    StartExperts,
+    /// Answers whether each rank's copies completed ([`RankReports::ExpertCopies`]).
+    CheckExperts,
+    /// Abandons the prepared or copying redistribution. Answers [`RankReports::None`].
+    AbortExperts,
+    /// Loads the LoRA adapter at `path` into `slot`. Answers [`RankReports::Adapters`].
+    LoadAdapter { slot: u32, path: PathBuf },
+    /// Releases `slot`'s adapter. Answers [`RankReports::Adapters`].
+    UnloadAdapter { slot: u32 },
+    /// Starts a profiling session. Answers [`RankReports::ProfileStarts`].
+    StartProfile(Box<SessionStart>),
+    /// Ends profiling session `session` for `reason`. Answers [`RankReports::ProfileStops`].
+    StopProfile { session: u64, reason: String },
+    /// Turns `collector` of profiling session `session` off for `reason`. Answers
+    /// [`RankReports::ProfileReleases`].
+    ReleaseProfile {
+        session: u64,
+        collector: Collector,
+        reason: String,
+    },
+    /// Switches the fence probes on or off, the module classes `off` names off whatever
+    /// `enabled` says. Answers [`RankReports::Fences`].
+    SwitchFences { enabled: bool, off: Vec<String> },
+}
+
+/// What the ranks report of a [`RankOperation`], every rank's in rank order, the main process's
+/// first and then each peer's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RankReports {
+    /// The operation reports nothing.
+    None,
+    ExpertAllocations(Vec<ExpertAllocation>),
+    /// Whether each rank's expert copies completed.
+    ExpertCopies(Vec<bool>),
+    Adapters(Vec<AdapterReport>),
+    ProfileStarts(Vec<RankStart>),
+    ProfileStops(Vec<RankStop>),
+    ProfileReleases(Vec<RankRelease>),
+    /// Each process's switch of its fence probes.
+    Fences(Vec<FencesSwitched>),
+}
+
+impl RankReports {
+    /// Appends another process's reports of the same operation after these.
+    ///
+    /// # Errors
+    ///
+    /// Reports of another kind: the processes ran different operations.
+    pub(crate) fn append(&mut self, other: Self) -> Result<(), String> {
+        match (self, other) {
+            (Self::None, Self::None) => {}
+            (Self::ExpertAllocations(ours), Self::ExpertAllocations(theirs)) => ours.extend(theirs),
+            (Self::ExpertCopies(ours), Self::ExpertCopies(theirs)) => ours.extend(theirs),
+            (Self::Adapters(ours), Self::Adapters(theirs)) => ours.extend(theirs),
+            (Self::ProfileStarts(ours), Self::ProfileStarts(theirs)) => ours.extend(theirs),
+            (Self::ProfileStops(ours), Self::ProfileStops(theirs)) => ours.extend(theirs),
+            (Self::ProfileReleases(ours), Self::ProfileReleases(theirs)) => ours.extend(theirs),
+            (Self::Fences(ours), Self::Fences(theirs)) => ours.extend(theirs),
+            (ours, theirs) => {
+                return Err(format!(
+                    "a process reported {theirs:?} beside {ours:?}: they ran different operations"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One rank's prepared allocation for a new expert order: the orders it took, the GPU it
+/// allocated on (its UUID) and the bytes it reserves there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExpertAllocation {
+    pub(crate) orders: BTreeMap<String, Vec<u32>>,
+    pub(crate) gpu: [u8; 16],
+    pub(crate) bytes: u64,
+}
+
+/// One rank's adapter slot: the tensors a load mapped there; `None` for a release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AdapterReport {
+    pub(crate) slot: u32,
+    pub(crate) tensors: Option<u32>,
+}
+
+/// One process's switch of its fence probes: whether its graphs hold probes at all, the switch
+/// it applied, and the probed classes it switched off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FencesSwitched {
+    pub(crate) probes: bool,
+    pub(crate) enabled: bool,
+    pub(crate) off: Vec<String>,
 }
 
 /// Kind discriminator carried by each worker response frame.
@@ -422,8 +532,9 @@ pub(crate) enum MainProcessResponse {
     Operated {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
-        /// The JSON of the operation's value.
-        reply: String,
+        /// The operation's value, in the link's own encoding (MessagePack).
+        #[serde(with = "serde_bytes")]
+        reply: Vec<u8>,
     },
     /// Returns a structured worker failure.
     Error {

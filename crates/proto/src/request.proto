@@ -72,13 +72,13 @@ message EngineMismatch {
 
 // What travels from the engine process after the welcome.
 message FromEngine {
-  reserved 8, 9;
+  reserved 5, 8, 9;
   oneof kind {
     State state = 1;
     Accepted accepted = 2;
     Event event = 3;
     Stats stats = 4;
-    Hooked hooked = 5;
+    Operated operated = 12;
     Configured configured = 6;
     // TCP artifact bytes, sent contiguously before their Artifact event.
     ArtifactPart artifact_part = 10;
@@ -315,16 +315,16 @@ message Takeover {
   uint64 events = 1;
 }
 
-// A command for the whole engine.
+// A command for the whole engine. Every command that names an `id` is
+// answered with an `Operated` of that id, carrying the reports its kind
+// states, or with `Configured` for a `Configure`.
 message EngineCommand {
-  reserved 13, 14, 16, 17;
+  reserved 5, 13, 14, 16, 17;
   oneof kind {
     // Finish every request as aborted, close the workers and exit.
     Shutdown shutdown = 1;
     // Revoke every cached prefix page; requests in flight keep theirs.
     FlushCache flush_cache = 4;
-    // Run a named operation of the data plane; answered with `Hooked`.
-    Hook hook = 5;
     // Take other scheduling limits and policy from each scheduler's next
     // step; answered with `Configured`.
     Configure configure = 6;
@@ -334,13 +334,34 @@ message EngineCommand {
     // own requests, until the last closes its connection.
     Attach attach = 7;
     // Give back or restore KV cache storage on every scheduler; answered
-    // with `Hooked`.
+    // with no reports.
     ResizeCache resize_cache = 8;
     // Rewrite the weights in place from another checkpoint of the same
-    // model, once no request runs; answered with `Hooked`.
+    // model, once no request runs; answered with `WeightReports`.
     UpdateWeights update_weights = 9;
-    // Install completed expert copies at the common drained step boundary.
+    // Install completed expert copies at the common drained step boundary;
+    // answered with `WeightReports`.
     CommitExperts commit_experts = 18;
+    // The stages of an expert redistribution, beside the batches: prepare
+    // the copies of an order (answered with `ExpertAllocations`), start
+    // them, ask whether they completed (`ExpertCopies`), or abandon them.
+    PrepareExperts prepare_experts = 19;
+    StartExperts start_experts = 20;
+    CheckExperts check_experts = 21;
+    AbortExperts abort_experts = 22;
+    // Load a LoRA adapter's tensors into a slot of every rank, or release
+    // a slot's; answered with `AdapterReports`.
+    LoadAdapter load_adapter = 23;
+    UnloadAdapter unload_adapter = 24;
+    // A profiling session's changes on every rank: its start
+    // (`ProfileStarts`), its end (`ProfileStops`) and the release of one of
+    // its collectors (`ProfileReleases`).
+    StartProfile start_profile = 25;
+    StopProfile stop_profile = 26;
+    ReleaseProfile release_profile = 27;
+    // Switch the fence probes the graphs captured on or off in place, at
+    // the next step boundary; answered with `FenceSwitches`.
+    SwitchFences switch_fences = 28;
   }
 }
 
@@ -349,23 +370,262 @@ message CommitExperts {
   map<string, ExpertOrder> order = 2;
 }
 
-// A named operation of the data plane: an expert redistribution's stages, a
-// LoRA adapter's load and unload.
-message Hook {
-  // Matches the `Hooked` answer.
+// Prepare, on every rank, the copies of the routed experts that put each
+// named layer's experts in `order` (`docs/admin.md`, Expert
+// redistribution): allocate their storage beside the serving weights.
+message PrepareExperts {
   uint64 id = 1;
-  string name = 2;
-  // A JSON value.
-  string payload = 3;
+  map<string, ExpertOrder> order = 2;
 }
 
-// The answer to a `Hook` and to the data plane's other commands: each rank's
-// JSON result, or why it failed.
-message Hooked {
+// Start the prepared copies beside the batches.
+message StartExperts {
   uint64 id = 1;
-  repeated string results = 2;
-  // Empty when every rank ran the operation.
-  string error = 3;
+}
+
+// Whether every rank's copies completed.
+message CheckExperts {
+  uint64 id = 1;
+}
+
+// Abandon the redistribution prepared or copying: its allocations go back,
+// and the serving order stays.
+message AbortExperts {
+  uint64 id = 1;
+}
+
+// Load the LoRA adapter at `path` into `slot` of every rank.
+message LoadAdapter {
+  uint64 id = 1;
+  uint32 slot = 2;
+  string path = 3;
+}
+
+// Release `slot`'s adapter on every rank; a slot that holds none is a load
+// that failed part of the way, and nothing is owed.
+message UnloadAdapter {
+  uint64 id = 1;
+  uint32 slot = 2;
+}
+
+// Start profiling session `session` on every rank it selects.
+message StartProfile {
+  uint64 id = 1;
+  ProfileSession session = 2;
+}
+
+// End profiling session `session` for `reason` on every rank that records
+// it: each writes what remains and closes its file.
+message StopProfile {
+  uint64 id = 1;
+  uint64 session = 2;
+  string reason = 3;
+}
+
+// Turn `collector` of profiling session `session` off on every rank, for
+// `reason`.
+message ReleaseProfile {
+  uint64 id = 1;
+  uint64 session = 2;
+  ProfileCollector collector = 3;
+  string reason = 4;
+}
+
+// Switch the fence probes on (`enabled`) or off, with the probed module
+// classes `off` (patterns of their names) switched off whatever `enabled`
+// says.
+message SwitchFences {
+  uint64 id = 1;
+  bool enabled = 2;
+  repeated string off = 3;
+}
+
+// A profiling session as the daemon starts it (`proto::profile::SessionStart`).
+message ProfileSession {
+  uint64 session = 1;
+  uint64 epoch = 2;
+  ProfileRequest request = 3;
+}
+
+// A profiling session's request (`proto::profile::SessionRequest`).
+message ProfileRequest {
+  repeated ProfileCollector collectors = 1;
+  uint64 start_step = 2;
+  optional uint64 steps = 3;
+  optional double seconds = 4;
+  repeated string stages = 5;
+  repeated uint32 workers = 6;
+  repeated string modules = 7;
+  string output_dir = 8;
+  ProfileGraphTrace timeline_graphs = 9;
+  repeated string pm_metrics = 10;
+  uint64 pm_interval_ns = 11;
+  repeated string range_metrics = 12;
+  ProfileMetricRanges metric_ranges = 13;
+  uint64 pass_ranges = 14;
+  uint32 pc_period = 15;
+  optional double max_slowdown = 16;
+}
+
+enum ProfileCollector {
+  // No collector: a command that states none is refused.
+  PROFILE_COLLECTOR_UNSPECIFIED = 0;
+  PROFILE_COLLECTOR_TIMELINE = 1;
+  PROFILE_COLLECTOR_FENCE_TIMELINE = 2;
+  PROFILE_COLLECTOR_PM_SAMPLING = 3;
+  PROFILE_COLLECTOR_RANGE_METRICS = 4;
+  PROFILE_COLLECTOR_PC_SAMPLING = 5;
+}
+
+enum ProfileGraphTrace {
+  PROFILE_GRAPH_TRACE_WHOLE = 0;
+  PROFILE_GRAPH_TRACE_NODES = 1;
+}
+
+enum ProfileMetricRanges {
+  PROFILE_METRIC_RANGES_KERNEL = 0;
+  PROFILE_METRIC_RANGES_MODULE = 1;
+}
+
+// The answer to an engine command that names an `id`: what every rank
+// reported, of the kind the command states, or why the command failed.
+message Operated {
+  uint64 id = 1;
+  // Empty when every rank ran the command.
+  string error = 2;
+  // Unset for a command that reports nothing, and with an error.
+  oneof reports {
+    ExpertAllocations expert_allocations = 3;
+    ExpertCopies expert_copies = 4;
+    AdapterReports adapter_reports = 5;
+    ProfileStarts profile_starts = 6;
+    ProfileStops profile_stops = 7;
+    ProfileReleases profile_releases = 8;
+    FenceSwitches fence_switches = 9;
+    WeightReports weight_reports = 10;
+  }
+}
+
+// Each rank's prepared allocation for a new expert order, in rank order.
+message ExpertAllocations {
+  repeated ExpertAllocation ranks = 1;
+}
+
+// One rank's prepared allocation: the orders it took, the GPU it allocated
+// on (its UUID's sixteen bytes) and the bytes it reserves there.
+message ExpertAllocation {
+  map<string, ExpertOrder> order = 1;
+  bytes gpu = 2;
+  uint64 bytes = 3;
+}
+
+// Whether each rank's expert copies completed, in rank order.
+message ExpertCopies {
+  repeated bool ready = 1;
+}
+
+// What each rank did with an adapter's slot, in rank order.
+message AdapterReports {
+  repeated AdapterReport ranks = 1;
+}
+
+// One rank's adapter slot: the tensors a load mapped there; unset for a
+// release.
+message AdapterReport {
+  uint32 slot = 1;
+  optional uint32 tensors = 2;
+}
+
+message ProfileStarts {
+  repeated ProfileStart ranks = 1;
+}
+
+// One rank's answer to a session's start (`proto::profile::RankStart`).
+message ProfileStart {
+  uint32 rank = 1;
+  // Whether the session records the rank.
+  bool selected = 2;
+  // Why the rank refused the session; empty when it did not.
+  string refused = 3;
+  // The rank's file; empty when the session does not record the rank.
+  string path = 4;
+  // Each collector's state on the rank, by the collector's name.
+  map<string, string> collectors = 5;
+  // The device storage, in bytes, the rank's collectors measured they hold on
+  // its GPU while the session runs; 0 on a rank the session does not record.
+  uint64 device_storage = 6;
+}
+
+message ProfileStops {
+  repeated ProfileStop ranks = 1;
+}
+
+// One rank's answer to a session's end (`proto::profile::RankStop`).
+message ProfileStop {
+  uint32 rank = 1;
+  uint64 session = 2;
+  // Whether the session recorded the rank; a rank of no session or another
+  // answers false and nothing else.
+  bool selected = 3;
+  uint64 steps = 4;
+  string reason = 5;
+  // What the rank's file holds, or why it could not be finished; unset
+  // for a rank that recorded no file.
+  oneof file {
+    ProfileFile written = 6;
+    string failed = 7;
+  }
+}
+
+// A finished profile file: where it lies, its bytes and its rows by table.
+message ProfileFile {
+  string path = 1;
+  uint64 bytes = 2;
+  map<string, uint64> rows = 3;
+}
+
+message ProfileReleases {
+  repeated ProfileRelease ranks = 1;
+}
+
+// Whether one rank ran the collector a release turned off.
+message ProfileRelease {
+  uint32 rank = 1;
+  bool released = 2;
+}
+
+// What each process of the engine switched, in process order.
+message FenceSwitches {
+  repeated FencesSwitched processes = 1;
+}
+
+// One process's switch: whether its graphs hold probes at all, the switch
+// it applied, and the probed classes it switched off.
+message FencesSwitched {
+  bool probes = 1;
+  bool enabled = 2;
+  repeated string off = 3;
+}
+
+// Each rank's report of a change of its weights, in rank order.
+message WeightReports {
+  repeated WeightReport ranks = 1;
+}
+
+// One rank's report of a change of its weights.
+message WeightReport {
+  // The rank's worker group and rank; unset for a worker of no storage
+  // scope.
+  optional string group = 1;
+  optional uint32 rank = 2;
+  // The identity of the rank's new weights, which keys the trajectories
+  // they compute; unset when it has none.
+  optional string identity = 3;
+  // The page identity of each of the rank's cache groups under the new
+  // weights; empty for a rank that keeps no paged cache.
+  repeated string identities = 4;
+  // The weights the change rewrote.
+  uint64 moved = 5;
 }
 
 // Scheduling limits and policy for every scheduler of a serving engine,
@@ -401,7 +661,7 @@ message Configured {
 // An in-place weight update: every worker rewrites its weights from the
 // checkpoint at `model_path`, which loads the same tensors.
 message UpdateWeights {
-  // Matches the `Hooked` answer.
+  // Matches the `Operated` answer.
   uint64 id = 1;
   string model_path = 2;
   WeightsInFlight in_flight = 3;
@@ -420,28 +680,15 @@ enum WeightsInFlight {
 
 // A change to the device storage of every scheduler's KV cache.
 message ResizeCache {
-  // Matches the `Hooked` answer.
+  reserved 4, 7, 13;
+  // Matches the `Operated` answer.
   uint64 id = 1;
   CacheChange change = 2;
-  // Before the change: epochs of the deployment that keep their weights
-  // alone on every node (a previous epoch kept as its weights, whose
-  // processes exited), so that a growth takes the rest of their storage.
-  repeated uint64 keep_weights = 4;
-  // With `keep_weights`: the epochs keep their weights in host storage
-  // (`update_config.previous_epoch = "host"`), which moves the weights each
-  // epoch alone retains there through every node's Transfer Server; a node
-  // that cannot keeps them on its GPUs. The `Hooked` answer then carries
-  // each node's report first, as JSON `{"kept": {"host", "released",
-  // "moved_bytes", "refused"}}`, `refused` saying why a node kept the
-  // weights on its GPUs.
-  bool keep_in_host_storage = 7;
   // For a make-room change: the device bytes each device's quota
   // must have room for beside everything it reserves.
   uint64 room_bytes = 9;
   // Per-device allocation requirements override room_bytes on named GPUs.
   repeated DeviceBytes device_bytes = 11;
-  // Completed Host cache copies retained for rollback when execution retires.
-  repeated bytes cache_keys = 13;
 }
 
 message DeviceBytes {

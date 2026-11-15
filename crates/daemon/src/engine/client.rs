@@ -150,11 +150,9 @@ struct Shared {
 /// command failed.
 type Responder = oneshot::Sender<Result<Response, String>>;
 
-/// What the engine responded to a command with.
-enum Response {
-    /// Each worker's JSON result (`Hooked`), or nothing (`Configured`).
-    Results(Vec<String>),
-}
+/// What the engine responded to a command with: the reports of an `Operated` answer, `None` for
+/// a command that reports nothing and for a `Configured` answer.
+type Response = Option<wire::operated::Reports>;
 
 impl Shared {
     /// Sends one frame to the engine, waiting until the socket took all of it,
@@ -547,58 +545,236 @@ impl EngineClient {
             .unwrap_or_else(|_| Err("the engine ended before it responded".to_owned()))
     }
 
-    /// Runs the engine's operation `name` with the JSON `payload`, and
-    /// returns each rank's JSON result.
+    /// Prepares, on every rank, the copies that put each named routed-expert layer's experts in
+    /// `order`, and returns each rank's allocation.
     ///
     /// # Errors
     ///
-    /// Fails with the reason a worker gave, or when the engine ends first.
-    pub async fn hook(&self, name: &str, payload: &str) -> Result<Vec<String>, String> {
-        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let (responder, response) = oneshot::channel();
-        lock(&self.shared.responses).insert(id, responder);
-        self.shared
-            .send(to_engine::Kind::Engine(wire::EngineCommand {
-                kind: Some(wire::engine_command::Kind::Hook(wire::Hook {
-                    id,
-                    name: name.to_owned(),
-                    payload: payload.to_owned(),
-                })),
-            }));
-        response
-            .await
-            .unwrap_or_else(|_| Err("the engine ended before it responded".to_owned()))
-            .map(Response::results)
+    /// Fails with the reason a rank refused the order, or when the engine ends first.
+    pub async fn prepare_experts(
+        &self,
+        order: std::collections::HashMap<String, wire::ExpertOrder>,
+    ) -> Result<Vec<wire::ExpertAllocation>, String> {
+        match self
+            .ask(|id| {
+                wire::engine_command::Kind::PrepareExperts(wire::PrepareExperts { id, order })
+            })
+            .await?
+        {
+            Some(wire::operated::Reports::ExpertAllocations(allocations)) => Ok(allocations.ranks),
+            other => Err(unexpected("prepare_experts", other)),
+        }
     }
 
-    /// Commit completed expert copies and record the order in worker launches.
+    /// Starts the prepared expert copies beside the batches.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no redistribution is prepared, or when the engine ends first.
+    pub async fn start_experts(&self) -> Result<(), String> {
+        self.ask(|id| wire::engine_command::Kind::StartExperts(wire::StartExperts { id }))
+            .await
+            .map(drop)
+    }
+
+    /// Whether each rank's expert copies completed.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a rank's copies failed, or when the engine ends first.
+    pub async fn check_experts(&self) -> Result<Vec<bool>, String> {
+        match self
+            .ask(|id| wire::engine_command::Kind::CheckExperts(wire::CheckExperts { id }))
+            .await?
+        {
+            Some(wire::operated::Reports::ExpertCopies(copies)) => Ok(copies.ready),
+            other => Err(unexpected("check_experts", other)),
+        }
+    }
+
+    /// Abandons the prepared or copying expert redistribution; the serving order stays.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the engine ends first.
+    pub async fn abort_experts(&self) -> Result<(), String> {
+        self.ask(|id| wire::engine_command::Kind::AbortExperts(wire::AbortExperts { id }))
+            .await
+            .map(drop)
+    }
+
+    /// Loads the LoRA adapter at `path` into `slot` of every rank, and returns each rank's report.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a rank could not load it, or when the engine ends first.
+    pub async fn load_adapter(
+        &self,
+        slot: u32,
+        path: &str,
+    ) -> Result<Vec<wire::AdapterReport>, String> {
+        let path = path.to_owned();
+        match self
+            .ask(|id| wire::engine_command::Kind::LoadAdapter(wire::LoadAdapter { id, slot, path }))
+            .await?
+        {
+            Some(wire::operated::Reports::AdapterReports(reports)) => Ok(reports.ranks),
+            other => Err(unexpected("load_adapter", other)),
+        }
+    }
+
+    /// Releases `slot`'s adapter on every rank, and returns each rank's report.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the engine ends first.
+    pub async fn unload_adapter(&self, slot: u32) -> Result<Vec<wire::AdapterReport>, String> {
+        match self
+            .ask(|id| wire::engine_command::Kind::UnloadAdapter(wire::UnloadAdapter { id, slot }))
+            .await?
+        {
+            Some(wire::operated::Reports::AdapterReports(reports)) => Ok(reports.ranks),
+            other => Err(unexpected("unload_adapter", other)),
+        }
+    }
+
+    /// Starts the profiling session `start` on every rank it selects, and returns each rank's
+    /// answer.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a rank could not start it, or when the engine ends first.
+    pub async fn start_profile(
+        &self,
+        start: &proto::profile::SessionStart,
+    ) -> Result<Vec<proto::profile::RankStart>, String> {
+        let session = wire::ProfileSession::from(start);
+        match self
+            .ask(|id| {
+                wire::engine_command::Kind::StartProfile(wire::StartProfile {
+                    id,
+                    session: Some(session),
+                })
+            })
+            .await?
+        {
+            Some(wire::operated::Reports::ProfileStarts(starts)) => {
+                Ok(starts.ranks.iter().map(Into::into).collect())
+            }
+            other => Err(unexpected("start_profile", other)),
+        }
+    }
+
+    /// Ends profiling session `session` for `reason` on every rank that records it, and returns
+    /// each rank's answer: what its file holds.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a rank could not end it, or when the engine ends first.
+    pub async fn stop_profile(
+        &self,
+        session: u64,
+        reason: &str,
+    ) -> Result<Vec<proto::profile::RankStop>, String> {
+        let reason = reason.to_owned();
+        match self
+            .ask(|id| {
+                wire::engine_command::Kind::StopProfile(wire::StopProfile {
+                    id,
+                    session,
+                    reason,
+                })
+            })
+            .await?
+        {
+            Some(wire::operated::Reports::ProfileStops(stops)) => {
+                Ok(stops.ranks.iter().map(Into::into).collect())
+            }
+            other => Err(unexpected("stop_profile", other)),
+        }
+    }
+
+    /// Turns `collector` of profiling session `session` off for `reason` on every rank, and
+    /// returns whether each ran it.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a rank could not release it, or when the engine ends first.
+    pub async fn release_profile(
+        &self,
+        session: u64,
+        collector: proto::profile::Collector,
+        reason: &str,
+    ) -> Result<Vec<proto::profile::RankRelease>, String> {
+        let reason = reason.to_owned();
+        match self
+            .ask(|id| {
+                wire::engine_command::Kind::ReleaseProfile(wire::ReleaseProfile {
+                    id,
+                    session,
+                    collector: wire::ProfileCollector::from(collector) as i32,
+                    reason,
+                })
+            })
+            .await?
+        {
+            Some(wire::operated::Reports::ProfileReleases(releases)) => {
+                Ok(releases.ranks.iter().map(Into::into).collect())
+            }
+            other => Err(unexpected("release_profile", other)),
+        }
+    }
+
+    /// Switches the fence probes on (`enabled`) or off, with the probed classes `off` switched
+    /// off whatever `enabled` says, in place at the next step boundary; returns each process's
+    /// switch.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a process could not switch, or when the engine ends first.
+    pub async fn switch_fences(
+        &self,
+        enabled: bool,
+        off: Vec<String>,
+    ) -> Result<Vec<wire::FencesSwitched>, String> {
+        match self
+            .ask(|id| {
+                wire::engine_command::Kind::SwitchFences(wire::SwitchFences { id, enabled, off })
+            })
+            .await?
+        {
+            Some(wire::operated::Reports::FenceSwitches(switches)) => Ok(switches.processes),
+            other => Err(unexpected("switch_fences", other)),
+        }
+    }
+
+    /// Commit completed expert copies and record the order in worker launches; returns each
+    /// rank's report.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a rank could not commit, or when the engine ends first.
     pub async fn commit_experts(
         &self,
         order: std::collections::HashMap<String, wire::ExpertOrder>,
-    ) -> Result<Vec<String>, String> {
-        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let (responder, response) = oneshot::channel();
-        lock(&self.shared.responses).insert(id, responder);
-        self.shared
-            .send(to_engine::Kind::Engine(wire::EngineCommand {
-                kind: Some(wire::engine_command::Kind::CommitExperts(
-                    wire::CommitExperts { id, order },
-                )),
-            }));
-        response
-            .await
-            .unwrap_or_else(|_| Err("the engine ended before it responded".to_owned()))
-            .map(Response::results)
+    ) -> Result<Vec<wire::WeightReport>, String> {
+        match self
+            .ask(|id| wire::engine_command::Kind::CommitExperts(wire::CommitExperts { id, order }))
+            .await?
+        {
+            Some(wire::operated::Reports::WeightReports(reports)) => Ok(reports.ranks),
+            other => Err(unexpected("commit_experts", other)),
+        }
     }
 
     /// Gives back or restores the device storage of the engine's KV cache
-    /// (`wire::CacheChange`), and returns what each worker reported.
+    /// (`wire::CacheChange`).
     ///
     /// # Errors
     ///
     /// Fails with the reason a scheduler could not make the change, or when
     /// the engine ends first.
-    pub async fn resize_cache(&self, change: wire::CacheChange) -> Result<Vec<String>, String> {
+    pub async fn resize_cache(&self, change: wire::CacheChange) -> Result<(), String> {
         self.ask(|id| {
             wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
                 id,
@@ -607,14 +783,13 @@ impl EngineClient {
             })
         })
         .await
-        .map(Response::results)
+        .map(drop)
     }
 
     /// Gives back the tail of the engine's KV cache until each device's
     /// quota has room for `bytes`, overridden by `devices` on named
     /// GPUs, beside everything it reserves; the requests that hold the tail
-    /// run on, and the response comes once they let it go. Returns each
-    /// device's report.
+    /// run on, and the response comes once they let it go.
     ///
     /// # Errors
     ///
@@ -626,7 +801,7 @@ impl EngineClient {
         &self,
         bytes: u64,
         devices: &std::collections::BTreeMap<storage::manifest::Gpu, u64>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<(), String> {
         self.ask(|id| {
             wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
                 id,
@@ -639,11 +814,10 @@ impl EngineClient {
                         bytes: *bytes,
                     })
                     .collect(),
-                ..wire::ResizeCache::default()
             })
         })
         .await
-        .map(Response::results)
+        .map(drop)
     }
 
     /// Has every worker rewrite its weights in place from the checkpoint at
@@ -658,30 +832,26 @@ impl EngineClient {
         &self,
         model_path: &str,
         in_flight: crate::leader::WeightsInFlight,
-    ) -> Result<Vec<String>, String> {
-        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let (responder, response) = oneshot::channel();
-        lock(&self.shared.responses).insert(id, responder);
-        self.shared
-            .send(to_engine::Kind::Engine(wire::EngineCommand {
-                kind: Some(wire::engine_command::Kind::UpdateWeights(
-                    wire::UpdateWeights {
-                        id,
-                        model_path: model_path.to_owned(),
-                        in_flight: match in_flight {
-                            crate::leader::WeightsInFlight::Keep => wire::WeightsInFlight::Keep,
-                            crate::leader::WeightsInFlight::Recompute => {
-                                wire::WeightsInFlight::Recompute
-                            }
-                            crate::leader::WeightsInFlight::Abort => wire::WeightsInFlight::Abort,
-                        } as i32,
-                    },
-                )),
-            }));
-        response
-            .await
-            .unwrap_or_else(|_| Err("the engine ended before it responded".to_owned()))
-            .map(Response::results)
+    ) -> Result<Vec<wire::WeightReport>, String> {
+        let in_flight = match in_flight {
+            crate::leader::WeightsInFlight::Keep => wire::WeightsInFlight::Keep,
+            crate::leader::WeightsInFlight::Recompute => wire::WeightsInFlight::Recompute,
+            crate::leader::WeightsInFlight::Abort => wire::WeightsInFlight::Abort,
+        } as i32;
+        let model_path = model_path.to_owned();
+        match self
+            .ask(|id| {
+                wire::engine_command::Kind::UpdateWeights(wire::UpdateWeights {
+                    id,
+                    model_path,
+                    in_flight,
+                })
+            })
+            .await?
+        {
+            Some(wire::operated::Reports::WeightReports(reports)) => Ok(reports.ranks),
+            other => Err(unexpected("update_weights", other)),
+        }
     }
 
     /// Commands the engine to revoke every cached prefix page; requests in
@@ -800,13 +970,10 @@ impl Drop for EngineClient {
     }
 }
 
-impl Response {
-    /// The results a `Hooked` response carries; none for any other response.
-    fn results(self) -> Vec<String> {
-        match self {
-            Self::Results(results) => results,
-        }
-    }
+/// Why an answer to `command` that carries `reports` of another kind is refused: the engine
+/// answered another command under its identity.
+fn unexpected(command: &str, reports: Response) -> String {
+    format!("the engine answered {command} with {reports:?}")
 }
 
 /// Files the engine's frames until its connection closes, then ends every
@@ -936,19 +1103,19 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                     });
                 }
             }
-            Some(from_engine::Kind::Hooked(hooked)) => {
-                if let Some(responder) = lock(&shared.responses).remove(&hooked.id) {
-                    let _ = responder.send(if hooked.error.is_empty() {
-                        Ok(Response::Results(hooked.results))
+            Some(from_engine::Kind::Operated(operated)) => {
+                if let Some(responder) = lock(&shared.responses).remove(&operated.id) {
+                    let _ = responder.send(if operated.error.is_empty() {
+                        Ok(operated.reports)
                     } else {
-                        Err(hooked.error)
+                        Err(operated.error)
                     });
                 }
             }
             Some(from_engine::Kind::Configured(configured)) => {
                 if let Some(responder) = lock(&shared.responses).remove(&configured.id) {
                     let _ = responder.send(if configured.error.is_empty() {
-                        Ok(Response::Results(Vec::new()))
+                        Ok(None)
                     } else {
                         Err(configured.error)
                     });

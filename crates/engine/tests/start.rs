@@ -302,9 +302,9 @@ fn holds_session(storage: &StorageServer, epoch: u64, generation: u64) -> bool {
     }
 }
 
-/// Sends the engine command `kind` on `requests` and returns its `Hooked` answer's error, empty
+/// Sends the engine command `kind` on `requests` and returns its `Operated` answer's error, empty
 /// when every rank ran it.
-fn hooked(requests: &mut Connection, id: u64, kind: wire::engine_command::Kind) -> String {
+fn operated(requests: &mut Connection, id: u64, kind: wire::engine_command::Kind) -> String {
     requests
         .deliver(&wire::ToEngine {
             kind: Some(wire::to_engine::Kind::Engine(wire::EngineCommand {
@@ -313,7 +313,7 @@ fn hooked(requests: &mut Connection, id: u64, kind: wire::engine_command::Kind) 
         })
         .unwrap();
     until(requests, READ, |kind| match kind {
-        from_engine::Kind::Hooked(hooked) if hooked.id == id => Some(hooked.error),
+        from_engine::Kind::Operated(operated) if operated.id == id => Some(operated.error),
         _ => None,
     })
 }
@@ -643,9 +643,9 @@ fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts
             ..Default::default()
         })
     };
-    let slept = hooked(&mut a.requests, 21, resize(21, wire::CacheChange::Sleep));
+    let slept = operated(&mut a.requests, 21, resize(21, wire::CacheChange::Sleep));
     assert_eq!(slept, "");
-    let woken = hooked(&mut a.requests, 22, resize(22, wire::CacheChange::Wake));
+    let woken = operated(&mut a.requests, 22, resize(22, wire::CacheChange::Wake));
     assert_eq!(woken, "");
 
     // A shutdown of the scheduler node ends the epoch in order.

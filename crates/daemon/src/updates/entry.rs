@@ -889,10 +889,7 @@ impl Replica {
             let enabled = target_engine.profiling.fence_probes;
             let off = target_engine.profiling.fence_probes_off.clone();
             running
-                .hook(
-                    "uniserve.fence_switch",
-                    &serde_json::json!({ "enabled": enabled, "off": off }).to_string(),
-                )
+                .switch_fences(enabled, off.clone())
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!("the workers did not switch the probes: {error}")

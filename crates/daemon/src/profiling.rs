@@ -2,10 +2,9 @@
 //! `specs/online-operations.md` section 11).
 //!
 //! A session starts on every worker of the executing epoch at the engine's
-//! next step boundary (the worker hook `uniserve.profile_start`), records
-//! within each worker's window of steps (`docs/profiling.md`) and ends, with
-//! every worker's file written (`uniserve.profile_stop`), when the first of
-//! these happens:
+//! next step boundary (the engine command `StartProfile`), records within
+//! each worker's window of steps (`docs/profiling.md`) and ends, with every
+//! worker's file written (`StopProfile`), when the first of these happens:
 //!
 //! - every selected worker's window of steps ended, as the workers report
 //!   with their batch results (`ForwardStats::profile`);
@@ -19,8 +18,8 @@
 //! the session's epoch over the [`BASELINE`] before the session started and
 //! over the last [`GUARD_WINDOW`] of the session. With `max_slowdown`, a
 //! step time past the baseline by more than that fraction turns off the
-//! session's costliest collector still running (`uniserve.profile_release`,
-//! in `Collector::COSTLIEST_FIRST` order), at most once a [`GUARD_WINDOW`] so
+//! session's costliest collector still running (`ReleaseProfile`, in
+//! `Collector::COSTLIEST_FIRST` order), at most once a [`GUARD_WINDOW`] so
 //! that each change is measured; a slowdown that remains with no collector
 //! left ends the session. Every action is in the session's status.
 
@@ -28,7 +27,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use proto::profile::{Collector, SessionRequest, SessionStart};
+use proto::profile::{Collector, RankStart, RankStop, SessionRequest, SessionStart};
 use proto::request::wire;
 use serde::Serialize;
 use tracing::{info, warn};
@@ -90,9 +89,9 @@ pub struct Session {
     pub request: SessionRequest,
     /// Each worker's answer to the start: its rank, whether the session
     /// selects it, its file and its collectors' states.
-    pub workers: Vec<serde_json::Value>,
+    pub workers: Vec<RankStart>,
     /// Each worker's answer to the end: what its file holds.
-    pub files: Vec<serde_json::Value>,
+    pub files: Vec<RankStop>,
     /// The steps the workers' windows took, summed over the workers.
     pub steps: u64,
     /// The bytes the workers' files hold, summed.
@@ -124,14 +123,6 @@ fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |elapsed| elapsed.as_secs_f64())
-}
-
-/// The JSON answers of every worker.
-fn answers(results: &[String]) -> Vec<serde_json::Value> {
-    results
-        .iter()
-        .map(|result| serde_json::from_str(result).unwrap_or(serde_json::Value::Null))
-        .collect()
 }
 
 impl Leader {
@@ -220,12 +211,11 @@ impl Replica {
             started_at.checked_sub(BASELINE).unwrap_or(started_at),
             BASELINE,
         );
-        let payload = serde_json::to_string(&SessionStart {
+        let start = SessionStart {
             session: id,
             epoch,
             request: request.clone(),
-        })
-        .map_err(|error| UpdateError::Failed(error.into()))?;
+        };
         // The device storage the collectors hold on each selected worker's GPU (a range_metrics
         // pass) has no size CUPTI states: each worker measures it as the session starts there,
         // and reserves it in its GPU's quota. A worker whose quota lacks the room refuses,
@@ -236,25 +226,27 @@ impl Replica {
         let mut room = 0;
         let workers =
             loop {
-                let results = match self.hook("uniserve.profile_start", &payload).await {
-                    Ok(results) => results,
+                let started = self
+                    .operate("profile_start", |client| {
+                        let start = start.clone();
+                        async move { client.start_profile(&start).await }
+                    })
+                    .await;
+                let workers = match started {
+                    Ok(workers) => workers,
                     Err(error) => {
                         self.abandon_profile(id, room, &client).await;
                         return Err(error);
                     }
                 };
-                let workers = answers(&results);
-                let Some(refusal) = workers
-                    .iter()
-                    .find_map(|worker| worker["refused"].as_str().map(str::to_owned))
-                else {
+                let Some(refusal) = workers.iter().find_map(|worker| worker.refused.clone()) else {
                     break workers;
                 };
                 self.abandon_profile(id, room, &client).await;
                 let needed = workers
                     .iter()
-                    .filter(|worker| worker["refused"].is_string())
-                    .filter_map(|worker| worker["device_storage"].as_u64())
+                    .filter(|worker| worker.refused.is_some())
+                    .map(|worker| worker.device_storage)
                     .max()
                     .unwrap_or(0);
                 if room > 0 || needed == 0 {
@@ -272,22 +264,23 @@ impl Replica {
         // What the selected workers measured their collectors hold, the largest of them.
         let device_storage = workers
             .iter()
-            .filter_map(|worker| worker["device_storage"].as_u64())
+            .map(|worker| worker.device_storage)
             .max()
             .unwrap_or(0)
             .max(room);
         // The collectors some selected worker runs.
         let collectors: BTreeSet<Collector> = workers
             .iter()
-            .filter(|worker| worker["selected"] == true)
+            .filter(|worker| worker.selected)
             .flat_map(|worker| {
-                worker["collectors"]
-                    .as_object()
-                    .into_iter()
-                    .flatten()
+                worker
+                    .collectors
+                    .iter()
                     .filter(|(_, state)| *state == "prepared")
                     .filter_map(|(name, _)| {
-                        serde_json::from_value(serde_json::Value::String(name.clone())).ok()
+                        Collector::ALL
+                            .into_iter()
+                            .find(|collector| collector.as_str() == name)
                     })
             })
             .collect();
@@ -352,8 +345,12 @@ impl Replica {
     /// their reserved storage. The KV cache grows back into the room it made
     /// for the session's `device_storage`.
     async fn abandon_profile(&self, id: u64, device_storage: u64, client: &EngineClient) {
-        let payload = serde_json::json!({ "session": id, "reason": "not started" }).to_string();
-        if let Err(error) = self.hook("uniserve.profile_stop", &payload).await {
+        let stopped = self
+            .operate("profile_stop", |client| async move {
+                client.stop_profile(id, "not started").await
+            })
+            .await;
+        if let Err(error) = stopped {
             warn!(
                 session = id,
                 "ending a session other workers did not start failed: {error}"
@@ -436,11 +433,8 @@ pub(crate) async fn end(
     if let Some(client) =
         client.filter(|client| client.epoch() == epoch && client.state() == EngineState::Serving)
     {
-        let payload = serde_json::json!({ "session": id, "reason": reason }).to_string();
-        match tokio::time::timeout(STOP_TIMEOUT, client.hook("uniserve.profile_stop", &payload))
-            .await
-        {
-            Ok(Ok(results)) => files = answers(&results),
+        match tokio::time::timeout(STOP_TIMEOUT, client.stop_profile(id, reason)).await {
+            Ok(Ok(stopped)) => files = stopped,
             Ok(Err(error)) => failure = Some(format!("the workers did not end it: {error}")),
             Err(_) => {
                 failure = Some(format!(
@@ -502,7 +496,7 @@ async fn watch(replica: Arc<Replica>, id: u64, started: Instant) {
             let selected = running
                 .workers
                 .iter()
-                .filter(|worker| worker["selected"] == true)
+                .filter(|worker| worker.selected)
                 .count() as u64;
             let ended = running.request.steps.is_some() && running.windows_ended >= selected;
             if ended {
@@ -549,18 +543,13 @@ async fn watch(replica: Arc<Replica>, id: u64, started: Instant) {
             return;
         };
         record(&replica, id, "release", Some(collector), overhead.slowdown);
-        let payload = serde_json::json!({
-            "session": id,
-            "collector": collector,
-            "reason": format!(
-                "the step time rose {:.1}% over the baseline, past the {:.1}% allowed",
-                overhead.slowdown * 100.0,
-                max * 100.0
-            ),
-        })
-        .to_string();
+        let reason = format!(
+            "the step time rose {:.1}% over the baseline, past the {:.1}% allowed",
+            overhead.slowdown * 100.0,
+            max * 100.0
+        );
         let released = match &client {
-            Some(client) => client.hook("uniserve.profile_release", &payload).await,
+            Some(client) => client.release_profile(id, collector, &reason).await,
             None => Err("no engine serves".to_owned()),
         };
         if let Err(error) = released {

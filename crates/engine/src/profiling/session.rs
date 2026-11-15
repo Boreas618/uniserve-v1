@@ -36,7 +36,9 @@ use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use platform::DeviceId;
-use proto::profile::{Collector, SessionRequest, SessionStart};
+use proto::profile::{
+    Collector, FileReport, RankRelease, RankStart, RankStop, SessionRequest, SessionStart,
+};
 
 use super::artifact::{ClockRow, Message, Writer, send};
 use super::collectors::{self, Collectors};
@@ -75,6 +77,58 @@ pub(crate) enum Change {
     },
 }
 
+/// A rank's answer to a [`Change`]: its report of the start, the end or the release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProfileAnswer {
+    Started(RankStart),
+    Stopped(RankStop),
+    Released(RankRelease),
+}
+
+impl ProfileAnswer {
+    /// The report of a start.
+    ///
+    /// # Errors
+    ///
+    /// An answer to another change.
+    pub(crate) fn started(self) -> Result<RankStart> {
+        match self {
+            Self::Started(started) => Ok(started),
+            other => Err(Error::Invariant(format!(
+                "a profiling start was answered with {other:?}"
+            ))),
+        }
+    }
+
+    /// The report of an end.
+    ///
+    /// # Errors
+    ///
+    /// An answer to another change.
+    pub(crate) fn stopped(self) -> Result<RankStop> {
+        match self {
+            Self::Stopped(stopped) => Ok(stopped),
+            other => Err(Error::Invariant(format!(
+                "a profiling stop was answered with {other:?}"
+            ))),
+        }
+    }
+
+    /// The report of a release.
+    ///
+    /// # Errors
+    ///
+    /// An answer to another change.
+    pub(crate) fn released(self) -> Result<RankRelease> {
+        match self {
+            Self::Released(released) => Ok(released),
+            other => Err(Error::Invariant(format!(
+                "a profiling release was answered with {other:?}"
+            ))),
+        }
+    }
+}
+
 /// A session on a rank the session selected.
 pub(crate) struct Session {
     id: u64,
@@ -107,8 +161,8 @@ pub(crate) struct Session {
 
 impl Session {
     /// Performs `change` on `slot`, the session of the rank whose CUDA device is `device`, and
-    /// returns the rank's response to the daemon's operation, as JSON: a start fills the slot when
-    /// the session selects the rank, a stop of the session in the slot empties it, and a release
+    /// returns the rank's answer to the daemon's operation: a start fills the slot when the
+    /// session selects the rank, a stop of the session in the slot empties it, and a release
     /// turns one of its collectors off.
     ///
     /// The worker calls this between two batches, with nothing of the rank in flight: a start
@@ -123,7 +177,7 @@ impl Session {
         slot: &mut Option<Self>,
         change: Change,
         device: DeviceId,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ProfileAnswer> {
         match change {
             Change::Start { start, rank } => {
                 if let Some(session) = slot {
@@ -134,36 +188,29 @@ impl Session {
                 }
                 let (session, response) = Self::start(*start, rank, device)?;
                 *slot = session;
-                Ok(response)
+                Ok(ProfileAnswer::Started(response))
             }
             Change::Stop {
                 session,
                 reason,
                 rank,
-            } => match slot.take_if(|running| running.id == session) {
-                Some(running) => {
-                    let mut response = running.stop(&reason);
-                    response["rank"] = serde_json::json!(rank);
-                    Ok(response)
-                }
-                None => Ok(serde_json::json!({
-                    "rank": rank,
-                    "session": session,
-                    "selected": false,
-                })),
-            },
+            } => Ok(ProfileAnswer::Stopped(
+                match slot.take_if(|running| running.id == session) {
+                    Some(running) => running.stop(&reason, rank),
+                    None => RankStop::unselected(rank, session),
+                },
+            )),
             Change::Release {
                 session,
                 collector,
                 reason,
                 rank,
             } => {
-                let mut response = match slot {
+                let released = match slot {
                     Some(running) if running.id == session => running.release(collector, &reason),
-                    _ => serde_json::json!({ "released": false }),
+                    _ => false,
                 };
-                response["rank"] = serde_json::json!(rank);
-                Ok(response)
+                Ok(ProfileAnswer::Released(RankRelease { rank, released }))
             }
         }
     }
@@ -179,7 +226,7 @@ impl Session {
         start: SessionStart,
         rank: u32,
         device: DeviceId,
-    ) -> Result<(Option<Self>, serde_json::Value)> {
+    ) -> Result<(Option<Self>, RankStart)> {
         let SessionStart {
             session,
             epoch,
@@ -187,7 +234,7 @@ impl Session {
         } = start;
         request.validate().map_err(Error::Invalid)?;
         if !request.workers.is_empty() && !request.workers.contains(&rank) {
-            return Ok((None, serde_json::json!({ "rank": rank, "selected": false })));
+            return Ok((None, RankStart::unselected(rank)));
         }
 
         std::fs::create_dir_all(&request.output_dir).map_err(|error| {
@@ -212,13 +259,14 @@ impl Session {
         let running = collectors.running();
         let collectors = Arc::new(Mutex::new(collectors));
         let sampler = sampler(Arc::clone(&collectors))?;
-        let response = serde_json::json!({
-            "rank": rank,
-            "selected": true,
-            "path": path,
-            "collectors": states,
-            "device_storage": device_storage,
-        });
+        let response = RankStart {
+            rank,
+            selected: true,
+            refused: None,
+            device_storage,
+            path: Some(path.clone()),
+            collectors: states,
+        };
         tracing::info!(session, path = %path.display(), "a profiling session started");
 
         Ok((
@@ -354,17 +402,16 @@ impl Session {
         progress
     }
 
-    /// Releases `collector`, which the quality-of-service guard turned off for `reason`; responds
-    /// whether the rank ran it.
-    fn release(&mut self, collector: Collector, reason: &str) -> serde_json::Value {
-        let released = lock(&self.collectors).release(collector, "released", reason);
-        serde_json::json!({ "released": released })
+    /// Releases `collector`, which the quality-of-service guard turned off for `reason`; whether
+    /// the rank ran it.
+    fn release(&mut self, collector: Collector, reason: &str) -> bool {
+        lock(&self.collectors).release(collector, "released", reason)
     }
 
-    /// Ends the session for `reason`: disarms and releases the collectors, writes what remains
-    /// and closes the file. Runs while the rank runs no batch. Responds with the steps recorded
-    /// and what the file holds.
-    fn stop(mut self, reason: &str) -> serde_json::Value {
+    /// Ends the session for `reason` on rank `rank`: disarms and releases the collectors, writes
+    /// what remains and closes the file. Runs while the rank runs no batch. Reports the steps
+    /// recorded and what the file holds.
+    fn stop(mut self, reason: &str, rank: u32) -> RankStop {
         if let Some((stop, thread)) = self.sampler.take() {
             drop(stop);
             let _ = thread.join();
@@ -396,19 +443,22 @@ impl Session {
         } = self;
         drop(collectors);
         drop(rows);
-        let file = match writer.map(Writer::finish) {
-            Some(Ok(finished)) => finished,
-            Some(Err(error)) => serde_json::json!({ "error": error.to_string() }),
-            None => serde_json::Value::Null,
-        };
+        let file = writer.map(|writer| match writer.finish() {
+            Ok(finished) => finished,
+            Err(error) => FileReport::Failed {
+                error: error.to_string(),
+            },
+        });
         tracing::info!(session = id, reason, "a profiling session ended");
 
-        serde_json::json!({
-            "session": id,
-            "steps": recorded,
-            "reason": reason,
-            "file": file,
-        })
+        RankStop {
+            rank,
+            session: id,
+            selected: true,
+            steps: recorded,
+            reason: reason.to_owned(),
+            file,
+        }
     }
 }
 
@@ -523,10 +573,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            response,
-            serde_json::json!({ "rank": 1, "selected": false })
-        );
+        assert_eq!(response, ProfileAnswer::Started(RankStart::unselected(1)));
         assert!(slot.is_none());
     }
 
@@ -544,10 +591,7 @@ mod tests {
             DeviceId(3),
         )
         .unwrap();
-        assert_eq!(
-            stopped,
-            serde_json::json!({ "rank": 3, "session": 7, "selected": false })
-        );
+        assert_eq!(stopped, ProfileAnswer::Stopped(RankStop::unselected(3, 7)));
 
         let released = Session::change(
             &mut slot,
@@ -562,7 +606,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             released,
-            serde_json::json!({ "released": false, "rank": 3 })
+            ProfileAnswer::Released(RankRelease {
+                rank: 3,
+                released: false
+            })
         );
         assert!(slot.is_none());
     }

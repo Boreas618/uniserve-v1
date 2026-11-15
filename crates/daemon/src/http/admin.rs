@@ -997,7 +997,7 @@ async fn update_weights(State(state): State<AdminState>, body: axum::body::Bytes
                 json!({
                     "model_path": body.model_path,
                     "in_flight": body.in_flight,
-                    "results": json_results(&results),
+                    "results": results.iter().map(weight_report).collect::<Vec<_>>(),
                 })
             })
             .map_err(|error| {
@@ -1035,7 +1035,7 @@ async fn sleep(State(state): State<AdminState>) -> Response {
         leader
             .sleep()
             .await
-            .map(|results| json!({ "results": json_results(&results) }))
+            .map(|()| json!({ "asleep": true }))
             .map_err(|error| {
                 (
                     update_status(&error),
@@ -1054,7 +1054,7 @@ async fn wake_up(State(state): State<AdminState>) -> Response {
         leader
             .wake()
             .await
-            .map(|results| json!({ "results": json_results(&results) }))
+            .map(|()| json!({ "asleep": false }))
             .map_err(|error| {
                 (
                     update_status(&error),
@@ -1065,12 +1065,15 @@ async fn wake_up(State(state): State<AdminState>) -> Response {
     .await
 }
 
-/// The workers' JSON results; one that is not JSON reads as `null`.
-fn json_results(results: &[String]) -> Vec<serde_json::Value> {
-    results
-        .iter()
-        .map(|result| serde_json::from_str(result).unwrap_or(serde_json::Value::Null))
-        .collect()
+/// One rank's report of a change of its weights, as the admin API answers it.
+fn weight_report(report: &proto::request::wire::WeightReport) -> serde_json::Value {
+    json!({
+        "group": report.group,
+        "rank": report.rank,
+        "identity": report.identity,
+        "identities": report.identities,
+        "moved": report.moved,
+    })
 }
 
 /// The request's JSON object body.
@@ -1100,7 +1103,7 @@ async fn load_lora_adapter(State(state): State<AdminState>, body: axum::body::By
         leader
             .load_adapter(body)
             .await
-            .map(|results| json!({ "results": json_results(&results) }))
+            .map(|results| json!({ "results": results }))
             .map_err(|error| {
                 (
                     update_status(&error),
@@ -1123,7 +1126,7 @@ async fn unload_lora_adapter(State(state): State<AdminState>, body: axum::body::
         leader
             .unload_adapter(body)
             .await
-            .map(|results| json!({ "results": json_results(&results) }))
+            .map(|results| json!({ "results": results }))
             .map_err(|error| {
                 (
                     update_status(&error),

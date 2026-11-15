@@ -82,14 +82,16 @@
 //! paused, and no batch travels to a peer until it ended there. A weight load's replacement stays
 //! in each process: a peer pairs, loads, stages and discards its own as this process does.
 //! An expert redistribution's stages run on each process's own ranks as the daemon's operations
-//! reach it ([`WeightBinding::hook_peers`]); its commit acts on every rank.
+//! reach it ([`WeightBinding::on_peers`]); its commit acts on every rank.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use crate::executor::peers::messages::DataOperation;
+use crate::executor::peers::messages::{
+    AdapterReport, DataOperation, ExpertAllocation, RankOperation, RankReports,
+};
 use crate::executor::peers::{Answer, Remote, operated};
 use crate::memory::cache::KvCacheMemory;
 use crate::memory::cache::info::CacheTable;
@@ -99,7 +101,7 @@ use crate::memory::graph_pool::GraphPool;
 use crate::memory::reload::{MetaWeights, Reload, paired};
 use crate::memory::state::StateMemory;
 use crate::memory::weights::WeightStore;
-use crate::profiling::session::Change;
+use crate::profiling::session::{Change, ProfileAnswer};
 use crate::worker::completion::Outcome;
 use nn::WeightKey;
 use platform::{DeviceId, Nvml, Stream};
@@ -429,15 +431,16 @@ fn agreed(tables: &[Option<CacheTable>]) -> Result<()> {
 ///
 /// # Errors
 ///
-/// The first peer's failure, or a reply that is not the value's JSON.
+/// The first peer's failure, or a reply that is not the value's encoding.
 fn answered<T: DeserializeOwned>(answers: Vec<(u32, Answer)>) -> Result<Vec<T>> {
     let mut values = Vec::with_capacity(answers.len());
     let mut failure = None;
     for (rank, answer) in answers {
         let value = operated(rank, &answer).and_then(|reply| {
-            serde_json::from_str(&reply).map_err(|error| {
+            rmp_serde::from_slice(&reply).map_err(|error| {
                 Error::Invalid(format!(
-                    "rank {rank}'s engine process answered an operation with {reply:?}: {error}"
+                    "rank {rank}'s engine process answered an operation with a value of another \
+                     kind: {error}"
                 ))
             })
         });
@@ -672,20 +675,16 @@ impl WeightBinding {
             .collect()
     }
 
-    /// Runs the operation the daemon names `name` with the JSON `payload` on every peer's ranks
-    /// (`crate::process::operations::hook` runs it on this process's), and returns each peer
-    /// rank's result, in rank order.
+    /// Runs `operation`, which the daemon commands on every rank, on every peer's ranks
+    /// (`crate::process::operations::on_ranks` runs it on this process's), and returns each
+    /// peer's reports, in rank order.
     ///
     /// # Errors
     ///
     /// The first peer's failure.
-    pub(crate) fn hook_peers(&self, name: &str, payload: &str) -> Result<Vec<String>> {
-        let answers = self.ask_peers(None, || DataOperation::Hook {
-            name: name.to_owned(),
-            payload: payload.to_owned(),
-        })?;
-        let results: Vec<Vec<String>> = answered(answers)?;
-        Ok(results.into_iter().flatten().collect())
+    pub(crate) fn on_peers(&self, operation: &RankOperation) -> Result<Vec<RankReports>> {
+        let answers = self.ask_peers(None, || DataOperation::Rank(operation.clone()))?;
+        answered(answers)
     }
 
     /// Reserves what each rank's process holds beside its pools and the Storage Server's storages
@@ -838,10 +837,10 @@ impl WeightBinding {
     /// # Errors
     ///
     /// When the payload is no session, or a rank cannot create its file.
-    pub(crate) fn start_profile(&self, payload: &str) -> Result<Vec<String>> {
-        let start: proto::profile::SessionStart =
-            serde_json::from_str(payload).map_err(|error| rejected("profile_start", error))?;
-
+    pub(crate) fn start_profile(
+        &self,
+        start: &proto::profile::SessionStart,
+    ) -> Result<Vec<proto::profile::RankStart>> {
         let mut responses = Vec::with_capacity(self.ranks.len());
         for (index, rank) in self.ranks.iter().enumerate() {
             let (number, worker) = {
@@ -849,36 +848,36 @@ impl WeightBinding {
                 (rank.rank, rank.worker()?)
             };
 
-            let response = worker.profile(Change::Start {
-                start: Box::new(start.clone()),
-                rank: number,
-            })?;
+            let response = worker
+                .profile(Change::Start {
+                    start: Box::new(start.clone()),
+                    rank: number,
+                })
+                .and_then(ProfileAnswer::started)?;
             // The storage the rank's collectors measured they hold; none on a rank the session
             // does not select.
-            let held = response["device_storage"].as_u64().unwrap_or(0);
+            let held = response.device_storage;
             if let Some(refusal) = self.reserve_profiling(index, held)? {
                 // The session holds the storage only while it runs: it ends here.
-                worker.profile(Change::Stop {
-                    session: start.session,
-                    reason: "refused".to_owned(),
-                    rank: number,
-                })?;
-                responses.push(
-                    serde_json::json!({
-                        "rank": number,
-                        "selected": true,
-                        "device_storage": held,
-                        "refused": format!(
-                            "range_metrics holds {held} bytes of device storage for its range \
-                             profiler pass, which the quota of the rank's GPU cannot fit: \
-                             {refusal}"
-                        ),
+                worker
+                    .profile(Change::Stop {
+                        session: start.session,
+                        reason: "refused".to_owned(),
+                        rank: number,
                     })
-                    .to_string(),
-                );
+                    .and_then(ProfileAnswer::stopped)?;
+                responses.push(proto::profile::RankStart {
+                    refused: Some(format!(
+                        "range_metrics holds {held} bytes of device storage for its range \
+                         profiler pass, which the quota of the rank's GPU cannot fit: {refusal}"
+                    )),
+                    selected: true,
+                    device_storage: held,
+                    ..proto::profile::RankStart::unselected(number)
+                });
                 continue;
             }
-            responses.push(response.to_string());
+            responses.push(response);
         }
         Ok(responses)
     }
@@ -901,14 +900,11 @@ impl WeightBinding {
     /// # Errors
     ///
     /// When the payload names no session, or a rank's worker is gone.
-    pub(crate) fn stop_profile(&self, payload: &str) -> Result<Vec<String>> {
-        let value: serde_json::Value =
-            serde_json::from_str(payload).map_err(|error| rejected("profile_stop", error))?;
-        let session = value["session"]
-            .as_u64()
-            .ok_or_else(|| Error::Invalid("profile_stop names no session".into()))?;
-        let reason = value["reason"].as_str().unwrap_or("stopped").to_owned();
-
+    pub(crate) fn stop_profile(
+        &self,
+        session: u64,
+        reason: &str,
+    ) -> Result<Vec<proto::profile::RankStop>> {
         let mut responses = Vec::with_capacity(self.ranks.len());
         for (index, rank) in self.ranks.iter().enumerate() {
             let (number, worker) = {
@@ -916,13 +912,15 @@ impl WeightBinding {
                 (rank.rank, rank.worker()?)
             };
 
-            let response = worker.profile(Change::Stop {
-                session,
-                reason: reason.clone(),
-                rank: number,
-            })?;
+            let response = worker
+                .profile(Change::Stop {
+                    session,
+                    reason: reason.to_owned(),
+                    rank: number,
+                })
+                .and_then(ProfileAnswer::stopped)?;
             self.release_profiling(index);
-            responses.push(response.to_string());
+            responses.push(response);
         }
         Ok(responses)
     }
@@ -932,17 +930,12 @@ impl WeightBinding {
     /// # Errors
     ///
     /// When the payload names no session or collector, or a rank's worker is gone.
-    pub(crate) fn release_profile(&self, payload: &str) -> Result<Vec<String>> {
-        let value: serde_json::Value =
-            serde_json::from_str(payload).map_err(|error| rejected("profile_release", error))?;
-        let session = value["session"]
-            .as_u64()
-            .ok_or_else(|| Error::Invalid("profile_release names no session".into()))?;
-        let collector: proto::profile::Collector =
-            serde_json::from_value(value["collector"].clone())
-                .map_err(|error| rejected("profile_release", error))?;
-        let reason = value["reason"].as_str().unwrap_or("released").to_owned();
-
+    pub(crate) fn release_profile(
+        &self,
+        session: u64,
+        collector: proto::profile::Collector,
+        reason: &str,
+    ) -> Result<Vec<proto::profile::RankRelease>> {
         let mut responses = Vec::with_capacity(self.ranks.len());
         for rank in &self.ranks {
             let (number, worker) = {
@@ -950,13 +943,15 @@ impl WeightBinding {
                 (rank.rank, rank.worker()?)
             };
 
-            let response = worker.profile(Change::Release {
-                session,
-                collector,
-                reason: reason.clone(),
-                rank: number,
-            })?;
-            responses.push(response.to_string());
+            let response = worker
+                .profile(Change::Release {
+                    session,
+                    collector,
+                    reason: reason.to_owned(),
+                    rank: number,
+                })
+                .and_then(ProfileAnswer::released)?;
+            responses.push(response);
         }
         Ok(responses)
     }
@@ -2001,8 +1996,8 @@ impl WeightBinding {
     /// changed.
     pub(crate) fn prepare_experts(
         &self,
-        orders: BTreeMap<String, Vec<u32>>,
-    ) -> Result<Vec<String>> {
+        orders: &BTreeMap<String, Vec<u32>>,
+    ) -> Result<Vec<ExpertAllocation>> {
         let mut experts = lock(&self.experts);
         if experts.is_some() {
             return Err(Error::State("an expert redistribution is already prepared"));
@@ -2015,7 +2010,7 @@ impl WeightBinding {
                 .ok_or(Error::State("no rank is served"))?;
             lock(rank).model.expert_layers()
         };
-        for (layer, order) in &orders {
+        for (layer, order) in orders {
             let Some(count) = layers.get(layer) else {
                 return Err(Error::Invalid(format!(
                     "{layer:?} is not a routed expert layer"
@@ -2039,14 +2034,11 @@ impl WeightBinding {
         let mut reports = Vec::with_capacity(self.ranks.len());
         for (rank, share) in self.ranks.iter().zip(&replacement.ranks) {
             let device = lock(rank).device;
-            reports.push(
-                serde_json::json!({
-                    "orders": orders,
-                    "gpu": device.uuid()?.0,
-                    "bytes": share.bytes,
-                })
-                .to_string(),
-            );
+            reports.push(ExpertAllocation {
+                orders: orders.clone(),
+                gpu: device.uuid()?.0,
+                bytes: share.bytes,
+            });
         }
 
         *experts = Some(Experts::Paired(replacement));
@@ -2058,7 +2050,7 @@ impl WeightBinding {
     /// # Errors
     ///
     /// When no redistribution is prepared, or it started already.
-    pub(crate) fn start_experts(self: &Arc<Self>) -> Result<Vec<String>> {
+    pub(crate) fn start_experts(self: &Arc<Self>) -> Result<()> {
         let mut experts = lock(&self.experts);
         let replacement = match experts.take() {
             Some(Experts::Paired(replacement)) => replacement,
@@ -2075,7 +2067,7 @@ impl WeightBinding {
             .map_err(|error| rejected("starting the expert copies", error))?;
 
         *experts = Some(Experts::Copying(copying));
-        Ok(self.ranks.iter().map(|_| "null".to_owned()).collect())
+        Ok(())
     }
 
     /// Whether the copies completed, as each rank responds.
@@ -2083,7 +2075,7 @@ impl WeightBinding {
     /// # Errors
     ///
     /// When a rank's copies failed; the redistribution is over, and the routing did not change.
-    pub(crate) fn experts_ready(&self) -> Result<Vec<String>> {
+    pub(crate) fn experts_ready(&self) -> Result<Vec<bool>> {
         let mut experts = lock(&self.experts);
         let ready = match experts.take() {
             Some(Experts::Copying(task)) if task.is_finished() => {
@@ -2107,7 +2099,7 @@ impl WeightBinding {
             }
         };
 
-        Ok(self.ranks.iter().map(|_| ready.to_string()).collect())
+        Ok(self.ranks.iter().map(|_| ready).collect())
     }
 
     /// Ends a redistribution that will not commit: the incoming storage goes, and the routing and
@@ -2116,7 +2108,7 @@ impl WeightBinding {
     /// # Errors
     ///
     /// When the copies panicked.
-    pub(crate) fn abort_experts(&self) -> Result<Vec<String>> {
+    pub(crate) fn abort_experts(&self) -> Result<()> {
         let state = lock(&self.experts).take();
         match state {
             Some(Experts::Paired(replacement) | Experts::Ready(replacement)) => {
@@ -2134,7 +2126,7 @@ impl WeightBinding {
             None => {}
         }
 
-        Ok(self.ranks.iter().map(|_| "null".to_owned()).collect())
+        Ok(())
     }
 
     /// Puts the finished redistribution in place on every rank, the peers' included, each of
@@ -2193,22 +2185,21 @@ impl WeightBinding {
     /// # Errors
     ///
     /// When the payload names no path or slot, or the path holds no adapter; nothing stays loaded.
-    pub(crate) fn load_adapter(&self, payload: &str) -> Result<Vec<String>> {
-        let body: serde_json::Value = serde_json::from_str(payload)
-            .map_err(|error| rejected("an adapter's payload", error))?;
-        let slot = body["adapter"]
-            .as_u64()
-            .and_then(|slot| u32::try_from(slot).ok())
-            .ok_or_else(|| Error::Invalid("load_lora_adapter names no slot".into()))?;
-        let path = body["lora_path"]
-            .as_str()
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| Error::Invalid("load_lora_adapter names no lora_path".into()))?;
-
-        let checkpoint = nn::Checkpoint::open(std::path::Path::new(path))
-            .map_err(|error| rejected("reading the adapter", error))?;
+    pub(crate) fn load_adapter(
+        &self,
+        slot: u32,
+        path: &std::path::Path,
+    ) -> Result<Vec<AdapterReport>> {
+        if path.as_os_str().is_empty() {
+            return Err(Error::Invalid("an adapter's load names no path".into()));
+        }
+        let checkpoint =
+            nn::Checkpoint::open(path).map_err(|error| rejected("reading the adapter", error))?;
         if checkpoint.is_empty() {
-            return Err(Error::Invalid(format!("{path} holds no adapter tensors")));
+            return Err(Error::Invalid(format!(
+                "{} holds no adapter tensors",
+                path.display()
+            )));
         }
         let names: Vec<String> = checkpoint.names().map(str::to_owned).collect();
 
@@ -2224,10 +2215,10 @@ impl WeightBinding {
                 .and_then(|store| Self::load_adapter_on(&checkpoint, &names, store));
             match loaded {
                 Ok(adapter) => {
-                    responses.push(
-                        serde_json::json!({ "adapter": slot, "tensors": adapter.tensors.len() })
-                            .to_string(),
-                    );
+                    responses.push(AdapterReport {
+                        slot,
+                        tensors: Some(u32::try_from(adapter.tensors.len()).unwrap_or(u32::MAX)),
+                    });
                     adapters.push(adapter);
                 }
                 Err(error) => {
@@ -2239,7 +2230,7 @@ impl WeightBinding {
 
         tracing::info!(
             slot,
-            path,
+            path = %path.display(),
             tensors = names.len(),
             "loaded an adapter's tensors"
         );
@@ -2323,19 +2314,8 @@ impl WeightBinding {
         }
     }
 
-    /// Releases the adapter of the slot `payload` names, on every rank.
-    ///
-    /// # Errors
-    ///
-    /// When the payload names no slot.
-    pub(crate) fn unload_adapter(&self, payload: &str) -> Result<Vec<String>> {
-        let body: serde_json::Value = serde_json::from_str(payload)
-            .map_err(|error| rejected("an adapter's payload", error))?;
-        let slot = body["adapter"]
-            .as_u64()
-            .and_then(|slot| u32::try_from(slot).ok())
-            .ok_or_else(|| Error::Invalid("unload_lora_adapter names no slot".into()))?;
-
+    /// Releases the adapter of `slot`, on every rank.
+    pub(crate) fn unload_adapter(&self, slot: u32) -> Vec<AdapterReport> {
         // A slot with no adapter is a load that failed part of the way, which the daemon cleans
         // up after: nothing is held, and nothing is owed.
         let adapters = lock(&self.adapters).remove(&slot);
@@ -2343,15 +2323,17 @@ impl WeightBinding {
             Self::unload(slot, adapters);
         }
 
-        Ok(self
-            .ranks
+        self.ranks
             .iter()
-            .map(|_| serde_json::json!({ "adapter": slot }).to_string())
-            .collect())
+            .map(|_| AdapterReport {
+                slot,
+                tensors: None,
+            })
+            .collect()
     }
 }
 
-/// What a rank responds of a weight update: the JSON text of each is the update's `Hooked` result.
+/// What a rank responds of a change of its weights: an update's or an expert commit's report.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WeightsUpdated {
     /// The rank's worker group and rank; `None` from a worker of no
@@ -2392,12 +2374,12 @@ mod tests {
     type Peer = ((Vec<GroupId>, Arc<Remote>), JoinHandle<Vec<DataOperation>>);
 
     /// The link to a peer engine process whose ranks are of the groups `held` and whose binding
-    /// answers each operation it is sent with the JSON `answer` gives; the peer's thread returns
-    /// the operations in the order they arrived, once the link closes.
+    /// answers each operation it is sent with the encoded value `answer` gives; the peer's thread
+    /// returns the operations in the order they arrived, once the link closes.
     fn peer(
         rank: u32,
         held: Vec<GroupId>,
-        answer: impl Fn(&DataOperation) -> String + Send + 'static,
+        answer: impl Fn(&DataOperation) -> Vec<u8> + Send + 'static,
     ) -> Peer {
         let listener = Listener::bind(&["127.0.0.1:0"]).unwrap();
         let address = listener.addresses()[0].clone();
@@ -2465,9 +2447,9 @@ mod tests {
         }
     }
 
-    /// The JSON of `value`, as a peer answers it.
-    fn json(value: &impl Serialize) -> String {
-        serde_json::to_string(value).unwrap()
+    /// `value` in the peer link's encoding, as a peer answers it.
+    fn json(value: &impl Serialize) -> Vec<u8> {
+        rmp_serde::to_vec(value).unwrap()
     }
 
     /// The room a grow creates segments in leaves the Transfer Server's context, which the server

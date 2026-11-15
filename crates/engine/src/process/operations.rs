@@ -1,16 +1,16 @@
 //! The operator's operations inside an epoch (`docs/admin.md`): a weight update in place, sleep
 //! and wake, the room a profiling session's storage takes from the KV cache, a cache flush, the
-//! commit of an expert redistribution, the named operations beside the batches (LoRA adapters,
-//! the experts' copies, profiling sessions, the fence probes' switch), and the scheduling
-//! limits.
+//! commit of an expert redistribution, the operations every rank runs beside the batches (LoRA
+//! adapters, the experts' copies, profiling sessions, the fence probes' switch: [`on_ranks`]), and
+//! the scheduling limits.
 //!
 //! Each operation is a job: a function of the parts it reads, which returns once the operation
 //! ended and touches nothing of the control thread's. One that changes what a batch reads does so
 //! at a batch boundary of every scheduler ([`at_boundary`]): every scheduler is paused, the work
 //! runs once none has a batch in flight, and every scheduler resumes, whatever the work did
 //! (`specs/scheduler-design.md` §2.4). The control thread runs these jobs one at a time on its
-//! operations thread, so two boundaries never interleave; the named operations run beside the
-//! batches, on threads of their own.
+//! operations thread, so two boundaries never interleave; the operations beside the batches run
+//! on threads of their own.
 //!
 //! The schedulers are named by their inboxes, in the order of the session's schedulers
 //! (`Open::schedulers`); the head is the engine's connection to its host's Storage Server, which
@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::executor::peers::Operate;
-use crate::executor::peers::messages::DataOperation;
+use crate::executor::peers::messages::{DataOperation, FencesSwitched, RankOperation, RankReports};
 use crate::process::binding::{Replacement, WeightsUpdated};
 use anyhow::{Context as _, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender};
@@ -462,41 +462,66 @@ pub(crate) fn commit_experts(
     })
 }
 
-/// Runs the operation the daemon names `name` with the JSON `payload`, beside the batches, and
-/// returns each rank's result: an expert redistribution's stages (`uniserve.prepare_experts`,
-/// `start_experts`, `experts_ready`, `abort_experts`), a LoRA adapter's load and unload
-/// (`load_lora_adapter`, `unload_lora_adapter`), a profiling session's changes
-/// (`uniserve.profile_start`, `profile_stop`, `profile_release`) and the fence probes' switch
-/// (`uniserve.fence_switch`). Nothing here changes what a batch reads: a redistribution copies
-/// into new storage, and its change of the served weights is [`commit_experts`].
+/// Runs `operation`, which the daemon commands on every rank, beside the batches, on this
+/// process's ranks and then on every peer's, each of which runs it on its own as this process
+/// does ([`operate`]), and returns every rank's reports, this process's first. Nothing here
+/// changes what a batch reads: a redistribution copies into new storage, and its change of the
+/// served weights is [`commit_experts`].
 ///
 /// # Errors
 ///
-/// A name this process has no operation of, a payload the operation refuses, or the
-/// operation's failure.
-pub(crate) fn hook(binding: &Arc<WeightBinding>, name: &str, payload: &str) -> Result<Vec<String>> {
-    let results = match name {
-        "uniserve.prepare_experts" => {
-            let orders: BTreeMap<String, Vec<u32>> =
-                serde_json::from_str(payload).context("an expert order")?;
-            binding.prepare_experts(orders)?
-        }
-        "uniserve.start_experts" => binding.start_experts()?,
-        "uniserve.experts_ready" => binding.experts_ready()?,
-        "uniserve.abort_experts" => binding.abort_experts()?,
-        "load_lora_adapter" => binding.load_adapter(payload)?,
-        "unload_lora_adapter" => binding.unload_adapter(payload)?,
-        "uniserve.profile_start" => binding.start_profile(payload)?,
-        "uniserve.profile_stop" => binding.stop_profile(payload)?,
-        "uniserve.profile_release" => binding.release_profile(payload)?,
-        "uniserve.fence_switch" => fence_switch(payload)?,
-        other => bail!("this process has no operation named {other:?}"),
-    };
+/// The operation's failure on a rank of this process or of a peer.
+pub(crate) fn on_ranks(
+    binding: &Arc<WeightBinding>,
+    operation: &RankOperation,
+) -> Result<RankReports> {
+    let mut reports = here(binding, operation)?;
+    for peer in binding.on_peers(operation)? {
+        reports.append(peer).map_err(|error| anyhow!(error))?;
+    }
+    Ok(reports)
+}
 
-    // The epoch's peers run it on their own ranks, each as this process runs it on its own.
-    let mut results = results;
-    results.extend(binding.hook_peers(name, payload)?);
-    Ok(results)
+/// Runs `operation` on this process's own ranks and returns their reports.
+///
+/// # Errors
+///
+/// The operation's failure.
+fn here(binding: &Arc<WeightBinding>, operation: &RankOperation) -> Result<RankReports> {
+    Ok(match operation {
+        RankOperation::PrepareExperts { orders } => {
+            RankReports::ExpertAllocations(binding.prepare_experts(orders)?)
+        }
+        RankOperation::StartExperts => {
+            binding.start_experts()?;
+            RankReports::None
+        }
+        RankOperation::CheckExperts => RankReports::ExpertCopies(binding.experts_ready()?),
+        RankOperation::AbortExperts => {
+            binding.abort_experts()?;
+            RankReports::None
+        }
+        RankOperation::LoadAdapter { slot, path } => {
+            RankReports::Adapters(binding.load_adapter(*slot, path)?)
+        }
+        RankOperation::UnloadAdapter { slot } => {
+            RankReports::Adapters(binding.unload_adapter(*slot))
+        }
+        RankOperation::StartProfile(start) => {
+            RankReports::ProfileStarts(binding.start_profile(start)?)
+        }
+        RankOperation::StopProfile { session, reason } => {
+            RankReports::ProfileStops(binding.stop_profile(*session, reason)?)
+        }
+        RankOperation::ReleaseProfile {
+            session,
+            collector,
+            reason,
+        } => RankReports::ProfileReleases(binding.release_profile(*session, *collector, reason)?),
+        RankOperation::SwitchFences { enabled, off } => {
+            RankReports::Fences(vec![switch_fences(*enabled, off)?])
+        }
+    })
 }
 
 /// The end of a process's own preparation of a generation, as its control thread states it: the
@@ -523,8 +548,9 @@ pub(crate) fn operator(
 }
 
 /// Runs `operation`, which the scheduler node relayed, on this peer's `binding` and `workers`, and
-/// returns the JSON of its value, as the scheduler node's binding reads it. `held` is the weight
-/// load's replacement this process keeps from the pairing to the stage or discard that ends it.
+/// returns its value in the peer link's encoding, as the scheduler node's binding reads it.
+/// `held` is the weight load's replacement this process keeps from the pairing to the stage or
+/// discard that ends it.
 ///
 /// # Errors
 ///
@@ -535,7 +561,7 @@ fn operate(
     held: &mut Option<Replacement>,
     preparations: (&Receiver<Preparation>, Duration),
     operation: DataOperation,
-) -> Result<String> {
+) -> Result<Vec<u8>> {
     use DataOperation as Operation;
 
     let reply = match operation {
@@ -613,14 +639,15 @@ fn operate(
             encoded(&prepared(preparations, generation, bound)?)
         }
         Operation::Uncompared => encoded(&super::generation::uncompared(workers)),
-        Operation::Hook { name, payload } => encoded(&hook(binding, &name, &payload)?),
+        // A peer runs the operation on its own ranks alone: the scheduler node asks every peer.
+        Operation::Rank(operation) => encoded(&here(binding, &operation)?),
     };
     reply.context("encoding the operation's value")
 }
 
-/// The JSON of an operation's value.
-fn encoded(value: &impl serde::Serialize) -> serde_json::Result<String> {
-    serde_json::to_string(value)
+/// An operation's value in the peer link's own encoding (MessagePack).
+fn encoded(value: &impl serde::Serialize) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    rmp_serde::to_vec(value)
 }
 
 /// The end of this process's own preparation of generation `generation`, which its control
@@ -650,32 +677,19 @@ fn prepared(preparations: &Receiver<Preparation>, generation: u64, bound: Durati
     }
 }
 
-/// Writes the fence probes' device switch (`docs/profiling.md`): `{"enabled": bool, "off":
-/// [patterns]}`. The range markers read it in device storage, and writing it waits for nothing.
-/// A process without range markers says so.
-fn fence_switch(payload: &str) -> Result<Vec<String>> {
-    let payload: serde_json::Value = serde_json::from_str(payload).context("fence_switch")?;
-    let enabled = payload["enabled"]
-        .as_bool()
-        .context("fence_switch states no enabled")?;
-    let off: Vec<String> = match payload.get("off") {
-        Some(off) if !off.is_null() => {
-            serde_json::from_value(off.clone()).context("fence_switch off")?
-        }
-        _ => Vec::new(),
-    };
-
+/// Writes the fence probes' device switch (`docs/profiling.md`): on when `enabled`, with the
+/// probed module classes `off` names switched off whatever `enabled` says. The range markers read
+/// it in device storage, and writing it waits for nothing. A process without range markers says
+/// so.
+fn switch_fences(enabled: bool, off: &[String]) -> Result<FencesSwitched> {
     let switched = crate::profiling::markers::Markers::installed()
-        .map(|markers| markers.switch(enabled, &off))
+        .map(|markers| markers.switch(enabled, off))
         .transpose()?;
-    Ok(vec![
-        serde_json::json!({
-            "probes": switched.is_some(),
-            "enabled": enabled,
-            "off": switched.unwrap_or_default(),
-        })
-        .to_string(),
-    ])
+    Ok(FencesSwitched {
+        probes: switched.is_some(),
+        enabled,
+        off: switched.unwrap_or_default(),
+    })
 }
 
 /// Applies `config`'s scheduling limits in place on every scheduler (`Configure`,
