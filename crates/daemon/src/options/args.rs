@@ -70,9 +70,8 @@ impl Stated {
 impl ServerArgs {
     /// Resolves the configuration this command line states: the `--config` files, each
     /// overriding the ones before it, overridden by the flags the command line states,
-    /// overridden by `--set`, with every unstated option at its default and
-    /// `server_config.api_key` falling back to `UNISERVE_API_KEY`. `--host` and `--port` state the
-    /// daemon's own address (`admin_config`). Returns it with the paths the invocation stated.
+    /// overridden by `--set`, with every unstated option at its default. `--host` and `--port`
+    /// state the daemon's own address (`admin_config`). Returns it with the paths the invocation stated.
     ///
     /// `matches` are the command line's own: a flag counts when the command line states it, which
     /// clap's value source tells apart from the default it parsed beside the stated ones.
@@ -157,11 +156,7 @@ fn deserialize_options<T: serde::de::DeserializeOwned>(tree: Table) -> anyhow::R
 /// The configuration of a TOML tree of options, with the paths it states.
 fn configured(tree: Table) -> anyhow::Result<(ServerArgs, Stated)> {
     let stated = Stated::of(&tree);
-    let mut config: ServerArgs = deserialize_options(tree)?;
-    // The environment supplies the key the configuration leaves unset or
-    // blank.
-    config.server_config.api_key =
-        super::configured_api_key(config.server_config.api_key.as_deref());
+    let config: ServerArgs = deserialize_options(tree)?;
     Ok((config, stated))
 }
 
@@ -935,6 +930,8 @@ mod tests {
         assert!(lowered(&["m", "--port", "0"]).is_ok());
         assert!(lowered(&["m", "--host", " "]).is_err());
         assert!(lowered(&["m", "--set", "admin_config.uds=\"\""]).is_err());
+        assert!(lowered(&["m", "--set", "server_config.api_key=\"\""]).is_err());
+        assert!(lowered(&["m", "--set", "server_config.api_key=\"secret\""]).is_ok());
         for (seconds, valid) in [("4", true), ("15.5", true), ("0", false), ("-1", false)] {
             let set = format!("video_config.max_seconds={seconds}");
             assert_eq!(lowered(&["m", "--set", &set]).is_ok(), valid, "{seconds} s");

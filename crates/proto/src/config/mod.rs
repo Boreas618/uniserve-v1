@@ -51,8 +51,8 @@ pub const fn positive(count: usize) -> NonZeroUsize {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Bearer token every route but `/health` and `/metrics` requires;
-    /// `UNISERVE_API_KEY` supplies it when unset or blank. Never printed.
+    /// Bearer token every route but `/health` and `/metrics` requires; a
+    /// stated key is not empty. Never printed.
     #[serde(skip_serializing)]
     pub api_key: Option<String>,
     /// Time until a response head is sent, answered with 504 when it

@@ -129,7 +129,7 @@ A checkpoint that declares its own quantization (ModelOpt's `quantization_config
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `api_key` | Unset | Bearer token every route but `/health` and `/metrics` requires; `UNISERVE_API_KEY` supplies it when unset or blank. Never printed |
+| `api_key` | Unset | Bearer token every route but `/health` and `/metrics` requires; the configuration is its one source, and a stated key is not empty. Never printed |
 | `request_timeout` | Unset | Time until a response head is sent, answered with 504 when it expires; streamed bodies are not bounded |
 | `max_concurrent_requests` | Unset | In-flight chat and synchronous video requests above which requests are shed with 503 |
 | `shutdown_timeout` | `"30s"` | Longest drain of in-flight requests at shutdown; `0` stops at once |

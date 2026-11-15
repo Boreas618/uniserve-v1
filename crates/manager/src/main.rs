@@ -52,9 +52,6 @@ struct Cli {
     /// before the command.
     #[arg(long = "node", required = true)]
     nodes: Vec<String>,
-    /// The nodes' API key.
-    #[arg(long, env = "UNISERVE_API_KEY", global = true, hide_env_values = true)]
-    api_key: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -139,13 +136,12 @@ struct Node {
     /// host for a Unix socket, which the client connects by path.
     url: String,
     http: reqwest::Client,
-    api_key: Option<String>,
 }
 
 impl Node {
     /// The node at `address`: `unix:<path>` for its admin socket, else a base
     /// URL.
-    fn new(address: &str, api_key: Option<&str>) -> Result<Self> {
+    fn new(address: &str) -> Result<Self> {
         let (http, url) = match address.strip_prefix("unix:") {
             Some(path) => (
                 reqwest::Client::builder().unix_socket(path),
@@ -160,16 +156,11 @@ impl Node {
             base: address.trim_end_matches('/').to_owned(),
             url,
             http: http.build().context("building the HTTP client")?,
-            api_key: api_key.map(str::to_owned),
         })
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let request = self.http.request(method, format!("{}{path}", self.url));
-        match &self.api_key {
-            Some(key) => request.bearer_auth(key),
-            None => request,
-        }
+        self.http.request(method, format!("{}{path}", self.url))
     }
 
     /// `GET path` as JSON; `None` when the node responds 404 or 503.
@@ -230,7 +221,7 @@ async fn main() -> Result<()> {
     let nodes: Vec<Node> = cli
         .nodes
         .iter()
-        .map(|address| Node::new(address, cli.api_key.as_deref()))
+        .map(|address| Node::new(address))
         .collect::<Result<_>>()?;
     match cli.command {
         Command::Status => status(&nodes).await,

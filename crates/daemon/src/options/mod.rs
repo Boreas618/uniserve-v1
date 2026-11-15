@@ -43,10 +43,6 @@ pub use proto::config::{
 };
 use proto::config::{positive, values};
 
-/// Environment variable read for the API key when `server_config.api_key`
-/// is unset.
-const API_KEY_ENV: &str = "UNISERVE_API_KEY";
-
 /// Options that place ranks without a deployment layout, refused beside `worker_groups`.
 const RANK_LAYOUT_SHORTHAND: [&str; 5] = [
     "tensor_parallel_size",
@@ -843,6 +839,14 @@ impl ServerArgs {
                  place their own ranks"
             );
         }
+        // A stated key is the token itself: an empty one would admit an empty bearer token.
+        anyhow::ensure!(
+            self.server_config
+                .api_key
+                .as_ref()
+                .is_none_or(|key| !key.is_empty()),
+            "`server_config.api_key` must not be empty"
+        );
         // The daemon binds `admin_config`'s address, so an empty one fails
         // here rather than at the bind.
         let admin = &self.admin_config;
@@ -936,29 +940,6 @@ impl ServerArgs {
             connector: self.kv_cache_config.mooncake.clone(),
         }
     }
-}
-
-/// Returns the bearer token the server requires, if any.
-///
-/// [`ServeArgs::resolve`] stores it in `server_config.api_key`.
-///
-/// The configured key takes precedence over the `UNISERVE_API_KEY`
-/// environment variable. Each source is trimmed, and a blank value counts as
-/// unset, so a blank configured key falls through to the environment
-/// variable.
-pub fn configured_api_key(configured: Option<&str>) -> Option<String> {
-    non_empty_secret(configured).or_else(|| {
-        std::env::var(API_KEY_ENV)
-            .ok()
-            .and_then(|value| non_empty_secret(Some(&value)))
-    })
-}
-
-/// Returns the secret with surrounding whitespace trimmed, or `None` when it
-/// is absent or blank.
-fn non_empty_secret(value: Option<&str>) -> Option<String> {
-    let trimmed = value?.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Checks that a stated capture or capacity list is strictly increasing: the workers capture or
