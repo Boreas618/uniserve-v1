@@ -13,7 +13,8 @@ publish = false
 # a thread and the launch of a fixture checkpoint). Never a dependency of a serving build.
 [dependencies]
 anyhow.workspace = true
-# The policy package's manifest, whose declared parameters a test engine's policy runs with.
+# A policy package's manifest: by it a test finds the workspace member that is the package, and
+# reads the parameters a test engine's policy runs with.
 build-server.workspace = true
 crossbeam-channel.workspace = true
 engine.workspace = true
@@ -35,6 +36,8 @@ storage-server.workspace = true
 scheduling.workspace = true
 # The pipe that wakes a Storage Server's loop to stop.
 rustix = { workspace = true, features = ["pipe"] }
+# The reports of `cargo metadata` and of a policy package's build.
+serde_json.workspace = true
 uuid.workspace = true
 proto.workspace = true
 tempfile.workspace = true

@@ -4420,6 +4420,7 @@ dependencies = [
  "proto",
  "rustix",
  "scheduling",
+ "serde_json",
  "service",
  "storage",
  "storage-server",

@@ -8,16 +8,19 @@
 //! engine's schedulers serve (`engine::scheduler::policy::ceilings`). Every scheduler instantiates
 //! it as it instantiates a deployment's, so a caller's fixtures exercise the mechanism rather than
 //! a stand-in for it, and there is no second policy in the tree to keep honest.
+//!
+//! The policy packages a test runs are the workspace's own ([`package`]), built by the cargo that
+//! built the tests ([`module`]): the engine's policy host tests the packaged policy, the engine's
+//! start test installs it into a Build Server, and the fake engine serves it.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use ::engine::scheduler::policy;
 use anyhow::Result;
 use scheduling::{Limits, Parameters};
-
-/// The scheduling policy package this tree builds, relative to the workspace.
-const PACKAGE: &str = "crates/scheduling/policies/arrival";
 
 /// The arguments a revision of the tree's policy package runs with when its deployment states
 /// none: the defaults its manifest declares, as the Build Server fills them in.
@@ -27,7 +30,7 @@ const PACKAGE: &str = "crates/scheduling/policies/arrival";
 /// When the package's manifest cannot be read or declares parameters the policy interface does
 /// not name.
 pub fn packaged_parameters() -> Parameters {
-    let root = Path::new(proto::WORKSPACE).join(PACKAGE);
+    let root = package(proto::config::DEFAULT_SCHEDULING_POLICY);
     let manifest = build_server::manifest::Manifest::load(&root)
         .unwrap_or_else(|error| panic!("reading the policy package {}: {error}", root.display()));
     toml::Value::Table(manifest.parameters.into_iter().collect())
@@ -78,69 +81,116 @@ pub fn packaged_policy(ceilings: &Limits) -> Result<(Arc<wasmtime::Module>, Para
     Ok((Arc::new(module), packaged_arguments(ceilings)))
 }
 
-/// The `arrival` module this tree builds for `wasm32-unknown-unknown`, as a deployment's store
-/// serves a policy, made once per process and shared by every fixture that installs a policy.
-///
-/// `SCHED_POLICY_WASM` names a module to serve with instead, which a caller testing a build of its
-/// own sets. Unset, the module is built from this tree's `scheduling-policy-arrival` on first use,
-/// into a target directory of its own (`target/it-policy`), so a test run needs no setup step and
-/// the build does not contend for the lock of the tree the running tests were built in.
+/// The module of the workspace's default policy package ([`module`]), as a deployment's store
+/// serves a policy.
 ///
 /// # Panics
 ///
-/// When `SCHED_POLICY_WASM` names an unreadable file, or the build fails; the message names the
-/// command that builds the module.
+/// As [`module`].
 pub fn packaged_module() -> Vec<u8> {
-    static MODULE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    MODULE
-        .get_or_init(|| match std::env::var("SCHED_POLICY_WASM") {
-            Ok(path) => std::fs::read(&path).unwrap_or_else(|error| {
-                panic!("SCHED_POLICY_WASM names `{path}`, which cannot be read: {error}")
-            }),
-            Err(_) => build_packaged_module(),
-        })
-        .clone()
+    module(proto::config::DEFAULT_SCHEDULING_POLICY)
 }
 
-/// Builds this tree's `arrival` policy package and returns the module bytes.
+/// The directory of the workspace's scheduling policy package whose backend is `backend`: the
+/// workspace member whose `package.toml` states the scheduling operator and that backend, as the
+/// Build Server reads a package from its directory. A test runs in its package's directory, from
+/// which cargo finds the workspace.
 ///
-/// The build runs the same `cargo` that started the tests (`CARGO`), so the toolchain and the
-/// target the caller selected are the ones the module is built with. A failure states the status
-/// and the end of the build's stderr, and names the export that skips the build.
-fn build_packaged_module() -> Vec<u8> {
-    let workspace = std::path::PathBuf::from(proto::WORKSPACE);
-    // The build's own target directory when the caller set one, else Cargo's default one.
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| workspace.join("target"), std::path::PathBuf::from)
-        .join("it-policy");
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = std::process::Command::new(&cargo)
-        .current_dir(&workspace)
-        .arg("build")
-        .args(["-q", "-p", "scheduling-policy-arrival"])
-        .args(["--target", "wasm32-unknown-unknown", "--release"])
-        .arg("--target-dir")
-        .arg(&target_dir)
-        .output()
-        .unwrap_or_else(|error| {
-            panic!("running {cargo:?} to build the arrival policy module: {error}")
-        });
+/// # Panics
+///
+/// When `cargo metadata` fails, or no member is that package.
+pub fn package(backend: &str) -> PathBuf {
+    member(backend).0
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let tail: Vec<&str> = stderr.lines().rev().take(20).collect();
-    let tail: Vec<&str> = tail.into_iter().rev().collect();
+/// The wasm32 binary of the workspace's policy package `backend` ([`package`]), built once per
+/// test process by the cargo that built the tests, into a target directory of its own beside the
+/// workspace's (`it-policy`, so the build does not wait for the lock of the build that runs the
+/// tests), and read from the artifact cargo's JSON messages name.
+///
+/// # Panics
+///
+/// When the package is not found, or its build fails or reports no wasm artifact.
+#[expect(clippy::unwrap_used, reason = "test support fails the test that asks")]
+pub fn module(backend: &str) -> Vec<u8> {
+    static MODULES: Mutex<BTreeMap<String, Vec<u8>>> = Mutex::new(BTreeMap::new());
+
+    // The lock is held through a build, so one test process builds each package once.
+    let mut modules = MODULES.lock().unwrap();
+    if let Some(module) = modules.get(backend) {
+        return module.clone();
+    }
+
+    let (_, id, target) = member(backend);
+    let build = Command::new(env!("CARGO"))
+        .args(["build", "--release", "--locked", "--offline", "--lib"])
+        .args(["--message-format=json-render-diagnostics", "--target"])
+        .arg(build_server::target::WASM)
+        .arg("--package")
+        .arg(&id)
+        .arg("--target-dir")
+        .arg(target.join("it-policy"))
+        .output()
+        .unwrap();
     assert!(
-        output.status.success(),
-        "building this tree's arrival policy module failed ({}). Set SCHED_POLICY_WASM to a \
-         module built with `cargo build -p scheduling-policy-arrival --target \
-         wasm32-unknown-unknown --release` to run without the build. The build's stderr \
-         ended:\n{}",
-        output.status,
-        tail.join("\n"),
+        build.status.success(),
+        "building the policy package {backend}: {}",
+        String::from_utf8_lossy(&build.stderr)
     );
 
-    let path = target_dir.join("wasm32-unknown-unknown/release/scheduling_policy_arrival.wasm");
-    std::fs::read(&path).unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
+    let artifact = build
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .filter(|message| message["reason"] == "compiler-artifact" && message["package_id"] == id)
+        .flat_map(|message| message["filenames"].as_array().cloned().unwrap_or_default())
+        .filter_map(|file| file.as_str().map(PathBuf::from))
+        .find(|file| {
+            file.extension()
+                .is_some_and(|extension| extension == "wasm")
+        })
+        .unwrap_or_else(|| panic!("cargo reported no wasm artifact of {backend}"));
+    let module = std::fs::read(artifact).unwrap();
+    modules.insert(backend.to_owned(), module.clone());
+    module
+}
+
+/// The directory, the cargo package id and the workspace's target directory of the policy
+/// package `backend` ([`package`]).
+#[expect(clippy::unwrap_used, reason = "test support fails the test that asks")]
+fn member(backend: &str) -> (PathBuf, String, PathBuf) {
+    let metadata = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        metadata.status.success(),
+        "cargo metadata: {}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+
+    let (directory, id) = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|package| {
+            let directory = Path::new(package["manifest_path"].as_str()?).parent()?;
+            let manifest = build_server::manifest::Manifest::load(directory).ok()?;
+            if manifest.op != proto::module::POLICY || manifest.backend != backend {
+                return None;
+            }
+            Some((directory.to_path_buf(), package["id"].as_str()?.to_owned()))
+        })
+        .unwrap_or_else(|| panic!("no workspace member is the policy package {backend}"));
+    let target = PathBuf::from(metadata["target_directory"].as_str().unwrap());
+    (directory, id, target)
 }
 
 #[cfg(test)]

@@ -113,21 +113,18 @@ impl Drop for StorageServer {
     }
 }
 
-/// The workspace's scheduling policy package (`crates/scheduling/policies/arrival`).
-const POLICY_PACKAGE: &str = "crates/scheduling/policies/arrival";
-
-/// A revision of the workspace's policy package whose arguments are `stated` (TOML) over the
-/// package's declared defaults, as the Build Server states a revision's arguments to the daemon
-/// that launches it.
+/// A revision of the workspace's default policy package (`crate::policy::package`) whose arguments
+/// are `stated` (TOML) over the package's declared defaults, as the Build Server states a
+/// revision's arguments to the daemon that launches it.
 ///
 /// # Panics
 ///
 /// When the package's manifest cannot be read, or `stated` is not a TOML table.
 #[expect(clippy::unwrap_used, reason = "test support fails the test that asks")]
 pub fn policy_revision(stated: &str) -> proto::module::PackageRevision {
-    let manifest = build_server::manifest::Manifest::load(
-        &std::path::Path::new(proto::WORKSPACE).join(POLICY_PACKAGE),
-    )
+    let manifest = build_server::manifest::Manifest::load(&crate::policy::package(
+        proto::config::DEFAULT_SCHEDULING_POLICY,
+    ))
     .unwrap();
     let mut arguments: toml::Table = manifest.parameters.into_iter().collect();
     arguments.extend(toml::from_str::<toml::Table>(stated).unwrap());

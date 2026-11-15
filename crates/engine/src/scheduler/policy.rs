@@ -922,8 +922,6 @@ impl Scheduler {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::sync::Mutex;
 
     use scheduling::End;
@@ -940,97 +938,18 @@ pub(crate) mod tests {
     use super::super::view::view_of;
     use super::*;
 
-    /// The module of the workspace's scheduling policy package whose backend is `backend`, built
-    /// for wasm32 once per test process and compiled on first use by [`load`].
-    ///
-    /// The package is the workspace member whose `package.toml` states the scheduling operator
-    /// and that backend, as the Build Server finds a package's crate. The cargo that built these
-    /// tests builds the member's library for wasm32 into a target directory of its own beside
-    /// the workspace's (`it-policy`, so the build does not wait for the lock of the build that
-    /// runs these tests), and the module is the artifact cargo's JSON messages report.
+    /// The module of the workspace's scheduling policy package whose backend is `backend`
+    /// (`testkit::policy::module`), compiled once per test process by [`load`].
     pub(crate) fn packaged(backend: &str) -> Arc<Module> {
         static MODULES: Mutex<BTreeMap<String, Arc<Module>>> = Mutex::new(BTreeMap::new());
 
-        // The lock is held through a build, so one test process builds each package once.
         let mut modules = MODULES.lock().unwrap();
         if let Some(module) = modules.get(backend) {
             return Arc::clone(module);
         }
-        let module = Arc::new(load(&built(backend)).unwrap());
+        let module = Arc::new(load(&testkit::policy::module(backend)).unwrap());
         modules.insert(backend.to_owned(), Arc::clone(&module));
         module
-    }
-
-    /// The wasm32 binary cargo builds of the workspace's scheduling policy package `backend`
-    /// ([`packaged`]). A test runs in its package's directory, from which cargo finds the
-    /// workspace.
-    fn built(backend: &str) -> Vec<u8> {
-        let cargo = env!("CARGO");
-        let metadata = Command::new(cargo)
-            .args([
-                "metadata",
-                "--format-version",
-                "1",
-                "--no-deps",
-                "--offline",
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            metadata.status.success(),
-            "cargo metadata: {}",
-            String::from_utf8_lossy(&metadata.stderr)
-        );
-        let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
-
-        let member = metadata["packages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|package| {
-                let manifest = Path::new(package["manifest_path"].as_str().unwrap());
-                manifest
-                    .parent()
-                    .and_then(|root| build_server::manifest::Manifest::load(root).ok())
-                    .is_some_and(|manifest| {
-                        manifest.op == proto::module::POLICY && manifest.backend == backend
-                    })
-            })
-            .unwrap_or_else(|| panic!("no workspace member is the policy package {backend}"));
-        let id = member["id"].as_str().unwrap();
-        let target = Path::new(metadata["target_directory"].as_str().unwrap()).join("it-policy");
-
-        let build = Command::new(cargo)
-            .args(["build", "--release", "--locked", "--offline", "--lib"])
-            .args(["--message-format=json-render-diagnostics", "--target"])
-            .arg(build_server::target::WASM)
-            .arg("--package")
-            .arg(id)
-            .arg("--target-dir")
-            .arg(&target)
-            .output()
-            .unwrap();
-        assert!(
-            build.status.success(),
-            "building the policy package {backend}: {}",
-            String::from_utf8_lossy(&build.stderr)
-        );
-
-        let artifact = build
-            .stdout
-            .split(|byte| *byte == b'\n')
-            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
-            .filter(|message| {
-                message["reason"] == "compiler-artifact" && message["package_id"] == id
-            })
-            .flat_map(|message| message["filenames"].as_array().cloned().unwrap_or_default())
-            .filter_map(|file| file.as_str().map(PathBuf::from))
-            .find(|file| {
-                file.extension()
-                    .is_some_and(|extension| extension == "wasm")
-            })
-            .unwrap_or_else(|| panic!("cargo reported no wasm artifact of {backend}"));
-        std::fs::read(artifact).unwrap()
     }
 
     /// The policy modules of the policy host's own tests, each a module of the interface's

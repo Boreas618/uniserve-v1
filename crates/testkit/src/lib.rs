@@ -12,8 +12,8 @@
 //! - [`engine`]: the fake engine's start over both, and the thread that runs its control thread.
 //! - [`layouts`]: the worker-group layouts the engine's media tests place a pipeline in.
 //! - [`pools`]: the launch a fake engine is started with and what its worker groups serve.
-//! - [`policy`]: the `arrival` module this tree builds, and the arguments a test engine's
-//!   schedulers instantiate it with.
+//! - [`policy`]: the workspace's policy packages and the modules they build, and the arguments a
+//!   test engine's schedulers instantiate the default package with.
 //! - [`text`]: what a fake's text model samples, and where its text ends.
 //! - [`process`]: a fake engine at the process interface, and a fake node daemon behind it.
 //! - [`serving`]: what the engine's own tests serve from: a Storage Server on a thread of the

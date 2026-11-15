@@ -34,13 +34,9 @@ use service::{Connection, Listener};
 use testkit::LONG;
 use testkit::serving::{DEPLOYMENT, StorageServer};
 
-/// The workspace the tests were built from.
-fn workspace() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-/// A Build Server on a thread of the test process at `directory`'s socket, holding the tree's
-/// `arrival` policy package as revision 1 with its module built, as a daemon's prepare step leaves
+/// A Build Server on a thread of the test process at `directory`'s socket, holding the
+/// workspace's `arrival` policy package (`testkit::policy::package`) as revision 1 with its module
+/// built, as a daemon's prepare step leaves
 /// a deployment's packages before it starts the engine, so an engine's start resolves a module
 /// the store holds. The server serves until the returned stop end is dropped. Returns its socket
 /// and that end.
@@ -74,7 +70,9 @@ fn build_server(directory: &Path) -> (PathBuf, std::os::unix::net::UnixStream) {
 
     let mut client = build_server::protocol::Client::connect(&socket).unwrap();
     let installed = client
-        .install(&workspace().join("crates/scheduling/policies/arrival"))
+        .install(&testkit::policy::package(
+            proto::config::DEFAULT_SCHEDULING_POLICY,
+        ))
         .unwrap();
     assert_eq!(installed.revision, 1);
 
