@@ -8,7 +8,8 @@
 //! gather_gemm (FC1)   hidden [T, H] · weights [E, 2I, H]
 //!                     out[M_perm, I] = act(gate rows) · up rows, per row's expert
 //! route_gemm  (FC2)   rows [M_perm, I] · weights [E, H, I]
-//!                     out[T · top, H], route k of token t at row t · top + k, unweighted
+//!                     out[M_perm, H], row p the product of permuted row p, unweighted
+//!                     (route k of token t at row expanded_to_permuted[t · top + k])
 //! ```
 //!
 //! Each expert's FC1 weight holds its `I` up rows followed by its `I` gate rows (Hugging Face stores

@@ -37,9 +37,9 @@ FC2 of a mixture of experts over FlashInfer's MoE sort metadata: every
 tile of permuted rows of ``A [M, K]`` (the gated FC1 products, in sort
 order) belongs to one expert; TMA loads the tile and the expert's BF16
 ``B [N, K]`` rows, tcgen05 MMA accumulates in FP32 in tensor memory, and
-the epilogue rounds each row to BF16 once and bulk-copies it to row
-``permuted_idx_to_expanded_idx[row]`` of ``out``: route ``k`` of token
-``t`` lands at row ``t * K + k``, unweighted. Those rows with the route
+the epilogue rounds each row to BF16 once and bulk-copies it to the same
+permuted row of ``out``: route ``k`` of token ``t`` is at row
+``expanded_to_permuted[t * K + k]``, unweighted. Those rows with the route
 weights are the experts' uncombined routes; nothing is reduced across
 rows, so results repeat bit for bit whatever the tile schedule.
 
@@ -150,7 +150,7 @@ class RouteGroupedGemmKernel(GroupedGemm):
 
         self._setup_ab_smem_layouts(tiled_mma)
         # Row-major C tile with a 16-byte row pad, from which each output row
-        # is bulk-copied to its expanded row.
+        # is bulk-copied to its permuted row.
         swizzled_pad = 16 // (self.out_dtype.width // 8)
         self.c_smem_layout_staged = cute.make_layout(
             (
@@ -188,8 +188,8 @@ class RouteGroupedGemmKernel(GroupedGemm):
         """Launch the kernel on ``stream``, of ``multiprocessors``.
 
         ``a`` is the ``(M, K, 1)`` permuted rows, ``b`` the ``(N, K, E)``
-        expert weights, ``out`` the ``(R, N, 1)`` route rows written at
-        ``permuted_idx_to_expanded_idx[row]``.
+        expert weights, ``out`` the ``(M, N, 1)`` route rows, row ``p`` the
+        unweighted product of permuted row ``p``.
         """
         self.a_dtype: type[cutlass.Numeric] = a.element_type
         self.b_dtype: type[cutlass.Numeric] = b.element_type
@@ -1041,7 +1041,7 @@ class RouteGroupedGemmKernel(GroupedGemm):
                 if is_partial_tile:
                     self.epilog_sync_barrier.arrive_and_wait()
 
-                # Copy each valid row to its expanded row; a partial tile
+                # Copy each valid row to its permuted row; a partial tile
                 # redistributes rows so every warp copies contiguous rows.
                 copy_row = epi_tidx
                 if is_partial_tile:
