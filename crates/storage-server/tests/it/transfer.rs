@@ -16,7 +16,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ::storage::protocol::{
-    ErrorKind, Event, Link, LinkEnd, Priority, Region, Span, TaskStatus, TaskTotal, Throttle,
+    ErrorKind, Event, Link, LinkEnd, Priority, Region, Span, TaskFailure, TaskStatus, TaskTotal,
+    Throttle,
 };
 use ::storage::{Access, Claimant, Client, Role};
 
@@ -744,7 +745,13 @@ fn a_crashed_transfer_server_fails_its_tasks_and_the_server_starts_another() {
     assert_eq!(unsafe { libc::kill(crashed, libc::SIGKILL) }, 0);
     let (_, end) = end_of(&mut worker, task);
     assert!(
-        matches!(&end, TaskStatus::Failed { message } if message.contains("Transfer Server")),
+        matches!(
+            &end,
+            TaskStatus::Failed {
+                failure: TaskFailure::Ended,
+                ..
+            }
+        ),
         "{end:?}"
     );
     // The submitter learns it at once, before the server starts another
@@ -813,7 +820,8 @@ pub(crate) mod device {
     use std::time::{Duration, Instant};
 
     use ::storage::protocol::{
-        Event, Link, LinkEnd, Location, Priority, Region, StorageRecord, TaskStatus, Throttle,
+        Event, Link, LinkEnd, Location, Priority, Region, StorageRecord, TaskFailure, TaskStatus,
+        Throttle,
     };
     use ::storage::{Access, Claimant};
     use platform::{
@@ -1214,7 +1222,13 @@ pub(crate) mod device {
             )
             .unwrap();
         match end_of(&mut worker, task) {
-            (0, TaskStatus::Failed { message }) => assert!(
+            (
+                0,
+                TaskStatus::Failed {
+                    failure: TaskFailure::Copy,
+                    message,
+                },
+            ) => assert!(
                 message.contains("quota") && message.contains("limit"),
                 "{message}"
             ),

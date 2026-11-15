@@ -76,7 +76,7 @@ use std::time::Duration;
 use ::storage::client::Client;
 use ::storage::protocol::{
     Allocation, ContextBytes, Event, Item, Link, LinkEnd, Move, Priority, Registration, Request,
-    Response, Role, TaskStatus,
+    Response, Role, TaskFailure, TaskStatus,
 };
 use platform::DeviceId;
 use rustix::event::{PollFd, PollFlags, poll};
@@ -275,7 +275,7 @@ enum Done {
     Sources {
         task: u64,
         priority: Priority,
-        pieces: Result<Sources, String>,
+        pieces: Result<Sources, (TaskFailure, String)>,
     },
     /// The registrations of the server's `request`: the agent's metadata
     /// and each allocation's range, or why they failed; and the holds on
@@ -577,7 +577,9 @@ impl TransferServer {
                     .map(|piece| pieces.push(piece)),
             };
             if let Err(message) = taken {
-                self.threads.end(task, TaskStatus::Failed { message });
+                let failure = TaskFailure::Copy;
+                self.threads
+                    .end(task, TaskStatus::Failed { failure, message });
                 return;
             }
         }
@@ -694,9 +696,10 @@ impl TransferServer {
                         self.threads.submit(task, priority, sources.pieces);
                     }
                     Err(_) if cancelled => self.threads.end(task, TaskStatus::Cancelled),
-                    Err(message) => {
+                    Err((failure, message)) => {
                         tracing::warn!(task, message, "a task's sources on other hosts failed");
-                        self.threads.end(task, TaskStatus::Failed { message });
+                        self.threads
+                            .end(task, TaskStatus::Failed { failure, message });
                     }
                 }
                 None

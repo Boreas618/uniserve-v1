@@ -822,8 +822,30 @@ pub enum TaskStatus {
     /// The task was cancelled; its destinations hold any part of the spans.
     Cancelled,
     /// A span could not be copied, or the Transfer Server ended; its
-    /// destinations hold any part of the spans.
-    Failed { message: String },
+    /// destinations hold any part of the spans. `failure` states why, and
+    /// `message` tells it.
+    Failed {
+        failure: TaskFailure,
+        message: String,
+    },
+}
+
+/// Why a transfer task failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskFailure {
+    /// A copy on this host failed: a mapping or registration of its storage,
+    /// a GPU context or stream, or a READ the network or the other host
+    /// failed.
+    Copy,
+    /// The Storage Server of another host a source lies on could not be
+    /// reached, or its connection failed.
+    Unreachable,
+    /// Another host's Storage Server refused to expose a source, for the
+    /// reason its error kind states.
+    Refused { kind: ErrorKind },
+    /// The Transfer Server ended while the task ran.
+    Ended,
 }
 
 /// One allocation of the server's, as the server names it to its Transfer

@@ -449,7 +449,7 @@ impl Copier {
                         TaskStatus::Complete => completed += 1,
                         TaskStatus::Cancelled if cancelling => {}
                         TaskStatus::Cancelled => bail!("task {task} was cancelled"),
-                        TaskStatus::Failed { message } => {
+                        TaskStatus::Failed { message, .. } => {
                             bail!("task {task} failed: {message}")
                         }
                     }

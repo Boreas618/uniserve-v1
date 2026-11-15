@@ -47,7 +47,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ::storage::Client;
-use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registration};
+use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registration, TaskFailure};
 use platform::DeviceId;
 
 use super::contexts::Hold;
@@ -128,6 +128,16 @@ pub(super) struct Sources {
 /// device storage.
 pub(super) type Exposed = (Arc<Mapping>, Option<Hold>);
 
+/// Why a task's sources on other hosts cannot be read, and the message that
+/// tells it.
+pub(super) type Failed = (TaskFailure, String);
+
+/// A failure of this host's part of a READ: a registration, a GPU context, the
+/// agent, a span that does not fit.
+fn copy(message: String) -> Failed {
+    (TaskFailure::Copy, message)
+}
+
 impl Network {
     pub(super) fn new() -> Self {
         Self {
@@ -159,14 +169,14 @@ impl Network {
     /// written fails before its first READ, ending the exposures it got.
     /// Blocks on the other hosts' responses and on the destinations' GPU
     /// contexts.
-    pub(super) fn pieces(&self, task: u64, moves: Vec<Inbound>) -> Result<Sources, String> {
+    pub(super) fn pieces(&self, task: u64, moves: Vec<Inbound>) -> Result<Sources, Failed> {
         let mut leases = Vec::new();
         let pieces = self.expose_moves(task, moves, &mut leases);
         match pieces {
             Ok(pieces) => Ok(Sources { pieces, leases }),
-            Err(message) => {
+            Err(failed) => {
                 self.unexpose(leases);
-                Err(message)
+                Err(failed)
             }
         }
     }
@@ -177,7 +187,7 @@ impl Network {
         task: u64,
         moves: Vec<Inbound>,
         leases: &mut Vec<Lease>,
-    ) -> Result<Vec<(ThreadKey, Piece)>, String> {
+    ) -> Result<Vec<(ThreadKey, Piece)>, Failed> {
         let mut wanted: HashMap<(String, String), Vec<Region>> = HashMap::new();
         for copy in &moves {
             let regions = wanted
@@ -196,11 +206,11 @@ impl Network {
                 exposure,
             });
             if ranges.len() != regions.len() {
-                return Err(format!(
+                return Err(copy(format!(
                     "{endpoint} exposed {} of {} regions",
                     ranges.len(),
                     regions.len()
-                ));
+                )));
             }
             for (region, range) in regions.into_iter().zip(ranges) {
                 let source = Source {
@@ -211,7 +221,7 @@ impl Network {
                             _ => None,
                         },
                     },
-                    region: source_region(&range)?,
+                    region: source_region(&range).map_err(copy)?,
                     endpoint: endpoint.clone(),
                     peer: peer.clone(),
                     fabric: range.fabric,
@@ -223,13 +233,13 @@ impl Network {
             }
         }
 
-        let agent = self.agent()?;
+        let agent = self.agent().map_err(copy)?;
         let mut pieces = Vec::with_capacity(moves.len());
         // Each fabric handle is imported once per task and GPU.
         let mut imports: HashMap<([u8; 64], DeviceId), Arc<Fabric>> = HashMap::new();
         for copy in moves {
             let Some(source) = sources.get(&(copy.endpoint, copy.deployment, copy.region)) else {
-                return Err("a region was not exposed".into());
+                return Err(self::copy("a region was not exposed".into()));
             };
             // Another host checked the region; the span is checked here,
             // against the range it registered from the region's first byte:
@@ -240,7 +250,7 @@ impl Network {
                 .and_then(|start| start.checked_add(copy.bytes))
                 .is_some_and(|end| end <= source.region.len as u64);
             if !within {
-                return Err(format!(
+                return Err(self::copy(format!(
                     "a span's source of {} rows of {} bytes at offset {} and pitch {} reaches \
                      past the {} bytes of its region at {}",
                     copy.rows,
@@ -249,7 +259,7 @@ impl Network {
                     copy.source_pitch,
                     source.region.len,
                     source.endpoint
-                ));
+                )));
             }
             let read = Piece {
                 task,
@@ -274,7 +284,7 @@ impl Network {
                         let source_offset = fabric
                             .offset
                             .checked_add(read.source_offset)
-                            .ok_or("a span's source offset overflows")?;
+                            .ok_or_else(|| self::copy("a span's source offset overflows".into()))?;
                         pieces.push((
                             thread,
                             Piece {
@@ -293,9 +303,12 @@ impl Network {
                 }
             }
             match hold {
-                Some(hold) => hold.session()?.nixl_region(agent, mapped)?,
-                None => mapped.nixl_host_region(agent)?,
-            };
+                Some(hold) => hold
+                    .session()
+                    .and_then(|session| session.nixl_region(agent, mapped)),
+                None => mapped.nixl_host_region(agent),
+            }
+            .map_err(self::copy)?;
             let link = Link {
                 source: source.end.clone(),
                 destination: mapped.end.clone(),
@@ -340,13 +353,15 @@ impl Network {
     /// Have the Storage Server at `endpoint` expose `regions` of
     /// `deployment`, and load the metadata of the agent that registered
     /// them: returns that agent's name, the exposure and each region's
-    /// range.
+    /// range. A server that cannot be reached fails it as
+    /// [`TaskFailure::Unreachable`], one that refuses as
+    /// [`TaskFailure::Refused`] with its error's kind.
     fn expose(
         &self,
         endpoint: &str,
         deployment: &str,
         regions: Vec<Region>,
-    ) -> Result<(String, u64, Vec<Registration>), String> {
+    ) -> Result<(String, u64, Vec<Registration>), Failed> {
         let host = self.host(endpoint);
         let mut host = ::service::lock(&host);
         tracing::debug!(
@@ -358,12 +373,25 @@ impl Network {
         let (exposure, metadata, ranges) =
             host.expose(endpoint, deployment, regions)
                 .map_err(|error| {
-                    format!("{endpoint} did not expose the regions of {deployment}: {error}")
+                    let failure = match &error {
+                        ::storage::Error::Server { kind, .. } => {
+                            TaskFailure::Refused { kind: *kind }
+                        }
+                        ::storage::Error::Io(_) | ::storage::Error::Protocol(_) => {
+                            TaskFailure::Unreachable
+                        }
+                        _ => TaskFailure::Copy,
+                    };
+                    let message =
+                        format!("{endpoint} did not expose the regions of {deployment}: {error}");
+                    (failure, message)
                 })?;
 
-        let agent = self.agent()?;
+        let agent = self.agent().map_err(copy)?;
         let peer = agent.load_peer(&metadata).map_err(|error| {
-            format!("loading the metadata of the NIXL agent of {endpoint}: {error}")
+            copy(format!(
+                "loading the metadata of the NIXL agent of {endpoint}: {error}"
+            ))
         })?;
         if let Some(previous) = host.peer.replace(peer.clone())
             && previous != peer

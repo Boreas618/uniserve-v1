@@ -271,7 +271,7 @@ impl Server {
         let failure = match end {
             TaskStatus::Complete => None,
             TaskStatus::Cancelled => Some("the copy was cancelled".to_owned()),
-            TaskStatus::Failed { message } => Some(message.clone()),
+            TaskStatus::Failed { message, .. } => Some(message.clone()),
         };
         self.item_ended(number, index, failure);
     }

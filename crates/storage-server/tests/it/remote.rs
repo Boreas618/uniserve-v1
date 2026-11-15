@@ -21,7 +21,7 @@
 use std::os::fd::AsFd;
 use std::path::Path;
 
-use ::storage::protocol::{Priority, TaskStatus};
+use ::storage::protocol::{ErrorKind, Priority, TaskFailure, TaskStatus};
 use ::storage::{Access, Claimant, Client, Role};
 
 use crate::server::{Running, head, host, key, memfd, scope, tensor, transfer_child, worker};
@@ -79,12 +79,18 @@ fn a_read_from_another_host_fails_when_that_host_cannot_expose_its_source() {
         )
         .unwrap();
 
-    // A host nothing listens on.
-    let unreachable = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .to_string();
+    // A host nothing listens on: the test holds the endpoint's socket bound, not listening, so
+    // no other process takes the port and every connection to it is refused.
+    let unbound = rustix::net::socket(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::STREAM,
+        None,
+    )
+    .unwrap();
+    let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    rustix::net::bind(&unbound, &loopback).unwrap();
+    let bound: rustix::net::SocketAddrAny = rustix::net::getsockname(&unbound).unwrap();
+    let unreachable = std::net::SocketAddr::try_from(bound).unwrap().to_string();
     // A host that holds the source, whose server runs no Transfer Server.
     let bare = Running::with_children(None);
     let mut bare_head = crate::server::head(&bare.socket);
@@ -103,9 +109,19 @@ fn a_read_from_another_host_fails_when_that_host_cannot_expose_its_source() {
     let empty = serving(Gpus::Hidden);
 
     let cases = [
-        (unreachable, "Connection refused"),
-        (endpoint(&bare.socket), "no Transfer Server"),
-        (endpoint(&empty.socket), "no retained tensor"),
+        (unreachable, TaskFailure::Unreachable),
+        (
+            endpoint(&bare.socket),
+            TaskFailure::Refused {
+                kind: ErrorKind::Unavailable,
+            },
+        ),
+        (
+            endpoint(&empty.socket),
+            TaskFailure::Refused {
+                kind: ErrorKind::Invalid,
+            },
+        ),
     ];
     for (source_host, reason) in cases {
         let task = worker
@@ -122,10 +138,10 @@ fn a_read_from_another_host_fails_when_that_host_cannot_expose_its_source() {
             )
             .unwrap();
         match end_of(&mut worker, task) {
-            (0, TaskStatus::Failed { message }) => assert!(
-                message.contains(&source_host) && message.contains(reason),
-                "the failure names neither {source_host} nor {reason:?}: {message}"
-            ),
+            (0, TaskStatus::Failed { failure, message }) => {
+                assert_eq!(failure, reason, "{message}");
+                assert!(message.contains(&source_host), "{message}");
+            }
             other => panic!("a read from {source_host} ended {other:?}"),
         }
     }

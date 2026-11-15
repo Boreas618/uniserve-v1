@@ -1056,6 +1056,7 @@ impl Server {
         self.transfers.contexts.clear();
         self.transfers.sessions.clear();
         let failed = TaskStatus::Failed {
+            failure: ::storage::protocol::TaskFailure::Ended,
             message: "the Transfer Server ended".into(),
         };
         for (task, entry) in std::mem::take(&mut self.transfers.tasks) {

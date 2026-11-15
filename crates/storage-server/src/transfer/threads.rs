@@ -52,7 +52,9 @@ use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use ::storage::protocol::{Link, LinkBandwidth, LinkEnd, Priority, TaskStatus, Throttle};
+use ::storage::protocol::{
+    Link, LinkBandwidth, LinkEnd, Priority, TaskFailure, TaskStatus, Throttle,
+};
 use platform::{
     DeviceId, Event, EventFlags, Pitched, PitchedBatch, SourceOrder, Stream, memcpy_async,
 };
@@ -416,7 +418,10 @@ impl State {
             }
             Some(message) => {
                 if state.end.is_none() {
-                    state.end = Some(TaskStatus::Failed { message });
+                    state.end = Some(TaskStatus::Failed {
+                        failure: TaskFailure::Copy,
+                        message,
+                    });
                 }
                 self.purge(task)
             }
