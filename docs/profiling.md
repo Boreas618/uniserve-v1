@@ -106,7 +106,7 @@ CUPTI also needs free device addresses among the lowest ones for a pass's storag
 
 **Quality-of-service guard.** The daemon averages the executing epoch's step time over the minute before the session and, every half second, over the session's last 10 seconds. With `max_slowdown`, a step time past the earlier one by more than that fraction turns off the costliest collector still running, at most once every 10 seconds so that each change is measured; a slowdown that remains with no collector left ends the session. The collectors are turned off in this order: `range_metrics`, `pc_sampling`, `timeline`, `pm_sampling`, `fence_timeline`. Every action, with the slowdown that caused it, is in the session's state.
 
-**NVTX.** The `uniserve.worker` ranges, one per turn of a worker's job named by its kind (`uniserve.worker.execute`, `.capture`, `.prepare`, `.control` and the others) with the batch it belongs to as its payload, the scheduler's (`uniserve.scheduler.update`, a batch's output applied, with the batch as its payload; `uniserve.scheduler.step`, one step of its loop) and the main process's control thread's (`uniserve.process.event` and `uniserve.process.terminal`, one request's event written to its daemon, with the request as its payload), follow a run-time switch, which starts as `UNISERVE_NVTX` states and which a `timeline` collector turns on while it records and restores after. NVTX reaches CUPTI through the injection the `uniserve-engine` executable registers in process, which hands NVTX's marks to the CUPTI the process loads at its first NVTX call; a profiler that names its own injection library in the environment, as Nsight Systems does, receives them instead.
+**NVTX.** The `uniserve.worker` ranges, one per turn of a worker's job named by its kind (`uniserve.worker.execute`, `.capture`, `.prepare`, `.control` and the others) with the batch it belongs to as its payload, the scheduler's (`uniserve.scheduler.update`, a batch's output applied, with the batch as its payload; `uniserve.scheduler.step`, one step of its loop) and the main process's control thread's (`uniserve.process.event` and `uniserve.process.terminal`, one request's event written to its daemon, with the request as its payload), follow a run-time switch, which starts as `profiling_config.nvtx_ranges` states (`docs/configuration.md`) and which a `timeline` collector turns on while it records and restores after. NVTX reaches CUPTI through the injection the `uniserve-engine` executable registers in process, which hands NVTX's marks to the CUPTI the process loads at its first NVTX call; a profiler that names its own injection library in the environment, as Nsight Systems does, receives them instead.
 
 **Ranks of one process.** A main process serves every rank of its node, and CUPTI's records have one consumer, so its ranks share one timeline: the first to arm starts it and the last to disarm stops it, and a record reaches the file of the rank whose device ran it. An API call and a topology record name no device, so every recording rank's file holds them. The other collectors are each rank's own.
 
@@ -125,17 +125,17 @@ Every time is in nanoseconds of one of two clocks: CUPTI's (about `CLOCK_REALTIM
 
 ## Capture and inspect a CUDA timeline with Nsight Systems
 
-Set `UNISERVE_NVTX=1` before starting the server to start its ranges on; a session's `timeline` collector also switches them on while it runs. Each worker, the thread of one device, marks every job it runs with a synchronous range of the `uniserve.worker` domain named for the job's kind: `uniserve.worker.execute`, `resume`, `pass`, `shadow`, `map`, `stamp`, `capture`, `prepare`, `switch`, `commit`, `rollback`, `profile` and `control`; `execute`, `resume` and `shadow` carry the batch ID as a numeric payload. Native ranges use the NVIDIA NVTX SDK directly and issue no CUDA operations. Nsight Systems holds CUPTI's subscription in the processes it traces, so their sessions run no CUPTI collector.
+Set `profiling_config.nvtx_ranges = true` in the deployment to start its ranges on; a session's `timeline` collector also switches them on while it runs. Each worker, the thread of one device, marks every job it runs with a synchronous range of the `uniserve.worker` domain named for the job's kind: `uniserve.worker.execute`, `resume`, `pass`, `shadow`, `map`, `stamp`, `capture`, `prepare`, `switch`, `commit`, `rollback`, `profile` and `control`; `execute`, `resume` and `shadow` carry the batch ID as a numeric payload. Native ranges use the NVIDIA NVTX SDK directly and issue no CUDA operations. Nsight Systems holds CUPTI's subscription in the processes it traces, so their sessions run no CUPTI collector.
 
 Capture a representative workload with Nsight Systems. `CAPTURE` is an output prefix; run the fixed workload against the server the command starts.
 
 ```bash
-UNISERVE_NVTX=1 nsys profile \
+nsys profile \
   --trace=cuda,nvtx --cuda-trace-all-apis=true \
   --cuda-graph-trace=graph --sample=process-tree \
   --cudabacktrace=sync:0,storage:0 \
   --export=sqlite --output="$CAPTURE" \
-  uniserve serve "$MODEL"
+  uniserve serve "$MODEL" --set profiling_config.nvtx_ranges=true
 
 .venv/bin/python -m uniserve_eval.sanitizer trace "$CAPTURE.sqlite"
 .venv/bin/python -m uniserve_eval.sanitizer trace "$CAPTURE.sqlite" --json

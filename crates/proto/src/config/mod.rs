@@ -1010,6 +1010,12 @@ pub struct ProfilingConfig {
     /// records, so sessions of those are refused. The graphs are captured
     /// at an epoch's start, so a change takes a new epoch.
     pub graph_pc_sampling: bool,
+    /// Whether the engine's NVTX ranges (the `uniserve.worker` domain and
+    /// the scheduler's and control thread's ranges) are emitted from the
+    /// epoch's start, for a profiler that records them, such as Nsight
+    /// Systems; a session's `timeline` collector turns them on while it
+    /// records either way. A change takes a new epoch.
+    pub nvtx_ranges: bool,
 }
 
 impl Default for ProfilingConfig {
@@ -1019,6 +1025,7 @@ impl Default for ProfilingConfig {
             fence_modules: None,
             fence_probes_off: Vec::new(),
             graph_pc_sampling: false,
+            nvtx_ranges: false,
         }
     }
 }
@@ -1450,6 +1457,7 @@ impl EngineConfig {
             fence_modules,
             fence_probes_off: _,
             graph_pc_sampling,
+            nvtx_ranges,
         } = profiling;
         BuildPart {
             executable,
@@ -1471,6 +1479,7 @@ impl EngineConfig {
             video,
             fence_modules,
             graph_pc_sampling: *graph_pc_sampling,
+            nvtx_ranges: *nvtx_ranges,
         }
     }
 
@@ -1510,6 +1519,7 @@ pub struct BuildPart<'a> {
     pub video: &'a VideoConfig,
     pub fence_modules: &'a Option<Vec<String>>,
     pub graph_pc_sampling: bool,
+    pub nvtx_ranges: bool,
 }
 
 impl BuildPart<'_> {

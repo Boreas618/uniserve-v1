@@ -953,6 +953,7 @@ mod tests {
             fence_modules: Some(vec!["*.Transformer".to_owned()]),
             fence_probes_off: Vec::new(),
             graph_pc_sampling: false,
+            nvtx_ranges: false,
         });
         let switched = profiled(proto::config::ProfilingConfig {
             fence_probes: false,

@@ -4,9 +4,9 @@
 //! the kernels they issue, and when the scheduler applies a batch's output and the control thread
 //! writes its events to the daemon. These ranges mark what a thread of the engine does on the
 //! host; the time a module of the model takes on the device is measured by the range markers
-//! ([`super::markers`]). Ranges are cheap and switched: the switch starts from `UNISERVE_NVTX`
-//! (`1`, `true`, `yes` or `on`) and a timeline session changes it while the process serves
-//! ([`set_enabled`]).
+//! ([`super::markers`]). Ranges are cheap and switched: the switch starts as the launch's
+//! `profiling_config.nvtx_ranges` states, set as the start instruments the devices, and a
+//! timeline session changes it while the process serves ([`set_enabled`]).
 //!
 //! NVTX reaches a tool through its injection when the process makes its first NVTX call: the
 //! `uniserve-engine` executable registers the CUPTI the process loads as NVTX's static injection
@@ -19,32 +19,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use nvtx::{Domain, domain::LocalRange};
 
-/// Whether ranges are emitted; set from `UNISERVE_NVTX` at the first range.
-static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
-
-fn switch() -> &'static AtomicBool {
-    ENABLED.get_or_init(|| AtomicBool::new(flag(std::env::var("UNISERVE_NVTX").ok().as_deref())))
-}
-
-/// Whether a switch value turns ranges on.
-pub(crate) fn flag(value: Option<&str>) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
+/// Whether ranges are emitted: off until the start sets the launch's switch.
+static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether ranges are emitted now.
 pub(crate) fn enabled() -> bool {
-    switch().load(Ordering::Acquire)
+    ENABLED.load(Ordering::Acquire)
 }
 
 /// Emits ranges from now on, or stops; returns whether they were emitted.
 pub(crate) fn set_enabled(value: bool) -> bool {
-    switch().swap(value, Ordering::AcqRel)
+    ENABLED.swap(value, Ordering::AcqRel)
 }
 
 /// Marks a synchronous phase on its executing thread: a turn of a worker's job, which prepares a
@@ -67,20 +52,4 @@ pub(crate) fn range(name: &'static CStr, batch: Option<u64>) -> Option<LocalRang
         attributes = attributes.payload(batch);
     }
     Some(domain.local_range(attributes.build()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_switch_reads_its_spellings() {
-        assert!(flag(Some("1")));
-        assert!(flag(Some("true")));
-        assert!(flag(Some("YES")));
-        assert!(flag(Some(" on ")));
-        assert!(!flag(Some("0")));
-        assert!(!flag(Some("off")));
-        assert!(!flag(None));
-    }
 }

@@ -1086,7 +1086,8 @@ fn weight_binding(
 }
 
 /// Installs what the deployment's always-on profiling captures into every graph of the devices
-/// `model_runner` serves: the range markers of the classes `profiling_config.fence_modules` names,
+/// `model_runner` serves, after setting the NVTX ranges' switch as `profiling_config.nvtx_ranges`
+/// states: the range markers of the classes `profiling_config.fence_modules` names,
 /// or of the family's step stack when it names none ([`ModelRunner::step_stack`]), with their
 /// kernels resolved through `build`, the Build Server's client and the devices' targets, as every
 /// operator's are; and PC sampling when `graph_pc_sampling` keeps it on, which CUPTI attributes
@@ -1107,6 +1108,7 @@ fn instrument(
     build: Option<&(Arc<Mutex<build_server::Client>>, Vec<Target>)>,
 ) -> Result<()> {
     let profiling = &launch.engine_config.profiling;
+    crate::profiling::ranges::set_enabled(profiling.nvtx_ranges);
     let devices = model_runner.devices();
     let classes = crate::profiling::markers::classes(profiling, model_runner.step_stack());
     if !classes.is_empty() {
