@@ -251,8 +251,6 @@ pub const DEFAULT_MAX_BATCH: usize = 128;
 pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 /// Default maximum number of concurrently running requests.
 pub const DEFAULT_MAX_RUNNING_REQUESTS: usize = 128;
-/// Default token threshold above which a prefill is chunked.
-pub const DEFAULT_CHUNKED_PREFILL_SIZE: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
 /// The order a scheduling policy's waiting queue admits by, which `scheduler_config.order` states.
 pub use scheduling::QueueOrder;
 
@@ -278,8 +276,9 @@ pub struct SchedulerConfig {
     /// Waiting requests, and finished ones with undelivered events, before
     /// a submission is refused as overloaded; unbounded when unset.
     pub max_queued_requests: Option<NonZeroUsize>,
-    /// Prompt tokens one request prefills in one step, 8192 when unset;
-    /// token models only.
+    /// Prompt tokens one request prefills in one step, the scheduling policy's
+    /// `chunked_prefill_size` argument; unset, the policy package's manifest declares it
+    /// (`[parameters]`), which is its one source. Token models only.
     pub chunked_prefill_size: Option<NonZeroUsize>,
     /// Calls assembled into one forward batch; once resolved, the largest bucket of the ranks'
     /// catalog, which is what the workers accept.
@@ -412,9 +411,9 @@ impl SchedulerConfig {
     /// `max_batch` calls and `max_num_batched_tokens` tokens, `graph_tiers` being the catalog's
     /// sizes in tokens, ascending (§4.4, §4.5).
     ///
-    /// The rest is the configuration's: its running requests, its waiting queue and its prefill
-    /// chunk, the drafter's tokens, the KV cache's copy timeouts and the workers' report
-    /// period.
+    /// The rest is the configuration's: its running requests, its waiting queue and the prefill
+    /// chunk it states (the policy package's own when it states none), the drafter's tokens, the
+    /// KV cache's copy timeouts and the workers' report period.
     pub fn of(
         engine: &EngineConfig,
         max_batch: usize,
@@ -425,12 +424,7 @@ impl SchedulerConfig {
             policy: engine.scheduler.policy.clone(),
             order: engine.scheduler.order,
             max_queued_requests: engine.scheduler.max_queued_requests,
-            chunked_prefill_size: Some(
-                engine
-                    .scheduler
-                    .chunked_prefill_size
-                    .unwrap_or(positive(DEFAULT_CHUNKED_PREFILL_SIZE)),
-            ),
+            chunked_prefill_size: engine.scheduler.chunked_prefill_size,
             max_batch: positive(max_batch),
             max_num_batched_tokens,
             max_running_requests: engine.max_running_requests.get(),
@@ -449,12 +443,6 @@ impl SchedulerConfig {
     pub fn copy_timeout(&self, tokens: u32) -> Duration {
         let share = self.prefetch_timeout_per_ki_token.saturating_mul(tokens) / 1024;
         self.prefetch_timeout_base.saturating_add(share)
-    }
-
-    /// The prefill chunk, as resolved: the configured one, or the default.
-    pub fn prefill_chunk(&self) -> usize {
-        self.chunked_prefill_size
-            .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, NonZeroUsize::get)
     }
 }
 

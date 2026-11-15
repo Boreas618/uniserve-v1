@@ -280,9 +280,13 @@ impl Arrival {
     ///
     /// # Panics
     ///
-    /// When the snapshot and the events before stated no such page: the mechanism names only
-    /// pages it stated, so this policy's view no longer follows the mechanism's, and the trap
-    /// has the mechanism instantiate the policy again from a snapshot.
+    /// When the snapshot and the events before stated no such page. The interface states a page
+    /// to the policy before any `Hit`, `Released` or `Held` names it (`scheduling::Event`): the
+    /// mechanism names in those events only rows that were in its cache before the change, and a
+    /// row that enters it is a `Cached`. A page outside that contract is a defect of the
+    /// mechanism or of this policy, so the policy fails (a trap, which the mechanism handles as
+    /// it handles every fault of a policy) instead of inventing a view the mechanism never
+    /// stated.
     fn used(&mut self, page: PageId, event: &str) -> &mut PageView {
         self.pages
             .touch(page)
