@@ -782,8 +782,6 @@ fn a_text_only_deployment_refuses_an_image_part() {
 /// digest that keys its encodings within the request's cache partition.
 #[test]
 fn an_image_part_becomes_a_vision_block_in_place_of_its_placeholder() {
-    use base64::Engine as _;
-
     let (_directory, tokenizer, loaded) = resolved_model("qwen3");
     let renderer = HfChatRenderer::new(
         Some(CHAT_TEMPLATE.to_string()),
@@ -845,12 +843,7 @@ fn an_image_part_becomes_a_vision_block_in_place_of_its_placeholder() {
     };
     assert_eq!(encoder.encoder, proto::request::ImageEncoder::Vision);
     assert_eq!(encoder.num_cache_tokens, Some(2));
-    assert_eq!(
-        base64::engine::general_purpose::STANDARD
-            .decode(&image.b64)
-            .unwrap(),
-        png(64, 32).bytes().to_vec()
-    );
+    assert_eq!(image.encoded, png(64, 32).bytes().to_vec());
     // Requests of another cache partition share no encoding of the image.
     assert_ne!(
         lower(Some("tenant")).multimodal_inputs.images[0].digest,

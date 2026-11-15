@@ -790,8 +790,6 @@ impl Processor {
         images: &[crate::api::input::ImageInput],
         isolation: Option<u64>,
     ) -> std::result::Result<Vec<proto::request::ImageInput>, TokenizeError> {
-        use base64::Engine as _;
-
         let Some(processor) = self.images.as_ref() else {
             return Ok(Vec::new());
         };
@@ -837,7 +835,7 @@ impl Processor {
             }
             inputs.push(proto::request::ImageInput {
                 digest: digest.finish(),
-                b64: base64::engine::general_purpose::STANDARD.encode(image.bytes()),
+                encoded: image.bytes().to_vec(),
                 position: kept.len() as u32,
                 num_positions: block.positions,
                 encoders: vec![proto::request::ImageEncoderInput {

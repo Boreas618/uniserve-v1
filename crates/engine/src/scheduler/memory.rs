@@ -3979,7 +3979,7 @@ mod tests {
         let id = session.request(1, vec![1, 2, 3]);
         let image = proto::request::ImageInput {
             digest: [9; 32],
-            b64: String::new(),
+            encoded: Vec::new(),
             position: 1,
             num_positions: 1,
             encoders: vec![proto::request::ImageEncoderInput {

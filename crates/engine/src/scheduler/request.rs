@@ -1013,7 +1013,7 @@ mod tests {
     fn image(position: u32, kind: ImageEncoder, rows: u32) -> ImageInput {
         ImageInput {
             digest: [position as u8; 32],
-            b64: "aW1hZ2U=".to_owned(),
+            encoded: b"image".to_vec(),
             position,
             num_positions: 1,
             encoders: vec![ImageEncoderInput {

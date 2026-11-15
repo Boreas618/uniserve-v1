@@ -305,6 +305,31 @@ pub struct MediaOutput {
     pub bytes: u64,
 }
 
+/// The serde form of a media row's image: the encoded file as one byte string, which the peer
+/// link's MessagePack carries as binary rather than as a sequence of integers.
+mod image_bytes {
+    use std::sync::Arc;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        image: &Option<Arc<[u8]>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match image {
+            Some(bytes) => serializer.serialize_some(serde_bytes::Bytes::new(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Arc<[u8]>>, D::Error> {
+        let image: Option<serde_bytes::ByteBuf> = Deserialize::deserialize(deserializer)?;
+        Ok(image.map(|bytes| Arc::from(bytes.into_vec())))
+    }
+}
+
 /// The host columns of one token batch, in the layout the phase's kernels read.
 ///
 /// The scheduler writes these from the request state it owns; the runner stages them into its
@@ -894,9 +919,10 @@ pub struct MediaRow {
     /// in an odd one, each decoding its own, and the encode of a round, which each process runs
     /// over the units its ranks decoded ([`Variant::dealt`]).
     pub rank: Option<u32>,
-    /// A chat image's encoded bytes, base64, for the vision or latent encoding of a token
-    /// request's image; `None` for every other row.
-    pub image: Option<Arc<str>>,
+    /// A chat image's encoded file, for the vision or latent encoding of a token request's
+    /// image; `None` for every other row.
+    #[serde(with = "image_bytes")]
+    pub image: Option<Arc<[u8]>>,
     /// The declared results the call reads, then those it writes, as positions in the request's
     /// product table, which holds one block per declared result in the order the scheduler asked
     /// for them at admission. A video decode round after the first reads the splice tail its

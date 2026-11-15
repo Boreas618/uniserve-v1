@@ -37,8 +37,9 @@ pub struct ImageInput {
     /// encoder pools, by this digest, the encoder and, for an encoder that
     /// samples, the request's draw.
     pub digest: [u8; 32],
-    /// Base64-encoded input image.
-    pub b64: String,
+    /// The encoded image file, its bytes as the request fetched them.
+    #[serde(with = "serde_bytes")]
+    pub encoded: Vec<u8>,
     /// Exclusive prompt-token position at the end of this image's marker gap.
     /// Equal positions preserve input order, including multiple images at one marker.
     pub position: u32,
@@ -536,7 +537,7 @@ impl GenerationRequest {
         let context_tokens = self.prompt_token_ids.len();
         let mut previous_position = 0;
         for image in &self.multimodal_inputs.images {
-            if image.b64.is_empty() {
+            if image.encoded.is_empty() {
                 return Err(GenerationRequestError::EmptyImagePayload);
             }
             validate_image_encoders(&image.encoders, image.num_positions)?;
@@ -691,7 +692,7 @@ mod tests {
             multimodal_inputs: MultimodalInputs {
                 images: vec![ImageInput {
                     digest: [17; 32],
-                    b64: "aW1hZ2U=".into(),
+                    encoded: b"image".to_vec(),
                     position: 2,
                     num_positions: 1,
                     encoders: vec![
@@ -773,7 +774,7 @@ mod tests {
         request.prompt_token_ids = vec![1; 35];
         request.multimodal_inputs.images = vec![ImageInput {
             digest: [17; 32],
-            b64: "aW1hZ2U=".into(),
+            encoded: b"image".to_vec(),
             position: 35,
             num_positions: 1,
             encoders: vec![

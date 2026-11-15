@@ -149,7 +149,7 @@ fn every_image_a_prefill_reaches_is_encoded_before_it() {
     harness.settle(100);
 
     let encodes = harness.batches_of_phase(id, Phase::VisionEncode);
-    let images: Vec<Option<std::sync::Arc<str>>> = encodes
+    let images: Vec<Option<std::sync::Arc<[u8]>>> = encodes
         .iter()
         .flat_map(|batch| batch.media.iter().map(|row| row.image.clone()))
         .collect();

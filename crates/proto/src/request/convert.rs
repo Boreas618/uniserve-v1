@@ -172,7 +172,7 @@ impl From<&ImageInput> for wire::ImageInput {
     fn from(image: &ImageInput) -> Self {
         Self {
             digest: image.digest.to_vec(),
-            b64: image.b64.clone(),
+            encoded: image.encoded.clone(),
             position: image.position,
             num_positions: image.num_positions,
             encoders: image.encoders.iter().map(Into::into).collect(),
@@ -186,7 +186,7 @@ impl TryFrom<wire::ImageInput> for ImageInput {
     fn try_from(image: wire::ImageInput) -> Result<Self, WireError> {
         Ok(Self {
             digest: digest(&image.digest, "an input image's digest")?,
-            b64: image.b64,
+            encoded: image.encoded,
             position: image.position,
             num_positions: image.num_positions,
             encoders: image

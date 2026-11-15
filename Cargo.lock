@@ -1229,7 +1229,6 @@ name = "engine"
 version = "2.0.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "build-server",
  "bytemuck",
  "clap",
@@ -1252,6 +1251,7 @@ dependencies = [
  "rustix",
  "scheduling",
  "serde",
+ "serde_bytes",
  "serde_json",
  "service",
  "storage",

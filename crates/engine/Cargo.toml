@@ -22,7 +22,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-base64.workspace = true
 # Byte views of plain numeric slices handed to device copies.
 bytemuck.workspace = true
 clap.workspace = true
@@ -61,6 +60,7 @@ rustix = { workspace = true, features = ["fs", "pipe", "system"] }
 # computes.
 scheduling.workspace = true
 serde = { workspace = true, features = ["rc"] }
+serde_bytes.workspace = true
 serde_json.workspace = true
 storage.workspace = true
 thiserror.workspace = true

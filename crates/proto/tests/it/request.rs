@@ -19,7 +19,7 @@ fn generation() -> GenerationRequest {
         multimodal_inputs: MultimodalInputs {
             images: vec![ImageInput {
                 digest: [0xfe; 32],
-                b64: "aW1hZ2U=".to_owned(),
+                encoded: b"image".to_vec(),
                 position: 2,
                 num_positions: 6,
                 encoders: vec![

@@ -551,8 +551,9 @@ message ImageInput {
   // (its bytes, a request-dependent preprocessing parameter, its cache
   // partition), which keys their outputs.
   bytes digest = 6;
-  // The encoded image, base64.
-  string b64 = 2;
+  // The encoded image file (its JPEG, PNG or other bytes as the request
+  // fetched them).
+  bytes encoded = 2;
   uint32 position = 3;
   uint32 num_positions = 4;
   repeated ImageEncoderInput encoders = 5;

@@ -1541,7 +1541,7 @@ pub(crate) fn chat_image(
     digest[..8].copy_from_slice(&id.to_le_bytes());
     request.multimodal_inputs.images = vec![ImageInput {
         digest,
-        b64: "aW1hZ2U=".to_owned(),
+        encoded: b"image".to_vec(),
         position: prompt_tokens / 2,
         num_positions: image_tokens,
         encoders: vec![ImageEncoderInput {

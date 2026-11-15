@@ -93,7 +93,7 @@ pub(crate) struct VisionRunner {
 
 /// One image of a batch, read far enough to know its block: its encoded bytes, its displayed
 /// `(width, height)`, its patch grid and the address of the encoder output it is written to.
-type Sized = (Vec<u8>, (u32, u32), [u32; 3], u64);
+type Sized = (Arc<[u8]>, (u32, u32), [u32; 3], u64);
 
 impl VisionRunner {
     /// The bytes of the input tensors of a runner of `model` that encodes images of at most
@@ -276,8 +276,6 @@ impl VisionRunner {
         row: &MediaRow,
         tables: &BlockTables,
     ) -> Result<std::result::Result<Sized, String>> {
-        use base64::Engine as _;
-
         let (Some(image), [position], 0) = (&row.image, row.results.as_slice(), row.reads) else {
             return Err(Error::Invalid(format!(
                 "request {} is encoded by the vision runner with no image, or with results other \
@@ -287,9 +285,7 @@ impl VisionRunner {
         };
 
         let read = || -> std::result::Result<_, String> {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(image.as_bytes())
-                .map_err(|error| format!("an input image's base64: {error}"))?;
+            let bytes = Arc::clone(image);
 
             // The displayed size, orientation applied, as the reader decodes the pixels and
             // the frontend sized the image's block.
@@ -626,7 +622,6 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use crate::batch::{MediaRow, Variant};
-    use base64::Engine as _;
     use nn::capability::{CausalLm, PatchFormat, PixelNorm, Vision};
     use nn::family::{CacheShape, ExpertShape, StateShape, TextModel};
     use nn::{Drafter, ExpertExchange, KvCache, RecurrentState, TokenBatch};
@@ -849,11 +844,7 @@ pub(crate) mod tests {
             rounds: 0,
             unit: 0,
             rank: None,
-            image: Some(
-                base64::engine::general_purpose::STANDARD
-                    .encode(image)
-                    .into(),
-            ),
+            image: Some(Arc::from(image)),
             results: vec![2],
             reads: 0,
         }

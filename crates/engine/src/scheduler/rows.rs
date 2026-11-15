@@ -812,7 +812,7 @@ fn image_row(
         rounds: 0,
         unit: 0,
         rank: None,
-        image: Some(Arc::from(image.b64.as_str())),
+        image: Some(Arc::from(image.encoded.as_slice())),
         results: vec![output],
         reads: 0,
     })
@@ -1081,7 +1081,7 @@ mod tests {
     fn image(position: u32, encoder: ImageEncoder, rows: u32) -> ImageInput {
         ImageInput {
             digest: [0; 32],
-            b64: "aW1hZ2U=".to_owned(),
+            encoded: b"image".to_vec(),
             position,
             num_positions: 2,
             encoders: vec![ImageEncoderInput {
@@ -2007,7 +2007,7 @@ mod tests {
         assert!(!scheduler.push_media_row(&mut batch, RequestId(1), Phase::LatentEncode));
         assert!(scheduler.push_media_row(&mut batch, RequestId(1), Phase::VisionEncode));
         let row = &batch.media[0];
-        assert_eq!(row.image.as_deref(), Some("aW1hZ2U="));
+        assert_eq!(row.image.as_deref(), Some(&b"image"[..]));
         assert_eq!((row.slot, row.results.clone(), row.reads), (1, vec![0], 0));
         scheduler.seal(&mut batch).unwrap();
         assert_eq!(batch.shape.variant, Variant::ConditionEncode);
