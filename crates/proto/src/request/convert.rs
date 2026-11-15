@@ -334,7 +334,8 @@ impl From<&DiffusionRequest> for wire::DiffusionRequest {
                 height: sampling.height,
                 condition_rows: sampling.condition_rows,
             }),
-            trajectory: request.trajectory.id,
+            // Zero states no identity on the wire.
+            trajectory: request.trajectory.id.map_or(0, std::num::NonZeroU64::get),
             denoised_steps: request.trajectory.denoised_steps,
             state_seed: request.trajectory.state_seed,
             stored_layout: request.trajectory.stored_layout.clone(),
@@ -396,7 +397,7 @@ impl TryFrom<wire::DiffusionRequest> for DiffusionRequest {
                 condition_rows: sampling.condition_rows,
             },
             trajectory: Trajectory {
-                id: request.trajectory,
+                id: std::num::NonZeroU64::new(request.trajectory),
                 denoised_steps: request.denoised_steps,
                 state_seed: request.state_seed,
                 stored_layout: request.stored_layout,

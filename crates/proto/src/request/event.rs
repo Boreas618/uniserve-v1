@@ -311,8 +311,8 @@ pub struct EncoderInputs {
 pub struct Trajectory {
     /// The identity that keys the stored trajectory: the daemon gives a
     /// request one when it first submits it and keeps it across its
-    /// migrations; zero for a request no engine stores a trajectory of.
-    pub id: u64,
+    /// migrations; `None` for a request no engine stores a trajectory of.
+    pub id: Option<std::num::NonZeroU64>,
     /// The denoising steps of the trajectory an engine stored when it
     /// preempted the request; zero for a request that starts from noise.
     pub denoised_steps: u32,

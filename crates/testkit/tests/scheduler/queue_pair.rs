@@ -853,7 +853,7 @@ fn a_refused_key_of_a_restore_starts_the_video_from_noise() {
     let mut harness = Deployment::video(&[&VIDEO_PHASES]).build();
     let mut resumed = video(1, 1);
     resumed.trajectory = Trajectory {
-        id: 7,
+        id: std::num::NonZeroU64::new(7),
         denoised_steps: 2,
         ..Trajectory::default()
     };
@@ -1178,7 +1178,7 @@ fn a_full_to_a_save_ends_the_video_with_no_stored_step() {
     // The latent pool holds one unit of 4096 bytes; a trajectory takes 30 000.
     let mut harness = Deployment::video(&[&VIDEO_PHASES]).latents(1).build();
     let mut request = video(1, 1);
-    request.trajectory.id = 7;
+    request.trajectory.id = std::num::NonZeroU64::new(7);
     let id = harness.submit_video(request);
     let denoised = |harness: &Harness| {
         harness.events(id).into_iter().any(|event| {

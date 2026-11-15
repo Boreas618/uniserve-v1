@@ -321,18 +321,20 @@ impl Request {
             .and_then(|group| self.slot_on(group))
             .is_some();
         drained
-            && video.trajectory.id != 0
+            && video.trajectory.id.is_some()
             && self.completed[Phase::Denoise.index()] > 0
             && attached
     }
 
     /// The key a video request's trajectory at its completed step is stored under,
     /// `latent_content(seed, trajectory, steps)`, with `seed` the latent seed of what the serving
-    /// epoch's denoising computes (SD §4.3; `S/trajectories.rs:487`). `None` for a token request.
+    /// epoch's denoising computes (SD §4.3; `S/trajectories.rs:487`). `None` for a token request
+    /// and for a request that names no trajectory.
     pub(super) fn trajectory_key(&self, seed: u64) -> Option<Key> {
         let video = self.video()?;
         let steps = self.completed[Phase::Denoise.index()];
-        Some(Key(latent_content(seed, video.trajectory.id, steps)))
+        let trajectory = video.trajectory.id?;
+        Some(Key(latent_content(seed, trajectory.get(), steps)))
     }
 
     /// The key a resumed video request's admission restores its trajectory from: when it names
@@ -347,7 +349,7 @@ impl Request {
             return None;
         }
         let seed = trajectory.state_seed.unwrap_or(seed);
-        Some(Key(latent_content(seed, trajectory.id, steps)))
+        Some(Key(latent_content(seed, trajectory.id?.get(), steps)))
     }
 
     /// Whether a video request runs to its end instead of being preempted: every denoising step
@@ -1974,7 +1976,7 @@ mod tests {
     fn a_drained_request_stores_its_step_and_resumes_from_it() {
         let groups = groups(&[(A, &phases()[..])]);
         let mut input = video(1, 40, Vec::new());
-        input.trajectory.id = 77;
+        input.trajectory.id = std::num::NonZeroU64::new(77);
         let drained = |completed: u32, cause: MigrationCause, placement: &[(Phase, GroupId)]| {
             let mut request = request(input.clone(), placement);
             request.completed[Phase::Denoise.index()] = completed;
@@ -1997,7 +1999,7 @@ mod tests {
         assert!(!drained(2, MigrationCause::Drain, &[]).stores_trajectory());
         let mut anonymous = drained(2, MigrationCause::Drain, &on(A));
         if let proto::request::Request::Diffusion(video) = &mut anonymous.input {
-            video.trajectory.id = 0;
+            video.trajectory.id = None;
         }
         assert!(!anonymous.stores_trajectory());
 

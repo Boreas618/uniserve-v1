@@ -84,8 +84,9 @@ impl Migrator {
         let resumable = match &mut request {
             Request::Generation(generation) => Some(Resumable::Generation(generation.clone())),
             Request::Diffusion(diffusion) => {
-                if diffusion.trajectory.id == 0 {
-                    diffusion.trajectory.id = uuid::Uuid::new_v4().as_u64_pair().0;
+                if diffusion.trajectory.id.is_none() {
+                    diffusion.trajectory.id =
+                        std::num::NonZeroU64::new(uuid::Uuid::new_v4().as_u64_pair().0);
                 }
                 Some(Resumable::Diffusion(diffusion.clone()))
             }
@@ -914,7 +915,7 @@ mod tests {
                 condition_rows: 0,
             },
             trajectory: Trajectory {
-                id: 7,
+                id: std::num::NonZeroU64::new(7),
                 ..Trajectory::default()
             },
             encoder_inputs: None,
@@ -934,7 +935,7 @@ mod tests {
         assert_eq!(
             stored,
             Trajectory {
-                id: 7,
+                id: std::num::NonZeroU64::new(7),
                 denoised_steps: 3,
                 state_seed: None,
                 stored_layout: b"pages".to_vec(),
@@ -952,7 +953,7 @@ mod tests {
 
         let named = Resumable::Diffusion(DiffusionRequest {
             trajectory: Trajectory {
-                id: 7,
+                id: std::num::NonZeroU64::new(7),
                 denoised_steps: 3,
                 state_seed: Some(11),
                 stored_layout: b"pages".to_vec(),
@@ -963,7 +964,7 @@ mod tests {
         assert_eq!(
             trajectory(named.continuation(&migration(MigrationCause::Loss, 0, &[]), None)),
             Trajectory {
-                id: 7,
+                id: std::num::NonZeroU64::new(7),
                 denoised_steps: 3,
                 state_seed: Some(11),
                 stored_layout: b"pages".to_vec(),

@@ -37,7 +37,7 @@ const TRAJECTORY_UNITS: u32 = 30_000_u32.div_ceil(4096);
 /// Video request `id` of one media unit with the cases' trajectory identity.
 fn identified(id: u64) -> DiffusionRequest {
     let mut request = video(id, 1);
-    request.trajectory.id = TRAJECTORY;
+    request.trajectory.id = std::num::NonZeroU64::new(TRAJECTORY);
     request
 }
 
@@ -45,7 +45,7 @@ fn identified(id: u64) -> DiffusionRequest {
 fn resumed(request: &DiffusionRequest, steps: u32, state_seed: Option<u64>) -> DiffusionRequest {
     DiffusionRequest {
         trajectory: Trajectory {
-            id: TRAJECTORY,
+            id: std::num::NonZeroU64::new(TRAJECTORY),
             denoised_steps: steps,
             state_seed,
             stored_layout: Vec::new(),

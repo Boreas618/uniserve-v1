@@ -114,7 +114,7 @@ fn requests_come_back_from_their_messages_unchanged() {
             // stored, the latent seed it continues with and where the pages
             // lie.
             trajectory: Trajectory {
-                id: 11,
+                id: std::num::NonZeroU64::new(11),
                 denoised_steps: 4,
                 state_seed: Some(13),
                 stored_layout: b"{\"version\":1}".to_vec(),

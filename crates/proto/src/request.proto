@@ -1016,7 +1016,8 @@ message DiffusionRequest {
   bytes conditioning = 3;
   repeated ConditionExtent conditions = 4;
   DiffusionSamplingParams sampling = 5;
-  // The request's trajectory identity, preserved across engine migrations.
+  // The request's trajectory identity, preserved across engine migrations;
+  // zero for a request no engine stores a trajectory of.
   uint64 trajectory = 6;
   // The stored denoising step; zero starts the trajectory from noise.
   uint32 denoised_steps = 7;
