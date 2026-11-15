@@ -103,8 +103,9 @@ use crate::worker::{Error, Result};
 /// The bytes of the length an encoded unit's row starts with ([`media::frame_unit`]).
 const LENGTH: u64 = size_of::<u64>() as u64;
 
-/// The bytes of one stereo sample of a decoded track: two `i16`.
-const STEREO: u64 = 2 * size_of::<i16>() as u64;
+/// The bytes of one sample of a decoded track: an `i16` of each channel of the PCM a track
+/// encode takes.
+const PCM_SAMPLE: u64 = media::codec::PCM_CHANNELS as u64 * size_of::<i16>() as u64;
 
 /// The bytes of one element of a condition's pixels and samples: FP32.
 const FLOAT: u64 = size_of::<f32>() as u64;
@@ -516,7 +517,7 @@ impl MediaHost {
                 // The video's duration of the track, which the decoder's window covers; a block
                 // that holds less is read whole, and the track padded with silence.
                 let run = self.read(tables, row.slot, AUDIO_SAMPLES, *samples_at)?;
-                let duration = self.track_samples(row)? as u64 * STEREO;
+                let duration = self.track_samples(row)? as u64 * PCM_SAMPLE;
                 let read = self.span(run, 0, duration.min(u64::from(run.2) * UNIT_BYTES))?;
                 Ok((vec![read], Vec::new()))
             }
@@ -1655,7 +1656,7 @@ mod tests {
         [
             frames(&UNITS) * frame,
             MediaHost::encoded_bytes(&UNITS, SIDE, SIDE),
-            samples * STEREO,
+            samples * PCM_SAMPLE,
         ]
         .map(|bytes| u32::try_from(bytes.div_ceil(UNIT_BYTES)).unwrap())
     }

@@ -117,9 +117,6 @@ use crate::worker::{Error, Result};
 /// The channels of a decoded raster and of its packed bytes: red, green and blue.
 const CHANNELS: u64 = rgb::CHANNELS as u64;
 
-/// The channels of the interleaved PCM.
-const PCM_CHANNELS: u32 = 2;
-
 /// The element type a tail travels as between the decoder ranks: bytes, so its element count is
 /// its bytes whatever the decoder's element type.
 const TAIL_ELEMENT: DataType = DataType::Uint8;
@@ -268,10 +265,10 @@ impl DecoderRunner {
     /// [`Error::Invalid`] for no bucket, a bucket that is neither a clip nor a track, a clip's
     /// that states a request (a splice's, [`Runner::eager_buckets`]), a video
     /// decoder serving no timeline or with a round that deals no unit to its memory's rank, a
-    /// splicer of another element type, a track that is not stereo, a stream without a device or
-    /// the reverse; a communicator a runner on a device whose rounds pass tails between ranks
-    /// lacks, or one another runner holds or whose members are not the round's ranks with this
-    /// rank at its place; what the model or the splicer refuses: a canvas the model lays out no
+    /// splicer of another element type, a track of other channels than a track encode takes, a
+    /// stream without a device or the reverse; a communicator a runner on a device whose rounds
+    /// pass tails between ranks lacks, or one another runner holds or whose members are not the
+    /// round's ranks with this rank at its place; what the model or the splicer refuses: a canvas the model lays out no
     /// clip of, a timeline the splicer has no splices of; the driver's refusal of the buffers.
     pub(crate) fn new(
         model: Arc<dyn Decoder + Send + Sync>,
@@ -389,9 +386,14 @@ impl DecoderRunner {
                     let track = layout.audio.ok_or_else(|| {
                         Error::Invalid(format!("bucket {bucket} states no audio track to decode"))
                     })?;
-                    if model.pcm_window(&track)?.1 != PCM_CHANNELS {
+                    // The interleaved PCM is what the track encode takes, whose channels the
+                    // media crate states: a waveform of other channels has no encode.
+                    let channels = model.pcm_window(&track)?.1;
+                    if channels != media::codec::PCM_CHANNELS {
                         return Err(Error::Invalid(format!(
-                            "bucket {bucket}'s track is not the stereo track PCM interleaves"
+                            "bucket {bucket}'s track has {channels} channels, and a track encode \
+                             takes {}",
+                            media::codec::PCM_CHANNELS
                         )));
                     }
                     latents = latents.max(elements(&track) * latent);
@@ -1010,7 +1012,7 @@ impl DecoderRunner {
         let waveform = ops::empty((channels as usize, samples as usize), DType::F32)?;
         self.model.decode(layout, &latents, None, Some(&waveform))?;
 
-        let pcm = ops::empty((samples as usize, PCM_CHANNELS as usize), DType::I16)?;
+        let pcm = ops::empty((samples as usize, channels as usize), DType::I16)?;
         ops::launch::<PcmInterleave>(
             &pcm::Descriptor {
                 dtype: DType::F32,

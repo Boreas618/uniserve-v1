@@ -54,6 +54,10 @@ pub const AUDIO_ENCODER: Encoder = Encoder {
 /// Samples of one planar AAC frame.
 pub const AUDIO_FRAME_SAMPLES: usize = 1024;
 
+/// The channels of the interleaved int16 PCM a track encode takes ([`encode_audio_track`]):
+/// stereo, which [`AUDIO_ENCODER`] codes as two planes.
+pub const PCM_CHANNELS: u32 = 2;
+
 /// A borrowed sequence of RGB24 frames, `[frames, height, width, 3]` uint8,
 /// frame-major and contiguous.
 #[derive(Clone, Copy, Debug)]
@@ -136,7 +140,7 @@ pub fn encode_video_unit(frames: Rgb24Frames<'_>, frame_rate: u32) -> crate::Res
     )
 }
 
-/// Encodes interleaved int16 stereo PCM as a self-contained MP4 of
+/// Encodes interleaved int16 PCM of [`PCM_CHANNELS`] channels as a self-contained MP4 of
 /// [`AUDIO_ENCODER`].
 ///
 /// The track is truncated or zero-padded to `samples` (the video's duration at
@@ -145,11 +149,12 @@ pub fn encode_video_unit(frames: Rgb24Frames<'_>, frame_rate: u32) -> crate::Res
 ///
 /// # Errors
 ///
-/// [`crate::Error::Invalid`] when `pcm` is not a whole number of stereo pairs,
+/// [`crate::Error::Invalid`] when `pcm` is not a whole number of samples of every channel,
 /// `samples` or `rate` are not positive; [`crate::Error::Codec`] when the
 /// encoder or muxer fails.
 pub fn encode_audio_track(pcm: &[i16], samples: usize, rate: u32) -> crate::Result<Vec<u8>> {
-    if !pcm.len().is_multiple_of(2) {
+    let channels = PCM_CHANNELS as usize;
+    if !pcm.len().is_multiple_of(channels) {
         return Err(crate::Error::invalid(
             "audio capture has invalid stereo dimensions",
         ));
@@ -161,13 +166,18 @@ pub fn encode_audio_track(pcm: &[i16], samples: usize, rate: u32) -> crate::Resu
     }
     // The soundtrack is the video's duration: samples past the captured track
     // are silence, and captured samples past that duration are dropped.
-    let available = pcm.len() / 2;
+    let available = pcm.len() / channels;
     if available >= samples {
-        crate::ffi::encode_audio_track(&AUDIO_ENCODER, &pcm[..samples * 2], samples as u32, rate)
+        crate::ffi::encode_audio_track(
+            &AUDIO_ENCODER,
+            &pcm[..samples * channels],
+            samples as u32,
+            rate,
+        )
     } else {
-        let mut padded = Vec::with_capacity(samples * 2);
+        let mut padded = Vec::with_capacity(samples * channels);
         padded.extend_from_slice(pcm);
-        padded.resize(samples * 2, 0);
+        padded.resize(samples * channels, 0);
         crate::ffi::encode_audio_track(&AUDIO_ENCODER, &padded, samples as u32, rate)
     }
 }
