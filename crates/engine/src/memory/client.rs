@@ -563,9 +563,17 @@ impl StorageClient {
     /// The segments each device region of `layout` states were created by the engine's ranks
     /// before this call, on every rank that maps the region (BP §14.2). A region an earlier
     /// session named keeps the numbering the buffer pool holds for it (`Opened::limits`), which
-    /// may differ from the one `layout` states when the epochs measured their devices apart: the
-    /// kept layout states each region with the numbering the answer states, which the ranks lay
-    /// their memory out by and the schedulers grow their regions to.
+    /// may differ from the one `layout` states when the epochs measured their devices apart or
+    /// state another capacity: the kept layout states each region with the numbering the answer
+    /// states, which the ranks lay their memory out by.
+    ///
+    /// The kept layout's units are those each region serves, which its schedulers resize it to
+    /// (`crate::process::epoch::grow_regions`). A device region that asks for no unit at `Open`,
+    /// the memory of the KV planes and the state units its ranks create once the session is
+    /// open, serves its capacity: the units past its reserved ones of the numbering `layout`
+    /// states, the epoch's own (`kv_cache_config.max_tokens`, or what its share holds), within
+    /// the numbering the buffer pool holds. An epoch of the same layout that shares the region
+    /// with an epoch of another capacity therefore resizes it to its own.
     ///
     /// # Errors
     ///
@@ -597,6 +605,11 @@ impl StorageClient {
             );
         }
         for (region, &limit) in layout.regions.iter_mut().zip(&opened.limits) {
+            // The stated numbering is the epoch's capacity, and the answer's may be another
+            // epoch's: the region serves the smaller, past its reserved units.
+            if region.tier == Tier::Device && region.units == 0 {
+                region.units = region.limit.min(limit).saturating_sub(region.reserved);
+            }
             region.limit = limit;
         }
 
@@ -636,12 +649,12 @@ impl StorageClient {
         Ok(())
     }
 
-    /// The layout the session was opened with, each region numbered as the buffer pool holds it,
-    /// and the buffer pool's answer to it; `None` before the session is open and on a rank's
-    /// connection. The answer's segment table of each region
-    /// is the one the Storage Server holds for the region's memory space: as `Open` answered it,
-    /// with the segments this head granted since ([`Self::grant`]) and without those it withdrew
-    /// ([`Self::withdraw`]).
+    /// The layout the session was opened with, each region numbered as the buffer pool holds it
+    /// and stating the units it serves ([`Self::open`], [`Self::keep_units`]), and the buffer
+    /// pool's answer to it; `None` before the session is open and on a rank's connection. The
+    /// answer's segment table of each region is the one the Storage Server holds for the region's
+    /// memory space: as `Open` answered it, with the segments this head granted since
+    /// ([`Self::grant`]) and without those it withdrew ([`Self::withdraw`]).
     pub(crate) fn session(&self) -> Option<(&Open, &Opened)> {
         self.session
             .as_ref()

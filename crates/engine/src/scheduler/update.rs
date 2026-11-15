@@ -1383,8 +1383,9 @@ impl Scheduler {
     }
 
     /// A region's units after a `Resize` (SD §3.8): the reply owed to a `Message::Resize` for the
-    /// region, which states them, or, for the shrink of a drain, `Output::Shrunk`, which the
-    /// engine divides among the target epoch's schedulers.
+    /// region, which states them; nothing for the scheduler's own shrink toward the region's
+    /// bound (`resize.rs`); or, for the shrink of a drain, `Output::Shrunk`, which the engine
+    /// divides among the target epoch's schedulers.
     fn resized(&mut self, region: u8, units: u32) {
         if let Some(index) = self.region_index(region)
             && let Some(capacity) = self.capacity.get_mut(index)
@@ -1395,7 +1396,9 @@ impl Scheduler {
             Some(at) => {
                 let (_, reply) = self.resizing.remove(at);
                 // A requester that stopped waiting needs no reply.
-                let _ = reply.send(units);
+                if let Some(reply) = reply {
+                    let _ = reply.send(units);
+                }
             }
             None => self.emit(Output::Shrunk(region, units)),
         }
@@ -2454,7 +2457,7 @@ mod tests {
     fn a_resize_is_answered_at_its_resized() {
         let (mut bench, outputs) = scheduler();
         let (reply, replied) = crossbeam_channel::bounded(1);
-        bench.scheduler.resizing.push((5, reply));
+        bench.scheduler.resizing.push((5, Some(reply)));
         bench.scheduler.submit(runtime::Request::Resize {
             region: 5,
             units: 32,

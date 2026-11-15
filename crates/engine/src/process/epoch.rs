@@ -14,7 +14,11 @@
 //!
 //! The session's layout states which memory each region is: the head's view of it
 //! ([`StorageClient::session`]) is where these jobs read a region's name, its reserved units,
-//! its units, its segment table and the worker groups whose ranks map it. A model that keeps a
+//! the units it serves, its segment table and the worker groups whose ranks map it. A region of
+//! the KV planes serves the epoch's capacity, within the numbering the buffer pool holds for it:
+//! an epoch of the same layout shares the regions of the epoch it succeeds and resizes them to
+//! its own capacity, and a promotion resizes them to the promoted epoch's again, so that a
+//! rollback restores what the target changed. A model that keeps a
 //! recurrent state has a state region beside each KV region, one checkpoint a unit
 //! (`specs/engine-worker-port.md` §1.6): every job names the region whose memory the ranks change,
 //! a growth creates a state region's segments before a KV region's, and a start's give-back once
@@ -178,8 +182,8 @@ pub(crate) fn by_host(
 /// Grows the engine's regions into the memory its GPUs' quotas hold now (`specs/updates.md`
 /// §3.7, `Promote { grow }`, `ResizeCache { Grow }`): the ranks of each region of the KV planes
 /// create as many of the segments they gave back as their quotas and devices have room for, the
-/// head grants them, and every scheduler resizes its device regions to every unit the session
-/// numbers, which each reaches as far as its space's free ranges go. Returns each device
+/// head grants them, and every scheduler resizes its regions to the units the session states of
+/// them ([`grow_regions`]), which each reaches as far as its space's free ranges go. Returns each
 /// region's number with the units it reached.
 ///
 /// # Errors
@@ -360,13 +364,26 @@ fn whole(
 
 /// Opens admission on an engine a drain or its start parked (`docs/architecture.md`, `Promote`):
 /// the graph pools a parked engine gave back are restored at the addresses the graphs hold, what
-/// the ranks' processes hold beside their pools is reserved in their GPUs' quotas once, and
-/// every scheduler admits again. The regions a drain shrank grow by [`grow`].
+/// the ranks' processes hold beside their pools is reserved in their GPUs' quotas once, the
+/// session's head (`head`, none on a peer, whose regions the scheduler node's head states) has
+/// every scheduler resize its regions to the units the session states of them
+/// ([`grow_regions`]), and every scheduler admits again. The regions a drain shrank grow by
+/// [`grow`].
+///
+/// The resize is how a rollback restores the promoted epoch's sizes: a target of the same layout
+/// shares the promoted engine's regions and resized them to its own device cache's capacity and
+/// host pools. A shrink that stops short of the blocks requests still hold goes on in the
+/// scheduler as they come free.
 ///
 /// # Errors
 ///
-/// A device or quota that refuses the graph pools or the reservation; nothing admits then.
-pub(crate) fn promote(schedulers: &[Sender<Message>], binding: &WeightBinding) -> Result<()> {
+/// A device or quota that refuses the graph pools or the reservation, or a scheduler that
+/// stopped; nothing admits then.
+pub(crate) fn promote(
+    schedulers: &[Sender<Message>],
+    head: Option<&Mutex<StorageClient>>,
+    binding: &WeightBinding,
+) -> Result<()> {
     binding
         .restore_graphs()
         .context("restoring the promoted engine's graph pools")?;
@@ -374,6 +391,10 @@ pub(crate) fn promote(schedulers: &[Sender<Message>], binding: &WeightBinding) -
         .reserve_serving()
         .context("reserving what the ranks hold in their devices' quotas")?;
 
+    // The regions are resized first, so the first request admitted finds what the epoch states.
+    if let Some(head) = head {
+        grow_regions(schedulers, head).context("resizing the promoted engine's regions")?;
+    }
     resume(schedulers);
     Ok(())
 }
@@ -576,20 +597,22 @@ pub(super) fn grant_held(
     Ok(count)
 }
 
-/// Resizes the regions each scheduler's queue pair uses to what the session states of them, and
-/// returns each region's number with the units it reached: every device region of the KV planes
-/// to every unit the session numbers for it past its reserved ones, and every other region to
-/// the units the session states it serves, within the numbering the buffer pool holds for it:
-/// what the epoch's layout asked for, or the fewer a region of a warm media rank's slots kept
-/// (`StorageClient::keep_units`). A grow takes what its space's free ranges hold and a shrink
-/// frees what its blocks let it; either may stop short. Every region is asked before any reply
-/// is waited for.
+/// Resizes the regions each scheduler's queue pair uses to the units the session states each
+/// serves, within the numbering the buffer pool holds for it, and returns each region's number
+/// with the units it reached. A device region of the KV planes or of the state units serves the
+/// epoch's capacity, from the numbering the epoch's own division stated (`StorageClient::open`);
+/// every other region serves what the epoch's layout asked for, or the fewer a region of a warm
+/// media rank's slots kept (`StorageClient::keep_units`). A grow takes what its space's free
+/// ranges hold and a shrink frees what its blocks let it; either may stop short, and a scheduler
+/// whose shrink stopped short shrinks the region again as the units held past it come free.
+/// Every region is asked before any reply is waited for.
 ///
 /// The session asks for no unit of a region whose memory the ranks create once it is open, so
 /// this is how the start's regions, and a woken engine's, reach the segments the head granted.
-/// A host region an earlier epoch opened keeps that epoch's numbering and units at `Open`, so
-/// this is how the epoch's own statement of its host tier (`kv_cache_config.host_gib`) takes
-/// effect on it (`specs/buffer-pool.md` §14.1).
+/// A region an earlier epoch opened keeps that epoch's numbering and units at `Open`, so this is
+/// how the epoch's own statement of its device cache (`kv_cache_config.max_tokens`) and of its
+/// host tier (`kv_cache_config.host_gib`) takes effect on a region of the same layout
+/// (`specs/buffer-pool.md` §14.1): a shrink to fewer units and a grow back alike.
 ///
 /// # Errors
 ///
@@ -601,7 +624,6 @@ pub(super) fn grow_regions(
     let targets: Vec<(usize, u8, u32)> = {
         let head = lock(head);
         let (open, opened) = session(&head)?;
-        let planes = kv_regions(open);
 
         let mut targets = Vec::new();
         for (scheduler, registers) in opened.registers.iter().enumerate() {
@@ -612,16 +634,14 @@ pub(super) fn grow_regions(
                 let Some(stated) = open.regions.get(index) else {
                     continue;
                 };
-                // A region of the KV planes asks for no unit at `Open`: it reaches every unit it
-                // numbers as far as the segments granted to its space go. Every other region
-                // serves the units the session states of it.
+                if stated.tier == Tier::Remote {
+                    continue;
+                }
+                // The units the region serves, never past the numbering it shares with the
+                // epochs that named it before: a region of the KV planes reaches them as far as
+                // the segments granted to its space go.
                 let numbered = stated.limit.saturating_sub(stated.reserved);
-                let units = match stated.tier {
-                    Tier::Device if planes.contains(&index) => numbered,
-                    Tier::Device | Tier::Host => stated.units.min(numbered),
-                    Tier::Remote => continue,
-                };
-                targets.push((scheduler, number, units));
+                targets.push((scheduler, number, stated.units.min(numbered)));
             }
         }
         targets

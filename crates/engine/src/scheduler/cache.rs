@@ -852,11 +852,12 @@ impl Scheduler {
     /// order's head is not the one installed: `Victims { region, keys }` with the leading keys of
     /// the order whose units cover what one step's allocations can take there and what the
     /// requests not yet written take, a `Load` of an admission's host hit included (the whole
-    /// order, as far as a record holds it, while a drain shrinks the regions). It is held ahead
-    /// of those requests, which `available` lets take those units. Then `List`, when a region's
-    /// `evictable` word counts more units than the scheduler can account for: blocks another
-    /// queue pair or a closed session committed, which this queue pair's allocations evict only
-    /// once a `Victims` names them.
+    /// order, as far as a record holds it, while a drain shrinks the regions and while a region
+    /// holds more units than its bound, `resize.rs`). It is held ahead of those requests, which
+    /// `available` lets take those units. Then `List`, when a region's `evictable` word counts
+    /// more units than the scheduler can account for: blocks another queue pair or a closed
+    /// session committed, which this queue pair's allocations evict only once a `Victims` names
+    /// them.
     pub(super) fn install_victims(&mut self) {
         let shrinking = self.draining.as_ref().is_some_and(|(.., shrink)| *shrink);
         let fits = self.queue.max_record().saturating_sub(VICTIMS_RECORD) / size_of::<Key>();
@@ -885,7 +886,9 @@ impl Scheduler {
         let mut installing = Vec::new();
         for &(number, region) in &regions {
             let taken = taking.get(region).copied().unwrap_or(0);
-            let reserve = (!shrinking).then(|| self.reserve(region).max(taken));
+            // A region that shrinks may give up every block this scheduler knows to be unpinned.
+            let whole = shrinking || self.excess(region) > 0;
+            let reserve = (!whole).then(|| self.reserve(region).max(taken));
             let reserve = reserve.unwrap_or(u32::MAX);
             let (mut head, mut covered) = (Vec::new(), 0u32);
             for &(_, id) in self.order.get(region).into_iter().flatten() {

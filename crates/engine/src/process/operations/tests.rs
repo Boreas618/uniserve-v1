@@ -1,12 +1,14 @@
 //! The parts of a serving engine that the jobs act on, over a Storage Server in the test's
 //! process and workers that hold no device: one scheduler on its thread, over a session whose
 //! region of the KV planes is made of four segments, with the engine's worker of its one worker
-//! group, whose rank serves generation 1 of no kernel, and a weight binding of no rank.
+//! group, whose rank serves generation 1 of no kernel, and a weight binding of no rank; and the
+//! same parts of an engine of a later epoch of the same layout beside it ([`Node::successor`]).
 //!
 //! The tests read what the jobs leave: the scheduler's replies and statistics, the generation
 //! each worker serves, and the segment table the Storage Server holds.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -18,7 +20,7 @@ use proto::config::{SchedulerConfig, WorkerGroupConfig};
 use proto::report::SchedulerStats;
 use proto::request::GenerationLimits;
 use service::lock;
-use storage::runtime::{self, Class, Open, Region, Segments, Tier};
+use storage::runtime::{self, Class, Open, Opened, Region, Segments, Tier};
 
 use super::at_boundary;
 use crate::executor::WorkerExecutor;
@@ -126,16 +128,42 @@ pub(in crate::process) struct Node {
     /// The generation the scheduler's batches carry.
     pub(in crate::process) served: Arc<AtomicU64>,
     threads: Vec<JoinHandle<()>>,
-    server: StorageServer,
+    /// The Storage Server's socket.
+    socket: PathBuf,
+    /// The Storage Server, which the node of epoch 1 runs and a successor shares.
+    server: Option<StorageServer>,
 }
 
 impl Node {
     pub(in crate::process) fn start() -> Self {
         let server = StorageServer::start();
-        let layout = layout(1);
-        let mut head = StorageClient::connect_head(&server.socket, DEPLOYMENT, 1, 1).unwrap();
-        let mut pairs = head.open(layout.clone()).unwrap();
-        let opened = head.session().unwrap().1.clone();
+        let mut node = Self::open(&server.socket, layout(1));
+        node.server = Some(server);
+        node
+    }
+
+    /// An engine of epoch `epoch` beside this one, of the same layout, whose division numbers its
+    /// KV planes `units` units, the padding unit included, as one stating another
+    /// `kv_cache_config.max_tokens` numbers them: its session names the region of the KV planes
+    /// this one's names and, as a start's does, asks for no unit of it at `Open` and states no
+    /// segment of it; its one scheduler runs over a worker of its own.
+    pub(in crate::process) fn successor(&self, epoch: u64, units: u32) -> Self {
+        let mut layout = layout(epoch);
+        layout.regions[0].units = 0;
+        layout.regions[0].limit = units;
+        Self::open(&self.socket, layout)
+    }
+
+    /// The parts of an engine of `layout`'s epoch whose session the Storage Server at `socket`
+    /// answers, its scheduler running over the session as the head keeps it.
+    fn open(socket: &Path, layout: Open) -> Self {
+        let epoch = layout.epoch;
+        let mut head = StorageClient::connect_head(socket, DEPLOYMENT, epoch, epoch).unwrap();
+        let mut pairs = head.open(layout).unwrap();
+        let (layout, opened) = head
+            .session()
+            .map(|(layout, opened)| (layout.clone(), opened.clone()))
+            .unwrap();
 
         let (route, workers) = node(1, &Arc::default());
         let (inbox, messages) = crossbeam_channel::unbounded();
@@ -184,7 +212,8 @@ impl Node {
             head: Mutex::new(head),
             served,
             threads: vec![thread],
-            server,
+            socket: socket.to_owned(),
+            server: None,
         }
     }
 
@@ -196,12 +225,23 @@ impl Node {
     /// The segment table of the KV planes' memory space as the Storage Server holds it: what a
     /// session of the same layout, of epoch `epoch`, opened now is answered.
     pub(in crate::process) fn segments_seen(&self, epoch: u64) -> Segments {
-        let mut head =
-            StorageClient::connect_head(&self.server.socket, DEPLOYMENT, epoch, epoch).unwrap();
+        self.seen(epoch).segments[0].clone()
+    }
+
+    /// The units in the region of the KV planes, the most its blocks can take: what a session of
+    /// the same layout, of epoch `epoch`, opened now is answered.
+    pub(in crate::process) fn units_seen(&self, epoch: u64) -> u32 {
+        self.seen(epoch).regions[0].1
+    }
+
+    /// The buffer pool's answer to a session of the same layout, of epoch `epoch`, opened now
+    /// and closed again.
+    fn seen(&self, epoch: u64) -> Opened {
+        let mut head = StorageClient::connect_head(&self.socket, DEPLOYMENT, epoch, epoch).unwrap();
         head.open(layout(epoch)).unwrap();
-        let segments = head.session().unwrap().1.segments[0].clone();
+        let opened = head.session().unwrap().1.clone();
         head.close().unwrap();
-        segments
+        opened
     }
 
     /// The next statistics the scheduler reports.

@@ -7,10 +7,13 @@ use std::time::{Duration, Instant};
 
 use proto::config::{ParallelConfig, WorkerGroupConfig, WorkerGroupId, WorkerRank};
 
-use super::{by_host, drain, release};
+use super::{by_host, drain, grow_regions, promote, release};
 use crate::process::operations::ask;
-use crate::process::operations::tests::{LONG, Node, SEGMENT_UNITS, UNIT_BYTES, segment};
+use crate::process::operations::tests::{KV_UNITS, LONG, Node, SEGMENT_UNITS, UNIT_BYTES, segment};
 use crate::scheduler::Message;
+
+/// The epoch whose sessions read what the buffer pool holds, beside the engines of each case.
+const READER: u64 = 9;
 
 #[test]
 fn a_drain_with_no_request_replies_at_once() {
@@ -53,6 +56,44 @@ fn a_release_after_a_shrink_withdraws_only_the_segments_past_the_units() {
     let (_, bytes) = release(&node.head, &node.binding, kv, 0).unwrap();
     assert_eq!(bytes, 2 * u64::from(SEGMENT_UNITS) * UNIT_BYTES);
     assert!(node.segments_seen(3).is_empty());
+}
+
+/// The device cache's size is no layout (`kv_cache_config.max_tokens`): an epoch of the node's
+/// layout whose capacity numbers half the node's KV planes names the node's region of them, which
+/// keeps the node's numbering, and resizes it to its own units; the node's promotion, as at a
+/// rollback, resizes the region to the node's units again; and after another epoch of half the
+/// cache, one of the whole cache grows the region back from the memory the shrink left in its
+/// space. Each size is what a session opened then finds in the region: what its blocks can take.
+#[test]
+fn an_epoch_of_the_same_layout_resizes_the_shared_region_to_its_own_capacity() {
+    let node = Node::start();
+    let kv = node.kv();
+    // Every unit past the padding unit, of the whole cache and of half of it.
+    let (whole, half) = (KV_UNITS - 1, KV_UNITS / 2 - 1);
+    assert_eq!(node.units_seen(READER), whole);
+
+    let target = node.successor(2, KV_UNITS / 2);
+    assert_eq!(
+        target.kv(),
+        kv,
+        "an epoch of the same layout names the node's region"
+    );
+    let reached = grow_regions(&target.schedulers, &target.head).unwrap();
+    assert!(reached.contains(&(kv, half)), "{reached:?}");
+    assert_eq!(node.units_seen(READER), half);
+
+    // The rollback: the node serves again, at its own size, and the target goes.
+    promote(&node.schedulers, Some(&node.head), &node.binding).unwrap();
+    assert_eq!(node.units_seen(READER), whole);
+    drop(target);
+
+    let shrunk = node.successor(3, KV_UNITS / 2);
+    grow_regions(&shrunk.schedulers, &shrunk.head).unwrap();
+    assert_eq!(node.units_seen(READER), half);
+    let grown = node.successor(4, KV_UNITS);
+    let reached = grow_regions(&grown.schedulers, &grown.head).unwrap();
+    assert!(reached.contains(&(kv, whole)), "{reached:?}");
+    assert_eq!(node.units_seen(READER), whole);
 }
 
 /// The daemon is told of a release once per host whose devices gave memory back: this

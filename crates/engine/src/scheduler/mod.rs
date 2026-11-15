@@ -50,6 +50,7 @@ mod group;
 mod memory;
 pub mod policy;
 mod request;
+mod resize;
 mod rows;
 mod schedule;
 mod stats;
@@ -282,6 +283,13 @@ pub struct Scheduler {
     registers: runtime::Registers,
     /// Per region, its units, from the answer to `Open` and from `Resized`.
     capacity: Vec<u32>,
+    /// Per region, the units the engine last resized it to (`Message::Resize`), which bound what
+    /// it holds from then on: while a shrink has stopped short of them, the scheduler installs
+    /// the whole of the region's eviction order, takes none of the units past them for its own
+    /// allocations, and shrinks the region again as units come free (`resize.rs`). `None` before
+    /// the engine resized the region and from a drain on, which leaves the region's size to the
+    /// drain's own shrink or to the epoch serving beside it.
+    bounds: Vec<Option<u32>>,
     /// Per region, the units an allocation of this queue pair can take: the buffer pool's word,
     /// less the units of the `Allocate`s held, being stamped or outstanding, and with the units
     /// of `order` beyond the head this scheduler installed.
@@ -375,9 +383,11 @@ pub struct Scheduler {
     boundary: Vec<Sender<()>>,
     /// The reply, cause, deadline and whether memory is given back, of a drain under way.
     draining: Option<(Sender<()>, MigrationCause, Instant, bool)>,
-    /// The region, by number, of each `Resize` outstanding and its reply, owed at `Resized` with
-    /// the units the region reached.
-    resizing: Vec<(u8, Sender<u32>)>,
+    /// The region, by number, of each `Resize` outstanding that is not a drain's, in the order
+    /// submitted, with the reply owed at its `Resized` with the units the region reached: the
+    /// engine's, or none for the scheduler's own shrink toward the region's bound. The buffer
+    /// pool answers the `Resize`s of one queue pair in the order it takes them.
+    resizing: Vec<(u8, Option<Sender<u32>>)>,
     /// The `List`s submitted, and those answered, which the buffer pool answers in the order it
     /// takes them: a resumed request waits for one asked after it arrived (SD §4.4, §4.5).
     lists_asked: u64,
@@ -521,6 +531,7 @@ impl Scheduler {
             registers,
             available: capacity.clone(),
             capacity,
+            bounds: vec![None; count],
             retiring: vec![0; count],
             cache: HashMap::new(),
             order: vec![BTreeSet::new(); count],
@@ -767,10 +778,7 @@ impl Scheduler {
             Message::Flush(seeds, in_flight, reply) => {
                 let _ = reply.send(self.flush(seeds, in_flight));
             }
-            Message::Resize(region, units, reply) => {
-                self.submit(runtime::Request::Resize { region, units });
-                self.resizing.push((region, reply));
-            }
+            Message::Resize(region, units, reply) => self.resize(region, units, reply),
             Message::Configure(config, reply) => {
                 let _ = reply.send(self.configure(config));
             }
@@ -787,8 +795,10 @@ impl Scheduler {
     ///    longer covers what the step's requests take is installed, ahead of them;
     /// 3. the step's requests are written into the submission queue as far as it and the
     ///    completion queue have room;
-    /// 4. a drain's deadline ends what it ends, `Pause` and `Drain` are answered once due
-    ///    ([`Scheduler::reply_at_boundary`]), and the statistics leave once a second has passed.
+    /// 4. a drain's deadline ends what it ends, a region past its bound is asked to shrink again
+    ///    once something there may leave ([`Scheduler::shrink_to_bounds`]), `Pause` and `Drain`
+    ///    are answered once due ([`Scheduler::reply_at_boundary`]), and the statistics leave once
+    ///    a second has passed.
     ///
     /// True when it formed a batch. A stopped scheduler takes no step.
     pub fn step(&mut self) -> bool {
@@ -850,6 +860,7 @@ impl Scheduler {
             return false;
         }
         self.drain_due(now);
+        self.shrink_to_bounds();
         self.reply_at_boundary();
         self.publish_stats(now);
         formed
@@ -1773,7 +1784,9 @@ impl Scheduler {
     /// pool's word may not show yet (a `Load` or a `Clone` answered `Copy` took its blocks then,
     /// and the word shows them), and by what it counts as evictable of the blocks its `Pin`s
     /// held, being stamped or outstanding name (`evictable`), which no allocation can evict once
-    /// the buffer pool has taken them.
+    /// the buffer pool has taken them. A region that holds more units than its bound lowers it
+    /// by those units too ([`Scheduler::excess`]): they are its shrink's to take, so no
+    /// allocation of this scheduler holds units past the bound.
     fn read_capacity(&mut self) {
         let words: Vec<(usize, u32, u32)> = self
             .registers
@@ -1786,7 +1799,9 @@ impl Scheduler {
             })
             .collect();
         for (region, available, retiring) in words {
-            self.available[region] = available.saturating_add(self.beyond_head(region));
+            self.available[region] = available
+                .saturating_add(self.beyond_head(region))
+                .saturating_sub(self.excess(region));
             self.retiring[region] = retiring;
         }
 

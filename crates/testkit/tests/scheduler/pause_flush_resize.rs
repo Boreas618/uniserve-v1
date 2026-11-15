@@ -3,10 +3,11 @@
 //! every cached block the scheduler knows of, with a weight update's seeds from then on, while
 //! the requests it holds keep their state, compute it again or end as the update says; `Resize`
 //! is answered at its `Resized` with the units the region reached, which are its capacity from
-//! then on.
+//! then on, and the units it asked for bound the region: a shrink that stops short goes on as
+//! the units held past them come free.
 
 use crossbeam_channel::{Receiver, bounded};
-use engine::scheduler::{Message, Seeds};
+use engine::scheduler::{Message, Output, Seeds};
 use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, FinishReason, MigrationCause, RejectionKind};
 use storage::Key;
@@ -247,4 +248,65 @@ fn a_resize_is_replied_at_resized_and_the_regions_capacity_changes() {
     let admitted = harness.submit(token(2, 40, 2));
     harness.settle(100);
     assert_eq!(harness.tokens(admitted).len(), 2);
+}
+
+/// The units a `Resize` asks for bound the region from then on, whatever its shrink reaches (SD
+/// §2.4 `Resize`): a shrink that a running request's blocks stop short of goes on by itself as
+/// they come free, the scheduler asking the buffer pool again until the region reaches those
+/// units, with no further `Message::Resize` and no `Shrunk`; meanwhile no allocation takes the
+/// units held past the bound, so a request that needs more than the bound waits rather than
+/// taking them, and is refused at its admission once the region holds no more than the bound.
+#[test]
+fn a_shrink_stopped_short_goes_on_as_the_units_held_past_its_bound_come_free() {
+    let mut harness = Deployment::tokens().build();
+    let kv = harness.region("kv-0");
+
+    // Ten blocks of prompt and room to decode: the request holds more than the four units the
+    // region is resized to while it runs, so the shrink stops short of its blocks.
+    let running = harness.submit(token(1, 40, 30));
+    harness.run_until(20, |harness| !harness.tokens(running).is_empty());
+    let reached = harness.resize("kv-0", 4);
+    assert!(
+        reached > 4,
+        "the shrink stops short of the held blocks: {reached}"
+    );
+
+    // Six blocks of prompt: fewer than the region holds after the first shrink, more than its
+    // bound.
+    let waiting = harness.submit(token(2, 24, 2));
+    harness.settle(200);
+
+    assert!(
+        harness.terminal(running).is_some(),
+        "{:?}",
+        harness.events(running)
+    );
+    let events = harness.events(waiting);
+    let [Event::Rejected { kind, message }] = &events[..] else {
+        panic!("{events:?}");
+    };
+    assert_eq!(*kind, RejectionKind::Invalid);
+    assert_eq!(message, "request exceeds total KV capacity");
+
+    // The scheduler asked again by itself, and the last answer reached the bound.
+    let resized: Vec<u32> = harness
+        .answers()
+        .into_iter()
+        .filter_map(|answer| match answer {
+            (Request::Resize { region, units: 4 }, Completion::Resized { units, .. })
+                if region == kv =>
+            {
+                Some(units)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(resized.len() > 1, "{resized:?}");
+    assert_eq!(resized.last(), Some(&4), "{resized:?}");
+    assert!(
+        !harness
+            .outputs()
+            .iter()
+            .any(|output| matches!(output, Output::Shrunk(..)))
+    );
 }

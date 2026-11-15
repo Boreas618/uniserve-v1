@@ -662,17 +662,18 @@ impl MainProcess {
         self.grow_kept();
     }
 
-    /// Opens admission: the graph storage restored, what serving holds reserved and every
-    /// scheduler resumed on the operations thread; then the warm-up on the first opening, and
-    /// `Serving`.
+    /// Opens admission: the graph storage restored, what serving holds reserved, the regions
+    /// resized to what the epoch states of them and every scheduler resumed on the operations
+    /// thread; then the warm-up on the first opening, and `Serving`.
     fn open_admission(&mut self) {
         let Some(engine) = self.engine.as_ref() else {
             return;
         };
         let schedulers = engine.inboxes();
+        let head = engine.head.clone();
         let binding = Arc::clone(&engine.binding);
         self.serial(Box::new(move || {
-            let opened = epoch::promote(&schedulers, &binding);
+            let opened = epoch::promote(&schedulers, head.as_deref(), &binding);
             done(move |main| main.opened(opened))
         }));
     }

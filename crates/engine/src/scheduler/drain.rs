@@ -38,6 +38,10 @@ impl Scheduler {
     ) {
         self.draining = Some((reply, cause, deadline, shrink));
         self.released.fill(false);
+        // A draining epoch no longer sizes its regions (`resize.rs`): with `shrink` it gives
+        // them back, and otherwise the epoch of the same layout serving beside it sizes the
+        // regions the two share.
+        self.bounds.fill(None);
         self.drain_due(Instant::now());
     }
 
@@ -130,7 +134,7 @@ impl Scheduler {
     }
 
     /// Whether a `Resize` of region `number` is held or outstanding: one at a time per region.
-    fn resizing_region(&self, number: u8) -> bool {
+    pub(super) fn resizing_region(&self, number: u8) -> bool {
         let of = |request: &runtime::Request| match request {
             runtime::Request::Resize { region, .. } => *region == number,
             _ => false,
