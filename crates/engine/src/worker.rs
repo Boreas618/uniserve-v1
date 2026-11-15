@@ -102,8 +102,10 @@
 //! ([`crate::worker::Error::InFlight`]), and the jobs behind it still run. The exception is a
 //! device whose context reports a sticky error, which no later launch survives: the worker checks
 //! the context after a failure and from then on fails every job with that error without issuing it.
-//! The control thread makes the same check on its own schedule ([`Worker::sticky_error`],
-//! [`watchdog`]), because a job stuck behind such an error never returns to make it.
+//! A sticky error surfaces at the worker's own wait on its stream's event, which returns it as soon
+//! as the context faults, so that wait is where the device states it: the worker records the error
+//! as its device's fault and tells whoever subscribed ([`Worker::on_fault`]), and the control
+//! thread fails the epoch then, whatever job of another device waits behind the failure.
 //!
 //! ## What execution owns
 //!
@@ -161,6 +163,10 @@ use storage::runtime::{Completion, GroupId, Request, RequestId};
 use crate::batch::{Batch, BatchId, BatchOutput, Phase, Variant};
 
 use self::completion::{Outcome, Submission, Waker, add_stamp};
+
+/// The fault of a worker's device: settled once, failed with the sticky error the worker found on
+/// its context, and never otherwise. Its subscribers are told when it settles.
+type Fault = self::completion::Completion<Waker, (), platform::Error>;
 pub use self::error::{Error, Result};
 use self::queue::Entry;
 pub(crate) use self::queue::Queue;
@@ -432,6 +438,8 @@ pub struct Worker {
     counters: Arc<Counters>,
     /// What the generation update in flight has no comparison for; see [`Worker::uncompared`].
     uncompared: Arc<Mutex<Vec<String>>>,
+    /// The device's fault, which the worker thread settles; see [`Worker::on_fault`].
+    fault: Arc<Fault>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -485,6 +493,7 @@ impl Worker {
         let queue = Queue::new(phases);
         let counters = Arc::new(Counters::default());
         let uncompared = Arc::new(Mutex::new(Vec::new()));
+        let fault = Arc::new(Fault::default());
 
         let state = Thread {
             device,
@@ -495,6 +504,7 @@ impl Worker {
             uncompared: Arc::clone(&uncompared),
             unmeasured: Vec::new(),
             sticky: None,
+            fault: Arc::clone(&fault),
             session: None,
             blocking: Calls::default(),
             forwards: (0, 0),
@@ -522,6 +532,7 @@ impl Worker {
             queue,
             counters,
             uncompared,
+            fault,
             thread: Some(thread),
         })
     }
@@ -782,18 +793,23 @@ impl Worker {
         self.queue.performing()
     }
 
-    /// The sticky error of the device's context, if it has one: an illegal memory access or a
-    /// device-side assert left the context unusable, and the engine must be replaced. The
-    /// control thread checks while a job has been in flight for a second, because the jobs
-    /// behind such an error never complete.
+    /// Calls `wake` once the worker found a sticky error on its device's context (an illegal
+    /// memory access or a device-side assert left the context unusable, and the engine must be
+    /// replaced), at once when it already did. The worker finds it at its wait for the job the
+    /// fault ended, which returns as the context faults; [`Worker::fault`] then states it.
     ///
-    /// # Errors
-    ///
-    /// When the context cannot be read.
-    pub(crate) fn sticky_error(&self) -> Result<Option<platform::Error>> {
-        match self.device {
-            Some(device) => Ok(platform::PrimaryContext::retain(device)?.sticky_error()?),
-            None => Ok(None),
+    /// `wake` runs on the worker thread, so it only signals.
+    pub(crate) fn on_fault(&self, wake: &Waker) {
+        if let Some(wake) = self.fault.subscribe(Arc::clone(wake)) {
+            wake();
+        }
+    }
+
+    /// The sticky error the worker found on its device's context, once it found one.
+    pub(crate) fn fault(&self) -> Option<platform::Error> {
+        match self.fault.outcome()? {
+            Outcome::Failed(error) => Some(error.as_ref().clone()),
+            Outcome::Success(()) | Outcome::Cancelled => None,
         }
     }
 
@@ -949,6 +965,8 @@ struct Thread {
     /// The context's sticky error, once one was seen: every launch after it fails, so the
     /// worker issues nothing more and fails each job with this error.
     sticky: Option<platform::Error>,
+    /// The device's fault, settled with the sticky error once it was seen.
+    fault: Arc<Fault>,
     /// The profiling session that records the device, while one does.
     session: Option<Session>,
     /// This thread's driver calls that waited for the device, when its last batch output left.
@@ -1874,7 +1892,8 @@ impl Thread {
         Ok(())
     }
 
-    /// Reads the device's context for a sticky error and keeps the first one found.
+    /// Reads the device's context for a sticky error, keeps the first one found and settles the
+    /// device's fault with it, telling the fault's subscribers.
     fn check_sticky(&mut self) {
         let Some(device) = self.device else {
             return;
@@ -1888,7 +1907,14 @@ impl Thread {
                 %sticky,
                 "the device's context has a sticky error; no further job is issued"
             );
+            let subscribers = self
+                .fault
+                .settle(Outcome::Failed(Arc::new(sticky.clone())))
+                .unwrap_or_default();
             self.sticky = Some(sticky);
+            for wake in subscribers {
+                wake();
+            }
         }
     }
 

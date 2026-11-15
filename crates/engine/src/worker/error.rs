@@ -3,8 +3,8 @@
 //! Every module of the worker, its runners and the rank's memory fails with [`Error`]. A failed
 //! job reaches its caller as this error in words, stated with the work in flight
 //! ([`Error::InFlight`]); a failed call of a batch states its class in the batch's output
-//! (`crate::batch::ErrorCode`), and a context that a failure left unusable is the worker's sticky
-//! error (`Worker::sticky_error`).
+//! (`crate::batch::ErrorCode`), and a context that a failure left unusable is the fault of the
+//! worker's device (`Worker::fault`).
 
 /// What an operation of the worker failed with.
 #[derive(Debug, thiserror::Error)]

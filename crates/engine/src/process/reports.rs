@@ -152,10 +152,9 @@ impl MainProcess {
         self.broadcast(&from_engine::Kind::Metrics(metrics));
     }
 
-    /// The watchdog's rules at `now` and the metrics' second: a job a worker has been inside
-    /// for the stall bound is a stall, and while a job has been in flight for a second every
-    /// device's context is checked once a second for a sticky error; both fail the epoch. A
-    /// change of the ranks' weights that failed part of the way fails it too.
+    /// The watchdog's rule at `now` and the metrics' second: a job a worker has been inside
+    /// for the stall bound is a stall, which fails the epoch. A change of the ranks' weights that
+    /// failed part of the way fails it too.
     pub(super) fn watch(&mut self, now: Instant) {
         if now >= self.next_metrics {
             self.metrics();
@@ -189,25 +188,6 @@ impl MainProcess {
             failure = Some((reason, stalled));
         }
 
-        if failure.is_none() && self.watchdog.check_due(now, &in_flight) {
-            self.watchdog.checked(now);
-            for worker in &engine.workers {
-                let device = worker.device().map_or(0, |device| device.0);
-                let device = u32::try_from(device).unwrap_or_default();
-                match worker.sticky_error() {
-                    Ok(None) => {}
-                    Ok(Some(error)) => {
-                        let reason = format!("device {device} reports a sticky error: {error}");
-                        let fault = lifecycle::fault("sticky", error.to_string(), device);
-                        failure = Some((reason, fault));
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::warn!(device, %error, "a device's context could not be read");
-                    }
-                }
-            }
-        }
         self.watchdog.settled(&in_flight);
 
         if failure.is_none()
@@ -219,6 +199,30 @@ impl MainProcess {
         if let Some((reason, report)) = failure {
             self.fail(reason, report);
         }
+    }
+
+    /// The worker of rank `rank` found a sticky error on its device's context
+    /// ([`Worker::on_fault`](crate::worker::Worker::on_fault)): no later launch on the device
+    /// survives it, so the epoch fails at once, whatever job of another device waits behind it.
+    pub(super) fn faulted(&mut self, rank: usize) {
+        let Some(worker) = self
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.workers.get(rank))
+        else {
+            return;
+        };
+        let Some(error) = worker.fault() else {
+            return;
+        };
+
+        let device = worker
+            .device()
+            .and_then(|device| u32::try_from(device.0).ok())
+            .unwrap_or_default();
+        let reason = format!("device {device} reports a sticky error: {error}");
+        let fault = lifecycle::fault("sticky", error.to_string(), device);
+        self.fail(reason, fault);
     }
 
     /// What each worker of the process has in flight, in rank order, as the watchdog reads it.

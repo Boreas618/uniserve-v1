@@ -99,6 +99,8 @@ pub(crate) enum Input {
     /// A peer link of the epoch closed: it was lost, or the scheduler node closed this peer's
     /// link in order, which ends the epoch.
     LinkClosed(String),
+    /// The worker of rank `.0` of the started epoch found a sticky error on its device's context.
+    Faulted(usize),
     /// A job ended: what it produced, applied on the control thread.
     Done(Box<dyn FnOnce(&mut MainProcess) + Send>),
 }
@@ -454,6 +456,7 @@ impl MainProcess {
                 self.process = None;
                 self.end_when_unserved();
             }
+            Input::Faulted(rank) => self.faulted(rank),
             Input::LinkClosed(reason) => {
                 let liveness = self
                     .engine
@@ -634,6 +637,15 @@ impl MainProcess {
             }
         };
         self.serving.extend(engine.kernels.clone());
+        // Each worker states its device's fault as it finds one, at once for a fault found
+        // during the start, and the control thread fails the epoch then.
+        for (rank, worker) in engine.workers.iter().enumerate() {
+            let inbox = self.inbox.0.clone();
+            let faulted: crate::worker::completion::Waker = Arc::new(move || {
+                let _ = inbox.send(Input::Faulted(rank));
+            });
+            worker.on_fault(&faulted);
+        }
         self.engine = Some(engine);
         // An engine that failed while it started is left as it is when the control thread ends.
         if self.lifecycle != Lifecycle::Starting {

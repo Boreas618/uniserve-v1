@@ -19,7 +19,7 @@ use storage::QueuePair;
 use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Run, Tier};
 use tensor::{DType, Tensor};
 
-use super::watchdog::{CONTEXT_CHECK, Watchdog};
+use super::watchdog::Watchdog;
 use super::{Sequences, Worker};
 use crate::executor::Route;
 use crate::executor::peers::{Liveness, Remote, Upstream, accept, register};
@@ -920,11 +920,11 @@ fn the_watchdog_reads_the_job_in_flight_longest_with_its_batch() {
         Some("holding the worker for a test")
     );
 
-    // The control thread looks again when the job in flight longest has run for a second, and
-    // reports each job once it reached the stall bound, with its rank and batch.
+    // The control thread looks again when the job in flight longest reaches the stall bound, and
+    // reports each job once it reached it, with its rank and batch.
     let timeout = Duration::from_secs(30);
     let mut watchdog = Watchdog::new(timeout).unwrap();
-    assert_eq!(watchdog.deadline(&jobs), Some(since + CONTEXT_CHECK));
+    assert_eq!(watchdog.deadline(&jobs), Some(since + timeout));
     assert!(watchdog.stalls(later, &jobs).is_empty());
 
     let stalls = watchdog.stalls(later + timeout, &jobs);
@@ -1029,7 +1029,7 @@ fn a_worker_with_no_device_records_no_profiling_session() {
     let log = Log::default();
     let (worker, _) = worker(&["a"], &log);
     assert_eq!(worker.device(), None);
-    assert!(matches!(worker.sticky_error(), Ok(None)));
+    assert!(worker.fault().is_none());
 
     let refused = worker
         .profile(crate::profiling::session::Change::Stop {
