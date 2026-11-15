@@ -1,0 +1,245 @@
+"""The kernel packages as the kernel checks reach them, outside a build.
+
+A check reaches a package of ``crates/ops/kernels/<op>/<backend>/`` in three
+ways, each through the package's own files or the Build Server's interface:
+
+- its kernel source, imported in this process from the package's ``src/``
+  directory by its location (:func:`source_module`), so the kernels are
+  decorated in the session's Triton mode (``tests/python/kernels/conftest.py``);
+- the compilation a Triton package's launch table states for a descriptor key,
+  as the Build Server states it for a build of that key (:class:`Launches`);
+- a built module, resolved at a Build Server, which builds it when its store
+  holds none (:class:`Modules`).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+from pathlib import Path
+from types import ModuleType
+from typing import IO, Any
+
+
+def source_module(package: Path, name: str) -> ModuleType:
+    """The module ``name`` of a package's source directory, imported from it.
+
+    The module is found in ``package / "src"`` alone, as the Build Server's
+    compilation finds a package's kernel module, and is executed here: every
+    ``@triton.jit`` function it defines takes the mode Triton is in now.
+
+    Raises:
+        LookupError: When the source directory holds no such module.
+    """
+    source = package / "src"
+    spec = importlib.machinery.PathFinder.find_spec(name, [str(source)])
+    if spec is None:
+        raise LookupError(f"{source} holds no module {name}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class RefusedLaunchError(LookupError):
+    """A package states no launch for a descriptor key: its dimensions do not
+    declare the key, or its launch table or derivation refuses it. The message
+    is the package's reason.
+    """  # noqa: D205
+
+
+@dataclasses.dataclass(frozen=True)
+class StatedLaunch:
+    """The compilation a launch table states for one descriptor key.
+
+    ``kernel`` is the ``@triton.jit`` function the table names, of this
+    session's import of the package's source; ``signature`` holds every kernel
+    parameter in order, a Triton type or ``"constexpr"``; ``constexprs`` the
+    compile-time values a launch passes by name; ``options`` the warp count,
+    the dependent launch and the further ``triton.compile`` options.
+    """
+
+    kernel: Any
+    signature: dict[str, str]
+    constexprs: dict[str, Any]
+    options: dict[str, Any]
+
+    @property
+    def words(self) -> list[str]:
+        """The parameters a launch passes in order: the non-constexpr ones."""
+        return [
+            name for name, kind in self.signature.items() if kind != "constexpr"
+        ]
+
+
+class Launches:
+    """What Triton packages' launch tables state, from the Build Server.
+
+    One ``uniserve build-server launch <package> --target <target>`` runs per
+    package and target for the session and is asked key by key: the command
+    reads each key with the Build Server's reader of the key grammar and has
+    the driver a build compiles through state its compilation, so a check
+    launches the compilation the key's module is built with. An answer is kept
+    for the session.
+    """
+
+    def __init__(
+        self, uniserve: str, kernels: Path, logs: Path, source: Any
+    ) -> None:
+        """``uniserve`` is the executable, ``kernels`` the package tree,
+        ``logs`` a directory for each command's standard error, and
+        ``source(op)`` this session's import of a package's kernel module.
+        """  # noqa: D205
+        self._uniserve = uniserve
+        self._kernels = kernels
+        self._logs = logs
+        self._source = source
+        self._commands: dict[tuple[str, str], subprocess.Popen[str]] = {}
+        self._errors: dict[tuple[str, str], IO[str]] = {}
+        self._stated: dict[tuple[str, str, str], StatedLaunch] = {}
+
+    def __call__(self, op: str, key: str, target: str) -> StatedLaunch:
+        """The launch ``op``'s Triton package states for ``key`` on ``target``.
+
+        Raises:
+            RefusedLaunchError: When the package states none, with its reason.
+            RuntimeError: When the command ends without answering.
+        """
+        stated = self._stated.get((op, key, target))
+        if stated is not None:
+            return stated
+
+        command = self._command(op, target)
+        command.stdin.write(key + "\n")
+        command.stdin.flush()
+        line = command.stdout.readline()
+        if not line:
+            log = self._errors[(op, target)].name
+            raise RuntimeError(
+                f"uniserve build-server launch of {op} for {target} ended "
+                f"(exit {command.wait()}) before it answered {key}:\n"
+                f"{Path(log).read_text(errors='replace')}"
+            )
+        answer = json.loads(line)
+        if "refused" in answer:
+            raise RefusedLaunchError(f"{op} {key}: {answer['refused']}")
+
+        launch = answer["launch"]
+        stated = StatedLaunch(
+            kernel=getattr(self._source(op), launch["kernel"]),
+            signature=launch["signature"],
+            constexprs=launch["constexprs"],
+            options=launch["options"],
+        )
+        self._stated[(op, key, target)] = stated
+        return stated
+
+    def _command(self, op: str, target: str) -> subprocess.Popen[str]:
+        """The running command of ``op``'s Triton package for ``target``."""
+        command = self._commands.get((op, target))
+        if command is None:
+            errors = (self._logs / f"launch-{op}-{target}.log").open("w")
+            command = subprocess.Popen(
+                [
+                    self._uniserve,
+                    "build-server",
+                    "launch",
+                    str(self._kernels / op / "triton"),
+                    "--target",
+                    target,
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=errors,
+                text=True,
+            )
+            self._commands[(op, target)] = command
+            self._errors[(op, target)] = errors
+        return command
+
+    def close(self) -> None:
+        """End every command: each ends when its input does."""
+        for key, command in self._commands.items():
+            command.stdin.close()
+            command.wait()
+            command.stdout.close()
+            self._errors[key].close()
+        self._commands.clear()
+
+
+class Modules:
+    """Built modules of the kernel packages, resolved at a Build Server.
+
+    A package is installed at the server the first time a module of it is
+    asked for, and ``uniserve build-server resolve`` names the module's files
+    in the server's store, building the module first when the store holds
+    none.
+    """
+
+    def __init__(
+        self, uniserve: str, socket: Path, kernels: Path, target: str
+    ) -> None:
+        """``uniserve`` is the executable, ``socket`` the server's, ``kernels``
+        the package tree and ``target`` what every module is built for.
+        """  # noqa: D205
+        self._uniserve = uniserve
+        self._socket = socket
+        self._kernels = kernels
+        self._target = target
+        self._revisions: dict[tuple[str, str], int] = {}
+
+    def __call__(self, op: str, backend: str, key: str) -> Path:
+        """The directory holding the module of descriptor ``key`` of
+        ``op``'s ``backend`` package.
+
+        Raises:
+            RuntimeError: When the server cannot install the package or
+                resolve the module, with its reason.
+        """  # noqa: D205
+        resolved = self._run(
+            "resolve",
+            op,
+            backend,
+            str(self._revision(op, backend)),
+            "--target",
+            self._target,
+            "--key",
+            key,
+        )
+        files = [Path(line) for line in resolved.splitlines() if line]
+        return Path(os.path.commonpath([file.parent for file in files]))
+
+    def _revision(self, op: str, backend: str) -> int:
+        """The revision the server installed ``op``'s ``backend`` package as."""
+        revision = self._revisions.get((op, backend))
+        if revision is None:
+            # `install` prints `<op> <backend> revision <revision>`.
+            installed = self._run("install", str(self._kernels / op / backend))
+            revision = int(installed.split()[-1])
+            self._revisions[(op, backend)] = revision
+        return revision
+
+    def _run(self, command: str, *arguments: str) -> str:
+        """The standard output of one ``build-server`` command at the server."""
+        completed = subprocess.run(
+            [
+                self._uniserve,
+                "build-server",
+                command,
+                "--socket",
+                str(self._socket),
+                *arguments,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"build-server {command} {' '.join(arguments)} failed: "
+                f"{completed.stderr.strip()}"
+            )
+        return completed.stdout

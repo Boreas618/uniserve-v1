@@ -4,12 +4,21 @@ The repository's checks run from the `justfile`: `just lint`, `just test-rust`, 
 
 ## Kernel package checks
 
-The numerical checks of the kernel packages under `crates/ops/kernels` live in `tests/python/kernels/<family>/`, one copy per family of operators (a check shared by several operators takes the operator with `--op`), and each family's `test_<family>.py` runs every one of them as a subprocess. The ones marked `unit and not gpu` run on Triton's interpreter with no device visible and are part of `just test-python-fast`; the ones marked `gpu` compile and launch their kernel on a device and are skipped on a host without one.
+The numerical checks of the kernel packages under `crates/ops/kernels` live in `tests/python/kernels/<family>/`. A check is a pytest module, `test_<op>.py`, whose test functions launch a package's kernel in the test process the way its operator launches it and hold the result to a reference within the operator's bound, one test per case; `tests/python/kernels/conftest.py` states the fixtures and conventions every family shares. A family whose checks are still scripts holds a `test_<family>.py` that runs each script as a subprocess.
+
+Where the kernels run is one choice per session, `--kernel-device`:
+
+```text
+pytest tests/python/kernels -m "unit and not gpu"   # Triton's interpreter, no device: part of just test-python-fast
+pytest tests/python/kernels --kernel-device cuda    # compiled for and launched on the host's CUDA device
+```
+
+The interpreter is the default. A test marked `gpu` needs a device (a libdevice call, a dependent launch, a built native module, a device's own rounding) and is skipped with that reason on the interpreter; a test without the mark runs in both modes, on host tensors for the interpreter and on the device otherwise. In the `cuda` mode a host without a CUDA device skips every check.
 
 | Variable | What it names | Tests |
 | --- | --- | --- |
-| `UNISERVE_KERNEL_MODULES` | A directory of built modules, `<op>/<backend>/` holding the module of the descriptor the check's defaults describe (a check comparing two builds reads named subdirectories, such as `dense_attention/f32/causal`) | the module checks of the native and cubin packages, among them the `topk_softmax` router's launch |
-| `UNISERVE_BINARY` | The base executable, whose `build-server fields` reads a descriptor key against its package's manifest; `uniserve` on the search path when unset. `just test-python-fast` builds it and sets the variable | the tensor primitives' checks (`tests/python/kernels/tensor`), which launch the module a key names |
+| `UNISERVE_BINARY` | The base executable; `uniserve` on the search path when unset. Its `build-server launch` states what a Triton package's launch table compiles for a descriptor key, through the Build Server's Python environment, whose program `uniserve-build-server` must be on the search path (`uv sync --locked --project crates/build-server/python` creates it); its `build-server serve`, `install` and `resolve` build the modules the `gpu` checks of native and cubin packages load. `just test-python-fast` builds it and sets the variable | the checks that launch the module a key names (the `stated_launch` fixture), and the `gpu` checks of native and cubin modules (the `kernel_module` fixture) |
+| `UNISERVE_KERNEL_MODULES` | A directory of built modules, `<op>/<backend>/` holding the module of the descriptor the check's defaults describe (a check comparing two builds reads named subdirectories, such as `dense_attention/f32/causal`) | the module scripts of the families whose checks are scripts, among them the `topk_softmax` router's launch |
 | `UNISERVE_KERNEL_KEYS`, `UNISERVE_KERNEL_STORE` | A key fixture and the store built from it | `test_kernel_arguments.py`, which compares every built cell's arguments with its operator's |
 
 ## GPU end-to-end tests

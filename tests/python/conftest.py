@@ -1,4 +1,4 @@
-"""Collection rules every Python test of the repository shares."""
+"""Collection rules and options every Python test of the repository shares."""
 
 from __future__ import annotations
 
@@ -8,6 +8,22 @@ import pytest
 
 #: The variable that opts a run into the GPU end-to-end tests.
 GPU_E2E_GATE = "UNISERVE_RUN_GPU_E2E"
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register ``--kernel-device``, where the kernel checks run.
+
+    The option belongs to ``tests/python/kernels/conftest.py``, which reads it;
+    it is registered here because pytest takes options only from the conftest
+    files it loads before collection.
+    """
+    parser.addoption(
+        "--kernel-device",
+        choices=("interpreter", "cuda"),
+        default="interpreter",
+        help="run the kernel checks on Triton's interpreter, which needs no "
+        "device (the default), or compiled for and launched on a CUDA device",
+    )
 
 
 def pytest_collection_modifyitems(
