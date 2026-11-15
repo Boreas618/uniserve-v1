@@ -1675,7 +1675,7 @@ fn is_token(phase: Phase) -> bool {
 }
 
 /// Whether `group` takes another batch: fewer of its batches are in flight than its depth.
-fn queue_open(group: &WorkerGroup) -> bool {
+pub(super) fn queue_open(group: &WorkerGroup) -> bool {
     (group.in_flight as usize) < group.config.queue_depth
 }
 

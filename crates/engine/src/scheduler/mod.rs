@@ -97,11 +97,6 @@ const LENGTH_WORD: usize = 8;
 /// its variant and the length of its key list.
 const EVICT_RECORD: usize = 13;
 
-/// The least time the loop sleeps for a starvation deadline: a step that could not judge a
-/// starved request (every group's queue full, a paused scheduler) does not spin on it
-/// (`S/run.rs:1064-1075`).
-const STARVATION_WAKE: Duration = Duration::from_millis(1);
-
 /// The phases whose calls hold a sequence of tokens in a group's KV cache, which the group's
 /// longest sequence bounds.
 const SEQUENCE_PHASES: [Phase; 4] = [Phase::Prefill, Phase::Decode, Phase::Verify, Phase::Refill];
@@ -929,14 +924,19 @@ impl Scheduler {
     }
 
     /// Until when the loop may block after a step that formed no batch: the next statistics
-    /// second; the moment the first running request passes its starvation bound (the policy's
-    /// `timeout` from its last progress), at least [`STARVATION_WAKE`] away; a drain's deadline
-    /// still ahead; and the earliest bound of a copy in flight. What changes on the queue pair
-    /// rings the doorbell instead ([`Scheduler::interest`]).
+    /// second; while a step can judge starvation, the moment the first running request passes its
+    /// starvation bound (the policy's `timeout` from its last progress); a drain's deadline still
+    /// ahead; and the earliest bound of a copy in flight. What changes on the queue pair rings the
+    /// doorbell instead ([`Scheduler::interest`]).
+    ///
+    /// A step judges starvation only while it schedules: unpaused, with room in some group's
+    /// queue (`schedule`). Otherwise the bound waits for the message that makes the next step
+    /// judge it: the output of a batch, which frees its group's queue, or `Resume`.
     fn next_deadline(&self) -> Instant {
         let now = Instant::now();
         let mut deadline = self.stats_due();
 
+        let judges = !self.paused && self.groups.iter().any(schedule::queue_open);
         // A request waiting for the buffer pool's transfer is exempt from the bound.
         let timeout = Duration::from_nanos(self.policy.limits.timeout.0);
         let starves = self
@@ -946,8 +946,8 @@ impl Scheduler {
             .filter(|request| request.status == RequestStatus::Running)
             .filter_map(|request| request.last_progress.checked_add(timeout))
             .min();
-        if let Some(starves) = starves {
-            deadline = deadline.min(starves.max(now + STARVATION_WAKE));
+        if let Some(starves) = starves.filter(|_| judges) {
+            deadline = deadline.min(starves);
         }
 
         // A deadline already passed was met by the step that just ran.
