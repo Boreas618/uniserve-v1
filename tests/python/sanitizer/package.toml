@@ -19,3 +19,4 @@ form = "executable"
 [source]
 kind = "executable"
 files = ["memcheck-engine"]
+binary = "memcheck-engine"

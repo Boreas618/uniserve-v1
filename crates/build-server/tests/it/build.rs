@@ -114,6 +114,7 @@ interface_version = 3
 [source]
 kind = "executable"
 files = ["bin/sampler"]
+binary = "bin/sampler"
 
 [kernel]
 requires = ["{arch}"]
@@ -146,6 +147,11 @@ fn an_executable_revision_is_installed_stored_and_resolved_as_it_is() {
         .unwrap();
 
     assert_eq!(resolved.form, ModuleForm::Executable);
+    assert_eq!(
+        resolved.executable.as_deref(),
+        Some("bin/sampler"),
+        "the module names the file its process runs as"
+    );
     assert!(resolved.metadata.is_none());
     assert!(resolved.entries.is_empty());
     assert_eq!(

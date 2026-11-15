@@ -125,6 +125,10 @@ pub struct Module {
     /// store recorded it when the module was built. Its loader compares it
     /// with the version it was built for and refuses another.
     pub interface_version: u32,
+    /// An executable module's entry: the name among [`Self::files`] of the
+    /// executable its process runs as, which the package's manifest names
+    /// (`[source] binary`); `None` for every other form.
+    pub executable: Option<String>,
 }
 
 /// One module of an installed package, as `list` names it.
@@ -541,6 +545,8 @@ impl Client {
                         metadata: (!resolved.metadata.is_empty()).then_some(resolved.metadata),
                         entries: resolved.entries.into_iter().collect(),
                         interface_version: resolved.interface_version,
+                        executable: (!resolved.executable.is_empty())
+                            .then_some(resolved.executable),
                     });
                 }
                 wire::server_message::Message::Refused(refused) => {

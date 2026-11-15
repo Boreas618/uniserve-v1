@@ -638,6 +638,7 @@ interface_version = 1
 [source]
 kind = "executable"
 files = ["bin/sampler"]
+binary = "bin/sampler"
 "#;
 
 /// A module set resolves from a store a release shipped: the server serves

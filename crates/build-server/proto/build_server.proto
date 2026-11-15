@@ -232,6 +232,10 @@ message ResolveResponse {
   // store recorded it when the module was built. The loader refuses a module
   // built for another version than its own.
   uint32 interface_version = 6;
+  // The name among the files of the executable an executable module's process
+  // runs as, which its package's manifest names (`[source] binary`); empty for
+  // every other form.
+  string executable = 7;
 }
 
 message ModuleEntry {

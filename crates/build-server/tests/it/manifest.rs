@@ -678,6 +678,7 @@ interface_version = 1
 [source]
 kind = "executable"
 files = ["bin/sampler"]
+binary = "bin/sampler"
 
 [kernel]
 descriptors = [{ dimensions = { dtype = ["bf16"] } }]
@@ -696,6 +697,20 @@ fn an_executable_package_stores_its_binary_and_compiles_nothing() {
     assert_eq!(manifest.source.kind, SourceKind::Executable);
     assert!(manifest.module.metadata.is_none());
     assert!(manifest.module.entries.is_empty());
+    assert_eq!(manifest.executable(), Some("bin/sampler"));
+}
+
+/// An executable module names the file its process runs as, and that file is one the package
+/// carries: a process is never started from a file guessed among the module's.
+#[test]
+fn an_executable_package_names_one_of_its_files_as_its_executable() {
+    let unnamed = EXECUTABLE.replace("binary = \"bin/sampler\"\n", "");
+    let error = load(&unnamed, &["bin/sampler"]).unwrap_err();
+    assert!(error.contains("[source] binary"), "{error}");
+
+    let elsewhere = EXECUTABLE.replace("binary = \"bin/sampler\"", "binary = \"bin/other\"");
+    let error = load(&elsewhere, &["bin/sampler", "bin/other"]).unwrap_err();
+    assert!(error.contains("bin/other"), "{error}");
 }
 
 #[test]

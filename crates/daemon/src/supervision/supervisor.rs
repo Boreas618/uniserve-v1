@@ -369,18 +369,17 @@ pub(crate) fn engine_executable(launch: &proto::config::EngineArgs) -> Result<Pa
         ));
     }
 
-    // The module is the executable, with any tuning data its package carries beside it.
-    use std::os::unix::fs::PermissionsExt as _;
+    // The module holds the executable its manifest names, with any tuning data its package
+    // carries beside it.
+    let entry = module
+        .executable
+        .ok_or_else(|| format!("the module of {named} names no executable"))?;
     module
         .files
         .into_iter()
-        .find(|file| {
-            file.file
-                .metadata()
-                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
-        })
+        .find(|file| file.name == entry)
         .map(|file| file.path)
-        .ok_or_else(|| format!("the module of {named} holds no executable file"))
+        .ok_or_else(|| format!("the module of {named} holds no file {entry}, its executable"))
 }
 
 /// A daemon's lifeline: both ends of the pipe, close-on-exec in the

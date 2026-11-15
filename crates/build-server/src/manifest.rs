@@ -351,8 +351,9 @@ pub struct SourceSpec {
     /// under [`ModuleSpec::metadata`]; it may hold [`DESCRIPTOR_PLACEHOLDER`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<String>,
-    /// The executable a cargo source builds and the module holds, such as
-    /// `uniserve-engine`: a binary target of the package's crate.
+    /// The executable an executable module's process runs as: for a cargo source the binary
+    /// target of the package's crate it builds, such as `uniserve-engine`; for an executable
+    /// source the one of its files that is the executable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
 }
@@ -866,6 +867,15 @@ impl Manifest {
         Ok(manifest)
     }
 
+    /// An executable module's entry: the file its process runs as, which `[source] binary`
+    /// names (the binary a cargo source builds, or the file of an executable source that is
+    /// the executable); `None` for every other form.
+    pub fn executable(&self) -> Option<&str> {
+        (self.module.form == ModuleForm::Executable)
+            .then_some(self.source.binary.as_deref())
+            .flatten()
+    }
+
     /// Checks the manifest against the package's files.
     pub fn validate(&self, root: &Path) -> Result<(), ManifestError> {
         if self.op.is_empty() || self.backend.is_empty() {
@@ -1011,6 +1021,28 @@ impl Manifest {
                 return Err(ManifestError::Invalid(
                     "a cargo source names the executable it builds in [source] binary".into(),
                 ));
+            }
+        }
+        // An executable module names the file its process runs as: the binary a cargo source
+        // builds, or one of an executable source's files.
+        if self.module.form == ModuleForm::Executable {
+            match self.source.binary.as_deref() {
+                None | Some("") => {
+                    return Err(ManifestError::Invalid(
+                        "an executable module names the file its process runs as in [source] \
+                         binary"
+                            .into(),
+                    ));
+                }
+                Some(binary)
+                    if self.source.kind == SourceKind::Executable
+                        && !self.source.files.iter().any(|file| file == binary) =>
+                {
+                    return Err(ManifestError::Invalid(format!(
+                        "the executable {binary} is none of the package's [source] files"
+                    )));
+                }
+                Some(_) => {}
             }
         }
         for shape in self.descriptors() {

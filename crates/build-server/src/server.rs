@@ -373,6 +373,7 @@ impl BuildServer {
                             entries: module.entries.into_iter().collect(),
                             metadata: module.metadata.unwrap_or_default(),
                             interface_version: module.interface_version,
+                            executable: module.executable.unwrap_or_default(),
                         },
                     )),
                 };
@@ -844,6 +845,7 @@ impl BuildServer {
             files: module_files,
             metadata: package.manifest.module.metadata_name(&path.descriptor),
             entries,
+            executable: package.manifest.executable().map(str::to_owned),
             // The record written with the module when it was built: every
             // committed module states the interface version it was built for.
             interface_version: self
