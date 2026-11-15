@@ -4,14 +4,10 @@
 // trtllm-gen FMHA launch.
 //
 // The kernels are TensorRT-LLM's: `TllmGenFmhaRunner` selects one from the
-// artifact's generated kernel table for the call's configuration, and
-// `fmhaKernels.cuh` loads the chosen cubin through `getCubin`. The module
-// publishes the cubins its descriptors can select beside itself, under
-// `cubins/`, and answers that call from its own directory: the Build Server
-// hands a resolved module to the process, so a path compiled in at build time
-// would point at the build host. The manifest records each cubin's sha256, which
-// is what the installer verified when the module arrived; this loader opens the
-// file the kernel table names.
+// library's generated kernel table for the call's configuration, and
+// `fmhaKernels.cuh` loads the chosen cubin through `getCubin`, which the kernel
+// packages' shared cubin loader defines over the directory `ops` hands the
+// module's load entry (`uniserve_trtllm/cubins.h`).
 //
 // What this unit owns is the operator's side of the trade: the tier's
 // configuration (paged KV, causal or dense mask, persistent scheduler for the
@@ -19,16 +15,11 @@
 // the multi-CTA counter and the split-KV scratch, and the refusal of a call the
 // module does not serve.
 
-#include <dlfcn.h>
-
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -37,49 +28,9 @@
 
 #include "flashinfer/trtllm/fmha/fmhaRunner.cuh"
 
+#include <uniserve_trtllm/cubins.h>
+
 #include "entry.h"
-
-namespace {
-
-namespace fs = std::filesystem;
-
-// The directory this module was loaded from.
-fs::path module_directory() {
-  Dl_info info{};
-  if (dladdr(reinterpret_cast<void*>(&uniserve_paged_attention), &info) == 0 ||
-      info.dli_fname == nullptr) {
-    return fs::current_path();
-  }
-  return fs::path(info.dli_fname).parent_path();
-}
-
-}  // namespace
-
-namespace flashinfer::trtllm_cubin_loader {
-
-// The artifact's kernel table asks for a cubin by the name its build gave it;
-// this module publishes the ones its descriptors can select beside itself,
-// under `cubins/`. The manifest recorded each cubin's sha256, which the
-// installer verified when the module arrived, so the file the table names is the
-// one the table's hash belongs to.
-std::string getCubin(const std::string& name, const std::string& sha256) {
-  (void)sha256;
-  // The build host cannot run a kernel, so the module names the cubin its
-  // launcher asked for when asked to: the GPU check reads which kernel served a
-  // call from that file. Diagnostics only; the load path does not depend on it.
-  if (const char* log = std::getenv("UNISERVE_CUBIN_LOG"); log != nullptr && log[0] != '\0') {
-    std::ofstream written(log, std::ios::app);
-    written << fs::path(name).filename().string() << "\n";
-  }
-  const fs::path cubin = module_directory() / "cubins" / fs::path(name).filename();
-  std::ifstream file(cubin, std::ios::binary);
-  if (!file) {
-    throw std::runtime_error("the module has no cubin " + cubin.string());
-  }
-  return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-}
-
-}  // namespace flashinfer::trtllm_cubin_loader
 
 namespace {
 

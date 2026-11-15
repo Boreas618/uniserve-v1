@@ -217,8 +217,10 @@ pub use device::{cuda, meta};
 pub use error::{Error, Result};
 pub use fp4::{Nvfp4Gemm, Nvfp4Quantize, ScaleLayout};
 pub use generation::{Generation, KernelEntry};
-pub use install::{Module, install};
-pub use kernel::{Arguments, CubinMetadata, Entry, Kernel, LaunchGrid, NativeCall, NativeEntry};
+pub use install::{LOAD_ENTRY, Module, install};
+pub use kernel::{
+    Arguments, CubinMetadata, Entry, Kernel, LaunchGrid, LoadCall, NativeCall, NativeEntry,
+};
 pub use launch::launch;
 pub use op::{Call, Checked, Op, Route};
 pub use operand::Operand;

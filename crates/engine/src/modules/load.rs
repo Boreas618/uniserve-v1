@@ -317,9 +317,10 @@ pub(crate) fn parameters(package: &PackageRevision) -> Result<Parameters> {
 ///
 /// A native library is loaded from the store's own file ([`build_server::ModuleFile::path`]),
 /// which the server and this process share on their host and which names the module's bytes for
-/// as long as the store holds them. The object finds the files beside it (a `paged_attention`
-/// module's `cubins/`) from the path it was loaded from (`dladdr` of its own entry), so the path
-/// is the module directory's own file and never a copy or a descriptor's.
+/// as long as the store holds them. `ops` hands a module that reads the files beside it (a
+/// `paged_attention` trtllm module's `cubins/`) the directory of the path it was loaded from,
+/// through the module's load entry ([`ops::LOAD_ENTRY`]), so the path is the module directory's own
+/// file and never a copy or a descriptor's.
 enum Resolved {
     Cubin {
         image: Vec<u8>,
@@ -329,6 +330,8 @@ enum Resolved {
     Native {
         library: PathBuf,
         entry: String,
+        /// The module's load entry ([`ops::LOAD_ENTRY`]), when its package declares one.
+        load: Option<String>,
     },
 }
 
@@ -370,7 +373,12 @@ impl Resolved {
                     .context("the native module states no launch entry")?
                     .clone();
                 let library = named(build_server::source::MODULE_SO)?.path.clone();
-                Ok(Self::Native { library, entry })
+                let load = module.entries.get(ops::LOAD_ENTRY).cloned();
+                Ok(Self::Native {
+                    library,
+                    entry,
+                    load,
+                })
             }
             other => bail!("a {other:?} module is not a kernel this process installs"),
         }
@@ -380,9 +388,14 @@ impl Resolved {
     fn as_ops(&self) -> ops::Module<'_> {
         match self {
             Self::Cubin { image, metadata } => ops::Module::Cubin { image, metadata },
-            Self::Native { library, entry } => ops::Module::Native {
+            Self::Native {
+                library,
+                entry,
+                load,
+            } => ops::Module::Native {
                 path: library,
                 entry,
+                load: load.as_deref(),
             },
         }
     }
@@ -452,7 +465,7 @@ mod tests {
             interface_version: 1,
             executable: None,
         };
-        let Resolved::Native { library, entry } = Resolved::of(native).unwrap() else {
+        let Resolved::Native { library, entry, .. } = Resolved::of(native).unwrap() else {
             panic!("a native module reads as a native library");
         };
         assert_eq!(library, store.path().join(build_server::source::MODULE_SO));

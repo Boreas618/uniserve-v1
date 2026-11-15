@@ -7,7 +7,9 @@ their table (the `trtllm-gen-fmha` and `trtllm-gen-bmm` pins of
 :mod:`uniserve_build_server.fetch`). A package compiles the launch code it
 needs with its own C entry into ``module.so``, and a package launching
 trtllm-gen kernels publishes the cubins its descriptor can select beside the
-module under ``cubins/``.
+module, under :data:`CUBINS`, and reads them through the cubin loader of the
+kernel packages' shared sources (``uniserve_trtllm/cubins.h`` of
+``uniserve_kernels``), from the directory the loader hands its load entry.
 
 This module is the one statement of what those packages share:
 
@@ -19,8 +21,9 @@ This module is the one statement of what those packages share:
   each part of the launch code, with the definitions it is compiled with
   (:class:`LaunchCode`: :data:`COMBINE`, :data:`FMHA`, :data:`ROUTED_GEMM`);
 - the one build routine (:func:`build`): a package's entry unit and the launch
-  code's units as the CUDA driver's units, compiled and linked into
-  ``module.so`` by :func:`uniserve_build_server.cuda.native`;
+  code's units as the CUDA driver's units, with the kernel packages' shared
+  C++ sources on the include path, compiled and linked into ``module.so`` by
+  :func:`uniserve_build_server.cuda.native`;
 - staging a pinned trtllm-gen library (:func:`stage`);
 - the libraries' tables read into typed kernels (:func:`fmha_table`,
   :func:`bmm_table`, with the vendor's enumerations, :func:`enumerations`),
@@ -36,6 +39,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.metadata
+import importlib.resources
 import pathlib
 import re
 import shutil
@@ -43,11 +47,16 @@ import sys
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from uniserve_build_server import cuda, fetch
+from uniserve_build_server import cuda, fetch, toolchain
 from uniserve_build_server.request import Request, Target
 
 #: The distribution whose data tree holds the launch code.
 FLASHINFER = "flashinfer-python"
+
+#: The directory of a module that holds the cubins it publishes. The launch
+#: code's loader prefixes it to a cubin's name (:attr:`LaunchCode.cubin_path`),
+#: and the module's loader reads that name in the module's directory.
+CUBINS = "cubins"
 
 
 def data_tree() -> pathlib.Path:
@@ -129,14 +138,16 @@ class LaunchCode:
 
     ``units`` are its translation units, relative to the data tree, and
     ``definitions`` the definitions every unit of a module compiling it
-    reads, the package's entry unit included. ``library`` is the pinned
-    trtllm-gen library whose kernels it launches, for launch code that
-    launches them.
+    reads, the package's entry unit included. Launch code that launches
+    trtllm-gen kernels names the pinned ``library`` of them and the macro
+    whose value its loader prefixes to a cubin's name (``cubin_path``), which
+    the vendor's headers refuse to compile without.
     """
 
     units: tuple[str, ...]
     definitions: Mapping[str, cuda.Definition]
     library: str | None = None
+    cubin_path: str | None = None
 
 
 #: trtllm-gen's MoE combine (`moeUnpermute`) and the commons its checks call.
@@ -155,6 +166,7 @@ FMHA = LaunchCode(
     units=("csrc/fmhaReduction.cu",),
     definitions={**TENSORRT_LLM, **FLASHINFER_TYPES},
     library="trtllm-gen-fmha",
+    cubin_path="TLLM_GEN_FMHA_CUBIN_PATH",
 )
 
 #: The routed MoE products' runners (`PermuteGemm1::Runner`,
@@ -168,6 +180,7 @@ ROUTED_GEMM = LaunchCode(
     ),
     definitions={**TENSORRT_LLM, **BATCHED_GEMM},
     library="trtllm-gen-bmm",
+    cubin_path="TLLM_GEN_GEMM_CUBIN_PATH",
 )
 
 
@@ -203,10 +216,11 @@ def build(
     launch code's definitions and ``definitions``; the entry unit also reads
     ``entry_definitions``, the descriptor's values it is compiled for. The
     include path is ``includes`` (a staged library's headers, searched
-    first) and then the data tree's :data:`INCLUDES`. Every unit is C++17 in
-    the language its file names, as FlashInfer's own build compiles it, and
-    lets device code call constexpr host functions, as CUTLASS's headers
-    need.
+    first), the kernel packages' shared C++ sources and then the data tree's
+    :data:`INCLUDES`; launch code with a cubin path defines it as
+    :data:`CUBINS`. Every unit is C++17 in the language its file names, as
+    FlashInfer's own build compiles it, and lets device code call constexpr
+    host functions, as CUTLASS's headers need.
 
     The module links the driver API beside the CUDA runtime: trtllm-gen's
     launcher calls `cuModuleLoadData`, `cuModuleGetFunction` and
@@ -218,8 +232,9 @@ def build(
             "[source] unit"
         )
     data = data_tree()
-    search = [*includes, *(data / one for one in INCLUDES)]
     shared = {**code.definitions, **(definitions or {})}
+    if code.cubin_path is not None:
+        shared[code.cubin_path] = f'"{CUBINS}"'
     sources = [
         (
             request.package / request.unit,
@@ -227,11 +242,15 @@ def build(
         ),
         *((data / unit, shared) for unit in code.units),
     ]
-    units = []
-    for source, unit_definitions in sources:
+    for source, _ in sources:
         if not source.is_file():
             raise SystemExit(f"{request.op}/{request.backend} has no {source}")
-        units.append(
+
+    with importlib.resources.as_file(
+        importlib.resources.files(toolchain.KERNELS).joinpath("include")
+    ) as kernel_sources:
+        search = [*includes, kernel_sources, *(data / one for one in INCLUDES)]
+        units = [
             cuda.Unit(
                 source=source,
                 standard="c++17",
@@ -239,8 +258,9 @@ def build(
                 includes=search,
                 relaxed_constexpr=True,
             )
-        )
-    cuda.native(request, units, libraries=["cuda"])
+            for source, unit_definitions in sources
+        ]
+        cuda.native(request, units, libraries=["cuda"])
 
 
 # The tables of trtllm-gen's libraries.
@@ -622,14 +642,27 @@ def publish(
     kernels: Sequence[Kernel],
     staging: pathlib.Path,
 ) -> None:
-    """Publishes the kernels' cubins beside the module, under ``cubins/``.
+    """Publishes the kernels' cubins beside the module, under :data:`CUBINS`.
 
-    Each cubin is staged from the pinned library into ``staging`` and copied
-    into the module's output, its own bytes and not a link into the cache of
-    pins.
+    Each cubin is staged from the pinned library into ``staging`` (verified
+    against the pin's manifest) and copied into the module's output, its own
+    bytes and not a link into the cache of pins. A cubin whose digest in the
+    manifest is not the hash the library's table states for its kernel is
+    refused: the module's loader reads the published file in place of the
+    hash the launch code hands it.
     """
     stage(request, library, staging, [kernel.cubin for kernel in kernels])
-    published = request.output / "cubins"
+    try:
+        digests = fetch.manifest(fetch.pin(library), request.cache)
+    except fetch.FetchError as error:
+        raise SystemExit(f"reading the {library} manifest: {error}") from error
+    for kernel in kernels:
+        if digests[kernel.cubin] != kernel.sha256:
+            raise SystemExit(
+                f"{library} lists {kernel.cubin} with sha256 "
+                f"{digests[kernel.cubin]} and its table states {kernel.sha256}"
+            )
+    published = request.output / CUBINS
     published.mkdir(parents=True, exist_ok=True)
     for kernel in kernels:
         shutil.copyfile(staging / kernel.cubin, published / kernel.cubin)
@@ -769,7 +802,7 @@ def build_routed_gemm(
     2. select the kernels (:func:`select`) by the options the manifest's
        `[parameters.selected]` states and the descriptor's MMA tile and
        cluster, on the target's architecture families;
-    3. publish the selected cubins under ``cubins/`` (:func:`publish`) and
+    3. publish the selected cubins under :data:`CUBINS` (:func:`publish`) and
        write a filtered table into the compile's include path, so the
        runner's configuration list is exactly this descriptor's tactics: a
        cubin that is not published cannot be selected;
@@ -824,7 +857,6 @@ def build_routed_gemm(
             request,
             ROUTED_GEMM,
             includes=artifact_includes(staging),
-            definitions={"TLLM_GEN_GEMM_CUBIN_PATH": '"."'},
             entry_definitions={
                 **geometry(request.fields),
                 **(entry_definitions or {}),

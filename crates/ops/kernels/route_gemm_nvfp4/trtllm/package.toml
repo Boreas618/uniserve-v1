@@ -18,6 +18,11 @@ interface_version = 1
 [toolchain]
 packages = ["flashinfer-python"]
 
+[module.entries]
+# The cubin loader's load entry (`uniserve_trtllm/cubins.h`): `ops` hands it the directory of the
+# module's files once it has opened the library, and the module reads its cubins from there.
+load = "uniserve_trtllm_load"
+
 [source]
 kind = "cuda"
 unit = "src/entry.cu"

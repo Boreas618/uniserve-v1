@@ -3,9 +3,10 @@
 
 This is the GPU check the Build Server cannot do on a build host: it loads
 the module the store holds exactly as a runner does (``module.so`` plus the
-``cubins/`` beside it), calls the operator's entry with the call structure of
-``crates/ops/src/attention/mod.rs`` (784 bytes, ``error`` at 272), and compares
-the module's output with exact attention computed in torch.
+``cubins/`` beside it, the directory handed to the module's load entry
+``uniserve_trtllm_load``), calls the operator's entry with the call structure
+of ``crates/ops/src/attention/mod.rs`` (784 bytes, ``error`` at 272), and
+compares the module's output with exact attention computed in torch.
 
     python decode_check.py <module_dir> [--page 64] [--batch 8] [--len 3000]
 
@@ -13,9 +14,9 @@ the module's output with exact attention computed in torch.
 ``cubins/``. Run it on the GPU host with the Build Server's own environment
 (``crates/build-server/python/.venv/bin/python``), which has torch.
 
-The kernel the module loads is logged when ``UNISERVE_CUBIN_LOG`` names a file:
-the module appends the cubin name its launcher asked for, and this script
-prints it, so the check states which cubin served the decode.
+The check states which kernels served the decode as the profiler records
+them (``torch.profiler``, the kernels' own names on the device): a cubin's
+kernel is named as the library's table names it.
 
 ``--expect-refusal <guard>`` asks the entry for one of the guards it states
 before it reaches the device, and asserts the words it answers with, not merely
@@ -124,6 +125,15 @@ class Call(ctypes.Structure):
         ("dtype_key_value", ctypes.c_int64),
         ("dtype_output", ctypes.c_int64),
         ("phase", ctypes.c_int64),
+        ("error", ctypes.c_char * 512),
+    ]
+
+
+class Load(ctypes.Structure):
+    """The load entry's call (`uniserve_trtllm/cubins.h`, `ops::LoadCall`)."""
+
+    _fields_ = [
+        ("directory", ctypes.c_char_p),
         ("error", ctypes.c_char * 512),
     ]
 
@@ -357,6 +367,19 @@ def main() -> int:
         )
         return 0
     library = ctypes.CDLL(str(module_path))
+    # The module reads its cubins in the directory its loader hands it, as
+    # `ops` hands it the directory of the file it loaded.
+    load = library.uniserve_trtllm_load
+    load.argtypes = [ctypes.POINTER(Load), ctypes.c_void_p]
+    load.restype = ctypes.c_int32
+    loaded = Load(str(module_path.parent).encode(), b"")
+    if load(ctypes.byref(loaded), None) != 0:
+        print(
+            f"the load entry refused the module's directory: "
+            f"{loaded.error.decode(errors='replace')}",
+            file=sys.stderr,
+        )
+        return 1
     entry = library.uniserve_paged_attention
     entry.argtypes = [ctypes.POINTER(Call), ctypes.c_void_p]
     entry.restype = ctypes.c_int32
@@ -369,8 +392,10 @@ def main() -> int:
     call, out, query, key, value, page_table, seq_lens = build(
         arguments, device, arguments.head_dim, arguments.page, -1
     )
-    status = entry(ctypes.byref(call), ctypes.c_void_p(stream))
-    torch.cuda.synchronize()
+    activities = [torch.profiler.ProfilerActivity.CUDA]
+    with torch.profiler.profile(activities=activities) as profiled:
+        status = entry(ctypes.byref(call), ctypes.c_void_p(stream))
+        torch.cuda.synchronize()
     if status != 0:
         print(
             f"the entry refused the call: {call.error.decode(errors='replace')}",
@@ -387,12 +412,14 @@ def main() -> int:
         f"max |out - exact attention| = {error:.6g} (largest value {scale:.6g})"
     )
 
-    logged = pathlib.Path(module_path.parent / "cubin-log.txt")
-    if logged.is_file():
-        names = logged.read_text().split()
-        print(
-            f"the launcher asked for {len(names)} cubin(s): {sorted(set(names))}"
-        )
+    kernels = sorted(
+        {
+            event.name
+            for event in profiled.events()
+            if event.device_type == torch.autograd.DeviceType.CUDA
+        }
+    )
+    print(f"the decode ran {len(kernels)} kernel(s): {kernels}")
     if error > 0.05 * max(scale, 1.0):
         print("the decode does not match exact attention", file=sys.stderr)
         return 1

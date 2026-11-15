@@ -59,6 +59,27 @@ pub trait NativeCall {
     }
 }
 
+/// The call of a native module's load entry ([`crate::LOAD_ENTRY`]): the directory of the module's
+/// files, for a module that reads files published beside its library (the cubins a trtllm-gen
+/// module launches). The package's header mirrors it as `uniserve_trtllm_load_call`.
+#[repr(C)]
+pub struct LoadCall {
+    /// The NUL-terminated path of the directory the module's files were published in.
+    pub directory: *const std::ffi::c_char,
+    /// The entry's NUL-terminated error message.
+    pub error: [u8; 512],
+}
+
+const _: () = assert!(std::mem::offset_of!(LoadCall, error) == 8);
+const _: () = assert!(std::mem::size_of::<LoadCall>() == 520);
+
+impl NativeCall for LoadCall {
+    fn message(&self) -> Option<&str> {
+        let end = self.error.iter().position(|&byte| byte == 0)?;
+        std::str::from_utf8(&self.error[..end]).ok()
+    }
+}
+
 /// A module's launch metadata, in Triton's field names.
 ///
 /// Triton writes this JSON beside every cubin it compiles, and the Build Server writes the same
@@ -522,6 +543,47 @@ impl Kernel {
         Ok(Self::Native { library, entry })
     }
 
+    /// Hand this native kernel's module the directory of its files through its load entry.
+    ///
+    /// `entry` is the symbol the package declares for [`crate::LOAD_ENTRY`]; the entry records
+    /// `directory` and issues no device work, so it is called without a stream.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KernelForm`] for a cubin kernel, [`Error::Platform`] when the library does not
+    /// export `entry`, [`Error::Metadata`] for a directory that is not a C string, and
+    /// [`Error::Native`] with the entry's message when it refuses the directory.
+    pub fn load_directory(&self, entry: &str, directory: &std::path::Path) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = std::ffi::CString::new(directory.as_os_str().as_bytes())
+            .map_err(|_| Error::Metadata(format!("{} is not a C string", directory.display())))?;
+        // SAFETY: the package's header declares the load entry with exactly `Entry`'s signature,
+        // taking a `LoadCall`.
+        let load = unsafe { self.native_symbol::<Entry>(entry)? };
+        let mut call = LoadCall {
+            directory: path.as_ptr(),
+            error: [0; 512],
+        };
+        // SAFETY: `call` has the layout the header declares, and `path` outlives the call; the
+        // entry issues no device work and takes no stream.
+        let status = unsafe {
+            load(
+                &mut call as *mut LoadCall as *const c_void,
+                std::ptr::null_mut(),
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(Error::Native {
+                entry: entry.to_owned(),
+                status,
+                message: call.message().map(str::to_owned),
+            })
+        }
+    }
+
     /// A further C entry of this native kernel's library, by the name its header gives it.
     ///
     /// A package's launch entry is the one [`Self::native`] calls; a lifecycle entry around it is
@@ -659,7 +721,8 @@ impl std::fmt::Debug for Kernel {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arguments, CubinMetadata, DevicePtr};
+    use super::{Arguments, CubinMetadata, DevicePtr, Kernel, NativeLibrary};
+    use crate::Error;
 
     /// A metadata record of a kernel taking `signature` (a JSON object, in parameter order) and
     /// `global_scratch_size` bytes of global scratch, the other fields as Triton writes them for a
@@ -758,5 +821,31 @@ mod tests {
             .pointer(DevicePtr::from_address(0x2000))
             .u64(4);
         assert_eq!(arguments.parameters(&module).unwrap().len(), 5);
+    }
+
+    /// A load entry that refuses the module's directory refuses the module, with the entry's
+    /// status: a module installed without its directory would fail at its first launch instead.
+    /// `getpid` stands in for an entry that answers a nonzero status.
+    #[test]
+    fn a_load_entry_s_refusal_refuses_the_module() {
+        let library = NativeLibrary::open("libc.so.6").expect("the C library loads");
+        let kernel = Kernel::load_native(library, "getpid").expect("the entry resolves");
+        let refused = kernel
+            .load_directory("getpid", std::path::Path::new("/module"))
+            .unwrap_err();
+        assert!(
+            matches!(&refused, Error::Native { entry, status, .. } if entry == "getpid" && *status != 0),
+            "{refused}"
+        );
+        let missing = kernel
+            .load_directory(
+                "uniserve_no_such_load_entry",
+                std::path::Path::new("/module"),
+            )
+            .unwrap_err();
+        assert!(
+            missing.to_string().contains("uniserve_no_such_load_entry"),
+            "{missing}"
+        );
     }
 }

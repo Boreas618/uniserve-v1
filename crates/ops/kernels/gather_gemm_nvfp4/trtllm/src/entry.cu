@@ -14,58 +14,13 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include <dlfcn.h>
-
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <stdexcept>
-#include <string>
+#include <exception>
 
 #include "flashinfer/trtllm/fused_moe/runner.h"
 
-#include "entry.h"
-#include <exception>
-
-namespace {
-
-namespace fs = std::filesystem;
-
-// The directory this module was loaded from.
-fs::path module_directory() {
-  Dl_info info{};
-  if (dladdr(reinterpret_cast<void*>(uniserve_gather_gemm_nvfp4), &info) == 0 ||
-      info.dli_fname == nullptr) {
-    return fs::current_path();
-  }
-  return fs::path(info.dli_fname).parent_path();
-}
-
-}  // namespace
-
-namespace flashinfer::trtllm_cubin_loader {
-
-// The artifact's kernel table asks for a cubin by the name its build gave it; this module publishes
-// the ones its descriptors can select beside itself, under `cubins/`. The manifest recorded each
-// cubin's sha256, which the installer verified when the module arrived, so the file the table names
-// is the one the table's hash belongs to.
-std::string getCubin(const std::string& name, const std::string& sha256) {
-  (void)sha256;
-  if (const char* log = std::getenv("UNISERVE_CUBIN_LOG"); log != nullptr && log[0] != '\0') {
-    std::ofstream written(log, std::ios::app);
-    written << fs::path(name).filename().string() << "\n";
-  }
-  const fs::path cubin = module_directory() / "cubins" / fs::path(name).filename();
-  std::ifstream file(cubin, std::ios::binary);
-  if (!file) {
-    throw std::runtime_error("the module has no cubin " + cubin.string());
-  }
-  return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-}
-
-}  // namespace flashinfer::trtllm_cubin_loader
+#include <uniserve_trtllm/cubins.h>
 
 
 // The compiled geometry, stated by the build from the descriptor's own values.

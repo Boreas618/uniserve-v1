@@ -117,16 +117,12 @@ def compile(request: Request) -> None:
         )
         trtllm.publish(request, library, kernels, staging)
 
-        # The launch code's header refuses to compile without the table's hash
-        # and the directory its loader prefixes to a cubin's name, both of
-        # which FlashInfer's own build defines.
+        # The launch code's header refuses to compile without the table's
+        # hash, which FlashInfer's own build defines.
         table_hash = hashlib.sha256((staging / TABLE).read_bytes()).hexdigest()
         trtllm.build(
             request,
             trtllm.FMHA,
             includes=[staging / "include"],
-            definitions={
-                "TLLM_GEN_FMHA_CUBIN_PATH": '"."',
-                "TLLM_GEN_FMHA_METAINFO_HASH": f'"{table_hash}"',
-            },
+            definitions={"TLLM_GEN_FMHA_METAINFO_HASH": f'"{table_hash}"'},
         )

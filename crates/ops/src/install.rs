@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use platform::NativeLibrary;
 
-use crate::Result;
 use crate::generation::KernelEntry;
 use crate::kernel::{CubinMetadata, Kernel};
+use crate::{Error, Result};
 
 /// One module of a generation layer, as the package delivered it.
 pub enum Module<'a> {
@@ -28,14 +28,23 @@ pub enum Module<'a> {
         /// The module's metadata record, as JSON.
         metadata: &'a [u8],
     },
-    /// A shared object the platform loads, and the C entry the package declares.
+    /// A shared object the platform loads, and the C entries the package declares.
     Native {
-        /// The library on disk.
+        /// The library on disk, in the directory the module's files were published in.
         path: &'a Path,
         /// The entry point's name, constants and launch scalars as the package declared them.
         entry: &'a str,
+        /// The module's load entry ([`LOAD_ENTRY`]), for a module that reads files published
+        /// beside its library: it is called once the library is open, before any launch, with the
+        /// directory of the module's files.
+        load: Option<&'a str>,
     },
 }
+
+/// The role of a native module's load entry among the C entries its manifest declares
+/// (`[module.entries]`): `int32_t load(LoadCall* call, void* stream)`, called once when the module
+/// is installed with the directory of the module's files ([`crate::kernel::LoadCall`]).
+pub const LOAD_ENTRY: &str = "load";
 
 /// Load `module` as the kernel of `operator` for `descriptor_key`.
 ///
@@ -67,9 +76,21 @@ fn load(device: &platform::Device, module: Module<'_>) -> Result<Kernel> {
             // kernel per descriptor, as paged attention does per phase.
             Kernel::load_cubin(device, image, CubinMetadata::parse(metadata)?)
         }
-        Module::Native { path, entry } => {
+        Module::Native { path, entry, load } => {
             let library = NativeLibrary::open(path)?;
-            Kernel::load_native(library, entry)
+            let kernel = Kernel::load_native(library, entry)?;
+            if let Some(load) = load {
+                // A module's files are published together in one directory, and its library is
+                // opened from its own file there, so the library's directory is the module's.
+                let directory = path.parent().ok_or_else(|| {
+                    Error::Metadata(format!(
+                        "the module's library {} is in no directory",
+                        path.display()
+                    ))
+                })?;
+                kernel.load_directory(load, directory)?;
+            }
+            Ok(kernel)
         }
     }
 }
