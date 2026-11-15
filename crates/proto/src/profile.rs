@@ -401,7 +401,7 @@ mod tests {
     fn request() -> SessionRequest {
         SessionRequest {
             collectors: vec![Collector::Timeline],
-            output_dir: "/tmp/profiles".into(),
+            output_dir: "profiles".into(),
             ..SessionRequest::default()
         }
     }
@@ -410,7 +410,7 @@ mod tests {
     fn a_request_reads_from_its_json_with_defaults() {
         let parsed: SessionRequest = serde_json::from_str(
             r#"{"collectors": ["timeline", "fence_timeline", "pm_sampling"], "steps": 8,
-                "stages": ["decode"], "output_dir": "/tmp/p",
+                "stages": ["decode"], "output_dir": "profiles",
                 "pm_sampling": {"interval_ns": 50000}}"#,
         )
         .unwrap();

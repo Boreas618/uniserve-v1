@@ -29,7 +29,7 @@ pub use generation::{
 };
 pub use sampling::{SamplingParams, SamplingParamsError};
 pub use spec::{
-    ExpertExchange, FlashInferBackend, FlashInferBackendParseError, LoadFormat, PrefixCacheDtype,
+    ExpertExchange, FlashInferBackend, FlashInferBackendParseError, PrefixCacheDtype,
     PrefixCacheDtypeParseError, SchedulingPolicy, StandbyStorage,
 };
 pub use values::{DiffusionSamplingParams, ImageEncoder, RequestId, TokenLogprob};

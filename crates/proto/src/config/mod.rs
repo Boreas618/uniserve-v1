@@ -21,8 +21,7 @@ use serde_json::Value;
 
 use crate::request::wire::{ExpertOrder, Predecessor};
 use crate::request::{
-    ExpertExchange, FlashInferBackend, LoadFormat, PrefixCacheDtype, SchedulingPolicy,
-    StandbyStorage,
+    ExpertExchange, FlashInferBackend, PrefixCacheDtype, SchedulingPolicy, StandbyStorage,
 };
 pub use block::{
     BlockConfig, BlockConfigError, BlockDistribution, BlockWeights, HeadProjection,
@@ -79,36 +78,12 @@ impl Default for ServerConfig {
 }
 
 /// Checkpoint loading (`load_config`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoadConfig {
-    /// Checkpoint reader: `auto`, `safetensors`, `pt`, `layered` (one layer
-    /// at a time) or `dummy` (no weights read).
-    pub format: LoadFormat,
-    /// Hugging Face cache root for repository models.
-    pub download_dir: Option<PathBuf>,
-    /// Concurrent checkpoint file readers.
-    pub threads: Option<NonZeroU32>,
     /// A plugin's weight source (`scheme://...`) that streams the
     /// checkpoint's tensors in place of its files; the files when unset.
     pub weights: Option<String>,
-    /// The tensor- and expert-parallel degrees the configurations of the
-    /// deployment use, which retained weight storage is chunked for so that
-    /// an epoch of any of them maps the chunks it shares with another;
-    /// every degree up to the GPUs a worker sees when empty.
-    pub parallel_degrees: Vec<NonZeroU32>,
-}
-
-impl Default for LoadConfig {
-    fn default() -> Self {
-        Self {
-            format: LoadFormat::Auto,
-            download_dir: None,
-            threads: None,
-            weights: None,
-            parallel_degrees: Vec::new(),
-        }
-    }
 }
 
 /// The KV cache (`kv_cache_config`).
@@ -546,7 +521,7 @@ pub enum ReasoningParser {
     None,
 }
 
-/// Chat models: `Qwen3` (`chat_config`).
+/// Chat-template rendering and reasoning output of the chat families (`chat_config`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChatConfig {
@@ -859,8 +834,8 @@ pub struct Quantization {
     /// The mode every module takes that `modules` does not select.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<PrecisionMode>,
-    /// Representations selected by module, under the names the model family gives its modules
-    /// (MiniMax-H3: `attention`, `mlp`, `text_encoder`, `video_vae`).
+    /// Representations selected by module, under the names the model family declares for its
+    /// modules; the family refuses a name it does not declare.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub modules: BTreeMap<String, WeightFormat>,
 }

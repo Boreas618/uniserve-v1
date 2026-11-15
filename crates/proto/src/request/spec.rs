@@ -97,23 +97,6 @@ pub enum StandbyStorage {
     Suspended,
 }
 
-/// How a rank reads its checkpoint.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LoadFormat {
-    /// Detects the checkpoint files' own format.
-    #[default]
-    Auto,
-    /// Reads safetensors files.
-    Safetensors,
-    /// Reads PyTorch pickle files.
-    Pt,
-    /// Initializes weights without reading the checkpoint.
-    Dummy,
-    /// Reads the checkpoint one layer at a time.
-    Layered,
-}
-
 /// Storage dtype used by paged key/value cache tensors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrefixCacheDtype {
