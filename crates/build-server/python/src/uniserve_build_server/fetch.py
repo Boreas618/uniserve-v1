@@ -22,7 +22,17 @@ distribution this environment's lock installs (``distribution``).
 
 A pin of Python sources states the directories among its files that are
 packages a build imports under their own names (``packages``), and
-:func:`load` imports them from a build's staged copy of the files.
+:func:`load` imports them from a build's staged copy of the files. A pin of
+C++ sources states the directories among its files a compilation includes
+(``include``), and :func:`includes` names them in the cache or in a staged
+copy.
+
+A header set that a distribution of this environment's lock installs (ATen's
+headers in ``torch``, CUTLASS in ``flashinfer-python``) is used where the
+distribution installs it (:func:`installed`) rather than pinned again: the
+lock fixes the distribution's content by its wheel's hash, and the package
+that includes it names the distribution in its manifest's ``[toolchain]
+packages``.
 
 The cache is the Build Server's: a build is handed its root in its request
 (:attr:`uniserve_build_server.request.Request.cache`), and
@@ -83,6 +93,9 @@ class Pin:
     #: The directories of the pin's files that are Python packages, each
     #: imported under its directory's name (:func:`load`).
     packages: tuple[str, ...] = ()
+    #: The directories of the pin's files a C++ compilation searches for the
+    #: headers it includes (:func:`includes`).
+    include: tuple[str, ...] = ()
 
     def directory(self, cache: Path) -> Path:
         """The pin's cache directory, content-addressed by its manifest."""
@@ -176,12 +189,7 @@ class Distribution:
     def fetch(
         self, pin: Pin, cache: Path, wanted: dict[str, str], jobs: int
     ) -> None:
-        try:
-            installed = importlib.metadata.distribution(self.name)
-        except importlib.metadata.PackageNotFoundError:
-            raise FetchError(
-                f"{sys.executable} has no {self.name} distribution"
-            ) from None
+        installed = _distribution(self.name)
         root = Path(installed.locate_file(""))
         for name, digest in wanted.items():
             if not (root / name).is_file():
@@ -194,6 +202,31 @@ class Distribution:
                 digest,
                 f"{self.name} {installed.version}: {name}",
             )
+
+
+def _distribution(name: str) -> importlib.metadata.Distribution:
+    """The installed distribution ``name``, refused when it is absent."""
+    try:
+        return importlib.metadata.distribution(name)
+    except importlib.metadata.PackageNotFoundError:
+        raise FetchError(
+            f"{sys.executable} has no {name} distribution"
+        ) from None
+
+
+def installed(distribution: str, path: str) -> Path:
+    """Where a distribution of this environment's lock installs ``path``.
+
+    ``path`` is relative to the distribution's installation root
+    (``site-packages``), such as ``torch/include`` of ``torch``: a header set a
+    package compiles against in place. A distribution the environment lacks,
+    or one that installs no such path, is refused.
+    """
+    found = _distribution(distribution)
+    located = Path(found.locate_file(path))
+    if not located.exists():
+        raise FetchError(f"{distribution} {found.version} installs no {path}")
+    return located
 
 
 def _origin(stated: dict[str, str]) -> Files | Archive | Distribution:
@@ -220,6 +253,7 @@ def pins() -> dict[str, Pin]:
             origin=_origin(stated["origin"]),
             manifest=stated.get("manifest"),
             packages=tuple(stated.get("packages", ())),
+            include=tuple(stated.get("include", ())),
         )
     return found
 
@@ -466,6 +500,20 @@ def load(source: Pin, tree: Path) -> None:
         sys.modules[spec.name] = module
     for spec, module in found:
         spec.loader.exec_module(module)
+
+
+def includes(source: Pin, tree: Path) -> list[Path]:
+    """The include directories of a pin's files under ``tree``, in its order.
+
+    ``tree`` holds the pin's files under their manifest paths: the pin's cache
+    directory (:func:`fetch`) or a build's staged copy (:func:`stage`). A pin
+    that states no include directory holds no header set and is refused.
+    """
+    if not source.include:
+        raise FetchError(
+            f"the {source.name} pin states no include directory of its files"
+        )
+    return [tree / directory for directory in source.include]
 
 
 def apply_patch(root: Path, patch: Path) -> None:

@@ -1,9 +1,11 @@
-"""Pinned sources: importing a pin's packages from a build's staged copy.
+"""Pinned sources: the declared pins, and a build's staged copy of one.
 
 A pin of Python sources states which of its directories are packages, and a
 build imports them from its own staged copy of the files under their own names
-(``fetch.load``). These tests stage small trees of their own, so no pin is
-fetched.
+(``fetch.load``); a pin of C++ sources states the directories a compilation
+includes (``fetch.includes``). A header set of a locked distribution is used
+where the distribution installs it (``fetch.installed``). These tests stage
+small trees of their own and read the packaged pins, so no pin is fetched.
 """
 
 from __future__ import annotations
@@ -78,3 +80,37 @@ def test_a_package_the_process_already_imported_is_refused(staged):
 
     with pytest.raises(fetch.FetchError, match="already imported"):
         fetch.load(pin("vendor/src/json"), staged)
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [one for one in fetch.pins().values() if one.manifest is None],
+    ids=lambda one: one.name,
+)
+def test_a_packaged_manifest_is_the_pins_and_holds_its_include_directories(
+    declared, tmp_path
+):
+    # The manifest is refused unless its digest is the one the pin names.
+    files = fetch.manifest(declared, tmp_path)
+    if not declared.include:
+        return
+
+    # Every include directory holds files of the pin.
+    for directory in fetch.includes(declared, tmp_path):
+        relative = directory.relative_to(tmp_path).as_posix()
+        assert any(name.startswith(f"{relative}/") for name in files), relative
+
+
+def test_a_pin_without_include_directories_is_refused(tmp_path):
+    with pytest.raises(fetch.FetchError, match="no include directory"):
+        fetch.includes(pin(), tmp_path)
+
+
+def test_a_locked_distribution_is_used_where_it_installs_a_path():
+    found = fetch.installed("urllib3", "urllib3/__init__.py")
+
+    assert found.is_file()
+    with pytest.raises(fetch.FetchError, match="installs no"):
+        fetch.installed("urllib3", "urllib3/absent")
+    with pytest.raises(fetch.FetchError, match="has no"):
+        fetch.installed("uniserve-absent-distribution", "include")
