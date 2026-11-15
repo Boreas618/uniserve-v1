@@ -723,6 +723,49 @@ fn retained_names(client: &mut Client) -> Vec<String> {
     names
 }
 
+/// The engines of one epoch on a host each claim, through the node's daemon,
+/// the scopes they place (the independent replicas of the epoch's
+/// configuration, and a process that replaces one of them): one engine's
+/// claim leaves the storage another engine of the epoch retains under its own
+/// scope, and a claim that retires the epoch ends it.
+#[test]
+fn an_engine_s_claim_keeps_another_engine_of_its_epoch_retained() {
+    let server = Running::start();
+    let mut claim = ::storage::ClaimClient::connect(&server.socket, "model").unwrap();
+    let mut observer = head(&server.socket);
+    let token = claim
+        .claim(1, vec![scope("model-0", 0)], Vec::new())
+        .unwrap();
+
+    // The first replica's worker publishes its exclusive planes.
+    let mut first = epoch_worker(&server.socket, scope("model-0", 0), 1, token);
+    let planes = memfd(&[1; 4]);
+    first
+        .put(
+            vec![tensor(key(1), "planes", 0, 0, Access::Exclusive)],
+            &[(host(4), planes.as_fd())],
+        )
+        .unwrap();
+    assert_eq!(retained_names(&mut observer), vec!["planes"]);
+
+    // The second replica of the same epoch claims its own scope, and the
+    // first replica's next process claims its own again, as a relaunch does.
+    let second = claim
+        .claim(1, vec![scope("model-1", 0)], Vec::new())
+        .unwrap();
+    assert_eq!(second, token);
+    assert_eq!(retained_names(&mut observer), vec!["planes"]);
+    let relaunch = claim
+        .claim(1, vec![scope("model-0", 0)], Vec::new())
+        .unwrap();
+    assert_eq!(relaunch, token);
+    assert_eq!(retained_names(&mut observer), vec!["planes"]);
+
+    // The next epoch's claim that retires epoch 1 ends its storage.
+    claim.claim(2, vec![scope("model-0", 0)], vec![1]).unwrap();
+    assert!(retained_names(&mut observer).is_empty());
+}
+
 /// Two epochs of one deployment share a scope without touching each other's
 /// storage: the head keeps one claim token for both, each epoch's `retain`
 /// releases its own tensors alone, and a claim that retires an epoch releases

@@ -839,18 +839,31 @@ impl ClaimClient {
         })
     }
 
-    /// Claim the deployment for `epoch`, which places `scopes` on the host,
-    /// and end every epoch of `retire` there ([`Request::Claim`]). An epoch
-    /// that claimed the same scopes and retires nothing keeps the claim
-    /// held, without asking the server. Returns the claim's token, which
-    /// the deployment's workers state.
+    /// Claim the deployment for `epoch`, which places `scopes` on the host
+    /// beside the scopes earlier claims of `epoch` named, and end every epoch
+    /// of `retire` there ([`Request::Claim`]). The engines of one epoch on a
+    /// host each claim the scopes they place: the independent replicas of
+    /// the epoch's configuration, each a process of its own, and a process
+    /// that replaces one of them or stands by for it. So the server is asked
+    /// for every scope the epoch's claims named, and one engine's claim never
+    /// ends the retention of another's storage (the server ends the epoch's
+    /// retention of the scopes a claim does not name). An epoch whose scopes
+    /// the claims named already and that retires nothing keeps the claim
+    /// held, without asking the server. Returns the claim's token, which the
+    /// deployment's workers state.
     ///
     /// # Errors
     ///
     /// Fails when the server cannot be reached, or refuses the claim
     /// because another head of the deployment is connected.
     pub fn claim(&mut self, epoch: u64, mut scopes: Vec<Scope>, retire: Vec<u64>) -> Result<Claim> {
+        if let Some(claimed) = self.epochs.get(&epoch)
+            && !retire.contains(&epoch)
+        {
+            scopes.extend(claimed.iter().cloned());
+        }
         scopes.sort();
+        scopes.dedup();
         if let Some(claim) = self.claim
             && retire.is_empty()
             && self.epochs.get(&epoch) == Some(&scopes)

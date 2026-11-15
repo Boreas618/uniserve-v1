@@ -328,6 +328,33 @@ pub(crate) fn replica_configs(
         .collect())
 }
 
+/// The launch arguments of every replica of an epoch numbered `epoch`: each replica's engine
+/// configuration ([`replica_configs`]) running `modules`, every one stating the epoch's one number.
+///
+/// An epoch numbers one engine build with its build configuration (`docs/admin.md`), however many
+/// independent replicas that configuration divides into: their storages, their claims and their
+/// buffer pool sessions at a host's Storage Server are the epoch's, a commit retires them together
+/// as the previous epoch, and the next epoch's number lies above every one of them. A process
+/// that replaces a replica's lost engine, and its standby, go on with the number.
+///
+/// # Errors
+///
+/// Fails as [`replica_configs`] fails.
+pub(crate) fn epoch_launches(
+    config: &proto::config::EngineConfig,
+    modules: &crate::epoch::ModuleSet,
+    epoch: u64,
+) -> anyhow::Result<Vec<proto::config::EngineArgs>> {
+    Ok(replica_configs(config)?
+        .into_iter()
+        .map(|replica| {
+            let mut args = proto::config::EngineArgs::new(replica, modules.clone());
+            args.epoch = epoch;
+            args
+        })
+        .collect())
+}
+
 /// What a leader prepares before it has an engine (`Leader::prepare`).
 pub(crate) struct Prepared {
     families: processing::Registry,
@@ -715,16 +742,16 @@ impl Leader {
             "the epoch's module set is fixed"
         );
 
-        let replicas = replica_configs(&prepared.engine)?;
+        // The deployment's first epoch takes the number of its first engine, and every replica
+        // starts in it.
+        let launches = epoch_launches(&prepared.engine, &modules, control.next_engine())?;
         let clients =
-            futures::future::join_all(replicas.into_iter().enumerate().map(|(index, replica)| {
+            futures::future::join_all(launches.into_iter().enumerate().map(|(index, mut args)| {
                 let model = config.model().to_owned();
                 let starting = Arc::clone(&control);
-                let modules = modules.clone();
                 tokio::task::spawn_blocking(move || {
                     let observer = Arc::new(crate::observe::Observer::default());
                     let sink = stats_sink(model, Arc::clone(&observer), index);
-                    let mut args = proto::config::EngineArgs::new(replica, modules);
                     let client = starting.start(args.clone(), sink)?;
                     args.epoch = client.epoch();
                     Ok::<_, anyhow::Error>((client, args, observer))

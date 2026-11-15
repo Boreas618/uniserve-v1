@@ -524,16 +524,20 @@ impl Leader {
         // or with an engine the engine control numbered.
         let group = crate::engine::control::ENGINE_GROUP;
         epochs.launched_up_to(group, 0, control.next_engine().saturating_sub(1));
-        let configs = crate::leader::replica_configs(&engine).map_err(refused)?;
-        let mut worlds = Vec::with_capacity(configs.len());
-        for config in &configs {
-            let hosts = crate::engine::control::world_hosts(config).map_err(refused)?;
+        let launches =
+            crate::leader::epoch_launches(&engine, &next.modules, target_epoch).map_err(refused)?;
+        let configs: Vec<_> = launches
+            .iter()
+            .map(|args| args.engine_config.clone())
+            .collect();
+        let mut worlds = Vec::with_capacity(launches.len());
+        for args in launches {
+            let hosts =
+                crate::engine::control::world_hosts(&args.engine_config).map_err(refused)?;
             let numbers: Vec<u64> = hosts
                 .iter()
                 .map(|_| epochs.next_generation(group, 0))
                 .collect();
-            let mut args = proto::config::EngineArgs::new(config.clone(), next.modules.clone());
-            args.epoch = target_epoch;
             worlds.push((args, hosts, numbers));
         }
         let serving_configs: Vec<_> = replicas

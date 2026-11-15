@@ -1949,6 +1949,51 @@ mod tests {
         );
     }
 
+    /// Every independent replica of an epoch is launched in the epoch's one number, whichever
+    /// engine number its process gets: the replicas' storages, claims and buffer pool sessions
+    /// are the epoch's, and the next epoch's number lies above all of them.
+    #[test]
+    fn every_replica_of_an_epoch_is_launched_in_its_number() {
+        let directory = tempfile::tempdir().unwrap();
+        let control = EngineControl::new(
+            &directory.path().join("requests.sock"),
+            "unix:/run/processes.sock".into(),
+            "rank-0".into(),
+            "model".into(),
+            std::path::PathBuf::from("/run/build-server.sock"),
+        )
+        .unwrap();
+        let mut options = ServerArgs {
+            model: Some("/models/qwen3".to_owned()),
+            served_model_name: Some("model".to_owned()),
+            host_identity: "rank-0".to_owned(),
+            data_parallel_size: std::num::NonZeroUsize::new(2).unwrap(),
+            ..Default::default()
+        };
+        options.device_config.devices = vec![0, 1];
+        let config = options.engine_config().expect("the configuration resolves");
+
+        // The deployment's first epoch is numbered as its first engine is.
+        let epoch = control.next_engine();
+        let launches = crate::leader::epoch_launches(&config, &modules(), epoch).unwrap();
+        assert_eq!(launches.len(), 2, "two independent replicas");
+        let placed: Vec<EngineArgs> = launches
+            .iter()
+            .zip([epoch, epoch + 1])
+            .map(|(args, engine)| control.target_world(args, &[engine]).unwrap()[0].0.clone())
+            .collect();
+        let epochs: Vec<u64> = placed.iter().map(|launch| launch.epoch).collect();
+        assert_eq!(epochs, vec![epoch, epoch]);
+        let groups: Vec<Vec<&str>> = placed
+            .iter()
+            .map(|launch| {
+                let groups = &launch.engine_config.parallel.worker_groups;
+                groups.iter().map(|group| group.id.0.as_str()).collect()
+            })
+            .collect();
+        assert_eq!(groups, vec![vec!["model-0"], vec!["model-1"]]);
+    }
+
     /// A handoff's control connection whose accepted side is gone closed with the
     /// predecessor's service, and that is the predecessor leaving, not an engine exit:
     /// the successor waits for the engine's own dial instead of refusing the adoption.
