@@ -6,11 +6,10 @@
 //! hits, the batches whose outputs were applied and their tokens), its gauges state the scheduler
 //! as it is when the report leaves (requests running and waiting), and its lifetime values carry
 //! from report to report (the batches submitted, the longest queue wait, the steps). A warm-up
-//! request is an ordinary request whose id is at or above `WARMUP_REQUEST_IDS`: it is served and
-//! counted like any other, and its events are dropped.
+//! request is the engine's, under an id the scheduler gives it: it is served and counted like any
+//! other request, and its events are dropped.
 
-use engine::batch::Phase;
-use engine::scheduler::WARMUP_REQUEST_IDS;
+use engine::batch::{Batch, Phase};
 use proto::report::SchedulerStats;
 use proto::request::{CachePolicy, FinishReason, GenerationRequest, RequestId, SamplingParams};
 
@@ -120,16 +119,10 @@ fn each_report_counts_its_second_and_states_the_gauges_as_they_are() {
     assert_eq!(last.step_counter, batches.len() as u64);
 }
 
-/// A warm-up request (an id from `WARMUP_REQUEST_IDS`: the prompt `[bos]`, greedy, ignoring the
-/// end of text, seed 0, cache read and write off, two tokens) is served like any request, and
-/// gives back what it held, but no event of it reaches the daemon; it is counted as admitted
-/// like any request (SD §3.2, §7.2 "Warm-up requests", §9.2 question 4). A request after it is
-/// served as usual.
-#[test]
-fn a_warm_up_request_is_served_with_its_events_dropped() {
-    let mut harness = Deployment::tokens().build();
-    let id = RequestId(WARMUP_REQUEST_IDS);
-    let warm_up = GenerationRequest {
+/// The warm-up request the engine hands a scheduler (SD §3.2): the prompt `[bos]`, greedy,
+/// ignoring the end of text, seed 0, cache read and write off, two tokens.
+fn warm_up_request() -> GenerationRequest {
+    GenerationRequest {
         prompt_token_ids: vec![1],
         sampling: SamplingParams {
             temperature: 0.0,
@@ -142,9 +135,24 @@ fn a_warm_up_request_is_served_with_its_events_dropped() {
             write: false,
             ..CachePolicy::default()
         },
-        ..token(id.0, 1, 2)
-    };
-    harness.submit(warm_up);
+        ..token(0, 1, 2)
+    }
+}
+
+/// The id the scheduler gave the warm-up request whose prefill is the first batch it formed.
+fn warm_up_id(batches: &[Batch]) -> RequestId {
+    batches[0].requests[0]
+}
+
+/// A warm-up request is served like any request, and gives back what it held, but no event of it
+/// reaches the daemon; it is counted as admitted like any request (SD §3.2, §7.2 "Warm-up
+/// requests", §9.2 question 4). A request after it is served as usual.
+#[test]
+fn a_warm_up_request_is_served_with_its_events_dropped() {
+    let mut harness = Deployment::tokens().build();
+    harness.warm_up(warm_up_request());
+    harness.run_until(30, |harness| !harness.batches().is_empty());
+    let id = warm_up_id(&harness.batches());
     harness.run_until(30, |harness| {
         let phases: Vec<Phase> = harness
             .batches_of(id)
@@ -173,9 +181,35 @@ fn a_warm_up_request_is_served_with_its_events_dropped() {
     assert_eq!(harness.batches_of(id).len(), batches, "it ended");
 
     // A warm-up request has no terminal event, so the steps end with the request after it.
-    let after = harness.submit(token(1, 10, 3));
+    let after = harness.submit(token(id.0 + 1, 10, 3));
     harness.run_until(100, |harness| {
         harness.terminal(after).is_some() && harness.held() == 0
     });
     assert_eq!(harness.tokens(after).len(), 3);
+}
+
+/// A request of the daemon that takes the id of the warm-up request the scheduler holds is a
+/// request of its own: it waits until the warm-up request ended, then is served whole, with every
+/// event of its own and none of the warm-up's (SD §3.2).
+#[test]
+fn a_request_of_a_warm_up_request_s_id_waits_for_its_end() {
+    let mut harness = Deployment::tokens().build();
+    harness.warm_up(warm_up_request());
+    harness.run_until(30, |harness| !harness.batches().is_empty());
+    let id = warm_up_id(&harness.batches());
+
+    let client = harness.submit(token(id.0, 10, 3));
+    harness.run_until(100, |harness| {
+        harness.terminal(client).is_some() && harness.held() == 0
+    });
+
+    // The warm-up's prefill and decode run before the request's first call, its prefill.
+    let phases: Vec<Phase> = harness
+        .batches_of(id)
+        .iter()
+        .map(|batch| batch.phase)
+        .collect();
+    assert_eq!(phases[..3], [Phase::Prefill, Phase::Decode, Phase::Prefill]);
+    assert_eq!(harness.tokens(client).len(), 3, "the request's own tokens");
+    assert!(harness.finished_with(client, FinishReason::MaxTokens));
 }

@@ -55,8 +55,7 @@ use storage::Key;
 use storage::runtime::{self, Cause, Completion, GroupId, OwnerId};
 
 use super::{
-    Error, Output, Request, RequestStatus, Scheduler, WARMUP_REQUEST_IDS, WorkerGroup,
-    monotonic_nanos, unix_secs,
+    Error, Output, Request, RequestStatus, Scheduler, WorkerGroup, monotonic_nanos, unix_secs,
 };
 
 /// Why a request fails once its execution began (SD §7.2 "A call's failure"): the message of its
@@ -843,7 +842,7 @@ impl Scheduler {
     /// the batch output's events while `update` applies one, and at once otherwise. The events of
     /// a warm-up request are dropped (SD §3.2).
     pub(super) fn send(&mut self, id: RequestId, event: Event) {
-        if id.0 >= WARMUP_REQUEST_IDS {
+        if self.warm_ups.contains_key(&id) {
             return;
         }
         if let Some(request) = self.requests.get_mut(&id) {
@@ -940,6 +939,7 @@ impl Scheduler {
         }
         self.waiting.retain(|waiting| *waiting != id);
         self.running.retain(|running| *running != id);
+        self.warmed(id);
     }
 
     /// Takes a request off each group it is placed on, once per group, as its `placement` reads.

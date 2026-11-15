@@ -1070,6 +1070,12 @@ impl Harness {
         self.add(request.into())
     }
 
+    /// Hands the scheduler `request` as its warm-up request, as the engine does when admission
+    /// opens (`Message::WarmUp`), under the harness's event window. The scheduler gives it its id.
+    pub(crate) fn warm_up(&mut self, request: GenerationRequest) {
+        self.apply(Message::WarmUp(Box::new(request), EVENT_WINDOW));
+    }
+
     /// Submits a video request, as the daemon does (`Message::AddRequest`).
     pub(crate) fn submit_video(&mut self, request: DiffusionRequest) -> RequestId {
         self.add(proto::request::Request::Diffusion(request))

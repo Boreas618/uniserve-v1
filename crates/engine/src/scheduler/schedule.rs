@@ -55,6 +55,17 @@ type Budget = (u32, usize);
 /// while the target is enabled, and nothing the scheduler decides reads them.
 pub(super) const STEPS: &str = "engine::scheduler::steps";
 
+/// A request from the daemon that arrived while a warm-up request held its id, which waits until
+/// that warm-up request is forgotten ([`Scheduler::warm_up`]).
+#[derive(Debug)]
+pub(super) struct Deferred {
+    input: proto::request::Request,
+    /// The event window its consumer stated.
+    window: std::num::NonZeroU32,
+    /// The end the daemon asked of it while it waited (`Message::Cancel`).
+    pub(super) ended: Option<FinishReason>,
+}
+
 /// A request's arrival and the step (SD §3.2, §3.4).
 impl Scheduler {
     /// Whether request `id` takes calls this step: admitted and in no queue, running or waiting
@@ -78,6 +89,21 @@ impl Scheduler {
         input: proto::request::Request,
         window: std::num::NonZeroU32,
     ) {
+        // A request of the id of a warm-up request the scheduler holds waits until the warm-up
+        // request is forgotten: the two are distinct requests the id cannot tell apart.
+        if let Some(deferred) = self.warm_ups.get_mut(&input.request_id()) {
+            *deferred = Some(Deferred {
+                input,
+                window,
+                ended: None,
+            });
+            return;
+        }
+        self.arrive(input, window);
+    }
+
+    /// Queues `input`, a request under the event window `window`, or refuses it (`add_request`).
+    fn arrive(&mut self, input: proto::request::Request, window: std::num::NonZeroU32) {
         let id = input.request_id();
 
         // Refusals answer at once and keep nothing.
@@ -110,6 +136,55 @@ impl Scheduler {
             .events
             .push(PolicyEvent::Arrived { request: view });
         self.requests.insert(id, request);
+    }
+
+    /// Serves `request`, a warm-up request of the engine (SD §3.2 "warm-up"), like a request from
+    /// the daemon under the event window `window`, under an id no request the scheduler holds
+    /// takes: its events, a refusal included, are dropped, and nothing of it reaches the daemon.
+    /// A request from the daemon that takes the warm-up request's id meanwhile waits until the
+    /// warm-up request is forgotten, and an end the daemon asks of it meanwhile is applied once it
+    /// is added ([`Scheduler::warmed`]).
+    pub(crate) fn warm_up(
+        &mut self,
+        mut request: proto::request::GenerationRequest,
+        window: std::num::NonZeroU32,
+    ) {
+        #[expect(
+            clippy::expect_used,
+            reason = "the scheduler holds far fewer requests than there are ids"
+        )]
+        let id = (0..=u64::MAX)
+            .map(RequestId)
+            .find(|id| !self.requests.contains_key(id) && !self.warm_ups.contains_key(id))
+            .expect("an id no held request takes");
+
+        request.request_id = id;
+        self.warm_ups.insert(id, None);
+        self.arrive(request.into(), window);
+        // A refused warm-up request was never held, and so is forgotten at once.
+        if !self.requests.contains_key(&id) {
+            self.warmed(id);
+        }
+    }
+
+    /// Ends what the scheduler holds of the warm-up request `id`, once it is forgotten: the
+    /// daemon's request of its id that waited is added, and the end the daemon asked of it
+    /// meanwhile applied. Does nothing for an id no warm-up request takes.
+    pub(super) fn warmed(&mut self, id: RequestId) {
+        let Some(deferred) = self.warm_ups.remove(&id) else {
+            return;
+        };
+        if let Some(Deferred {
+            input,
+            window,
+            ended,
+        }) = deferred
+        {
+            self.arrive(input, window);
+            if let Some(reason) = ended {
+                self.cancel(id, reason);
+            }
+        }
     }
 
     /// Whether the waiting queue is at the bound the serving policy declared.

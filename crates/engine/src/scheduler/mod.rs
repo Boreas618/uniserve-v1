@@ -86,11 +86,8 @@ pub(crate) use group::WorkerGroup;
 pub(crate) use policy::tests::packaged;
 use policy::{Policy, PolicyError, ceilings};
 pub(crate) use request::{Blocks, Request, RequestStatus};
+use schedule::Deferred;
 pub(crate) use view::view_of;
-
-/// The first request id of the warm-up requests the engine adds when admission opens: an
-/// ordinary request whose id is at or above it has its events dropped (SD §3.2).
-pub const WARMUP_REQUEST_IDS: u64 = 1 << 63;
 
 /// The bytes of a record's length word in a ring of a queue pair (`storage::queue`): a ring of
 /// `max_record()` bytes of record holds that many more.
@@ -148,9 +145,12 @@ impl std::error::Error for Error {}
     reason = "a batch and its output travel once per batch, by value, as the message itself"
 )]
 pub enum Message {
-    /// A request from the daemon.
     /// A request from the daemon, with the event window its consumer stated.
     AddRequest(proto::request::Request, std::num::NonZeroU32),
+    /// A warm-up request of the engine (SD §3.2), with the event window it is scheduled under:
+    /// served like a request from the daemon, under an id the scheduler gives it, with its events
+    /// dropped ([`Scheduler::warm_up`]).
+    WarmUp(Box<proto::request::GenerationRequest>, std::num::NonZeroU32),
     /// End a request: `Cancelled`, `Aborted`, or `Stop` when the daemon's decoder matched a stop
     /// string.
     Cancel(RequestId, FinishReason),
@@ -388,6 +388,10 @@ pub struct Scheduler {
     boundary: Vec<Sender<()>>,
     /// The reply, cause, deadline and whether memory is given back, of a drain under way.
     draining: Option<(Sender<()>, MigrationCause, Instant, bool)>,
+    /// The warm-up requests the scheduler holds, by the id it gave each, with the daemon's request
+    /// of the same id that arrived meanwhile, which waits until the warm-up request is forgotten
+    /// ([`Scheduler::warm_up`]).
+    warm_ups: HashMap<RequestId, Option<Deferred>>,
     /// The region, by number, of each `Resize` outstanding that is not a drain's, in the order
     /// submitted, with the reply owed at its `Resized` with the units the region reached: the
     /// engine's, or none for the scheduler's own shrink toward the region's bound. The buffer
@@ -570,6 +574,7 @@ impl Scheduler {
             stopped: false,
             boundary: Vec::new(),
             draining: None,
+            warm_ups: HashMap::new(),
             resizing: Vec::new(),
             lists_asked: 0,
             lists_answered: 0,
@@ -789,9 +794,21 @@ impl Scheduler {
 
         match message {
             Message::AddRequest(input, window) => self.add_request(input, window),
-            Message::Cancel(id, reason) => self.cancel(id, reason),
-            Message::Acknowledge(id, tokens) => self.acknowledge(id, tokens),
-            Message::Consumed(id, events) => self.consumed(id, events),
+            Message::WarmUp(input, window) => self.warm_up(*input, window),
+            // The daemon's messages name its own requests: never a warm-up request, whose id a
+            // request of the daemon may take only once it waits for the warm-up's end.
+            Message::Cancel(id, reason) => match self.warm_ups.get_mut(&id) {
+                Some(Some(deferred)) => deferred.ended = Some(reason),
+                Some(None) => {}
+                None => self.cancel(id, reason),
+            },
+            Message::Acknowledge(id, tokens) if !self.warm_ups.contains_key(&id) => {
+                self.acknowledge(id, tokens);
+            }
+            Message::Consumed(id, events) if !self.warm_ups.contains_key(&id) => {
+                self.consumed(id, events);
+            }
+            Message::Acknowledge(..) | Message::Consumed(..) => {}
             // The requests of each completed batch advance.
             Message::Output(batch, output) => self.update(batch, output),
             // The executor's stamped requests join the step's requests, behind those held.

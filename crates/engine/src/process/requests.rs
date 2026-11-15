@@ -35,7 +35,7 @@ use scheduling::view::{RankView, RequestView, Snapshot};
 use super::MainProcess;
 use super::lifecycle::Lifecycle;
 use crate::scheduler::policy::Policy;
-use crate::scheduler::{Message, Request, WARMUP_REQUEST_IDS, view_of};
+use crate::scheduler::{Message, Request, view_of};
 
 /// The artifact bytes an event travels with, which a replay writes again with it.
 type Media = Option<Arc<dyn ArtifactMedia>>;
@@ -482,9 +482,10 @@ impl MainProcess {
     /// The warm-up requests of admission's first opening (SD §3.2 "warm-up"): one token request
     /// per scheduler of one prompt token and two generated tokens, greedy, ignoring the end of
     /// sequence, reading and writing no cache, so every scheduler's prefill and decode path runs
-    /// before a client's request does. Their ids are at or above `WARMUP_REQUEST_IDS`, whose
-    /// events the scheduler drops. A deployment that launches nothing on a device (the meta
-    /// device) or does not serve such a request warms nothing.
+    /// before a client's request does. Each is the scheduler's warm-up request
+    /// (`Message::WarmUp`), which it numbers itself and whose events it drops. A deployment that
+    /// launches nothing on a device (the meta device) or does not serve such a request warms
+    /// nothing.
     pub(super) fn warm_up(&mut self) {
         if self.launch.engine_config.device.device != proto::config::DeviceKind::Cuda {
             return;
@@ -496,7 +497,8 @@ impl MainProcess {
         let bos = self.launch.engine_config.model.bos;
         for (index, scheduler) in engine.schedulers.iter().enumerate() {
             let request = GenerationRequest {
-                request_id: RequestId(WARMUP_REQUEST_IDS + index as u64),
+                // The scheduler gives its warm-up request an id of its own (`Scheduler::warm_up`).
+                request_id: RequestId::default(),
                 prompt_token_ids: vec![bos],
                 multimodal_inputs: Default::default(),
                 sampling: SamplingParams {
@@ -525,12 +527,11 @@ impl MainProcess {
                 tracing::info!("the deployment's limits refuse the token warm-up request");
                 return;
             }
-            let input = proto::request::Request::Generation(Box::new(request));
             // A warm-up request's events are dropped: it runs under the launching front's
             // window, which only its scheduling reads.
             if scheduler
                 .inbox
-                .send(Message::AddRequest(input, self.windows[0]))
+                .send(Message::WarmUp(Box::new(request), self.windows[0]))
                 .is_err()
             {
                 tracing::warn!(scheduler = index, "a scheduler took no warm-up request");
