@@ -26,7 +26,8 @@
 //! modulation row is `3 · group + tag`.
 
 use nn::modules::{
-    Linear, LinearConfig, Parallel, TimestepEmbedding, TimestepEmbeddingConfig, TimestepTable,
+    AdaLnBlock, AdaLnOut, Linear, LinearConfig, Parallel, TimestepEmbedding,
+    TimestepEmbeddingConfig, TimestepTable,
 };
 use nn::{DType, Device, Result, Tensor, VarBuilder, functional};
 
@@ -42,13 +43,13 @@ pub const VISUAL_CONDITION_TIME: f32 = 0.999;
 /// (`pipeline_minimax_h3.py:234,395`).
 pub const AUDIO_CONDITION_TIME: f32 = 1.0;
 
-/// The modulation columns of one block's table row: three tags of six vectors, in hidden
-/// widths.
-pub const BLOCK_COLUMNS: u32 = 18;
+/// The modulation columns of one block's table row, in hidden widths: the block's vectors for
+/// each of its tags ([`crate::minimax_h3::transformer::TAGS`]).
+pub const BLOCK_COLUMNS: u32 = crate::minimax_h3::transformer::TAGS * AdaLnBlock::VECTORS;
 
-/// The modulation columns of the final norm's table row: a shift and a scale, in hidden
-/// widths.
-pub const OUTPUT_COLUMNS: u32 = 2;
+/// The modulation columns of the final norm's table row, in hidden widths: its shift and
+/// scale.
+pub const OUTPUT_COLUMNS: u32 = AdaLnOut::VECTORS;
 
 /// The timestep groups a step reads: the generated video and audio, and for a `conditioned`
 /// network also a visual condition's level and an audio reference's.

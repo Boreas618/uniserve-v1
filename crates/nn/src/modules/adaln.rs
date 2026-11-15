@@ -31,13 +31,6 @@ use crate::functional;
 use crate::modules::mlp::{Mlp, MlpConfig};
 use crate::var_builder::VarBuilder;
 
-/// The affine vectors one parameter row of a diffusion block holds, in storage order: shift,
-/// scale and gate of the attention, then of the MLP.
-const BLOCK_VECTORS: usize = 6;
-
-/// The vectors one parameter row of the final norm holds: shift, then scale.
-const OUTPUT_VECTORS: usize = 2;
-
 /// Vector `index` of every parameter row of `table`, `[parameters, vectors · width]`: a
 /// `[parameters, width]` view whose rows stride over the whole table row.
 fn vector(
@@ -84,6 +77,11 @@ pub struct AdaLnBlock {
 }
 
 impl AdaLnBlock {
+    /// The affine vectors one parameter row of the block's table holds, in storage order:
+    /// shift, scale and gate of the attention, then of the MLP. A row is `VECTORS · width`
+    /// columns wide.
+    pub const VECTORS: u32 = 6;
+
     /// The block the module at `vb` states, its MLP at the rank its config's split states.
     ///
     /// # Errors
@@ -109,8 +107,8 @@ impl AdaLnBlock {
     /// The attention's input: `hidden`, `[rows, width]`, normalized by `norm1` and modulated by
     /// the attention's shift and scale at each row's parameter row, in `hidden`'s element type.
     ///
-    /// `table` is the step's `[parameters, 6 · width]` modulation and `rows` the `[rows]` `U32`
-    /// parameter row of each activation row.
+    /// `table` is the step's `[parameters, VECTORS · width]` modulation ([`Self::VECTORS`]) and
+    /// `rows` the `[rows]` `U32` parameter row of each activation row.
     ///
     /// # Errors
     ///
@@ -121,7 +119,15 @@ impl AdaLnBlock {
         rows: &Tensor,
         hidden: &Tensor,
     ) -> Result<Tensor> {
-        let stage = |index| vector("AdaLnBlock", table, BLOCK_VECTORS, self.width, index);
+        let stage = |index| {
+            vector(
+                "AdaLnBlock",
+                table,
+                Self::VECTORS as usize,
+                self.width,
+                index,
+            )
+        };
 
         functional::modulated_rms_norm(
             hidden,
@@ -151,7 +157,15 @@ impl AdaLnBlock {
         hidden: &Tensor,
         update: Tensor,
     ) -> Result<Tensor> {
-        let stage = |index| vector("AdaLnBlock", table, BLOCK_VECTORS, self.width, index);
+        let stage = |index| {
+            vector(
+                "AdaLnBlock",
+                table,
+                Self::VECTORS as usize,
+                self.width,
+                index,
+            )
+        };
 
         // One launch folds the attention's gated update into the stream and normalizes and
         // modulates the sum for the MLP.
@@ -214,6 +228,10 @@ pub struct AdaLnOut {
 }
 
 impl AdaLnOut {
+    /// The vectors one parameter row of the norm's table holds: shift, then scale. A row is
+    /// `VECTORS · width` columns wide.
+    pub const VECTORS: u32 = 2;
+
     /// The norm module at `vb`: its `weight` of `config.hidden` channels.
     ///
     /// # Errors
@@ -230,14 +248,14 @@ impl AdaLnOut {
     }
 
     /// `hidden`, `[rows, width]`, normalized and modulated by the shift and scale of `table`,
-    /// `[parameters, 2 · width]`, at each row's `U32` parameter row: a tensor of `hidden`'s
-    /// shape and element type.
+    /// `[parameters, VECTORS · width]` ([`Self::VECTORS`]), at each row's `U32` parameter row: a
+    /// tensor of `hidden`'s shape and element type.
     ///
     /// # Errors
     ///
     /// A table of another width, or the norm's refusal.
     pub fn forward(&self, table: &Tensor, rows: &Tensor, hidden: &Tensor) -> Result<Tensor> {
-        let stage = |index| vector("AdaLnOut", table, OUTPUT_VECTORS, self.width, index);
+        let stage = |index| vector("AdaLnOut", table, Self::VECTORS as usize, self.width, index);
 
         functional::modulated_rms_norm(
             hidden,

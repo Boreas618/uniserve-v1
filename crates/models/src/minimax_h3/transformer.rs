@@ -60,10 +60,9 @@ const TRANSFORMER_BLOCK: &str = "TransformerBlock";
 /// The coordinate axes of a packed row's rotary position: time, height and width.
 const ROTARY_AXES: u32 = 3;
 
-/// The affine vectors one block reads per row, and the tags a timestep group's vectors are
-/// stored for: a block's modulation row is `[3 tags · 6 vectors · hidden]`.
-const BLOCK_VECTORS: usize = 6;
-const TAGS: usize = 3;
+/// The tags a timestep group's block vectors are stored for: a block's modulation row is
+/// `[TAGS · AdaLnBlock::VECTORS · hidden]`, each tag's vectors one row of the block's table.
+pub const TAGS: u32 = 3;
 
 /// The attention of a block, relative to the block: its module, the input projections in the
 /// order the attention reads them (the compression gate is a sparse block's alone), and the
@@ -890,9 +889,10 @@ impl Transformer {
     fn modulation(&self, table: &TimestepTable, index: usize, entries: &Tensor) -> Result<Tensor> {
         let groups = entries.elem_count();
 
-        Ok(table
-            .layer(self.first_block + index, entries)?
-            .reshape((groups * TAGS, BLOCK_VECTORS * self.hidden))?)
+        Ok(table.layer(self.first_block + index, entries)?.reshape((
+            groups * TAGS as usize,
+            AdaLnBlock::VECTORS as usize * self.hidden,
+        ))?)
     }
 
     /// The stack over `hidden`, this rank's `[rows, hidden]` packed rows, at one step: the rows
