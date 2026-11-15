@@ -19,13 +19,13 @@ DTYPES = {"bf16": cutlass.BFloat16}
 ALIGN = 16
 
 
-def spec(fields, parameters, target):
+def spec(request):
     """The compilation of one route_gemm descriptor."""
-    tiler = tuple(fields["tile"])
-    element = DTYPES[fields["dtype"]]
+    tiler = tuple(request.field("tile"))
+    element = DTYPES[request.field("dtype")]
     kernel = kernels.RouteGroupedGemmKernel(
         mma_tiler_mn=tiler,
-        cluster_shape_mn=tuple(fields["cluster"]),
+        cluster_shape_mn=tuple(request.field("cluster")),
     )
     # The row counts, both widths and the expert count are the call's runtime
     # words: the kernel's grids derive from the tile count at launch, so the
@@ -50,7 +50,9 @@ def spec(fields, parameters, target):
             ],
             {
                 "tile_size": tiler[0],
-                "max_active_clusters": int(parameters["max_active_clusters"]),
+                "max_active_clusters": int(
+                    request.parameters["max_active_clusters"]
+                ),
             },
         ),
     }

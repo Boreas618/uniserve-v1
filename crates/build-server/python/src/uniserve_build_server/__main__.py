@@ -14,7 +14,7 @@ for four things:
     package's modules import as the interpreter imports any program's own. A
     Triton package's launch table is compiled by
     :mod:`uniserve_build_server.triton`; a CuTe DSL package's build module
-    states ``spec(fields, parameters, target)``, which
+    states ``spec(request)``, which
     :mod:`uniserve_build_server.cute_dsl` compiles; a CUDA package's declared
     compilation is compiled by :mod:`uniserve_build_server.cuda`, and the
     build module of a CUDA package whose compilation is computed states

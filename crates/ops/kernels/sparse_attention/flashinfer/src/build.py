@@ -13,9 +13,11 @@ parameters rather than its dimensions.
 from bsa_sm120 import NAME, BsaCompiler
 
 
-def spec(fields, parameters, target):
+def spec(request):
     """The compilation of one sparse_attention sm120 descriptor."""
     return {
         "name": NAME,
-        "compile": BsaCompiler(fields, parameters, target).compile,
+        "compile": BsaCompiler(
+            request.fields, request.parameters, request.target
+        ).compile,
     }

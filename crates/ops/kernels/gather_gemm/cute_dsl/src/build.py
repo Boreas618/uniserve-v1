@@ -19,17 +19,17 @@ DTYPES = {"bf16": cutlass.BFloat16}
 ALIGN = 16
 
 
-def spec(fields, parameters, target):
+def spec(request):
     """The compilation of one gather_gemm descriptor."""
-    tiler = tuple(fields["tile"])
-    element = DTYPES[fields["dtype"]]
+    tiler = tuple(request.field("tile"))
+    element = DTYPES[request.field("dtype")]
     # The kernel class names its gated activations as the operator does, and
     # the manifest's `activation` dimension admits only the ones it implements.
     kernel = kernels.GatherGroupedGemmKernel(
         mma_tiler_mn=tiler,
-        cluster_shape_mn=tuple(fields["cluster"]),
-        topk=fields["top"],
-        activation=fields["activation"],
+        cluster_shape_mn=tuple(request.field("cluster")),
+        topk=request.field("top"),
+        activation=request.field("activation"),
     )
     # The token count, the permuted rows, both widths and the expert count are
     # the call's runtime words: the kernel's grids derive from the tile count
@@ -54,7 +54,9 @@ def spec(fields, parameters, target):
             ],
             {
                 "tile_size": tiler[0],
-                "max_active_clusters": int(parameters["max_active_clusters"]),
+                "max_active_clusters": int(
+                    request.parameters["max_active_clusters"]
+                ),
             },
         ),
     }

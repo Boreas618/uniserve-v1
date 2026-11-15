@@ -9,11 +9,14 @@ vendor's configuration is chosen for.
 import fa4
 
 
-def spec(fields, parameters, target):
+def spec(request):
     """The compilation of one dense_attention descriptor."""
+    fields = request.fields
     if fields["kv"] != fields["dtype"] or fields["out"] != fields["dtype"]:
-        raise SystemExit("FA4's dense pass serves one element type for query, cache and output")
-    compiler = fa4.DenseCompiler(fields, parameters, target)
+        raise SystemExit(
+            "FA4's dense pass serves one element type for query, cache and output"
+        )
+    compiler = fa4.DenseCompiler(fields, request.parameters, request.target)
     return {
         "name": fa4.NAME,
         "compile": compiler,

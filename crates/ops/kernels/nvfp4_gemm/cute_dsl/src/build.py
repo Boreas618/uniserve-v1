@@ -1,14 +1,14 @@
 """The nvfp4_gemm package's compile script: one descriptor -> one module.
 
 A descriptor is the operands' element types, the activation scales' layout, what
-follows the contraction, the problem's three extents and the dependent-launch
-flag. The product is a dense ``[m, n]`` tile product over packed E2M1 operands,
-so one module covers exactly the problem size its key names.
+follows the contraction and the problem's three extents. The product is a dense
+``[m, n]`` tile product over packed E2M1 operands, so one module covers exactly
+the problem size its key names; the manifest's dimensions admit only the scale
+type, scale layout and epilogue the kernel reads, and only whole tiles.
 
 The CTA's tile is the package's choice: 128 rows by 256 columns of the product
-and 256 elements of the contraction, the smallest tile CUTLASS's block-scaled FP4
-instruction pair forms. A descriptor's ``m`` and ``n`` must therefore be whole
-tiles.
+and 256 elements of the contraction, the smallest tile CUTLASS's block-scaled
+FP4 instruction pair forms.
 """
 
 import cutlass
@@ -27,32 +27,12 @@ MMA_INST_SHAPE_K = 64
 ALIGN = 16
 
 
-def spec(fields, parameters, target):
+def spec(request):
     """The compilation of one nvfp4_gemm descriptor."""
-    m = int(fields["m"])
-    n = int(fields["n"])
-    k = int(fields["k"])
-    if fields["scale"] != "f8e4m3":
-        # The block scales are the checkpoint's E4M3 values, one byte per sixteen
-        # elements of the contraction. Any other byte type names a buffer this
-        # module would misread, so it is refused by name.
-        raise SystemExit(f"the {fields['scale']} block scales are not served")
-    if fields["layout"] != "swizzled_128x4":
-        # The atom both scale fields are read in. A row-major matrix needs a
-        # conversion pass the kernel does not have, so it is refused rather than
-        # decoded as if it were the atom.
-        raise SystemExit(f"the {fields['layout']} scale layout is not served")
-    if fields["epilogue"] != "none":
-        raise SystemExit(f"the {fields['epilogue']} epilogue is not served")
-    if (
-        m % TILE_MN[0] != 0
-        or n % TILE_MN[1] != 0
-        or k % (MMA_INST_SHAPE_K * 4) != 0
-    ):
-        raise SystemExit(
-            f"{m}x{n}x{k} is not whole {TILE_MN[0]}x{TILE_MN[1]} tiles of 256"
-        )
-    out_dtype = OUTPUTS[fields["output"]]
+    m = request.field("m")
+    n = request.field("n")
+    k = request.field("k")
+    out_dtype = OUTPUTS[request.field("output")]
     return {
         "name": "nvfp4_gemm",
         "compile": driver.kernel(
@@ -63,7 +43,8 @@ def spec(fields, parameters, target):
                 out_dtype=out_dtype,
             ).launch,
             # The operator packs the activation, the weight, both scale
-            # matrices, the alpha and the output, then the three extents.
+            # matrices, the alpha and the output, then the three extents, which
+            # the kernel compiles in.
             [
                 driver.pointer(cutlass.Float4E2M1FN, ALIGN),
                 driver.pointer(cutlass.Float4E2M1FN, ALIGN),

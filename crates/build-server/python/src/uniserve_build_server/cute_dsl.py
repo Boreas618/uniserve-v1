@@ -13,8 +13,10 @@ CuTe DSL's ``libcuda_dialect_runtime_static.a`` and the CUDA runtime. The
 archive carries the device-dialect runtime; the CUDA runtime must come with it,
 or the module loads with undefined ``cuda*`` symbols.
 
-A package's build module states ``spec(fields, parameters, target)``, one shape
-for every package:
+A package's build module states ``spec(request)``, the compilation of the
+descriptor the request names (:class:`uniserve_build_server.request.Request`:
+its typed fields, the manifest's parameters, the target and the installed
+package, whose tuning data a package reads), one shape for every package:
 
 - ``name``: the exported launcher's name, which the entry unit calls;
 - ``compile``: a callable that returns the compiled kernel. A kernel the DSL
@@ -51,9 +53,9 @@ from cutlass.cutlass_dsl import CuTeDSL
 from uniserve_build_server.request import Request, Target
 from uniserve_build_server.toolchain import Cuda
 
-#: What a package's ``spec`` is: the descriptor's fields, the manifest's
-#: ``[parameters]`` and the target, to the compilation of one descriptor.
-Spec = Callable[[dict[str, str], dict[str, Any], Target], dict[str, Any]]
+#: What a package's ``spec`` is: the request, to the compilation of the one
+#: descriptor it names.
+Spec = Callable[[Request], dict[str, Any]]
 
 #: The CuTe DSL's static device-dialect runtime, which every module links whole.
 DIALECT_RUNTIME = "libcuda_dialect_runtime_static.a"
@@ -136,12 +138,7 @@ def compile_cxx(compiler: str, arguments: list[str], what: str) -> None:
 def build(request: Request, spec: Spec) -> None:
     """Compile the descriptor ``request`` names into its output directory."""
     configure(request.target)
-    try:
-        stated = spec(request.fields, request.parameters, request.target)
-    except KeyError as absent:
-        raise SystemExit(
-            f"{request.descriptor}: the descriptor names no {absent}"
-        ) from None
+    stated = spec(request)
     compiled = stated["compile"]()
 
     cuda = request.toolchain.require_cuda()
