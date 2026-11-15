@@ -496,7 +496,8 @@ impl RecurrentState {
 }
 
 /// The slots a request's rows read and write when acceptance copies no state (vLLM's
-/// `state_indices` and `num_accepted`, `refs/vllm/vllm/v1/attention/backends/gdn_attn.py:463-486`).
+/// `state_indices` and `num_accepted`,
+/// <https://github.com/vllm-project/vllm/blob/cdd09707378563a4228270bd0bb5b83bcb0d1acc/vllm/v1/attention/backends/gdn_attn.py#L463-L486>).
 ///
 /// A request of a deployment that drafts `n` tokens owns `Q = n + 1` slots of a matrix-valued
 /// field and one slot, its first, of every window field, whose windows are `n` rows longer than

@@ -574,7 +574,7 @@ impl TextConfig {
             return Err(ID.config("sliding-window attention is not served".to_owned()));
         }
         // The references multiply each block's output by a learned scale under this flag
-        // (`refs/vllm/vllm/model_executor/models/qwen3_next.py:612`); no served checkpoint
+        // (`vllm:vllm/model_executor/models/qwen3_next.py:612`); no served checkpoint
         // sets it, and a stack that ignored it would compute another model.
         if fields.optional_flag("layer_scale")?.unwrap_or(false) {
             return Err(

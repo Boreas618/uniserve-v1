@@ -1,8 +1,8 @@
 //! The n-gram hash embedding and the layer that gates it into the residual streams.
 //!
 //! [`NgramEmbedding`] (vLLM's `Qwen4ExpNgramEmbedding`,
-//! `refs/vllm/vllm/models/qwen4_exp/nvidia/ngram_embedding.py`, ids
-//! `refs/vllm/vllm/models/qwen4_exp/common/ops/ple.py:24-168`) hashes each token with the
+//! `vllm:vllm/models/qwen4_exp/nvidia/ngram_embedding.py`, ids
+//! `vllm:vllm/models/qwen4_exp/common/ops/ple.py:24-168`) hashes each token with the
 //! `n − 1` before it (`n` the checkpoint's `ngram_size`) into rows of one large table, `p_k`
 //! being the id `k` before the token `t0`:
 //!
@@ -16,11 +16,11 @@
 //!
 //! The table is E4M3 with one scale: a row is read as its E4M3 values, exactly, in the
 //! activations' type, and multiplied by the scale rounded to that type, the product rounded
-//! once (`refs/vllm/vllm/models/qwen4_exp/common/ngram_embedding.py:390-402`).
+//! once (`vllm:vllm/models/qwen4_exp/common/ngram_embedding.py:390-402`).
 //!
 //! [`PleLayer`] (vLLM's `Qwen4ExpPLELayer`,
-//! `refs/vllm/vllm/models/qwen4_exp/nvidia/ple_layer.py:74-484`, kernels
-//! `refs/vllm/vllm/models/qwen4_exp/common/ops/ple.py:185-537`) projects the embedding to a key
+//! `vllm:vllm/models/qwen4_exp/nvidia/ple_layer.py:74-484`, kernels
+//! `vllm:vllm/models/qwen4_exp/common/ops/ple.py:185-537`) projects the embedding to a key
 //! per stream and one value, gates the value by how each stream's key agrees with the stream,
 //! and adds the gated value and a dilated causal convolution of it:
 //!
@@ -103,7 +103,7 @@ impl NgramEmbedding {
     ///
     /// A rank holds `parts / size` consecutive shards, so every table row is on one rank and
     /// the ranks sum the rows they read
-    /// (`refs/vllm/vllm/models/qwen4_exp/common/ngram_embedding.py:764-772`).
+    /// (`vllm:vllm/models/qwen4_exp/common/ngram_embedding.py:764-772`).
     ///
     /// # Errors
     ///

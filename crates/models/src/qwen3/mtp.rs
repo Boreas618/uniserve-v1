@@ -1,6 +1,6 @@
 //! The Qwen3.5 drafter: the checkpoint's multi-token-prediction module (`mtp.*`), Qwen3-Next's
 //! `Qwen3NextMultiTokenPredictor` (vLLM's `Qwen3_5MultiTokenPredictor`,
-//! `refs/vllm/vllm/model_executor/models/qwen3_5_mtp.py:148-193`).
+//! `vllm:vllm/model_executor/models/qwen3_5_mtp.py:148-193`).
 //!
 //! An entry at position `i` reads the model's final hidden state `h` there and the embedding
 //! `e` of the token at `i + 1`:
@@ -17,7 +17,7 @@
 //! the model's layers.
 //!
 //! The references run one multi-token-prediction layer per forward: SGLang builds one
-//! (`refs/sglang/python/sglang/srt/models/qwen3_5_mtp.py:139-140`), and vLLM runs layer
+//! (`sglang:python/sglang/srt/models/qwen3_5_mtp.py:139-140`), and vLLM runs layer
 //! `step mod layers` of a speculation's steps (`qwen3_5_mtp.py:172-173`). A forward here is
 //! not told its step, so a checkpoint of more than one layer is refused at load.
 

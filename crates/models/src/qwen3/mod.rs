@@ -22,6 +22,17 @@
 //! values a forward needs beyond its inputs (positions, row indices, sequence offsets) are CPU
 //! tensors moved to the device of the tensor they meet, their shapes following from the batch's
 //! extents alone.
+//!
+//! ## References
+//!
+//! A citation `name:path:lines` names a file of a reference implementation at the commit
+//! this table pins, its path below the directory the table states, and the lines a rule is
+//! read from:
+//!
+//! | Name | Repository | Commit | Paths below |
+//! | --- | --- | --- | --- |
+//! | `vllm` | <https://github.com/vllm-project/vllm> | `cdd09707378563a4228270bd0bb5b83bcb0d1acc` | the repository |
+//! | `sglang` | <https://github.com/sgl-project/sglang> | `505120f0c3026b198ee0dd81a486389a9f82ce27` | the repository |
 
 pub mod causal_lm;
 pub mod config;

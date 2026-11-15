@@ -114,7 +114,7 @@ impl IndexerConfig {
     /// Raw index keys a request's ring keeps for a deployment that drafts `draft_tokens`
     /// tokens a step: the members of the group open at the last committed token and the
     /// draft rows, rounded up to whole groups
-    /// (`refs/vllm/vllm/models/qwen4_exp/common/qsa_indexer.py:848-866`).
+    /// (`vllm:vllm/models/qwen4_exp/common/qsa_indexer.py:848-866`).
     pub const fn ring_capacity(&self, draft_tokens: u32) -> u32 {
         (self.compress_ratio + draft_tokens).next_multiple_of(self.compress_ratio)
     }
@@ -164,7 +164,7 @@ impl NgramEmbeddingConfig {
 
     /// Each head's partition of the table, `(sizes, offsets)`: the sizes are the consecutive
     /// primes above the base and the offsets their prefix sums
-    /// (`refs/vllm/vllm/models/qwen4_exp/nvidia/ngram_embedding.py:342-360`).
+    /// (`vllm:vllm/models/qwen4_exp/nvidia/ngram_embedding.py:342-360`).
     pub fn head_partitions(&self) -> (Vec<u64>, Vec<u64>) {
         let (mut sizes, mut offsets) = (Vec::new(), Vec::new());
         let (mut size, mut offset) = (self.vocab_size_base, 0);
@@ -195,7 +195,7 @@ impl NgramEmbeddingConfig {
     /// newest token first: `2 · (splitmix64(seed + 10007 · dense_id + γ · (i + 1)) mod half) + 1`
     /// with `half = ((2⁶³ − 1) / vocab_size) / 2`, so the product of a token id and a
     /// multiplier stays below `2⁶³`
-    /// (`refs/vllm/vllm/models/qwen4_exp/nvidia/ngram_embedding.py:266-340`).
+    /// (`vllm:vllm/models/qwen4_exp/nvidia/ngram_embedding.py:266-340`).
     pub fn multipliers(&self, dense_id: u64, vocab_size: u32) -> Vec<u64> {
         const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
         let half = (i64::MAX as u64) / u64::from(vocab_size.max(1)) / 2;
@@ -467,7 +467,7 @@ impl TextConfig {
         }
 
         // The state is FP32 in vLLM, which takes the checkpoint's `mamba_ssm_dtype`
-        // (`refs/vllm/vllm/model_executor/models/config.py:1284-1309`).
+        // (`vllm:vllm/model_executor/models/config.py:1284-1309`).
         if let Some(dtype) = values.optional_text("mamba_ssm_dtype")?
             && dtype != "float32"
         {
@@ -476,7 +476,7 @@ impl TextConfig {
             )));
         }
         // The gated delta network of this family gates its output norm with a sigmoid
-        // (`refs/vllm/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:817-831`).
+        // (`vllm:vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:817-831`).
         let gate = values.optional_text("output_gate_type")?.unwrap_or("silu");
         let sigmoid_gate = match gate {
             "sigmoid" => true,
@@ -501,7 +501,7 @@ impl TextConfig {
             eps: rms_norm_eps,
             sigmoid_gate,
             // vLLM stores a state as rows of values over the keys
-            // (`refs/vllm/vllm/model_executor/layers/mamba/mamba_utils.py:296-300`).
+            // (`vllm:vllm/model_executor/layers/mamba/mamba_utils.py:296-300`).
             axes: StateAxes::ValueKey,
             draft_tokens: 0,
             split: Split::WHOLE,
@@ -559,7 +559,7 @@ impl IndexerConfig {
         }
         // The index heads rotate by the layer's rotary embedding, so its rotated channels fit
         // an index head; a group is at least two tokens and the budget whole groups
-        // (`refs/vllm/vllm/models/qwen4_exp/common/qsa_indexer.py:783-786`).
+        // (`vllm:vllm/models/qwen4_exp/common/qsa_indexer.py:783-786`).
         if config.compress_ratio < 2
             || !config.budget.is_multiple_of(config.compress_ratio)
             || config.head_dim < text.rope.dim
@@ -578,7 +578,7 @@ impl NgramEmbeddingConfig {
     /// The n-gram and PLE fields of `text_config`.
     fn read(values: &Fields<'_>, text: &TextConfig) -> Result<Self> {
         // The checkpoint counts layers from one: `ple_layer_ids: [2]` is the layer whose
-        // tensors are `layers.1.ple.*` (`refs/vllm/vllm/models/qwen4_exp/nvidia/model.py:218-224`).
+        // tensors are `layers.1.ple.*` (`vllm:vllm/models/qwen4_exp/nvidia/model.py:218-224`).
         let mut layers = Vec::new();
         for id in values
             .optional_indices("ple_layer_ids")?

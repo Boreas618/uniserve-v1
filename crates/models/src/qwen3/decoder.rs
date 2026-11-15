@@ -3,7 +3,7 @@
 //! The layer is Hugging Face's `Qwen3DecoderLayer`, with the feed-forward block of
 //! `Qwen3MoeDecoderLayer` and the token mixer and shared expert of `Qwen3_5MoeDecoderLayer`,
 //! in vLLM's residual form (`Qwen3NextDecoderLayer.forward(hidden_states, residual,
-//! positions)`, `refs/vllm/vllm/model_executor/models/qwen3_next.py:583-655`):
+//! positions)`, `vllm:vllm/model_executor/models/qwen3_next.py:583-655`):
 //!
 //! ```text
 //! residual None:     residual = hidden;            x = input_layernorm(hidden)

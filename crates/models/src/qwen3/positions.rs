@@ -16,7 +16,7 @@
 //! | [`frame_offsets`] | `[time + 1]` U32 offsets of a grid's time steps | `get_vision_cu_seqlens` |
 //!
 //! The references are transformers' (`transformers/models/qwen3_vl/modeling_qwen3_vl.py`,
-//! `transformers/vision_utils.py`) and vLLM's (`refs/vllm/vllm/model_executor/models/
+//! `transformers/vision_utils.py`) and vLLM's (`vllm:vllm/model_executor/models/
 //! qwen3_vl.py`); the expressions follow them operation for operation: positions as integers,
 //! and the learned table's sample coordinates on an FP32 `torch.linspace`.
 
@@ -207,7 +207,7 @@ pub fn vision_rows(ids: &[u32], image_token_id: u32, video_token_id: u32) -> Res
 ///
 /// A merging encoder serializes a patch grid block by block: the blocks of `merge × merge`
 /// patches in raster order, and the patches of a block in raster order, so a merged token
-/// reads `merge²` consecutive patch rows (`refs/vllm/vllm/model_executor/models/
+/// reads `merge²` consecutive patch rows (`vllm:vllm/model_executor/models/
 /// qwen3_vl.py:695-715`).
 fn merge_order(grid: &Tensor, merge: u32) -> Result<Tensor> {
     let (height, width) = grid.dims2()?;

@@ -8,7 +8,7 @@
 //! these are the DeepStack features the language model adds at its own layer boundaries.
 //!
 //! The module tree is vLLM's `Qwen3_VisionTransformer`
-//! (`refs/vllm/vllm/model_executor/models/qwen3_vl.py:381-908`) and transformers'
+//! (`vllm:vllm/model_executor/models/qwen3_vl.py:381-908`) and transformers'
 //! `Qwen3VLVisionModel` (`transformers/models/qwen3_vl/modeling_qwen3_vl.py:609-732`).
 //!
 //! ## What a grid decides

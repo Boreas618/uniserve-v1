@@ -18,8 +18,7 @@
 //! ## Tensor parallelism
 //!
 //! A rank of a tensor-parallel group holds a contiguous run of the key heads and the value
-//! heads they serve (vLLM's shards, `refs/vllm/vllm/models/qwen4_exp/nvidia/low_latency_gemm.py:27-65`):
-//! its rows of `in_proj_qkv` (three runs, one of each of `q`, `k` and `v`), of `in_proj_z`,
+//! heads they serve: its rows of `in_proj_qkv` (three runs, one of each of `q`, `k` and `v`), of `in_proj_z`,
 //! `in_proj_b` and `in_proj_a`, its channels of the convolution, its entries of `A_log` and
 //! `dt_bias`, and its columns of `out_proj`, whose partial products the group sums. The state
 //! is the rank's heads' own.

@@ -1,7 +1,7 @@
 //! Gated attention over the tokens an indexer selects (vLLM's Qwen sparse attention,
-//! `refs/vllm/vllm/models/qwen4_exp/nvidia/qsa.py:281-631`, with its indexer,
-//! `refs/vllm/vllm/models/qwen4_exp/nvidia/qsa_indexer.py:90-448` and
-//! `refs/vllm/vllm/models/qwen4_exp/common/qsa_indexer.py`).
+//! `vllm:vllm/models/qwen4_exp/nvidia/qsa.py:281-631`, with its indexer,
+//! `vllm:vllm/models/qwen4_exp/nvidia/qsa_indexer.py:90-448` and
+//! `vllm:vllm/models/qwen4_exp/common/qsa_indexer.py`).
 //!
 //! ```text
 //! projections   [q | gate] per head, k, v;   q, k = rope(gemma(·))        over a head's channels

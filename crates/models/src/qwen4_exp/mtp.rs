@@ -1,5 +1,5 @@
 //! The drafter: the checkpoint's multi-token-prediction module (`mtp.*`; vLLM's
-//! `Qwen4ExpMultiTokenPredictor`, `refs/vllm/vllm/models/qwen4_exp/nvidia/mtp.py:181-401`).
+//! `Qwen4ExpMultiTokenPredictor`, `vllm:vllm/models/qwen4_exp/nvidia/mtp.py:181-401`).
 //!
 //! An entry at position `i` reads the streams `S` of position `i` (the model's, or the
 //! drafter's own when it drafts further ahead) and the embedding `e` of the token at `i + 1`:
@@ -17,7 +17,7 @@
 //! [`Drafter::logits_rows`] mixes the rows the model's head projects.
 //!
 //! The drafter's indexer runs at every step, as vLLM's does when the checkpoint states no
-//! `index_share_for_mtp_iteration` (`refs/vllm/vllm/config/speculative.py:1079-1088`). Its
+//! `index_share_for_mtp_iteration` (`vllm:vllm/config/speculative.py:1079-1088`). Its
 //! experts keep the checkpoint's order, because an expert redistribution names only the
 //! model's layers.
 //!

@@ -1,5 +1,5 @@
 //! The causal language model of `Qwen4ExpForConditionalGeneration` (vLLM's
-//! `Qwen4ExpForCausalLM`, `refs/vllm/vllm/models/qwen4_exp/nvidia/model.py:540-671`).
+//! `Qwen4ExpForCausalLM`, `vllm:vllm/models/qwen4_exp/nvidia/model.py:540-671`).
 //!
 //! ```text
 //! embedding:  x = Σ_ranks embed_shard(ids)                          [tokens, H]

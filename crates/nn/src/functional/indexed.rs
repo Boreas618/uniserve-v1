@@ -5,9 +5,7 @@
 //! its pages of keys and values ([`KvPlanes::index_keys`](crate::KvPlanes::index_keys)). A query
 //! row scores the keys of the groups it may see ([`index_scores`]), keeps the best
 //! ([`super::top_k`]), and attends the tokens of those groups and of its own unfinished group
-//! ([`indexed_attention`]), as vLLM's Qwen sparse attention does
-//! (`refs/vllm/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py:20-277`,
-//! `refs/vllm/vllm/models/qwen4_exp/nvidia/ops/qsa.py:75-330`):
+//! ([`indexed_attention`]):
 //!
 //! ```text
 //! index_scores        s[t, g] = Σ_h relu(q[t, h] · key[g])        g < visible[t], −inf otherwise

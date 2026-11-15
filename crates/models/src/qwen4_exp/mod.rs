@@ -2,7 +2,7 @@
 //! checkpoint configuration, its modules and the model built from them.
 //!
 //! The arithmetic and the structure follow vLLM's implementation of the family
-//! (`refs/vllm/vllm/models/qwen4_exp/`); where SGLang differs, vLLM's choice is taken.
+//! (`vllm:vllm/models/qwen4_exp/`); where SGLang differs, vLLM's choice is taken.
 //!
 //! - [`config`]: [`Config`], read once from a checkpoint's sidecars;
 //! - [`hyper_connection`]: [`HyperConnection`], the gated read and write of several residual
@@ -27,6 +27,17 @@
 //! values a forward needs beyond its inputs (each token's row, position and state slot) are
 //! tensor expressions over the batch's columns, so their shapes follow from the batch's
 //! extents alone.
+//!
+//! ## References
+//!
+//! A citation `name:path:lines` names a file of a reference implementation at the commit
+//! this table pins, its path below the directory the table states, and the lines a rule is
+//! read from:
+//!
+//! | Name | Repository | Commit | Paths below |
+//! | --- | --- | --- | --- |
+//! | `vllm` | <https://github.com/vllm-project/vllm> | `cdd09707378563a4228270bd0bb5b83bcb0d1acc` | the repository |
+//! | `qwen-kernel-challenge` | <https://github.com/Boreas618/qwen-kernel-challenge> (private) | `86bd5f21e9d0b15fcbc8c2e401a2502556e103aa` | the repository |
 
 pub mod attention;
 pub mod causal_lm;

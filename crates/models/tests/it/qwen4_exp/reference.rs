@@ -133,7 +133,7 @@ fn with_fixture<T>(fixture: &Fixture, check: impl FnOnce(&Config, VarBuilder<'_,
 
 /// The relative L2 difference of `actual` from `expected` over the whole tensor and of its
 /// worst row, a row's norm floored at a tenth of the mean row norm
-/// (`refs/qwen-kernel-challenge/packages/_common/checks.py:11-23`).
+/// (`qwen-kernel-challenge:packages/_common/checks.py:11-23`).
 fn differences(actual: &Tensor, expected: &Tensor) -> (f64, f64) {
     assert_eq!(actual.dims(), expected.dims(), "the shapes differ");
     let rows = expected.dims()[0];

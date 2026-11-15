@@ -1,7 +1,7 @@
 //! The gated hyper-connection: how a block reads and writes a residual of several streams
 //! (vLLM's `Qwen4ExpHyperConnection`,
-//! `refs/vllm/vllm/models/qwen4_exp/nvidia/hyperconnection.py:56-231`, kernels
-//! `refs/vllm/vllm/models/qwen4_exp/nvidia/ops/hc.py`).
+//! `vllm:vllm/models/qwen4_exp/nvidia/hyperconnection.py:56-231`, kernels
+//! `vllm:vllm/models/qwen4_exp/nvidia/ops/hc.py`).
 //!
 //! The residual is `S`, `[tokens, C · H]`: `C` streams of the hidden width `H`. A block reads
 //! one row of `H` mixed from the normalized streams and writes its output back into every

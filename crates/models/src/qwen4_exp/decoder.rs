@@ -1,5 +1,5 @@
 //! The decoder layer over hyper-connected streams (vLLM's `Qwen4ExpDecoderLayer`,
-//! `refs/vllm/vllm/models/qwen4_exp/nvidia/model.py:295-368`).
+//! `vllm:vllm/models/qwen4_exp/nvidia/model.py:295-368`).
 //!
 //! ```text
 //! PLE (the layers that hold one):  S ← S + ple(S, ids)           after any pending combine

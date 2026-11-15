@@ -1,7 +1,7 @@
 //! The Qwen3-VL model as an encoder: a prompt's hidden states, its media merged in.
 //!
 //! [`Qwen3VlModel`] is Hugging Face's `Qwen3VLModel` over a prefix of its decoder layers
-//! (vLLM's `Qwen3LLMModel.forward`, `refs/vllm/vllm/model_executor/models/
+//! (vLLM's `Qwen3LLMModel.forward`, `vllm:vllm/model_executor/models/
 //! qwen3_vl.py:1852-1905`):
 //!
 //! ```text

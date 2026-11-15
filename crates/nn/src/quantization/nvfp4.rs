@@ -104,9 +104,8 @@ fn arrange(layout: ValueLayout, bytes: &[u8], experts: u64, rows: u64, row_bytes
 /// checkpoint's matrices: `count` rows or columns from `first`, published as `padded` of them,
 /// the ones past the share zero.
 ///
-/// A rank of a tensor-parallel group holds a share of each expert's intermediate width (vLLM's
-/// split of the family's experts, `refs/vllm/vllm/models/qwen4_exp/nvidia/low_latency_gemm.py:27-65`):
-/// rows of the gate and up projections, columns of the down projection. The grouped products
+/// A rank of a tensor-parallel group holds a contiguous share of each expert's intermediate
+/// width: rows of the gate and up projections, columns of the down projection. The grouped products
 /// read whole row tiles, so a share that is not whole tiles is padded with rows and columns of
 /// zero codes and zero block scales, which contribute nothing: a gated row of zeros is zero
 /// and a down column of zeros multiplies it. The bounds are whole bytes and whole block
