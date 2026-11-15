@@ -33,6 +33,13 @@ info = "uniserve_expert_exchange_info"
 [source]
 kind = "cuda"
 
+# One unit holds every entry and the kernels; the transport calls the driver's virtual-memory API
+# directly.
+[compile]
+units = ["src/exchange.cu"]
+standard = "c++17"
+libraries = ["cuda"]
+
 # `mode_dispatch_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_8192_ranks_2_attention_0_dtype_bf16`.
 # Every extent is a launch value the kernels read from the call, so one object serves any of
 # them; `src/exchange.cu`'s create refuses a row that is not whole 16-byte vectors (`hidden`

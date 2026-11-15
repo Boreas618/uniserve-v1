@@ -15,7 +15,13 @@
 //
 // The ranks of a group run the same sequence of launches, so a phase number they
 // all count is the value a rank waits to see in its flags: a flag is written with
-// a release store of system scope and read with an acquire load of system scope.
+// a release store of system scope and read with an acquire load of system scope
+// (`cuda::atomic_ref` of libcu++). A rank waits for its peers' flags without a
+// bound of its own: a peer that never arrives leaves the launch in flight, and
+// the host detects it, as it detects any job that stops progressing: the worker's
+// watchdog reports the stalled job after half `worker_config.watchdog_timeout`,
+// which fails the rank's group, and the group is replaced
+// (`crates/engine/src/worker/watchdog.rs`).
 //
 // Row safety across launches needs no further flag. A rank starts layer `L + 1`'s
 // dispatch only after its layer `L` combine saw every peer's flag, and a peer sets
@@ -27,6 +33,7 @@
 #include <uniserve_expert_exchange.h>
 
 #include <cuda.h>
+#include <cuda/atomic>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -43,10 +50,6 @@ constexpr int kThreads = 256;
 /// The most blocks a launch takes: every one of them fits on the device at once,
 /// so a block that waits for a flag never keeps out the block that sets it.
 constexpr int kMaxBlocks = 256;
-/// How long a block waits for a peer before it stops the device, in nanoseconds.
-/// A rank can lag by a module load or a first call's setup during warmup, so the bound
-/// is minutes; an unbounded wait would turn a lost peer into a silent hang.
-constexpr unsigned long long kPeerTimeoutNs = 600ull * 1000 * 1000 * 1000;
 
 /// The bytes of one row of `hidden` elements of `dtype`, or -1 for a type that
 /// is not an activation.
@@ -318,32 +321,22 @@ void unmap_storage(Transport& transport) {
   transport.mapped = false;
 }
 
-__device__ __forceinline__ void store_release(uint32_t* flag, uint32_t value) {
-  asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(flag), "r"(value) : "memory");
+/// A flag as every rank of the group sees it: peers on other devices and nodes
+/// read and write it over the fabric, so its ordering is of system scope.
+using Flag = cuda::atomic_ref<uint32_t, cuda::thread_scope_system>;
+
+/// Publishes `phase` in `flag`, after every store this thread made before it.
+__device__ __forceinline__ void store_release(uint32_t* flag, uint32_t phase) {
+  Flag(*flag).store(phase, cuda::memory_order_release);
 }
 
-__device__ __forceinline__ uint32_t load_acquire(const uint32_t* flag) {
-  uint32_t value;
-  asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(value) : "l"(flag) : "memory");
-  return value;
-}
-
-/// Waits until every rank's flag in `flags` reached `phase`, or stops the device
-/// when a peer never does: a trap is a failure the worker sees, a hang is not.
-__device__ void wait_for_peers(const uint32_t* flags, int ranks, uint32_t phase) {
-  const unsigned long long start = [] {
-    unsigned long long now;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
-    return now;
-  }();
+/// Waits until every rank's flag in `flags` reached `phase`; what a peer stored
+/// before it published its phase is visible after the wait.
+__device__ void wait_for_peers(uint32_t* flags, int ranks, uint32_t phase) {
   for (int rank = threadIdx.x; rank < ranks; rank += blockDim.x) {
+    const Flag flag(flags[rank]);
     // Phases only grow, and the difference stays correct across a wrap.
-    while (static_cast<int32_t>(load_acquire(flags + rank) - phase) < 0) {
-      unsigned long long now;
-      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
-      if (now - start > kPeerTimeoutNs) {
-        __trap();
-      }
+    while (static_cast<int32_t>(flag.load(cuda::memory_order_acquire) - phase) < 0) {
     }
   }
 }
@@ -460,7 +453,7 @@ __global__ void __launch_bounds__(kThreads) dispatch_kernel(const DispatchParams
   if (threadIdx.x == 0) {
     *reinterpret_cast<uint32_t*>(own + p.layout.done) = 0;
   }
-  wait_for_peers(reinterpret_cast<const uint32_t*>(own + p.layout.dispatch_flags), p.ranks, phase);
+  wait_for_peers(reinterpret_cast<uint32_t*>(own + p.layout.dispatch_flags), p.ranks, phase);
 }
 
 /// Marks the rows no source filled: a row past a source's count holds what an
@@ -550,7 +543,7 @@ __global__ void __launch_bounds__(kThreads) combine_kernel(const CombineParams p
                     phase);
     }
   }
-  wait_for_peers(reinterpret_cast<const uint32_t*>(own + p.layout.combine_flags), p.ranks, phase);
+  wait_for_peers(reinterpret_cast<uint32_t*>(own + p.layout.combine_flags), p.ranks, phase);
   __syncthreads();
 
   for (int32_t token = blockIdx.x; token < p.tokens; token += gridDim.x) {
