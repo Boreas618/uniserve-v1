@@ -733,8 +733,8 @@ async fn prepared_successor(
     tokio::task::spawn_blocking(|| -> anyhow::Result<()> {
         storage_server_speaks(&storage::default_socket()?)
     })
-        .await
-        .context("the check of the Storage Server's protocol did not complete")??;
+    .await
+    .context("the check of the Storage Server's protocol did not complete")??;
     let (mut config, _) = crate::options::resolve_text(&prepare.config, &[])?;
     config.server_config.api_key = prepare.api_key;
     let stated = Stated::from_paths(prepare.stated);

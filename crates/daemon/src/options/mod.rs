@@ -38,8 +38,8 @@ pub use args::{Stated, overridden, printed, resolve_text};
 pub use proto::config::{
     ChatConfig, ChatTemplateContentFormat, CudaGraphConfig, DeviceConfig, ImageFetchConfig,
     KvCacheConfig, LoadConfig, LoggingConfig, MediaConfig, MigrationConfig, MoeConfig,
-    ProfilingConfig, ReasoningParser, SchedulerConfig, ServerConfig,
-    SpeculativeConfig, VideoConfig, VideoJobConfig, WorkerConfig,
+    ProfilingConfig, ReasoningParser, SchedulerConfig, ServerConfig, SpeculativeConfig,
+    VideoConfig, VideoJobConfig, WorkerConfig,
 };
 use proto::config::{positive, values};
 
