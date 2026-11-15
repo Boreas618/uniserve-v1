@@ -46,13 +46,15 @@ Each probe thus costs about a microsecond of every step even when switched off, 
 
 A session attaches collectors to every worker of the executing epoch for a window of steps or seconds, and leaves one SQLite file per worker in a directory it names. One session runs at a time:
 
+The routes are the admin API's, on the daemon's operator socket, whose path the daemon's readiness record states (`$admin`, as [Listeners](admin.md#listeners) reads it):
+
 ```bash
-curl -X POST http://127.0.0.1:8000/admin/profile -H 'Content-Type: application/json' -d '{
+curl --unix-socket "$admin" -X POST http://admin/admin/profile -H 'Content-Type: application/json' -d '{
   "collectors": ["timeline", "fence_timeline", "pm_sampling"],
   "stages": ["decode"], "start_step": 10, "steps": 200,
-  "output_dir": "/data/profiles", "max_slowdown": 0.1}'
-curl http://127.0.0.1:8000/admin/profile             # its state
-curl -X DELETE http://127.0.0.1:8000/admin/profile   # end it now
+  "output_dir": "profiles", "max_slowdown": 0.1}'
+curl --unix-socket "$admin" http://admin/admin/profile             # its state
+curl --unix-socket "$admin" -X DELETE http://admin/admin/profile   # end it now
 ```
 
 | Field | Default | Meaning |
@@ -64,7 +66,7 @@ curl -X DELETE http://127.0.0.1:8000/admin/profile   # end it now
 | `stages` | Every stage | The steps recorded, by call kind (`prefill`, `decode`, `verify`, `denoising`, ...) |
 | `workers` | Every worker | The workers recorded, by rank |
 | `modules` | Every probed class | Name patterns (`*` matches any run) of the module classes whose fence records `fence_timeline` keeps |
-| `output_dir` | Required | The directory each worker writes `profile-SESSION-epochEPOCH-rankRANK.sqlite` into; it is created |
+| `output_dir` | Required | The directory each worker writes `profile-SESSION-epochEPOCH-rankRANK.sqlite` into, created when absent; a relative path resolves against the server's working directory |
 | `timeline`, `pm_sampling`, `range_metrics`, `pc_sampling` | Below | Each collector's options |
 | `sampler_read_ms` | `100` | How often each worker reads its armed samplers (`pm_sampling`, `pc_sampling`), in milliseconds (below) |
 | `max_slowdown` | Unguarded | The quality-of-service guard's bound, a fraction of the step time before the session |
@@ -119,8 +121,8 @@ Each rank writes one SQLite file per session, in UniServe's own schema: every ra
 Every time is in nanoseconds of one of two clocks: CUPTI's (about `CLOCK_REALTIME`), for CUPTI's records, the steps and PM samples; and each device's `%globaltimer`, for the fence records. `clocks` holds samples of them at the session's start and end: CUPTI's clock with `CLOCK_REALTIME` and `CLOCK_MONOTONIC`, and each device's `%globaltimer`, read by a kernel that stores it into pinned host storage, followed on its stream by a host function that reads the host's clocks once the kernel completed, with half the host's time from the kernel's launch to that function as the sample's uncertainty. A client aligns a clock through the sample of least uncertainty. CUPTI's records carry the correlation id of the API call that issued them, a graph's nodes that of its launch.
 
 ```bash
-.venv/bin/python -m uniserve_eval.profile summary /data/profiles/profile-1-epoch1-rank0.sqlite
-.venv/bin/python -m uniserve_eval.profile perfetto /data/profiles/profile-1-*.sqlite -o trace.json
+.venv/bin/python -m uniserve_eval.profile summary profiles/profile-1-epoch1-rank0.sqlite
+.venv/bin/python -m uniserve_eval.profile perfetto profiles/profile-1-*.sqlite -o trace.json
 ```
 
 `summary` states each file's session, worker, collectors and rows by table. `perfetto` writes one trace of a session's files in the Trace Event Format, which the Perfetto UI opens: a process per worker, with a track per CUDA stream, host thread and device's fence probes (each probed module instance's call a slice, nested as the calls nest), the steps, and counter tracks for PM samples, all on CUPTI's clock. `uniserve_eval.profile.ProfileFile` reads a file from Python.
