@@ -945,9 +945,7 @@ mod tests {
     /// The released four-step export's manifest, trimmed to the first block of each calibrated
     /// stage: the fixture the manifest's reader is tested on.
     fn manifest() -> Value {
-        json(include_str!(
-            "../../../../nn/tests/fixtures/modelopt_manifest.json"
-        ))
+        json(include_str!("modelopt_manifest.json"))
     }
 
     /// A packed export's manifest becomes each stage's declaration: the network's feed-forward

@@ -442,10 +442,7 @@ mod tests {
         let mut files = dmd_export(release(), "VIDEO_SPARSE_ATTN_H3");
         files.insert(
             ModeloptManifest::FILE.to_owned(),
-            serde_json::from_str(include_str!(
-                "../../../../nn/tests/fixtures/modelopt_manifest.json"
-            ))
-            .unwrap(),
+            serde_json::from_str(include_str!("modelopt_manifest.json")).unwrap(),
         );
         let mut config = read(&files, None).unwrap();
 
