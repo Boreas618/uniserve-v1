@@ -32,7 +32,7 @@ pub(crate) fn run(
         .validate(&stated)
         .context("invalid serving configuration")?;
     anyhow::ensure!(
-        config.model.is_some(),
+        config.states_model(),
         "`keys` records a deployment's model: name MODEL on the command line or set `model` \
          in --config"
     );

@@ -13,7 +13,7 @@ A UniServe server is configured by one tree of serving options and, for a parall
 Options none of them states keep their defaults. `GET /admin/config` returns the resolved non-default options as reloadable TOML. Reading it restores defaults without treating options belonging to other model families or rank-assignment modes as explicitly configured.
 
 ```bash
-uniserve serve "$H3_MODEL" --config configs/minimax_h3/ulysses4.toml \
+uniserve serve --model-dir "$H3_MODEL" --config configs/minimax_h3/ulysses4.toml \
   --max-running-requests 2 --max-model-len 10240 \
   --set 'video_config.text_capacities=[1024]'
 
@@ -23,12 +23,13 @@ uniserve serve --config fasth3.toml --set video_config.max_seconds=10
 | Flag | Path |
 | --- | --- |
 | `MODEL` (positional) | `model` |
+| `--model-dir` | `model_dir` |
 | `--host`, `--port` | `admin_config.host`, `admin_config.port` |
 | `--served-model-name` | `served_model_name` |
 | `--tensor-parallel-size`, `--data-parallel-size` | `tensor_parallel_size`, `data_parallel_size` |
 | `--max-running-requests` | `max_running_requests` |
 | `--max-model-len` | `max_model_len` |
-| `--lora-path` | `lora_path` |
+| `--lora`, `--lora-dir` | `lora`, `lora_dir` |
 | `--mem-fraction-static` | `mem_fraction_static` |
 | `--host-identity` | `host_identity` |
 | `--nnodes`, `--node-rank`, `--dist-init-addr` | `nnodes`, `node_rank`, `dist_init_addr` |
@@ -48,7 +49,7 @@ Each host's Build Server (`uniserve build-server serve`, see `architecture.md`) 
 `uniserve keys MODEL [OPTIONS]` prints the key list a deployment's main processes launch, in the format `build-server build --keys` reads (`operator<TAB>descriptor key` lines, sorted, each key once), and exits, so a store can be built for a deployment before it serves. It takes `serve`'s options, resolves them as `serve` does, and runs each main process's own start on this node: the same family, rank placement, capacity, model and runners, up to the profile run every device's runners make at start, in which each runner runs the forwards it captures and runs eagerly under a meta context that reports each launch's descriptor key instead of launching it (`architecture.md`, The profile run). The model is loaded from its checkpoint's safetensors headers, so no weight is read; no daemon, Storage Server or NCCL communicator is started. Each main process is the executable of the engine package the deployment selects, run with `--keys`: the command fixes that package's revision at this host's Build Server, which it starts when none serves and which builds the executable when its store misses it. The deployment's devices are used, because the ranks' resident memory and the runners' buffers are device allocations, so they must be free. Logs go to standard error and the key list to standard output:
 
 ```bash
-uniserve keys /workspace/models/Qwen3-30B-A3B --max-model-len 2048 --max-running-requests 8 \
+uniserve keys Qwen/Qwen3-30B-A3B --max-model-len 2048 --max-running-requests 8 \
   --set 'dtype="bfloat16"' --set 'attention_backend="trtllm"' > keys.txt \
   && uniserve build-server build --keys keys.txt --packages crates/ops/kernels --target sm_100a \
        --store /var/lib/uniserve/store
@@ -90,8 +91,8 @@ Three backend-name fields are read with `attention_backend` (`modules_of`, `crat
 
 | Destination | Options |
 | --- | --- |
-| Deployment identity, cannot change | `model`, `served_model_name` |
-| Build config | `max_model_len`, `lora_path`, `dtype`, `quantization`, `max_running_requests`, `mem_fraction_static`, `tensor_parallel_size`, `data_parallel_size`, `worker_groups`, `engine_host` |
+| Deployment identity, cannot change | `model`, `model_dir`, `served_model_name` |
+| Build config | `max_model_len`, `lora`, `lora_dir`, `dtype`, `quantization`, `max_running_requests`, `mem_fraction_static`, `tensor_parallel_size`, `data_parallel_size`, `worker_groups`, `engine_host` |
 | Host layer, daemon (a node's startup arguments) | `host_identity`, `nnodes`, `node_rank`, `dist_init_addr` |
 | Host layer | `mm_processor_kwargs` |
 | Module selection | `attention_backend` (attention), with `prefill_attention_backend` and `decode_attention_backend` overriding it per phase |
@@ -100,10 +101,12 @@ Three backend-name fields are read with `attention_backend` (`modules_of`, `crat
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `model` | Required | Local model directory or Hugging Face repository |
-| `served_model_name` | `model` | The single model name the API serves |
-| `max_model_len` | The checkpoint's `max_position_embeddings`, 8192 when it declares none; a media pipeline (MiniMax-H3) has none and its deployment must state it | Longest sequence a request may reach, in tokens; for a media pipeline the longest prompt presentation it admits |
-| `lora_path` | Unset | A weight adapter fused into the checkpoint's weights at load and serving every request: an adapter file, or a directory holding `adapter_model.safetensors`; video families only, and the family must recognize it ([FastH3 adapters](minimax_h3/minimax_h3.md#fasth3-adapters)) |
+| `model` | Required, or `model_dir` | The Hugging Face checkpoint the deployment serves, `<owner>/<name>[@<revision>][/<folder>]`: a repository at its default branch or at a branch, tag or commit, and the folder of it that holds the checkpoint when it is not the root. The leader resolves the revision to its commit and reads the checkpoint from the standard Hugging Face cache's snapshot of that commit (`$HF_HOME/hub`, `~/.cache/huggingface/hub` by default), downloading what the snapshot lacks: a chat model's every file, or a diffusers pipeline's root files and the folders of the stages its index declares. `HF_ENDPOINT` names a mirror and `HF_TOKEN` the access token (else the token `hf auth login` wrote); with `HF_HUB_OFFLINE=1` nothing is downloaded, and the cache must hold the revision's snapshot. The engines open the snapshot, so every node of the deployment reads the same cache path |
+| `model_dir` | Unset | A local checkpoint directory the deployment serves, read in place, instead of a repository; stating both is refused |
+| `served_model_name` | `model` or `model_dir` | The single model name the API serves |
+| `max_model_len` | The context length the checkpoint states where its family keeps it (a Qwen3 checkpoint's `max_position_embeddings`, a Qwen3.6 or Qwen3.8 Flash Next checkpoint's `text_config.max_position_embeddings`); a checkpoint that states none is refused, and a media pipeline (MiniMax-H3) has none, so its deployment must state it | Longest sequence a request may reach, in tokens; for a media pipeline the longest prompt presentation it admits |
+| `lora` | Unset | A weight adapter fused into the checkpoint's weights at load and serving every request: the Hugging Face repository, or the folder of one, that holds `adapter_model.safetensors`, `<owner>/<name>[@<revision>][/<folder>]`, resolved as `model` is; video families only, and the family must recognize it ([FastH3 adapters](minimax_h3/minimax_h3.md#fasth3-adapters)) |
+| `lora_dir` | Unset | The adapter as a local directory holding `adapter_model.safetensors`, read in place, instead of a repository; stating both is refused |
 | `dtype` | `"bfloat16"` | Element type of parameters and activations: `bfloat16`, `float16` or `float32` |
 | `quantization` | `{}` | Precision policy: `mode` (`quality`, `balanced`, `performance`, `maximum`) and representations selected by module under `modules` (`bf16`, `fp16`, `fp8`, `nvfp4`); empty selects the checkpoint's own quantization. The model family interprets it when the engine opens the checkpoint and refuses a policy it does not serve, naming each module: MiniMax-H3 serves every mode and selection but `video_vae = "bf16"` over a dense checkpoint, converting its FP8 and NVFP4 modules' projections at load and measuring each activation's scale on every call ([FastH3 precision](minimax_h3/minimax_h3.md#precision)); the chat families state no mode and no module, and a checkpoint that declares its own quantization takes no policy |
 | `mm_processor_kwargs` | `{}` | Options of the model's multimodal processor; MiniMax-H3 takes `reference_image_short_edge` and `enlarge_references` ([FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity)) |

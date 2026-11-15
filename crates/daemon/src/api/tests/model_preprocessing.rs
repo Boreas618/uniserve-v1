@@ -8,7 +8,7 @@ use crate::api::input::chat::{CHATML_TEMPLATE, HfChatRenderer};
 use crate::api::input::media::ImageInput;
 use crate::api::input::{ModelResolutionError, Processor, RequestRenderer};
 use crate::api::model::ModelConfig;
-use crate::api::model::assets::ResolvedModelFiles;
+use crate::api::model::assets::ChatFiles;
 use crate::api::openai::ApiError;
 use crate::api::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use processing::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
@@ -51,6 +51,10 @@ const PLAIN: Family = Family {
         reasoning: None,
         tool_calls: None,
         images: None,
+        checkpoint: processing::ChatCheckpoint {
+            context_length: &["max_position_embeddings"],
+            chat_template: processing::ChatTemplate::TokenizerConfig,
+        },
     }),
 };
 
@@ -66,6 +70,10 @@ const CHAT: Family = Family {
         }),
         tool_calls: Some(ToolCallFormat::Json),
         images: None,
+        checkpoint: processing::ChatCheckpoint {
+            context_length: &["max_position_embeddings"],
+            chat_template: processing::ChatTemplate::TokenizerConfig,
+        },
     }),
 };
 
@@ -111,50 +119,30 @@ fn try_resolved_model(
             .map(|token| AddedToken::from(*token, true))
             .collect::<Vec<_>>(),
     );
-    let tokenizer_path = directory.path().join("tokenizer.json");
-    tokenizer_builder.save(&tokenizer_path, false).unwrap();
+    tokenizer_builder
+        .save(directory.path().join("tokenizer.json"), false)
+        .unwrap();
 
-    let config_path = directory.path().join("config.json");
     fs::write(
-        &config_path,
+        directory.path().join("config.json"),
         format!(
             r#"{{"architectures":["{class}"],"max_position_embeddings":4096,"num_attention_heads":8}}"#
         ),
     )
     .unwrap();
-    let tokenizer_config_path = directory.path().join("tokenizer_config.json");
     fs::write(
-        &tokenizer_config_path,
+        directory.path().join("tokenizer_config.json"),
         format!(
             "{{\"eos_token\":\"<|im_end|>\",\"chat_template\":{}}}",
             serde_json::to_string(CHAT_TEMPLATE).unwrap()
         ),
     )
     .unwrap();
-    let generation_config_path = directory.path().join("generation_config.json");
+    // A family that keeps its template in a file of its own reads it there.
+    fs::write(directory.path().join("chat_template.jinja"), CHAT_TEMPLATE).unwrap();
     fs::write(
-        &generation_config_path,
+        directory.path().join("generation_config.json"),
         r#"{"eos_token_id":2,"max_new_tokens":128}"#,
-    )
-    .unwrap();
-    let files = ResolvedModelFiles {
-        tokenizer_path,
-        tokenizer_config_path: Some(tokenizer_config_path),
-        generation_config_path: Some(generation_config_path),
-        chat_template_path: None,
-        config_path: Some(config_path),
-    };
-    let tokenizer: DynTokenizer = Arc::new(
-        HuggingFaceTokenizer::load(
-            &files.tokenizer_path,
-            files.tokenizer_config_path.as_deref(),
-        )
-        .unwrap(),
-    );
-    let renderer = HfChatRenderer::new(
-        Some(CHAT_TEMPLATE.to_string()),
-        HashMap::new(),
-        Some(ChatTemplateContentFormat::String),
     )
     .unwrap();
     // The family the checkpoint's `config.json` declares, as startup resolves it.
@@ -167,6 +155,18 @@ fn try_resolved_model(
                 .as_str(),
         )])
         .unwrap();
+    let Serving::Chat(profile) = family.serving else {
+        panic!("{} serves chat", family.id);
+    };
+    let files = ChatFiles::locate(directory.path(), profile.checkpoint).unwrap();
+    let tokenizer: DynTokenizer =
+        Arc::new(HuggingFaceTokenizer::load(files.tokenizer_directory()).unwrap());
+    let renderer = HfChatRenderer::new(
+        Some(CHAT_TEMPLATE.to_string()),
+        HashMap::new(),
+        Some(ChatTemplateContentFormat::String),
+    )
+    .unwrap();
     let config = ModelConfig::from_files(family, &files, Some(4096), tokenizer.as_ref()).unwrap();
     let renderer = RequestRenderer::Chat(renderer);
     let model = Processor::new(config, Arc::clone(&tokenizer), renderer, limits, true)?;

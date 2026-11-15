@@ -17,7 +17,6 @@ pub mod video;
 
 pub use error::{ServeError, TokenizeError};
 pub use media::ImageInput;
-pub(crate) use processor::declared_family;
 pub use processor::{AdapterSelection, ModelResolutionError, Processor, RequestRenderer};
 pub use processor::{LoadedModel, LoadedRenderer};
 

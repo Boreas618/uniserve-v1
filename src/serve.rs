@@ -53,7 +53,7 @@ async fn serve(
 ) -> Result<()> {
     // A model-less leader serves its admin API until a deployment is
     // configured. Followers join the leader without loading a model.
-    if config.leads() && config.model.is_none() {
+    if config.leads() && !config.states_model() {
         info!(
             host = %config.admin_config.host,
             port = config.admin_config.port,

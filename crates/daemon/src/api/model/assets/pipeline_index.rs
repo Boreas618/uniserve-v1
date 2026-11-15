@@ -5,9 +5,8 @@
 //! `modular_model_index.json`, where each stage lives in the folder named by
 //! its key unless its specification names its folder explicitly.
 //!
-//! The class selects the family (`processing::Registry::resolve`); server
-//! startup (`ModelConfig::load` in `input::processor`) then reads this index,
-//! through `PipelineCheckpoint`, for the folder of each stage it loads.
+//! The class selects the family ([`super::declared_family`]); `PipelineCheckpoint` then reads
+//! the index for the folder of each stage it loads.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -15,28 +14,25 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::api::model::assets::error::{Error, Result};
-use crate::api::model::assets::model_files::ModelSource;
 
 /// Stage folders declared by a checkpoint's root index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PipelineIndex {
-    /// Stage name mapped to the checkpoint-relative folder holding its
-    /// files.
+    /// Stage name mapped to the checkpoint-relative folder holding its files.
     stages: BTreeMap<String, String>,
 }
 
 impl PipelineIndex {
     /// Parses a root index.
     ///
-    /// Keys starting with `_` are index metadata. Every other key whose value
-    /// is an array (a stage specification `[library, class, options?]`)
-    /// names a stage; its folder is the string `subfolder` option when
-    /// present and the key otherwise. Keys with non-array values are ignored.
+    /// Keys starting with `_` are index metadata. Every other key whose value is an array (a
+    /// stage specification `[library, class, options?]`) names a stage; its folder is the string
+    /// `subfolder` option when present and the key otherwise. Keys with non-array values are
+    /// ignored.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Invalid`] when `content` is not JSON or not a JSON
-    /// object.
+    /// Returns [`Error::Invalid`] when `content` is not JSON or not a JSON object.
     pub(super) fn parse(content: &str) -> Result<Self> {
         let value: Value = serde_json::from_str(content)
             .map_err(|error| Error::invalid(format!("pipeline index is not JSON: {error}")))?;
@@ -58,130 +54,91 @@ impl PipelineIndex {
         Ok(Self { stages })
     }
 
-    /// Returns the checkpoint-relative path of `filename` inside `stage`'s folder.
+    /// The checkpoint-relative folders of the stages the index declares.
+    pub(super) fn folders(&self) -> impl Iterator<Item = &str> {
+        self.stages.values().map(String::as_str)
+    }
+
+    /// Whether the checkpoint-relative `file` lies in the folder of a declared stage.
+    pub(super) fn holds(&self, file: &str) -> bool {
+        within(file, self.folders())
+    }
+
+    /// The checkpoint-relative folder that holds `stage`'s files.
     ///
-    /// The result is suitable for `ModelSource::file`. An undeclared
-    /// stage is [`Error::Invalid`].
-    pub(super) fn stage_file(&self, stage: &str, filename: &str) -> Result<String> {
-        let folder = self
-            .stages
+    /// # Errors
+    ///
+    /// Returns [`Error::Invalid`] for a stage the index does not declare.
+    pub(super) fn stage_folder(&self, stage: &str) -> Result<&str> {
+        self.stages
             .get(stage)
-            .ok_or_else(|| Error::invalid(format!("the pipeline declares no {stage} stage")))?;
-        Ok(format!("{folder}/{filename}"))
+            .map(String::as_str)
+            .ok_or_else(|| Error::invalid(format!("the pipeline declares no {stage} stage")))
     }
 }
 
-/// Resolves the root index of the diffusers pipeline checkpoint `source`
-/// holds: its `modular_model_index.json` ([`processing::RootFile::ModularIndex`]).
+/// Whether the checkpoint-relative `file` lies in one of `folders`.
+pub(super) fn within<'a>(file: &str, mut folders: impl Iterator<Item = &'a str>) -> bool {
+    folders.any(|folder| {
+        file.strip_prefix(folder)
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// The text of the root index of the pipeline checkpoint in `directory`, which its family
+/// declares in `index` (a modular pipeline's `modular_model_index.json`), or `None` for a
+/// checkpoint that publishes none and so is no pipeline.
 ///
-/// A checkpoint that publishes no index is not a pipeline checkpoint:
-/// [`Error::MissingFile`] yields `None`. Any other resolution failure, such as
-/// a refused, rate-limited or unreachable Hub request, is returned, since it
-/// says nothing about whether the index exists. An index that resolves but
-/// cannot be read or parsed is an error.
-pub(super) async fn pipeline_index(source: &ModelSource) -> Result<Option<PipelineIndex>> {
-    match source.file(processing::RootFile::ModularIndex.name()).await {
-        Ok(path) => read_pipeline_index(&path).map(Some),
-        Err(Error::MissingFile { .. }) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-/// Reads and parses one resolved index file.
-fn read_pipeline_index(path: &Path) -> Result<PipelineIndex> {
-    let content = std::fs::read_to_string(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    PipelineIndex::parse(&content)
+/// # Errors
+///
+/// Fails when a published index cannot be read.
+pub(super) fn index_text(directory: &Path, index: processing::RootFile) -> Result<Option<String>> {
+    super::optional_text(directory, index.name())
 }
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
-
     use super::*;
-    use crate::api::model::assets::hub_stub::HubStub;
 
     #[test]
     fn a_modular_stage_resolves_to_its_declared_subfolder() {
         let index = PipelineIndex::parse(
             r#"{
-                "_class_name": "MiniMaxH3ModularPipeline",
+                "_class_name": "ExamplePipeline",
                 "_diffusers_version": "0.36.0",
-                "tokenizer": ["transformers", "Qwen2TokenizerFast",
+                "tokenizer": ["transformers", "ExampleTokenizerFast",
                               {"subfolder": "text_tokenizer", "revision": null}]
             }"#,
         )
         .unwrap();
 
-        assert_eq!(
-            index.stage_file("tokenizer", "tokenizer.json").unwrap(),
-            "text_tokenizer/tokenizer.json"
-        );
+        assert_eq!(index.stage_folder("tokenizer").unwrap(), "text_tokenizer");
     }
 
     #[test]
-    fn a_classic_stage_resolves_to_its_key() {
+    fn a_stage_without_a_subfolder_resolves_to_its_key() {
         let index = PipelineIndex::parse(
-            r#"{"_class_name": "ClassicPipeline", "tokenizer": ["transformers", "CLIPTokenizer"]}"#,
+            r#"{"_class_name": "ExamplePipeline", "tokenizer": ["transformers", "ExampleTokenizer"]}"#,
         )
         .unwrap();
 
-        assert_eq!(
-            index.stage_file("tokenizer", "tokenizer.json").unwrap(),
-            "tokenizer/tokenizer.json"
-        );
-        assert!(index.stage_file("vae", "config.json").is_err());
+        assert_eq!(index.stage_folder("tokenizer").unwrap(), "tokenizer");
+        assert!(index.stage_folder("vae").is_err());
     }
 
-    #[tokio::test]
-    async fn a_directory_without_an_index_is_not_a_pipeline() {
+    /// A checkpoint is a pipeline when it publishes the index its family declares, and no other
+    /// file stands in for it.
+    #[test]
+    fn a_checkpoint_is_a_pipeline_when_it_publishes_its_index() {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("config.json"), "{}").unwrap();
+        let index = processing::RootFile::ModularIndex;
+        std::fs::write(directory.path().join("model_index.json"), "classic").unwrap();
+        assert_eq!(index_text(directory.path(), index).unwrap(), None);
 
-        let resolved = pipeline_index(&ModelSource::Local(directory.path().to_path_buf()))
-            .await
-            .unwrap();
-
-        assert_eq!(resolved, None);
-    }
-
-    const REPO: &str = "org/pipeline";
-    const MODULAR_INDEX: &str = r#"{"_class_name": "MiniMaxH3ModularPipeline"}"#;
-
-    /// A Hub repository that publishes an index is a pipeline, and one that
-    /// publishes neither index file is not.
-    #[tokio::test]
-    async fn a_hub_repository_is_a_pipeline_when_it_publishes_an_index() {
-        let root = tempfile::tempdir().unwrap();
-        let pipeline = HubStub::with_files(&[("modular_model_index.json", MODULAR_INDEX)])
-            .serve(root.path(), REPO)
-            .await;
-        let plain = HubStub::with_files(&[("config.json", r#"{"model_type":"qwen3"}"#)])
-            .serve(root.path(), "org/plain")
-            .await;
-
-        let index = pipeline_index(&pipeline).await.unwrap().unwrap();
-
-        assert_eq!(index, PipelineIndex::parse(MODULAR_INDEX).unwrap());
-        assert_eq!(pipeline_index(&plain).await.unwrap(), None);
-    }
-
-    /// A download the Hub refuses is reported as a remote failure rather than
-    /// taken as a checkpoint without an index.
-    #[tokio::test]
-    async fn a_refused_index_download_is_a_remote_error() {
-        let root = tempfile::tempdir().unwrap();
-        let source = HubStub {
-            download_status: Some(StatusCode::UNAUTHORIZED),
-            ..HubStub::with_files(&[("modular_model_index.json", MODULAR_INDEX)])
-        }
-        .serve(root.path(), REPO)
-        .await;
-
-        let error = pipeline_index(&source).await.unwrap_err();
-
-        assert!(matches!(error, Error::Remote { .. }), "{error:?}");
+        std::fs::write(directory.path().join("modular_model_index.json"), "modular").unwrap();
+        assert_eq!(
+            index_text(directory.path(), index).unwrap().as_deref(),
+            Some("modular")
+        );
     }
 }

@@ -276,6 +276,10 @@ mod tests {
             reasoning: None,
             tool_calls: None,
             images: None,
+            checkpoint: crate::ChatCheckpoint {
+                context_length: &["max_position_embeddings"],
+                chat_template: crate::ChatTemplate::TokenizerConfig,
+            },
         }),
     };
 

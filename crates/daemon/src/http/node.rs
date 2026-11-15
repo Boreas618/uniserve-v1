@@ -253,7 +253,7 @@ async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
     if let Err(error) = config.validate(&stated) {
         return ApiError::invalid_request(format!("{error:#}"), Some("config")).into_response();
     }
-    if config.model.is_none() {
+    if !config.states_model() {
         return ApiError::invalid_request("the configuration names no model", Some("config"))
             .into_response();
     }

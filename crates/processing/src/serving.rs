@@ -29,6 +29,32 @@ pub struct ChatProfile {
     /// How the family's checkpoints take images, when they do; a family without it serves text
     /// alone and refuses an image part.
     pub images: Option<&'static dyn ImageFamily>,
+    /// What the family's checkpoints state beside their tokenizer that request processing reads.
+    pub checkpoint: ChatCheckpoint,
+}
+
+/// What a chat family's checkpoints state at their root beside their tokenizer (`tokenizer.json`
+/// and `tokenizer_config.json`), as request processing reads it: each fact where the family's
+/// checkpoints keep it, so nothing is found by trying the places other families use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChatCheckpoint {
+    /// The field of the configuration ([`crate::RootFile::Config`]) that states the longest
+    /// sequence the model's positions cover, as the keys from the document's root to it:
+    /// `["max_position_embeddings"]`, or `["text_config", "max_position_embeddings"]` for a
+    /// checkpoint whose language model is one section of its configuration.
+    pub context_length: &'static [&'static str],
+    /// Where the checkpoints keep their chat template.
+    pub chat_template: ChatTemplate,
+}
+
+/// Where a chat family's checkpoints keep their chat template.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatTemplate {
+    /// The `chat_template` field of `tokenizer_config.json`, where `transformers` stored a
+    /// template before it saved templates as files of their own.
+    TokenizerConfig,
+    /// A file of Jinja source at the checkpoint's root, such as `chat_template.jinja`.
+    File(&'static str),
 }
 
 impl std::fmt::Debug for ChatProfile {
@@ -38,18 +64,22 @@ impl std::fmt::Debug for ChatProfile {
             .field("reasoning", &self.reasoning)
             .field("tool_calls", &self.tool_calls)
             .field("images", &self.images.is_some())
+            .field("checkpoint", &self.checkpoint)
             .finish()
     }
 }
 
 impl PartialEq for ChatProfile {
-    /// Equal formats, and image input of the same family or of none.
+    /// Equal formats and checkpoint layouts, and image input of the same family or of none.
     fn eq(&self, other: &Self) -> bool {
         let images = match (self.images, other.images) {
             (Some(left), Some(right)) => std::ptr::addr_eq(left, right),
             (left, right) => left.is_none() && right.is_none(),
         };
-        self.reasoning == other.reasoning && self.tool_calls == other.tool_calls && images
+        self.reasoning == other.reasoning
+            && self.tool_calls == other.tool_calls
+            && self.checkpoint == other.checkpoint
+            && images
     }
 }
 

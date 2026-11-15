@@ -1,9 +1,8 @@
-//! Deserialized tokenizer and processor metadata used during profile resolution.
+//! Deserialized tokenizer and generation metadata of a checkpoint.
 //!
-//! Each loader treats an absent file (a `None` path) as an empty document and
-//! fills every field with its serde default, so a missing optional file never
-//! fails resolution. Fields a present file omits also take their defaults,
-//! and unknown JSON fields are ignored.
+//! Each loader reads one file the checkpoint publishes ([`super::ChatFiles`] locates them). A
+//! field the file does not state is `None`, as the format makes every one of these fields
+//! optional, and fields the daemon does not read are ignored.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -15,8 +14,9 @@ use crate::api::model::assets::error::{Error, Result};
 /// Tokenizer metadata consumed by configured chat rendering and stop handling.
 ///
 /// Read from `tokenizer_config.json` by `ModelConfig::from_files` (for the
-/// primary EOS) and by `HfChatRenderer::load` (for the template and the
-/// special tokens exposed to it).
+/// primary EOS), by `HfChatRenderer::load` (for the special tokens exposed to
+/// its template) and by [`super::ChatFiles::chat_template`] (for a family that
+/// keeps its template there).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct HfTokenizerConfig {
@@ -98,23 +98,6 @@ impl HfSpecialTokens {
     }
 }
 
-/// Model metadata used to bind a root-configured checkpoint to its description.
-///
-/// This is the raw view of the file `ResolvedModelFiles::config_path` selects,
-/// distinct from the resolved `crate::api::model::ModelConfig`. Composite
-/// checkpoints may nest their language model under `llm_config` or
-/// `text_config`; the family is what the root files declare
-/// (`processing::Registry::resolve`).
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct HfConfig {
-    max_position_embeddings: Option<u32>,
-    /// Nested language-model section a composite checkpoint may carry.
-    llm_config: Option<Box<HfConfig>>,
-    /// Nested language-model section a composite checkpoint may carry.
-    text_config: Option<Box<HfConfig>>,
-}
-
 /// Generation defaults consumed by configured request lowering.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -156,50 +139,21 @@ impl OneOrManyTokenIds {
     }
 }
 
-impl HfConfig {
-    /// Returns the nested `llm_config` or `text_config` section when present,
-    /// otherwise the root configuration.
-    fn language_model(&self) -> &Self {
-        self.llm_config
-            .as_deref()
-            .or(self.text_config.as_deref())
-            .unwrap_or(self)
-    }
-
-    /// Returns the language model's declared maximum position count.
-    ///
-    /// Reads only the nested language-model section when it exists, without
-    /// falling back to a root-level value.
-    pub fn max_position_embeddings(&self) -> Option<u32> {
-        self.language_model().max_position_embeddings
-    }
-}
-
-/// Loads tokenizer metadata, returning defaults when no file is configured.
-pub fn load_tokenizer_config(path: Option<&Path>) -> Result<HfTokenizerConfig> {
-    read_json_file(path)
-}
-
-/// Loads generation defaults, returning defaults when no file is configured.
-pub fn load_generation_config(path: Option<&Path>) -> Result<GenerationConfig> {
-    read_json_file(path)
-}
-
-/// Loads model metadata, returning defaults when no file is configured.
-pub fn load_model_config(path: Option<&Path>) -> Result<HfConfig> {
-    read_json_file(path)
-}
-
-/// Deserializes the JSON file at `path`, or returns `T::default()` for `None`.
+/// Loads a checkpoint's tokenizer metadata (`tokenizer_config.json`).
 ///
-/// A present but unreadable or malformed file is an error.
-fn read_json_file<T>(path: Option<&Path>) -> Result<T>
-where
-    T: for<'de> Deserialize<'de> + Default,
-{
-    let Some(path) = path else {
-        return Ok(T::default());
-    };
+/// # Errors
+///
+/// As [`read_json`].
+pub fn load_tokenizer_config(path: &Path) -> Result<HfTokenizerConfig> {
+    read_json(path)
+}
+
+/// Loads a checkpoint's generation defaults (`generation_config.json`).
+///
+/// # Errors
+///
+/// As [`read_json`].
+pub fn load_generation_config(path: &Path) -> Result<GenerationConfig> {
     read_json(path)
 }
 
@@ -222,31 +176,4 @@ where
         path: path.to_path_buf(),
         source,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::HfConfig;
-
-    /// A flat layout and a nested one: the context limit comes from the
-    /// language-model section.
-    #[test]
-    fn configured_model_layouts_expose_context_limits() {
-        for (source, max_tokens) in [
-            (
-                r#"{"model_type":"qwen3","num_attention_heads":64,"max_position_embeddings":40960}"#,
-                40960,
-            ),
-            (
-                // A checkpoint may nest its language model; the root model
-                // type names the checkpoint and the nested section states the
-                // context limit.
-                r#"{"model_type":"nested_example","llm_config":{"model_type":"qwen3","num_attention_heads":32,"max_position_embeddings":262144}}"#,
-                262144,
-            ),
-        ] {
-            let config: HfConfig = serde_json::from_str(source).unwrap();
-            assert_eq!(config.max_position_embeddings(), Some(max_tokens));
-        }
-    }
 }

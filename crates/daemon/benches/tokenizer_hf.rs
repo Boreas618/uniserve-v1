@@ -1,19 +1,39 @@
-//! Encoding and decoding throughput benchmarks for Hugging Face tokenizers.
+//! Encoding and decoding throughput of a chat checkpoint's tokenizer.
 //!
-//! The fixture resolves `tokenizer.json` for `MODEL_ID` from the Hugging Face
-//! cache configured by the environment and downloads it through `hf-hub` when
-//! it is absent, so a cold cache needs network access. Encoding throughput is
-//! reported in input bytes and decoding throughput in token IDs.
+//! `cargo bench --bench tokenizer_hf -- --checkpoint <owner>/<name>[@<revision>] [FILTER]`
+//!
+//! The checkpoint is a Hugging Face repository, resolved as the daemon resolves one: through the
+//! Hub the standard Hugging Face environment configures, into its cache (a cold cache needs the
+//! network, an offline host a populated cache), and only its root files are fetched. The sample
+//! is the conversation of `--turns` user and assistant turns rendered through the checkpoint's own
+//! chat template, as a chat request's prompt is. Encoding throughput is reported in input bytes
+//! and decoding throughput in token IDs; `FILTER` selects benchmarks by name, as Criterion's does.
 
 use std::error::Error;
 
+use clap::Parser;
 use criterion::{Criterion, Throughput, black_box};
+use daemon::api::input::chat::{GenerationPromptMode, HfChatRenderer};
+use daemon::api::model::assets::{ChatFiles, Hub, HubAsset, declared_family, root_file};
+use daemon::api::protocol::ChatCompletionRequest;
 use daemon::api::tokenizer::HuggingFaceTokenizer;
-use hf_hub::api::sync::ApiBuilder;
 
-const MODEL_ID: &str = "Qwen/Qwen3-30B-A3B";
-const SAMPLE_TEXT: &str =
-    "<|im_start|>user\nSummarize this request.\n<|im_end|>\n<|im_start|>assistant\n";
+/// The bench's protocol.
+#[derive(Debug, Parser)]
+struct Arguments {
+    /// The chat checkpoint whose tokenizer is measured: `<owner>/<name>[@<revision>]`.
+    #[arg(long)]
+    checkpoint: String,
+    /// The user and assistant turns of the rendered conversation: 32 renders a prompt of a few
+    /// thousand tokens, the size of a long chat request's.
+    #[arg(long, default_value_t = 32)]
+    turns: usize,
+    /// Runs only the benchmarks whose names contain it.
+    filter: Option<String>,
+    /// Passed by `cargo bench` to every bench executable.
+    #[arg(long, hide = true)]
+    bench: bool,
+}
 
 /// Loaded tokenizer plus a sample text and its encoding.
 struct BenchFixture {
@@ -23,16 +43,36 @@ struct BenchFixture {
 }
 
 impl BenchFixture {
-    /// Load the tokenizer and encode and decode the sample once, so the
-    /// measured calls repeat calls known to succeed.
-    fn load() -> Result<Self, Box<dyn Error>> {
-        let path = ApiBuilder::from_env()
-            .with_progress(false)
-            .build()?
-            .model(MODEL_ID.to_string())
-            .get("tokenizer.json")?;
-        let tokenizer = HuggingFaceTokenizer::load(&path, None)?;
-        let text = SAMPLE_TEXT.repeat(32);
+    /// Loads the checkpoint's tokenizer and renders the sample, and encodes and decodes it once,
+    /// so the measured calls repeat calls known to succeed.
+    async fn load(arguments: &Arguments) -> Result<Self, Box<dyn Error>> {
+        let hub = Hub::from_env()?;
+        let snapshot = hub
+            .snapshot(&HubAsset::parse(&arguments.checkpoint)?)
+            .await?;
+        snapshot.fetch(root_file).await?;
+        let directory = snapshot.directory();
+        let family = declared_family(directory, &processing::Registry::new(processing::FAMILIES)?)?;
+        let processing::Serving::Chat(profile) = family.serving else {
+            return Err(format!("{} is not a chat checkpoint", arguments.checkpoint).into());
+        };
+        let files = ChatFiles::locate(directory, profile.checkpoint)?;
+        let tokenizer = HuggingFaceTokenizer::load(files.tokenizer_directory())?;
+        let renderer = HfChatRenderer::load(&files, &Default::default(), None)?;
+
+        let messages = (0..arguments.turns)
+            .flat_map(|turn| {
+                [
+                    serde_json::json!({"role": "user", "content": format!("Summarize request {turn}.")}),
+                    serde_json::json!({"role": "assistant", "content": format!("Request {turn} asks for a summary.")}),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": arguments.checkpoint,
+            "messages": messages,
+        }))?;
+        let text = renderer.render(&request, GenerationPromptMode::StartNewAssistant)?;
         let token_ids = tokenizer.encode(&text, false)?;
         tokenizer.decode(&token_ids, false)?;
         Ok(Self {
@@ -69,10 +109,14 @@ fn bench_decode(c: &mut Criterion, fixture: &BenchFixture) {
     group.finish();
 }
 
-/// Load the fixture once, then run both groups as `criterion_main!` would.
+/// Loads the fixture once, then runs both groups as `criterion_main!` would.
 fn main() -> Result<(), Box<dyn Error>> {
-    let fixture = BenchFixture::load()?;
-    let mut criterion = Criterion::default().configure_from_args();
+    let arguments = Arguments::parse();
+    let fixture = tokio::runtime::Runtime::new()?.block_on(BenchFixture::load(&arguments))?;
+    let mut criterion = Criterion::default();
+    if let Some(filter) = &arguments.filter {
+        criterion = criterion.with_filter(filter);
+    }
     bench_encode(&mut criterion, &fixture);
     bench_decode(&mut criterion, &fixture);
     criterion.final_summary();

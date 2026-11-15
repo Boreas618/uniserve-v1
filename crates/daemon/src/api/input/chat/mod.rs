@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use crate::api::input::{ModelResolutionError, TokenizeError};
 use crate::api::model::assets::{
-    HfSpecialTokens, HfTokenizerConfig, ResolvedModelFiles, load_tokenizer_config,
+    ChatFiles, HfSpecialTokens, HfTokenizerConfig, load_tokenizer_config,
 };
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -35,11 +35,6 @@ mod jinja;
 mod python;
 
 pub use jinja::TemplateError;
-
-/// The name of the template file a multimodal checkpoint's processor configuration states its
-/// template in, as an object with a `chat_template` string; any other template file holds the
-/// template's Jinja source.
-const TEMPLATE_JSON: &str = "chat_template.json";
 
 /// How prompt rendering ends after the existing chat history.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -132,25 +127,21 @@ impl HfChatRenderer {
     /// Creates the renderer of a checkpoint's `files` under the deployment's chat `options`.
     ///
     /// The template is the one `options.template` states, read exactly as written, when it
-    /// states one; otherwise it is the checkpoint's own: the standalone template file it ships
-    /// (`files.chat_template_path`), else the `chat_template` entry of its
-    /// `tokenizer_config.json`. Special tokens always come from the tokenizer config; when it
-    /// defines none, templates see them as undefined.
+    /// states one; otherwise it is the checkpoint's own, read where its family keeps it
+    /// ([`ChatFiles::chat_template`]). Special tokens always come from the tokenizer config;
+    /// when it defines none, templates see them as undefined.
     ///
     /// # Errors
     ///
     /// Fails when the tokenizer config cannot be loaded, the template's file cannot be read, or
     /// the template is empty or does not compile.
     pub fn load(
-        files: &ResolvedModelFiles,
+        files: &ChatFiles,
         options: &ChatConfig,
         multimodal: Option<MultimodalRenderInfo>,
     ) -> Result<Self, ModelResolutionError> {
-        let HfTokenizerConfig {
-            special_tokens,
-            chat_template,
-            ..
-        } = load_tokenizer_config(files.tokenizer_config_path.as_deref())?;
+        let HfTokenizerConfig { special_tokens, .. } =
+            load_tokenizer_config(files.tokenizer_config())?;
         let special_tokens = (!special_tokens.is_empty()).then_some(special_tokens);
 
         let template = match &options.template {
@@ -162,13 +153,7 @@ impl HfChatRenderer {
                 info!("rendering with the configured chat template");
                 Some(source.clone())
             }
-            None => match files.chat_template_path.as_deref() {
-                Some(path) if path.file_name().is_some_and(|name| name == TEMPLATE_JSON) => {
-                    Some(jinja::read_template_json(path)?)
-                }
-                Some(path) => Some(jinja::read_jinja(path)?),
-                None => chat_template,
-            },
+            None => Some(files.chat_template()?),
         };
 
         Ok(Self::new(

@@ -21,7 +21,9 @@
 use crate::family::{Family, RootFile};
 use crate::image::{ImageFamily, ImageProcessor};
 use crate::qwen_vl::ProcessorConfig;
-use crate::serving::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
+use crate::serving::{
+    ChatCheckpoint, ChatProfile, ChatTemplate, ReasoningFormat, Serving, ToolCallFormat,
+};
 
 /// How every Qwen chat model since Qwen3 delimits its reasoning.
 const THINK: ReasoningFormat = ReasoningFormat {
@@ -44,6 +46,12 @@ pub const QWEN3: Family = Family {
         reasoning: Some(THINK),
         tool_calls: Some(ToolCallFormat::Json),
         images: None,
+        // A Qwen3 checkpoint states its context bound at the root of its configuration and its
+        // template in its tokenizer configuration.
+        checkpoint: ChatCheckpoint {
+            context_length: &["max_position_embeddings"],
+            chat_template: ChatTemplate::TokenizerConfig,
+        },
     }),
 };
 
@@ -57,6 +65,7 @@ pub const QWEN3_5_MOE: Family = Family {
         reasoning: Some(THINK),
         tool_calls: Some(ToolCallFormat::Xml),
         images: Some(&Images),
+        checkpoint: VISION_CHAT_CHECKPOINT,
     }),
 };
 
@@ -70,7 +79,15 @@ pub const QWEN4_EXP: Family = Family {
         reasoning: Some(THINK),
         tool_calls: Some(ToolCallFormat::Xml),
         images: Some(&Images),
+        checkpoint: VISION_CHAT_CHECKPOINT,
     }),
+};
+
+/// Where a Qwen checkpoint with a vision tower states what request processing reads: its language
+/// model is the `text_config` section of its configuration, and its template a file of its own.
+const VISION_CHAT_CHECKPOINT: ChatCheckpoint = ChatCheckpoint {
+    context_length: &["text_config", "max_position_embeddings"],
+    chat_template: ChatTemplate::File("chat_template.jinja"),
 };
 
 /// How request processing binds the image processor of a Qwen checkpoint whose vision tower

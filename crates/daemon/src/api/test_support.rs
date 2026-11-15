@@ -83,6 +83,10 @@ pub const CHAT: processing::Family = processing::Family {
         }),
         tool_calls: Some(processing::ToolCallFormat::Json),
         images: None,
+        checkpoint: processing::ChatCheckpoint {
+            context_length: &["max_position_embeddings"],
+            chat_template: processing::ChatTemplate::TokenizerConfig,
+        },
     }),
 };
 
@@ -112,6 +116,10 @@ impl processing::VideoFamily for TestVideo {
 
     fn processing_parts(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    fn base_pin(&self) -> Option<processing::BasePin> {
+        None
     }
 
     fn bind(

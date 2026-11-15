@@ -1,242 +1,151 @@
-//! Stage files of a diffusers pipeline checkpoint.
+//! Stage files of a diffusers pipeline checkpoint, over the release a layered checkpoint pins.
 //!
-//! A pipeline checkpoint holds its stages in the folders its root index
-//! names (`PipelineIndex`). A FastH3 export may omit some of them; its
-//! `fastvideo_inference.json` then pins, in `base_model_revision`
-//! (`hf://<repository>@<revision>`), the base revision whose folders supply
-//! them. [`PipelineCheckpoint`] reads each stage file from the
-//! checkpoint, or from the Hub snapshot of that revision when the checkpoint
-//! lacks it, as the rank's loader (`uniserve.models.registry`) reads them.
+//! A pipeline checkpoint holds its stages in the folders its root index names
+//! ([`PipelineIndex`]). A family whose checkpoints may hold only some of them declares where they
+//! pin the release whose folders supply the others ([`processing::BasePin`]); such a checkpoint
+//! holds the stage folders it replaces, and every other stage is read from the release's
+//! snapshot. An engine opens the checkpoint and the release as one checkpoint
+//! ([`super::Checkpoint::base`]).
 
-use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use hf_hub::{Repo, RepoType};
 use serde_json::Value;
 
 use crate::api::model::assets::error::{Error, Result};
-use crate::api::model::assets::model_files::{HubClient, ModelSource, fetch_file};
-use crate::api::model::assets::pipeline_index::{PipelineIndex, pipeline_index};
+use crate::api::model::assets::hub::{Hub, HubAsset, Snapshot};
+use crate::api::model::assets::pipeline_index::{self, PipelineIndex, within};
+use crate::api::model::assets::{optional_text, required_file, root_file};
 
-/// The inference description a FastVideo export publishes at its root.
-const INFERENCE_FILE: &str = "fastvideo_inference.json";
-
-/// A Hugging Face repository pinned at one commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BaseRevision {
-    /// Repository id, `<owner>/<name>`.
-    pub repository: String,
-    /// Commit of the repository the export draws from.
-    pub revision: String,
-}
-
-impl BaseRevision {
-    /// Parses `hf://<repository>@<revision>`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Invalid`] when `value` is not of that form with an
-    /// `<owner>/<name>` repository and a non-empty revision.
-    pub fn parse(value: &str) -> Result<Self> {
-        let malformed = || {
-            Error::invalid(format!(
-                "a FastH3 export's base_model_revision must be \
-                 hf://<repository>@<revision>, got {value:?}"
-            ))
-        };
-        let (repository, revision) = value
-            .strip_prefix("hf://")
-            .and_then(|pinned| pinned.rsplit_once('@'))
-            .ok_or_else(malformed)?;
-        let well_formed = repository.split_once('/').is_some_and(|(owner, name)| {
-            !owner.is_empty() && !name.is_empty() && !name.contains('/')
-        });
-        if !well_formed || revision.is_empty() {
-            return Err(malformed());
-        }
-        Ok(Self {
-            repository: repository.to_owned(),
-            revision: revision.to_owned(),
-        })
-    }
-}
-
-impl fmt::Display for BaseRevision {
-    /// Formats the pin as `<repository>@<revision>`.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}@{}", self.repository, self.revision)
-    }
-}
-
-/// Returns `filename` from the Hub cache's snapshot of `pin`, downloading it
-/// at that commit when the snapshot lacks it.
-///
-/// A commit's snapshot is immutable, so a file it holds is read without a
-/// Hub request; `huggingface_hub` fills such snapshots without recording a
-/// ref for the commit, which `hf_hub`'s own cache lookup requires.
-///
-/// # Errors
-///
-/// Returns [`Error::MissingFile`] when the Hub does not publish `filename` at
-/// `pin`, and [`Error::Remote`] when a Hub request fails.
-async fn pinned_file(client: &HubClient, pin: &BaseRevision, filename: &str) -> Result<PathBuf> {
-    let repo = Repo::with_revision(
-        pin.repository.clone(),
-        RepoType::Model,
-        pin.revision.clone(),
-    );
-    let snapshot = client.cache.repo(repo.clone()).pointer_path(&pin.revision);
-    let cached = snapshot.join(filename);
-    if cached.is_file() {
-        return Ok(cached);
-    }
-
-    fetch_file(&client.api.repo(repo), &pin.to_string(), filename).await
-}
-
-/// The Hub cache's snapshot of the base revision the export at `root` pins, or
-/// `None` for a checkpoint that publishes no inference description or pins no base.
-///
-/// A rank opens the export and this snapshot as one checkpoint: the export
-/// holds its own DiT, and the snapshot the directories it omits. Nothing is
-/// downloaded here, because a rank reads weights where they already are; a
-/// snapshot the cache lacks is refused by name.
-///
-/// # Errors
-///
-/// Returns [`Error::Invalid`] when the description or its pin is malformed or the
-/// snapshot is not in the cache, and the errors of reading the description.
-pub fn pinned_snapshot(root: &std::path::Path) -> Result<Option<PathBuf>> {
-    let path = root.join(INFERENCE_FILE);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let content = std::fs::read_to_string(&path).map_err(|source| Error::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let description: Value =
-        serde_json::from_str(&content).map_err(|source| Error::Json { path, source })?;
-    let Some(pin) = description.get("base_model_revision") else {
-        return Ok(None);
-    };
-    let pin = pin.as_str().ok_or_else(|| {
-        Error::invalid(format!(
-            "{} states a base_model_revision that is not a string",
-            root.display()
-        ))
-    })?;
-    let pin = BaseRevision::parse(pin)?;
-    let repo = Repo::with_revision(
-        pin.repository.clone(),
-        RepoType::Model,
-        pin.revision.clone(),
-    );
-    let snapshot = hf_hub::Cache::from_env()
-        .repo(repo)
-        .pointer_path(&pin.revision);
-    if !snapshot.is_dir() {
-        return Err(Error::invalid(format!(
-            "{} continues {pin}, and the Hub cache holds no snapshot of it at {}",
-            root.display(),
-            snapshot.display()
-        )));
-    }
-    Ok(Some(snapshot))
-}
-
-/// Reads the base revision a FastH3 export pins, or `None` for a checkpoint
-/// that publishes no inference description or pins no base.
-async fn pinned_base(root: &ModelSource) -> Result<Option<BaseRevision>> {
-    let path = match root.file(INFERENCE_FILE).await {
-        Ok(path) => path,
-        Err(Error::MissingFile { .. }) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let content = std::fs::read_to_string(&path).map_err(|source| Error::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let description: Value =
-        serde_json::from_str(&content).map_err(|source| Error::Json { path, source })?;
-    match description.get("base_model_revision") {
-        None => Ok(None),
-        Some(pin) => pin
-            .as_str()
-            .ok_or_else(|| {
-                Error::invalid(format!(
-                    "{} states a base_model_revision that is not a string",
-                    root.id()
-                ))
-            })
-            .and_then(BaseRevision::parse)
-            .map(Some),
-    }
-}
-
-/// A diffusers pipeline checkpoint with the source of each stage's files.
+/// A diffusers pipeline checkpoint with the source of each stage's folder.
 pub struct PipelineCheckpoint {
     /// The checkpoint's root index.
     index: PipelineIndex,
-    /// The checkpoint itself.
-    root: ModelSource,
-    /// The base revision that supplies the folders a FastH3 export omits,
-    /// with the client its snapshot is read through; `None` for a
-    /// checkpoint that pins none.
-    base: Option<(HubClient, BaseRevision)>,
+    /// The checkpoint's directory.
+    directory: PathBuf,
+    /// The snapshot of the release that supplies the stage folders the checkpoint omits; `None`
+    /// for a checkpoint that pins none.
+    base: Option<PathBuf>,
 }
 
 impl PipelineCheckpoint {
-    /// Resolves the pipeline checkpoint `model_id` names.
+    /// Opens the pipeline checkpoint `snapshot` holds, of the video family `family`, whose
+    /// checkpoints publish their stage index in `index`; `None` for a checkpoint that publishes
+    /// no index.
     ///
-    /// `model_id` is a local directory or a Hub repository, as for
-    /// `ModelSource::file`. Returns `None` for
-    /// a checkpoint that publishes no pipeline index.
+    /// The checkpoint's root files and the folders of the stages its index declares are fetched
+    /// into the snapshot, as `diffusers` downloads a pipeline. When the family declares a pin
+    /// and the checkpoint states one, the pinned release is resolved through `hub`, and its root
+    /// files and the folders of the declared stages the checkpoint omits are fetched into the
+    /// release's snapshot.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Invalid`] when the export's pin is malformed, and the
-    /// errors of resolving and parsing the root index: any failure to
-    /// resolve it other than its absence, and an index that is not a JSON
-    /// object.
-    pub async fn resolve(model_id: &str) -> Result<Option<Self>> {
-        let root = ModelSource::from_model_id(model_id)?;
-        Self::locate(root, || HubClient::from_env(model_id)).await
-    }
-
-    /// Resolves the checkpoint `root` holds; `hub` builds the client its
-    /// base revision is read through.
-    async fn locate(
-        root: ModelSource,
-        hub: impl FnOnce() -> Result<HubClient>,
+    /// Returns [`Error::Invalid`] for a malformed index or pin, and the errors of resolving and
+    /// fetching either snapshot.
+    pub async fn open(
+        snapshot: &Snapshot,
+        index: processing::RootFile,
+        family: &dyn processing::VideoFamily,
+        hub: &Hub,
     ) -> Result<Option<Self>> {
-        let Some(index) = pipeline_index(&root).await? else {
+        let directory = snapshot.directory();
+        let Some(index) = pipeline_index::index_text(directory, index)? else {
             return Ok(None);
         };
-        let base = match pinned_base(&root).await? {
-            Some(pin) => Some((hub()?, pin)),
+        let index = PipelineIndex::parse(&index)?;
+        snapshot
+            .fetch(|file| root_file(file) || index.holds(file))
+            .await?;
+
+        let pinned = match family.base_pin() {
+            Some(pin) => pinned_release(directory, pin)?,
             None => None,
         };
-        Ok(Some(Self { index, root, base }))
+        let base = match pinned {
+            Some(release) => {
+                let release = hub.snapshot(&release).await?;
+                let omitted: Vec<&str> = index
+                    .folders()
+                    .filter(|folder| !directory.join(folder).is_dir())
+                    .collect();
+                release
+                    .fetch(|file| root_file(file) || within(file, omitted.iter().copied()))
+                    .await?;
+                Some(release.directory().to_path_buf())
+            }
+            None => None,
+        };
+        Ok(Some(Self {
+            index,
+            directory: directory.to_path_buf(),
+            base,
+        }))
     }
 
-    /// Returns `filename` inside `stage`'s folder, read from the
-    /// checkpoint, or from its base revision when the checkpoint lacks it.
+    /// The directory of `stage`'s files: the checkpoint's folder of the stage when the
+    /// checkpoint holds it, and the pinned release's otherwise.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Invalid`] for a stage the index does not declare,
-    /// and the errors of `ModelSource::file`
-    /// for the file, including [`Error::MissingFile`] when neither source
-    /// holds it.
-    pub async fn stage_file(&self, stage: &str, filename: &str) -> Result<PathBuf> {
-        let path = self.index.stage_file(stage, filename)?;
-        match (self.root.file(&path).await, &self.base) {
-            (Err(Error::MissingFile { .. }), Some((client, pin))) => {
-                pinned_file(client, pin, &path).await
-            }
-            (file, _) => file,
+    /// Returns [`Error::Invalid`] for a stage the index does not declare, and
+    /// [`Error::MissingFile`] when neither the checkpoint nor its release holds the stage's
+    /// folder.
+    pub fn stage_directory(&self, stage: &str) -> Result<PathBuf> {
+        let folder = self.index.stage_folder(stage)?;
+        let own = self.directory.join(folder);
+        if own.is_dir() {
+            return Ok(own);
         }
+        match &self.base {
+            Some(base) if base.join(folder).is_dir() => Ok(base.join(folder)),
+            _ => Err(Error::MissingFile {
+                model: self.directory.display().to_string(),
+                file: folder.to_owned(),
+            }),
+        }
+    }
+
+    /// The file `filename` of `stage`'s directory ([`Self::stage_directory`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::stage_directory`], and [`Error::MissingFile`] when the stage's directory has
+    /// no such file.
+    pub fn stage_file(&self, stage: &str, filename: &str) -> Result<PathBuf> {
+        required_file(&self.stage_directory(stage)?, filename)
+    }
+
+    /// The snapshot of the release the checkpoint continues; `None` for a checkpoint that pins
+    /// none.
+    pub fn base(&self) -> Option<&Path> {
+        self.base.as_deref()
+    }
+}
+
+/// The release the pipeline checkpoint in `directory` pins where `pin` says its family's
+/// checkpoints do; `None` for a checkpoint that publishes no such file or states no such field.
+///
+/// # Errors
+///
+/// Fails when the file cannot be read, is not JSON, or states a field that is not
+/// `hf://<owner>/<name>@<revision>`.
+fn pinned_release(directory: &Path, pin: processing::BasePin) -> Result<Option<HubAsset>> {
+    let Some(text) = optional_text(directory, pin.file)? else {
+        return Ok(None);
+    };
+    let path = directory.join(pin.file);
+    let description: Value = serde_json::from_str(&text).map_err(|source| Error::Json {
+        path: path.clone(),
+        source,
+    })?;
+    match description.get(pin.field) {
+        None => Ok(None),
+        Some(Value::String(release)) => HubAsset::parse_pin(release).map(Some),
+        Some(_) => Err(Error::invalid(format!(
+            "{} states a {} that is not a string",
+            path.display(),
+            pin.field
+        ))),
     }
 }
 
@@ -245,24 +154,55 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use processing::{BasePin, VideoBinding, VideoFamily, VideoProcessor};
     use tempfile::{TempDir, tempdir};
 
     use super::*;
-    use crate::api::model::assets::hub_stub::{HubStub, seed_snapshot};
+    use crate::api::model::assets::hub_stub::{COMMIT, HubStub, seed_snapshot};
 
     const BASE: &str = "org/base";
-    const PIN: &str = "9bfb6693f2cf6de171db46d1aa586f67d773a1da";
 
-    /// Index of a FastH3 export: every MiniMax-H3 stage, of which the
-    /// export holds only `transformer_ref`.
+    /// A family whose checkpoints pin their release in `release.json`.
+    struct Layered;
+
+    impl VideoFamily for Layered {
+        fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
+            &[]
+        }
+
+        fn default_sizes(&self) -> &'static [&'static str] {
+            &["64x64"]
+        }
+
+        fn default_max_seconds(&self) -> f64 {
+            1.0
+        }
+
+        fn processing_parts(&self) -> &'static [&'static str] {
+            &["tokenizer", "processor"]
+        }
+
+        fn base_pin(&self) -> Option<BasePin> {
+            Some(BasePin {
+                file: "release.json",
+                field: "base",
+            })
+        }
+
+        fn bind(
+            &self,
+            _: VideoBinding<'_>,
+        ) -> std::result::Result<Box<dyn VideoProcessor>, String> {
+            Err("this family binds no processor".to_owned())
+        }
+    }
+
+    /// The index of a layered export: three stages, of which the export holds `transformer`.
     const INDEX: &str = r#"{
-        "_class_name": "MiniMaxH3ModularPipeline",
-        "text_encoder": ["transformers", "Qwen3VLForConditionalGeneration", {"subfolder": "text_encoder"}],
-        "tokenizer": ["transformers", "Qwen2TokenizerFast", {"subfolder": "tokenizer"}],
-        "processor": ["transformers", "Qwen3VLProcessor", {"subfolder": "processor"}],
-        "vae": ["diffusers", "AutoencoderKLMiniMaxH3", {"subfolder": "vae"}],
-        "audio_vae": ["diffusers", "AutoencoderKLMiniMaxH3Audio", {"subfolder": "audio_vae"}],
-        "transformer_ref": ["diffusers", "MiniMaxH3Transformer3DModel", {"subfolder": "transformer_ref"}]
+        "_class_name": "ExamplePipeline",
+        "tokenizer": ["transformers", "ExampleTokenizer", {"subfolder": "tokenizer"}],
+        "processor": ["transformers", "ExampleProcessor", {"subfolder": "processor"}],
+        "transformer": ["diffusers", "ExampleTransformer", {"subfolder": "transformer"}]
     }"#;
 
     fn write(path: &Path, content: &str) {
@@ -270,95 +210,97 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
-    /// A FastH3 OmniRef-style export pinning `BASE` at `PIN`.
+    /// An export pinning `BASE` at `COMMIT`.
     fn export() -> TempDir {
         let root = tempdir().unwrap();
         write(&root.path().join("modular_model_index.json"), INDEX);
         write(
-            &root.path().join(INFERENCE_FILE),
-            &format!(r#"{{"model_type": "ref2va", "base_model_revision": "hf://{BASE}@{PIN}"}}"#),
+            &root.path().join("release.json"),
+            &format!(r#"{{"base": "hf://{BASE}@{COMMIT}"}}"#),
         );
-        write(
-            &root.path().join("transformer_ref/config.json"),
-            "export DiT",
-        );
+        write(&root.path().join("transformer/config.json"), "export DiT");
         root
     }
 
-    fn read(path: PathBuf) -> String {
-        fs::read_to_string(path).unwrap()
-    }
-
-    /// The folders the export omits come from the Hub cache's snapshot of
-    /// the pinned commit: a cached file is read without a Hub request (the
-    /// stub does not publish it), and an uncached one is downloaded into
-    /// that snapshot. The export's own DiT is read from the export.
+    /// The stage folders the export omits come from the snapshot of the pinned release: a file
+    /// the cache holds is read without a request (the stub does not publish it), the others are
+    /// downloaded, and the release's own copy of a stage the export holds, like a file of no
+    /// stage, is never fetched. The export's own stage is read from the export.
     #[tokio::test]
-    async fn an_export_reads_the_folders_it_omits_at_the_pinned_revision() {
+    async fn an_export_reads_the_stages_it_omits_from_its_release() {
         let (export, cache) = (export(), tempdir().unwrap());
-        let repository = seed_snapshot(
+        let seeded = seed_snapshot(
             cache.path(),
             BASE,
-            PIN,
+            COMMIT,
             &[("tokenizer/tokenizer.json", "cached")],
         );
-        let client = HubStub {
-            commit: Some(PIN),
-            ..HubStub::with_files(&[("processor/config.json", "downloaded")])
-        }
-        .client(cache.path())
+        let hub = HubStub::with_files(&[
+            ("processor/config.json", "downloaded"),
+            ("transformer/config.json", "release DiT"),
+            ("docs/notes.md", "notes"),
+        ])
+        .listing(&[
+            "tokenizer/tokenizer.json",
+            "processor/config.json",
+            "transformer/config.json",
+            "docs/notes.md",
+        ])
+        .serve(cache.path())
         .await;
 
-        let checkpoint =
-            PipelineCheckpoint::locate(ModelSource::Local(export.path().to_path_buf()), || {
-                Ok(client)
-            })
-            .await
-            .unwrap()
-            .unwrap();
+        let checkpoint = PipelineCheckpoint::open(
+            &Snapshot::local(export.path().to_path_buf()),
+            processing::RootFile::ModularIndex,
+            &Layered,
+            &hub,
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
-        let snapshot = repository.join("snapshots").join(PIN);
+        assert_eq!(checkpoint.base(), Some(seeded.as_path()));
+        let read = |path: PathBuf| fs::read_to_string(path).unwrap();
         let tokenizer = checkpoint
             .stage_file("tokenizer", "tokenizer.json")
-            .await
             .unwrap();
-        assert_eq!(tokenizer, snapshot.join("tokenizer/tokenizer.json"));
+        assert_eq!(tokenizer, seeded.join("tokenizer/tokenizer.json"));
         assert_eq!(read(tokenizer), "cached");
-        let processor = checkpoint
-            .stage_file("processor", "config.json")
-            .await
-            .unwrap();
-        assert!(processor.starts_with(&snapshot), "{}", processor.display());
-        assert_eq!(read(processor), "downloaded");
         assert_eq!(
-            read(
-                checkpoint
-                    .stage_file("transformer_ref", "config.json")
-                    .await
-                    .unwrap()
-            ),
+            read(checkpoint.stage_file("processor", "config.json").unwrap()),
+            "downloaded"
+        );
+        assert_eq!(
+            read(checkpoint.stage_file("transformer", "config.json").unwrap()),
             "export DiT"
         );
+        assert!(!seeded.join("transformer").exists());
+        assert!(!seeded.join("docs").exists());
     }
 
-    #[test]
-    fn a_base_pin_names_one_repository_at_one_revision() {
-        assert_eq!(
-            BaseRevision::parse(&format!("hf://{BASE}@{PIN}")).unwrap(),
-            BaseRevision {
-                repository: BASE.to_owned(),
-                revision: PIN.to_owned()
-            }
-        );
-        for malformed in [
-            "org/base@main",
-            "hf://org/base",
-            "hf://base@main",
-            "hf://org/base/extra@main",
-            "hf://org/base@",
-            "hf:///base@main",
-        ] {
-            assert!(BaseRevision::parse(malformed).is_err(), "{malformed}");
-        }
+    /// A checkpoint that states no pin reads every stage from itself, and a stage folder it
+    /// lacks is a missing file.
+    #[tokio::test]
+    async fn a_checkpoint_without_a_pin_reads_its_own_stages() {
+        let (export, cache) = (export(), tempdir().unwrap());
+        fs::remove_file(export.path().join("release.json")).unwrap();
+        let hub = HubStub::default().serve(cache.path()).await;
+
+        let checkpoint = PipelineCheckpoint::open(
+            &Snapshot::local(export.path().to_path_buf()),
+            processing::RootFile::ModularIndex,
+            &Layered,
+            &hub,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(checkpoint.base(), None);
+        assert!(checkpoint.stage_file("transformer", "config.json").is_ok());
+        assert!(matches!(
+            checkpoint.stage_file("tokenizer", "tokenizer.json"),
+            Err(Error::MissingFile { .. })
+        ));
     }
 }

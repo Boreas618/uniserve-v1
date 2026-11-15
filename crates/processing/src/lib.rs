@@ -48,9 +48,11 @@ pub use image::{ImageBlock, ImageFamily, ImageProcessor};
 pub use media::{
     AudioMetadata, FrameRate, ImageMetadata, MediaMetadata, VideoMetadata, resampled_len,
 };
-pub use serving::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
+pub use serving::{
+    ChatCheckpoint, ChatProfile, ChatTemplate, ReasoningFormat, Serving, ToolCallFormat,
+};
 pub use video::{
-    ConditionInput, InputError, Length, Reference, ReferenceKind, VideoBinding, VideoFamily,
-    VideoInput, VideoProcessor, VideoSpec,
+    BasePin, ConditionInput, InputError, Length, Reference, ReferenceKind, VideoBinding,
+    VideoFamily, VideoInput, VideoProcessor, VideoSpec,
 };
 pub use vocabulary::{Vocabulary, VocabularyError};

@@ -1,30 +1,18 @@
-// The served checkpoint's files and JSON metadata.
+// The served checkpoint's files and JSON metadata, and the model facts startup resolves.
 //
-// [`assets`] locates a checkpoint in a local directory, the local Hugging
-// Face Hub cache, or the Hub itself; reads the root `config.json` or diffusers
-// pipeline index that selects the model family; reads the tokenizer's and
-// generation's metadata; and reads tensor shapes from a safetensors header
-// without loading weights. The resolved model, its family profile and its
-// output parsers are the frontend's as well; they move here from the daemon
-// with the rest of the application layer.
+// [`assets`] resolves where a checkpoint lies (a Hugging Face repository's snapshot or a local
+// directory) and reads the files its family declares. The server identifies the served model
+// family from the checkpoint itself, by what its root `config.json` or, for a diffusers pipeline,
+// its root index declares (`processing::Registry::resolve`). The result is one [`ModelConfig`],
+// built at startup by `ModelConfig::load` in `input::processor`. The leader's startup reads it,
+// and `Processor::new` then binds the worker's capabilities onto it before request preprocessing
+// and discovery share it immutably.
+//
+// Which family a checkpoint is, and what that family serves, is the executable's registry of
+// families (`processing::Registry`), whose request processing reads the checkpoint's tokenizer
+// (`crate::api::tokenizer`) through `processing::Vocabulary`.
 
 pub mod assets;
-pub mod generation;
-
-// Model-profile selection and load-time serving capabilities.
-//
-// The server identifies the served model family from the checkpoint itself,
-// by what its root `config.json` or, for a diffusers pipeline, its root index
-// declares (`processing::Registry::resolve`). The result is one
-// [`ModelConfig`], built at startup by `ModelConfig::load` in
-// `input::processor`. The leader's startup reads it, and `Processor::new` then
-// binds the worker's capabilities onto it before request preprocessing and
-// discovery share it immutably.
-//
-// The checkpoint's files are resolved and read here ([`assets`]); which family
-// a checkpoint is, and what that family serves, is the executable's registry
-// of families (`processing::Registry`), whose request processing reads the
-// checkpoint's tokenizer (`crate::api::tokenizer`) through `processing::Vocabulary`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -33,8 +21,8 @@ use processing::Family;
 use processing::{ChatProfile, Serving, VideoFamily};
 
 use crate::api::model::assets::{
-    GenerationConfig, HfTokenizerConfig, ResolvedModelFiles, load_generation_config,
-    load_model_config, load_tokenizer_config,
+    ChatFiles, GenerationConfig, HfTokenizerConfig, OneOrManyTokenIds, load_generation_config,
+    load_tokenizer_config,
 };
 use crate::api::tokenizer::HuggingFaceTokenizer;
 
@@ -66,8 +54,8 @@ pub struct ModelConfig {
     /// Checkpoint defaults applied only to omitted request fields.
     pub sampling_defaults: SamplingDefaults,
     /// Combined input/output token ceiling: the configured `--max-model-len`,
-    /// else the checkpoint's own bound. `build_state` in the crate root passes
-    /// it to the workers, and request preprocessing enforces it.
+    /// else the bound the checkpoint states where its family declares it. The
+    /// leader passes it to the workers, and request preprocessing enforces it.
     pub max_model_len: u32,
     /// Tokenizer-config `eos_token` resolved through the vocabulary.
     ///
@@ -80,37 +68,43 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
-    /// Context length of a model whose configuration declares none and for
-    /// which no `max_model_len` is configured.
-    pub const DEFAULT_MAX_MODEL_LEN: u32 = 8192;
     /// Resolves vocabulary and checkpoint defaults for `family`, the chat
-    /// family the checkpoint declares.
+    /// family the checkpoint declares, from its `files`.
     ///
-    /// A configured `max_model_len` takes precedence over the checkpoint's
-    /// `max_position_embeddings`, and [`ModelConfig::DEFAULT_MAX_MODEL_LEN`]
-    /// applies when neither is set.
+    /// A configured `max_model_len` takes precedence over the context length
+    /// the checkpoint states where its family declares it
+    /// ([`ChatFiles::context_length`]); a checkpoint that states no generation
+    /// defaults leaves every sampling default unset.
     ///
     /// # Errors
     ///
-    /// Fails when a present metadata file cannot be read or parsed.
+    /// Fails when a metadata file cannot be read or parsed, or no
+    /// `max_model_len` is configured and the checkpoint states no context
+    /// length.
     pub fn from_files(
         family: Family,
-        files: &ResolvedModelFiles,
+        files: &ChatFiles,
         max_model_len: Option<u32>,
         tokenizer: &HuggingFaceTokenizer,
     ) -> assets::Result<Self> {
-        let model_config = load_model_config(files.config_path.as_deref())?;
-        let generation_config = load_generation_config(files.generation_config_path.as_deref())?;
-        let tokenizer_config = load_tokenizer_config(files.tokenizer_config_path.as_deref())?;
+        let generation_config = files
+            .generation_config()
+            .map(load_generation_config)
+            .transpose()?;
+        let tokenizer_config = load_tokenizer_config(files.tokenizer_config())?;
         let (primary_eos_token_id, eos_token_ids) =
-            stop_token_ids(&tokenizer_config, &generation_config, tokenizer);
+            stop_token_ids(&tokenizer_config, generation_config.as_ref(), tokenizer);
 
         Ok(Self {
             family,
-            sampling_defaults: generation_defaults(&generation_config),
-            max_model_len: max_model_len
-                .or(model_config.max_position_embeddings())
-                .unwrap_or(Self::DEFAULT_MAX_MODEL_LEN),
+            sampling_defaults: generation_config
+                .as_ref()
+                .map(generation_defaults)
+                .unwrap_or_default(),
+            max_model_len: match max_model_len {
+                Some(configured) => configured,
+                None => files.context_length()?,
+            },
             primary_eos_token_id,
             eos_token_ids,
         })
@@ -165,6 +159,28 @@ impl ModelConfig {
             Serving::Chat(_) => None,
         }
     }
+
+    /// The generation bounds the model's family states before its workers report their own,
+    /// which the engine lowers to its workers' capacities (each limit is the smaller of the
+    /// two).
+    ///
+    /// No family states a capacity of its own: a text family bounds no position's candidates
+    /// (its workers' samplers do), and a family that takes images bounds none of their
+    /// encodings (its workers' feature storage and encoder cache do), which the engine's
+    /// interface states as the largest value of each limit. A family that takes no images
+    /// states none of their limits.
+    pub fn generation_limits(&self) -> proto::request::GenerationLimits {
+        let mut limits = proto::request::GenerationLimits::default();
+        if self.chat().is_some() {
+            limits.max_logprobs = u32::MAX;
+        }
+        if self.chat().is_some_and(|profile| profile.images.is_some()) {
+            limits.max_vision_feature_bytes = u64::MAX;
+            limits.max_vit_grid_tokens = u32::MAX;
+            limits.encoder_cache_entries = u32::MAX;
+        }
+        limits
+    }
 }
 
 /// Extracts serving generation defaults from repository configuration.
@@ -182,12 +198,12 @@ fn generation_defaults(config: &GenerationConfig) -> SamplingDefaults {
 /// Combines tokenizer and generation metadata into one canonical termination policy.
 ///
 /// Returns the tokenizer-config `eos_token` as the primary id and the union of
-/// the generation-config `eos_token_id` values with that primary. An
-/// `eos_token` absent from the vocabulary yields no primary rather than an
-/// error.
+/// the generation-config `eos_token_id` values, when the checkpoint states
+/// generation defaults, with that primary. An `eos_token` absent from the
+/// vocabulary yields no primary rather than an error.
 fn stop_token_ids(
     tokenizer_config: &HfTokenizerConfig,
-    generation_config: &GenerationConfig,
+    generation_config: Option<&GenerationConfig>,
     tokenizer: &HuggingFaceTokenizer,
 ) -> (Option<u32>, BTreeSet<u32>) {
     let primary = tokenizer_config
@@ -196,9 +212,8 @@ fn stop_token_ids(
         .as_ref()
         .and_then(|token| tokenizer.token_to_id(token.as_str()));
     let mut ids = generation_config
-        .eos_token_id
-        .clone()
-        .map(|ids| ids.into_set())
+        .and_then(|config| config.eos_token_id.clone())
+        .map(OneOrManyTokenIds::into_set)
         .unwrap_or_default();
     if let Some(primary) = primary {
         ids.insert(primary);
@@ -215,31 +230,27 @@ mod tests {
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
     use processing::{
-        ChatProfile, Family, ReasoningFormat, Registry, RootFile, Serving, ToolCallFormat,
-        VideoBinding, VideoFamily, VideoProcessor,
+        BasePin, ChatCheckpoint, ChatProfile, ChatTemplate, Family, ReasoningFormat, Registry,
+        RootFile, Serving, ToolCallFormat, VideoBinding, VideoFamily, VideoProcessor,
     };
 
     use super::ModelConfig;
-    use crate::api::model::assets::ResolvedModelFiles;
+    use crate::api::input::ModelResolutionError;
+    use crate::api::model::assets::{ChatFiles, Hub, HubSettings, Source};
     use crate::api::tokenizer::HuggingFaceTokenizer;
 
-    const SPECIAL_TOKENS: &[&str] = &[
-        "<|im_start|>",
-        "<|im_end|>",
-        "<|vision_start|>",
-        "<|vision_end|>",
-        "<img>",
-        "</img>",
-        "<think>",
-        "</think>",
-        "<answer>",
-        "</answer>",
-    ];
+    const SPECIAL_TOKENS: &[&str] = &["<|start|>", "<|end|>", "<think>", "</think>"];
+
+    /// Where [`CHAT`]'s checkpoints keep what request processing reads.
+    const CHECKPOINT: ChatCheckpoint = ChatCheckpoint {
+        context_length: &["max_position_embeddings"],
+        chat_template: ChatTemplate::TokenizerConfig,
+    };
 
     /// Writes a minimal checkpoint of the model class `class`: a character-level BPE
     /// tokenizer over ASCII plus [`SPECIAL_TOKENS`], and root, tokenizer, and
     /// generation configs. Dropping the returned directory deletes the files.
-    fn configured_files(class: &str) -> (tempfile::TempDir, ResolvedModelFiles) {
+    fn checkpoint(class: &str) -> tempfile::TempDir {
         let directory = tempdir().expect("create model directory");
         let mut vocab = Vocab::from_iter([("<unk>".to_string(), 0_u32)]);
         for codepoint in 1_u32..=127 {
@@ -257,46 +268,48 @@ mod tests {
                 .map(|token| AddedToken::from(*token, true))
                 .collect::<Vec<_>>(),
         );
-        let tokenizer_path = directory.path().join("tokenizer.json");
         tokenizer
-            .save(&tokenizer_path, false)
+            .save(directory.path().join("tokenizer.json"), false)
             .expect("save tokenizer");
 
-        let config_path = directory.path().join("config.json");
         fs::write(
-            &config_path,
-            format!(
-                r#"{{"architectures":["{class}"],"max_position_embeddings":4096,"num_attention_heads":8}}"#
-            ),
+            directory.path().join("config.json"),
+            format!(r#"{{"architectures":["{class}"],"max_position_embeddings":4096}}"#),
         )
         .expect("write model config");
-        let tokenizer_config_path = directory.path().join("tokenizer_config.json");
-        fs::write(&tokenizer_config_path, r#"{"eos_token":"<|im_end|>"}"#)
-            .expect("write tokenizer config");
-        let generation_config_path = directory.path().join("generation_config.json");
         fs::write(
-            &generation_config_path,
+            directory.path().join("tokenizer_config.json"),
+            r#"{"eos_token":"<|end|>","chat_template":"{{ messages }}"}"#,
+        )
+        .expect("write tokenizer config");
+        fs::write(
+            directory.path().join("generation_config.json"),
             r#"{"eos_token_id":2,"temperature":0.6,"top_p":0.95,"top_k":20,"max_new_tokens":512}"#,
         )
         .expect("write generation config");
-
-        let files = ResolvedModelFiles {
-            tokenizer_path,
-            tokenizer_config_path: Some(tokenizer_config_path),
-            generation_config_path: Some(generation_config_path),
-            chat_template_path: None,
-            config_path: Some(config_path),
-        };
-        (directory, files)
+        directory
     }
 
-    /// The family the checkpoint [`configured_files`] writes for `class` declares, as startup
-    /// loads it with a registry of [`CHAT`] and [`VIDEO`].
-    async fn loaded(class: &str) -> Result<ModelConfig, crate::api::input::ModelResolutionError> {
-        let (directory, _files) = configured_files(class);
+    /// A Hub that reaches no network: these tests state local checkpoints.
+    fn offline_hub(cache: &std::path::Path) -> Hub {
+        Hub::new(HubSettings {
+            cache: cache.to_path_buf(),
+            endpoint: None,
+            token: None,
+            offline: true,
+        })
+        .unwrap()
+    }
+
+    /// The family the checkpoint [`checkpoint`] writes for `class` declares, as startup loads
+    /// it with a registry of [`CHAT`] and [`VIDEO`].
+    async fn loaded(class: &str) -> Result<ModelConfig, ModelResolutionError> {
+        let (directory, cache) = (checkpoint(class), tempdir().unwrap());
         let registry = Registry::new([CHAT, VIDEO]).unwrap();
         let loaded = ModelConfig::load(
-            directory.path().to_str().unwrap(),
+            &offline_hub(cache.path()),
+            &Source::Directory(directory.path().to_path_buf()),
+            None,
             None,
             &proto::config::ChatConfig::default(),
             &serde_json::Map::new(),
@@ -318,6 +331,7 @@ mod tests {
             }),
             tool_calls: Some(ToolCallFormat::Json),
             images: None,
+            checkpoint: CHECKPOINT,
         }),
     };
 
@@ -341,6 +355,10 @@ mod tests {
             &[]
         }
 
+        fn base_pin(&self) -> Option<BasePin> {
+            None
+        }
+
         fn bind(&self, _: VideoBinding<'_>) -> Result<Box<dyn VideoProcessor>, String> {
             Err("this family binds no processor".to_owned())
         }
@@ -354,15 +372,12 @@ mod tests {
     };
 
     /// A chat checkpoint's facts are the files it publishes: its context bound and its
-    /// generation defaults.
+    /// generation defaults; one that publishes no generation defaults states none.
     #[test]
     fn a_chat_checkpoint_states_its_bound_and_defaults() {
-        let (_directory, files) = configured_files("ChatForCausalLM");
-        let tokenizer = HuggingFaceTokenizer::load(
-            &files.tokenizer_path,
-            files.tokenizer_config_path.as_deref(),
-        )
-        .unwrap();
+        let directory = checkpoint("ChatForCausalLM");
+        let files = ChatFiles::locate(directory.path(), CHECKPOINT).unwrap();
+        let tokenizer = HuggingFaceTokenizer::load(files.tokenizer_directory()).unwrap();
         let profile = ModelConfig::from_files(CHAT, &files, None, &tokenizer).unwrap();
         assert_eq!(profile.family, CHAT);
         assert_eq!(profile.max_model_len, 4096);
@@ -370,25 +385,37 @@ mod tests {
 
         let bounded = ModelConfig::from_files(CHAT, &files, Some(1024), &tokenizer).unwrap();
         assert_eq!(bounded.max_model_len, 1024);
+
+        fs::remove_file(directory.path().join("generation_config.json")).unwrap();
+        let files = ChatFiles::locate(directory.path(), CHECKPOINT).unwrap();
+        let undefaulted = ModelConfig::from_files(CHAT, &files, None, &tokenizer).unwrap();
+        assert_eq!(
+            undefaulted.sampling_defaults,
+            super::SamplingDefaults::default()
+        );
+        assert_eq!(
+            undefaulted.eos_token_ids,
+            [tokenizer.token_to_id("<|end|>").unwrap()].into()
+        );
     }
 
-    /// Startup serves the family the checkpoint declares; a root configuration naming the class a
-    /// video family declares in its pipeline index alone, and a class no family claims, are
+    /// Startup serves the family the checkpoint declares; a video family's class named in a
+    /// root configuration rather than its pipeline index, and a class no family claims, are
     /// refused.
     #[tokio::test]
     async fn startup_serves_the_family_the_checkpoint_declares() {
         assert_eq!(loaded("ChatForCausalLM").await.unwrap().family, CHAT);
         assert!(matches!(
             loaded("VideoModularPipeline").await,
-            Err(crate::api::input::ModelResolutionError::Family(
+            Err(ModelResolutionError::Assets(super::assets::Error::Family(
                 processing::ResolveError::Unserved { .. }
-            ))
+            )))
         ));
         assert!(matches!(
             loaded("unsupported_architecture").await,
-            Err(crate::api::input::ModelResolutionError::Family(
+            Err(ModelResolutionError::Assets(super::assets::Error::Family(
                 processing::ResolveError::Unserved { .. }
-            ))
+            )))
         ));
     }
 

@@ -43,6 +43,38 @@ pub use proto::config::{
 };
 use proto::config::{positive, values};
 
+use crate::api::model::assets::{HubAsset, Source};
+
+/// The source text of a checkpoint stated as a repository or a directory, whichever is stated; a
+/// directory that is not UTF-8 is refused by [`source`].
+fn stated<'a>(repository: Option<&'a str>, directory: Option<&'a Path>) -> Option<&'a str> {
+    repository.or_else(|| directory.and_then(Path::to_str))
+}
+
+/// The checkpoint the option `name` (a repository) or `<name>_dir` (a directory) states, of
+/// which at most one is stated.
+fn source(
+    name: &str,
+    repository: Option<&str>,
+    directory: Option<&Path>,
+) -> anyhow::Result<Option<Source>> {
+    match (repository, directory) {
+        (None, None) => Ok(None),
+        (Some(repository), None) => Ok(Some(Source::Hub(HubAsset::parse(repository)?))),
+        (None, Some(directory)) => {
+            anyhow::ensure!(
+                directory.to_str().is_some(),
+                "`{name}_dir` {} is not UTF-8, which the engines' configuration states paths in",
+                directory.display()
+            );
+            Ok(Some(Source::Directory(directory.to_path_buf())))
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("`{name}` and `{name}_dir` both state one checkpoint: state one of them")
+        }
+    }
+}
+
 /// Options that place ranks without a deployment layout, refused beside `worker_groups`.
 const RANK_LAYOUT_SHORTHAND: [&str; 5] = [
     "tensor_parallel_size",
@@ -83,7 +115,8 @@ const KIND_OPTIONS: [(Kind, &[&str]); 2] = [
             "video_config",
             "media_config",
             "video_job_config",
-            "lora_path",
+            "lora",
+            "lora_dir",
         ],
     ),
 ];
@@ -143,9 +176,17 @@ impl Stated {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, clap::Args)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerArgs {
-    /// Local model directory or Hugging Face repository; required.
+    /// The Hugging Face checkpoint the deployment serves, `<owner>/<name>[@<revision>][/<folder>]`:
+    /// a repository at its default branch or at a branch, tag or commit, and the folder of it that
+    /// holds the checkpoint when it is not the root, read from the standard cache's snapshot of
+    /// the revision; this or `model_dir` is required.
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
+    /// A local checkpoint directory the deployment serves, read in place, instead of a
+    /// repository (`model`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "DIR")]
+    pub model_dir: Option<PathBuf>,
     /// The single model name the API serves; `model` when unset.
     #[arg(long)]
     pub served_model_name: Option<String>,
@@ -156,11 +197,16 @@ pub struct ServerArgs {
     #[arg(long)]
     pub max_model_len: Option<NonZeroU32>,
     /// A weight adapter fused into the checkpoint's weights at load, for
-    /// every request of the deployment: an adapter file, or a local directory
-    /// holding one. The model family must recognize it; video families only.
+    /// every request of the deployment: the Hugging Face repository, or the
+    /// folder of one, that holds it (`<owner>/<name>[@<revision>][/<folder>]`,
+    /// as `model`). The model family must recognize it; video families only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "PATH")]
-    pub lora_path: Option<PathBuf>,
+    #[arg(long, value_name = "REPOSITORY")]
+    pub lora: Option<String>,
+    /// The adapter (`lora`) as a local directory holding it, read in place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "DIR")]
+    pub lora_dir: Option<PathBuf>,
     /// Element type of parameters and activations.
     #[arg(skip = ServerArgs::default().dtype)]
     pub dtype: ModelDtype,
@@ -352,9 +398,11 @@ impl Default for ServerArgs {
     fn default() -> Self {
         Self {
             model: None,
+            model_dir: None,
             served_model_name: None,
             max_model_len: None,
-            lora_path: None,
+            lora: None,
+            lora_dir: None,
             dtype: ModelDtype::BFloat16,
             quantization: proto::config::Quantization::default(),
             mm_processor_kwargs: serde_json::Map::new(),
@@ -496,9 +544,11 @@ impl ServerArgs {
         let Self {
             // The engine configuration, the deployment's layout and hosts, and the updates.
             model: _,
+            model_dir: _,
             served_model_name: _,
             max_model_len: _,
-            lora_path: _,
+            lora: _,
+            lora_dir: _,
             dtype: _,
             quantization: _,
             attention_backend: _,
@@ -720,12 +770,12 @@ impl ServerArgs {
         Ok(proto::config::EngineConfig {
             executable: proto::BUILD.to_owned(),
             model: proto::config::ModelConfig {
+                // The stated sources; the leader resolves each to the directory its engines
+                // open when it reads the checkpoint (`Leader::prepare`).
                 model: self.model().to_owned(),
                 base: None,
-                lora_path: self
-                    .lora_path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned()),
+                lora_path: stated(self.lora.as_deref(), self.lora_dir.as_deref())
+                    .map(str::to_owned),
                 max_model_len: self.max_model_len.map_or(0, NonZeroU32::get),
                 dtype: self.dtype,
                 quantization: self.quantization.clone(),
@@ -762,11 +812,39 @@ impl ServerArgs {
         })
     }
 
-    /// The configured model: a local directory or a Hugging Face repository.
+    /// The configured model as it is stated: the repository (`model`) or the
+    /// directory (`model_dir`).
     ///
     /// Empty while unstated; [`ServerArgs::validate`] refuses that.
     pub fn model(&self) -> &str {
-        self.model.as_deref().unwrap_or_default()
+        stated(self.model.as_deref(), self.model_dir.as_deref()).unwrap_or_default()
+    }
+
+    /// Whether the configuration states a model, as a repository or a directory.
+    pub fn states_model(&self) -> bool {
+        self.model.is_some() || self.model_dir.is_some()
+    }
+
+    /// Where the configured model lies ([`Source`]).
+    ///
+    /// # Errors
+    ///
+    /// Fails when neither or both of `model` and `model_dir` are stated, or
+    /// `model` names no repository.
+    pub fn model_source(&self) -> anyhow::Result<Source> {
+        source("model", self.model.as_deref(), self.model_dir.as_deref())?
+            .context("the configuration states no model: name MODEL or set `model_dir`")
+    }
+
+    /// Where the configured adapter lies ([`Source`]); `None` when the
+    /// configuration states none.
+    ///
+    /// # Errors
+    ///
+    /// Fails when both `lora` and `lora_dir` are stated, or `lora` names no
+    /// repository.
+    pub fn adapter_source(&self) -> anyhow::Result<Option<Source>> {
+        source("lora", self.lora.as_deref(), self.lora_dir.as_deref())
     }
 
     /// The single model name the API serves: `served_model_name`, else the
@@ -803,7 +881,7 @@ impl ServerArgs {
             "a deployment of several nodes needs the leader's address: set `dist_init_addr`"
         );
         anyhow::ensure!(
-            !self.leads() || self.model.is_some() || self.nnodes.get() == 1,
+            !self.leads() || self.states_model() || self.nnodes.get() == 1,
             "`model` is required on the leader of several nodes: name MODEL on the command line \
              or set `model` in --config"
         );
@@ -813,6 +891,17 @@ impl ServerArgs {
         // policy's declared limits would be refused at the first prepare
         // instead (`crates/scheduling/src/limits.rs`). A stated value is never
         // clamped — the deployment either means it or is wrong.
+        // A checkpoint is stated once; the resolver checks a repository's name when it resolves
+        // the checkpoint (`ServerArgs::model_source`).
+        for (name, repository, directory) in [
+            ("model", self.model.is_some(), self.model_dir.is_some()),
+            ("lora", self.lora.is_some(), self.lora_dir.is_some()),
+        ] {
+            anyhow::ensure!(
+                !(repository && directory),
+                "`{name}` and `{name}_dir` both state one checkpoint: state one of them"
+            );
+        }
         let graphs = &self.cuda_graph_config;
         increasing(
             "cuda_graph_config.decode_batch_sizes",

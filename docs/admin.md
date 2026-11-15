@@ -100,7 +100,7 @@ A harness is an agent program that observes the deployment, installs packages at
 A hot restart's successor goes on in its predecessor's instance directory, binds both sockets over its predecessor's, which finishes the requests it accepted, and owns the directory once the handover completed. An example, reading the sockets from the record:
 
 ```bash
-uniserve serve /models/qwen3 --ready-fd 3 3>ready.jsonl >serve.log &
+uniserve serve Qwen/Qwen3-30B-A3B --ready-fd 3 3>ready.jsonl >serve.log &
 # once ready.jsonl holds the line whose state is "serving":
 admin=$(jq -r 'select(.state == "serving") | .endpoints.admin | ltrimstr("unix:")' ready.jsonl)
 harness=$(jq -r 'select(.state == "serving") | .endpoints.harness | ltrimstr("unix:")' ready.jsonl)
@@ -142,7 +142,7 @@ The committed distribution is included in worker recovery launches and daemon ha
 
 `/admin/load_lora_adapter` assigns the adapter the lowest free slot and has every rank publish the tensors of `lora_path` at the Storage Server, through the path every weight takes, and map them read-only under the slot; `/v1/models` lists it, and its prefix cache and encoder cache entries are kept apart from the base model's and every other adapter's. An engine that replaces another, after an epoch change, a rollback or a relaunch, loads every adapter again before it serves; one that does not load leaves the registry, so requests naming it are refused. `/admin/unload_lora_adapter` removes the name at once and has every rank release the slot's tensors.
 
-What computes with an adapter of a slot is a kernel package, and this repository holds none, so a request that names a loaded adapter as its `model` is refused rather than answered by the base model. The kernel package that provides it reads a slot's tensors and each token's slot. An adapter that a deployment serves for every request is fused into its weights at load instead, with `lora_path` ([Configuration](configuration.md)), and needs no slot.
+What computes with an adapter of a slot is a kernel package, and this repository holds none, so a request that names a loaded adapter as its `model` is refused rather than answered by the base model. The kernel package that provides it reads a slot's tensors and each token's slot. An adapter that a deployment serves for every request is fused into its weights at load instead, with `lora` or `lora_dir` ([Configuration](configuration.md)), and needs no slot.
 
 ## Nodes
 

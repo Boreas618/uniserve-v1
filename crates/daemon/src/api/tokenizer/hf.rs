@@ -1,18 +1,24 @@
 //! Hugging Face tokenizer loading and the unified tokenizer implementation.
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use fastokens::Tokenizer as FastokensTokenizer;
 use fastokens::decoders::Decoder as FastokensDecoder;
-use serde_json::{Value, json};
+use fastokens::{NewToken, Tokenizer as FastokensTokenizer};
+use indexmap::IndexMap;
+use serde::Deserialize;
 use thiserror_ext::AsReport as _;
 use tracing::info;
 
 use crate::api::tokenizer::Result;
 use crate::api::tokenizer::byte_level_decode::decode_byte_level as decode_tokens_byte_level;
 use crate::api::tokenizer::incremental::IncrementalDecoder;
+
+/// The tokenizer definition of a tokenizer directory, as `transformers` saves a tokenizer.
+const TOKENIZER_FILE: &str = "tokenizer.json";
+
+/// The tokenizer metadata saved beside the definition.
+const TOKENIZER_CONFIG_FILE: &str = "tokenizer_config.json";
 
 /// Returns whether a tokenizer decoder consists of exactly one `ByteLevel`
 /// step, possibly nested inside `Sequence` steps.
@@ -59,7 +65,7 @@ fn decode_fastokens_byte_level(
     decode_tokens_byte_level(tokens)
 }
 
-/// Tokenizer loaded from a Hugging Face `tokenizer.json` file.
+/// Tokenizer loaded from a Hugging Face tokenizer directory.
 ///
 /// One instance is shared through `DynTokenizer` by every request of a
 /// resolved model; all methods take `&self`.
@@ -74,30 +80,62 @@ pub struct HuggingFaceTokenizer {
 }
 
 impl HuggingFaceTokenizer {
-    /// Loads a tokenizer the way `transformers` loads a checkpoint's
-    /// directory: the `tokenizer.json` at `path` plus the tokens the
-    /// `tokenizer_config.json` at `config`, when the checkpoint publishes one,
-    /// declares and the definition lacks.
+    /// Loads the tokenizer in `directory` the way `transformers` loads a
+    /// checkpoint's tokenizer: its `tokenizer.json`, with every token its
+    /// `tokenizer_config.json` declares and the definition lacks.
     ///
-    /// A checkpoint may declare tokens only in its configuration
-    /// (`added_tokens_decoder`); MiniMax-H3's `<d>` dialogue marker is one.
-    /// `transformers` registers them when it loads the tokenizer, so a prompt
-    /// containing one encodes it as a single token; `register_declared_tokens`
-    /// states the rule.
+    /// `fastokens` reads the definition and registers the configuration's
+    /// `added_tokens_decoder` at the ids it states; the special tokens the
+    /// configuration declares by name or in its lists ([`DeclaredTokens`]) are
+    /// registered through `fastokens`' own registration, which assigns ids as
+    /// `tokenizers` does. A prompt containing such a token then encodes it as
+    /// one token, as the checkpoint's own processor encodes it.
+    ///
+    /// # Errors
     ///
     /// Returns a tokenizer error when either file cannot be read or parsed,
-    /// or when `fastokens` cannot build the definition.
-    pub fn load(path: &Path, config: Option<&Path>) -> Result<Self> {
-        info!(
-            path = %path.display(),
-            config = ?config.map(Path::display),
-            "loading configured Hugging Face tokenizer"
-        );
-        let mut definition = read_json(path)?;
-        if let Some(config) = config {
-            register_declared_tokens(&mut definition, &read_json(config)?)?;
-        }
-        Self::from_json(definition)
+    /// or when `fastokens` cannot build or extend the definition.
+    pub fn load(directory: &Path) -> Result<Self> {
+        let definition = directory.join(TOKENIZER_FILE);
+        let config = directory.join(TOKENIZER_CONFIG_FILE);
+        info!(directory = %directory.display(), "loading the Hugging Face tokenizer");
+        let mut tokenizer = FastokensTokenizer::from_file(&definition).map_err(|error| {
+            tokenizer_error!(
+                "failed to load {}: {}",
+                definition.display(),
+                error.as_report()
+            )
+        })?;
+        let text = std::fs::read_to_string(&config).map_err(|error| {
+            tokenizer_error!("failed to read {}: {}", config.display(), error.as_report())
+        })?;
+        let declared: DeclaredTokens = serde_json::from_str(&text).map_err(|error| {
+            tokenizer_error!(
+                "failed to parse {}: {}",
+                config.display(),
+                error.as_report()
+            )
+        })?;
+
+        // A token the definition or the decoder entries registered keeps its entry as it is.
+        let registered: std::collections::HashSet<String> = tokenizer
+            .added_token_configs()
+            .iter()
+            .map(|token| token.content.clone())
+            .collect();
+        let missing: Vec<NewToken> = declared
+            .tokens()
+            .into_iter()
+            .filter(|token| !registered.contains(&token.content))
+            .collect();
+        tokenizer.add_tokens(&missing).map_err(|error| {
+            tokenizer_error!(
+                "failed to register the tokens {} declares: {}",
+                config.display(),
+                error.as_report()
+            )
+        })?;
+        Ok(Self::from_fastokens(tokenizer))
     }
 
     /// Builds a tokenizer from a parsed `tokenizer.json` definition.
@@ -200,206 +238,124 @@ impl processing::Vocabulary for HuggingFaceTokenizer {
     }
 }
 
-/// Reads one JSON tokenizer file.
-fn read_json(path: &Path) -> Result<Value> {
-    let text = std::fs::read_to_string(path).map_err(|error| {
-        tokenizer_error!("failed to read {}: {}", path.display(), error.as_report())
-    })?;
-    serde_json::from_str(&text).map_err(|error| {
-        tokenizer_error!("failed to parse {}: {}", path.display(), error.as_report())
-    })
+/// The special tokens a `tokenizer_config.json` declares beside its
+/// `added_tokens_decoder`, which `transformers` registers when it loads the
+/// tokenizer and `fastokens` does not.
+///
+/// `fastokens` 0.3 merges only the configuration's `added_tokens_decoder`
+/// into the definition; `transformers` also registers the named special tokens
+/// (`SPECIAL_TOKENS_ATTRIBUTES`), the model-specific ones a table of
+/// `extra_special_tokens` names, and the listed extra special tokens. A
+/// `transformers` 5 configuration states that list as `extra_special_tokens`
+/// and a `transformers` 4 configuration as `additional_special_tokens`, which
+/// `transformers` 5 reads when its own key is absent, as here.
+#[derive(Debug, Deserialize)]
+struct DeclaredTokens {
+    bos_token: Option<DeclaredToken>,
+    eos_token: Option<DeclaredToken>,
+    unk_token: Option<DeclaredToken>,
+    sep_token: Option<DeclaredToken>,
+    pad_token: Option<DeclaredToken>,
+    cls_token: Option<DeclaredToken>,
+    mask_token: Option<DeclaredToken>,
+    /// The extra special tokens of a `transformers` 5 configuration: a list,
+    /// or a table naming the model-specific ones.
+    extra_special_tokens: Option<ExtraTokens>,
+    /// The extra special tokens of a `transformers` 4 configuration.
+    #[serde(default)]
+    additional_special_tokens: Vec<DeclaredToken>,
 }
 
-/// The named special tokens `transformers` registers first, in its order
-/// (`SPECIAL_TOKENS_ATTRIBUTES`).
-const NAMED_SPECIAL_TOKENS: [&str; 7] = [
-    "bos_token",
-    "eos_token",
-    "unk_token",
-    "sep_token",
-    "pad_token",
-    "cls_token",
-    "mask_token",
-];
+/// The extra special tokens a `transformers` 5 configuration states.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ExtraTokens {
+    /// Tokens listed without names.
+    Listed(Vec<DeclaredToken>),
+    /// Model-specific special tokens by attribute name (`image_token`, ...), in
+    /// the order the file states them.
+    Named(IndexMap<String, DeclaredToken>),
+}
 
-/// One token a `tokenizer_config.json` declares, with its matching flags.
-#[derive(Debug)]
-struct DeclaredToken {
-    content: String,
-    single_word: bool,
-    lstrip: bool,
-    rstrip: bool,
-    normalized: bool,
-    special: bool,
+/// One token a `tokenizer_config.json` declares: its text, which
+/// `transformers` makes a special token, or an `AddedToken` object.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum DeclaredToken {
+    Text(String),
+    Token {
+        content: String,
+        #[serde(default)]
+        single_word: bool,
+        #[serde(default)]
+        lstrip: bool,
+        #[serde(default)]
+        rstrip: bool,
+        normalized: Option<bool>,
+        special: Option<bool>,
+    },
 }
 
 impl DeclaredToken {
-    /// Reads a token written as its text, which `transformers` makes a
-    /// special token, or as an `AddedToken` object. An unset `normalized`
-    /// defaults to `!special`, as `AddedToken` does; `special` forces the
-    /// special flag of a named token.
-    fn parse(value: &Value, special: bool) -> Option<Self> {
-        if let Some(content) = value.as_str() {
-            return Some(Self {
-                content: content.to_owned(),
-                single_word: false,
-                lstrip: false,
-                rstrip: false,
-                normalized: false,
+    /// The token to register: `named` forces the special flag of a named
+    /// token; an unset `normalized` is `!special`, as `AddedToken` sets it.
+    fn new_token(self, named: bool) -> NewToken {
+        match self {
+            Self::Text(content) => NewToken {
+                content,
                 special: true,
-            });
+                ..NewToken::default()
+            },
+            Self::Token {
+                content,
+                single_word,
+                lstrip,
+                rstrip,
+                normalized,
+                special,
+            } => {
+                let special = named || special.unwrap_or(false);
+                NewToken {
+                    content,
+                    single_word,
+                    lstrip,
+                    rstrip,
+                    normalized: normalized.unwrap_or(!special),
+                    special,
+                }
+            }
         }
-        let content = value.get("content")?.as_str()?.to_owned();
-        let flag = |name: &str| value.get(name).and_then(Value::as_bool);
-        let special = special || flag("special").unwrap_or(false);
-        Some(Self {
-            content,
-            single_word: flag("single_word").unwrap_or(false),
-            lstrip: flag("lstrip").unwrap_or(false),
-            rstrip: flag("rstrip").unwrap_or(false),
-            normalized: flag("normalized").unwrap_or(!special),
-            special,
-        })
     }
 }
 
-/// Lists the tokens a `tokenizer_config.json` declares, in the order
-/// `transformers` (5.x) registers them: the `added_tokens_decoder` entries
-/// by id; the named special tokens ([`NAMED_SPECIAL_TOKENS`], then any other
-/// `*_token` key holding a token, then the entries of an object-valued
-/// `extra_special_tokens`); and the listed extra special tokens
-/// (`extra_special_tokens`, or the older `additional_special_tokens`).
-fn declared_tokens(config: &Value) -> Vec<DeclaredToken> {
-    let mut tokens = Vec::new();
-
-    if let Some(decoder) = config
-        .get("added_tokens_decoder")
-        .and_then(Value::as_object)
-    {
-        let mut entries: Vec<(u64, &Value)> = decoder
-            .iter()
-            .filter_map(|(id, token)| Some((id.parse().ok()?, token)))
-            .collect();
-        entries.sort_by_key(|&(id, _)| id);
-        tokens.extend(
-            entries
-                .into_iter()
-                .filter_map(|(_, token)| DeclaredToken::parse(token, false)),
-        );
-    }
-
-    let named = NAMED_SPECIAL_TOKENS
-        .iter()
-        .filter_map(|&key| config.get(key));
-    let model_specific = config.as_object().into_iter().flat_map(|fields| {
-        fields
-            .iter()
-            .filter(|(key, _)| {
-                key.ends_with("_token") && !NAMED_SPECIAL_TOKENS.contains(&key.as_str())
-            })
-            .map(|(_, value)| value)
-    });
-    let extras = config.get("extra_special_tokens");
-    let named_extras = extras
-        .and_then(Value::as_object)
+impl DeclaredTokens {
+    /// The declared tokens in the order `transformers` (5.x) registers them
+    /// after the `added_tokens_decoder` entries: the named special tokens,
+    /// then the model-specific named ones, then the listed extra special
+    /// tokens.
+    fn tokens(self) -> Vec<NewToken> {
+        let named = [
+            self.bos_token,
+            self.eos_token,
+            self.unk_token,
+            self.sep_token,
+            self.pad_token,
+            self.cls_token,
+            self.mask_token,
+        ]
         .into_iter()
-        .flat_map(|fields| fields.values());
-    tokens.extend(
+        .flatten();
+        let (model_specific, listed) = match self.extra_special_tokens {
+            Some(ExtraTokens::Named(table)) => (table.into_values().collect(), Vec::new()),
+            Some(ExtraTokens::Listed(list)) => (Vec::new(), list),
+            None => (Vec::new(), self.additional_special_tokens),
+        };
         named
             .chain(model_specific)
-            .chain(named_extras)
-            .filter_map(|token| DeclaredToken::parse(token, true)),
-    );
-
-    // `additional_special_tokens` stands in only for an absent
-    // `extra_special_tokens`.
-    let listed = extras
-        .or_else(|| config.get("additional_special_tokens"))
-        .and_then(Value::as_array);
-    tokens.extend(
-        listed
-            .into_iter()
-            .flatten()
-            .filter_map(|token| DeclaredToken::parse(token, false)),
-    );
-    tokens
-}
-
-/// The id a `tokenizer.json` model vocabulary gives `content`: an object
-/// from text to id (BPE, WordPiece) or a list of `[text, score]` rows whose
-/// position is the id (Unigram).
-fn vocabulary_id(vocabulary: &Value, content: &str) -> Option<u64> {
-    match vocabulary {
-        Value::Object(entries) => entries.get(content)?.as_u64(),
-        Value::Array(rows) => rows
-            .iter()
-            .position(|row| row.get(0).and_then(Value::as_str) == Some(content))
-            .map(|position| position as u64),
-        _ => None,
+            .map(|token| token.new_token(true))
+            .chain(listed.into_iter().map(|token| token.new_token(false)))
+            .collect()
     }
-}
-
-/// Registers the tokens a `tokenizer_config.json` declares in the
-/// `added_tokens` of a `tokenizer.json` definition, as `transformers` does
-/// when it loads the pair.
-///
-/// The tokens of [`declared_tokens`] are registered in order unless their
-/// text is already an added token. As in `tokenizers`, a text the model
-/// vocabulary holds keeps its vocabulary id, and any other text takes the
-/// next id after both the model vocabulary and every added token.
-fn register_declared_tokens(definition: &mut Value, config: &Value) -> Result<()> {
-    let vocabulary = &definition["model"]["vocab"];
-    let vocabulary_size = match vocabulary {
-        Value::Object(entries) => entries.len(),
-        Value::Array(rows) => rows.len(),
-        _ => return Err(tokenizer_error!("the tokenizer model has no vocabulary")),
-    } as u64;
-    // Resolve the vocabulary ids before the added tokens are borrowed
-    // mutably.
-    let declared: Vec<(DeclaredToken, Option<u64>)> = declared_tokens(config)
-        .into_iter()
-        .map(|token| {
-            let id = vocabulary_id(vocabulary, &token.content);
-            (token, id)
-        })
-        .collect();
-
-    let added = definition
-        .get_mut("added_tokens")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| tokenizer_error!("the tokenizer has no added_tokens list"))?;
-    let mut registered: HashSet<String> = added
-        .iter()
-        .filter_map(|token| token["content"].as_str().map(ToOwned::to_owned))
-        .collect();
-    let mut next_id = added
-        .iter()
-        .filter_map(|token| token["id"].as_u64())
-        .map(|id| id + 1)
-        .fold(vocabulary_size, u64::max);
-    for (token, vocabulary_id) in declared {
-        if !registered.insert(token.content.clone()) {
-            continue;
-        }
-        let id = match vocabulary_id {
-            Some(id) => id,
-            None => {
-                let id = next_id;
-                next_id += 1;
-                id
-            }
-        };
-        added.push(json!({
-            "id": id,
-            "content": token.content,
-            "single_word": token.single_word,
-            "lstrip": token.lstrip,
-            "rstrip": token.rstrip,
-            "normalized": token.normalized,
-            "special": token.special,
-        }));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -437,23 +393,18 @@ mod tests {
         TokenizerBuilder::new(model)
     }
 
-    fn save_tokenizer(tokenizer: &TokenizerBuilder) -> (tempfile::TempDir, std::path::PathBuf) {
-        let directory = tempdir().expect("create tokenizer directory");
-        let path = directory.path().join("tokenizer.json");
-        tokenizer.save(&path, false).expect("save tokenizer");
-        (directory, path)
-    }
-
     #[test]
     fn configured_tokenizer_encodes_decodes_and_identifies_special_tokens() {
         let mut tokenizer = tiny_bpe_tokenizer();
         tokenizer.add_special_tokens(&[AddedToken::from("<|im_end|>", true)]);
-        let (_directory, path) = save_tokenizer(&tokenizer);
+        let directory = tempdir().expect("create tokenizer directory");
+        tokenizer
+            .save(directory.path().join("tokenizer.json"), false)
+            .expect("save tokenizer");
+        std::fs::write(directory.path().join("tokenizer_config.json"), "{}").unwrap();
         let configured =
-            HuggingFaceTokenizer::load(&path, None).expect("load configured tokenizer");
+            HuggingFaceTokenizer::load(directory.path()).expect("load configured tokenizer");
 
-        // The tiny BPE tokenizer has no decoder, so this decodes through
-        // `fastokens` rather than the byte-level fast path.
         let encoded = configured.encode("hello", false).expect("encode text");
         assert_eq!(configured.decode(&encoded, false).unwrap(), "hello");
         let special_id = configured
@@ -494,16 +445,27 @@ mod tests {
         }
     }"#;
 
+    /// A tokenizer directory of [`BYTE_LEVEL_TOKENIZER`] and `config`.
+    fn byte_level_directory(config: &str) -> tempfile::TempDir {
+        let directory = tempdir().expect("create tokenizer directory");
+        std::fs::write(
+            directory.path().join("tokenizer.json"),
+            BYTE_LEVEL_TOKENIZER,
+        )
+        .expect("write tokenizer");
+        std::fs::write(directory.path().join("tokenizer_config.json"), config)
+            .expect("write tokenizer config");
+        directory
+    }
+
     fn byte_level_tokenizers() -> (
         tempfile::TempDir,
         HuggingFaceTokenizer,
         fastokens::Tokenizer,
     ) {
-        let directory = tempdir().expect("create tokenizer directory");
-        let path = directory.path().join("tokenizer.json");
-        std::fs::write(&path, BYTE_LEVEL_TOKENIZER).expect("write tokenizer");
+        let directory = byte_level_directory("{}");
         let configured =
-            HuggingFaceTokenizer::load(&path, None).expect("load configured tokenizer");
+            HuggingFaceTokenizer::load(directory.path()).expect("load configured tokenizer");
         let value = serde_json::from_str(BYTE_LEVEL_TOKENIZER).expect("parse tokenizer");
         let provider = fastokens::Tokenizer::from_json(value).expect("load provider tokenizer");
         (directory, configured, provider)
@@ -542,10 +504,12 @@ mod tests {
     /// vocabulary, so an ID in that gap can reach decoding. Like Hugging Face
     /// `tokenizers`, decoding skips it instead of failing.
     #[test]
-    fn configured_byte_level_decode_skips_unknown_token_ids() {
-        let (_directory, configured, _provider) = byte_level_tokenizers();
+    fn decoding_skips_unknown_token_ids() {
+        let directory = byte_level_directory("{}");
+        let configured = HuggingFaceTokenizer::load(directory.path()).unwrap();
         assert_eq!(configured.decode(&[999], false).unwrap(), "");
         assert_eq!(configured.decode(&[1, 999, 2], false).unwrap(), "He");
+        assert_eq!(configured.decode(&[1, 8, 5], false).unwrap(), "H w");
     }
 
     /// The special tokens a `tokenizer_config.json` declares but the
@@ -556,12 +520,7 @@ mod tests {
     /// when it loads the same two files.
     #[test]
     fn configured_special_tokens_are_registered_like_transformers() {
-        let directory = tempdir().expect("create tokenizer directory");
-        let path = directory.path().join("tokenizer.json");
-        std::fs::write(&path, BYTE_LEVEL_TOKENIZER).expect("write tokenizer");
-        let config = directory.path().join("tokenizer_config.json");
-        std::fs::write(
-            &config,
+        let directory = byte_level_directory(
             r#"{
                 "added_tokens_decoder": {
                     "0": {"content": "<|endoftext|>", "lstrip": false, "normalized": false,
@@ -572,10 +531,9 @@ mod tests {
                 "add_bos_token": false,
                 "additional_special_tokens": ["<|endoftext|>", "<d>", "</d>", "<d>", "H"]
             }"#,
-        )
-        .expect("write tokenizer config");
+        );
         let configured =
-            HuggingFaceTokenizer::load(&path, Some(&config)).expect("load configured tokenizer");
+            HuggingFaceTokenizer::load(directory.path()).expect("load configured tokenizer");
 
         for (token, id) in [("<|pad|>", 11), ("<d>", 12), ("</d>", 13), ("H", 1)] {
             assert_eq!(configured.token_to_id(token), Some(id), "{token}");
@@ -587,5 +545,24 @@ mod tests {
                 .unwrap(),
             [1, 2, 3, 3, 4, 12, 5, 4, 6, 3, 7, 13, 9, 11]
         );
+    }
+
+    /// A `transformers` 5 configuration names model-specific special tokens in
+    /// a table of `extra_special_tokens`, which are registered in the file's
+    /// order after the named ones, and its own key stands for its list.
+    #[test]
+    fn named_extra_special_tokens_are_registered_in_order() {
+        let directory = byte_level_directory(
+            r#"{
+                "eos_token": "<|endoftext|>",
+                "extra_special_tokens": {"video_token": "<|video|>", "image_token": "<|image|>"},
+                "additional_special_tokens": ["<|unread|>"]
+            }"#,
+        );
+        let configured = HuggingFaceTokenizer::load(directory.path()).unwrap();
+
+        assert_eq!(configured.token_to_id("<|video|>"), Some(11));
+        assert_eq!(configured.token_to_id("<|image|>"), Some(12));
+        assert_eq!(configured.token_to_id("<|unread|>"), None);
     }
 }

@@ -522,6 +522,14 @@ pub struct H3Family;
 /// `_class_name`).
 pub const PIPELINE_CLASS: &str = "MiniMaxH3ModularPipeline";
 
+/// Where a FastH3 export of MiniMax-H3 pins the MiniMax-H3 release it continues: the inference
+/// description FastVideo publishes at the export's root, whose `base_model_revision` names the
+/// release (`hf://MiniMaxAI/MiniMax-H3@<commit>`) whose stage folders the export omits.
+const BASE_PIN: crate::BasePin = crate::BasePin {
+    file: "fastvideo_inference.json",
+    field: "base_model_revision",
+};
+
 /// The MiniMax-H3 family as request processing serves it: a diffusers modular pipeline, which every
 /// release and export publishes with its `modular_model_index.json`, served through its video
 /// processor ([`H3Family`]).
@@ -548,6 +556,10 @@ impl VideoFamily for H3Family {
     fn processing_parts(&self) -> &'static [&'static str] {
         // The conditioner's tokenizer and processor, and the video and audio schedules.
         &["tokenizer", "processor", "scheduler", "audio_scheduler"]
+    }
+
+    fn base_pin(&self) -> Option<crate::BasePin> {
+        Some(BASE_PIN)
     }
 
     fn bind(&self, binding: VideoBinding<'_>) -> Result<Box<dyn VideoProcessor>, String> {

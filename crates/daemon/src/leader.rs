@@ -864,12 +864,18 @@ impl Leader {
         config: &ServerArgs,
         stated: &Stated,
     ) -> anyhow::Result<Prepared> {
+        // The process's one view of the Hugging Face Hub, from the standard environment, through
+        // which every repository the deployment states is resolved.
+        let hub = crate::api::model::assets::Hub::from_env()?;
         let LoadedModel {
             config: model_config,
             tokenizer,
             renderer,
+            checkpoint,
         } = ModelConfig::load(
-            config.model(),
+            &hub,
+            &config.model_source()?,
+            config.adapter_source()?.as_ref(),
             config.max_model_len,
             &config.chat_config,
             &config.mm_processor_kwargs,
@@ -888,9 +894,13 @@ impl Leader {
         let mut engine = config.engine_config()?;
         let control_tokens = special_token_ids(&model_config);
         let model = &mut engine.model;
-        model.base = base_release(&model.model)?;
+        // The engines open the checkpoint where it was resolved: its directory, the release a
+        // layered checkpoint continues, and the adapter's directory.
+        model.model = utf8(checkpoint.directory)?;
+        model.base = checkpoint.base.map(utf8).transpose()?;
+        model.lora_path = checkpoint.adapter.map(utf8).transpose()?;
         model.max_model_len = max_model_len;
-        model.generation_limits = model_config.generation_limits(config.dtype);
+        model.generation_limits = model_config.generation_limits();
         model.bos = control_tokens.bos;
         model.eos = control_tokens.eos;
         // Video workers prepare exactly the configured sizes, refusing one
@@ -1599,35 +1609,33 @@ pub(crate) fn configurable(
         && within(updated.max_running_requests, capacity.max_running_requests)
 }
 
-/// Whether the daemon processes requests for the checkpoint `path` names as it does for the
-/// served checkpoint `served`, whose family of `families` both must declare: the files its family
-/// reads to process a request, each the same in both, byte for byte, and published by both or by
-/// neither.
+/// Whether the daemon processes requests for the checkpoint in the directory `path` as it does
+/// for the served checkpoint in the directory `served`, whose family of `families` both must
+/// declare: the files its family reads to process a request, each the same in both, byte for
+/// byte, and published by both or by neither.
 ///
 /// What a family reads is declared, not probed: a chat family's request processing reads the
-/// checkpoint's tokenizer, tokenizer settings, generation defaults and chat template (the
-/// resolved model files, [`ResolvedModelFiles`]); a video family's reads its pipeline index and
-/// every file of the pipeline parts it declares ([`processing::VideoFamily::processing_parts`]).
-/// The model facts (`config.json`) are compared by the engine configuration's own comparison
-/// (`proto::config::ModelConfig::processes_as`).
+/// checkpoint's tokenizer, tokenizer settings, generation defaults and chat template where the
+/// family keeps them ([`crate::api::model::assets::ChatFiles`]); a video family's reads its
+/// pipeline index and every file of the pipeline parts it declares
+/// ([`processing::VideoFamily::processing_parts`]). The model facts (`config.json`) are compared
+/// by the engine configuration's own comparison (`proto::config::ModelConfig::processes_as`).
 ///
 /// # Errors
 ///
 /// The reason the checkpoints differ, or the reason a checkpoint's files cannot be resolved or
 /// read.
-///
-/// [`ResolvedModelFiles`]: crate::api::model::assets::model_files::ResolvedModelFiles
 pub(crate) async fn same_processing(
     families: &processing::Registry,
     served: &str,
     path: &str,
 ) -> Result<(), String> {
-    let family = crate::api::input::declared_family(served, families)
-        .await
-        .map_err(|error| format!("resolving the family of {served}: {error}"))?;
-    let other = crate::api::input::declared_family(path, families)
-        .await
-        .map_err(|error| format!("resolving the family of {path}: {error}"))?;
+    let declared = |directory: &str| {
+        crate::api::model::assets::declared_family(std::path::Path::new(directory), families)
+            .map_err(|error| format!("resolving the family of {directory}: {error}"))
+    };
+    let family = declared(served)?;
+    let other = declared(path)?;
     if other != family {
         return Err(format!(
             "the checkpoint at {path} is a {} model, not a {} model as the served one: deploy it \
@@ -1642,46 +1650,51 @@ pub(crate) async fn same_processing(
             std::path::Path::new(served),
             std::path::Path::new(path),
         ),
-        processing::Serving::Chat(_) => same_model_files(served, path).await,
+        processing::Serving::Chat(profile) => same_model_files(profile.checkpoint, served, path),
     }
 }
 
-/// [`same_processing`] for a chat checkpoint: the resolved model files request processing reads.
-async fn same_model_files(served: &str, path: &str) -> Result<(), String> {
-    use crate::api::model::assets::model_files::ResolvedModelFiles;
+/// [`same_processing`] for a chat checkpoint: the files of it request processing reads, where
+/// its family (`checkpoint`) keeps them.
+fn same_model_files(
+    checkpoint: processing::ChatCheckpoint,
+    served: &str,
+    path: &str,
+) -> Result<(), String> {
+    use crate::api::model::assets::ChatFiles;
 
-    /// The files request processing reads, named for the refusal. Every field of the resolved
-    /// set is classified here, so a file the set gains is compared or named as a model fact.
-    fn processing_files(
-        files: ResolvedModelFiles,
-    ) -> [(&'static str, Option<std::path::PathBuf>); 4] {
-        let ResolvedModelFiles {
-            tokenizer_path,
-            tokenizer_config_path,
-            generation_config_path,
-            chat_template_path,
-            // The model facts, which the engine configuration compares.
-            config_path: _,
-        } = files;
-        [
-            ("tokenizer.json", Some(tokenizer_path)),
-            ("tokenizer_config.json", tokenizer_config_path),
-            ("generation_config.json", generation_config_path),
-            ("chat template", chat_template_path),
-        ]
-    }
-
-    let resolve = |model: &str| {
-        let model = model.to_owned();
-        async move {
-            ResolvedModelFiles::new(&model)
-                .await
-                .map_err(|error| format!("resolving the files of {model}: {error}"))
-        }
+    let locate = |directory: &str| {
+        ChatFiles::locate(std::path::Path::new(directory), checkpoint)
+            .map_err(|error| format!("resolving the files of {directory}: {error}"))
     };
-    let (old, new) = (resolve(served).await?, resolve(path).await?);
-    for ((name, old), (_, new)) in processing_files(old).into_iter().zip(processing_files(new)) {
-        if read_published(old.as_deref())? != read_published(new.as_deref())? {
+    let (old, new) = (locate(served)?, locate(path)?);
+    let template = |files: &ChatFiles| files.chat_template().map_err(|error| error.to_string());
+    if template(&old)? != template(&new)? {
+        return Err(format!(
+            "the checkpoint at {path} has another chat template than the served model, which \
+             changes how requests are processed: deploy it instead"
+        ));
+    }
+    let tokenizer = |files: &ChatFiles| files.tokenizer_directory().join("tokenizer.json");
+    let (old_tokenizer, new_tokenizer) = (tokenizer(&old), tokenizer(&new));
+    for (name, old, new) in [
+        (
+            "tokenizer.json",
+            Some(old_tokenizer.as_path()),
+            Some(new_tokenizer.as_path()),
+        ),
+        (
+            "tokenizer_config.json",
+            Some(old.tokenizer_config()),
+            Some(new.tokenizer_config()),
+        ),
+        (
+            "generation_config.json",
+            old.generation_config(),
+            new.generation_config(),
+        ),
+    ] {
+        if read_published(old)? != read_published(new)? {
             return Err(format!(
                 "the checkpoint at {path} has another {name} than the served model, which \
                  changes how requests are processed: deploy it instead"
@@ -3350,18 +3363,29 @@ impl Replica {
         // checkpoint, whose configuration and tokenizer stay; another
         // checkpoint of the model is checked to process requests alike.
         let streamed = matches!(source, WeightSource::Streamed(_));
+        let mut prepared_model = None;
         if streamed {
             config.load_config.weights = Some(model_path.to_owned());
         } else {
-            same_processing(&self.families, config.model(), model_path)
-                .await
-                .map_err(UpdateError::Refused)?;
-            config.model = Some(model_path.to_owned());
+            // The checkpoint is a local directory, as the engine reads it.
+            config.model = None;
+            config.model_dir = Some(model_path.into());
             config.load_config.weights = None;
             let prepared =
                 Leader::prepare(&self.families, &config, &Stated::from_paths(Vec::new()))
                     .await
                     .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+            let served_checkpoint = service::lock(&self.served)
+                .as_ref()
+                .map(|args| args.engine_config.model.model.clone())
+                .ok_or(UpdateError::NoEngine)?;
+            same_processing(
+                &self.families,
+                &served_checkpoint,
+                &prepared.engine.model.model,
+            )
+            .await
+            .map_err(UpdateError::Refused)?;
             let served = service::lock(&self.served)
                 .as_ref()
                 .map(|args| args.engine_config.model.clone());
@@ -3371,6 +3395,7 @@ impl Replica {
                      special tokens or context length) than the served model: deploy it instead"
                 )));
             }
+            prepared_model = Some(prepared.engine.model);
         }
 
         let paused = !hold.pause();
@@ -3383,10 +3408,10 @@ impl Replica {
             UpdateError::Failed(anyhow::anyhow!("the weights were not updated: {error}"))
         })?;
         if let Some(args) = service::lock(&self.served).as_mut() {
-            if !streamed {
-                args.engine_config.model.model = model_path.to_owned();
-                args.engine_config.model.base =
-                    base_release(model_path).map_err(UpdateError::Failed)?;
+            if let Some(prepared) = prepared_model {
+                let proto::config::ModelConfig { model, base, .. } = prepared;
+                args.engine_config.model.model = model;
+                args.engine_config.model.base = base;
             }
             args.engine_config
                 .load
@@ -3599,14 +3624,18 @@ struct SpecialTokenIds {
     eos: Vec<u32>,
 }
 
-/// The local snapshot of the base release the checkpoint at `model` continues, when it pins one
-/// (`crate::api::model::assets::pipeline::pinned_snapshot`): an engine opens the checkpoint and its
-/// base as one checkpoint, and reads where the weights already are.
-fn base_release(model: &str) -> anyhow::Result<Option<String>> {
-    let snapshot =
-        crate::api::model::assets::pipeline::pinned_snapshot(std::path::Path::new(model))
-            .with_context(|| format!("reading the base release {model} pins"))?;
-    Ok(snapshot.map(|path| path.to_string_lossy().into_owned()))
+/// A resolved checkpoint directory as the engine configuration states it.
+///
+/// # Errors
+///
+/// Fails for a directory whose path is not UTF-8.
+fn utf8(directory: std::path::PathBuf) -> anyhow::Result<String> {
+    directory.into_os_string().into_string().map_err(|path| {
+        anyhow::anyhow!(
+            "the checkpoint directory {} is not UTF-8, which the engines' configuration states              paths in",
+            std::path::Path::new(&path).display()
+        )
+    })
 }
 
 /// Resolves the control tokens the engine uses for the loaded model.
@@ -4305,6 +4334,10 @@ mod tests {
                 &["processor"]
             }
 
+            fn base_pin(&self) -> Option<processing::BasePin> {
+                None
+            }
+
             fn bind(
                 &self,
                 _: processing::VideoBinding<'_>,
@@ -4323,7 +4356,9 @@ mod tests {
         let checkpoint = |files: &[(&str, &str)]| {
             let directory = tempfile::tempdir().unwrap();
             std::fs::write(
-                directory.path().join(processing::RootFile::ModularIndex.name()),
+                directory
+                    .path()
+                    .join(processing::RootFile::ModularIndex.name()),
                 r#"{"_class_name": "PartsPipeline"}"#,
             )
             .unwrap();

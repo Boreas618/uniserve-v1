@@ -1,9 +1,9 @@
 //! Chat-template sources, the Jinja environment a template compiles in, and compiled-template
 //! rendering.
 //!
-//! A template's source is read exactly as written: [`read_jinja`] for a file of Jinja source,
-//! [`read_template_json`] for a checkpoint's `chat_template.json`, whose one schema is an object
-//! with a `chat_template` string. [`CompiledChatTemplate`] compiles the source once, in an
+//! A configured template file's source is read exactly as written ([`read_jinja`]); a
+//! checkpoint's own template is read where its family keeps it (`ChatFiles::chat_template`).
+//! [`CompiledChatTemplate`] compiles the source once, in an
 //! environment configured as Hugging Face templates expect, together with the content format it
 //! renders message content in (stated, or detected from the parsed template in `format`), and
 //! [`TemplateContext`] is the set of global variables a render sees.
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use minijinja::Environment;
 use minijinja::machinery::{Token, WhitespaceConfig, tokenize};
 use minijinja::syntax::SyntaxConfig;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use thiserror::Error as ThisError;
 
 use super::format::{ChatTemplateContentFormat, detect_chat_template_content_format};
@@ -36,15 +36,6 @@ pub enum TemplateError {
         /// The read's failure.
         #[source]
         source: std::io::Error,
-    },
-    /// A `chat_template.json` is not an object with a string `chat_template`.
-    #[error("{} is not an object with a string `chat_template`", path.display())]
-    TemplateJson {
-        /// The file.
-        path: PathBuf,
-        /// The parse's failure.
-        #[source]
-        source: serde_json::Error,
     },
     /// The template's source is empty, so it renders every request to an empty prompt.
     #[error("the chat template is empty")]
@@ -73,28 +64,6 @@ pub(super) fn read_jinja(path: &Path) -> Result<String> {
         path: path.to_owned(),
         source,
     })
-}
-
-/// The template a checkpoint's `chat_template.json` holds: the string of its `chat_template`
-/// field, as the processor configuration of a multimodal checkpoint states it.
-///
-/// # Errors
-///
-/// [`TemplateError::Read`] when the file cannot be read, and [`TemplateError::TemplateJson`] when
-/// it is not an object with a string `chat_template`.
-pub(super) fn read_template_json(path: &Path) -> Result<String> {
-    #[derive(Deserialize)]
-    struct TemplateFile {
-        chat_template: String,
-    }
-
-    let text = read_jinja(path)?;
-    serde_json::from_str::<TemplateFile>(&text)
-        .map(|file| file.chat_template)
-        .map_err(|source| TemplateError::TemplateJson {
-            path: path.to_owned(),
-            source,
-        })
 }
 
 /// `source` with Hugging Face's `{% generation %}` and `{% endgeneration %}` tags as the
@@ -338,21 +307,5 @@ mod tests {
         fs::write(&path, "  {{ messages }}\\n\n").unwrap();
 
         assert_eq!(read_jinja(&path).unwrap(), "  {{ messages }}\\n\n");
-    }
-
-    /// A `chat_template.json` holds its template in a `chat_template` field; any other shape is
-    /// refused.
-    #[test]
-    fn a_template_json_holds_its_template_in_one_field() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("chat_template.json");
-        fs::write(&path, r#"{"chat_template":"{{ messages }}"}"#).unwrap();
-        assert_eq!(read_template_json(&path).unwrap(), "{{ messages }}");
-
-        fs::write(&path, "\"{{ messages }}\"").unwrap();
-        assert!(matches!(
-            read_template_json(&path),
-            Err(TemplateError::TemplateJson { .. })
-        ));
     }
 }

@@ -1,44 +1,43 @@
-//! Loopback stand-in for the Hugging Face Hub endpoints the asset resolvers use.
+//! Loopback stand-in for the Hugging Face Hub endpoints a [`Hub`] reaches.
 //!
-//! The stub serves a repository listing (`/api/models/{repo}/revision/main`)
-//! and whole or byte-range file downloads (`/{repo}/resolve/{revision}/{file}`)
-//! of one commit's files, answering an unpublished file with 404 as the Hub
-//! does, or answers either kind of request with a fixed failure status. Tests
-//! drive the real Hub client against it, so only the network boundary is
-//! replaced.
+//! The stub serves a revision's listing (`/api/models/{repo}/revision/{revision}`) and whole or
+//! byte-range file downloads (`/{repo}/resolve/{revision}/{file}`) of one commit's files,
+//! answering an unpublished file with 404 as the Hub does, or answers either kind of request with
+//! a fixed failure status. Tests drive the real Hub client against it, so only the network
+//! boundary is replaced; the cache layout the tests seed is computed through `hf_hub`'s own cache
+//! API.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use axum::Router;
 use axum::http::{HeaderMap, HeaderName, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use hf_hub::Cache;
-use hf_hub::api::tokio::ApiBuilder;
+use hf_hub::{Cache, Repo, RepoType};
 
-use crate::api::model::assets::model_files::{HubClient, ModelSource};
+use crate::api::model::assets::hub::{Hub, HubSettings};
 
-/// Commit the stub reports for every file unless told otherwise, and the
-/// snapshot [`seed_cache`] writes, so downloads land beside seeded files.
-const COMMIT: &str = "5f3b0c1e";
+/// The commit the stub reports for every revision unless told otherwise.
+pub(super) const COMMIT: &str = "5f3b0c1e9d2a4b6c8e0f1a3b5c7d9e1f2a4b6c8d";
 
 /// Repository contents and failure modes served by the stub.
 #[derive(Clone, Default)]
 pub(super) struct HubStub {
     /// Published file contents by repository-relative path.
     pub(super) files: BTreeMap<String, Vec<u8>>,
-    /// Status answered for the repository listing in place of the listing.
+    /// The files the listing names in place of `files`' paths, for a test whose cache holds a
+    /// listed file the stub does not serve.
+    pub(super) listed: Option<Vec<String>>,
+    /// Status answered for the listing in place of the listing.
     pub(super) listing_status: Option<StatusCode>,
     /// Status answered for every file download in place of its content.
     pub(super) download_status: Option<StatusCode>,
-    /// Commit reported for every file in place of [`COMMIT`], whatever
-    /// revision the request names.
+    /// Commit reported for every revision in place of [`COMMIT`].
     pub(super) commit: Option<&'static str>,
 }
 
 impl HubStub {
-    /// Publishes `files` as `(path, content)` pairs; contents must be
-    /// non-empty.
+    /// Publishes `files` as `(path, content)` pairs; contents must be non-empty.
     pub(super) fn with_files<C: AsRef<[u8]>>(files: &[(&str, C)]) -> Self {
         Self {
             files: files
@@ -49,21 +48,17 @@ impl HubStub {
         }
     }
 
-    /// Serves the stub on a loopback port for the rest of the test.
-    ///
-    /// Returns a Hub source for `repo_id` whose client talks to the stub and
-    /// whose cache lives under `cache_root`, the directory [`seed_cache`]
-    /// writes.
-    pub(super) async fn serve(self, cache_root: &Path, repo_id: &str) -> ModelSource {
-        ModelSource::Hub {
-            api: self.client(cache_root).await.api,
-            repo_id: repo_id.to_owned(),
+    /// Lists `names` as the revision's files in place of the published files' paths.
+    pub(super) fn listing(self, names: &[&str]) -> Self {
+        Self {
+            listed: Some(names.iter().map(|&name| name.to_owned()).collect()),
+            ..self
         }
     }
 
-    /// Serves the stub on a loopback port for the rest of the test and
-    /// returns a client that talks to it, with its cache under `cache_root`.
-    pub(super) async fn client(self, cache_root: &Path) -> HubClient {
+    /// Serves the stub on a loopback port for the rest of the test and returns a Hub that reaches
+    /// it, with its cache under `cache_root` (the directory [`seed_snapshot`] writes).
+    pub(super) async fn serve(self, cache_root: &Path) -> Hub {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let router = Router::new().fallback(move |uri: Uri, headers: HeaderMap| {
@@ -72,15 +67,15 @@ impl HubStub {
         });
         tokio::spawn(async move { axum::serve(listener, router).await });
 
-        // A cache under the test directory also keeps the client from reading
-        // a token file outside it.
-        let cache = Cache::new(cache_root.join("hub"));
-        let api = ApiBuilder::from_cache(cache.clone())
-            .with_endpoint(endpoint)
-            .with_progress(false)
-            .build()
-            .unwrap();
-        HubClient { api, cache }
+        // A cache under the test directory also keeps the client from reading a token file
+        // outside it.
+        Hub::new(HubSettings {
+            cache: cache_root.join("hub"),
+            endpoint: Some(endpoint),
+            token: None,
+            offline: false,
+        })
+        .unwrap()
     }
 
     /// The commit the stub reports.
@@ -95,9 +90,12 @@ impl HubStub {
             if let Some(status) = self.listing_status {
                 return status.into_response();
             }
-            let siblings = self
-                .files
-                .keys()
+            let names = match &self.listed {
+                Some(names) => names.clone(),
+                None => self.files.keys().cloned().collect(),
+            };
+            let siblings = names
+                .iter()
                 .map(|name| serde_json::json!({ "rfilename": name }))
                 .collect::<Vec<_>>();
             return axum::Json(serde_json::json!({ "siblings": siblings, "sha": self.commit() }))
@@ -117,10 +115,9 @@ impl HubStub {
             return StatusCode::NOT_FOUND.into_response();
         };
 
-        // A `bytes=start-end` range is answered as partial content with the
-        // end clamped to the file, as HTTP servers do; the Hub client probes
-        // metadata with `bytes=0-0` and requests past the end when it
-        // downloads. A request without a range receives the whole file.
+        // A `bytes=start-end` range is answered as partial content with the end clamped to the
+        // file, as HTTP servers do; the Hub client probes metadata with `bytes=0-0` and requests
+        // past the end when it downloads. A request without a range receives the whole file.
         let last = content.len() - 1;
         let (status, first, end) = match headers
             .get(header::RANGE)
@@ -134,8 +131,8 @@ impl HubStub {
             None => (StatusCode::OK, 0, last),
         };
 
-        // The client sizes the download from Content-Range, names the cached
-        // blob after the ETag and files it under the reported commit.
+        // The client sizes the download from Content-Range, names the cached blob after the ETag
+        // and files it under the reported commit.
         (
             status,
             [
@@ -155,32 +152,26 @@ impl HubStub {
     }
 }
 
-/// Writes `files` into the Hub cache under `cache_root` as the snapshot of
-/// `repo_id` that `refs/main` names, the layout an earlier download leaves.
-pub(super) fn seed_cache(cache_root: &Path, repo_id: &str, files: &[(&str, &str)]) {
-    let repository = seed_snapshot(cache_root, repo_id, COMMIT, files);
-    std::fs::create_dir_all(repository.join("refs")).unwrap();
-    std::fs::write(repository.join("refs").join("main"), COMMIT).unwrap();
-}
-
-/// Writes `files` into the Hub cache under `cache_root` as the snapshot of
-/// `repo_id` at `commit`, with no ref naming it, the layout
-/// `huggingface_hub` leaves when it downloads at a commit revision. Returns
-/// the repository's cache directory.
+/// Writes `files` into the Hub cache under `cache_root` as the snapshot of `repo_id` at
+/// `commit`, with no ref naming it, the layout `huggingface_hub` leaves when it downloads at a
+/// commit. Returns the snapshot's directory.
 pub(super) fn seed_snapshot(
     cache_root: &Path,
     repo_id: &str,
     commit: &str,
     files: &[(&str, &str)],
-) -> std::path::PathBuf {
-    let repository = cache_root
-        .join("hub")
-        .join(format!("models--{}", repo_id.replace('/', "--")));
-    let snapshot = repository.join("snapshots").join(commit);
+) -> PathBuf {
+    let snapshot = Cache::new(cache_root.join("hub"))
+        .repo(Repo::with_revision(
+            repo_id.to_owned(),
+            RepoType::Model,
+            commit.to_owned(),
+        ))
+        .pointer_path(commit);
     for (name, content) in files {
         let path = snapshot.join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
     }
-    repository
+    snapshot
 }

@@ -1097,8 +1097,8 @@ mod tests {
             ("mem_fraction_static", |config: &mut ServerArgs| {
                 config.mem_fraction_static = 0.5
             }),
-            ("lora_path", |config: &mut ServerArgs| {
-                config.lora_path = Some("/adapters/fasth3".into())
+            ("lora", |config: &mut ServerArgs| {
+                config.lora = Some("org/adapter".to_owned())
             }),
             (
                 "speculative_config.num_draft_tokens",

@@ -507,10 +507,16 @@ impl Leader {
         // Other model files serve the deployment's requests only when they
         // are processed as the serving ones are.
         if current.model() != target.model() {
-            crate::leader::same_processing(&self.families, current.model(), target.model())
+            let served = service::lock(&replicas[0].served).clone();
+            if let Some(served) = &served {
+                crate::leader::same_processing(
+                    &self.families,
+                    &served.engine_config.model.model,
+                    &engine.model.model,
+                )
                 .await
                 .map_err(UpdateError::Refused)?;
-            let served = service::lock(&replicas[0].served).clone();
+            }
             if served.is_some_and(|served| !served.engine_config.model.processes_as(&engine.model))
             {
                 return Err(UpdateError::Refused(format!(

@@ -23,38 +23,55 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
-    #[error("model `{model}` is missing required asset `{file}`")]
-    /// A required model file is absent from a local model directory or from a
-    /// remote repository's file listing.
+    #[error("the checkpoint `{model}` has no `{file}`")]
+    /// A file the checkpoint's family declares, or its format requires, is absent from the
+    /// checkpoint's directory.
     MissingFile {
-        /// Model identifier or local directory.
+        /// The checkpoint's directory.
         model: String,
-        /// Required checkpoint-relative file path.
+        /// The checkpoint-relative file path.
         file: String,
     },
+    #[error("`{model}` is not a checkpoint directory")]
+    /// A checkpoint stated as a local directory is not one.
+    NotDirectory {
+        /// The stated directory.
+        model: String,
+    },
+    #[error(transparent)]
+    /// The checkpoint declares no family the executable serves.
+    Family(#[from] processing::ResolveError),
     #[error("unsupported diffusers pipeline {class_name}")]
-    /// A pipeline index declares a pipeline class UniServe does not serve, or
-    /// a family that has no pipeline form is resolved as a pipeline.
+    /// A family that has no pipeline form is resolved as a pipeline.
     UnsupportedPipeline {
-        /// Pipeline class declared by the checkpoint's root index, or the
-        /// family id when `ModelConfig::from_pipeline` rejects the family.
+        /// The family id `ModelConfig::from_pipeline` rejects.
         class_name: String,
     },
     #[error(
         "a media deployment states its `max_model_len`, the longest prompt it admits: the \
          pipeline keeps no key/value cache, so no checkpoint figure implies one"
     )]
-    /// A media pipeline is served without the prompt length its deployment
-    /// must state.
+    /// A media pipeline is served without the prompt length its deployment must state.
     MissingPromptLength,
-    #[error("failed to resolve remote model `{model}`: {message}")]
-    /// Building the Hub client, fetching repository metadata, or downloading a
-    /// file failed.
+    #[error("failed to resolve `{model}` on the Hugging Face Hub: {message}")]
+    /// Listing a revision or downloading a file failed.
     Remote {
-        /// Remote model identifier.
+        /// The repository and revision.
         model: String,
         /// Human-readable remote resolution failure.
         message: String,
+    },
+    #[error(
+        "the Hugging Face cache holds no snapshot of `{asset}` ({}), and HF_HUB_OFFLINE forbids \
+         downloading it: populate the cache first",
+        path.display()
+    )]
+    /// An offline host's cache holds no snapshot of a revision.
+    NotCached {
+        /// The repository and revision.
+        asset: String,
+        /// The reference or snapshot the cache lacks.
+        path: std::path::PathBuf,
     },
     #[error("invalid model asset: {0}")]
     /// Model asset content violates a profile invariant.

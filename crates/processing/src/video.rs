@@ -231,6 +231,21 @@ pub struct VideoBinding<'a> {
     pub files: &'a [String],
 }
 
+/// Where a pipeline checkpoint pins the release it continues: a JSON file at the checkpoint's root
+/// and the field of it that names the release as `hf://<repository>@<revision>`.
+///
+/// A checkpoint that pins a release holds the stage folders it replaces and omits the others,
+/// which the pinned release's snapshot supplies: request processing reads each stage from the
+/// checkpoint when the checkpoint holds the stage's folder and from the release otherwise, and
+/// an engine opens the checkpoint and the release as one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BasePin {
+    /// The file at the checkpoint's root.
+    pub file: &'static str,
+    /// The field of `file` that names the release.
+    pub field: &'static str,
+}
+
 /// A video family, as request processing serves it.
 pub trait VideoFamily: Send + Sync {
     /// The checkpoint files the processor reads, as `(stage, file)` of the pipeline: the stage's
@@ -250,6 +265,11 @@ pub trait VideoFamily: Send + Sync {
     /// schedules. A checkpoint whose files in any of them differ from the served one's is
     /// another deployment, not new weights of the served model.
     fn processing_parts(&self) -> &'static [&'static str];
+
+    /// Where the family's checkpoints pin the release whose stage folders they continue, for a
+    /// family whose checkpoints may hold only some of a pipeline's stages; `None` for a family
+    /// whose checkpoints hold every stage they declare.
+    fn base_pin(&self) -> Option<BasePin>;
 
     /// Binds the deployment's processor.
     ///

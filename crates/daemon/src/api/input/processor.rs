@@ -18,10 +18,11 @@
 use std::sync::Arc;
 
 use crate::api::model::ModelConfig;
-use crate::api::model::assets::model_files::ModelSource;
-use crate::api::model::assets::{PipelineCheckpoint, ResolvedModelFiles};
+use crate::api::model::assets::{
+    self, ChatFiles, Checkpoint, Hub, PipelineCheckpoint, Source, required_file,
+};
 use crate::api::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
-use processing::{Family, ImageFamily, ImageProcessor, Registry, Serving, VideoFamily};
+use processing::{ImageFamily, ImageProcessor, Registry, Serving, VideoFamily};
 use proto::handoff;
 use proto::request::{
     CachePolicy, GenerationFeatures, GenerationLimits, GenerationRequest, RequestId,
@@ -76,12 +77,10 @@ pub enum ModelResolutionError {
         #[source]
         source: std::io::Error,
     },
-    /// Model files or profile metadata cannot be resolved.
+    /// Model files or profile metadata cannot be resolved, or the checkpoint declares no family
+    /// the executable serves.
     #[error(transparent)]
     Assets(#[from] crate::api::model::assets::Error),
-    /// The checkpoint declares no family the executable serves.
-    #[error(transparent)]
-    Family(#[from] processing::ResolveError),
     /// A family that serves video is declared by a checkpoint with no pipeline index.
     #[error("the {family} family serves video, and this checkpoint publishes no pipeline index")]
     NoPipeline {
@@ -115,6 +114,8 @@ pub struct LoadedModel {
     pub tokenizer: DynTokenizer,
     /// What renders the checkpoint's requests once its engine has started.
     pub renderer: LoadedRenderer,
+    /// The checkpoint in the local directories its engines open.
+    pub checkpoint: Checkpoint,
 }
 
 /// What renders a loaded checkpoint's requests, fixed by its layout.
@@ -145,106 +146,109 @@ pub enum RequestRenderer {
     Video(VideoService),
 }
 
-/// Loads a diffusers pipeline's `tokenizer` stage as the pipeline's own
-/// `transformers` tokenizer loads it: `tokenizer.json` with the special
-/// tokens its `tokenizer_config.json`, when published, declares.
+/// Loads a diffusers pipeline's `tokenizer` stage as the pipeline's own `transformers` tokenizer
+/// loads it: the stage's tokenizer directory, with the tokens its configuration declares.
 ///
-/// The conditioner reads token ids, so a declared token missing here would
-/// split into text tokens the reference never presents (MiniMax-H3 declares
-/// its `<d>` dialogue marker only in the configuration).
-pub async fn pipeline_tokenizer(
+/// The conditioner reads token ids, so a declared token missing here would split into text
+/// tokens the reference never presents.
+pub fn pipeline_tokenizer(
     pipeline: &PipelineCheckpoint,
 ) -> std::result::Result<HuggingFaceTokenizer, ModelResolutionError> {
-    let path = pipeline.stage_file("tokenizer", "tokenizer.json").await?;
-    let config = match pipeline
-        .stage_file("tokenizer", "tokenizer_config.json")
-        .await
-    {
-        Ok(config) => Some(config),
-        Err(crate::api::model::assets::Error::MissingFile { .. }) => None,
-        Err(error) => return Err(error.into()),
-    };
-    let tokenizer = HuggingFaceTokenizer::load(&path, config.as_deref())?;
-    Ok(tokenizer)
+    let directory = pipeline.stage_directory("tokenizer")?;
+    Ok(HuggingFaceTokenizer::load(&directory)?)
 }
 
 impl ModelConfig {
-    /// Loads the checkpoint `model` names: its facts and the tokenizer and
-    /// template resources request processing needs, with the family of
-    /// `registry` that claims it.
+    /// Loads the checkpoint `model` states, with the adapter `adapter` states: its facts, the
+    /// tokenizer and template resources request processing needs, and the local directories its
+    /// engines open, with the family of `registry` that claims it.
     ///
-    /// A diffusers pipeline has no chat template and carries its conditioner's
-    /// vision processor configuration instead. The returned `max_model_len` is the
-    /// configured `max_model_len`, else, for a root configuration, its
-    /// `max_position_embeddings` or `ModelConfig::DEFAULT_MAX_MODEL_LEN`; a
-    /// pipeline's deployment must state it. `chat` configures a chat
-    /// checkpoint's template, and `processor_options` (`mm_processor_kwargs`)
-    /// are a chat family's image processor's, which binds with them; a video
-    /// family's processor binds with them once its workers described the
-    /// placed denoiser.
+    /// The checkpoint's root files declare its family, which decides what else is read: a chat
+    /// checkpoint's every file (its engines read it whole) and the files its family declares; a
+    /// diffusers pipeline's stage folders, over the release a layered checkpoint pins, and the
+    /// files its video family's processor reads. A Hugging Face repository is fetched through
+    /// `hub` into its cache's snapshot as each is read. The returned `max_model_len` is the
+    /// configured `max_model_len`, else, for a chat checkpoint, the bound it states where its
+    /// family declares it; a pipeline's deployment must state it. `chat` configures a chat
+    /// checkpoint's template, and `processor_options` (`mm_processor_kwargs`) are a chat
+    /// family's image processor's, which binds with them; a video family's processor binds with
+    /// them once its workers described the placed denoiser.
     ///
     /// # Errors
     ///
-    /// Fails when the checkpoint's files cannot be resolved or read, no
-    /// family of `registry` serves it, or a chat family that binds no image
-    /// processor is given processor options.
+    /// Fails when the checkpoint's files cannot be resolved or read, no family of `registry`
+    /// serves it, or a chat family that binds no image processor is given processor options.
     pub async fn load(
-        model: &str,
+        hub: &Hub,
+        model: &Source,
+        adapter: Option<&Source>,
         max_model_len: Option<std::num::NonZeroU32>,
         chat: &proto::config::ChatConfig,
         processor_options: &serde_json::Map<String, serde_json::Value>,
         registry: &Registry,
     ) -> std::result::Result<LoadedModel, ModelResolutionError> {
         let max_model_len = max_model_len.map(std::num::NonZeroU32::get);
-        let family = declared_family(model, registry).await?;
+        let snapshot = model.locate(hub).await?;
+        snapshot.fetch(assets::root_file).await?;
+        let directory = snapshot.directory();
+        let family = assets::declared_family(directory, registry)?;
+        let adapter = match adapter {
+            Some(adapter) => Some(adapter.directory(hub).await?),
+            None => None,
+        };
 
-        // A diffusers pipeline names its stage folders in its root index, which
-        // locates the tokenizer stage before any other asset is resolved. A
-        // stage export reads the stages its pinned base supplies from the Hub
-        // cache at the pinned revision, as its workers do.
-        if let Serving::Video(video) = family.serving {
-            let pipeline = PipelineCheckpoint::resolve(model)
-                .await?
-                .ok_or(ModelResolutionError::NoPipeline { family: family.id })?;
-            let tokenizer: DynTokenizer = Arc::new(pipeline_tokenizer(&pipeline).await?);
-            let mut files = Vec::with_capacity(video.processor_files().len());
-            for (stage, name) in video.processor_files() {
-                let path = pipeline.stage_file(stage, name).await?;
-                let text = std::fs::read_to_string(&path).map_err(|source| {
-                    ModelResolutionError::ProcessorFile {
-                        path: path.clone(),
-                        source,
-                    }
-                })?;
-                files.push(text);
+        let profile = match family.serving {
+            Serving::Chat(profile) => profile,
+            // A diffusers pipeline names its stage folders in its root index, which locates the
+            // tokenizer stage before any other asset is read.
+            Serving::Video(video) => {
+                let pipeline = PipelineCheckpoint::open(&snapshot, family.root, video, hub)
+                    .await?
+                    .ok_or(ModelResolutionError::NoPipeline { family: family.id })?;
+                let tokenizer: DynTokenizer = Arc::new(pipeline_tokenizer(&pipeline)?);
+                let mut files = Vec::with_capacity(video.processor_files().len());
+                for (stage, name) in video.processor_files() {
+                    let path = pipeline.stage_file(stage, name)?;
+                    let text = std::fs::read_to_string(&path).map_err(|source| {
+                        ModelResolutionError::ProcessorFile {
+                            path: path.clone(),
+                            source,
+                        }
+                    })?;
+                    files.push(text);
+                }
+                return Ok(LoadedModel {
+                    config: Self::from_pipeline(family, max_model_len)?,
+                    tokenizer,
+                    renderer: LoadedRenderer::Video {
+                        family: video,
+                        files,
+                    },
+                    checkpoint: Checkpoint {
+                        directory: directory.to_path_buf(),
+                        base: pipeline.base().map(std::path::Path::to_path_buf),
+                        adapter,
+                    },
+                });
             }
-            return Ok(LoadedModel {
-                config: Self::from_pipeline(family, max_model_len)?,
-                tokenizer,
-                renderer: LoadedRenderer::Video {
-                    family: video,
-                    files,
-                },
-            });
-        }
+        };
 
-        let files = ResolvedModelFiles::new(model).await?;
-        let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::load(
-            &files.tokenizer_path,
-            files.tokenizer_config_path.as_deref(),
-        )?);
+        snapshot.fetch(|_| true).await?;
+        let files = ChatFiles::locate(directory, profile.checkpoint)?;
+        let tokenizer: DynTokenizer =
+            Arc::new(HuggingFaceTokenizer::load(files.tokenizer_directory())?);
         let config = Self::from_files(family, &files, max_model_len, tokenizer.as_ref())?;
         // A family that takes images binds its processor to the checkpoint's processor files; a
         // template that reads content parts writes its own image markup, and one that reads
         // flattened content is given the family's.
-        let images = match config.chat().and_then(|profile| profile.images) {
-            Some(family) => Some(bind_images(model, family, processor_options).await?),
+        let images = match profile.images {
+            Some(images) => Some(bind_images(directory, images, processor_options)?),
             None if processor_options.is_empty() => None,
             None => {
                 return Err(ModelResolutionError::ImageProcessor(format!(
                     "the {} family binds no image processor, which `mm_processor_kwargs` \
                      configures",
-                    family.id
+                    config.family.id
                 )));
             }
         };
@@ -259,53 +263,25 @@ impl ModelConfig {
                 renderer: Box::new(renderer),
                 images,
             },
+            checkpoint: Checkpoint {
+                directory: directory.to_path_buf(),
+                base: None,
+                adapter,
+            },
         })
     }
 }
 
-/// The family of `registry` the checkpoint `model` names declares in the root files the
-/// registry's families declare in.
-pub(crate) async fn declared_family(
-    model: &str,
-    registry: &Registry,
-) -> std::result::Result<Family, ModelResolutionError> {
-    let source = ModelSource::from_model_id(model)?;
-    let mut files = Vec::new();
-    for file in registry.root_files() {
-        if let Some(text) = root_file(&source, file.name()).await? {
-            files.push((file, text));
-        }
-    }
-    Ok(registry.resolve(files.iter().map(|(file, text)| (*file, text.as_str())))?)
-}
-
-/// The text of the checkpoint's root file `name`; `None` when the checkpoint
-/// publishes none.
-async fn root_file(
-    source: &ModelSource,
-    name: &str,
-) -> std::result::Result<Option<String>, crate::api::model::assets::Error> {
-    use crate::api::model::assets::Error;
-
-    match source.file(name).await {
-        Ok(path) => std::fs::read_to_string(&path)
-            .map(Some)
-            .map_err(|source| Error::Io { path, source }),
-        Err(Error::MissingFile { .. }) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-/// Binds a chat family's image processor to the processor files of the checkpoint `model` names.
-async fn bind_images(
-    model: &str,
+/// Binds a chat family's image processor to the processor files of the checkpoint in
+/// `directory`.
+fn bind_images(
+    directory: &std::path::Path,
     family: &'static dyn ImageFamily,
     options: &serde_json::Map<String, serde_json::Value>,
 ) -> std::result::Result<Arc<dyn ImageProcessor>, ModelResolutionError> {
-    let source = crate::api::model::assets::model_files::ModelSource::from_model_id(model)?;
     let mut files = Vec::with_capacity(family.processor_files().len());
     for name in family.processor_files() {
-        let path = source.file(name).await?;
+        let path = required_file(directory, name)?;
         let text = std::fs::read_to_string(&path)
             .map_err(|source| ModelResolutionError::ProcessorFile { path, source })?;
         files.push(text);
@@ -931,6 +907,7 @@ mod tests {
             directory.path().join("tokenizer_config.json"),
             r#"{
                 "eos_token": "<|im_end|>",
+                "chat_template": "{{ messages }}",
                 "added_tokens_decoder": {
                     "7": {"content": "<d>", "lstrip": false, "normalized": false,
                           "rstrip": false, "single_word": false, "special": true}
@@ -940,8 +917,18 @@ mod tests {
         .unwrap();
 
         let registry = processing::Registry::new([crate::api::test_support::CHAT]).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let hub = Hub::new(assets::HubSettings {
+            cache: cache.path().to_path_buf(),
+            endpoint: None,
+            token: None,
+            offline: true,
+        })
+        .unwrap();
         let loaded = ModelConfig::load(
-            directory.path().to_str().unwrap(),
+            &hub,
+            &Source::Directory(directory.path().to_path_buf()),
+            None,
             None,
             &proto::config::ChatConfig::default(),
             &serde_json::Map::new(),

@@ -47,15 +47,15 @@ An OmniRef export holds only its DiT partition and schedulers. Its `fastvideo_in
 
 ### FastH3 adapters
 
-The [FastH3 Preview v1 adapters](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA) (`dense-datafree`, `vsa-datafree`) are FastVideo's four-step DMD students of the base release's `transformer`, stored as edits of the base checkpoint in FastVideo's `fastvideo-lora-v2` container: rank-64 `lora_A`/`lora_B` factors of the attention, feed-forward and modulation projections, full-rank `.diff`/`.diff_b` deltas of the patch, condition and time embeddings, the norms, the biases and the final layer, and, in the VSA variant, the layers' sparse-attention compression gates as `.set_weight` tensors the base does not hold. Serve one over the base release with `--lora-path`, naming the adapter file or the directory that holds `adapter_model.safetensors`:
+The [FastH3 Preview v1 adapters](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA) (`dense-datafree`, `vsa-datafree`) are FastVideo's four-step DMD students of the base release's `transformer`, stored as edits of the base checkpoint in FastVideo's `fastvideo-lora-v2` container: rank-64 `lora_A`/`lora_B` factors of the attention, feed-forward and modulation projections, full-rank `.diff`/`.diff_b` deltas of the patch, condition and time embeddings, the norms, the biases and the final layer, and, in the VSA variant, the layers' sparse-attention compression gates as `.set_weight` tensors the base does not hold. Serve one over the base release with `--lora`, naming the adapter's folder of the repository (`FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA/vsa-datafree`), or with `--lora-dir`, naming the local directory that holds `adapter_model.safetensors`:
 
 ```bash
-uniserve serve "$H3_ROOT" --lora-path /workspace/models/FastH3-LoRA/vsa-datafree \
+uniserve serve --model-dir "$H3_ROOT" --lora-dir /workspace/models/FastH3-LoRA/vsa-datafree \
   --config configs/minimax_h3/ulysses4.toml --served-model-name FastH3 \
   --host 0.0.0.0 --max-running-requests 2
 ```
 
-The adapter is fused into the weights once, as each rank loads them: every element of an edited parameter is `(lora_B @ lora_A + diff) + base`, evaluated in FP32 and rounded once to the base tensor's element type, the format's own reconstruction with no `alpha` (a scale of one), and a parameter the adapter does not edit is read unchanged. The deployment then serves that student for every request, as its full export would: `t2va` and `fl2va` from the `transformer` partition on the release's ladder of four DMD rungs (`[999, 749, 500, 250]`) at the base schedulers' shifts, with VSA sparse attention at 64-row tiles and 0.9 sparsity when the adapter carries the compression gates and dense attention when it does not. A request cannot select or drop the adapter; another adapter is another deployment, and changing `lora_path` with `PUT /admin/config` starts a new epoch. An adapter is refused at startup when its metadata does not name a FastH3 student of FastVideo over `MiniMaxAI/MiniMax-H3`, when it carries other tensor counts or another rank than its metadata states, when it edits a tensor the checkpoint does not hold or assigns one it does, or when the checkpoint is a FastH3 export rather than the base release.
+The adapter is fused into the weights once, as each rank loads them: every element of an edited parameter is `(lora_B @ lora_A + diff) + base`, evaluated in FP32 and rounded once to the base tensor's element type, the format's own reconstruction with no `alpha` (a scale of one), and a parameter the adapter does not edit is read unchanged. The deployment then serves that student for every request, as its full export would: `t2va` and `fl2va` from the `transformer` partition on the release's ladder of four DMD rungs (`[999, 749, 500, 250]`) at the base schedulers' shifts, with VSA sparse attention at 64-row tiles and 0.9 sparsity when the adapter carries the compression gates and dense attention when it does not. A request cannot select or drop the adapter; another adapter is another deployment, and changing `lora` or `lora_dir` with `PUT /admin/config` starts a new epoch. An adapter is refused at startup when its metadata does not name a FastH3 student of FastVideo over `MiniMaxAI/MiniMax-H3`, when it carries other tensor counts or another rank than its metadata states, when it edits a tensor the checkpoint does not hold or assigns one it does, or when the checkpoint is a FastH3 export rather than the base release.
 
 ```bash
 export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
@@ -75,7 +75,7 @@ hf download MiniMaxAI/MiniMax-H3 --revision <base_model_revision> \
 FastH3 text-to-video and keyframe requests:
 
 ```bash
-uniserve serve "$H3_MODEL" \
+uniserve serve --model-dir "$H3_MODEL" \
   --config configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
@@ -86,7 +86,7 @@ uniserve serve "$H3_MODEL" \
 Base text-to-video and keyframe requests:
 
 ```bash
-uniserve serve "$H3_ROOT" \
+uniserve serve --model-dir "$H3_ROOT" \
   --config configs/minimax_h3/ulysses4.toml --served-model-name MiniMax-H3 \
   --host 0.0.0.0 --set video_config.max_seconds=8 --max-model-len 2048 \
   --set 'video_config.text_capacities=[2048]'
@@ -95,7 +95,7 @@ uniserve serve "$H3_ROOT" \
 Reference requests, with the base reference denoiser or an OmniRef export:
 
 ```bash
-uniserve serve "$H3_ROOT" \
+uniserve serve --model-dir "$H3_ROOT" \
   --config configs/minimax_h3/ulysses4-reference.toml \
   --served-model-name MiniMax-H3 --host 0.0.0.0 \
   --set video_config.max_seconds=5 --max-model-len 8192 \
@@ -103,7 +103,7 @@ uniserve serve "$H3_ROOT" \
   --set video_config.max_condition_rows=40960 \
   --set 'media_config.directory="/srv/media"'
 
-uniserve serve "$OMNIREF_EXPORT" \
+uniserve serve --model-dir "$OMNIREF_EXPORT" \
   --config configs/minimax_h3/ulysses4-reference.toml \
   --served-model-name MiniMax-H3-OmniRef --host 0.0.0.0 \
   --set video_config.max_seconds=5 --max-model-len 8192 \

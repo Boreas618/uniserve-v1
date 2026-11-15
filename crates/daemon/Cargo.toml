@@ -27,9 +27,10 @@ futures.workspace = true
 hf-hub.workspace = true
 http-body.workspace = true
 image.workspace = true
-indexmap.workspace = true
 # The IANA special-purpose address registries: the destinations a media fetch may not reach.
 iprfc.workspace = true
+# The ordered tables of a checkpoint's JSON files, read in the order the file states them.
+indexmap = { workspace = true, features = ["serde"] }
 itertools.workspace = true
 libc.workspace = true
 # This host's name (`uname(2)`), the default host identity.

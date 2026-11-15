@@ -50,7 +50,7 @@ Download the checkpoint and serve it on four GPUs:
 export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
 
-uniserve serve "$H3_MODEL" \
+uniserve serve --model-dir "$H3_MODEL" \
   --config configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
@@ -118,7 +118,7 @@ The metrics endpoint publishes scheduler, worker, request and HTTP metrics in on
 UniServe's options form one tree, following TensorRT-LLM's serving configuration: the options most deployments state sit at its top level, and the rest in `*_config` tables, one per part of the system. `uniserve serve` reads the tree from a `--config` TOML file, from flags for the most common options, and from repeatable `--set PATH=VALUE` assignments that reach any option by its path, each overriding the last:
 
 ```bash
-uniserve serve "$H3_MODEL" --config configs/minimax_h3/ulysses4.toml \
+uniserve serve --model-dir "$H3_MODEL" --config configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 --max-running-requests 2 \
   --set 'quantization.mode="balanced"'
 ```

@@ -854,6 +854,10 @@ mod tests {
                 reasoning: None,
                 tool_calls: None,
                 images: None,
+                checkpoint: processing::ChatCheckpoint {
+                    context_length: &["max_position_embeddings"],
+                    chat_template: processing::ChatTemplate::TokenizerConfig,
+                },
             }),
         },
         model: Model::Text(&Unopened),
