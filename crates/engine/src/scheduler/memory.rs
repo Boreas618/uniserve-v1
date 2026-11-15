@@ -910,31 +910,33 @@ impl Scheduler {
     }
 
     /// Per region, the units a request's admission holds there when no other request holds any:
-    /// what `never_fits` compares with the region's capacity (SD §3.5, §7.2). Per cache class but
-    /// the draft cache, the most of the fewest blocks that must coexist to compute its prompt in
-    /// chunks and the blocks its first call and the low watermark take from its start, every
-    /// block of a context with images; and every encoder output and declared result, pinned or
-    /// allocated, since a pinned block lies in the region too. A request whose `never_fits`
-    /// passes is admitted once the requests ahead of it have ended: alone, and with no hit, it
-    /// takes no more than this, and its hit is one it holds alone ([`Scheduler::holds_alone`]).
+    /// what `never_fits` compares with the units the region is declared to hold (SD §3.5, §7.2).
+    /// Per cache class but the draft cache, the most of the fewest blocks that must coexist to
+    /// compute its prompt in chunks and the blocks its first call and the low watermark take from
+    /// its start, every block of a context with images; and every encoder output and declared
+    /// result, pinned or allocated, since a pinned block lies in the region too. A request whose
+    /// `never_fits` passes is admitted once the requests ahead of it have ended: alone, and with
+    /// no hit, it takes no more than this, and its hit is one it holds alone
+    /// ([`Scheduler::holds_alone`]).
     pub(super) fn units_alone(&self, request: &Request) -> Vec<u32> {
         self.units(request, None, true)
     }
 
     /// Whether the admission of a token request with a prefix hit of `hit` tokens holds no more
-    /// than each region's capacity when no other request holds any (SD §4.4 "The hit"): per
-    /// cache class the blocks of the hit it reads, pinned or loaded, beside what
-    /// [`Scheduler::units_needed`] counts from the hit on, and every encoder output. From a hit
-    /// the first chunk may reach further than from position 0, the low watermark beyond it, so a
-    /// hit can hold more than [`Scheduler::units_alone`] counts. With a hit that holds no more
-    /// than the capacity, `fits` holds once every other request has left the regions, so no
-    /// admission is tried with a deeper one: it would wait at the head of the queue for good.
+    /// than the units each region is declared to hold ([`Scheduler::declared`]) when no other
+    /// request holds any (SD §4.4 "The hit"): per cache class the blocks of the hit it reads,
+    /// pinned or loaded, beside what [`Scheduler::units_needed`] counts from the hit on, and
+    /// every encoder output. From a hit the first chunk may reach further than from position 0,
+    /// the low watermark beyond it, so a hit can hold more than [`Scheduler::units_alone`]
+    /// counts. With a hit that holds no more than the declared units, `fits` holds once every
+    /// other request has left the regions and a resize in progress completed, so no admission is
+    /// tried with a deeper one: it would wait at the head of the queue for good.
     fn holds_alone(&self, request: &Request, hit: u32) -> bool {
         let units = self.units(request, Some(hit), true);
         units
             .iter()
             .enumerate()
-            .all(|(region, &units)| units <= self.capacity.get(region).copied().unwrap_or(0))
+            .all(|(region, &units)| units <= self.declared(region))
     }
 
     /// [`Scheduler::units_needed`] with a hit. With `alone`, what the admission holds when no

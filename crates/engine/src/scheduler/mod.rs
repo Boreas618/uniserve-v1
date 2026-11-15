@@ -289,7 +289,8 @@ pub struct Scheduler {
     /// Per region, the units the engine last resized it to (`Message::Resize`), which bound what
     /// it holds from then on: while a shrink has stopped short of them, the scheduler installs
     /// the whole of the region's eviction order, takes none of the units past them for its own
-    /// allocations, and shrinks the region again as units come free (`resize.rs`). `None` before
+    /// allocations, and shrinks the region again as units come free (`resize.rs`); they are the
+    /// units a request's admission is judged against (`Scheduler::declared`). `None` before
     /// the engine resized the region and from a drain on, which leaves the region's size to the
     /// drain's own shrink or to the epoch serving beside it.
     bounds: Vec<Option<u32>>,

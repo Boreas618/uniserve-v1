@@ -980,8 +980,9 @@ pub(crate) struct Harness {
     pub(crate) steps: u64,
     /// The session's layout.
     layout: runtime::Open,
-    /// Another engine epoch's session of the same layout, opened at its first use
-    /// ([`Harness::elsewhere`]): its end of its queue pair and the last number it drew.
+    /// Another engine epoch's session, of the same layout opened at its first use
+    /// ([`Harness::elsewhere`]) or of another layout ([`Harness::beside`]): its end of its queue
+    /// pair and the last number it drew.
     other: Option<(QueuePair, u64)>,
 }
 
@@ -1207,6 +1208,41 @@ impl Harness {
             completions.push(Completion::decode(&record).unwrap().1);
         }
         completions
+    }
+
+    /// Opens the session of an engine epoch of another layout (epoch 2) beside this scheduler's,
+    /// as an epoch update's target of another layout starts: its region of the memory space of
+    /// this session's region `name` is a region of its own, `{name}-beside`, which takes `units`
+    /// units of that space at its opening, as far as the space's free memory goes. Returns that
+    /// region's number; [`Harness::elsewhere`] submits on this epoch's queue pair from then on.
+    ///
+    /// # Panics
+    ///
+    /// When the session's layout states no region `name`, or the buffer pool refuses the session.
+    pub(crate) fn beside(&mut self, name: &str, units: u32) -> u8 {
+        let renamed = format!("{name}-beside");
+        let mut layout = runtime::Open {
+            epoch: 2,
+            ..self.layout.clone()
+        };
+        let region = layout
+            .regions
+            .iter_mut()
+            .find(|region| region.name == name)
+            .unwrap_or_else(|| panic!("the layout states no region {name}"));
+        // The space keeps its name: the two epochs' regions share its memory.
+        region.name.clone_from(&renamed);
+        region.units = units;
+
+        let groups: Vec<GroupId> = layout.groups.iter().map(|group| group.id).collect();
+        let (inbox, _) = unbounded();
+        let executor = FakeExecutor::new(&groups, Vec::new(), inbox);
+        let (_, mut ends) = self
+            .pool
+            .open(&layout, vec![executor])
+            .unwrap_or_else(|refusal| panic!("the buffer pool refuses epoch 2: {refusal}"));
+        self.other = Some((ends.remove(0), 0));
+        self.region(&renamed)
     }
 
     /// The number the buffer pool gives the session's region `name` (`kv-0`, `slots-0`,

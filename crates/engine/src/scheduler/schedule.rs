@@ -1200,16 +1200,17 @@ impl Scheduler {
     }
 
     /// Whether `request` can never fit (SD §3.5, §7.2): in some region, the units its admission
-    /// holds when no other request holds any exceed the region's capacity. Below that, `fits`
-    /// holds once the requests ahead of it have ended and the units they held came back, since
-    /// its hit is one its admission holds alone (SD §4.4 "The hit"), so a request this does not
-    /// refuse is admitted.
+    /// holds when no other request holds any exceed the units the region is declared to hold
+    /// ([`Scheduler::declared`]). Below that, `fits` holds once the requests ahead of it have
+    /// ended, the units they held came back and a resize in progress completed, since its hit is
+    /// one its admission holds alone (SD §4.4 "The hit"), so a request this does not refuse is
+    /// admitted.
     fn never_fits(&self, request: &Request) -> bool {
         let alone = self.units_alone(request);
         alone
             .iter()
             .enumerate()
-            .any(|(region, &units)| units > self.capacity.get(region).copied().unwrap_or(0))
+            .any(|(region, &units)| units > self.declared(region))
     }
 
     /// The units of `region` (an index) the entries of `request`'s tables of fixed-size blocks
@@ -1504,8 +1505,9 @@ impl Scheduler {
     }
 
     /// Whether running request `id` can never fit in `region`: the units it holds there and the
-    /// units its next call still needs there exceed the region's capacity, so that no victim
-    /// could let it grow (`S/preemption/tokens.rs:133-164`). It ends with
+    /// units its next call still needs there exceed the units the region is declared to hold
+    /// ([`Scheduler::declared`]), so that neither a victim nor a resize in progress could let it
+    /// grow (`S/preemption/tokens.rs:133-164`). It ends with
     /// `FinishReason::CacheCapacity` at the length the cache holds, once no call of it is in
     /// flight: those calls write within the blocks it holds and may end it themselves, and their
     /// outputs are applied (a call in flight of a finished request is dropped, SD §3.7). Until
@@ -1516,8 +1518,7 @@ impl Scheduler {
         };
         let held = self.units_held(request, region);
         let need = self.units_short(id, region);
-        let capacity = self.capacity.get(region).copied().unwrap_or(0);
-        if held.saturating_add(need) <= capacity {
+        if held.saturating_add(need) <= self.declared(region) {
             return false;
         }
 

@@ -96,6 +96,25 @@ impl Scheduler {
         }
     }
 
+    /// The units region `region` (an index) is declared to hold: the units the engine last
+    /// resized it to, or, before any resize and from a drain on, the units its last `Resized`
+    /// (or the session's `Open`) stated. A request is too large for the region only beyond these.
+    ///
+    /// The region's current units may lie on either side of them for a while: a shrink that
+    /// stopped short holds more until the units held past the bound come free, and a grow that
+    /// stopped short holds fewer until the memory it waits for is granted to the region's space,
+    /// after which the engine resizes the region again — a rollback's promotion grows its regions
+    /// while the target's drain still gives the memory back. A request that fits the declared
+    /// units waits through either; refusing it against the current units would refuse a request
+    /// the region holds once its resize completes.
+    pub(super) fn declared(&self, region: usize) -> u32 {
+        self.bounds
+            .get(region)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| self.capacity.get(region).copied().unwrap_or(0))
+    }
+
     /// The units region `region` (an index) holds past its bound, as its last `Resized` stated
     /// them: what its shrink is still to take. 0 for a region with no bound.
     pub(super) fn excess(&self, region: usize) -> u32 {
