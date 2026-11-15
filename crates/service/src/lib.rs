@@ -24,6 +24,7 @@
 //! ([`Message`]). [`lock`] is the one way a thread takes a mutex.
 
 mod connection;
+mod directories;
 pub mod frame;
 pub mod logging;
 pub mod shm;
@@ -32,6 +33,7 @@ pub use connection::{
     Connection, DEAD_PEER_SECS, Framing, Handed, Hangup, Listener, Message, READ_CHUNK, Socket,
     Wake, Waker,
 };
+pub use directories::{cache_directory, data_directory};
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
