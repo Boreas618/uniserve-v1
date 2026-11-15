@@ -75,54 +75,133 @@ fn source(
     }
 }
 
-/// Options that place ranks without a deployment layout, refused beside `worker_groups`.
-const RANK_LAYOUT_SHORTHAND: [&str; 5] = [
-    "tensor_parallel_size",
-    "device_config.device",
-    "device_config.devices",
-    "device_config.worker_hosts",
-    "device_config.queue_depth",
-];
+/// What an option is bound to beside every deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Every deployment.
+    Every,
+    /// The deployments of one kind of model, by what the served family's `Serving` declares; it
+    /// is refused for a model of another kind rather than ignored
+    /// ([`Stated::refuse_foreign_options`]).
+    ///
+    /// Chat models schedule token batches, render chat prompts and call a causal language
+    /// model's operators (attention, the grouped expert GEMM and the expert exchange, whose
+    /// kernel backends select modules of the epoch a video pipeline would fix and never run);
+    /// the video tables configure behavior only video models have.
+    Kind(Kind),
+    /// The rank layout shorthand, which places ranks without `worker_groups` and is refused
+    /// beside them.
+    Shorthand,
+}
 
-/// The kinds of model whose behavior some options configure, with those
-/// options by configuration path.
-///
-/// Chat models schedule token batches and render chat prompts, which a video
-/// pipeline does neither of; the video tables configure behavior only video
-/// models have.
-const KIND_OPTIONS: [(Kind, &[&str]); 2] = [
-    (
-        Kind::Chat,
-        &[
-            // The kernel backends of a causal language model's operators: attention, the grouped
-            // expert GEMM and the expert exchange. A slot these name is a module of the epoch,
-            // which a model that calls no such operator would fix and never run.
-            "attention_backend",
-            "prefill_attention_backend",
-            "decode_attention_backend",
-            "moe_runner_backend",
-            "moe_config",
-            "max_num_batched_tokens",
-            "scheduler_config.chunked_prefill_size",
-            "speculative_config",
-            "chat_config",
-            "image_fetch_config",
-        ],
-    ),
-    (
-        Kind::Video,
-        &[
-            "video_config",
-            "media_config",
-            "video_job_config",
-            "lora",
-            "lora_dir",
-        ],
-    ),
-];
+/// Classifies every field of a struct of the configuration, by its path: it expands to an
+/// exhaustive pattern of the struct, so a field added to it does not compile until it is
+/// classified here, and to each field's path (`prefix` and its name) with its scope.
+macro_rules! classified {
+    ($type:path, $prefix:literal, { $($field:ident: $scope:expr),* $(,)? }) => {{
+        #[allow(dead_code, reason = "the pattern is the completeness check, never run")]
+        fn exhaustive(value: &$type) {
+            let $type { $($field: _),* } = value;
+        }
+        [$((concat!($prefix, stringify!($field)), $scope)),*]
+    }};
+}
+
+impl ServerArgs {
+    /// The scope of every option that is not every deployment's, by configuration path: the
+    /// classification of every field of the configuration, and of the tables classified field
+    /// by field.
+    fn scoped_options() -> impl Iterator<Item = (&'static str, Scope)> {
+        use Scope::{Every, Kind as Of, Shorthand};
+        let top = classified!(ServerArgs, "", {
+            model: Every,
+            model_dir: Every,
+            served_model_name: Every,
+            max_model_len: Every,
+            lora: Of(Kind::Video),
+            lora_dir: Of(Kind::Video),
+            dtype: Every,
+            quantization: Every,
+            mm_processor_kwargs: Every,
+            attention_backend: Of(Kind::Chat),
+            prefill_attention_backend: Of(Kind::Chat),
+            decode_attention_backend: Of(Kind::Chat),
+            moe_runner_backend: Of(Kind::Chat),
+            build_config: Every,
+            max_running_requests: Every,
+            max_num_batched_tokens: Of(Kind::Chat),
+            max_logprobs: Every,
+            mem_fraction_static: Every,
+            tensor_parallel_size: Shorthand,
+            data_parallel_size: Every,
+            worker_groups: Every,
+            host_identity: Every,
+            engine_host: Every,
+            nnodes: Every,
+            node_rank: Every,
+            dist_init_addr: Every,
+            server_config: Every,
+            admin_config: Every,
+            storage_config: Every,
+            load_config: Every,
+            kv_cache_config: Every,
+            // Classified field by field below.
+            scheduler_config: Every,
+            speculative_config: Of(Kind::Chat),
+            migration_config: Every,
+            update_config: Every,
+            // Classified field by field below.
+            device_config: Every,
+            moe_config: Of(Kind::Chat),
+            cuda_graph_config: Every,
+            worker_config: Every,
+            profiling_config: Every,
+            logging_config: Every,
+            chat_config: Of(Kind::Chat),
+            image_fetch_config: Of(Kind::Chat),
+            video_config: Of(Kind::Video),
+            media_config: Of(Kind::Video),
+            video_job_config: Of(Kind::Video),
+            // The command line's inputs, which are no option and are never stated.
+            config_files: Every,
+            set: Every,
+            host: Every,
+            port: Every,
+            ready_fd: Every,
+            predecessor: Every,
+        });
+        let scheduler = classified!(SchedulerConfig, "scheduler_config.", {
+            policy: Every,
+            order: Every,
+            max_queued_requests: Every,
+            chunked_prefill_size: Of(Kind::Chat),
+            max_batch: Every,
+            policy_budget: Every,
+            // Values the configuration resolves, which no statement names.
+            max_num_batched_tokens: Every,
+            max_running_requests: Every,
+            draft_tokens: Every,
+            graph_tiers: Every,
+            block_tokens: Every,
+            prefetch_timeout_base: Every,
+            prefetch_timeout_per_ki_token: Every,
+            report_period: Every,
+        });
+        let devices = classified!(DeviceConfig, "device_config.", {
+            device: Shorthand,
+            devices: Shorthand,
+            worker_hosts: Shorthand,
+            queue_depth: Shorthand,
+        });
+        top.into_iter()
+            .chain(scheduler)
+            .chain(devices)
+            .filter(|(_, scope)| *scope != Every)
+    }
+}
 
 /// A kind of model some options belong to.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Chat,
     Video,
@@ -156,11 +235,11 @@ impl Stated {
     /// video pipeline states a chat option, or a chat model states a video
     /// table.
     pub fn refuse_foreign_options(&self, family: &Family) -> anyhow::Result<()> {
-        for (kind, paths) in KIND_OPTIONS {
-            if kind.serves(family) {
-                continue;
-            }
-            if let Some(path) = paths.iter().find(|path| self.contains(path)) {
+        for (path, scope) in ServerArgs::scoped_options() {
+            if let Scope::Kind(kind) = scope
+                && !kind.serves(family)
+                && self.contains(path)
+            {
                 anyhow::bail!(
                     "`{path}` configures {}, but the served checkpoint is a {} model; remove it",
                     kind.name(),
@@ -1046,9 +1125,8 @@ impl ServerArgs {
             self.mem_fraction_static
         );
         if self.worker_groups.is_some()
-            && let Some(option) = RANK_LAYOUT_SHORTHAND
-                .iter()
-                .find(|option| stated.contains(option))
+            && let Some((option, _)) = Self::scoped_options()
+                .find(|(path, scope)| *scope == Scope::Shorthand && stated.contains(path))
         {
             anyhow::bail!(
                 "`{option}` places ranks without a deployment layout; the stated `worker_groups` \
