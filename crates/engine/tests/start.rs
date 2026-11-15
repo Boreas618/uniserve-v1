@@ -31,14 +31,8 @@ use proto::request::wire::{self, from_engine};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::process::{Pid, PidfdFlags, pidfd_open};
 use service::{Connection, Listener};
+use testkit::LONG;
 use testkit::serving::{DEPLOYMENT, StorageServer};
-
-/// A bound on a read only a defect reaches.
-const READ: Duration = Duration::from_secs(60);
-
-/// A bound on the engine's start: the Build Server vendors the snapshot's registry sources and
-/// builds the policy module from its snapshot on the first resolve.
-const START: Duration = Duration::from_secs(900);
 
 /// The workspace the tests were built from.
 fn workspace() -> PathBuf {
@@ -46,8 +40,10 @@ fn workspace() -> PathBuf {
 }
 
 /// A Build Server on a thread of the test process at `directory`'s socket, holding the tree's
-/// `arrival` policy package as revision 1, which serves until the returned stop end is dropped.
-/// Returns its socket and that end.
+/// `arrival` policy package as revision 1 with its module built, as a daemon's prepare step leaves
+/// a deployment's packages before it starts the engine, so an engine's start resolves a module
+/// the store holds. The server serves until the returned stop end is dropped. Returns its socket
+/// and that end.
 fn build_server(directory: &Path) -> (PathBuf, std::os::unix::net::UnixStream) {
     let config = build_server::server::ServerConfig {
         package_root: directory.join("packages"),
@@ -81,6 +77,19 @@ fn build_server(directory: &Path) -> (PathBuf, std::os::unix::net::UnixStream) {
         .install(&workspace().join("crates/scheduling/policies/arrival"))
         .unwrap();
     assert_eq!(installed.revision, 1);
+
+    // The policy module the launches resolve, built from the package's snapshot now: its first
+    // build vendors the snapshot's registry sources and compiles the crate for wasm32.
+    let policy = testkit::serving::launch().modules.policy;
+    client
+        .resolve(
+            proto::module::POLICY,
+            &policy,
+            &build_server::Target::wasm(),
+            build_server::manifest::SINGLE_KEY,
+            &mut |_| {},
+        )
+        .unwrap();
     (socket, stop)
 }
 
@@ -242,8 +251,8 @@ fn started(
     drop(launch_file);
 
     // The request interface: hello, welcome, `Starting`.
-    let mut requests = accept(&requests_socket, &mut engine, READ);
-    let hello: wire::Hello = requests.recv(READ).unwrap().unwrap();
+    let mut requests = accept(&requests_socket, &mut engine, LONG);
+    let hello: wire::Hello = requests.recv(LONG).unwrap().unwrap();
     assert_eq!(hello.engine, launch.engine);
     assert_eq!(hello.interface, proto::process::Interface::Requests as i32);
     requests
@@ -253,14 +262,14 @@ fn started(
             event_window: 64,
         })
         .unwrap();
-    let from_engine::Kind::State(starting) = next(&mut requests, READ) else {
+    let from_engine::Kind::State(starting) = next(&mut requests, LONG) else {
         panic!("the engine's first frame states no state");
     };
     assert_eq!(starting.state, wire::EngineState::Starting as i32);
 
     // The process interface: hello, welcome, the claim answered with the Storage Server.
-    let mut processes = accept(&processes_socket, &mut engine, READ);
-    let hello: proto::process::Hello = processes.recv(READ).unwrap().unwrap();
+    let mut processes = accept(&processes_socket, &mut engine, LONG);
+    let hello: proto::process::Hello = processes.recv(LONG).unwrap().unwrap();
     assert!(matches!(
         hello.peer,
         Some(proto::process::hello::Peer::Engine(proto::process::Engine { engine, .. }))
@@ -277,7 +286,7 @@ fn started(
             }],
         })
         .unwrap();
-    let claim: proto::process::Upstream = processes.recv(READ).unwrap().unwrap();
+    let claim: proto::process::Upstream = processes.recv(LONG).unwrap().unwrap();
     let Some(upstream::Kind::Request(request)) = claim.kind else {
         panic!("the engine's first frame on its process interface is no request");
     };
@@ -345,7 +354,7 @@ fn operated(requests: &mut Connection, id: u64, kind: wire::engine_command::Kind
             })),
         })
         .unwrap();
-    until(requests, READ, |kind| match kind {
+    until(requests, LONG, |kind| match kind {
         from_engine::Kind::Operated(operated) if operated.id == id => Some(operated.error),
         _ => None,
     })
@@ -365,14 +374,14 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
 
     // The start ends serving: `Serving` with what it serves on the request interface, and the
     // first generation on the process interface.
-    let info = until(&mut requests, START, |kind| match kind {
+    let info = until(&mut requests, LONG, |kind| match kind {
         from_engine::Kind::State(state) if state.state == wire::EngineState::Serving as i32 => {
             Some(state.info.expect("a serving engine states what it serves"))
         }
         _ => None,
     });
     assert_eq!(info.schedulers, 1);
-    let serving: proto::process::Upstream = processes.recv(READ).unwrap().unwrap();
+    let serving: proto::process::Upstream = processes.recv(LONG).unwrap().unwrap();
     assert_eq!(
         serving.kind,
         Some(upstream::Kind::Report(proto::process::Report {
@@ -406,7 +415,7 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
             })),
         })
         .unwrap();
-    let accepted = until(&mut requests, READ, |kind| match kind {
+    let accepted = until(&mut requests, LONG, |kind| match kind {
         from_engine::Kind::Accepted(accepted) => Some(accepted),
         _ => None,
     });
@@ -419,7 +428,7 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
     );
 
     // The metrics, once a second.
-    until(&mut requests, READ, |kind| match kind {
+    until(&mut requests, LONG, |kind| match kind {
         from_engine::Kind::Metrics(metrics) => Some(metrics),
         _ => None,
     });
@@ -432,7 +441,7 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
             })),
         })
         .unwrap();
-    let status = engine.exited(READ);
+    let status = engine.exited(LONG);
     assert!(status.success(), "the engine exited with {status}");
 
     // The epoch's session is open no more: a head of the epoch opens one again.
@@ -569,7 +578,7 @@ impl Reserved {
 /// Reads the start of an epoch of two processes to its end: the scheduler node `a` states
 /// `Serving` with its one scheduler, and both report their first generation to their daemons.
 fn both_serve(a: &mut Daemon, b: &mut Daemon) {
-    let info = until(&mut a.requests, START, |kind| match kind {
+    let info = until(&mut a.requests, LONG, |kind| match kind {
         from_engine::Kind::State(state) if state.state == wire::EngineState::Serving as i32 => {
             Some(state.info.expect("a serving engine states what it serves"))
         }
@@ -577,7 +586,7 @@ fn both_serve(a: &mut Daemon, b: &mut Daemon) {
     });
     assert_eq!(info.schedulers, 1);
     for daemon in [a, b] {
-        let serving: proto::process::Upstream = daemon.processes.recv(START).unwrap().unwrap();
+        let serving: proto::process::Upstream = daemon.processes.recv(LONG).unwrap().unwrap();
         assert!(matches!(
             serving.kind,
             Some(upstream::Kind::Report(proto::process::Report {
@@ -602,9 +611,9 @@ fn both_shut_down(a: &mut Daemon, b: &mut Daemon, storage: [(&StorageServer, u64
             })),
         })
         .unwrap();
-    let status = a.engine.exited(READ);
+    let status = a.engine.exited(LONG);
     assert!(status.success(), "the scheduler node exited with {status}");
-    let status = b.engine.exited(READ);
+    let status = b.engine.exited(LONG);
     assert!(status.success(), "the peer exited with {status}");
     for (storage, engine) in storage {
         assert!(!holds_session(storage, epoch, engine));
@@ -668,7 +677,7 @@ fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts
             })),
         })
         .unwrap();
-    let accepted = until(&mut a.requests, READ, |kind| match kind {
+    let accepted = until(&mut a.requests, LONG, |kind| match kind {
         from_engine::Kind::Accepted(accepted) => Some(accepted),
         _ => None,
     });
