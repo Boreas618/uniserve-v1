@@ -435,9 +435,7 @@ impl Op for KvWriteScaled {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let row = u64::from(descriptor.heads) * u64::from(descriptor.head_dim);
         let tokens = args.source.rows();
-        let pages = args.cache.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
@@ -451,12 +449,13 @@ impl Op for KvWriteScaled {
             .u32(descriptor.heads)
             .u32(descriptor.head_dim)
             .flag(descriptor.pdl);
-        // One program per page, not per token: the page's maximum is over every row it holds, the
-        // re-encode is over every row already written, and a per-token grid could not compute either
-        // without a second pass. A page no token of this launch touches still re-encodes nothing and
-        // costs one program that reads its flag and returns.
+        // One program per token, so the work follows the tokens this launch writes and not the
+        // pages the cache has: a page's maximum is over every row the launch brings to it and its
+        // re-encode over every row already written, so one program writes each page, the program
+        // of the page's first token in the launch, and every other token's returns at once. A
+        // launch of no token still runs one program, which writes nothing.
         kernel.launch(
-            LaunchGrid::new([pages, row.div_ceil(u64::from(descriptor.block)), 1])?,
+            LaunchGrid::new([tokens.max(1), 1, 1])?,
             &mut arguments,
             stream,
         )

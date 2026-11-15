@@ -3,14 +3,14 @@
 A descriptor is the element type of the source, the page's scale type, the page
 size, the heads and head width this rank holds, the elements of a row one pass
 covers, and the dependent-launch flag. The token count and the page count stay
-runtime values: the grid is the pages the cache has.
+runtime values: the grid is the tokens the launch writes.
 """
 
 import kv_write_scaled as kernels
 from uniserve_build_server import triton as driver
 
-#: Element types the source may have. The cache is E4M3 in every descriptor, which
-#: is what this operator is for; a full-precision cache is `kv_write`.
+#: Element types the source may have. The cache is E4M3 in every descriptor,
+#: which is what this operator is for; a full-precision cache is `kv_write`.
 DTYPES = {"bf16": "bf16", "f32": "fp32"}
 
 
@@ -19,8 +19,9 @@ def spec(fields, parameters, target):
     dtype = fields["dtype"]
     if fields["scale"] != "f32":
         raise SystemExit(
-            f"a {fields['scale']} page scale is not the rule: the page's maximum is compared and "
-            "the rows are divided in f32, and a narrower scale would round the page twice"
+            f"a {fields['scale']} page scale is not the rule: the page's "
+            "maximum is compared and the rows are divided in f32, and a "
+            "narrower scale would round the page twice"
         )
     pointer = "*" + DTYPES[dtype]
     pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
@@ -39,8 +40,13 @@ def spec(fields, parameters, target):
             "pdl": "i32",
             "BLOCK": "constexpr",
             "PDL": "constexpr",
+            "SCAN": "constexpr",
         },
-        "constexprs": {"BLOCK": int(fields["block"]), "PDL": pdl},
+        "constexprs": {
+            "BLOCK": int(fields["block"]),
+            "PDL": pdl,
+            "SCAN": kernels.SCAN,
+        },
         "options": {"num_warps": 4, "launch_pdl": pdl},
     }
 

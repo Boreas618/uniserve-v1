@@ -32,10 +32,19 @@ def test_an_attention_kernel_matches_its_reference_on_the_interpreter(check):
 
 @pytest.mark.gpu
 @pytest.mark.parametrize(
-    "check", ["paged_triton_decode_check.py", "paged_triton_prefill_check.py"]
+    "check",
+    [
+        "paged_triton_decode_check.py",
+        "paged_triton_prefill_check.py",
+        "kv_write_scaled_check.py",
+    ],
 )
 def test_the_triton_paged_attention_matches_its_reference_on_the_device(check):
-    """The same cases, with the device's rounding of the narrowed store."""
+    """The same cases, with the device's rounding and its concurrent programs.
+
+    The interpreter runs one program after another, so two programs that race
+    on a page of the scaled write show only here.
+    """
     on_device(FAMILY / check, "--device")
 
 
