@@ -220,6 +220,7 @@ pub use kernel::{
 pub use launch::launch;
 pub use op::{Call, Checked, Op, Route};
 pub use operand::Operand;
+pub use primitives::GENERIC_OPERATORS;
 pub use profiler::Profiler;
 pub use storage::{empty, external, meta_tensor, operand, retained};
 pub use tolerance::Tolerance;

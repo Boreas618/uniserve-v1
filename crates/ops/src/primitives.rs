@@ -72,7 +72,22 @@ use tensor::scalar::Scalar;
 use tensor::{CpuStorage, DType, Layout, Shape};
 
 use crate::storage::CudaStorage;
-use crate::{Error, Result, launch};
+use crate::{Error, Op, Result, launch};
+
+/// The operators only the primitives launch: the generic elementwise, conversion, copy, fill,
+/// gather and reduction operators of the module's table. A product and a convolution are
+/// primitives too, and their operators (`gemm`, the convolutions) are also the fused operators a
+/// layer launches itself.
+pub const GENERIC_OPERATORS: [&str; 8] = [
+    Cast::NAME,
+    CopyStrided::NAME,
+    ElementwiseBinary::NAME,
+    ElementwiseUnary::NAME,
+    ElementwiseWhere::NAME,
+    Fill::NAME,
+    Index::NAME,
+    Reduce::NAME,
+];
 
 /// Whether a primitive's kernel is compiled for programmatic dependent launch. Like the block
 /// it is part of the key, and the backend states one value for every primitive.
