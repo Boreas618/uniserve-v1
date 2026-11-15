@@ -250,7 +250,21 @@ pub struct SessionRequest {
     /// the costliest collector, and then ends the session; unguarded when
     /// unset.
     pub max_slowdown: Option<f64>,
+    /// The span before the session, in seconds, whose average step time the guard compares the
+    /// session's with.
+    pub baseline_s: f64,
+    /// The span of the session, in seconds, the guard averages its step time over, and the
+    /// least time between two of its actions, so that each is measured.
+    pub guard_window_s: f64,
 }
+
+/// The default `baseline_s` of a session: a minute of the serving epoch's steps, which holds
+/// every scheduler's steps of the batch sizes its load visits.
+pub const BASELINE_S: f64 = 60.0;
+
+/// The default `guard_window_s` of a session: ten seconds of steps, long enough that one
+/// collector's change of the step time stands out of the steps' second-to-second variation.
+pub const GUARD_WINDOW_S: f64 = 10.0;
 
 impl Default for SessionRequest {
     fn default() -> Self {
@@ -269,6 +283,8 @@ impl Default for SessionRequest {
             pc_sampling: PcSamplingOptions::default(),
             sampler_read_ms: DEFAULT_SAMPLER_READ_MS,
             max_slowdown: None,
+            baseline_s: BASELINE_S,
+            guard_window_s: GUARD_WINDOW_S,
         }
     }
 }
@@ -344,6 +360,14 @@ impl SessionRequest {
             && !(slowdown.is_finite() && slowdown >= 0.0)
         {
             return Err("max_slowdown is a nonnegative fraction".to_owned());
+        }
+        for (name, seconds) in [
+            ("baseline_s", self.baseline_s),
+            ("guard_window_s", self.guard_window_s),
+        ] {
+            if !(seconds.is_finite() && seconds > 0.0) {
+                return Err(format!("{name} is a positive number of seconds"));
+            }
         }
         if self.output_dir.as_os_str().is_empty() {
             return Err("output_dir names the directory the workers write to".to_owned());

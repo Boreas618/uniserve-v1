@@ -78,6 +78,8 @@ impl From<&SessionStart> for wire::ProfileSession {
                 pc_hardware_buffer_mib: request.pc_sampling.hardware_buffer_mib,
                 sampler_read_ms: request.sampler_read_ms,
                 max_slowdown: request.max_slowdown,
+                baseline_s: request.baseline_s,
+                guard_window_s: request.guard_window_s,
             }),
         }
     }
@@ -143,6 +145,8 @@ impl TryFrom<&wire::ProfileSession> for SessionStart {
                 },
                 sampler_read_ms: request.sampler_read_ms,
                 max_slowdown: request.max_slowdown,
+                baseline_s: request.baseline_s,
+                guard_window_s: request.guard_window_s,
             },
         })
     }
@@ -276,6 +280,8 @@ mod tests {
                 },
                 sampler_read_ms: 250,
                 max_slowdown: Some(0.1),
+                baseline_s: 30.0,
+                guard_window_s: 5.0,
             },
         };
         let message = wire::ProfileSession::from(&start);

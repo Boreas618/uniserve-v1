@@ -1056,12 +1056,12 @@ fn a_threshold_reads_the_trial_from_the_switchs_end_and_the_status_keeps_its_inp
         window: Some(window),
         ..Default::default()
     };
-    let observer = Arc::new(Observer::default());
+    let observer = Arc::new(Observer::new(Duration::from_secs(60)));
     let trial = |observer: &Arc<Observer>, switch: Instant| {
         let replica = Baseline::new(
             Arc::clone(observer),
             TARGET,
-            SERVING,
+            Some(SERVING),
             thresholds.window,
             switch,
         );
@@ -1080,12 +1080,13 @@ fn a_threshold_reads_the_trial_from_the_switchs_end_and_the_status_keeps_its_inp
     deployment.engines.engine(SPAWNED).withhold();
     deployment.run();
     assert_eq!(deployment.updater.in_flight(), Some((1, Phase::Switching)));
-    let switch = deployment.updater.switch_began().expect("the switch began");
 
     // The target's first batches, while the serving epoch still steps.
     observer.record(TARGET, 0, &steps(29_744, 3));
     assert!(
-        !deployment.updater.begin_trial(trial(&observer, switch)),
+        !deployment
+            .updater
+            .begin_trial(|switch| trial(&observer, switch)),
         "the switch has not ended"
     );
     assert_eq!(deployment.updater.read_trial(1, (0, 0)), None);
@@ -1093,7 +1094,11 @@ fn a_threshold_reads_the_trial_from_the_switchs_end_and_the_status_keeps_its_inp
     deployment.release(SPAWNED);
     assert_eq!(deployment.updater.in_flight(), Some((1, Phase::Trial)));
     std::thread::sleep(Duration::from_millis(2));
-    assert!(deployment.updater.begin_trial(trial(&observer, switch)));
+    assert!(
+        deployment
+            .updater
+            .begin_trial(|switch| trial(&observer, switch))
+    );
     std::thread::sleep(window);
     observer.record(TARGET, 0, &steps(9_829, 400));
     assert_eq!(deployment.updater.read_trial(1, (0, 0)), None);

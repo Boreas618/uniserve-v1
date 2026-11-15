@@ -6,7 +6,7 @@ use crate::request::wire;
 
 use super::{
     BaseCacheStats, DomainSchedulerStats, FenceHistogram, ForwardStats, PrefixCacheStats,
-    SchedulerStats,
+    ProfileProgress, SchedulerStats,
 };
 
 impl From<&SchedulerStats> for wire::SchedulerStats {
@@ -172,7 +172,11 @@ impl From<&ForwardStats> for wire::ForwardStats {
                 .map(|(name, histogram)| (name.clone(), histogram.into()))
                 .collect(),
             fence_records_lost: stats.fence_records_lost,
-            profile: counts(&stats.profile),
+            profile: stats
+                .profile
+                .iter()
+                .map(|(session, progress)| (*session, progress.into()))
+                .collect(),
             attention_launches: stats.attention_launches,
             attention_us: stats.attention_us,
             attention_backend_counts: counts(&stats.attention_backend_counts),
@@ -211,7 +215,11 @@ impl From<wire::ForwardStats> for ForwardStats {
                 .map(|(name, histogram)| (name, histogram.into()))
                 .collect(),
             fence_records_lost: stats.fence_records_lost,
-            profile: stats.profile.into_iter().collect(),
+            profile: stats
+                .profile
+                .into_iter()
+                .map(|(session, progress)| (session, progress.into()))
+                .collect(),
             attention_launches: stats.attention_launches,
             attention_us: stats.attention_us,
             attention_backend_counts: stats.attention_backend_counts.into_iter().collect(),
@@ -235,6 +243,26 @@ impl From<wire::ForwardStats> for ForwardStats {
             spec_verify_rejected_tokens: stats.spec_verify_rejected_tokens,
             spec_verify_committed_tokens: stats.spec_verify_committed_tokens,
             spec_verify_path_counts: stats.spec_verify_path_counts.into_iter().collect(),
+        }
+    }
+}
+
+impl From<&ProfileProgress> for wire::ProfileProgress {
+    fn from(progress: &ProfileProgress) -> Self {
+        Self {
+            steps: progress.steps,
+            bytes: progress.bytes,
+            windows_ended: progress.windows_ended,
+        }
+    }
+}
+
+impl From<wire::ProfileProgress> for ProfileProgress {
+    fn from(progress: wire::ProfileProgress) -> Self {
+        Self {
+            steps: progress.steps,
+            bytes: progress.bytes,
+            windows_ended: progress.windows_ended,
         }
     }
 }

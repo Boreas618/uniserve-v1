@@ -12,9 +12,9 @@
 //!   warm-up at its first opening, the first steps of the requests migrated to
 //!   it at the drain's deadline, and steps that shared each GPU with the
 //!   draining epoch.
-//! - **Step time and throughput** are the [`Rates`] of the once-a-second
-//!   scheduler reports ([`Observer`]): the host-observed batch time over the
-//!   batches, and the query tokens the batches computed over the span. The
+//! - **Step time and throughput** are the [`Rates`] of the scheduler reports
+//!   ([`Observer`]): the host-observed batch time over the batches, and the
+//!   query tokens the batches computed over the span their reports cover. The
 //!   baseline is what serving reported over `rollback.window` up to the
 //!   switch; the trial reads the same `window` up to each reading, from its
 //!   beginning on, and decides only once a whole `window` of it passed, so a
@@ -32,9 +32,11 @@
 //! the status shows the empty baseline.
 //!
 //! The trial only decides. [`Trial::read`] reads the reports once and names the
-//! first threshold the reading passed as the update's [`Failure`]; the updater
-//! reads it only while the update stands on trial and rolls back through the
-//! path a fault takes, so the update ends unavailable with that reason. The
+//! first threshold the reading passed as the update's [`Failure`]; the update's
+//! follower reads it as each report of the trial's replicas arrives
+//! ([`Observer::records`]), the updater only while the update stands on trial,
+//! and rolls back through the path a fault takes, so the update ends
+//! unavailable with that reason. The
 //! status states the latest reading ([`Trial::report`]): for a trial a
 //! threshold ended, the very rates that decided it.
 
@@ -47,11 +49,6 @@ use crate::epoch::Failure;
 use crate::observe::{Observer, Rates};
 use crate::options::RollbackConfig;
 
-/// How often a trial reads its thresholds and its switch's end: a report
-/// arrives once a second, and a rollback waits for the hold to name the epoch
-/// that serves next, so this is part of the pause a rollback costs.
-pub(crate) const INTERVAL: Duration = Duration::from_millis(100);
-
 /// One replica's reports a trial reads: the epoch the update serves it from,
 /// and what serving reported before the switch.
 pub(crate) struct Baseline {
@@ -63,15 +60,15 @@ pub(crate) struct Baseline {
 impl Baseline {
     /// `epoch`'s reports through `observer`, with the baseline of `previous`,
     /// the epoch that served, over `window` up to `switch`, when the switch
-    /// began.
+    /// began; no baseline without an epoch that served before.
     pub(crate) fn new(
         observer: Arc<Observer>,
         epoch: u64,
-        previous: u64,
+        previous: Option<u64>,
         window: Option<Duration>,
         switch: Instant,
     ) -> Self {
-        let baseline = window.and_then(|window| {
+        let baseline = window.zip(previous).and_then(|(window, previous)| {
             let from = switch.checked_sub(window).unwrap_or(switch);
             observer.rates_between(previous, from, switch)
         });
@@ -197,15 +194,16 @@ impl Trial {
                 ));
             }
             if let Some(regression) = self.thresholds.throughput_regression
-                && baseline.tokens_per_second > 0.0
-                && rates.tokens_per_second < baseline.tokens_per_second * (1.0 - regression)
+                && let (Some(before), Some(now)) =
+                    (baseline.tokens_per_second, rates.tokens_per_second)
+                && before > 0.0
+                && now < before * (1.0 - regression)
             {
                 return Some(failure(
                     "throughput_regression",
                     format!(
-                        "the epoch on trial computes {:.0} tokens/s against {:.0} before the \
-                         switch, past the regression {regression}",
-                        rates.tokens_per_second, baseline.tokens_per_second
+                        "the epoch on trial computes {now:.0} tokens/s against {before:.0} \
+                         before the switch, past the regression {regression}"
                     ),
                 ));
             }
@@ -272,7 +270,7 @@ mod tests {
         let replica = Baseline::new(
             Arc::clone(observer),
             2,
-            1,
+            Some(1),
             thresholds.window,
             Instant::now(),
         );
@@ -294,7 +292,7 @@ mod tests {
     /// it do not.
     #[test]
     fn a_slowed_target_breaches_the_step_time_regression() {
-        let observer = Arc::new(Observer::default());
+        let observer = Arc::new(Observer::new(Duration::from_secs(60)));
         let mut trial = trial(regressions(Some(0.2), None), &observer);
         observer.record(2, 0, &stats(1_100, 100, 10_000));
         assert_eq!(trial.read((10, 1)), None, "10% slower is within 20%");
@@ -318,12 +316,12 @@ mod tests {
     fn the_trial_reads_its_target_from_the_switchs_end_and_states_what_it_decided_on() {
         let thresholds = regressions(Some(0.05), None);
         let serve = |target_us: u64| {
-            let observer = Arc::new(Observer::default());
+            let observer = Arc::new(Observer::new(Duration::from_secs(60)));
             observer.record(1, 0, &stats(10_666, 400, 400));
             let replica = Baseline::new(
                 Arc::clone(&observer),
                 2,
-                1,
+                Some(1),
                 thresholds.window,
                 Instant::now(),
             );
@@ -359,7 +357,7 @@ mod tests {
     /// trial without thresholds is the operator's alone.
     #[test]
     fn no_threshold_decides_nothing() {
-        let observer = Arc::new(Observer::default());
+        let observer = Arc::new(Observer::new(Duration::from_secs(60)));
         let mut trial = trial(RollbackConfig::default(), &observer);
         observer.record(2, 0, &stats(9_000, 100, 10));
         assert_eq!(trial.read((1_000, 1_000)), None);
@@ -369,26 +367,29 @@ mod tests {
     /// the failure names it, not the step time.
     #[test]
     fn a_target_that_computes_less_breaches_the_throughput_regression() {
-        let observer = Arc::new(Observer::default());
-        let observed_before = stats(1_000, 100, 10_000);
-        observer.record(1, 0, &observed_before);
+        let observer = Arc::new(Observer::new(Duration::from_secs(60)));
+        // A scheduler's first report covers no known interval; the second covers a window.
+        observer.record(1, 0, &stats(1_000, 100, 10_000));
+        std::thread::sleep(WINDOW);
+        observer.record(1, 0, &stats(1_000, 100, 10_000));
         let thresholds = regressions(None, Some(0.5));
         let replica = Baseline::new(
             Arc::clone(&observer),
             2,
-            1,
+            Some(1),
             thresholds.window,
             Instant::now(),
         );
         let baseline = replica.baseline.expect("a report before the switch");
+        assert!(baseline.tokens_per_second.is_some(), "{baseline:?}");
         let mut trial = Trial::begin(thresholds, vec![replica], (0, 0));
+        observer.record(2, 0, &stats(1_000, 100, 10_000));
         std::thread::sleep(WINDOW);
-        let close = (baseline.tokens_per_second * 0.6) as u64;
-        observer.record(2, 0, &stats(1_000, 100, close));
-        assert_eq!(trial.read((0, 0)), None, "60% of it is within the half");
+        observer.record(2, 0, &stats(1_000, 100, 9_000));
+        assert_eq!(trial.read((0, 0)), None, "90% of it is within the half");
         std::thread::sleep(WINDOW);
-        observer.record(2, 0, &stats(1_000, 100, close / 4));
-        let failure = trial.read((0, 0)).expect("a quarter is past the half");
+        observer.record(2, 0, &stats(1_000, 100, 1_000));
+        let failure = trial.read((0, 0)).expect("a tenth is past the half");
         assert_eq!(failure.kind, "throughput_regression");
     }
 
@@ -396,14 +397,14 @@ mod tests {
     /// the threshold breaches at the first report of it, before any window.
     #[test]
     fn failed_requests_past_the_rate_breach_it() {
-        let observer = Arc::new(Observer::default());
+        let observer = Arc::new(Observer::new(Duration::from_secs(60)));
         let thresholds = RollbackConfig {
             failure_rate: Some(0.25),
             ..Default::default()
         };
         let mut trial = Trial::begin(
             thresholds,
-            vec![Baseline::new(observer, 2, 1, None, Instant::now())],
+            vec![Baseline::new(observer, 2, Some(1), None, Instant::now())],
             (100, 50),
         );
         assert_eq!(trial.read((100, 50)), None, "nothing ended on trial");
@@ -416,7 +417,7 @@ mod tests {
     /// A window that has not passed decides nothing, however slow the target.
     #[test]
     fn a_window_decides_only_once_it_passed() {
-        let observer = Arc::new(Observer::default());
+        let observer = Arc::new(Observer::new(Duration::from_secs(60)));
         observer.record(1, 0, &stats(1_000, 100, 10_000));
         let thresholds = RollbackConfig {
             step_time_regression: Some(0.1),
@@ -426,7 +427,7 @@ mod tests {
         let replica = Baseline::new(
             Arc::clone(&observer),
             2,
-            1,
+            Some(1),
             thresholds.window,
             Instant::now(),
         );
@@ -439,12 +440,12 @@ mod tests {
     /// regressions decide nothing, and the status shows it empty.
     #[test]
     fn a_trial_without_a_baseline_decides_nothing_and_reports_it() {
-        let observer = Arc::new(Observer::default());
+        let observer = Arc::new(Observer::new(Duration::from_secs(60)));
         let thresholds = regressions(Some(0.1), Some(0.1));
         let replica = Baseline::new(
             Arc::clone(&observer),
             2,
-            1,
+            Some(1),
             thresholds.window,
             Instant::now(),
         );

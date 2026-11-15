@@ -89,7 +89,9 @@ impl ImageFamily for Images {
     ) -> Result<Box<dyn ImageProcessor>, String> {
         // The Qwen-VL processor rules read every value from the checkpoint's processor files.
         if let Some(name) = options.keys().next() {
-            return Err(format!("the Qwen-VL image processor takes no option {name:?}"));
+            return Err(format!(
+                "the Qwen-VL image processor takes no option {name:?}"
+            ));
         }
         let [image, video] = files else {
             return Err(format!("{} processor files, two expected", files.len()));
@@ -146,7 +148,9 @@ mod tests {
     /// binds without options and refuses any, naming it.
     #[test]
     fn the_qwen_vl_image_processor_takes_no_option() {
-        let images = profile(QWEN3_5_MOE).images.expect("a family that takes images");
+        let images = profile(QWEN3_5_MOE)
+            .images
+            .expect("a family that takes images");
         let file = r#"{"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
             "size": {"shortest_edge": 4096, "longest_edge": 16777216}}"#;
         let files = [file.to_owned(), file.to_owned()];

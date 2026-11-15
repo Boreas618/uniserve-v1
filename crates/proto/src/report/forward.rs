@@ -48,10 +48,8 @@ pub struct ForwardStats {
     /// Fence probe records the rank's reader lost: overwritten before it
     /// read them.
     pub fence_records_lost: u64,
-    /// A profiling session's progress on the rank, keyed `{session}/steps`
-    /// (the steps of its window the rank recorded), `{session}/bytes` (the
-    /// bytes of its file) and `{session}/ended` (1 once its window ended).
-    pub profile: BTreeMap<String, u64>,
+    /// Each profiling session's progress on the rank, by session.
+    pub profile: BTreeMap<u64, ProfileProgress>,
     /// Attention kernel launch count.
     pub attention_launches: u64,
     /// Cumulative attention kernel time in microseconds.
@@ -94,6 +92,27 @@ pub struct ForwardStats {
     pub spec_verify_path_counts: BTreeMap<String, u64>,
 }
 
+/// One profiling session's progress on a rank since its previous report, or summed over
+/// reports and ranks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileProgress {
+    /// The steps of its window the rank recorded.
+    pub steps: u64,
+    /// The bytes its file grew by.
+    pub bytes: u64,
+    /// The ranks whose window ended: 1 in the report of the rank's window's end.
+    pub windows_ended: u64,
+}
+
+impl ProfileProgress {
+    /// Adds `other`'s progress, saturating at the wire representation's limit.
+    pub fn add(&mut self, other: &Self) {
+        self.steps = self.steps.saturating_add(other.steps);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.windows_ended = self.windows_ended.saturating_add(other.windows_ended);
+    }
+}
+
 impl ForwardStats {
     /// Add another invocation's counters, retaining every keyed breakdown.
     /// Counters saturate at the wire representation's unsigned 64-bit limit.
@@ -116,12 +135,14 @@ impl ForwardStats {
                 &mut self.spec_verify_path_counts,
                 &other.spec_verify_path_counts,
             ),
-            (&mut self.profile, &other.profile),
         ] {
             for (name, &value) in values {
                 let count = target.entry(name.clone()).or_default();
                 *count = count.saturating_add(value);
             }
+        }
+        for (session, progress) in &other.profile {
+            self.profile.entry(*session).or_default().add(progress);
         }
         for (name, histogram) in &other.fence_us {
             self.fence_us

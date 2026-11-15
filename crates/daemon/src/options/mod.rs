@@ -618,6 +618,14 @@ pub struct UpdateConfig {
     /// hardware and workload (`docs/configuration.md`); unset, the transfers
     /// take their links' whole budgets.
     pub transfer_slowdown: Option<f64>,
+    /// The span of serving steps before a preparation that each scheduler's
+    /// baseline step times are read from (`transfer_slowdown`).
+    #[serde(with = "values::duration")]
+    pub baseline: Duration,
+    /// The fewest batches of one batch-size range that make a scheduler's
+    /// baseline step time in that range, so that a range the load visited
+    /// for a few steps sets none.
+    pub baseline_batches: NonZeroU32,
     /// Seconds a draining engine steps its running requests beside the
     /// engine promoted before it, after which it ends the ones still running
     /// as migratable: it bounds the time two epochs share each GPU.
@@ -628,12 +636,22 @@ pub struct UpdateConfig {
 /// requests in flight end by themselves.
 pub const DRAIN_S: f64 = 5.0;
 
+/// The default `update_config.baseline`: a minute of a serving epoch's steps,
+/// which holds every scheduler's steps of the batch sizes its load visits.
+pub const BASELINE: Duration = Duration::from_secs(60);
+
+/// The default `update_config.baseline_batches`: enough batches of one size
+/// that a few steps the load passed through set no baseline.
+pub const BASELINE_BATCHES: NonZeroU32 = NonZeroU32::new(20).unwrap();
+
 impl Default for UpdateConfig {
     fn default() -> Self {
         Self {
             previous_epoch: PreviousEpoch::Parked,
             rollback: RollbackConfig::default(),
             transfer_slowdown: None,
+            baseline: BASELINE,
+            baseline_batches: BASELINE_BATCHES,
             drain_s: DRAIN_S,
         }
     }
@@ -870,6 +888,10 @@ impl ServerArgs {
                 "invalid `update_config.transfer_slowdown`: {slowdown} must be positive"
             );
         }
+        anyhow::ensure!(
+            !self.update_config.baseline.is_zero(),
+            "invalid `update_config.baseline`: a baseline spans some time"
+        );
         let drain = self.update_config.drain_s;
         anyhow::ensure!(
             drain.is_finite() && drain >= 0.0,

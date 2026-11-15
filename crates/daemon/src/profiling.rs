@@ -14,48 +14,61 @@
 //!   trial rolls back. Neither carries a session into the next epoch;
 //! - the quality-of-service guard ends it.
 //!
-//! At most one session runs. The guard measures the average step time of
-//! the session's epoch over the [`BASELINE`] before the session started and
-//! over the last [`GUARD_WINDOW`] of the session. With `max_slowdown`, a
-//! step time past the baseline by more than that fraction turns off the
-//! session's costliest collector still running (`ReleaseProfile`, in
-//! `Collector::COSTLIEST_FIRST` order), at most once a [`GUARD_WINDOW`] so
-//! that each change is measured; a slowdown that remains with no collector
-//! left ends the session. Every action is in the session's status.
+//! At most one session runs, under one identity on every replica. Its task
+//! decides as each statistics report of its replica arrives
+//! ([`crate::observe::Observer::records`]), and at its window's seconds. The
+//! guard measures the average step time of the session's epoch over the
+//! request's `baseline_s` before the session started and over its last
+//! `guard_window_s`. With `max_slowdown`, a step time past the baseline by more
+//! than that fraction turns off the session's costliest collector still
+//! running (`ReleaseProfile`, in `Collector::COSTLIEST_FIRST` order), at most
+//! once a guard window so that each change is measured; a slowdown that
+//! remains with no collector left ends the session. Every action is in the
+//! session's status.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use proto::profile::{Collector, RankStart, RankStop, SessionRequest, SessionStart};
 use proto::request::wire;
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::engine::client::{EngineClient, EngineState};
 use crate::leader::{Leader, Replica, UpdateError};
 use crate::observe::Rates;
 
-/// The span before a session's start its baseline step time averages.
-pub const BASELINE: Duration = Duration::from_secs(60);
+/// Where a session is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    /// Its workers record.
+    Running,
+    /// Its workers write their files.
+    Ending,
+    /// It ended.
+    Ended,
+}
 
-/// The span of a session the guard averages its step time over, and the
-/// least time between two of its actions.
-pub const GUARD_WINDOW: Duration = Duration::from_secs(10);
-
-/// How often the session's task checks its window and its guard.
-const POLL: Duration = Duration::from_millis(500);
-
-/// How long ending a session waits for the workers to write their files.
-const STOP_TIMEOUT: Duration = Duration::from_secs(120);
+/// What the quality-of-service guard did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardActionKind {
+    /// It turned a collector off.
+    Release,
+    /// It ended the session: no collector was left to turn off.
+    End,
+}
 
 /// One action of the quality-of-service guard.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GuardAction {
-    /// Seconds since the Unix epoch.
-    pub time: f64,
-    /// `release` (a collector was turned off) or `end`.
-    pub action: String,
+    /// When it acted, in seconds since the Unix epoch.
+    #[serde(serialize_with = "unix_seconds")]
+    pub time: SystemTime,
+    pub action: GuardActionKind,
     pub collector: Option<Collector>,
     /// The slowdown that caused it: the session's step time over the
     /// baseline's, less one.
@@ -67,22 +80,24 @@ pub struct GuardAction {
 pub struct Overhead {
     /// The epoch's average step before the session, microseconds.
     pub baseline_step_us: f64,
-    /// The session's average step over its last [`GUARD_WINDOW`].
+    /// The session's average step over its last guard window.
     pub step_us: f64,
     /// `step_us / baseline_step_us - 1`.
     pub slowdown: f64,
 }
 
-/// A session, running or the last that ended.
+/// One replica's session, running or the last that ended.
 #[derive(Debug, Clone, Serialize)]
 pub struct Session {
     pub id: u64,
     pub epoch: u64,
-    /// `running` or `ended`.
-    pub state: String,
-    /// Seconds since the Unix epoch.
-    pub started: f64,
-    pub ended: Option<f64>,
+    pub state: SessionState,
+    /// When it started, in seconds since the Unix epoch.
+    #[serde(serialize_with = "unix_seconds")]
+    pub started: SystemTime,
+    /// When it ended, in seconds since the Unix epoch.
+    #[serde(serialize_with = "optional_unix_seconds")]
+    pub ended: Option<SystemTime>,
     /// Why it ended: `window`, `seconds`, `operator`, `epoch change`,
     /// `rollback`, `quality of service`, or a failure.
     pub end_reason: Option<String>,
@@ -110,106 +125,228 @@ pub struct Session {
     pub device_storage: u64,
 }
 
-/// The deployment's sessions.
+/// The deployment's session: one identity on every replica, each replica's session, and what
+/// they hold together.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileReport {
+    pub id: u64,
+    /// `running` while a replica's session records, `ending` while one writes its files and
+    /// none records, `ended` once every one ended.
+    pub state: SessionState,
+    /// The reasons the replicas' sessions ended, each once, in replica order; `None` while
+    /// none ended.
+    pub end_reason: Option<String>,
+    /// Every replica's workers' answers to the start, replica by replica.
+    pub workers: Vec<RankStart>,
+    /// Every replica's workers' answers to the end, replica by replica.
+    pub files: Vec<RankStop>,
+    /// The steps every worker's window took.
+    pub steps: u64,
+    /// The bytes every worker's file holds.
+    pub bytes_written: u64,
+    /// The workers whose window ended.
+    pub windows_ended: u64,
+    /// The collectors still running on any replica.
+    pub collectors: Vec<Collector>,
+    /// Each replica's session, in replica order.
+    pub replicas: Vec<Session>,
+}
+
+impl ProfileReport {
+    /// The deployment's session `id` made of its replicas' `sessions`; `None` without any.
+    fn of(id: u64, sessions: Vec<Session>) -> Option<Self> {
+        let state =
+            sessions
+                .iter()
+                .map(|session| session.state)
+                .min_by_key(|state| match state {
+                    SessionState::Running => 0,
+                    SessionState::Ending => 1,
+                    SessionState::Ended => 2,
+                })?;
+        let mut reasons: Vec<&str> = Vec::new();
+        for reason in sessions
+            .iter()
+            .filter_map(|session| session.end_reason.as_deref())
+        {
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+        }
+        let end_reason = (!reasons.is_empty()).then(|| reasons.join("; "));
+        Some(Self {
+            id,
+            state,
+            end_reason,
+            workers: sessions
+                .iter()
+                .flat_map(|session| session.workers.clone())
+                .collect(),
+            files: sessions
+                .iter()
+                .flat_map(|session| session.files.clone())
+                .collect(),
+            steps: sessions.iter().map(|session| session.steps).sum(),
+            bytes_written: sessions.iter().map(|session| session.bytes_written).sum(),
+            windows_ended: sessions.iter().map(|session| session.windows_ended).sum(),
+            collectors: sessions
+                .iter()
+                .flat_map(|session| session.collectors.iter().copied())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            replicas: sessions,
+        })
+    }
+}
+
+/// A replica's sessions: the one that runs or the last that ended.
 #[derive(Default)]
 pub(crate) struct Profiles {
     session: std::sync::Mutex<Option<Session>>,
-    next: std::sync::atomic::AtomicU64,
     /// When the guard last acted, for the running session.
     acted: std::sync::Mutex<Option<Instant>>,
+    /// Cancelled when the running session ends, which ends its task.
+    ending: std::sync::Mutex<CancellationToken>,
 }
 
-fn now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0.0, |elapsed| elapsed.as_secs_f64())
+/// `time` in seconds since the Unix epoch.
+///
+/// # Errors
+///
+/// A time before the Unix epoch, which no clock of a serving host states.
+fn unix_seconds<S: serde::Serializer>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error> {
+    let seconds = time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(serde::ser::Error::custom)?;
+    serializer.serialize_f64(seconds.as_secs_f64())
+}
+
+/// [`unix_seconds`] of a time that may be unset.
+fn optional_unix_seconds<S: serde::Serializer>(
+    time: &Option<SystemTime>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match time {
+        Some(time) => unix_seconds(time, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// The deployment's report as the admin API answers it.
+///
+/// # Errors
+///
+/// When the report does not serialize: a session time before the Unix epoch.
+fn answer(report: Option<ProfileReport>) -> Result<serde_json::Value, UpdateError> {
+    serde_json::to_value(report).map_err(|error| UpdateError::Failed(error.into()))
 }
 
 impl Leader {
+    /// Starts a session of `request` on every replica's executing epoch, under one identity.
+    ///
+    /// # Errors
+    ///
+    /// As [`Replica::start_profile`], for the first replica that refuses or fails; the
+    /// replicas that started end their session.
     pub async fn start_profile(
         self: &Arc<Self>,
         request: SessionRequest,
     ) -> Result<serde_json::Value, UpdateError> {
+        let id = self.replicas.next_profile();
         let mut sessions = Vec::new();
         for replica in self.replicas() {
-            sessions.push(replica.start_profile(request.clone()).await?);
+            match replica.start_profile(id, request.clone()).await {
+                Ok(session) => sessions.push(session),
+                Err(error) => {
+                    for started in self.replicas() {
+                        if started.profile_running() == Some(id) {
+                            let client = started.hold().client();
+                            end(&started, client.as_deref(), id, "not started", true).await;
+                        }
+                    }
+                    return Err(error);
+                }
+            }
         }
-        let mut report = sessions[0].clone();
-        report["replicas"] = sessions.into();
-        Ok(report)
+        answer(ProfileReport::of(id, sessions))
     }
 
-    pub fn profile_status(&self) -> Option<serde_json::Value> {
-        let sessions: Vec<_> = self
+    /// The deployment's session that runs, or the last that ended; `None` before any.
+    pub fn profile_status(&self) -> Option<ProfileReport> {
+        let sessions: Vec<Session> = self
             .replicas()
             .iter()
             .filter_map(|replica| replica.profile_status())
             .collect();
-        let mut report = serde_json::to_value(sessions.first()?).ok()?;
-        report["replicas"] = serde_json::to_value(sessions).ok()?;
-        Some(report)
+        let id = sessions.iter().map(|session| session.id).max()?;
+        ProfileReport::of(
+            id,
+            sessions
+                .into_iter()
+                .filter(|session| session.id == id)
+                .collect(),
+        )
     }
 
+    /// Ends the running session for `reason` on every replica.
+    ///
+    /// # Errors
+    ///
+    /// Refuses when no session runs.
     pub async fn stop_profile(&self, reason: &str) -> Result<serde_json::Value, UpdateError> {
-        let mut reports = Vec::new();
+        let mut running = None;
         for replica in self.replicas() {
-            if replica
-                .profile_status()
-                .is_some_and(|session| session.state == "running")
-            {
-                reports.push(replica.stop_profile(reason).await?);
+            if let Some(id) = replica.profile_running() {
+                let client = replica.hold().client();
+                end(&replica, client.as_deref(), id, reason, true).await;
+                running = Some(id);
             }
         }
-        if reports.is_empty() {
+        if running.is_none() {
             return Err(UpdateError::Refused("no profiling session runs".to_owned()));
         }
-        let mut report = reports[0].clone();
-        report["replicas"] = reports.into();
-        Ok(report)
+        answer(self.profile_status())
     }
 }
 
 impl Replica {
-    /// Start a session of `request` on the executing epoch.
+    /// Starts session `id` of `request` on the executing epoch, and returns it.
     ///
     /// # Errors
     ///
-    /// Refuses an invalid request and a session while one runs; fails when
-    /// no engine serves or a worker cannot start it.
+    /// Refuses an invalid request, a baseline or guard window longer than the replica keeps
+    /// its statistics for, and a session while one runs; fails when no engine serves or a
+    /// worker cannot start it. A worker refuses what it cannot run: its GPU's quota cannot fit
+    /// the session's storage, or a collector CUPTI cannot run beside its graphs' PC sampling.
     pub(crate) async fn start_profile(
         self: &Arc<Self>,
+        id: u64,
         request: SessionRequest,
-    ) -> Result<serde_json::Value, UpdateError> {
+    ) -> Result<Session, UpdateError> {
         request.validate().map_err(UpdateError::Refused)?;
-        // Ranks that keep PC sampling enabled for their graphs refuse the
-        // collectors CUPTI cannot run beside it.
-        let graph_pc_sampling = service::lock(&self.served)
-            .as_ref()
-            .is_some_and(|args| args.engine_config.profiling.graph_pc_sampling);
-        if graph_pc_sampling && let Some(reason) = request.refused_beside_graph_pc_sampling() {
-            return Err(UpdateError::Refused(reason));
-        }
-        let profiles = &self.profiles;
-        if let Some(running) = service::lock(&profiles.session)
-            .as_ref()
-            .filter(|session| session.state == "running")
-        {
+        let baseline_span = Duration::from_secs_f64(request.baseline_s);
+        let guard_window = Duration::from_secs_f64(request.guard_window_s);
+        let kept = self.observer.retention();
+        if baseline_span.max(guard_window) > kept {
             return Err(UpdateError::Refused(format!(
-                "profiling session {} runs: end it first (DELETE /admin/profile)",
-                running.id
+                "the replica keeps its statistics for {} s (update_config's baseline and \
+                 rollback window), shorter than the session's baseline or guard window",
+                kept.as_secs_f64()
+            )));
+        }
+        if let Some(running) = self.profile_running() {
+            return Err(UpdateError::Refused(format!(
+                "profiling session {running} runs: end it first (DELETE /admin/profile)"
             )));
         }
         let client = self.hold().client().ok_or(UpdateError::NoEngine)?;
         let epoch = client.epoch();
-        let id = profiles
-            .next
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
         let started_at = Instant::now();
         let baseline = self.observer.rates(
             epoch,
-            started_at.checked_sub(BASELINE).unwrap_or(started_at),
-            BASELINE,
+            started_at.checked_sub(baseline_span).unwrap_or(started_at),
+            baseline_span,
         );
         let start = SessionStart {
             session: id,
@@ -224,43 +361,45 @@ impl Replica {
         // preparation does, the requests holding them running on, and the session starts once
         // more, its storage now known. Any other refusal ends the start.
         let mut room = 0;
-        let workers =
-            loop {
-                let started = self
-                    .operate("profile_start", |client| {
-                        let start = start.clone();
-                        async move { client.start_profile(&start).await }
-                    })
-                    .await;
-                let workers = match started {
-                    Ok(workers) => workers,
-                    Err(error) => {
-                        self.abandon_profile(id, room, &client).await;
-                        return Err(error);
-                    }
-                };
-                let Some(refusal) = workers.iter().find_map(|worker| worker.refused.clone()) else {
-                    break workers;
-                };
-                self.abandon_profile(id, room, &client).await;
-                let needed = workers
-                    .iter()
-                    .filter(|worker| worker.refused.is_some())
-                    .map(|worker| worker.device_storage)
-                    .max()
-                    .unwrap_or(0);
-                if room > 0 || needed == 0 {
-                    return Err(UpdateError::Refused(refusal));
+        let workers = loop {
+            let started = self
+                .operate("profile_start", |client| {
+                    let start = start.clone();
+                    async move { client.start_profile(&start).await }
+                })
+                .await;
+            let workers = match started {
+                Ok(workers) => workers,
+                Err(error) => {
+                    self.abandon_profile(id, room, &client).await;
+                    return Err(error);
                 }
-                client.reserve_storage(crate::engine::client::Room::Each(needed)).await.map_err(|error| {
-                UpdateError::Refused(format!(
-                    "the session holds {needed} bytes of device storage on a selected worker's \
-                     GPU (a range_metrics pass, as the worker measured it), for which the KV \
-                     cache cannot make room: {error}"
-                ))
-            })?;
-                room = needed;
             };
+            let Some(refusal) = workers.iter().find_map(|worker| worker.refused.clone()) else {
+                break workers;
+            };
+            self.abandon_profile(id, room, &client).await;
+            let needed = workers
+                .iter()
+                .filter(|worker| worker.refused.is_some())
+                .map(|worker| worker.device_storage)
+                .max()
+                .unwrap_or(0);
+            if room > 0 || needed == 0 {
+                return Err(UpdateError::Refused(refusal));
+            }
+            client
+                .reserve_storage(crate::engine::client::Room::Each(needed))
+                .await
+                .map_err(|error| {
+                    UpdateError::Refused(format!(
+                        "the session holds {needed} bytes of device storage on a selected \
+                         worker's GPU (a range_metrics pass, as the worker measured it), for \
+                         which the KV cache cannot make room: {error}"
+                    ))
+                })?;
+            room = needed;
+        };
         // What the selected workers measured their collectors hold, the largest of them.
         let device_storage = workers
             .iter()
@@ -287,8 +426,8 @@ impl Replica {
         let session = Session {
             id,
             epoch,
-            state: "running".to_owned(),
-            started: now(),
+            state: SessionState::Running,
+            started: SystemTime::now(),
             ended: None,
             end_reason: None,
             request,
@@ -303,40 +442,30 @@ impl Replica {
             guard: Vec::new(),
             device_storage,
         };
-        let answer = serde_json::to_value(&session).unwrap_or_default();
-        *service::lock(&profiles.session) = Some(session);
-        *service::lock(&profiles.acted) = None;
+        let ending = CancellationToken::new();
+        *service::lock(&self.profiles.session) = Some(session.clone());
+        *service::lock(&self.profiles.acted) = None;
+        *service::lock(&self.profiles.ending) = ending.clone();
         info!(session = id, epoch, "a profiling session started");
-        tokio::spawn(watch(Arc::clone(self), id, started_at));
-        Ok(answer)
+        tokio::spawn(watch(Arc::clone(self), id, started_at, ending));
+        Ok(session)
+    }
+
+    /// The running session's identity; `None` while none runs.
+    pub(crate) fn profile_running(&self) -> Option<u64> {
+        service::lock(&self.profiles.session)
+            .as_ref()
+            .filter(|session| session.state == SessionState::Running)
+            .map(|session| session.id)
     }
 
     /// The running session, or the last that ended; `None` before any.
     pub(crate) fn profile_status(&self) -> Option<Session> {
         let mut session = service::lock(&self.profiles.session).clone()?;
-        if session.state == "running" {
+        if session.state == SessionState::Running {
             self.profiles.progress(&mut session, &self.observer);
         }
         Some(session)
-    }
-
-    /// End the running session for `reason`, every worker writing its file.
-    ///
-    /// # Errors
-    ///
-    /// Refuses when no session runs.
-    pub(crate) async fn stop_profile(
-        &self,
-        reason: &str,
-    ) -> Result<serde_json::Value, UpdateError> {
-        let id = service::lock(&self.profiles.session)
-            .as_ref()
-            .filter(|session| session.state == "running")
-            .map(|session| session.id)
-            .ok_or_else(|| UpdateError::Refused("no profiling session runs".to_owned()))?;
-        let client = self.hold().client();
-        end(self, client.as_deref(), id, reason, true).await;
-        Ok(serde_json::to_value(self.profile_status()).unwrap_or_default())
     }
 
     /// End session `id` on the workers that started it after another
@@ -366,13 +495,14 @@ impl Profiles {
     /// Read the workers' progress of `session` from the statistics they
     /// reported, and the guard's measure.
     fn progress(&self, session: &mut Session, observer: &crate::observe::Observer) {
-        let (steps, bytes, ended) = observer.profile(session.id);
-        session.steps = steps;
-        session.bytes_written = bytes;
-        session.windows_ended = ended;
+        let progress = observer.profile(session.id);
+        session.steps = progress.steps;
+        session.bytes_written = progress.bytes;
+        session.windows_ended = progress.windows_ended;
+        let guard_window = Duration::from_secs_f64(session.request.guard_window_s);
         session.overhead = session.baseline.and_then(|baseline| {
-            let since = Instant::now().checked_sub(GUARD_WINDOW)?;
-            let current = observer.rates(session.epoch, since, GUARD_WINDOW)?;
+            let since = Instant::now().checked_sub(guard_window)?;
+            let current = observer.rates(session.epoch, since, guard_window)?;
             (baseline.step_us > 0.0).then(|| Overhead {
                 baseline_step_us: baseline.step_us,
                 step_us: current.step_us,
@@ -382,15 +512,11 @@ impl Profiles {
     }
 }
 
-/// End session `id` for `reason` on the workers of `client`, when it still
-/// runs: every worker writes its file. A session whose epoch no longer
-/// executes on `client` ends without its workers' answers, which wrote what
-/// they recorded as their epoch closed or keep it in their files' logs.
 /// Grow the engine's KV cache back into the room session `id` made for its
 /// device storage, once the workers released it.
 async fn grow_back(client: &EngineClient, id: u64) {
     match client.resize_cache(wire::CacheChange::Grow).await {
-        Ok(_) => info!(
+        Ok(()) => info!(
             session = id,
             "the KV cache grew back after the profiling session"
         ),
@@ -401,11 +527,11 @@ async fn grow_back(client: &EngineClient, id: u64) {
     }
 }
 
-/// End session `id` for `reason`: the workers of an epoch that still serves
-/// write their files, and, with `grow`, the KV cache grows back into the
-/// room the session made for its device storage; an epoch that stops
-/// executing (an epoch change's promotion, a rollback) keeps its cache as
-/// the change left it.
+/// End session `id` for `reason`, when it still runs: the workers of an epoch that still
+/// serves write their files, and, with `grow`, the KV cache grows back into the room the
+/// session made for its device storage; an epoch that stops executing (an epoch change's
+/// promotion, a rollback) keeps its cache as the change left it, and its workers wrote what
+/// they recorded as their epoch closed or keep it in their files' logs.
 pub(crate) async fn end(
     replica: &crate::leader::Replica,
     client: Option<&EngineClient>,
@@ -417,30 +543,28 @@ pub(crate) async fn end(
         let mut session = service::lock(&replica.profiles.session);
         let Some(running) = session
             .as_mut()
-            .filter(|session| session.id == id && session.state == "running")
+            .filter(|session| session.id == id && session.state == SessionState::Running)
         else {
             return;
         };
         replica.profiles.progress(running, &replica.observer);
-        // Ending from here on: a second end finds it ended.
-        running.state = "ending".to_owned();
+        // Ending from here on: a second end finds it ending.
+        running.state = SessionState::Ending;
         (running.epoch, running.device_storage)
     };
+    service::lock(&replica.profiles.ending).cancel();
     let mut files = Vec::new();
     let mut failure = None;
     // Only an epoch that still serves writes its files: a failed one's
-    // workers keep what they committed (the files' write-ahead logs).
+    // workers keep what they committed (the files' write-ahead logs). The
+    // workers answer once their files are written, or their engine's end
+    // ends the wait.
     if let Some(client) =
         client.filter(|client| client.epoch() == epoch && client.state() == EngineState::Serving)
     {
-        match tokio::time::timeout(STOP_TIMEOUT, client.stop_profile(id, reason)).await {
-            Ok(Ok(stopped)) => files = stopped,
-            Ok(Err(error)) => failure = Some(format!("the workers did not end it: {error}")),
-            Err(_) => {
-                failure = Some(format!(
-                    "the workers did not end it within {STOP_TIMEOUT:?}"
-                ))
-            }
+        match client.stop_profile(id, reason).await {
+            Ok(stopped) => files = stopped,
+            Err(error) => failure = Some(format!("the workers did not end it: {error}")),
         }
         if grow && device_storage > 0 {
             grow_back(client, id).await;
@@ -448,8 +572,8 @@ pub(crate) async fn end(
     }
     let mut session = service::lock(&replica.profiles.session);
     if let Some(ended) = session.as_mut().filter(|session| session.id == id) {
-        ended.state = "ended".to_owned();
-        ended.ended = Some(now());
+        ended.state = SessionState::Ended;
+        ended.ended = Some(SystemTime::now());
         ended.end_reason = Some(match &failure {
             Some(failure) => format!("{reason}; {failure}"),
             None => reason.to_owned(),
@@ -470,92 +594,116 @@ pub(crate) async fn end_for_epoch(
     client: Option<&EngineClient>,
     reason: &str,
 ) {
-    let running = service::lock(&replica.profiles.session)
-        .as_ref()
-        .filter(|session| session.state == "running")
-        .map(|session| session.id);
-    if let Some(id) = running {
+    if let Some(id) = replica.profile_running() {
         end(replica, client, id, reason, false).await;
     }
 }
 
-/// The session's task: ends it when its windows end, its seconds pass or
-/// its guard ends it, and runs the guard.
-async fn watch(replica: Arc<Replica>, id: u64, started: Instant) {
+/// What the session's task does after a report of its replica arrived.
+enum Next {
+    /// The session goes on.
+    Running,
+    /// The session ends for the reason.
+    End(&'static str),
+}
+
+/// The session's task: decides as each report of its replica arrives whether its windows
+/// ended or its guard acts, ends it once its window of seconds passed, and stops once
+/// something else ended it (`ending`).
+async fn watch(replica: Arc<Replica>, id: u64, started: Instant, ending: CancellationToken) {
+    let mut records = vec![replica.observer.records()];
+    let seconds = service::lock(&replica.profiles.session)
+        .as_ref()
+        .and_then(|session| session.request.seconds)
+        .map(|seconds| started + Duration::from_secs_f64(seconds));
+    let expiry = async {
+        match seconds {
+            Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(expiry);
     loop {
-        tokio::time::sleep(POLL).await;
-        let (request, collectors, overhead) = {
-            let mut session = service::lock(&replica.profiles.session);
-            let Some(running) = session
-                .as_mut()
-                .filter(|session| session.id == id && session.state == "running")
-            else {
-                return;
-            };
-            replica.profiles.progress(running, &replica.observer);
-            let selected = running
-                .workers
-                .iter()
-                .filter(|worker| worker.selected)
-                .count() as u64;
-            let ended = running.request.steps.is_some() && running.windows_ended >= selected;
-            if ended {
-                (None, Vec::new(), None)
-            } else {
-                (
-                    Some(running.request.clone()),
-                    running.collectors.clone(),
-                    running.overhead,
-                )
-            }
+        let reason = tokio::select! {
+            () = ending.cancelled() => return,
+            () = &mut expiry => "seconds",
+            () = crate::observe::next_record(&mut records) => match guard(&replica, id, started).await {
+                Next::Running => continue,
+                Next::End(reason) => reason,
+            },
         };
         let client = replica.hold.client();
-        let Some(request) = request else {
-            end(&replica, client.as_deref(), id, "window", true).await;
-            return;
-        };
-        if request
-            .seconds
-            .is_some_and(|seconds| started.elapsed().as_secs_f64() >= seconds)
-        {
-            end(&replica, client.as_deref(), id, "seconds", true).await;
-            return;
-        }
-        let (Some(max), Some(overhead)) = (request.max_slowdown, overhead) else {
-            continue;
-        };
-        if overhead.slowdown <= max {
-            continue;
-        }
-        let due = service::lock(&replica.profiles.acted)
-            .is_none_or(|acted| acted.elapsed() >= GUARD_WINDOW)
-            && started.elapsed() >= GUARD_WINDOW;
-        if !due {
-            continue;
-        }
-        *service::lock(&replica.profiles.acted) = Some(Instant::now());
-        let costliest = Collector::COSTLIEST_FIRST
-            .into_iter()
-            .find(|collector| collectors.contains(collector));
-        let Some(collector) = costliest else {
-            record(&replica, id, "end", None, overhead.slowdown);
-            end(&replica, client.as_deref(), id, "quality of service", true).await;
-            return;
-        };
-        record(&replica, id, "release", Some(collector), overhead.slowdown);
-        let reason = format!(
-            "the step time rose {:.1}% over the baseline, past the {:.1}% allowed",
-            overhead.slowdown * 100.0,
-            max * 100.0
-        );
-        let released = match &client {
-            Some(client) => client.release_profile(id, collector, &reason).await,
-            None => Err("no engine serves".to_owned()),
-        };
-        if let Err(error) = released {
-            warn!(session = id, %error, "the guard did not turn a collector off");
-        }
+        end(&replica, client.as_deref(), id, reason, true).await;
+        return;
     }
+}
+
+/// Reads session `id`'s progress after a report: whether its windows ended, and the guard's
+/// decision on its step time.
+async fn guard(replica: &Replica, id: u64, started: Instant) -> Next {
+    let (request, collectors, overhead) = {
+        let mut session = service::lock(&replica.profiles.session);
+        let Some(running) = session
+            .as_mut()
+            .filter(|session| session.id == id && session.state == SessionState::Running)
+        else {
+            return Next::Running;
+        };
+        replica.profiles.progress(running, &replica.observer);
+        let selected = running
+            .workers
+            .iter()
+            .filter(|worker| worker.selected)
+            .count() as u64;
+        if running.request.steps.is_some() && running.windows_ended >= selected {
+            return Next::End("window");
+        }
+        (
+            running.request.clone(),
+            running.collectors.clone(),
+            running.overhead,
+        )
+    };
+    let (Some(max), Some(overhead)) = (request.max_slowdown, overhead) else {
+        return Next::Running;
+    };
+    if overhead.slowdown <= max {
+        return Next::Running;
+    }
+    let window = Duration::from_secs_f64(request.guard_window_s);
+    let due = service::lock(&replica.profiles.acted).is_none_or(|acted| acted.elapsed() >= window)
+        && started.elapsed() >= window;
+    if !due {
+        return Next::Running;
+    }
+    *service::lock(&replica.profiles.acted) = Some(Instant::now());
+    let costliest = Collector::COSTLIEST_FIRST
+        .into_iter()
+        .find(|collector| collectors.contains(collector));
+    let Some(collector) = costliest else {
+        record(replica, id, GuardActionKind::End, None, overhead.slowdown);
+        return Next::End("quality of service");
+    };
+    record(
+        replica,
+        id,
+        GuardActionKind::Release,
+        Some(collector),
+        overhead.slowdown,
+    );
+    let reason = format!(
+        "the step time rose {:.1}% over the baseline, past the {:.1}% allowed",
+        overhead.slowdown * 100.0,
+        max * 100.0
+    );
+    let released = match replica.hold.client() {
+        Some(client) => client.release_profile(id, collector, &reason).await,
+        None => Err("no engine serves".to_owned()),
+    };
+    if let Err(error) = released {
+        warn!(session = id, %error, "the guard did not turn a collector off");
+    }
+    Next::Running
 }
 
 /// Record a guard action on session `id`, and stop counting `collector`
@@ -563,7 +711,7 @@ async fn watch(replica: Arc<Replica>, id: u64, started: Instant) {
 fn record(
     replica: &crate::leader::Replica,
     id: u64,
-    action: &str,
+    action: GuardActionKind,
     collector: Option<Collector>,
     slowdown: f64,
 ) {
@@ -571,14 +719,14 @@ fn record(
     if let Some(running) = session.as_mut().filter(|session| session.id == id) {
         warn!(
             session = id,
-            action,
+            ?action,
             collector = collector.map(Collector::as_str),
             slowdown,
             "the profiling guard acted"
         );
         running.guard.push(GuardAction {
-            time: now(),
-            action: action.to_owned(),
+            time: SystemTime::now(),
+            action,
             collector,
             slowdown,
         });

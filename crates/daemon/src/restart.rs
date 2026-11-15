@@ -858,7 +858,9 @@ async fn prepared_successor(
                 let (options, _) = crate::options::resolve_text(&replica.config, &[])?;
                 let options = options.with_daemon_part(daemon_options.daemon_part());
                 let served = replica.served.clone();
-                let observer = Arc::new(crate::observe::Observer::default());
+                let observer = Arc::new(crate::observe::Observer::new(crate::observe::span(
+                    &options.update_config,
+                )));
                 let sink = stats_sink(options.model().to_owned(), Arc::clone(&observer), index);
                 let client = adopting.adopt(
                     replica.engine,

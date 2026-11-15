@@ -355,16 +355,22 @@ impl Updater {
         self.settle(&mut state);
     }
 
-    /// `trial` decides the update in flight from now on, and the status
-    /// reports it. A trial begins when the switch ended (`specs/updates.md`
-    /// §3.7): `false`, and nothing begins, unless the update in flight stands
-    /// on trial.
-    pub(crate) fn begin_trial(&self, trial: Trial) -> bool {
+    /// The trial `begin` makes, given when the update's switch began (what
+    /// its baselines end at), decides the update in flight from now on, and
+    /// the status reports it. A trial begins when the switch ended
+    /// (`specs/updates.md` §3.7): `false`, and nothing begins, unless the
+    /// update in flight stands on trial, which its switch led to.
+    pub(crate) fn begin_trial(&self, begin: impl FnOnce(Instant) -> Trial) -> bool {
         let mut state = self.lock();
-        if state.update.as_ref().map(Update::phase) != Some(Phase::Trial) {
+        let Some(switch) = state
+            .update
+            .as_ref()
+            .filter(|update| update.phase() == Phase::Trial)
+            .and_then(Update::switch_began)
+        else {
             return false;
-        }
-        state.trial = Some(trial);
+        };
+        state.trial = Some(begin(switch));
         true
     }
 
@@ -372,11 +378,6 @@ impl Updater {
     /// the target prepares, which the status reports.
     pub(crate) fn watch_transfers(&self, steps: Arc<Mutex<StepTime>>) {
         self.lock().transfers = Some(steps);
-    }
-
-    /// When the update in flight began to switch; `None` before it did.
-    pub(crate) fn switch_began(&self) -> Option<Instant> {
-        self.lock().update.as_ref()?.switch_began()
     }
 
     /// The launch generations of the previous epoch's engines that have to

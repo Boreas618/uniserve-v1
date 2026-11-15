@@ -474,6 +474,8 @@ message ProfileRequest {
   uint32 pc_hardware_buffer_mib = 17;
   // How often each worker reads its armed samplers, in milliseconds.
   uint64 sampler_read_ms = 18;
+  double baseline_s = 19;
+  double guard_window_s = 20;
 }
 
 enum ProfileCollector {
@@ -833,6 +835,7 @@ message DomainSchedulerStats {
 }
 
 message ForwardStats {
+  reserved 8;
   map<string, uint64> mode_counts = 1;
   map<string, uint64> mode_tokens = 2;
   map<string, uint64> mode_us = 3;
@@ -840,7 +843,6 @@ message ForwardStats {
   map<string, uint64> blocking_calls = 5;
   map<string, FenceHistogram> fence_us = 6;
   uint64 fence_records_lost = 7;
-  map<string, uint64> profile = 8;
   uint64 attention_launches = 9;
   uint64 attention_us = 10;
   map<string, uint64> attention_backend_counts = 11;
@@ -861,6 +863,17 @@ message ForwardStats {
   uint64 spec_verify_rejected_tokens = 26;
   uint64 spec_verify_committed_tokens = 27;
   map<string, uint64> spec_verify_path_counts = 28;
+  // Each profiling session's progress on the rank, by session.
+  map<uint64, ProfileProgress> profile = 29;
+}
+
+// One profiling session's progress on a rank: the steps of its window it
+// recorded, the bytes its file grew by, and 1 in the report of its window's
+// end.
+message ProfileProgress {
+  uint64 steps = 1;
+  uint64 bytes = 2;
+  uint64 windows_ended = 3;
 }
 
 message FenceHistogram {

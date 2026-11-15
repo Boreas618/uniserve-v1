@@ -41,6 +41,7 @@ use platform::DeviceId;
 use proto::profile::{
     Collector, FileReport, RankRelease, RankStart, RankStop, SessionRequest, SessionStart,
 };
+use proto::report::ProfileProgress;
 
 use super::artifact::{ClockRow, Message, Writer, send};
 use super::collectors::{self, Collectors};
@@ -235,6 +236,19 @@ impl Session {
         if !request.workers.is_empty() && !request.workers.contains(&rank) {
             return Ok((None, RankStart::unselected(rank)));
         }
+        // A rank that keeps PC sampling enabled for its graphs' kernels (`pc_sampling::enable`)
+        // cannot run what CUPTI then refuses, and says so.
+        if super::pc_sampling::of(device).is_some()
+            && let Some(refusal) = request.refused_beside_graph_pc_sampling()
+        {
+            return Ok((
+                None,
+                RankStart {
+                    refused: Some(refusal),
+                    ..RankStart::unselected(rank)
+                },
+            ));
+        }
 
         std::fs::create_dir_all(&request.output_dir).map_err(|error| {
             Error::transport_source(format!("creating {}", request.output_dir.display()), error)
@@ -378,30 +392,28 @@ impl Session {
         }
     }
 
-    /// What the rank reports since its last report (`ForwardStats::profile`): the steps its window
-    /// took (`{session}/steps`), the bytes its file grew by (`{session}/bytes`), and that its
-    /// window ended (`{session}/ended`, once).
-    pub(crate) fn progress(&mut self) -> BTreeMap<String, u64> {
+    /// What the rank reports since its last report (`ForwardStats::profile`), under the session's
+    /// id: the steps its window took, the bytes its file grew by, and that its window ended
+    /// (once); none when nothing changed.
+    pub(crate) fn progress(&mut self) -> BTreeMap<u64, ProfileProgress> {
         let bytes = self.writer.as_ref().map_or(0, Writer::bytes);
-        let mut progress = BTreeMap::new();
         let (steps, reported_bytes, ended) = self.reported;
-        if self.recorded > steps {
-            progress.insert(format!("{}/steps", self.id), self.recorded - steps);
-        }
-        if bytes > reported_bytes {
-            progress.insert(format!("{}/bytes", self.id), bytes - reported_bytes);
-        }
         let ending = self.ended.is_some() && !self.intended && self.pending.is_empty();
-        if ending && !ended {
-            progress.insert(format!("{}/ended", self.id), 1);
-        }
+        let progress = ProfileProgress {
+            steps: self.recorded.saturating_sub(steps),
+            bytes: bytes.saturating_sub(reported_bytes),
+            windows_ended: u64::from(ending && !ended),
+        };
 
         self.reported = (
             self.recorded.max(steps),
             bytes.max(reported_bytes),
             ended || ending,
         );
-        progress
+        if progress == ProfileProgress::default() {
+            return BTreeMap::new();
+        }
+        BTreeMap::from([(self.id, progress)])
     }
 
     /// Releases `collector`, which the quality-of-service guard turned off for `reason`; whether

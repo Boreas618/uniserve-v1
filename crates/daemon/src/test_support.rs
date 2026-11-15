@@ -28,7 +28,6 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
 use crate::api::input::chat::HfChatRenderer;
-use crate::api::input::media::MediaConnector;
 use crate::api::input::{Processor, RequestRenderer};
 use crate::api::model::{ModelConfig, SamplingDefaults};
 use crate::api::openai::video_jobs::VideoJobs;
@@ -36,7 +35,7 @@ use crate::api::tokenizer::DynTokenizer;
 use crate::engine::client::EngineClient;
 use crate::leader::Leader;
 use crate::options::ChatTemplateContentFormat;
-use crate::options::{ImageFetchConfig, LoggingConfig, ServerArgs, ServerConfig, VideoJobConfig};
+use crate::options::{LoggingConfig, ServerArgs, ServerConfig, VideoJobConfig};
 
 /// Served model name the test engines serve under.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
@@ -237,7 +236,13 @@ pub(crate) fn fake_engine(
         writer,
         info,
         state,
-        crate::leader::stats_sink(model_name, std::sync::Arc::default(), 0),
+        crate::leader::stats_sink(
+            model_name,
+            std::sync::Arc::new(crate::observe::Observer::new(crate::observe::span(
+                &crate::options::UpdateConfig::default(),
+            ))),
+            0,
+        ),
         None,
     )
     .expect("a client");
@@ -353,23 +358,27 @@ pub(crate) fn leader_over(
         false,
     )
     .unwrap();
-    let images = MediaConnector::new(&ImageFetchConfig::default()).unwrap();
     let options = ServerArgs {
+        model: Some(model_name),
+        served_model_name: Some(SERVED_MODEL.to_owned()),
         logging_config: LoggingConfig {
             log_requests: false,
             log_stats: false,
         },
         ..ServerArgs::default()
     };
+    let observer = std::sync::Arc::new(crate::observe::Observer::new(crate::observe::span(
+        &options.update_config,
+    )));
     Leader::new(
-        SERVED_MODEL.to_owned(),
-        model_name,
+        processing::Registry::default(),
         clients,
         processor,
-        images,
         &options,
+        observer,
         test_updater(),
     )
+    .unwrap()
 }
 
 /// How long a fixture's request may wait for its response before it is a stall.

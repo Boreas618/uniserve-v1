@@ -10,7 +10,7 @@
 //! so the rank first holds the kinds of its always-on stream record enabled for its life; the
 //! stream record and the timelines that trace graphs by node start later beside it. While it is
 //! enabled CUPTI refuses PM sampling, the range profiler and whole-graph activity records, which
-//! the leader refuses at the session request
+//! the rank refuses at the session's start
 //! (`proto::profile::SessionRequest::refused_beside_graph_pc_sampling`). Without the option, a
 //! session enables a sampler of its own, which attributes only kernels launched outside CUDA
 //! graphs.

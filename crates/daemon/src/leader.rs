@@ -98,6 +98,16 @@ pub(crate) struct Replicas {
     /// generation is paused, the engine sleeps, or no engine is ready
     /// (`LeaderStatus::held`).
     pub(crate) held: AtomicUsize,
+    /// The last profiling session's identity, which every replica's session of it states
+    /// (`crate::profiling`).
+    profile_sessions: std::sync::atomic::AtomicU64,
+}
+
+impl Replicas {
+    /// The identity of the deployment's next profiling session.
+    pub(crate) fn next_profile(&self) -> u64 {
+        self.profile_sessions.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 /// Counts one new request in [`Replicas::held`] while it waits for a
@@ -146,18 +156,21 @@ pub(crate) enum Following {
     },
     /// The target engines of another epoch serve the deployment from the
     /// first one's `Serving`.
-    Epoch {
-        /// What starts and joins the replicas' engines.
-        control: Arc<EngineControl>,
-        /// Each target replica: the arguments it serves with, once it is no
-        /// longer an engine that succeeds another, and its world's engines
-        /// by host and launch generation, the scheduler node's first.
-        targets: Vec<(proto::config::EngineArgs, Vec<(String, u64)>)>,
-        /// The configuration the target serves.
-        config: Box<ServerArgs>,
-        /// The epoch the target serves.
-        epoch: u64,
-    },
+    Epoch(EpochTarget),
+}
+
+/// The target of an epoch update, which its follower joins and routes the deployment to.
+pub(crate) struct EpochTarget {
+    /// What starts and joins the replicas' engines.
+    pub(crate) control: Arc<EngineControl>,
+    /// Each target replica: the arguments it serves with, once it is no
+    /// longer an engine that succeeds another, and its world's engines
+    /// by host and launch generation, the scheduler node's first.
+    pub(crate) targets: Vec<(proto::config::EngineArgs, Vec<(String, u64)>)>,
+    /// The configuration the target serves.
+    pub(crate) config: Box<ServerArgs>,
+    /// The epoch the target serves.
+    pub(crate) epoch: u64,
 }
 
 /// Records each scheduler's statistics under `model_name`, and with
@@ -467,7 +480,9 @@ impl Leader {
             in_flight: replicas.iter().map(|replica| replica.in_flight).sum(),
             held: self.replicas.held.load(Ordering::Relaxed),
             generation: first.and_then(|replica| replica.generation),
-            standby: first.map(|replica| replica.standby.clone()).unwrap_or_default(),
+            standby: first
+                .map(|replica| replica.standby.clone())
+                .unwrap_or_default(),
             update: self
                 .updates
                 .in_flight()
@@ -581,9 +596,12 @@ impl Leader {
                     "the adapter {name} is loaded already"
                 )));
             }
-            (1..)
+            // Slot 0 is the base model's; a request names its adapter's slot.
+            (1..=u32::MAX)
                 .find(|slot| adapters.values().all(|adapter| adapter.slot != *slot))
-                .unwrap_or(u32::MAX)
+                .ok_or_else(|| {
+                    UpdateError::Refused("every adapter slot of the workers is taken".to_owned())
+                })?
         };
         let mut results = Vec::new();
         for client in &clients {
@@ -741,16 +759,18 @@ impl Leader {
 
         // The deployment's first epoch takes the number of its first engine, and every replica
         // starts in it.
-        let launches = epoch_launches(&prepared.engine, &modules, control.next_engine())?;
+        let epoch = control.next_engine();
+        let launches = epoch_launches(&prepared.engine, &modules, epoch)?;
+        // Each replica's statistics are kept for the longest span its updates read back.
+        let span = crate::observe::span(&config.update_config);
         let clients =
-            futures::future::join_all(launches.into_iter().enumerate().map(|(index, mut args)| {
+            futures::future::join_all(launches.into_iter().enumerate().map(|(index, args)| {
                 let model = config.model().to_owned();
                 let starting = Arc::clone(&control);
                 tokio::task::spawn_blocking(move || {
-                    let observer = Arc::new(crate::observe::Observer::default());
+                    let observer = Arc::new(crate::observe::Observer::new(span));
                     let sink = stats_sink(model, Arc::clone(&observer), index);
                     let client = starting.start(args.clone(), sink)?;
-                    args.epoch = client.epoch();
                     Ok::<_, anyhow::Error>((client, args, observer))
                 })
             }))
@@ -759,7 +779,6 @@ impl Leader {
             .map(|started| started.context("the engine startup task did not complete")?)
             .collect::<anyhow::Result<Vec<_>>>()
             .context("failed to start the UniServe engine")?;
-        let epoch = clients.first().map_or(0, |(client, _, _)| client.epoch());
         let mut clients = clients.into_iter();
         let (client, served, observer) = clients
             .next()
@@ -925,7 +944,6 @@ impl Leader {
             renderer,
             engine: _,
         } = prepared;
-        let model_name = config.model().to_owned();
         let info = client.info().clone();
 
         // A video checkpoint serves what its placed denoiser declares in the
@@ -974,75 +992,49 @@ impl Leader {
         )
         .context("failed to bind the configured model description")?
         .with_images(images);
-        let images = MediaConnector::new(&config.image_fetch_config)
-            .context("failed to initialize the image URL fetcher")?;
-        let engine = Self::observed(
+        let engine = Self::new(
             families,
-            config.served_model_name().to_owned(),
-            model_name,
             vec![Arc::new(client)],
             processor,
-            images,
             config,
             observer,
             updates,
-        );
+        )?;
         let replica = Arc::clone(&engine.replicas.serving.borrow()[0]);
         let _ = replica.control.set(control);
         *service::lock(&replica.served) = Some(served);
         Ok(engine)
     }
 
-    /// Serves `processor`'s model under `served_model_name` over the
-    /// independent replicas in `clients`, labelling metrics with `model_name`.
-    /// `images` resolves the image references of every request, and `options`
-    /// states the request and statistics logging (`logging_config`) and
-    /// request migration (`migration_config`).
-    #[cfg(test)]
+    /// Serves `processor`'s model over the independent replicas in `clients`, each replica's
+    /// statistics read through `observer`, under the names `options` states (its
+    /// `served_model_name` for the API, its model for the metrics' labels), resolving every
+    /// request's image references as its `image_fetch_config` states, and logging and migrating
+    /// requests as its `logging_config` and `migration_config` state. `families` resolves the
+    /// checkpoint of every later update.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the image fetcher cannot be built.
     pub(crate) fn new(
-        served_model_name: String,
-        model_name: String,
-        clients: Vec<Arc<EngineClient>>,
-        processor: Processor,
-        images: MediaConnector,
-        options: &ServerArgs,
-        updates: Arc<crate::updates::Updater>,
-    ) -> Self {
-        Self::observed(
-            processing::Registry::default(),
-            served_model_name,
-            model_name,
-            clients,
-            processor,
-            images,
-            options,
-            Arc::default(),
-            updates,
-        )
-    }
-
-    /// As [`Self::new`], with `observer` reading the engine's statistics
-    /// for its epoch's trials.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a leader's model, engine and options, and its statistics' observer"
-    )]
-    fn observed(
         families: processing::Registry,
-        served_model_name: String,
-        model_name: String,
         clients: Vec<Arc<EngineClient>>,
         processor: Processor,
-        images: MediaConnector,
         options: &ServerArgs,
         observer: Arc<crate::observe::Observer>,
         updates: Arc<crate::updates::Updater>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        let served_model_name = options.served_model_name().to_owned();
+        let model_name = options.model().to_owned();
+        let images = MediaConnector::new(&options.image_fetch_config)
+            .context("failed to initialize the image URL fetcher")?;
         let logging = &options.logging_config;
-        let mut info = clients[0].info().clone();
-        info.schedulers = clients.iter().map(|client| client.info().schedulers).sum();
+        // The engines state their schedulers: the throughput log divides by every replica's.
         let schedulers = Arc::new(std::sync::atomic::AtomicUsize::new(
-            (info.schedulers as usize).max(options.data_parallel_size.get()),
+            clients
+                .iter()
+                .map(|client| client.info().schedulers as usize)
+                .sum(),
         ));
         let stats_logger = logging
             .log_stats
@@ -1075,11 +1067,12 @@ impl Leader {
             adapters: Arc::clone(&adapters),
             updates: Arc::downgrade(&updates),
             held: AtomicUsize::new(0),
+            profile_sessions: std::sync::atomic::AtomicU64::new(0),
         });
         for replica in replicas.serving.borrow().iter() {
             replica.monitor();
         }
-        Self {
+        Ok(Self {
             families,
             served_model_name,
             model_name,
@@ -1089,7 +1082,7 @@ impl Leader {
             updates,
             log_requests: logging.log_requests,
             _stats_logger: stats_logger,
-        }
+        })
     }
 
     /// The loaded model's input processor.
@@ -1607,7 +1600,9 @@ async fn same_model_files(served: &str, path: &str) -> Result<(), String> {
 
     /// The files request processing reads, named for the refusal. Every field of the resolved
     /// set is classified here, so a file the set gains is compared or named as a model fact.
-    fn processing_files(files: ResolvedModelFiles) -> [(&'static str, Option<std::path::PathBuf>); 4] {
+    fn processing_files(
+        files: ResolvedModelFiles,
+    ) -> [(&'static str, Option<std::path::PathBuf>); 4] {
         let ResolvedModelFiles {
             tokenizer_path,
             tokenizer_config_path,
@@ -1697,7 +1692,10 @@ fn same_pipeline(
         ));
     }
     for part in parts {
-        let (old, new) = (part_files(&served.join(part))?, part_files(&path.join(part))?);
+        let (old, new) = (
+            part_files(&served.join(part))?,
+            part_files(&path.join(part))?,
+        );
         let differs = match (old, new) {
             (None, None) => None,
             (Some(old), Some(new)) => {
@@ -1867,6 +1865,17 @@ impl Replica {
         deadline: Option<Instant>,
         following: Following,
     ) {
+        // The update's options may read back further than the deployment's own: every replica
+        // keeps its reports for the update's span from now on.
+        let span = crate::observe::span(&options);
+        let replicas = self
+            .registry
+            .upgrade()
+            .map(|registry| registry.serving.borrow().clone())
+            .unwrap_or_default();
+        for replica in replicas.iter().chain(std::iter::once(self)) {
+            replica.observer.retain(span);
+        }
         let replica = Arc::clone(self);
         tokio::spawn(async move {
             match following {
@@ -1875,18 +1884,11 @@ impl Replica {
                         .follow_generation(&updater, number, &options, deadline, *config, modules)
                         .await;
                 }
-                Following::Epoch {
-                    control,
-                    targets,
-                    config,
-                    epoch,
-                } => {
+                Following::Epoch(target) => {
                     // The epoch form's follower holds both epochs' launch
                     // arguments and configurations across its whole wait.
-                    Box::pin(replica.follow_epoch(
-                        &updater, number, &options, deadline, control, targets, *config, epoch,
-                    ))
-                    .await;
+                    Box::pin(replica.follow_epoch(&updater, number, &options, deadline, target))
+                        .await;
                 }
             }
         });
@@ -1894,16 +1896,16 @@ impl Replica {
 
     /// Waits for the next thing an update's follower acts on: the update's
     /// progress, its `deadline` (which rolls it back, once), or, once its
-    /// trial began (`on_trial`), the next reading of the trial's thresholds
-    /// (a threshold passed rolls it back). Returns update `number`'s phase
-    /// afterwards; `None` once another update, or none, is what the updater
-    /// states.
+    /// trial began, the next report of the replicas `trial` observes, on
+    /// which the trial's thresholds are read (a threshold passed rolls it
+    /// back). Returns update `number`'s phase afterwards; `None` once another
+    /// update, or none, is what the updater states.
     async fn next_phase(
         updater: &crate::updates::Updater,
         number: u64,
         phases: &mut watch::Receiver<Option<(u64, Phase)>>,
         deadline: &mut Option<Instant>,
-        on_trial: bool,
+        trial: &mut [watch::Receiver<u64>],
     ) -> Option<Phase> {
         let expiry = async {
             match *deadline {
@@ -1911,13 +1913,7 @@ impl Replica {
                 None => std::future::pending().await,
             }
         };
-        let reading = async {
-            if on_trial {
-                tokio::time::sleep(crate::updates::trial::INTERVAL).await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
+        let reading = crate::observe::next_record(trial);
         tokio::select! {
             changed = phases.changed() => {
                 if changed.is_err() {
@@ -1956,28 +1952,36 @@ impl Replica {
         modules: crate::epoch::ModuleSet,
     ) {
         let mut phases = updater.watch();
-        let mut on_trial = false;
+        // The reports the trial reads, once it began.
+        let mut trial = Vec::new();
         let mut phase = updater.phase_of(number);
         loop {
             match phase {
-                Some(Phase::Trial) if !on_trial => {
+                Some(Phase::Trial) if trial.is_empty() => {
                     // Serving and the update share an epoch, so the baseline
                     // ends where the switch began.
-                    let switch = updater.switch_began().unwrap_or_else(Instant::now);
-                    let observed = self.hold.client().map(|client| {
-                        crate::updates::trial::Baseline::new(
-                            Arc::clone(&self.observer),
-                            client.epoch(),
-                            client.epoch(),
-                            options.rollback.window,
-                            switch,
+                    let epoch = self.hold.client().map(|client| client.epoch());
+                    let began = updater.begin_trial(|switch| {
+                        crate::updates::trial::Trial::begin(
+                            options.rollback.clone(),
+                            epoch
+                                .map(|epoch| {
+                                    crate::updates::trial::Baseline::new(
+                                        Arc::clone(&self.observer),
+                                        epoch,
+                                        Some(epoch),
+                                        options.rollback.window,
+                                        switch,
+                                    )
+                                })
+                                .into_iter()
+                                .collect(),
+                            request_counts(),
                         )
                     });
-                    on_trial = updater.begin_trial(crate::updates::trial::Trial::begin(
-                        options.rollback.clone(),
-                        observed.into_iter().collect(),
-                        request_counts(),
-                    ));
+                    if began {
+                        trial.push(self.observer.records());
+                    }
                 }
                 Some(Phase::Committed) => {
                     // The configuration and the module set are what the next
@@ -1997,7 +2001,7 @@ impl Replica {
                 Some(Phase::RolledBack | Phase::Abandoned) | None => return,
                 Some(Phase::Preparing | Phase::Switching | Phase::Trial) => {}
             }
-            phase = Self::next_phase(updater, number, &mut phases, &mut deadline, on_trial).await;
+            phase = Self::next_phase(updater, number, &mut phases, &mut deadline, &mut trial).await;
         }
     }
 
@@ -2011,18 +2015,21 @@ impl Replica {
     /// does the same the other way. Each replica's hold serves its new engine
     /// at once, and requests go to the replicas whose engine serves, so none
     /// waits for a target that is not yet ready.
-    #[allow(clippy::too_many_arguments)]
     async fn follow_epoch(
         self: &Arc<Self>,
         updater: &Arc<crate::updates::Updater>,
         number: u64,
         options: &crate::options::UpdateConfig,
         mut deadline: Option<Instant>,
-        control: Arc<EngineControl>,
-        targets: Vec<(proto::config::EngineArgs, Vec<(String, u64)>)>,
-        config: ServerArgs,
-        epoch: u64,
+        target: EpochTarget,
     ) {
+        let EpochTarget {
+            control,
+            targets,
+            config,
+            epoch,
+        } = target;
+        let config = *config;
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
@@ -2044,6 +2051,7 @@ impl Replica {
                     &replica.observer,
                     serving.epoch(),
                     slowdown,
+                    options,
                     Instant::now(),
                 );
                 Some((Arc::clone(&replica.observer), throttling))
@@ -2056,7 +2064,6 @@ impl Replica {
         tokio::spawn(crate::interference::control(
             Arc::clone(&control) as Arc<dyn crate::interference::Throttle>,
             throttled,
-            crate::interference::INTERVAL,
             preparing,
             steps,
         ));
@@ -2065,10 +2072,9 @@ impl Replica {
         // they start, and state that they parked once they resolved their
         // modules and captured their graphs.
         let observers: Vec<Arc<crate::observe::Observer>> = (0..targets.len())
-            .map(|index| {
-                previous
-                    .get(index)
-                    .map_or_else(Default::default, |replica| Arc::clone(&replica.observer))
+            .map(|index| match previous.get(index) {
+                Some(replica) => Arc::clone(&replica.observer),
+                None => Arc::new(crate::observe::Observer::new(crate::observe::span(options))),
             })
             .collect();
         let joining =
@@ -2121,7 +2127,7 @@ impl Replica {
                         return;
                     }
                 }
-                next = Self::next_phase(updater, number, &mut phases, &mut deadline, false) => {
+                next = Self::next_phase(updater, number, &mut phases, &mut deadline, &mut []) => {
                     phase = next;
                 }
             }
@@ -2172,10 +2178,7 @@ impl Replica {
                      clients: &[Option<Arc<EngineClient>>]| {
             for (index, replica) in replicas.iter().enumerate() {
                 replica.following.store(true, Ordering::SeqCst);
-                let client = clients
-                    .get(index)
-                    .or_else(|| clients.get(index % clients.len().max(1)));
-                if let Some(client) = client.cloned().flatten() {
+                if let Some(client) = routed_client(clients, index) {
                     replica.hold.serve(client);
                 }
             }
@@ -2200,8 +2203,9 @@ impl Replica {
         let previous_epoch = before
             .iter()
             .find_map(|(client, _)| client.as_ref())
-            .map_or(0, |client| client.epoch());
-        let mut on_trial = false;
+            .map(|client| client.epoch());
+        // The reports the trial reads, once it began.
+        let mut trial = Vec::new();
 
         // The previous engines' ends, when the trial stops them: their nodes
         // then keep the weights alone.
@@ -2224,26 +2228,29 @@ impl Replica {
             // The trial begins once every serving engine drained: the target's
             // steps while both epochs stepped, its warm-up and the first steps
             // of the requests migrated to it are not its trial's.
-            if phase == Some(Phase::Trial) && !on_trial {
-                let switch = updater.switch_began().unwrap_or_else(Instant::now);
-                let baselines = routed
-                    .iter()
-                    .take(previous.len())
-                    .map(|replica| {
-                        crate::updates::trial::Baseline::new(
-                            Arc::clone(&replica.observer),
-                            epoch,
-                            previous_epoch,
-                            options.rollback.window,
-                            switch,
-                        )
-                    })
-                    .collect();
-                on_trial = updater.begin_trial(crate::updates::trial::Trial::begin(
-                    options.rollback.clone(),
-                    baselines,
-                    request_counts(),
-                ));
+            if phase == Some(Phase::Trial) && trial.is_empty() {
+                let judged = || routed.iter().take(previous.len());
+                let began = updater.begin_trial(|switch| {
+                    let baselines = judged()
+                        .map(|replica| {
+                            crate::updates::trial::Baseline::new(
+                                Arc::clone(&replica.observer),
+                                epoch,
+                                previous_epoch,
+                                options.rollback.window,
+                                switch,
+                            )
+                        })
+                        .collect();
+                    crate::updates::trial::Trial::begin(
+                        options.rollback.clone(),
+                        baselines,
+                        request_counts(),
+                    )
+                });
+                if began {
+                    trial = judged().map(|replica| replica.observer.records()).collect();
+                }
             }
             // A rollback of an epoch whose engines the trial stopped, or that
             // exited, starts them again on the weights they kept, a replica's
@@ -2334,7 +2341,7 @@ impl Replica {
                     number,
                     &mut phases,
                     &mut deadline,
-                    on_trial,
+                    &mut trial,
                 ) => phase = next,
             }
         }
@@ -2448,6 +2455,19 @@ impl Replica {
     }
 }
 
+/// The engine the hold of an epoch's replica `index` serves while `clients` serve the
+/// deployment: its own engine, or, for a replica past their last, the engine it hands the
+/// requests it holds to, the replicas past the last spread over `clients` in index order;
+/// none when no engine of `clients` serves.
+fn routed_client(clients: &[Option<Arc<EngineClient>>], index: usize) -> Option<Arc<EngineClient>> {
+    let spread = index.checked_rem(clients.len())?;
+    clients
+        .get(index)
+        .or(clients.get(spread))
+        .cloned()
+        .flatten()
+}
+
 /// The launch generations of `client`'s world, the scheduler node's first.
 fn launches(client: &EngineClient) -> Vec<u64> {
     client
@@ -2479,36 +2499,54 @@ pub(crate) struct Standby {
     pub(crate) generations: Vec<(String, u64)>,
 }
 
-impl Standby {
-    /// The scheduler node's standby generation, which names the standby in the log.
-    fn generation(&self) -> u64 {
-        self.generations
-            .first()
-            .map_or(0, |(_, generation)| *generation)
-    }
+/// The first rank each host of `config`'s world holds, by host.
+///
+/// # Errors
+///
+/// Fails when the world's ranks cannot be placed.
+fn first_ranks(config: &proto::config::EngineConfig) -> anyhow::Result<BTreeMap<String, u32>> {
+    Ok(crate::engine::control::world_hosts(config)?
+        .into_iter()
+        .map(|placed| (placed.host, placed.first))
+        .collect())
+}
+
+/// The first rank `host` holds of the world `ranks` places ([`first_ranks`]).
+///
+/// # Errors
+///
+/// Fails when the world places no rank on `host`.
+fn first_rank(ranks: &BTreeMap<String, u32>, host: &str) -> anyhow::Result<u32> {
+    ranks
+        .get(host)
+        .copied()
+        .with_context(|| format!("the world places no rank on host {host}"))
 }
 
 /// The failure-domain rules' view of the serving engine: one engine process per host of its worker
 /// group, which form one domain when there are several (`crate::standby::Standbys`).
+///
+/// # Errors
+///
+/// Fails when the world's ranks cannot be placed, or place none on a host the engine runs on.
 fn domain_processes(
     serving: &EngineClient,
     config: &proto::config::EngineConfig,
-) -> Vec<crate::standby::MainProcess> {
+) -> anyhow::Result<Vec<crate::standby::MainProcess>> {
     let processes = serving.processes();
-    let ranks = crate::engine::control::world_hosts(config).unwrap_or_default();
+    let ranks = first_ranks(config)?;
     let spans = processes.len() > 1;
     processes
         .into_iter()
-        .map(|process| crate::standby::MainProcess {
-            rank: ranks
-                .iter()
-                .find(|host| host.host == process.host)
-                .map_or(0, |host| host.first),
-            host: process.host,
-            group: crate::engine::control::ENGINE_GROUP.to_owned(),
-            generation: process.engine,
-            standby_generation: 0,
-            epoch: spans.then(|| serving.epoch()),
+        .map(|process| {
+            Ok(crate::standby::MainProcess {
+                rank: first_rank(&ranks, &process.host)?,
+                host: process.host,
+                group: crate::engine::control::ENGINE_GROUP.to_owned(),
+                generation: process.engine,
+                standby_generation: 0,
+                epoch: spans.then(|| serving.epoch()),
+            })
         })
         .collect()
 }
@@ -2534,21 +2572,25 @@ impl Replica {
     /// frontend, and the replica's own engine is then the drained previous
     /// epoch's: it keeps no standby and is not promoted, because nothing routes
     /// to it and a promoted process would be a second engine of a released epoch.
+    ///
+    /// A replica whose deployment is ending, or that runs no engine of its own, serves no epoch;
+    /// before the deployment recorded its first epoch, the epoch the replica starts is the one it
+    /// serves.
     fn serves_serving_epoch(&self) -> bool {
         let Some(updater) = self
             .registry
             .upgrade()
             .and_then(|registry| registry.updates.upgrade())
         else {
-            return true;
-        };
-        let Some((epoch, _)) = updater.epochs().serving() else {
-            return true;
+            return false;
         };
         let Some(served) = service::lock(&self.served).as_ref().map(|args| args.epoch) else {
-            return true;
+            return false;
         };
-        epoch == served
+        updater
+            .epochs()
+            .serving()
+            .is_none_or(|(epoch, _)| epoch == served)
     }
 
     /// The failure-domain rules over `serving`'s engines: the rules this replica keeps, or
@@ -2575,9 +2617,13 @@ impl Replica {
             members == serving
         });
         if !current && let Some(config) = config {
-            *domain = Some(crate::standby::Standbys::new(domain_processes(
-                serving, &config,
-            )));
+            match domain_processes(serving, &config) {
+                Ok(processes) => *domain = Some(crate::standby::Standbys::new(processes)),
+                Err(error) => {
+                    warn!("the serving engine forms no failure domain: {error:#}");
+                    *domain = None;
+                }
+            }
         }
         domain
     }
@@ -2593,7 +2639,7 @@ impl Replica {
         });
         if ends && let Some(standby) = service::lock(&self.standby).take() {
             info!(
-                generation = standby.generation(),
+                generations = ?standby.generations,
                 "the failure domain's standby epoch is ended"
             );
         }
@@ -2630,7 +2676,7 @@ impl Replica {
         let dropped = { service::lock(&self.standby).take() };
         if let Some(standby) = dropped {
             info!(
-                generation = standby.generation(),
+                generations = ?standby.generations,
                 "the standby is dropped: its epoch no longer serves"
             );
         }
@@ -2925,22 +2971,29 @@ impl Replica {
             .registry
             .upgrade()
             .and_then(|registry| registry.updates.upgrade())?;
-        let ranks = service::lock(&self.config)
+        let placed = service::lock(&self.config)
             .engine_config()
-            .ok()
-            .and_then(|config| crate::engine::control::world_hosts(&config).ok())
-            .unwrap_or_default();
-        for (host, generation) in &promotions {
-            let rank = ranks
-                .iter()
-                .find(|ranks| ranks.host == *host)
-                .map_or(0, |ranks| ranks.first);
-            updater.promote(
-                host,
-                crate::engine::control::ENGINE_GROUP,
-                rank,
-                *generation,
-            );
+            .and_then(|config| first_ranks(&config))
+            .and_then(|ranks| {
+                promotions
+                    .iter()
+                    .map(|(host, generation)| Ok((host, *generation, first_rank(&ranks, host)?)))
+                    .collect::<anyhow::Result<Vec<_>>>()
+            });
+        let placed = match placed {
+            Ok(placed) => placed,
+            Err(error) => {
+                warn!(
+                    generations = ?standby.generations,
+                    "the standby cannot be promoted, its world placing no rank: {error:#}; the \
+                     engine is relaunched"
+                );
+                *service::lock(&self.domain) = None;
+                return None;
+            }
+        };
+        for (host, generation, rank) in placed {
+            updater.promote(host, crate::engine::control::ENGINE_GROUP, rank, generation);
         }
         match standby.client.await_serving().await {
             Ok(()) => {
@@ -2967,7 +3020,7 @@ impl Replica {
                 }
                 *service::lock(&self.domain) = None;
                 warn!(
-                    generation = standby.generation(),
+                    generations = ?standby.generations,
                     "the standby could not be promoted: {error}; the engine is relaunched"
                 );
                 None
@@ -4276,7 +4329,9 @@ mod tests {
 
         let more = checkpoint(&[processor, ("processor/extra.json", "{}")]);
         for (from, to) in [(&served, &more), (&more, &served)] {
-            let error = compare(from, to).await.expect_err("a file one side holds alone");
+            let error = compare(from, to)
+                .await
+                .expect_err("a file one side holds alone");
             assert!(error.contains("processor/extra.json"), "{error}");
         }
     }

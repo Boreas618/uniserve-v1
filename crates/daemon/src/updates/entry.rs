@@ -631,12 +631,12 @@ impl Leader {
             number,
             options.clone(),
             deadline,
-            crate::leader::Following::Epoch {
+            crate::leader::Following::Epoch(crate::leader::EpochTarget {
                 control: Arc::clone(control),
                 targets,
                 config: Box::new(target.clone()),
                 epoch: target_epoch,
-            },
+            }),
         );
         Ok(Applied::Update(report))
     }
@@ -850,8 +850,8 @@ impl Replica {
                 &served_model.model,
                 &target_engine.model.model,
             )
-                .await
-                .map_err(UpdateError::Refused)?;
+            .await
+            .map_err(UpdateError::Refused)?;
             if !served_model.processes_as(&target_engine.model) {
                 return Err(UpdateError::Refused(format!(
                     "the model at {} has other generation limits, control tokens or context \

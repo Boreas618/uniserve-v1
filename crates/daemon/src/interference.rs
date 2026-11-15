@@ -5,8 +5,8 @@
 //! nodes copy beside the serving epoch (weights, warmed pages), on copy
 //! engines and links whose byte budgets a head may halve. The leader reads
 //! each scheduler's step time of the serving epoch from the statistics the
-//! schedulers report once a second ([`Observer`]) and compares it with that
-//! scheduler's steps before the change:
+//! schedulers report ([`Observer`]) and compares it with that scheduler's
+//! steps before the change:
 //!
 //! - **Step time** of one report is its host-observed batch time over its
 //!   batches (`batch_roundtrip_us / batch_count`), the step time the trial's
@@ -16,15 +16,15 @@
 //!   compared only with steps of its own size: each report falls in the
 //!   power-of-two range of its query tokens per batch, and a scheduler's
 //!   baseline of a range is the batch time over the batches of its reports
-//!   in that range during the [`BASELINE`] before the preparation began,
-//!   once they hold [`MIN_BATCHES`]. A report of a range without a baseline
-//!   decides nothing.
-//! - **Decision.** Once per interval, the reports that arrived since the
+//!   in that range during the `update_config.baseline` before the preparation
+//!   began, once they hold `update_config.baseline_batches`. A report of a
+//!   range without a baseline decides nothing.
+//! - **Decision.** As each report arrives, the reports that arrived since the
 //!   previous decision are read: a scheduler whose step takes more than
 //!   `1 + transfer_slowdown` times its baseline makes the leader halve the
 //!   budgets of the links the deployment's transfers use, on every node,
-//!   again each interval while it lasts (the Transfer Servers keep a 1/64
-//!   floor); once every scheduler's steps are back within the ratio, the
+//!   again with each report while it lasts (the Transfer Servers keep their
+//!   own floor); once every scheduler's steps are back within the ratio, the
 //!   leader restores them, which the Transfer Servers do gradually, and it
 //!   restores them when the preparation ends.
 //!
@@ -34,25 +34,15 @@
 //! node that holds no claim of the deployment has none to throttle.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::observe::{Observer, Sample};
-
-/// The span before an epoch change whose steps make the schedulers'
-/// baselines: sixty of their once-a-second reports.
-pub(crate) const BASELINE: Duration = Duration::from_secs(60);
-
-/// How often the control reads the schedulers' reports, which they make
-/// once a second.
-pub(crate) const INTERVAL: Duration = Duration::from_secs(1);
-
-/// The fewest batches of one batch-size range that make its baseline, so
-/// that a range the load visited for a few steps does not set it.
-const MIN_BATCHES: u64 = 20;
+use crate::options::UpdateConfig;
 
 /// The power-of-two range of `tokens` query tokens per batch: 0 for one
 /// token, `k` for `(2^(k-1), 2^k]`.
@@ -72,16 +62,28 @@ fn step(sample: &Sample) -> Option<(f64, u32)> {
 }
 
 /// Each scheduler's step time before a change, per batch-size range.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Baseline {
     /// Batch microseconds and batches, by scheduler and range.
     steps: BTreeMap<(u32, u32), (u64, u64)>,
+    /// The fewest batches of a range that make its baseline.
+    batches: NonZeroU32,
 }
 
 impl Baseline {
-    /// `epoch`'s baseline from its reports in `[from, until)`.
-    pub(crate) fn of(observer: &Observer, epoch: u64, from: Instant, until: Instant) -> Self {
-        let mut baseline = Self::default();
+    /// `epoch`'s baseline from its reports in `[from, until)`, of the ranges whose reports hold
+    /// `batches` batches.
+    pub(crate) fn of(
+        observer: &Observer,
+        epoch: u64,
+        from: Instant,
+        until: Instant,
+        batches: NonZeroU32,
+    ) -> Self {
+        let mut baseline = Self {
+            steps: BTreeMap::new(),
+            batches,
+        };
         observer.samples(epoch, from, until, |sample| {
             if let Some((_, range)) = step(sample) {
                 let entry = baseline.steps.entry((sample.scheduler, range)).or_default();
@@ -96,11 +98,11 @@ impl Baseline {
     /// batches there make one.
     fn step_us(&self, scheduler: u32, range: u32) -> Option<f64> {
         let &(batch_us, batches) = self.steps.get(&(scheduler, range))?;
-        (batches >= MIN_BATCHES).then(|| batch_us as f64 / batches as f64)
+        (batches >= u64::from(self.batches.get())).then(|| batch_us as f64 / batches as f64)
     }
 }
 
-/// What one interval's reports ask of the transfers' budgets.
+/// What the reports read at one decision ask of the transfers' budgets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Decision {
     Halve,
@@ -118,7 +120,7 @@ pub(crate) struct Throttling {
     /// Where the previous decision stopped reading.
     read: Instant,
     halved: bool,
-    /// The largest step-to-baseline ratio of the latest interval whose
+    /// The largest step-to-baseline ratio of the latest decision whose
     /// reports had a baseline.
     ratio: Option<f64>,
 }
@@ -126,13 +128,20 @@ pub(crate) struct Throttling {
 impl Throttling {
     /// The control of `epoch`, the serving epoch's, whose target began
     /// preparing at `preparing`, tolerating steps `1 + slowdown` times their
-    /// baseline.
-    pub(crate) fn new(observer: &Observer, epoch: u64, slowdown: f64, preparing: Instant) -> Self {
-        let from = preparing.checked_sub(BASELINE).unwrap_or(preparing);
+    /// baseline, which `options` state the span and batches of
+    /// (`update_config`).
+    pub(crate) fn new(
+        observer: &Observer,
+        epoch: u64,
+        slowdown: f64,
+        options: &UpdateConfig,
+        preparing: Instant,
+    ) -> Self {
+        let from = preparing.checked_sub(options.baseline).unwrap_or(preparing);
         Self {
             epoch,
             slowdown,
-            baseline: Baseline::of(observer, epoch, from, preparing),
+            baseline: Baseline::of(observer, epoch, from, preparing, options.baseline_batches),
             read: preparing,
             halved: false,
             ratio: None,
@@ -193,7 +202,7 @@ pub(crate) struct Throttled {
 #[derive(Debug, Default, Clone, Copy, PartialEq, serde::Serialize)]
 pub(crate) struct StepTime {
     /// The largest ratio of a scheduler's step time to its baseline of the
-    /// same batch size among the reports of the latest interval that had a
+    /// same batch size among the reports of the latest decision that had a
     /// baseline; `None` before any had.
     pub(crate) ratio: Option<f64>,
     /// The slowdown tolerated (`update_config.transfer_slowdown`): a step
@@ -210,6 +219,10 @@ pub(crate) trait Throttle: Send + Sync + 'static {
     /// Halves, or restores when not `halve`, the byte budgets of the links the
     /// deployment's transfers use on every node, and returns the hosts that
     /// took it. Blocks until every node's daemon replied.
+    ///
+    /// # Errors
+    ///
+    /// The reason a node's daemon did not take it.
     fn throttle(&self, halve: bool) -> Result<Vec<String>, String>;
 }
 
@@ -221,16 +234,16 @@ async fn pass_on(throttle: &Arc<dyn Throttle>, halve: bool) -> Result<Vec<String
         .map_err(|error| error.to_string())?
 }
 
-/// Runs `throttling` every `interval` until `done`, sending its decisions
-/// through `throttle`, and restores the budgets at the end when they stand
-/// halved; returns the throttles that were passed on. A throttle that cannot
-/// be passed on is logged: the preparation goes on, at the budgets the
-/// Transfer Servers keep. After each interval `steps` holds the serving
+/// Runs `throttling` as each report of its observers arrives until `done`,
+/// sending its decisions through `throttle`, and restores the budgets at the
+/// end when they stand halved; returns the throttles that were passed on. A
+/// throttle that cannot be passed on is logged: the preparation goes on, at
+/// the budgets the Transfer Servers keep, and the change's report counts only
+/// the throttles that were taken. After each decision `steps` holds the serving
 /// epoch's steps against their baseline as read.
 pub(crate) async fn control(
     throttle: Arc<dyn Throttle>,
     mut observed: Vec<(Arc<Observer>, Throttling)>,
-    interval: Duration,
     done: CancellationToken,
     steps: Arc<std::sync::Mutex<StepTime>>,
 ) -> Throttled {
@@ -239,14 +252,19 @@ pub(crate) async fn control(
         .iter()
         .map(|(_, throttling)| throttling.slowdown)
         .fold(0.0, f64::max);
-    let mut ticks = tokio::time::interval(interval);
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The first tick completes at once.
-    ticks.tick().await;
+    let mut records: Vec<_> = observed
+        .iter()
+        .map(|(observer, _)| observer.records())
+        .collect();
+    // The first decision reads the reports that arrived since the preparation began, before the
+    // control watched for them; each later one, the reports since the decision before it.
+    let mut first = true;
     loop {
-        tokio::select! {
-            () = done.cancelled() => break,
-            _ = ticks.tick() => {}
+        if !std::mem::take(&mut first) {
+            tokio::select! {
+                () = done.cancelled() => break,
+                () = crate::observe::next_record(&mut records) => {}
+            }
         }
         let decisions: Vec<_> = observed
             .iter_mut()
@@ -318,9 +336,10 @@ pub(crate) async fn control(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::time::Duration;
 
     use proto::report::SchedulerStats;
+    use tokio::sync::mpsc;
 
     use super::*;
 
@@ -335,17 +354,26 @@ mod tests {
         }
     }
 
+    /// The slowdown the controls tolerate.
+    const SLOWDOWN: f64 = 0.2;
+
     /// A step is compared with its scheduler's steps of its own batch-size
     /// range: larger batches that take longer are not a slowdown, and a
     /// range without a baseline decides nothing.
     #[test]
     fn steps_are_compared_within_their_batch_size_range() {
-        let observer = Observer::default();
+        let observer = Observer::new(Duration::from_secs(600));
         for _ in 0..4 {
             observer.record(1, 0, &report(10_000, 10, 32));
             observer.record(1, 0, &report(30_000, 10, 256));
         }
-        let mut throttling = Throttling::new(&observer, 1, 0.2, Instant::now());
+        let mut throttling = Throttling::new(
+            &observer,
+            1,
+            SLOWDOWN,
+            &UpdateConfig::default(),
+            Instant::now(),
+        );
 
         observer.record(1, 0, &report(30_000, 10, 250));
         assert_eq!(throttling.decide(&observer), None);
@@ -365,94 +393,84 @@ mod tests {
         );
     }
 
-    /// A throttle that records what it was told.
-    struct Recorded(std::sync::Mutex<Sender<bool>>);
+    /// A throttle that sends what it was told.
+    struct Recorded(mpsc::UnboundedSender<bool>);
 
     impl Throttle for Recorded {
         fn throttle(&self, halve: bool) -> Result<Vec<String>, String> {
-            service::lock(&self.0)
-                .send(halve)
-                .map_err(|error| error.to_string())?;
+            self.0.send(halve).map_err(|error| error.to_string())?;
             Ok(vec!["rank-0".to_owned()])
         }
     }
 
-    fn recorded() -> (Arc<dyn Throttle>, Receiver<bool>) {
-        let (decisions, told) = channel();
-        (Arc::new(Recorded(std::sync::Mutex::new(decisions))), told)
-    }
-
-    /// The serving epoch's slowed scheduler makes the leader halve the
-    /// budgets of the deployment's transfers through the engine, once each
-    /// interval while it lasts; its recovery makes it restore them once.
+    /// The serving epoch's slowed scheduler makes the leader halve the budgets of the
+    /// deployment's transfers with each slowed report, its recovery restores them once, steps
+    /// within the tolerated slowdown change nothing, and a preparation that ends halved restores
+    /// them: the throttles the control passed on are exactly that sequence.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_slowed_scheduler_halves_the_transfers_budgets_and_its_recovery_restores_them() {
-        let (throttle, throttles) = recorded();
-        let observer = Arc::new(Observer::default());
+        let (told, mut throttles) = mpsc::unbounded_channel();
+        let observer = Arc::new(Observer::new(Duration::from_secs(600)));
 
-        // A minute of steps of 10 ms at 32 tokens per batch before the
-        // change.
+        // A minute of steps of 10 ms at 32 tokens per batch before the change.
         for _ in 0..60 {
             observer.record(1, 0, &report(10_000, 25, 32));
         }
-        let throttling = Throttling::new(&observer, 1, 0.2, Instant::now());
-        let interval = Duration::from_millis(100);
+        let throttling = Throttling::new(
+            &observer,
+            1,
+            SLOWDOWN,
+            &UpdateConfig::default(),
+            Instant::now(),
+        );
         let done = CancellationToken::new();
         let steps = Arc::new(std::sync::Mutex::new(StepTime::default()));
         let control = tokio::spawn(control(
-            throttle,
+            Arc::new(Recorded(told)),
             vec![(Arc::clone(&observer), throttling)],
-            interval,
             done.clone(),
             Arc::clone(&steps),
         ));
-        let next = |wait: Duration| throttles.recv_timeout(wait).ok();
+        // Each report is decided before the next is recorded: the throttle of the report before
+        // is awaited, and a report that changes nothing is followed by one that does.
+        let mut next = async || throttles.recv().await.expect("the control throttles");
 
-        // Steps within the tolerated slowdown change nothing.
+        // Steps within the tolerated slowdown change nothing, and the 50% slower ones after
+        // them halve the budgets, which the change in progress reports.
         observer.record(1, 0, &report(11_000, 25, 32));
-        assert_eq!(next(interval * 5), None);
-
-        // Steps 50% longer halve the budgets each interval they last, which
-        // the change in progress reports.
         observer.record(1, 0, &report(15_000, 25, 32));
-        assert_eq!(next(Duration::from_secs(10)), Some(true));
-        // The control states the interval's reading once the halving it
-        // passed on returned.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let read = loop {
-            let read = *service::lock(&steps);
-            if read.halved || Instant::now() >= deadline {
-                break read;
-            }
-            tokio::time::sleep(interval).await;
-        };
+        assert!(next().await);
+        observer.record(1, 0, &report(15_000, 25, 32));
+        assert!(next().await);
+        let read = *service::lock(&steps);
         assert!(
             read.ratio.is_some_and(|ratio| (ratio - 1.5).abs() < 1e-9),
             "{read:?}"
         );
         assert!(read.halved, "{read:?}");
         assert!((read.slowdown - 0.2).abs() < 1e-12, "{read:?}");
-        observer.record(1, 0, &report(15_000, 25, 32));
-        assert_eq!(next(Duration::from_secs(10)), Some(true));
 
-        // Steps back within it restore them, once.
+        // Steps back within it restore them, once; the next slowed step halves them again.
         observer.record(1, 0, &report(10_200, 25, 32));
-        assert_eq!(next(Duration::from_secs(10)), Some(false));
+        assert!(!next().await);
         observer.record(1, 0, &report(10_100, 25, 32));
-        assert_eq!(next(interval * 5), None);
+        observer.record(1, 0, &report(20_000, 25, 32));
+        assert!(next().await);
 
         // A preparation that ends with the budgets halved restores them.
-        observer.record(1, 0, &report(20_000, 25, 32));
-        assert_eq!(next(Duration::from_secs(10)), Some(true));
         done.cancel();
         let throttled = control.await.expect("the control ended");
-        assert_eq!(next(Duration::from_secs(10)), Some(false));
+        assert!(!next().await);
         assert_eq!(
             throttled,
             Throttled {
                 halvings: 3,
                 restorations: 2
             }
+        );
+        assert!(
+            throttles.try_recv().is_err(),
+            "no other throttle was passed on"
         );
     }
 }
