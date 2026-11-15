@@ -357,13 +357,14 @@ impl Default for ServerArgs {
             build_config: build_server::command::Settings::default(),
             max_running_requests: positive(128),
             max_num_batched_tokens: None,
-            // vLLM's default, which clients asking for `top_logprobs` expect to be served.
+            // The most the OpenAI API admits per position (`top_logprobs` lies in 0..=20), so
+            // every request of that API is served.
             max_logprobs: 20,
             mem_fraction_static: 0.7,
             tensor_parallel_size: NonZeroUsize::MIN,
             data_parallel_size: NonZeroUsize::MIN,
             worker_groups: None,
-            host_identity: "localhost".to_owned(),
+            host_identity: this_host(),
             engine_host: None,
             nnodes: NonZeroU32::MIN,
             node_rank: 0,
@@ -604,9 +605,11 @@ pub struct UpdateConfig {
     /// may take while the successor prepares, as a fraction (`0.1` for
     /// 10%), past which the leader halves the byte budgets of the links the
     /// change's transfers use, and restores them once the steps are back
-    /// within it. Steps are compared within their batch-size range. The
-    /// default is the value measured on GB200 (`docs/configuration.md`).
-    pub transfer_slowdown: f64,
+    /// within it. Steps are compared within their batch-size range. Like the
+    /// rollback thresholds it has no default: it is measured on the target
+    /// hardware and workload (`docs/configuration.md`); unset, the transfers
+    /// take their links' whole budgets.
+    pub transfer_slowdown: Option<f64>,
     /// Seconds a draining engine steps its running requests beside the
     /// engine promoted before it, after which it ends the ones still running
     /// as migratable: it bounds the time two epochs share each GPU.
@@ -617,18 +620,12 @@ pub struct UpdateConfig {
 /// requests in flight end by themselves.
 pub const DRAIN_S: f64 = 5.0;
 
-/// The default `update_config.transfer_slowdown`: on GB200, above the
-/// serving steps' second-to-second variation without transfers and below
-/// the slowdowns copies at a link's whole budget cause
-/// (`docs/configuration.md`).
-pub const TRANSFER_SLOWDOWN: f64 = 0.1;
-
 impl Default for UpdateConfig {
     fn default() -> Self {
         Self {
             previous_epoch: PreviousEpoch::Parked,
             rollback: RollbackConfig::default(),
-            transfer_slowdown: TRANSFER_SLOWDOWN,
+            transfer_slowdown: None,
             drain_s: DRAIN_S,
         }
     }
@@ -859,11 +856,12 @@ impl ServerArgs {
                 "invalid `speculative_config.refill_token_cost`: {cost} must not be negative"
             );
         }
-        let slowdown = self.update_config.transfer_slowdown;
-        anyhow::ensure!(
-            slowdown.is_finite() && slowdown > 0.0,
-            "invalid `update_config.transfer_slowdown`: {slowdown} must be positive"
-        );
+        if let Some(slowdown) = self.update_config.transfer_slowdown {
+            anyhow::ensure!(
+                slowdown.is_finite() && slowdown > 0.0,
+                "invalid `update_config.transfer_slowdown`: {slowdown} must be positive"
+            );
+        }
         let drain = self.update_config.drain_s;
         anyhow::ensure!(
             drain.is_finite() && drain >= 0.0,
@@ -1029,6 +1027,15 @@ impl ServerArgs {
             connector: self.kv_cache_config.mooncake.clone(),
         }
     }
+}
+
+/// This host's name, `uname(2)`'s node name: the host identity a node states unless its
+/// configuration names another, and the host its unplaced ranks run on.
+fn this_host() -> String {
+    rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Checks that a stated capture or capacity list is strictly increasing: the workers capture or

@@ -1118,7 +1118,7 @@ mod tests {
                 config.logging_config.log_requests = true
             }),
             ("update_config", |config: &mut ServerArgs| {
-                config.update_config.transfer_slowdown += 1.0
+                config.update_config.transfer_slowdown = Some(0.25)
             }),
         ];
         // The values that build an engine: an `Epoch` change.

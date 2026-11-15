@@ -1967,11 +1967,13 @@ impl Replica {
         let throttled: Vec<_> = previous
             .iter()
             .filter_map(|replica| {
+                // Without a stated slowdown the transfers take their links' whole budgets.
+                let slowdown = options.transfer_slowdown?;
                 let serving = replica.hold.client()?;
                 let throttling = crate::interference::Throttling::new(
                     &replica.observer,
                     serving.epoch(),
-                    options.transfer_slowdown,
+                    slowdown,
                     Instant::now(),
                 );
                 Some((Arc::clone(&replica.observer), throttling))

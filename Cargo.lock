@@ -969,6 +969,7 @@ dependencies = [
  "prost",
  "proto",
  "reqwest",
+ "rustix",
  "safetensors",
  "serde",
  "serde-json-fmt",

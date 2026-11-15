@@ -31,6 +31,8 @@ image.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
 libc.workspace = true
+# This host's name (`uname(2)`), the default host identity.
+rustix.workspace = true
 llm-multimodal.workspace = true
 # The media decoders condition media is probed with, the ones that read it.
 media.workspace = true
