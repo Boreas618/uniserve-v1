@@ -105,9 +105,7 @@
 //!
 //! | Operator | `NAME` | Module |
 //! | --- | --- | --- |
-//! | [`conv::Conv3d`] | `conv3d` | [`conv`] |
-//! | [`conv::Conv1d`] | `conv1d` | [`conv`] |
-//! | [`conv::ConvTranspose1d`] | `conv_transpose1d` | [`conv`] |
+//! | [`conv::Conv`] | `conv` | [`conv`] |
 //! | [`transpose::Transpose`] | `transpose` | [`transpose`] |
 //!
 //! The attention and mixture-of-experts operators are `attention` and `moe`, beside these.

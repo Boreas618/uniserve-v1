@@ -6,7 +6,7 @@
 //! conv3d            x [n, c, d, h, w]  weight [k, c/groups, t, r, s]   out [n, k, d', h', w']
 //! ```
 //!
-//! Each is one launch of its cuDNN operator with the bias and the groups inside it, where the
+//! Each is one launch of the cuDNN operator with the bias and the groups inside it, where the
 //! tensor library's own convolution launches one operator per group and adds no bias. The
 //! output extent follows torch's rule along every spatial axis: `(l + 2p − d(t − 1) − 1) / s + 1`
 //! for a convolution and `(l − 1)s − 2p + d(t − 1) + 1` for a transposed one, which has no
@@ -29,7 +29,7 @@
 //! the normalization that precedes such a convolution writes its output already padded
 //! ([`frame_norm_pad`](super::frame_norm_pad)).
 
-use ops::conv::{Args, Conv1d, Conv3d, ConvTranspose1d, Descriptor};
+use ops::conv::{Args, Conv, Descriptor};
 use ops::frame::is_channels_last;
 use tensor::{DType, Device, Tensor};
 
@@ -300,11 +300,7 @@ fn convolve(
         out: ops::operand(&result)?,
     };
     let descriptor = Descriptor::of(&args, transposed, [stride, padding, dilation], groups, tf32)?;
-    match (rank, transposed) {
-        (1, false) => ops::launch::<Conv1d>(&descriptor, args)?,
-        (1, true) => ops::launch::<ConvTranspose1d>(&descriptor, args)?,
-        _ => ops::launch::<Conv3d>(&descriptor, args)?,
-    }
+    ops::launch::<Conv>(&descriptor, args)?;
     Ok(result)
 }
 

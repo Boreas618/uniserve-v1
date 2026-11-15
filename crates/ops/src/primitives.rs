@@ -18,8 +18,8 @@
 //! | `scatter_set`, `scatter_add_set` | `index` (scatter_set, scatter_add) |
 //! | `const_set`, and a device's `zeros` | `fill` |
 //! | `matmul` | `gemm`, once per product (see [`CudaStorage::product`]) |
-//! | `conv1d`, `conv_transpose1d` | `conv1d`, `conv_transpose1d` |
-//! | `conv2d` | `conv3d` over a depth of one |
+//! | `conv1d`, `conv_transpose1d` | `conv` over one spatial axis |
+//! | `conv2d` | `conv` over three spatial axes, a depth of one |
 //!
 //! Each operator's own `Descriptor::of` states the descriptor of the call, so a call has one
 //! key. An operation over no element launches nothing, because the operators refuse an operand
@@ -54,7 +54,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::cast::Cast;
-use crate::conv::{Conv1d, Conv3d, ConvTranspose1d};
+use crate::conv::Conv;
 use crate::copy_strided::CopyStrided;
 use crate::elementwise::{
     BinaryArgs, BinaryDescriptor, BinaryFunction, ElementwiseBinary, ElementwiseUnary,
@@ -483,7 +483,7 @@ impl CudaStorage {
     }
 
     /// The convolution of the input `layout` views with the filter `kernel_layout` views in
-    /// `kernel`, launched by `convolve` over packed operands.
+    /// `kernel`, launched as the `conv` operator over packed operands.
     ///
     /// `dims` are the output's dimensions, `spatial` the operator's spatial rank and `window` the
     /// convolution's stride, padding and dilation per spatial axis; a spatial rank of three
@@ -504,13 +504,12 @@ impl CudaStorage {
         dims: &[usize],
         (spatial, transposed, window): (u32, bool, [[u32; 3]; 3]),
         operation: &'static str,
-        convolve: impl Fn(&conv::Descriptor, conv::Args) -> Result<()>,
     ) -> Result<Self> {
         if !matches!(self.dtype(), DType::BF16 | DType::F32) {
             return Err(unsupported(
                 operation,
                 format!(
-                    "the convolution operators compute bf16 and f32, not {:?}",
+                    "the convolution operator computes bf16 and f32, not {:?}",
                     self.dtype()
                 ),
             ));
@@ -552,7 +551,7 @@ impl CudaStorage {
             out: view(&storage, dims, 0)?,
         };
         let descriptor = conv::Descriptor::of(&args, transposed, window, 1, false)?;
-        convolve(&descriptor, args)?;
+        launch::<Conv>(&descriptor, args)?;
 
         Ok(storage)
     }
@@ -936,7 +935,6 @@ impl BackendStorage for CudaStorage {
             &params.out_dims(),
             (1, false, window),
             NAME,
-            launch::<Conv1d>,
         )?))
     }
 
@@ -952,8 +950,8 @@ impl BackendStorage for CudaStorage {
         if params.output_padding != 0 {
             return Err(unsupported(
                 NAME,
-                "the conv_transpose1d operator has no output padding: its output length follows \
-                 from the stride, the padding and the filter alone",
+                "the conv operator's transposed pass has no output padding: its output length \
+                 follows from the stride, the padding and the filter alone",
             )
             .into());
         }
@@ -970,7 +968,6 @@ impl BackendStorage for CudaStorage {
             &params.out_dims(),
             (1, true, window),
             NAME,
-            launch::<ConvTranspose1d>,
         )?))
     }
 
@@ -1002,7 +999,6 @@ impl BackendStorage for CudaStorage {
             &params.out_dims(),
             (3, false, window),
             NAME,
-            launch::<Conv3d>,
         )?))
     }
 

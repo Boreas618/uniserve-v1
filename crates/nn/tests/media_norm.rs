@@ -643,11 +643,11 @@ fn a_resnet_block_adds_its_input_or_its_projection() {
         [
             "frame_moments",
             "frame_norm_pad",
-            "conv3d",
+            "conv",
             "frame_moments",
             "frame_norm_pad",
-            "conv3d",
-            "conv3d",
+            "conv",
+            "conv",
             "elementwise_binary",
         ]
     );

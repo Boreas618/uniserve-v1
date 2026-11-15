@@ -1,16 +1,18 @@
-//! The convolutions, through cuDNN.
+//! The convolution, through cuDNN: one operator for every rank and direction.
 //!
-//! `conv3d`, `conv1d` and `conv_transpose1d` are native programs: cuDNN frontend builds an engine
-//! for one geometry and the package's tuning data names that engine, so the same descriptor always
-//! selects the same engine and the same workspace. The grid is the library's.
+//! `conv` is a native program: the call names the spatial extents as three axes and says whether
+//! the pass is transposed, so one module computes a 1-d or a 3-d convolution, and a transposed one
+//! as cuDNN's backward-data pass of the convolution it transposes. The key names the element types
+//! alone; the rank, the direction, the window, the groups, the bias, the TF32 permission and the
+//! storage order travel in the call. The grid is the library's.
 //!
-//! An FP32 convolution may allow TF32; that is a descriptor value, because it changes the numerical
-//! result the module guarantees and therefore its key.
+//! An FP32 convolution may allow TF32; the call carries that permission, and the module refuses it
+//! for inputs of another precision.
 //!
 //! ```text
-//! conv3d            input [n, c, d, h, w]  weight [k, c/groups, t, h, w]   out [n, k, od, oh, ow]
-//! conv1d            input [n, c, l]        weight [k, c/groups, t]         out [n, k, ol]
-//! conv_transpose1d  input [n, c, l]        weight [c, k/groups, t]         out [n, k, ol]
+//! 3-d             input [n, c, d, h, w]  weight [k, c/groups, t, h, w]   out [n, k, od, oh, ow]
+//! 1-d             input [n, c, l]        weight [k, c/groups, t]         out [n, k, ol]
+//! transposed 1-d  input [n, c, l]        weight [c, k/groups, t]         out [n, k, ol]
 //! ```
 
 use std::ffi::c_void;
@@ -57,7 +59,7 @@ pub struct Descriptor {
     /// derives and the cuDNN engine it selects, not a different compiled module - so, like the
     /// filter's window and `tf32`, it travels in the call and is not part of the key.
     pub channels_last: bool,
-    /// The spatial rank: 3 for `conv3d`, 1 for the one-dimensional pair.
+    /// The spatial rank: 3 for a frame's convolution, 1 for a sequence's.
     pub rank: u32,
     /// Whether the operation is a transposed convolution.
     pub transposed: bool,
@@ -143,10 +145,10 @@ impl Descriptor {
 
 /// The call structure a convolution package's entry receives.
 ///
-/// Mirrored by hand in `crates/ops/include/uniserve_conv.h`, which each convolution package links
+/// Mirrored by hand in `crates/ops/include/uniserve_conv.h`, which the convolution package links
 /// into its `include/`; the assertions below and the test beside this module pin its layout. The
 /// spatial extents are passed as three axes, so one
-/// structure serves the 1-d and the 3-d operator and the unused axes are 1.
+/// structure serves a 1-d and a 3-d convolution and the unused axes are 1.
 #[repr(C)]
 pub struct Call {
     pub out: *mut c_void,
@@ -189,8 +191,8 @@ const _: () = assert!(
     std::mem::offset_of!(Call, kernel) == 32 + 3 * 5 * 8,
     "the convolution call structure's filter moved without its header"
 );
-// The message's offset and the structure's size are pinned on both sides - here and by the three
-// headers' `static_assert`s - because a field added to one mirror and not the other is a kernel
+// The message's offset and the structure's size are pinned on both sides - here and by the
+// header's `static_assert`s - because a field added to one mirror and not the other is a kernel
 // reading its geometry out of its error buffer.
 const _: () = assert!(
     std::mem::offset_of!(Call, error) == 216,
@@ -272,13 +274,17 @@ fn check_layouts(operator: &'static str, descriptor: &Descriptor, args: &Args) -
     Ok(())
 }
 
-/// A convolution through cuDNN.
+/// The convolution through cuDNN.
 pub struct Conv;
 
-impl Conv {
-    /// The argument rules shared by the three operators, which differ only in their descriptor's
-    /// rank and direction.
-    fn check(operator: &'static str, descriptor: &Descriptor, args: &Args) -> Result<()> {
+impl Op for Conv {
+    const NAME: &'static str = proto::module::operator::CONV;
+
+    type Descriptor = Descriptor;
+    type Args<'a> = Args;
+
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
+        let operator = Self::NAME;
         let rank = descriptor.rank;
         if !(1..=3).contains(&rank) {
             return Err(Error::argument(
@@ -347,8 +353,12 @@ impl Conv {
         Ok(())
     }
 
-    /// The launch shared by the three operators, of arguments [`Conv::check`] accepted.
-    fn launch(kernel: &Kernel, descriptor: &Descriptor, args: Args, stream: &Stream) -> Result<()> {
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
         let rank = descriptor.rank as usize;
         // The descriptor declares a bias exactly when the call passes one.
         let bias = args.bias.as_ref().map_or(std::ptr::null(), |bias| {
@@ -420,39 +430,6 @@ impl Conv {
         // pinned by the assertions above and the test beside this module.
         unsafe { kernel.native(&mut call, stream) }
     }
-}
-
-fn to_i64(value: u64) -> Result<i64> {
-    i64::try_from(value).map_err(|_| Error::argument("conv", "an extent above i64::MAX"))
-}
-
-/// A 3-d convolution over `[n, c, d, h, w]`.
-pub struct Conv3d;
-
-impl Op for Conv3d {
-    const NAME: &'static str = proto::module::operator::CONV3D;
-
-    type Descriptor = Descriptor;
-    type Args<'a> = Args;
-
-    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        if descriptor.rank != 3 || descriptor.transposed {
-            return Err(Error::argument(
-                Self::NAME,
-                "the descriptor is not a 3-d convolution",
-            ));
-        }
-        Conv::check(Self::NAME, descriptor, args)
-    }
-
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
-        Conv::launch(kernel, descriptor, args, stream)
-    }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         Args {
@@ -462,105 +439,25 @@ impl Op for Conv3d {
     }
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        // The contraction is over the filter's taps times its input channels; the bound is the
-        // statistical one for a sum of mixed-sign products.
-        let taps: u64 = descriptor
-            .kernel
-            .iter()
-            .take(descriptor.rank as usize)
-            .map(|&extent| u64::from(extent))
+        // Each output sums the taps of its input channel that reach it, in FP32, rounded once into
+        // the output; the bound is the statistical one for a sum of mixed-sign products. A
+        // convolution's output reads every tap of its window along each spatial axis, whatever the
+        // stride, and a transposed one's reads the `kernel / stride` taps that overlap it.
+        let taps: u64 = (0..descriptor.rank as usize)
+            .map(|axis| {
+                let kernel = u64::from(descriptor.kernel[axis]);
+                match descriptor.transposed {
+                    false => kernel,
+                    true => kernel.div_ceil(u64::from(descriptor.stride[axis].max(1))),
+                }
+            })
             .product();
         Tolerance::dot(taps, DType::F32, descriptor.output)
     }
 }
 
-/// A 1-d convolution over `[n, c, l]`.
-pub struct Conv1d;
-
-impl Op for Conv1d {
-    const NAME: &'static str = proto::module::operator::CONV1D;
-
-    type Descriptor = Descriptor;
-    type Args<'a> = Args;
-
-    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        if descriptor.rank != 1 || descriptor.transposed {
-            return Err(Error::argument(
-                Self::NAME,
-                "the descriptor is not a 1-d convolution",
-            ));
-        }
-        Conv::check(Self::NAME, descriptor, args)
-    }
-
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
-        Conv::launch(kernel, descriptor, args, stream)
-    }
-
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
-        Args {
-            out: twins.shadow_of(args.out),
-            ..args
-        }
-    }
-
-    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        // A non-transposed convolution: each output sums exactly `kernel` taps of its input channel
-        // in FP32 — the stride changes which taps, not how many — rounded once into the output.
-        Tolerance::dot(
-            u64::from(descriptor.kernel[0]),
-            DType::F32,
-            descriptor.output,
-        )
-    }
-}
-
-/// A transposed 1-d convolution over `[n, c, l]`: an upsampling stage.
-pub struct ConvTranspose1d;
-
-impl Op for ConvTranspose1d {
-    const NAME: &'static str = proto::module::operator::CONV_TRANSPOSE1D;
-
-    type Descriptor = Descriptor;
-    type Args<'a> = Args;
-
-    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        if descriptor.rank != 1 || !descriptor.transposed {
-            return Err(Error::argument(
-                Self::NAME,
-                "the descriptor is not a transposed 1-d convolution",
-            ));
-        }
-        Conv::check(Self::NAME, descriptor, args)
-    }
-
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
-        Conv::launch(kernel, descriptor, args, stream)
-    }
-
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
-        Args {
-            out: twins.shadow_of(args.out),
-            ..args
-        }
-    }
-
-    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        // Each output sums the taps that overlap it: `kernel / stride` contributions.
-        let stride = u64::from(descriptor.stride[0].max(1));
-        let taps = u64::from(descriptor.kernel[0]);
-        Tolerance::dot(taps.div_ceil(stride), DType::F32, descriptor.output)
-    }
+fn to_i64(value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| Error::argument(Conv::NAME, "an extent above i64::MAX"))
 }
 
 #[cfg(test)]
@@ -606,7 +503,7 @@ mod tests {
             bias: None,
             out: channels_last(&shape),
         };
-        let error = check_layouts("conv3d", &descriptor(true), &args)
+        let error = check_layouts(Conv::NAME, &descriptor(true), &args)
             .expect_err("a channels-last module over a channel-first buffer must refuse");
         let message = error.to_string();
         assert!(
@@ -630,13 +527,13 @@ mod tests {
             bias: None,
             out: channels_last(&shape),
         };
-        check_layouts("conv3d", &descriptor(true), &args)
+        check_layouts(Conv::NAME, &descriptor(true), &args)
             .expect("a packed filter is the form both layouts read");
         let args = Args {
             weight: reordered,
             ..args
         };
-        let error = check_layouts("conv3d", &descriptor(true), &args)
+        let error = check_layouts(Conv::NAME, &descriptor(true), &args)
             .expect_err("a filter outside the checkpoint's order must refuse");
         assert!(
             error.to_string().contains("not packed row-major"),
@@ -662,14 +559,14 @@ mod tests {
     }
 
     /// The entry derives row-major strides for channels-first operands, so any other view of
-    /// the input or the output is refused by every convolution operator.
+    /// the input or the output is refused, in either direction.
     #[test]
     fn a_channels_first_convolution_refuses_an_input_or_an_output_that_is_not_contiguous() {
         let input = view(&[2, 4, 16], &[64, 16, 1]);
         let out = view(&[2, 8, 16], &[128, 16, 1]);
 
         let (descriptor, args) = one_dimensional(input.clone(), out.clone());
-        Conv1d::check(&descriptor, &args).unwrap();
+        Conv::check(&descriptor, &args).unwrap();
 
         // `[n, l, c]` storage read as `[n, c, l]`: the channels are innermost in memory.
         let permuted = view(&[2, 4, 16], &[64, 1, 4]);
@@ -682,15 +579,15 @@ mod tests {
 
         for strided_input in [permuted.clone(), stepped, broadcast, window] {
             let (descriptor, args) = one_dimensional(strided_input, out.clone());
-            let message = Conv1d::check(&descriptor, &args).unwrap_err().to_string();
+            let message = Conv::check(&descriptor, &args).unwrap_err().to_string();
             assert!(message.contains("input must be contiguous"), "{message}");
         }
 
         let (descriptor, args) = one_dimensional(input, view(&[2, 8, 16], &[160, 20, 1]));
-        let message = Conv1d::check(&descriptor, &args).unwrap_err().to_string();
+        let message = Conv::check(&descriptor, &args).unwrap_err().to_string();
         assert!(message.contains("out must be contiguous"), "{message}");
 
-        // The transposed operator reads its operands the same way: `[in, out, taps]`.
+        // The transposed pass reads its operands the same way: `[in, out, taps]`.
         let transposed = Descriptor {
             transposed: true,
             padding: [1, 0, 0],
@@ -702,15 +599,13 @@ mod tests {
             bias: None,
             out,
         };
-        let message = ConvTranspose1d::check(&transposed, &args)
-            .unwrap_err()
-            .to_string();
+        let message = Conv::check(&transposed, &args).unwrap_err().to_string();
         assert!(message.contains("input must be contiguous"), "{message}");
 
         // An axis of one element is never stepped along, whatever stride it carries.
         let single = view(&[1, 4, 16], &[7, 16, 1]);
         let (descriptor, args) = one_dimensional(single, view(&[1, 8, 16], &[0, 16, 1]));
-        Conv1d::check(&descriptor, &args).unwrap();
+        Conv::check(&descriptor, &args).unwrap();
     }
 
     #[test]
@@ -722,14 +617,14 @@ mod tests {
             bias: None,
             out: view(&[1, 8, 2, 2, 2], &[64, 8, 4, 2, 1]),
         };
-        Conv3d::check(&descriptor(false), &args).unwrap();
+        Conv::check(&descriptor(false), &args).unwrap();
 
         // Depth and height exchanged.
         let permuted = Args {
             input: view(&shape, &[32, 8, 2, 4, 1]),
             ..args.clone()
         };
-        let message = Conv3d::check(&descriptor(false), &permuted)
+        let message = Conv::check(&descriptor(false), &permuted)
             .unwrap_err()
             .to_string();
         assert!(message.contains("input must be contiguous"), "{message}");
@@ -743,14 +638,14 @@ mod tests {
             bias: Some(view(&[8], &[2])),
             ..args.clone()
         };
-        let message = Conv3d::check(&biased, &stepped).unwrap_err().to_string();
+        let message = Conv::check(&biased, &stepped).unwrap_err().to_string();
         assert!(message.contains("bias must be contiguous"), "{message}");
 
         let packed = Args {
             bias: Some(view(&[8], &[1])),
             ..args
         };
-        Conv3d::check(&biased, &packed).unwrap();
+        Conv::check(&biased, &packed).unwrap();
     }
 
     /// A convolution's descriptor follows from its operands and the window the caller states:
@@ -816,7 +711,7 @@ mod tests {
         assert_eq!(stored.kernel, [3, 3, 3]);
         assert_eq!(stored.to_string(), "input_bf16_weight_bf16_output_bf16");
 
-        // A two-dimensional input is no convolution any operator computes.
+        // A two-dimensional input is no convolution the operator computes.
         let flat = Args {
             input: packed(&[1, 4, 8, 8]),
             weight: packed(&[6, 4, 3, 3]),

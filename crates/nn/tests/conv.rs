@@ -501,8 +501,7 @@ fn each_convolution_is_one_launch_keyed_by_its_element_types() {
     assert_eq!(output.unwrap(), (vec![2, 8, 16], vec![2, 4, 32]));
     assert_eq!(
         launches,
-        [("conv1d", F32_KEY), ("conv_transpose1d", F32_KEY)]
-            .map(|(operator, key)| (operator, key.to_owned()))
+        [("conv", F32_KEY), ("conv", F32_KEY)].map(|(operator, key)| (operator, key.to_owned()))
     );
 
     // A frame stored channels-last launches the channel-first kernel, and its output is stored
@@ -526,7 +525,7 @@ fn each_convolution_is_one_launch_keyed_by_its_element_types() {
 
     let (first, first_launches) = strides(false);
     assert_eq!(first.unwrap(), (vec![1, 8, 2, 2, 2], vec![64, 8, 4, 2, 1]));
-    assert_eq!(first_launches, [("conv3d", F32_KEY.to_owned())]);
+    assert_eq!(first_launches, [("conv", F32_KEY.to_owned())]);
 
     let (last, last_launches) = strides(true);
     assert_eq!(last.unwrap(), (vec![1, 8, 2, 2, 2], vec![64, 1, 32, 16, 8]));

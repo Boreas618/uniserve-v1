@@ -1,6 +1,6 @@
 """The cuDNN convolution modules against torch's own convolution in FP64.
 
-The three convolution operators share one source and one check. Each test
+The `conv` operator's one module computes the three convolutions. Each test
 loads the built module of its descriptor (``input_<t>_weight_<t>_output_<t>``,
 resolved at the session's Build Server) as a runner loads it, calls its entry
 with the call structure of ``crates/ops/src/conv.rs``, and compares the output
@@ -36,14 +36,12 @@ import torch
 
 pytestmark = [pytest.mark.unit, pytest.mark.gpu]
 
-#: The convolution operators, each with its C entry and torch's reference.
+#: The convolutions the `conv` operator's one module computes, each named by
+#: and compared with PyTorch's function.
 OPERATORS = {
-    "conv1d": ("uniserve_conv1d", torch.nn.functional.conv1d),
-    "conv3d": ("uniserve_conv3d", torch.nn.functional.conv3d),
-    "conv_transpose1d": (
-        "uniserve_conv_transpose1d",
-        torch.nn.functional.conv_transpose1d,
-    ),
+    "conv1d": torch.nn.functional.conv1d,
+    "conv3d": torch.nn.functional.conv3d,
+    "conv_transpose1d": torch.nn.functional.conv_transpose1d,
 }
 
 #: The unit round-off of each element type, as `ops::tolerance::unit_roundoff`
@@ -97,13 +95,12 @@ def key(dtype):
     return f"input_{dtype}_weight_{dtype}_output_{dtype}"
 
 
-def entry(kernel_module, op, dtype):
-    """The C entry of `op`'s built module of element type `dtype`."""
-    name, _ = OPERATORS[op]
+def entry(kernel_module, dtype):
+    """The C entry of the `conv` module of element type `dtype`."""
     library = ctypes.CDLL(
-        str(kernel_module(op, "cudnn", key(dtype)) / "module.so")
+        str(kernel_module("conv", "cudnn", key(dtype)) / "module.so")
     )
-    function = getattr(library, name)
+    function = library.uniserve_conv
     function.argtypes = [ctypes.POINTER(Call), ctypes.c_void_p]
     function.restype = ctypes.c_int32
     return function
@@ -149,7 +146,7 @@ def stored(tensor, channels_last):
 def test_a_convolution_matches_torch_within_the_operators_bound(
     op, dtype, channels_last, geometry, torch_device, kernel_module
 ):
-    function = entry(kernel_module, op, dtype)
+    function = entry(kernel_module, dtype)
     shape = GEOMETRIES[geometry]
     torch.manual_seed(0)
     rank = 3 if op == "conv3d" else 1
@@ -181,7 +178,7 @@ def test_a_convolution_matches_torch_within_the_operators_bound(
         )
     bias = torch.randn(OUT_CHANNELS, dtype=element, device=torch_device)
 
-    _, reference = OPERATORS[op]
+    reference = OPERATORS[op]
     with torch.no_grad():
         expected = reference(
             x.double(),
@@ -245,7 +242,7 @@ def test_a_half_precision_convolution_refuses_tf32(op, kernel_module):
     before any address is examined: the call is empty but for the flag, and is
     made on no stream.
     """
-    function = entry(kernel_module, op, "bf16")
+    function = entry(kernel_module, "bf16")
     call = Call()
     call.tf32 = 1
 

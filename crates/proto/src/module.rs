@@ -165,9 +165,7 @@ pub mod operator {
     pub const SLOT_COMMIT: &str = "slot_commit";
     pub const TRANSPOSE: &str = "transpose";
     pub const VSA_SCORES: &str = "vsa_scores";
-    pub const CONV3D: &str = "conv3d";
-    pub const CONV1D: &str = "conv1d";
-    pub const CONV_TRANSPOSE1D: &str = "conv_transpose1d";
+    pub const CONV: &str = "conv";
     pub const EMBEDDING: &str = "embedding";
     pub const FRAME_PAD: &str = "frame_pad";
     pub const FRAME_MOMENTS: &str = "frame_moments";
@@ -272,9 +270,7 @@ pub mod operator {
         SLOT_COMMIT,
         TRANSPOSE,
         VSA_SCORES,
-        CONV3D,
-        CONV1D,
-        CONV_TRANSPOSE1D,
+        CONV,
         EMBEDDING,
         FRAME_PAD,
         FRAME_MOMENTS,

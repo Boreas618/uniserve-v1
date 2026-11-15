@@ -617,7 +617,7 @@ fn operands_a_product_or_a_convolution_cannot_read_in_place_are_made_contiguous_
         "gemm",
         "input_f32_weight_f32_accumulate_f32_output_f32_order_kxn_epilogue_none".to_owned(),
     );
-    let conv1d = ("conv1d", "input_f32_weight_f32_output_f32".to_owned());
+    let conv = ("conv", "input_f32_weight_f32_output_f32".to_owned());
     assert_eq!(
         table_of,
         table(&[
@@ -630,9 +630,9 @@ fn operands_a_product_or_a_convolution_cannot_read_in_place_are_made_contiguous_
             // A window of a wider weight keeps the wider weight's row stride: read in place.
             gemm,
             copy(2),
-            conv1d.clone(),
+            conv.clone(),
             copy(2),
-            conv1d,
+            conv,
         ])
     );
 }
@@ -662,7 +662,7 @@ fn a_batch_of_distinct_matrices_is_one_product_per_member() {
 }
 
 #[test]
-fn convolutions_launch_the_convolution_operators() {
+fn convolutions_launch_the_convolution_operator() {
     let table_of = launches(|| {
         let signal = input((1, 2, 16), DType::F32);
         let filter = input((3, 2, 4), DType::F32);
@@ -681,14 +681,11 @@ fn convolutions_launch_the_convolution_operators() {
         Ok(())
     });
 
+    // Every rank and direction is one operator of one key: the call carries the rest.
     let key = "input_f32_weight_f32_output_f32".to_owned();
     assert_eq!(
         table_of,
-        table(&[
-            ("conv1d", key.clone()),
-            ("conv3d", key.clone()),
-            ("conv_transpose1d", key),
-        ])
+        table(&[("conv", key.clone()), ("conv", key.clone()), ("conv", key),])
     );
 }
 

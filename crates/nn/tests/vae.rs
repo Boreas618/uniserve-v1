@@ -511,11 +511,11 @@ fn a_bigvgan_generator_upsamples_through_its_stages() {
     // Two dilation steps of two activations each, then the post activation, each once per
     // batch row; the block's four convolutions between the pre- and post-convolutions.
     assert_eq!(count("activation1d"), 2 * (2 * 2 + 1));
-    assert_eq!(count("conv1d"), 1 + 4 + 1);
-    assert_eq!(count("conv_transpose1d"), 1);
+    // The pre-convolution, the block's four, the post-convolution and the upsampling one.
+    assert_eq!(count("conv"), 1 + 4 + 1 + 1);
     assert_eq!(
         launches.first().map(|(operator, _)| *operator),
-        Some("conv1d")
+        Some("conv")
     );
     assert_eq!(
         launches
@@ -595,7 +595,7 @@ fn a_dac_encoder_widens_and_strides_through_its_stages() {
             .count()
     };
     assert_eq!(count("snake"), 3 * 2 + 1 + 1);
-    assert_eq!(count("conv1d"), 1 + 3 * 2 + 1 + 1);
+    assert_eq!(count("conv"), 1 + 3 * 2 + 1 + 1);
     assert_eq!(count("elementwise_binary"), 3, "one residual add per unit");
     let (refused, _) = recorded(|| encoder.forward(&meta((2, 1, 15), DType::F32)));
     assert!(refused.is_err());

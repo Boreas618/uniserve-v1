@@ -1,0 +1,55 @@
+# The conv operator's cudnn backend: design 5.2's package.
+#
+# One native module per descriptor. The module is the convolution itself, through
+# cuDNN 9's backend API: an engine per shape, the first proposal of cuDNN's heuristic
+# that keeps the call's numerics, chosen once and executed on the caller's stream,
+# workspace from the stream's pool so a captured graph records it. A shape the
+# heuristic proposes no such engine for is refused, naming its graph.
+#
+# One module computes every convolution the operator has. The call structure names
+# three spatial axes, so a 1-d convolution passes `[l, 1, 1]` and its filter, stride,
+# padding and dilation are trivial along the other two. A transposed convolution is
+# cuDNN's backward-data pass of the convolution it transposes: the layer's weight is
+# `[c, k/groups, t]` in memory and is read by the pass as `[k, c, t]` through the
+# filter descriptor's strides, without copying it. The layer's output padding is zero
+# in `ops`, so both paddings are the layer's own. A grouped transposed convolution is
+# not described by that pass in this layout and the module refuses it.
+#
+# The descriptor carries the element types only: the rank, the direction, the geometry,
+# the strides, the padding, the dilation, the groups, the bias, the TF32 permission and
+# the storage order travel in the call structure the entry reads, so one compilation
+# serves every shape a request brings — a descriptor that named them would compile one
+# module per clip length and per filter shape. The key is the operator crate's:
+# `input_f32_weight_f32_output_f32`.
+#
+# `tf32` is a permission, not a setting: it says whether the engine *may* use TF32
+# tensor cores for an FP32 convolution, which is what design 9 asks the video VAE
+# to keep. cuDNN 9's backend API chooses the engine's arithmetic itself and exposes
+# no math-type knob (`cudnnSetConvolutionMathType` is the legacy path), so this
+# module cannot turn TF32 on inside an engine that would not use it. It does the part
+# that matters: `tf32` is validated against the input type — true for FP32 only — and
+# with `tf32` clear an FP32 convolution takes only an engine whose numerical notes say
+# it does not narrow its inputs.
+
+op = "conv"
+backend = "cudnn"
+interface_version = 1
+
+[source]
+kind = "cuda"
+
+# The module is compiled against cuDNN's headers and linked against its library, the
+# distribution the Build Server's toolchain description names. The element types are
+# cuDNN's data types of the descriptor's fields.
+[compile]
+units = ["src/conv.cu"]
+standard = "c++17"
+libraries = ["cudnn"]
+
+[compile.definitions]
+UNISERVE_CONV_INPUT = { field = "input", values = { bf16 = "CUDNN_DATA_BFLOAT16", f32 = "CUDNN_DATA_FLOAT" } }
+UNISERVE_CONV_WEIGHT = { field = "weight", values = { bf16 = "CUDNN_DATA_BFLOAT16", f32 = "CUDNN_DATA_FLOAT" } }
+UNISERVE_CONV_OUTPUT = { field = "output", values = { bf16 = "CUDNN_DATA_BFLOAT16", f32 = "CUDNN_DATA_FLOAT" } }
+
+[[kernel.descriptors]]
+dimensions = { input = ["bf16", "f32"], weight = ["bf16", "f32"], output = ["bf16", "f32"] }
