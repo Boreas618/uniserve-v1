@@ -24,8 +24,9 @@ pub struct VideoSpec {
     pub length: Option<Length>,
     /// The output's frame rate.
     pub fps: Option<u32>,
-    /// The noise seed.
-    pub seed: Option<u64>,
+    /// The noise seed: the request's own, or the one its server draws when it states none, as it
+    /// does for every request.
+    pub seed: u64,
     /// Denoiser evaluations of the schedule.
     pub num_inference_steps: Option<u32>,
     /// Classifier-free guidance scale.

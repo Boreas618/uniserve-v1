@@ -191,7 +191,7 @@ impl processing::VideoProcessor for TestProcessor {
             }),
             num_frames: 22,
             fps: 24,
-            seed: request.seed.unwrap_or(42),
+            seed: request.seed,
             prompt_token_ids,
             vision_spans: Vec::new(),
             condition_rows: conditions

@@ -1328,7 +1328,7 @@ pub(super) mod tests {
                     .and_then(Value::as_f64)
                     .map(Length::Seconds),
                 fps: None,
-                seed: None,
+                seed: 0,
                 num_inference_steps: None,
                 guidance_scale: None,
                 references,
@@ -1420,7 +1420,7 @@ pub(super) mod tests {
             size,
             length: Some(Length::Seconds(seconds)),
             fps: None,
-            seed: None,
+            seed: 0,
             num_inference_steps: None,
             guidance_scale: None,
             references,

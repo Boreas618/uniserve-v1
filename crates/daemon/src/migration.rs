@@ -26,10 +26,10 @@
 //! A migration caused by a drain is not counted. A request survives
 //! `max_migrations` migrations caused by losses and fails on the next one.
 //!
-//! The random stream of a migrated request continues as it began: the
-//! migrator gives a token request that names no seed one of its own when it
-//! is first submitted, and every draw of a seeded request follows its seed
-//! and its token position alone; a latent encoding's posterior draw follows
+//! The random stream of a migrated request continues as it began: every
+//! request carries a seed from entry, its own or one drawn for it
+//! (`api::input::request_seed`), and every draw of a token request follows
+//! its seed and its token position alone; a latent encoding's posterior draw follows
 //! the encoding's place among the request's encodings, which the request's
 //! facts fix. A video request's draws follow its seed. The migrator gives a
 //! video request the identity that keys its stored trajectories
@@ -69,9 +69,10 @@ impl Migrator {
     /// Submits `request` through the hold and returns its events and the
     /// scheduler serving it, as `RequestHold::submit` does. A token request
     /// that resumes from its tokens, and a video request, are kept for a
-    /// later migration; a token request that names no seed takes one first,
-    /// so that its draws repeat on the engine that serves it next, and a
-    /// video request takes its trajectories' identity.
+    /// later migration, a token request with the seed it carries from entry
+    /// (`api::input::request_seed`), so that its draws repeat on the engine
+    /// that serves it next, and a video request with its trajectories'
+    /// identity.
     ///
     /// # Errors
     ///
@@ -81,12 +82,7 @@ impl Migrator {
         mut request: Request,
     ) -> Result<(RequestEvents, Option<u32>), SubmitError> {
         let resumable = match &mut request {
-            Request::Generation(generation) => {
-                if generation.sampling.seed.is_none() {
-                    generation.sampling.seed = Some(uuid::Uuid::new_v4().as_u64_pair().0);
-                }
-                Some(Resumable::Generation(generation.clone()))
-            }
+            Request::Generation(generation) => Some(Resumable::Generation(generation.clone())),
             Request::Diffusion(diffusion) => {
                 if diffusion.trajectory.id == 0 {
                     diffusion.trajectory.id = uuid::Uuid::new_v4().as_u64_pair().0;

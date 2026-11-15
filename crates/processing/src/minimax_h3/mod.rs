@@ -109,9 +109,6 @@ pub const REFERENCE_LIMITS: ReferenceLimits = ReferenceLimits {
     image_short_edge: 2048,
 };
 
-/// The seed a request without one draws its noise from, as the reference does.
-pub const DEFAULT_SEED: u64 = 42;
-
 /// The checkpoint files the processor reads, as `(stage, file)` of the pipeline: the conditioner's
 /// Qwen3-VL processor, which fixes how condition media is patched.
 pub const PROCESSOR_FILES: &[(&str, &str)] = &[

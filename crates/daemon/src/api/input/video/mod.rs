@@ -99,7 +99,7 @@ impl VideoGenerationRequest {
             size,
             length,
             fps: self.fps,
-            seed: self.seed,
+            seed: super::request_seed(self.seed),
             num_inference_steps: self.num_inference_steps,
             guidance_scale: self.guidance_scale,
             references,

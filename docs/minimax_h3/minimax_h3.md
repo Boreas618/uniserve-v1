@@ -262,7 +262,7 @@ The request fields are the same for every video model; any other field is refuse
 | `num_frames` | Must already be a count of the frame rule, from the count 4 seconds generate to the count `video_config.max_seconds` generates: 107 to 124 frames for a 5-second deployment, although 124 frames last 5.17 seconds. |
 | `fps` | 24 when stated. |
 | `num_inference_steps` | When stated, the schedule's denoiser evaluations, which the served checkpoint fixes and `/v1/capabilities` reports. |
-| `seed` | 42 when not stated. |
+| `seed` | Drawn at random when not stated, as for every request. |
 | `negative_prompt`, `guidance_scale`, `extra_params` | Refused: the schedule runs without classifier-free guidance, and the model defines no extra parameter. |
 
 The sizes MiniMax-H3 generates:

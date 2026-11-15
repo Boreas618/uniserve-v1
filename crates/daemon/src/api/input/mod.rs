@@ -22,6 +22,13 @@ pub use processor::{LoadedModel, LoadedRenderer};
 /// Result type returned by serving-runtime calls.
 pub type Result<T> = std::result::Result<T, ServeError>;
 
+/// The seed a request is served with: the one it states, or one drawn at random when it states
+/// none, for every kind of request alike. A request carries its seed from entry on, so its draws
+/// repeat wherever it runs, on every engine a migration moves it to.
+pub(crate) fn request_seed(stated: Option<u64>) -> u64 {
+    stated.unwrap_or_else(|| uuid::Uuid::new_v4().as_u64_pair().0)
+}
+
 /// The 64-bit FNV-1a hash of `bytes`, stable across processes, builds and
 /// platforms. It keys cache isolation and request-derived seeds; it is not
 /// collision resistant.

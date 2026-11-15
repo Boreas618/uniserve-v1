@@ -43,7 +43,7 @@ pub(super) fn lower(
             .or(defaults.repetition_penalty)
             .unwrap_or(1.0),
         // The seed's signed bit pattern seeds the engine.
-        seed: request.seed.map(|seed| seed as u64),
+        seed: Some(super::request_seed(request.seed.map(|seed| seed as u64))),
         ignore_eos: request.ignore_eos,
         min_tokens: request.min_tokens.unwrap_or(0) as usize,
         frequency_penalty: request.frequency_penalty.unwrap_or(0.0),

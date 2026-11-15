@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use super::prompt::present;
 use super::rules::{KEYFRAME_ANCHORS, REFERENCES, ReferenceSizing};
 use super::{
-    AUDIO_SAMPLE_RATE, CANVAS_RULE, DEFAULT_SEED, DenoiserInfo, FPS, FRAMES, MAX_SECONDS,
-    MIN_SECONDS, PROCESSOR_FILES, VideoTask,
+    AUDIO_SAMPLE_RATE, CANVAS_RULE, DenoiserInfo, FPS, FRAMES, MAX_SECONDS, MIN_SECONDS,
+    PROCESSOR_FILES, VideoTask,
 };
 use crate::media::MediaMetadata;
 use crate::qwen_vl::ProcessorConfig;
@@ -219,7 +219,7 @@ impl VideoProcessor for H3Processor {
             },
             num_frames: generation.num_frames,
             fps: FPS,
-            seed: request.seed.unwrap_or(DEFAULT_SEED),
+            seed: request.seed,
             prompt_token_ids: prompt.token_ids,
             vision_spans: prompt.vision_spans,
             conditions,
@@ -305,7 +305,7 @@ mod tests {
             size: size.map(|(width, height)| Canvas { width, height }),
             length,
             fps: None,
-            seed: None,
+            seed: 7,
             num_inference_steps: None,
             guidance_scale: None,
             references: Vec::new(),
@@ -320,8 +320,8 @@ mod tests {
         }
     }
 
-    /// A duration aligns up to the frame rule, a size selects its served canvas, and an omitted
-    /// seed is the reference's; the prompt is the conditioner prompt's tokens.
+    /// A duration aligns up to the frame rule, a size selects its served canvas, and the seed is
+    /// the request's; the prompt is the conditioner prompt's tokens.
     #[test]
     fn a_text_request_resolves_its_served_canvas_and_aligned_frames() {
         let processor = processor(&[VideoTask::TextToVideoAudio], 15.0).unwrap();
@@ -333,7 +333,7 @@ mod tests {
         assert_eq!((input.size.width, input.size.height), (768, 1344));
         assert_eq!(input.num_frames, 124, "5 s at 24 fps aligns up to 17n + 5");
         assert_eq!(input.fps, 24);
-        assert_eq!(input.seed, DEFAULT_SEED);
+        assert_eq!(input.seed, 7);
         assert_eq!(input.video_units, FRAMES.units(124));
         assert!(input.conditions.is_empty());
         assert!(!input.prompt_token_ids.is_empty());
