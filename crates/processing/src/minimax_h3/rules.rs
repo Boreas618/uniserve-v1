@@ -21,6 +21,8 @@
 //! - without a stated length, a `ref2va` request whose references carry exactly one soundtrack
 //!   lasts as long as that soundtrack after its start offset.
 
+use std::num::NonZeroU32;
+
 use proto::video::{Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VisionGrid};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -377,27 +379,13 @@ impl PreparedCondition {
     /// Denoiser video rows of each unit the video encoder encodes, in unit order. `canvas` is the
     /// generated canvas.
     ///
-    /// A keyframe is one unit, one latent frame of the canvas it is fitted to. A reference image is
-    /// `image_bands` units: bands of its rows of 32-pixel denoiser patches dealt as evenly as
-    /// possible in order, so with `g` patch rows band `b` holds rows `b * g / bands` to
-    /// `(b + 1) * g / bands`, rounded down, `image_bands` clamped to one through `g`; the bands
-    /// assemble the whole image's encoding. A video's encoded frames are one unit per clip of the
-    /// frame rule (five latent frames) and one for the tail (two). An audio reference has none.
-    pub fn latent_units(&self, canvas: Canvas, image_bands: u32) -> Vec<u32> {
+    /// A keyframe is one unit, one latent frame of the canvas it is fitted to, and a reference
+    /// image one latent frame at its own size. A video's encoded frames are one unit per clip of
+    /// the frame rule (five latent frames) and one for the tail (two). An audio reference has none.
+    pub fn latent_units(&self, canvas: Canvas) -> Vec<u32> {
         match &self.preparation {
             Preparation::Keyframe { .. } => vec![patch_rows(canvas)],
-            Preparation::Image(size) => {
-                let side = super::LATENT_COMPRESSION * super::PATCH_SIDE;
-                let (rows, columns) = (size.height / side, size.width / side);
-                let bands = image_bands.clamp(1, rows.max(1));
-                (0..bands)
-                    .map(|band| {
-                        let start = band * rows / bands;
-                        let stop = (band + 1) * rows / bands;
-                        (stop - start) * columns
-                    })
-                    .collect()
-            }
+            Preparation::Image(size) => vec![patch_rows(*size)],
             Preparation::Video(clip) => {
                 let rows = patch_rows(clip.canvas);
                 let mut units =
@@ -410,9 +398,9 @@ impl PreparedCondition {
     }
 
     /// The condition as the engine and the workers read it, before its media is published: its
-    /// role and decoded media, what the conditioner reads of it, and its denoiser rows, a reference
-    /// image in `image_bands` units ([`Self::latent_units`]). `canvas` is the generated canvas.
-    pub fn describe(&self, canvas: Canvas, image_bands: u32) -> ConditionInput {
+    /// role and decoded media, what the conditioner reads of it, and its denoiser rows
+    /// ([`Self::latent_units`]). `canvas` is the generated canvas.
+    pub fn describe(&self, canvas: Canvas) -> ConditionInput {
         let (role, media) = self.media(canvas);
         let vision = self.vision.as_ref().map(|vision| match vision {
             Vision::Image { grid, tokens } => ConditionVision {
@@ -435,7 +423,7 @@ impl PreparedCondition {
             role,
             media,
             vision,
-            latent_units: self.latent_units(canvas, image_bands),
+            latent_units: self.latent_units(canvas),
             audio_rows: self.audio_rows,
         }
     }
@@ -478,8 +466,8 @@ pub enum VisualRows {
 /// request's condition rows by it ([`condition_rows`]), and the denoiser's packing places the rows
 /// it counts.
 pub fn condition_tiles(audio_rows: u32, visual: VisualRows, packing: &ConditionPacking) -> u32 {
-    let tile = packing.tile_rows.max(1);
-    let [time, height, width] = packing.video_tile.map(|side| side.max(1));
+    let tile = packing.tile_rows.get();
+    let [time, height, width] = packing.video_tile.map(NonZeroU32::get);
     let visual = match visual {
         VisualRows::None => 0,
         VisualRows::Patches(rows) => rows.div_ceil(tile),
@@ -499,7 +487,7 @@ pub fn condition_rows(
     canvas: Canvas,
     packing: &ConditionPacking,
 ) -> u32 {
-    let tile = packing.tile_rows.max(1);
+    let tile = packing.tile_rows.get();
     conditions
         .iter()
         .map(|condition| condition.tiles(canvas, packing).saturating_mul(tile))
@@ -526,41 +514,6 @@ impl Generation {
     /// Denoiser rows the request's conditions take in a layout of `packing` ([`condition_rows`]).
     pub fn condition_rows(&self, packing: &ConditionPacking) -> u32 {
         condition_rows(&self.conditions, self.canvas, packing)
-    }
-
-    /// The units each condition's reference image is encoded in when one latent encoding round
-    /// covers `round_units` units, one entry per condition (other conditions' entries are unread).
-    ///
-    /// A lone reference image is the largest visual condition and is a single rank's work as one
-    /// unit; its bands spread its encoder tiles over the ranks of one round. Fewer images than a
-    /// round's units divide them evenly, at least one unit each. More images than a round's units
-    /// encode whole, `round_units` images per round, except that when every visual unit is an
-    /// image, the `k` images of a final partial round take `round_units / k` bands each whenever
-    /// `k` divides `round_units`, so that round is full rather than leaving ranks idle.
-    pub fn image_bands(&self, round_units: u32) -> Vec<u32> {
-        let is_image =
-            |condition: &PreparedCondition| matches!(condition.preparation, Preparation::Image(_));
-        let images = self.conditions.iter().filter(|c| is_image(c)).count() as u32;
-        let mut bands = vec![(round_units / images.max(1)).max(1); self.conditions.len()];
-        let only_images = self.conditions.iter().all(|condition| {
-            is_image(condition) || matches!(condition.preparation, Preparation::Audio(_))
-        });
-        let partial = images % round_units.max(1);
-        if only_images && images > round_units && partial > 0 && round_units.is_multiple_of(partial)
-        {
-            // The last `partial` images, in request order, form the final round.
-            let mut remaining = partial;
-            for (entry, condition) in bands.iter_mut().zip(&self.conditions).rev() {
-                if remaining == 0 {
-                    break;
-                }
-                if is_image(condition) {
-                    *entry = round_units / partial;
-                    remaining -= 1;
-                }
-            }
-        }
-        bands
     }
 }
 
@@ -947,8 +900,13 @@ impl H3Processor {
     /// Refuses the first public parameter at fault.
     pub fn check_request(&self, request: &VideoSpec) -> Result<(), InputError> {
         let task = task(request);
-        if !self.tasks.contains(&task) {
-            let served: Vec<&str> = self.tasks.iter().map(|task| task.as_str()).collect();
+        if !self.denoiser.tasks.contains(&task) {
+            let served: Vec<&str> = self
+                .denoiser
+                .tasks
+                .iter()
+                .map(|task| task.as_str())
+                .collect();
             return Err(InputError::invalid(
                 REFERENCES,
                 format!(
@@ -1247,22 +1205,17 @@ pub(super) mod tests {
         let vectors = vectors();
         H3Processor {
             denoiser: DenoiserInfo {
-                tasks: VideoTask::ALL
-                    .iter()
-                    .map(|task| task.as_str().to_owned())
-                    .collect(),
+                tasks: VideoTask::ALL.to_vec(),
                 schedule_points: 9,
                 video_shift: 12.0,
                 audio_shift: 3.0,
                 canvases: vector_canvases(),
                 references: REFERENCE_LIMITS,
-                condition_packing: ConditionPacking::default(),
+                condition_packing: ConditionPacking::dense(0),
             },
-            tasks: VideoTask::ALL.to_vec(),
             max_seconds: 15.0,
             sizing: ReferenceSizing::released(&REFERENCE_LIMITS),
             vision: vision(&vectors),
-            latent_encoding_units: 1,
         }
     }
 
@@ -1518,7 +1471,7 @@ pub(super) mod tests {
         };
         let mut entry = json!({
             "index": condition.index,
-            "video_rows": condition.latent_units(canvas, 1).iter().sum::<u32>(),
+            "video_rows": condition.latent_units(canvas).iter().sum::<u32>(),
             "audio_rows": condition.audio_rows,
             "vision": vision,
         });
@@ -1642,8 +1595,8 @@ pub(super) mod tests {
             vision: None,
             audio_rows: 0,
         };
-        // A video's units are its encoder windows, however many bands an image would take.
-        let units = video.latent_units(canvas, 4);
+        // A video's units are its encoder windows.
+        let units = video.latent_units(canvas);
         assert_eq!(units, [vec![5 * 1008; 7], vec![2 * 1008]].concat());
         assert_eq!(units.iter().sum::<u32>(), FRAMES.latent_frames(124) * 1008);
 
@@ -1656,7 +1609,7 @@ pub(super) mod tests {
             }),
             ..video.clone()
         };
-        assert_eq!(image.latent_units(canvas, 1), [7296]);
+        assert_eq!(image.latent_units(canvas), [7296]);
         let keyframe = PreparedCondition {
             preparation: Preparation::Keyframe {
                 role: ConditionRole::FirstFrame,
@@ -1664,88 +1617,7 @@ pub(super) mod tests {
             },
             ..video
         };
-        assert_eq!(keyframe.latent_units(canvas, 1), [1008]);
-    }
-
-    /// A reference image's bands are runs of whole 32-pixel patch rows dealt as evenly as
-    /// possible, together its rows.
-    #[test]
-    fn reference_image_bands_partition_its_patch_rows() {
-        // A 16:9 reference at its 2048-pixel short edge: 64 patch rows of 114 patches.
-        let size = Canvas {
-            width: 3648,
-            height: 2048,
-        };
-        let image = PreparedCondition {
-            index: 0,
-            preparation: Preparation::Image(size),
-            vision: None,
-            audio_rows: 0,
-        };
-        assert_eq!(image.latent_units(size, 4), [16 * 114; 4]);
-        assert_eq!(image.latent_units(size, 3), [21 * 114, 21 * 114, 22 * 114]);
-        assert_eq!(image.latent_units(size, 0), [64 * 114]);
-        assert_eq!(image.latent_units(size, 100), [114; 64]);
-    }
-
-    /// A latent encoding round's units are divided evenly among a request's reference images, at
-    /// least one unit each; other conditions take no share.
-    #[test]
-    fn reference_images_share_the_latent_round() {
-        let image = PreparedCondition {
-            index: 0,
-            preparation: Preparation::Image(Canvas {
-                width: 2048,
-                height: 2048,
-            }),
-            vision: None,
-            audio_rows: 0,
-        };
-        let audio = PreparedCondition {
-            preparation: Preparation::Audio(AudioClip {
-                sample_rate: 32_000,
-                start_sample: 0,
-                source_samples: 32_000,
-                samples: 32_000,
-                latents: 40,
-            }),
-            audio_rows: 80,
-            ..image.clone()
-        };
-        let generation = |conditions: Vec<PreparedCondition>| Generation {
-            task: VideoTask::ReferenceToVideoAudio,
-            canvas: Canvas {
-                width: 1344,
-                height: 768,
-            },
-            duration_seconds: 5.0,
-            num_frames: 124,
-            conditions,
-        };
-        assert_eq!(
-            generation(vec![image.clone(), audio.clone()]).image_bands(4),
-            [4, 4]
-        );
-        assert_eq!(generation(vec![image.clone(); 3]).image_bands(4), [1; 3]);
-        assert_eq!(generation(vec![image.clone(); 2]).image_bands(4), [2; 2]);
-        assert_eq!(generation(vec![image.clone()]).image_bands(0), [1]);
-
-        // Images beyond one round encode whole, a round's worth at a time, and the images of a
-        // final partial round split into bands that fill it: with four units per round nine
-        // images take 1 x 8 + 4 units and six take 1 x 4 + 2 x 2, while seven, whose final three
-        // cannot share four units evenly, stay whole. An audio track takes no part.
-        assert_eq!(
-            generation(vec![image.clone(); 9]).image_bands(4),
-            [vec![1; 8], vec![4]].concat()
-        );
-        assert_eq!(
-            generation(vec![image.clone(); 6]).image_bands(4),
-            [vec![1; 4], vec![2; 2]].concat()
-        );
-        assert_eq!(generation(vec![image.clone(); 7]).image_bands(4), [1; 7]);
-        let mut five = vec![image; 5];
-        five.insert(2, audio);
-        assert_eq!(generation(five).image_bands(4), [1, 1, 1, 1, 1, 4]);
+        assert_eq!(keyframe.latent_units(canvas), [1008]);
     }
 
     /// A sparse denoiser's tiles hold each condition's audio and pixels apart, and a video fills
@@ -1758,11 +1630,7 @@ pub(super) mod tests {
             width: 1344,
             height: 768,
         };
-        let packing = ConditionPacking {
-            capacity: u32::MAX,
-            tile_rows: 128,
-            video_tile: [4, 4, 8],
-        };
+        let packing = ConditionPacking::tiled(u32::MAX, 128, [4, 4, 8]).unwrap();
         let keyframe = PreparedCondition {
             index: 0,
             preparation: Preparation::Keyframe {
@@ -1806,7 +1674,7 @@ pub(super) mod tests {
     }
 
     /// Every prepared condition of the vectors is described with the rows its preparation counts,
-    /// in its encoder units however its image is banded, and its audio rows.
+    /// in its encoder units, and its audio rows.
     #[test]
     fn described_conditions_carry_their_rows() {
         for case in vectors()["requests"].as_array().unwrap() {
@@ -1815,10 +1683,10 @@ pub(super) mod tests {
             }
             let generation = Request::parse(case).prepare().unwrap();
             for condition in &generation.conditions {
-                let described = condition.describe(generation.canvas, 4);
+                let described = condition.describe(generation.canvas);
                 assert_eq!(
                     described.latent_units,
-                    condition.latent_units(generation.canvas, 4),
+                    condition.latent_units(generation.canvas),
                     "{}",
                     case["name"]
                 );
@@ -2011,7 +1879,7 @@ pub(super) mod tests {
             let video_rows: u32 = generation
                 .conditions
                 .iter()
-                .flat_map(|condition| condition.latent_units(generation.canvas, 1))
+                .flat_map(|condition| condition.latent_units(generation.canvas))
                 .sum();
             let audio_rows: u32 = generation.conditions.iter().map(|c| c.audio_rows).sum();
             assert_eq!(
@@ -2026,11 +1894,7 @@ pub(super) mod tests {
             );
             // A dense denoiser packs them row for row, so the rows a request's layout holds are
             // the reference's too.
-            let dense = ConditionPacking {
-                capacity: u32::MAX,
-                tile_rows: 1,
-                video_tile: [1, 1, 1],
-            };
+            let dense = ConditionPacking::dense(u32::MAX);
             assert_eq!(
                 u64::from(generation.condition_rows(&dense)),
                 expected["condition_video_rows"].as_u64().unwrap()
@@ -2249,7 +2113,7 @@ pub(super) mod tests {
     #[test]
     fn only_served_tasks_are_accepted() {
         let mut processor = processor();
-        processor.tasks = vec![VideoTask::ReferenceToVideoAudio];
+        processor.denoiser.tasks = vec![VideoTask::ReferenceToVideoAudio];
         let error = processor.check_request(&text(None, 5.0)).unwrap_err();
         assert_eq!(param(error), "input_references");
     }

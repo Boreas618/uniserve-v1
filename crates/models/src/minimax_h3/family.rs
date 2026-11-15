@@ -395,7 +395,7 @@ impl MinimaxH3 {
     /// How the placed denoiser lays a request's conditions into its rows, as request
     /// processing sizes them: whole tiles under sparse attention, row for row under dense
     /// attention, and the rows it holds when this rank places the condition encoders.
-    fn condition_packing(&self, denoiser: &Denoiser) -> ConditionPacking {
+    fn condition_packing(&self, denoiser: &Denoiser) -> Result<ConditionPacking> {
         let capacity = if denoiser.places_encoders() {
             denoiser.condition_capacity()
         } else {
@@ -403,16 +403,9 @@ impl MinimaxH3 {
         };
 
         match denoiser.config().vsa {
-            Some(vsa) => ConditionPacking {
-                capacity,
-                tile_rows: vsa.tile_rows,
-                video_tile: vsa.tile_shape(),
-            },
-            None => ConditionPacking {
-                capacity,
-                tile_rows: 1,
-                video_tile: [1, 1, 1],
-            },
+            Some(vsa) => ConditionPacking::tiled(capacity, vsa.tile_rows, vsa.tile_shape())
+                .ok_or_else(|| Error::config("a sparse attention tile is empty".to_owned())),
+            None => Ok(ConditionPacking::dense(capacity)),
         }
     }
 }
@@ -545,7 +538,7 @@ impl VideoModel for MinimaxH3 {
             &self.tasks,
             serving,
             &denoiser.condition_ladder(),
-            &self.condition_packing(denoiser),
+            &self.condition_packing(denoiser)?,
             self.config.processor.as_ref(),
         )?)
     }
@@ -579,7 +572,7 @@ impl VideoModel for MinimaxH3 {
         let steps = schedule.num_steps();
 
         let info = DenoiserInfo {
-            tasks: tasks.iter().map(|task| task.as_str().to_owned()).collect(),
+            tasks: tasks.clone(),
             schedule_points: steps + 1,
             video_shift: f64::from(schedule.video_shift),
             audio_shift: f64::from(schedule.audio_shift),
@@ -589,7 +582,7 @@ impl VideoModel for MinimaxH3 {
             } else {
                 ReferenceLimits::default()
             },
-            condition_packing: self.condition_packing(denoiser),
+            condition_packing: self.condition_packing(denoiser)?,
         };
         info.validate()
             .map_err(|reason| Error::config(format!("the denoiser's description: {reason}")))?;
@@ -597,9 +590,7 @@ impl VideoModel for MinimaxH3 {
         Ok(Description {
             takes_conditions: tasks.iter().any(|task| task.conditioned()),
             denoise_steps: steps,
-            details: info
-                .encode()
-                .map_err(|error| Error::config(format!("encoding the description: {error}")))?,
+            details: info.encode(),
         })
     }
 }
@@ -995,7 +986,7 @@ fn reference_openings(
             _ => processing::minimax_h3::rules::VisualRows::Grid(grid),
         };
         let tiles = processing::minimax_h3::rules::condition_tiles(audio as u32, visual, packing);
-        tiles.saturating_mul(packing.tile_rows.max(1))
+        tiles.saturating_mul(packing.tile_rows.get())
     };
     let samples = |frames: u32| frames * AUDIO_SAMPLE_RATE / FPS;
 
@@ -1005,7 +996,7 @@ fn reference_openings(
 
         // The image of the most cells the rung holds within the declared edge and the widest
         // aspect, as square as they divide.
-        let tile = packing.tile_rows.max(1);
+        let tile = packing.tile_rows.get();
         let cells = rung / tile * tile;
         let (narrow, wide) = (CANVAS_RULE.widest.1.max(1), CANVAS_RULE.widest.0);
         let short = (REFERENCE_LIMITS.image_short_edge / cell).max(1);
@@ -1508,11 +1499,7 @@ mod tests {
     #[test]
     fn a_reference_rung_opens_with_the_largest_references_it_holds() {
         // OmniRef's tiling: 128-row tiles, a video's token grid in tiles of 4 x 4 x 8 tokens.
-        let packing = ConditionPacking {
-            capacity: 49_152,
-            tile_rows: 128,
-            video_tile: [4, 4, 8],
-        };
+        let packing = ConditionPacking::tiled(49_152, 128, [4, 4, 8]).unwrap();
         let ladder = [1024, 49_152];
         let candidates = candidates(
             &[VideoTask::ReferenceToVideoAudio],
@@ -1584,11 +1571,7 @@ mod tests {
     #[test]
     fn a_rung_opens_with_the_keyframes_it_holds() {
         // Row for row: a 1344x768 keyframe is 42x24 latent patches, 1008 rows.
-        let packing = ConditionPacking {
-            capacity: 2048,
-            tile_rows: 1,
-            video_tile: [1, 1, 1],
-        };
+        let packing = ConditionPacking::dense(2048);
         let candidates = candidates(
             &[
                 VideoTask::TextToVideoAudio,

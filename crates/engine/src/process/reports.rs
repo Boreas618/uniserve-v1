@@ -74,7 +74,6 @@ impl MainProcess {
         Some(wire::EngineInfo {
             limits: Some((&engine.limits).into()),
             video_denoiser: engine.video.clone(),
-            latent_encoding_units: 0,
             schedulers: u32::try_from(engine.schedulers.len()).unwrap_or(u32::MAX),
             capacity: Some(wire::BatchCapacity {
                 max_batch,

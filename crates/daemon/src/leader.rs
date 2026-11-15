@@ -997,12 +997,9 @@ impl Leader {
                     !info.video_denoiser.is_empty(),
                     "the video worker reported no video denoiser"
                 );
-                // Reference images are banded to the units one latent encoding round covers on
-                // the deployment's latent encoder while a request's prompt is encoded.
                 let processor = family
                     .bind(processing::VideoBinding {
                         description: &info.video_denoiser,
-                        latent_encoding_units: info.latent_encoding_units.max(1),
                         max_seconds: served
                             .engine_config
                             .video

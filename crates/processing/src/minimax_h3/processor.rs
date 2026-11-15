@@ -27,17 +27,12 @@ use crate::vocabulary::Vocabulary;
 pub struct H3Processor {
     /// What the placed denoiser serves, as its workers described it.
     pub(super) denoiser: DenoiserInfo,
-    /// The denoiser's tasks, read from its description.
-    pub(super) tasks: Vec<VideoTask>,
     /// The deployment's longest output, in seconds (`video_config.max_seconds`).
     pub(super) max_seconds: f64,
     /// How the deployment sizes references.
     pub(super) sizing: ReferenceSizing,
     /// The conditioner's vision processor.
     pub(super) vision: ProcessorConfig,
-    /// Condition units one latent encoding round covers while a request's prompt is encoded,
-    /// which reference images are banded to fill.
-    pub(super) latent_encoding_units: u32,
 }
 
 impl H3Processor {
@@ -57,20 +52,8 @@ impl H3Processor {
                 binding.max_seconds
             ));
         }
-        let denoiser = DenoiserInfo::decode(binding.description).map_err(|error| {
-            format!("the video worker described its denoiser unreadably: {error}")
-        })?;
-        denoiser
-            .validate()
-            .map_err(|message| format!("the video worker's denoiser: {message}"))?;
-        let tasks = denoiser
-            .tasks
-            .iter()
-            .map(|name| {
-                VideoTask::from_name(name)
-                    .ok_or_else(|| format!("the worker serves unknown video task {name:?}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let denoiser = DenoiserInfo::decode(binding.description)
+            .map_err(|error| format!("the video worker's denoiser: {error}"))?;
 
         let sizing = ReferenceSizing::from_options(binding.processor_options, &denoiser.references)
             .map_err(|message| format!("invalid mm_processor_kwargs: {message}"))?;
@@ -86,11 +69,9 @@ impl H3Processor {
 
         Ok(Self {
             denoiser,
-            tasks,
             max_seconds: binding.max_seconds,
             sizing,
             vision,
-            latent_encoding_units: binding.latent_encoding_units.max(1),
         })
     }
 
@@ -141,6 +122,7 @@ impl VideoProcessor for H3Processor {
     fn capabilities(&self) -> Value {
         let limits = &self.denoiser.references;
         let task_references: serde_json::Map<String, Value> = self
+            .denoiser
             .tasks
             .iter()
             .map(|task| {
@@ -163,7 +145,7 @@ impl VideoProcessor for H3Processor {
             })
             .collect();
         json!({
-            "tasks": self.tasks.iter().map(|task| task.as_str()).collect::<Vec<_>>(),
+            "tasks": self.denoiser.tasks.iter().map(|task| task.as_str()).collect::<Vec<_>>(),
             "task_references": task_references,
             "sizes": self.served_sizes(),
             "canvas_rule": {
@@ -217,12 +199,10 @@ impl VideoProcessor for H3Processor {
         }
 
         let prompt = present(vocabulary, &generation, &request.prompt)?;
-        let image_bands = generation.image_bands(self.latent_encoding_units);
         let conditions = generation
             .conditions
             .iter()
-            .zip(image_bands)
-            .map(|(condition, bands)| condition.describe(generation.canvas, bands))
+            .map(|condition| condition.describe(generation.canvas))
             .collect();
 
         Ok(VideoInput {
@@ -248,14 +228,16 @@ mod tests {
     use serde_json::Map;
 
     use super::super::prompt::tests::CharacterTokenizer;
-    use super::super::{ConditionPacking, ReferenceLimits, ServedCanvas, vectors};
+    use super::super::{
+        ConditionPacking, DescriptionError, ReferenceLimits, ServedCanvas, vectors,
+    };
     use super::*;
     use crate::video::{Length, Reference, ReferenceKind};
 
     /// A base denoiser serving `tasks` at 768p 16:9 and 9:16, on a 9-point schedule.
-    fn processor(tasks: &[&str], max_seconds: f64) -> Result<H3Processor, String> {
-        let description = DenoiserInfo {
-            tasks: tasks.iter().map(|task| (*task).to_owned()).collect(),
+    fn description(tasks: &[VideoTask]) -> DenoiserInfo {
+        DenoiserInfo {
+            tasks: tasks.to_vec(),
             schedule_points: 9,
             video_shift: 12.0,
             audio_shift: 3.0,
@@ -278,10 +260,14 @@ mod tests {
                 },
             ],
             references: ReferenceLimits::default(),
-            condition_packing: ConditionPacking::default(),
+            condition_packing: ConditionPacking::dense(0),
         }
-        .encode()
-        .unwrap();
+    }
+
+    /// The processor of a deployment of [`description`] serving `tasks` for at most
+    /// `max_seconds`.
+    fn processor(tasks: &[VideoTask], max_seconds: f64) -> Result<H3Processor, String> {
+        let description = description(tasks).encode();
         // The conditioner's two processor files, as the checkpoint publishes them.
         let vectors = vectors();
         let vision = &vectors["vision"];
@@ -299,7 +285,6 @@ mod tests {
         };
         H3Processor::bind(VideoBinding {
             description: &description,
-            latent_encoding_units: 1,
             max_seconds,
             processor_options: &Map::new(),
             files: &[file("image"), file("video")],
@@ -332,7 +317,7 @@ mod tests {
     /// seed is the reference's; the prompt is the conditioner prompt's tokens.
     #[test]
     fn a_text_request_resolves_its_served_canvas_and_aligned_frames() {
-        let processor = processor(&["t2va"], 15.0).unwrap();
+        let processor = processor(&[VideoTask::TextToVideoAudio], 15.0).unwrap();
         let request = spec(Some((768, 1344)), Some(Length::Seconds(5.0)));
         processor.check(&request).unwrap();
         let input = processor
@@ -362,7 +347,7 @@ mod tests {
     /// fetched.
     #[test]
     fn unserved_requests_are_refused_by_parameter() {
-        let processor = processor(&["t2va"], 15.0).unwrap();
+        let processor = processor(&[VideoTask::TextToVideoAudio], 15.0).unwrap();
         let seconds = Some(Length::Seconds(5.0));
         assert_eq!(
             refused(processor.check(&spec(Some((1000, 1000)), seconds))),
@@ -392,11 +377,36 @@ mod tests {
     /// A deployment's longest output must lie within the model's own bounds.
     #[test]
     fn a_deployment_beyond_the_models_duration_is_refused() {
-        assert!(processor(&["t2va"], MAX_SECONDS + 1.0).is_err());
-        assert!(processor(&["t2va"], MIN_SECONDS - 1.0).is_err());
-        assert!(
-            processor(&["t3va"], MAX_SECONDS).is_err(),
-            "an unknown task"
+        assert!(processor(&[VideoTask::TextToVideoAudio], MAX_SECONDS + 1.0).is_err());
+        assert!(processor(&[VideoTask::TextToVideoAudio], MIN_SECONDS - 1.0).is_err());
+    }
+
+    /// A description round-trips through its encoding; one that names a task the family does
+    /// not have, or prepared no canvas, is refused.
+    #[test]
+    fn a_denoiser_description_round_trips_and_is_validated() {
+        let described = description(&[VideoTask::TextToVideoAudio]);
+        assert_eq!(
+            DenoiserInfo::decode(&described.encode()),
+            Ok(described.clone())
         );
+        assert_eq!(described.denoise_steps(), 8);
+
+        let mut message: proto::request::wire::VideoDenoiser =
+            prost::Message::decode(described.encode().as_slice()).unwrap();
+        message.tasks = vec!["t3va".to_owned()];
+        assert_eq!(
+            DenoiserInfo::decode(&prost::Message::encode_to_vec(&message)),
+            Err(DescriptionError::Task("t3va".to_owned()))
+        );
+
+        let bare = DenoiserInfo {
+            canvases: Vec::new(),
+            ..described
+        };
+        assert!(matches!(
+            DenoiserInfo::decode(&bare.encode()),
+            Err(DescriptionError::Invalid(_))
+        ));
     }
 }

@@ -35,9 +35,6 @@ pub struct EngineInfo {
     /// processing (`processing::VideoBinding::description`); empty when the
     /// engine generates no video.
     pub video_denoiser: Vec<u8>,
-    /// Condition units one latent encoding call covers at once; zero when no
-    /// worker encodes latents.
-    pub latent_encoding_units: u32,
     /// The engine's schedulers, one per DP rank.
     pub schedulers: u32,
     /// Each worker group's KV cache segments as the engine started with
@@ -63,7 +60,6 @@ impl From<wire::EngineInfo> for EngineInfo {
         Self {
             limits: info.limits.map(GenerationLimits::from).unwrap_or_default(),
             video_denoiser: info.video_denoiser,
-            latent_encoding_units: info.latent_encoding_units,
             schedulers: info.schedulers,
             segments: info.segments,
             capacity: info.capacity,

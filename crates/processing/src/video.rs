@@ -204,10 +204,9 @@ pub trait VideoProcessor: Send + Sync {
 #[derive(Debug, Clone, Copy)]
 pub struct VideoBinding<'a> {
     /// The placed denoiser as the model's workers described it
-    /// (`nn::family::Description::details`).
+    /// (`nn::family::Description::details`): the encoding of the family's description message,
+    /// which the engine carries without reading it.
     pub description: &'a [u8],
-    /// Condition units one latent encoding round covers while a request's prompt is encoded.
-    pub latent_encoding_units: u32,
     /// The deployment's longest output, in seconds.
     pub max_seconds: f64,
     /// The deployment's processor options (`mm_processor_kwargs`).

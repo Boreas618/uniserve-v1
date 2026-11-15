@@ -3228,6 +3228,7 @@ dependencies = [
 name = "processing"
 version = "2.0.0"
 dependencies = [
+ "prost",
  "proto",
  "serde",
  "serde_json",

@@ -19,6 +19,9 @@ pub mod processor;
 pub mod prompt;
 pub mod rules;
 
+use std::num::NonZeroU32;
+
+use proto::request::wire;
 use proto::video::Canvas;
 use serde::{Deserialize, Serialize};
 
@@ -228,7 +231,7 @@ pub struct ServedCanvas {
 /// `total` bounds the references of every kind together, keyframes not counted; a video's
 /// soundtrack counts with the video, and `audios` bounds the audio references that are not one. A
 /// denoiser that takes no references declares zeros.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct ReferenceLimits {
     /// Image references.
     pub images: u32,
@@ -246,18 +249,44 @@ pub struct ReferenceLimits {
 ///
 /// A sparse denoiser attends whole tiles, so each condition's audio and each condition's pixels
 /// fill tiles of their own, and a reference video fills the tiles of its token grid. A dense
-/// denoiser packs row for row: its tile is one row and one token. What a request takes is
-/// therefore the denoiser's tiling and not its rows' sum ([`condition_rows`]), and it decides both
-/// whether the deployment serves the request and which of its graphs does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// denoiser packs row for row: its tile is one row and one token ([`Self::dense`]). What a request
+/// takes is therefore the denoiser's tiling and not its rows' sum ([`condition_rows`]), and it
+/// decides both whether the deployment serves the request and which of its graphs does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConditionPacking {
     /// Rows one request's conditions may take: the deployment's capacity, zero for a denoiser
     /// that takes none.
     pub capacity: u32,
     /// Rows of one tile.
-    pub tile_rows: u32,
+    pub tile_rows: NonZeroU32,
     /// Tokens of one video tile along time, height and width.
-    pub video_tile: [u32; 3],
+    pub video_tile: [NonZeroU32; 3],
+}
+
+impl ConditionPacking {
+    /// A dense denoiser's packing of `capacity` rows: row for row, one token a tile.
+    pub const fn dense(capacity: u32) -> Self {
+        Self {
+            capacity,
+            tile_rows: NonZeroU32::MIN,
+            video_tile: [NonZeroU32::MIN; 3],
+        }
+    }
+
+    /// A sparse denoiser's packing of `capacity` rows into tiles of `tile_rows` rows, a video's
+    /// token grid into tiles of `video_tile` tokens; `None` when a tile is empty.
+    pub fn tiled(capacity: u32, tile_rows: u32, video_tile: [u32; 3]) -> Option<Self> {
+        let [time, height, width] = video_tile;
+        Some(Self {
+            capacity,
+            tile_rows: NonZeroU32::new(tile_rows)?,
+            video_tile: [
+                NonZeroU32::new(time)?,
+                NonZeroU32::new(height)?,
+                NonZeroU32::new(width)?,
+            ],
+        })
+    }
 }
 
 /// What the video denoiser a deployment places serves, as its workers report it to request
@@ -265,13 +294,14 @@ pub struct ConditionPacking {
 ///
 /// The denoiser fixes its schedule, and with it every request's step count; the tasks, canvases and
 /// reference limits bound what a request may ask for, and its condition packing what its
-/// conditions may take. The engine carries it JSON-encoded ([`Self::encode`]), so request
-/// processing reads the report of workers of another build. The output clock, the frame rule and
-/// the canvas rule are the family's ([`FPS`], [`FRAMES`], [`CANVAS_RULE`]), not the deployment's.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// conditions may take. The engine carries it as the encoding of the request interface's
+/// `VideoDenoiser` message ([`Self::encode`]), which it does not read. The output clock, the frame
+/// rule and the canvas rule are the family's ([`FPS`], [`FRAMES`], [`CANVAS_RULE`]), not the
+/// deployment's.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DenoiserInfo {
-    /// Task names the denoiser serves, in canonical order.
-    pub tasks: Vec<String>,
+    /// The tasks the denoiser serves, in canonical order.
+    pub tasks: Vec<VideoTask>,
     /// Sigma points of the fixed schedule, the clean endpoint included: one more than the network
     /// evaluations ([`Self::denoise_steps`]).
     pub schedule_points: u32,
@@ -280,7 +310,8 @@ pub struct DenoiserInfo {
     /// Shift of the audio schedule.
     pub audio_shift: f64,
     /// The only canvases the deployment serves, each with the `(short_edge, aspect_ratio)` its
-    /// model names it by, in the order the deployment names them.
+    /// model names it by, in the order the deployment names them; the first is the canvas of a
+    /// request that states no size.
     pub canvases: Vec<ServedCanvas>,
     /// The references one request may carry and the largest short edge an image reference is
     /// encoded at; zeros for a denoiser that takes none.
@@ -289,47 +320,149 @@ pub struct DenoiserInfo {
     pub condition_packing: ConditionPacking,
 }
 
+/// Why bytes are no description of a MiniMax-H3 denoiser.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DescriptionError {
+    /// The bytes are no `VideoDenoiser` message.
+    #[error("the description does not decode: {0}")]
+    Undecodable(String),
+    /// The message leaves out a part every description states.
+    #[error("the description states no {0}")]
+    Missing(&'static str),
+    /// A task this family does not have.
+    #[error("the description names the unknown task {0:?}")]
+    Task(String),
+    /// A tile of no rows or tokens.
+    #[error("the description's condition packing has an empty tile")]
+    Tile,
+    /// The description breaks a rule of [`DenoiserInfo::validate`].
+    #[error("{0}")]
+    Invalid(&'static str),
+}
+
 impl DenoiserInfo {
     /// The network evaluations of the fixed schedule: one fewer than its sigma points, and the step
-    /// count of every request.
+    /// count of every request. A validated description has at least two points.
     pub fn denoise_steps(&self) -> u32 {
-        self.schedule_points.saturating_sub(1)
+        self.schedule_points - 1
     }
 
-    /// The JSON encoding the engine carries.
+    /// The encoding the engine carries: the description's `VideoDenoiser` message.
+    pub fn encode(&self) -> Vec<u8> {
+        let packing = &self.condition_packing;
+        let canvas = |canvas: Canvas| wire::Canvas {
+            width: canvas.width,
+            height: canvas.height,
+        };
+        let references = &self.references;
+        prost::Message::encode_to_vec(&wire::VideoDenoiser {
+            tasks: self
+                .tasks
+                .iter()
+                .map(|task| task.as_str().to_owned())
+                .collect(),
+            schedule_points: self.schedule_points,
+            video_shift: self.video_shift,
+            audio_shift: self.audio_shift,
+            canvases: self
+                .canvases
+                .iter()
+                .map(|served| wire::ServedCanvas {
+                    short_edge: served.short_edge,
+                    aspect_ratio: served.aspect_ratio.clone(),
+                    canvas: Some(canvas(served.canvas)),
+                })
+                .collect(),
+            references: Some(wire::ReferenceLimits {
+                images: references.images,
+                videos: references.videos,
+                audios: references.audios,
+                total: references.total,
+                image_short_edge: references.image_short_edge,
+            }),
+            condition_packing: Some(wire::ConditionPacking {
+                capacity: packing.capacity,
+                tile_rows: packing.tile_rows.get(),
+                video_tile: packing.video_tile.iter().map(|side| side.get()).collect(),
+            }),
+        })
+    }
+
+    /// Decodes [`Self::encode`]'s encoding and validates it ([`Self::validate`]).
     ///
     /// # Errors
     ///
-    /// Fails only when serialization fails, which these plain values do not.
-    pub fn encode(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
-    }
+    /// Fails when `bytes` are no `VideoDenoiser` message, leave out a part, name a task the
+    /// family does not have, state an empty tile or break a rule of [`Self::validate`].
+    pub fn decode(bytes: &[u8]) -> Result<Self, DescriptionError> {
+        let message: wire::VideoDenoiser = prost::Message::decode(bytes)
+            .map_err(|error| DescriptionError::Undecodable(error.to_string()))?;
+        let canvas = |canvas: Option<wire::Canvas>| {
+            canvas
+                .map(|canvas| Canvas {
+                    width: canvas.width,
+                    height: canvas.height,
+                })
+                .ok_or(DescriptionError::Missing("canvas raster"))
+        };
+        let references = message
+            .references
+            .ok_or(DescriptionError::Missing("reference limits"))?;
+        let packing = message
+            .condition_packing
+            .ok_or(DescriptionError::Missing("condition packing"))?;
+        let [time, height, width] = <[u32; 3]>::try_from(packing.video_tile)
+            .map_err(|_| DescriptionError::Missing("three video tile sides"))?;
 
-    /// Decodes [`Self::encode`]'s encoding.
-    ///
-    /// # Errors
-    ///
-    /// Fails when `bytes` are not a denoiser's report.
-    pub fn decode(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+        let description = Self {
+            tasks: message
+                .tasks
+                .into_iter()
+                .map(|name| VideoTask::from_name(&name).ok_or(DescriptionError::Task(name)))
+                .collect::<Result<_, _>>()?,
+            schedule_points: message.schedule_points,
+            video_shift: message.video_shift,
+            audio_shift: message.audio_shift,
+            canvases: message
+                .canvases
+                .into_iter()
+                .map(|served| {
+                    Ok(ServedCanvas {
+                        short_edge: served.short_edge,
+                        aspect_ratio: served.aspect_ratio,
+                        canvas: canvas(served.canvas)?,
+                    })
+                })
+                .collect::<Result<_, DescriptionError>>()?,
+            references: ReferenceLimits {
+                images: references.images,
+                videos: references.videos,
+                audios: references.audios,
+                total: references.total,
+                image_short_edge: references.image_short_edge,
+            },
+            condition_packing: ConditionPacking::tiled(
+                packing.capacity,
+                packing.tile_rows,
+                [time, height, width],
+            )
+            .ok_or(DescriptionError::Tile)?,
+        };
+        description.validate().map_err(DescriptionError::Invalid)?;
+        Ok(description)
     }
 
     /// Checks that tasks are named once each, the schedule has an endpoint and positive finite
-    /// shifts, a denoiser that takes conditions has a tile to pack them in, the reference limits
-    /// bound each kind within the total with an image edge where images are taken, and at least one
-    /// canvas is served, each a positive raster named by its own `(short_edge, aspect_ratio)`.
+    /// shifts, the reference limits bound each kind within the total with an image edge where
+    /// images are taken, and at least one canvas is served, each a positive raster named by its own
+    /// `(short_edge, aspect_ratio)`.
     ///
     /// # Errors
     ///
     /// The first rule the report breaks.
     pub fn validate(&self) -> Result<(), &'static str> {
         let mut names = std::collections::HashSet::new();
-        if self.tasks.is_empty()
-            || !self
-                .tasks
-                .iter()
-                .all(|task| !task.is_empty() && names.insert(task.as_str()))
-        {
+        if self.tasks.is_empty() || !self.tasks.iter().all(|task| names.insert(*task)) {
             return Err("a video denoiser names each of its tasks once");
         }
         if self.schedule_points < 2
@@ -338,11 +471,6 @@ impl DenoiserInfo {
                 .all(|shift| shift.is_finite() && *shift > 0.0)
         {
             return Err("a video denoiser schedule needs points and positive shifts");
-        }
-
-        let packing = self.condition_packing;
-        if packing.capacity > 0 && (packing.tile_rows == 0 || packing.video_tile.contains(&0)) {
-            return Err("a video denoiser takes conditions and declares no tile to pack them in");
         }
 
         let references = &self.references;
@@ -491,11 +619,11 @@ mod tests {
         assert_eq!(track_rows(40), 80);
     }
 
-    /// A report round-trips through its encoding, and one that names a task twice is refused.
+    /// A description that names a task twice is refused, and a packing tile is never empty.
     #[test]
-    fn a_denoiser_report_round_trips_and_is_validated() {
+    fn a_description_names_each_task_once_and_packs_in_tiles() {
         let report = DenoiserInfo {
-            tasks: vec!["t2va".to_owned()],
+            tasks: vec![VideoTask::TextToVideoAudio, VideoTask::TextToVideoAudio],
             schedule_points: 9,
             video_shift: 12.0,
             audio_shift: 3.0,
@@ -508,19 +636,10 @@ mod tests {
                 },
             }],
             references: ReferenceLimits::default(),
-            condition_packing: ConditionPacking::default(),
+            condition_packing: ConditionPacking::dense(0),
         };
-        assert_eq!(report.validate(), Ok(()));
-        assert_eq!(
-            DenoiserInfo::decode(&report.encode().unwrap()).unwrap(),
-            report
-        );
-        assert_eq!(report.denoise_steps(), 8);
-
-        let twice = DenoiserInfo {
-            tasks: vec!["t2va".to_owned(), "t2va".to_owned()],
-            ..report
-        };
-        assert!(twice.validate().is_err());
+        assert!(report.validate().is_err());
+        assert_eq!(ConditionPacking::tiled(1024, 0, [4, 4, 8]), None);
+        assert_eq!(ConditionPacking::tiled(1024, 128, [4, 0, 8]), None);
     }
 }
