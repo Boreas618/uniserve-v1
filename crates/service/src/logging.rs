@@ -110,11 +110,12 @@ impl Levels {
 /// The levels [`init`] installed: this process's one log configuration.
 static INSTALLED: OnceLock<Levels> = OnceLock::new();
 
-/// Installs the process-wide tracing subscriber with `levels`, writing to `output`, and keeps
-/// `levels` as the process's configuration ([`arguments`]).
+/// Installs the process-wide tracing subscriber with `levels`, writing to `output`, keeps
+/// `levels` as the process's configuration ([`arguments`]), and reports every later panic of the
+/// process as an error event of that log ([`report_panics`]).
 ///
 /// Installation failure, for example because a global subscriber is already set, is reported on
-/// stderr and is not fatal.
+/// stderr and is not fatal; panics then keep the default report on stderr.
 pub fn init(process: &str, levels: &Levels, output: Output) {
     let formatter = UniserveEventFormatter::new(process);
     let writer = match output {
@@ -138,6 +139,30 @@ pub fn init(process: &str, levels: &Levels, output: Output) {
         return;
     }
     let _ = INSTALLED.set(levels.clone());
+    report_panics();
+}
+
+/// Replaces the default panic report with an error event of the process's log, which carries
+/// the panic's message and location, the thread and, when `RUST_BACKTRACE` asks for one, the
+/// backtrace.
+///
+/// The log is where a process's output goes whichever process holds its standard error: a
+/// supervised process's standard error may be the pipe of a supervisor that is gone (a hot
+/// restart's successor adopts its processes without that pipe), so the default report on
+/// standard error alone could be lost.
+fn report_panics() {
+    std::panic::set_hook(Box::new(|panic| {
+        let thread = std::thread::current();
+        let backtrace = std::backtrace::Backtrace::capture();
+        let backtrace = match backtrace.status() {
+            std::backtrace::BacktraceStatus::Captured => format!("\n{backtrace}"),
+            _ => String::new(),
+        };
+        tracing::error!(
+            thread = thread.name().unwrap_or("<unnamed>"),
+            "the process {panic}{backtrace}"
+        );
+    }));
 }
 
 /// The command-line arguments that give a child process of this one, such as an engine process

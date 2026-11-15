@@ -60,6 +60,9 @@ tracing.workspace = true
 workspace = true
 
 [dev-dependencies]
+# The process's own memory mappings, which the allocator test reads through the kernel's
+# process file system.
+procfs.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 
@@ -132,7 +135,9 @@ nvtx = { version = "2.0.0", default-features = false, features = ["std"] }
 llm-multimodal = { git = "https://github.com/vllm-project/llm-multimodal", rev = "5b558989844d1c7af3e43d0f604069ffd9c06320" }
 # Keep scheduler heap mappings out of transparent-huge-page collapse.
 mimalloc = { version = "0.1.52", features = ["no_thp"] }
-minijinja = { version = "2.0", features = ["unstable_machinery", "json", "builtins", "loader", "loop_controls", "preserve_order"] }
+# `stacker` grows a rendering thread's stack as a template recurses, so a deeply nested chat
+# template renders on any thread at minijinja's own recursion bound.
+minijinja = { version = "2.0", features = ["unstable_machinery", "json", "builtins", "loader", "loop_controls", "preserve_order", "stacker"] }
 minijinja-contrib = { version = "2.0", features = ["pycompat"] }
 # Mooncake Store's C API, loaded at run time (`libmooncake_store.so`, built
 # with `WITH_STORE_C_SHARED`), so nothing links Mooncake.
@@ -152,6 +157,7 @@ rmp-serde = "1.3.1"
 rusqlite = { version = "0.41.0", features = ["bundled"] }
 # The safetensors format: the header a checkpoint file starts with, and its tensors.
 safetensors = "0.8.0"
+procfs = { version = "0.18", default-features = false }
 rustix = { version = "1.1.4", features = ["event", "net"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_bytes = "0.11"

@@ -24,8 +24,6 @@ mod cli;
 mod keys;
 mod serve;
 
-use std::env;
-
 use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -37,37 +35,6 @@ use crate::cli::{Cli, Command};
 // heap while the scheduler thread runs.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-const TOKIO_WORKER_THREADS_ENV: &str = "TOKIO_WORKER_THREADS";
-const DEFAULT_MAX_TOKIO_WORKER_THREADS: usize = 32;
-const TOKIO_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
-
-/// Caps the default number of Tokio worker threads when `TOKIO_WORKER_THREADS` is unset.
-///
-/// The cap bounds scheduling overhead on machines with many logical CPUs.
-/// Returns `None`, leaving the choice to Tokio's builder, when the variable
-/// is set (the builder reads it itself) or when the available parallelism
-/// cannot be queried.
-fn tokio_worker_threads() -> Option<usize> {
-    if env::var_os(TOKIO_WORKER_THREADS_ENV).is_some() {
-        return None;
-    }
-
-    std::thread::available_parallelism()
-        .map(|parallelism| {
-            let available = parallelism.get();
-            let worker_threads = available.min(DEFAULT_MAX_TOKIO_WORKER_THREADS);
-            if worker_threads < available {
-                info!(
-                    available_parallelism = available,
-                    capped_worker_threads = worker_threads,
-                    "capping tokio worker threads, set {TOKIO_WORKER_THREADS_ENV} to override"
-                );
-            }
-            worker_threads
-        })
-        .ok()
-}
 
 /// Returns a cancellation token triggered by SIGINT (Ctrl-C) or SIGTERM.
 ///
@@ -101,16 +68,6 @@ pub(crate) fn shutdown_signal() -> CancellationToken {
 
 /// Starts the UniServe command-line process.
 fn main() -> Result<std::process::ExitCode> {
-    // A supervised process's standard error is its supervisor's pipe, and the supervisor that
-    // started it may be gone: after a hot restart the successor adopts the process without its
-    // predecessor's pipe, so a panic written only to standard error is invisible in the run's
-    // log. Standard output is the log every process of the deployment shares, so a panic is
-    // stated there as well - one line, before the process ends either way.
-    let default = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic| {
-        println!("a process panicked: {panic}");
-        default(panic);
-    }));
     // The serving commands read which flags their command line states, so they keep its matches.
     let matches = <Cli as clap::CommandFactory>::command().get_matches();
     let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
@@ -157,58 +114,40 @@ pub(crate) fn served() -> Result<processing::Registry> {
     Ok(processing::Registry::new(processing::FAMILIES)?)
 }
 
-/// The daemon's Tokio runtime.
+/// The daemon's Tokio runtime: one worker per CPU this process may run on (Tokio's default,
+/// the available parallelism, which follows the process's CPU affinity and cgroup quota), at
+/// Tokio's default thread stack.
 pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
-    let mut runtime = tokio::runtime::Builder::new_multi_thread();
-    runtime.enable_all();
-    // Chat-template rendering runs on Tokio's blocking pool. Complex model
-    // templates require more than the platform's small pthread default.
-    runtime.thread_stack_size(TOKIO_THREAD_STACK_BYTES);
-    if let Some(worker_threads) = tokio_worker_threads() {
-        runtime.worker_threads(worker_threads);
-    }
-    runtime.build().context("failed to build Tokio runtime")
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build Tokio runtime")
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    /// Returns the `VmFlags` of the mapping in `/proc/self/smaps` that holds
-    /// `address`.
-    fn mapping_flags(address: usize) -> Option<String> {
-        let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
-        let mut inside = false;
-        for line in smaps.lines() {
-            let range = line
-                .split_whitespace()
-                .next()
-                .and_then(|field| field.split_once('-'))
-                .and_then(|(start, end)| {
-                    Some((
-                        usize::from_str_radix(start, 16).ok()?,
-                        usize::from_str_radix(end, 16).ok()?,
-                    ))
-                });
-            if let Some((start, end)) = range {
-                inside = (start..end).contains(&address);
-            } else if inside && let Some(flags) = line.strip_prefix("VmFlags:") {
-                return Some(flags.trim().to_owned());
-            }
-        }
-        None
-    }
+    use procfs::process::{MMapExtension, Process, VmFlags};
 
     /// The process heap is never advised for transparent huge pages
-    /// (`MADV_HUGEPAGE`, flag `hg`), so khugepaged has nothing of it to
+    /// (`MADV_HUGEPAGE`, the mapping flag `hg`), so khugepaged has nothing of it to
     /// collapse while the engine runs.
     #[test]
     fn the_heap_carries_no_huge_page_advice() {
         // Large enough to be served from an allocator arena rather than a
         // small-object page.
         let block = vec![1_u8; 64 << 20];
-        let flags = mapping_flags(block.as_ptr() as usize).expect("the heap block is mapped");
+        let address = block.as_ptr() as u64;
+        let maps = Process::myself()
+            .and_then(|process| process.smaps())
+            .expect("reading this process's mappings");
+        let mapping = maps
+            .into_iter()
+            .find(|map| (map.address.0..map.address.1).contains(&address))
+            .expect("the heap block is mapped");
+        let MMapExtension { vm_flags, .. } = mapping.extension;
         assert!(
-            !flags.split_whitespace().any(|flag| flag == "hg"),
-            "the heap mapping is advised for huge pages: {flags}"
+            !vm_flags.contains(VmFlags::HG),
+            "the heap mapping is advised for huge pages: {vm_flags:?}"
         );
     }
 }
