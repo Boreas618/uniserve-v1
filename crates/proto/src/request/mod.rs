@@ -16,7 +16,7 @@ mod spec;
 mod values;
 
 pub use convert::WireError;
-pub use dtype::{ModelDtype, ModelDtypeParseError};
+pub use dtype::ModelDtype;
 pub use event::{
     ArtifactEvent, ArtifactMedia, ConditionExtent, DiffusionRequest, DiffusionRequestError,
     EncoderInputs, Event, FinishReason, MediaKind, MigrationCause, PositionLogprobs, RejectionKind,
@@ -30,7 +30,7 @@ pub use generation::{
 pub use sampling::{SamplingParams, SamplingParamsError};
 pub use spec::{
     ExpertExchange, FlashInferBackend, FlashInferBackendParseError, PrefixCacheDtype,
-    PrefixCacheDtypeParseError, SchedulingPolicy, StandbyStorage,
+    SchedulingPolicy, StandbyStorage,
 };
 pub use values::{DiffusionSamplingParams, ImageEncoder, RequestId, TokenLogprob};
 

@@ -139,12 +139,7 @@ fn cell_bytes(plane_bytes: u64, quantized: bool, index_bytes: u64) -> u64 {
 
 /// The element type the cache stores for the engine's `dtype`.
 fn stored(dtype: PrefixCacheDtype) -> DType {
-    match dtype {
-        PrefixCacheDtype::Float16 => DType::F16,
-        PrefixCacheDtype::BFloat16 => DType::BF16,
-        PrefixCacheDtype::Float32 => DType::F32,
-        PrefixCacheDtype::Float8E4m3Fn => DType::F8E4M3,
-    }
+    ops::abi::from_wire(dtype.dtype())
 }
 
 /// The layout of the unit pool.

@@ -79,18 +79,16 @@ pub fn bytes(dtype: DType) -> Option<u64> {
     }
 }
 
-/// The element type of a tensor that crossed a process boundary.
+/// The element type an interface names (a configuration's `dtype`, `kv_cache_config.dtype`), as
+/// the tensor library's.
 pub const fn from_wire(dtype: proto::tensor::DType) -> DType {
     use proto::tensor::DType as Wire;
 
     match dtype {
-        Wire::U8 => DType::U8,
-        Wire::I16 => DType::I16,
-        Wire::I32 => DType::I32,
-        Wire::I64 => DType::I64,
         Wire::F16 => DType::F16,
         Wire::BF16 => DType::BF16,
         Wire::F32 => DType::F32,
+        Wire::F8E4M3 => DType::F8E4M3,
     }
 }
 
@@ -138,11 +136,17 @@ mod tests {
     }
 
     #[test]
-    fn a_wire_element_type_is_the_same_element_type() {
+    fn an_interface_element_type_is_the_same_element_type() {
         use proto::tensor::DType as Wire;
 
-        assert_eq!(from_wire(Wire::BF16), DType::BF16);
-        assert_eq!(from_wire(Wire::I16), DType::I16);
-        assert_eq!(from_wire(Wire::U8), DType::U8);
+        for (wire, dtype) in [
+            (Wire::F16, DType::F16),
+            (Wire::BF16, DType::BF16),
+            (Wire::F32, DType::F32),
+            (Wire::F8E4M3, DType::F8E4M3),
+        ] {
+            assert_eq!(from_wire(wire), dtype);
+            assert_eq!(wire.element_bytes(), bytes(dtype).unwrap());
+        }
     }
 }
