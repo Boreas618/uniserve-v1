@@ -33,15 +33,18 @@
 //! product. The blocks' MLPs take the checkpoint's `gelu_pytorch_tanh`, the mergers PyTorch's
 //! exact `nn.GELU()`.
 
-use nn::family::SequenceSplit;
+use nn::family::{SequenceSplit, TextPlacement};
 use nn::modules::{
     Attention, AttentionConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, Parallel,
     Precision, QkNorm, QkvBias, QkvLinearConfig, QkvNames, Rotary, RotaryConfig, Spectrum,
 };
-use nn::{DType, PatchFormat, PixelNorm, Result, Split, Tensor, VarBuilder, Vision, functional};
+use nn::{
+    Checkpoint, DType, PatchFormat, PixelNorm, Result, Split, Tensor, VarBuilder, Vision,
+    functional,
+};
 use processing::qwen_vl::ProcessorConfig;
 
-use crate::qwen3::config::{POSITION_AXES, VisionConfig};
+use crate::qwen3::config::{POSITION_AXES, VisionConfig, processor};
 use crate::qwen3::{ID, positions};
 
 /// Every normalization's variance floor (`partial(nn.LayerNorm, eps=1e-6)` in the reference).
@@ -260,6 +263,45 @@ pub struct VisionTower {
 }
 
 impl VisionTower {
+    /// The tower a deployment placed by `placement` serves of a causal language model whose
+    /// configuration declares `vision`: `None` when the placement serves no tower
+    /// ([`TextPlacement::vision`]) or the configuration declares none, and otherwise the tower
+    /// at `vb` (`model.visual`), its images sized and normalized by `checkpoint`'s processor
+    /// files ([`crate::qwen3::config::processor`]).
+    ///
+    /// A causal language model's prefill places the tower's merged rows and adds no DeepStack
+    /// features.
+    ///
+    /// # Errors
+    ///
+    /// A declared tower that states DeepStack features, whose checkpoint holds no processor
+    /// files or no tower weights, or that [`Self::load`] refuses.
+    pub fn served(
+        vision: Option<&VisionConfig>,
+        checkpoint: &Checkpoint,
+        vb: &VarBuilder<'_, '_>,
+        placement: &TextPlacement,
+    ) -> Result<Option<Self>> {
+        let Some(vision) = vision.filter(|_| placement.vision) else {
+            return Ok(None);
+        };
+        if !vision.deepstack_visual_indexes.is_empty() {
+            return Err(ID.config(
+                "a causal language model's prefill adds no DeepStack features, but the tower \
+                 states some"
+                    .to_owned(),
+            ));
+        }
+
+        let (processor, pixels) = processor(checkpoint)?;
+        Ok(Some(Self::load(
+            vision,
+            vb.pp("model.visual"),
+            processor,
+            pixels,
+        )?))
+    }
+
     /// The tower of `config` at `vb` (`model.visual`), its images sized by `processor` and
     /// normalized by `pixels`.
     ///

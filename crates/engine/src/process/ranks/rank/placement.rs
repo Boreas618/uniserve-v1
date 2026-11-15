@@ -166,6 +166,9 @@ impl Mapping {
             // The drafter's layers load when the deployment speculates with them, and a model
             // whose state keeps a window per request sizes it by the drafts.
             drafter: draft_tokens > 0,
+            // No deployment option selects the tower: every tower a checkpoint declares is
+            // served.
+            vision: true,
             draft_tokens,
         })
     }

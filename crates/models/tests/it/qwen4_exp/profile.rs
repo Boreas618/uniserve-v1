@@ -47,11 +47,12 @@ const STEP_ROWS: usize = DRAFTS as usize + 1;
 type Keys = BTreeSet<(&'static str, String)>;
 
 /// The profiled deployment at `tensor`'s rank: it drafts [`DRAFTS`] tokens a step with the
-/// checkpoint's drafter.
+/// checkpoint's drafter and serves its vision tower.
 fn placement(tensor: Split) -> TextPlacement {
     TextPlacement {
         tensor,
         drafter: true,
+        vision: true,
         draft_tokens: DRAFTS,
         ..TextPlacement::WHOLE
     }

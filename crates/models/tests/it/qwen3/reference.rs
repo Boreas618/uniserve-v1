@@ -212,6 +212,7 @@ fn model(fixture: &Fixture, drafter: bool) -> (Arc<dyn TextModel>, Config) {
     let mut loader = WeightLoader::new(&checkpoint, &store, None);
     let placement = TextPlacement {
         drafter,
+        vision: true,
         ..TextPlacement::WHOLE
     };
 
@@ -670,7 +671,7 @@ fn the_vl_encoder_computes_the_references_states() {
     let config = Config::open(&checkpoint).expect("the configuration");
     let reference = fixture.tensors("reference.safetensors");
     let vision = config.vision.as_ref().expect("a tower's configuration");
-    let images = config.images.expect("the processor files");
+    let images = models::qwen3::config::processor(&checkpoint).expect("the processor files");
 
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);

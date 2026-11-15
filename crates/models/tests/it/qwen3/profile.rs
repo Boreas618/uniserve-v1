@@ -491,6 +491,7 @@ fn keys_of<'k>(keys: &'k Keys, operator: &str) -> Vec<&'k str> {
 fn qwen3_6_profiles_its_buckets_its_drafter_and_its_tower() {
     let placement = TextPlacement {
         drafter: true,
+        vision: true,
         ..TextPlacement::WHOLE
     };
     let model = load(QWEN3_6_35B_A3B, &placement);

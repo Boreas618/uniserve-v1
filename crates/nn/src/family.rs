@@ -308,6 +308,12 @@ pub struct TextPlacement {
     /// Whether the deployment speculates with the checkpoint's own drafter, so its layers load
     /// beside the model's ([`TextModel::drafter`]); a deployment that does not leaves them unread.
     pub drafter: bool,
+    /// Whether the deployment serves the vision tower the checkpoint's configuration declares,
+    /// so the tower's weights load beside the model's and its processor files are read
+    /// ([`TextModel::vision`]); a deployment that does not, or a checkpoint that declares no
+    /// tower, leaves them unread. No deployment option states it: execution serves every
+    /// tower a checkpoint declares.
+    pub vision: bool,
     /// The tokens a step of the deployment drafts beyond the one it commits, zero for a
     /// deployment that does not speculate: a model whose state fields hold a window per request
     /// ([`crate::capability::VerifySlots`]) sizes them by it.
@@ -315,7 +321,7 @@ pub struct TextPlacement {
 }
 
 impl TextPlacement {
-    /// One rank holding the whole model: no split along any axis, no drafter.
+    /// One rank holding the whole model: no split along any axis, no drafter, no vision tower.
     pub const WHOLE: Self = Self {
         tensor: Split::WHOLE,
         pipeline: Split::WHOLE,
@@ -323,6 +329,7 @@ impl TextPlacement {
         experts: Split::WHOLE,
         tensor_experts: false,
         drafter: false,
+        vision: false,
         draft_tokens: 0,
     };
 }
@@ -362,8 +369,9 @@ pub trait TextModel: CausalLm + Send + Sync {
     /// layers), when the model loaded one; `None` for a model that drafts nothing.
     fn drafter(&self) -> Option<&dyn Drafter>;
 
-    /// Its vision tower, when the checkpoint holds one and the model serves it: the model then
-    /// takes image rows in a prefill ([`crate::capability::TokenBatch::rope_positions`]).
+    /// Its vision tower, when the checkpoint declares one and the placement serves it
+    /// ([`TextPlacement::vision`]): the model then takes image rows in a prefill
+    /// ([`crate::capability::TokenBatch::rope_positions`]).
     fn vision(&self) -> Option<&dyn Vision> {
         None
     }

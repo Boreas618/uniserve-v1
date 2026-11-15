@@ -36,8 +36,8 @@ use nn::family::{
 };
 use nn::modules::{Embedding, EmbeddingConfig, LmHead, LmHeadConfig, Rotary};
 use nn::{
-    CausalLm, DType, Device, Drafter, ExpertExchange, KvCache, RecurrentState, Result, Split,
-    Tensor, TokenBatch, VarBuilder, Vision,
+    CausalLm, Checkpoint, DType, Device, Drafter, ExpertExchange, KvCache, RecurrentState, Result,
+    Split, Tensor, TokenBatch, VarBuilder, Vision,
 };
 
 use crate::qwen3::VisionTower;
@@ -221,18 +221,19 @@ pub fn expert_layers(config: &Config) -> BTreeMap<String, u32> {
 }
 
 impl Qwen4ExpForCausalLm {
-    /// The model `config` describes, its modules read under `vb` (the checkpoint's root), at
-    /// the ranks `placement` states, with the routed experts in the slots `order` states, the
-    /// drafter when the deployment speculates, and the vision tower when the configuration
-    /// states the processor its images are sized by.
+    /// The model `config` describes, the configuration of `checkpoint`, its modules read under
+    /// `vb` (the checkpoint's root), at the ranks `placement` states, with the routed experts in
+    /// the slots `order` states, the drafter when the deployment speculates, and the vision
+    /// tower the class declares when the deployment serves it ([`VisionTower::served`]).
     ///
     /// # Errors
     ///
-    /// A split the model does not divide; a pipeline or sequence
-    /// split, which this model's layers do not serve; an order that names no layer; a drafter
-    /// the checkpoint does not carry; or a module the loader refuses.
+    /// A split the model does not divide; a pipeline or sequence split, which this model's
+    /// layers do not serve; an order that names no layer; a drafter the checkpoint does not
+    /// carry; a served tower the checkpoint does not hold; or a module the loader refuses.
     pub fn load(
         config: &Config,
+        checkpoint: &Checkpoint,
         vb: VarBuilder<'_, '_>,
         placement: &TextPlacement,
         order: &ExpertOrder,
@@ -291,15 +292,7 @@ impl Qwen4ExpForCausalLm {
         } else {
             None
         };
-        let visual = match config.images {
-            Some((processor, pixels)) => Some(VisionTower::load(
-                &config.vision,
-                vb.pp("model.visual"),
-                processor,
-                pixels,
-            )?),
-            None => None,
-        };
+        let visual = VisionTower::served(Some(&config.vision), checkpoint, &vb, placement)?;
 
         Ok(Self {
             config: config.clone(),

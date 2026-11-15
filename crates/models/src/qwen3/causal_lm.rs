@@ -54,7 +54,7 @@ use nn::{
     CausalLm, DType, Drafter, ExpertExchange, KvCache, RecurrentState, Split, Tensor, TokenBatch,
     VarBuilder, Vision, functional,
 };
-use nn::{Result, collective};
+use nn::{Checkpoint, Result, collective};
 
 use crate::qwen3::ID;
 use crate::qwen3::config::{Config, QWEN3_MOE};
@@ -128,10 +128,11 @@ pub fn expert_layers(config: &Config) -> BTreeMap<String, u32> {
 }
 
 impl Qwen3ForCausalLm {
-    /// The model `config` describes, its modules read under `vb` (the checkpoint's root), at
-    /// the ranks `placement` states, with the routed experts in the slots `order` states, the
-    /// drafter when the deployment speculates, and the vision tower when the configuration
-    /// states the processor its images are sized by.
+    /// The model `config` describes, the configuration of `checkpoint`, its modules read under
+    /// `vb` (the checkpoint's root), at the ranks `placement` states, with the routed experts in
+    /// the slots `order` states, the drafter when the deployment speculates, and the vision
+    /// tower the configuration declares when the deployment serves it
+    /// ([`VisionTower::served`]).
     ///
     /// A pipeline stage loads its share of the decoder layers and every other module whole; a
     /// sequence member loads every module, its attention exchanging its rows over the split
@@ -140,10 +141,12 @@ impl Qwen3ForCausalLm {
     /// # Errors
     ///
     /// A placement the model refuses ([`Config::check_placement`]), an order that names no
-    /// routed layer, a drafter the checkpoint does not carry, a tower with DeepStack features (a
-    /// causal LM's prefill adds none), or a module the loader refuses.
+    /// routed layer, a drafter the checkpoint does not carry, a served tower the checkpoint
+    /// does not hold or the model does not serve ([`VisionTower::served`]), or a module the
+    /// loader refuses.
     pub fn load(
         config: &Config,
+        checkpoint: &Checkpoint,
         vb: VarBuilder<'_, '_>,
         placement: &TextPlacement,
         order: &ExpertOrder,
@@ -201,33 +204,12 @@ impl Qwen3ForCausalLm {
             None
         };
 
+        // A model that takes images turns their rows by the sectioned spectrum.
         let rotary = model.pp("rotary_emb");
-        let (visual, mrope) = match (config.images, &config.vision) {
-            (None, _) => (None, None),
-            (Some(_), None) => {
-                return Err(
-                    ID.config("the checkpoint states processor files and no tower".to_owned())
-                );
-            }
-            (Some((processor, pixels)), Some(vision)) => {
-                if !vision.deepstack_visual_indexes.is_empty() {
-                    return Err(ID.config(
-                        "a causal language model's prefill adds no DeepStack features, but the \
-                         tower states some"
-                            .to_owned(),
-                    ));
-                }
-
-                (
-                    Some(VisionTower::load(
-                        vision,
-                        vb.pp("model.visual"),
-                        processor,
-                        pixels,
-                    )?),
-                    Some(Rotary::load(&text.rope, rotary.pp("sectioned"))?),
-                )
-            }
+        let visual = VisionTower::served(config.vision.as_ref(), checkpoint, &vb, placement)?;
+        let mrope = match visual {
+            Some(_) => Some(Rotary::load(&text.rope, rotary.pp("sectioned"))?),
+            None => None,
         };
 
         Ok(Self {

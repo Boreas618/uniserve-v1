@@ -27,8 +27,7 @@ use nn::config::Fields;
 use nn::functional::{Activation, StateAxes};
 use nn::modules::{GatedDeltaNetConfig, Precision, RotaryConfig};
 use nn::quantization::Declaration;
-use nn::{PixelNorm, Result, Split};
-use processing::qwen_vl::ProcessorConfig;
+use nn::{Result, Split};
 
 use crate::qwen3::{MoeConfig, VisionConfig};
 use crate::qwen4_exp::ID;
@@ -38,9 +37,6 @@ pub const CLASS: &str = "Qwen4ExpForConditionalGeneration";
 
 /// The arithmetic the family's reference evaluates its rotary spectrum in.
 const PRECISION: Precision = Precision::F32;
-
-/// A tensor every checkpoint's vision tower holds: the patch embedding.
-const TOWER_WEIGHT: &str = "model.visual.patch_embed.proj.weight";
 
 /// The decoder stack: the fields of `text_config` its layers read.
 #[derive(Clone, PartialEq, Debug)]
@@ -260,20 +256,16 @@ pub struct Config {
     /// What the checkpoint's export declares about its packed weights; dense for a
     /// configuration read from `config.json` alone ([`Config::parse`]).
     pub quantization: Declaration,
-    /// The processor rules the tower's images are sized by and their pixel normalization,
-    /// when the checkpoint holds both the tower's weights and its processor files; `None` for
-    /// a checkpoint that serves text alone.
-    pub images: Option<(ProcessorConfig, PixelNorm)>,
 }
 
 impl Config {
-    /// Reads and validates what `checkpoint` states: its `config.json`, the quantization its
-    /// export declares, and, when it holds a vision tower, its processor files.
+    /// Reads and validates what `checkpoint` states: its `config.json` and the quantization
+    /// its export declares.
     ///
     /// # Errors
     ///
-    /// No `config.json`, what [`Self::parse`] refuses, a declaration the loader does not
-    /// serve, or processor files that are not a Qwen-VL processor's.
+    /// No `config.json`, what [`Self::parse`] refuses, or a declaration the loader does not
+    /// serve.
     pub fn open(checkpoint: &nn::Checkpoint) -> Result<Self> {
         let value = checkpoint.sidecar("config.json")?.ok_or_else(|| {
             ID.config(format!(
@@ -283,12 +275,6 @@ impl Config {
         })?;
         let mut config = Self::parse(&Fields::of("config.json", &value)?)?;
         config.quantization = Declaration::read(checkpoint)?;
-
-        // The tower serves when the checkpoint holds both its weights and its processor
-        // files; otherwise the checkpoint serves text alone.
-        if checkpoint.tensor(TOWER_WEIGHT).is_some() {
-            config.images = crate::qwen3::config::processor(checkpoint)?;
-        }
         Ok(config)
     }
 
@@ -361,7 +347,6 @@ impl Config {
             vision,
             mtp_num_hidden_layers: mtp_layers(&values)?,
             quantization: Declaration::dense(),
-            images: None,
         };
         config.check()?;
         Ok(config)

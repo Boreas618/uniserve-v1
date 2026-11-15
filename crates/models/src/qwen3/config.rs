@@ -40,9 +40,6 @@ const PRECISION: Precision = Precision::F32;
 /// The M-RoPE position axes of a Qwen3-VL or Qwen3.5 language model: time, height and width.
 pub const POSITION_AXES: u32 = 3;
 
-/// A tensor every Qwen3-VL and Qwen3.5 vision tower holds: the patch embedding.
-const TOWER_WEIGHT: &str = "model.visual.patch_embed.proj.weight";
-
 /// The decoder stack: the fields of Hugging Face's `Qwen3Config` its layers read.
 #[derive(Clone, PartialEq, Debug)]
 pub struct TextConfig {
@@ -188,7 +185,9 @@ pub struct Config {
     pub text: TextConfig,
     /// The routed experts, for a mixture-of-experts stack.
     pub moe: Option<MoeConfig>,
-    /// The vision tower, for a checkpoint that states one.
+    /// The vision tower, for a checkpoint whose configuration declares one (`vision_config`):
+    /// a deployment that serves it reads its weights and its processor files
+    /// ([`crate::qwen3::VisionTower::served`]).
     pub vision: Option<VisionConfig>,
     /// The multi-token-prediction layers the checkpoint carries (Qwen3.5's `mtp.*`), zero for
     /// none. They embed with the model's own table.
@@ -196,10 +195,6 @@ pub struct Config {
     /// What the checkpoint's export declares about its packed weights; dense for a
     /// configuration read from `config.json` alone ([`Config::parse`]).
     pub quantization: Declaration,
-    /// The processor rules the tower's images are sized by and their pixel normalization,
-    /// when the checkpoint holds both the tower's weights and its processor files; `None` for
-    /// a checkpoint that serves text alone.
-    pub images: Option<(ProcessorConfig, PixelNorm)>,
 }
 
 /// The model classes [`Config::parse`] reads.
@@ -215,13 +210,13 @@ pub const QWEN3_5_MOE: &str = processing::qwen::QWEN3_5_MOE_CLASS;
 pub const QWEN3_VL: &str = "Qwen3VLForConditionalGeneration";
 
 impl Config {
-    /// Reads and validates what `checkpoint` states: its `config.json`, the quantization its
-    /// export declares, and, when it holds a vision tower, its processor files.
+    /// Reads and validates what `checkpoint` states: its `config.json` and the quantization
+    /// its export declares.
     ///
     /// # Errors
     ///
-    /// No `config.json`, what [`Self::parse`] refuses, a declaration the loader does not
-    /// serve, or processor files that are not a Qwen-VL processor's.
+    /// No `config.json`, what [`Self::parse`] refuses, or a declaration the loader does not
+    /// serve.
     pub fn open(checkpoint: &nn::Checkpoint) -> Result<Self> {
         let value = checkpoint.sidecar("config.json")?.ok_or_else(|| {
             ID.config(format!(
@@ -231,12 +226,6 @@ impl Config {
         })?;
         let mut config = Self::parse(&Fields::of("config.json", &value)?)?;
         config.quantization = Declaration::read(checkpoint)?;
-
-        // The tower serves when the checkpoint holds both its weights and its processor
-        // files; otherwise the checkpoint serves text alone.
-        if checkpoint.tensor(TOWER_WEIGHT).is_some() {
-            config.images = processor(checkpoint)?;
-        }
         Ok(config)
     }
 
@@ -410,7 +399,6 @@ impl Config {
             vision,
             mtp_num_hidden_layers,
             quantization: Declaration::dense(),
-            images: None,
         }
     }
 
@@ -794,21 +782,29 @@ impl VisionConfig {
     }
 }
 
-/// The processor rules of `checkpoint` and its images' pixel normalization, or `None` when it
-/// states no processor files.
-pub fn processor(checkpoint: &nn::Checkpoint) -> Result<Option<(ProcessorConfig, PixelNorm)>> {
-    let [image_file, video_file] = ProcessorConfig::FILES;
-    let (Some(image), Some(video)) = (
-        checkpoint.sidecar(image_file)?,
-        checkpoint.sidecar(video_file)?,
-    ) else {
-        return Ok(None);
+/// The processor rules of `checkpoint` and its images' pixel normalization: what sizes the
+/// images of the vision tower its configuration declares.
+///
+/// # Errors
+///
+/// A checkpoint that holds no processor files, or files that are not a Qwen-VL processor's.
+pub fn processor(checkpoint: &nn::Checkpoint) -> Result<(ProcessorConfig, PixelNorm)> {
+    let sidecar = |file: &str| {
+        checkpoint.sidecar(file)?.ok_or_else(|| {
+            ID.checkpoint(format!(
+                "{} holds no {file}, which sizes the images of the vision tower its \
+                 configuration declares",
+                checkpoint.root().display()
+            ))
+        })
     };
+    let [image_file, video_file] = ProcessorConfig::FILES;
+    let (image, video) = (sidecar(image_file)?, sidecar(video_file)?);
 
     let norm = Fields::of(image_file, &image)?.pixel_norm()?;
     let processor =
         ProcessorConfig::from_values(&image, &video).map_err(|problem| ID.config(problem))?;
-    Ok(Some((processor, norm)))
+    Ok((processor, norm))
 }
 
 /// The routed experts a configuration states: the expert count `num_experts`, the name every
@@ -1067,6 +1063,7 @@ mod tests {
             experts: Split::WHOLE,
             tensor_experts: false,
             drafter: false,
+            vision: false,
             draft_tokens: 0,
         };
         let whole = Split::WHOLE;

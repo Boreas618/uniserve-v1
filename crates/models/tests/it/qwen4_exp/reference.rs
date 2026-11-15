@@ -60,9 +60,11 @@ const DRAFTS: u32 = 3;
 const STEP: usize = DRAFTS as usize + 1;
 
 /// The checked deployment: one rank that drafts [`DRAFTS`] tokens a step with the checkpoint's
-/// drafter.
+/// drafter. The fixture declares the release's vision tower and holds none of it, so the
+/// deployment serves none.
 const DEPLOYMENT: TextPlacement = TextPlacement {
     drafter: true,
+    vision: false,
     draft_tokens: DRAFTS,
     ..TextPlacement::WHOLE
 };
@@ -760,6 +762,35 @@ fn reference_model(fixture: &Fixture) -> std::sync::Arc<dyn TextModel> {
     let mut loader = WeightLoader::new(&checkpoint, &store, None);
 
     text::load(&FAMILIES, &checkpoint, &mut loader, &DEPLOYMENT).expect("the load")
+}
+
+/// The fixture declares the release's vision tower and holds neither its processor files nor
+/// its weights: a deployment that serves the tower is refused, naming the file, and one that
+/// does not loads the model without a tower.
+#[test]
+fn a_declared_tower_the_checkpoint_does_not_hold_is_refused_where_it_is_served() {
+    let fixture = reference();
+    let checkpoint = fixture.checkpoint("model");
+    let store = CpuWeights::new();
+    let load = |vision| {
+        let mut loader = WeightLoader::new(&checkpoint, &store, None);
+        text::load(
+            &FAMILIES,
+            &checkpoint,
+            &mut loader,
+            &TextPlacement {
+                vision,
+                ..DEPLOYMENT
+            },
+        )
+    };
+
+    let error = load(true)
+        .err()
+        .expect("a served tower the checkpoint lacks")
+        .to_string();
+    assert!(error.contains("preprocessor_config.json"), "{error}");
+    assert!(load(false).expect("the load").vision().is_none());
 }
 
 /// The read-out and the head: the last layer's output folded into the streams, and the logits

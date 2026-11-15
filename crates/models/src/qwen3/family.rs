@@ -62,7 +62,7 @@ impl TextCheckpoint for Config {
 
     fn load(
         &self,
-        _checkpoint: &Checkpoint,
+        checkpoint: &Checkpoint,
         loader: &mut WeightLoader<'_>,
         placement: &TextPlacement,
         experts: &ExpertOrder,
@@ -72,6 +72,7 @@ impl TextCheckpoint for Config {
 
         Ok(Arc::new(Qwen3ForCausalLm::load(
             self,
+            checkpoint,
             loader.root(),
             placement,
             experts,
