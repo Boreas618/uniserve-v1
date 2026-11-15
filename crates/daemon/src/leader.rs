@@ -2272,18 +2272,6 @@ impl Replica {
         // The reports the trial reads, once it began.
         let mut trial = Vec::new();
 
-        // The previous engines' ends, when the trial stops them: their nodes
-        // then keep the weights alone.
-        let mut ending: Vec<(Vec<u64>, watch::Receiver<EngineState>)> =
-            if options.previous_epoch == crate::options::PreviousEpoch::Parked {
-                Vec::new()
-            } else {
-                before
-                    .iter()
-                    .filter_map(|(client, _)| client.as_ref())
-                    .map(|client| (launches(client), client.states()))
-                    .collect()
-            };
         let mut serving_again: Vec<Option<Arc<EngineClient>>> =
             before.iter().map(|(client, _)| client.clone()).collect();
         let mut relaunched = vec![false; previous.len()];
@@ -2374,28 +2362,7 @@ impl Replica {
                     "the update returns the deployment to the previous epoch"
                 );
             }
-            let ended = async {
-                if ending.is_empty() {
-                    return std::future::pending().await;
-                }
-                let waits = ending.iter_mut().map(|(_, states)| {
-                    Box::pin(async move {
-                        while *states.borrow_and_update() != EngineState::Stopped {
-                            if states.changed().await.is_err() {
-                                break;
-                            }
-                        }
-                    })
-                });
-                futures::future::select_all(waits).await.1
-            };
             tokio::select! {
-                index = ended => {
-                    let (stopped, _) = ending.swap_remove(index);
-                    for launch in stopped {
-                        updater.previous_ended(launch);
-                    }
-                }
                 changed = served.changed() => {
                     if changed.is_err() {
                         break;

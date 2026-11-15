@@ -1281,7 +1281,10 @@ fn a_node_that_refuses_host_storage_keeps_the_weights_on_its_gpus() {
     });
     let update = deployment.epoch(1, PreviousEpoch::Host, None);
     deployment.apply(update);
-    deployment.updater.previous_ended(PREVIOUS);
+    // The previous epoch's engine, which the trial stopped, exits: its node reports the exit as
+    // it reports every engine's.
+    deployment.engines.exit(HOST, PREVIOUS, "exit status: 0");
+    deployment.run();
 
     let retentions = deployment.engines.retentions();
     assert!(retentions[0].to_host);
@@ -1289,10 +1292,6 @@ fn a_node_that_refuses_host_storage_keeps_the_weights_on_its_gpus() {
     assert_eq!(status["previous_epoch_kept"], "weights");
     assert_eq!(status["host_refused"][0], "rank-0: the host holds no room");
     assert_eq!(status["moved_to_host_bytes"], 0);
-
-    // The node is asked once, whoever reports the engine's end.
-    deployment.engines.exit(HOST, PREVIOUS, "exit status: 0");
-    deployment.run();
     assert_eq!(deployment.engines.retentions().len(), 1);
 }
 

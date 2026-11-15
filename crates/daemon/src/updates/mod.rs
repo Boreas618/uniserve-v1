@@ -390,18 +390,6 @@ impl Updater {
             .unwrap_or_default()
     }
 
-    /// The previous epoch's engine of launch generation `launch` ended for
-    /// the trial.
-    pub(crate) fn previous_ended(&self, launch: u64) {
-        let mut state = self.lock();
-        let State {
-            processes, update, ..
-        } = &mut *state;
-        if let Some(update) = update.as_mut() {
-            update.previous_ended(processes, launch);
-        }
-    }
-
     /// The previous epoch's engine of launch generation `previous` serves
     /// again at launch generation `launch`, which its owner started it at.
     pub(crate) fn relaunched(&self, previous: u64, launch: u64) {

@@ -534,37 +534,29 @@ impl EngineClient {
         }
     }
 
-    /// Waits at most `timeout` for the engine's process to exit, as the
-    /// daemon that started it reports, and returns its exit status; `None`
-    /// for an engine whose process this client did not start.
+    /// Waits for the engine's process to exit, as the daemon that started it reports on the
+    /// control connection the process lives under, and returns its exit status; `None` for an
+    /// engine whose process this client did not start. The daemon reports every exit of a
+    /// process it supervises, so the wait ends with the report or with the connection's end.
     ///
     /// # Errors
     ///
-    /// Fails when the daemon connection fails or the process does not exit
-    /// in time.
-    pub fn await_exit(&self, timeout: Duration) -> anyhow::Result<Option<String>> {
+    /// Fails when the control connection ends before the exit's report.
+    pub fn await_exit(&self) -> anyhow::Result<Option<String>> {
         use proto::process::{Downstream, Event as ProcessEvent, downstream, event};
 
         let mut control = lock(&self.control);
         let Some(control) = control.as_mut() else {
             return Ok(None);
         };
-        let deadline = std::time::Instant::now() + timeout;
         loop {
-            while let Some(message) = control.try_recv::<Downstream>()? {
-                if let Some(downstream::Kind::Event(ProcessEvent {
-                    kind: Some(event::Kind::Exit(exit)),
-                })) = message.kind
-                {
-                    return Ok(Some(exit.status));
-                }
+            let message: Downstream = control.recv_next()?;
+            if let Some(downstream::Kind::Event(ProcessEvent {
+                kind: Some(event::Kind::Exit(exit)),
+            })) = message.kind
+            {
+                return Ok(Some(exit.status));
             }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            anyhow::ensure!(
-                !remaining.is_zero(),
-                "the engine process did not exit within {timeout:?}"
-            );
-            control.wait(remaining.min(READ_INTERVAL))?;
         }
     }
 

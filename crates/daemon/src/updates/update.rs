@@ -887,19 +887,6 @@ impl Update {
         }
     }
 
-    /// The previous epoch's engine of launch generation `launch` ended for
-    /// the trial: its node keeps its weights alone, in host storage when the
-    /// update asked and the node can.
-    ///
-    /// An engine the daemon's engine control started ends with its
-    /// connection, which no process event states, so its owner reports it
-    /// here as well; the node is asked once.
-    pub(crate) fn previous_ended(&mut self, processes: &mut Processes, launch: u64) {
-        if let Some(node) = self.nodes.iter().position(|node| node.launch == launch) {
-            self.keep_weights(processes, node);
-        }
-    }
-
     /// Asks `node`'s host to keep the previous epoch's weights. A node that
     /// refuses, or fails to keep them, keeps them on its GPUs: nothing else
     /// of the trial depends on it, and the status says why.
