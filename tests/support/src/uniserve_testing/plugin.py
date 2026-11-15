@@ -23,6 +23,9 @@ Options:
   host of a two-host case (an ssh destination that has ``uniserve``
   installed), the address this host reaches it at, and the address it reaches
   this host at.
+
+With pytest-xdist, ``-n auto`` starts one worker per GPU the run may lease
+(:func:`pytest_xdist_auto_num_workers`).
 """
 
 from __future__ import annotations
@@ -197,13 +200,35 @@ def e2e_settings(pytestconfig: pytest.Config) -> Settings:
     )
 
 
-@pytest.fixture(scope="session")
-def run_devices(pytestconfig: pytest.Config) -> tuple[int, ...]:
+def _run_devices(config: pytest.Config) -> tuple[int, ...]:
     """The GPUs the run's cases may lease: ``--e2e-devices``, else every GPU
     NVML reports on this host.
     """  # noqa: D205
-    stated = pytestconfig.getoption("e2e_devices")
+    stated = config.getoption("e2e_devices")
     return stated if stated is not None else host_devices()
+
+
+@pytest.fixture(scope="session")
+def run_devices(pytestconfig: pytest.Config) -> tuple[int, ...]:
+    """The GPUs the run's cases may lease (:func:`_run_devices`)."""
+    return _run_devices(pytestconfig)
+
+
+# pytest-xdist calls this hook for `-n auto` and takes the first answer, so
+# this one runs before xdist's own (the host's CPU count); it is optional so
+# that a session of an environment without pytest-xdist still loads the
+# plugin.
+@pytest.hookimpl(optionalhook=True, tryfirst=True)
+def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
+    """The worker count of ``pytest -n auto``: one per GPU the run may lease.
+
+    Each end-to-end case serves on the GPUs it leases and blocks until they
+    are free (:mod:`uniserve_testing.devices`), so one worker per leasable
+    GPU lets the one-GPU cases fill every GPU, and a further worker could
+    only wait for a lease while it holds a session of its own (a Build
+    Server and the session's imports).
+    """
+    return len(_run_devices(config))
 
 
 @pytest.fixture(scope="session")
