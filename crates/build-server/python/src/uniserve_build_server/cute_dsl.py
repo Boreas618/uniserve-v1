@@ -9,9 +9,9 @@ Steps: compile the kernel for the request's target (no GPU is read: the target
 is stated to the DSL, and fake tensors and a fake stream describe the runtime
 signature), ``export_to_c`` to emit the host launcher object and its header,
 then compile the package's entry unit beside that header and link both with the
-CuTe DSL's ``libcuda_dialect_runtime_static.a`` and the CUDA runtime. The
-archive carries the device-dialect runtime; the CUDA runtime must come with it,
-or the module loads with undefined ``cuda*`` symbols.
+CuTe DSL's ``libcuda_dialect_runtime_static.a``, whose members the launcher
+calls, through the CUDA driver's routines (:mod:`uniserve_build_server.cuda`:
+``objects`` and ``link``, which links the CUDA runtime with every module).
 
 A package's build module states ``spec(request)``, the compilation of the
 descriptor the request names (:class:`uniserve_build_server.request.Request`:
@@ -23,7 +23,8 @@ package, whose tuning data a package reads), one shape for every package:
   of the package's launcher (its own kernel, or a vendor's kernel class it
   constructs with an explicit configuration) and the fake arguments
   :func:`pointer`, :func:`tensor` and :func:`scalar` describe;
-- ``defines`` (optional): preprocessor definitions of the entry unit.
+- ``definitions`` (optional): preprocessor definitions of the entry unit, by
+  macro name (:data:`uniserve_build_server.cuda.Definition`).
 
 The entry unit is the C++ translation unit the manifest names in ``[source]
 unit``, which defines the C entry ``[module.entries]`` names; it is compiled
@@ -42,8 +43,6 @@ from __future__ import annotations
 import importlib.metadata
 import importlib.resources
 import pathlib
-import subprocess
-import tempfile
 from collections.abc import Callable
 from typing import Any
 
@@ -53,6 +52,7 @@ from cutlass.cute.runtime import make_fake_stream, make_fake_tensor, make_ptr
 from cutlass.cute.typing import Pointer, Tensor
 from cutlass.cutlass_dsl import CuTeDSL
 
+from uniserve_build_server import cuda
 from uniserve_build_server.request import Request, Target
 from uniserve_build_server.toolchain import Cuda
 
@@ -60,11 +60,11 @@ from uniserve_build_server.toolchain import Cuda
 #: descriptor it names.
 Spec = Callable[[Request], dict[str, Any]]
 
-#: The CuTe DSL's static device-dialect runtime, which every module links whole.
+#: The CuTe DSL's static device-dialect runtime, which every module links.
 DIALECT_RUNTIME = "libcuda_dialect_runtime_static.a"
 
-#: The flags every C++ translation unit of a module is compiled with.
-CXX_FLAGS = ["-O2", "-std=c++20", "-fPIC"]
+#: The C++ standard the entry units are written in.
+STANDARD = "c++20"
 
 
 def configure(target: Target) -> None:
@@ -160,72 +160,38 @@ def shared_headers() -> pathlib.Path:
     )
 
 
-def compile_cxx(compiler: str, arguments: list[str], what: str) -> None:
-    """Run the host C++ compiler; a failure refuses the build."""
-    built = subprocess.run(
-        [compiler, *CXX_FLAGS, *arguments],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if built.returncode != 0:
-        raise SystemExit(f"{what} failed:\n{built.stderr}")
-
-
 def build(request: Request, spec: Spec) -> None:
     """Compile the descriptor ``request`` names into its output directory."""
     configure(request.target)
     stated = spec(request)
     compiled = stated["compile"]()
 
-    cuda = request.toolchain.require_cuda()
-    compiler = request.toolchain.require_host_compiler()
     # The Build Server resolves a CuTe DSL source's entry unit (``[source]
     # unit``, ``src/entry.cpp`` unless the manifest states another).
     if request.unit is None:
         raise SystemExit("the request names no entry unit")
-    out = request.output
-    # The export and the entry unit's object are the build's own intermediates:
-    # they live in a directory of the build's workspace the module does not
-    # publish (a dot directory).
-    with tempfile.TemporaryDirectory(dir=out, prefix=".") as scratch:
-        staging = pathlib.Path(scratch)
+    runtime = dialect_runtime(request.toolchain.require_cuda())
+    # The export and the entry unit's object are the build's own
+    # intermediates, in its scratch directory.
+    with cuda.scratch(request) as staging:
         name = stated["name"]
         compiled.export_to_c(str(staging), name)
-        unit = staging / "entry.o"
-        compile_cxx(
-            compiler,
+        (entry,) = cuda.objects(
+            request,
             [
-                "-c",
-                "-o",
-                str(unit),
-                str(request.package / request.unit),
-                *(f"-D{one}" for one in stated.get("defines", [])),
-                f"-I{staging}",
-                f"-I{shared_headers()}",
-                f"-I{cuda.include}",
+                cuda.Unit(
+                    source=request.package / request.unit,
+                    standard=STANDARD,
+                    definitions=stated.get("definitions", {}),
+                    includes=[staging, shared_headers()],
+                )
             ],
-            "compiling the entry unit",
+            staging,
         )
-        # The dialect runtime archive is linked whole and the CUDA runtime
-        # dynamically with `--no-as-needed`: without the runtime the module
-        # loads with undefined `cuda*` symbols, and without `--no-as-needed`
-        # the linker drops it because the archive references it only
-        # indirectly.
-        compile_cxx(
-            compiler,
-            [
-                "-shared",
-                "-o",
-                str(out / "module.so"),
-                str(staging / f"{name}.o"),
-                str(unit),
-                "-Wl,--whole-archive",
-                str(dialect_runtime(cuda)),
-                "-Wl,--no-whole-archive",
-                "-Wl,--no-as-needed",
-                f"-L{cuda.lib}",
-                "-lcudart",
-            ],
-            "linking module.so",
+        # The archive gives the dialect runtime's members the launcher calls.
+        cuda.link(
+            request,
+            [staging / f"{name}.o", entry, runtime],
+            request.output / cuda.MODULE_SO,
+            standard=STANDARD,
         )
