@@ -21,7 +21,7 @@ use std::time::Instant;
 use crate::batch::Capacity;
 use crate::batch::product::KINDS;
 use crate::batch::{Phase, Shape, Variant};
-use crate::executor::peers::{LOST_EXIT, Liveness};
+use crate::executor::peers::Liveness;
 use crate::memory::buffers::UNIT_BYTES;
 use crate::memory::encoders;
 use proto::config::EngineArgs;
@@ -69,7 +69,7 @@ fn start_on_meta(server: &StorageServer, launch: &EngineArgs) -> Engine {
     let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
     let policy = (crate::scheduler::packaged("arrival"), parameters);
     // An engine of one main process has no peer link to lose.
-    let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
+    let liveness = Liveness::new(Arc::new(|| {}));
     start(
         launch,
         &registry,
@@ -294,7 +294,7 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
         standby_storage: Default::default(),
     };
     // An engine of one main process has no peer link to lose.
-    let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
+    let liveness = Liveness::new(Arc::new(|| {}));
     // The packaged policy the launch names, with the arguments the launch pins on it.
     let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
     let policy = (crate::scheduler::packaged("arrival"), parameters);
@@ -398,7 +398,7 @@ fn a_standby_of_the_serving_epoch_opens_a_session_of_its_own_and_maps_its_region
         (open.clone(), opened.clone())
     };
 
-    let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
+    let liveness = Liveness::new(Arc::new(|| {}));
     let serving = start(&launch, &registry, &storage, None, policy(), liveness).unwrap();
     let (open, opened) = session(&serving);
     let kv = kv_regions(&open)[0];
@@ -408,7 +408,7 @@ fn a_standby_of_the_serving_epoch_opens_a_session_of_its_own_and_maps_its_region
     parked.predecessor = Some(proto::request::wire::Predecessor {
         epoch: launch.epoch,
     });
-    let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
+    let liveness = Liveness::new(Arc::new(|| {}));
     let standby = start(&parked, &registry, &storage, None, policy(), liveness).unwrap();
     let (standby_open, standby_opened) = session(&standby);
     assert_eq!(standby_open.regions[kv].name, open.regions[kv].name);
@@ -452,7 +452,7 @@ fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session
         standby: false,
         standby_storage: Default::default(),
     };
-    let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
+    let liveness = Liveness::new(Arc::new(|| {}));
     let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
     let policy = (crate::scheduler::packaged("arrival"), parameters);
 
@@ -516,7 +516,7 @@ fn a_meta_start_of_a_model_with_a_vision_tower_encodes_images_beside_its_prefill
         standby: false,
         standby_storage: Default::default(),
     };
-    let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
+    let liveness = Liveness::new(Arc::new(|| {}));
     let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
     let policy = (crate::scheduler::packaged("arrival"), parameters);
     let engine = start(&launch, &registry, &storage, None, policy, liveness).unwrap();

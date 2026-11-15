@@ -114,8 +114,6 @@ const PEER: usize = 1;
 /// The engine number the peer registers under.
 const ENGINE: u64 = 7;
 
-/// How long a process whose peer link was lost has before it is ended: longer than any run.
-const DAY: Duration = Duration::from_secs(86_400);
 
 /// The request numbers of the `Finish` requests whose answers are mapped: this plus the copy's.
 const ANSWERS: u64 = 1_000;
@@ -1233,17 +1231,17 @@ fn worker(
 }
 
 /// What the replays of one recording share: the node's peer listener, and the peer's liveness,
-/// which notes the close of each replay's link as a loss and ends nothing within a day.
+/// which notes the close of each replay's link as a loss.
 struct Peers {
-    listener: engine::executor::peers::link::Listener,
+    listener: service::Listener,
     liveness: Arc<Liveness>,
 }
 
 impl Peers {
     fn new() -> Self {
         Self {
-            listener: engine::executor::peers::link::Listener::bind(&["127.0.0.1:0"]).unwrap(),
-            liveness: Liveness::new(Arc::new(|| {}), DAY),
+            listener: service::Listener::bind(&"127.0.0.1:0".parse().unwrap()).unwrap(),
+            liveness: Liveness::new(Arc::new(|| {})),
         }
     }
 }
@@ -1271,7 +1269,7 @@ impl Group {
         });
 
         // The peer process: its one rank of the group, serving what the node hands it.
-        let address = peers.listener.addresses()[0].clone();
+        let address = peers.listener.endpoint().to_string();
         let dialling =
             std::thread::spawn(move || register(&address, PEER as u32, ENGINE, LONG).unwrap());
         let (first, channel) = accept(&peers.listener, 1, ENGINE, LONG)
@@ -1294,7 +1292,7 @@ impl Group {
 
         // The scheduler node: its rank 0, and the link that holds rank 1.
         let (near, near_ends) = worker(0, 0, &sequences, &watch, turns);
-        let remote = Remote::spawn(first, channel, Liveness::new(Arc::new(|| {}), DAY)).unwrap();
+        let remote = Remote::spawn(first, channel, Liveness::new(Arc::new(|| {}))).unwrap();
         let route = Route::new(
             vec![sequences],
             vec![near],

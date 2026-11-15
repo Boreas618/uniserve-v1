@@ -58,7 +58,6 @@
 
 pub(crate) mod rank;
 
-use std::net::TcpListener;
 use std::sync::{Arc, Barrier, Mutex, OnceLock, Weak};
 
 use crate::batch::Capacity;
@@ -79,7 +78,7 @@ use crate::memory::latent;
 use crate::memory::state::StateMemory;
 use crate::memory::tables::BlockTables;
 use crate::memory::weights::WeightStore;
-use crate::parallel::host::{HostGroup, STARTUP_TIMEOUT};
+use crate::parallel::{HostGroup, Rendezvous};
 use crate::runner::causal_lm::experts::JoinHook;
 use crate::runner::causal_lm::{CausalLmConfig, CausalLmRunner};
 use crate::runner::graphs::Graphs;
@@ -356,14 +355,11 @@ impl LoadedRank {
 
 /// Where the ranks of a process's worker group form their host group.
 pub(crate) enum Meeting {
-    /// This process holds every rank: they meet over the loopback.
+    /// This process holds every rank: they are connected within the process.
     Local,
-    /// The group has ranks on other hosts: its members meet at `address`, which the process that
-    /// holds rank 0 serves on `listener`, the socket its daemon reserved; a peer holds none.
-    World {
-        address: String,
-        listener: Option<TcpListener>,
-    },
+    /// The group has ranks on other hosts: its members meet at the rendezvous, which the process
+    /// that holds rank 0 serves on the socket its daemon reserved.
+    World(Rendezvous),
 }
 
 /// Loads every rank of this process to its division, each on a thread of its own, onto
@@ -371,12 +367,12 @@ pub(crate) enum Meeting {
 ///
 /// The ranks agree their cache's units and exchange their communicators' ids over one host group,
 /// whose collectives every member must reach, so they run side by side rather than one after
-/// another; the weights of four ranks then also load at once. The group is formed over the
-/// loopback when this process holds all its members, and at the group's rendezvous
+/// another; the weights of four ranks then also load at once. The group is formed within the
+/// process when this process holds all its members, and at the group's rendezvous
 /// ([`Meeting::World`]) when other hosts hold some, each rank a member under its rank number in the
 /// deployment (a media process's ranks need not be consecutive: a host may hold ranks of several
-/// groups). The members of an expert union, which lives on one node's devices, meet once more over
-/// the loopback for the union's own collectives.
+/// groups). The members of an expert union, which lives on one node's devices, form a host group of
+/// their own within the process for the union's own collectives.
 ///
 /// The request slots of a media deployment's groups are agreed over the same host group once
 /// every rank is loaded ([`fit_media_slots`]).
@@ -391,53 +387,38 @@ pub(crate) fn load_ranks(
     meeting: Meeting,
 ) -> Result<Vec<LoadedRank>> {
     let count = model_runners.len();
-    // Each rank's member number, and how many members there are.
-    let world = matches!(meeting, Meeting::World { .. });
-    let member = |index: usize, model_runner: &ModelRunner| -> usize {
-        if world {
-            model_runner.rank() as usize
-        } else {
-            index
-        }
-    };
-    let (members, address, mut listener) = match meeting {
-        Meeting::Local => {
-            let (address, listener) = loopback("the rendezvous of this process's ranks")?;
-            (count, address, Some(listener))
-        }
-        Meeting::World { address, listener } => {
-            let first = launch.rank as usize;
+    // Each rank's member of the host group: by its index in this process when the process holds
+    // every member, and by its rank number in the deployment when other hosts hold some.
+    let mut hosts: Vec<Option<HostGroup>> = match meeting {
+        Meeting::Local => HostGroup::local(count)
+            .context("connecting this process's ranks")?
+            .into_iter()
+            .map(Some)
+            .collect(),
+        Meeting::World(rendezvous) => {
             let members = launch.world_size as usize;
-            if let Some(beyond) = model_runners
+            let held: Vec<usize> = model_runners
                 .iter()
                 .map(|model_runner| model_runner.rank() as usize)
-                .find(|rank| *rank >= members)
-            {
-                bail!("this process serves rank {beyond} of a group of {members}");
-            }
-            if (first == 0) != listener.is_some() {
-                bail!(
-                    "the process that holds rank 0 serves the group's rendezvous, and only it: \
-                     this one holds rank {first} and {} the socket",
-                    if listener.is_some() {
-                        "inherited"
-                    } else {
-                        "was given no"
-                    }
-                );
-            }
-            (members, address, listener)
+                .collect();
+            HostGroup::world(rendezvous, &held, members)
+                .context("joining the deployment's ranks at their rendezvous")?
+                .into_iter()
+                .map(Some)
+                .collect()
         }
     };
-    let union = model_runners
-        .first()
-        .and_then(ModelRunner::union)
-        .map(|_| loopback("the rendezvous of this node's expert union"))
-        .transpose()?;
-    let (union_address, mut union_listener) = match union {
-        Some((address, listener)) => (address, Some(listener)),
-        None => (String::new(), None),
-    };
+    // The expert union's members, by their place in the union: every member is a rank of this
+    // process.
+    let mut unions: Vec<Option<HostGroup>> =
+        match model_runners.first().and_then(ModelRunner::union) {
+            Some((members, _)) => HostGroup::local(members as usize)
+                .context("connecting this node's expert union")?
+                .into_iter()
+                .map(Some)
+                .collect(),
+            None => Vec::new(),
+        };
     // One join target list for the union, which `spawn` fills with its members' workers.
     let targets: Members = Arc::default();
     let meetings = meetings(&model_runners)?;
@@ -445,27 +426,27 @@ pub(crate) fn load_ranks(
     let mut ranks = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(count);
         for (index, (model_runner, meets)) in model_runners.into_iter().zip(meetings).enumerate() {
-            // Member 0 serves the rendezvous on the listener.
-            let member = member(index, &model_runner);
-            let meeting = (address.clone(), listener.take_if(|_| member == 0));
-            let union = model_runner.union().map(|_| {
-                (
-                    union_address.clone(),
-                    union_listener.take(),
-                    Arc::clone(&targets),
-                )
-            });
+            let host = hosts[index]
+                .take()
+                .context("a rank of this process has no member of the host group")?;
+            let union = match model_runner.union() {
+                Some((_, place)) => {
+                    let group = unions
+                        .get_mut(place as usize)
+                        .and_then(Option::take)
+                        .with_context(|| {
+                            format!(
+                                "two ranks of this process are place {place} of its expert union"
+                            )
+                        })?;
+                    Some((group, Arc::clone(&targets)))
+                }
+                None => None,
+            };
             let handle = std::thread::Builder::new()
                 .name(format!("rank-load-{index}"))
                 .spawn_scoped(scope, move || {
-                    load_rank(
-                        model_runner,
-                        meeting,
-                        (member, members),
-                        union,
-                        meets,
-                        backing,
-                    )
+                    load_rank(model_runner, host, union, meets, backing)
                 })
                 .context("starting a rank's load")?;
             handles.push(handle);
@@ -540,27 +521,15 @@ fn agree_slots(hosts: &[HostGroup], fewest: &[u32]) -> Result<Vec<u32>> {
         .collect()
 }
 
-/// A listener on the loopback for the members of a host group of this process, and its address.
-fn loopback(what: &str) -> Result<(String, TcpListener)> {
-    let listener =
-        TcpListener::bind(("127.0.0.1", 0)).with_context(|| format!("binding {what}"))?;
-    let address = listener
-        .local_addr()
-        .with_context(|| format!("reading {what}"))?
-        .to_string();
-    Ok((address, listener))
-}
-
-/// Loads one rank onto `backing` to its division: it joins the process's host group at
-/// `meeting` as `member` of `members` and, in an expert union, the union's host group, then runs
-/// steps 1-15 of the rank's start (module documentation); a rank of a media deployment runs
-/// [`load_video_rank`] once it joined the host group. `meets` holds the host meeting of each of
-/// the rank's collective groups that meets ([`meetings`]).
+/// Loads one rank onto `backing` to its division over `host`, its member of the deployment's host
+/// group, and in an expert union `union`, its member of the union's host group with the union's
+/// join targets: it runs steps 1-15 of the rank's start (module documentation); a rank of a media
+/// deployment runs [`load_video_rank`]. `meets` holds the host meeting of each of the rank's
+/// collective groups that meets ([`meetings`]).
 fn load_rank(
     model_runner: ModelRunner,
-    meeting: (String, Option<TcpListener>),
-    (member, members): (usize, usize),
-    union: Option<(String, Option<TcpListener>, Members)>,
+    host: HostGroup,
+    union: Option<(HostGroup, Members)>,
     meets: Vec<Option<Meet>>,
     backing: Backing<'_>,
 ) -> Result<LoadedRank> {
@@ -589,30 +558,15 @@ fn load_rank(
         Backing::Meta => None,
     };
 
-    // Step 2: the host group the division agrees over, and the expert union's.
-    let (address, listener) = meeting;
-    let host = HostGroup::connect(&address, listener, member, members, STARTUP_TIMEOUT)
-        .context("joining this process's ranks")?;
+    // Step 2: the host group the division agrees over, and the expert union's, which the start
+    // formed for every rank of the process.
     if model_runner.is_video() {
         return load_video_rank(model_runner, device, client, host, meets, backing);
     }
-    let union = match union {
-        Some((address, listener, targets)) => {
-            let (members, place) = model_runner
-                .union()
-                .context("a union member states its union")?;
-            let group = HostGroup::connect(
-                &address,
-                listener,
-                place as usize,
-                members as usize,
-                STARTUP_TIMEOUT,
-            )
-            .context("joining this node's expert union")?;
-            Some((Arc::new(group), targets, place as usize))
-        }
-        None => None,
-    };
+    let union = union.map(|(group, targets)| {
+        let place = group.rank();
+        (Arc::new(group), targets, place)
+    });
 
     // Step 3: the worker group's communicator, opened before any device measurement because
     // NCCL keeps device buffers. A text rank's parallel group is its worker group's ranks in their

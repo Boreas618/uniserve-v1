@@ -3,9 +3,11 @@
 //!
 //! An epoch whose worker group has ranks on several hosts runs one engine process per host. The
 //! scheduler node's process holds the schedulers; every other process (a peer) holds only ranks.
-//! A peer dials the scheduler node's peer listener when it starts and registers
-//! ([`PeerRegistration`]); the scheduler node accepts every peer its launch counts before
-//! its ranks load ([`accept`]), so a peer that never arrives fails the start by name.
+//! A peer connects once to the scheduler node's peer listener, which its daemon reserved before
+//! any process of the epoch started, and registers ([`PeerRegistration`]); the scheduler node
+//! accepts every peer its launch counts before its ranks load ([`accept`]), so a peer that never
+//! arrives fails the start by name once the epoch's join bound passes
+//! (`worker_config.join_timeout`).
 //!
 //! **The start.** Once its session with its host's buffer pool is open, the scheduler node
 //! relays it to every peer ([`Remote::session`]), which reads it on the registered connection
@@ -20,41 +22,43 @@
 //! and a generation's `Switch`, `Commit` and `Rollback`, which reach every rank of the peer in
 //! the order of every group's jobs. The peer hands each to its own ranks and responds with
 //! [`MainProcessResponse::Result`] (the batch's output and the requests its ranks returned, each
-//! stamped with the largest stamp among them) or with `Error`, under the request's `message_id`.
-//! Every response to a group's job states the last number the peer's ranks of the group have
-//! ended, which the scheduler node takes into the group's [`Sequences`] before it completes the
-//! submission, so the group's `completed` is the smallest over all of its ranks. A batch that
-//! failed on the peer after copies started with it returns their `Finish { ok: false }`, which
-//! the scheduler node's submission fails with as a local rank's would ([`Error::Copies`]).
+//! stamped with the largest stamp among them) or with `Error`, under the number of the frame that
+//! carried the request ([`ToPeer`], [`FromPeer`]). Every response to a group's job states the last
+//! number the peer's ranks of the group have ended, which the scheduler node takes into the
+//! group's [`Sequences`] before it completes the submission, so the group's `completed` is the
+//! smallest over all of its ranks. A batch that failed on the peer after copies started with it
+//! returns their `Finish { ok: false }`, which the scheduler node's submission fails with as a
+//! local rank's would ([`Error::Copies`]).
 //!
 //! **The data plane.** A `Data` frame runs one operation of the data plane on the peer's ranks
 //! ([`DataOperation`]); the peer runs them one at a time in the order they arrived, on a thread
-//! of its own, and answers each with the JSON of its value
+//! of its own, and answers each with its value in the link's encoding
 //! ([`MainProcessResponse::Operated`]).
 //!
 //! Each end's connection is owned by one link thread, which sends what other threads queued
-//! (they fire the channel's wake), reads what arrived and settles it; nothing else touches the
-//! socket. A connection's close is the only death signal of the process at its other end: the
-//! link marks the process's [`Liveness`] lost and calls the control thread's callback, which ends
-//! the process, and the daemon then replaces the epoch's failure domain. The scheduler node's
-//! orderly end closes its links with a `Close` frame first, which a peer reads as the end of the
-//! epoch: its control thread ends in order too.
+//! (they fire the connection's wake, which is never lost), reads what arrived and settles it, and
+//! otherwise sleeps on the connection; nothing else touches the socket. A connection's close is
+//! the only death signal of the process at its other end: the link marks the process's
+//! [`Liveness`] lost and calls the control thread's callback, which ends the process, and the
+//! daemon, which owns every process's lifetime, replaces the epoch's failure domain and ends what
+//! is left of it. The scheduler node's orderly end closes its links with a `Close` frame first,
+//! which a peer reads as the end of the epoch: its control thread ends in order too.
 
 pub mod link;
 pub mod messages;
 pub(crate) mod registration;
 
 use std::collections::HashMap;
+use std::os::fd::AsRawFd as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
-use service::Connection;
+use service::{Connection, Listener};
 
-use self::link::Listener;
-use self::messages::{DataOperation, MainProcessRequest, MainProcessResponse};
+use self::messages::{DataOperation, FromPeer, MainProcessRequest, MainProcessResponse, ToPeer};
 use self::registration::{PeerAccepted, PeerRegistration};
 use storage::runtime::{Completion, GroupId, Open, Opened, Request};
 
@@ -63,17 +67,6 @@ use crate::worker::Sequences;
 use crate::worker::completion::{Fault, Outcome, Submission, SubmissionId, SubmissionState, Waker};
 use crate::worker::{Error, Result};
 use service::lock;
-
-/// The longest a link thread waits for its connection before it looks at its queue unasked.
-/// Every queue fires the channel's wake, so this bounds only a wake that was lost.
-const LINK_WAIT: Duration = Duration::from_millis(500);
-
-/// How long a registration may take to arrive once a peer connected: its first frame.
-const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long an engine process that lost a peer link has to end before it is ended, as the
-/// engine gives it to [`Liveness::new`].
-pub(crate) const LOST_EXIT: Duration = Duration::from_secs(20);
 
 /// Whether the processes at the far ends of an engine process's peer links still serve, and the
 /// first reason one stopped.
@@ -91,20 +84,16 @@ pub struct Liveness {
     /// Called once, on the link thread that lost or closed its link, after the reason is
     /// recorded: it only signals the control thread.
     callback: Waker,
-    /// How long the process has to end once a link is lost.
-    exit_after: Duration,
 }
 
 impl Liveness {
-    /// Liveness that calls `callback` when a link is first lost, and ends the process
-    /// `exit_after` later if the control thread has not ([`LOST_EXIT`]).
-    pub fn new(callback: Waker, exit_after: Duration) -> Arc<Self> {
+    /// Liveness that calls `callback` when a link is first lost or closed.
+    pub fn new(callback: Waker) -> Arc<Self> {
         Arc::new(Self {
             lost: AtomicBool::new(false),
             reason: Mutex::new(None),
             closed: AtomicBool::new(false),
             callback,
-            exit_after,
         })
     }
 
@@ -133,6 +122,10 @@ impl Liveness {
 
     /// Records that a link was lost for `reason`, keeping the first reason, and calls the
     /// control thread's callback the first time.
+    ///
+    /// The control thread ends the process on its next pass. A pass that does not come (a call of
+    /// the control thread that waits on a device whose collective waits for the lost process's
+    /// ranks) leaves the process to its daemon, which ends the failure domain it replaces.
     fn lose(&self, reason: String) {
         let first = {
             let mut slot = lock(&self.reason);
@@ -147,35 +140,14 @@ impl Liveness {
         if first {
             (self.callback)();
         }
-
-        // The control thread ends the process on its next pass. A pass that never comes (a call
-        // of the control thread that waits on a device whose collective waits for the lost
-        // process's ranks) does not keep the process: it ends at the deadline all the same,
-        // without its orderly close, which a hung collective could not finish either.
-        if first {
-            let exit_after = self.exit_after;
-            let spawned = std::thread::Builder::new()
-                .name("peer-lost".into())
-                .spawn(move || {
-                    std::thread::sleep(exit_after);
-                    tracing::error!(
-                        "the control thread did not end the process after a peer was lost"
-                    );
-
-                    // SAFETY: `_exit` ends the process at once; nothing of this process runs
-                    // after it.
-                    unsafe { libc::_exit(1) };
-                });
-            if let Err(error) = spawned {
-                tracing::warn!(%error, "the lost peer's exit deadline did not start");
-            }
-        }
     }
 }
 
-/// Accepts the registrations of `expected` peers on `listener`, each of the epoch whose
-/// scheduler node runs under engine number `engine`, and returns each channel with the first
-/// rank its process serves, in rank order.
+/// Accepts on `listener` the registrations of `expected` peers, each of the epoch whose scheduler
+/// node runs under engine number `engine`, and returns each channel with the first rank its
+/// process serves, in rank order. The registrations are read as they arrive, so a connection that
+/// stays silent holds up none; one that closes or sends no registration is not a peer and is
+/// dropped.
 ///
 /// # Errors
 ///
@@ -190,74 +162,96 @@ pub fn accept(
 ) -> Result<Vec<(u32, Connection)>> {
     let deadline = Instant::now() + timeout;
     let mut accepted: Vec<(u32, Connection)> = Vec::with_capacity(expected);
+    let mut connecting: Vec<Connection> = Vec::new();
 
     while accepted.len() < expected {
-        let Some(mut channel) = listener
+        while let Some(channel) = listener
             .try_accept()
             .map_err(|error| Error::transport_source("accepting a peer engine process", error))?
-        else {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(Error::transport(format!(
-                    "{} of the epoch's {expected} peer engine processes registered within {} s",
-                    accepted.len(),
-                    timeout.as_secs()
+        {
+            connecting.push(channel);
+        }
+
+        let mut index = 0;
+        while index < connecting.len() {
+            let registration = match connecting[index].try_recv::<PeerRegistration>() {
+                Ok(Some(registration)) => registration,
+                Ok(None) => {
+                    index += 1;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "a connection to the peer listener sent no registration");
+                    connecting.swap_remove(index);
+                    continue;
+                }
+            };
+            let mut channel = connecting.swap_remove(index);
+
+            if !registration.accepted_by(engine) {
+                return Err(Error::Invalid(format!(
+                    "rank {} registered for engine {} of build {} with engine {engine} of build {}",
+                    registration.rank,
+                    registration.engine,
+                    registration.version,
+                    proto::BUILD
+                )));
+            }
+            if accepted.iter().any(|(rank, _)| *rank == registration.rank) {
+                return Err(Error::Invalid(format!(
+                    "two peer engine processes registered for rank {}",
+                    registration.rank
                 )));
             }
 
-            // The listener's sockets become readable when a peer connects.
-            let mut sockets = listener.poll_fds();
-            let millis = i32::try_from(left.as_millis().max(1)).unwrap_or(i32::MAX);
-            // SAFETY: the call borrows this live array for its own duration only.
-            unsafe { libc::poll(sockets.as_mut_ptr(), sockets.len() as libc::nfds_t, millis) };
-            continue;
-        };
-
-        channel
-            .wait(REGISTRATION_TIMEOUT)
-            .map_err(|error| Error::transport_source("waiting for a peer's registration", error))?;
-        let registration: PeerRegistration = channel
-            .try_recv()
-            .map_err(|error| Error::transport_source("reading a peer's registration", error))?
-            .ok_or_else(|| Error::transport("a peer connected without a registration"))?;
-
-        if !registration.accepted_by(engine) {
-            return Err(Error::Invalid(format!(
-                "rank {} registered for engine {} of build {} with engine {engine} of build {}",
-                registration.rank,
-                registration.engine,
-                registration.version,
-                registration::VERSION
-            )));
+            let rank = registration.rank;
+            channel.send(&PeerAccepted { rank }).map_err(|error| {
+                Error::transport_source("accepting a peer's registration", error)
+            })?;
+            tracing::info!(rank, "a peer engine process registered");
+            accepted.push((rank, channel));
         }
-        if accepted.iter().any(|(rank, _)| *rank == registration.rank) {
-            return Err(Error::Invalid(format!(
-                "two peer engine processes registered for rank {}",
-                registration.rank
+        if accepted.len() == expected {
+            break;
+        }
+
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(Error::transport(format!(
+                "{} of the epoch's {expected} peer engine processes registered within {} s",
+                accepted.len(),
+                timeout.as_secs()
             )));
         }
 
-        let rank = registration.rank;
-        channel
-            .send(&PeerAccepted { rank })
-            .map_err(|error| Error::transport_source("accepting a peer's registration", error))?;
-        tracing::info!(rank, "a peer engine process registered");
-        accepted.push((rank, channel));
+        // The listener becomes readable when a peer connects, a connection when its registration
+        // arrives.
+        let mut sockets: Vec<libc::pollfd> = std::iter::once(listener.as_raw_fd())
+            .chain(connecting.iter().map(|channel| channel.as_raw_fd()))
+            .map(|fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let millis = i32::try_from(left.as_millis().max(1)).unwrap_or(i32::MAX);
+        // SAFETY: the call borrows this live array for its own duration only. A poll a signal
+        // interrupts returns early, and the loop looks again.
+        unsafe { libc::poll(sockets.as_mut_ptr(), sockets.len() as libc::nfds_t, millis) };
     }
 
     accepted.sort_by_key(|(rank, _)| *rank);
     Ok(accepted)
 }
 
-/// Dials the scheduler node's peer listener at `address` and registers this process as the one
-/// whose ranks start at `rank`, in the epoch whose scheduler node runs under engine `engine`.
-///
-/// The scheduler node may still be starting and has no socket to wait on until it listens, so
-/// the dial is repeated until `timeout`.
+/// Connects once to the scheduler node's peer listener at `address`, which its daemon reserved
+/// before the epoch's processes started, and registers this process as the one whose ranks start
+/// at `rank`, in the epoch whose scheduler node runs under engine `engine`.
 ///
 /// # Errors
 ///
-/// When no connection is made in time, or the scheduler node does not accept the registration.
+/// When the connection is refused, or the scheduler node does not accept the registration within
+/// `timeout`.
 pub fn register(address: &str, rank: u32, engine: u64, timeout: Duration) -> Result<Connection> {
     let endpoint: service::Endpoint = address.parse().map_err(|error| {
         Error::transport_source(
@@ -265,105 +259,77 @@ pub fn register(address: &str, rank: u32, engine: u64, timeout: Duration) -> Res
             std::io::Error::from(error),
         )
     })?;
-    let deadline = Instant::now() + timeout;
-    let mut channel = loop {
-        match Connection::connect(&endpoint) {
-            Ok(channel) => break channel,
-            Err(error) if Instant::now() >= deadline => {
-                return Err(Error::transport_source(
-                    format!("dialling the scheduler node's peer listener at {address}"),
-                    error,
-                ));
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
-        }
-    };
+    let mut channel = Connection::connect(&endpoint).map_err(|error| {
+        Error::transport_source(
+            format!("connecting to the scheduler node's peer listener at {address}"),
+            error,
+        )
+    })?;
 
     channel
         .send(&PeerRegistration {
             rank,
             engine,
-            version: registration::VERSION.to_owned(),
+            version: proto::BUILD.to_owned(),
         })
         .map_err(|error| Error::transport_source("sending this process's registration", error))?;
 
-    loop {
-        if let Some(accepted) = channel.try_recv::<PeerAccepted>().map_err(|error| {
-            Error::transport_source("reading the registration's response", error)
-        })? {
-            if accepted.rank != rank {
-                return Err(Error::Invalid(format!(
-                    "the scheduler node accepted rank {} for this process's rank {rank}",
-                    accepted.rank
-                )));
-            }
-            return Ok(channel);
-        }
-
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(Error::transport(format!(
-                "the scheduler node at {address} did not accept this process's registration"
-            )));
-        }
-        channel.wait(left).map_err(|error| {
-            Error::transport_source("awaiting the registration's response", error)
+    let accepted = channel
+        .recv::<PeerAccepted>(timeout)
+        .map_err(|error| Error::transport_source("awaiting the registration's response", error))?
+        .ok_or_else(|| {
+            Error::transport(format!(
+                "the scheduler node at {address} did not accept this process's registration \
+                 within {} s",
+                timeout.as_secs()
+            ))
         })?;
+    if accepted.rank != rank {
+        return Err(Error::Invalid(format!(
+            "the scheduler node accepted rank {} for this process's rank {rank}",
+            accepted.rank
+        )));
     }
+    Ok(channel)
 }
 
 /// Reads the session the scheduler node relays to this peer ([`Remote::session`]) on `channel`,
-/// its registered connection, before any thread owns it, within `timeout`: the request's
-/// `message_id`, which the answer ([`MainProcessResponse::Placed`]) carries, the layout the
-/// session was opened with, and the buffer pool's answer.
+/// its registered connection, before any thread owns it: the number of the frame, which the answer
+/// ([`MainProcessResponse::Placed`]) states, the layout the session was opened with, and the buffer
+/// pool's answer. The scheduler node relays it once its own ranks loaded; it waits for as long as
+/// the scheduler node keeps the connection.
 ///
 /// # Errors
 ///
-/// When no frame arrives in time, the connection fails, or its first frame is not the session.
-pub(crate) fn session(channel: &mut Connection, timeout: Duration) -> Result<(u64, Open, Opened)> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let request = channel.try_recv::<MainProcessRequest>().map_err(|error| {
+/// When the connection fails or closes, or its first frame is not the session.
+pub(crate) fn session(channel: &mut Connection) -> Result<(u64, Open, Opened)> {
+    let frame = loop {
+        let received = channel.recv::<ToPeer>(Duration::MAX).map_err(|error| {
             Error::transport_source("reading the scheduler node's session", error)
         })?;
-        match request {
-            Some(MainProcessRequest::Session {
-                message_id,
-                open,
-                opened,
-            }) => return Ok((message_id.unwrap_or(0), *open, *opened)),
-            Some(other) => {
-                return Err(Error::transport(format!(
-                    "the scheduler node's first request after the registration is no session: \
-                     {other:?}"
-                )));
-            }
-            None => {}
+        if let Some(frame) = received {
+            break frame;
         }
-
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(Error::transport(format!(
-                "the scheduler node relayed no session within {} s",
-                timeout.as_secs()
-            )));
-        }
-        channel.wait(left).map_err(|error| {
-            Error::transport_source("awaiting the scheduler node's session", error)
-        })?;
+    };
+    match frame.request {
+        MainProcessRequest::Session { open, opened } => Ok((frame.id, *open, *opened)),
+        other => Err(Error::transport(format!(
+            "the scheduler node's first request after the registration is no session: {other:?}"
+        ))),
     }
 }
 
-/// The submissions a peer has not completed yet, by the `message_id` they were sent under: each
-/// with, for a job of a group, the sequences of its group and the rank the peer reports there
-/// as; none for a generation's switch, commit or rollback, which addresses no group.
+/// The submissions a peer has not completed yet, by the number of the frame they were sent in:
+/// each with, for a job of a group, the sequences of its group and the rank the peer reports
+/// there as; none for a generation's switch, commit or rollback, which addresses no group.
 type Pending = Mutex<HashMap<u64, (Arc<SubmissionState>, Option<(Arc<Sequences>, usize)>)>>;
 
 /// What a peer answers a request that is no job of a group (the relayed session, a data plane's
 /// operation): its response, or why there is none.
 pub(crate) type Answer = Receiver<std::result::Result<MainProcessResponse, String>>;
 
-/// The requests that are no job of a group a peer has not answered yet, by their `message_id`.
+/// The requests that are no job of a group a peer has not answered yet, by the number of their
+/// frame.
 type Asked = Mutex<HashMap<u64, Sender<std::result::Result<MainProcessResponse, String>>>>;
 
 /// The scheduler node's link to one peer engine process: where a group's jobs for the peer's
@@ -371,11 +337,11 @@ type Asked = Mutex<HashMap<u64, Sender<std::result::Result<MainProcessResponse, 
 pub struct Remote {
     /// The first rank the peer's process serves, which its registration stated.
     rank: u32,
-    outbox: Sender<MainProcessRequest>,
+    outbox: Sender<ToPeer>,
     wake: service::Wake,
     pending: Arc<Pending>,
     asked: Arc<Asked>,
-    /// The `message_id` of the next request.
+    /// The number of the next frame.
     next: AtomicU64,
     liveness: Arc<Liveness>,
     closing: Arc<AtomicBool>,
@@ -443,7 +409,7 @@ impl Remote {
 
     /// Runs `operation` of the data plane on the peer's ranks
     /// ([`MainProcessRequest::Data`]). Its answer is [`MainProcessResponse::Operated`] with the
-    /// JSON of the operation's value, or the peer's failure; see [`operated`].
+    /// operation's value, or the peer's failure; see [`operated`].
     ///
     /// # Errors
     ///
@@ -453,15 +419,14 @@ impl Remote {
     }
 
     /// Sends `request`, which is no job of a group, and returns where its answer arrives.
-    fn ask(&self, mut request: MainProcessRequest) -> Result<Answer> {
+    fn ask(&self, request: MainProcessRequest) -> Result<Answer> {
         self.live()?;
 
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        request.set_message_id(Some(id));
         let (answer, answered) = crossbeam_channel::bounded(1);
         lock(&self.asked).insert(id, answer);
 
-        if self.outbox.send(request).is_err() {
+        if self.outbox.send(ToPeer { id, request }).is_err() {
             lock(&self.asked).remove(&id);
             return Err(Error::State("the peer link's thread has ended"));
         }
@@ -490,19 +455,18 @@ impl Remote {
     /// Once the link is lost: the group cannot run its jobs without the peer's ranks.
     pub(super) fn send(
         &self,
-        mut request: MainProcessRequest,
+        request: MainProcessRequest,
         reporting: Option<(&Arc<Sequences>, usize)>,
     ) -> Result<Submission> {
         self.live()?;
 
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        request.set_message_id(Some(id));
         let (submission, state) = Submission::pending(SubmissionId(id));
         let reporting = reporting.map(|(sequences, rank)| (Arc::clone(sequences), rank));
         lock(&self.pending).insert(id, (state, reporting));
 
         self.outbox
-            .send(request)
+            .send(ToPeer { id, request })
             .map_err(|_| Error::State("the peer link's thread has ended"))?;
         self.wake.wake();
         Ok(submission)
@@ -511,7 +475,11 @@ impl Remote {
     /// Closes the link: the peer reads the close and ends, as the scheduler node does.
     pub fn close(&self) {
         self.closing.store(true, Ordering::Release);
-        let _ = self.outbox.send(MainProcessRequest::close());
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let _ = self.outbox.send(ToPeer {
+            id,
+            request: MainProcessRequest::close(),
+        });
         self.wake.wake();
 
         if let Some(thread) = lock(&self.thread).take()
@@ -540,7 +508,7 @@ pub(crate) fn operated(rank: u32, answer: &Answer) -> Result<Vec<u8>> {
         .recv()
         .map_err(|_| Error::State("the peer link ended before it answered"))?;
     match answered {
-        Ok(MainProcessResponse::Operated { reply, .. }) => Ok(reply),
+        Ok(MainProcessResponse::Operated { reply }) => Ok(reply),
         Ok(other) => Err(Error::transport(format!(
             "rank {rank}'s engine process answered an operation with {:?}",
             other.kind()
@@ -552,12 +520,12 @@ pub(crate) fn operated(rank: u32, answer: &Answer) -> Result<Vec<u8>> {
 }
 
 /// The scheduler node's side of the connection to the peer whose ranks start at `rank`: sends
-/// what the scheduler queued, settles each response by its `message_id`, and on a close fails
-/// every submission and request the peer left open.
+/// what the scheduler queued, settles each response by the number of its frame, and on a close
+/// fails every submission and request the peer left open.
 fn remote_link(
     rank: u32,
     mut channel: Connection,
-    queued: &Receiver<MainProcessRequest>,
+    queued: &Receiver<ToPeer>,
     pending: &Pending,
     asked: &Asked,
     liveness: &Liveness,
@@ -566,9 +534,9 @@ fn remote_link(
     let failure = loop {
         let mut failed = None;
 
-        while let Ok(request) = queued.try_recv() {
-            let close = matches!(request, MainProcessRequest::Close { .. });
-            if let Err(error) = channel.send(&request) {
+        while let Ok(frame) = queued.try_recv() {
+            let close = matches!(frame.request, MainProcessRequest::Close);
+            if let Err(error) = channel.send(&frame) {
                 failed = Some(format!("sending to rank {rank}'s engine process: {error}"));
                 break;
             }
@@ -589,8 +557,8 @@ fn remote_link(
         }
 
         loop {
-            match channel.try_recv::<MainProcessResponse>() {
-                Ok(Some(response)) => settle(rank, pending, asked, response),
+            match channel.try_recv::<FromPeer>() {
+                Ok(Some(frame)) => settle(rank, pending, asked, frame),
                 Ok(None) => break,
                 Err(error) => {
                     failed = Some(format!("rank {rank}'s engine process: {error}"));
@@ -602,7 +570,9 @@ fn remote_link(
             break failed;
         }
 
-        if let Err(error) = channel.wait(LINK_WAIT) {
+        // Whatever is queued fires the connection's wake, so the link sleeps until a frame
+        // arrives, a queued frame is written or another thread queues one.
+        if let Err(error) = channel.wait(Duration::MAX) {
             break format!("rank {rank}'s engine process: {error}");
         }
     };
@@ -615,18 +585,10 @@ fn remote_link(
     }
 }
 
-/// Settles the submission or the request `response` belongs to.
-fn settle(rank: u32, pending: &Pending, asked: &Asked, response: MainProcessResponse) {
+/// Settles the submission or the request the frame `id` answers with `response`.
+fn settle(rank: u32, pending: &Pending, asked: &Asked, FromPeer { id, response }: FromPeer) {
     // An answer to a request that is no job of a group, or its refusal, settles that request.
-    let question = match &response {
-        MainProcessResponse::Placed { message_id, .. }
-        | MainProcessResponse::Operated { message_id, .. }
-        | MainProcessResponse::Error { message_id, .. } => {
-            message_id.and_then(|id| lock(asked).remove(&id))
-        }
-        _ => None,
-    };
-    if let Some(question) = question {
+    if let Some(question) = lock(asked).remove(&id) {
         let _ = question.send(match response {
             MainProcessResponse::Error { error, .. } => Err(error.message),
             answer => Ok(answer),
@@ -634,20 +596,14 @@ fn settle(rank: u32, pending: &Pending, asked: &Asked, response: MainProcessResp
         return;
     }
 
-    let (id, status, ended) = match response {
+    let (status, ended) = match response {
         MainProcessResponse::Result {
-            message_id,
             result,
             requests,
             ended,
         } => match messages::decode_requests(&requests) {
-            Ok(requests) => (
-                message_id,
-                Outcome::Success((result, requests)),
-                Some(ended),
-            ),
+            Ok(requests) => (Outcome::Success((result, requests)), Some(ended)),
             Err(error) => (
-                message_id,
                 Outcome::Failed(fault(Error::transport(format!(
                     "rank {rank}'s engine process returned a request that is not one: {error}"
                 )))),
@@ -655,7 +611,6 @@ fn settle(rank: u32, pending: &Pending, asked: &Asked, response: MainProcessResp
             ),
         },
         MainProcessResponse::Error {
-            message_id,
             error,
             requests,
             ended,
@@ -676,26 +631,15 @@ fn settle(rank: u32, pending: &Pending, asked: &Asked, response: MainProcessResp
                     "rank {rank}'s engine process returned a request that is not one: {error}"
                 )),
             };
-            (message_id, Outcome::Failed(fault(failure)), Some(ended))
-        }
-        MainProcessResponse::Stalled { stall } => {
-            // The peer's own watchdog fails its rank on a stall; its close follows.
-            tracing::warn!(
-                rank,
-                batch = ?stall.batch_id,
-                running_ms = stall.running_ms,
-                "a peer engine process reports a stalled job"
-            );
-            return;
+            (Outcome::Failed(fault(failure)), Some(ended))
         }
         other => {
-            tracing::warn!(rank, kind = ?other.kind(), "a peer sent what nothing asked for");
+            tracing::warn!(rank, id, kind = ?other.kind(), "a peer sent what nothing asked for");
             return;
         }
     };
 
-    let state = id.and_then(|id| lock(pending).remove(&id));
-    match state {
+    match lock(pending).remove(&id) {
         Some((state, reporting)) => {
             // The group's word covers what the peer's ranks ended before anyone reads the job's
             // outcome.
@@ -706,7 +650,7 @@ fn settle(rank: u32, pending: &Pending, asked: &Asked, response: MainProcessResp
         }
         None => tracing::warn!(
             rank,
-            ?id,
+            id,
             "a peer completed a submission this link did not send"
         ),
     }
@@ -727,13 +671,13 @@ fn fault(error: Error) -> Arc<Fault> {
     Arc::new(error)
 }
 
-/// What a peer runs a data plane's operation with: the operation's value as JSON, or its
-/// failure in words. It runs on the peer's operations thread, one operation at a time.
+/// What a peer runs a data plane's operation with: the operation's value in the link's encoding,
+/// or its failure in words. It runs on the peer's operations thread, one operation at a time.
 pub type Operate = Box<dyn FnMut(DataOperation) -> std::result::Result<Vec<u8>, String> + Send>;
 
 /// One job of this process's ranks the responder waits for, in the order it was handed: the
-/// request's `message_id`, the group whose ended sequence its response states (none for a
-/// generation's switch, commit or rollback), and its submission.
+/// number of the frame that carried it, the group whose ended sequence its response states (none
+/// for a generation's switch, commit or rollback), and its submission.
 type Awaited = (u64, Option<GroupId>, Submission);
 
 /// A peer's side of its connection to the scheduler node: hands every job the scheduler node
@@ -764,7 +708,7 @@ impl Upstream {
         liveness: Arc<Liveness>,
         mut operate: Operate,
     ) -> Result<Self> {
-        let (responses, responded) = crossbeam_channel::unbounded::<MainProcessResponse>();
+        let (responses, responded) = crossbeam_channel::unbounded::<FromPeer>();
         let (waiting, awaited) = crossbeam_channel::unbounded::<Awaited>();
         let (operations, operating) = crossbeam_channel::unbounded::<(u64, DataOperation)>();
         let closing = Arc::new(AtomicBool::new(false));
@@ -785,13 +729,10 @@ impl Upstream {
                         let ended = group.map_or(Ok(0), |group| route.completed(group));
                         let response = match (outcome, ended) {
                             (Outcome::Success((output, requests)), Ok(ended)) => {
-                                let mut response =
-                                    MainProcessResponse::result(output, &requests, ended);
-                                response.set_message_id(Some(id));
-                                response
+                                MainProcessResponse::result(output, &requests, ended)
                             }
                             (Outcome::Success(_), Err(error)) => {
-                                MainProcessResponse::failed(id, error.to_string(), &[], 0)
+                                MainProcessResponse::failed(error.to_string(), &[], 0)
                             }
                             (Outcome::Failed(error), ended) => {
                                 // A failed batch returns the `Finish` of each copy it started.
@@ -799,16 +740,13 @@ impl Upstream {
                                     .downcast_ref::<Error>()
                                     .map_or(&[][..], Error::finished);
                                 let ended = ended.unwrap_or(0);
-                                MainProcessResponse::failed(id, error.to_string(), finished, ended)
+                                MainProcessResponse::failed(error.to_string(), finished, ended)
                             }
-                            (Outcome::Cancelled, _) => MainProcessResponse::failed(
-                                id,
-                                "the job was cancelled".into(),
-                                &[],
-                                0,
-                            ),
+                            (Outcome::Cancelled, _) => {
+                                MainProcessResponse::failed("the job was cancelled".into(), &[], 0)
+                            }
                         };
-                        if responses.send(response).is_err() {
+                        if responses.send(FromPeer { id, response }).is_err() {
                             return;
                         }
                         wake.wake();
@@ -825,13 +763,10 @@ impl Upstream {
                 .spawn(move || {
                     for (id, operation) in operating {
                         let response = match operate(operation) {
-                            Ok(reply) => MainProcessResponse::Operated {
-                                message_id: Some(id),
-                                reply,
-                            },
-                            Err(reason) => MainProcessResponse::failed(id, reason, &[], 0),
+                            Ok(reply) => MainProcessResponse::Operated { reply },
+                            Err(reason) => MainProcessResponse::failed(reason, &[], 0),
                         };
-                        if responses.send(response).is_err() {
+                        if responses.send(FromPeer { id, response }).is_err() {
                             return;
                         }
                         wake.wake();
@@ -893,7 +828,7 @@ fn upstream_link(
     mut channel: Connection,
     route: &Route,
     (waiting, operations): (&Sender<Awaited>, &Sender<(u64, DataOperation)>),
-    responded: &Receiver<MainProcessResponse>,
+    responded: &Receiver<FromPeer>,
     liveness: &Liveness,
     closing: &AtomicBool,
 ) {
@@ -916,8 +851,8 @@ fn upstream_link(
         }
 
         loop {
-            let request = match channel.try_recv::<MainProcessRequest>() {
-                Ok(Some(request)) => request,
+            let ToPeer { id, request } = match channel.try_recv::<ToPeer>() {
+                Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(error) => {
                     failed = Some(format!("the scheduler node's engine process: {error}"));
@@ -925,43 +860,25 @@ fn upstream_link(
                 }
             };
 
-            let (id, group, submitted) = match request {
+            let (group, submitted) = match request {
                 MainProcessRequest::Submit {
-                    message_id,
                     sequence,
                     pass,
                     batch,
-                } => (
-                    message_id.unwrap_or(0),
-                    Some(batch.group),
-                    route.run(sequence, *batch, pass, false),
-                ),
-                MainProcessRequest::Shadow {
-                    message_id,
-                    sequence,
-                    batch,
-                } => (
-                    message_id.unwrap_or(0),
-                    Some(batch.group),
-                    route.run(sequence, *batch, false, true),
-                ),
+                } => (Some(batch.group), route.run(sequence, *batch, pass, false)),
+                MainProcessRequest::Shadow { sequence, batch } => {
+                    (Some(batch.group), route.run(sequence, *batch, false, true))
+                }
                 MainProcessRequest::Map {
-                    message_id,
                     group,
                     slot,
                     request,
                     completion,
                 } => (
-                    message_id.unwrap_or(0),
                     Some(group),
                     mapped(route, group, slot, &request, &completion),
                 ),
-                MainProcessRequest::Stamp {
-                    message_id,
-                    group,
-                    requests,
-                } => (
-                    message_id.unwrap_or(0),
+                MainProcessRequest::Stamp { group, requests } => (
                     Some(group),
                     messages::decode_requests(&requests)
                         .map_err(|error| {
@@ -969,40 +886,24 @@ fn upstream_link(
                         })
                         .and_then(|requests| route.stamp(group, requests)),
                 ),
-                MainProcessRequest::Switch {
-                    message_id,
-                    generation,
-                } => (message_id.unwrap_or(0), None, route.switch(generation)),
-                MainProcessRequest::Commit {
-                    message_id,
-                    generation,
-                } => (message_id.unwrap_or(0), None, route.commit(generation)),
-                MainProcessRequest::Rollback {
-                    message_id,
-                    generation,
-                } => (message_id.unwrap_or(0), None, route.rollback(generation)),
-                MainProcessRequest::Data {
-                    message_id,
-                    operation,
-                } => {
-                    if operations
-                        .send((message_id.unwrap_or(0), operation))
-                        .is_err()
-                    {
+                MainProcessRequest::Switch { generation } => (None, route.switch(generation)),
+                MainProcessRequest::Commit { generation } => (None, route.commit(generation)),
+                MainProcessRequest::Rollback { generation } => (None, route.rollback(generation)),
+                MainProcessRequest::Data { operation } => {
+                    if operations.send((id, operation)).is_err() {
                         failed = Some("the peer's operations thread ended".into());
                         break;
                     }
                     continue;
                 }
                 // The session was read before this thread owned the connection.
-                MainProcessRequest::Session { message_id, .. } => (
-                    message_id.unwrap_or(0),
+                MainProcessRequest::Session { .. } => (
                     None,
                     Err(Error::Invalid(
                         "the session was relayed once, at this process's start".to_owned(),
                     )),
                 ),
-                MainProcessRequest::Close { .. } => {
+                MainProcessRequest::Close => {
                     // The scheduler node's orderly end: this process ends in order with it.
                     let _ = channel.flush();
                     channel.shutdown();
@@ -1020,13 +921,12 @@ fn upstream_link(
                 }
                 Err(error) => {
                     let ended = group.map_or(Ok(0), |group| route.completed(group));
-                    let refusal = MainProcessResponse::failed(
-                        id,
+                    let response = MainProcessResponse::failed(
                         error.to_string(),
                         error.finished(),
                         ended.unwrap_or(0),
                     );
-                    if let Err(error) = channel.send(&refusal) {
+                    if let Err(error) = channel.send(&FromPeer { id, response }) {
                         failed = Some(format!("responding to the scheduler node: {error}"));
                         break;
                     }
@@ -1037,7 +937,9 @@ fn upstream_link(
             break failed;
         }
 
-        if let Err(error) = channel.wait(LINK_WAIT) {
+        // The responder and the operations thread fire the connection's wake for what they
+        // queue, so the link sleeps until a frame arrives, a response is written or one is queued.
+        if let Err(error) = channel.wait(Duration::MAX) {
             break format!("the scheduler node's engine process: {error}");
         }
     };
@@ -1082,14 +984,21 @@ mod tests {
     /// The worker group of the tests' batches.
     const GROUP: GroupId = GroupId(0);
 
-    /// Liveness of a test process, which a lost link must not end, with what its callback
-    /// receives once a link is lost or closed.
+    /// Liveness of a test process, with what its callback receives once a link is lost or
+    /// closed.
     fn liveness() -> (Arc<Liveness>, Receiver<()>) {
         let (lost, called) = crossbeam_channel::unbounded();
         let callback: Waker = Arc::new(move || {
             let _ = lost.send(());
         });
-        (Liveness::new(callback, Duration::from_secs(3600)), called)
+        (Liveness::new(callback), called)
+    }
+
+    /// A peer listener on a port of the loopback, as the daemon reserves one, with its address.
+    fn listener() -> (Listener, String) {
+        let listener = Listener::bind(&"127.0.0.1:0".parse().unwrap()).expect("a listener");
+        let address = listener.endpoint().to_string();
+        (listener, address)
     }
 
     /// Batch `id` of [`GROUP`]: a greedy decode of no row.
@@ -1107,20 +1016,20 @@ mod tests {
         }
     }
 
-    /// The next request the scheduler node sends on `channel`.
-    fn next_request(channel: &mut Connection) -> MainProcessRequest {
-        loop {
-            if let Some(request) = channel.try_recv::<MainProcessRequest>().expect("a request") {
-                return request;
-            }
-            channel.wait(LONG).expect("the request arrives");
-        }
+    /// The next request the scheduler node sends on `channel`, with the number of its frame.
+    fn next_request(channel: &mut Connection) -> (u64, MainProcessRequest) {
+        let frame = channel
+            .recv::<ToPeer>(LONG)
+            .expect("a request")
+            .expect("the request arrives");
+        (frame.id, frame.request)
     }
 
-    /// Sends `response` as the answer to the request sent under `id`.
-    fn answer(channel: &mut Connection, id: Option<u64>, mut response: MainProcessResponse) {
-        response.set_message_id(id);
-        channel.deliver(&response).expect("the response is sent");
+    /// Sends `response` as the answer to the request of frame `id`.
+    fn answer(channel: &mut Connection, id: u64, response: MainProcessResponse) {
+        channel
+            .deliver(&FromPeer { id, response })
+            .expect("the response is sent");
     }
 
     /// The scheduler node's link to one peer that registers as rank `rank` of engine `engine`
@@ -1131,8 +1040,7 @@ mod tests {
         liveness: Arc<Liveness>,
         peer: impl FnOnce(Connection) + Send + 'static,
     ) -> (Arc<Remote>, JoinHandle<()>) {
-        let listener = Listener::bind(&["127.0.0.1:0"]).expect("a listener");
-        let address = listener.addresses()[0].clone();
+        let (listener, address) = listener();
         let peer = std::thread::spawn(move || {
             peer(register(&address, rank, engine, LONG).expect("the peer registers"));
         });
@@ -1185,10 +1093,12 @@ mod tests {
 
     #[test]
     fn a_peer_registers_with_the_scheduler_node_of_its_epoch() {
-        let listener = Listener::bind(&["127.0.0.1:0"]).expect("a listener");
+        let (listener, address) = listener();
 
-        let address = listener.addresses()[0].clone();
-        let dialling = std::thread::spawn(move || register(&address, 4, 7, LONG).map(|_| ()));
+        let dialling = {
+            let address = address.clone();
+            std::thread::spawn(move || register(&address, 4, 7, LONG).map(|_| ()))
+        };
         let accepted = accept(&listener, 1, 7, LONG).expect("the peer registers");
         assert_eq!(
             accepted.iter().map(|(rank, _)| *rank).collect::<Vec<_>>(),
@@ -1200,7 +1110,6 @@ mod tests {
             .expect("the registration is accepted");
 
         // A registration of another epoch is refused, and the peer learns it from the close.
-        let address = listener.addresses()[0].clone();
         let stranger = std::thread::spawn(move || {
             register(&address, 4, 8, Duration::from_secs(2)).map(|_| ())
         });
@@ -1208,9 +1117,28 @@ mod tests {
         assert!(stranger.join().expect("the stranger's dial").is_err());
     }
 
+    /// A connection that stays silent, or sends what no peer sends, holds up no registration.
+    #[test]
+    fn a_stranger_on_the_peer_listener_holds_up_no_registration() {
+        use std::io::Write as _;
+
+        let (listener, address) = listener();
+        let _silent = std::net::TcpStream::connect(&address).unwrap();
+        let mut stranger = std::net::TcpStream::connect(&address).unwrap();
+        stranger.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+
+        let dialling = std::thread::spawn(move || register(&address, 2, 7, LONG).map(|_| ()));
+        let accepted = accept(&listener, 1, 7, LONG).expect("the peer registers");
+        assert_eq!(accepted[0].0, 2);
+        dialling
+            .join()
+            .expect("the dial")
+            .expect("the registration is accepted");
+    }
+
     #[test]
     fn peers_that_do_not_arrive_fail_the_start_by_count() {
-        let listener = Listener::bind(&["127.0.0.1:0"]).expect("a listener");
+        let (listener, _) = listener();
 
         let refused = accept(&listener, 2, 7, Duration::from_millis(50))
             .err()
@@ -1291,22 +1219,21 @@ mod tests {
         let (remote, peer) = linked(1, 5, liveness, move |mut channel| {
             // The session is the first request after the registration, read before any thread
             // owns the connection.
-            let (id, open, opened) = session(&mut channel, LONG).expect("the relayed session");
+            let (id, open, opened) = session(&mut channel).expect("the relayed session");
             assert_eq!((open, opened), relayed);
 
             let (created, places, capacities) = held;
             let placed = MainProcessResponse::Placed {
-                message_id: None,
                 endpoint: "10.0.0.2:7000".to_owned(),
                 created,
                 places,
                 capacities,
             };
-            answer(&mut channel, Some(id), placed);
+            answer(&mut channel, id, placed);
 
             assert!(matches!(
-                next_request(&mut channel),
-                MainProcessRequest::Close { .. }
+                next_request(&mut channel).1,
+                MainProcessRequest::Close
             ));
         });
 
@@ -1346,24 +1273,19 @@ mod tests {
 
         let returned = finish.clone();
         let (remote, peer) = linked(1, 3, liveness, move |mut channel| {
-            let MainProcessRequest::Submit {
-                message_id,
-                sequence,
-                ..
-            } = next_request(&mut channel)
+            let (id, MainProcessRequest::Submit { sequence, .. }) = next_request(&mut channel)
             else {
                 panic!("the scheduler node sent no batch");
             };
             assert_eq!(sequence, 1);
 
             // The peer's ranks failed the batch after its copy started, and ended it.
-            let id = message_id.unwrap_or(0);
-            let failed = MainProcessResponse::failed(id, "a device fault".into(), &[returned], 1);
-            channel.deliver(&failed).expect("the failure is sent");
+            let failed = MainProcessResponse::failed("a device fault".into(), &[returned], 1);
+            answer(&mut channel, id, failed);
 
             assert!(matches!(
-                next_request(&mut channel),
-                MainProcessRequest::Close { .. }
+                next_request(&mut channel).1,
+                MainProcessRequest::Close
             ));
         });
         let (route, sequences) = routed(&remote);
@@ -1398,12 +1320,14 @@ mod tests {
         let peer = |failing: bool, expected: [(u64, bool); 2]| {
             move |mut channel: Connection| {
                 for (sequence, pass) in expected {
-                    let MainProcessRequest::Submit {
-                        message_id,
-                        sequence: handed,
-                        pass: passed,
-                        batch,
-                    } = next_request(&mut channel)
+                    let (
+                        id,
+                        MainProcessRequest::Submit {
+                            sequence: handed,
+                            pass: passed,
+                            batch,
+                        },
+                    ) = next_request(&mut channel)
                     else {
                         panic!("the scheduler node sent no batch");
                     };
@@ -1421,11 +1345,11 @@ mod tests {
                         ..BatchOutput::default()
                     };
                     let ended = MainProcessResponse::result(output, &[], sequence);
-                    answer(&mut channel, message_id, ended);
+                    answer(&mut channel, id, ended);
                 }
                 assert!(matches!(
-                    next_request(&mut channel),
-                    MainProcessRequest::Close { .. }
+                    next_request(&mut channel).1,
+                    MainProcessRequest::Close
                 ));
             }
         };
@@ -1471,24 +1395,15 @@ mod tests {
         let (remote, peer) = linked(1, 3, liveness, |mut channel| {
             let mut seen = Vec::new();
             for _ in 0..3 {
-                let (id, response) = match next_request(&mut channel) {
-                    MainProcessRequest::Submit {
-                        message_id,
-                        sequence,
-                        ..
-                    } => {
+                let (id, request) = next_request(&mut channel);
+                let response = match request {
+                    MainProcessRequest::Submit { sequence, .. } => {
                         seen.push(format!("batch {sequence}"));
-                        let ended =
-                            MainProcessResponse::result(BatchOutput::default(), &[], sequence);
-                        (message_id, ended)
+                        MainProcessResponse::result(BatchOutput::default(), &[], sequence)
                     }
-                    MainProcessRequest::Switch {
-                        message_id,
-                        generation,
-                    } => {
+                    MainProcessRequest::Switch { generation } => {
                         seen.push(format!("switch {generation}"));
-                        let ended = MainProcessResponse::result(BatchOutput::default(), &[], 0);
-                        (message_id, ended)
+                        MainProcessResponse::result(BatchOutput::default(), &[], 0)
                     }
                     other => panic!("the scheduler node sent {other:?}"),
                 };
@@ -1497,8 +1412,8 @@ mod tests {
             assert_eq!(seen, ["batch 1", "switch 2", "batch 2"]);
 
             assert!(matches!(
-                next_request(&mut channel),
-                MainProcessRequest::Close { .. }
+                next_request(&mut channel).1,
+                MainProcessRequest::Close
             ));
         });
         let (route, sequences) = routed(&remote);

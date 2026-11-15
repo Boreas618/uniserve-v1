@@ -25,7 +25,7 @@
 //! | [`worker`] | One [`Worker`](worker::Worker) per device, the only thread that issues on its streams: its job queue, sequences, watchdog, the completion of its jobs | one per device |
 //! | [`runner`] | The runners (causal language model, encoder, vision, denoiser, decoder, media host), graphs, buckets, the sampler | worker |
 //! | [`memory`] | A rank's memory: block tables, product buffers, the KV cache's planes, recurrent state, weights, the division of the quota, the client of the Storage Server (head and rank) | worker, start |
-//! | `profiling`, `parallel` | Profiling sessions and markers; communicators of a rank's groups | worker |
+//! | `profiling`, `parallel` | Profiling sessions and markers; the host groups ranks agree over | worker, start |
 //! | [`modules`] | Resolution of packages at the Build Server and the load of their modules | start, jobs |
 
 pub mod batch;

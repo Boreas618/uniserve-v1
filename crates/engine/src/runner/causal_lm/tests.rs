@@ -8,7 +8,6 @@
 //! writes its keys and values (`kv_write_`) and attends over them (`paged_attention`) through
 //! the page tables the runner gathers.
 
-use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,7 +40,7 @@ use super::{CausalLmConfig, CausalLmRunner, PageWork};
 use crate::memory::cache::{CacheLayout, CacheRegions, KvCacheConfig, KvCacheMemory};
 use crate::memory::state::{StateConfig, StateMemory};
 use crate::memory::tables::{BlockCopy, BlockTables};
-use crate::parallel::host::HostGroup;
+use crate::parallel::HostGroup;
 use crate::runner::Runner;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::graphs::Graphs;
@@ -2081,31 +2080,13 @@ fn the_runner_serves_the_phases_of_its_config() {
 /// The most rows a member of the tested union sends in a step: the largest bucket's tokens.
 const UNION_ROWS: u32 = 80;
 
-/// The host groups of a union of `size` members over loopback connections, in member order.
+/// The host groups of a union of `size` members of this process, in member order.
 fn host_groups(size: usize) -> Vec<Arc<HostGroup>> {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    let mut listener = Some(listener);
-
-    std::thread::scope(|scope| {
-        let members: Vec<_> = (0..size)
-            .map(|rank| {
-                // The first member holds the listener the address names.
-                let listener = listener.take().filter(|_| rank == 0);
-                let address = address.as_str();
-
-                scope.spawn(move || {
-                    let timeout = Duration::from_secs(30);
-                    Arc::new(HostGroup::connect(address, listener, rank, size, timeout).unwrap())
-                })
-            })
-            .collect();
-
-        members
-            .into_iter()
-            .map(|member| member.join().unwrap())
-            .collect()
-    })
+    HostGroup::local(size)
+        .unwrap()
+        .into_iter()
+        .map(Arc::new)
+        .collect()
 }
 
 /// Member `rank` of a union of two over `group`, whose join batches go to `join`.

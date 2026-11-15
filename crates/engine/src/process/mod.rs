@@ -53,8 +53,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::executor::peers::Liveness;
 use crate::executor::peers::messages::{RankOperation, RankReports};
-use crate::executor::peers::{LOST_EXIT, Liveness};
 use crate::process::binding::WeightsUpdated;
 use crate::worker::watchdog::Watchdog;
 use anyhow::{Context as _, Result, bail};
@@ -182,7 +182,7 @@ pub fn run(launch: EngineArgs, registry: &nn::family::Registry) -> Result<()> {
         let mut build = build_server::Client::connect(socket)
             .with_context(|| format!("connecting to the Build Server at {}", socket.display()))?;
         let policy = load::policy(&mut build, &launch.modules.policy)?;
-        let liveness = Liveness::new(lost, LOST_EXIT);
+        let liveness = Liveness::new(lost);
 
         let build = Some(Arc::new(Mutex::new(build)));
         start::start(launch, &registry, &storage, build, policy, liveness)

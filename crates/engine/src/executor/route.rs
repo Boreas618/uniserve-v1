@@ -315,10 +315,7 @@ impl Route {
     pub(crate) fn switch(&self, generation: u64) -> Result<Submission> {
         self.everywhere(
             |worker| worker.switch(generation),
-            || MainProcessRequest::Switch {
-                message_id: None,
-                generation,
-            },
+            || MainProcessRequest::Switch { generation },
         )
     }
 
@@ -331,10 +328,7 @@ impl Route {
     pub(crate) fn commit(&self, generation: u64) -> Result<Submission> {
         self.everywhere(
             |worker| worker.commit(generation),
-            || MainProcessRequest::Commit {
-                message_id: None,
-                generation,
-            },
+            || MainProcessRequest::Commit { generation },
         )
     }
 
@@ -347,10 +341,7 @@ impl Route {
     pub(crate) fn rollback(&self, generation: u64) -> Result<Submission> {
         self.everywhere(
             |worker| worker.rollback(generation),
-            || MainProcessRequest::Rollback {
-                message_id: None,
-                generation,
-            },
+            || MainProcessRequest::Rollback { generation },
         )
     }
 

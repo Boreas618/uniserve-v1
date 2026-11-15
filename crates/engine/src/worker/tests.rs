@@ -1734,8 +1734,8 @@ fn a_batch_with_no_rows_takes_its_number_runs_the_copies_and_no_forward() {
 #[test]
 fn a_group_s_ranks_on_another_host_take_its_jobs_and_state_what_they_ended() {
     let log = Log::default();
-    let listener = crate::executor::peers::link::Listener::bind(&["127.0.0.1:0"]).unwrap();
-    let address = listener.addresses()[0].clone();
+    let listener = service::Listener::bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = listener.endpoint().to_string();
 
     // The peer: an engine process holding the group's one rank, serving the scheduler node's
     // jobs until the test closes the link.
@@ -1746,7 +1746,7 @@ fn a_group_s_ranks_on_another_host_take_its_jobs_and_state_what_they_ended() {
         std::thread::spawn(move || {
             let channel = register(&address, 0, 7, LONG).unwrap();
             let (ranks, _, _) = group(ranks(1, &log), Vec::new());
-            let liveness = Liveness::new(Arc::new(|| {}), Duration::from_secs(3600));
+            let liveness = Liveness::new(Arc::new(|| {}));
             // This test's scheduler node runs no operation of the data plane.
             let operate: crate::executor::peers::Operate =
                 Box::new(|_| Err("this peer runs no operation".to_owned()));
@@ -1760,7 +1760,7 @@ fn a_group_s_ranks_on_another_host_take_its_jobs_and_state_what_they_ended() {
     // The scheduler node: it holds no rank of the group, only the link to the peer, whose
     // ended sequence its register holds.
     let (rank, channel) = accept(&listener, 1, 7, LONG).unwrap().pop().unwrap();
-    let liveness = Liveness::new(Arc::new(|| {}), Duration::from_secs(3600));
+    let liveness = Liveness::new(Arc::new(|| {}));
     let remote = Remote::spawn(rank, channel, Arc::clone(&liveness)).unwrap();
     let (pool, engine) = queue_pair(1);
     let sequences = Sequences::new(GROUP, 1, vec![(engine, 0)]);

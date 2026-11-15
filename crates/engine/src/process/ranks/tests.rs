@@ -1215,10 +1215,12 @@ fn two_host_ranks(layout: Layout, checkpoint: &Path) -> (EngineArgs, Vec<LoadedR
         let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
         let family = crate::process::catalogue::resolve(&registry, checkpoint).unwrap();
         let model_runner = ModelRunner::of(&launch, family).unwrap();
-        let meeting = Meeting::World {
-            address: address.clone(),
+        let meeting = Meeting::World(crate::parallel::Rendezvous {
             listener,
-        };
+            endpoint: address.clone(),
+            epoch: launch.epoch,
+            timeout: launch.engine_config.worker.join_timeout,
+        });
         let ranks = load_ranks(
             model_runner.ranks().unwrap(),
             Backing::Meta,
@@ -1536,7 +1538,7 @@ fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
     let limit = crate::memory::client::quota_limit(GB200_BYTES, 0.70);
     assert_eq!(limit, 138_528_423_936);
     let unreserved = limit - RETAINED_WEIGHTS - WARM_PROCESS;
-    let host = crate::parallel::host::HostGroup::single();
+    let host = crate::parallel::HostGroup::local(1).unwrap().remove(0);
     let (slots, (units, first), states) = rank
         .model_runner
         .divide_unreserved(

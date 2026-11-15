@@ -41,7 +41,7 @@ use crate::memory::cache::{ATTENTION_WORKSPACE_BYTES, CacheLayout, KvCacheConfig
 use crate::memory::client::{StorageClient, quota_limit};
 use crate::memory::division;
 use crate::memory::state::StateConfig;
-use crate::parallel::host::HostGroup;
+use crate::parallel::HostGroup;
 use crate::runner::buckets::Buckets;
 use crate::runner::causal_lm::{CausalLmConfig, CausalLmRunner};
 use anyhow::{Context as _, Result, bail};

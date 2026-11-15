@@ -1,12 +1,12 @@
-//! The peer link between the engine processes of an epoch: the codec its messages take on the
-//! workspace's one connection (`service::Connection`), and the scheduler node's listener.
+//! The peer link between the engine processes of an epoch: the codec its frames take on the
+//! workspace's one connection (`service::Connection`).
 //!
-//! Each [`MainProcessRequest`], [`MainProcessResponse`], [`PeerRegistration`] and [`PeerAccepted`]
-//! is one frame (`service::frame`) whose payload is the message in MessagePack
-//! (`rmp-serde`). The message types are the only definition of the protocol: the encoding is the
-//! one their `serde` derives describe, and both ends are built from this workspace
-//! ([`super::registration::VERSION`]), so no schema, generated code or version field accompanies
-//! it, and no bound beyond the frame header's limits a message.
+//! Each [`ToPeer`], [`FromPeer`], [`PeerRegistration`] and [`PeerAccepted`] is one frame
+//! (`service::frame`) whose payload is the message in MessagePack (`rmp-serde`). The message types
+//! are the only definition of the protocol: the encoding is the one their `serde` derives
+//! describe, and both ends are built from this workspace (a registration states the build,
+//! `proto::BUILD`), so no schema, generated code or version field accompanies it, and no bound
+//! beyond the frame header's limits a message.
 //!
 //! The encoding is positional: a struct is the array of its fields in declaration order, without
 //! their names. Every message type must therefore decode from a sequence, which rules out three
@@ -17,12 +17,8 @@
 //! round-trip tests of this crate carry every message family through its encoding.
 
 use std::io;
-use std::net::TcpListener;
-use std::os::fd::AsRawFd as _;
 
-use service::Connection;
-
-use super::messages::{MainProcessRequest, MainProcessResponse};
+use super::messages::{FromPeer, ToPeer};
 use super::registration::{PeerAccepted, PeerRegistration};
 
 /// Implements the workspace's connection codec for each message of the peer link.
@@ -53,88 +49,7 @@ macro_rules! peer_messages {
     };
 }
 
-peer_messages!(
-    MainProcessRequest,
-    MainProcessResponse,
-    PeerRegistration,
-    PeerAccepted
-);
-
-/// Accepts the peer link's connections on one or more addresses.
-pub struct Listener {
-    listeners: Vec<service::Listener>,
-    /// The bound addresses, in the order they were given.
-    addresses: Vec<String>,
-}
-
-impl Listener {
-    /// Binds every address in `addresses`: `unix:<path>` or `<host>:<port>`, where port zero
-    /// picks a free port that [`Self::addresses`] then reports.
-    ///
-    /// # Errors
-    ///
-    /// Fails when an address cannot be bound, for example a Unix socket path that exists.
-    pub fn bind(addresses: &[&str]) -> io::Result<Self> {
-        let listeners = addresses
-            .iter()
-            .map(|address| service::Listener::bind(&address.parse()?))
-            .collect::<io::Result<Vec<_>>>()?;
-        Ok(Self::over(listeners))
-    }
-
-    /// Accepts on a TCP socket that is already bound and listening: one the process inherited
-    /// from the daemon that reserved it, so the address its peers were given is live before the
-    /// process starts.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the socket's address cannot be read or it cannot be made non-blocking.
-    pub(crate) fn from_tcp(listener: TcpListener) -> io::Result<Self> {
-        Ok(Self::over(vec![service::Listener::from_tcp(listener)?]))
-    }
-
-    /// The bound addresses, in the order they were given to [`Self::bind`].
-    pub fn addresses(&self) -> &[String] {
-        &self.addresses
-    }
-
-    /// Takes one waiting connection, if any, without blocking.
-    ///
-    /// # Errors
-    ///
-    /// Fails when accepting fails.
-    pub(crate) fn try_accept(&self) -> io::Result<Option<Connection>> {
-        for listener in &self.listeners {
-            if let Some(connection) = listener.try_accept()? {
-                return Ok(Some(connection));
-            }
-        }
-        Ok(None)
-    }
-
-    /// The descriptors that become readable when a connection waits.
-    pub(crate) fn poll_fds(&self) -> Vec<libc::pollfd> {
-        self.listeners
-            .iter()
-            .map(|listener| libc::pollfd {
-                fd: listener.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            })
-            .collect()
-    }
-
-    fn over(listeners: Vec<service::Listener>) -> Self {
-        let addresses = listeners
-            .iter()
-            .map(|listener| listener.endpoint().to_string())
-            .collect();
-        Self {
-            listeners,
-            addresses,
-        }
-    }
-}
+peer_messages!(ToPeer, FromPeer, PeerRegistration, PeerAccepted);
 
 #[cfg(test)]
 mod tests;

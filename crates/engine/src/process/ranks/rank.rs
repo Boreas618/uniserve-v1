@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::parallel::host::HostGroup;
+use crate::parallel::HostGroup;
 use crate::runner::buckets::Buckets;
 use crate::runner::causal_lm::experts::{JoinHook, Member};
 use crate::runner::thread_pool::ThreadPool;

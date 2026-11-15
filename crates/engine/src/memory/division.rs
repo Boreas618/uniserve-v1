@@ -88,7 +88,7 @@
 use platform::{DeviceId, Nvml};
 use storage::{Item, Quota, Scope};
 
-use crate::parallel::host::HostGroup;
+use crate::parallel::HostGroup;
 use crate::worker::{Error, Result};
 
 /// `bytes` as a device pool maps them: whole allocation granules of `granularity` bytes, and
@@ -488,9 +488,6 @@ pub fn call_window(depth: usize, calls: usize) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::TcpListener;
-    use std::time::Duration;
-
     use storage::Reservation;
 
     use super::*;
@@ -532,23 +529,15 @@ mod tests {
         }
     }
 
-    /// Runs `body` on every member of a loopback group of `size` ranks, one thread each.
+    /// Runs `body` on every member of a group of `size` ranks of this process, one thread each.
     fn group<T: Send>(size: usize, body: impl Fn(HostGroup) -> T + Sync) -> Vec<T> {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap().to_string();
-        let mut listener = Some(listener);
-
         std::thread::scope(|threads| {
-            let handles: Vec<_> = (0..size)
-                .map(|rank| {
-                    let listener = listener.take().filter(|_| rank == 0);
-                    let address = address.as_str();
+            let handles: Vec<_> = HostGroup::local(size)
+                .unwrap()
+                .into_iter()
+                .map(|member| {
                     let body = &body;
-
-                    threads.spawn(move || {
-                        let timeout = Duration::from_secs(30);
-                        body(HostGroup::connect(address, listener, rank, size, timeout).unwrap())
-                    })
+                    threads.spawn(move || body(member))
                 })
                 .collect();
 
@@ -834,7 +823,7 @@ mod tests {
 
     #[test]
     fn the_cache_takes_the_remainder_in_whole_units() {
-        let group = HostGroup::single();
+        let group = HostGroup::local(1).unwrap().remove(0);
 
         // Ten units and most of an eleventh fit: the cache holds ten.
         let units = cache_units(10 * MIB + MIB - 1, MIB, 3, None, &group).unwrap();
@@ -846,7 +835,14 @@ mod tests {
 
     #[test]
     fn a_remainder_below_the_fewest_units_is_refused_with_the_shortfall() {
-        let error = cache_units(2 * MIB + 1, MIB, 3, None, &HostGroup::single()).unwrap_err();
+        let error = cache_units(
+            2 * MIB + 1,
+            MIB,
+            3,
+            None,
+            &HostGroup::local(1).unwrap().remove(0),
+        )
+        .unwrap_err();
 
         let message = error.to_string();
         assert!(matches!(error, Error::Unsupported(_)), "{message}");
@@ -856,7 +852,7 @@ mod tests {
 
     #[test]
     fn a_configured_capacity_sizes_the_cache_and_is_refused_when_it_does_not_fit() {
-        let group = HostGroup::single();
+        let group = HostGroup::local(1).unwrap().remove(0);
 
         // The remainder holds a hundred units; the configuration asks for forty.
         assert_eq!(
@@ -878,7 +874,7 @@ mod tests {
 
     #[test]
     fn a_cache_without_units_or_unit_bytes_is_refused() {
-        let group = HostGroup::single();
+        let group = HostGroup::local(1).unwrap().remove(0);
 
         assert!(matches!(
             cache_units(GIB, 0, 3, None, &group),

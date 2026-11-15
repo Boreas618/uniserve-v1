@@ -9,8 +9,8 @@ use service::{Connection, Message};
 use crate::batch::cache::CacheGroupKind;
 use crate::batch::{self, Capacity, ErrorCode, TimingCounters};
 use crate::executor::peers::messages::{
-    DataOperation, MainProcessRequest, MainProcessResponse, MainProcessResponseError,
-    RankOperation, ResponseKind, Stall, decode_requests,
+    DataOperation, FromPeer, MainProcessRequest, MainProcessResponse, MainProcessResponseError,
+    RankOperation, ResponseKind, ToPeer, decode_requests,
 };
 
 /// Returns `message` as a receiver decodes it from the payload a sender encoded.
@@ -195,13 +195,10 @@ fn operations() -> Vec<DataOperation> {
     ]
 }
 
-/// One fixture per kind of request, the submit frame with and without a correlation identity,
-/// and a data frame of every operation.
+/// One fixture per kind of request, and a data frame of every operation.
 fn request_fixtures() -> Vec<MainProcessRequest> {
     use storage::runtime::{Completion, GroupId, OwnerId, Request};
 
-    let mut submit = MainProcessRequest::submit(12, false, group_batch());
-    submit.set_message_id(Some(91));
     let allocate = Request::Allocate {
         owner: OwnerId(5),
         class: 1,
@@ -216,7 +213,7 @@ fn request_fixtures() -> Vec<MainProcessRequest> {
     let (open, opened) = session();
     let mut fixtures = vec![
         MainProcessRequest::session(&open, &opened),
-        submit,
+        MainProcessRequest::submit(12, false, group_batch()),
         MainProcessRequest::submit(13, true, group_batch()),
         MainProcessRequest::shadow(14, group_batch()),
         MainProcessRequest::map(
@@ -227,18 +224,9 @@ fn request_fixtures() -> Vec<MainProcessRequest> {
             &allocated,
         ),
         MainProcessRequest::stamp(GroupId(2), &stamped()),
-        MainProcessRequest::Switch {
-            message_id: Some(5),
-            generation: 2,
-        },
-        MainProcessRequest::Commit {
-            message_id: Some(6),
-            generation: 2,
-        },
-        MainProcessRequest::Rollback {
-            message_id: Some(7),
-            generation: 2,
-        },
+        MainProcessRequest::Switch { generation: 2 },
+        MainProcessRequest::Commit { generation: 2 },
+        MainProcessRequest::Rollback { generation: 2 },
         MainProcessRequest::close(),
     ];
     fixtures.extend(operations().into_iter().map(MainProcessRequest::data));
@@ -258,14 +246,12 @@ fn response_fixtures() -> Vec<MainProcessResponse> {
     }];
     vec![
         MainProcessResponse::Placed {
-            message_id: Some(16),
             endpoint: "10.0.0.3:7000".to_owned(),
             created: vec![(open.regions[0].name.clone(), opened.segments[0].clone())],
             places: vec![(open.regions[0].name.clone(), "a/0,b/0".to_owned(), 1, runs)],
             capacities: vec![(storage::runtime::GroupId(2), group_capacity())],
         },
         MainProcessResponse::Result {
-            message_id: Some(17),
             result: batch::BatchOutput {
                 timing: TimingCounters {
                     queued_us: 3,
@@ -280,11 +266,9 @@ fn response_fixtures() -> Vec<MainProcessResponse> {
         },
         MainProcessResponse::result(batch::BatchOutput::default(), &stamped(), 14),
         MainProcessResponse::Operated {
-            message_id: Some(18),
             reply: rmp_serde::to_vec(&[3_u32]).unwrap(),
         },
         MainProcessResponse::Error {
-            message_id: Some(17),
             error: MainProcessResponseError {
                 message: "device fault on decode".into(),
                 code: Some(ErrorCode::ComputeError),
@@ -295,22 +279,28 @@ fn response_fixtures() -> Vec<MainProcessResponse> {
             requests: Vec::new(),
             ended: 0,
         },
-        MainProcessResponse::failed(19, "a device fault".into(), &stamped()[1..], 9),
-        MainProcessResponse::Stalled {
-            stall: Stall {
-                batch_id: Some(12),
-                route: Some("decode".into()),
-                method: Some("uniserve.runner.forward".into()),
-                running_ms: 150_000,
-            },
-        },
+        MainProcessResponse::failed("a device fault".into(), &stamped()[1..], 9),
     ]
+}
+
+/// `request` as the peer reads it from the frame the scheduler node sent it in as `id`.
+fn request_round_trip(id: u64, request: MainProcessRequest) -> MainProcessRequest {
+    let frame = round_trip(&ToPeer { id, request });
+    assert_eq!(frame.id, id);
+    frame.request
+}
+
+/// `response` as the scheduler node reads it from the frame a peer answered request `id` with.
+fn response_round_trip(id: u64, response: MainProcessResponse) -> MainProcessResponse {
+    let frame = round_trip(&FromPeer { id, response });
+    assert_eq!(frame.id, id);
+    frame.response
 }
 
 #[test]
 fn every_request_kind_round_trips_through_ipc() {
-    for request in request_fixtures() {
-        assert_eq!(round_trip(&request), request);
+    for (id, request) in (1..).zip(request_fixtures()) {
+        assert_eq!(request_round_trip(id, request.clone()), request);
     }
 }
 
@@ -322,16 +312,15 @@ fn every_response_kind_round_trips_through_ipc() {
         ResponseKind::Result,
         ResponseKind::Operated,
         ResponseKind::Error,
-        ResponseKind::Stalled,
     ] {
         assert!(
             fixtures.iter().any(|response| response.kind() == kind),
             "no fixture covers response kind {kind:?}"
         );
     }
-    for response in fixtures {
+    for (id, response) in (1..).zip(fixtures) {
         assert_eq!(
-            round_trip(&response),
+            response_round_trip(id, response.clone()),
             response,
             "round trip for {:?}",
             response.kind()
@@ -341,19 +330,18 @@ fn every_response_kind_round_trips_through_ipc() {
 
 #[test]
 fn the_buffer_pool_s_requests_read_back_from_the_frames_that_carry_them() {
-    let MainProcessRequest::Stamp { requests, .. } = round_trip(&MainProcessRequest::stamp(
-        storage::runtime::GroupId(2),
-        &stamped(),
-    )) else {
+    let MainProcessRequest::Stamp { requests, .. } = request_round_trip(
+        1,
+        MainProcessRequest::stamp(storage::runtime::GroupId(2), &stamped()),
+    ) else {
         panic!("a stamp frame reads back as a stamp frame");
     };
     assert_eq!(decode_requests(&requests).unwrap(), stamped());
 
-    let response = round_trip(&MainProcessResponse::result(
-        batch::BatchOutput::default(),
-        &stamped(),
-        14,
-    ));
+    let response = response_round_trip(
+        2,
+        MainProcessResponse::result(batch::BatchOutput::default(), &stamped(), 14),
+    );
     let MainProcessResponse::Result {
         requests, ended, ..
     } = response
@@ -364,12 +352,10 @@ fn the_buffer_pool_s_requests_read_back_from_the_frames_that_carry_them() {
     assert_eq!(ended, 14);
 
     // A failure returns the `Finish` of the copies its batch started, readable as requests.
-    let response = round_trip(&MainProcessResponse::failed(
+    let response = response_round_trip(
         3,
-        "a device fault".into(),
-        &stamped()[1..],
-        9,
-    ));
+        MainProcessResponse::failed("a device fault".into(), &stamped()[1..], 9),
+    );
     let MainProcessResponse::Error {
         requests, ended, ..
     } = response
@@ -385,16 +371,24 @@ fn the_buffer_pool_s_requests_read_back_from_the_frames_that_carry_them() {
 
 #[test]
 fn a_message_decodes_only_as_the_message_it_is() {
-    let request = MainProcessRequest::close().encode().unwrap();
-    let refused = MainProcessResponse::decode(&request).unwrap_err();
+    let request = ToPeer {
+        id: 1,
+        request: MainProcessRequest::close(),
+    }
+    .encode()
+    .unwrap();
+    let refused = FromPeer::decode(&request).unwrap_err();
     assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
 
     // A message cut short, as a frame of another build may be, is refused: the frame's length
     // field counts the shortened message, so the connection receives it whole and its decoding
     // fails.
-    let mut cut = MainProcessResponse::result(batch::BatchOutput::default(), &[], 0)
-        .encode()
-        .unwrap();
+    let mut cut = FromPeer {
+        id: 1,
+        response: MainProcessResponse::result(batch::BatchOutput::default(), &[], 0),
+    }
+    .encode()
+    .unwrap();
     cut.pop();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut connection =
@@ -406,7 +400,7 @@ fn a_message_decodes_only_as_the_message_it_is() {
         }
     }
 
-    let received = connection.recv::<MainProcessResponse>(Duration::from_secs(5));
+    let received = connection.recv::<FromPeer>(Duration::from_secs(5));
     assert!(
         received
             .as_ref()

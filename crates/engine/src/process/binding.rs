@@ -2359,8 +2359,9 @@ pub(crate) struct WeightsUpdated {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::peers::link::Listener;
-    use crate::executor::peers::messages::{MainProcessRequest, MainProcessResponse};
+    use crate::executor::peers::messages::{
+        FromPeer, MainProcessRequest, MainProcessResponse, ToPeer,
+    };
     use crate::executor::peers::{Liveness, accept, register};
     use crate::memory::cache::info::CacheSegment;
     use crate::process::generation;
@@ -2380,33 +2381,30 @@ mod tests {
         held: Vec<GroupId>,
         answer: impl Fn(&DataOperation) -> Vec<u8> + Send + 'static,
     ) -> Peer {
-        let listener = Listener::bind(&["127.0.0.1:0"]).unwrap();
-        let address = listener.addresses()[0].clone();
+        let listener = service::Listener::bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = listener.endpoint().to_string();
         let thread = std::thread::spawn(move || {
             let mut channel = register(&address, rank, 1, LONG).unwrap();
             let mut operated = Vec::new();
             loop {
-                let Some(request) = channel.recv::<MainProcessRequest>(LONG).unwrap() else {
+                let Some(ToPeer { id, request }) = channel.recv::<ToPeer>(LONG).unwrap() else {
                     continue;
                 };
                 match request {
-                    MainProcessRequest::Data {
-                        message_id,
-                        operation,
-                    } => {
+                    MainProcessRequest::Data { operation } => {
                         let reply = answer(&operation);
                         operated.push(operation);
-                        let answered = MainProcessResponse::Operated { message_id, reply };
-                        channel.deliver(&answered).unwrap();
+                        let response = MainProcessResponse::Operated { reply };
+                        channel.deliver(&FromPeer { id, response }).unwrap();
                     }
-                    MainProcessRequest::Close { .. } => return operated,
+                    MainProcessRequest::Close => return operated,
                     other => panic!("the scheduler node sent {other:?}"),
                 }
             }
         });
 
         let (accepted, channel) = accept(&listener, 1, 1, LONG).unwrap().pop().unwrap();
-        let liveness = Liveness::new(Arc::new(|| {}), Duration::from_secs(3600));
+        let liveness = Liveness::new(Arc::new(|| {}));
         let remote = Remote::spawn(accepted, channel, liveness).unwrap();
         ((held, remote), thread)
     }

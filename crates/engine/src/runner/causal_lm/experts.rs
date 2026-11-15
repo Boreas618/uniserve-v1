@@ -58,7 +58,7 @@ use platform::Stream;
 use storage::runtime::GroupId;
 use tensor::Tensor;
 
-use crate::parallel::host::HostGroup;
+use crate::parallel::HostGroup;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::worker::{Error, Result};
 

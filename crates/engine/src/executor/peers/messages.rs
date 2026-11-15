@@ -1,12 +1,10 @@
-//! Worker request and response envelopes.
+//! The frames of the peer link and the requests and responses they carry.
 //!
-//! One [`MainProcessRequest`] or [`MainProcessResponse`] is the message of one
-//! frame of the peer link ([`super::link`]). Each envelope's optional `message_id` is the
-//! request-response correlation identity: a rank responds to a request under the
-//! identity it carried, and a transport that matches a response to its request
-//! reads the identity from the decoded envelope, taking `None` as zero. The one
-//! message a rank sends unasked, [`MainProcessResponse::Stalled`], responds to no
-//! request and carries no identity.
+//! Every frame the scheduler node sends a peer is a [`ToPeer`]: one [`MainProcessRequest`] under
+//! the number the scheduler node's link gave it. Every frame a peer sends back is a [`FromPeer`]:
+//! one [`MainProcessResponse`] under the number of the request it answers. The number is the
+//! frame's, not the request's: the link that sends a request numbers it, and the request and the
+//! response themselves state none.
 //!
 //! Between the engine processes of an epoch these frames carry:
 //!
@@ -49,8 +47,6 @@ pub(crate) enum MainProcessRequest {
     /// their parts of the host regions at their own host's Storage Server. Responds with
     /// [`MainProcessResponse::Placed`] once the peer's ranks are open, bound, spawned and warm.
     Session {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
         /// The layout the scheduler node opened the session with.
         open: Box<Open>,
         /// The buffer pool's answer: the numbers of the regions and their segment tables.
@@ -60,8 +56,6 @@ pub(crate) enum MainProcessRequest {
     /// [`MainProcessResponse::Result`]: the batch's output and the `Finish` of
     /// each copy the ranks ran with it.
     Submit {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
         /// The batch's number among the group's jobs that address its device
         /// block tables, which the scheduler node gave it.
         sequence: u64,
@@ -75,8 +69,6 @@ pub(crate) enum MainProcessRequest {
     /// against the serving one, which a group's ranks run together as they run
     /// its serving batches. Responds as [`Self::Submit`] is.
     Shadow {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
         /// The shadow batch's number among the group's jobs, as for a batch.
         sequence: u64,
         /// The shadow batch.
@@ -86,8 +78,6 @@ pub(crate) enum MainProcessRequest {
     /// the device block tables of the process's ranks of `group`, under
     /// `slot`. Responds with an empty [`MainProcessResponse::Result`].
     Map {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
         group: GroupId,
         /// The slot under which the request's entries are kept in the group.
         slot: u32,
@@ -102,8 +92,6 @@ pub(crate) enum MainProcessRequest {
     /// that returns the requests, each with the group's stamp as the process's
     /// ranks state it.
     Stamp {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
         group: GroupId,
         /// The requests' records (`storage::runtime::Request::encode`); their
         /// numbers are not read.
@@ -112,62 +100,26 @@ pub(crate) enum MainProcessRequest {
     /// Switches every rank of the process to the prepared generation `generation`, between the
     /// jobs of every group handed before and after it. Responds with an empty
     /// [`MainProcessResponse::Result`].
-    Switch {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
-        generation: u64,
-    },
+    Switch { generation: u64 },
     /// Commits the trial of generation `generation` on every rank of the process, behind the
     /// jobs handed before it. Responds as [`Self::Switch`] is.
-    Commit {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
-        generation: u64,
-    },
+    Commit { generation: u64 },
     /// Rolls generation `generation` back on every rank of the process, between the jobs of
     /// every group handed before and after it. Responds as [`Self::Switch`] is.
-    Rollback {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
-        generation: u64,
-    },
+    Rollback { generation: u64 },
     /// Runs one operation of the data plane on the process's ranks. Responds with
     /// [`MainProcessResponse::Operated`], or with [`MainProcessResponse::Error`] when the
     /// operation failed.
-    Data {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
-        operation: DataOperation,
-    },
+    Data { operation: DataOperation },
     /// Requests orderly worker shutdown.
-    Close {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
-    },
+    Close,
 }
 
 impl MainProcessRequest {
-    /// Replaces the request-response correlation identity (`message_id`).
-    pub(crate) fn set_message_id(&mut self, value: Option<u64>) {
-        match self {
-            Self::Session { message_id, .. }
-            | Self::Submit { message_id, .. }
-            | Self::Shadow { message_id, .. }
-            | Self::Map { message_id, .. }
-            | Self::Stamp { message_id, .. }
-            | Self::Switch { message_id, .. }
-            | Self::Commit { message_id, .. }
-            | Self::Rollback { message_id, .. }
-            | Self::Data { message_id, .. }
-            | Self::Close { message_id } => *message_id = value,
-        }
-    }
-
     /// Constructs a batch-submission request of the batch numbered
     /// `sequence`, which the process's ranks only number when `pass` is set.
     pub(crate) fn submit(sequence: u64, pass: bool, batch: Batch) -> Self {
         Self::Submit {
-            message_id: None,
             sequence,
             pass,
             batch: Box::new(batch),
@@ -178,7 +130,6 @@ impl MainProcessRequest {
     /// `sequence`.
     pub(crate) fn shadow(sequence: u64, batch: Batch) -> Self {
         Self::Shadow {
-            message_id: None,
             sequence,
             batch: Box::new(batch),
         }
@@ -199,7 +150,6 @@ impl MainProcessRequest {
         completion.encode(id, &mut answer);
 
         Self::Map {
-            message_id: None,
             group,
             slot,
             request: encoded,
@@ -211,7 +161,6 @@ impl MainProcessRequest {
     /// `requests`.
     pub(crate) fn stamp(group: GroupId, requests: &[Request]) -> Self {
         Self::Stamp {
-            message_id: None,
             group,
             requests: records(requests),
         }
@@ -220,7 +169,6 @@ impl MainProcessRequest {
     /// Constructs the request that relays the session `open` opened and `opened` answered.
     pub(crate) fn session(open: &Open, opened: &Opened) -> Self {
         Self::Session {
-            message_id: None,
             open: Box::new(open.clone()),
             opened: Box::new(opened.clone()),
         }
@@ -228,16 +176,29 @@ impl MainProcessRequest {
 
     /// Constructs the request that runs `operation` on the process's ranks.
     pub(crate) fn data(operation: DataOperation) -> Self {
-        Self::Data {
-            message_id: None,
-            operation,
-        }
+        Self::Data { operation }
     }
 
     /// Constructs a worker-shutdown request.
     pub(crate) fn close() -> Self {
-        Self::Close { message_id: None }
+        Self::Close
     }
+}
+
+/// A frame of the peer link from the scheduler node to a peer: `request`, numbered `id` by the
+/// scheduler node's link, which the answer states.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ToPeer {
+    pub(crate) id: u64,
+    pub(crate) request: MainProcessRequest,
+}
+
+/// A frame of the peer link from a peer to the scheduler node: `response`, the answer to the
+/// request the scheduler node numbered `id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FromPeer {
+    pub(crate) id: u64,
+    pub(crate) response: MainProcessResponse,
 }
 
 /// One operation of the data plane (`crate::process::data_plane::DataPlane`) on a peer's
@@ -443,9 +404,6 @@ pub(crate) enum ResponseKind {
     Operated,
     /// Structured worker failure.
     Error,
-    /// A job of the rank that has not completed within the rank's stall
-    /// bound.
-    Stalled,
 }
 
 /// Structured worker failure.
@@ -497,8 +455,6 @@ pub(crate) enum MainProcessResponse {
     /// Answers the relayed session ([`MainProcessRequest::Session`]) once the peer's ranks are
     /// open, bound, spawned and warm: what the scheduler node grants, places and schedules them by.
     Placed {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
         /// The TCP address of the peer's host's Storage Server (`StorageLaunch::tcp`), at
         /// which its ranks' units are retained.
         endpoint: String,
@@ -515,8 +471,6 @@ pub(crate) enum MainProcessResponse {
     /// Responds to a job of a worker group: a batch, a shadow batch, a
     /// completion mapped, requests stamped.
     Result {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
         /// A batch's output; empty for every other job.
         result: BatchOutput,
         /// The requests the job returns for the buffer pool's submission
@@ -530,16 +484,12 @@ pub(crate) enum MainProcessResponse {
     },
     /// Answers a data plane's operation ([`MainProcessRequest::Data`]).
     Operated {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
         /// The operation's value, in the link's own encoding (MessagePack).
         #[serde(with = "serde_bytes")]
         reply: Vec<u8>,
     },
     /// Returns a structured worker failure.
     Error {
-        /// Optional request-response correlation identity.
-        message_id: Option<u64>,
         /// Structured failure details.
         error: MainProcessResponseError,
         /// The `Finish { ok: false }` of each copy a failed batch had started, stamped with the
@@ -549,13 +499,6 @@ pub(crate) enum MainProcessResponse {
         /// The last numbered job of the failed job's group every rank of the responding
         /// process has ended, with every earlier one ended; zero for a job of no group.
         ended: u64,
-    },
-    /// Reports, unasked, a job the rank's builder thread stays inside. The
-    /// rank's control thread sends it once, and goes on serving the
-    /// channel; the engine fails the rank on it.
-    Stalled {
-        /// The job's batch, its method and how long it has run.
-        stall: Stall,
     },
 }
 
@@ -567,19 +510,6 @@ impl MainProcessResponse {
             Self::Result { .. } => ResponseKind::Result,
             Self::Operated { .. } => ResponseKind::Operated,
             Self::Error { .. } => ResponseKind::Error,
-            Self::Stalled { .. } => ResponseKind::Stalled,
-        }
-    }
-
-    /// Replaces the request-response correlation identity (`message_id`) of
-    /// a response; a stall report has none to replace.
-    pub(crate) fn set_message_id(&mut self, value: Option<u64>) {
-        match self {
-            Self::Placed { message_id, .. }
-            | Self::Result { message_id, .. }
-            | Self::Operated { message_id, .. }
-            | Self::Error { message_id, .. } => *message_id = value,
-            Self::Stalled { .. } => {}
         }
     }
 
@@ -588,19 +518,17 @@ impl MainProcessResponse {
     /// ended every numbered job up to `ended`.
     pub(crate) fn result(result: BatchOutput, requests: &[Request], ended: u64) -> Self {
         Self::Result {
-            message_id: None,
             result,
             requests: records(requests),
             ended,
         }
     }
 
-    /// Constructs the response to request `id` that failed for `message`, returning `finished`,
-    /// the `Finish { ok: false }` of each copy a failed batch had started, from a process whose
-    /// ranks of the job's group have ended every numbered job up to `ended`.
-    pub(crate) fn failed(id: u64, message: String, finished: &[Request], ended: u64) -> Self {
+    /// Constructs the response to a request that failed for `message`, returning `finished`, the
+    /// `Finish { ok: false }` of each copy a failed batch had started, from a process whose ranks
+    /// of the job's group have ended every numbered job up to `ended`.
+    pub(crate) fn failed(message: String, finished: &[Request], ended: u64) -> Self {
         Self::Error {
-            message_id: Some(id),
             error: MainProcessResponseError {
                 message,
                 code: None,

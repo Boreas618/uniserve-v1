@@ -40,7 +40,7 @@ use crate::memory::client::StorageClient;
 use crate::memory::division::{self, call_window};
 use crate::memory::encoders;
 use crate::memory::latent::host::BankPages;
-use crate::parallel::host::HostGroup;
+use crate::parallel::HostGroup;
 use crate::runner::buckets::{Bucket, Buckets};
 use crate::runner::decoder::{DecoderConfig, DecoderRunner, RoundConfig};
 use crate::runner::denoiser::{DenoiserConfig, DenoiserRunner};

@@ -57,12 +57,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use crate::batch::Capacity;
 use crate::batch::Phase;
 use crate::executor::Route;
-use crate::executor::peers::messages::MainProcessResponse;
+use crate::executor::peers::messages::{FromPeer, MainProcessResponse};
 use crate::executor::peers::{Answer, Liveness, Remote, Upstream};
 use crate::profiling::counters::Counters;
 use crate::worker::Worker;
@@ -87,15 +86,12 @@ use super::{epoch, operations};
 use crate::executor::{Executor, Shadow, WorkerExecutor};
 use crate::memory::client::{StorageClient, StorageLaunch};
 use crate::modules::load;
+use crate::parallel::Rendezvous;
 use crate::process::binding::{Target as LoadTarget, WeightBinding};
 use crate::process::ranks::rank::ModelRunner;
 use crate::process::ranks::rank::text::Keys;
 use crate::scheduler::policy::{self, Policy};
 use crate::scheduler::{Message, Output, Scheduler};
-
-/// How long the scheduler node waits for every peer main process to register, and a peer for the
-/// scheduler node to accept it: each starts at once and registers before it loads anything.
-const PEER_START: Duration = Duration::from_secs(300);
 
 /// The started epoch: its schedulers and the ranks they drive (module documentation).
 pub struct Engine {
@@ -759,14 +755,16 @@ type Placed = (
 
 /// The answer of the peer whose ranks start at `rank` to the relayed session: its Storage
 /// Server's endpoint, the segments its ranks created, where their units lie, and what they serve.
+/// The peer answers once its ranks are open, bound, spawned and warm; its link fails the wait if
+/// the peer's process exits or its host stops answering meanwhile.
 ///
 /// # Errors
 ///
-/// When the peer does not answer within [`PEER_START`], fails its start, or its link is lost.
+/// When the peer fails its start, or its link is lost.
 fn placed(rank: u32, answer: &Answer) -> Result<Placed> {
     let answered = answer
-        .recv_timeout(PEER_START)
-        .map_err(|_| anyhow::anyhow!("rank {rank}'s main process did not start in time"))?
+        .recv()
+        .map_err(|_| anyhow::anyhow!("rank {rank}'s main process link ended before it answered"))?
         .map_err(|reason| {
             anyhow::anyhow!("rank {rank}'s main process failed to start: {reason}")
         })?;
@@ -776,7 +774,6 @@ fn placed(rank: u32, answer: &Answer) -> Result<Placed> {
             created,
             places,
             capacities,
-            ..
         } => Ok((endpoint, created, places, capacities)),
         other => bail!(
             "rank {rank}'s main process answered the session with {:?}",
@@ -836,7 +833,7 @@ fn start_peer(
     mut channel: service::Connection,
     liveness: Arc<Liveness>,
 ) -> Result<Engine> {
-    let (id, open, opened) = crate::executor::peers::session(&mut channel, PEER_START)?;
+    let (id, open, opened) = crate::executor::peers::session(&mut channel)?;
 
     // The parts of the session's host regions lie on this host, created by its Storage Server,
     // which follows the epoch's processes for the session's close as for any session.
@@ -886,14 +883,16 @@ fn start_peer(
     drop(ranks);
 
     let placed = MainProcessResponse::Placed {
-        message_id: Some(id),
         endpoint: storage.tcp.clone().unwrap_or_default(),
         created,
         places,
         capacities: capacities.clone(),
     };
     channel
-        .deliver(&placed)
+        .deliver(&FromPeer {
+            id,
+            response: placed,
+        })
         .context("answering the scheduler node's session")?;
 
     let (prepared, preparations) = crossbeam_channel::unbounded();
@@ -1162,8 +1161,9 @@ enum Links {
 }
 
 /// Meets the epoch's other main processes the launch names: the scheduler node accepts every
-/// peer's registration on the listener it inherited, and a peer dials it and registers. Returns
-/// where the group's ranks form their host group, and the channels.
+/// peer's registration on the listener it inherited, and a peer connects to it and registers,
+/// each within the epoch's join bound (`worker_config.join_timeout`). Returns where the group's
+/// ranks form their host group, and the channels.
 ///
 /// # Errors
 ///
@@ -1171,6 +1171,15 @@ enum Links {
 fn meet(launch: &EngineArgs) -> Result<(Meeting, Links)> {
     let Some(world) = &launch.world else {
         return Ok((Meeting::Local, Links::Alone));
+    };
+    let join = launch.engine_config.worker.join_timeout;
+    let rendezvous = |listener| {
+        Meeting::World(Rendezvous {
+            listener,
+            endpoint: world.store.clone(),
+            epoch: world.scheduler,
+            timeout: join,
+        })
     };
     match world.inherited {
         Some(inherited) => {
@@ -1185,7 +1194,7 @@ fn meet(launch: &EngineArgs) -> Result<(Meeting, Links)> {
                     <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(inherited.store),
                 )
             };
-            let listener = crate::executor::peers::link::Listener::from_tcp(channel)
+            let listener = service::Listener::from_tcp(channel)
                 .context("taking the peer listener this process inherited")?;
             tracing::info!(
                 peers = world.peers,
@@ -1196,35 +1205,23 @@ fn meet(launch: &EngineArgs) -> Result<(Meeting, Links)> {
                 &listener,
                 world.peers as usize,
                 launch.engine,
-                PEER_START,
+                join,
             )?;
-            Ok((
-                Meeting::World {
-                    address: world.store.clone(),
-                    listener: Some(store),
-                },
-                Links::Accepted(accepted),
-            ))
+            Ok((rendezvous(Some(store)), Links::Accepted(accepted)))
         }
         None => {
             let channel = crate::executor::peers::register(
                 &world.channel,
                 launch.rank,
                 world.scheduler,
-                PEER_START,
+                join,
             )?;
             tracing::info!(
                 rank = launch.rank,
                 scheduler = %world.channel,
                 "registered with the epoch's scheduler node"
             );
-            Ok((
-                Meeting::World {
-                    address: world.store.clone(),
-                    listener: None,
-                },
-                Links::Registered(channel),
-            ))
+            Ok((rendezvous(None), Links::Registered(channel)))
         }
     }
 }
