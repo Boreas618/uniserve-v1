@@ -25,11 +25,11 @@
 //! taken at (`video_scheduler_shift`, `audio_scheduler_shift`).
 
 use nn::config::Fields;
-use nn::family::Stage;
 use nn::{Result, Source};
 use serde_json::Value;
 
 use super::{Component, VsaConfig, network};
+use crate::minimax_h3::stage::Stage;
 use crate::minimax_h3::{ID, VideoTask};
 
 /// What a FastH3 student's contract states.

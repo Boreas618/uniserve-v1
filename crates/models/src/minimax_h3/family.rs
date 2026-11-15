@@ -41,8 +41,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use nn::family::{
-    ConditionBounds, Description, Family, Model, Stage, Stages, VideoCheckpoint, VideoFamily,
-    VideoModel, VideoPlacement, VideoServing,
+    ConditionBounds, Description, Family, Model, VideoCheckpoint, VideoFamily, VideoModel,
+    VideoPlacement, VideoServing,
 };
 use nn::pipeline::{Block, Extent, Phase, Pipeline, Product, ProductSpec};
 use nn::{
@@ -63,6 +63,7 @@ use crate::minimax_h3::config::{
 };
 use crate::minimax_h3::denoiser::{Denoiser, SAMPLE_DTYPE};
 use crate::minimax_h3::splice::VideoPostprocessor;
+use crate::minimax_h3::stage::{Stage, Stages};
 use crate::minimax_h3::video_vae::{self, VideoDecoder, VideoEncoder};
 use crate::minimax_h3::{Config, ID, VideoTask, packing};
 use crate::qwen3::Qwen3VlModel;

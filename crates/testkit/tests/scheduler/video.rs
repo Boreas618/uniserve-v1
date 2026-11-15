@@ -581,7 +581,7 @@ fn a_decoder_that_deals_no_units_decodes_one_a_rank_and_a_codec_covering_that_ro
 /// two ranks both denoise decodes, and one whose second rank only decodes does not.
 #[test]
 fn a_decode_waits_for_the_last_step_s_output_where_a_decoder_rank_does_not_denoise() {
-    // The denoiser's block as a deployment names it (`nn::family::Stage::Transformer`).
+    // The denoiser's block as a deployment names it (`models::minimax_h3::stage::Stage::Transformer`).
     const DENOISER_BLOCK: &str = "transformer";
     let decoder = BlockConfig {
         distribution: Some(BlockDistribution::TemporalUnits),
@@ -628,7 +628,7 @@ fn a_decode_waits_for_the_last_step_s_output_where_a_decoder_rank_does_not_denoi
 /// both encode text prepares, and one whose second rank only denoises does not.
 #[test]
 fn a_latent_preparation_waits_for_the_encode_s_output_where_a_denoising_rank_encodes_no_text() {
-    // The blocks as a deployment names them (`nn::family::Stage::{Transformer, TextEncoder}`).
+    // The blocks as a deployment names them (`models::minimax_h3::stage::Stage::{Transformer, TextEncoder}`).
     const DENOISER_BLOCK: &str = "transformer";
     const TEXT_BLOCK: &str = "text_encoder";
     for (encoders, follows) in [(vec![0, 1], true), (vec![0], false)] {

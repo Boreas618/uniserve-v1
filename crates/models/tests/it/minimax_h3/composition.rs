@@ -11,7 +11,7 @@ use std::path::Path;
 
 use models::minimax_h3::config::{Contract, Networks};
 use models::minimax_h3::family::compose;
-use nn::family::Stage;
+use models::minimax_h3::stage::Stage;
 use nn::{Checkpoint, DType, Source, Sources};
 
 use nn_testing::{decode, encode, write_file};

@@ -17,9 +17,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use models::minimax_h3::stage::Stage;
 use nn::family::{
-    DenoiserSplit, Model, Projection, SequenceSplit, Stage, VideoModel, VideoPlacement,
-    VideoServing,
+    DenoiserSplit, Model, Projection, SequenceSplit, VideoModel, VideoPlacement, VideoServing,
 };
 use nn::{
     Clip, ConditionRole, ConditionShape, Conditioning, DType, MetaWeights, Split, VideoRequest,

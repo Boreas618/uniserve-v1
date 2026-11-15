@@ -234,7 +234,7 @@ fn listed(items: impl Iterator<Item = String>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use nn::family::Stage;
+    use crate::minimax_h3::stage::Stage;
     use nn::quantization::ModeloptManifest;
 
     use super::*;

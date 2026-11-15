@@ -30,7 +30,6 @@ mod video_vae;
 use std::collections::BTreeMap;
 
 use nn::config::Fields;
-use nn::family::Stage;
 use nn::quantization::ModeloptManifest;
 use nn::{PipelineIndex, PixelNorm, Result};
 use processing::qwen_vl::ProcessorConfig;
@@ -46,6 +45,7 @@ pub use processing::minimax_h3::{
 pub use text::RETAINED_LAYERS;
 pub use video_vae::VideoVaeConfig;
 
+use crate::minimax_h3::stage::Stage;
 use crate::minimax_h3::{ID, VideoTask};
 
 /// The video VAE's temporal compression: one latent frame covers this many video frames.
