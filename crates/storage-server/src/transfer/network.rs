@@ -44,7 +44,6 @@
 //! [`Role::Peer`]: ::storage::protocol::Role::Peer
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ::storage::Client;
@@ -59,8 +58,6 @@ use super::threads::{End, Piece, Runner, ThreadKey};
 /// The process's NIXL agent and its connections to other hosts' Storage
 /// Servers.
 pub(super) struct Network {
-    /// NIXL's C API library, when the loader's search path does not find it.
-    library: Option<PathBuf>,
     /// The agent, or why it could not start, once something needed it.
     agent: OnceLock<Result<nixl::Agent, String>>,
     /// Other hosts' Storage Servers by endpoint, each locked by the helper
@@ -132,9 +129,8 @@ pub(super) struct Sources {
 pub(super) type Exposed = (Arc<Mapping>, Option<Hold>);
 
 impl Network {
-    pub(super) fn new(library: Option<PathBuf>) -> Self {
+    pub(super) fn new() -> Self {
         Self {
-            library,
             agent: OnceLock::new(),
             hosts: Mutex::new(HashMap::new()),
         }
@@ -145,9 +141,6 @@ impl Network {
     pub(super) fn agent(&self) -> Result<&nixl::Agent, String> {
         self.agent
             .get_or_init(|| {
-                if let Some(library) = &self.library {
-                    nixl::load_library(library).map_err(|error| error.to_string())?;
-                }
                 let name = agent_name().map_err(|error| format!("naming a NIXL agent: {error}"))?;
                 let agent = nixl::Agent::new(&name)
                     .map_err(|error| format!("starting a NIXL agent: {error}"))?;

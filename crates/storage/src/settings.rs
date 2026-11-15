@@ -62,10 +62,6 @@ pub struct ServerSettings {
     /// How long a buffer pool's put of host copies to the remote store may take, in seconds,
     /// before it is stopped and answered with the keys put so far. Default 60.
     pub put_deadline_s: u64,
-    /// NIXL's C API library (`libnixl_capi.so`, of the NIXL release this build pins) that the
-    /// Transfer Server loads for copies from other hosts; found on the loader's search path when
-    /// unset.
-    pub nixl_library: Option<PathBuf>,
     /// Record the trace of every buffer pool's inputs in this directory: per deployment, every
     /// input its pool acts on and every completion it produces (`specs/buffer-pool.md` §18). A
     /// failure to write stops the trace, not the pool. No trace when unset.
@@ -94,7 +90,6 @@ impl Default for ServerSettings {
             transfer_gpus: true,
             transfer_deadline_s: 60,
             put_deadline_s: 60,
-            nixl_library: None,
             buffer_pool_trace: None,
             buffer_pool_check: false,
             child_restart_s: 5,

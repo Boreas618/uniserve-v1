@@ -344,8 +344,7 @@ message StorageSettings {
   uint64 transfer_chunk_us = 3;
   uint64 transfer_deadline_s = 4;
   uint64 put_deadline_s = 5;
-  // NIXL's C API library; empty for the loader's search path.
-  string nixl_library = 6;
+  reserved 6;
   // The directory of the buffer pools' traces; empty for none.
   string buffer_pool_trace = 7;
   bool buffer_pool_check = 8;

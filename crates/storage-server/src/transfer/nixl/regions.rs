@@ -33,9 +33,9 @@ pub(crate) enum Access {
     ReadWrite,
     /// Reads alone, local and remote: a source mapped read-only, which
     /// peers can READ but never write. NIXL's UCX backend registers it so
-    /// with the read-only registration patch of UniServe's NIXL build
-    /// (`artifacts/native/patches`); without it the registration asks for
-    /// write access, which a read-only mapping of host storage refuses.
+    /// in the NIXL and UCX packages with read-only registration (`docs/nixl.md`);
+    /// others ask for write access, which a read-only mapping of host storage
+    /// refuses.
     Read,
 }
 

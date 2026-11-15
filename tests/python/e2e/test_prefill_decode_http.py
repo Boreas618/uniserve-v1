@@ -25,9 +25,9 @@ two-host variables (docs/testing.md, Two hosts): ``UNISERVE_H3_FOLLOWER``,
 an ssh destination with this checkout at the same path, and
 ``UNISERVE_H3_LEADER_ADDRESS``, this host's address as the second reaches
 it. Its Transfer Server reads the prefill rank's planes through NIXL, which
-both hosts' Storage Servers load from ``UNISERVE_NIXL_LIBRARY``'s directory,
-and serves on the second host's GPU ``UNISERVE_FOLLOWER_DEVICE`` (``0``
-unless stated). Without these variables the two-host case is skipped.
+both hosts have installed as docs/nixl.md states, and serves on the second
+host's GPU ``UNISERVE_FOLLOWER_DEVICE`` (``0`` unless stated). Without
+these variables the two-host case is skipped.
 """
 
 from __future__ import annotations
@@ -70,7 +70,6 @@ pytestmark = [
 
 FOLLOWER = os.environ.get("UNISERVE_H3_FOLLOWER")
 LEADER_ADDRESS = os.environ.get("UNISERVE_H3_LEADER_ADDRESS")
-NIXL_LIBRARY = os.environ.get("UNISERVE_NIXL_LIBRARY")
 FOLLOWER_DEVICE = os.environ.get("UNISERVE_FOLLOWER_DEVICE", "0")
 
 SERVED_MODEL = "qwen3-prefill-decode"
@@ -291,15 +290,15 @@ def test_a_prefill_group_transfers_requests_to_a_decode_group_on_one_host(
 def test_a_prefill_group_transfers_requests_to_a_decode_group_on_another_host(
     tmp_path: Path, reference: list[list[str]]
 ):
-    if FOLLOWER is None or LEADER_ADDRESS is None or NIXL_LIBRARY is None:
+    if FOLLOWER is None or LEADER_ADDRESS is None:
         pytest.skip(
-            "a decode group on another host needs UNISERVE_H3_FOLLOWER, "
-            "UNISERVE_H3_LEADER_ADDRESS and UNISERVE_NIXL_LIBRARY"
+            "a decode group on another host needs UNISERVE_H3_FOLLOWER and "
+            "UNISERVE_H3_LEADER_ADDRESS"
         )
     log = tmp_path / "server.log"
     # The leader binds its join endpoint on a port it picks, and both hosts'
     # Storage Servers, which the daemons start with the deployment's
-    # settings, load NIXL.
+    # settings, load the installed NIXL.
     command = _command(
         "--worker-groups",
         str(_split(tmp_path, "rank-1")),
@@ -309,8 +308,6 @@ def test_a_prefill_group_transfers_requests_to_a_decode_group_on_another_host(
         "2",
         "--dist-init-addr",
         f"{LEADER_ADDRESS}:0",
-        "--set",
-        f"storage_config.nixl_library={NIXL_LIBRARY}",
     )
     with (
         runtime_directory(tmp_path / "storage-server.log") as runtime,

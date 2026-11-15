@@ -10,14 +10,12 @@
 //! the bytes cross the network adapter as a READ from another host does.
 //!
 //! Both processes use CUDA device 0 of the process; run with
-//! `CUDA_VISIBLE_DEVICES` naming one GPU. `NIXL_CAPI_LIBRARY` names NIXL's
-//! `libnixl_capi.so`; without it the loader's search path must find it.
-//! `UCX_NET_DEVICES` limits UCX to the host's usable RDMA ports where UCX
+//! `CUDA_VISIBLE_DEVICES` naming one GPU, and with the NIXL package's C API on
+//! the loader's default search path. `UCX_NET_DEVICES` limits UCX to the host's usable RDMA ports where UCX
 //! cannot open some device. Run with
 //! `cargo test -p storage-server --lib transfer::nixl -- --ignored`.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -60,9 +58,6 @@ const SOURCE_STORAGE: &str = "UNISERVE_NIXL_TEST_SOURCE_STORAGE";
 /// destination maps again at the address of a registration it released,
 /// `host-remap` or `device-remap`.
 const DESTINATION: &str = "UNISERVE_NIXL_TEST_DESTINATION";
-
-/// Names NIXL's `libnixl_capi.so`.
-const LIBRARY: &str = "NIXL_CAPI_LIBRARY";
 
 /// How long one process may take to start, register and READ. A transfer
 /// that never completes fails the test at this bound instead of hanging it.
@@ -520,9 +515,6 @@ fn read_into_device_mapped_again(agent: &Agent, peer: &str, source: Region) {
 }
 
 fn new_agent(name: &str) -> Agent {
-    if let Some(library) = std::env::var_os(LIBRARY) {
-        super::super::load_library(Path::new(&library)).unwrap();
-    }
     Agent::new(name).unwrap()
 }
 

@@ -16,24 +16,41 @@
 //! 3. the destination posts a READ of spans of the source's regions into its
 //!    own ([`Agent::read`]) and polls it until it completes ([`Transfer::poll`]).
 //!
-//! The module binds NIXL's C API (`libnixl_capi.so` of NIXL 1.5.1) itself,
-//! resolving the entry points it calls when the library loads at run time
-//! ([`load_library`]): building the Storage Server needs no NIXL
-//! installation, no binary links NIXL, and a process that creates no agent
-//! (every process but a Transfer Server that READs from or is read by
-//! another host) never loads it. Read-only host storage needs NIXL and UCX
-//! built with the patches in `crates/storage-server/patches` (`docs/nixl.md`).
+//! The module binds NIXL's C API itself, resolving the entry points it calls when the library
+//! loads at run time from the loader's default search path ([`library`]): building the Storage
+//! Server needs no NIXL installation, no binary links NIXL, and a process that creates no agent
+//! (every process but a Transfer Server that READs from or is read by another host) never loads
+//! it. A registration for reads alone ([`Access::Read`]) needs the read-only registration of the
+//! NIXL and UCX packages `docs/nixl.md` names.
 
 mod agent;
 mod capi;
-mod error;
 mod library;
 mod regions;
 
 pub(crate) use agent::{Agent, Transfer};
-pub(crate) use error::{Error, Result};
-pub(crate) use library::load_library;
 pub(crate) use regions::{Access, Region, Registration, Segment, Span};
+
+pub(crate) use crate::Error;
+
+/// The NIXL release whose C API these bindings bind.
+pub(crate) const RELEASE: &str = "1.5.1";
+
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// `Ok` for a call that returned `SUCCESS`, the failure of `call` otherwise.
+pub(crate) fn check(call: &'static str, status: capi::Status) -> Result<()> {
+    if status == capi::SUCCESS {
+        Ok(())
+    } else {
+        Err(Error::Nixl { call, status })
+    }
+}
+
+/// The name of a NIXL status, as its C API declares it.
+pub(crate) fn status_name(status: i32) -> &'static str {
+    capi::status_name(status)
+}
 
 #[cfg(test)]
 mod tests;

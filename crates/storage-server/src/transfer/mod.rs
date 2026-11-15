@@ -63,14 +63,13 @@
 mod contexts;
 mod devices;
 mod network;
-mod nixl;
+pub(crate) mod nixl;
 mod storage;
 mod threads;
 
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
-use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -96,10 +95,9 @@ pub struct Options {
     /// copies, so a copy engine turns to that epoch's copies, and to
     /// higher-priority tasks, between chunks.
     pub chunk: Duration,
-    /// NIXL's C API library (`libnixl_capi.so`) of the release the `nixl`
-    /// crate binds, which the agent of the path between hosts loads; the
-    /// loader's search path finds it when `None`.
-    pub nixl_library: Option<PathBuf>,
+    /// Whether the server serves other hosts (it accepts them on a TCP endpoint), whose READs
+    /// of this host need the NIXL agent from the start.
+    pub serves_peers: bool,
     /// Whether to copy on the host's GPUs: the CUDA driver must load then, and every GPU it
     /// shows is used (none when it shows none); otherwise only host storage is copied, and no
     /// driver is loaded.
@@ -138,12 +136,12 @@ pub fn run(channel: service::Connection, options: &Options) -> Result<(), Error>
             wake: Arc::clone(&wake),
         },
     ));
-    let network = Arc::new(Network::new(options.nixl_library.clone()));
-    // A server that names its NIXL library serves other hosts: its agent starts now, beside the
-    // first tasks, so the first READ from or of this host does not wait for UCX to come up (several
-    // seconds) inside a request's bounded wait. Without a named library the agent starts at the
-    // first task that needs it, and a host without NIXL never starts one.
-    if options.nixl_library.is_some() {
+    let network = Arc::new(Network::new());
+    // A server that serves other hosts starts its agent now, beside the first tasks, so the first
+    // READ from or of this host does not wait for UCX to come up (several seconds) inside a
+    // request's bounded wait. Otherwise the agent starts at the first task that needs it, and a
+    // host without NIXL never starts one.
+    if options.serves_peers {
         let starting = Arc::clone(&network);
         std::thread::Builder::new()
             .name("nixl-agent".into())

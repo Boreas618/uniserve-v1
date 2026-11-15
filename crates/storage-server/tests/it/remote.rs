@@ -13,8 +13,8 @@
 //! their Transfer Servers see this process's GPUs, and UCX is limited to
 //! RDMA between processes (`rc`) and copies within one (`cuda_copy`), so
 //! the bytes cross the network adapter as they do between hosts, not CUDA
-//! IPC or shared memory. `NIXL_CAPI_LIBRARY` names NIXL's
-//! `libnixl_capi.so`, and `UCX_NET_DEVICES` limits UCX to the host's usable
+//! IPC or shared memory. The NIXL package's C API must be on the loader's default
+//! search path, and `UCX_NET_DEVICES` limits UCX to the host's usable
 //! RDMA ports where UCX cannot open some device. Run them with
 //! `cargo test -p storage-server --test it remote -- --ignored`.
 

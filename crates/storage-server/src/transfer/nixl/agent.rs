@@ -6,7 +6,7 @@ use std::ptr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::capi::{self, AgentConfig, Api, Handle};
-use super::error::check;
+use super::check;
 use super::regions::{Access, Region, Registration, Span};
 use super::{Error, Result};
 
@@ -75,8 +75,7 @@ impl Agent {
     /// default. The `UCX_*` environment variables apply: `UCX_NET_DEVICES`
     /// limits UCX to the host's usable RDMA ports, since UCX fails to start
     /// when it cannot open a device it found. Loads NIXL's C API library
-    /// from the loader's search path unless [`super::load_library`] loaded
-    /// it.
+    /// from the loader's default search path on first use.
     ///
     /// # Errors
     ///
@@ -85,7 +84,7 @@ impl Agent {
     pub(crate) fn new(name: &str) -> Result<Self> {
         let api = super::library::api()?;
         let c_name = CString::new(name)
-            .map_err(|_| Error::Invalid("an agent's name holds no NUL byte".to_owned()))?;
+            .map_err(|_| Error::NixlArgument("an agent's name holds no NUL byte".to_owned()))?;
 
         // A progress thread; no listener, since metadata travels over the
         // caller's channel; NIXL's defaults otherwise (one UCX worker, the
@@ -186,7 +185,7 @@ impl Agent {
     /// Fails for an empty region or when UCX cannot register the storage.
     pub(crate) unsafe fn register(&self, region: Region, access: Access) -> Result<Registration> {
         if region.len == 0 {
-            return Err(Error::Invalid(
+            return Err(Error::NixlArgument(
                 "a registered region is not empty".to_owned(),
             ));
         }
@@ -240,7 +239,7 @@ impl Agent {
     /// lacks.
     pub(crate) fn load_peer(&self, metadata: &[u8]) -> Result<String> {
         if metadata.is_empty() {
-            return Err(Error::Invalid("peer metadata is not empty".to_owned()));
+            return Err(Error::NixlArgument("peer metadata is not empty".to_owned()));
         }
         let mut state = self.shared.lock();
         let mut name: *mut std::ffi::c_char = ptr::null_mut();
@@ -273,7 +272,7 @@ impl Agent {
     /// Fails when no metadata of `peer` is loaded.
     pub(crate) fn forget_peer(&self, peer: &str) -> Result<()> {
         let c_peer = CString::new(peer)
-            .map_err(|_| Error::Invalid("a peer's name holds no NUL byte".to_owned()))?;
+            .map_err(|_| Error::NixlArgument("a peer's name holds no NUL byte".to_owned()))?;
         let mut state = self.shared.lock();
         // SAFETY: a live agent and a NUL-terminated name.
         check("forgetting a peer", unsafe {
@@ -301,26 +300,28 @@ impl Agent {
     /// agent or `peer` registered under the span's key.
     pub(crate) fn read(&self, peer: &str, spans: &[Span]) -> Result<Transfer> {
         let Some(first) = spans.first() else {
-            return Err(Error::Invalid("a READ has at least one span".to_owned()));
+            return Err(Error::NixlArgument(
+                "a READ has at least one span".to_owned(),
+            ));
         };
         let source_kind = first.source.segment;
         let destination_kind = first.destination.segment;
         for span in spans {
             let (source, destination) = (span.source, span.destination);
             if source.len != destination.len || source.len == 0 {
-                return Err(Error::Invalid(format!(
+                return Err(Error::NixlArgument(format!(
                     "a span reads {} bytes into {}: the lengths are equal and nonzero",
                     source.len, destination.len
                 )));
             }
             if source.segment != source_kind || destination.segment != destination_kind {
-                return Err(Error::Invalid(
+                return Err(Error::NixlArgument(
                     "the spans of one READ read one kind of storage into one kind".to_owned(),
                 ));
             }
         }
         let c_peer = CString::new(peer)
-            .map_err(|_| Error::Invalid("a peer's name holds no NUL byte".to_owned()))?;
+            .map_err(|_| Error::NixlArgument("a peer's name holds no NUL byte".to_owned()))?;
 
         // NIXL's local list is this agent's destinations; its remote list,
         // the peer's sources.

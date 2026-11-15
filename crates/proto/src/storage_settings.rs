@@ -21,7 +21,6 @@ impl From<&storage::Settings> for StorageSettings {
             transfer_chunk_us: server.transfer_chunk_us,
             transfer_deadline_s: server.transfer_deadline_s,
             put_deadline_s: server.put_deadline_s,
-            nixl_library: path(&server.nixl_library),
             buffer_pool_trace: path(&server.buffer_pool_trace),
             buffer_pool_check: server.buffer_pool_check,
             child_restart_s: server.child_restart_s,
@@ -89,7 +88,6 @@ impl TryFrom<&StorageSettings> for storage::Settings {
                 transfer_chunk_us: message.transfer_chunk_us,
                 transfer_deadline_s: message.transfer_deadline_s,
                 put_deadline_s: message.put_deadline_s,
-                nixl_library: path(&message.nixl_library),
                 buffer_pool_trace: path(&message.buffer_pool_trace),
                 buffer_pool_check: message.buffer_pool_check,
                 child_restart_s: message.child_restart_s,
@@ -111,7 +109,6 @@ mod tests {
         let settings = storage::Settings {
             server: storage::ServerSettings {
                 tcp: Some("0.0.0.0:0".parse().unwrap()),
-                nixl_library: Some("/opt/nixl/lib/libnixl_capi.so".into()),
                 buffer_pool_check: true,
                 ..storage::ServerSettings::default()
             },

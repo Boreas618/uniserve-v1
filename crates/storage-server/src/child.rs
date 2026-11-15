@@ -283,7 +283,7 @@ impl Children {
             connector: settings.connector.clone(),
             transfer: Some(crate::transfer::Options {
                 chunk: settings.server.transfer_chunk(),
-                nixl_library: settings.server.nixl_library.clone(),
+                serves_peers: settings.server.tcp.is_some(),
                 gpus: settings.server.transfer_gpus,
             }),
         }

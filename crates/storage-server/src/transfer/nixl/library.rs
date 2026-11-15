@@ -1,97 +1,52 @@
-//! NIXL's C API library, `libnixl_capi.so`, loaded once per process and
-//! never unloaded.
+//! NIXL's C API library, loaded once per process and never unloaded.
 //!
-//! The library is opened with `RTLD_NOW | RTLD_LOCAL`, and every entry point
-//! these bindings call is resolved from it at once ([`super::capi::Api`]): a
-//! missing library, or one that lacks an entry point, is an [`Error`] of the
-//! first call that needs NIXL, never an abort. A process that creates no
-//! agent never loads NIXL, and building the Storage Server needs no NIXL
-//! installation.
+//! The library is opened by its file name, `libnixl_capi.so`, from the loader's default search
+//! path, where the NIXL package installs it with the rest of NIXL and its UCX backend plugin; no
+//! path is configured, and no environment variable points the loader elsewhere. It is opened
+//! with `RTLD_NOW | RTLD_LOCAL`, and every entry point these bindings call is resolved from it at
+//! once ([`super::capi::Api`]): a missing library, or one that lacks an entry point, is an
+//! [`Error::NixlLibrary`] of the first call that needs NIXL, never an abort. A process that
+//! creates no agent never loads NIXL, and building the Storage Server needs no NIXL installation.
 //!
-//! The library must come from the NIXL release these bindings bind, 1.5.1,
-//! built as `docs/nixl.md` describes: the entry points are
-//! declared as that release's `wrapper.h` declares them, and a registration
-//! for reads alone ([`super::Access::Read`]) relies on the read-only
-//! registration patch that build applies to the UCX backend.
+//! The entry points are declared as the `wrapper.h` of the NIXL release these bindings bind
+//! ([`super::RELEASE`]) declares them.
 
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
 
 use super::capi::Api;
 use super::{Error, Result};
 
-/// The library's file name, which the loader's search path finds when no
-/// path was given.
-const NAME: &str = "libnixl_capi.so";
+/// The library's file name, as the NIXL package installs it on the loader's default search
+/// path.
+pub(crate) const LIBRARY: &str = "libnixl_capi.so";
 
-/// The loaded library, the path it was opened by and its entry points,
-/// leaked: they live for the process.
-struct Loaded {
-    path: PathBuf,
-    api: Api,
-    _library: Library,
-}
+/// The loaded library and its entry points, or why it cannot be used, for the process's life.
+static LOADED: OnceLock<std::result::Result<(Library, Api), String>> = OnceLock::new();
 
-static LOADED: Mutex<Option<&'static Loaded>> = Mutex::new(None);
-
-/// Loads NIXL's C API library from `path`, a `libnixl_capi.so` of the NIXL
-/// release these bindings bind (`lib/<arch>-linux-gnu/libnixl_capi.so` of a
-/// NIXL installation). Without this call, the first agent loads the library
-/// from the dynamic loader's search path.
-///
-/// The library's own run path, or the loader's search path, must resolve
-/// the rest of NIXL and UCX; NIXL finds its backend plugins in `plugins/`
-/// beside `libnixl.so`, or in `NIXL_PLUGIN_DIR`.
+/// The entry points, loading the library on first use.
 ///
 /// # Errors
 ///
-/// Fails when the library cannot be opened, when it lacks an entry point
-/// these bindings call (the error names it), or when a library was loaded
-/// already from another path.
-pub(crate) fn load_library(path: &Path) -> Result<()> {
-    load(path).map(|_| ())
-}
-
-/// The entry points, loading the library from the loader's search path
-/// unless it is loaded.
+/// Fails when the library is not on the loader's default search path or lacks an entry point
+/// these bindings call (the error names it); the first failure stands for the process.
 pub(crate) fn api() -> Result<&'static Api> {
-    load(Path::new(NAME))
-}
-
-fn load(path: &Path) -> Result<&'static Api> {
-    let mut loaded = ::service::lock(&LOADED);
-    if let Some(loaded) = *loaded {
-        // Asking for the library by name, as an agent does, accepts
-        // whichever path loaded it.
-        if loaded.path == path || path == Path::new(NAME) {
-            return Ok(&loaded.api);
-        }
-        return Err(Error::Load {
-            library: path.to_owned(),
-            reason: format!("NIXL is loaded already from {}", loaded.path.display()),
-        });
+    let loaded = LOADED.get_or_init(|| {
+        // SAFETY: opening a library runs its initializers; NIXL's register its plugin manager
+        // and logging and have no other effect on this process.
+        let library = unsafe { Library::open(Some(LIBRARY), RTLD_NOW | RTLD_LOCAL) }
+            .map_err(|error| format!("it is not installed where the loader finds it: {error}"))?;
+        let api = Api::resolve(&library)
+            .map_err(|missing| format!("it lacks the entry point {missing}"))?;
+        Ok((library, api))
+    });
+    match loaded {
+        Ok((_, api)) => Ok(api),
+        Err(reason) => Err(Error::NixlLibrary {
+            library: LIBRARY,
+            release: super::RELEASE,
+            reason: reason.clone(),
+        }),
     }
-
-    // SAFETY: opening a library runs its initializers; NIXL's register its
-    // plugin manager and logging and have no other effect on this process.
-    let library = unsafe { Library::open(Some(path), RTLD_NOW | RTLD_LOCAL) }.map_err(|error| {
-        Error::Load {
-            library: path.to_owned(),
-            reason: error.to_string(),
-        }
-    })?;
-    let api = Api::resolve(&library).map_err(|missing| Error::Load {
-        library: path.to_owned(),
-        reason: format!("it lacks the entry point {missing}"),
-    })?;
-
-    let entry: &'static Loaded = Box::leak(Box::new(Loaded {
-        path: path.to_owned(),
-        api,
-        _library: library,
-    }));
-    *loaded = Some(entry);
-    Ok(&entry.api)
 }

@@ -45,10 +45,9 @@ at the same path, and ``UNISERVE_H3_LEADER_ADDRESS``, this host's address as
 the second reaches it. Both hosts' Storage Servers are the deployments'
 own, which their daemons start with the settings the deployments state: a
 TCP endpoint on a port each picks, which A's readiness record states as the
-peer endpoint B names, and NIXL (``UNISERVE_NIXL_LIBRARY``, the
-``libnixl_capi.so`` of docs/nixl.md); without these variables the two-host
-case is skipped. The peer endpoints are unauthenticated: the hosts share an
-isolated network.
+peer endpoint B names, and NIXL, which both hosts have installed as
+docs/nixl.md states; without these variables the two-host case is skipped.
+The peer endpoints are unauthenticated: the hosts share an isolated network.
 """
 
 from __future__ import annotations
@@ -89,7 +88,6 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
 FOLLOWER = os.environ.get("UNISERVE_H3_FOLLOWER")
 LEADER_ADDRESS = os.environ.get("UNISERVE_H3_LEADER_ADDRESS")
-NIXL_LIBRARY = os.environ.get("UNISERVE_NIXL_LIBRARY")
 # The second host's GPU the cases serve on.
 FOLLOWER_DEVICE = os.environ.get("UNISERVE_FOLLOWER_DEVICE", "0")
 
@@ -214,7 +212,6 @@ def _serve_command(
     other hosts at `address`, on a port it picks, and reads them through
     NIXL.
     """  # noqa: D205
-    assert NIXL_LIBRARY is not None
     return [
         str(require_uniserve_binary()),
         "serve",
@@ -236,8 +233,6 @@ def _serve_command(
         "chat_config.reasoning_parser=none",
         "--set",
         f"storage_config.tcp={address}:0",
-        "--set",
-        f"storage_config.nixl_library={NIXL_LIBRARY}",
         *extra,
     ]
 
@@ -299,10 +294,10 @@ def _leader_environment(runtime: Path) -> dict[str, str]:
 
 
 def _skip_without_two_hosts() -> None:
-    if FOLLOWER is None or LEADER_ADDRESS is None or NIXL_LIBRARY is None:
+    if FOLLOWER is None or LEADER_ADDRESS is None:
         pytest.skip(
-            "peer reads across hosts need UNISERVE_H3_FOLLOWER, "
-            "UNISERVE_H3_LEADER_ADDRESS and UNISERVE_NIXL_LIBRARY"
+            "peer reads across hosts need UNISERVE_H3_FOLLOWER and "
+            "UNISERVE_H3_LEADER_ADDRESS"
         )
 
 
