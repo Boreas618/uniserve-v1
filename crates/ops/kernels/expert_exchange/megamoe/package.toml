@@ -3,8 +3,9 @@
 # FlashInfer's fused MegaMoE kernel: one launch per layer exchanges the tokens, runs the
 # experts and combines. Its sources are the `megamoe` pin of `uniserve_build_server.fetch`
 # (FlashInfer 0.6.18's `moe_ep/kernel_src/cutedsl_megamoe/src`, from the distribution the
-# Build Server's environment locks) with `patches/megamoe.patch` applied: the
-# tanh-approximated GELU gate and the token exchange's peer-metadata stride.
+# Build Server's environment locks) with `patches/megamoe.patch` applied: the token
+# exchange addresses a peer's route metadata by its strides, which the capacity fixes, and
+# not by the launch's token extent, which differs between ranks and launches.
 # The `flashinfer-python` version is the pin's, so it is declared below and a change of it
 # is a new revision. `src/build.py` compiles it with the CuTe DSL
 # for one group and one shape and exports it with its host launcher; `src/entry.cpp` and

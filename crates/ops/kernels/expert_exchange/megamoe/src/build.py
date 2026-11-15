@@ -97,11 +97,13 @@ def load_kernel_sources(request, staging):
     """Import the kernel's packages as this package compiles them.
 
     They are the pinned FlashInfer copy (`uniserve_build_server.fetch`'s
-    `megamoe` pin) with `patches/megamoe.patch` applied, which adds the
-    tanh-approximated GELU gate and fixes the peer-metadata stride of the token
-    exchange. The patch is applied to copies in the build's staging directory,
-    so neither the distribution nor the Build Server's verified cache of pins
-    is changed, and the pin's packages are imported from those copies.
+    `megamoe` pin) with `patches/megamoe.patch` applied: the token exchange
+    addresses a peer's route metadata by that metadata's strides, which its
+    capacity fixes, rather than by this launch's token extent, which differs
+    between ranks and launches. The patch is applied to copies in the build's
+    staging directory, so neither the distribution nor the Build Server's
+    verified cache of pins is changed, and the pin's packages are imported from
+    those copies.
     """
     pinned = fetch.pin("megamoe")
     staged = staging / "megamoe"
@@ -177,7 +179,6 @@ def compile_kernel(request, shape, staging):
         flag_batch=knobs["flag_batch"],
         epi_flag_batch=knobs["epi_flag_batch"],
         combine_format=CombineFormat.parse("bf16"),
-        activation="silu",
     )
 
     def described(tensor, align=16):
