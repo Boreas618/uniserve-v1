@@ -8,6 +8,12 @@ op = "gather_gemm"
 backend = "cute_dsl"
 interface_version = 1
 
+# The kernel is a `uniserve_kernels.grouped_gemm.GroupedGemm`, derived from FlashInfer's MoE
+# grouped GEMMs (that module states the provenance), and calls the pipelines and device
+# functions of the FlashInfer distribution the Build Server's environment locks.
+[toolchain]
+packages = ["flashinfer-python"]
+
 [source]
 kind = "cute_dsl"
 

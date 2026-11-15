@@ -26,11 +26,10 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# Derived from FlashInfer 0.6.18 flashinfer/fused_moe/cute_dsl/blackwell/
-# blockscaled_contiguous_grouped_gemm_finalize_fusion.py (itself from
-# TensorRT-LLM tensorrt_llm/_torch/cute_dsl_kernels/blackwell/), keeping its
-# deterministic expanded-row store (use_fused_finalize=False) with the
-# block-scaled MMA and its scale-factor loads replaced by BF16 tcgen05 MMA.
+# Derived from FlashInfer's MoE grouped GEMMs as `uniserve_kernels.grouped_gemm`
+# states (the finalize-fusion kernel's deterministic row store,
+# `use_fused_finalize=False`), which holds the computation this kernel shares
+# with gather_gemm's.
 
 """BF16 grouped GEMM storing every route's row for routed experts (SM100).
 
@@ -45,7 +44,9 @@ weights are the experts' uncombined routes; nothing is reduced across
 rows, so results repeat bit for bit whatever the tile schedule.
 
 - Warp roles: epilogue (0-3), MMA (4), TMA A/B (5), scheduler (6) and
-  a row-index loader (7) that stages each tile's output rows.
+  a row-index loader (7) that stages each tile's output rows. The
+  scheduler, the B load, the MMA and the tensor memory are
+  :class:`uniserve_kernels.grouped_gemm.GroupedGemm`'s.
 - Tiles at or past ``num_non_exiting_tiles`` are skipped and rows at or
   past a tile's ``mn_limit`` are not stored, so padded metadata of a
   larger capacity is safe under CUDA graphs.
@@ -63,9 +64,10 @@ from flashinfer.fused_moe.cute_dsl.blackwell.utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
 )
+from uniserve_kernels.grouped_gemm import GroupedGemm
 
 
-class RouteGroupedGemmKernel:
+class RouteGroupedGemmKernel(GroupedGemm):
     """Grouped GEMM of permuted rows storing each route's row (FC2).
 
     ``mma_tiler_mn`` is the MMA tile (M, N): M 128 runs one-CTA MMA, M 256
@@ -77,30 +79,14 @@ class RouteGroupedGemmKernel:
         self,
         mma_tiler_mn: tuple[int, int],
         cluster_shape_mn: tuple[int, int],
-        raster_along_m: bool = False,
-        enable_pdl: bool = True,
     ):
-        self.enable_pdl = enable_pdl
-        self.acc_dtype = cutlass.Float32
-        self.use_2cta_instrs = mma_tiler_mn[0] == 256
-        self.cluster_shape_mn = cluster_shape_mn
-        self.raster_along_m = raster_along_m
-        # K dimension is deferred in _setup_attributes
-        self.mma_tiler = (*mma_tiler_mn, 1)
+        super().__init__(mma_tiler_mn, cluster_shape_mn)
 
-        self.cta_group = (
-            tcgen05.CtaGroup.TWO
-            if self.use_2cta_instrs
-            else tcgen05.CtaGroup.ONE
-        )
-
-        self.occupancy = 1
         self.epilog_warp_id = (0, 1, 2, 3)
         self.mma_warp_id = 4
         self.tma_warp_id = 5
         self.sched_warp_id = 6
         self.meta_load_warp_id = 7
-        self.threads_per_warp = 32
         self.threads_per_cta = self.threads_per_warp * len(
             (
                 *self.epilog_warp_id,
@@ -118,65 +104,18 @@ class RouteGroupedGemmKernel:
                 self.meta_load_warp_id,
             )
         )
-        # Set barrier for cta sync, epilogue sync and tmem ptr sync
-        self.cta_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=1,
-            num_threads=self.threads_per_cta,
-        )
-        self.epilog_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=2,
-            num_threads=32 * len(self.epilog_warp_id),
-        )
-        self.tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=3,
-            num_threads=32 * len((self.mma_warp_id, *self.epilog_warp_id)),
-        )
-        self.sched_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=4,
-            num_threads=self.threads_per_warp,
-        )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self._make_barriers()
 
     def _setup_attributes(self):
         """Derive the tiled MMA, tile shapes, stages and layouts from the
         operand dtypes and the kernel's tile configuration.
         """  # noqa: D205
-        self.mma_inst_shape_mn = (self.mma_tiler[0], self.mma_tiler[1])
+        tiled_mma = self._setup_mma_tiles()
+        self._setup_cluster_layout(tiled_mma)
 
-        tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.acc_dtype,
-            self.cta_group,
-            self.mma_inst_shape_mn,
-        )
-
-        # Four MMA instructions per K tile: 64 BF16 values (128 bytes).
-        mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
-        mma_inst_tile_k = 4
-        self.mma_tiler = (
-            self.mma_tiler[0],
-            self.mma_tiler[1],
-            mma_inst_shape_k * mma_inst_tile_k,
-        )
-        self.cta_tile_shape_mnk = (
-            self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape),
-            self.mma_tiler[1],
-            self.mma_tiler[2],
-        )
-
-        # Compute cluster layout
-        self.cluster_layout_vmnk = cute.tiled_divide(
-            cute.make_layout((*self.cluster_shape_mn, 1)),
-            (tiled_mma.thr_id.shape,),
-        )
-
-        # Compute number of multicast CTAs for A/B
+        # Compute number of multicast CTAs for A
         self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
-        self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
         self.is_a_mcast = self.num_mcast_ctas_a > 1
-        self.is_b_mcast = self.num_mcast_ctas_b > 1
 
         # Compute epilogue subtile
         self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
@@ -204,18 +143,7 @@ class RouteGroupedGemmKernel:
             self.occupancy,
         )
 
-        self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
-            tiled_mma,
-            self.mma_tiler,
-            self.a_dtype,
-            self.num_ab_stage,
-        )
-        self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            tiled_mma,
-            self.mma_tiler,
-            self.b_dtype,
-            self.num_ab_stage,
-        )
+        self._setup_ab_smem_layouts(tiled_mma)
         # Row-major C tile with a 16-byte row pad, from which each output row
         # is bulk-copied to its expanded row.
         swizzled_pad = 16 // (self.out_dtype.width // 8)
@@ -238,7 +166,6 @@ class RouteGroupedGemmKernel:
         self.num_accumulator_tmem_cols = (
             self.cta_tile_shape_mnk[1] * self.num_acc_stage
         )
-        self.num_tmem_alloc_cols = 512
 
     @cute.jit
     def __call__(
@@ -268,14 +195,7 @@ class RouteGroupedGemmKernel:
 
         self._setup_attributes()
 
-        tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.acc_dtype,
-            self.cta_group,
-            self.mma_inst_shape_mn,
-        )
+        tiled_mma = self._make_tiled_mma()
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
         # Setup TMA load for A
@@ -295,32 +215,22 @@ class RouteGroupedGemmKernel:
         )
 
         # Setup TMA load for B
-        b_op = sm100_utils.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mn, tiled_mma.thr_id
-        )
-        b_smem_layout = cute.slice_(
-            self.b_smem_layout_staged, (None, None, None, 0)
-        )
-        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op,
-            b,
-            b_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
+        tma_atom_b, tma_tensor_b, b_copy_size = self._make_tma_b(tiled_mma, b)
 
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
-        b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
 
-        # Compute the grid size
+        # Compute the grid size: the persistent schedule covers the
+        # (M, N, L) product's CTA tiles.
+        num_ctas_mnl = (
+            cute.ceil_div(a.shape[0], self.cta_tile_shape_mnk[0]),
+            cute.ceil_div(b.shape[0], self.cta_tile_shape_mnk[1]),
+            a.shape[2],
+        )
         self.tile_sched_params, grid = self._compute_grid(
-            (a.shape[0], b.shape[0], a.shape[2]),
-            self.cta_tile_shape_mnk,
+            num_ctas_mnl,
             self.cluster_shape_mn,
             max_active_clusters,
-            self.raster_along_m,
         )
 
         self.buffer_align_bytes = 1024
@@ -394,7 +304,7 @@ class RouteGroupedGemmKernel:
         self.shared_storage = SharedStorage
 
         # Launch the kernel synchronously
-        self.kernel(
+        kernel = self.kernel(
             tiled_mma,
             tma_atom_a,
             tma_tensor_a,
@@ -412,15 +322,8 @@ class RouteGroupedGemmKernel:
             self.epi_tile,
             self.epi_layout,
             self.tile_sched_params,
-        ).launch(
-            grid=grid,
-            block=[self.threads_per_cta, 1, 1],
-            cluster=(*self.cluster_shape_mn, 1),
-            smem=self.shared_storage.size_in_bytes(),  # type: ignore[attr-defined]
-            stream=stream,
-            min_blocks_per_mp=1,
-            use_pdl=self.enable_pdl,
         )
+        self._launch(kernel, grid, stream)
         return
 
     @cute.kernel
@@ -455,31 +358,14 @@ class RouteGroupedGemmKernel:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
 
-        use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
-
-        #
-        # Setup cta/thread coordinates
-        #
-        # Coords inside cluster
-        bidx, bidy, bidz = cute.arch.block_idx()
-        mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
-        is_leader_cta = mma_tile_coord_v == 0
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
-        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
-            cta_rank_in_cluster
-        )
-
-        # Coord inside cta
-        tidx, _, _ = cute.arch.thread_idx()
-
-        #
-        # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory
-        # dealloc barrier
-        #
-        smem = utils.SmemAllocator()
-        storage = smem.allocate(self.shared_storage)
+        (
+            use_2cta_instrs,
+            mma_tile_coord_v,
+            is_leader_cta,
+            block_in_cluster_coord_vmnk,
+            tidx,
+            storage,
+        ) = self._cta_coordinates(tiled_mma, cluster_layout_vmnk)
 
         # Initialize mainloop ab_pipeline (barrier) and states
         ab_pipeline_producer_group = pipeline.CooperativeGroup(
@@ -498,40 +384,10 @@ class RouteGroupedGemmKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
-        # Initialize acc_pipeline (barrier) and states
-        acc_pipeline_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread
-        )
-        num_acc_consumer_threads = (
-            len(self.epilog_warp_id)
-            * self.threads_per_warp
-            * (2 if use_2cta_instrs else 1)
-        )
-        acc_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, num_acc_consumer_threads
-        )
-        acc_pipeline = pipeline.PipelineUmmaAsync.create(
-            barrier_storage=storage.acc_mbar_ptr.data_ptr(),
-            num_stages=self.num_acc_stage,
-            producer_group=acc_pipeline_producer_group,
-            consumer_group=acc_pipeline_consumer_group,
-            cta_layout_vmnk=cluster_layout_vmnk,
-        )
-
-        # Initialize tile info pipeline (barrier) and states
-        tile_info_pipeline_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread,
-            self.threads_per_warp * 1,
-        )
-        tile_info_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread,
-            self.threads_wo_sched,
-        )
-        tile_info_pipeline = pipeline.PipelineAsync.create(
-            barrier_storage=storage.tile_info_mbar_ptr.data_ptr(),
-            num_stages=self.num_tile_stage,
-            producer_group=tile_info_pipeline_producer_group,
-            consumer_group=tile_info_pipeline_consumer_group,
+        acc_pipeline, tile_info_pipeline = (
+            self._make_acc_and_tile_info_pipelines(
+                storage, cluster_layout_vmnk, use_2cta_instrs
+            )
         )
 
         # Initialize metadata pipeline (meta loader warp -> epilogue warps)
@@ -550,37 +406,22 @@ class RouteGroupedGemmKernel:
             consumer_group=meta_pipeline_consumer_group,
         )
 
-        # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf.ptr,
-            barrier_for_retrieve=self.tmem_alloc_barrier,
-            allocator_warp_id=self.epilog_warp_id[0],
-            is_two_cta=use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
-        )
+        tmem = self._make_tmem_allocator(storage, use_2cta_instrs)
         tmem.allocate(self.num_tmem_alloc_cols)
 
         # Cluster arrive after barrier init
-        if cute.size(self.cluster_shape_mn) > 1:
-            cute.arch.cluster_arrive_relaxed()
+        self._cluster_arrive()
 
         #
         # Setup smem tensor A/B/C/Scale/ExpandedIdx
         #
-        # (MMA, MMA_M, MMA_K, STAGE)
-        s_a = storage.s_a.get_tensor(
-            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
-        )
-        # (MMA, MMA_N, MMA_K, STAGE)
-        s_b = storage.s_b.get_tensor(
-            b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
+        s_a, s_b = self._ab_smem_tensors(
+            storage, a_smem_layout_staged, b_smem_layout_staged
         )
 
         s_c = storage.s_c.get_tensor(c_smem_layout_staged)
 
-        # (bidx, bidy, bidz, valid)
-        info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
-        s_info = storage.s_info.get_tensor(info_layout)
+        s_info = self._tile_info_smem(storage)
 
         # Output row of each tile row, staged by the meta loader warp:
         # (row, stage)
@@ -601,8 +442,8 @@ class RouteGroupedGemmKernel:
             a_full_mcast_mask = cpasync.create_tma_multicast_mask(
                 cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
             )
-            b_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
+            b_full_mcast_mask = self._b_full_mcast_mask(
+                cluster_layout_vmnk, block_in_cluster_coord_vmnk
             )
 
         #
@@ -615,11 +456,7 @@ class RouteGroupedGemmKernel:
             (None, None, None),
         )
         # (bN, bK, loopN, loopK, loopL)
-        g_b_nkl = cute.local_tile(
-            m_b_nkl,
-            cute.slice_(self.mma_tiler, (0, None, None)),
-            (None, None, None),
-        )
+        g_b_nkl = self._local_tile_b(m_b_nkl)
 
         k_tile_cnt = cutlass.Int32(cute.size(g_a_mkl, mode=[3]))
 
@@ -648,33 +485,17 @@ class RouteGroupedGemmKernel:
             cute.group_modes(s_a, 0, 3),
             cute.group_modes(t_cg_a, 0, 3),
         )
-        # TMA load B partition_S/D
-        b_cta_layout = cute.make_layout(
-            cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
-        )
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), loopM, loopK, loopL)
-        t_bs_b, t_bg_b = cpasync.tma_partition(
-            tma_atom_b,
-            block_in_cluster_coord_vmnk[1],
-            b_cta_layout,
-            cute.group_modes(s_b, 0, 3),
-            cute.group_modes(t_cg_b, 0, 3),
-        )
-
-        #
-        # Partition shared/tensor memory tensor for TiledMMA_A/B/C
-        #
-        # (MMA, MMA_M, MMA_K, STAGE)
-        t_cr_a = tiled_mma.make_fragment_A(s_a)
-        # (MMA, MMA_N, MMA_K, STAGE)
-        t_cr_b = tiled_mma.make_fragment_B(s_b)
-        # (MMA, MMA_M, MMA_N)
-        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
-
-        # (MMA, MMA_M, MMA_N, STAGE)
-        t_ct_acc_fake = tiled_mma.make_fragment_C(
-            cute.append(acc_shape, self.num_acc_stage)
+        # The TMA load of B and the MMA's fragments
+        t_bs_b, t_bg_b, t_cr_a, t_cr_b, t_ct_acc_fake = (
+            self._partition_b_and_fragments(
+                tiled_mma,
+                tma_atom_b,
+                cluster_layout_vmnk,
+                block_in_cluster_coord_vmnk,
+                s_a,
+                s_b,
+                t_cg_b,
+            )
         )
 
         g_c_mnl = cute.local_tile(
@@ -717,28 +538,21 @@ class RouteGroupedGemmKernel:
                         tile_info_producer_state
                     )
                     mn_limit = tile_idx_to_mn_limit[tile_idx]
-                    with cute.arch.elect_one():
-                        s_info[(0, tile_info_producer_state.index)] = (
-                            cur_tile_coord[0]
-                        )
-                        s_info[(1, tile_info_producer_state.index)] = (
-                            cur_tile_coord[1]
-                        )
-                        s_info[(2, tile_info_producer_state.index)] = expert_idx
-                        s_info[(3, tile_info_producer_state.index)] = (
-                            cutlass.Int32(work_tile.is_valid_tile)
-                        )
-                        s_info[(4, tile_info_producer_state.index)] = mn_limit
-                    cute.arch.fence_proxy(
-                        "async.shared",
-                        space="cta",
+                    self._publish_tile(
+                        s_info,
+                        tile_info_producer_state,
+                        cur_tile_coord,
+                        expert_idx,
+                        work_tile.is_valid_tile,
+                        mn_limit,
                     )
                     self.sched_sync_barrier.arrive_and_wait()
                     tile_info_pipeline.producer_commit(tile_info_producer_state)
                     tile_info_producer_state.advance()
                 else:
-                    if cutlass.const_expr(not self.raster_along_m):
-                        is_continue = cutlass.Boolean(0)
+                    # Clusters raster along N, so the first padding M tile
+                    # ends the schedule.
+                    is_continue = cutlass.Boolean(0)
 
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
@@ -761,110 +575,46 @@ class RouteGroupedGemmKernel:
             # Persistent tile scheduling loop, starting after the pre-emitted
             # first tile.
             #
-            if cutlass.const_expr(self.raster_along_m):
-                while work_tile.is_valid_tile:
-                    cur_tile_coord = work_tile.tile_idx
-                    mma_tile_coord_m = cur_tile_coord[0] // cute.size(
-                        tiled_mma.thr_id.shape
+            while work_tile.is_valid_tile and is_continue:
+                cur_tile_coord = work_tile.tile_idx
+                mma_tile_coord_m = cur_tile_coord[0] // cute.size(
+                    tiled_mma.thr_id.shape
+                )
+                expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
+                tile_idx = mma_tile_coord_m
+                if tile_idx < num_valid_tiles:
+                    tile_info_pipeline.producer_acquire(
+                        tile_info_producer_state
                     )
-                    expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
-                    tile_idx = mma_tile_coord_m
-                    if tile_idx < num_valid_tiles:
-                        tile_info_pipeline.producer_acquire(
-                            tile_info_producer_state
-                        )
-                        mn_limit = tile_idx_to_mn_limit[tile_idx]
-                        with cute.arch.elect_one():
-                            s_info[(0, tile_info_producer_state.index)] = (
-                                cur_tile_coord[0]
-                            )
-                            s_info[(1, tile_info_producer_state.index)] = (
-                                cur_tile_coord[1]
-                            )
-                            s_info[(2, tile_info_producer_state.index)] = (
-                                expert_idx
-                            )
-                            s_info[(3, tile_info_producer_state.index)] = (
-                                cutlass.Int32(work_tile.is_valid_tile)
-                            )
-                            s_info[(4, tile_info_producer_state.index)] = (
-                                mn_limit
-                            )
-                            # fence view async shared
-                        cute.arch.fence_proxy(
-                            "async.shared",
-                            space="cta",
-                        )
-
-                        self.sched_sync_barrier.arrive_and_wait()
-                        tile_info_pipeline.producer_commit(
-                            tile_info_producer_state
-                        )
-                        tile_info_producer_state.advance()
-
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
-            else:
-                while work_tile.is_valid_tile and is_continue:
-                    cur_tile_coord = work_tile.tile_idx
-                    mma_tile_coord_m = cur_tile_coord[0] // cute.size(
-                        tiled_mma.thr_id.shape
+                    mn_limit = tile_idx_to_mn_limit[tile_idx]
+                    self._publish_tile(
+                        s_info,
+                        tile_info_producer_state,
+                        cur_tile_coord,
+                        expert_idx,
+                        work_tile.is_valid_tile,
+                        mn_limit,
                     )
-                    expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
-                    tile_idx = mma_tile_coord_m
-                    if tile_idx < num_valid_tiles:
-                        tile_info_pipeline.producer_acquire(
-                            tile_info_producer_state
-                        )
-                        mn_limit = tile_idx_to_mn_limit[tile_idx]
-                        with cute.arch.elect_one():
-                            s_info[(0, tile_info_producer_state.index)] = (
-                                cur_tile_coord[0]
-                            )
-                            s_info[(1, tile_info_producer_state.index)] = (
-                                cur_tile_coord[1]
-                            )
-                            s_info[(2, tile_info_producer_state.index)] = (
-                                expert_idx
-                            )
-                            s_info[(3, tile_info_producer_state.index)] = (
-                                cutlass.Int32(work_tile.is_valid_tile)
-                            )
-                            s_info[(4, tile_info_producer_state.index)] = (
-                                mn_limit
-                            )
-                            # fence view async shared
-                        cute.arch.fence_proxy(
-                            "async.shared",
-                            space="cta",
-                        )
 
-                        self.sched_sync_barrier.arrive_and_wait()
-                        tile_info_pipeline.producer_commit(
-                            tile_info_producer_state
-                        )
-                        tile_info_producer_state.advance()
+                    self.sched_sync_barrier.arrive_and_wait()
+                    tile_info_pipeline.producer_commit(tile_info_producer_state)
+                    tile_info_producer_state.advance()
 
-                    else:
-                        is_continue = cutlass.Boolean(0)
+                else:
+                    is_continue = cutlass.Boolean(0)
 
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
 
+            # The end of the schedule: an invalid tile.
             tile_info_pipeline.producer_acquire(tile_info_producer_state)
-            with cute.arch.elect_one():
-                s_info[(0, tile_info_producer_state.index)] = (
-                    work_tile.tile_idx[0]
-                )
-                s_info[(1, tile_info_producer_state.index)] = (
-                    work_tile.tile_idx[1]
-                )
-                s_info[(2, tile_info_producer_state.index)] = -1
-                s_info[(3, tile_info_producer_state.index)] = cutlass.Int32(0)
-                s_info[(4, tile_info_producer_state.index)] = cutlass.Int32(0)
-            cute.arch.fence_proxy(
-                "async.shared",
-                space="cta",
+            self._publish_tile(
+                s_info,
+                tile_info_producer_state,
+                work_tile.tile_idx,
+                -1,
+                0,
+                cutlass.Int32(0),
             )
             self.sched_sync_barrier.arrive_and_wait()
             tile_info_pipeline.producer_commit(tile_info_producer_state)
@@ -886,17 +636,13 @@ class RouteGroupedGemmKernel:
             # Get the first tile info from pipeline (scheduler has filtered out
             # tiles >= num_non_exiting_tiles)
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
-            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            tile_info[0] = s_info[(0, tile_info_consumer_state.index)]
-            tile_info[1] = s_info[(1, tile_info_consumer_state.index)]
-            tile_info[2] = s_info[(2, tile_info_consumer_state.index)]
-            tile_info[3] = s_info[(3, tile_info_consumer_state.index)]
-            is_valid_tile = tile_info[3] == 1
-            cute.arch.fence_proxy(
-                "async.shared",
-                space="cta",
+            is_valid_tile = self._read_tile_info(
+                tile_info_pipeline,
+                tile_info_consumer_state,
+                s_info,
+                tile_info,
+                (0, 1, 2, 3),
             )
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
             while is_valid_tile:
@@ -969,17 +715,13 @@ class RouteGroupedGemmKernel:
                 #
                 # Advance to next tile
                 #
-                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                tile_info[0] = s_info[(0, tile_info_consumer_state.index)]
-                tile_info[1] = s_info[(1, tile_info_consumer_state.index)]
-                tile_info[2] = s_info[(2, tile_info_consumer_state.index)]
-                tile_info[3] = s_info[(3, tile_info_consumer_state.index)]
-                is_valid_tile = tile_info[3] == 1
-                cute.arch.fence_proxy(
-                    "async.shared",
-                    space="cta",
+                is_valid_tile = self._read_tile_info(
+                    tile_info_pipeline,
+                    tile_info_consumer_state,
+                    s_info,
+                    tile_info,
+                    (0, 1, 2, 3),
                 )
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
             #
             # Wait A/B buffer empty
@@ -990,17 +732,8 @@ class RouteGroupedGemmKernel:
         # Specialized MMA warp
         #
         if warp_idx == self.mma_warp_id:
-            #
-            # Bar sync for retrieve tensor memory ptr from shared mem
-            #
-            tmem.wait_for_alloc()
-
-            #
-            # Retrieving tensor memory ptr and make accumulator tensor
-            #
-            acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
-            t_ct_acc_base = cute.make_tensor(acc_tmem_ptr, t_ct_acc_fake.layout)
+            _, t_ct_acc_base = self._accumulator_base(tmem, t_ct_acc_fake)
 
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
@@ -1016,17 +749,13 @@ class RouteGroupedGemmKernel:
             # Get the first tile info from pipeline (scheduler has filtered out
             # tiles >= num_non_exiting_tiles)
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
-            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            tile_info[0] = s_info[(0, tile_info_consumer_state.index)]
-            tile_info[1] = s_info[(1, tile_info_consumer_state.index)]
-            tile_info[2] = s_info[(2, tile_info_consumer_state.index)]
-            tile_info[3] = s_info[(3, tile_info_consumer_state.index)]
-            is_valid_tile = tile_info[3] == 1
-            cute.arch.fence_proxy(
-                "async.shared",
-                space="cta",
+            is_valid_tile = self._read_tile_info(
+                tile_info_pipeline,
+                tile_info_consumer_state,
+                s_info,
+                tile_info,
+                (0, 1, 2, 3),
             )
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
             while is_valid_tile:
@@ -1115,17 +844,13 @@ class RouteGroupedGemmKernel:
                 #
                 # Advance to next tile
                 #
-                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                tile_info[0] = s_info[(0, tile_info_consumer_state.index)]
-                tile_info[1] = s_info[(1, tile_info_consumer_state.index)]
-                tile_info[2] = s_info[(2, tile_info_consumer_state.index)]
-                tile_info[3] = s_info[(3, tile_info_consumer_state.index)]
-                is_valid_tile = tile_info[3] == 1
-                cute.arch.fence_proxy(
-                    "async.shared",
-                    space="cta",
+                is_valid_tile = self._read_tile_info(
+                    tile_info_pipeline,
+                    tile_info_consumer_state,
+                    s_info,
+                    tile_info,
+                    (0, 1, 2, 3),
                 )
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
             #
             # Wait for accumulator buffer empty
@@ -1145,14 +870,13 @@ class RouteGroupedGemmKernel:
                 pipeline.PipelineUserType.Producer, self.num_meta_stage
             )
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
-            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            tile_info[0] = s_info[(0, tile_info_consumer_state.index)]
-            tile_info[2] = s_info[(2, tile_info_consumer_state.index)]
-            tile_info[3] = s_info[(3, tile_info_consumer_state.index)]
-            tile_info[4] = s_info[(4, tile_info_consumer_state.index)]
-            is_valid_tile = tile_info[3] == 1
-            cute.arch.fence_proxy("async.shared", space="cta")
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            is_valid_tile = self._read_tile_info(
+                tile_info_pipeline,
+                tile_info_consumer_state,
+                s_info,
+                tile_info,
+                (0, 2, 3, 4),
+            )
             tile_info_consumer_state.advance()
 
             while is_valid_tile:
@@ -1160,16 +884,20 @@ class RouteGroupedGemmKernel:
 
                 meta_pipeline.producer_acquire(meta_producer_state)
                 meta_stage = meta_producer_state.index
-                # Strided row assignment keeps the smem stores coalesced (each fixed j: 32 lanes
-                # touch 32 contiguous rows). Rows at or past mn_limit are padding; the epilogue
-                # never stores them, so their staged index is irrelevant.
+                # Strided row assignment keeps the smem stores coalesced
+                # (each fixed j: 32 lanes touch 32 contiguous rows). Rows at
+                # or past mn_limit are padding; the epilogue never stores
+                # them, so their staged index is irrelevant.
                 #
-                # The destination row is the **permuted** row: this product's row `p` is the sort's
-                # permuted row `p`, the same row of gated activations the tile read, so the
-                # consumer (`moe_unpermute`, which compiles `kInputIsExpanded = false`) finds every
-                # route through `expanded_to_permuted` and no map is inverted here. The Blackwell
-                # example this kernel descends from stores expanded rows (`t · top + k`), which is
-                # the other convention and would need the inverse map; the identity needs none.
+                # The destination row is the **permuted** row: this
+                # product's row `p` is the sort's permuted row `p`, the same
+                # row of gated activations the tile read, so the consumer
+                # (`moe_unpermute`, which compiles `kInputIsExpanded =
+                # false`) finds every route through `expanded_to_permuted`
+                # and no map is inverted here. The Blackwell kernel this one
+                # descends from stores expanded rows (`t · top + k`), which
+                # is the other convention and would need the inverse map; the
+                # identity needs none.
                 for j in cutlass.range(
                     self.cta_tile_shape_mnk[0] // self.threads_per_warp,
                     unroll_full=True,
@@ -1181,14 +909,13 @@ class RouteGroupedGemmKernel:
                 meta_pipeline.producer_commit(meta_producer_state)
                 meta_producer_state.advance()
 
-                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                tile_info[0] = s_info[(0, tile_info_consumer_state.index)]
-                tile_info[2] = s_info[(2, tile_info_consumer_state.index)]
-                tile_info[3] = s_info[(3, tile_info_consumer_state.index)]
-                tile_info[4] = s_info[(4, tile_info_consumer_state.index)]
-                is_valid_tile = tile_info[3] == 1
-                cute.arch.fence_proxy("async.shared", space="cta")
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                is_valid_tile = self._read_tile_info(
+                    tile_info_pipeline,
+                    tile_info_consumer_state,
+                    s_info,
+                    tile_info,
+                    (0, 2, 3, 4),
+                )
                 tile_info_consumer_state.advance()
             meta_pipeline.producer_tail(meta_producer_state)
 
@@ -1196,17 +923,10 @@ class RouteGroupedGemmKernel:
         # Specialized epilogue warps
         #
         if warp_idx < self.mma_warp_id:
-            #
-            # Bar sync for retrieve tensor memory ptr from shared memory
-            #
-            tmem.wait_for_alloc()
-
-            #
-            # Retrieving tensor memory ptr and make accumulator tensor
-            #
-            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
-            t_ct_acc_base = cute.make_tensor(tmem_ptr, t_ct_acc_fake.layout)
+            tmem_ptr, t_ct_acc_base = self._accumulator_base(
+                tmem, t_ct_acc_fake
+            )
 
             #
             # Partition for epilogue
@@ -1241,17 +961,13 @@ class RouteGroupedGemmKernel:
             # Get the first tile info
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
 
-            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            tile_info[0] = s_info[(0, tile_info_consumer_state.index)]
-            tile_info[1] = s_info[(1, tile_info_consumer_state.index)]
-            tile_info[3] = s_info[(3, tile_info_consumer_state.index)]
-            tile_info[4] = s_info[(4, tile_info_consumer_state.index)]
-            is_valid_tile = tile_info[3] == 1
-            cute.arch.fence_proxy(
-                "async.shared",
-                space="cta",
+            is_valid_tile = self._read_tile_info(
+                tile_info_pipeline,
+                tile_info_consumer_state,
+                s_info,
+                tile_info,
+                (0, 1, 3, 4),
             )
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
             while is_valid_tile:
@@ -1364,24 +1080,15 @@ class RouteGroupedGemmKernel:
                 #
                 # Advance to next tile
                 #
-                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                tile_info[0] = s_info[(0, tile_info_consumer_state.index)]
-                tile_info[1] = s_info[(1, tile_info_consumer_state.index)]
-                tile_info[3] = s_info[(3, tile_info_consumer_state.index)]
-                tile_info[4] = s_info[(4, tile_info_consumer_state.index)]
-                is_valid_tile = tile_info[3] == 1
-                cute.arch.fence_proxy(
-                    "async.shared",
-                    space="cta",
+                is_valid_tile = self._read_tile_info(
+                    tile_info_pipeline,
+                    tile_info_consumer_state,
+                    s_info,
+                    tile_info,
+                    (0, 1, 3, 4),
                 )
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
-            #
-            # Dealloc the tensor memory buffer
-            #
-            tmem.relinquish_alloc_permit()
-            self.epilog_sync_barrier.arrive_and_wait()
-            tmem.free(tmem_ptr)
+            self._free_tensor_memory(tmem, tmem_ptr)
 
         griddepcontrol_launch_dependents()
 
@@ -1398,41 +1105,17 @@ class RouteGroupedGemmKernel:
         Returns the T2R tiled copy, this thread's partition of the staged
         accumulators and a register fragment for one epilogue subtile.
         """
-        # Make tiledCopy for tensor memory load
-        copy_atom_t2r = sm100_utils.get_tmem_load_op(
-            self.cta_tile_shape_mnk,
-            self.gemm_output_layout,
-            self.out_dtype,
-            self.acc_dtype,
+        tiled_copy_t2r, t_tr_t_acc, fragment = self._partition_accumulators(
+            tidx,
+            t_acc,
+            g_c_mnl,
             epi_tile,
             use_2cta_instrs,
+            self.gemm_output_layout,
+            self.out_dtype,
         )
-
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, STAGE)
-        t_acc_epi = cute.flat_divide(
-            t_acc[((None, None), 0, 0, None)],
-            epi_tile,
-        )
-        # (EPI_TILE_M, EPI_TILE_N)
-        tiled_copy_t2r = tcgen05.make_tmem_copy(
-            copy_atom_t2r, t_acc_epi[(None, None, 0, 0, 0)]
-        )
-
-        thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
-        # (T2R, T2R_M, T2R_N, EPI_M, EPI_M, STAGE)
-        t_tr_t_acc = thr_copy_t2r.partition_S(t_acc_epi)
-
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, loopM, loopN, loopL)
-        g_c_mnl_epi = cute.flat_divide(
-            g_c_mnl[((None, None), 0, 0, None, None, None)], epi_tile
-        )
-
-        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, loopM, loopN, loopL)
-        t_tr_g_c = thr_copy_t2r.partition_D(g_c_mnl_epi)
         # (T2R, T2R_M, T2R_N)
-        t_tr_r_acc = cute.make_rmem_tensor(
-            t_tr_g_c[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
-        )
+        t_tr_r_acc = cute.make_rmem_tensor(fragment, self.acc_dtype)
 
         return tiled_copy_t2r, t_tr_t_acc, t_tr_r_acc
 
@@ -1513,36 +1196,6 @@ class RouteGroupedGemmKernel:
             num_tile_stage,
             num_meta_stage,
         )
-
-    @staticmethod
-    def _compute_grid(
-        gemm_shape: tuple[int, int, int],
-        cta_tile_shape_mnk: tuple[int, int, int],
-        cluster_shape_mn: tuple[int, int],
-        max_active_clusters: cutlass.Constexpr,
-        raster_along_m: bool,
-    ) -> tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]:
-        """Return the persistent tile scheduler parameters and grid.
-
-        ``gemm_shape`` is the GEMM's (M, N, L).
-        """
-        (m, n, l) = gemm_shape  # noqa: E741
-
-        num_ctas_m = cute.ceil_div(m, cta_tile_shape_mnk[0])
-        num_ctas_n = cute.ceil_div(n, cta_tile_shape_mnk[1])
-        num_ctas_l = l
-
-        num_ctas_mnl = (num_ctas_m, num_ctas_n, num_ctas_l)
-        cluster_shape_mnl = (*cluster_shape_mn, 1)
-
-        tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl, cluster_shape_mnl, raster_along_m=raster_along_m
-        )
-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
-            tile_sched_params, max_active_clusters
-        )
-
-        return tile_sched_params, grid
 
     @cute.jit
     def wrapper(

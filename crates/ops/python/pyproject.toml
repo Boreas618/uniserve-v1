@@ -2,8 +2,9 @@
 #
 # What several kernel packages of `crates/ops/kernels` compile is one library,
 # installed where they are compiled: the programmatic dependent launch prologue
-# of the Triton kernels and the address arithmetic of the tensor primitives'
-# strided operands. A package imports it as it imports Triton (`from
+# of the Triton kernels, the address arithmetic of the tensor primitives'
+# strided operands and the CuTe DSL grouped GEMM the routed experts' two
+# products share. A package imports it as it imports Triton (`from
 # uniserve_kernels import dependent_launch`), so no package reaches outside
 # itself and none carries a copy.
 #
@@ -17,7 +18,9 @@ name = "uniserve-kernels"
 version = "2.0.0"
 description = "The shared sources of UniServe's kernel packages"
 requires-python = ">=3.11"
-# The sources are Triton's; the environment that installs them locks Triton.
+# The sources are Triton's and the CuTe DSL's, and the grouped GEMM calls
+# FlashInfer's; the environment that compiles them (the Build Server's) locks
+# those distributions.
 dependencies = []
 
 [build-system]

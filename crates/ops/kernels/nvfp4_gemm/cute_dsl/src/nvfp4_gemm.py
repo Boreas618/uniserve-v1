@@ -27,6 +27,16 @@
 
 """NVFP4 dense product: the CuTe DSL source of the ``nvfp4_gemm`` operator.
 
+Provenance: derived from CUTLASS's CuTe DSL tutorial kernel
+``examples/python/CuTeDSL/blackwell/tutorial_gemm/nvfp4_gemm_0.py``
+(``Sm100BlockScaledDenseGemmKernel``), as the locked FlashInfer 0.6.18
+distribution ships it among its data files (``flashinfer/data/cutlass/``). The
+changes are the call's alpha in the epilogue, the problem's extents and element
+types as parameters of the class, and the removal of the tutorial's torch
+runner. The tutorial is a script, not an importable module (it imports torch
+and its sibling ``blackwell.tutorial_gemm.utils`` when loaded), so the kernel
+is this package's source rather than an import.
+
 The kernel is CUTLASS's block-scaled dense GEMM for Blackwell: one CTA computes a
 128x256 tile of the product over packed E2M1 operands, reducing over whole 256
 element steps with the tensor-core FP4 instructions, and the epilogue applies the
