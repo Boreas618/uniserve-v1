@@ -716,21 +716,9 @@ def reference_fixture():
     )
     del logits
 
-    # A block-scaled FP8 weight and the dense matrix it states
-    # (`mtp_draft.block_quantize`).
-    dense = torch.randn(1, 128, 256, generator=generator) * 0.05
-    values, scales = mtp.block_quantize(dense)
-    model |= {
-        "fp8_blocks.weight": values[0].contiguous(),
-        "fp8_blocks.weight_scale_inv": bf16(scales[0]),
-    }
-    vectors["fp8_blocks.dense"] = bf16(
-        mtp.dequantize(values[0], bf16(scales[0]).float())
-    )
-
     # vLLM's own references of the indexer's scores, its top-k and the attention
-    # over a
-    # selection, in FP32.
+    # over a selection, in FP32, over inputs of their own generator.
+    generator = torch.Generator().manual_seed(4545)
     scores_of, top_of, attend = vllm_functions(
         [
             "_qsa_mqa_paged_reference",
@@ -837,16 +825,14 @@ def reference_fixture():
             "vocab_size": ple.VOCAB,
         },
         "vision_config": VISION,
-    }
-    quantization = {
-        "producer": {"name": "modelopt", "version": "0.46.0"},
-        "quantization": {
+        # The routed experts' NVFP4 weights, declared as a ModelOpt export
+        # declares them.
+        "quantization_config": {
+            "quant_method": "modelopt",
             "quant_algo": "NVFP4",
-            "group_size": 16,
-            "exclude_modules": [],
         },
     }
-    write("reference", config, model, vectors, quantization)
+    write("reference", config, model, vectors)
 
 
 #: A vision tower's configuration; the fixtures hold no tower and serve text.
@@ -1116,17 +1102,13 @@ def consistency_fixture():
         },
         "vision_config": {**VISION, "out_hidden_size": hidden},
     }
-    write("consistency", config, model, None, None)
+    write("consistency", config, model, None)
 
 
-def write(name, config, model, vectors, quantization):
+def write(name, config, model, vectors):
     directory = DATA / name / "model"
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    if quantization is not None:
-        (directory / "hf_quant_config.json").write_text(
-            json.dumps(quantization, indent=2) + "\n"
-        )
     save_file(
         {name: tensor.contiguous() for name, tensor in model.items()},
         directory / "model.safetensors",
