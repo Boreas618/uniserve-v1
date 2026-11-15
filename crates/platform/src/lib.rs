@@ -44,6 +44,7 @@ mod event;
 mod graph;
 #[cfg(test)]
 mod header;
+pub mod host;
 mod launch;
 mod library;
 mod memory;

@@ -1267,7 +1267,7 @@ impl Server {
     /// What the host admits of new host storage now ([`Self::admit_host`]).
     fn host_storage(&self) -> io::Result<HostStorage> {
         Ok(HostStorage {
-            available: available_storage()?,
+            available: platform::host::available_memory()?,
             reserve: self.host_reserve,
             // A host region's parts are storages of their own, admitted whole as each is
             // created: what they have yet to allocate counts here.
@@ -2444,35 +2444,6 @@ fn dedup(holders: &mut Vec<Holder>) {
         }
         new
     });
-}
-
-/// The host's available storage (`MemAvailable` of `/proc/meminfo`), in
-/// bytes.
-fn available_storage() -> io::Result<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo")?;
-    let available = meminfo
-        .lines()
-        .find_map(|line| line.strip_prefix("MemAvailable:"))
-        .and_then(|value| value.trim().strip_suffix("kB"))
-        .and_then(|kib| kib.trim().parse::<u64>().ok())
-        .map(|kib| kib * 1024)
-        .ok_or_else(|| io::Error::other("/proc/meminfo states no MemAvailable"))?;
-    Ok(cgroup_room().map_or(available, |room| available.min(room)))
-}
-
-/// What the server's storage cgroup (v2) lets it allocate beyond what the
-/// cgroup holds: its limit less its usage; `None` without a limit.
-fn cgroup_room() -> Option<u64> {
-    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let path = membership
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))?
-        .trim();
-    let directory = std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
-    let read = |name: &str| std::fs::read_to_string(directory.join(name)).ok();
-    let limit = read("memory.max")?.trim().parse::<u64>().ok()?;
-    let usage = read("memory.current")?.trim().parse::<u64>().ok()?;
-    Some(limit.saturating_sub(usage))
 }
 
 fn invalid(message: &str) -> (ErrorKind, String) {
