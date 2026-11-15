@@ -7,12 +7,18 @@
 // library of the distribution the Build Server's toolchain description names,
 // which the serving process's loader finds by the same default search.
 //
-// The engine is the first proposal of cuDNN's own heuristic (`CUDNN_HEUR_MODE_A`,
-// which measures nothing) for the shape and the device that keeps the call's
-// numerics: with `tf32` clear, an FP32 convolution takes only an engine that does
-// not narrow its inputs. A shape for which the heuristic proposes no such engine is
-// refused, with the graph and the geometry check in the message - design section
-// 5.4's rule: never measure in service.
+// The engine is chosen as PyTorch's cuDNN convolution chooses it with
+// `torch.backends.cudnn.benchmark` off, the runtime the models' references compute
+// in (`aten/src/ATen/native/cudnn/Conv_v8.cpp`: `run_single_conv` and
+// `filterEngineConfigs`): the first proposal of cuDNN's heuristic
+// (`CUDNN_HEUR_MODE_A`, PyTorch's `CUDNN_HEUR_MODE_INSTANT`) that keeps the call's
+// numerics, and when the heuristic proposes none, the first such engine of cuDNN's
+// fallback list (`CUDNN_HEUR_MODE_FALLBACK`). Neither list measures anything -
+// design section 5.4's rule: never measure in service. An engine keeps the call's
+// numerics when it does not convert its inputs to a narrower type and, for FP32
+// inputs whose call withholds `tf32`, does not compute on tensor cores, which read
+// FP32 operands as TF32. A shape for which neither list holds such an engine is
+// refused, with the graph and the geometry check in the message.
 //
 // The executable (the finalized `CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR`) is
 // built once per shape and device and reused, so service calls
@@ -359,100 +365,137 @@ Executable executable_of(const uniserve_conv_call& call, const std::string& key,
           set(properties, CUDNN_ATTR_DEVICEPROP_DEVICE_ID, CUDNN_TYPE_INT32, 1, &ordinal) &&
           finalize(properties, "the device's properties");
 
-  // The heuristic, asked once for this shape.
-  cudnnBackendDescriptor_t heuristic = nullptr;
-  const cudnnBackendHeurMode_t heuristic_mode = CUDNN_HEUR_MODE_A;
-  built = built && make(CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR, &heuristic) &&
-          set(heuristic, CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1,
-              &graph) &&
-          set(heuristic, CUDNN_ATTR_ENGINEHEUR_SM_COUNT_TARGET, CUDNN_TYPE_INT32, 1,
-              &multiprocessors) &&
-          set(heuristic, CUDNN_ATTR_ENGINEHEUR_DEVICEPROP, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1,
-              &properties) &&
-          set(heuristic, CUDNN_ATTR_ENGINEHEUR_MODE, CUDNN_TYPE_HEUR_MODE, 1, &heuristic_mode) &&
-          finalize(heuristic, "the heuristic");
-
+  // One list of engine configurations for the graph, asked of a heuristic descriptor of `mode`
+  // made for it: an attribute cannot be reset once a descriptor is finalized, so each list has its
+  // own. Fills `configs` with configurations the caller releases and `answered` with whether
+  // cuDNN answered the query, and answers false when the heuristic descriptor cannot be built.
+  //
   // **A list longer than the array is a query cuDNN refuses, and a refused query reads exactly like
   // an empty one.** The count is asked for separately - zero elements, no array - and the array is
   // sized from the answer, so the list is readable whatever its length. The cap keeps a library that
   // reports nonsense from taking the process with it. The results are written into descriptors the
   // caller made: an array of null pointers is refused entry by entry, and the list then reads as
-  // empty.
-  std::vector<cudnnBackendDescriptor_t> configs;
-  bool answered = false;
-  if (built) {
-    int64_t needed = 0;
-    const bool sized =
-        cudnnBackendGetAttribute(heuristic, CUDNN_ATTR_ENGINEHEUR_RESULTS,
-                                 CUDNN_TYPE_BACKEND_DESCRIPTOR, 0, &needed,
-                                 nullptr) == CUDNN_STATUS_SUCCESS;
-    int64_t room = sized && needed > 0 ? needed : kMaxEngineConfigs;
-    if (room > kMaxEngineConfigs * 64) {
-      room = kMaxEngineConfigs * 64;
-    }
-    configs.assign(static_cast<size_t>(room), nullptr);
-    for (cudnnBackendDescriptor_t& config : configs) {
-      if (cudnnBackendCreateDescriptor(CUDNN_BACKEND_ENGINECFG_DESCRIPTOR, &config) !=
-          CUDNN_STATUS_SUCCESS) {
-        config = nullptr;
+  // empty. The configurations do not refer to the heuristic, which is released here.
+  auto list_of = [&](cudnnBackendHeurMode_t mode, std::vector<cudnnBackendDescriptor_t>* configs,
+                     bool* answered) {
+    cudnnBackendDescriptor_t heuristic = nullptr;
+    const bool asked =
+        make(CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR, &heuristic) &&
+        set(heuristic, CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1,
+            &graph) &&
+        set(heuristic, CUDNN_ATTR_ENGINEHEUR_SM_COUNT_TARGET, CUDNN_TYPE_INT32, 1,
+            &multiprocessors) &&
+        set(heuristic, CUDNN_ATTR_ENGINEHEUR_DEVICEPROP, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1,
+            &properties) &&
+        set(heuristic, CUDNN_ATTR_ENGINEHEUR_MODE, CUDNN_TYPE_HEUR_MODE, 1, &mode) &&
+        finalize(heuristic, "the heuristic");
+    *answered = false;
+    configs->clear();
+    if (asked) {
+      int64_t needed = 0;
+      const bool sized =
+          cudnnBackendGetAttribute(heuristic, CUDNN_ATTR_ENGINEHEUR_RESULTS,
+                                   CUDNN_TYPE_BACKEND_DESCRIPTOR, 0, &needed,
+                                   nullptr) == CUDNN_STATUS_SUCCESS;
+      int64_t room = sized && needed > 0 ? needed : kMaxEngineConfigs;
+      if (room > kMaxEngineConfigs * 64) {
+        room = kMaxEngineConfigs * 64;
       }
-    }
-    int64_t count = 0;
-    answered = cudnnBackendGetAttribute(heuristic, CUDNN_ATTR_ENGINEHEUR_RESULTS,
-                                        CUDNN_TYPE_BACKEND_DESCRIPTOR, room, &count,
-                                        configs.data()) == CUDNN_STATUS_SUCCESS;
-    // A refused query may have written some of its array, and an answered one fills only its
-    // count: the rest are configurations only this function can release.
-    const size_t kept = answered && count > 0 ? static_cast<size_t>(count < room ? count : room) : 0;
-    for (size_t at = kept; at < configs.size(); ++at) {
-      if (configs[at] != nullptr) {
-        cudnnBackendDestroyDescriptor(configs[at]);
+      configs->assign(static_cast<size_t>(room), nullptr);
+      for (cudnnBackendDescriptor_t& config : *configs) {
+        if (cudnnBackendCreateDescriptor(CUDNN_BACKEND_ENGINECFG_DESCRIPTOR, &config) !=
+            CUDNN_STATUS_SUCCESS) {
+          config = nullptr;
+        }
       }
+      int64_t count = 0;
+      *answered = cudnnBackendGetAttribute(heuristic, CUDNN_ATTR_ENGINEHEUR_RESULTS,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR, room, &count,
+                                           configs->data()) == CUDNN_STATUS_SUCCESS;
+      // A refused query may have written some of its array, and an answered one fills only its
+      // count: the rest are configurations only this function can release.
+      const size_t kept =
+          *answered && count > 0 ? static_cast<size_t>(count < room ? count : room) : 0;
+      for (size_t at = kept; at < configs->size(); ++at) {
+        if ((*configs)[at] != nullptr) {
+          cudnnBackendDestroyDescriptor((*configs)[at]);
+        }
+      }
+      configs->resize(kept);
     }
-    configs.resize(kept);
-  }
-
-  // Whether an engine narrows its inputs before computing with them: a tensor-core engine reads FP32
-  // inputs as TF32 whatever its other notes say, and `CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS` is
-  // the note that distinguishes a convolution that may use TF32 from one that may not. Answers
-  // false when the notes cannot be read.
-  auto narrows_inputs = [](cudnnBackendDescriptor_t engine, bool* narrows) {
-    cudnnBackendNumericalNote_t notes[kMaxNumericalNotes] = {};
-    int64_t notes_count = 0;
-    if (cudnnBackendGetAttribute(engine, CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
-                                 CUDNN_TYPE_NUMERICAL_NOTE, kMaxNumericalNotes, &notes_count,
-                                 notes) != CUDNN_STATUS_SUCCESS) {
-      return false;
+    if (heuristic != nullptr) {
+      cudnnBackendDestroyDescriptor(heuristic);
     }
-    *narrows = false;
-    for (int64_t at = 0; at < notes_count && at < kMaxNumericalNotes; ++at) {
-      *narrows = *narrows || notes[at] == CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS ||
-                 notes[at] == CUDNN_NUMERICAL_NOTE_TENSOR_CORE;
-    }
-    return true;
+    return asked;
   };
-  // The engine: the heuristic's first proposal that keeps the call's numerics. With `tf32` clear, an
-  // engine that narrows FP32 inputs is not a candidate - that is what makes the permission mean
-  // something - and an unreadable note is not a reason to give up the exactness the call asked for:
-  // only an engine that says it does not narrow its inputs is usable then.
+
+  // Whether an engine keeps the call's numerics, read from the notes cuDNN publishes for it - the
+  // rule of PyTorch's `filterEngineConfigs`. `CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS` marks an
+  // engine that converts its inputs to a narrower type before computing, which no call admits: the
+  // narrowest product an FP32 call may declare is TF32's, and a 16-bit call's products are exact.
+  // `CUDNN_NUMERICAL_NOTE_TENSOR_CORE` marks a tensor-core engine, which reads FP32 operands as
+  // TF32, so an FP32 call takes one only when it grants `tf32`. An engine whose notes cannot be
+  // read states nothing the call can rely on and is not taken.
   const bool exact_fp32 = kFp32Inputs && call.tf32 == 0;
-  int64_t take = -1;
-  for (int64_t at = 0; at < static_cast<int64_t>(configs.size()) && take < 0; ++at) {
+  auto keeps_numerics = [exact_fp32](cudnnBackendDescriptor_t config) {
     // As with the list, the engine is read into a descriptor made here.
     cudnnBackendDescriptor_t engine = nullptr;
     if (cudnnBackendCreateDescriptor(CUDNN_BACKEND_ENGINE_DESCRIPTOR, &engine) !=
         CUDNN_STATUS_SUCCESS) {
-      continue;
+      return false;
     }
     int64_t engines = 0;
-    bool narrows = true;
-    const bool read = cudnnBackendGetAttribute(configs[at], CUDNN_ATTR_ENGINECFG_ENGINE,
-                                               CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &engines,
-                                               &engine) == CUDNN_STATUS_SUCCESS &&
-                      narrows_inputs(engine, &narrows);
+    cudnnBackendNumericalNote_t notes[kMaxNumericalNotes] = {};
+    int64_t notes_count = 0;
+    const bool read =
+        cudnnBackendGetAttribute(config, CUDNN_ATTR_ENGINECFG_ENGINE,
+                                 CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &engines,
+                                 &engine) == CUDNN_STATUS_SUCCESS &&
+        cudnnBackendGetAttribute(engine, CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
+                                 CUDNN_TYPE_NUMERICAL_NOTE, kMaxNumericalNotes, &notes_count,
+                                 notes) == CUDNN_STATUS_SUCCESS;
     cudnnBackendDestroyDescriptor(engine);
-    if (read && (!exact_fp32 || !narrows)) {
-      take = at;
+    if (!read) {
+      return false;
+    }
+
+    for (int64_t at = 0; at < notes_count && at < kMaxNumericalNotes; ++at) {
+      if (notes[at] == CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS ||
+          (exact_fp32 && notes[at] == CUDNN_NUMERICAL_NOTE_TENSOR_CORE)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // The engine: the first configuration that keeps the call's numerics, of the heuristic's list
+  // and then of the fallback list. **The heuristic's list can hold no exact engine for a wide FP32
+  // convolution**: on sm_100 it can be tensor-core configurations alone, all of which an exact call
+  // forbids, while the fallback list holds engines that compute in FP32.
+  //
+  // What each list said when neither holds an engine the call may take: a query cuDNN refused, an
+  // empty list and a list of engines the call's numerics forbid have different cures, so the
+  // refusal names each list's answer.
+  const cudnnBackendHeurMode_t modes[2] = {CUDNN_HEUR_MODE_A, CUDNN_HEUR_MODE_FALLBACK};
+  const char* said[2] = {"unasked", "unasked"};
+  std::vector<cudnnBackendDescriptor_t> configs;
+  int64_t take = -1;
+  for (int32_t list = 0; built && list < 2 && take < 0; ++list) {
+    bool answered = false;
+    built = list_of(modes[list], &configs, &answered);
+    for (int64_t at = 0; at < static_cast<int64_t>(configs.size()) && take < 0; ++at) {
+      if (keeps_numerics(configs[at])) {
+        take = at;
+      }
+    }
+    if (take < 0) {
+      said[list] = !answered         ? "unanswered"
+                   : configs.empty() ? "no engine"
+                                     : "only engines whose numerics the call forbids";
+      for (cudnnBackendDescriptor_t config : configs) {
+        cudnnBackendDestroyDescriptor(config);
+      }
+      configs.clear();
     }
   }
 
@@ -475,12 +518,6 @@ Executable executable_of(const uniserve_conv_call& call, const std::string& key,
                                  : (source + spread - window) / step + 1;
       agrees = agrees && implied[axis] == y_dims[axis + 2];
     }
-    // What the heuristic said: a list that could not be asked for, a list that came back empty and
-    // a list of engines the call's numerics forbid have different cures.
-    const char* said = !answered          ? "unanswered"
-                       : configs.empty()  ? "no engine"
-                                          : "only engines that convert FP32 inputs, which the call "
-                                            "forbids";
     // **The graph travels with the refusal.** An empty engine list is an answer about one exact
     // request: these dims, these strides, this geometry, this element type and this permission.
     // A reader given only the sentence has to guess which of them cuDNN would not take - and the
@@ -488,17 +525,18 @@ Executable executable_of(const uniserve_conv_call& call, const std::string& key,
     char why[512];
     std::snprintf(
         why, sizeof(why),
-        // The two things that decide the cure come first, so that a message truncated by its own
-        // room still says what the heuristic answered and whether the geometry agrees: `heuristic`
-        // is that answer, and `geometry` compares the stated output with the one the input, weight
-        // and geometry imply. The graph follows, because a reader with only the verdict has to
-        // guess which shape cuDNN would not take.
-        "cuDNN proposes no engine for this convolution: %s, heuristic %s, geometry %s (imply "
-        "[%lld %lld %lld]); x [%lld %lld %lld %lld %lld] strides [%lld %lld %lld %lld %lld] type "
-        "%d, w [%lld %lld %lld %lld %lld] type %d, y [%lld %lld %lld %lld %lld] type %d, kernel "
-        "[%lld %lld %lld] stride [%lld %lld %lld] padding [%lld %lld %lld] dilation [%lld %lld "
-        "%lld], tf32 %d, channels_last %d",
-        transposed ? "backward-data" : "forward", said, agrees ? "agrees" : "DISAGREES",
+        // The things that decide the cure come first, so that a message truncated by its own room
+        // still says what each list answered and whether the geometry agrees: `heuristic` and
+        // `fallback` are the lists' answers, and `geometry` compares the stated output with the
+        // one the input, weight and geometry imply. The graph follows, because a reader with only
+        // the verdict has to guess which shape cuDNN would not take.
+        "cuDNN proposes no engine for this convolution: %s, heuristic %s, fallback %s, geometry "
+        "%s (imply [%lld %lld %lld]); x [%lld %lld %lld %lld %lld] strides [%lld %lld %lld %lld "
+        "%lld] type %d, w [%lld %lld %lld %lld %lld] type %d, y [%lld %lld %lld %lld %lld] type "
+        "%d, kernel [%lld %lld %lld] stride [%lld %lld %lld] padding [%lld %lld %lld] dilation "
+        "[%lld %lld %lld], tf32 %d, channels_last %d",
+        transposed ? "backward-data" : "forward", said[0], said[1],
+        agrees ? "agrees" : "DISAGREES",
         static_cast<long long>(implied[0]), static_cast<long long>(implied[1]),
         static_cast<long long>(implied[2]), static_cast<long long>(x_dims[0]),
         static_cast<long long>(x_dims[1]), static_cast<long long>(x_dims[2]),
@@ -533,10 +571,10 @@ Executable executable_of(const uniserve_conv_call& call, const std::string& key,
   for (cudnnBackendDescriptor_t config : configs) {
     cudnnBackendDestroyDescriptor(config);
   }
-  // The heuristic names the device-properties descriptor, so it is released first. A descriptor
-  // that was never made is null, which cuDNN refuses to destroy and nothing here needs.
-  for (cudnnBackendDescriptor_t made :
-       {heuristic, properties, graph, operation, convolution, y, w, x}) {
+  // The heuristics, which name the device-properties descriptor and the graph, are released where
+  // their lists are read. A descriptor that was never made is null, which cuDNN refuses to destroy
+  // and nothing here needs.
+  for (cudnnBackendDescriptor_t made : {properties, graph, operation, convolution, y, w, x}) {
     if (made != nullptr) {
       cudnnBackendDestroyDescriptor(made);
     }

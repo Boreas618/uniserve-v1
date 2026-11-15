@@ -16,6 +16,12 @@ these calls withhold it: a convolution cuDNN may run on TF32 tensor cores
 does not meet the FP32 bound, which the operator's tolerance does not
 account for.
 
+An FP32 call that withholds ``tf32`` is served at every width: the wide case
+is a convolution for which cuDNN's heuristic proposes only tensor-core
+engines, so the module's engine is one of cuDNN's fallback list. Over its
+thousands of products the operator's bound no longer separates TF32 products
+from FP32 ones; the case holds the call's service and its values.
+
 Channels-last stores the input and the output with the channel axis fastest
 and leaves the filter packed, which is the order ``conv.rs`` declares; a bias
 is on, so that run also reads the bias against the output's order.
@@ -63,6 +69,15 @@ GEOMETRIES = {
     "unit stride": {"kernel": 3, "stride": 1, "padding": 1, "dilation": 1},
     "stride 2": {"kernel": 3, "stride": 2, "padding": 1, "dilation": 1},
 }
+
+#: A wide FP32 convolution, by the extents :func:`compare` takes and its
+#: geometry: the first convolution of MiniMax-H3's audio decoder (`conv_pre`,
+#: 2048 to 1024 channels over 7 taps) over a track of 207 latent frames. On
+#: sm_100, cuDNN's heuristic proposes only tensor-core engines for it, which an
+#: FP32 call that withholds `tf32` may not take, so the module takes an engine
+#: of cuDNN's fallback list.
+WIDE_EXTENTS = (2, 2048, 1024, 207)
+WIDE_GEOMETRY = {"kernel": 7, "stride": 1, "padding": 3, "dilation": 1}
 
 #: The phrase a half-precision module's refusal of `tf32` contains.
 TF32_REFUSAL = "cannot use it"
@@ -143,18 +158,15 @@ def stored(tensor, channels_last):
     )
 
 
-@pytest.mark.gpu
-@pytest.mark.parametrize("geometry", GEOMETRIES)
-@pytest.mark.parametrize(
-    "channels_last", [False, True], ids=["channels first", "channels last"]
-)
-@pytest.mark.parametrize("dtype", ["f32", "bf16"])
-@pytest.mark.parametrize("op", OPERATORS)
-def test_a_convolution_matches_torch_within_the_operators_bound(
-    op, dtype, channels_last, geometry, torch_device, kernel_module
-):
-    function = entry(kernel_module, dtype)
-    shape = GEOMETRIES[geometry]
+def compare(function, op, dtype, channels_last, extents, shape, device):
+    """Launches `op` of element type `dtype` with `tf32` withheld and holds
+    its output to torch's convolution in FP64 within the operator's bound.
+
+    `extents` are the batch, the input and output channels and the spatial
+    extent along each axis; `shape` is a geometry as :data:`GEOMETRIES` states
+    one.
+    """  # noqa: D205
+    batch, channels, out_channels, length = extents
     torch.manual_seed(0)
     rank = 3 if op == "conv3d" else 1
     element = TORCH_TYPES[dtype]
@@ -167,23 +179,23 @@ def test_a_convolution_matches_torch_within_the_operators_bound(
 
     x = stored(
         torch.randn(
-            BATCH,
-            CHANNELS,
-            *([LENGTH] * rank),
+            batch,
+            channels,
+            *([length] * rank),
             dtype=element,
-            device=torch_device,
+            device=device,
         ),
         channels_last,
     )
     if op == "conv_transpose1d":
         weight = torch.randn(
-            CHANNELS, OUT_CHANNELS, *kernel, dtype=element, device=torch_device
+            channels, out_channels, *kernel, dtype=element, device=device
         )
     else:
         weight = torch.randn(
-            OUT_CHANNELS, CHANNELS, *kernel, dtype=element, device=torch_device
+            out_channels, channels, *kernel, dtype=element, device=device
         )
-    bias = torch.randn(OUT_CHANNELS, dtype=element, device=torch_device)
+    bias = torch.randn(out_channels, dtype=element, device=device)
 
     reference = OPERATORS[op]
     with torch.no_grad():
@@ -198,7 +210,7 @@ def test_a_convolution_matches_torch_within_the_operators_bound(
     # The output's own extents, from the reference: the call carries them, and
     # a module that disagreed with them would refuse the launch.
     out = stored(
-        torch.empty(expected.shape, dtype=element, device=torch_device),
+        torch.empty(expected.shape, dtype=element, device=device),
         channels_last,
     )
 
@@ -219,14 +231,14 @@ def test_a_convolution_matches_torch_within_the_operators_bound(
     call.tf32 = 0
     call.channels_last = int(channels_last)
 
-    stream = torch.cuda.current_stream(torch_device).cuda_stream
+    stream = torch.cuda.current_stream(device).cuda_stream
     status = function(ctypes.byref(call), ctypes.c_void_p(stream))
-    torch.cuda.synchronize(torch_device)
+    torch.cuda.synchronize(device)
     assert status == 0, (
         f"the entry refused the call: {call.error.decode(errors='replace')}"
     )
 
-    taps = math.prod(kernel) * CHANNELS
+    taps = math.prod(kernel) * channels
     difference = (out.double() - expected).abs()
     # A NaN anywhere makes a maximum NaN, which hides every other error and
     # passes a `>` comparison: it counts as an infinite error.
@@ -238,6 +250,43 @@ def test_a_convolution_matches_torch_within_the_operators_bound(
         f"{tuple(expected.shape)}, {taps} taps: max |out - exact| = "
         f"{worst:.6g} exceeds the operator's bound {relative:.3g} of the "
         f"largest value {largest:.6g}"
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("geometry", GEOMETRIES)
+@pytest.mark.parametrize(
+    "channels_last", [False, True], ids=["channels first", "channels last"]
+)
+@pytest.mark.parametrize("dtype", ["f32", "bf16"])
+@pytest.mark.parametrize("op", OPERATORS)
+def test_a_convolution_matches_torch_within_the_operators_bound(
+    op, dtype, channels_last, geometry, torch_device, kernel_module
+):
+    compare(
+        entry(kernel_module, dtype),
+        op,
+        dtype,
+        channels_last,
+        (BATCH, CHANNELS, OUT_CHANNELS, LENGTH),
+        GEOMETRIES[geometry],
+        torch_device,
+    )
+
+
+@pytest.mark.gpu
+def test_a_wide_exact_fp32_convolution_is_served(torch_device, kernel_module):
+    """An FP32 call that withholds `tf32` is served within the operator's
+    bound whatever engines cuDNN's heuristic proposes for its width.
+    """  # noqa: D205
+    compare(
+        entry(kernel_module, "f32"),
+        "conv1d",
+        "f32",
+        False,
+        WIDE_EXTENTS,
+        WIDE_GEOMETRY,
+        torch_device,
     )
 
 
