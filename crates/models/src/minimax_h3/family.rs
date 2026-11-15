@@ -512,7 +512,7 @@ impl VideoModel for MinimaxH3 {
         // one latent frame, which covers up to a clip's frames over its latent frames, rounded
         // up; a track's latent step is two rows.
         let frames = FRAMES.clip_frames.div_ceil(FRAMES.clip_latent_frames);
-        let cell = CANVAS_RULE.multiple;
+        let cell = processing::minimax_h3::PATCH_PIXELS;
         let merge = self
             .config
             .vision()
@@ -965,7 +965,7 @@ fn reference_openings(
     packing: &ConditionPacking,
 ) -> Vec<(u32, Vec<ConditionShape>)> {
     // A condition row is one latent patch of the raster's cells, which the packing tiles.
-    let cell = processing::minimax_h3::LATENT_COMPRESSION * processing::minimax_h3::PATCH_SIDE;
+    let cell = processing::minimax_h3::PATCH_PIXELS;
     let reference = |frames: u32, height: u32, width: u32, audio_samples: u32| ConditionShape {
         role: ConditionRole::Reference,
         frames,

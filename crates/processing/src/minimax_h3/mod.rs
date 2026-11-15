@@ -78,13 +78,17 @@ pub const LATENT_COMPRESSION: u32 = 16;
 /// frame.
 pub const PATCH_SIDE: u32 = 2;
 
-/// The canvas rule H3 generates by (diffusers' `adapt_shape_v1`): a 768-pixel short edge, an area
-/// cap of `768 * 1344` pixels, aspects from 1:4 to 4:1, and sides on a 32-pixel grid, so a side
+/// Pixels along one side of a denoiser patch: the VAE's spatial compression times the
+/// transformer's patch side, 32. Every canvas side is a multiple of it.
+pub const PATCH_PIXELS: u32 = LATENT_COMPRESSION * PATCH_SIDE;
+
+/// The canvas rule H3 generates by: a 768-pixel short edge, an area cap of `768 * 1344` pixels,
+/// aspects from 1:4 to 4:1, and sides on the denoiser patch's grid ([`PATCH_PIXELS`]), so a side
 /// survives the VAE's spatial compression on a whole number of transformer patches.
 pub const CANVAS_RULE: CanvasRule = CanvasRule {
     short_edge: 768,
     max_pixels: 768 * 1344,
-    multiple: LATENT_COMPRESSION * PATCH_SIDE,
+    multiple: PATCH_PIXELS,
     narrowest: (1, 4),
     widest: (4, 1),
 };
@@ -139,8 +143,7 @@ pub fn named_canvases() -> Result<Vec<ServedCanvas>, CanvasError> {
 /// Denoiser rows of one latent frame of `canvas`: one per `2 x 2` patch of its `16x`-compressed
 /// latent raster.
 pub const fn patch_rows(canvas: Canvas) -> u32 {
-    (canvas.height / LATENT_COMPRESSION / PATCH_SIDE)
-        * (canvas.width / LATENT_COMPRESSION / PATCH_SIDE)
+    (canvas.height / PATCH_PIXELS) * (canvas.width / PATCH_PIXELS)
 }
 
 /// Denoiser rows of a stereo track of `latents` latent steps: one per channel per step,

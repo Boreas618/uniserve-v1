@@ -237,6 +237,11 @@ impl From<ServeError> for ApiError {
                 InputError::Invalid { param, .. } => {
                     Self::invalid_request(error.to_string(), video_param(param))
                 }
+                // A capacity refusal names the option that sizes the deployment's capacity.
+                InputError::Capacity { param, .. } => Self::invalid_request(
+                    format!("{error}; serve with a larger video_config.max_condition_rows"),
+                    video_param(param),
+                ),
                 InputError::Internal(message) => {
                     Self::server_error(format!("video request processing failed: {message}"))
                 }

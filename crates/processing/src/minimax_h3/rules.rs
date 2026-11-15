@@ -24,13 +24,13 @@
 use std::num::NonZeroU32;
 
 use proto::video::{Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VisionGrid};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::processor::H3Processor;
 use super::{
-    AUDIO_SAMPLE_RATE, CANVAS_RULE, ConditionPacking, FPS, FRAMES, MIN_SECONDS, ReferenceLimits,
-    VideoTask, audio_latents, patch_rows, track_rows,
+    AUDIO_SAMPLE_RATE, CANVAS_RULE, ConditionPacking, FPS, FRAMES, MIN_SECONDS, PATCH_PIXELS,
+    ReferenceLimits, VideoTask, audio_latents, patch_rows, track_rows,
 };
 use crate::canvas::{CoverCrop, cover_crop};
 use crate::frames::requested_frames;
@@ -38,8 +38,9 @@ use crate::media::{AudioMetadata, ImageMetadata, MediaMetadata, VideoMetadata, r
 use crate::qwen_vl::{ProcessorConfig, sample_frames};
 use crate::video::{ConditionInput, InputError, Length, Reference, ReferenceKind, VideoSpec};
 
-/// The ratio a request without a size takes, for `t2va` and `ref2va`.
-const DEFAULT_ASPECT_RATIO: (u32, u32) = (16, 9);
+/// The keyframe sets a request may anchor, by the generated frames their `frame_index` values
+/// name: the first, the last, or both. A `ref2va` request may also anchor none.
+pub const KEYFRAME_ANCHORS: [&[i64]; 3] = [&[0], &[-1], &[0, -1]];
 
 /// The public request parameter a refusal of the output size names.
 pub const SIZE: &str = "size";
@@ -93,6 +94,19 @@ pub fn frame_count(seconds: f64, max_seconds: f64) -> Result<u32, String> {
     Ok(FRAMES.align_up(requested_frames(seconds, FPS)))
 }
 
+/// The MiniMax-H3 processor's options a deployment states (`mm_processor_kwargs`); an option of
+/// another name is refused.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessorOptions {
+    /// Short edge, in pixels, an image reference is encoded at, at most; the edge the denoiser
+    /// declares when absent.
+    reference_image_short_edge: Option<u32>,
+    /// Whether a reference smaller than its encoding size is enlarged to it; false when absent.
+    #[serde(default)]
+    enlarge_references: bool,
+}
+
 /// How a deployment sizes the references of a `ref2va` request: the MiniMax-H3 processor's options
 /// (`mm_processor_kwargs`), within what the denoiser declares ([`ReferenceLimits`]).
 ///
@@ -111,23 +125,6 @@ pub struct ReferenceSizing {
 }
 
 impl ReferenceSizing {
-    /// The default sizing of a deployment whose denoiser declares `limits`: images reduced to the
-    /// declared edge, nothing enlarged.
-    pub const fn new(limits: &ReferenceLimits) -> Self {
-        Self {
-            image_short_edge: limits.image_short_edge,
-            enlarge: false,
-        }
-    }
-
-    /// The released pipeline's sizing: every reference at its encoding size, enlarged when smaller.
-    pub const fn released(limits: &ReferenceLimits) -> Self {
-        Self {
-            image_short_edge: limits.image_short_edge,
-            enlarge: true,
-        }
-    }
-
     /// The sizing a deployment's processor options state: `reference_image_short_edge`, by default
     /// the edge the denoiser declares, and `enlarge_references`, by default false.
     ///
@@ -139,23 +136,14 @@ impl ReferenceSizing {
         options: &Map<String, Value>,
         limits: &ReferenceLimits,
     ) -> Result<Self, String> {
-        let mut sizing = Self::new(limits);
-        for (name, value) in options {
-            match name.as_str() {
-                "reference_image_short_edge" => {
-                    sizing.image_short_edge = value
-                        .as_u64()
-                        .and_then(|edge| u32::try_from(edge).ok())
-                        .ok_or_else(|| format!("{name} must be a whole number of pixels"))?;
-                }
-                "enlarge_references" => {
-                    sizing.enlarge = value
-                        .as_bool()
-                        .ok_or_else(|| format!("{name} must be true or false"))?;
-                }
-                _ => return Err(format!("the MiniMax-H3 processor takes no option {name:?}")),
-            }
-        }
+        let options = ProcessorOptions::deserialize(&Value::Object(options.clone()))
+            .map_err(|error| error.to_string())?;
+        let sizing = Self {
+            image_short_edge: options
+                .reference_image_short_edge
+                .unwrap_or(limits.image_short_edge),
+            enlarge: options.enlarge_references,
+        };
 
         // A denoiser that takes no image reference sizes none.
         let (edge, largest, multiple) = (
@@ -433,14 +421,11 @@ impl PreparedCondition {
         let visual = match &self.preparation {
             Preparation::Keyframe { .. } => VisualRows::Patches(patch_rows(canvas)),
             Preparation::Image(size) => VisualRows::Patches(patch_rows(*size)),
-            Preparation::Video(clip) => {
-                let side = super::LATENT_COMPRESSION * super::PATCH_SIDE;
-                VisualRows::Grid([
-                    FRAMES.latent_frames(clip.vae_frames),
-                    clip.canvas.height / side,
-                    clip.canvas.width / side,
-                ])
-            }
+            Preparation::Video(clip) => VisualRows::Grid([
+                FRAMES.latent_frames(clip.vae_frames),
+                clip.canvas.height / PATCH_PIXELS,
+                clip.canvas.width / PATCH_PIXELS,
+            ]),
             Preparation::Audio(_) => VisualRows::None,
         };
         condition_tiles(self.audio_rows, visual, packing)
@@ -626,12 +611,9 @@ pub fn video_reference(
     let source_rate =
         f64::from(media.frame_rate.numerator) / f64::from(media.frame_rate.denominator);
     let fps = f64::from(FPS);
-    let timeline = if source_rate == fps {
-        media.frames
-    } else {
-        // The timeline ends at the output-rate slot the stream's end rounds to.
-        (media.frames as f64 * (fps / source_rate) + 0.5).floor() as u64
-    };
+    // The timeline ends at the output-rate slot the stream's end rounds to; a stream at the output
+    // rate keeps its frames, as `fps / source_rate` is then exactly one.
+    let timeline = (media.frames as f64 * (fps / source_rate) + 0.5).floor() as u64;
     let start_frame = start_offset(start_seconds, fps);
     let available = timeline.saturating_sub(start_frame);
     let too_short = || {
@@ -644,7 +626,9 @@ pub fn video_reference(
     if available < u64::from(FRAMES.min_frames) {
         return Err(too_short());
     }
-    let kept = u32::try_from(available).map_or(frames, |available| available.min(frames));
+    // At most the generated frames, which a `u32` counts.
+    let kept = u32::try_from(available.min(u64::from(frames)))
+        .map_err(|_| "a reference clip longer than a frame count holds".to_owned())?;
     // The VAE encodes the leading frames that form a frame count of its rule.
     let vae_frames = FRAMES.align_down(kept).ok_or_else(too_short)?;
     let soundtrack = media
@@ -655,14 +639,17 @@ pub fn video_reference(
 
     let (frame_indices, block_timestamps) =
         sample_frames(kept, vision.temporal_patch_size, FPS).map_err(|error| error.to_string())?;
-    let sampled = u32::try_from(frame_indices.len()).unwrap_or(u32::MAX);
+    // Distinct indices below `kept`, so a `u32` counts them.
+    let sampled = u32::try_from(frame_indices.len())
+        .map_err(|_| "more vision samples than a frame count holds".to_owned())?;
     let grid = vision
         .video_grid(sampled, size.height, size.width)
         .map_err(|error| error.to_string())?;
     let clip = VideoClip {
         canvas: size,
-        // Offsets past the timeline were refused above.
-        start_frame: u32::try_from(start_frame).unwrap_or(u32::MAX),
+        start_frame: u32::try_from(start_frame).map_err(|_| {
+            format!("start_time_seconds skips {start_frame} frames, more than a frame count holds")
+        })?,
         frames: kept,
         vae_frames,
         soundtrack,
@@ -674,6 +661,19 @@ pub fn video_reference(
         block_timestamps,
     };
     Ok((clip, seen))
+}
+
+/// The refusal of a request that states no length and cannot take one from a soundtrack: a
+/// `ref2va` request exactly one of whose references carries audio lasts as long as that track
+/// after its start offset, and every other request states its length. `known` counts the
+/// references known to carry audio.
+fn unstated_length(request: &VideoSpec, known: usize) -> InputError {
+    InputError::invalid(
+        length_param(request),
+        format!(
+            "is required unless a ref2va request has exactly one reference with audio, got {known}"
+        ),
+    )
 }
 
 /// Checks that the probed media is the reference's kind.
@@ -721,8 +721,13 @@ fn check_references(
             if reference_.kind != ReferenceKind::Image {
                 return reject("a keyframe must be an image".to_owned());
             }
-            if !matches!(frame_index, 0 | -1) {
-                return reject(format!("frame_index must be 0 or -1, got {frame_index}"));
+            if !KEYFRAME_ANCHORS
+                .iter()
+                .any(|anchors| anchors.contains(&frame_index))
+            {
+                return reject(format!(
+                    "frame_index must be one of {KEYFRAME_ANCHORS:?}, got {frame_index}"
+                ));
             }
         }
         if let Some(start) = reference_.start_time_seconds {
@@ -739,11 +744,13 @@ fn check_references(
         .iter()
         .filter_map(|reference| reference.frame_index)
         .collect();
-    let keyframes_valid = matches!(anchors.as_slice(), [0] | [-1] | [0, -1]);
+    let keyframes_valid = KEYFRAME_ANCHORS.contains(&anchors.as_slice());
     if (task == VideoTask::FirstLastToVideoAudio || !anchors.is_empty()) && !keyframes_valid {
         return Err(InputError::invalid(
             REFERENCES,
-            format!("keyframe frame_index values must be [0], [-1] or [0, -1], got {anchors:?}"),
+            format!(
+                "keyframe frame_index values must be one of {KEYFRAME_ANCHORS:?}, got {anchors:?}"
+            ),
         ));
     }
 
@@ -793,19 +800,12 @@ impl H3Processor {
             .collect()
     }
 
-    /// The short edge a request without a size is generated at: the deployment's first canvas's.
-    fn default_short_edge(&self) -> u32 {
-        self.denoiser
-            .canvases
-            .first()
-            .map_or(CANVAS_RULE.short_edge, |served| served.short_edge)
-    }
-
     /// The canvas a request names without consulting media; `None` for an `fl2va` request without
     /// a size, whose canvas follows its first keyframe.
     ///
     /// A stated size must be one of the canvases the deployment serves. Without one, a `t2va` or
-    /// `ref2va` request takes the 16:9 canvas at the short edge of the deployment's first canvas.
+    /// `ref2va` request takes the deployment's first canvas, the default its configuration
+    /// declares by naming it first.
     fn named_canvas(
         &self,
         task: VideoTask,
@@ -829,23 +829,7 @@ impl H3Processor {
         if task == VideoTask::FirstLastToVideoAudio {
             return Ok(None);
         }
-
-        let short_edge = self.default_short_edge();
-        let ratio = format!("{}:{}", DEFAULT_ASPECT_RATIO.0, DEFAULT_ASPECT_RATIO.1);
-        canvases
-            .iter()
-            .find(|served| served.short_edge == short_edge && served.aspect_ratio == ratio)
-            .map(|served| Some(served.canvas))
-            .ok_or_else(|| {
-                InputError::invalid(
-                    SIZE,
-                    format!(
-                        "is required: this deployment serves no {ratio} canvas at a \
-                         {short_edge}-pixel short edge; it serves {}",
-                        self.served_sizes().join(", ")
-                    ),
-                )
-            })
+        Ok(Some(self.default_canvas))
     }
 
     /// The length a request states, as its duration in seconds and its frame count; `None` when
@@ -921,16 +905,18 @@ impl H3Processor {
         check_references(task, &request.references, &self.denoiser.references)?;
 
         if self.stated_length(request)?.is_none() {
-            let may_follow_audio = task == VideoTask::ReferenceToVideoAudio
-                && request
+            // Before its media is probed an audio reference carries audio and a video reference
+            // may.
+            let count = |kind: ReferenceKind| {
+                request
                     .references
                     .iter()
-                    .any(|reference| reference.kind != ReferenceKind::Image);
-            if !may_follow_audio {
-                return Err(InputError::invalid(
-                    length_param(request),
-                    "is required unless a ref2va request has exactly one reference with audio",
-                ));
+                    .filter(|reference| !is_keyframe(reference) && reference.kind == kind)
+                    .count()
+            };
+            let (audios, videos) = (count(ReferenceKind::Audio), count(ReferenceKind::Video));
+            if !(task == VideoTask::ReferenceToVideoAudio && audios <= 1 && audios + videos >= 1) {
+                return Err(unstated_length(request, audios));
             }
         }
         Ok(())
@@ -945,14 +931,10 @@ impl H3Processor {
         if let Some(stated) = self.stated_length(request)? {
             return Ok(stated);
         }
-        let [(index, track, start_seconds)] = soundtracks else {
-            return Err(InputError::invalid(
-                length_param(request),
-                format!(
-                    "is required unless exactly one reference has audio, got {}",
-                    soundtracks.len()
-                ),
-            ));
+        let (VideoTask::ReferenceToVideoAudio, [(index, track, start_seconds)]) =
+            (task(request), soundtracks)
+        else {
+            return Err(unstated_length(request, soundtracks.len()));
         };
         let rate = f64::from(track.sample_rate);
         let start_sample = start_offset(*start_seconds, rate);
@@ -984,19 +966,8 @@ impl H3Processor {
         let canvas = match self.named_canvas(task, request.size)? {
             Some(size) => size,
             None => {
-                // `fl2va` without a size: the first keyframe sets the canvas at the rule's short
-                // edge.
-                if self.default_short_edge() != CANVAS_RULE.short_edge {
-                    return Err(InputError::invalid(
-                        SIZE,
-                        format!(
-                            "is required: the first keyframe sets a canvas at a {}-pixel short \
-                             edge, which this deployment does not serve; it serves {}",
-                            CANVAS_RULE.short_edge,
-                            self.served_sizes().join(", ")
-                        ),
-                    ));
-                }
+                // `fl2va` without a size: the first keyframe sets the canvas by the canvas rule,
+                // which must be one the deployment serves.
                 let Some(MediaMetadata::Image(first)) = media.first() else {
                     return Err(reference(0, "the first keyframe is not an image"));
                 };
@@ -1160,11 +1131,13 @@ pub(super) mod tests {
     }
 
     /// The canvases of the vectors' accepted requests, as a deployment that prepares them all
-    /// declares them. A `t2va` or `ref2va` request's ratio names its canvas (`auto` naming 16:9);
-    /// an `fl2va` canvas, which the canvas rule resolves from a free ratio or the first keyframe,
-    /// is declared under its own size.
+    /// declares them, the canvas an `auto` target names first, as the default of a request that
+    /// states no size. A `t2va` or `ref2va` request's ratio names its canvas (`auto` naming
+    /// 16:9); an `fl2va` canvas, which the canvas rule resolves from a free ratio or the first
+    /// keyframe, is declared under its own size.
     fn vector_canvases() -> Vec<ServedCanvas> {
         let mut declared: Vec<ServedCanvas> = Vec::new();
+        let mut default = None;
         for case in vectors()["requests"].as_array().unwrap() {
             let Some(expected) = case.get("expected") else {
                 continue;
@@ -1175,7 +1148,10 @@ pub(super) mod tests {
             let named = target["aspect_ratio"].as_str().unwrap();
             let aspect_ratio = match (case["task"].as_str().unwrap(), named) {
                 ("fl2va", _) => format!("{}:{}", canvas.width, canvas.height),
-                (_, "auto") => "16:9".to_owned(),
+                (_, "auto") => {
+                    default = default.or(Some(canvas));
+                    "16:9".to_owned()
+                }
                 (_, named) => named.to_owned(),
             };
             if !declared.iter().any(|served| {
@@ -1188,7 +1164,31 @@ pub(super) mod tests {
                 });
             }
         }
+        if let Some(index) = declared
+            .iter()
+            .position(|served| Some(served.canvas) == default)
+        {
+            let first = declared.remove(index);
+            declared.insert(0, first);
+        }
         declared
+    }
+
+    /// The sizing of a deployment whose processor options enlarge references, as the released
+    /// pipeline sizes them (which the vectors follow).
+    fn released() -> ReferenceSizing {
+        ReferenceSizing {
+            image_short_edge: REFERENCE_LIMITS.image_short_edge,
+            enlarge: true,
+        }
+    }
+
+    /// The sizing of a deployment that states no processor option: references only reduced.
+    fn reduced() -> ReferenceSizing {
+        ReferenceSizing {
+            enlarge: false,
+            ..released()
+        }
     }
 
     fn served(short_edge: u32, aspect_ratio: &str, width: u32, height: u32) -> ServedCanvas {
@@ -1203,25 +1203,28 @@ pub(super) mod tests {
     /// vectors, sized as the released pipeline sizes references (which the vectors follow).
     pub(in crate::minimax_h3) fn processor() -> H3Processor {
         let vectors = vectors();
+        let canvases = vector_canvases();
         H3Processor {
+            default_canvas: canvases[0].canvas,
             denoiser: DenoiserInfo {
                 tasks: VideoTask::ALL.to_vec(),
                 schedule_points: 9,
                 video_shift: 12.0,
                 audio_shift: 3.0,
-                canvases: vector_canvases(),
+                canvases,
                 references: REFERENCE_LIMITS,
                 condition_packing: ConditionPacking::dense(0),
             },
             max_seconds: 15.0,
-            sizing: ReferenceSizing::released(&REFERENCE_LIMITS),
+            sizing: released(),
             vision: vision(&vectors),
         }
     }
 
-    /// The same processor serving only `canvases`.
+    /// The same processor serving only `canvases`, the first the default.
     fn serving(canvases: Vec<ServedCanvas>) -> H3Processor {
         let mut processor = processor();
+        processor.default_canvas = canvases[0].canvas;
         processor.denoiser.canvases = canvases;
         processor
     }
@@ -1404,7 +1407,7 @@ pub(super) mod tests {
     /// The parameter a refusal names.
     fn param(error: InputError) -> String {
         match error {
-            InputError::Invalid { param, .. } => param,
+            InputError::Invalid { param, .. } | InputError::Capacity { param, .. } => param,
             InputError::Internal(message) => panic!("not a refusal: {message}"),
         }
     }
@@ -1541,8 +1544,7 @@ pub(super) mod tests {
         let vision = vision(&vectors);
         for case in vectors["reference_image_cases"].as_array().unwrap() {
             let (width, height) = pair(&case["size"]);
-            let resized =
-                reference_image_size(width, height, &ReferenceSizing::released(&REFERENCE_LIMITS));
+            let resized = reference_image_size(width, height, &released());
             if case.get("error").is_some() {
                 assert!(resized.is_err(), "{case}");
                 continue;
@@ -1705,7 +1707,7 @@ pub(super) mod tests {
     fn reference_videos_match_the_reference() {
         let vectors = vectors();
         let vision = vision(&vectors);
-        let sizing = ReferenceSizing::released(&REFERENCE_LIMITS);
+        let sizing = released();
         for case in vectors["video_reference_cases"].as_array().unwrap() {
             let facts = video_facts(case);
             let start = case["start_seconds"].as_f64().unwrap();
@@ -1749,8 +1751,7 @@ pub(super) mod tests {
     #[test]
     fn references_are_enlarged_only_on_request() {
         let sized = |width, height| Canvas { width, height };
-        let reduced = ReferenceSizing::new(&REFERENCE_LIMITS);
-        let released = ReferenceSizing::released(&REFERENCE_LIMITS);
+        let (reduced, released) = (reduced(), released());
         let image = |width, height, sizing: &ReferenceSizing| {
             reference_image_size(width, height, sizing).unwrap()
         };
@@ -1808,10 +1809,10 @@ pub(super) mod tests {
             ReferenceSizing::from_options(options.as_object().unwrap(), limits)
         };
         let limits = &REFERENCE_LIMITS;
-        assert_eq!(read(json!({}), limits), Ok(ReferenceSizing::new(limits)));
+        assert_eq!(read(json!({}), limits), Ok(reduced()));
         assert_eq!(
             read(json!({"enlarge_references": true}), limits),
-            Ok(ReferenceSizing::released(limits))
+            Ok(released())
         );
         assert_eq!(
             read(json!({"reference_image_short_edge": 1024}), limits),
@@ -1963,8 +1964,8 @@ pub(super) mod tests {
     }
 
     /// A deployment that declares 480p canvases serves them: a stated size is the canvas the
-    /// deployment declares, a request without one takes the 16:9 canvas at its first canvas's
-    /// short edge, and a size it did not prepare is refused before any media is needed.
+    /// deployment declares, a request without one takes the deployment's first canvas, and a size
+    /// it did not prepare is refused before any media is needed.
     #[test]
     fn declared_canvases_are_the_sizes_served() {
         let canvas = |width, height| Canvas { width, height };
@@ -1987,11 +1988,10 @@ pub(super) mod tests {
             assert_eq!(param(error), "size");
         }
 
-        // A deployment whose first short edge serves no 16:9 canvas has no default for a text
-        // request.
-        let portrait_first = serving(vec![served(480, "21:9", 992, 416)]);
-        let error = portrait_first.check_request(&text(None, 5.0)).unwrap_err();
-        assert_eq!(param(error), "size");
+        // The first canvas a deployment names is its default, whatever its ratio.
+        let wide_first = serving(vec![served(480, "21:9", 992, 416)]);
+        let generation = wide_first.prepare(&text(None, 5.0), &[]).unwrap();
+        assert_eq!(generation.canvas, canvas(992, 416));
     }
 
     /// An `fl2va` request without a size takes the canvas its first keyframe sets through the
@@ -2042,6 +2042,37 @@ pub(super) mod tests {
             let error = processor.check_request(&frames(count)).unwrap_err();
             assert_eq!(param(error), "num_frames", "{count}");
         }
+    }
+
+    /// A request that states no length takes it from its one soundtrack: one whose references
+    /// carry no audio, or two audio tracks, is refused before any media is fetched, and a video
+    /// whose soundtrack is unknown before its media is probed may set it.
+    #[test]
+    fn a_length_is_stated_or_follows_one_soundtrack() {
+        let processor = processor();
+        let unstated = |references: Vec<Reference>| VideoSpec {
+            length: None,
+            ..request(None, 5.0, references)
+        };
+        let (image, video, audio) = (
+            reference_of(ReferenceKind::Image),
+            reference_of(ReferenceKind::Video),
+            reference_of(ReferenceKind::Audio),
+        );
+        for references in [vec![image], vec![image, audio, audio], Vec::new()] {
+            let error = processor.check_request(&unstated(references)).unwrap_err();
+            assert_eq!(param(error), "seconds");
+        }
+        assert!(
+            processor
+                .check_request(&unstated(vec![image, video]))
+                .is_ok()
+        );
+        assert!(
+            processor
+                .check_request(&unstated(vec![image, audio]))
+                .is_ok()
+        );
     }
 
     /// The served maximum duration narrows the model's own range.

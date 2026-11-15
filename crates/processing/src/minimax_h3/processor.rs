@@ -4,7 +4,7 @@
 //! which ([`VideoTask`]): none is `t2va`, image keyframes alone (`frame_index` 0 or -1) are
 //! `fl2va`, and any reference without a frame index is `ref2va`. A size selects one of the canvases
 //! the deployment serves; without one, an `fl2va` request takes the canvas rule over its first
-//! keyframe and every other request the deployment's first canvas's short edge at 16:9. A duration
+//! keyframe and every other request the deployment's first canvas. A duration
 //! aligns up to the `17n + 5` frame rule, and a frame count must already be one of it. Every
 //! refusal names the public request parameter at fault.
 
@@ -12,7 +12,7 @@ use proto::video::Canvas;
 use serde_json::{Value, json};
 
 use super::prompt::present;
-use super::rules::{REFERENCES, ReferenceSizing};
+use super::rules::{KEYFRAME_ANCHORS, REFERENCES, ReferenceSizing};
 use super::{
     AUDIO_SAMPLE_RATE, CANVAS_RULE, DEFAULT_SEED, DenoiserInfo, FPS, FRAMES, MAX_SECONDS,
     MIN_SECONDS, PROCESSOR_FILES, VideoTask,
@@ -27,6 +27,8 @@ use crate::vocabulary::Vocabulary;
 pub struct H3Processor {
     /// What the placed denoiser serves, as its workers described it.
     pub(super) denoiser: DenoiserInfo,
+    /// The canvas of a request that states no size: the first the deployment serves.
+    pub(super) default_canvas: Canvas,
     /// The deployment's longest output, in seconds (`video_config.max_seconds`).
     pub(super) max_seconds: f64,
     /// How the deployment sizes references.
@@ -54,6 +56,11 @@ impl H3Processor {
         }
         let denoiser = DenoiserInfo::decode(binding.description)
             .map_err(|error| format!("the video worker's denoiser: {error}"))?;
+        let default_canvas = denoiser
+            .canvases
+            .first()
+            .map(|served| served.canvas)
+            .ok_or_else(|| "the video worker's denoiser serves no canvas".to_owned())?;
 
         let sizing = ReferenceSizing::from_options(binding.processor_options, &denoiser.references)
             .map_err(|message| format!("invalid mm_processor_kwargs: {message}"))?;
@@ -69,6 +76,7 @@ impl H3Processor {
 
         Ok(Self {
             denoiser,
+            default_canvas,
             max_seconds: binding.max_seconds,
             sizing,
             vision,
@@ -129,14 +137,16 @@ impl VideoProcessor for H3Processor {
                 let rules = match task {
                     VideoTask::TextToVideoAudio => json!({"input_references": []}),
                     VideoTask::FirstLastToVideoAudio => json!({
-                        "keyframe_frame_indices": [[0], [-1], [0, -1]],
+                        "keyframe_frame_indices": KEYFRAME_ANCHORS,
                     }),
                     VideoTask::ReferenceToVideoAudio => json!({
                         "max_images": limits.images,
                         "max_videos": limits.videos,
                         "max_audios": limits.audios,
                         "max_references": limits.total,
-                        "keyframe_frame_indices": [[], [0], [-1], [0, -1]],
+                        "keyframe_frame_indices": std::iter::once(&[][..])
+                            .chain(KEYFRAME_ANCHORS)
+                            .collect::<Vec<&[i64]>>(),
                         "reference_image_short_edge": self.sizing.image_short_edge,
                         "enlarge_references": self.sizing.enlarge,
                     }),
@@ -188,14 +198,11 @@ impl VideoProcessor for H3Processor {
         let packing = self.denoiser.condition_packing;
         let condition_rows = generation.condition_rows(&packing);
         if condition_rows > packing.capacity {
-            return Err(InputError::invalid(
-                REFERENCES,
-                format!(
-                    "the references take {condition_rows} denoiser rows, more than the {} this \
-                     deployment serves; serve with a larger video_config.max_condition_rows",
-                    packing.capacity
-                ),
-            ));
+            return Err(InputError::Capacity {
+                param: REFERENCES.to_owned(),
+                rows: condition_rows,
+                capacity: packing.capacity,
+            });
         }
 
         let prompt = present(vocabulary, &generation, &request.prompt)?;
@@ -372,6 +379,35 @@ mod tests {
             start_time_seconds: None,
         });
         assert_eq!(refused(processor.check(&keyframed)), "input_references");
+    }
+
+    /// A request whose conditions take more denoiser rows than the deployment serves is refused
+    /// with the rows and the capacity, for the daemon to name its option.
+    #[test]
+    fn conditions_beyond_the_capacity_are_refused_as_such() {
+        let processor = processor(&[VideoTask::FirstLastToVideoAudio], 15.0).unwrap();
+        let mut keyframed = spec(Some((1344, 768)), Some(Length::Seconds(5.0)));
+        keyframed.references.push(Reference {
+            kind: ReferenceKind::Image,
+            frame_index: Some(0),
+            start_time_seconds: None,
+        });
+        let keyframe = [MediaMetadata::Image(crate::ImageMetadata {
+            width: 1344,
+            height: 768,
+        })];
+        processor.check(&keyframed).unwrap();
+        let refused = processor
+            .process(&keyframed, &keyframe, &CharacterTokenizer)
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            InputError::Capacity {
+                param: "input_references".to_owned(),
+                rows: 42 * 24,
+                capacity: 0,
+            }
+        );
     }
 
     /// A deployment's longest output must lie within the model's own bounds.

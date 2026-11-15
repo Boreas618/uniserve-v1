@@ -47,7 +47,7 @@ use proto::video::Layout;
 
 use crate::minimax_h3::config::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_LATENTS_PER_SECOND, FPS, FRAMES, LATENT_COMPRESSION,
-    PATCH_SIDE, TransformerConfig, VsaConfig,
+    PATCH_PIXELS, PATCH_SIDE, TransformerConfig, VsaConfig,
 };
 use crate::minimax_h3::{Error, Result};
 
@@ -76,9 +76,6 @@ const FRAME_RESCALE: f64 = 5.0 / 3.0;
 
 /// Output frames each of the five latent frames of one clip covers (`packed_sequence.py:43`).
 const FRAME_PER_TOKEN: [f64; 5] = [1.0, 4.0, 4.0, 4.0, 4.0];
-
-/// The pixels one patch spans along each side: the VAE's compression times the patch side.
-const PATCH_PIXELS: u32 = LATENT_COMPRESSION * PATCH_SIDE;
 
 /// The CPU device every tensor of a packed sequence is built on.
 const CPU: &Device = &Device::Cpu;

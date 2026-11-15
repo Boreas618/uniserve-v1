@@ -98,6 +98,20 @@ pub enum InputError {
         /// What is wrong with it.
         message: String,
     },
+    /// The request's conditions take more denoiser rows than the deployment serves; the same
+    /// request fails again on this deployment, and one of a larger condition capacity serves it.
+    #[error(
+        "{param}: the references take {rows} denoiser rows, more than the {capacity} this \
+         deployment serves"
+    )]
+    Capacity {
+        /// The request parameter at fault, as the public API names it.
+        param: String,
+        /// Denoiser rows the request's conditions take.
+        rows: u32,
+        /// Rows the deployment serves.
+        capacity: u32,
+    },
     /// Processing valid input failed, for example because the tokenizer lacks a token the model
     /// presents.
     #[error("{0}")]

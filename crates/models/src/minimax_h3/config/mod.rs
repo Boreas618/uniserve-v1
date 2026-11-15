@@ -38,7 +38,7 @@ pub use audio_vae::AudioVaeConfig;
 pub use denoiser::{DenoiserConfig, ScheduleConfig, TransformerConfig, VsaConfig};
 pub use processing::minimax_h3::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_LATENTS_PER_SECOND, AUDIO_SAMPLE_RATE, FPS, FRAMES,
-    LATENT_COMPRESSION, PATCH_SIDE,
+    LATENT_COMPRESSION, PATCH_PIXELS, PATCH_SIDE,
 };
 pub use text::RETAINED_LAYERS;
 pub use video_vae::VideoVaeConfig;
