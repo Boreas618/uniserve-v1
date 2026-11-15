@@ -6,19 +6,20 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use proto::admin::{
+    EpochState, Failure, FailureKind, Phase, PreviousEpoch, RollbackConfig, Threshold,
+};
 use proto::process::{self, command};
 use proto::report::SchedulerStats;
 use testkit::process::Refusals;
 
-use crate::epoch::{
-    Epoch, EpochRecord, Epochs, Failure, FailureKind, PackageRevision, Recorded, Status, Threshold,
-};
+use crate::epoch::{Epoch, EpochRecord, Epochs, PackageRevision, Recorded};
 use crate::observe::Observer;
-use crate::options::{PreviousEpoch, RollbackConfig, ServerArgs, UpdateConfig};
+use crate::options::{ServerArgs, UpdateConfig};
 use crate::supervision::processes::Processes;
 use crate::test_support::Engines;
 use crate::updates::trial::{Baseline, Trial};
-use crate::updates::update::{EpochSwitch, Node, Phase, Update};
+use crate::updates::update::{EpochSwitch, Node, Update};
 use crate::updates::{Transition, Updater};
 
 /// The epoch that serves when a test begins, and the epoch form's target.
@@ -72,7 +73,7 @@ impl Deployment {
                 kernels: serving.modules.kernels.clone(),
                 policy: serving.modules.policy.clone(),
                 previous: None,
-                status: Status::Serving,
+                status: EpochState::Serving,
                 generation: Some(1),
             },
         );
@@ -304,7 +305,7 @@ fn a_generation_update_serves_on_trial_and_a_commit_keeps_it() {
 
     // On trial the record names the new modules and keeps the previous ones.
     let record = deployment.record(SERVING);
-    assert_eq!(record.status, Status::Trial);
+    assert_eq!(record.status, EpochState::Trial);
     assert_eq!(record.policy, deployment.target.modules.policy);
     assert_eq!(
         record.previous.map(|previous| previous.policy),
@@ -319,7 +320,7 @@ fn a_generation_update_serves_on_trial_and_a_commit_keeps_it() {
         ["prepare", "switch", "commit"]
     );
     let record = deployment.record(SERVING);
-    assert_eq!(record.status, Status::Serving);
+    assert_eq!(record.status, EpochState::Serving);
     assert_eq!(record.policy, deployment.target.modules.policy);
     assert_eq!(record.previous, None);
     assert_eq!(deployment.updater.in_flight(), None);
@@ -341,7 +342,7 @@ fn a_failed_preparation_abandons_the_update_and_nothing_changed() {
     assert_eq!(deployment.entered(), ["preparing", "abandoned"]);
     assert_eq!(deployment.engines.engine(PREVIOUS).generation(), 1);
     let record = deployment.record(SERVING);
-    assert_eq!(record.status, Status::Serving);
+    assert_eq!(record.status, EpochState::Serving);
     assert_eq!(record.policy, deployment.serving.modules.policy);
     let status = deployment.status();
     assert_eq!(status["phase"], "abandoned");
@@ -422,7 +423,7 @@ fn a_fault_on_trial_rolls_a_generation_update_back() {
         "the engine rolled back by itself"
     );
     let record = deployment.record(SERVING);
-    assert_eq!(record.status, Status::Serving);
+    assert_eq!(record.status, EpochState::Serving);
     assert_eq!(record.policy, deployment.serving.modules.policy);
     assert_eq!(record.previous, None);
     let mark = deployment
@@ -638,7 +639,7 @@ fn an_epoch_update_promotes_the_target_and_then_drains_the_serving_engine() {
 
     // Trial: the previous epoch is kept parked.
     assert_eq!(deployment.entered(), ["preparing", "switching", "trial"]);
-    assert_eq!(deployment.record(TARGET).status, Status::Trial);
+    assert_eq!(deployment.record(TARGET).status, EpochState::Trial);
     assert_eq!(deployment.record(TARGET).generation, Some(1));
     assert_eq!(deployment.record(TARGET).config.executable, BUILD);
     assert!(deployment.engines.stops().is_empty());
@@ -650,7 +651,7 @@ fn an_epoch_update_promotes_the_target_and_then_drains_the_serving_engine() {
     assert!(deployment.updater.commit().is_some());
     deployment.run();
     assert_eq!(deployment.entered(), ["committed"]);
-    assert_eq!(deployment.record(TARGET).status, Status::Serving);
+    assert_eq!(deployment.record(TARGET).status, EpochState::Serving);
     assert_eq!(deployment.engines.stops(), vec![Some(PREVIOUS)]);
     let retiring = deployment
         .engines
@@ -932,7 +933,7 @@ fn a_refused_spawn_or_claim_abandons_the_update() {
     assert_eq!(deployment.status()["phase"], "abandoned");
     assert_eq!(deployment.status()["failure"]["kind"], "spawn_failed");
     assert!(deployment.engines.received(PREVIOUS).is_empty());
-    assert_eq!(deployment.record(TARGET).status, Status::Released);
+    assert_eq!(deployment.record(TARGET).status, EpochState::Released);
 
     let mut deployment = Deployment::new(Refusals {
         claim: Some("the Storage Server refused".to_owned()),
@@ -1022,7 +1023,7 @@ fn a_rollback_on_trial_promotes_the_previous_epoch_before_the_target_drains() {
     );
     assert_eq!(deployment.entered(), ["switching", "rolled_back"]);
     assert_eq!(deployment.engines.stops(), vec![Some(SPAWNED)]);
-    assert_eq!(deployment.record(TARGET).status, Status::Released);
+    assert_eq!(deployment.record(TARGET).status, EpochState::Released);
     // The target's storage is retired on the node that keeps the previous epoch.
     let retiring = deployment
         .engines

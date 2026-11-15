@@ -98,7 +98,7 @@ def chunk(event):
 
 async def record(phase):
     events.append({
-        "seq": len(events) + 1, "time": time.time(), "kind": "deployment",
+        "seq": len(events) + 1, "time": time.time(), "kind": "update",
         "message": f"update 1: {phase}", "data": {"phase": phase},
     })
     async with appended:

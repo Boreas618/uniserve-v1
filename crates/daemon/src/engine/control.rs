@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
+use proto::admin::NodeUsage;
 use proto::process::{self, downstream, event, hello, reply, request, upstream};
 use proto::request::wire;
 use service::{Connection, Listener};
@@ -1100,17 +1101,6 @@ pub fn prepare_epoch(
         "the epoch's modules are prepared at every host"
     );
     Ok(pinned)
-}
-
-/// What one node's Storage Server keeps for the deployment, as `GET /admin/config` reports it
-/// (`quotas`): the node's host identity, its quota of every GPU the deployment uses, what the host
-/// admits of new host storage, and what the deployment's tasks copied there by priority.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct NodeUsage {
-    pub(crate) host: String,
-    pub(crate) quotas: Vec<storage::protocol::Quota>,
-    pub(crate) host_storage: storage::protocol::HostStorage,
-    pub(crate) tasks: Vec<storage::protocol::TaskTotal>,
 }
 
 /// Prepares the module set a node request names (`Request::PrepareModules`) at this node's Build Server,

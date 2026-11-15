@@ -14,6 +14,8 @@
 //!   workers, JSON in worker hooks.
 //! - [`module`]: the package revisions an epoch fills its operators with, the phases
 //!   and slots they fill, and the operators a build has.
+//! - [`admin`]: the schema of a node's admin API, JSON over HTTP, which the daemon serves
+//!   and its clients (`uniserve-manager`, a harness) read.
 //!
 //! Each connection opens with a hello exchange in which the daemon refuses a
 //! peer of any other version of the engine interface than its own
@@ -23,6 +25,7 @@
 //! between nodes: every envelope of the interfaces implements
 //! `service::Message` here.
 
+pub mod admin;
 pub mod catalog;
 pub mod config;
 pub mod media;

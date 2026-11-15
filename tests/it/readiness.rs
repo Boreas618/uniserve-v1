@@ -147,7 +147,7 @@ fn a_daemon_reports_the_listeners_it_bound_on_port_0() {
     let mut stream = std::os::unix::net::UnixStream::connect(admin.path().unwrap()).unwrap();
     std::io::Write::write_all(
         &mut stream,
-        b"GET /admin/node HTTP/1.1\r\nHost: admin\r\nConnection: close\r\n\r\n",
+        b"GET /admin/status HTTP/1.1\r\nHost: admin\r\nConnection: close\r\n\r\n",
     )
     .unwrap();
     let mut response = String::new();

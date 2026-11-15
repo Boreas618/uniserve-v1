@@ -1140,11 +1140,10 @@ mod tests {
             let ready = Ready::new(None, instance.path());
             let token = node::deployment_token(node::Lifetime::Deployment, &shutdown);
             let retire = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let admin = admin::Admin::with_epochs(
+            let admin = admin::Admin::new(
                 token.clone(),
                 Arc::clone(&retire),
-                Arc::new(crate::epoch::Epochs::default()),
-                config.admin_config.event_log,
+                admin::Journal::new(config.admin_config.event_log),
             );
             let jobs = Arc::new(VideoJobs::new(
                 config.video_job_config.clone(),

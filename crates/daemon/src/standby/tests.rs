@@ -3,10 +3,11 @@
 
 use std::collections::BTreeMap;
 
-use super::*;
-use crate::epoch::{Failure, FailureKind, Status};
+use proto::admin::{EpochState, Failure, FailureKind};
 use proto::process::FaultKind;
 use proto::request::StandbyStorage;
+
+use super::*;
 
 /// The serving generation the fake standbys's processes are at.
 const SERVING: u64 = 7;
@@ -126,7 +127,7 @@ fn standbys() -> Standbys {
 /// Starts the standby of every domain.
 fn start(standbys: &mut Standbys) {
     let actions = standbys.serve(
-        Status::Serving,
+        EpochState::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
     );
@@ -195,7 +196,7 @@ fn a_serving_epoch_starts_one_standby_a_generation_ahead_of_each_member() {
     start(&mut standbys);
     // The standbys exist: serving again starts none beside them.
     let again = standbys.serve(
-        Status::Serving,
+        EpochState::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
     );
@@ -225,7 +226,7 @@ fn the_standby_generation_is_the_epoch_layers_number_and_is_never_computed() {
         },
     ]);
     let actions = standbys.serve(
-        Status::Serving,
+        EpochState::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
     );
@@ -243,7 +244,11 @@ fn the_standby_generation_is_the_epoch_layers_number_and_is_never_computed() {
 #[test]
 fn an_epoch_that_does_not_serve_keeps_no_standby() {
     let mut standbys = standbys();
-    for status in [Status::Preparing, Status::Trial, Status::Released] {
+    for status in [
+        EpochState::Preparing,
+        EpochState::Trial,
+        EpochState::Released,
+    ] {
         let actions = standbys.serve(
             status,
             options(StandbyStorage::Auto),
@@ -252,7 +257,7 @@ fn an_epoch_that_does_not_serve_keeps_no_standby() {
         assert!(actions.is_empty(), "{status:?} keeps a standby");
     }
     let disabled = standbys.serve(
-        Status::Serving,
+        EpochState::Serving,
         StandbyOptions {
             enabled: false,
             storage: StandbyStorage::Auto,
@@ -298,7 +303,7 @@ fn a_parked_domain_is_promoted_on_a_sticky_fault_and_a_new_standby_follows() {
     // the old generation.
     allocated(&mut standbys, &["b", "c"], SERVING + 2);
     let actions = standbys.serve(
-        Status::Serving,
+        EpochState::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
     );
@@ -364,7 +369,7 @@ fn a_domain_with_a_member_that_has_no_parked_standby_relaunches_wholly() {
     standbys.relaunched("c", SERVING + 2);
     allocated(&mut standbys, &["b", "c"], SERVING + 3);
     let actions = standbys.serve(
-        Status::Serving,
+        EpochState::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
     );
@@ -447,7 +452,7 @@ fn an_epoch_that_stops_serving_retires_its_standby_and_its_domain_goes_on_short(
     // Serving again starts no standby on the retired node.
     allocated(&mut standbys, &["b"], SERVING + 2);
     let actions = standbys.serve(
-        Status::Serving,
+        EpochState::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
     );
@@ -526,7 +531,7 @@ fn one_crowded_device_suspends_the_whole_domain() {
     let mut standbys = standbys();
     let mut facts = roomy(&["a", "b", "c"]);
     facts.get_mut("b").expect("b's facts").crowded = true;
-    let actions = standbys.serve(Status::Serving, options(StandbyStorage::Auto), &facts);
+    let actions = standbys.serve(EpochState::Serving, options(StandbyStorage::Auto), &facts);
     assert_eq!(
         actions,
         vec![
@@ -545,7 +550,7 @@ fn a_standby_that_cannot_fit_even_suspended_is_not_kept() {
     let c = facts.get_mut("c").expect("c's facts");
     c.crowded = true;
     c.fits_suspended = false;
-    let actions = standbys.serve(Status::Serving, options(StandbyStorage::Auto), &facts);
+    let actions = standbys.serve(EpochState::Serving, options(StandbyStorage::Auto), &facts);
     assert_eq!(
         actions,
         vec![spawn("a", SERVING + 1, Storage::Resident)],
@@ -570,7 +575,7 @@ fn a_standby_that_fails_to_start_is_left_out() {
     standbys.relaunched("a", SERVING + 2);
     allocated(&mut standbys, &["a"], SERVING + 3);
     let actions = standbys.serve(
-        Status::Serving,
+        EpochState::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
     );

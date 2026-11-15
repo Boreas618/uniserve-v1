@@ -38,6 +38,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
 
+use proto::admin::{StepTime, Throttled};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -187,31 +188,6 @@ impl Throttling {
     pub(crate) fn halved(&self) -> bool {
         self.halved
     }
-}
-
-/// The throttles one preparation sent, which its change reports.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct Throttled {
-    pub(crate) halvings: u32,
-    pub(crate) restorations: u32,
-}
-
-/// The serving epoch's steps against their baseline while a successor
-/// prepares, as the control last read them, which `GET /admin/config`
-/// reports of the change in progress.
-#[derive(Debug, Default, Clone, Copy, PartialEq, serde::Serialize)]
-pub(crate) struct StepTime {
-    /// The largest ratio of a scheduler's step time to its baseline of the
-    /// same batch size among the reports of the latest decision that had a
-    /// baseline; `None` before any had.
-    pub(crate) ratio: Option<f64>,
-    /// The slowdown tolerated (`update_config.transfer_slowdown`): a step
-    /// may take `1 + slowdown` times its baseline.
-    pub(crate) slowdown: f64,
-    /// Whether the transfers' link budgets stand halved.
-    pub(crate) halved: bool,
-    #[serde(flatten)]
-    pub(crate) throttled: Throttled,
 }
 
 /// Who passes a decision on to the nodes' Transfer Servers.

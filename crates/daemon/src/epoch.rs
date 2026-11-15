@@ -4,7 +4,7 @@
 //! engines on every node, their graphs and the storage they create. The
 //! leader's daemon keeps one [`EpochRecord`] per epoch: the
 //! [`proto::config::EngineConfig`] it was built from, the module set it runs,
-//! the modules a trial keeps as the previous generation, and its [`Status`].
+//! the modules a trial keeps as the previous generation, and its [`EpochState`].
 //!
 //! A configuration change is routed by comparing what it moves ([`change`]):
 //! with the build configuration unchanged and only the kernel or policy
@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use proto::admin::{EpochState, EpochStatus, KernelPackage, ManagedProcess};
 pub use proto::module::{ModuleSet, ModuleSlot, PackageRevision, Phase};
 // The operators the configuration selects a backend for are named by the
 // module vocabulary (`proto::module::operator`), whose names each
@@ -25,7 +26,6 @@ pub use proto::module::{ModuleSet, ModuleSlot, PackageRevision, Phase};
 // cannot disagree about a slot's name.
 use proto::module::operator;
 use serde::Serialize;
-use serde_json::Value;
 
 use crate::options::ServerArgs;
 
@@ -34,33 +34,6 @@ use crate::options::ServerArgs;
 /// slots are `proto::module`'s types, which the daemon, the engine
 /// and the Build Server all name modules with.
 pub type KernelKey = ModuleSlot;
-
-/// Where an epoch is in its life.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Status {
-    /// Its engines start beside the serving epoch's, map external state
-    /// read-only and park.
-    Preparing,
-    /// Its engines serve requests.
-    Serving,
-    /// Its engines serve while what they replaced is kept for a rollback:
-    /// the previous epoch, or the previous generation of this one.
-    Trial,
-    /// Its engines exited and its storage was retired.
-    Released,
-}
-
-impl Status {
-    /// The status as `GET /admin/config` names it.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Preparing => "preparing",
-            Self::Serving => "serving",
-            Self::Trial => "trial",
-            Self::Released => "released",
-        }
-    }
-}
 
 /// What the leader's daemon records of one epoch.
 #[derive(Debug, Clone, PartialEq)]
@@ -79,7 +52,7 @@ pub struct EpochRecord {
     /// rollback returns to them, and a commit drops them.
     pub previous: Option<Generation>,
     /// Where the epoch is in its life.
-    pub status: Status,
+    pub status: EpochState,
     /// The generation: the number the epoch's own engines gave the modules
     /// they execute, read from their `Parked` or `Serving` report and never
     /// invented here. It is not a process's identity: that is
@@ -108,256 +81,6 @@ impl Recorded {
     /// The epoch's number.
     pub fn number(self) -> u64 {
         self.0
-    }
-}
-
-/// The state of a process a node's daemon manages.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProcessState {
-    /// The daemon started it and it has not reported for service yet.
-    Starting,
-    /// It serves.
-    Serving,
-    /// It is parked: it executes nothing and keeps its storage until it is
-    /// promoted or ends.
-    Parked,
-    /// It ended.
-    Stopped,
-    /// It failed, and why.
-    Failed(String),
-}
-
-/// One engine a node's daemon manages, as `GET /admin/config` reports
-/// it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManagedProcess {
-    /// The worker group it runs in (`engine`, `worker`, ...): the group a
-    /// launch generation is allocated for.
-    pub group: String,
-    /// Its rank inside that group.
-    pub rank: u64,
-    /// Its process id on its node, once started.
-    pub pid: Option<u32>,
-    /// The epoch it serves, once its own report named it.
-    pub epoch: Option<u64>,
-    /// The build identity it was started from.
-    pub build: String,
-    /// The LAUNCH generation: the identity of this launch of the process,
-    /// which the deployment's engine control allocates (`EngineControl::launch_number`) and the
-    /// process names in its launch file and its reports. It is not the
-    /// model generation ([`EpochRecord::generation`]), which the engine
-    /// numbers for the modules it executes; 0 until launched.
-    pub generation: u64,
-    /// Where it is.
-    pub state: ProcessState,
-}
-
-/// A threshold of a trial (`update_config.rollback`) that its reading passed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Threshold {
-    /// The share of the trial's requests that failed (`failure_rate`).
-    FailureRate,
-    /// The new epoch's average step against the previous one's
-    /// (`step_time_regression`).
-    StepTimeRegression,
-    /// The new epoch's token throughput against the previous one's
-    /// (`throughput_regression`).
-    ThroughputRegression,
-}
-
-impl Threshold {
-    /// The threshold's option name under `update_config.rollback`.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::FailureRate => "failure_rate",
-            Self::StepTimeRegression => "step_time_regression",
-            Self::ThroughputRegression => "throughput_regression",
-        }
-    }
-}
-
-/// What made an engine fail or an update not stand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailureKind {
-    /// A fault an engine reported, of the kind it stated.
-    Fault(proto::process::FaultKind),
-    /// A job of a batch ran past the engine's watchdog.
-    Stalled,
-    /// A request's logits were not finite.
-    NonFiniteLogits,
-    /// A scheduling policy failed and its engine went back to the previous policy.
-    PolicyRolledBack,
-    /// A main process exited, as its daemon observed it.
-    ProcessExit,
-    /// An engine could not prepare the update's modules.
-    PrepareFailed,
-    /// An engine rolled the update back by itself.
-    RolledBack,
-    /// A target process could not be spawned.
-    SpawnFailed,
-    /// A target's storage could not be claimed.
-    ClaimFailed,
-    /// An engine runs another build than its epoch's.
-    BuildMismatch,
-    /// A switched engine executes modules other than the update prepared.
-    StaleModules,
-    /// A threshold of the trial passed.
-    Threshold(Threshold),
-    /// The trial was not committed by its deadline.
-    Deadline,
-    /// The submitter's or the operator's decision.
-    Decision,
-}
-
-impl FailureKind {
-    /// The stable short name the admin API and the event log state.
-    pub fn name(self) -> &'static str {
-        use proto::process::FaultKind;
-        match self {
-            Self::Fault(fault) => match fault {
-                FaultKind::Device => "device_fault",
-                FaultKind::Weights => "weights_fault",
-                FaultKind::Policy => "policy_fault",
-                FaultKind::ProcessExit => "process_exit",
-                FaultKind::Scheduler => "scheduler_fault",
-                FaultKind::Operations => "operations_fault",
-                FaultKind::Work => "work_fault",
-                FaultKind::Start => "start_fault",
-                FaultKind::Promote => "promote_fault",
-                FaultKind::Commit => "commit_fault",
-                FaultKind::Rollback => "rollback_fault",
-                FaultKind::Drain => "drain_fault",
-                FaultKind::Release => "release_fault",
-                FaultKind::Unspecified => "fault",
-            },
-            Self::Stalled => "stalled",
-            Self::NonFiniteLogits => "non_finite_logits",
-            Self::PolicyRolledBack => "policy_rolled_back",
-            Self::ProcessExit => "process_exit",
-            Self::PrepareFailed => "prepare_failed",
-            Self::RolledBack => "rolled_back",
-            Self::SpawnFailed => "spawn_failed",
-            Self::ClaimFailed => "claim_failed",
-            Self::BuildMismatch => "build_mismatch",
-            Self::StaleModules => "stale_modules",
-            Self::Threshold(threshold) => threshold.name(),
-            Self::Deadline => "deadline",
-            Self::Decision => "decision",
-        }
-    }
-
-    /// Whether the failure leaves the failed process's failure domain unusable, so a standby of
-    /// it is promoted in its place: a device whose context holds a sticky error, a process of the
-    /// engine that exited, or a job that stalled. The other failures fail the operation or the
-    /// update they were observed in, and the processes go on.
-    pub fn replaces_domain(self) -> bool {
-        use proto::process::FaultKind;
-        matches!(
-            self,
-            Self::Fault(FaultKind::Device | FaultKind::ProcessExit)
-                | Self::ProcessExit
-                | Self::Stalled
-        )
-    }
-}
-
-impl std::fmt::Display for FailureKind {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-impl Serialize for FailureKind {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.name())
-    }
-}
-
-/// Why an engine failed or an update did not stand: a fault an engine observed, a stalled job,
-/// non-finite logits, a scheduling policy the engine had to roll back, a failed step of the
-/// update, a threshold, the deadline or the operator's decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Failure {
-    /// What failed.
-    pub kind: FailureKind,
-    /// The account given with it, for the daemon's record.
-    pub reason: String,
-    /// The ordinal of the device the failure happened on, on the host of the process that
-    /// reported it, when it names one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub device: Option<u32>,
-}
-
-impl Failure {
-    /// A failure of `kind` for `reason`, naming no device.
-    pub fn new(kind: FailureKind, reason: String) -> Self {
-        Self {
-            kind,
-            reason,
-            device: None,
-        }
-    }
-}
-
-impl Failure {
-    /// The failure an engine's report states, or `None` for a report that
-    /// states none: an acknowledgement, a lifecycle state, or a failed
-    /// preparation, which drops the new generation and leaves the serving
-    /// one alone.
-    pub fn of_report(report: &proto::process::Report) -> Option<Self> {
-        use proto::process::report::Kind;
-        let kind = report.kind.as_ref()?;
-        match kind {
-            Kind::Fault(fault) => Some(Self {
-                kind: FailureKind::Fault(fault.kind()),
-                reason: fault.reason.clone(),
-                device: fault.device,
-            }),
-            Kind::Stalled(stalled) => Some(Self {
-                kind: FailureKind::Stalled,
-                reason: format!(
-                    "the {} job of batch {} ran {} ms",
-                    stalled.job, stalled.batch, stalled.elapsed_ms
-                ),
-                device: None,
-            }),
-            Kind::NonFiniteLogits(logits) => Some(Self {
-                kind: FailureKind::NonFiniteLogits,
-                reason: format!("non-finite logits for request {}", logits.request),
-                device: None,
-            }),
-            Kind::PolicyRolledBack(policy) => Some(Self {
-                kind: FailureKind::PolicyRolledBack,
-                reason: {
-                    // Absent is the route instance the engine's control
-                    // thread runs, a value one scheduler thread's policy.
-                    let instance = match policy.scheduler {
-                        Some(scheduler) => format!("scheduler {scheduler}"),
-                        None => "the engine's control thread".to_owned(),
-                    };
-                    let fatal = if policy.fatal {
-                        ", and no previous policy module is left"
-                    } else {
-                        ""
-                    };
-                    format!(
-                        "the policy of {instance} (backend {} revision {}) failed: {}{fatal}",
-                        policy.backend, policy.revision, policy.reason
-                    )
-                },
-                device: None,
-            }),
-            Kind::Parked(_)
-            | Kind::Serving(_)
-            | Kind::Prepared(_)
-            | Kind::Switched(_)
-            | Kind::Warming(_)
-            | Kind::Committed(_)
-            | Kind::RolledBack(_)
-            | Kind::Drained(_)
-            | Kind::Shrunk(_)
-            | Kind::PrepareFailed(_) => None,
-        }
     }
 }
 
@@ -433,8 +156,8 @@ impl Epochs {
                 kernels: std::mem::replace(&mut record.kernels, modules.kernels),
                 policy: std::mem::replace(&mut record.policy, modules.policy),
             });
-            if record.status == Status::Serving {
-                record.status = Status::Trial;
+            if record.status == EpochState::Serving {
+                record.status = EpochState::Trial;
             }
         });
     }
@@ -444,7 +167,7 @@ impl Epochs {
     pub fn committed(&self, epoch: Recorded) {
         self.change_record(epoch, |record| {
             record.previous = None;
-            record.status = Status::Serving;
+            record.status = EpochState::Serving;
         });
     }
 
@@ -457,7 +180,7 @@ impl Epochs {
                 record.kernels = previous.kernels;
                 record.policy = previous.policy;
             }
-            record.status = Status::Serving;
+            record.status = EpochState::Serving;
         });
     }
 
@@ -475,7 +198,7 @@ impl Epochs {
                 kernels: deployment.modules.kernels.clone(),
                 policy: deployment.modules.policy.clone(),
                 previous: None,
-                status: Status::Serving,
+                status: EpochState::Serving,
                 generation: generations.first().copied(),
             },
         )
@@ -497,7 +220,7 @@ impl Epochs {
         service::lock(&self.records)
             .iter()
             .rev()
-            .find(|(_, record)| matches!(record.status, Status::Serving | Status::Trial))
+            .find(|(_, record)| matches!(record.status, EpochState::Serving | EpochState::Trial))
             .map(|(epoch, record)| (Recorded(*epoch), record.clone()))
     }
 
@@ -533,90 +256,41 @@ impl Epochs {
         service::lock(&self.processes).clone()
     }
 
-    /// The epochs and the process table as `GET /admin/config` reports
-    /// them: one array entry per epoch, ascending by number, with the
-    /// modules in the form the daemon records, and one entry per process
-    /// the daemon manages.
-    pub fn report(&self) -> Value {
-        let epochs = service::lock(&self.records)
+    /// Every epoch's record as `GET /admin/config` reports it (`epochs`), ascending by number.
+    pub fn statuses(&self) -> Vec<EpochStatus> {
+        service::lock(&self.records)
             .iter()
-            .map(|(epoch, record)| record_report(*epoch, record))
-            .collect::<Vec<_>>();
-        let processes = self
-            .processes()
-            .iter()
-            .map(process_report)
-            .collect::<Vec<_>>();
-        serde_json::json!({ "epochs": epochs, "processes": processes })
+            .map(|(epoch, record)| EpochStatus {
+                epoch: *epoch,
+                engine_config: record.config.clone(),
+                engine: record.engine.clone(),
+                kernels: kernel_packages(&record.kernels),
+                policy: record.policy.clone(),
+                previous_kernels: record
+                    .previous
+                    .as_ref()
+                    .map(|previous| kernel_packages(&previous.kernels))
+                    .unwrap_or_default(),
+                previous_policy: record
+                    .previous
+                    .as_ref()
+                    .map(|previous| previous.policy.clone()),
+                generation: record.generation,
+                status: record.status,
+            })
+            .collect()
     }
 }
 
-/// One epoch record as JSON: its number, the build config, the modules by
-/// operator and phase, the previous generation, and the status, as the
-/// design names them.
-fn record_report(epoch: u64, record: &EpochRecord) -> Value {
-    let kernels = record
-        .kernels
+/// The kernel packages of `kernels` by slot, in the slots' order, as a report states them.
+pub fn kernel_packages(kernels: &BTreeMap<KernelKey, PackageRevision>) -> Vec<KernelPackage> {
+    kernels
         .iter()
-        .map(|(slot, package)| {
-            serde_json::json!({
-                "op": slot.op,
-                "phase": slot.phase.map(Phase::name),
-                "package": package_report(package),
-            })
+        .map(|(slot, package)| KernelPackage {
+            slot: slot.clone(),
+            package: package.clone(),
         })
-        .collect::<Vec<_>>();
-    let previous = record
-        .previous
-        .iter()
-        .flat_map(|previous| &previous.kernels)
-        .map(|(slot, package)| {
-            serde_json::json!({
-                "op": slot.op,
-                "phase": slot.phase.map(Phase::name),
-                "package": package_report(package),
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "epoch": epoch,
-        "engine_config": serde_json::to_value(&record.config).unwrap_or(Value::Null),
-        "engine": package_report(&record.engine),
-        "kernels": kernels,
-        "policy": package_report(&record.policy),
-        "previous_kernels": previous,
-        "previous_policy": record.previous.as_ref().map(|previous| package_report(&previous.policy)),
-        "generation": record.generation,
-        "status": record.status.name(),
-    })
-}
-
-/// One package as JSON: its backend, revision and parameters.
-fn package_report(package: &PackageRevision) -> Value {
-    serde_json::json!({
-        "backend": package.backend,
-        "revision": package.revision,
-        "arguments": package.arguments,
-    })
-}
-
-/// One managed process as JSON.
-fn process_report(process: &ManagedProcess) -> Value {
-    serde_json::json!({
-        "pid": process.pid,
-        "epoch": process.epoch,
-        "group": process.group,
-        "rank": process.rank,
-        "build": process.build,
-        "generation": process.generation,
-        "state": match &process.state {
-            ProcessState::Starting => "starting".to_owned(),
-            ProcessState::Serving => "serving".to_owned(),
-            ProcessState::Parked => "parked".to_owned(),
-            ProcessState::Stopped => "stopped".to_owned(),
-            ProcessState::Failed(reason) => format!("failed: {reason}"),
-        },
-    })
+        .collect()
 }
 
 /// The module set `config` names: the engine package, the scheduling policy's
@@ -914,7 +588,7 @@ mod tests {
             kernels: BTreeMap::from([(KernelKey::all("rms_norm"), package("base"))]),
             policy: package("fcfs"),
             previous: None,
-            status: Status::Serving,
+            status: EpochState::Serving,
             generation: None,
         }
     }
@@ -952,19 +626,11 @@ mod tests {
             epoch: Some(0),
             build: "uniserve".to_owned(),
             generation: 4,
-            state: ProcessState::Serving,
+            state: proto::admin::ProcessState::Serving,
         }];
-        let reported = epochs.report();
-        assert_eq!(reported["processes"].as_array().map(Vec::len), Some(1));
-        assert_eq!(reported["processes"][0]["pid"], serde_json::json!(42));
-        assert_eq!(reported["processes"][0]["generation"], serde_json::json!(4));
-        assert_eq!(reported["processes"][0]["state"], "serving");
+        assert_eq!(epochs.processes(), *service::lock(&table));
         service::lock(&table).clear();
-        assert!(
-            epochs.report()["processes"]
-                .as_array()
-                .is_some_and(Vec::is_empty)
-        );
+        assert!(epochs.processes().is_empty());
     }
 
     /// A process a hot restart's successor adopted is one row: the row the
@@ -979,7 +645,7 @@ mod tests {
             epoch: None,
             build: "uniserve".to_owned(),
             generation: 1,
-            state: ProcessState::Serving,
+            state: proto::admin::ProcessState::Serving,
         }]));
         let epochs = Epochs::new(std::sync::Arc::clone(&table));
 
@@ -990,7 +656,7 @@ mod tests {
             epoch: Some(3),
             build: "engine".to_owned(),
             generation: 1,
-            state: ProcessState::Serving,
+            state: proto::admin::ProcessState::Serving,
         });
         let processes = epochs.processes();
         assert_eq!(processes.len(), 1, "{processes:?}");
@@ -1167,7 +833,7 @@ mod tests {
             ("mm_processor_kwargs", |config: &mut ServerArgs| {
                 config
                     .mm_processor_kwargs
-                    .insert("min_pixels".to_owned(), Value::from(1024));
+                    .insert("min_pixels".to_owned(), serde_json::Value::from(1024));
             }),
         ];
         // The daemon's own options: a `Host` change.
@@ -1516,111 +1182,6 @@ mod tests {
         );
     }
 
-    /// The reports that fail an update become its failure, with the kind
-    /// the engine named; the acknowledgements do not.
-    #[test]
-    fn the_engines_reports_become_the_updates_failure() {
-        use proto::process::report::Kind;
-
-        let fault = proto::process::Report {
-            kind: Some(Kind::Fault(proto::process::Fault {
-                kind: proto::process::FaultKind::Device.into(),
-                reason: "an illegal memory access was encountered".to_owned(),
-                device: Some(2),
-            })),
-        };
-        assert_eq!(
-            Failure::of_report(&fault),
-            Some(Failure {
-                kind: FailureKind::Fault(proto::process::FaultKind::Device),
-                reason: "an illegal memory access was encountered".to_owned(),
-                device: Some(2),
-            })
-        );
-
-        let stalled = proto::process::Report {
-            kind: Some(Kind::Stalled(proto::process::Stalled {
-                generation: 4,
-                batch: "batch-9".to_owned(),
-                job: "copy".to_owned(),
-                elapsed_ms: 400,
-            })),
-        };
-        assert_eq!(
-            Failure::of_report(&stalled).map(|failure| failure.kind),
-            Some(FailureKind::Stalled)
-        );
-
-        // The policy's failure names the instance, the backend and the
-        // revision, and whether no previous module is left.
-        let rolled_back = proto::process::Report {
-            kind: Some(Kind::PolicyRolledBack(proto::process::PolicyRolledBack {
-                scheduler: Some(2),
-                backend: "attention-c".to_owned(),
-                revision: 7,
-                reason: "the fuel budget is exhausted".to_owned(),
-                fatal: false,
-            })),
-        };
-        let failure = Failure::of_report(&rolled_back).expect("a policy rollback fails the update");
-        assert_eq!(failure.kind, FailureKind::PolicyRolledBack);
-        assert!(failure.reason.contains("scheduler 2"), "{}", failure.reason);
-        assert!(failure.reason.contains("attention-c"), "{}", failure.reason);
-        assert!(failure.reason.contains("revision 7"), "{}", failure.reason);
-        assert!(
-            failure.reason.contains("the fuel budget is exhausted"),
-            "{}",
-            failure.reason
-        );
-        let route = proto::process::Report {
-            kind: Some(Kind::PolicyRolledBack(proto::process::PolicyRolledBack {
-                scheduler: None,
-                backend: "fcfs".to_owned(),
-                revision: 1,
-                reason: "a decision was refused".to_owned(),
-                fatal: true,
-            })),
-        };
-        let failure = Failure::of_report(&route).expect("a fatal policy rollback fails the update");
-        assert!(
-            failure.reason.contains("the engine's control thread"),
-            "{}",
-            failure.reason
-        );
-        assert!(
-            failure.reason.contains("no previous policy module is left"),
-            "{}",
-            failure.reason
-        );
-
-        for acknowledged in [
-            proto::process::Report {
-                kind: Some(Kind::Prepared(proto::process::Prepared {
-                    generation: 4,
-                    uncompared: Vec::new(),
-                })),
-            },
-            proto::process::Report {
-                kind: Some(Kind::Switched(proto::process::Switched { generation: 4 })),
-            },
-            proto::process::Report {
-                kind: Some(Kind::Committed(proto::process::Committed {})),
-            },
-            proto::process::Report {
-                kind: Some(Kind::RolledBack(proto::process::RolledBack::default())),
-            },
-            // A failed preparation drops the new generation and leaves the
-            // serving one alone: the update is abandoned by its own report.
-            proto::process::Report {
-                kind: Some(Kind::PrepareFailed(proto::process::PrepareFailed {
-                    reason: "the package has no module for this descriptor".to_owned(),
-                })),
-            },
-        ] {
-            assert_eq!(Failure::of_report(&acknowledged), None);
-        }
-    }
-
     /// Modules are recorded per operator and, where the configuration fills
     /// one per phase, per phase; the epoch that serves is the one of the
     /// highest number that is serving or on trial.
@@ -1628,10 +1189,10 @@ mod tests {
     fn epochs_are_reported_by_operator_phase_and_status() {
         let epochs = Epochs::default();
         let mut first = record();
-        first.status = Status::Trial;
+        first.status = EpochState::Trial;
         epochs.record(1, first);
         let mut second = record();
-        second.status = Status::Preparing;
+        second.status = EpochState::Preparing;
         second.kernels.insert(
             KernelKey::phase(operator::PAGED_ATTENTION, Phase::Decode),
             package("attention-c"),
@@ -1641,44 +1202,21 @@ mod tests {
             epochs
                 .serving()
                 .map(|(epoch, record)| (epoch.number(), record.status)),
-            Some((1, Status::Trial))
+            Some((1, EpochState::Trial))
         );
 
-        // The epochs are one array, ascending, each naming its number.
-        let report = epochs.report();
-        let entries = report["epochs"].as_array().expect("epochs is an array");
+        // The epochs are reported ascending, each naming its number.
+        let statuses = epochs.statuses();
         assert_eq!(
-            entries
+            statuses
                 .iter()
-                .map(|entry| entry["epoch"].as_u64())
+                .map(|status| (status.epoch, status.status))
                 .collect::<Vec<_>>(),
-            vec![Some(1), Some(2)]
+            vec![(1, EpochState::Trial), (2, EpochState::Preparing)]
         );
-        assert_eq!(entries[0]["status"], Value::from("trial"));
-        assert_eq!(entries[1]["status"], Value::from("preparing"));
-        assert_eq!(entries[1]["kernels"][0]["phase"], Value::from("decode"));
-        assert_eq!(
-            entries[1]["kernels"][0]["package"]["backend"],
-            Value::from("attention-c")
-        );
-    }
-
-    /// The process table names each process's epoch and state.
-    #[test]
-    fn the_process_table_reports_what_the_daemon_manages() {
-        let epochs = Epochs::default();
-        epochs.set_processes(vec![ManagedProcess {
-            group: "engine".to_owned(),
-            rank: 0,
-            pid: Some(42),
-            epoch: Some(7),
-            build: "2.0.0+0123456789abcdef".to_owned(),
-            generation: 4,
-            state: ProcessState::Parked,
-        }]);
-        let report = epochs.report();
-        assert_eq!(report["processes"][0]["epoch"], Value::from(7));
-        assert_eq!(report["processes"][0]["state"], Value::from("parked"));
+        let decode = &statuses[1].kernels[0];
+        assert_eq!(decode.slot.phase, Some(Phase::Decode));
+        assert_eq!(decode.package.backend, "attention-c");
     }
 
     /// The epoch's engine configuration is written by the daemon into each

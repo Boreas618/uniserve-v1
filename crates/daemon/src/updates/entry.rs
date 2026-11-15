@@ -24,33 +24,21 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use proto::admin::{
+    ApplyRequest, ConfigStatus, DryRun, EngineLaunch, Executing, ExecutingState, Failure,
+    FailureKind, Gpu, GpuShare, GpuUuid, InFlight, InPlaceChange, NodeUsage, Quotas, ReplicaDryRun,
+    ReplicaStatus, Switched, UpdateReport,
+};
 use proto::config::EngineConfig;
 use tracing::info;
 
 use crate::engine::client::EngineState;
-use crate::engine::control::NodeUsage;
 use crate::engine::hold::HoldState;
-use crate::epoch::{Change, Epoch, Failure, FailureKind};
+use crate::epoch::{Change, Epoch};
 use crate::leader::{Leader, Replica, UpdateError};
 use crate::options::ServerArgs;
-use crate::updates::change::{Applied, ApplyRequest, InFlight, resolve};
+use crate::updates::change::{Applied, resolve};
 use crate::updates::update::{EpochSwitch, Node, Update};
-
-/// A GPU the deployment's epochs hold storage on (`GET /admin/config`'s `gpus`). A manager of
-/// several deployments reads which GPUs they share from it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct GpuShare {
-    /// The host the GPU is on, as rank layouts name it.
-    pub(crate) host: String,
-    /// The GPU's identity, its UUID in the `GPU-` form the device reports.
-    pub(crate) gpu: String,
-    /// Its storage in bytes.
-    pub(crate) total: u64,
-    /// The deployment's quota there in bytes, when it states one.
-    pub(crate) quota: Option<u64>,
-    /// The bytes the quota reserves now.
-    pub(crate) used: u64,
-}
 
 /// The GPUs the deployment's epochs hold storage on, from every node's storage report.
 fn deployment_gpus(nodes: &[NodeUsage]) -> Vec<GpuShare> {
@@ -61,69 +49,16 @@ fn deployment_gpus(nodes: &[NodeUsage]) -> Vec<GpuShare> {
                 .iter()
                 .filter(|quota| quota.deployment.is_some())
                 .map(|quota| GpuShare {
-                    host: node.host.clone(),
-                    gpu: storage::protocol::gpu_name(&quota.gpu),
+                    gpu: Gpu {
+                        host: node.host.clone(),
+                        gpu: GpuUuid(quota.gpu),
+                    },
                     total: quota.total,
                     quota: quota.limit,
                     used: quota.usage(),
                 })
         })
         .collect()
-}
-
-/// The nodes' storage as `GET /admin/config` states it: each node's usage, or why it was not
-/// read.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(untagged)]
-pub(crate) enum Quotas {
-    Read(Vec<NodeUsage>),
-    Unread { error: String },
-}
-
-/// What one replica executes, as its status states it: the epoch, and the engine's state there
-/// or why the epoch is unavailable.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct Executing {
-    pub(crate) epoch: u64,
-    pub(crate) state: ExecutingState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) reason: Option<String>,
-}
-
-/// Where a replica's engine is, as its status names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ExecutingState {
-    Starting,
-    Parked,
-    Serving,
-    Draining,
-    Unavailable,
-}
-
-/// One replica's configuration and what it executes (`GET /admin/config`).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct ReplicaStatus {
-    /// Its configuration's non-default options, as reloadable TOML.
-    pub(crate) config: String,
-    /// The digest that names the configuration.
-    pub(crate) digest: String,
-    pub(crate) executing: Executing,
-}
-
-/// The deployment's configuration and resource ownership, as `GET /admin/config` states them:
-/// the first replica's status at the top level, every replica's, the GPUs and quotas of the
-/// deployment's nodes, the update in flight or the last one, and the targets a rollback marked
-/// unavailable.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ConfigStatus {
-    #[serde(flatten)]
-    pub(crate) first: Option<ReplicaStatus>,
-    pub(crate) replicas: Vec<ReplicaStatus>,
-    pub(crate) gpus: Option<Vec<GpuShare>>,
-    pub(crate) quotas: Option<Quotas>,
-    pub(crate) update: Option<crate::updates::update::UpdateReport>,
-    pub(crate) unavailable: Vec<crate::updates::Unavailable>,
 }
 
 /// Whether `target` differs from `served` in the profiler ranges' switch
@@ -411,7 +346,9 @@ impl Leader {
             Some(index) => vec![index],
             None => (0..replicas.len()).collect(),
         };
-        let mut reports = Vec::new();
+        // What each replica the change reaches would change, for a dry run, or changed.
+        let mut dry_runs = Vec::new();
+        let mut changed = Vec::new();
         for index in indices.iter().copied() {
             let replica = replicas
                 .get(index)
@@ -425,23 +362,18 @@ impl Leader {
                     }
                     return Ok(applied);
                 }
-                Applied::DryRun(report) | Applied::InPlace(report) => reports.push(report),
-                applied @ Applied::Update(_) => return Ok(applied),
+                Applied::DryRun(DryRun::InPlace { replicas }) => dry_runs.extend(replicas),
+                Applied::InPlace(changes) => changed.extend(changes),
+                applied @ (Applied::DryRun(_) | Applied::Update(_)) => return Ok(applied),
                 Applied::Unchanged => {}
             }
         }
-        if reports.is_empty() {
-            return Ok(Applied::Unchanged);
-        }
-        let report = if reports.len() == 1 {
-            reports.remove(0)
+        Ok(if !dry_runs.is_empty() {
+            Applied::DryRun(DryRun::InPlace { replicas: dry_runs })
+        } else if !changed.is_empty() {
+            Applied::InPlace(changed)
         } else {
-            serde_json::json!({ "replicas": reports })
-        };
-        Ok(if request.dry_run {
-            Applied::DryRun(report)
-        } else {
-            Applied::InPlace(report)
+            Applied::Unchanged
         })
     }
 
@@ -489,11 +421,10 @@ impl Leader {
         deadline: Option<Instant>,
     ) -> Result<Applied, UpdateError> {
         if request.dry_run {
-            return Ok(Applied::DryRun(serde_json::json!({
-                "change": "generation",
-                "epoch": serving.number(),
-                "modules": crate::updates::change::modules_report(&next.modules),
-            })));
+            return Ok(Applied::DryRun(DryRun::Generation {
+                epoch: serving.number(),
+                modules: crate::updates::change::modules_report(&next.modules),
+            }));
         }
         let nodes = self.serving_nodes()?;
         if nodes.is_empty() {
@@ -682,22 +613,25 @@ impl Leader {
             .collect();
         let shrink = layouts_differ(&serving_configs, &configs);
         if request.dry_run {
-            return Ok(Applied::DryRun(serde_json::json!({
-                "change": "epoch",
-                "epoch": target_epoch,
-                "engine": {
-                    "backend": next.modules.engine.backend,
-                    "revision": next.modules.engine.revision,
-                },
-                "replicas": worlds.len(),
-                "engines": worlds.iter().map(|(_, hosts, numbers)| {
-                    hosts.iter().zip(numbers).map(|(host, number)| serde_json::json!({
-                        "host": host.host,
-                        "launch_generation": number,
-                    })).collect::<Vec<_>>()
-                }).collect::<Vec<_>>(),
-                "shrink": shrink,
-            })));
+            return Ok(Applied::DryRun(DryRun::Epoch {
+                epoch: target_epoch,
+                engine: next.modules.engine.clone(),
+                replicas: worlds.len(),
+                engines: worlds
+                    .iter()
+                    .map(|(_, hosts, numbers)| {
+                        hosts
+                            .iter()
+                            .zip(numbers)
+                            .map(|(host, number)| EngineLaunch {
+                                host: host.host.clone(),
+                                launch_generation: *number,
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                shrink,
+            }));
         }
 
         // Each target world's launch files. A target starts parked: its launch
@@ -780,7 +714,7 @@ impl Leader {
 
     /// Commits the update in flight: the decision is recorded before the kept
     /// side is released.
-    pub(crate) async fn commit(&self) -> Result<crate::updates::update::UpdateReport, UpdateError> {
+    pub(crate) async fn commit(&self) -> Result<UpdateReport, UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
         self.updates.commit().ok_or_else(|| {
             UpdateError::Refused("no update is in flight: there is nothing to commit".to_owned())
@@ -797,10 +731,7 @@ impl Leader {
 
     /// Rolls the update in flight back, with `reason` as the operator's or
     /// the submitter's own account.
-    pub(crate) async fn rollback(
-        &self,
-        reason: String,
-    ) -> Result<crate::updates::update::UpdateReport, UpdateError> {
+    pub(crate) async fn rollback(&self, reason: String) -> Result<UpdateReport, UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
         if self.updates.in_flight().is_some() {
             self.end_profiles("rollback").await;
@@ -867,6 +798,11 @@ impl Leader {
             // The update in flight, or the one that ended last, with its trial.
             update: self.updates.status(),
             unavailable: self.updates.unavailable_marks(),
+            // The epochs and the processes this daemon manages sit beside the configuration:
+            // `EpochRecord`s are the daemon's record of what it executes, not the engine's
+            // (`crate::epoch`).
+            epochs: self.updates.epochs().statuses(),
+            processes: self.updates.epochs().processes(),
         })
     }
 }
@@ -1010,11 +946,14 @@ impl Replica {
         // A dry run states what the change would do and changes nothing: no
         // handover, no engine command, no configuration written back.
         if request.dry_run {
-            return Ok(Applied::DryRun(serde_json::json!({
-                "daemon": daemon_changes,
-                "scheduling": in_place,
-                "fence_probes": switches_probes_only(&served.engine_config, &target_engine),
-            })));
+            return Ok(Applied::DryRun(DryRun::InPlace {
+                replicas: vec![ReplicaDryRun {
+                    replica: self.ordinal,
+                    daemon: daemon_changes,
+                    scheduling: in_place,
+                    fence_probes: switches_probes_only(&served.engine_config, &target_engine),
+                }],
+            }));
         }
         // The daemon orchestrates what changes in its own options: a hot
         // restart applies them first, and its successor applies the change
@@ -1046,9 +985,10 @@ impl Replica {
             args.engine_config = target_engine;
             *service::lock(&self.served) = Some(args);
             *service::lock(&self.config) = target;
-            return Ok(Applied::InPlace(
-                serde_json::json!({ "in_place": ["the fence probes"] }),
-            ));
+            return Ok(Applied::InPlace(vec![InPlaceChange {
+                replica: self.ordinal,
+                switched: Switched::FenceProbes,
+            }]));
         }
         // A scheduling limit is a parameter of the policy package, so a generation update has
         // moved the schedulers to it or they run it already. What is left is the record of it
@@ -1058,9 +998,10 @@ impl Replica {
             args.engine_config = target_engine;
             *service::lock(&self.served) = Some(args);
             *service::lock(&self.config) = target;
-            return Ok(Applied::InPlace(
-                serde_json::json!({ "in_place": ["the scheduling limits"] }),
-            ));
+            return Ok(Applied::InPlace(vec![InPlaceChange {
+                replica: self.ordinal,
+                switched: Switched::SchedulingLimits,
+            }]));
         }
         // Every change an update moves was decided before this path: what
         // reaches here changed nothing an epoch is built from and no module,
@@ -1195,24 +1136,29 @@ mod tests {
         // start records them.
         *service::lock(&replica.served) = Some(testkit::args(crate::test_support::SERVED_MODEL));
 
-        let status = serde_json::to_value(leader.config_status().await.unwrap()).unwrap();
+        let status = leader.config_status().await.unwrap();
+        let executing = |status: &ConfigStatus| status.first.as_ref().unwrap().executing.clone();
         assert_eq!(
-            status["executing"],
-            serde_json::json!({ "epoch": epoch, "state": "serving" })
+            executing(&status),
+            Executing {
+                epoch,
+                state: ExecutingState::Serving,
+                reason: None,
+            }
         );
         // The engine refuses the quota read, so the status states no GPUs.
-        assert_eq!(status["gpus"], serde_json::Value::Null);
+        assert_eq!(status.gpus, None);
 
         // An epoch whose engine no longer serves is unavailable.
         replica.hold().close("the engine process ended");
-        let status = serde_json::to_value(leader.config_status().await.unwrap()).unwrap();
+        let status = leader.config_status().await.unwrap();
         assert_eq!(
-            status["executing"],
-            serde_json::json!({
-                "epoch": epoch,
-                "state": "unavailable",
-                "reason": "the engine process ended",
-            })
+            executing(&status),
+            Executing {
+                epoch,
+                state: ExecutingState::Unavailable,
+                reason: Some("the engine process ended".to_owned()),
+            }
         );
         client.shutdown();
     }

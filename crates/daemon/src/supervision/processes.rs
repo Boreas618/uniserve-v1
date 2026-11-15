@@ -19,9 +19,10 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
+use proto::admin::{ManagedProcess, ProcessState};
 use proto::process::{self, Command, Exit, Report, Request, Spawn};
 
-use crate::epoch::{Epochs, ManagedProcess, ProcessState};
+use crate::epoch::Epochs;
 use crate::supervision::{ProcessCommands, ToService};
 
 /// The update's ends of the leader service: requests down, and what the
@@ -396,8 +397,8 @@ impl Processes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::epoch::ProcessState;
     use crate::test_support::Engines;
+    use proto::admin::ProcessState;
     use proto::process::{command, report};
     use testkit::process::Refusals;
 

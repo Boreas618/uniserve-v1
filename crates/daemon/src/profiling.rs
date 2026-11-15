@@ -30,6 +30,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use proto::admin::Rates;
 use proto::profile::{Collector, RankStart, RankStop, SessionRequest, SessionStart};
 use proto::request::wire;
 use serde::Serialize;
@@ -38,7 +39,6 @@ use tracing::{info, warn};
 
 use crate::engine::client::{EngineClient, EngineState};
 use crate::leader::{Leader, Replica, UpdateError};
-use crate::observe::Rates;
 
 /// Where a session is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

@@ -34,7 +34,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::epoch::{Failure, Status};
+use proto::admin::{EpochState, Failure};
+
 use crate::options::StandbyStorage;
 
 /// One node's engine of an epoch, as the standby rules see it.
@@ -310,11 +311,11 @@ impl Standbys {
     /// keeps the domain from starting one.
     pub fn serve(
         &mut self,
-        status: Status,
+        status: EpochState,
         options: StandbyOptions,
         facts: &BTreeMap<String, StandbyRoom>,
     ) -> Vec<Action> {
-        if !options.enabled || status != Status::Serving {
+        if !options.enabled || status != EpochState::Serving {
             return Vec::new();
         }
         let mut actions = Vec::new();
@@ -769,7 +770,7 @@ impl Phase {
 /// resident standby's would not fit. Suspended pools move to host storage, so they fit when the
 /// host's Storage Server admits every graph pool its devices reserve.
 pub(crate) fn rooms(
-    reports: &[crate::engine::control::NodeUsage],
+    reports: &[proto::admin::NodeUsage],
     deployment: &str,
 ) -> BTreeMap<String, StandbyRoom> {
     let mut rooms = BTreeMap::new();

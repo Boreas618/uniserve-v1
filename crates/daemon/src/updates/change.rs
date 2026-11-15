@@ -1,61 +1,25 @@
 //! A configuration change (`PUT /admin/config`): the request, what applying
 //! it did, and how in-flight requests continue.
 //!
-//! `http/admin.rs` builds an [`ApplyRequest`] and renders an [`Applied`].
+//! `http/admin.rs` reads an [`ApplyRequest`] and renders an [`Applied`].
 //! [`resolve`] is the one place a request becomes a target configuration, so
 //! the target a dry run reports is the target an apply moves to.
 
-use serde::{Deserialize, Serialize};
+use proto::admin::{ApplyRequest, DryRun, InPlaceChange, Modules, UpdateReport};
 
 use crate::leader::UpdateError;
 use crate::options::ServerArgs;
-
-/// How the requests in flight at an epoch's switch continue when the new
-/// epoch computes other numerics than the one they ran on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum InFlight {
-    /// Each continues with the state it reached, which the new epoch reads
-    /// as its own; the pages it writes afterwards reach no shared tier.
-    #[default]
-    Keep,
-    /// Each computes its state again from its tokens, exactly.
-    Recompute,
-}
-
-/// A change of the deployment's configuration (`PUT /admin/config`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ApplyRequest {
-    /// Update this independent replica. Without an index, a deployment
-    /// update advances through replicas as each trial is committed.
-    pub replica: Option<usize>,
-    /// The whole target configuration as TOML, as `--config` reads it;
-    /// `None` takes the current one.
-    pub config: Option<String>,
-    /// `PATH=VALUE` assignments over that configuration, as `--set` states
-    /// them.
-    pub set: Vec<String>,
-    pub in_flight: InFlight,
-    /// Report what the change would do and change nothing.
-    pub dry_run: bool,
-    /// Apply a configuration a rollback marked unavailable.
-    pub force: bool,
-    /// Seconds from the apply by which the update must be committed: one that
-    /// is not is rolled back by the daemon. Unset leaves the trial to the
-    /// submitter's and the operator's decision.
-    pub deadline_s: Option<f64>,
-}
 
 /// What an apply did.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Applied {
     /// The target is the current configuration.
     Unchanged,
-    /// The workers took the options that changed at their next step, or the
+    /// The replicas took the options that changed at their engines' next step, or the
     /// daemon reads them from its next request on.
-    InPlace(serde_json::Value),
+    InPlace(Vec<InPlaceChange>),
     /// What a dry run found the change would do; nothing changed.
-    DryRun(serde_json::Value),
+    DryRun(DryRun),
     /// The daemon's own options change: a hot restart of the
     /// daemon with the target configuration applies them. When the change
     /// also moves modules or the build configuration, the daemon's successor
@@ -67,33 +31,17 @@ pub(crate) enum Applied {
     },
     /// An update started, in its generation or its epoch form: the report is
     /// the update as it stood when its `Preparing` began.
-    Update(Box<crate::updates::update::UpdateReport>),
+    Update(Box<UpdateReport>),
 }
 
-/// A module set by operator and revision, as a report names it.
-pub(crate) fn modules_report(modules: &crate::epoch::ModuleSet) -> serde_json::Value {
-    let kernels = modules
-        .kernels
-        .iter()
-        .map(|(slot, package)| {
-            serde_json::json!({
-                "op": slot.op,
-                "backend": package.backend,
-                "revision": package.revision,
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "engine": {
-            "backend": modules.engine.backend,
-            "revision": modules.engine.revision,
-        },
-        "kernels": kernels,
-        "policy": {
-            "backend": modules.policy.backend,
-            "revision": modules.policy.revision,
-        },
-    })
+/// A module set as a report names it: the engine package, the kernel package of each slot and
+/// the scheduling policy package.
+pub(crate) fn modules_report(modules: &crate::epoch::ModuleSet) -> Modules {
+    Modules {
+        engine: modules.engine.clone(),
+        kernels: crate::epoch::kernel_packages(&modules.kernels),
+        policy: modules.policy.clone(),
+    }
 }
 
 /// Resolves `request` against the serving configuration `current`: the target
@@ -137,25 +85,4 @@ pub(crate) fn resolve(
         ));
     }
     Ok((target, stated, update))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The API's spelling of the two continuation modes is the wire the
-    /// operator sends; `keep` is the default when the field is absent.
-    #[test]
-    fn in_flight_is_snake_case_and_defaults_to_keep() {
-        assert_eq!(serde_json::to_value(InFlight::Keep).unwrap(), "keep");
-        assert_eq!(
-            serde_json::to_value(InFlight::Recompute).unwrap(),
-            "recompute"
-        );
-        assert_eq!(
-            serde_json::from_str::<InFlight>("\"recompute\"").unwrap(),
-            InFlight::Recompute
-        );
-        assert_eq!(InFlight::default(), InFlight::Keep);
-    }
 }

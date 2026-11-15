@@ -13,7 +13,7 @@
 //!    socket of its own, which it responds with (`Prepared`).
 //! 2. The daemon stops its service thread between two rounds and sends what
 //!    the thread served, its HTTP listener and the connection its engine's
-//!    process lives under, with the arguments the engine serves with, the admin's log
+//!    process lives under, with the arguments the engine serves with, the node's journal
 //!    and the video jobs (`Takeover`), and commands the engine to attach to
 //!    the successor's request socket (`EngineCommand::Attach`).
 //! 3. The successor goes on with the service, adopts the engine once it
@@ -50,7 +50,7 @@ use tracing::{info, warn};
 
 use crate::api::openai::video_jobs::{VideoJob, VideoJobs};
 use crate::engine::control::EngineControl;
-use crate::http::admin::{Admin, AdminHandoff};
+use crate::http::admin::{Admin, Journal, JournalHandoff};
 use crate::http::listener::{Listener, ListenerHandoff};
 use crate::leader::{Leader, stats_sink};
 use crate::options::Stated;
@@ -141,9 +141,9 @@ struct Takeover {
     adapters: std::collections::BTreeMap<String, crate::leader::Adapter>,
     service: ServiceHandoff,
     service_descriptors: usize,
-    admin: AdminHandoff,
+    journal: JournalHandoff,
     jobs: Vec<(VideoJob, Option<u64>)>,
-    then: Option<crate::updates::change::ApplyRequest>,
+    then: Option<proto::admin::ApplyRequest>,
     /// Whether the leader's admissions were paused (new requests waited) when the predecessor
     /// handed over: the successor's admissions start as the predecessor's ended, so a hot
     /// restart never reopens them.
@@ -168,7 +168,7 @@ struct ReplicaHandoff {
     paused: bool,
     asleep: bool,
     sleep_paused: bool,
-    unavailable: Vec<crate::updates::Unavailable>,
+    unavailable: Vec<proto::admin::Unavailable>,
 }
 
 /// What `POST /admin/restart` needs of the daemon it restarts.
@@ -262,7 +262,7 @@ impl Restarter {
     pub(crate) async fn restart(
         &self,
         config: Option<crate::options::ServerArgs>,
-        then: Option<Box<crate::updates::change::ApplyRequest>>,
+        then: Option<Box<proto::admin::ApplyRequest>>,
         leader: &Arc<Leader>,
         admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
@@ -295,7 +295,7 @@ impl Restarter {
     async fn hand_over(
         &self,
         config: Option<crate::options::ServerArgs>,
-        then: Option<Box<crate::updates::change::ApplyRequest>>,
+        then: Option<Box<proto::admin::ApplyRequest>>,
         leader: &Arc<Leader>,
         admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
@@ -430,7 +430,7 @@ impl Restarter {
                     adapters: service::lock(&leader.replicas.adapters).clone(),
                     service,
                     service_descriptors: service_count,
-                    admin: admin.hand_over(),
+                    journal: admin.journal.hand_over(),
                     jobs: job_records,
                     then: then.map(|request| *request),
                     admissions_paused: leader.status().paused,
@@ -775,7 +775,7 @@ async fn prepared_successor(
         adapters,
         service,
         service_descriptors,
-        admin,
+        journal,
         jobs,
         then,
         admissions_paused,
@@ -931,17 +931,16 @@ async fn prepared_successor(
     let retire = Arc::new(AtomicBool::new(false));
     // The deployment's end is its node's as the predecessor's node lived.
     let token = crate::http::node::deployment_token(prepare.lifetime, &shutdown);
-    let admin = Admin::resume(
+    // The node's journal goes on in the successor, which the adopted deployment writes.
+    let admin = Admin::new(
         token.clone(),
         Arc::clone(&retire),
-        admin,
-        Arc::clone(&epoch_records),
-        config.admin_config.event_log,
+        Journal::resume(journal, config.admin_config.event_log),
     );
-    admin.record(
-        "deployment",
-        format!("serving {} after a hot restart", leader.served_model_name()),
-    );
+    admin.record(format!(
+        "serving {} after a hot restart",
+        leader.served_model_name()
+    ));
     if let Some(request) = then {
         crate::http::admin::apply_after_restart(&admin, &leader, request);
     }
@@ -1118,7 +1117,7 @@ fn adopted_epoch(
     engine: u64,
     options: &crate::options::ServerArgs,
     modules: Option<proto::module::ModuleSet>,
-) -> anyhow::Result<(crate::epoch::EpochRecord, crate::epoch::ManagedProcess)> {
+) -> anyhow::Result<(crate::epoch::EpochRecord, proto::admin::ManagedProcess)> {
     let deployment = crate::epoch::Epoch::of(options.clone())?;
     let modules = modules.unwrap_or_else(|| deployment.modules.clone());
     let record = crate::epoch::EpochRecord {
@@ -1127,17 +1126,17 @@ fn adopted_epoch(
         kernels: modules.kernels,
         policy: modules.policy,
         previous: None,
-        status: crate::epoch::Status::Serving,
+        status: proto::admin::EpochState::Serving,
         generation: None,
     };
-    let process = crate::epoch::ManagedProcess {
+    let process = proto::admin::ManagedProcess {
         group: crate::engine::control::ENGINE_GROUP.to_owned(),
         rank: 0,
         pid: None,
         epoch: Some(epoch),
         build: deployment.engine.executable.clone(),
         generation: engine,
-        state: crate::epoch::ProcessState::Serving,
+        state: proto::admin::ProcessState::Serving,
     };
     Ok((record, process))
 }
@@ -1186,7 +1185,7 @@ mod tests {
         let options = crate::options::ServerArgs::default();
         let (record, process) =
             adopted_epoch(7, 12, &options, None).expect("the configuration resolves");
-        assert_eq!(record.status, crate::epoch::Status::Serving);
+        assert_eq!(record.status, proto::admin::EpochState::Serving);
         assert_eq!(
             record.generation, None,
             "the model generation is not the launch generation the engine reported"
@@ -1197,7 +1196,7 @@ mod tests {
         );
         assert_eq!(process.generation, 12);
         assert_eq!(process.epoch, Some(7));
-        assert_eq!(process.state, crate::epoch::ProcessState::Serving);
+        assert_eq!(process.state, proto::admin::ProcessState::Serving);
     }
 
     /// A host's Storage Server of another release, as a successor daemon reaches it at its

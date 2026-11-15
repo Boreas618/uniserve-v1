@@ -38,129 +38,14 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use proto::admin::{
+    ChangeForm, EngineCounts, EpochState, EpochSwitchReport, Failure, FailureKind, Phase,
+    PreviousEpoch, UpdateReport,
+};
 use proto::process::{self, Report, Spawn, command, report};
 
-use crate::epoch::{Epoch, EpochRecord, Epochs, Failure, FailureKind, Recorded, Status};
-use crate::options::PreviousEpoch;
+use crate::epoch::{Epoch, EpochRecord, Epochs, Recorded};
 use crate::supervision::processes::{Event, Processes};
-
-/// Where an update is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Phase {
-    /// The new is made ready beside the old; serving is untouched.
-    Preparing,
-    /// Service moves at a boundary: to the new, or back to the kept side.
-    Switching,
-    /// The new serves and the old is kept.
-    Trial,
-    /// The new serves and the kept side is released.
-    Committed,
-    /// The kept side serves again and the new is released.
-    RolledBack,
-    /// The new was never ready: nothing changed.
-    Abandoned,
-}
-
-impl serde::Serialize for Phase {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.name())
-    }
-}
-
-/// The form of an update, as its report names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ChangeForm {
-    /// New modules inside the serving engines.
-    Generation,
-    /// A new epoch beside the serving one.
-    Epoch,
-}
-
-/// The engines an epoch update moves service between.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct EngineCounts {
-    /// The serving epoch's engines.
-    pub(crate) serving: usize,
-    /// The target epoch's engines.
-    pub(crate) target: usize,
-}
-
-/// What an epoch update reports beyond what every update does.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub(crate) struct EpochReport {
-    /// The engine build the target epoch runs.
-    pub(crate) build: String,
-    pub(crate) engines: EngineCounts,
-    /// The seconds the switch lets the serving engines' requests run on.
-    pub(crate) drain_s: f64,
-    /// Whether the serving epoch's layout differs, so its device memory moves to the target's.
-    pub(crate) shrink: bool,
-    /// What the previous epoch keeps during the trial.
-    pub(crate) previous_epoch_kept: PreviousEpoch,
-    /// The hosts that refused to move the previous epoch's weights to host storage.
-    pub(crate) host_refused: Vec<String>,
-    /// The bytes of the previous epoch's weights moved to host storage.
-    pub(crate) moved_to_host_bytes: u64,
-}
-
-/// An update as the operator reads it: `GET /admin/config`'s `update`, an apply's, commit's
-/// or rollback's answer, and the data of the event log's phase events.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub(crate) struct UpdateReport {
-    pub(crate) change: ChangeForm,
-    /// The update's number.
-    pub(crate) update: u64,
-    pub(crate) phase: Phase,
-    /// The epoch the update's side executes in.
-    pub(crate) epoch: u64,
-    /// Whether the update is rolling back or rolled back.
-    pub(crate) rollback: bool,
-    /// How long the switch took, once it ended.
-    pub(crate) switch_ms: Option<u128>,
-    /// How long the update has been on trial.
-    pub(crate) trial_s: Option<f64>,
-    /// The seconds left before the deadline rolls the update back.
-    pub(crate) deadline_s: Option<f64>,
-    /// Why the update did not stand, when it did not.
-    pub(crate) failure: Option<Failure>,
-    /// The engines' state the switch could not compare with the target's.
-    pub(crate) uncompared: Vec<String>,
-    /// Why the storage claim that ended the update failed: the storage it released stays
-    /// retained until the deployment's next claim.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) claim_failed: Option<String>,
-    /// The generation the update's engines execute.
-    pub(crate) generation: Option<u64>,
-    /// What an epoch update reports beyond this.
-    #[serde(flatten)]
-    pub(crate) epoch_form: Option<EpochReport>,
-    /// What the trial's thresholds read.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) trial: Option<crate::updates::trial::TrialReport>,
-    /// The serving epoch's steps against their baseline while the target prepares.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) transfers: Option<crate::interference::StepTime>,
-}
-
-impl Phase {
-    /// The phase as the status and the event log name it.
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Preparing => "preparing",
-            Self::Switching => "switching",
-            Self::Trial => "trial",
-            Self::Committed => "committed",
-            Self::RolledBack => "rolled_back",
-            Self::Abandoned => "abandoned",
-        }
-    }
-
-    /// Whether the update ended: nothing more moves it.
-    pub(crate) fn ended(self) -> bool {
-        matches!(self, Self::Committed | Self::RolledBack | Self::Abandoned)
-    }
-}
 
 /// One engine process the update commands: a serving engine (a scheduler
 /// node's main process or a peer's), or a target the epoch form started.
@@ -503,7 +388,7 @@ impl Update {
             ),
             Form::Epoch(trial) => (
                 trial.switch.record.generation,
-                Some(EpochReport {
+                Some(EpochSwitchReport {
                     build: trial.switch.record.config.executable.clone(),
                     engines: EngineCounts {
                         serving: self.nodes.len(),
@@ -635,7 +520,7 @@ impl Update {
         let Form::Epoch(trial) = &mut self.form else {
             return;
         };
-        trial.switch.record.status = Status::Preparing;
+        trial.switch.record.status = EpochState::Preparing;
         self.epochs
             .record(trial.switch.epoch, trial.switch.record.clone());
 
@@ -1044,7 +929,7 @@ impl Update {
         match &mut self.form {
             Form::Generation => self.epochs.committed(self.serving),
             Form::Epoch(trial) => {
-                trial.switch.record.status = Status::Serving;
+                trial.switch.record.status = EpochState::Serving;
                 self.epochs
                     .record(trial.switch.epoch, trial.switch.record.clone());
             }
@@ -1121,7 +1006,7 @@ impl Update {
             }
             Form::Epoch(trial) => {
                 trial.switch.retire.push(trial.switch.epoch);
-                trial.switch.record.status = Status::Released;
+                trial.switch.record.status = EpochState::Released;
                 self.epochs
                     .record(trial.switch.epoch, trial.switch.record.clone());
                 for target in &trial.targets {
@@ -1160,7 +1045,7 @@ impl Update {
             Form::Epoch(trial) => {
                 // The record is what an engine started now reads its modules
                 // from: the target's stands no more.
-                trial.switch.record.status = Status::Released;
+                trial.switch.record.status = EpochState::Released;
                 self.epochs
                     .record(trial.switch.epoch, trial.switch.record.clone());
                 // A target that failed is stopped instead of drained: its
@@ -1291,7 +1176,7 @@ impl Update {
                     .switched(self.serving, self.target.modules.clone());
             }
             Form::Epoch(trial) => {
-                trial.switch.record.status = Status::Trial;
+                trial.switch.record.status = EpochState::Trial;
                 self.epochs
                     .record(trial.switch.epoch, trial.switch.record.clone());
             }

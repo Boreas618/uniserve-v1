@@ -25,27 +25,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use crate::epoch::{Epoch, Epochs, Failure};
-use crate::interference::StepTime;
+use proto::admin::{Failure, Phase, StepTime, Unavailable, UpdateReport};
+
+use crate::epoch::{Epoch, Epochs};
 use crate::leader::UpdateError;
 use crate::supervision::processes::Processes;
 use trial::Trial;
-use update::{Phase, Update, UpdateReport};
-
-/// A configuration a rollback marked unavailable, and why: a target that was
-/// rolled back is not tried again until it is applied with `force`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Unavailable {
-    /// The digest of what the configuration moves the deployment to: its
-    /// build configuration and its module set, revisions included. A revision
-    /// installed later is another target.
-    pub digest: String,
-    /// The epoch that executed it and was rolled back.
-    pub epoch: u64,
-    pub reason: String,
-    /// Seconds since the Unix epoch.
-    pub at: f64,
-}
+use update::Update;
 
 /// One phase an update entered, for the admin event log.
 #[derive(Debug, Clone, PartialEq)]

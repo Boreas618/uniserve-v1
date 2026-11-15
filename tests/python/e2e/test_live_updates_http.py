@@ -435,8 +435,11 @@ def _node(runtime: Path, device: str, log: Path) -> Iterator[tuple[str, int]]:
 
 
 def _node_state(base_url: str) -> dict:
-    """``GET /admin/node``: the node's state and its last deployment's error."""
-    return admin_request(base_url, "GET", "/admin/node", timeout_s=10).json()
+    """``GET /admin/status``: what the node serves (``state``), the
+    deployment's status while it serves, and its last deployment's error
+    while it idles.
+    """  # noqa: D205
+    return admin_status(base_url)
 
 
 def _deploy(base_url: str, name: str, *assignments: str) -> None:
@@ -453,6 +456,7 @@ def _deploy(base_url: str, name: str, *assignments: str) -> None:
                 *OPTIONS,
                 *assignments,
             ],
+            "wait": False,
         },
         timeout_s=60,
     )
@@ -460,10 +464,11 @@ def _deploy(base_url: str, name: str, *assignments: str) -> None:
 
 
 def _settle(base_url: str, timeout_s: float = 900) -> dict:
-    """Waits until the node serves or idles, and returns its state."""
+    """Waits until the node serves or idles, and returns its status."""
     state: dict = {}
 
     def settled() -> bool:
+        state.clear()
         state.update(_node_state(base_url))
         return state["state"] in ("serving", "idle")
 
@@ -484,11 +489,8 @@ def test_a_node_serves_deployments_one_after_another_and_releases_their_storage(
             name = f"qwen3-live-{index}"
             _deploy(base_url, name)
             state = _settle(base_url)
-            assert state == {
-                "state": "serving",
-                "deployment": name,
-                "last_error": None,
-            }, state
+            assert state["state"] == "serving", state
+            assert state["deployment"]["deployment"] == name, state
             reply = _chat(base_url, name, "Say hello.")
             assert reply["choices"][0]["message"]["content"]
             regions = _host_region_gib(runtime)
@@ -531,7 +533,7 @@ def test_a_node_serves_deployments_one_after_another_and_releases_their_storage(
         assert "available" in error and "reserve" in error, error
         # The node is the same process throughout.
         assert (
-            admin_request(base_url, "GET", "/admin/node", timeout_s=10)
+            admin_request(base_url, "GET", "/admin/status", timeout_s=10)
         ).status_code == 200
         assert runs(pid)
 
@@ -1123,7 +1125,10 @@ def _restart_while_streaming(
     wait_until(lambda: changed() is not None, 900, "the epoch did not change")
     last = changed()
     assert last["state"] == "succeeded", last
-    assert last["result"]["change"] == "epoch", last
+    # The update the successor's operation started is numbered by it.
+    update = admin_config(both_url)["update"]
+    assert update["change"] == "epoch", update
+    assert update["update"] == last["id"], (update, last)
     committed = admin(both_url, "config/commit")
     assert committed.status_code == 200, committed.text
 

@@ -404,8 +404,8 @@ def end_update(base_url: str, action: str) -> None:
 
 
 def _phase_of(event: dict) -> str:
-    """The phase of the update a `deployment` event states."""
-    if event.get("kind") != "deployment":
+    """The phase of the update an `update` event states."""
+    if event.get("kind") != "update":
         return ""
     phase = (event.get("data") or {}).get("phase")
     return phase if isinstance(phase, str) else ""

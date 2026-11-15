@@ -43,9 +43,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::epoch::{Failure, FailureKind, Threshold};
-use crate::observe::{Observer, Rates};
-use crate::options::RollbackConfig;
+use proto::admin::{
+    Failure, FailureKind, Rates, ReplicaReading, RollbackConfig, Threshold, TrialReport,
+};
+
+use crate::observe::Observer;
 
 /// One replica's reports a trial reads: the epoch the update serves it from,
 /// and what serving reported before the switch.
@@ -88,31 +90,6 @@ struct Reading {
     /// Each replica's rates over the window up to it, in the order of the
     /// trial's baselines; `None` for a replica that ran no batch in it.
     rates: Vec<Option<Rates>>,
-}
-
-/// What a trial's thresholds read, as the update's report states it.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub(crate) struct TrialReport {
-    /// The thresholds the trial is read against.
-    pub(crate) thresholds: RollbackConfig,
-    /// How long the trial has run.
-    pub(crate) seconds: f64,
-    /// The requests that ended on trial, and those of them that failed.
-    pub(crate) requests_ended: u64,
-    pub(crate) requests_failed: u64,
-    /// Each replica's baseline and its rates at the latest reading.
-    pub(crate) replicas: Vec<ReplicaReading>,
-}
-
-/// One replica's side of a trial's reading.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
-pub(crate) struct ReplicaReading {
-    /// The epoch the update serves the replica from.
-    pub(crate) epoch: u64,
-    /// What serving reported before the switch.
-    pub(crate) baseline: Option<Rates>,
-    /// The replica's rates over the window up to the latest reading.
-    pub(crate) rates: Option<Rates>,
 }
 
 /// An update on trial, as far as its thresholds read it.

@@ -523,7 +523,7 @@ fn report_exit(
 
 /// The daemon's process table: the processes this node supervises, which
 /// `GET /admin/config` reports and which a successor daemon keeps.
-pub(crate) type ProcessTable = std::sync::Arc<std::sync::Mutex<Vec<crate::epoch::ManagedProcess>>>;
+pub(crate) type ProcessTable = std::sync::Arc<std::sync::Mutex<Vec<proto::admin::ManagedProcess>>>;
 
 /// Publishes the node's live processes into `table`, keeping what the
 /// updater recorded of each of them — its epoch, its build and the state it
@@ -537,7 +537,7 @@ fn publish(local: &Local, table: &ProcessTable) {
             row.pid = Some(process.pid);
             continue;
         }
-        rows.push(crate::epoch::ManagedProcess {
+        rows.push(proto::admin::ManagedProcess {
             group: process.group,
             rank: u64::from(process.rank),
             pid: Some(process.pid),
@@ -549,7 +549,7 @@ fn publish(local: &Local, table: &ProcessTable) {
             // The daemon sees it running; whether it serves requests, parks
             // or failed is what the process itself reports, which the
             // updater records against this row.
-            state: crate::epoch::ProcessState::Serving,
+            state: proto::admin::ProcessState::Serving,
         });
     }
 }
@@ -557,7 +557,7 @@ fn publish(local: &Local, table: &ProcessTable) {
 /// Whether `row` and `process` are the same process: one launch generation of
 /// one worker group's rank.
 fn same_process(
-    row: &crate::epoch::ManagedProcess,
+    row: &proto::admin::ManagedProcess,
     process: &crate::supervision::supervisor::ProcessHandoff,
 ) -> bool {
     row.group == process.group

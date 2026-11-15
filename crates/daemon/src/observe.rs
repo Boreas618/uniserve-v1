@@ -10,19 +10,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use proto::admin::Rates;
 use proto::report::{ProfileProgress, SchedulerStats};
-use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
-
-/// Average step time and throughput of one epoch over a span.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Rates {
-    /// Microseconds per batch.
-    pub step_us: f64,
-    /// Tokens per second the forwards computed over the span the reports cover; `None` when
-    /// every report of the span is its scheduler's first, whose span is unknown.
-    pub tokens_per_second: Option<f64>,
-}
 
 /// One statistics report of one scheduler of one epoch: the interval's host-observed batch
 /// time, batches and query tokens.

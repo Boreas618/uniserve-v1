@@ -35,6 +35,7 @@ use processing::Family;
 use processing::Serving;
 
 pub use args::{Stated, overridden, printed, resolve_text};
+use proto::admin::{PreviousEpoch, RollbackConfig};
 pub use proto::config::{
     ChatConfig, ChatTemplateContentFormat, CudaGraphConfig, DeviceConfig, ImageFetchConfig,
     KvCacheConfig, LoadConfig, LoggingConfig, MediaConfig, MigrationConfig, MoeConfig,
@@ -794,44 +795,6 @@ impl Default for UpdateConfig {
             drain_s: DRAIN_S,
         }
     }
-}
-
-/// What the previous epoch keeps during its successor's trial
-/// (`update_config.previous_epoch`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PreviousEpoch {
-    /// Its processes, communicators, graph storage, weights and the KV cache
-    /// its successor maps: a rollback resumes it at once.
-    Parked,
-    /// Its weights (and the KV cache its successor maps): a rollback starts
-    /// its processes again, which bind them.
-    Weights,
-    /// The KV cache its successor maps, and in host storage the weights its
-    /// successor does not map: a rollback copies them back and starts its
-    /// processes again.
-    Host,
-}
-
-/// The thresholds past which a trial rolls back by itself
-/// (`update_config.rollback`). None has a default: each is measured on the
-/// target workload before it is set.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RollbackConfig {
-    /// The share of the requests that end during the trial, in `(0, 1]`,
-    /// past which it rolls back when they failed.
-    pub failure_rate: Option<f64>,
-    /// How much longer than the previous epoch's before its promotion the
-    /// new epoch's average step may take, as a fraction (`0.2` for 20%).
-    pub step_time_regression: Option<f64>,
-    /// How much lower than the previous epoch's before its promotion the
-    /// new epoch's token throughput may fall, as a fraction.
-    pub throughput_regression: Option<f64>,
-    /// The span the step time and throughput are averaged over, before the
-    /// promotion and during the trial; required with either regression.
-    #[serde(with = "values::optional_duration")]
-    pub window: Option<Duration>,
 }
 
 impl ServerArgs {

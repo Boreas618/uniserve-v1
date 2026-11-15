@@ -31,11 +31,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::updates::update::Phase;
-
 use crate::metrics::{Metrics, RequestLabels, SchedulerLabels};
 use anyhow::Context as _;
 use futures::StreamExt as _;
+use proto::admin::{DeploymentStatus, Phase, ServingState, UpdateStatus};
 use proto::request::Request;
 use proto::request::wire;
 use tokio::sync::watch;
@@ -98,7 +97,7 @@ pub(crate) struct Replicas {
     pub(crate) updates: std::sync::Weak<crate::updates::Updater>,
     /// The new requests that wait for a replica to accept them: while
     /// generation is paused, the engine sleeps, or no engine is ready
-    /// (`LeaderStatus::held`).
+    /// (`DeploymentStatus::held`).
     pub(crate) held: AtomicUsize,
     /// The last profiling session's identity, which every replica's session of it states
     /// (`crate::profiling`).
@@ -504,7 +503,7 @@ impl Leader {
     }
 
     /// The deployment's aggregate serving state.
-    pub fn status(&self) -> LeaderStatus {
+    pub fn status(&self) -> DeploymentStatus {
         let replicas: Vec<ReplicaStatus> = self
             .replicas()
             .iter()
@@ -523,7 +522,7 @@ impl Leader {
                 (replica.engine, replica.reason.clone())
             })
         };
-        LeaderStatus {
+        DeploymentStatus {
             deployment: self.served_model_name.clone(),
             model: self.model_name.clone(),
             engine,
@@ -886,14 +885,14 @@ impl Leader {
         {
             let mut processes = leader.epochs().processes();
             processes.retain(|process| process.generation != engine);
-            processes.push(crate::epoch::ManagedProcess {
+            processes.push(proto::admin::ManagedProcess {
                 group: crate::engine::control::ENGINE_GROUP.to_owned(),
                 rank: 0,
                 pid: None,
                 epoch: Some(epoch),
                 build: deployment.engine.executable.clone(),
                 generation: engine,
-                state: crate::epoch::ProcessState::Serving,
+                state: proto::admin::ProcessState::Serving,
             });
             leader.epochs().set_processes(processes);
         }
@@ -1426,58 +1425,10 @@ pub(crate) struct EngineHandoff {
     pub(crate) asleep: bool,
     pub(crate) sleep_paused: bool,
     /// The configurations a rollback marked unavailable.
-    pub(crate) unavailable: Vec<crate::updates::Unavailable>,
+    pub(crate) unavailable: Vec<proto::admin::Unavailable>,
 }
 
-/// The lifecycle state of the engine a deployment's requests go to, as `GET /admin/status`
-/// names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ServingState {
-    /// It loads its ranks, resolves its modules and captures its graphs.
-    Starting,
-    /// It executes and admits nothing.
-    Parked,
-    /// It admits and executes requests.
-    Serving,
-    /// It admits nothing more; its requests end as migratable.
-    Draining,
-    /// It shut down, or its connection closed.
-    Stopped,
-    /// It serves nothing more: its start failed or its ranks are lost.
-    Failed,
-    /// An engine is being replaced, and requests wait for the next.
-    Holding,
-    /// The successor daemon of a hot restart serves the requests.
-    HandedOver,
-    /// No engine will serve.
-    Closed,
-}
-
-impl ServingState {
-    /// The state's name, as the status serializes it.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Starting => "starting",
-            Self::Parked => "parked",
-            Self::Serving => "serving",
-            Self::Draining => "draining",
-            Self::Stopped => "stopped",
-            Self::Failed => "failed",
-            Self::Holding => "holding",
-            Self::HandedOver => "handed_over",
-            Self::Closed => "closed",
-        }
-    }
-}
-
-impl std::fmt::Display for ServingState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-/// What one replica serves, of which the deployment's status ([`LeaderStatus`]) is made.
+/// What one replica serves, of which the deployment's status ([`DeploymentStatus`]) is made.
 pub(crate) struct ReplicaStatus {
     engine: ServingState,
     reason: Option<String>,
@@ -1555,60 +1506,6 @@ impl StatusChanges {
         }
         self.follow();
     }
-}
-
-/// What the leader serves, for `GET /admin/status`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct LeaderStatus {
-    /// The served model name, the deployment's name.
-    pub deployment: String,
-    /// The model the deployment serves.
-    pub model: String,
-    /// The lifecycle state of the engine requests go to: `serving` while any
-    /// replica's engine serves, otherwise the first replica's.
-    pub engine: ServingState,
-    /// Why the engine failed or no engine will serve.
-    pub reason: Option<String>,
-    /// Whether new requests wait (`/admin/pause_generation`).
-    pub paused: bool,
-    /// Whether the engine gave back its KV cache and graph storage
-    /// (`/admin/sleep`).
-    pub asleep: bool,
-    /// Whether an engine is being replaced: by an update or a relaunch.
-    pub replacing: bool,
-    /// The requests the serving engine has in flight.
-    pub in_flight: usize,
-    /// The new requests the daemon holds before any engine takes them: while
-    /// generation is paused, the engine sleeps, or no engine is ready.
-    pub held: usize,
-    /// The launch generation of the first replica's engine (the scheduler
-    /// node's, for a worker group over several hosts); `None` while none
-    /// serves, or for an engine this daemon did not start. It names that
-    /// process's row in `GET /admin/config`'s `processes`.
-    pub generation: Option<u64>,
-    /// The launch generation of each engine of the parked standby beside
-    /// the first replica's engine (`worker_config.standby`), one per host in
-    /// the world's order: the serving `generation` a promotion leaves is its
-    /// first. Empty while there is none.
-    pub standby: Vec<u64>,
-    /// The update in flight; `None` when none is.
-    pub update: Option<UpdateStatus>,
-}
-
-/// The update in flight, for `GET /admin/status`: `GET /admin/config` holds
-/// its whole report.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct UpdateStatus {
-    /// The admin operation that applied it.
-    pub number: u64,
-    /// `preparing`, `switching` or `trial`.
-    #[serde(serialize_with = "phase_name")]
-    pub(crate) phase: Phase,
-}
-
-/// An update's phase by its name ([`Phase::name`]).
-fn phase_name<S: serde::Serializer>(phase: &Phase, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(phase.name())
 }
 
 /// Where an in-place weight update reads the weights from (`POST /admin/update_weights`'s
@@ -2280,9 +2177,7 @@ impl Replica {
                 Some((Arc::clone(&replica.observer), throttling))
             })
             .collect();
-        let steps = Arc::new(std::sync::Mutex::new(
-            crate::interference::StepTime::default(),
-        ));
+        let steps = Arc::new(std::sync::Mutex::new(proto::admin::StepTime::default()));
         updater.watch_transfers(Arc::clone(&steps));
         tokio::spawn(crate::interference::control(
             Arc::clone(&control) as Arc<dyn crate::interference::Throttle>,
@@ -2330,8 +2225,8 @@ impl Replica {
             warn!(epoch, "{reason}");
             // Before the switch a rollback abandons the update; nothing that
             // serves changed.
-            updater.rollback(crate::epoch::Failure::new(
-                crate::epoch::FailureKind::PrepareFailed,
+            updater.rollback(proto::admin::Failure::new(
+                proto::admin::FailureKind::PrepareFailed,
                 reason,
             ));
             return;
@@ -3020,7 +2915,7 @@ impl Replica {
                 .flatten()
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut actions = standbys.serve(crate::epoch::Status::Serving, options, &rooms);
+            let mut actions = standbys.serve(proto::admin::EpochState::Serving, options, &rooms);
             if actions
                 .iter()
                 .any(|action| matches!(action, crate::standby::Action::Allocate { .. }))
@@ -3030,7 +2925,7 @@ impl Replica {
                         standbys.allocated(host, control.launch_number());
                     }
                 }
-                actions = standbys.serve(crate::epoch::Status::Serving, options, &rooms);
+                actions = standbys.serve(proto::admin::EpochState::Serving, options, &rooms);
             }
             let spawns: Vec<(String, u64, crate::standby::Storage)> = actions
                 .into_iter()
@@ -3137,8 +3032,8 @@ impl Replica {
         // A standby being started or prepared is waited for: it is closer to serving than a
         // process this replica has yet to launch.
         let starting = self.standby_starting.lock().await;
-        let failure = crate::epoch::Failure::new(
-            crate::epoch::FailureKind::ProcessExit,
+        let failure = proto::admin::Failure::new(
+            proto::admin::FailureKind::ProcessExit,
             "the serving engine ended".to_owned(),
         );
         let promotions: Vec<(String, u64)> = {
