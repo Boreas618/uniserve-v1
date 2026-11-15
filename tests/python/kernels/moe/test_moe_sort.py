@@ -29,13 +29,18 @@ import ctypes
 
 import pytest
 import torch
-
-from tests.python.kernels.packages import assert_abi_layout
+from uniserve_testing.kernels.packages import (
+    abi_enumerator,
+    assert_abi_layout,
+)
 
 pytestmark = pytest.mark.unit
 
 #: `ops::abi::code`'s numbers of the scales' element types.
-ELEMENT_TYPES = {"f16": 3, "bf16": 4, "f32": 5}
+ELEMENT_TYPES = {
+    name: abi_enumerator(f"UNISERVE_DTYPE_{name.upper()}")
+    for name in ("f16", "bf16", "f32")
+}
 
 TORCH_TYPES = {
     "f16": torch.float16,

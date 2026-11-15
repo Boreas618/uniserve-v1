@@ -1,9 +1,10 @@
 """The block-sparse attention modules against the operator's definition.
 
-Each test loads a built module of the `sparse_attention` operator (resolved
-at the session's Build Server for the session's device) as a runner loads it
-(``module.so``), calls its entry with the call structure of
-``crates/ops/src/attention/sparse.rs`` and compares the output, and the
+Each module test loads a built module of the `sparse_attention` operator
+(resolved at the session's Build Server for the session's device) as a runner
+loads it (``module.so``), calls its entry with the call structure of
+``crates/ops/src/attention/sparse.rs`` (its mirror held to the generated
+header, which needs no device) and compares the output, and the
 normalizer where the module writes one, with the operator's definition
 computed in torch: each query tile attends the key blocks its selection
 names, each block cut to its valid key count.
@@ -22,11 +23,15 @@ import math
 
 import pytest
 import torch
+from uniserve_testing.kernels.packages import (
+    abi_enumerator,
+    assert_abi_layout,
+)
 
-pytestmark = [pytest.mark.unit, pytest.mark.gpu]
+pytestmark = pytest.mark.unit
 
 #: `ops::abi::code`'s number of BF16.
-BF16 = 4
+BF16 = abi_enumerator("UNISERVE_DTYPE_BF16")
 
 #: The words of the Build Server's refusal of a package for a target that does
 #: not meet the package's requirements.
@@ -80,6 +85,11 @@ class Call(ctypes.Structure):
         ("scale", ctypes.c_float),
         ("error", ctypes.c_char * 512),
     ]
+
+
+def test_the_call_mirror_is_the_headers_sparse_attention_call():
+    """The generated header asserts the size and offsets `SparseCall` has."""
+    assert_abi_layout(Call, "uniserve_sparse_attention_call")
 
 
 def pointer(tensor):
@@ -159,6 +169,7 @@ def reference(query, key, value, indices, counts, valid, scale, block):
     return out, lse
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_a_sparse_module_matches_the_operators_definition(
     backend, torch_device, kernel_module

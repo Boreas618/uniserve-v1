@@ -4,7 +4,7 @@ The first half of the prefix cache's block copy:
 ``snapshot[row, :] = field[blocks[row], ...]``, so the second half can write
 the same blocks elsewhere without a host read between the two launches. It
 reads a block-major bank at the field's own strides
-(:mod:`tests.python.kernels.memory.banks`), the arithmetic that can be wrong
+(:mod:`uniserve_testing.kernels.memory.banks`), the arithmetic that can be wrong
 without a build noticing: a bank whose blocks are 2048 elements apart while a
 block's content covers 1088 comes back as a shifted row and no error.
 
@@ -18,8 +18,7 @@ element.
 
 import pytest
 import torch
-
-from tests.python.kernels.memory import banks
+from uniserve_testing.kernels.memory import banks
 
 pytestmark = pytest.mark.unit
 

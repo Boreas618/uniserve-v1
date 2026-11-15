@@ -2,9 +2,10 @@
 
 The second half of the prefix cache's block copy:
 ``field[blocks[row], ...] = snapshot[row, :]`` through the bank's own strides
-(:mod:`tests.python.kernels.memory.banks`). The address arithmetic is what can
-be wrong, and wrong invisibly: a dense-looking bank holds the right *count* of
-right values in the wrong places, and every later read is a shifted tensor.
+(:mod:`uniserve_testing.kernels.memory.banks`). The address arithmetic is what
+can be wrong, and wrong invisibly: a dense-looking bank holds the right
+*count* of right values in the wrong places, and every later read is a
+shifted tensor.
 
 So the bank is a strided view of one buffer primed with a sentinel: the gaps
 between blocks and inside a block keep it, and every element no row names must
@@ -16,8 +17,7 @@ is exact: the comparison is element for element.
 
 import pytest
 import torch
-
-from tests.python.kernels.memory import banks
+from uniserve_testing.kernels.memory import banks
 
 pytestmark = pytest.mark.unit
 

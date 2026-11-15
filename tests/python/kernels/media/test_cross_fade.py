@@ -27,14 +27,13 @@ round to nearest), so on the interpreter the BF16 reference narrows every step
 by truncation, and the comparison stays bit for bit.
 
 A module compiled for a dependent launch reads only what the grid before it
-wrote (:mod:`tests.python.kernels.chain`); that launch needs a device.
+wrote (:mod:`uniserve_testing.kernels.chain`); that launch needs a device.
 """
 
 import numpy as np
 import pytest
 import torch
-
-from tests.python.kernels import chain
+from uniserve_testing.kernels import chain
 
 pytestmark = pytest.mark.unit
 

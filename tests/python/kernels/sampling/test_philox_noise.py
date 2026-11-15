@@ -62,13 +62,14 @@ UNIT_ROUNDOFF = 2.0**-24
 ADDRESSABLE = 1 << 20
 
 
+#: The recorded draws, relative to the repository.
+RECORDED_DRAWS = ("tests", "python", "generated", "sampling_rng_parity.json")
+
+
 @pytest.fixture(scope="module")
-def recorded_draws(pytestconfig):
+def recorded_draws(repository):
     """The reference implementation's recorded draws."""
-    path = pytestconfig.rootpath.joinpath(
-        "tests", "python", "generated", "sampling_rng_parity.json"
-    )
-    return json.loads(path.read_text())
+    return json.loads(repository.joinpath(*RECORDED_DRAWS).read_text())
 
 
 def launch(kernels, out, keys, elements, stage, draw, key, block, normal):

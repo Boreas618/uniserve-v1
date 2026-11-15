@@ -23,7 +23,7 @@ What is covered:
 - **the comparisons and the extrema on a NaN, on equal values and on signed
   zeros**: a comparison writes ``u8``, and ``maximum``/``minimum`` return the
   left operand unless the right is strictly beyond;
-- **every layout** of :data:`~tests.python.kernels.tensor.operands.LAYOUTS`
+- **every layout** of :data:`~uniserve_testing.kernels.tensor.operands.LAYOUTS`
   as the left operand, against a right operand that is contiguous, one value
   repeated everywhere (every stride zero), and one row repeated over the
   leading axes: the three broadcasts a tensor library's arithmetic makes.
@@ -32,9 +32,8 @@ What is covered:
 import numpy as np
 import pytest
 import torch
-
-from tests.python.kernels.packages import RefusedLaunchError
-from tests.python.kernels.tensor import operands
+from uniserve_testing.kernels.packages import RefusedLaunchError
+from uniserve_testing.kernels.tensor import operands
 
 pytestmark = pytest.mark.unit
 

@@ -27,15 +27,14 @@ so the row stride is twice the sample's; a channel-major caller (the VAE's
 rasters) passes ``(1, positions)``, the moments' halves an offset apart.
 
 A module compiled for a dependent launch reads only what the grid before it
-wrote (:mod:`tests.python.kernels.chain`); that launch needs a device.
+wrote (:mod:`uniserve_testing.kernels.chain`); that launch needs a device.
 """
 
 import struct
 
 import pytest
 import torch
-
-from tests.python.kernels import chain
+from uniserve_testing.kernels import chain
 
 pytestmark = pytest.mark.unit
 

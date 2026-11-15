@@ -71,8 +71,7 @@ import struct
 
 import pytest
 import torch
-
-from tests.python.kernels.vsa import operands
+from uniserve_testing.kernels.vsa import operands
 
 pytestmark = pytest.mark.unit
 

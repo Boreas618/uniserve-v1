@@ -28,8 +28,7 @@ pass.
 
 import pytest
 import torch
-
-from tests.python.kernels.norm.rounding import (
+from uniserve_testing.kernels.norm.rounding import (
     TORCH_TYPES,
     UNIT_ROUNDOFF,
     gamma,

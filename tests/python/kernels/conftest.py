@@ -17,17 +17,17 @@ reference are the operator's (``crates/ops/src``) and are written once,
 beside the check that uses them. A launch of a kernel is written once per
 module, in one function the tests call.
 
-**Where the kernels run.** ``--kernel-device`` (registered in
-``tests/python/conftest.py``) chooses once per session: ``interpreter``, the
-default, runs every kernel on Triton's interpreter with host tensors and needs
-no device; ``cuda`` compiles the kernels for the session's CUDA device and
-launches them there. Triton fixes a function's mode when ``@triton.jit``
-decorates it (``triton.knobs.runtime.interpret``), it decorates its own
-language library (``tl.cdiv``, the reductions) when it is first imported, and
-a kernel and every ``@triton.jit`` function it calls (``uniserve_kernels``,
-``triton.language``) must share one mode; so the mode is one per process,
-fixed by :func:`pytest_configure` before Triton is first imported, and no
-check sets it again.
+**Where the kernels run.** ``--kernel-device`` (an option of the tests'
+plugin, :mod:`uniserve_testing.plugin`) chooses once per session:
+``interpreter``, the default, runs every kernel on Triton's interpreter with
+host tensors and needs no device; ``cuda`` compiles the kernels for the
+session's CUDA device and launches them there. Triton fixes a function's mode
+when ``@triton.jit`` decorates it (``triton.knobs.runtime.interpret``), it
+decorates its own language library (``tl.cdiv``, the reductions) when it is
+first imported, and a kernel and every ``@triton.jit`` function it calls
+(``uniserve_kernels``, ``triton.language``) must share one mode; so the mode
+is one per process, fixed by :func:`pytest_configure` before Triton is first
+imported, and no check sets it again.
 
 - A test that runs in both modes takes its tensors on ``torch_device``; one
   whose reference models the interpreter's stores (Triton's interpreter
@@ -40,54 +40,53 @@ check sets it again.
 - In the ``cuda`` mode a host without a CUDA device skips every check, naming
   the reason.
 
-**What a check reaches** (:mod:`tests.python.kernels.packages`), each through a
-fixture of this module:
+**What a check reaches** (:mod:`uniserve_testing.kernels.packages`), each
+through a fixture of this module or of the plugin:
 
-- ``kernels``: the package tree, ``crates/ops/kernels`` of pytest's root
-  directory.
+- ``kernels``: the package tree, ``crates/ops/kernels`` of the repository
+  (the plugin's ``repository``).
 - ``kernel_source(op, backend="triton")``: the package's kernel module
   ``src/<op>.py``, imported from the package by its location and kept for the
   session, decorated in the session's mode.
 - ``stated_launch(op, key, target)``: the compilation a Triton package's
   launch table states for descriptor ``key`` on ``target`` (the kernel of
   ``kernel_source(op)``, its signature, its compile-time values and its
-  options), from ``uniserve build-server launch``; a key the package does not
-  state raises :class:`~tests.python.kernels.packages.RefusedLaunchError`
-  with its reason. The ``uniserve`` executable is ``UNISERVE_BINARY``, or
-  ``uniserve`` on the search path; it runs the Build Server's Python
-  environment's program ``uniserve-build-server``, which must be on the
-  search path.
+  options), from ``uniserve build-server launch`` run by the environment's
+  ``uniserve`` (the plugin's ``uniserve``); a key the package does not state
+  raises :class:`~uniserve_testing.kernels.packages.RefusedLaunchError` with
+  its reason. The command runs the Build Server's toolchain program
+  ``uniserve-build-server``, which must be on the search path.
+- ``launch_target``: the target a check's stated launch names, the session
+  device's (``module_target``) or, on the interpreter,
+  :data:`INTERPRETED_TARGET`.
 - ``kernel_module(op, backend, key)``: the directory of the built module of a
-  descriptor key, resolved at a Build Server the session starts for the
-  session's device (``uniserve build-server resolve``, which builds a missing
-  module), for a check of a native or cubin module. It needs a device.
+  descriptor key, resolved at the session's Build Server
+  (:mod:`uniserve_testing.builds`, which builds a missing module for this
+  host's devices), for a check of a native or cubin module. It needs a
+  device.
 
 A check of a dependent launch runs its operator behind a producer that writes
-the inputs late (:mod:`tests.python.kernels.chain`); a family's shared
-reference arithmetic is a helper module beside its checks.
+the inputs late (:mod:`uniserve_testing.kernels.chain`); a family's shared
+reference arithmetic and operands are a module of the family's subpackage of
+:mod:`uniserve_testing.kernels`.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import sys
-import tempfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 import torch
-
-from tests.python.kernels.packages import (
+from uniserve_testing import builds
+from uniserve_testing.kernels.packages import (
     Launches,
     Modules,
     source_module,
 )
-
-#: The kernel package tree, from pytest's root directory, the repository's.
-PACKAGES = ("crates", "ops", "kernels")
 
 
 def interpreting(config: pytest.Config) -> bool:
@@ -106,8 +105,11 @@ def pytest_configure(config: pytest.Config) -> None:
     No check and no kernel source imports Triton before this hook runs, which
     pytest calls once this file is loaded and before it imports a test module
     of this directory. The choice is Triton's own setting, the only one it
-    reads before it decorates its language library; the processes a check
-    starts inherit it with the rest of the session's environment.
+    reads before it decorates its language library. A process a check starts
+    runs with the declared environment of the tests' servers
+    (:func:`uniserve_testing.servers.environment`), which does not carry it:
+    the Build Server's driver decorates a package's kernels in Triton's
+    compiled mode itself.
 
     Raises:
         pytest.UsageError: When Triton was imported earlier in another mode,
@@ -131,9 +133,9 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 
 
 @pytest.fixture(scope="session")
-def kernels(pytestconfig: pytest.Config) -> Path:
+def kernels(repository: Path) -> Path:
     """The kernel package tree."""
-    return pytestconfig.rootpath.joinpath(*PACKAGES)
+    return repository / builds.KERNEL_TREE
 
 
 @pytest.fixture(scope="session")
@@ -170,16 +172,8 @@ def kernel_source(kernels: Path) -> Callable[..., ModuleType]:
 
 
 @pytest.fixture(scope="session")
-def uniserve() -> str:
-    """The ``uniserve`` executable: ``UNISERVE_BINARY``, or ``uniserve`` on the
-    search path.
-    """  # noqa: D205
-    return os.environ.get("UNISERVE_BINARY", "uniserve")
-
-
-@pytest.fixture(scope="session")
 def stated_launch(
-    uniserve: str,
+    uniserve: Path,
     kernels: Path,
     kernel_source: Callable[..., ModuleType],
     tmp_path_factory: pytest.TempPathFactory,
@@ -197,61 +191,48 @@ def module_target(torch_device: torch.device) -> str:
     """The target the session's device runs: the architecture-specific one of
     its compute capability, as the Build Server names it.
     """  # noqa: D205
+    # `uniserve build-server resolve` and `launch` take a kernel module's
+    # target by its name, and no command names the target of a device, so the
+    # name is the Build Server's rule for a device of this capability
+    # (`Target::arch`).
     major, minor = torch.cuda.get_device_capability(torch_device)
     return f"sm_{major}{minor}a"
 
 
+#: The target a launch is stated for on the interpreter. The interpreter
+#: compiles for no target, and ``uniserve build-server launch`` states a
+#: compilation for a GPU target of the Build Server's description. The
+#: launches the interpreted checks state read no fact of a target: their keys
+#: ask for no dependent launch and no derivation of their packages reads a
+#: target's facts, so every target states the same kernel, compile-time values
+#: and options, and this one, the description's first, states them.
+INTERPRETED_TARGET = "sm_90a"
+
+
+@pytest.fixture(scope="session")
+def launch_target(interpreted: bool, request: pytest.FixtureRequest) -> str:
+    """The target a check's launch is stated for: the session device's, or on
+    the interpreter :data:`INTERPRETED_TARGET`.
+    """  # noqa: D205
+    if interpreted:
+        return INTERPRETED_TARGET
+    return request.getfixturevalue("module_target")
+
+
 @pytest.fixture(scope="session")
 def build_server(
-    uniserve: str,
-    module_target: str,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[Path]:
-    """A Build Server for the session's modules, over an empty store; its
-    socket.
-    """  # noqa: D205
-    # The servers' helpers are the end-to-end tests', whose HTTP stack only a
-    # session that builds modules needs.
-    from tests.python.e2e.build_server import (
-        BUILD_SERVER_START_S,
-        require_toolchain_environment,
-    )
-    from tests.python.e2e.http_helpers import start_server, stop_server
-
-    require_toolchain_environment()
-    work = tmp_path_factory.mktemp("build-server")
-    # A Unix socket's path is bounded (`SUN_LEN`, 108 bytes), so the socket
-    # lives in a short directory of its own.
-    sockets = Path(tempfile.mkdtemp(prefix="uniserve-kernels-"))
-    socket = sockets / "build-server.sock"
-    server = start_server(
-        [
-            uniserve,
-            "build-server",
-            "serve",
-            "--socket",
-            str(socket),
-            "--package-root",
-            str(work / "packages"),
-            "--store-root",
-            str(work / "modules"),
-            "--target",
-            module_target,
-        ],
-        work / "build-server.log",
-    )
-    try:
-        server.wait("serving", BUILD_SERVER_START_S)
-        yield socket
-    finally:
-        stop_server(server.process)
-        server.close()
-        shutil.rmtree(sockets, ignore_errors=True)
+    uniserve: Path, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[builds.BuildServer]:
+    """The session's Build Server, over an empty package root and store."""
+    with builds.build_server(
+        uniserve, tmp_path_factory.mktemp("build-server")
+    ) as server:
+        yield server
 
 
 @pytest.fixture(scope="session")
 def kernel_module(
-    uniserve: str, build_server: Path, kernels: Path, module_target: str
+    build_server: builds.BuildServer, kernels: Path, module_target: str
 ) -> Modules:
     """``kernel_module(op, backend, key)``: a built module's directory."""
-    return Modules(uniserve, build_server, kernels, module_target)
+    return Modules(build_server, kernels, module_target)

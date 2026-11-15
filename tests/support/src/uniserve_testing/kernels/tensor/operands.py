@@ -32,12 +32,7 @@ from collections.abc import Callable
 import numpy as np
 import torch
 
-from tests.python.kernels.packages import Launches, StatedLaunch
-
-#: The architecture whose compilation a check launches. It has no
-#: programmatic dependent launch, so a key's ``pdl`` compiles to nothing and a
-#: check launches one grid at a time.
-ARCHITECTURE = "sm_90a"
+from uniserve_testing.kernels.packages import Launches, StatedLaunch
 
 #: The most axes an operand has (``ops::MAX_RANK``).
 MAX_RANK = 6
@@ -251,23 +246,35 @@ def with_atol(bound, atol: float):
 class Primitives:
     """What a tensor check launches on: the session's device and the launches
     the packages state for their keys (the ``primitives`` fixture).
+
+    Every key a check launches asks for no dependent launch (``pdl_false``),
+    so each launch is one grid, ordered after the stream's earlier work.
     """  # noqa: D205
 
     def __init__(
-        self, device: torch.device, interpreted: bool, launches: Launches
+        self,
+        device: torch.device,
+        interpreted: bool,
+        launches: Launches,
+        target: str,
     ) -> None:
+        """``target`` is the target every launch is stated for: the session
+        device's, or the interpreted session's (the ``launch_target``
+        fixture).
+        """  # noqa: D205
         self.device = device
         self.interpreted = interpreted
         self._launches = launches
+        self._target = target
 
     def described(self, op: str, key: str) -> StatedLaunch:
         """What ``op``'s package states for the module of descriptor ``key``.
 
         A key the manifest does not declare, or one its launch table refuses,
-        raises :class:`~tests.python.kernels.packages.RefusedLaunchError`
+        raises :class:`~uniserve_testing.kernels.packages.RefusedLaunchError`
         rather than passing as a launch of something else.
         """
-        return self._launches(op, key, ARCHITECTURE)
+        return self._launches(op, key, self._target)
 
     def launch(self, op: str, key: str, programs: tuple, *words) -> None:
         """Launch the module ``key`` names over ``programs``, with ``words``.

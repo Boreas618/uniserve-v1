@@ -7,13 +7,12 @@ this operator sees in service is 151,936). The cases: the fixture's width; and
 ties, a repeated maximum and one at the last column.
 
 A module compiled for a dependent launch reads only what the grid before it
-wrote (:mod:`tests.python.kernels.chain`); that launch needs a device.
+wrote (:mod:`uniserve_testing.kernels.chain`); that launch needs a device.
 """
 
 import pytest
 import torch
-
-from tests.python.kernels import chain
+from uniserve_testing.kernels import chain
 
 pytestmark = pytest.mark.unit
 

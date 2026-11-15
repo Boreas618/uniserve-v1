@@ -30,8 +30,7 @@ negative index and is no mode of these cases, so ``SKIP`` is false here.
 
 import pytest
 import torch
-
-from tests.python.kernels import chain
+from uniserve_testing.kernels import chain
 
 pytestmark = pytest.mark.unit
 

@@ -3,9 +3,10 @@
 The module (resolved at the session's Build Server for the session's device)
 is compiled for one descriptor, below, so every case runs its shapes and the
 token count, a runtime argument, is the check's. It is called with the
-operator's `moe::grouped::GatherCall` (``crates/ops/src/moe/grouped.rs``, 624
-bytes), over a valid sort built on the host (:mod:`.routes`) that holds an
-expert with no routes and a partly filled last tile.
+operator's `moe::grouped::GatherCall` (``crates/ops/src/moe/grouped.rs``, the
+generated header's ``uniserve_gather_call``), over a valid sort built on the
+host (:mod:`uniserve_testing.kernels.gemm.routes`) that holds an expert with
+no routes and a partly filled last tile.
 
 The reference is the operator's text: for a live tile's row `p` with map entry
 `r`, `out[p] = act(gate) · up` where `up = W[e, :I] · x` and
@@ -24,16 +25,16 @@ import math
 
 import pytest
 import torch
-
-from tests.python.kernels.gemm import routes
+from uniserve_testing.kernels.gemm import routes
+from uniserve_testing.kernels.packages import (
+    abi_enumerator,
+    assert_abi_layout,
+)
 
 pytestmark = pytest.mark.unit
 
 #: `ops::abi::code`'s number of BF16.
-BF16 = 4
-
-#: The size `GATHER_CALL_LAYOUT` states for the call structure.
-GATHER_CALL_SIZE = 624
+BF16 = abi_enumerator("UNISERVE_DTYPE_BF16")
 
 #: The module's descriptor: hidden and intermediate widths, experts, routes
 #: per token; and the tokens the case sorts.
@@ -70,12 +71,9 @@ class Call(ctypes.Structure):
     ]
 
 
-def test_the_call_mirror_is_the_operators_gather_call():
-    assert ctypes.sizeof(Call) == GATHER_CALL_SIZE, (
-        f"the check's GatherCall mirror is {ctypes.sizeof(Call)} bytes, the "
-        f"operator's GATHER_CALL_LAYOUT says {GATHER_CALL_SIZE} "
-        "(crates/ops/src/moe/grouped.rs)"
-    )
+def test_the_call_mirror_is_the_headers_gather_call():
+    """The generated header asserts the size and offsets `GatherCall` has."""
+    assert_abi_layout(Call, "uniserve_gather_call")
 
 
 def gamma(reduction, unit):

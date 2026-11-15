@@ -6,7 +6,7 @@ Both halves are checked, because a kernel that zeroed the whole tile passes
 any check that only looks at the padding, and one that zeroed the wrong block
 passes any check that only looks at a tile's first rows. The reference masks a
 ``[tiles, tile, heads, width]`` view of the rows by the same comparison
-(:func:`tests.python.kernels.vsa.operands.zero_padding`), and
+(:func:`uniserve_testing.kernels.vsa.operands.zero_padding`), and
 the rows are non-zero everywhere, so a row left unzeroed cannot pass as
 already zero and a row written by mistake cannot pass as untouched.
 
@@ -25,8 +25,7 @@ The cases are the ones a plausible-but-wrong kernel passes:
 
 import pytest
 import torch
-
-from tests.python.kernels.vsa import operands
+from uniserve_testing.kernels.vsa import operands
 
 pytestmark = pytest.mark.unit
 

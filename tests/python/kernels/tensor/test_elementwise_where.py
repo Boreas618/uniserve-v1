@@ -13,7 +13,7 @@ What is covered:
 - **a condition that is any nonzero value**, not only one: 2, 200 and, where
   the type is signed, a negative number select ``on_true`` as 1 does, which a
   kernel comparing against one would miss;
-- **every layout** of :data:`~tests.python.kernels.tensor.operands.LAYOUTS`
+- **every layout** of :data:`~uniserve_testing.kernels.tensor.operands.LAYOUTS`
   as the condition, with a permuted, stepped or broadcast ``on_true`` of the
   same shape and an ``on_false`` that is one value repeated everywhere, and
   the same condition repeated along its last axis over contiguous values;
@@ -25,8 +25,7 @@ import functools
 
 import pytest
 import torch
-
-from tests.python.kernels.tensor import operands
+from uniserve_testing.kernels.tensor import operands
 
 pytestmark = pytest.mark.unit
 

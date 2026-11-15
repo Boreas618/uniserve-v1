@@ -23,8 +23,9 @@ import math
 
 import pytest
 import torch
+from uniserve_testing.kernels.packages import assert_abi_layout
 
-pytestmark = [pytest.mark.unit, pytest.mark.gpu]
+pytestmark = pytest.mark.unit
 
 #: `ops::tolerance::unit_roundoff`, per element type.
 UNIT_ROUNDOFF = {
@@ -59,6 +60,11 @@ class Call(ctypes.Structure):
     ]
 
 
+def test_the_call_mirror_is_the_headers_gemm_call():
+    """The generated header asserts the size and offsets `Call` has."""
+    assert_abi_layout(Call, "UniserveGemmCall")
+
+
 def bound(reduction, accumulate, output):
     """The operator's relative bound over the contraction."""
     terms = reduction * UNIT_ROUNDOFF[accumulate]
@@ -79,6 +85,7 @@ CASES = [
 ]
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize(("epilogue", "alpha", "row_stride"), CASES)
 def test_the_product_is_within_the_operators_bound(
     epilogue, alpha, row_stride, torch_device, kernel_module

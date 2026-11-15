@@ -7,16 +7,40 @@ for a matrix of ``rows`` rows and ``scales = columns / 16`` scale columns:
 
 - ``linear``: ``[rows, scales]`` row major, offset ``row · scales + scale``;
 - ``swizzled_128x4``: rows padded to 128 and scale columns to 4, in the atom
-  layout the Blackwell block-scaled MMA reads: the padded matrix, cut into
+  layout the block-scaled ``tcgen05`` MMA reads: the padded matrix, cut into
   blocks of 128 rows by 4 scale columns, the 128 rows split into four groups
   of 32, and within a block ``lane · 16 + group · 4 + column``.
 
 ``test_nvfp4_gemm.py`` proves the swizzle is the atom layout ``cute`` builds,
 and ``test_nvfp4_quantize.py`` that both layouts read one logical matrix
-alike.
+alike. Both call the ``nvfp4_gemm`` module's entry with :class:`GemmCall`,
+which ``test_nvfp4_gemm.py`` holds to the generated header.
 """
 
+import ctypes
+
 import torch
+
+
+class GemmCall(ctypes.Structure):
+    """``uniserve_nvfp4_gemm_call`` (``ops::fp4``'s ``Nvfp4Gemm`` call), field
+    for field.
+    """  # noqa: D205
+
+    _fields_ = [
+        ("input", ctypes.c_void_p),
+        ("weight", ctypes.c_void_p),
+        ("input_scales", ctypes.c_void_p),
+        ("weight_scales", ctypes.c_void_p),
+        ("alpha", ctypes.c_void_p),
+        ("bias", ctypes.c_void_p),
+        ("out", ctypes.c_void_p),
+        ("m", ctypes.c_int64),
+        ("n", ctypes.c_int64),
+        ("k", ctypes.c_int64),
+        ("error", ctypes.c_char * 512),
+    ]
+
 
 #: E2M1's eight magnitudes, by the code's low three bits; bit 3 is the sign.
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)

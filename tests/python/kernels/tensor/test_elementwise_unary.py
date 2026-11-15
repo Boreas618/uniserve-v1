@@ -16,7 +16,7 @@ What is covered:
   cancels; ``powf`` also over a base of either sign under a whole exponent;
 - **the functions closed over the integers** on every integer element type,
   wrapping as the element type does;
-- **every layout** of :data:`~tests.python.kernels.tensor.operands.LAYOUTS`.
+- **every layout** of :data:`~uniserve_testing.kernels.tensor.operands.LAYOUTS`.
 
 ``tanh``, ``powf`` and every exponential (``exp``, and the one inside
 ``gelu``, ``silu``, ``sigmoid`` and ``elu``) call libdevice, which Triton's
@@ -33,8 +33,7 @@ import pytest
 import torch
 import triton.language as tl
 from triton.runtime import interpreter
-
-from tests.python.kernels.tensor import operands
+from uniserve_testing.kernels.tensor import operands
 
 pytestmark = pytest.mark.unit
 

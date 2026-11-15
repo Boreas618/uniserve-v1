@@ -17,7 +17,7 @@ with the conversion the operator states:
 
 All 72 ordered pairs run over a contiguous input and a permuted one, decided
 fractions run into every signed integer type, and four pairs run over every
-layout of :data:`~tests.python.kernels.tensor.operands.LAYOUTS`.
+layout of :data:`~uniserve_testing.kernels.tensor.operands.LAYOUTS`.
 """
 
 import functools
@@ -25,8 +25,7 @@ import functools
 import numpy as np
 import pytest
 import torch
-
-from tests.python.kernels.tensor import operands
+from uniserve_testing.kernels.tensor import operands
 
 pytestmark = pytest.mark.unit
 

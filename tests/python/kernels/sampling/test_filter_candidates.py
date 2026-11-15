@@ -18,13 +18,12 @@ Every test needs a device. The program combines a scalar comparison with an
 array comparison by ``|`` (``(min_p <= 0) | (kept >= threshold)``), which
 Triton's interpreter evaluates as ``numpy.bool_ | ndarray`` and its bitwise
 ufunc refuses. A module compiled for a dependent launch reads only what the
-grid before it wrote (:mod:`tests.python.kernels.chain`).
+grid before it wrote (:mod:`uniserve_testing.kernels.chain`).
 """
 
 import pytest
 import torch
-
-from tests.python.kernels import chain
+from uniserve_testing.kernels import chain
 
 pytestmark = [pytest.mark.unit, pytest.mark.gpu]
 

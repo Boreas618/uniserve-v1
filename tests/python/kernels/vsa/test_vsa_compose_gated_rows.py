@@ -2,7 +2,7 @@
 
 The operator writes one interval of every member's gated rows into a payload,
 member-major, with the arithmetic of ``vsa_add_gated_tiles``
-(:mod:`tests.python.kernels.vsa.operands`):
+(:mod:`uniserve_testing.kernels.vsa.operands`):
 
 ```text
 row  = member · owner_rows + start + i          the member's own row numbering
@@ -34,8 +34,7 @@ import dataclasses
 
 import pytest
 import torch
-
-from tests.python.kernels.vsa import operands
+from uniserve_testing.kernels.vsa import operands
 
 pytestmark = pytest.mark.unit
 

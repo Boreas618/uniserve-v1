@@ -11,8 +11,8 @@ one not written inside it.
 What is covered, by the backend primitive it serves:
 
 - **``contiguous`` and ``copy_strided_src``**: every layout of
-  :data:`~tests.python.kernels.tensor.operands.LAYOUTS` into a contiguous run
-  that begins at an element offset inside a longer buffer;
+  :data:`~uniserve_testing.kernels.tensor.operands.LAYOUTS` into a contiguous
+  run that begins at an element offset inside a longer buffer;
 - **``copy2d``**: rows whose stride differs on the two sides, read from an
   offset and written at an offset, which is how a concatenation along the last
   axis places each operand;
@@ -24,8 +24,7 @@ What is covered, by the backend primitive it serves:
 
 import pytest
 import torch
-
-from tests.python.kernels.tensor import operands
+from uniserve_testing.kernels.tensor import operands
 
 pytestmark = pytest.mark.unit
 

@@ -43,8 +43,7 @@ import struct
 import numpy as np
 import pytest
 import torch
-
-from tests.python.kernels.rope.rounding import gamma
+from uniserve_testing.kernels.rope.rounding import gamma
 
 pytestmark = pytest.mark.unit
 

@@ -40,15 +40,14 @@ per element.
 
 A module compiled for a dependent launch reads only what the grid before it
 wrote: the operator launched behind a producer still writing its inputs
-(:mod:`tests.python.kernels.chain`) must give its launch after a
+(:mod:`uniserve_testing.kernels.chain`) must give its launch after a
 synchronization, bit for bit. That launch needs a device.
 """  # noqa: D205
 
 import pytest
 import torch
-
-from tests.python.kernels import chain
-from tests.python.kernels.rope.rounding import TORCH_TYPES, gamma
+from uniserve_testing.kernels import chain
+from uniserve_testing.kernels.rope.rounding import TORCH_TYPES, gamma
 
 pytestmark = pytest.mark.unit
 

@@ -32,9 +32,8 @@ import ctypes
 
 import pytest
 import torch
-
-from tests.python.kernels.gemm import nvfp4
-from tests.python.kernels.packages import assert_abi_layout
+from uniserve_testing.kernels.gemm import nvfp4
+from uniserve_testing.kernels.packages import assert_abi_layout
 
 pytestmark = pytest.mark.unit
 
@@ -53,24 +52,6 @@ TORCH_TYPES = {
 
 #: The product's factor.
 ALPHA = 0.6875
-
-
-class Call(ctypes.Structure):
-    """``uniserve_nvfp4_gemm_call``, field for field."""
-
-    _fields_ = [
-        ("input", ctypes.c_void_p),
-        ("weight", ctypes.c_void_p),
-        ("input_scales", ctypes.c_void_p),
-        ("weight_scales", ctypes.c_void_p),
-        ("alpha", ctypes.c_void_p),
-        ("bias", ctypes.c_void_p),
-        ("out", ctypes.c_void_p),
-        ("m", ctypes.c_int64),
-        ("n", ctypes.c_int64),
-        ("k", ctypes.c_int64),
-        ("error", ctypes.c_char * 512),
-    ]
 
 
 def e2m1_values(codes):
@@ -123,7 +104,7 @@ def gamma(reduction, unit):
 
 def test_the_call_mirror_is_the_entrys_call_structure():
     """The generated header asserts the size and every offset it holds."""
-    assert_abi_layout(Call, "uniserve_nvfp4_gemm_call")
+    assert_abi_layout(nvfp4.GemmCall, "uniserve_nvfp4_gemm_call")
 
 
 @pytest.mark.parametrize(
@@ -224,7 +205,7 @@ def entry(kernel_module):
         str(kernel_module("nvfp4_gemm", "cute_dsl", key) / "module.so")
     )
     function = library.uniserve_nvfp4_gemm
-    function.argtypes = [ctypes.POINTER(Call), ctypes.c_void_p]
+    function.argtypes = [ctypes.POINTER(nvfp4.GemmCall), ctypes.c_void_p]
     function.restype = ctypes.c_int32
     return function
 
@@ -238,7 +219,7 @@ def test_the_entry_refuses_another_problem_size_before_the_device(entry):
     says.
     """  # noqa: D205
     address = 0x1000
-    call = Call(
+    call = nvfp4.GemmCall(
         input=address,
         weight=address,
         input_scales=address,
@@ -305,7 +286,7 @@ def test_the_product_is_within_the_operators_declared_bound(
     weight_scale_matrix = weight_scale_matrix.to(torch_device)
     out = torch.zeros(M, N, dtype=TORCH_TYPES[OUTPUT], device=torch_device)
 
-    call = Call(
+    call = nvfp4.GemmCall(
         input=packed_input.data_ptr(),
         weight=packed_weight.data_ptr(),
         input_scales=input_scale_matrix.data_ptr(),

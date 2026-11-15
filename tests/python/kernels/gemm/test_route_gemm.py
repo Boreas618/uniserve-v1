@@ -3,8 +3,9 @@
 The module (resolved at the session's Build Server for the session's device)
 is compiled for one descriptor, below, so every case runs its shapes. It is
 called with the operator's `RouteCall` (``crates/ops/src/moe/grouped.rs``)
-over a valid sort built on the host (:mod:`.routes`) that holds an expert with
-no routes and a partly filled last tile.
+over a valid sort built on the host
+(:mod:`uniserve_testing.kernels.gemm.routes`) that holds an expert with no
+routes and a partly filled last tile.
 
 The operator's product is a scatter as well as a multiply::
 
@@ -24,14 +25,16 @@ import math
 
 import pytest
 import torch
-
-from tests.python.kernels.gemm import routes
-from tests.python.kernels.packages import assert_abi_layout
+from uniserve_testing.kernels.gemm import routes
+from uniserve_testing.kernels.packages import (
+    abi_enumerator,
+    assert_abi_layout,
+)
 
 pytestmark = pytest.mark.unit
 
 #: `ops::abi::code`'s number of BF16.
-BF16 = 4
+BF16 = abi_enumerator("UNISERVE_DTYPE_BF16")
 
 #: The module's descriptor: hidden and intermediate widths, experts, routes
 #: per token; and the tokens the case sorts.

@@ -14,7 +14,8 @@ count is below its extent (whose rows past the count must come back zero), and
 a suspend and restore that must keep the views' addresses, since a captured
 graph holds them.
 
-It needs two CUDA devices.
+It needs two CUDA devices. The call structures' mirrors are held to the
+operator crate's generated header, which needs none.
 """
 
 import ctypes
@@ -22,11 +23,15 @@ import threading
 
 import pytest
 import torch
+from uniserve_testing.kernels.packages import (
+    abi_enumerator,
+    assert_abi_layout,
+)
 
-pytestmark = [pytest.mark.unit, pytest.mark.gpu]
+pytestmark = pytest.mark.unit
 
 #: `ops::abi::code`'s number of BF16.
-BF16 = 4
+BF16 = abi_enumerator("UNISERVE_DTYPE_BF16")
 
 #: The ranks, one per device, and the exchange's extents: the hidden width,
 #: the routes per token, the experts and the transport's rows per rank.
@@ -40,7 +45,8 @@ KEY = (
 ENTRIES = ("create", "step", "suspend", "restore", "release", "info", "launch")
 
 #: The directions of a launch.
-DISPATCH, COMBINE = 0, 1
+DISPATCH = abi_enumerator("UNISERVE_EXCHANGE_DISPATCH")
+COMBINE = abi_enumerator("UNISERVE_EXCHANGE_COMBINE")
 
 #: The trials, each the rows a rank sends and the live count among them: the
 #: transport's capacity, a step below it with a live count below its extent,
@@ -142,6 +148,20 @@ class Group(ctypes.Structure):
         ("barrier", BARRIER),
         ("error", ctypes.c_char * 512),
     ]
+
+
+@pytest.mark.parametrize(
+    ("mirror", "structure"),
+    [
+        pytest.param(Lifecycle, "uniserve_exchange_lifecycle", id="lifecycle"),
+        pytest.param(Info, "uniserve_exchange_info", id="info"),
+        pytest.param(Call, "uniserve_exchange_call", id="launch"),
+        pytest.param(Group, "UniserveGroup", id="group"),
+    ],
+)
+def test_a_call_mirror_is_its_generated_header_structure(mirror, structure):
+    """The generated header asserts the size and offsets the mirror has."""
+    assert_abi_layout(mirror, structure)
 
 
 class Channel:
@@ -335,6 +355,7 @@ def run_rank(library, channel, rank, device):
     entered(library, "release", life)
 
 
+@pytest.mark.gpu
 def test_two_ranks_dispatch_combine_suspend_and_restore(kernel_module):
     if torch.cuda.device_count() < RANKS:
         pytest.skip(

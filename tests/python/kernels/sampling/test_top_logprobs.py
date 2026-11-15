@@ -12,13 +12,12 @@ The cases: the vocabulary row keeping the deployment's twenty; tied entries
 across and within chunks; and a row narrower than its candidates.
 
 A module compiled for a dependent launch reads only what the grid before it
-wrote (:mod:`tests.python.kernels.chain`); that launch needs a device.
+wrote (:mod:`uniserve_testing.kernels.chain`); that launch needs a device.
 """
 
 import pytest
 import torch
-
-from tests.python.kernels import chain
+from uniserve_testing.kernels import chain
 
 pytestmark = pytest.mark.unit
 

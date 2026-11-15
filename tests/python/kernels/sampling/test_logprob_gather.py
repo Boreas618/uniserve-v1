@@ -12,13 +12,12 @@ gathered as it stands rather than repaired; tied entries sharing a rank, in a
 row the step does not divide; and an unscored row.
 
 A module compiled for a dependent launch reads only what the grid before it
-wrote (:mod:`tests.python.kernels.chain`); that launch needs a device.
+wrote (:mod:`uniserve_testing.kernels.chain`); that launch needs a device.
 """
 
 import pytest
 import torch
-
-from tests.python.kernels import chain
+from uniserve_testing.kernels import chain
 
 pytestmark = pytest.mark.unit
 

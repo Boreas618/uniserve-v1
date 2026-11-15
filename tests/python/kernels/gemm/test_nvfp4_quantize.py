@@ -28,7 +28,8 @@ two scale layouts against each other, since a wrong decoder would report the
 kernel as broken.
 
 The operator launched as a programmatic dependent reads only what the grid
-before it wrote (:mod:`tests.python.kernels.chain`), which needs a device too.
+before it wrote (:mod:`uniserve_testing.kernels.chain`), which needs a device
+too.
 """
 
 import ctypes
@@ -37,9 +38,8 @@ import math
 
 import pytest
 import torch
-
-from tests.python.kernels import chain
-from tests.python.kernels.gemm import nvfp4
+from uniserve_testing.kernels import chain
+from uniserve_testing.kernels.gemm import nvfp4
 
 pytestmark = pytest.mark.unit
 
@@ -399,24 +399,6 @@ def test_a_row_of_zeros_encodes_to_zeros_with_a_finite_factor(
     )
 
 
-class GemmCall(ctypes.Structure):
-    """`ops::fp4`'s `Nvfp4Gemm` call: 592 bytes with the error at 80."""
-
-    _fields_ = [
-        ("input", ctypes.c_void_p),
-        ("weight", ctypes.c_void_p),
-        ("input_scales", ctypes.c_void_p),
-        ("weight_scales", ctypes.c_void_p),
-        ("alpha", ctypes.c_void_p),
-        ("bias", ctypes.c_void_p),
-        ("out", ctypes.c_void_p),
-        ("m", ctypes.c_int64),
-        ("n", ctypes.c_int64),
-        ("k", ctypes.c_int64),
-        ("error", ctypes.c_char * 512),
-    ]
-
-
 #: The consumer's descriptor: the producer's rows by a square weight of its
 #: columns, the activation scales in the layout the gemm package declares, a
 #: BF16 output.
@@ -454,7 +436,7 @@ def test_the_consumer_multiplies_the_producers_bytes(
         str(kernel_module("nvfp4_gemm", "cute_dsl", GEMM_KEY) / "module.so")
     )
     entry = library.uniserve_nvfp4_gemm
-    entry.argtypes = [ctypes.POINTER(GemmCall), ctypes.c_void_p]
+    entry.argtypes = [ctypes.POINTER(nvfp4.GemmCall), ctypes.c_void_p]
     entry.restype = ctypes.c_int32
 
     torch.manual_seed(SEED + 1)
@@ -485,7 +467,7 @@ def test_the_consumer_multiplies_the_producers_bytes(
 
     alpha = torch.ones(1, dtype=torch.float32, device=torch_device)
     out = torch.zeros(ROWS, n, dtype=torch.bfloat16, device=torch_device)
-    call = GemmCall(
+    call = nvfp4.GemmCall(
         input=values.data_ptr(),
         weight=weights.data_ptr(),
         input_scales=scales.data_ptr(),

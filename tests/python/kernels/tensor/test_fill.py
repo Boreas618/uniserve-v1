@@ -22,8 +22,7 @@ What is covered:
 
 import pytest
 import torch
-
-from tests.python.kernels.tensor import operands
+from uniserve_testing.kernels.tensor import operands
 
 pytestmark = pytest.mark.unit
 

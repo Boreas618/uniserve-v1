@@ -34,8 +34,8 @@ stays at that shape and varies only the sequence lengths, because a
 configuration chosen for another shape is a different compilation. Its causal
 reference aligns the queries with the last of their sequence's keys.
 
-Every test but the call structure's size loads a module built for the
-session's device.
+Every test but the call structure's layout, held to the operator crate's
+generated header, loads a module built for the session's device.
 """
 
 import ctypes
@@ -43,22 +43,23 @@ import math
 
 import pytest
 import torch
+from uniserve_testing.kernels.packages import (
+    abi_enumerator,
+    assert_abi_layout,
+)
 
 pytestmark = pytest.mark.unit
 
 #: `ops::abi::code`'s numbers of the element types these modules serve.
-F16 = 3
-BF16 = 4
-F32 = 5
+F16 = abi_enumerator("UNISERVE_DTYPE_F16")
+BF16 = abi_enumerator("UNISERVE_DTYPE_BF16")
+F32 = abi_enumerator("UNISERVE_DTYPE_F32")
 
 #: The operator's value envelope, `ops::tolerance::VALUE_ENVELOPE`.
 VALUE_ENVELOPE = 8.0
 
 #: `DType::F32.unit_roundoff()`.
 UNIT_ROUNDOFF = 5.960464477539063e-08
-
-#: The size `DENSE_ATTENTION_CALL_LAYOUT` states for the call structure.
-DENSE_CALL_SIZE = 720
 
 
 class Call(ctypes.Structure):
@@ -95,12 +96,9 @@ class Call(ctypes.Structure):
     ]
 
 
-def test_the_call_mirror_is_the_operators_dense_call():
-    assert ctypes.sizeof(Call) == DENSE_CALL_SIZE, (
-        f"the check's Call mirror is {ctypes.sizeof(Call)} bytes; the "
-        f"operator's DENSE_ATTENTION_CALL_LAYOUT says {DENSE_CALL_SIZE} "
-        "(`crates/ops/src/attention/dense.rs`)"
-    )
+def test_the_call_mirror_is_the_headers_dense_attention_call():
+    """The generated header asserts the size and offsets `DenseCall` has."""
+    assert_abi_layout(Call, "uniserve_dense_attention_call")
 
 
 def pointer(tensor):

@@ -20,15 +20,14 @@ relative factor ``2 gamma(2) + u`` (`RopeApply::tolerance`,
 a cancelling sum, and stronger than the operator's where the element does not
 cancel. A channel past the rotation is held to its input at the same factor,
 on an output pre-filled with NaN. The store is checked apart from the
-arithmetic (:mod:`tests.python.kernels.rope.rounding`).
+arithmetic (:mod:`uniserve_testing.kernels.rope.rounding`).
 """
 
 import math
 
 import pytest
 import torch
-
-from tests.python.kernels.rope.rounding import (
+from uniserve_testing.kernels.rope.rounding import (
     TORCH_TYPES,
     UNIT_ROUNDOFF,
     gamma,

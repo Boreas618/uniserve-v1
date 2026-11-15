@@ -30,15 +30,14 @@ interpreter truncates where a device rounds, a whole unit in the last place
 instead of half of one, which the element-type comparison allows there.
 
 A module compiled for a dependent launch reads only what the grid before it
-wrote (:mod:`tests.python.kernels.chain`); that launch needs a device.
+wrote (:mod:`uniserve_testing.kernels.chain`); that launch needs a device.
 """
 
 import numpy as np
 import pytest
 import torch
 import torch.nn.functional as functional
-
-from tests.python.kernels import chain
+from uniserve_testing.kernels import chain
 
 pytestmark = pytest.mark.unit
 

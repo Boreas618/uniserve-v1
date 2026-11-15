@@ -24,8 +24,8 @@ The operator's rule that ``tf32`` is a permission for FP32 only is checked by
 a refusal: a half-precision module given ``tf32`` refuses the call with a
 message containing "cannot use it", before it examines any address.
 
-Every test loads a module built for the session's device, so every test
-needs one.
+Every test but the call structure's layout, held to the operator crate's
+generated header, loads a module built for the session's device.
 """
 
 import ctypes
@@ -33,8 +33,9 @@ import math
 
 import pytest
 import torch
+from uniserve_testing.kernels.packages import assert_abi_layout
 
-pytestmark = [pytest.mark.unit, pytest.mark.gpu]
+pytestmark = pytest.mark.unit
 
 #: The convolutions the `conv` operator's one module computes, each named by
 #: and compared with PyTorch's function.
@@ -90,6 +91,11 @@ class Call(ctypes.Structure):
     ]
 
 
+def test_the_call_mirror_is_the_headers_conv_call():
+    """The generated header asserts the size and offsets `Call` has."""
+    assert_abi_layout(Call, "uniserve_conv_call")
+
+
 def key(dtype):
     """The descriptor key of a convolution module of element type `dtype`."""
     return f"input_{dtype}_weight_{dtype}_output_{dtype}"
@@ -137,6 +143,7 @@ def stored(tensor, channels_last):
     )
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("geometry", GEOMETRIES)
 @pytest.mark.parametrize(
     "channels_last", [False, True], ids=["channels first", "channels last"]
@@ -234,6 +241,7 @@ def test_a_convolution_matches_torch_within_the_operators_bound(
     )
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("op", OPERATORS)
 def test_a_half_precision_convolution_refuses_tf32(op, kernel_module):
     """`tf32` is a permission only an FP32 convolution can use.

@@ -12,6 +12,11 @@ differed. Every target the Build Server describes launches dependently
 (its target description's `dependent_launch`), so a device a module is built
 for runs the case.
 
+The delay makes an early read likely, not certain: a dependent that becomes
+resident only after the producer wrote reads the inputs' final contents. A
+correct operator never differs, so a round that differs is a defect, and the
+rounds repeat the race to make a missing wait show.
+
 A case states one operator: the inputs it reads, the buffers it writes (with
 their starting contents, since some operators read them too) and a launch. The
 inputs live in one byte arena that one producer grid writes, so the operator's
@@ -49,18 +54,6 @@ ROUNDS = 20
 
 
 @triton.jit
-def _global_time():
-    return tl.inline_asm_elementwise(
-        "mov.u64 $0, %globaltimer;",
-        "=l",
-        [],
-        dtype=tl.int64,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
 def _late_copy_kernel(
     source_ptr,
     destination_ptr,
@@ -70,11 +63,13 @@ def _late_copy_kernel(
 ):
     """Release the dependent grid, wait `delay` ns, then copy `size` bytes.
 
-    Program `p` of `n` copies the blocks `p, p + n, ...`.
+    Program `p` of `n` copies the blocks `p, p + n, ...`. The wait reads the
+    device's global timer, in nanoseconds (Triton's
+    `tl.extra.cuda.globaltimer`).
     """
     tl.extra.cuda.gdc_launch_dependents()
-    start = _global_time()
-    while _global_time() - start < delay:
+    start = tl.extra.cuda.globaltimer()
+    while tl.extra.cuda.globaltimer() - start < delay:
         pass
     programs = tl.num_programs(0)
     for block in range(tl.program_id(0), tl.cdiv(size, BLOCK), programs):
@@ -182,9 +177,4 @@ def check(case: Case) -> int:
         torch.cuda.synchronize()
         if not _equal(result, reference):
             failures += 1
-    print(
-        f"{'PASS' if failures == 0 else 'FAIL'}: {case.name} launched as a "
-        f"dependent, {failures} of {ROUNDS} rounds differ from its launch "
-        "after a synchronization"
-    )
     return failures

@@ -26,8 +26,7 @@ device.
 
 import pytest
 import torch
-
-from tests.python.kernels.gemm import fp8
+from uniserve_testing.kernels.gemm import fp8
 
 pytestmark = pytest.mark.unit
 

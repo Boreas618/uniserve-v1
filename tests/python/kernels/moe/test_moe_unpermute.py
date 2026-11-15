@@ -34,16 +34,18 @@ import math
 
 import pytest
 import torch
-
-from tests.python.kernels.packages import assert_abi_layout
+from uniserve_testing.kernels.packages import (
+    abi_enumerator,
+    assert_abi_layout,
+)
 
 pytestmark = pytest.mark.unit
 
 #: `ops::abi::code`'s number and torch's type of each element type.
 DTYPES = {
-    "bf16": (4, torch.bfloat16),
-    "f16": (3, torch.float16),
-    "f32": (5, torch.float32),
+    "bf16": (abi_enumerator("UNISERVE_DTYPE_BF16"), torch.bfloat16),
+    "f16": (abi_enumerator("UNISERVE_DTYPE_F16"), torch.float16),
+    "f32": (abi_enumerator("UNISERVE_DTYPE_F32"), torch.float32),
 }
 
 #: The unit roundoff of each output type.
@@ -53,9 +55,10 @@ ROUNDOFF = {
     torch.float32: 2.0**-24,
 }
 
-#: The layouts the operator distinguishes: the routes read in permuted order,
-#: or in the order the expanded map gives.
-PERMUTED, EXPANDED = 0, 1
+#: The layout the check runs, of the two the operator distinguishes: the
+#: routes read in permuted order (the other reads them in the order the
+#: expanded map gives).
+PERMUTED = abi_enumerator("UNISERVE_UNPERMUTE_LAYOUT_PERMUTED")
 
 #: The module's descriptor and the tokens the cases combine.
 HIDDEN, TOP, EXPERTS, INPUT, SCALES, OUTPUT = (

@@ -3,24 +3,19 @@
 A test loads the built module of the package's descriptor (``dtype_f32``,
 resolved at the session's Build Server) as a runner loads it, calls the
 operator's entry with the call structure of ``crates/ops/src/frame.rs``
-(``FrameNormPadCall``, 728 bytes: ``values`` 0, ``values_batch`` 8,
-``values_channel`` 16, ``values_frame`` 24, ``mean`` 32, ``rstd`` 40,
-``weight`` 48, ``bias`` 56, ``out`` 64, the five output strides 72..104,
-``channels`` 112, ``frames`` 120, ``height`` 128, ``width`` 136,
-``out_frames`` 144, ``out_rows`` 152, ``out_columns`` 160,
-``channels_per_group`` 168, ``groups`` 176, ``top`` 184, ``left`` 192,
-``front`` 200, ``reflect`` 208, ``normalization`` 212, ``error`` 216), and
-compares the output with::
+(``FrameNormPadCall``, the generated header's
+``uniserve_frame_norm_pad_call``), and compares the output with::
 
     out = pad(silu(group_norm(values)))      # F.group_norm, F.silu, F.pad
 
 **What is checked.** The moments the call carries are computed by torch and
 passed in, so the tests check the normalization, the SiLU and the padded
 store: the parts of the entry that are not ``frame_moments``, whose own check
-holds the moments. The three normalization branches are the call's: with
-affine parameters (``normalization = 0``), without them (``1``), and
-``GroupNorm1dForward``'s expressions for frames of one pixel (``2``); each
-pads by replicating or by reflecting its border.
+holds the moments. The three normalization branches are the call's
+(``uniserve_normalization``): with affine parameters (``fused``), without
+them (``centered``), and ``GroupNorm1dForward``'s expressions for frames of
+one pixel (``singlepixel``); each pads by replicating or by reflecting its
+border.
 
 **The layout is the call's.** The entry's two template branches write the
 same addresses, ``channel * out_channel + column * out_column``; the layout
@@ -47,9 +42,11 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F  # noqa: N812
-
-from tests.python.kernels.norm.rounding import gamma, outside
-from tests.python.kernels.packages import assert_abi_layout
+from uniserve_testing.kernels.norm.rounding import gamma, outside
+from uniserve_testing.kernels.packages import (
+    abi_enumerator,
+    assert_abi_layout,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -60,7 +57,9 @@ MESSAGE = 512
 KEY = "dtype_f32"
 
 #: The normalization branches `frame.cu` implements.
-FUSED, CENTERED, SINGLE_PIXEL = 0, 1, 2
+FUSED = abi_enumerator("UNISERVE_NORMALIZATION_FUSED")
+CENTERED = abi_enumerator("UNISERVE_NORMALIZATION_CENTERED")
+SINGLE_PIXEL = abi_enumerator("UNISERVE_NORMALIZATION_SINGLEPIXEL")
 
 #: The extents of the values and of the padding: channels, groups, frames,
 #: height and width; the rows above and below, the columns left and right,

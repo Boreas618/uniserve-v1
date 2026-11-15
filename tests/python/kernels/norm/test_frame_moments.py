@@ -3,10 +3,8 @@
 A test loads the built module of the package's descriptor (``dtype_f32``,
 resolved at the session's Build Server) as a runner loads it, calls the
 operator's entry with the call structure of ``crates/ops/src/frame.rs``
-(``FrameMomentsCall``, 608 bytes: ``values`` 0, ``values_batch`` 8,
-``values_channel`` 16, ``values_frame`` 24, ``values_pixel`` 32, ``frames``
-40, ``pixels`` 48, ``channels_per_group`` 56, ``groups`` 64, ``epsilon`` 72,
-``mean`` 80, ``rstd`` 88, ``error`` 96), and compares both statistics with
+(``FrameMomentsCall``, the generated header's ``uniserve_frame_moments_call``),
+and compares both statistics with
 PyTorch's own: ``var_mean(unbiased=False)`` over the same group of channels
 and pixels of a frame, then ``rsqrt(var + eps)``.
 
@@ -39,9 +37,8 @@ import ctypes
 
 import pytest
 import torch
-
-from tests.python.kernels.norm.rounding import gamma, outside
-from tests.python.kernels.packages import assert_abi_layout
+from uniserve_testing.kernels.norm.rounding import gamma, outside
+from uniserve_testing.kernels.packages import assert_abi_layout
 
 pytestmark = pytest.mark.unit
 

@@ -1,7 +1,7 @@
 """The vsa_add_gated_tiles program against the operator's two steps.
 
 The operator adds one tile's gated compression to each of its rows, in place,
-as two eager steps (:mod:`tests.python.kernels.vsa.operands`):
+as two eager steps (:mod:`uniserve_testing.kernels.vsa.operands`):
 
 ```text
 row += narrow(compressed[tile] · gate[row])      the product narrowed first
@@ -31,8 +31,7 @@ import dataclasses
 
 import pytest
 import torch
-
-from tests.python.kernels.vsa import operands
+from uniserve_testing.kernels.vsa import operands
 
 pytestmark = pytest.mark.unit
 

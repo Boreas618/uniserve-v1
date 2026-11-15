@@ -26,7 +26,7 @@ element does not cancel::
     |got - reference| <= (2 gamma(head_dim) + u) (|first cos| + |second sin|)
 
 The store is checked apart from the arithmetic
-(:mod:`tests.python.kernels.rope.rounding`).
+(:mod:`uniserve_testing.kernels.rope.rounding`).
 """
 
 import math
@@ -34,8 +34,7 @@ import struct
 
 import pytest
 import torch
-
-from tests.python.kernels.rope.rounding import (
+from uniserve_testing.kernels.rope.rounding import (
     TORCH_TYPES,
     UNIT_ROUNDOFF,
     gamma,

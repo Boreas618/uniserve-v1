@@ -19,7 +19,8 @@ attention window, which this module is compiled without. Each refused call is
 built exactly as the served one is, so the refusal is the guard's and not a
 side effect of a malformed call.
 
-Every test needs a device.
+Every test but the call structures' layouts, held to the operator crate's
+generated headers, needs a device.
 """
 
 import ctypes
@@ -27,12 +28,16 @@ import math
 
 import pytest
 import torch
+from uniserve_testing.kernels.packages import (
+    abi_enumerator,
+    assert_abi_layout,
+)
 
-pytestmark = [pytest.mark.unit, pytest.mark.gpu]
+pytestmark = pytest.mark.unit
 
 #: `ops::abi::code`'s number of BF16, and the operator's decode phase.
-BF16 = 4
-DECODE = 1
+BF16 = abi_enumerator("UNISERVE_DTYPE_BF16")
+DECODE = abi_enumerator("UNISERVE_PHASE_DECODE")
 
 #: The decode: requests, the keys of the shortest one, query and key-value
 #: heads, the head width, the page and the workspace in MiB.
@@ -115,6 +120,18 @@ class Load(ctypes.Structure):
         ("directory", ctypes.c_char_p),
         ("error", ctypes.c_char * 512),
     ]
+
+
+@pytest.mark.parametrize(
+    ("mirror", "structure"),
+    [
+        pytest.param(Call, "uniserve_paged_attention_call", id="the call"),
+        pytest.param(Load, "uniserve_load_call", id="the load call"),
+    ],
+)
+def test_a_call_mirror_is_its_generated_header_structure(mirror, structure):
+    """The generated header asserts the size and offsets the mirror has."""
+    assert_abi_layout(mirror, structure)
 
 
 def pointer(tensor):
@@ -238,6 +255,7 @@ def reference(query, key_pages, value_pages, page_table, seq_lens, scale):
     return out
 
 
+@pytest.mark.gpu
 def test_a_decode_matches_exact_attention_and_names_its_kernels(
     entry, torch_device
 ):
@@ -274,6 +292,7 @@ def test_a_decode_matches_exact_attention_and_names_its_kernels(
     )
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize(("field", "value", "words"), REFUSALS)
 def test_a_call_the_module_cannot_serve_is_refused_by_its_guard(
     field, value, words, entry, torch_device

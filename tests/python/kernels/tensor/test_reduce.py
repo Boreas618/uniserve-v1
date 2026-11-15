@@ -19,7 +19,7 @@ What is covered:
 - **every choice of axes** of a rank-4 input: the last, the first, a middle
   one that splits the kept axes in two, two that are not adjacent, and all of
   them; an index along each single axis;
-- **every layout** of :data:`~tests.python.kernels.tensor.operands.LAYOUTS`
+- **every layout** of :data:`~uniserve_testing.kernels.tensor.operands.LAYOUTS`
   reduced along its last axis, its first axis and all of its axes;
 - **the largest magnitude** of every floating element type, over the same
   lengths and layouts, and of infinities of either sign;
@@ -34,8 +34,7 @@ import math
 import numpy as np
 import pytest
 import torch
-
-from tests.python.kernels.tensor import operands
+from uniserve_testing.kernels.tensor import operands
 
 pytestmark = pytest.mark.unit
 

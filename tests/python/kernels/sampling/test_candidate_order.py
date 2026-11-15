@@ -21,7 +21,8 @@ A permutation is integer comparison, ranks and moves with no narrowing cast,
 so Triton's interpreter answers it as a device does. The built module of the
 package's ``f32``/``i32`` descriptor is launched on a device as well, through
 the driver as a runner launches it; a module compiled for a dependent launch
-reads only what the grid before it wrote (:mod:`tests.python.kernels.chain`).
+reads only what the grid before it wrote
+(:mod:`uniserve_testing.kernels.chain`).
 """
 
 import ctypes
@@ -30,8 +31,7 @@ import json
 import numpy as np
 import pytest
 import torch
-
-from tests.python.kernels import chain
+from uniserve_testing.kernels import chain
 
 pytestmark = pytest.mark.unit
 
