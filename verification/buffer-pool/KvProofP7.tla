@@ -50,17 +50,17 @@ LEMMA UnitsOfRegions ==
                     /\ IsFiniteSet(UnitsIn(r))
                     /\ \A u \in UnitsIn(r) : InRegion(u)
   OBVIOUS
-<1>1. member \subseteq Units
+<1>1. member \subseteq Units \cup HostUnits
   BY DEF IndInv, Regions
 <1>2. CASE r \in {<<"device", UnitRegion[u]>> : u \in Units}
   <2>1. PICK v \in Units : r = <<"device", UnitRegion[v]>>
     BY <1>2
   <2>2. r[1] = "device" /\ r[2] = UnitRegion[v]
     BY <2>1
-  <2>3. UnitsIn(r) = {u \in member : UnitRegion[u] = r[2]}
+  <2>3. UnitsIn(r) = {u \in member \cap Units : UnitRegion[u] = r[2]}
     BY <2>2 DEF UnitsIn
   <2>4. UnitsIn(r) \subseteq Units
-    BY <1>1, <2>3
+    BY <2>3
   <2>5. IsFiniteSet(UnitsIn(r))
     BY <2>4, Finite, FS_Subset
   <2>6. \A u \in UnitsIn(r) : u \in member
@@ -78,19 +78,23 @@ LEMMA UnitsOfRegions ==
     BY <2>3
   <2>5. IsFiniteSet(UnitsIn(r))
     BY <2>4, Finite, FS_Subset
-  <2>6. \A u \in UnitsIn(r) : u \notin Units
+  <2>6. \A u \in UnitsIn(r) : u \notin Units \cup HostUnits
     BY <2>4, Sizes
   <2> QED
     BY <2>4, <2>5, <2>6 DEF AllUnits, InRegion
 <1>4. CASE r \in {<<"host", "host">>}
   <2>1. r[1] = "host"
     BY <1>4
-  <2>2. UnitsIn(r) = HostUnits
+  <2>2. UnitsIn(r) = member \cap HostUnits
     BY <2>1 DEF UnitsIn
-  <2>3. \A u \in UnitsIn(r) : u \notin Units
-    BY <2>2, Sizes
+  <2>3. UnitsIn(r) \subseteq HostUnits
+    BY <2>2
+  <2>4. IsFiniteSet(UnitsIn(r))
+    BY <2>3, Finite, FS_Subset
+  <2>5. \A u \in UnitsIn(r) : u \in member
+    BY <2>2
   <2> QED
-    BY <2>2, <2>3, Finite DEF AllUnits, InRegion
+    BY <2>3, <2>4, <2>5 DEF AllUnits, InRegion
 <1> QED
   BY <1>2, <1>3, <1>4 DEF Capacities
 

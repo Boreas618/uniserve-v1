@@ -47,7 +47,7 @@ LEMMA ServingStep ==
     BY <1>4, Step2 DEF Next2
   <1>5. CASE \/ \E k \in Keys : Evict(k) \/ EvictHost(k)
              \/ \E e \in Epochs : CommitUpdate(e) \/ Rollback(e)
-             \/ \E u \in Units : Shrink(u) \/ Grow(u)
+             \/ \E u \in Units \cup HostUnits : Shrink(u) \/ Grow(u)
     BY <1>5, Step3
   <1>6. CASE \/ Issue
              \/ \E g \in Groups, r \in requests : ExecStamp(g, r)

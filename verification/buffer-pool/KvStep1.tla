@@ -100,7 +100,7 @@ LEMMA AttachPool ==
     BY TypeFacts
   <1>2. \A v \in AllUnits : Held(v)' <=> Held(v) \/ v = s
     BY AttachHeld
-  <1>3. s \notin Units /\ s \in AllUnits /\ s # NONE
+  <1>3. s \notin Units /\ s \notin HostUnits /\ s \in AllUnits /\ s # NONE
     BY DEF AllUnits
   <1>4. TypeOK'
     BY <1>1, <1>3 DEF AttachAt, TypeOK, rare, AllUnits
@@ -154,7 +154,7 @@ LEMMA AttachPool ==
     <2> QED
       BY <2>1, <2>2
   <1>9. Outside'
-    <2>1. \A v \in Units : alloc'[v] = alloc[v]
+    <2>1. \A v \in Units \cup HostUnits : alloc'[v] = alloc[v]
       BY <1>1, <1>3 DEF AttachAt, TypeOK, AllUnits
     <2> QED
       BY <2>1 DEF AttachAt, IndInv, Outside
@@ -672,7 +672,15 @@ LEMMA AllocatePool ==
     <2> QED
       BY <2>1, <2>2
   <1>11. Outside'
-    BY <1>4, <1>5 DEF AllocateAt, IndInv, Outside, AllUnits
+    <2> SUFFICES ASSUME NEW v \in (Units \cup HostUnits) \ member'
+                 PROVE  alloc'[v] = NONE /\ sharedKey'[v] = NONE
+      BY DEF Outside
+    <2>1. v # u /\ v \in AllUnits /\ v \in (Units \cup HostUnits) \ member
+      BY DEF AllocateAt, AllUnits
+    <2>2. alloc[v] = NONE /\ sharedKey[v] = NONE
+      BY <2>1 DEF IndInv, Outside
+    <2> QED
+      BY <1>4, <2>1, <2>2
   <1>12. Regions'
     BY DEF AllocateAt, IndInv, Regions, OneRegion
   <1>13. AllocOwner' /\ SharedIff'
@@ -686,7 +694,12 @@ LEMMA AllocatePool ==
     <2>2. cache[sharedKey[v]] = v \/ hcache[sharedKey[v]] = v
       BY <2>1 DEF IndInv, SharedCached
     <2>3. sharedKey[v] \in Keys
-      BY <2>1 DEF IndInv, SharedIff, TypeInv, TypeOK
+      <3>1. sharedKey[v] # NONE
+        BY <2>1 DEF IndInv, SharedIff
+      <3>2. sharedKey \in [AllUnits -> Keys \cup {NONE}]
+        BY <1>1 DEF TypeOK
+      <3> QED
+        BY <3>1, <3>2
     <2> QED
       BY <2>1, <2>2, <2>3, <1>5 DEF AllocateAt
   <1>15. CacheShared'

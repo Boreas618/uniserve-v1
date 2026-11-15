@@ -21,10 +21,10 @@ ASSUME Sizes ==
     /\ SlotGroup \in [Slots -> Groups]
     /\ GroupEpoch \in [Groups -> Epochs]
     /\ OwnerEpoch \in [Owners -> Epochs]
-    /\ InitialUnits \subseteq Units /\ Movable \subseteq Units
+    /\ InitialUnits \subseteq Units \cup HostUnits /\ Movable \subseteq Units \cup HostUnits
     /\ TrialEpochs \subseteq Epochs /\ Losable \subseteq Epochs
     /\ Eager \in BOOLEAN
-    /\ \A u, v \in InitialUnits : u # v => UnitChunk[u] # UnitChunk[v]
+    /\ \A u, v \in InitialUnits \cap Units : u # v => UnitChunk[u] # UnitChunk[v]
     /\ GroupParts \in [Groups -> SUBSET HostParts]
     \* A memory is not a host part.
     /\ \A g \in Groups : GroupMemory[g] \notin HostParts
@@ -41,7 +41,7 @@ THEOREM InitInv == Init => IndInv
 <1> USE Sizes, Design DEF Init, NONE, SLOT, AllUnits, Rows, Empty, Private, Shared, NoEntry, NoStamp
 <1>1. TypeInv
   <2>1. TypeOK
-    <3>1. free \subseteq AllUnits /\ member \subseteq Units
+    <3>1. free \subseteq AllUnits /\ member \subseteq Units \cup HostUnits
       OBVIOUS
     <3>2. ostate \in [Owners -> {"new", "live", "gone"}]
           /\ ogroup \in [Owners -> Groups \cup {NONE}]

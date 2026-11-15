@@ -188,8 +188,9 @@ LEMMA PrefetchInv ==
         /\ t0.p = NONE
         /\ TaskRecord(t0)
     BY DEF PrefetchTask, Task, TaskRecord
-  <1>3. h \in AllUnits /\ h \notin Units /\ h \notin Slots /\ h # NONE
-    BY DEF AllUnits
+  <1>3. /\ h \in AllUnits /\ h \notin Units /\ h \notin Slots /\ h # NONE
+        /\ h \in member
+    BY DEF AllUnits, PrefetchAt, IndInv, Regions
   <1>4. \A v \in AllUnits : v # h => alloc'[v] = alloc[v]
     BY <1>1 DEF PrefetchAt, TypeOK
   <1>5. alloc'[h] = "task"
@@ -230,7 +231,7 @@ LEMMA PrefetchInv ==
     <2> QED
       BY <2>1, <2>2
   <1>11. Outside' /\ Regions' /\ AllocOwner' /\ SharedIff' /\ SharedCached' /\ CacheShared'
-    <2>1. \A v \in Units : alloc'[v] = alloc[v]
+    <2>1. \A v \in (Units \cup HostUnits) \ member : alloc'[v] = alloc[v]
       BY <1>3, <1>4 DEF AllUnits
     <2>2. Outside' /\ Regions'
       BY <2>1 DEF PrefetchAt, IndInv, Outside, Regions, OneRegion
@@ -729,7 +730,23 @@ LEMMA PrefetchCachedInv ==
     <2> QED
       BY <1>4, <1>8, <2>1, <2>2 DEF IndInv, FreeClean, NoLeak, InRegion
   <1>11. Outside' /\ Regions' /\ AllocOwner' /\ SharedIff'
-    BY <1>3, <1>4 DEF IndInv, Outside, Regions, OneRegion, AllocOwner, SharedIff, AllUnits
+    (* The prefetch's host block is allocated, so it is in its region.     *)
+    <2>1. t.h \in member
+      BY <1>2, <1>3 DEF IndInv, Outside, NONE
+    <2>2. Outside'
+      <3> SUFFICES ASSUME NEW v \in (Units \cup HostUnits) \ member'
+                   PROVE  alloc'[v] = NONE /\ sharedKey'[v] = NONE
+        BY DEF Outside
+      <3>1. v # t.h /\ v \in AllUnits /\ v \in (Units \cup HostUnits) \ member
+        BY <2>1 DEF AllUnits
+      <3>2. alloc[v] = NONE /\ sharedKey[v] = NONE
+        BY <3>1 DEF IndInv, Outside
+      <3> QED
+        BY <1>4, <3>1, <3>2
+    <2>3. Regions' /\ AllocOwner' /\ SharedIff'
+      BY <1>3, <1>4 DEF IndInv, Regions, OneRegion, AllocOwner, SharedIff, AllUnits
+    <2> QED
+      BY <2>2, <2>3
   <1>12. SharedCached'
     <2> SUFFICES ASSUME NEW v \in AllUnits, alloc'[v] = "shared"
                  PROVE  cache'[sharedKey'[v]] = v \/ hcache'[sharedKey'[v]] = v
@@ -884,8 +901,9 @@ LEMMA PrefetchDroppedInv ==
         /\ \A x \in tasks : x # t => t.h \notin x.units /\ t.h # x.slot /\ t.h # x.h
         /\ \A b \in inflight : \A y \in b.reads : y[2] # t.h
     BY PrefetchSole
-  <1>3. t.h \in AllUnits /\ t.h \notin Units /\ t.h \notin Slots
-    BY <1>2 DEF AllUnits
+  <1>3. /\ t.h \in AllUnits /\ t.h \notin Units /\ t.h \notin Slots
+        /\ t.h \in member
+    BY <1>2 DEF AllUnits, IndInv, Outside, NONE
   <1>4. /\ \A v \in AllUnits : v # t.h => alloc'[v] = alloc[v] /\ sharedKey'[v] = sharedKey[v]
         /\ alloc'[t.h] = NONE /\ sharedKey'[t.h] = NONE
     BY <1>3
@@ -908,7 +926,7 @@ LEMMA PrefetchDroppedInv ==
     <2> QED
       BY <2>2, <2>3
   <1>9. Outside' /\ Regions' /\ AllocOwner' /\ SharedIff' /\ SharedCached' /\ CacheShared'
-    <2>1. \A v \in Units : alloc'[v] = alloc[v] /\ sharedKey'[v] = sharedKey[v]
+    <2>1. \A v \in (Units \cup HostUnits) \ member : alloc'[v] = alloc[v] /\ sharedKey'[v] = sharedKey[v]
       BY <1>3, <1>4 DEF AllUnits
     <2>4. Outside'
       BY <2>1 DEF IndInv, Outside

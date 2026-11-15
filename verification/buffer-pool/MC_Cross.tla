@@ -15,7 +15,7 @@ MCUnitRegion == [u \in Units |-> "kv"]
 MCUnitChunk == [u \in Units |-> u]
 MCGroupRegion == [g \in Groups |-> "kv"]
 MCMovable == {}
-MCInitialUnits == Units
+MCInitialUnits == Units \cup HostUnits
 (* gb reads, in its own memory, the class an owner of ga holds.            *)
 MCReaders == [g \in Groups |-> IF g = ga THEN {gb} ELSE {}]
 AllRules == {"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10", "R11"}

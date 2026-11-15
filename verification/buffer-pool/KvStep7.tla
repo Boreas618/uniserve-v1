@@ -1812,7 +1812,7 @@ LEMMA FinishDue_Cache ==
         <4>2. Tables /\ OwnerTyped
           BY <1>0, <2>3
         <4> QED
-          BY <2>2, <3>1, <3>2, <4>1, <4>2, TablesEntry DEF Private, Shared
+          BY <2>2, <3>1, <3>2, <4>1, <4>2, TablesEntry, SMTT(20) DEF Private, Shared
       <3>4. OwnersOk'
         <4>1. \A q \in Owners, r \in Positions : q # o => table'[q][r] = table[q][r]
           BY <1>2
@@ -2176,10 +2176,23 @@ LEMMA FinishDue_Host ==
     <2>2. NoLeak'
       BY <1>2, <1>4, <2>0 DEF NoLeak, InRegion, AllUnits
     <2>3. Outside' /\ Regions'
-      <3>1. \A x \in G : x \in Units => x \in member
+      <3>1. \A x \in G : x \in Units \cup HostUnits => x \in member
         BY <1>4, <2>0 DEF NoLeak, InRegion, AllUnits
+      (* The host block the copy writes is allocated, so it is in its region. *)
+      <3>2. w \in member
+        BY <1>1, <2>0 DEF Outside, NONE
+      <3>3. Outside'
+        <4> SUFFICES ASSUME NEW v \in (Units \cup HostUnits) \ member'
+                     PROVE  alloc'[v] = NONE /\ sharedKey'[v] = NONE
+          BY DEF Outside
+        <4>1. v # w /\ v \in AllUnits /\ v \in (Units \cup HostUnits) \ member
+          BY <3>2 DEF AllUnits
+        <4> QED
+          BY <1>3, <2>0, <4>1 DEF Outside
+      <3>4. Regions'
+        BY <1>2, <2>0, <3>1 DEF Regions, OneRegion, AllUnits
       <3> QED
-        BY <1>1, <1>2, <1>3, <2>0, <3>1 DEF Outside, Regions, OneRegion, AllUnits
+        BY <3>3, <3>4
     <2>4. AllocOwner' /\ SharedIff'
       BY <1>1, <1>3, <2>0 DEF AllocOwner, SharedIff, NONE, AllUnits
     <2>5. SharedCached'

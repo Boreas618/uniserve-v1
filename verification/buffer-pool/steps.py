@@ -546,7 +546,11 @@ ACTS = {"attach": ["Attach"], "allocate": ["Allocate"], "pin": ["Pin"], "clone":
         # A session's end: its engine is lost (every stamp of its groups
         # counts as reached, as `Advance`s of their words), and the device
         # regions no other session names close, their cached blocks evicted.
-        "close": ["Lose", "Advance", "Evict", "Shrink"], "resize": ["Evict", "Shrink", "Grow"]}
+        "close": ["Lose", "Advance", "Evict", "Shrink"],
+        # A resize of a device region or of the host region: a shrink evicts
+        # in the installed order, the device copies or the host copies of the
+        # region it shrinks.
+        "resize": ["Evict", "EvictHost", "Shrink", "Grow"]}
 
 
 def acts(text):
@@ -1301,7 +1305,11 @@ def check(job):
         ordered = Seq(sorted(start["copies"], key=tla))
         finishes = Set(Rec(ok=line["ok"], at=ordered.index(line["copy"]) + 1, after=line["after"])
                        for line in start["finishes"])
-        member = Set(unit for unit in units["kv"]
+        # The device and host units in their regions: those the first state
+        # names, free or held. A unit of the window it does not name is
+        # outside its region (one a resize grows), or one the run's universe
+        # has beyond this window's.
+        member = Set(unit for unit in units["kv"] + units["host"]
                      if re.search(rf"(?<![\d:]){re.escape(unit)}(?![\d])", "\n".join(item["lines"][0])))
         begin = Rec(state=Raw(define("S", start)), member=member, copies=ordered, finishes=finishes)
 
@@ -1361,6 +1369,9 @@ def check(job):
         "TraceGroupParts": tla(group_parts),
         "TraceReaders": tla(readers),
         "TraceRules": "AllRules",
+        # Every device and host unit: a window's start states which are in
+        # their regions (KvTrace's `Start`), and `Resize` may move any.
+        "TraceRegionUnits": "TraceUnits \\cup TraceHostUnits",
     }
     module = [
         "---- MODULE MC_Trace ----",
@@ -1381,7 +1392,7 @@ def check(job):
         "GroupEpoch": "<- TraceGroupEpoch", "OwnerEpoch": "<- TraceOwnerEpoch",
         "GroupMemory": "<- TraceGroupMemory", "UnitRegion": "<- TraceUnitRegion",
         "UnitChunk": "<- TraceUnitChunk", "GroupRegion": "<- TraceGroupRegion",
-        "InitialUnits": "<- TraceUnits", "Movable": "<- TraceUnits", "TrialEpochs": "= {}",
+        "InitialUnits": "<- TraceRegionUnits", "Movable": "<- TraceRegionUnits", "TrialEpochs": "= {}",
         "Losable": "<- TraceEpochs",
         "MaxBatch": f"= {batches}", "MaxRequests": "= 1", "MaxCopies": f"= {copies}",
         "MaxTasks": f"= {tasks}", "Hazards": "= {}", "Eager": "= TRUE",

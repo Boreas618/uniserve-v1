@@ -194,7 +194,7 @@ LEMMA CrossingsPlacedFrame ==
 (* are records of their fields alone.                                      *)
 
 UnitTyped ==
-    /\ free \subseteq AllUnits /\ member \subseteq Units
+    /\ free \subseteq AllUnits /\ member \subseteq Units \cup HostUnits
     /\ alloc \in [AllUnits -> Owners \cup {NONE, "shared", "copy", "task"}]
     /\ sharedKey \in [AllUnits -> Keys \cup {NONE}]
     /\ cache \in [Keys -> Units \cup {NONE}] /\ hcache \in [Keys -> HostUnits \cup {NONE}]
@@ -598,7 +598,7 @@ LEMMA FreeReclaim ==
     BY DEF NoLeak, InRegion
   <1>3. Outside'
     BY DEF Outside, AllUnits
-  <1>4. \A v \in G : v \in Units => v \in member
+  <1>4. \A v \in G : v \in Units \cup HostUnits => v \in member
     BY DEF NoLeak, InRegion, AllUnits
   <1>5. Regions'
     BY <1>4 DEF Regions, OneRegion

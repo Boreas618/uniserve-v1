@@ -9,7 +9,7 @@ NoLeak ==
     \A u \in AllUnits :
         IF InRegion(u) THEN u \in free \/ Held(u) ELSE u \notin free /\ ~Held(u)
 (* Device memory is in one region.                                         *)
-OneRegion == \A u, v \in member : u # v => UnitChunk[u] # UnitChunk[v]
+OneRegion == \A u, v \in member \cap Units : u # v => UnitChunk[u] # UnitChunk[v]
 Quiescent ==
     (/\ \A o \in Owners : ostate[o] # "live"
      /\ deferred = {}

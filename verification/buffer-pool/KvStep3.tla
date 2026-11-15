@@ -727,7 +727,7 @@ LEMMA ResizeFrame ==
        CopiesPlacedFrame, CrossingsPlacedFrame, TransfersFrame DEF IndInv
 
 LEMMA Shrink_Inv ==
-  ASSUME IndInv, NEW u \in Units, Shrink(u), UNCHANGED rare
+  ASSUME IndInv, NEW u \in Units \cup HostUnits, Shrink(u), UNCHANGED rare
   PROVE  IndInv'
   <1>1. /\ u \in free /\ u \in Movable
         /\ free' = free \ {u}
@@ -760,10 +760,10 @@ LEMMA Shrink_Inv ==
     BY <1>1, <1>4, <1>5, <1>6, <1>7, ResizeFrame DEF IndInv
 
 LEMMA Grow_Inv ==
-  ASSUME IndInv, NEW u \in Units, Grow(u), UNCHANGED rare
+  ASSUME IndInv, NEW u \in Units \cup HostUnits, Grow(u), UNCHANGED rare
   PROVE  IndInv'
   <1>1. /\ u \in Movable /\ u \notin member
-        /\ \A v \in member : UnitChunk[v] # UnitChunk[u]
+        /\ u \in Units => \A v \in member \cap Units : UnitChunk[v] # UnitChunk[u]
         /\ free' = free \cup {u}
         /\ member' = member \cup {u}
         /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy, tasks,
@@ -797,7 +797,7 @@ LEMMA Grow_Inv ==
 THEOREM Step3 ==
     IndInv /\ (/\ \/ \E k \in Keys : Evict(k) \/ EvictHost(k)
                   \/ \E e \in Epochs : CommitUpdate(e) \/ Rollback(e)
-                  \/ \E u \in Units : Shrink(u) \/ Grow(u)
+                  \/ \E u \in Units \cup HostUnits : Shrink(u) \/ Grow(u)
                /\ UNCHANGED rare)
     => IndInv'
   BY Evict_Inv, EvictHost_Inv, CommitUpdate_Inv, Rollback_Inv, Shrink_Inv, Grow_Inv

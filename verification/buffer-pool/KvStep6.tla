@@ -1055,8 +1055,8 @@ LEMMA TakeDetach_Effect ==
   <1>1. UNION {{c.read, c.write} : c \in copies \ copies} = {}
     OBVIOUS
   <1> QED
-    BY <1>1 DEF TakeDetach, Submittable, StampGroups, ReleaseUnits, ReleaseWait, DetUnits,
-                DetTable, DetSlot, OwnSession, Live, On, AllRules
+    BY <1>1, ZenonT(20) DEF TakeDetach, Submittable, StampGroups, ReleaseUnits, ReleaseWait,
+                            DetUnits, DetTable, DetSlot, OwnSession, Live, On, AllRules
 
 (* What a detach taken with effect says of its owner, the executors'      *)
 (* tables and the completions it keeps.                                    *)

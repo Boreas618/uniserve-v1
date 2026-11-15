@@ -21,7 +21,7 @@ MCUnitRegion == [u \in Units |-> "kv"]
 MCUnitChunk == [u \in Units |-> u]
 MCGroupRegion == [g \in Groups |-> "kv"]
 MCMovable == {}
-MCInitialUnits == Units
+MCInitialUnits == Units \cup HostUnits
 AllRules == {"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10", "R11"}
 
 (* A stamped request arrives on a queue pair with any stamps: the buffer   *)
@@ -74,7 +74,7 @@ PoolServing ==
          ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ TransferDue(d) \/ ReplicateDue(d)
     \/ \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok) \/ ReplicateEnd(t, ok)
     \/ \E e \in Epochs : CommitUpdate(e) \/ Rollback(e)
-    \/ \E u \in Units : Shrink(u) \/ Grow(u)
+    \/ \E u \in Units \cup HostUnits : Shrink(u) \/ Grow(u)
 
 PoolNext ==
     \/ PoolServing /\ UNCHANGED rare

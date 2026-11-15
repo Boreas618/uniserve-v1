@@ -421,8 +421,9 @@ LEMMA HostCopyInv ==
   <1>2. /\ \A v \in AllUnits : v # h => alloc'[v] = alloc[v]
         /\ alloc'[h] = "copy"
     BY <1>1 DEF HostCopyAt, TypeOK, AllUnits
-  <1>3. h \in AllUnits /\ h # NONE /\ h \notin Units /\ h \notin Slots
-    BY DEF AllUnits
+  <1>3. /\ h \in AllUnits /\ h # NONE /\ h \notin Units /\ h \notin Slots
+        /\ h \in member
+    BY DEF AllUnits, HostCopyAt, IndInv, Regions
   <1>4. ncopy \in Nat /\ ncopy' \in 0 .. MaxCopies
     BY <1>1 DEF HostCopyAt, TypeOK
   <1>5. Transfers' = Transfers
