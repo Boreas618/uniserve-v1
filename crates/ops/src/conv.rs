@@ -3,11 +3,12 @@
 //! `conv` is a native program: the call names the spatial extents as three axes and says whether
 //! the pass is transposed, so one module computes a 1-d or a 3-d convolution, and a transposed one
 //! as cuDNN's backward-data pass of the convolution it transposes. The key names the element types
-//! alone; the rank, the direction, the window, the groups, the bias, the TF32 permission and the
-//! storage order travel in the call. The grid is the library's.
+//! alone; the rank, the direction, the window, the groups, the bias, the product precision and
+//! the storage order travel in the call. The grid is the library's.
 //!
-//! An FP32 convolution may allow TF32; the call carries that permission, and the module refuses it
-//! for inputs of another precision.
+//! How narrow an FP32 convolution's products may be is the model's declaration
+//! ([`ProductPrecision`]), which the descriptor carries and the launch hands the package; it
+//! changes the numerical result the call guarantees, not the module.
 //!
 //! ```text
 //! 3-d             input [n, c, d, h, w]  weight [k, c/groups, t, h, w]   out [n, k, od, oh, ow]
@@ -30,6 +31,22 @@ use crate::strided;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
+/// The precision a convolution's products of FP32 operands may be formed in: a model's
+/// declaration of the numerical result its stage is specified at, which every implementation of
+/// the operator keeps.
+///
+/// The accumulation is FP32 in both. A product of 16-bit operands is exact in FP32 whatever this
+/// says, so the declaration bears on FP32 operands alone.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum ProductPrecision {
+    /// Every product of FP32 operands is formed in FP32.
+    #[default]
+    Exact,
+    /// A product of FP32 operands may be formed from the operands rounded to TF32, eleven
+    /// significant bits: an implementation may compute the stage this way and need not.
+    Tf32,
+}
+
 /// One compilation of a convolution.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Descriptor {
@@ -51,13 +68,13 @@ pub struct Descriptor {
     pub groups: u32,
     /// Whether the operation has a bias term.
     pub bias: bool,
-    /// Whether the library may use TF32 for FP32 inputs.
-    pub tf32: bool,
+    /// The precision the products of FP32 inputs may be formed in.
+    pub precision: ProductPrecision,
     /// Whether the tensors are channels-last (NDHWC) rather than channels-first (NCDHW).
     ///
     /// The shapes in the call stay logical (`[n, c, d, h, w]`); the order is the strides the entry
     /// derives and the cuDNN engine it selects, not a different compiled module - so, like the
-    /// filter's window and `tf32`, it travels in the call and is not part of the key.
+    /// filter's window and the precision, it travels in the call and is not part of the key.
     pub channels_last: bool,
     /// The spatial rank: 3 for a frame's convolution, 1 for a sequence's.
     pub rank: u32,
@@ -68,7 +85,7 @@ pub struct Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Only what selects a compiled module is in the key. The filter's window (kernel, stride,
-        // padding, dilation, groups), the bias, the TF32 choice and the rank travel in the call
+        // padding, dilation, groups), the bias, the precision and the rank travel in the call
         // structure (`Call`), which the entry reads: a convolution of a different window, or with a
         // bias, or in the transposed direction, launches the same module.
         // A key that named them would compile one module per clip length and per filter shape.
@@ -87,7 +104,7 @@ impl Descriptor {
     /// and channels-last storage when a three-dimensional input is stored that way. What the
     /// operands cannot say is the caller's: the direction, the window (`stride`, `padding`,
     /// `dilation` per spatial axis, 1, 0 and 1 on an axis the rank leaves unused), the channel
-    /// groups and the permission to narrow FP32 inputs to TF32.
+    /// groups and the precision the products may be formed in.
     ///
     /// This is the one place a convolution's descriptor is made: the tensor library's
     /// convolutions on this backend and `nn`'s convolutions take it from here, so one call has
@@ -102,7 +119,7 @@ impl Descriptor {
         transposed: bool,
         [stride, padding, dilation]: [[u32; 3]; 3],
         groups: u32,
-        tf32: bool,
+        precision: ProductPrecision,
     ) -> Result<Self> {
         let rank = args.input.rank().saturating_sub(2);
         if !matches!(rank, 1 | 3) || args.weight.rank() != rank + 2 {
@@ -135,7 +152,7 @@ impl Descriptor {
             dilation,
             groups,
             bias: args.bias.is_some(),
-            tf32,
+            precision,
             channels_last: rank == 3 && is_channels_last(&args.input),
             rank: rank as u32,
             transposed,
@@ -406,7 +423,7 @@ impl Op for Conv {
             ],
             groups: descriptor.groups as i32,
             transposed: i32::from(descriptor.transposed),
-            tf32: i32::from(descriptor.tf32),
+            tf32: i32::from(descriptor.precision == ProductPrecision::Tf32),
             channels_last: i32::from(descriptor.channels_last),
             error: [0; MESSAGE],
         };
@@ -464,7 +481,7 @@ mod tests {
             dilation: [1, 1, 1],
             groups: 1,
             bias: false,
-            tf32: false,
+            precision: ProductPrecision::Exact,
             channels_last,
             rank: 3,
             transposed: false,
@@ -648,7 +665,13 @@ mod tests {
             bias: None,
             out: packed(&[1, 6, 1, 4, 4]),
         };
-        let stated = Descriptor::of(&planar, false, [[1, 2, 2], [0, 1, 1], [1, 1, 1]], 1, false);
+        let stated = Descriptor::of(
+            &planar,
+            false,
+            [[1, 2, 2], [0, 1, 1], [1, 1, 1]],
+            1,
+            ProductPrecision::Exact,
+        );
         assert_eq!(
             stated.unwrap(),
             Descriptor {
@@ -661,7 +684,7 @@ mod tests {
                 dilation: [1, 1, 1],
                 groups: 1,
                 bias: false,
-                tf32: false,
+                precision: ProductPrecision::Exact,
                 channels_last: false,
                 rank: 3,
                 transposed: false,
@@ -675,13 +698,20 @@ mod tests {
             bias: Some(packed(&[4])),
             out: packed(&[2, 4, 11]),
         };
-        let transposed = Descriptor::of(&line, true, [[2, 1, 1], [0, 0, 0], [1, 1, 1]], 1, true);
+        let transposed = Descriptor::of(
+            &line,
+            true,
+            [[2, 1, 1], [0, 0, 0], [1, 1, 1]],
+            1,
+            ProductPrecision::Tf32,
+        );
         let transposed = transposed.unwrap();
         assert_eq!(
             (transposed.kernel, transposed.rank, transposed.bias),
             ([3, 1, 1], 1, true)
         );
-        assert!(transposed.transposed && transposed.tf32 && !transposed.channels_last);
+        assert!(transposed.transposed && !transposed.channels_last);
+        assert_eq!(transposed.precision, ProductPrecision::Tf32);
 
         // A channels-last volume is stated as one, and its key is the element types alone.
         let volume = Args {
@@ -690,7 +720,7 @@ mod tests {
             bias: None,
             out: channels_last(&[1, 8, 2, 6, 6]),
         };
-        let stored = Descriptor::of(&volume, false, unit, 1, false).unwrap();
+        let stored = Descriptor::of(&volume, false, unit, 1, ProductPrecision::Exact).unwrap();
         assert!(stored.channels_last);
         assert_eq!(stored.kernel, [3, 3, 3]);
         assert_eq!(stored.to_string(), "input_bf16_weight_bf16_output_bf16");
@@ -702,6 +732,6 @@ mod tests {
             bias: None,
             out: packed(&[1, 6, 6, 6]),
         };
-        assert!(Descriptor::of(&flat, false, unit, 1, false).is_err());
+        assert!(Descriptor::of(&flat, false, unit, 1, ProductPrecision::Exact).is_err());
     }
 }

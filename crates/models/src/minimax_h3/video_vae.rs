@@ -56,7 +56,7 @@
 use std::ops::Range;
 
 use nn::family::SequenceSplit;
-use nn::functional::{self, Activation, Padding, Rounding};
+use nn::functional::{self, Activation, Padding, ProductPrecision, Rounding};
 use nn::modules::{
     Attention, AttentionConfig, Conv3d, ConvConfig, FrameNorm, FrameNormConfig, GateUp, Linear,
     LinearConfig, Mlp, MlpConfig, Parallel, Precision, QkNorm, QkvBias, QkvLinearConfig, QkvNames,
@@ -99,6 +99,11 @@ const STREAM: DType = DType::F32;
 
 /// The zero frames a causal convolution of three taps reads before a clip's first frame.
 const CAUSAL_FRONT: usize = 2;
+
+/// The precision the encoder's FP32 convolutions are declared at: their products may be formed
+/// from TF32-rounded operands, the numerical result the stage's latents are specified at, which
+/// the stage's fixtures compare under.
+const ENCODER_PRECISION: ProductPrecision = ProductPrecision::Tf32;
 
 /// The module the decoder's blocks are stored under, `decoder.transformer_blocks.<i>`.
 pub(crate) const BLOCKS: &str = "decoder.transformer_blocks";
@@ -969,11 +974,10 @@ impl VideoEncoder {
         let moments = 2 * config.latent_channels;
 
         // No convolution pads with zeros of its own: a causal pad, alone or written by the
-        // normalization before it, supplies the padded input. The reference keeps cuDNN's
-        // TF32 for these FP32 convolutions.
+        // normalization before it, supplies the padded input.
         let conv = |from: u32, to: u32, kernel: u32, stride: [u32; 3]| ConvConfig {
             stride,
-            tf32: true,
+            precision: ENCODER_PRECISION,
             ..ConvConfig::new(from, to, [kernel; 3])
         };
 
@@ -999,7 +1003,7 @@ impl VideoEncoder {
                             front: CAUSAL_FRONT,
                             padding,
                             kernel: 3,
-                            tf32: true,
+                            precision: ENCODER_PRECISION,
                         },
                         stage.pp("resnets").pp(block),
                     )

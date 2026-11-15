@@ -491,9 +491,9 @@ impl CudaStorage {
     /// convolution's stride, padding and dilation per spatial axis; a spatial rank of three
     /// states a two-dimensional convolution as the three-dimensional one over a depth of one,
     /// and every operand then gains that axis. The tensor library splits a grouped convolution
-    /// into convolutions of one group, and the permission to narrow FP32 inputs to TF32 is a
-    /// model's numerical declaration, which a tensor operation does not carry: the descriptor
-    /// ([`conv::Descriptor::of`]) states one group and exact FP32 arithmetic.
+    /// into convolutions of one group, and the precision of FP32 products is a model's
+    /// numerical declaration, which a tensor operation does not carry: the descriptor
+    /// ([`conv::Descriptor::of`]) states one group and exact FP32 products.
     ///
     /// # Errors
     ///
@@ -552,7 +552,8 @@ impl CudaStorage {
             bias: None,
             out: view(&storage, dims, 0)?,
         };
-        let descriptor = conv::Descriptor::of(&args, transposed, window, 1, false)?;
+        let descriptor =
+            conv::Descriptor::of(&args, transposed, window, 1, conv::ProductPrecision::Exact)?;
         launch::<Conv>(&descriptor, args)?;
 
         Ok(storage)

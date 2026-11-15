@@ -21,7 +21,7 @@
 use models::minimax_h3::audio_vae::{AudioDecoder, AudioEncoder};
 use models::minimax_h3::video_vae::{self, TransformerBlock, VideoDecoder, VideoEncoder};
 use models::minimax_h3::{AudioVaeConfig, VideoVaeConfig};
-use nn::functional::{self, Padding};
+use nn::functional::{self, Padding, ProductPrecision};
 use nn::modules::{ResnetBlock3d, ResnetBlock3dConfig, Rotary};
 use nn::{Checkpoint, Clip, CpuWeights, DType, Decoder, Device, LatentShape, Tensor, WeightLoader};
 use nn_testing::{Fixture, assert_close, checkpoint, decode, sequence, tensor, values};
@@ -137,7 +137,7 @@ fn the_encoders_residual_block_computes_the_references() {
             front: 2,
             padding: Padding::Reflect,
             kernel: 3,
-            tf32: true,
+            precision: ProductPrecision::Tf32,
         },
         loader.root(),
     )

@@ -11,7 +11,8 @@
 //! output extent follows torch's rule along every spatial axis: `(l + 2p − d(t − 1) − 1) / s + 1`
 //! for a convolution and `(l − 1)s − 2p + d(t − 1) + 1` for a transposed one, which has no
 //! output padding. Every sum is formed in FP32 and rounds once into the input's element type;
-//! `tf32` is a model's declaration that cuDNN may narrow the products of an FP32 convolution.
+//! `precision` is the model's declaration of how narrow the products of an FP32 convolution may
+//! be ([`ProductPrecision`]): the CPU formula forms them in FP32, which every declaration admits.
 //!
 //! ## Storage order
 //!
@@ -29,6 +30,7 @@
 //! the normalization that precedes such a convolution writes its output already padded
 //! ([`frame_norm_pad`](super::frame_norm_pad)).
 
+pub use ops::conv::ProductPrecision;
 use ops::conv::{Args, Conv, Descriptor};
 use ops::frame::is_channels_last;
 use tensor::{DType, Device, Tensor};
@@ -63,7 +65,7 @@ fn axes<const N: usize>(values: [u32; N], fill: u32) -> [u32; 3] {
 /// leaves no output, or the operator refuses its arguments.
 #[expect(
     clippy::too_many_arguments,
-    reason = "torch's conv1d arguments and the TF32 declaration"
+    reason = "torch's conv1d arguments and the precision declaration"
 )]
 pub fn conv1d(
     x: &Tensor,
@@ -73,7 +75,7 @@ pub fn conv1d(
     padding: u32,
     dilation: u32,
     groups: u32,
-    tf32: bool,
+    precision: ProductPrecision,
 ) -> Result<Tensor> {
     convolve(
         "conv1d",
@@ -82,7 +84,7 @@ pub fn conv1d(
         bias,
         [axes([stride], 1), axes([padding], 0), axes([dilation], 1)],
         groups,
-        tf32,
+        precision,
         1,
         false,
     )
@@ -97,7 +99,7 @@ pub fn conv1d(
 /// As [`conv1d`].
 #[expect(
     clippy::too_many_arguments,
-    reason = "torch's conv_transpose1d arguments and the TF32 declaration"
+    reason = "torch's conv_transpose1d arguments and the precision declaration"
 )]
 pub fn conv_transpose1d(
     x: &Tensor,
@@ -107,7 +109,7 @@ pub fn conv_transpose1d(
     padding: u32,
     dilation: u32,
     groups: u32,
-    tf32: bool,
+    precision: ProductPrecision,
 ) -> Result<Tensor> {
     convolve(
         "conv_transpose1d",
@@ -116,7 +118,7 @@ pub fn conv_transpose1d(
         bias,
         [axes([stride], 1), axes([padding], 0), axes([dilation], 1)],
         groups,
-        tf32,
+        precision,
         1,
         true,
     )
@@ -131,7 +133,7 @@ pub fn conv_transpose1d(
 /// As [`conv1d`], for a frame and its filter.
 #[expect(
     clippy::too_many_arguments,
-    reason = "torch's conv3d arguments and the TF32 declaration"
+    reason = "torch's conv3d arguments and the precision declaration"
 )]
 pub fn conv3d(
     x: &Tensor,
@@ -141,7 +143,7 @@ pub fn conv3d(
     padding: [u32; 3],
     dilation: [u32; 3],
     groups: u32,
-    tf32: bool,
+    precision: ProductPrecision,
 ) -> Result<Tensor> {
     convolve(
         "conv3d",
@@ -150,7 +152,7 @@ pub fn conv3d(
         bias,
         [stride, padding, dilation],
         groups,
-        tf32,
+        precision,
         3,
         false,
     )
@@ -169,7 +171,7 @@ fn convolve(
     bias: Option<&Tensor>,
     [stride, padding, dilation]: [[u32; 3]; 3],
     groups: u32,
-    tf32: bool,
+    precision: ProductPrecision,
     rank: usize,
     transposed: bool,
 ) -> Result<Tensor> {
@@ -299,7 +301,13 @@ fn convolve(
         bias: bias.map(ops::operand).transpose()?,
         out: ops::operand(&result)?,
     };
-    let descriptor = Descriptor::of(&args, transposed, [stride, padding, dilation], groups, tf32)?;
+    let descriptor = Descriptor::of(
+        &args,
+        transposed,
+        [stride, padding, dilation],
+        groups,
+        precision,
+    )?;
     ops::launch::<Conv>(&descriptor, args)?;
     Ok(result)
 }

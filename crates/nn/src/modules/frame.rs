@@ -4,7 +4,7 @@
 use tensor::{Module, Tensor};
 
 use crate::error::{Error, Result};
-use crate::functional::{self, Padding};
+use crate::functional::{self, Padding, ProductPrecision};
 use crate::modules::conv::{Conv3d, ConvConfig};
 use crate::var_builder::VarBuilder;
 
@@ -114,8 +114,8 @@ pub struct ResnetBlock3dConfig {
     pub padding: Padding,
     /// The convolutions' taps along each axis.
     pub kernel: u32,
-    /// Whether cuDNN may use TF32 for the block's FP32 convolutions.
-    pub tf32: bool,
+    /// The precision the block's FP32 convolutions' products may be formed in.
+    pub precision: ProductPrecision,
 }
 
 /// A causal video residual block (diffusers' `ResnetBlock3D` with causal convolutions): two
@@ -156,7 +156,7 @@ impl ResnetBlock3d {
             padding: config.padding,
         };
         let conv = |from: u32, to: u32, kernel: u32| ConvConfig {
-            tf32: config.tf32,
+            precision: config.precision,
             ..ConvConfig::new(from, to, [kernel; 3])
         };
         let (from, to) = (config.in_channels, config.out_channels);

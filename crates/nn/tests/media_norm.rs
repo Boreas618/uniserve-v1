@@ -8,7 +8,7 @@
 #![cfg(test)]
 
 use nn::collective::Split;
-use nn::functional::{self, Activation, Padding, Rounding};
+use nn::functional::{self, Activation, Padding, ProductPrecision, Rounding};
 use nn::modules::{
     AdaLnBlock, AdaLnBlockConfig, AdaLnOut, AdaLnOutConfig, FrameNorm, FrameNormConfig, GateUp,
     MlpConfig, ResnetBlock3d, ResnetBlock3dConfig,
@@ -546,7 +546,7 @@ const RESNET: ResnetBlock3dConfig = ResnetBlock3dConfig {
     front: 2,
     padding: Padding::Reflect,
     kernel: 3,
-    tf32: true,
+    precision: ProductPrecision::Tf32,
 };
 
 #[test]
@@ -598,7 +598,7 @@ fn a_resnet_block_adds_its_input_or_its_projection() {
             [0; 3],
             [1; 3],
             1,
-            true,
+            ProductPrecision::Tf32,
         )
         .unwrap()
     };
@@ -612,7 +612,7 @@ fn a_resnet_block_adds_its_input_or_its_projection() {
         [0; 3],
         [1; 3],
         1,
-        true,
+        ProductPrecision::Tf32,
     )
     .unwrap();
     assert_eq!(values(&out), values(&(update + shortcut).unwrap()));

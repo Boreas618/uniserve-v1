@@ -7,7 +7,7 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-use nn::functional::{self, Padding};
+use nn::functional::{self, Padding, ProductPrecision};
 use nn::modules::{Conv1d, Conv3d, ConvConfig, ConvTranspose1d};
 use nn::{CpuWeights, DType, MetaWeights, WeightLoader};
 use nn_testing::{
@@ -124,7 +124,7 @@ fn conv1d_sums_its_group_s_channels_over_the_filter_s_taps() {
         3,
         2,
         2,
-        false,
+        ProductPrecision::Exact,
     )
     .unwrap();
 
@@ -156,7 +156,7 @@ fn conv1d_rounds_its_fp32_sum_once_into_the_input_s_type() {
         0,
         1,
         1,
-        false,
+        ProductPrecision::Exact,
     )
     .unwrap();
     assert_eq!(out.dtype(), DType::BF16);
@@ -199,7 +199,7 @@ fn conv_transpose1d_adds_each_input_s_filter_into_its_outputs() {
         2,
         1,
         2,
-        false,
+        ProductPrecision::Exact,
     )
     .unwrap();
 
@@ -292,7 +292,7 @@ fn conv3d_sums_each_window_of_its_group_s_channels() {
         [1, 0, 1],
         [1, 1, 1],
         2,
-        true,
+        ProductPrecision::Tf32,
     )
     .unwrap();
 
@@ -315,7 +315,16 @@ fn a_convolution_refuses_operands_that_are_not_its_window() {
     let x = tensor(&sequence(4 * 8, 12), (1, 4, 8), DType::F32);
     let weight = tensor(&sequence(6 * 4 * 3, 13), (6, 4, 3), DType::F32);
     let conv = |x: &nn::Tensor, weight: &nn::Tensor, bias: Option<&nn::Tensor>, stride, groups| {
-        functional::conv1d(x, weight, bias, stride, 0, 1, groups, false)
+        functional::conv1d(
+            x,
+            weight,
+            bias,
+            stride,
+            0,
+            1,
+            groups,
+            ProductPrecision::Exact,
+        )
     };
 
     // Channels the filter does not read, no groups, no stride, a bias of another width.

@@ -71,7 +71,7 @@ pub use attention::{
     dense_attention, dense_attention_varlen, kv_write_, paged_attention, zero_arrival_counters_,
 };
 pub use commit::slot_commit_;
-pub use conv::{Padding, causal_pad, conv_transpose1d, conv1d, conv3d};
+pub use conv::{Padding, ProductPrecision, causal_pad, conv_transpose1d, conv1d, conv3d};
 pub use embedding::{embedding, vocabulary_shard};
 pub use frame::frame_norm_pad;
 pub use indexed::{index_scores, indexed_attention};

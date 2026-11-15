@@ -4,13 +4,13 @@
 //! A module's [`ConvConfig`] states what its torch module states: channels, kernel, stride, zero
 //! padding, dilation, groups and whether it has a bias. Two fields are the checkpoint's and the
 //! model's own: `weight_norm`, for a filter stored as torch's weight-norm pair `weight_v` and
-//! `weight_g`, folded once at load; and `tf32`, the model's numerical declaration for an FP32
-//! convolution.
+//! `weight_g`, folded once at load; and `precision`, the model's declaration of how narrow an
+//! FP32 convolution's products may be ([`ProductPrecision`]).
 
 use tensor::{Module, Tensor};
 
 use crate::error::{Error, Result};
-use crate::functional;
+use crate::functional::{self, ProductPrecision};
 use crate::var_builder::VarBuilder;
 
 /// A convolution's torch arguments over `N` spatial axes.
@@ -37,8 +37,8 @@ pub struct ConvConfig<const N: usize> {
     pub bias: bool,
     /// Whether the checkpoint stores the weight as torch's weight-norm pair, folded at load.
     pub weight_norm: bool,
-    /// Whether cuDNN may use TF32 for an FP32 convolution.
-    pub tf32: bool,
+    /// The precision an FP32 convolution's products may be formed in.
+    pub precision: ProductPrecision,
 }
 
 impl<const N: usize> ConvConfig<N> {
@@ -54,7 +54,7 @@ impl<const N: usize> ConvConfig<N> {
             groups: 1,
             bias: true,
             weight_norm: false,
-            tf32: false,
+            precision: ProductPrecision::Exact,
         }
     }
 
@@ -202,7 +202,7 @@ impl Conv1d {
             config.padding[0],
             config.dilation[0],
             config.groups,
-            config.tf32,
+            config.precision,
         )
     }
 }
@@ -254,7 +254,7 @@ impl ConvTranspose1d {
             config.padding[0],
             config.dilation[0],
             config.groups,
-            config.tf32,
+            config.precision,
         )
     }
 }
@@ -322,7 +322,7 @@ impl Conv3d {
             config.padding,
             config.dilation,
             config.groups,
-            config.tf32,
+            config.precision,
         )
     }
 }
