@@ -9,6 +9,7 @@ tests state that contract from the program's side.
 from __future__ import annotations
 
 import json
+import pathlib
 import re
 import subprocess
 import sys
@@ -46,8 +47,11 @@ def test_the_description_names_this_environment_and_its_compilers():
     assert description["interpreter"] == sys.executable
     assert re.fullmatch(r"[0-9a-f]{64}", description["driver"])
     # The kernel packages' shared sources are a library this environment
-    # installs, digested like the driver.
-    assert re.fullmatch(r"[0-9a-f]{64}", description["kernels"]["available"])
+    # installs, digested like the driver, whose generated C ABI headers are
+    # the include directory of a native compilation.
+    kernels = description["kernels"]["available"]
+    assert re.fullmatch(r"[0-9a-f]{64}", kernels["digest"])
+    assert pathlib.Path(kernels["include"], "uniserve_abi.h").is_file()
     # The two Python compilers are distributions this environment locks.
     assert description["triton"] == {
         "available": description["distributions"]["triton"]

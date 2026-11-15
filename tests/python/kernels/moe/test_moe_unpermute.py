@@ -35,6 +35,8 @@ import math
 import pytest
 import torch
 
+from tests.python.kernels.packages import assert_abi_layout
+
 pytestmark = pytest.mark.unit
 
 #: `ops::abi::code`'s number and torch's type of each element type.
@@ -54,9 +56,6 @@ ROUNDOFF = {
 #: The layouts the operator distinguishes: the routes read in permuted order,
 #: or in the order the expanded map gives.
 PERMUTED, EXPANDED = 0, 1
-
-#: The `static_assert` of the package's entry header that pins the call's size.
-SIZE_ASSERTION = "sizeof(uniserve_unpermute_call) =="
 
 #: The module's descriptor and the tokens the cases combine.
 HIDDEN, TOP, EXPERTS, INPUT, SCALES, OUTPUT = (
@@ -94,21 +93,9 @@ class Call(ctypes.Structure):
     ]
 
 
-def test_the_call_mirror_is_the_headers_unpermute_call(kernels):
-    """The package's ``entry.h`` pins the size, as
-    `crates/ops/src/moe/combine.rs` does on the operator's side; it is read
-    rather than restated.
-    """  # noqa: D205
-    header = kernels / "moe_unpermute" / "trtllm" / "src" / "entry.h"
-    text = header.read_text()
-    assert SIZE_ASSERTION in text, f"{header}: no `{SIZE_ASSERTION}` assertion"
-    declared = int(
-        text.split(SIZE_ASSERTION, 1)[1].lstrip(" =").split()[0].rstrip(",")
-    )
-    assert ctypes.sizeof(Call) == declared, (
-        f"the check's Call mirror is {ctypes.sizeof(Call)} bytes, the "
-        f"package's header says {declared}"
-    )
+def test_the_call_mirror_is_the_headers_unpermute_call():
+    """The generated header asserts `moe::combine::Call`'s layout."""
+    assert_abi_layout(Call, "uniserve_unpermute_call")
 
 
 def gamma(reduction, unit):

@@ -35,8 +35,8 @@ also states how many elements are bit-identical.
 **One sample per call**, because the call structure carries no sample count.
 The output frames are ``front + frames``: more would read past the source.
 
-The call structure is a ctypes mirror of the package header
-``include/uniserve_frame_norm_pad.h``, checked against the offsets the header
+The call structure is a ctypes mirror of the generated ABI header
+``uniserve_frame_norm_pad.h``, checked against the layout the header
 asserts; the reference is checked against an element-by-element composition
 on the host; every other test loads a module built for the session's device.
 """
@@ -49,10 +49,11 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 
 from tests.python.kernels.norm.rounding import gamma, outside
+from tests.python.kernels.packages import assert_abi_layout
 
 pytestmark = pytest.mark.unit
 
-#: The largest message an entry writes (`frame.rs`'s `MESSAGE`).
+#: The largest message an entry writes (`ops::abi::MESSAGE`).
 MESSAGE = 512
 
 #: The descriptor key of the package's one module.
@@ -121,20 +122,6 @@ class Call(ctypes.Structure):
         ("normalization", ctypes.c_int32),
         ("error", ctypes.c_char * MESSAGE),
     ]
-
-
-#: The offsets `include/uniserve_frame_norm_pad.h` asserts, the
-#: normalization's beside the reflection, and the header's size.
-HEADER_OFFSETS = {
-    "values": 0,
-    "weight": 48,
-    "out": 64,
-    "channels": 112,
-    "reflect": 208,
-    "normalization": 212,
-    "error": 216,
-}
-HEADER_SIZE = 216 + MESSAGE
 
 
 def declared_bound():
@@ -223,14 +210,8 @@ def source_index(index, extent, reflect):
 
 
 def test_the_call_structure_is_the_headers():
-    assert ctypes.sizeof(Call) == HEADER_SIZE, (
-        f"Call is {ctypes.sizeof(Call)} bytes, the header asserts {HEADER_SIZE}"
-    )
-    for name, offset in HEADER_OFFSETS.items():
-        assert getattr(Call, name).offset == offset, (
-            f"Call.{name} is at {getattr(Call, name).offset}, the header "
-            f"asserts {offset}"
-        )
+    """The generated header asserts the size and every offset it holds."""
+    assert_abi_layout(Call, "uniserve_frame_norm_pad_call")
 
 
 @pytest.mark.parametrize("mode", ["replicate", "reflect"])

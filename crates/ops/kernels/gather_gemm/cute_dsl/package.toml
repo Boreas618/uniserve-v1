@@ -1,8 +1,8 @@
 # The gather_gemm operator's CuTe DSL backend: design 5.2's package.
 #
 # One native module per descriptor: the compiled CuTe DSL specialization, its
-# cubin and the exported host launcher, behind the C entry `entry.h` declares for
-# the operator's `moe::grouped::GatherCall`.
+# cubin and the exported host launcher, behind the C entry that takes the
+# operator's `moe::grouped::GatherCall` (`uniserve_gather_gemm.h`).
 
 op = "gather_gemm"
 backend = "cute_dsl"

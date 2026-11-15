@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 
 from uniserve_build_server import cute_dsl, fetch
+from uniserve_build_server.cuda import includes as native_includes
 from uniserve_build_server.request import Request
 
 
@@ -277,7 +278,7 @@ def compile(request: Request) -> None:
                 "-fPIC",
                 *defines,
                 f"-I{staging}",
-                f"-I{package / 'include'}",
+                *[f"-I{one}" for one in native_includes(request)],
                 f"-I{cuda.include}",
                 f"-iquote{package / 'src'}",
                 str(package / "src" / "entry.cpp"),

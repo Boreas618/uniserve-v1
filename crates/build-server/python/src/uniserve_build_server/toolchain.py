@@ -14,9 +14,10 @@ Every entry is resolved through a declared mechanism, never by guessing a path:
   through :mod:`importlib.resources`: a module is stored under the driver it
   was built through, so an edited driver or pin is another identity;
 - the kernel packages' shared sources (the ``uniserve_kernels`` library of
-  ``crates/ops/python``, which the packages import) as the digest of their
-  files, read the same way, so an edit of what a package imports is another
-  identity too;
+  ``crates/ops/python``, which the packages import and compile against) as the
+  digest of their files, read the same way, so an edit of what a package
+  imports or includes is another identity too, and as the directory of the C
+  ABI headers the library ships, which every native compilation includes;
 - the CUDA toolkit of the release this environment's lock fixes (the release
   of the locked ``nvidia-cuda-runtime`` distribution, such as ``13.0``),
   through the ``cudart-<release>`` and ``cuda-<release>`` pkg-config modules
@@ -73,6 +74,9 @@ HOST_COMPILER = "c++"
 #: The kernel packages' shared sources, a library this environment installs.
 KERNELS = "uniserve_kernels"
 
+#: The directory of that library which holds its C ABI headers.
+INCLUDE = "include"
+
 
 @dataclasses.dataclass(frozen=True)
 class Cuda:
@@ -109,6 +113,22 @@ class Cudnn:
 
 
 @dataclasses.dataclass(frozen=True)
+class Kernels:
+    """The kernel packages' shared sources, as this environment installs them.
+
+    ``include`` is absolute: the directory of the C ABI headers generated from
+    the operator crate's call structures (``uniserve_<operator>.h`` and the
+    ``uniserve_abi.h`` they share), which a native compilation passes as an
+    include directory. The digest covers those headers with the rest of the
+    library's files.
+    """
+
+    #: The SHA-256 of the library's files, in hex.
+    digest: str
+    include: str
+
+
+@dataclasses.dataclass(frozen=True)
 class Toolchain:
     """This environment's toolchains, as the Build Server reads them.
 
@@ -121,7 +141,7 @@ class Toolchain:
     interpreter: str
     #: The SHA-256 of the compile driver's files, in hex.
     driver: str
-    #: The SHA-256 of the kernel packages' shared sources, in hex.
+    #: The kernel packages' shared sources (:class:`Kernels`).
     kernels: dict[str, Any]
     #: Every installed distribution by its normalized name (PEP 503), with its
     #: version.
@@ -148,6 +168,10 @@ class Toolchain:
     def require_cudnn(self) -> Cudnn:
         """cuDNN, or a refusal naming why this host has none."""
         return Cudnn(**_require(self.cudnn, "cuDNN"))
+
+    def require_kernels(self) -> Kernels:
+        """The kernel library, or a refusal naming why this host has none."""
+        return Kernels(**_require(self.kernels, "the kernel library"))
 
     def require_host_compiler(self) -> str:
         """The host C++ compiler, or a refusal naming why this host has none."""
@@ -374,9 +398,14 @@ def cudnn(compiler: dict[str, Any]) -> dict[str, Any]:
 
 
 def kernels() -> dict[str, Any]:
-    """The digest of the kernel packages' shared sources."""
+    """The kernel library: its digest and its C ABI headers' directory."""
     try:
-        return available(digest(KERNELS))
+        include = importlib.resources.files(KERNELS) / INCLUDE
+        return available(
+            dataclasses.asdict(
+                Kernels(digest=digest(KERNELS), include=str(include))
+            )
+        )
     except ModuleNotFoundError:
         return missing(
             f"this environment has no {KERNELS} library (crates/ops/python)"

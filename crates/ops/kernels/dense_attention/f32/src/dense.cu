@@ -45,8 +45,9 @@
 //
 // # The descriptor
 //
-// Two of the descriptor's fields are compiled in. The mask (`UNISERVE_CAUSAL`): a
-// causal module refuses a dense call and the other way round. And the sequence
+// Two of the descriptor's fields are compiled in. The mask (`UNISERVE_MASK`, a
+// `uniserve_mask` enumerator): a causal module refuses a dense call and the other way
+// round. And the sequence
 // layout (`UNISERVE_SEQUENCES`): `ops` prints `cu_seq_lens` only for the form whose
 // launch carries no `[batch + 1]` offsets, and that form attends one sequence —
 // `[0, q_tokens)` against `[0, kv_tokens)` — so a module built for it reads no
@@ -70,22 +71,25 @@
 #include <string>
 #include <unordered_map>
 
-#include "uniserve_dense_attention.h"
+#include <uniserve_dense_attention.h>
 
 // The descriptor's two compiled-in fields, which the package's manifest defines
 // (`[compile.definitions]`):
 //
-// - `UNISERVE_CAUSAL`: 0 for the dense mask, every key of the sequence visible; 1
-//   for the causal mask.
+// - `UNISERVE_MASK`: the descriptor's mask as a `uniserve_mask` enumerator, the
+//   dense mask, every key of the sequence visible, or the causal mask.
 // - `UNISERVE_SEQUENCES`: 1 when the launch carries `[batch + 1]` sequence offsets;
 //   0 when it carries none, and the module attends one sequence — `[0, q_tokens)`
 //   against `[0, kv_tokens)`. The two are separate compilations, so this module
 //   never branches on a missing table and never reads a null pointer.
-#if !defined(UNISERVE_CAUSAL) || !defined(UNISERVE_SEQUENCES)
-#error "the package's manifest defines UNISERVE_CAUSAL and UNISERVE_SEQUENCES"
+#if !defined(UNISERVE_MASK) || !defined(UNISERVE_SEQUENCES)
+#error "the package's manifest defines UNISERVE_MASK and UNISERVE_SEQUENCES"
 #endif
 
 namespace {
+
+/// Whether the module compiles the causal mask.
+constexpr bool kCausal = UNISERVE_MASK == UNISERVE_MASK_CAUSAL;
 
 /// The granularity of a query tile's rows. A tile is the unit the score product is
 /// computed for, so its rows are also the scratch's: `rows * keys` floats per head.
@@ -107,7 +111,7 @@ constexpr size_t kWorkspaceCap = 64u * 1024u * 1024u;
 
 /// Writes this entry's message into the call structure and returns the failure
 /// code the operator reports.
-int32_t fail(UniserveDenseAttentionCall* call, const char* format, ...) {
+int32_t fail(uniserve_dense_attention_call* call, const char* format, ...) {
   va_list arguments;
   va_start(arguments, format);
   std::vsnprintf(reinterpret_cast<char*>(call->error), sizeof(call->error), format,
@@ -476,7 +480,7 @@ __global__ void mask_softmax_kernel(float* tile, int64_t columns, int64_t head_s
 /// One dense attention call. Returns 0 when the attention ran, and 1 with this
 /// entry's message in `call->error` otherwise (design 4.2: a package reports
 /// through the call structure it was given).
-extern "C" int32_t uniserve_dense_attention(UniserveDenseAttentionCall* call, void* stream) {
+extern "C" int32_t uniserve_dense_attention(uniserve_dense_attention_call* call, void* stream) {
   if (call == nullptr) {
     return 1;
   }
@@ -511,10 +515,10 @@ extern "C" int32_t uniserve_dense_attention(UniserveDenseAttentionCall* call, vo
                 static_cast<long long>(call->dtype_key_value),
                 static_cast<long long>(call->dtype_output));
   }
-  if (call->causal != UNISERVE_CAUSAL) {
+  if (call->causal != kCausal) {
     return fail(call,
                 "this module compiles the %s mask; the call launches causal = %lld",
-                UNISERVE_CAUSAL == 1 ? "causal" : "dense",
+                kCausal ? "causal" : "dense",
                 static_cast<long long>(call->causal));
   }
   if (call->batch <= 0 || call->q_tokens <= 0 || call->kv_tokens <= 0) {
@@ -714,7 +718,7 @@ extern "C" int32_t uniserve_dense_attention(UniserveDenseAttentionCall* call, vo
           <<<dim3(static_cast<unsigned>(rows), static_cast<unsigned>(heads)), kThreads, 0,
              queue>>>(weights, call->kv_tokens, rows * call->kv_tokens, call->cu_seq_lens_q,
                       call->cu_seq_lens_k, static_cast<int>(call->batch), first_row,
-                      call->window_left, UNISERVE_CAUSAL);
+                      call->window_left, kCausal);
       status = cublasLtMatmul(handle, product->operation, &one, value, product->a,
                               weights, product->b, &zero, target, product->c, target,
                               product->d, &product->algorithm, workspace,

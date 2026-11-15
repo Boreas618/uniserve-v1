@@ -4,7 +4,8 @@
 //! A CUDA package states its compilation in its manifest, `[compile]`, the way
 //! a Triton package states its launch table: the translation units, the C++
 //! standard they are written in, the preprocessor definitions each descriptor
-//! compiles with (a literal, a field's value, the value a field selects, or a
+//! compiles with (a literal, a field's value, the value a field selects, the
+//! enumerator of a generated ABI header that a field's value names, or a
 //! manifest parameter), the libraries the module links beside the CUDA
 //! runtime, and the options that are genuinely the package's own, such as host
 //! code that must round every floating-point operation. A cubin module adds
@@ -34,12 +35,9 @@ pub struct Compile {
     pub units: Vec<String>,
     /// The C++ standard the units are written in.
     pub standard: Standard,
-    /// The preprocessor definitions of every unit, by macro name. A value is
-    /// a literal (an integer, a boolean, which is defined as 1 or 0, or the
-    /// text of an identifier), a descriptor field's value, the value a field
-    /// selects, or a manifest parameter, as a launch table's constant is.
+    /// The preprocessor definitions of every unit, by macro name.
     #[serde(default)]
-    pub definitions: BTreeMap<String, Constant>,
+    pub definitions: BTreeMap<String, Definition>,
     /// The libraries a native module links beside the CUDA runtime, each
     /// found where the toolchain description states it.
     #[serde(default)]
@@ -66,6 +64,43 @@ pub struct Compile {
     /// is launched through its C entries and states none.
     #[serde(default)]
     pub kernel: Option<Kernel>,
+}
+
+/// The value of one preprocessor definition.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum Definition {
+    /// The enumerator of `enumeration`, an enumeration of the kernel library's
+    /// generated ABI headers (`ops::abi`), that the field's value names:
+    /// `{ field = "order", enumeration = "uniserve_weight_order" }` defines
+    /// `UNISERVE_WEIGHT_ORDER_NXK` for `order_nxk`. An enumerator is its
+    /// enumeration's name and the value's spelling in a key, in capitals, so a
+    /// package compiles in the operator crate's number of a value and states
+    /// none itself; a value the enumeration lacks names no enumerator, and the
+    /// compilation refuses it.
+    Enumerator { field: String, enumeration: String },
+    /// A literal (an integer, a boolean, which is defined as 1 or 0, or the
+    /// text of an identifier), a descriptor field's value, the value a field
+    /// selects, or a manifest parameter, as a launch table's constant is.
+    Constant(Constant),
+}
+
+impl Definition {
+    /// The descriptor field the value is read from, when it is read from one.
+    pub fn field(&self) -> Option<&str> {
+        match self {
+            Self::Enumerator { field, .. } => Some(field),
+            Self::Constant(constant) => constant.field(),
+        }
+    }
+
+    /// The manifest parameter the value is read from, when it is read from one.
+    pub fn parameter(&self) -> Option<&str> {
+        match self {
+            Self::Enumerator { .. } => None,
+            Self::Constant(constant) => constant.parameter(),
+        }
+    }
 }
 
 /// The host compiler's default: contraction allowed.
@@ -134,7 +169,7 @@ impl Compile {
         let mut fields: Vec<&str> = self
             .definitions
             .values()
-            .filter_map(Constant::field)
+            .filter_map(Definition::field)
             .collect();
         if let Some(kernel) = &self.kernel {
             fields.extend(kernel.warps.field());
@@ -148,7 +183,7 @@ impl Compile {
         let mut parameters: Vec<&str> = self
             .definitions
             .values()
-            .filter_map(Constant::parameter)
+            .filter_map(Definition::parameter)
             .collect();
         if let Some(kernel) = &self.kernel {
             parameters.extend(kernel.warps.parameter());
@@ -172,6 +207,20 @@ impl Compile {
         }
         if let Some(name) = self.definitions.keys().find(|name| !identifier(name)) {
             return Some(format!("the definition `{name}` is no C identifier"));
+        }
+        if let Some((name, enumeration)) =
+            self.definitions
+                .iter()
+                .find_map(|(name, definition)| match definition {
+                    Definition::Enumerator { enumeration, .. } if !identifier(enumeration) => {
+                        Some((name, enumeration))
+                    }
+                    _ => None,
+                })
+        {
+            return Some(format!(
+                "the definition `{name}` names `{enumeration}`, which is no C identifier"
+            ));
         }
         if let Some(kernel) = &self.kernel {
             if !identifier(&kernel.name) {

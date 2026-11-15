@@ -34,6 +34,7 @@ import pytest
 import torch
 
 from tests.python.kernels.gemm import nvfp4
+from tests.python.kernels.packages import assert_abi_layout
 
 pytestmark = pytest.mark.unit
 
@@ -50,16 +51,12 @@ TORCH_TYPES = {
     "f32": torch.float32,
 }
 
-#: The call structure's size and the offsets of its fields `entry.h` asserts.
-CALL_SIZE = 592
-OFFSETS = {"out": 48, "m": 56, "k": 72, "error": 80}
-
 #: The product's factor.
 ALPHA = 0.6875
 
 
 class Call(ctypes.Structure):
-    """``uniserve_nvfp4_gemm_call``, field for field (``src/entry.h``)."""
+    """``uniserve_nvfp4_gemm_call``, field for field."""
 
     _fields_ = [
         ("input", ctypes.c_void_p),
@@ -125,14 +122,8 @@ def gamma(reduction, unit):
 
 
 def test_the_call_mirror_is_the_entrys_call_structure():
-    assert ctypes.sizeof(Call) == CALL_SIZE, (
-        f"Call is {ctypes.sizeof(Call)} bytes, entry.h asserts {CALL_SIZE}"
-    )
-    for name, offset in OFFSETS.items():
-        field = getattr(Call, name)
-        assert field.offset == offset, (
-            f"Call.{name} is at {field.offset}, entry.h asserts {offset}"
-        )
+    """The generated header asserts the size and every offset it holds."""
+    assert_abi_layout(Call, "uniserve_nvfp4_gemm_call")
 
 
 @pytest.mark.parametrize(
@@ -243,7 +234,8 @@ def test_the_entry_refuses_another_problem_size_before_the_device(entry):
     """The entry checks the pointers and then the call's three extents against
     the module's compiled problem before it touches a device, so a call naming
     other extents is answered on the host: the structure packed here is the
-    one the entry reads, and its error buffer is where ``entry.h`` says.
+    one the entry reads, and its error buffer is where the generated header
+    says.
     """  # noqa: D205
     address = 0x1000
     call = Call(

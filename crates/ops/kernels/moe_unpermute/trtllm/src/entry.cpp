@@ -13,7 +13,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#include "entry.h"
+#include <uniserve_moe_unpermute.h>
 
 #include <cstdio>
 #include <cstring>
@@ -97,8 +97,8 @@ int32_t launch(const uniserve_unpermute_call* call, void* stream) {
 
   // The input's row convention is the call's, not this unit's: the dense product writes one row per
   // expanded route and the encoded one writes permuted rows, so the module is compiled for one of
-  // them (`ops::moe::combine::Layout`, a descriptor field) and the entry dispatches on it.
-  const bool expanded = call->layout == 1;
+  // them (`uniserve_unpermute_layout`, a descriptor field) and the entry dispatches on it.
+  const bool expanded = call->layout == UNISERVE_UNPERMUTE_LAYOUT_EXPANDED;
 
   if (expanded) {
     return combine<true>(call, cuda_stream, tokens, top, hidden);

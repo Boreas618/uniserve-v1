@@ -21,9 +21,9 @@ This module is the one statement of what those packages share:
   each part of the launch code, with the definitions it is compiled with
   (:class:`LaunchCode`: :data:`COMBINE`, :data:`FMHA`, :data:`ROUTED_GEMM`);
 - the one build routine (:func:`build`): a package's entry unit and the launch
-  code's units as the CUDA driver's units, with the kernel packages' shared
-  C++ sources on the include path, compiled and linked into ``module.so`` by
-  :func:`uniserve_build_server.cuda.native`;
+  code's units as the CUDA driver's units, with the include directory every
+  native compile gets (the kernel library's), compiled and linked into
+  ``module.so`` by :func:`uniserve_build_server.cuda.native`;
 - staging a pinned trtllm-gen library (:func:`stage`);
 - the libraries' tables read into typed kernels (:func:`fmha_table`,
   :func:`bmm_table`, with the vendor's enumerations, :func:`enumerations`),
@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.metadata
-import importlib.resources
 import pathlib
 import re
 import shutil
@@ -47,7 +46,7 @@ import sys
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from uniserve_build_server import cuda, fetch, toolchain
+from uniserve_build_server import cuda, fetch
 from uniserve_build_server.request import Request, Target
 
 #: The distribution whose data tree holds the launch code.
@@ -230,12 +229,13 @@ def build(
     The entry unit is the manifest's ``[source] unit``. Every unit reads the
     launch code's definitions and ``definitions``; the entry unit also reads
     ``entry_definitions``, the descriptor's values it is compiled for. The
-    include path is ``includes`` (a staged library's headers, searched
-    first), the kernel packages' shared C++ sources and then the data tree's
-    :data:`INCLUDES`; launch code with a cubin path defines it as
-    :data:`CUBINS`. Every unit is C++17 in the language its file names, as
-    FlashInfer's own build compiles it, and lets device code call constexpr
-    host functions, as CUTLASS's headers need.
+    include path is what every native compile gets (:func:`cuda.includes`:
+    the kernel library's directory, which holds the generated ABI headers
+    and the shared C++ sources), ``includes`` (a staged library's headers)
+    and then the data tree's :data:`INCLUDES`; launch code with a cubin path
+    defines it as :data:`CUBINS`. Every unit is C++17 in the language its
+    file names, as FlashInfer's own build compiles it, and lets device code
+    call constexpr host functions, as CUTLASS's headers need.
 
     The module links the driver API beside the CUDA runtime: trtllm-gen's
     launcher calls `cuModuleLoadData`, `cuModuleGetFunction` and
@@ -261,21 +261,18 @@ def build(
         if not source.is_file():
             raise SystemExit(f"{request.op}/{request.backend} has no {source}")
 
-    with importlib.resources.as_file(
-        importlib.resources.files(toolchain.KERNELS).joinpath("include")
-    ) as kernel_sources:
-        search = [*includes, kernel_sources, *(data / one for one in INCLUDES)]
-        units = [
-            cuda.Unit(
-                source=source,
-                standard="c++17",
-                definitions=unit_definitions,
-                includes=search,
-                relaxed_constexpr=True,
-            )
-            for source, unit_definitions in sources
-        ]
-        cuda.native(request, units, libraries=["cuda"])
+    search = [*includes, *(data / one for one in INCLUDES)]
+    units = [
+        cuda.Unit(
+            source=source,
+            standard="c++17",
+            definitions=unit_definitions,
+            includes=search,
+            relaxed_constexpr=True,
+        )
+        for source, unit_definitions in sources
+    ]
+    cuda.native(request, units, libraries=["cuda"])
 
 
 # The tables of trtllm-gen's libraries.

@@ -14,7 +14,7 @@
 
 #include "flash_attn_dense.h"
 
-#include "entry.h"
+#include <uniserve_dense_attention.h>
 
 #include <uniserve_cute_dsl.h>
 

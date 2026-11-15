@@ -8,8 +8,8 @@
 # project pins, whose headers are the `nccl` pin (the `nvidia-nccl-cu13` 2.30.4 wheel;
 # `crates/platform` refuses an older NCCL when it loads the serving process's).
 #
-# One native module per descriptor, with the entries of the operator's header. The
-# group is one NVLink domain, whose ranks may be threads of one process.
+# One native module per descriptor, with the operator's eight entries. The group
+# is one NVLink domain, whose ranks may be threads of one process.
 
 op = "expert_exchange"
 backend = "deepep"

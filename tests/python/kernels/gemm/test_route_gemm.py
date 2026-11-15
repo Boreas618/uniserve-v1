@@ -26,6 +26,7 @@ import pytest
 import torch
 
 from tests.python.kernels.gemm import routes
+from tests.python.kernels.packages import assert_abi_layout
 
 pytestmark = pytest.mark.unit
 
@@ -43,9 +44,6 @@ KEY = (
 
 #: The expert the case leaves without routes.
 EMPTIED = 11
-
-#: The `static_assert` of the package's entry header that pins the call's size.
-SIZE_ASSERTION = "sizeof(uniserve_route_call) =="
 
 
 class Call(ctypes.Structure):
@@ -68,20 +66,9 @@ class Call(ctypes.Structure):
     ]
 
 
-def test_the_call_mirror_is_the_headers_route_call(kernels):
-    """The package's ``entry.h`` pins the size, as ``ROUTE_CALL_LAYOUT`` does
-    on the operator's side; it is read rather than restated.
-    """  # noqa: D205
-    header = kernels / "route_gemm" / "cute_dsl" / "src" / "entry.h"
-    text = header.read_text()
-    assert SIZE_ASSERTION in text, f"{header}: no `{SIZE_ASSERTION}` assertion"
-    declared = int(
-        text.split(SIZE_ASSERTION, 1)[1].lstrip(" =").split()[0].rstrip(",")
-    )
-    assert ctypes.sizeof(Call) == declared, (
-        f"the check's RouteCall mirror is {ctypes.sizeof(Call)} bytes, the "
-        f"package's header says {declared}"
-    )
+def test_the_call_mirror_is_the_headers_route_call():
+    """The generated header asserts the size and offsets `RouteCall` has."""
+    assert_abi_layout(Call, "uniserve_route_call")
 
 
 def gamma(reduction, unit):

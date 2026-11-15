@@ -98,7 +98,7 @@ constexpr int32_t kSpatial = 3;
 
 /// Writes `message` into an entry's error buffer and answers its status.
 int32_t refuse(char* error, const char* message) {
-  std::snprintf(error, 512, "%s", message);
+  std::snprintf(error, UNISERVE_MESSAGE, "%s", message);
   return 1;
 }
 
@@ -181,7 +181,7 @@ Executable executable_of(const uniserve_conv_call& call, const std::string& key,
     if (cudnnBackendFinalize(descriptor) == CUDNN_STATUS_SUCCESS) {
       return true;
     }
-    std::snprintf(error, 512,
+    std::snprintf(error, UNISERVE_MESSAGE,
                   "cudnnBackendFinalize failed on %s: dims [%lld %lld %lld %lld %lld] strides "
                   "[%lld %lld %lld %lld %lld] dtype %d",
                   which, static_cast<long long>(dims[0]), static_cast<long long>(dims[1]),

@@ -11,8 +11,8 @@
 //
 // The routed products (`gather_gemm_nvfp4`'s first matrix, `route_gemm_nvfp4`'s second) differ
 // only in their runner, the rows the runner sizes its tactics by, what the call's counts must
-// satisfy and the operands the runner takes. A package's entry unit includes its operator's header
-// (its call structure and `uniserve_dtype_bf16`), then this one, states those differences as a
+// satisfy and the operands the runner takes. A package's entry unit includes its operator's
+// generated header (its call structure), then this one, states those differences as a
 // `Product` (`using Runner`, `runner()`, `rows(call)`, `counts(call)`, `run(...)`) and defines its
 // C entry as `uniserve::trtllm::routed::entry<Product>(call, stream)`.
 //
@@ -134,7 +134,7 @@ int refuse_geometry(Call* call) {
 template <typename Product, typename Call>
 int launch(Call* call, void* stream) {
   std::memset(call->error, 0, sizeof(call->error));
-  if (call->dtype != uniserve_dtype_bf16) {
+  if (call->dtype != UNISERVE_DTYPE_BF16) {
     return refuse(call, "the product's output is compiled as bf16 and this module is the bf16 one");
   }
   if (!compiled_for<Product>(call)) {

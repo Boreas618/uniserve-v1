@@ -16,10 +16,11 @@
 //
 // It replaces the serving package's unit and reads the serving manifest's
 // definitions: the cuBLASLt data types of the input, the weight and the output,
-// the compute type of the accumulation, the weight order (0 for `[k, n]`, 1 for
-// `[n, k]`) and the epilogue (1 when a bias is added).
+// the compute type of the accumulation, the weight order (a
+// `uniserve_weight_order` enumerator: `[k, n]` or `[n, k]`) and the epilogue (a
+// `uniserve_epilogue` enumerator: none, or add the bias).
 
-#include "uniserve_gemm.h"
+#include <uniserve_gemm.h>
 
 #include <cublasLt.h>
 #include <cuda_bf16.h>
@@ -95,16 +96,12 @@ __global__ void product_kernel(const UniserveGemmCall call, float* scratch) {
     for (int64_t index = 0; index < call.k; ++index) {
       const float x = load<Input>(call.input, static_cast<int64_t>(row) * call.input_row_stride +
                                                   index);
-#if UNISERVE_WEIGHT_ORDER == 0
-      // `[k, n]`: the contraction axis first, so a column's elements are one
-      // row apart.
-      const float w = load<Weight>(
-          call.weight, static_cast<int64_t>(index) * call.weight_row_stride + column);
-#else
-      // `[n, k]`: the output axis first, so a column's row is contiguous.
-      const float w = load<Weight>(
-          call.weight, static_cast<int64_t>(column) * call.weight_row_stride + index);
-#endif
+      // `[k, n]`: the contraction axis first, so a column's elements are one row
+      // apart. `[n, k]`: the output axis first, so a column's row is contiguous.
+      const int64_t at = UNISERVE_WEIGHT_ORDER == UNISERVE_WEIGHT_ORDER_KXN
+                             ? static_cast<int64_t>(index) * call.weight_row_stride + column
+                             : static_cast<int64_t>(column) * call.weight_row_stride + index;
+      const float w = load<Weight>(call.weight, at);
       sum = fmaf(x, w, sum);
     }
     scratch[static_cast<int64_t>(row) * call.n + column] = sum;
@@ -119,16 +116,16 @@ __global__ void epilogue_kernel(const UniserveGemmCall call, const float* scratc
     const int64_t row = at / call.n;
     const int64_t column = at % call.n;
     float value = scratch[at] * call.alpha;
-#if UNISERVE_EPILOGUE == 1
-    value += load<Output>(call.bias, column);
-#endif
+    if (UNISERVE_EPILOGUE == UNISERVE_EPILOGUE_BIAS) {
+      value += load<Output>(call.bias, column);
+    }
     store<Output>(call.out, row * call.out_row_stride + column, value);
   }
 }
 
 /// Writes `message` into the call's error buffer and answers its status.
 int32_t refuse(UniserveGemmCall* call, const char* message) {
-  std::snprintf(call->error, 512, "%s", message);
+  std::snprintf(call->error, UNISERVE_MESSAGE, "%s", message);
   return 1;
 }
 
@@ -144,10 +141,10 @@ extern "C" int32_t uniserve_gemm(UniserveGemmCall* call, void* stream) {
   if (call->m <= 0 || call->n <= 0 || call->k <= 0) {
     return refuse(call, "a product needs positive rows, columns and contraction length");
   }
-  if (UNISERVE_EPILOGUE == 1 && call->bias == nullptr) {
+  if (UNISERVE_EPILOGUE == UNISERVE_EPILOGUE_BIAS && call->bias == nullptr) {
     return refuse(call, "this descriptor adds a bias and the call passed none");
   }
-  if (UNISERVE_EPILOGUE == 0 && call->bias != nullptr) {
+  if (UNISERVE_EPILOGUE == UNISERVE_EPILOGUE_NONE && call->bias != nullptr) {
     return refuse(call, "the call passed a bias this descriptor does not add");
   }
 

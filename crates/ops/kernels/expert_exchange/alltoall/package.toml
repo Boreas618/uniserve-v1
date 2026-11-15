@@ -1,10 +1,10 @@
 # The expert_exchange operator's alltoall backend: design 5.2's package.
 #
 # One native module per descriptor: the transport's lifecycle and the launch of
-# both directions of the exchange (`ops::moe::exchange`, the one call structure of
-# 632 bytes, mirrored in the package's header with its size and error offset
-# asserted). A module takes its direction from the call, so every descriptor of
-# this package compiles the same object.
+# both directions of the exchange (`ops::moe::exchange`, whose structures the
+# kernel library's generated `uniserve_expert_exchange.h` declares with their
+# layouts asserted). A module takes its direction from the call, so every
+# descriptor of this package compiles the same object.
 #
 # The transport is an execution resource: the worker creates it through this
 # package's `create` entry, writes each step's agreed capacity through `step`,

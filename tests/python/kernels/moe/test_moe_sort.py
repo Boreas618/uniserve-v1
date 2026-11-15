@@ -30,6 +30,8 @@ import ctypes
 import pytest
 import torch
 
+from tests.python.kernels.packages import assert_abi_layout
+
 pytestmark = pytest.mark.unit
 
 #: `ops::abi::code`'s numbers of the scales' element types.
@@ -40,11 +42,6 @@ TORCH_TYPES = {
     "bf16": torch.bfloat16,
     "f32": torch.float32,
 }
-
-#: The `static_assert` of the package's header that pins the call's size, and
-#: the offset of its error buffer.
-SIZE_ASSERTION = "sizeof(uniserve_moe_sort_call) =="
-ERROR_OFFSET = 120
 
 #: The value the route map starts as: the sort must overwrite it, where a
 #: pre-filled -1 would hide a kernel that never writes the absent entries.
@@ -76,23 +73,9 @@ class Call(ctypes.Structure):
     ]
 
 
-def test_the_call_mirror_is_the_headers_sort_call(kernels):
-    """The package's header pins the size, read rather than restated."""
-    header = kernels / "moe_sort" / "trtllm" / "include" / "uniserve_moe_sort.h"
-    text = header.read_text()
-    assert SIZE_ASSERTION in text, f"{header}: no `{SIZE_ASSERTION}` assertion"
-    declared = int(
-        text.split(SIZE_ASSERTION, 1)[1].lstrip(" =").split()[0].rstrip(",")
-    )
-    assert ctypes.sizeof(Call) == declared, (
-        f"the check's Call holds {ctypes.sizeof(Call)} bytes and the header "
-        f"declares {declared}: the mirror is stale, and the module would read "
-        "past it"
-    )
-    assert Call.error.offset == ERROR_OFFSET, (
-        f"Call.error is at {Call.error.offset}, the operator's at "
-        f"{ERROR_OFFSET}"
-    )
+def test_the_call_mirror_is_the_headers_sort_call():
+    """The generated header asserts the size and every offset it holds."""
+    assert_abi_layout(Call, "uniserve_moe_sort_call")
 
 
 def max_tiles(tokens, top, local_experts, tile):

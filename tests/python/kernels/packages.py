@@ -10,15 +10,24 @@ ways, each through the package's own files or the Build Server's interface:
   as the Build Server states it for a build of that key (:class:`Launches`);
 - a built module, resolved at a Build Server, which builds it when its store
   holds none (:class:`Modules`).
+
+A native module's call structure is declared by the C ABI headers the operator
+crate generates into the kernel library (``uniserve_kernels``'s ``include/``,
+``ops::abi``), each ending with the structure's size and every field offset as
+Rust lays it out, asserted; a check's ctypes mirror of a call is held to those
+assertions (:func:`abi_layout`).
 """
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import importlib.machinery
+import importlib.resources
 import importlib.util
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from types import ModuleType
@@ -42,6 +51,70 @@ def source_module(package: Path, name: str) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@dataclasses.dataclass(frozen=True)
+class AbiLayout:
+    """A call structure's size and field offsets, in bytes, as its generated
+    header asserts them.
+    """  # noqa: D205
+
+    size: int
+    offsets: dict[str, int]
+
+
+#: The kernel library and its directory of generated C ABI headers.
+KERNEL_LIBRARY = "uniserve_kernels"
+ABI_HEADERS = "include"
+
+
+def abi_layout(structure: str) -> AbiLayout:
+    """The size and field offsets the generated ABI header of the installed
+    kernel library asserts for the C structure ``structure``.
+
+    The headers are the ones every native module is compiled against; their
+    ``static_assert(sizeof(...) == ...)`` and ``static_assert(offsetof(...,
+    field) == ...)`` lines state the layout the operator crate passes.
+
+    Raises:
+        LookupError: When no generated header asserts the structure's size.
+    """  # noqa: D205
+    size = re.compile(rf"static_assert\(sizeof\({structure}\) == (\d+),")
+    offset = re.compile(
+        rf"static_assert\(offsetof\({structure}, (\w+)\) == (\d+),"
+    )
+    headers = importlib.resources.files(KERNEL_LIBRARY) / ABI_HEADERS
+    for header in sorted(headers.iterdir(), key=lambda one: one.name):
+        if not header.name.endswith(".h"):
+            continue
+        text = header.read_text()
+        stated = size.search(text)
+        if stated is not None:
+            return AbiLayout(
+                size=int(stated.group(1)),
+                offsets={
+                    field: int(value) for field, value in offset.findall(text)
+                },
+            )
+    raise LookupError(f"no generated ABI header asserts {structure}'s size")
+
+
+def assert_abi_layout(mirror: Any, structure: str) -> None:
+    """Assert that the ctypes structure ``mirror`` has the size and every
+    field offset the generated header asserts for ``structure``: a stale mirror
+    would hand the module a call it reads at other offsets.
+    """  # noqa: D205
+    layout = abi_layout(structure)
+    assert ctypes.sizeof(mirror) == layout.size, (
+        f"the check's {mirror.__name__} is {ctypes.sizeof(mirror)} bytes, and "
+        f"the generated header asserts {layout.size} for {structure}"
+    )
+    for field, offset in layout.offsets.items():
+        stated = getattr(mirror, field).offset
+        assert stated == offset, (
+            f"the check's {mirror.__name__}.{field} is at {stated}, and the "
+            f"generated header asserts {offset} for {structure}"
+        )
 
 
 def compile_time(value: Any) -> Any:

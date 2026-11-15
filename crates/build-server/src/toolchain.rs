@@ -92,6 +92,21 @@ pub struct Cudnn {
     pub lib: PathBuf,
 }
 
+/// The kernel packages' shared sources (`uniserve_kernels`, `crates/ops/python`)
+/// as the environment installs them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Kernels {
+    /// The SHA-256 of the library's files, in hex: what a module is built
+    /// with, and so part of its identity.
+    pub digest: String,
+    /// The directory of the C ABI headers the library ships, generated from
+    /// the operator crate's call structures: the include directory of every
+    /// native compilation. Where the environment installs it is no part of a
+    /// module's identity; what it holds is, through the digest.
+    pub include: PathBuf,
+}
+
 /// The toolchain description `uniserve-build-server toolchain --json` prints
 /// (`uniserve_build_server.toolchain.Toolchain`), which a compilation is
 /// handed back in its request.
@@ -102,9 +117,9 @@ pub struct Report {
     pub interpreter: PathBuf,
     /// The SHA-256 of the compile driver's files, in hex.
     pub driver: String,
-    /// The SHA-256 of the kernel packages' shared sources (`uniserve_kernels`,
-    /// `crates/ops/python`), in hex.
-    pub kernels: Entry<String>,
+    /// The kernel packages' shared sources: their digest and the include
+    /// directory of their generated C ABI headers.
+    pub kernels: Entry<Kernels>,
     /// Every installed distribution by its normalized name, with its version.
     pub distributions: BTreeMap<String, String>,
     pub triton: Entry<String>,
@@ -177,11 +192,14 @@ impl Report {
             Entry::Available(cudnn) => cudnn.version.clone(),
             Entry::Missing(_) => "none".to_owned(),
         };
+        let kernels = match &self.kernels {
+            Entry::Available(kernels) => kernels.digest.clone(),
+            Entry::Missing(_) => "none".to_owned(),
+        };
         format!(
-            "driver {}; kernels {}; triton {}; cute_dsl {}; cuda {cuda}; cudnn {cudnn}; \
+            "driver {}; kernels {kernels}; triton {}; cute_dsl {}; cuda {cuda}; cudnn {cudnn}; \
              distributions {}",
             self.driver,
-            entry(&self.kernels),
             entry(&self.triton),
             entry(&self.cute_dsl),
             self.distributions_digest()
@@ -482,7 +500,9 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "interpreter": "/env/bin/python",
             "driver": "ab".repeat(32),
-            "kernels": {"available": "cd".repeat(32)},
+            "kernels": {"available": {
+                "digest": "cd".repeat(32), "include": "/env/uniserve_kernels/include"
+            }},
             "distributions": {"triton": "3.7.1", "flash-attn-4": "4.0.0b30"},
             "triton": {"available": "3.7.1"},
             "cute_dsl": {"available": "4.6.2"},
@@ -548,10 +568,23 @@ mod tests {
         // What a package imports is the builder too: the kernel packages' shared sources and the
         // version the lock fixes of every distribution.
         let shared = Toolchains::from_report(Ok(Report {
-            kernels: Entry::Available("ef".repeat(32)),
+            kernels: Entry::Available(Kernels {
+                digest: "ef".repeat(32),
+                include: "/env/uniserve_kernels/include".into(),
+            }),
             ..report()
         }));
         assert_ne!(shared.identity(ToolchainKind::Triton, here).unwrap(), first);
+        // Where the environment installs them is not: another installation of the same files
+        // builds the same modules.
+        let moved = Toolchains::from_report(Ok(Report {
+            kernels: Entry::Available(Kernels {
+                digest: "cd".repeat(32),
+                include: "/elsewhere/uniserve_kernels/include".into(),
+            }),
+            ..report()
+        }));
+        assert_eq!(moved.identity(ToolchainKind::Triton, here).unwrap(), first);
         let relocked = Toolchains::from_report(Ok(Report {
             distributions: [("flash-attn-4".to_owned(), "4.0.0".to_owned())].into(),
             ..report()

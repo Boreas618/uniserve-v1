@@ -100,14 +100,15 @@ char* own_base(const Transport& transport) {
 }
 
 int32_t refuse(char* error, const char* message) {
-  std::snprintf(error, 512, "%s", message);
+  std::snprintf(error, UNISERVE_MESSAGE, "%s", message);
   return 1;
 }
 
 int32_t driver_refusal(char* error, const char* what, CUresult status) {
   const char* name = nullptr;
   cuGetErrorName(status, &name);
-  std::snprintf(error, 512, "expert_exchange: %s failed: %s", what, name ? name : "unknown");
+  std::snprintf(error, UNISERVE_MESSAGE, "expert_exchange: %s failed: %s", what,
+                name ? name : "unknown");
   return 1;
 }
 

@@ -68,7 +68,9 @@ def request(package: pathlib.Path, output: pathlib.Path, **changes) -> dict:
         "toolchain": {
             "interpreter": sys.executable,
             "driver": "ab" * 32,
-            "kernels": available("cd" * 32),
+            "kernels": available(
+                {"digest": "cd" * 32, "include": str(output / "include")}
+            ),
             "distributions": {},
             "triton": available("3.7.1"),
             "cute_dsl": available("4.6.2"),
@@ -177,10 +179,7 @@ def test_a_declared_native_compilation_binds_and_links(tmp_path):
         "units": ["src/entry.cpp", "src/dense.cu"],
         "standard": "c++17",
         "definitions": {
-            "UNISERVE_CAUSAL": {
-                "field": "mask",
-                "values": {"causal": 1, "dense": 0},
-            },
+            "UNISERVE_MASK": {"field": "mask", "enumeration": "uniserve_mask"},
             "UNISERVE_SEQUENCES": {"field": "cu_seq_lens", "absent": True},
             "UNISERVE_TILE": {"parameter": "tile"},
             "UNISERVE_INPUT": {
@@ -205,17 +204,19 @@ def test_a_declared_native_compilation_binds_and_links(tmp_path):
     )
     for arguments in units:
         assert "-std=c++17" in arguments and "-arch=sm_100a" in arguments
-        # Each definition is bound for this descriptor: the value the field
-        # selects, the absent field's value, the parameter.
+        # Each definition is bound for this descriptor: the generated
+        # enumerator the field names, the absent field's value, the parameter,
+        # the value the field selects.
         for bound in (
-            "-DUNISERVE_CAUSAL=1",
+            "-DUNISERVE_MASK=UNISERVE_MASK_CAUSAL",
             "-DUNISERVE_SEQUENCES=1",
             "-DUNISERVE_TILE=64",
             "-DUNISERVE_INPUT=CUDA_R_16BF",
         ):
             assert bound in arguments, arguments
-        # The package's own headers, a library's headers, and its own option.
-        assert f"-I{RECORDING / 'include'}" in arguments
+        # The kernel library's ABI headers, a library's headers, and the
+        # package's own option.
+        assert f"-I{output / 'include'}" in arguments
         assert "-I/cudnn/include" in arguments
         assert "-ffp-contract=off" in arguments
     # The libraries where the description states them, and the runtime.

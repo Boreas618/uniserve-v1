@@ -5,7 +5,7 @@
 // matrix's own: its runner, the rows it sizes its tactics by (the routes it reads), the counts a
 // call must satisfy and the operands the runner takes.
 
-#include "entry.h"
+#include <uniserve_route_gemm_nvfp4.h>
 
 #include <uniserve_trtllm/routed_gemm.h>
 

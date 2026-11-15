@@ -20,7 +20,7 @@
 
 #include "block_sparse_sm90a.cuh"
 
-#include "uniserve_sparse_attention.h"
+#include <uniserve_sparse_attention.h>
 
 #include <cmath>
 #include <cstdio>
@@ -56,7 +56,7 @@ extern "C" int32_t uniserve_sparse_attention(const uniserve_sparse_attention_cal
   if (call == nullptr) {
     return 1;
   }
-  if (call->dtype != UNISERVE_SPARSE_BF16 || call->output_dtype != UNISERVE_SPARSE_BF16) {
+  if (call->dtype != UNISERVE_DTYPE_BF16 || call->output_dtype != UNISERVE_DTYPE_BF16) {
     return refuse(call, "the sm90 module serves bf16 queries, keys, values and output");
   }
   if (call->head_dim != kHeadDim) {

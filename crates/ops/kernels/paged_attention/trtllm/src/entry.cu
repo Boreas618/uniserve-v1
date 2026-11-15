@@ -30,7 +30,7 @@
 
 #include <uniserve_trtllm/cubins.h>
 
-#include "entry.h"
+#include <uniserve_paged_attention.h>
 
 namespace {
 

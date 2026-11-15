@@ -14,7 +14,7 @@
 # the ones FlashInfer's frontend selects for the descriptor's token count (`default_knobs`
 # of the pin), so the pin fixes them.
 #
-# One native module per descriptor, with the entries of the operator's header.
+# One native module per descriptor, with the operator's eight entries.
 
 op = "expert_exchange"
 backend = "megamoe"

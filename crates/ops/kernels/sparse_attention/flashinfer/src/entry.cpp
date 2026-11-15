@@ -14,7 +14,7 @@
 
 #include "flash_attn_sparse_sm120.h"
 
-#include "entry.h"
+#include <uniserve_sparse_attention.h>
 
 #include <uniserve_cute_dsl.h>
 
@@ -41,7 +41,7 @@ extern "C" int32_t uniserve_sparse_attention(const uniserve_sparse_attention_cal
   if (call == nullptr) {
     return 1;
   }
-  if (call->dtype != UNISERVE_SPARSE_BF16 && call->dtype != UNISERVE_SPARSE_F16) {
+  if (call->dtype != UNISERVE_DTYPE_BF16 && call->dtype != UNISERVE_DTYPE_F16) {
     return cute_dsl_refuse(
         call, "the sm120 module serves bf16 and f16 queries, keys, values and output");
   }

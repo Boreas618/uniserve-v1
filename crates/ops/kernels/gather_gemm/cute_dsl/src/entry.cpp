@@ -5,12 +5,13 @@
 //
 // The generated header this file is compiled with (`gather_gemm.h`, written by
 // `export_to_c` during the package's build) declares the module handle and the
-// wrapper the export emits; `entry.h` is the stable ABI the operator's Rust side
-// calls, and `uniserve_cute_dsl.h` what every CuTe DSL entry shares.
+// wrapper the export emits; the kernel library's ABI header, generated from the
+// operator crate, declares the call structure the operator's Rust side passes,
+// and `uniserve_cute_dsl.h` is what every CuTe DSL entry shares.
 
 #include "gather_gemm.h"
 
-#include "entry.h"
+#include <uniserve_gather_gemm.h>
 
 #include <uniserve_cute_dsl.h>
 

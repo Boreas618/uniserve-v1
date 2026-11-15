@@ -6,7 +6,7 @@ the session's Build Server for the session's device) as a runner loads it
 ``crates/ops/src/attention/dense.rs`` and compares the output with exact
 attention computed in torch.
 
-**The f32 module.** Its mask (`UNISERVE_CAUSAL`) and its sequence layout
+**The f32 module.** Its mask (`UNISERVE_MASK`) and its sequence layout
 (`UNISERVE_SEQUENCES`: packed sequences with offsets, or one sequence whose
 key carries ``cu_seq_lens_false``) are compiled in, so each form is a module
 of its own, compared with exact attention in FP64; a history window is not

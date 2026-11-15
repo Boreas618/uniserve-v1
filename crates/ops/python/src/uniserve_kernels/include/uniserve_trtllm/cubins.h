@@ -31,13 +31,9 @@
 #include <stdexcept>
 #include <string>
 
-// The load entry's call: where the module's files are.
-struct uniserve_trtllm_load_call {
-  // The NUL-terminated path of the directory the module's files were published in.
-  const char* directory;
-  // The NUL-terminated message the entry writes before it returns a nonzero status.
-  char error[512];
-};
+// The load entry's call, where the module's files are: `uniserve_load_call`, generated from the
+// operator crate.
+#include <uniserve_load.h>
 
 namespace uniserve::trtllm {
 namespace {
@@ -91,7 +87,7 @@ std::string getCubin(const std::string& name, const std::string& /* sha256 */) {
 
 // The load entry: records the directory of the module's files. It issues no device work, so
 // `stream` is unused; it returns 0, or 1 with a message in `call->error`.
-extern "C" int32_t uniserve_trtllm_load(uniserve_trtllm_load_call* call, void* /* stream */) {
+extern "C" int32_t uniserve_trtllm_load(uniserve_load_call* call, void* /* stream */) {
   if (call == nullptr) {
     return 1;
   }

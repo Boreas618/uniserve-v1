@@ -19,9 +19,10 @@ interface_version = 1
 [source]
 kind = "cuda"
 
-# Host code alone, in C++20: cuBLASLt brings its own kernels. Each definition is cuBLASLt's name
-# of what a field states: the data types, the accumulation as cuBLASLt's compute type, the weight
-# order (0 for `[k, n]`, 1 for `[n, k]`, the checkpoint's own) and whether the bias is added.
+# Host code alone, in C++20: cuBLASLt brings its own kernels. The data types are cuBLASLt's names
+# of what a field states, and the accumulation its compute type; the weight order (`[k, n]`, or
+# `[n, k]`, the checkpoint's own) and whether the bias is added are the generated ABI header's
+# enumerators (`uniserve_gemm.h`).
 [compile]
 units = ["src/gemm.cpp"]
 standard = "c++20"
@@ -32,8 +33,8 @@ UNISERVE_INPUT_TYPE = { field = "input", values = { bf16 = "CUDA_R_16BF", f16 = 
 UNISERVE_WEIGHT_TYPE = { field = "weight", values = { bf16 = "CUDA_R_16BF", f16 = "CUDA_R_16F", f32 = "CUDA_R_32F" } }
 UNISERVE_ACCUMULATE_TYPE = { field = "accumulate", values = { f32 = "CUBLAS_COMPUTE_32F", bf16 = "CUBLAS_COMPUTE_32F_FAST_16BF", f16 = "CUBLAS_COMPUTE_32F_FAST_16F" } }
 UNISERVE_OUTPUT_TYPE = { field = "output", values = { bf16 = "CUDA_R_16BF", f16 = "CUDA_R_16F", f32 = "CUDA_R_32F" } }
-UNISERVE_WEIGHT_ORDER = { field = "order", values = { kxn = 0, nxk = 1 } }
-UNISERVE_EPILOGUE = { field = "epilogue", values = { none = 0, bias = 1 } }
+UNISERVE_WEIGHT_ORDER = { field = "order", enumeration = "uniserve_weight_order" }
+UNISERVE_EPILOGUE = { field = "epilogue", enumeration = "uniserve_epilogue" }
 
 # `input_bf16_weight_bf16_accumulate_f32_output_bf16_order_nxk_epilogue_none_k_2048`.
 [[kernel.descriptors]]

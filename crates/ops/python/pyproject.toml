@@ -4,11 +4,13 @@
 # installed where they are compiled: the programmatic dependent launch prologue
 # of the Triton kernels, the address arithmetic of the tensor primitives'
 # strided operands, the CuTe DSL grouped GEMM the routed experts' two products
-# share, and C++ headers native packages include (`include/`: the CuTe DSL
-# modules' entry support and the trtllm-gen modules' cubin loader). A package
-# imports it as it imports Triton (`from uniserve_kernels import
-# dependent_launch`), or its build puts its `include/` on the include path, so
-# no package reaches outside itself and none carries a copy.
+# share, and C++ headers native packages include (`include/`: the C ABI
+# headers generated from the operator crate's call structures by its tests,
+# the CuTe DSL modules' entry support and the trtllm-gen modules' cubin
+# loader). A package imports it as it imports Triton (`from uniserve_kernels
+# import dependent_launch`), or includes its headers from the include path the
+# Build Server passes every native compile, so no package reaches outside
+# itself and none carries a copy.
 #
 # The Build Server's Python environment (`crates/build-server/python`) installs
 # it from this directory, and its toolchain description digests its files into

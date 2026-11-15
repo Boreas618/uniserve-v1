@@ -201,3 +201,16 @@ class Request:
         raise SystemExit(
             f"the tuning data {data} has no configuration of {self.descriptor}"
         )
+
+    def enumerator(self, enumeration: str, field: str) -> str:
+        """The C enumerator of ``enumeration`` a descriptor field names.
+
+        A native build compiles a field in as a definition whose value is this
+        enumerator. The operator crate renders each enumeration a package
+        reads into the ABI headers of ``uniserve_kernels`` (``ops::abi``), its
+        enumerators named ``<enumeration>_<variant>`` in capitals, a variant's
+        name being its spelling in a key: field ``input`` of ``bf16`` in
+        ``uniserve_dtype`` is ``UNISERVE_DTYPE_BF16``. A value the enumeration
+        lacks names no enumerator, and the compile refuses it.
+        """
+        return f"{enumeration}_{self.field(field)}".upper()

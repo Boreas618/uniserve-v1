@@ -131,10 +131,12 @@ class Library:
 
 
 def includes(request: Request) -> list[pathlib.Path]:
-    """The include directories every native compile gets: the package's own
-    ``include/``, which holds its operator's C header.
+    """The include directories every native compile gets: the kernel
+    library's C ABI headers, generated from the operator crate (``ops::abi``),
+    which declare each operator's call structure and the enumerations a
+    package reads.
     """  # noqa: D205
-    return [request.package / "include"]
+    return [pathlib.Path(request.toolchain.require_kernels().include)]
 
 
 def library(request: Request, name: str) -> Library:
@@ -397,8 +399,16 @@ def build(request: Request) -> None:
             stated, request.fields, request.parameters, request.descriptor
         )
 
+    def defined(stated: Any) -> Any:
+        # A definition that names a generated enumeration takes the enumerator
+        # the field's value spells (`crates/build-server/src/compile.rs`).
+        if isinstance(stated, dict) and "enumeration" in stated:
+            return request.enumerator(stated["enumeration"], stated["field"])
+        return bound(stated)
+
     definitions = {
-        name: bound(stated) for name, stated in declared["definitions"].items()
+        name: defined(stated)
+        for name, stated in declared["definitions"].items()
     }
     try:
         headers = [

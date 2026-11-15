@@ -566,8 +566,9 @@ fn a_native_module_names_its_launch_entry_and_any_lifecycle_entries() {
 }
 
 /// A CUDA package that declares its compilation: a native module of two
-/// units whose definitions read the descriptor's fields and a parameter, and
-/// which links cuBLASLt.
+/// units whose definitions read the descriptor's fields (one as the generated
+/// ABI header's enumerator it names) and a parameter, and which links
+/// cuBLASLt.
 const DECLARED: &str = r#"
 op = "dense_attention"
 backend = "f32"
@@ -583,7 +584,7 @@ libraries = ["cublasLt"]
 host_contraction = false
 
 [compile.definitions]
-UNISERVE_CAUSAL = { field = "mask", values = { causal = 1, dense = 0 } }
+UNISERVE_MASK = { field = "mask", enumeration = "uniserve_mask" }
 UNISERVE_SEQUENCES = { field = "cu_seq_lens", absent = true }
 UNISERVE_TILE = { parameter = "tile" }
 
@@ -601,12 +602,12 @@ tile = 64
 const DECLARED_FILES: [&str; 2] = ["src/entry.cpp", "src/dense.cu"];
 
 /// A CUDA package may declare its compilation instead of writing a build module: its units, the
-/// standard, the definitions bound to literals, fields and parameters, the libraries and its own
-/// options, which the manifest types; it then has no build module, and its native module still
-/// launches through its operator's entry.
+/// standard, the definitions bound to literals, fields, the enumerators fields name and
+/// parameters, the libraries and its own options, which the manifest types; it then has no build
+/// module, and its native module still launches through its operator's entry.
 #[test]
 fn a_cuda_package_declares_its_compilation() {
-    use build_server::compile::{Library, Standard};
+    use build_server::compile::{Definition, Library, Standard};
 
     let manifest = load(DECLARED, &DECLARED_FILES).unwrap();
     let compile = manifest.compile.as_ref().unwrap();
@@ -615,6 +616,13 @@ fn a_cuda_package_declares_its_compilation() {
     assert_eq!(compile.libraries, [Library::CublasLt]);
     assert!(!compile.host_contraction);
     assert_eq!(compile.definitions.len(), 3);
+    assert_eq!(
+        compile.definitions["UNISERVE_MASK"],
+        Definition::Enumerator {
+            field: "mask".into(),
+            enumeration: "uniserve_mask".into()
+        }
+    );
     assert!(compile.kernel.is_none());
     assert!(!manifest.has_build_module());
     assert_eq!(manifest.toolchain.kind, ToolchainKind::Nvcc);
@@ -661,6 +669,11 @@ fn a_declared_compilation_is_checked_against_its_package() {
     );
     refused(
         &DECLARED.replace("UNISERVE_TILE =", "\"2TILE\" ="),
+        &DECLARED_FILES,
+        "no C identifier",
+    );
+    refused(
+        &DECLARED.replace("\"uniserve_mask\"", "\"uniserve mask\""),
         &DECLARED_FILES,
         "no C identifier",
     );

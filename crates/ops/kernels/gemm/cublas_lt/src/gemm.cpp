@@ -39,12 +39,13 @@
 #include <string>
 #include <unordered_map>
 
-#include "uniserve_gemm.h"
+#include <uniserve_gemm.h>
 
 // The descriptor's compile-time choices, which the package's manifest defines
 // (`[compile.definitions]`): the cuBLASLt data types of the input, the weight and
-// the output, the compute type of the accumulation, the weight order (0: `[k, n]`;
-// 1: `[n, k]`, the checkpoint's own layout) and the epilogue (0: none; 1: add the
+// the output, the compute type of the accumulation, the weight order (a
+// `uniserve_weight_order` enumerator: `[k, n]`, or `[n, k]`, the checkpoint's own
+// layout) and the epilogue (a `uniserve_epilogue` enumerator: none, or add the
 // bias).
 #if !defined(UNISERVE_INPUT_TYPE) || !defined(UNISERVE_WEIGHT_TYPE) ||       \
     !defined(UNISERVE_ACCUMULATE_TYPE) || !defined(UNISERVE_OUTPUT_TYPE) || \
@@ -219,7 +220,7 @@ class MatmulCache {
   /// algorithm with the workspace it asks for.
   static bool build(const MatmulKey& key, cublasLtHandle_t handle, Matmul* matmul,
                     std::string* error) {
-    const bool kxn = UNISERVE_WEIGHT_ORDER == 0;
+    const bool kxn = UNISERVE_WEIGHT_ORDER == UNISERVE_WEIGHT_ORDER_KXN;
     // cuBLASLt's view: A is [n, k] (kxn, transposed by the layout) or [k, n]
     // (nxk, transposed by the operation), B is [k, m] and C, D are [n, m].
     const uint64_t a_rows = kxn ? static_cast<uint64_t>(key.n) : static_cast<uint64_t>(key.k);
@@ -243,7 +244,7 @@ class MatmulCache {
       *error = std::string("describing the transpose: ") + cublas_status(status);
       return false;
     }
-    if (UNISERVE_EPILOGUE == 1) {
+    if (UNISERVE_EPILOGUE == UNISERVE_EPILOGUE_BIAS) {
       const cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
       const cudaDataType_t bias_type = UNISERVE_OUTPUT_TYPE;
       status = cublasLtMatmulDescSetAttribute(matmul->operation, CUBLASLT_MATMUL_DESC_EPILOGUE,
@@ -380,7 +381,7 @@ extern "C" int uniserve_gemm(UniserveGemmCall* call, void* stream) {
   if (matmul == nullptr) {
     return fail(call, "%s", error.c_str());
   }
-  if (UNISERVE_EPILOGUE == 1) {
+  if (UNISERVE_EPILOGUE == UNISERVE_EPILOGUE_BIAS) {
     status = cublasLtMatmulDescSetAttribute(matmul->operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
                                             &call->bias, sizeof(call->bias));
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -398,10 +399,12 @@ extern "C" int uniserve_gemm(UniserveGemmCall* call, void* stream) {
                 static_cast<long long>(call->m), static_cast<long long>(call->n),
                 static_cast<long long>(call->k), static_cast<long long>(call->m),
                 static_cast<long long>(call->k),
-                UNISERVE_WEIGHT_ORDER == 0 ? static_cast<long long>(call->k)
-                                           : static_cast<long long>(call->n),
-                UNISERVE_WEIGHT_ORDER == 0 ? static_cast<long long>(call->n)
-                                           : static_cast<long long>(call->k),
+                UNISERVE_WEIGHT_ORDER == UNISERVE_WEIGHT_ORDER_KXN
+                    ? static_cast<long long>(call->k)
+                    : static_cast<long long>(call->n),
+                UNISERVE_WEIGHT_ORDER == UNISERVE_WEIGHT_ORDER_KXN
+                    ? static_cast<long long>(call->n)
+                    : static_cast<long long>(call->k),
                 cublas_status(status));
   }
   return 0;

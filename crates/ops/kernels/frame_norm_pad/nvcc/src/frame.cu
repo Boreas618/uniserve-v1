@@ -19,7 +19,7 @@
 #include <cstdio>
 #include <limits>
 
-#include "uniserve_frame_norm_pad.h"
+#include <uniserve_frame_norm_pad.h>
 
 namespace {
 
@@ -37,17 +37,10 @@ __device__ __forceinline__ int64_t source_index(int64_t index, int64_t extent, b
   return index < 0 ? 0 : (index >= extent ? extent - 1 : index);
 }
 
-// How a frame's values normalize, following the branch PyTorch's
-// GroupNormKernelImplInternal takes for the parameters and frame size.
-enum Normalization : int {
-  // ComputeFusedParamsCUDAKernel's a = rstd * gamma and b = -a * mean + beta,
-  // then the apply's `a * x + b`; per channel (first, second) = (a, b).
-  kFused = 0,
-  // No affine parameters: `(x - mean) * rstd`; per channel (mean, rstd).
-  kCentered = 1,
-  // One-pixel frames (GroupNorm1dForward); per channel (mean, rstd).
-  kSinglePixel = 2,
-};
+// How a frame's values normalize is the call's `uniserve_normalization`. Per
+// channel, the fused branch reads (first, second) = (a, b) of
+// ComputeFusedParamsCUDAKernel's `a * x + b`; the centered and single-pixel
+// branches read (mean, rstd).
 
 // GroupNorm1dForward's expressions for one-pixel frames.
 __device__ __forceinline__ float normalize_single(
@@ -128,7 +121,7 @@ __global__ void __launch_bounds__(kThreads) frame_norm_pad_kernel(
   const int group_base = (sample * frames + frame) * groups;
   for (int channel = thread; channel < channels; channel += kThreads) {
     const int ng = group_base + channel / channels_per_group;
-    if (normalization == kFused) {
+    if (normalization == UNISERVE_NORMALIZATION_FUSED) {
       const float scale = weight == nullptr ? rstd[ng] : rstd[ng] * weight[channel];
       const float shift = -scale * mean[ng] + (bias == nullptr ? 0 : bias[channel]);
       parameters[channel] = scale;
@@ -184,9 +177,9 @@ __global__ void __launch_bounds__(kThreads) frame_norm_pad_kernel(
         }
         const float x = loaded[r][k];
         float y;
-        if (normalization == kFused) {
+        if (normalization == UNISERVE_NORMALIZATION_FUSED) {
           y = first * x + second;
-        } else if (normalization == kCentered) {
+        } else if (normalization == UNISERVE_NORMALIZATION_CENTERED) {
           y = (x - first) * second;
         } else {
           y = normalize_single(x, first, second, weight, bias, channel);
@@ -239,8 +232,9 @@ extern "C" int32_t uniserve_frame_norm_pad(const uniserve_frame_norm_pad_call* c
   if (call->channels_per_group <= 0 || call->groups <= 0) {
     return refuse(call, "frame_norm_pad needs positive channels per group and groups");
   }
-  if (call->normalization != kFused && call->normalization != kCentered &&
-      call->normalization != kSinglePixel) {
+  if (call->normalization != UNISERVE_NORMALIZATION_FUSED &&
+      call->normalization != UNISERVE_NORMALIZATION_CENTERED &&
+      call->normalization != UNISERVE_NORMALIZATION_SINGLEPIXEL) {
     return refuse(call, "frame_norm_pad was given no normalization branch it knows");
   }
   const int64_t widest = std::numeric_limits<int>::max();

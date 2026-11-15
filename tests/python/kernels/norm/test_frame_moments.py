@@ -30,8 +30,8 @@ the reduction's own rounding at the widest frame a launch carries. The module
 states its Welford tree is ATen's, bit for bit PyTorch's, so a failure also
 states how many statistics are bit-identical.
 
-The call structure is a ctypes mirror of the package header
-``include/uniserve_frame_moments.h``, checked against the offsets the header
+The call structure is a ctypes mirror of the generated ABI header
+``uniserve_frame_moments.h``, checked against the layout the header
 asserts; every other test loads a module built for the session's device.
 """
 
@@ -41,10 +41,11 @@ import pytest
 import torch
 
 from tests.python.kernels.norm.rounding import gamma, outside
+from tests.python.kernels.packages import assert_abi_layout
 
 pytestmark = pytest.mark.unit
 
-#: The largest message an entry writes (`frame.rs`'s `MESSAGE`).
+#: The largest message an entry writes (`ops::abi::MESSAGE`).
 MESSAGE = 512
 
 #: The descriptor key of the package's one module.
@@ -82,18 +83,6 @@ class Call(ctypes.Structure):
     ]
 
 
-#: The offsets `include/uniserve_frame_moments.h` asserts, and its size.
-HEADER_OFFSETS = {
-    "values": 0,
-    "values_pixel": 32,
-    "epsilon": 72,
-    "mean": 80,
-    "rstd": 88,
-    "error": 96,
-}
-HEADER_SIZE = 96 + MESSAGE
-
-
 def declared_bound():
     """`Tolerance::rounding(1 << 16, f32, f32)`'s relative bound."""
     return 2.0 * gamma(1 << 16) + 2.0**-24
@@ -125,14 +114,8 @@ def reference(values, groups, epsilon):
 
 
 def test_the_call_structure_is_the_headers():
-    assert ctypes.sizeof(Call) == HEADER_SIZE, (
-        f"Call is {ctypes.sizeof(Call)} bytes, the header asserts {HEADER_SIZE}"
-    )
-    for name, offset in HEADER_OFFSETS.items():
-        assert getattr(Call, name).offset == offset, (
-            f"Call.{name} is at {getattr(Call, name).offset}, the header "
-            f"asserts {offset}"
-        )
+    """The generated header asserts the size and every offset it holds."""
+    assert_abi_layout(Call, "uniserve_frame_moments_call")
 
 
 @pytest.mark.gpu

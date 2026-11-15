@@ -50,7 +50,7 @@ standard = "c++17"
 libraries = ["cublasLt"]
 
 [compile.definitions]
-UNISERVE_CAUSAL = { field = "mask", values = { causal = 1, dense = 0 } }
+UNISERVE_MASK = { field = "mask", enumeration = "uniserve_mask" }
 UNISERVE_SEQUENCES = { field = "cu_seq_lens", absent = true }
 
 # `dtype_f32_kv_f32_out_f32_head_dim_64_q_heads_8_kv_heads_8_mask_dense_window_false`

@@ -4,7 +4,7 @@
 // routing pipeline in `routing.cu` (derived from TensorRT-LLM's routing
 // kernels; see that file's notice).
 
-#include "uniserve_moe_sort.h"
+#include <uniserve_moe_sort.h>
 
 #include <cstdio>
 #include <exception>
