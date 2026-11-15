@@ -31,16 +31,10 @@ use crate::worker::{Error, Result};
 /// how often it checks them while one does.
 pub(crate) const CONTEXT_CHECK: Duration = Duration::from_secs(1);
 
-/// Half the configured watchdog timeout: a job in flight this long is reported to the scheduler
-/// with its batch.
-pub(crate) fn stall_bound(watchdog_timeout: Duration) -> Duration {
-    watchdog_timeout / 2
-}
-
 /// The stall bound, the once-per-job report, and the schedule of the context checks.
 #[derive(Debug)]
 pub(crate) struct Watchdog {
-    /// Half `worker_config.watchdog_timeout`.
+    /// `worker_config.watchdog_timeout`.
     stall_bound: Duration,
     /// When the control thread last checked the devices' contexts.
     checked_at: Option<Instant>,
@@ -50,29 +44,21 @@ pub(crate) struct Watchdog {
 }
 
 impl Watchdog {
-    /// A watchdog that reports a job in flight for half of `watchdog_timeout`.
+    /// A watchdog that reports a job in flight for `watchdog_timeout`.
     ///
     /// # Errors
     ///
-    /// When the timeout leaves no positive stall bound.
+    /// When the timeout is zero, which would report every job as it starts.
     pub(crate) fn new(watchdog_timeout: Duration) -> Result<Self> {
-        let stall_bound = stall_bound(watchdog_timeout);
-        if stall_bound.is_zero() {
-            return Err(Error::Invalid(
-                "the watchdog timeout must leave a positive stall bound".into(),
-            ));
+        if watchdog_timeout.is_zero() {
+            return Err(Error::Invalid("the watchdog timeout must be positive".into()));
         }
 
         Ok(Self {
-            stall_bound,
+            stall_bound: watchdog_timeout,
             checked_at: None,
             reported: BTreeMap::new(),
         })
-    }
-
-    /// How long a job may be in flight before it is reported.
-    pub(crate) fn stall_bound(&self) -> Duration {
-        self.stall_bound
     }
 
     /// The instant the control thread must look again: the sooner of the job in flight longest
@@ -177,7 +163,7 @@ mod tests {
     use super::*;
 
     fn watchdog() -> Watchdog {
-        Watchdog::new(Duration::from_secs(30)).expect("a positive watchdog timeout")
+        Watchdog::new(Duration::from_secs(15)).expect("a positive watchdog timeout")
     }
 
     /// A job of batch `batch` taken at `since`.
@@ -186,21 +172,9 @@ mod tests {
     }
 
     #[test]
-    fn the_stall_bound_is_half_the_watchdog_timeout() {
-        assert_eq!(
-            stall_bound(Duration::from_secs(30)),
-            Duration::from_secs(15)
-        );
-        assert_eq!(
-            stall_bound(Duration::from_secs(1)),
-            Duration::from_millis(500)
-        );
-    }
-
-    #[test]
     fn a_zero_watchdog_timeout_is_refused() {
         assert!(Watchdog::new(Duration::ZERO).is_err());
-        assert!(Watchdog::new(Duration::from_nanos(1)).is_err());
+        assert!(Watchdog::new(Duration::from_nanos(1)).is_ok());
     }
 
     #[test]
@@ -270,7 +244,7 @@ mod tests {
 
     #[test]
     fn a_stall_bound_under_a_second_is_the_deadline() {
-        let watchdog = Watchdog::new(Duration::from_secs(1)).expect("a positive stall bound");
+        let watchdog = Watchdog::new(Duration::from_millis(500)).expect("a positive stall bound");
         let now = Instant::now();
 
         assert_eq!(

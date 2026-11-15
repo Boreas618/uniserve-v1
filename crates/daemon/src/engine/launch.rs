@@ -117,7 +117,6 @@ mod tests {
             scheduler_node: true,
             world: None,
             standby_storage: crate::options::StandbyStorage::Resident,
-            watchdog_timeout_s: None,
             queue_depth: 4,
             world_size: 1,
         }
@@ -157,7 +156,6 @@ mod tests {
             "scheduler_node",
             "world",
             "standby_storage",
-            "watchdog_timeout_s",
             "queue_depth",
             "world_size",
         ]

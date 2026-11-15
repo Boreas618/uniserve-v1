@@ -275,8 +275,9 @@ pub(crate) fn uncompared(workers: &[Arc<Worker>]) -> Vec<String> {
 /// not compare its worker states once the pass ended ([`uncompared`]).
 ///
 /// A pass answers once a batch of its scheduler ran, so an engine whose running requests run no
-/// step within `bound` (twice the stall bound) compares nothing: the update is abandoned, naming
-/// the operators that changed (`changed`), rather than passed without the comparison.
+/// step within `bound` (`worker_config.compare_timeout`) compares nothing: the update is
+/// abandoned, naming the operators that changed (`changed`), rather than passed without the
+/// comparison.
 ///
 /// # Errors
 ///

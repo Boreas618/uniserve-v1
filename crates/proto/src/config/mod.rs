@@ -741,8 +741,8 @@ pub struct WorkerConfig {
     /// The revision of the engine package to run; the latest installed one, fixed when the
     /// configuration is applied, when unset.
     pub engine_revision: Option<u32>,
-    /// Time a batch may run without rank progress before the worker group is
-    /// replaced; a rank reports a stalled job after half of it.
+    /// Time a job of a rank's worker may stay in flight before it is reported `Stalled`, which
+    /// fails the epoch: its worker group is replaced, and an update on trial rolls back.
     #[serde(with = "values::duration")]
     pub watchdog_timeout: Duration,
     /// How long the main processes of an epoch whose ranks span several hosts
@@ -753,6 +753,11 @@ pub struct WorkerConfig {
     /// once; the bound covers a process that never arrives.
     #[serde(with = "values::duration")]
     pub join_timeout: Duration,
+    /// Time a generation update's shadow pass waits for the running requests of every scheduler
+    /// to run a step its changed kernels are compared on, and for every peer's own preparation of
+    /// the generation to end, before the update is abandoned as uncompared.
+    #[serde(with = "values::duration")]
+    pub compare_timeout: Duration,
     /// `tower=gen:<device>` places the generation tower on another device
     /// than the rank's.
     pub mesh: Option<String>,
@@ -808,6 +813,7 @@ impl Default for WorkerConfig {
             engine_revision: None,
             watchdog_timeout: DEFAULT_WATCHDOG_TIMEOUT,
             join_timeout: DEFAULT_JOIN_TIMEOUT,
+            compare_timeout: DEFAULT_COMPARE_TIMEOUT,
             mesh: None,
             standby: false,
             standby_storage: StandbyStorage::Auto,
@@ -838,11 +844,18 @@ pub const DEFAULT_COPY_BUDGET: u64 = 512 << 20;
 /// the one each thread runs, so a thread takes its next task without waiting for a step.
 pub const DEFAULT_HOST_QUEUE_DEPTH: usize = 4;
 
-/// How long a batch may run without its ranks' progress before its worker group is replaced, when
-/// the deployment states no bound (`worker_config.watchdog_timeout`): five minutes, a policy bound
-/// above the longest step a served model takes (a denoising step of the longest video, a prefill
-/// of the longest prompt) and below what an operator waits before replacing a stuck group by hand.
-pub const DEFAULT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a job may stay in flight before it is reported stalled and its worker group is
+/// replaced, when the deployment states no bound (`worker_config.watchdog_timeout`): two and a half
+/// minutes, a policy bound above the longest step a served model takes (a denoising step of the
+/// longest video, a prefill of the longest prompt) and below what an operator waits before
+/// replacing a stuck group by hand.
+pub const DEFAULT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// How long a generation update's shadow pass waits for a step of the running requests, when the
+/// deployment states no bound (`worker_config.compare_timeout`): five minutes, long enough for an
+/// engine whose requests arrive at a low rate to run a step of each scheduler, and short enough
+/// that an update on an idle engine is abandoned within the time an operator waits for it.
+pub const DEFAULT_COMPARE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long the main processes of a multi-host epoch wait for one another as they start, when the
 /// deployment states no bound (`worker_config.join_timeout`): five minutes, a policy bound above
@@ -1672,9 +1685,6 @@ pub struct EngineArgs {
     /// graph pools while it parks: the daemon resolves `worker_config.standby_storage` for the
     /// failure domain, so it states `resident` or `suspended` and never `auto`.
     pub standby_storage: StandbyStorage,
-    /// How long a job may run without progress before it is reported
-    /// `Stalled`, when the daemon states it apart from the engine configuration.
-    pub watchdog_timeout_s: Option<u64>,
     /// The rank layout's queue depth for this rank's worker groups.
     pub queue_depth: u32,
     /// The number of the deployment's ranks, every worker group's on every host: this process's
@@ -1740,7 +1750,6 @@ impl EngineArgs {
             scheduler_node: false,
             world: None,
             standby_storage: StandbyStorage::Resident,
-            watchdog_timeout_s: None,
             queue_depth: 0,
             world_size: 0,
         }
@@ -1750,10 +1759,5 @@ impl EngineArgs {
     /// maps read-only until it is promoted. A switch's target and a standby both start so.
     pub fn parked(&self) -> bool {
         self.predecessor.is_some()
-    }
-
-    /// §2.4's watchdog bound: this process's when the daemon states one apart from the epoch's.
-    pub fn watchdog_timeout(&self) -> Option<Duration> {
-        self.watchdog_timeout_s.map(Duration::from_secs)
     }
 }

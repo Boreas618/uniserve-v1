@@ -922,11 +922,12 @@ fn the_watchdog_reads_the_job_in_flight_longest_with_its_batch() {
 
     // The control thread looks again when the job in flight longest has run for a second, and
     // reports each job once it reached the stall bound, with its rank and batch.
-    let mut watchdog = Watchdog::new(Duration::from_secs(30)).unwrap();
+    let timeout = Duration::from_secs(30);
+    let mut watchdog = Watchdog::new(timeout).unwrap();
     assert_eq!(watchdog.deadline(&jobs), Some(since + CONTEXT_CHECK));
     assert!(watchdog.stalls(later, &jobs).is_empty());
 
-    let stalls = watchdog.stalls(later + watchdog.stall_bound(), &jobs);
+    let stalls = watchdog.stalls(later + timeout, &jobs);
     assert_eq!(stalls.len(), 2);
     assert_eq!((stalls[0].0, stalls[0].1.batch_id), (0, Some(5)));
     assert_eq!((stalls[1].0, stalls[1].1.batch_id), (1, None));

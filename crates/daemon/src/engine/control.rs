@@ -1677,9 +1677,6 @@ fn place_on(
     args.scheduler_node = scheduler_node;
     // The world is stated by the start that reserves its sockets.
     args.world = None;
-    // The bound is the epoch's, and the epoch states it in its engine
-    // configuration, which the engine reads.
-    args.watchdog_timeout_s = None;
     args.queue_depth = queue_depth;
     Ok(args)
 }

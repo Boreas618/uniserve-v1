@@ -320,9 +320,6 @@ impl MainProcess {
             })
             .context("starting the operations thread")?;
 
-        let timeout = launch
-            .watchdog_timeout()
-            .unwrap_or(launch.engine_config.worker.watchdog_timeout);
         // The module set's kernels are candidates, every package installed for an operator; the
         // kernels the first generation serves are those its start selected, added once it ends
         // (`started`).
@@ -333,7 +330,7 @@ impl MainProcess {
             fronts: vec![Some(front)],
             windows: vec![window],
             process: Some(writer),
-            watchdog: Watchdog::new(timeout)?,
+            watchdog: Watchdog::new(launch.engine_config.worker.watchdog_timeout)?,
             launch,
             lifecycle: Lifecycle::Starting,
             update: Update::Steady,
@@ -798,9 +795,9 @@ impl MainProcess {
         let ceilings = engine.ceilings;
         let budget = self.launch.engine_config.scheduler.policy_budget;
         let serving = kernels_of(&self.serving);
-        // A preparation whose shadow pass no running request reaches within twice the stall
-        // bound is abandoned, naming the operators it could not compare.
-        let bound = 2 * self.watchdog.stall_bound();
+        // A preparation whose shadow pass no running request reaches within the epoch's
+        // comparison bound is abandoned, naming the operators it could not compare.
+        let bound = self.launch.engine_config.worker.compare_timeout;
         self.work(Box::new(move || {
             let prepared = generation::kernels(&workers, &build, &named, &serving, generation)
                 .and_then(|kernels| {
