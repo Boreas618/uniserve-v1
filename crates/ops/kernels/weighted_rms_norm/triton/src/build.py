@@ -11,7 +11,6 @@ variants are two kernels. The epsilon stays a launch word.
 """
 
 import weighted_rms_norm as kernels
-from uniserve_build_server import triton as driver
 
 #: The floating dtypes a descriptor prints, and the Triton spelling of each: the vocabulary is
 #: `DType`'s, and Triton spells FP16 `fp16` and FP32 `fp32`.
@@ -46,7 +45,3 @@ def spec(fields, parameters, target):
         "constexprs": {"WIDTH": columns, "BLOCK": int(fields["tile"])},
         "options": {"num_warps": warps_of(columns)},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

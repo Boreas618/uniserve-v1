@@ -273,7 +273,10 @@ def launch(build, case, buffers):
     `VsaPrepareTiles::launch` packs them: without normalization the rows stand in for the weights
     and factor tables, which the module then does not read.
     """
-    stated = build.spec(case.fields(), {}, ARCHITECTURE)
+    # The Build Server's package is importable once the build module is loaded.
+    from uniserve_build_server.request import Target
+
+    stated = build.spec(case.fields(), {}, Target.named(ARCHITECTURE))
     sizes, pooled = case.outputs()
     query, key, value = (
         case.rows_view(buffers[name]) for name in ("query", "key", "value")

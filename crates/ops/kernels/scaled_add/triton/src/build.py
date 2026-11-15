@@ -11,7 +11,6 @@ The coefficients are launch scalars and the element count is a launch word.
 """
 
 import scaled_add as kernels
-from uniserve_build_server import triton as driver
 
 #: The element types either operand may have; the arithmetic is FP32 in each.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -38,7 +37,3 @@ def spec(fields, parameters, target):
         "constexprs": {"BLOCK": block},
         "options": {"num_warps": warps_of(block)},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

@@ -26,13 +26,12 @@ files = ["src/logprob_gather.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `columns_151936_ids_i64_tile_4096_pdl_true`.
 # The rank's count walks a row in steps of `min(tile, 4096)` lanes, a
 # `tl.arange` extent, so a tile below 4096 must be a power of two.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { columns = { min = 1 }, ids = ["i64", "i32"], tile = { min = 1 }, pdl = ["true", "false"] }
 
 [parameters]

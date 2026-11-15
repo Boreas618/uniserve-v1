@@ -11,7 +11,6 @@ parameters rather than its dimensions.
 """
 
 from bsa_sm120 import NAME, BsaCompiler
-from uniserve_build_server import cute_dsl as driver
 
 #: The entry the module exports, which the package's `[module.entries]` names.
 ENTRY = "uniserve_sparse_attention"
@@ -24,7 +23,3 @@ def spec(fields, parameters, target):
         "entry": ENTRY,
         "compile": BsaCompiler(fields, parameters, target).compile,
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

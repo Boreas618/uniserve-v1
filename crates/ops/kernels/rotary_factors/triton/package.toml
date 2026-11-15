@@ -25,7 +25,6 @@ files = ["src/rotary_factors.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_fp32_positions_i64_columns_64_block_256_scale_0x3f800000_pdl_true`.

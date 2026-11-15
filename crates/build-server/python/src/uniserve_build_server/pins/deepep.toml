@@ -1,0 +1,7 @@
+# DeepEP's elastic dispatch and combine kernels, at deepseek-ai/DeepEP commit
+# b306af06afd4, each file from the commit's raw tree. The manifest is
+# `deepep.sha256` beside this file.
+sha256 = "ee22833b7bf83ebf3da46056dcbe0b936cdb4e5442d22b583f1a0be0eda36a31"
+
+[origin]
+files = "https://raw.githubusercontent.com/deepseek-ai/DeepEP/b306af06afd412c88e51e71802951606e40b7358/"

@@ -41,12 +41,11 @@ files = ["src/paged_attention.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a"]
 
 # `phase_decode_dtype_bf16_kv_f8e4m3_out_bf16_head_dim_128_page_64_q_heads_32_kv_heads_4_mask_causal_window_false_len_40960`
 #
 # `head_dim` and `page` are `tl.arange` extents; the head counts compile into the query group, which
 # the compile script refuses unless `kv_heads` divides `q_heads`; `len` changes no program.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { phase = ["decode", "prefill"], dtype = ["bf16", "f16"], kv = ["f8e4m3", "bf16", "f16", "f32"], out = ["bf16", "f16"], head_dim = { power_of_two = true }, page = { power_of_two = true }, q_heads = { min = 1 }, kv_heads = { min = 1 }, mask = ["causal"], window = ["false"], len = { min = 1 } }

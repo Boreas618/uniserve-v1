@@ -27,7 +27,6 @@ files = ["src/rope_apply.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_output_bf16_head_dim_72_heads_16_rotation_half_rows_8_block_128_pdl_false`.

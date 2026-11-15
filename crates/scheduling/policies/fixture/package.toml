@@ -8,19 +8,19 @@ op = "scheduling"
 backend = "fcfs"
 interface_version = 4
 
-# An empty version means any wasmtime this host has, which is what a fixture
-# that must install on an arbitrary test host declares. A serving package pins
-# the precompiler's version instead, because a precompiled module carries
-# wasmtime's format.
+# An empty version means any cargo release this host has, which is what a
+# fixture that must install on an arbitrary test host declares. A serving
+# package pins the workspace's Rust toolchain instead.
 [toolchain]
-kind = "wasm"
+kind = "cargo"
 version = ""
 packages = []
 
 [module]
 form = "wasm"
 
-# The package is this crate, built by the Build Server from its snapshot.
+# The package is this crate, built by the Build Server for wasm32 from the
+# snapshot of its whole workspace.
 [source]
 kind = "wasm"
 files = []

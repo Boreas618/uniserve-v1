@@ -30,12 +30,12 @@ entries = { launch = "uniserve_sparse_attention" }
 kind = "cute_dsl"
 files = ["src/entry.h", "src/bsa_sm120.py", "src/build.py", "src/entry.cpp"]
 script = "src/build.py"
+unit = "src/entry.cpp"
 
 [kernel]
-target = "arch"
 architectures = ["sm_120a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { block = ["64"], dtype = ["bf16", "f16"], output = ["bf16", "f16"], head_dim = ["128"], lse = ["true"] }
 
 [parameters]

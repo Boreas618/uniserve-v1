@@ -51,27 +51,25 @@ def spec(fields, parameters, target):
     return {
         "name": "route_gemm",
         "entry": "uniserve_route_gemm",
-        "kernel": kernel.wrapper,
-        "args": [
-            pointer(element),
-            pointer(element),
-            pointer(element),
-            pointer(cutlass.Int32),
-            pointer(cutlass.Int32),
-            pointer(cutlass.Int32),
-            pointer(cutlass.Int32),
-            permuted_rows,
-            hidden,
-            intermediate,
-            experts,
-            permuted_rows,
-        ],
-        "options": {
-            "tile_size": tiler[0],
-            "max_active_clusters": int(parameters["max_active_clusters"]),
-        },
+        "compile": driver.kernel(
+            kernel.wrapper,
+            [
+                pointer(element),
+                pointer(element),
+                pointer(element),
+                pointer(cutlass.Int32),
+                pointer(cutlass.Int32),
+                pointer(cutlass.Int32),
+                pointer(cutlass.Int32),
+                permuted_rows,
+                hidden,
+                intermediate,
+                experts,
+                permuted_rows,
+            ],
+            {
+                "tile_size": tiler[0],
+                "max_active_clusters": int(parameters["max_active_clusters"]),
+            },
+        ),
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

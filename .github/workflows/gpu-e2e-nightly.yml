@@ -23,6 +23,8 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked --python 3.12 --extra test --extra bench --extra gpu
       - run: uv sync --locked --python 3.12 --project crates/build-server/python
+      # The Build Server runs its toolchain environment's program from the search path.
+      - run: echo "$PWD/crates/build-server/python/.venv/bin" >> "$GITHUB_PATH"
       - run: PYTHON=.venv/bin/python tools/gpu_e2e.sh -m "e2e and gpu"
       - uses: actions/upload-artifact@v4
         if: always()

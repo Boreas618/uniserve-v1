@@ -4,10 +4,11 @@
 //! A [`BuildServer`] keeps what is installed — one [`Package`] per
 //! `(operator, backend, revision)`, each holding its manifest, its directory
 //! and its [`Source`] — the module [`Store`] of section 5.3, the host's
-//! [`Toolchains`] and the compile [`Queue`] of section 6.2. It serves
-//! `install`, `prepare`, `resolve`, `list` and `cover` on a Unix socket to any
-//! number of clients: one thread per connection, one driver thread for the
-//! queue.
+//! [`Toolchains`] and the compile [`Queue`] of section 6.2, whose driver
+//! thread runs for the server's life. A store build calls its operations in
+//! process; `serve_on` serves `install`, `prepare`, `resolve`, `list` and
+//! `cover` on a Unix socket to any number of clients, one thread per
+//! connection.
 //!
 //! The server compiles, keeps and provides. It launches no kernel and
 //! allocates no device memory (section 6.1), and it never starts an update of
@@ -27,6 +28,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -34,22 +36,25 @@ use std::time::Duration;
 
 use crate::builder::{Build, BuildState, Builder, Limits, Urgency};
 use crate::inputs::Inputs;
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ToolchainKind};
 use service::Connection;
 
 use crate::protocol::{
     self, Descriptors, Module, ModuleFile, PrepareRequest, Progress, Selector, wire,
 };
-use crate::source::Source;
-use crate::store::{ModulePath, Root, Store};
-use crate::target::{self, Device, Target};
-use crate::toolchain::{ToolchainConfig, Toolchains};
+use crate::source::{Cache, Source, Workspace};
+use crate::store::{ModulePath, Root, Staging, Store, directories, file_name};
+use crate::target::Target;
+use crate::toolchain::Toolchains;
 use crate::{Error, Result};
 use proto::module::{ModuleSlot, PackageRevision};
 
-/// How long the queue's driver waits before it looks at the host's memory
-/// again while builds it cannot start are queued.
-const DRIVER_TICK: Duration = Duration::from_millis(250);
+/// How long the queue's driver waits before it reads the host's memory again
+/// while builds wait for memory and none of its own runs. The host states no
+/// event when other processes release memory, so this is the one wait of the
+/// driver that a notification cannot end; a submitted or finished build ends
+/// it at once.
+const MEMORY_RECHECK: Duration = Duration::from_secs(1);
 
 /// One installed package: its manifest, its directory and how its
 /// sources become modules (design sections 5.2 and 6.2).
@@ -65,9 +70,21 @@ pub struct Package {
 }
 
 impl Package {
-    /// The toolchain this package's sources compile with.
-    pub fn toolchain(&self) -> crate::manifest::ToolchainKind {
-        self.source.toolchain()
+    /// The toolchain this package's sources compile with, as its manifest
+    /// declares it.
+    pub fn toolchain(&self) -> ToolchainKind {
+        self.manifest.toolchain.kind
+    }
+
+    /// Where the package's toolchain runs: the workspace of a cargo package's
+    /// snapshot, whose `rust-toolchain.toml` selects cargo's release, and the
+    /// package's root otherwise.
+    fn toolchain_directory(&self) -> PathBuf {
+        if self.manifest.source.kind.builds_with_cargo() {
+            self.root.join(crate::snapshot::WORKSPACE)
+        } else {
+            self.root.clone()
+        }
     }
 
     /// The directory an installed revision of a package lives in.
@@ -79,11 +96,10 @@ impl Package {
     }
 }
 
-/// How to serve: what `uniserve build-server serve` takes.
+/// How a Build Server works: its roots, its upstream, its limits, its targets
+/// and its cache.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    /// The socket to serve on.
-    pub socket: PathBuf,
     /// The package root. It is writable on the upstream Build Server, which
     /// accepts `install`, and a read-only mount of the upstream's root on
     /// every other one (design section 6.2).
@@ -104,32 +120,40 @@ pub struct ServerConfig {
     pub read_only_stores: Vec<PathBuf>,
     /// The queue's limits (design section 6.2).
     pub limits: Limits,
-    /// Where this host's toolchains are.
-    pub toolchains: ToolchainConfig,
-    /// The devices this host builds for: their architectures and models
-    /// (design section 5.3).
-    pub devices: Vec<Device>,
+    /// The GPU targets this host builds for (design section 5.3).
+    pub targets: Vec<Target>,
+    /// The root of what builds keep between them ([`Cache`]): pinned sources,
+    /// cargo's target directory, vendored registry sources and workspaces.
+    pub cache: PathBuf,
 }
 
 /// A Build Server: what is installed, the module store, the toolchains and
 /// the compile queue.
 pub struct BuildServer {
-    socket: PathBuf,
     package_root: PathBuf,
     /// Whether this server accepts `install`, and where the upstream is.
     upstream: Option<PathBuf>,
     packages: RwLock<BTreeMap<(String, String, u32), Arc<Package>>>,
     store: Arc<Store>,
     toolchains: Arc<Toolchains>,
-    devices: Vec<Device>,
+    targets: Vec<Target>,
     queue: Arc<Queue>,
+    /// The queue's driver, which runs until the server is dropped.
+    driver: Option<std::thread::JoinHandle<()>>,
+    /// The upstream server's hold of its package root, which makes it the one
+    /// writer of the revisions there; a downstream server writes none.
+    _package_root: Option<fs::File>,
 }
 
 impl BuildServer {
     /// Opens a server over its configuration: loads the installed packages
-    /// from the package root, discovers the toolchains and opens the store.
-    /// The compile queue's driver starts with [`Self::serve`].
+    /// from the package root, reads the toolchains, opens the store and starts
+    /// the compile queue's driver, which runs until the server is dropped.
     pub fn open(config: &ServerConfig) -> Result<BuildServer> {
+        let package_root = match config.upstream {
+            None => Some(crate::store::hold(&config.package_root)?),
+            Some(_) => None,
+        };
         let mut roots = config.store_roots.clone();
         let mut packages = load_packages(&config.package_root)?;
         for store in &config.read_only_stores {
@@ -156,88 +180,85 @@ impl BuildServer {
             }
         }
         let store = Arc::new(Store::open(roots)?);
-        let toolchains = Arc::new(Toolchains::discover(&config.toolchains)?);
-        let queue = Queue::new(Arc::clone(&store), Arc::clone(&toolchains), config.limits);
+        let toolchains = Arc::new(Toolchains::discover());
+        let queue = Queue::new(
+            Arc::clone(&store),
+            Arc::clone(&toolchains),
+            config.limits,
+            Cache::new(config.cache.clone()),
+        );
+        let driver = std::thread::spawn({
+            let queue = Arc::clone(&queue);
+            move || queue.drive()
+        });
         Ok(BuildServer {
-            socket: config.socket.clone(),
             package_root: config.package_root.clone(),
             upstream: config.upstream.clone(),
             packages: RwLock::new(packages),
             store,
             toolchains,
-            devices: config.devices.clone(),
+            targets: config.targets.clone(),
             queue,
+            driver: Some(driver),
+            _package_root: package_root,
         })
     }
 
-    /// Serves until the process ends: binds the socket, serves every client
-    /// on its own thread, and drives the compile queue.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the socket cannot be bound or a listener cannot be made.
-    pub fn serve(self: Arc<Self>) -> Result<()> {
-        self.serve_until(Arc::new(std::sync::atomic::AtomicBool::new(false)))
-    }
-
-    /// Serves until `stop` is set: what [`Self::serve`] does, for a supervisor
-    /// that must shut the server down. The socket is removed on the way out.
-    ///
-    /// # Errors
-    ///
-    /// Fails when another server owns the socket, the socket cannot be bound
-    /// or a listener cannot be made.
-    pub fn serve_until(self: Arc<Self>, stop: Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
-        let Some((listener, lock)) = service::bind(&self.socket)? else {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                format!("a build server serves on {}", self.socket.display()),
-            )));
-        };
-        self.serve_on(listener, lock, stop)
-    }
-
     /// Serves on `listener`, the socket `lock` makes this server the owner of
-    /// ([`service::bind`]), until `stop` is set; the lock removes the socket
-    /// on the way out.
+    /// ([`service::bind`], which the caller ran, so the socket accepts
+    /// connections before this is called), until `stop` becomes readable or is
+    /// closed; the lock removes the socket on the way out.
+    ///
+    /// Each client's connection is served on its own thread.
     ///
     /// # Errors
     ///
-    /// Fails when the listener cannot be made non-blocking.
+    /// Fails when the wait for a connection or for `stop` fails.
     pub fn serve_on(
         self: Arc<Self>,
         listener: std::os::unix::net::UnixListener,
         lock: service::SocketLock,
-        stop: Arc<std::sync::atomic::AtomicBool>,
+        stop: &impl AsRawFd,
     ) -> Result<()> {
-        // The queue's driver runs beside the listener: it starts the builds
-        // the request queue holds and wakes the requests waiting on them.
-        std::thread::spawn({
-            let queue = Arc::clone(&self.queue);
-            move || Queue::drive(queue)
-        });
         listener.set_nonblocking(true)?;
         tracing::info!(
-            "build server listening on {} with {} package(s)",
-            self.socket.display(),
+            "build server listening with {} package(s)",
             self.packages
                 .read()
                 .map(|packages| packages.len())
                 .unwrap_or(0)
         );
-        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-            let stream = match listener.accept() {
-                Ok((stream, _)) => stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    // A supervisor can shut the server down between two
-                    // accept attempts; a client's connection is still handled
-                    // by its own thread, so this wait costs it nothing.
-                    std::thread::sleep(ACCEPT_TICK);
+        loop {
+            let mut ready = [
+                libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stop.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: poll borrows this live array only for the call.
+            if unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as libc::nfds_t, -1) } < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
+                return Err(Error::Io(error));
+            }
+            if ready[1].revents != 0 {
+                break;
+            }
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                // A client that connected and left before the accept leaves
+                // nothing to accept; the next poll waits for the next one.
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(error) => {
                     tracing::warn!("accepting a build server connection: {error}");
-                    std::thread::sleep(ACCEPT_TICK);
                     continue;
                 }
             };
@@ -251,7 +272,6 @@ impl BuildServer {
                 }
             });
         }
-        self.queue.stop();
         drop(lock);
         Ok(())
     }
@@ -350,8 +370,6 @@ impl BuildServer {
                         wire::ResolveResponse {
                             form: wire::ModuleForm::from(module.form) as i32,
                             files,
-                            // Field 3 is superseded by `entries` and left empty.
-                            entry: String::new(),
                             entries: module.entries.into_iter().collect(),
                             metadata: module.metadata.unwrap_or_default(),
                             interface_version: module.interface_version,
@@ -454,8 +472,9 @@ impl BuildServer {
     ///
     /// The revision records its build inputs ([`Inputs`]): the digest of the
     /// package's files and this host's identity of the toolchain that builds
-    /// them. A host without that toolchain records why it has none, and no host
-    /// builds the revision until it is installed where the toolchain is.
+    /// them. A host without that toolchain refuses the install with the
+    /// reason, because it cannot state what the revision's modules are built
+    /// by.
     pub fn install(&self, directory: &Path) -> Result<protocol::Package> {
         if let Some(upstream) = &self.upstream {
             return Err(Error::Refused {
@@ -475,18 +494,10 @@ impl BuildServer {
             .packages
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // A revision directory the server does not serve (one installed with
-        // no record of its inputs) still holds its number.
-        let on_disk = directories(&self.package_root.join(&manifest.op).join(&manifest.backend))
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|revision| revision.file_name()?.to_str()?.parse::<u32>().ok())
-            .max();
         let revision = packages
             .keys()
             .filter(|(op, backend, _)| op == &manifest.op && backend == &manifest.backend)
             .map(|(_, _, revision)| *revision)
-            .chain(on_disk)
             .max()
             .unwrap_or(0)
             .checked_add(1)
@@ -500,33 +511,22 @@ impl BuildServer {
             &manifest.backend,
             revision,
         );
-        let kind = manifest.source(directory)?.toolchain();
+        // A cargo package's toolchain is the one its workspace's
+        // `rust-toolchain.toml` selects, which cargo finds from the package's
+        // own directory.
         let toolchain = self
             .toolchains
-            .identity(kind)
-            .unwrap_or_else(|error| format!("{kind} unavailable: {error}"));
-        let (files, generated) = crate::snapshot::package_files(directory)?;
+            .identity(manifest.toolchain.kind, directory)?;
+        let files = crate::snapshot::package_files(directory, &manifest)?;
         let inputs = Inputs {
-            package: crate::snapshot::files_digest(&files, generated.as_deref())?,
+            package: crate::snapshot::files_digest(&files)?,
             toolchain,
         };
-        install_package(&files, generated.as_deref(), &root, &inputs, |staged| {
-            // A crate's revision is built with its lockfile, locked: the
-            // lockfile the snapshot took is its workspace's, so it is reduced
-            // here, once, to the crates the snapshot holds. A host without
-            // cargo keeps the revision as it is and builds nothing of it.
-            match (
-                &generated,
-                self.toolchains.get(crate::manifest::ToolchainKind::Cargo),
-            ) {
-                (Some(_), Ok(cargo)) => crate::source::lock_snapshot(cargo, staged),
-                _ => Ok(()),
-            }
-        })?;
+        install_package(&files, &root, &inputs)?;
         // The source compiles the installed copy, not the tree the install
         // named: a downstream server's package root is a read-only mount of the
         // upstream's, and the publisher's directory need not exist there.
-        let source = manifest.source(&root)?;
+        let source = manifest.source(&root);
         let package = Arc::new(Package {
             manifest,
             root,
@@ -580,10 +580,10 @@ impl BuildServer {
         let Some((revision, package)) = latest else {
             return Ok(None);
         };
-        let Ok(toolchain) = self.toolchains.identity(package.toolchain()) else {
+        let Ok(toolchain) = self.toolchains.identity(package.toolchain(), directory) else {
             return Ok(None);
         };
-        if Inputs::of(directory, toolchain)? != package.inputs {
+        if Inputs::of(directory, &manifest, toolchain)? != package.inputs {
             return Ok(None);
         }
         Ok(Some(protocol::Package {
@@ -779,10 +779,20 @@ impl BuildServer {
             descriptor,
         )?;
         if !self.store.contains(&path) {
-            // A failed build is retried by the resolve that needs it: a
-            // transient failure (host memory, a lost file) is worth another
-            // attempt, and the package's revision is what a real change
-            // would replace.
+            // A build that failed stays failed, for `resolve` as for
+            // `prepare`: the queue starts a build only when the host has its
+            // memory, so a failure is the package's or the toolchain's, and a
+            // new revision or toolchain is what changes it.
+            if let Some(BuildState::Failed(detail)) = self.queue.state(&path) {
+                return Err(Error::Build {
+                    op: path.op.clone(),
+                    backend: path.backend.clone(),
+                    revision: path.revision,
+                    target: path.target.clone(),
+                    descriptor: path.descriptor.clone(),
+                    message: detail,
+                });
+            }
             let receiver = self
                 .queue
                 .submit(Arc::clone(&package), &path, Urgency::Waiting);
@@ -827,18 +837,33 @@ impl BuildServer {
                 path,
             });
         }
-        let entries = entries_of(&package, &self.store.directory(&path))?;
+        let directory = self.store.find(&path).ok_or_else(|| Error::Build {
+            op: path.op.clone(),
+            backend: path.backend.clone(),
+            revision: path.revision,
+            target: path.target.clone(),
+            descriptor: path.descriptor.clone(),
+            message: "the module left the store while it was resolved".into(),
+        })?;
+        let entries = crate::source::entries(&package.manifest, &directory)?;
         Ok(Module {
             form: package.manifest.module.form,
             files: module_files,
             metadata: package.manifest.module.metadata_name(&path.descriptor),
             entries,
-            // The record written with the module when it was built; the
-            // revision's manifest fixed it.
+            // The record written with the module when it was built: every
+            // committed module states the interface version it was built for.
             interface_version: self
                 .store
                 .interface_version(&path)
-                .unwrap_or(package.manifest.interface_version),
+                .ok_or_else(|| Error::Build {
+                    op: path.op.clone(),
+                    backend: path.backend.clone(),
+                    revision: path.revision,
+                    target: path.target.clone(),
+                    descriptor: path.descriptor.clone(),
+                    message: "the module's record states no interface version".into(),
+                })?,
         })
     }
 
@@ -866,10 +891,10 @@ impl BuildServer {
             let Some(modules) = listed.get_mut(&key) else {
                 continue;
             };
-            let interface_version = self
-                .store
-                .interface_version(&path)
-                .unwrap_or(package.manifest.interface_version);
+            // A listed module is committed, and its mark states its version.
+            let Some(interface_version) = self.store.interface_version(&path) else {
+                continue;
+            };
             modules.push(protocol::ModuleEntry {
                 target: Target::new(path.target),
                 descriptor: path.descriptor,
@@ -1111,101 +1136,83 @@ impl BuildServer {
     /// supports (design section 5.3). A scheduling policy is built once, for
     /// wasm32, whatever the host's GPUs are.
     fn targets(&self, package: &Package, requested: &[Target]) -> Result<Vec<Target>> {
-        if package.manifest.kernel.is_none() {
+        let Some(kernel) = &package.manifest.kernel else {
             // A package of one module has one target, whatever the host's GPUs
             // are: wasm32 for a policy, the host's platform for an executable.
             // The targets a request names are its kernel packages', so they
             // do not select among this package's.
             return Ok(vec![package.manifest.single_target()]);
+        };
+        let refused = |target: String, message: String| Error::Build {
+            op: package.manifest.op.clone(),
+            backend: package.manifest.backend.clone(),
+            revision: 0,
+            target,
+            descriptor: String::new(),
+            message,
+        };
+        for target in requested {
+            if !self.targets.contains(target) {
+                return Err(refused(
+                    target.to_string(),
+                    format!(
+                        "this host builds for {:?} and not for {target}",
+                        self.targets
+                    ),
+                ));
+            }
         }
-        let kind = package.manifest.target_kind();
-        let host = target::targets(&self.devices, kind);
         let wanted = if requested.is_empty() {
-            host.clone()
+            &self.targets
         } else {
-            target::check(&self.devices, kind, requested)?;
-            requested.to_vec()
+            requested
         };
         let mut selected = Vec::new();
-        for wanted in wanted {
-            if package.manifest.builds_for(wanted.as_str()) {
-                selected.push(wanted);
+        for target in wanted {
+            if package.manifest.builds_for(target.as_str()) {
+                selected.push(target.clone());
             } else if !requested.is_empty() {
                 // A target the epoch names and the package cannot build for
                 // is a missing module the daemon must be told about, not a
                 // target to skip.
-                return Err(Error::Build {
-                    op: package.manifest.op.clone(),
-                    backend: package.manifest.backend.clone(),
-                    revision: 0,
-                    target: wanted.to_string(),
-                    descriptor: String::new(),
-                    message: format!(
-                        "the package builds for {:?}",
-                        package
-                            .manifest
-                            .kernel
-                            .as_ref()
-                            .map(|kernel| &kernel.architectures)
-                    ),
-                });
+                return Err(refused(
+                    target.to_string(),
+                    format!("the package builds for {:?}", kernel.architectures),
+                ));
             }
         }
         if selected.is_empty() {
-            return Err(Error::Build {
-                op: package.manifest.op.clone(),
-                backend: package.manifest.backend.clone(),
-                revision: 0,
-                target: String::new(),
-                descriptor: String::new(),
-                message: format!(
+            return Err(refused(
+                String::new(),
+                format!(
                     "the package builds for {:?} and this host builds for {:?}",
-                    package
-                        .manifest
-                        .kernel
-                        .as_ref()
-                        .map(|kernel| &kernel.architectures),
-                    host
+                    kernel.architectures, self.targets
                 ),
-            });
+            ));
         }
         Ok(selected)
     }
 }
 
-/// The C entries a module is launched through: its package's
-/// `[module.entries]`, overridden by each role the module's entries file names
-/// (design section 4.2). The file is part of the module, written by the build
-/// for this descriptor, so a package whose modules each launch through their
-/// own C entry returns the entries of the module it resolved.
-fn entries_of(package: &Package, directory: &Path) -> Result<BTreeMap<String, String>> {
-    let mut entries = package.manifest.module.entries.clone();
-    let Some(name) = package.manifest.module.entries_file.as_deref() else {
-        return Ok(entries);
-    };
-    let file = directory.join(name);
-    let text = fs::read_to_string(&file).map_err(|error| {
-        Error::Protocol(format!(
-            "the module names its entries in {name}, which it does not hold: {error}"
-        ))
-    })?;
-    let written: BTreeMap<String, String> = serde_json::from_str(&text).map_err(|error| {
-        Error::Protocol(format!(
-            "{name} is not a JSON object of C entry roles to symbols: {error}"
-        ))
-    })?;
-    entries.extend(written);
-    Ok(entries)
+impl Drop for BuildServer {
+    /// Stops the queue's driver once the build it was starting has begun;
+    /// builds already running end on their own threads.
+    fn drop(&mut self) {
+        self.queue.stop();
+        if let Some(driver) = self.driver.take() {
+            let _ = driver.join();
+        }
+    }
 }
-
-/// How long the listener waits between accept attempts, so a supervisor can
-/// stop the server.
-const ACCEPT_TICK: Duration = Duration::from_millis(10);
 
 /// The queue's side of a build: what is being built, and who waits for it.
 struct Queue {
     store: Arc<Store>,
     toolchains: Arc<Toolchains>,
+    cache: Cache,
+    /// The compiler processes each build may run, the queue's job limit.
+    jobs: usize,
+    peaks: crate::toolchain::PeakMemory,
     state: Mutex<QueueState>,
     wake: Condvar,
 }
@@ -1222,10 +1229,18 @@ struct QueueState {
 }
 
 impl Queue {
-    fn new(store: Arc<Store>, toolchains: Arc<Toolchains>, limits: Limits) -> Arc<Queue> {
+    fn new(
+        store: Arc<Store>,
+        toolchains: Arc<Toolchains>,
+        limits: Limits,
+        cache: Cache,
+    ) -> Arc<Queue> {
         Arc::new(Queue {
             store,
             toolchains,
+            cache,
+            jobs: limits.max_jobs,
+            peaks: limits.peaks,
             state: Mutex::new(QueueState {
                 builder: Builder::new(limits),
                 packages: HashMap::new(),
@@ -1273,35 +1288,57 @@ impl Queue {
     }
 
     /// Drives the queue until the server ends: starts every build the limits
-    /// allow, and waits for memory or for a build to end.
+    /// allow, and waits for a build to be submitted or to end.
+    ///
+    /// A build that cannot read the host's memory fails rather than start
+    /// ungated: the memory reservation is what keeps the host from running out.
     fn drive(self: Arc<Self>) {
         loop {
             let mut state = self.lock();
             if state.stopping {
                 return;
             }
-            // Without `MemAvailable` the host cannot be gated on memory; the
-            // job limit still applies.
-            let framed = available_host_memory().unwrap_or(u64::MAX);
+            let pending = state.builder.pending();
+            if pending == 0 {
+                drop(
+                    self.wake
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+                continue;
+            }
+            let available = match platform::host::available_memory() {
+                Ok(available) => available,
+                Err(error) => {
+                    let message = format!("the host's available memory cannot be read: {error}");
+                    let refused = state.builder.fail_queued(&message);
+                    self.notify(&mut state, refused);
+                    continue;
+                }
+            };
             let QueueState {
                 builder, packages, ..
             } = &mut *state;
-            let started = builder.start(framed, |build| {
+            let started = builder.start(available, |build| {
                 packages
                     .get(&build.path)
-                    .map_or(0, |package| peak(&self.toolchains, package, &build.path))
+                    .map_or(0, |package| self.peaks.of(package.toolchain()))
             });
             if started.is_empty() {
-                let timeout = if builder.pending() == 0 {
-                    // Nothing queued: wait until something is submitted.
-                    DRIVER_TICK * 8
+                // A running build's end frees what it reserved and wakes the
+                // driver; with none running, only the host's other processes
+                // can free memory, which they do without an event.
+                let running = builder.running();
+                drop(if running > 0 {
+                    self.wake
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
                 } else {
-                    DRIVER_TICK
-                };
-                let _ = self
-                    .wake
-                    .wait_timeout(state, timeout)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    self.wake
+                        .wait_timeout(state, MEMORY_RECHECK)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .0
+                });
                 continue;
             }
             let mut spawned = Vec::with_capacity(started.len());
@@ -1314,6 +1351,18 @@ impl Queue {
             for (package, path) in spawned {
                 let queue = Arc::clone(&self);
                 std::thread::spawn(move || queue.build(&package, &path));
+            }
+        }
+    }
+
+    /// Tells the waiters of `ended` builds how they ended.
+    fn notify(&self, state: &mut QueueState, ended: Vec<Build>) {
+        for build in ended {
+            state.packages.remove(&build.path);
+            for waiter in &build.waiters {
+                if let Some(sender) = state.waiters.remove(waiter) {
+                    let _ = sender.send(build.state.clone());
+                }
             }
         }
     }
@@ -1342,15 +1391,8 @@ impl Queue {
                 })
                 .map_err(|error| error.to_string());
         let mut state = self.lock();
-        let ended: Option<Build> = state.builder.finish(path, result);
-        state.packages.remove(path);
-        if let Some(build) = ended {
-            for waiter in &build.waiters {
-                if let Some(sender) = state.waiters.remove(waiter) {
-                    let _ = sender.send(build.state.clone());
-                }
-            }
-        }
+        let ended = state.builder.finish(path, result);
+        self.notify(&mut state, ended.into_iter().collect());
         drop(state);
         self.wake.notify_all();
     }
@@ -1364,19 +1406,19 @@ impl Queue {
     /// Compiles one module into the store.
     fn compile(&self, package: &Package, path: &ModulePath) -> Result<()> {
         let kind = package.toolchain();
-        let workspace = crate::source::Workspace::new()?;
+        let workspace = Workspace::new(&self.cache)?;
         let target = Target::new(path.target.clone());
-        let toolchain = self.toolchains.get(kind)?;
-        // A module is stored under the inputs its revision recorded, so
-        // only the toolchain and compile driver the revision was
-        // installed with may build it.
-        let identity = self.toolchains.identity(kind)?;
+        let directory = package.toolchain_directory();
+        // A module is stored under the inputs its revision recorded, so only
+        // the toolchain and compile driver the revision was installed with may
+        // build it.
+        let identity = self.toolchains.identity(kind, &directory)?;
         if identity != package.inputs.toolchain {
             return Err(Error::Toolchain {
                 kind,
                 message: format!(
-                    "the package {} {} revision {} was installed for {} and this host \
-                     builds with {identity}: install the package again",
+                    "the package {} {} revision {} was installed for {} and this host builds \
+                     with {identity}: install the package again",
                     package.manifest.op,
                     package.manifest.backend,
                     path.revision,
@@ -1384,24 +1426,23 @@ impl Queue {
                 ),
             });
         }
-        // A package that compiles nothing has no compiler version to
-        // match, and a package that declares no version is built by
-        // whatever this host has: both leave `[toolchain] version`
-        // empty, and neither is compared.
-        if kind != crate::manifest::ToolchainKind::None
-            && !package.manifest.toolchain.version.is_empty()
-            && toolchain.version() != package.manifest.toolchain.version
+        // A package that compiles nothing has no compiler version to match,
+        // and a package that declares no version is built by whatever this
+        // host has: both leave `[toolchain] version` empty, and neither is
+        // compared.
+        let version = self.toolchains.version(kind, &directory)?;
+        if !package.manifest.toolchain.version.is_empty()
+            && version != package.manifest.toolchain.version
         {
             return Err(Error::Toolchain {
                 kind,
                 message: format!(
-                    "the package {} {} revision {} is written for {kind} {} and this host \
-                     has {}",
+                    "the package {} {} revision {} is written for {kind} {} and this host has \
+                     {version}",
                     package.manifest.op,
                     package.manifest.backend,
                     path.revision,
                     package.manifest.toolchain.version,
-                    toolchain.version()
                 ),
             });
         }
@@ -1410,10 +1451,15 @@ impl Queue {
             &package.manifest.backend,
             &package.manifest.toolchain,
         )?;
-        let built =
-            package
-                .source
-                .build(&path.op, &path.descriptor, &target, toolchain, &workspace)?;
+        let built = package.source.build(&crate::source::Build {
+            op: &path.op,
+            key: &path.descriptor,
+            target: &target,
+            toolchains: &self.toolchains,
+            cache: &self.cache,
+            jobs: self.jobs,
+            workspace: &workspace,
+        })?;
         if built.is_empty() {
             return Err(Error::Build {
                 op: path.op.clone(),
@@ -1438,15 +1484,6 @@ impl Queue {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-}
-
-/// The peak host memory one build reserves, as its toolchain reports it.
-fn peak(toolchains: &Toolchains, package: &Package, path: &ModulePath) -> u64 {
-    let kind = package.toolchain();
-    toolchains
-        .get(kind)
-        .map(|toolchain| toolchain.peak_host_bytes(&path.op, &path.descriptor))
-        .unwrap_or(0)
 }
 
 /// Sends the progress of a request on its connection while it runs.
@@ -1525,7 +1562,7 @@ fn load_packages(root: &Path) -> Result<BTreeMap<(String, String, u32), Arc<Pack
                 else {
                     continue;
                 };
-                if !revision.join("package.toml").is_file() {
+                if !revision.join(Manifest::FILE).is_file() {
                     continue;
                 }
                 let manifest = Manifest::load(&revision).map_err(|source| Error::Manifest {
@@ -1542,18 +1579,10 @@ fn load_packages(root: &Path) -> Result<BTreeMap<(String, String, u32), Arc<Pack
                         ))),
                     });
                 }
-                // A revision installed with no record of its inputs cannot name
-                // the modules it would build, and modules found under its number
-                // may come from other inputs: it is not served, and its package
-                // is installed again.
-                let Some(inputs) = Inputs::read(&revision)? else {
-                    tracing::warn!(
-                        "{} records no build inputs and is not served: install the package again",
-                        revision.display()
-                    );
-                    continue;
-                };
-                let source = manifest.source(&revision)?;
+                // Every installed revision records its build inputs, which name
+                // the modules it builds.
+                let inputs = Inputs::read(&revision)?;
+                let source = manifest.source(&revision);
                 packages.insert(
                     (op_name.clone(), backend_name.clone(), number),
                     Arc::new(Package {
@@ -1572,48 +1601,24 @@ fn load_packages(root: &Path) -> Result<BTreeMap<(String, String, u32), Arc<Pack
 /// Writes a package's snapshot into its revision's directory with the record
 /// of its build inputs, atomically: a crash leaves no directory a later scan
 /// would mistake for an installed revision, and no revision without its
-/// record. `finish` completes the staged revision before it is published.
+/// record.
 ///
 /// A symbolic link is copied as what it names: an installed revision holds
 /// every byte it builds from, so a source several packages share in the tree
 /// (an operator's ABI header, one convolution source behind three operators)
 /// is one file there and a file of each package's revision.
-fn install_package(
-    files: &[(String, PathBuf)],
-    generated: Option<&str>,
-    destination: &Path,
-    inputs: &Inputs,
-    finish: impl FnOnce(&Path) -> Result<()>,
-) -> Result<()> {
+fn install_package(files: &[(String, PathBuf)], destination: &Path, inputs: &Inputs) -> Result<()> {
     let parent = destination.parent().ok_or_else(|| {
         Error::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{} has no parent directory", destination.display()),
         ))
     })?;
-    fs::create_dir_all(parent)?;
-    let staged = parent.join(format!(
-        ".{}.staged-{}",
-        destination
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        std::process::id()
-    ));
-    if staged.exists() {
-        fs::remove_dir_all(&staged)?;
-    }
-    fs::create_dir_all(&staged)?;
-    crate::snapshot::write_files(files, generated, &staged)?;
-    finish(&staged)?;
-    inputs.write(&staged)?;
-    if let Ok(handle) = fs::File::open(&staged) {
-        handle.sync_all()?;
-    }
-    fs::rename(&staged, destination)?;
-    if let Ok(handle) = fs::File::open(parent) {
-        handle.sync_all()?;
-    }
+    let staging = Staging::new(parent)?;
+    crate::snapshot::write_files(files, staging.path())?;
+    inputs.write(staging.path())?;
+    fs::File::open(staging.path())?.sync_all()?;
+    staging.publish(destination)?;
     Ok(())
 }
 
@@ -1659,40 +1664,4 @@ fn arguments(text: &str) -> Result<toml::Table> {
     }
     toml::from_str(text)
         .map_err(|error| Error::Protocol(format!("a package's arguments are not TOML: {error}")))
-}
-
-/// The host storage available to new work without swapping, in bytes:
-/// `MemAvailable` of `/proc/meminfo`. `None` when the host states none, in
-/// which case builds are not gated on memory.
-fn available_host_memory() -> Option<u64> {
-    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
-    meminfo
-        .lines()
-        .find_map(|line| line.strip_prefix("MemAvailable:"))
-        .and_then(|value| value.trim().strip_suffix("kB"))
-        .and_then(|kilobytes| kilobytes.trim().parse::<u64>().ok())
-        .map(|kilobytes| kilobytes << 10)
-}
-
-/// The subdirectories of a directory, in name order.
-fn directories(path: &Path) -> Result<Vec<PathBuf>> {
-    let mut directories = Vec::new();
-    if !path.is_dir() {
-        return Ok(directories);
-    }
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            directories.push(entry.path());
-        }
-    }
-    directories.sort();
-    Ok(directories)
-}
-
-/// A path's last name.
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }

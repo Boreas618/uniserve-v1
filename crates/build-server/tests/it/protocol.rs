@@ -14,6 +14,8 @@ use build_server::target::Target;
 use proto::module::{ModuleSlot, PackageRevision, PhaseKind};
 use service::Connection;
 
+use crate::support::arch;
+
 /// A package revision of the Triton `rms_norm` package.
 fn revision() -> PackageRevision {
     PackageRevision {
@@ -47,8 +49,11 @@ impl Frames for Connection {
     }
 
     fn receive<M: service::Message>(&mut self) -> std::io::Result<(M, Vec<OwnedFd>)> {
-        self.recv_with(std::time::Duration::from_secs(60))?
-            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))
+        // The blocking receive the client itself uses: no deadline, so a
+        // frame that never arrives fails the test by hanging it, not by a
+        // timeout that a slow host could reach.
+        self.recv_with(std::time::Duration::MAX)?
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
     }
 }
 
@@ -162,7 +167,7 @@ fn prepare_reports_each_build_and_returns_the_selected_packages() {
                 op: "rms_norm".into(),
                 backend: "triton".into(),
                 revision: 2,
-                target: "sm_100a".into(),
+                target: arch().to_string(),
                 descriptor: "dtype_bf16".into(),
                 state: state as i32,
                 detail: detail.into(),
@@ -198,7 +203,7 @@ fn prepare_reports_each_build_and_returns_the_selected_packages() {
     });
 
     let request = PrepareRequest {
-        targets: vec![Target::new("sm_100a")],
+        targets: vec![arch()],
         packages: vec![PackageRequest {
             slot: ModuleSlot::all("rms_norm"),
             selector: Selector::Latest {
@@ -224,7 +229,7 @@ fn prepare_reports_each_build_and_returns_the_selected_packages() {
             "triton",
             2,
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "sm_100a",
+            arch().as_str(),
             "dtype_bf16"
         )
         .unwrap()
@@ -251,7 +256,6 @@ fn a_module_comes_back_with_its_files_over_their_descriptors() {
                                 size: "the cubin bytes".len() as u64,
                                 path: "/store/module.cubin".into(),
                             }],
-                            entry: String::new(),
                             entries: std::collections::HashMap::new(),
                             metadata: "metadata.json".into(),
                             interface_version: 1,
@@ -264,13 +268,7 @@ fn a_module_comes_back_with_its_files_over_their_descriptors() {
     });
 
     let module = client
-        .resolve(
-            "rms_norm",
-            &revision(),
-            &Target::new("sm_100a"),
-            "dtype_bf16",
-            &mut |_| {},
-        )
+        .resolve("rms_norm", &revision(), &arch(), "dtype_bf16", &mut |_| {})
         .unwrap();
 
     assert_eq!(module.form, ModuleForm::Cubin);
@@ -299,7 +297,7 @@ fn a_listing_names_the_packages_revisions_and_modules() {
                             backend: "triton".into(),
                             revision: 2,
                             modules: vec![wire::ModuleEntry {
-                                target: "sm_100a".into(),
+                                target: arch().to_string(),
                                 descriptor: "dtype_bf16".into(),
                                 form: wire::ModuleForm::Cubin as i32,
                                 interface_version: 1,
@@ -410,7 +408,6 @@ fn a_native_module_comes_back_with_its_entries_by_role() {
                                 size: "the shared object".len() as u64,
                                 path: "/store/module.so".into(),
                             }],
-                            entry: String::new(),
                             entries: [
                                 ("launch".to_owned(), "uniserve_launch".to_owned()),
                                 ("restore".to_owned(), "uniserve_restore".to_owned()),
@@ -431,7 +428,7 @@ fn a_native_module_comes_back_with_its_entries_by_role() {
         .resolve(
             "expert_exchange",
             &revision(),
-            &Target::new("sm_100a"),
+            &arch(),
             "dtype_bf16",
             &mut |_| {},
         )
@@ -458,7 +455,7 @@ fn a_listing_names_a_policy_module_as_a_wasm_module() {
                             backend: "fcfs".into(),
                             revision: 1,
                             modules: vec![wire::ModuleEntry {
-                                target: "wasm32".into(),
+                                target: Target::wasm().to_string(),
                                 descriptor: "default".into(),
                                 form: wire::ModuleForm::Wasm as i32,
                                 interface_version: 1,
@@ -488,7 +485,7 @@ fn a_listed_module_of_an_unknown_form_is_refused_rather_than_guessed() {
                             backend: "triton".into(),
                             revision: 1,
                             modules: vec![wire::ModuleEntry {
-                                target: "sm_100a".into(),
+                                target: arch().to_string(),
                                 descriptor: "dtype_bf16".into(),
                                 form: 99,
                                 interface_version: 1,

@@ -13,7 +13,6 @@ The row count, the element count, the stage, the draw index and the scalar key a
 """
 
 import philox_noise as kernels
-from uniserve_build_server import triton as driver
 
 #: The dtypes the drawn noise may have: the draw is computed in FP32 and stored.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -51,7 +50,3 @@ def spec(fields, parameters, target):
         },
         "options": {"num_warps": warps_of(block)},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

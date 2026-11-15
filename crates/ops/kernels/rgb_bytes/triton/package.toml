@@ -37,10 +37,9 @@ files = ["src/rgb_bytes.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a", "sm_100f"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 # `f16` is the video VAE's raster dtype; `bf16` and `f32` are accepted because the
 # arithmetic is the same either way: the values convert to FP32 before the
 # de-normalization.

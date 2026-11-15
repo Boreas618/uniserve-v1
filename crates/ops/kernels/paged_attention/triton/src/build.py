@@ -14,7 +14,6 @@ only by accident.
 """
 
 import paged_attention as kernels
-from uniserve_build_server import triton as driver
 
 #: The element types a cache plane may have, as Triton spells them.
 PLANES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32", "f8e4m3": "fp8e4nv"}
@@ -151,7 +150,3 @@ def spec(fields, parameters, target):
         "options": options,
         "aligned": list(ALIGNED) if prefill else [],
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

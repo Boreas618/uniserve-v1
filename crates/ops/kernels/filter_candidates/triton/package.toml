@@ -26,14 +26,13 @@ files = ["src/filter_candidates.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `width_151936_tile_4096_ids_i32_pdl_false`.
 #
 # The width, the row's candidate bound, is a launch word; the tile is the power-of-two
 # chunk the program walks the row in.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { width = { min = 1 }, tile = { power_of_two = true }, ids = ["i32", "i64"], pdl = ["true", "false"] }
 
 [parameters]

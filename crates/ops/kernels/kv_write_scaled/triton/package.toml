@@ -32,13 +32,12 @@ files = ["src/kv_write_scaled.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_scale_f32_page_64_heads_4_head_dim_128_block_128_pdl_false`.
 #
 # `page`, `heads` and `head_dim` are launch words; the block is a `tl.arange` extent.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f32"], scale = ["f32"], page = { min = 1 }, heads = { min = 1 }, head_dim = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"] }
 
 [parameters]

@@ -32,10 +32,9 @@ files = ["src/pcm_interleave.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a", "sm_100f"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["f32"], block = { power_of_two = true }, pdl = ["true", "false"] }
 
 [parameters]

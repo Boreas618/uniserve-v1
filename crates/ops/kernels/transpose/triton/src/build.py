@@ -11,7 +11,6 @@ while the arithmetic does not.
 """
 
 import transpose as kernels
-from uniserve_build_server import triton as driver
 
 #: Triton's element type for each element type the operator accepts.
 POINTERS = {"f16": "*fp16", "bf16": "*bf16", "f32": "*fp32"}
@@ -41,7 +40,3 @@ def spec(fields, parameters, target):
         "constexprs": {"BLOCK": block, "PDL": pdl},
         "options": {"num_warps": warps_of(block), "launch_pdl": pdl},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

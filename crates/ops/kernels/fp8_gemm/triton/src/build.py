@@ -53,7 +53,3 @@ def spec(fields, parameters, target):
         # contraction (without the statement the product runs at a fortieth of its rate).
         "aligned": ["x_ptr", "w_ptr", "out_ptr", "k", "x_row_stride"],
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

@@ -11,7 +11,6 @@ launch words.
 """
 
 import vsa_select_tiles as kernels
-from uniserve_build_server import triton as driver
 
 
 def spec(fields, parameters, target):
@@ -33,7 +32,3 @@ def spec(fields, parameters, target):
         "constexprs": {"block": int(fields["block"])},
         "options": {"num_warps": 4},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

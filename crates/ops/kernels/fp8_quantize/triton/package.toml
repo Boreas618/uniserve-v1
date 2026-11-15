@@ -29,10 +29,9 @@ files = ["src/fp8_quantize.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16"], block = { power_of_two = true, min = 16 } }
 
 [parameters]

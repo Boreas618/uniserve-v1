@@ -9,15 +9,10 @@ kernels the deployment launches at startup.
 
 The kernels build with the Build Server's own Python environment
 (``crates/build-server/python``), which holds the compilers and the packages
-kernel packages import (Triton, CuTe DSL, FlashInfer). The repository's
-development environment holds the development tools and the evaluator, and none
-of those, so a build run with it stops at its first import.
-
-``UNISERVE_BUILD_SERVER_PYTHON`` names that environment's interpreter (the
-tree's ``crates/build-server/python/.venv`` when unset),
-``UNISERVE_SCHEDULING_PRECOMPILE`` the wasm precompiler (a ``uniserve-engine``
-executable), and ``UNISERVE_BINARY``
-the ``uniserve`` binary.
+kernel packages import (Triton, CuTe DSL, FlashInfer); the server runs its
+program, ``uniserve-build-server``, from the search path, so a host that runs
+these tests has that environment installed with its program there.
+``UNISERVE_BINARY`` names the ``uniserve`` binary.
 """
 
 from __future__ import annotations
@@ -66,45 +61,19 @@ def repository() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def compiler() -> Path:
-    """The interpreter of the Build Server's own environment.
+def require_toolchain_environment() -> None:
+    """Fails the test when this host has no Build Server toolchain environment.
 
-    It compiles every kernel package, and nothing else provides what the
-    modules import. ``UNISERVE_BUILD_SERVER_PYTHON`` names it; unset, it
-    is the environment `uv sync --locked --project crates/build-server/python`
-    creates in the tree.
+    The Build Server reads its toolchains from its environment's program,
+    ``uniserve-build-server``, on the search path; without it no kernel package
+    builds, and the first deployment would fail by its first module.
     """
-    named = os.environ.get("UNISERVE_BUILD_SERVER_PYTHON")
-    path = (
-        Path(named)
-        if named
-        else repository() / "crates/build-server/python/.venv/bin/python"
-    )
-    if not path.exists():
+    if shutil.which("uniserve-build-server") is None:
         pytest.fail(
-            f"the Build Server's interpreter {path} does not exist: "
-            "`uv sync --locked --project crates/build-server/python` "
-            "makes one, or UNISERVE_BUILD_SERVER_PYTHON names another"
+            "no uniserve-build-server on the search path: install the Build "
+            "Server's environment (`uv sync --locked --project "
+            "crates/build-server/python`) and put its program on the path"
         )
-    return path
-
-
-def precompiler() -> Path:
-    """The wasm precompiler the Build Server turns a policy module into.
-
-    A policy is built for wasm32 and precompiled for this host's CPU, so the
-    server needs the precompiler before it can install a policy: a
-    ``uniserve-engine`` executable, whose ``precompile`` command the server
-    runs. ``UNISERVE_SCHEDULING_PRECOMPILE`` names it.
-    """
-    named = os.environ.get("UNISERVE_SCHEDULING_PRECOMPILE")
-    if not named:
-        pytest.fail(
-            "UNISERVE_SCHEDULING_PRECOMPILE must name the precompiler, a "
-            "uniserve-engine executable: `cargo build -p engine --bin "
-            "uniserve-engine` builds it"
-        )
-    return Path(named)
 
 
 def module_target() -> str:
@@ -158,7 +127,7 @@ def build_server(
       name every descriptor key the deployment launches, and the server builds
       each on its first prepare, so a deployment's startup builds exactly what
       it launches;
-    * the policy — ``POLICY_PACKAGE``, a wasm package this host precompiles.
+    * the policy — ``POLICY_PACKAGE``, a crate this host builds for wasm32.
 
     The package root and the store live as long as the module, and every test
     of the module deploys against this one server, so a module is built once and
@@ -191,10 +160,8 @@ def build_server(
         str(store),
         "--target",
         module_target(),
-        "--wasm",
-        str(precompiler()),
     ]
-    command += ["--python", str(compiler())]
+    require_toolchain_environment()
     process = start_server(command, log)
     deadline = time.monotonic() + 120.0
     while time.monotonic() < deadline:
@@ -281,10 +248,6 @@ def remote_build_server(host: str) -> Iterator[str]:
         f"{work}/modules",
         "--target",
         module_target(),
-        "--wasm",
-        str(precompiler()),
-        "--python",
-        str(compiler()),
     ]
     # The server runs in this test's environment: its search paths, native
     # libraries and CUDA toolkit, the FFmpeg prefix and libclang (with its

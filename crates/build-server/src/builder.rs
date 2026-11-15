@@ -8,9 +8,8 @@
 //!
 //! The queue is ordered by urgency first and arrival second. A build starts
 //! only when two limits allow it: [`Limits::max_jobs`] builds at once, and the
-//! host has [`Limits::host_reserve`] bytes of memory left after the build's
-//! [`Toolchain::peak_host_bytes`](crate::toolchain::Toolchain::peak_host_bytes)
-//! would be spent. A build that cannot start waits in the queue, in its place;
+//! host has [`Limits::host_reserve`] bytes of memory left after the peak its
+//! toolchain declares ([`Limits::peaks`]) would be spent. A build that cannot start waits in the queue, in its place;
 //! the Build Server launches no kernel, so the only resource it rations is
 //! host memory.
 //!
@@ -21,24 +20,33 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use crate::store::ModulePath;
+use crate::toolchain::PeakMemory;
 
-/// How many builds may run at once, and how much host memory must stay free.
+/// How many builds may run at once, how much host memory must stay free, and
+/// how much each build reserves. Each is a declared option of the Build Server
+/// (`--max-jobs`, `--host-reserve`, `--peak-memory`) with the documented
+/// default [`Limits::default`] states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// The number of builds that may run at the same time
-    /// (`limits.max_jobs`). Every toolchain process also carries this number
-    /// as its `MAX_JOBS`, so a build's own compilers are capped too.
+    /// The number of builds that may run at the same time, which is also the
+    /// number of compiler processes each build may run: a compile request's
+    /// job limit and cargo's `--jobs`. 4 unless stated.
     pub max_jobs: usize,
-    /// The host memory that must remain available before a build starts
-    /// (`limits.host_reserve`), in bytes.
+    /// The host memory that must remain available before a build starts, in
+    /// bytes. 8 GiB unless stated.
     pub host_reserve: u64,
+    /// The peak host memory one build of each toolchain reserves, in bytes
+    /// ([`PeakMemory::default_for`] unless stated).
+    pub peaks: PeakMemory,
 }
 
 impl Default for Limits {
     fn default() -> Self {
+        let max_jobs = 4;
         Self {
-            max_jobs: 4,
+            max_jobs,
             host_reserve: 8 << 30,
+            peaks: PeakMemory::default_for(max_jobs),
         }
     }
 }
@@ -125,8 +133,8 @@ impl Builder {
             return;
         }
 
-        // A path built again (a resolve retrying a failed build) replaces
-        // what the queue knew about it.
+        // A path the queue knew as ended is submitted again only when its
+        // module left the store; the new build replaces what the queue knew.
         self.finished.retain(|build| build.key() != key);
         self.enqueue(Build {
             path: path.clone(),
@@ -208,5 +216,26 @@ impl Builder {
     /// The number of queued and running builds.
     pub fn pending(&self) -> usize {
         self.queued.len() + self.running.len()
+    }
+
+    /// The number of running builds.
+    pub fn running(&self) -> usize {
+        self.running.len()
+    }
+
+    /// Fails every queued build with `message`, and returns them: what the
+    /// queue does when the host's memory cannot be read, since a build is
+    /// started only against it.
+    pub fn fail_queued(&mut self, message: &str) -> Vec<Build> {
+        let failed: Vec<Build> = self
+            .queued
+            .drain(..)
+            .map(|mut build| {
+                build.state = BuildState::Failed(message.to_owned());
+                build
+            })
+            .collect();
+        self.finished.extend(failed.iter().cloned());
+        failed
     }
 }

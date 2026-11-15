@@ -12,7 +12,6 @@ a module option, so a descriptor that asks for it compiles one that declares it 
 """
 
 import patch as kernels
-from uniserve_build_server import triton as driver
 
 #: The element types the latent and the rows may have; the move is exact in each of them.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -50,7 +49,3 @@ def spec(fields, parameters, target):
             "launch_pdl": fields["pdl"] == "true",
         },
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

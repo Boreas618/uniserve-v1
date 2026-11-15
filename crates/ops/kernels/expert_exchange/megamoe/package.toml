@@ -34,8 +34,11 @@ restore = "uniserve_expert_exchange_restore"
 release = "uniserve_expert_exchange_release"
 info = "uniserve_expert_exchange_info"
 
+# `src/build.py` is the whole compilation (`compile(request)`), not a `spec` the
+# shared CuTe DSL driver compiles, so the source kind is `cuda`; `[toolchain]`
+# names the CuTe DSL release the Build Server checks.
 [source]
-kind = "cute_dsl"
+kind = "cuda"
 files = [
     "include/uniserve_expert_exchange.h",
     "patches/megamoe.patch",
@@ -46,7 +49,6 @@ files = [
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a"]
 
 # `mode_fused_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_512_ranks_2_attention_0_dtype_bf16`.
@@ -54,7 +56,7 @@ architectures = ["sm_100a"]
 # compiled for any value its tiles divide: the block-scaled operands' contiguous extents are
 # whole 128-element runs (`is_valid_tensor_alignment`), and a weight's rows are whole
 # 256-row two-CTA tiles, so `hidden` is a multiple of 256 and `intermediate` of 128.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { mode = ["fused"], hidden = { multiple = 256 }, intermediate = { multiple = 128 }, top = { min = 1 }, experts = { min = 1 }, max_tokens = { min = 1 }, ranks = { min = 1 }, attention = ["0"], dtype = ["bf16"] }
 
 [parameters]

@@ -28,7 +28,6 @@ import pathlib
 import re
 import sys
 import tempfile
-import tomllib
 
 # The compiler picks `ptxas` off `PATH`, and the system one may not know this host's architecture;
 # the CUDA toolkit `CUDA_HOME` names, which the store is built with, does. The Triton cache goes
@@ -50,7 +49,8 @@ KERNELS = REPOSITORY / "crates/ops/kernels"
 # A package's `build.py` imports its compile driver from the Build Server's Python package, so
 # the package's source is importable from this tree whichever interpreter runs the tool.
 sys.path.insert(0, str(REPOSITORY / "crates/build-server/python/src"))
-from uniserve_build_server import package as driver_package  # noqa: E402
+from uniserve_build_server import triton as driver  # noqa: E402
+from uniserve_build_server.request import Target  # noqa: E402
 
 #: The parameters the compiler's launcher appends to every Triton kernel.
 IMPLICIT = 2
@@ -150,14 +150,18 @@ def module_parameters(operator, key):
         source = manifest_path.parent / "src"
         if not (source / "build.py").exists():
             continue
-        manifest = tomllib.loads(manifest_path.read_text())
         sys.path.insert(0, str(source))
         try:
             spec_module = importlib.util.spec_from_file_location("build", source / "build.py")
             module = importlib.util.module_from_spec(spec_module)
             spec_module.loader.exec_module(module)
-            fields = driver_package.read_fields(source.parent, key)
-            described = module.spec(fields, manifest.get("parameters", {}), "sm_100a")
+            described = driver.stated_for(
+                module.spec,
+                source.parent,
+                key,
+                Target.named("sm_100a"),
+                os.environ.get("UNISERVE_BINARY", "uniserve"),
+            )
             import triton
             from triton.backends.compiler import GPUTarget
             from triton.compiler.compiler import ASTSource

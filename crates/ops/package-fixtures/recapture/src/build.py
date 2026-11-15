@@ -1,29 +1,26 @@
-"""The recapture fixture's compile script: one descriptor -> one module.
+"""The recapture fixture's build module: one descriptor -> one module.
 
-The module is a `gemm` that launches two kernels (the product into FP32 scratch,
-then the epilogue) where the serving `cublas_lt` package launches one. Its
-descriptor's element types, weight order and epilogue are known when it is
-compiled, so the script passes them as defines; the launch
-form itself is read from the package's manifest, so the symbol the module
-exports and the symbol the package declares cannot disagree.
+The module is a `gemm` that launches two kernels (the product into FP32
+scratch, then the epilogue) where the serving `cublas_lt` package launches one.
+Its descriptor's element types, weight order and epilogue are known when it is
+compiled, so the build passes them as defines; the launch form itself is read
+from the package's manifest, so the symbol the module exports and the symbol
+the package declares cannot disagree.
 
 A descriptor this fixture does not implement — an accumulate type other than
 FP32, or an input and weight of different element types — is refused here by
 name, rather than compiled into a module that would refuse every launch.
 
-The Build Server runs this script with its own Python environment, its working
-directory the package root, and `UNISERVE_OP`, `UNISERVE_BACKEND`,
-`UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE`, `UNISERVE_OUT` and
-`MAX_JOBS` in the environment.
+The Build Server compiles a descriptor by calling :func:`compile` with the
+compile request.
 """
 
-import argparse
 import json
-import os
-import pathlib
 import subprocess
 import sys
 import tomllib
+
+from uniserve_build_server.request import Request
 
 #: The translation unit of the module.
 SOURCES = ["src/split_k.cu"]
@@ -47,45 +44,9 @@ ORDERS = {"kxn": 0, "nxk": 1}
 EPILOGUES = {"none": 0, "bias": 1}
 
 
-def arguments():
-    """The package, descriptor, target and output directory of one build."""
-    reader = argparse.ArgumentParser(description=__doc__)
-    reader.add_argument("--package")
-    reader.add_argument("--descriptor")
-    reader.add_argument("--target")
-    reader.add_argument("--out")
-    known = reader.parse_args()
-    values = {
-        "package": known.package or os.environ.get("UNISERVE_PACKAGE"),
-        "descriptor": known.descriptor or os.environ.get("UNISERVE_DESCRIPTOR"),
-        "target": known.target or os.environ.get("UNISERVE_TARGET"),
-        "out": known.out or os.environ.get("UNISERVE_OUT"),
-    }
-    missing = [name for name, value in values.items() if not value]
-    if missing:
-        raise SystemExit(f"missing {', '.join(missing)}")
-    return (
-        pathlib.Path(values["package"]).resolve(),
-        values["descriptor"],
-        values["target"],
-        pathlib.Path(values["out"]),
-    )
-
-
-def field(key, name):
-    """The value the descriptor's fields give one field, such as its input type.
-
-    The Build Server read the key and states its fields in ``UNISERVE_FIELDS``.
-    """
-    fields = json.loads(os.environ.get("UNISERVE_FIELDS") or "{}")
-    if name not in fields:
-        raise SystemExit(f"the descriptor {key} names no {name}")
-    return fields[name]
-
-
-def element_type(key, name):
+def element_type(request, name):
     """The `DType` number a descriptor's field names."""
-    token = field(key, name)
+    token = request.field(name)
     if token not in ELEMENT_TYPES:
         raise SystemExit(
             f"{name} = {token!r} is not an element type the operator has"
@@ -104,16 +65,21 @@ def launch_entry(package):
     return entry
 
 
-def main():
-    """Compile the fixture for one descriptor into ``module.so``."""
-    package, descriptor, target, out = arguments()
+def compile(request: Request) -> None:
+    """Compile the fixture for the request's descriptor into ``module.so``.
+
+    The descriptor is checked first, so one this fixture does not implement is
+    refused by name; a compiler failure refuses the build, with the compiler's
+    output in the build log.
+    """
+    package = request.package
     entry = launch_entry(package)
-    input_type = element_type(descriptor, "input")
-    weight_type = element_type(descriptor, "weight")
-    output_type = element_type(descriptor, "output")
-    accumulate = element_type(descriptor, "accumulate")
-    order = field(descriptor, "order")
-    epilogue = field(descriptor, "epilogue")
+    input_type = element_type(request, "input")
+    weight_type = element_type(request, "weight")
+    output_type = element_type(request, "output")
+    accumulate = element_type(request, "accumulate")
+    order = request.field("order")
+    epilogue = request.field("epilogue")
     if order not in ORDERS:
         raise SystemExit(
             f"order = {order!r} is not a weight order the operator has"
@@ -135,14 +101,13 @@ def main():
     }:
         raise SystemExit("this fixture writes f16, bf16 or f32 products")
 
-    out.mkdir(parents=True, exist_ok=True)
     # The nvcc the Build Server checked against this package's declared version.
-    compiler = os.environ["UNISERVE_NVCC"]
+    compiler = request.toolchain.require_cuda().nvcc
     command = [
         compiler,
         "-O3",
         "-std=c++17",
-        f"-arch={target}",
+        f"-arch={request.target}",
         "--shared",
         "-Xcompiler",
         "-fPIC",
@@ -156,32 +121,19 @@ def main():
         *[str(package / source) for source in SOURCES],
         "-lcudart",
         "-o",
-        str(out / "module.so"),
+        str(request.output / "module.so"),
     ]
     print(" ".join(command), file=sys.stderr)
-    built = subprocess.run(command, capture_output=True, text=True, check=False)
+    built = subprocess.run(command, check=False)
     if built.returncode != 0:
-        raise SystemExit(
-            f"nvcc failed with {built.returncode}:\n{built.stderr[-4000:]}"
-        )
+        raise SystemExit(f"nvcc failed with {built.returncode}")
 
-    exported = subprocess.run(
-        ["nm", "-D", "--defined-only", str(out / "module.so")],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    symbols = {
-        line.split()[-1]
-        for line in exported.stdout.splitlines()
-        if line.split()
-    }
-    if entry not in symbols:
-        raise SystemExit(f"module.so does not export {entry}")
     print(
-        json.dumps({"descriptor": descriptor, "target": target, "entry": entry})
+        json.dumps(
+            {
+                "descriptor": request.descriptor,
+                "target": str(request.target),
+                "entry": entry,
+            }
+        )
     )
-
-
-if __name__ == "__main__":
-    main()

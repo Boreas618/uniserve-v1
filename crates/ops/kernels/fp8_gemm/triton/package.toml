@@ -32,11 +32,10 @@ files = ["src/fp8_gemm.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_block_m_128_block_n_128_block_k_128_bias_false`.
-[kernel.descriptors]
+[[kernel.descriptors]]
 # The three tile extents are `tl.arange` extents and `tl.dot` operands, so
 # powers of two of at least sixteen.
 dimensions = { dtype = ["bf16", "f16"], block_m = { power_of_two = true, min = 16 }, block_n = { power_of_two = true, min = 16 }, block_k = { power_of_two = true, min = 32 }, bias = ["false", "true"] }

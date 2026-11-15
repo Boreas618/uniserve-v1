@@ -28,7 +28,6 @@ files = ["src/philox_noise.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # Two shapes, because the operator prints two: a draw addressed by the rows' own keys names

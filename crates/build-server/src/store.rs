@@ -20,18 +20,26 @@
 //! the others are shared, read-only roots that other hosts mount, so a module
 //! one host built is found by all of them.
 //!
-//! Publication: a build writes into a workspace directory and the store moves
-//! that directory into place: every file is fsynced, the directory is renamed
-//! atomically, and a `.committed` mark is written into it. Only a directory
-//! with the mark is a module; a reader that sees a half-written directory
-//! without one ignores it, and a build interrupted before the rename leaves
-//! nothing a reader can find.
+//! Publication: a build writes into a workspace directory and the store copies
+//! its files into a staging directory beside the module's place, writes the
+//! `.committed` mark there, fsyncs every file and renames the directory into
+//! place atomically. Only a directory with the mark is a module, and the mark
+//! arrives with every file, so a reader never finds a partial module and a
+//! publish interrupted before the rename leaves nothing a reader can find.
 //!
 //! The mark is the module's record: it states the version of the interface
 //! the module's package implements, which `resolve` hands to the loader with
 //! the files so that a loader built for another version refuses the module.
+//!
+//! A staging directory is owned by its writer through a lock it holds for the
+//! staging's life ([`Staging`]): a staging directory whose lock no live
+//! process holds is a crashed writer's, and the next publish beside it removes
+//! it.
 
+use std::fs::File;
 use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::snapshot::Files;
@@ -45,9 +53,11 @@ pub const COMMITTED: &str = ".committed";
 /// for.
 pub const INTERFACE_VERSION: &str = "interface_version";
 
-/// Numbers the staging directories one process makes, so two publishes beside
-/// each other never share one.
-static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The prefix of a staging directory's name, and of its lock's.
+const STAGING: &str = ".staged-";
+
+/// The suffix of a staging directory's lock beside it.
+const STAGING_LOCK: &str = ".lock";
 
 /// The longest a module path's last segment may be, in bytes.
 ///
@@ -227,10 +237,10 @@ impl Store {
     /// `interface_version` of its package's interface.
     ///
     /// `workspace` is the build's directory; `files` names the files in it
-    /// that belong to the module, in the order they are stored. Every file is
-    /// fsynced, the directory is renamed into place atomically, and the
-    /// `.committed` mark, which records the interface version, is written
-    /// last, so a reader never finds a module that is partly written.
+    /// that belong to the module, in the order they are stored. The files and
+    /// the `.committed` mark, which records the interface version, are fsynced
+    /// in a staging directory that is renamed into place atomically, so a
+    /// reader never finds a module that is partly written.
     pub fn publish(
         &self,
         path: &ModulePath,
@@ -253,25 +263,11 @@ impl Store {
                 format!("{path} has no parent directory"),
             ))
         })?;
-        std::fs::create_dir_all(parent)?;
-        // The staged name carries no part of the key: a key may be as long as a
+        // The staging name carries no part of the key: a key may be as long as a
         // file name allows, and a staging name that embedded it would quietly
         // lower that bound by the length of a suffix.
-        let staged = parent.join(format!(
-            ".staged-{}-{}",
-            std::process::id(),
-            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        if staged.exists() {
-            std::fs::remove_dir_all(&staged)?;
-        }
-        // A publish that died between its staging and its rename leaves a
-        // directory no reader treats as a module and no later publish reuses, so
-        // the leftovers of a previous run are swept here. Only another process's
-        // are swept: this process's live ones are beside them and must be left
-        // alone.
-        sweep_other_staging(parent)?;
-        std::fs::create_dir_all(&staged)?;
+        let staging = Staging::new(parent)?;
+        let staged = staging.path();
         for name in files {
             let source = workspace.join(name);
             let destination = staged.join(name);
@@ -279,39 +275,34 @@ impl Store {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::copy(&source, &destination)?;
-            std::fs::File::open(&destination)?.sync_all()?;
+            File::open(&destination)?.sync_all()?;
         }
-        sync_directory(&staged)?;
-        if destination.exists() {
-            if recorded_version(&destination).is_some() {
-                // A path fixes a module's content, so a committed module
-                // is never replaced (design section 5.3).
-                std::fs::remove_dir_all(&staged)?;
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("{path} is already committed"),
-                )));
-            }
-            // A build that died between the rename and the mark, or a store
-            // written before modules recorded their interface version, left
-            // a directory no reader treats as a module; this publish
-            // replaces it.
-            std::fs::remove_dir_all(&destination)?;
-        }
-        std::fs::rename(&staged, &destination)?;
-        sync_directory(parent)?;
-        // The mark makes the directory a module. It is written after the
-        // rename and fsynced with its directory, so a reader that finds it
-        // finds every file.
-        let mark = destination.join(COMMITTED);
+        let mark = staged.join(COMMITTED);
         std::fs::write(
             &mark,
             format!("{INTERFACE_VERSION} = {interface_version}\n"),
         )?;
-        std::fs::File::open(&mark)?.sync_all()?;
-        sync_directory(&destination)?;
-        sync_directory(parent)?;
-        Ok(())
+        File::open(&mark)?.sync_all()?;
+        sync_directory(staged)?;
+        // A path fixes a module's content, so a committed module is never
+        // replaced (design section 5.3): the rename refuses a destination that
+        // holds one.
+        staging
+            .publish(&destination)
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty => {
+                    let held = if recorded_version(&destination).is_some() {
+                        "is already committed"
+                    } else {
+                        "holds a directory that is no committed module (no readable mark)"
+                    };
+                    Error::Io(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{path} {held}"),
+                    ))
+                }
+                _ => Error::Io(error),
+            })
     }
 
     /// Every committed module under the roots, from the first root that has
@@ -360,8 +351,7 @@ impl Store {
 }
 
 /// The interface version the mark of the module directory `directory` records,
-/// or `None` when the directory is no committed module: it has no mark, or a
-/// mark that states no version.
+/// or `None` when the directory is no committed module.
 fn recorded_version(directory: &Path) -> Option<u32> {
     let record = std::fs::read_to_string(directory.join(COMMITTED)).ok()?;
     let record: toml::Table = toml::from_str(&record).ok()?;
@@ -399,8 +389,9 @@ fn collect(directory: &Path, prefix: &Path, files: &mut Files) -> Result<()> {
     Ok(())
 }
 
-/// A path's last name, as a `String`. Every name the store makes is UTF-8.
-fn file_name(path: &Path) -> String {
+/// A path's last name, as a `String`. Every name the Build Server makes is
+/// UTF-8.
+pub(crate) fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default()
@@ -410,8 +401,10 @@ fn revision_path(revision: u32, backend: &Path) -> PathBuf {
     backend.join(revision.to_string())
 }
 
-/// The subdirectories of a directory, in name order.
-fn directories(path: &Path) -> Result<Vec<PathBuf>> {
+/// The subdirectories of a directory, in name order, without the ones whose
+/// name starts with `.`: those are a writer's staging directories, not names
+/// the Build Server publishes.
+pub(crate) fn directories(path: &Path) -> Result<Vec<PathBuf>> {
     let mut directories = Vec::new();
     if !path.is_dir() {
         return Ok(directories);
@@ -432,48 +425,166 @@ fn directories(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(directories)
 }
 
-/// Removes staging directories a previous process left beside a publish.
+/// A directory a writer fills beside the place it publishes it to, and the
+/// lock that makes the writer its owner.
 ///
-/// Publishing stages under `.staged-<pid>-<n>` and renames it into place, so a
-/// crash between the two leaves a directory that is invisible to a reader and
-/// never reused. A pid in the name is what says whether that process is still
-/// running: this one's staged directories are live and are left alone.
-fn sweep_other_staging(parent: &Path) -> Result<()> {
-    // Whether a process is alive is a fact this only knows how to ask for on a
-    // host with `/proc`. Without one, every other staging directory looks dead,
-    // and sweeping a live peer's would corrupt its publish — so a host that
-    // cannot response the question keeps the leftovers instead.
-    if !Path::new("/proc").is_dir() {
-        return Ok(());
+/// The lock is a file beside the directory (`.staged-<name>.lock`), created and
+/// locked (`flock`) before the directory exists and held until the staging is
+/// published or dropped, so a staging directory whose lock is free is a crashed
+/// writer's. Every new staging sweeps those beside it ([`Staging::sweep`]); a
+/// live writer's staging is never touched, whatever process or host made it.
+pub(crate) struct Staging {
+    directory: PathBuf,
+    lock: PathBuf,
+    /// The locked file; closing it releases the lock.
+    _held: File,
+    published: bool,
+}
+
+impl Staging {
+    /// A new staging directory in `parent`, after the crashed writers'
+    /// leftovers there are removed.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the directory, its lock or a sweep cannot be made.
+    pub(crate) fn new(parent: &Path) -> Result<Staging> {
+        std::fs::create_dir_all(parent)?;
+        Self::sweep(parent)?;
+        loop {
+            let named = tempfile::Builder::new()
+                .prefix(STAGING)
+                .suffix(STAGING_LOCK)
+                .tempfile_in(parent)?;
+            let (held, lock) = named.keep().map_err(|error| Error::Io(error.error))?;
+            flock(&held, libc::LOCK_EX)?;
+            // A sweeper may have taken and removed the lock between its creation
+            // and this lock: the file this process holds is then no longer the one
+            // at the path, and another is made.
+            if !same_file(&held, &lock) {
+                continue;
+            }
+            let name = file_name(&lock);
+            let directory = parent.join(name.trim_end_matches(STAGING_LOCK));
+            std::fs::create_dir(&directory)?;
+            return Ok(Staging {
+                directory,
+                lock,
+                _held: held,
+                published: false,
+            });
+        }
     }
-    let mine = format!(".staged-{}-", std::process::id());
-    for entry in std::fs::read_dir(parent)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with(".staged-") || name.starts_with(&mine) {
-            continue;
-        }
-        // A second server may be publishing into the same root, and its staging
-        // directory is as live as this one's. The name says which process made
-        // it; only a process that is gone leaves work to sweep.
-        let pid = name
-            .trim_start_matches(".staged-")
-            .split('-')
-            .next()
-            .and_then(|pid| pid.parse::<u32>().ok());
-        let Some(pid) = pid else { continue };
-        if Path::new(&format!("/proc/{pid}")).exists() {
-            continue;
-        }
-        if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(entry.path())?;
-        }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.directory
     }
-    Ok(())
+
+    /// Renames the staging directory into place at `destination`, which must
+    /// not hold a non-empty directory, and fsyncs its parent.
+    ///
+    /// # Errors
+    ///
+    /// The rename's error: `AlreadyExists` or `DirectoryNotEmpty` when the
+    /// destination is taken.
+    pub(crate) fn publish(mut self, destination: &Path) -> io::Result<()> {
+        std::fs::rename(&self.directory, destination)?;
+        self.published = true;
+        if let Some(parent) = destination.parent() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    }
+
+    /// Removes the staging directories in `parent` whose lock no writer
+    /// holds, with their locks.
+    fn sweep(parent: &Path) -> Result<()> {
+        for entry in std::fs::read_dir(parent)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            let Some(staged) = name
+                .strip_prefix(STAGING)
+                .and_then(|rest| rest.strip_suffix(STAGING_LOCK))
+            else {
+                continue;
+            };
+            let lock = parent.join(&name);
+            let Ok(file) = File::open(&lock) else {
+                continue;
+            };
+            // A writer holds its lock for the staging's whole life.
+            if flock(&file, libc::LOCK_EX | libc::LOCK_NB).is_err() {
+                continue;
+            }
+            let directory = parent.join(format!("{STAGING}{staged}"));
+            if directory.is_dir() {
+                std::fs::remove_dir_all(&directory)?;
+            }
+            // Another publish beside this one may have swept the same leftover.
+            match std::fs::remove_file(&lock) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::Io(error)),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Staging {
+    /// An unpublished staging directory is removed with its lock; a published
+    /// one leaves only its lock to remove.
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+        let _ = std::fs::remove_file(&self.lock);
+    }
+}
+
+/// Holds the lock file `.lock` of the directory `root` for the life of the
+/// returned file: the one writer of what the directory holds, such as an
+/// upstream Build Server's package root.
+///
+/// # Errors
+///
+/// `WouldBlock` when another live process holds the lock, or the lock's
+/// creation error.
+pub(crate) fn hold(root: &Path) -> Result<File> {
+    std::fs::create_dir_all(root)?;
+    let path = root.join(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    flock(&file, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| {
+        Error::Io(io::Error::new(
+            error.kind(),
+            format!("{} is held by another writer: {error}", path.display()),
+        ))
+    })?;
+    Ok(file)
+}
+
+/// Takes `operation` (`LOCK_EX`, with `LOCK_NB` for a try) on `file`.
+fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
+    // SAFETY: flock on a descriptor `file` owns for the call.
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Whether the open `file` is the file at `path` now.
+fn same_file(file: &File, path: &Path) -> bool {
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+        _ => false,
+    }
 }
 
 /// Flushes a directory's entries, so a rename into it survives a crash.
 fn sync_directory(path: &Path) -> io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
+    File::open(path)?.sync_all()
 }

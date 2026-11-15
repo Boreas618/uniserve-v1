@@ -28,12 +28,11 @@ files = ["src/gated_rms_norm.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_columns_128_tile_128`, and `..._gate_sigmoid` for a sigmoid gate; a key that
 # states no gate is the SiLU gate's.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true }, gate = ["sigmoid"] }
 
 [parameters]

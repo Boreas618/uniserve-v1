@@ -1,92 +1,101 @@
 # The Build Server's Python environment
 
-No serving process carries a Python interpreter: in a deployment, Python appears here alone, as the compiler of kernel packages. The Build Server runs every package's compile script with this environment's interpreter; it never imports it, and the environment never runs in the main process or on the serving path.
+No serving process carries a Python interpreter: in a deployment, Python appears here alone, as the compiler of kernel packages. The Build Server compiles every Triton, CuTe DSL and CUDA package through this environment; it never imports it, and the environment never runs in the main process or on the serving path.
 
-It is **not** the repository's `.venv`, which holds the `uniserve` executable with the development, test and evaluation tools; this one holds only what compiles a kernel, so a package's compile script cannot depend by accident on a package another environment happens to have.
+It is **not** the repository's `.venv`, which holds the `uniserve` executable with the development, test and evaluation tools; this one holds only what compiles a kernel, so a package's build module cannot depend by accident on a package another environment happens to have.
 
 ## Creating it
 
 ```text
-uv sync --project crates/build-server/python --python /usr/bin/python3.12
+uv sync --locked --project crates/build-server/python
 ```
 
-This writes `python/.venv` (git-ignored) from `pyproject.toml` and `uv.lock`. The Build Server's `--python` option (`build_config.python` for a server the daemon starts) names the interpreter, `crates/build-server/python/.venv/bin/python`; a relative path is made absolute against the directory the command was started in.
+This writes `python/.venv` (git-ignored) from `pyproject.toml` and `uv.lock` with an interpreter that meets `requires-python`, and installs the environment's program, `uniserve-build-server`, in its `bin` directory. The Build Server runs that program from its search path, as any installed program is run, so a host puts the environment's `bin` directory on the search path of the processes that start Build Servers (a daemon, or `uniserve build-server serve`).
 
-A server without the interpreter is not an error: the Triton and CuTe DSL toolchains are recorded as missing with that reason, and only a build that needs them fails.
+A server without the environment is not an error: the Triton, CuTe DSL and nvcc toolchains are recorded as missing with the reason, and only a build that needs them fails.
+
+## The toolchain description
+
+```text
+uniserve-build-server toolchain --json
+```
+
+prints what this environment compiles with, which the Build Server reads once when it starts (`crates/build-server/src/toolchain.rs`):
+
+| entry | how it is found |
+|---|---|
+| `interpreter` | the environment's own interpreter, which runs every compilation |
+| `driver` | the SHA-256 of this package's files, read through `importlib.resources`: a module is stored under the driver it was built through, so an edited driver, pin or target description is another identity |
+| `distributions` | every installed distribution and its version, through `importlib.metadata` |
+| `triton`, `cute_dsl` | the versions of the locked `triton` and `nvidia-cutlass-dsl` distributions |
+| `cuda` | the CUDA toolkit of the release the lock fixes (the release of the locked `nvidia-cuda-runtime`, such as `13.0`), through the `cudart-<release>` and `cuda-<release>` pkg-config modules NVIDIA's distribution packages register: its root, `nvcc`, include and library directories and the driver stub's directory; nvcc's version is read from the macros it predefines (`__CUDACC_VER_MAJOR__` and its siblings) |
+| `host_compiler` | the host C++ compiler the program `c++` names on the search path, resolved to its file |
+
+A toolchain the host lacks is `{"missing": "<reason>"}` instead of `{"available": ...}`. A package's `[toolchain] version` is compared with the version described, and its `[toolchain] packages` with the distributions; a disagreement refuses the build by name.
 
 ## What it locks
 
 | distribution | version | used by |
 |---|---|---|
-| `triton` | 3.7.1 | `TritonSource`: `triton.compile` writes the cubin and its metadata JSON |
-| `nvidia-cutlass-dsl[cu13]` | 4.6.2 | `CuteDslSource`: `cute.compile` and `export_to_c` write the host launcher that is linked into a native module |
+| `triton` | 3.7.1 | the Triton driver: `triton.compile` writes the cubin and its metadata JSON |
+| `nvidia-cutlass-dsl[cu13]` | 4.6.2 | the CuTe DSL driver: `cute.compile` and `export_to_c` write the host launcher that is linked into a native module |
 | `flashinfer-python` | 0.6.18 | the trtllm-gen launch code (`paged_attention/trtllm`, the routed NVFP4 products), the `moe_sort` and `moe_unpermute` sources, and the MegaMoE kernel (the `megamoe` pin) |
 | `flash-attn-4[cu13]` | 4.0.0b30 | the FlashAttention-4 package |
-| `torch` | 2.13.0 | required by the two above; it is never imported by the Build Server itself |
+| `urllib3`, `patch-ng` | 2.8.0, 1.19.1 | the pinned sources' fetcher and its patch of a staged copy |
+| `torch` | 2.13.0 | required by FlashInfer and FlashAttention-4; never imported by the Build Server itself |
 
-A package names the distributions it imports and their versions in its `[toolchain] packages`, by distribution name (`flash-attn-4`, `flashinfer-python`) and at the version this lock fixes; changing any of them is a new installation and a new revision. The Build Server refuses to build a package whose declared distribution this environment does not have at that version, naming each disagreement, as it refuses a toolchain of another version.
+A package names the distributions it imports and their versions in its `[toolchain] packages`, by distribution name (`flash-attn-4`, `flashinfer-python`) and at the version this lock fixes; changing any of them is a new installation and a new revision.
 
-## How a package's compile script is run
+## How a package is compiled
 
-The Build Server runs `<interpreter> <package>/<source.script>` with the package root as the working directory and this environment:
+The Build Server compiles one descriptor by running
 
-| variable | value |
-|---|---|
-| `UNISERVE_OP`, `UNISERVE_BACKEND` | the operator and backend of the module's store path |
-| `UNISERVE_DESCRIPTOR` | the descriptor key, such as `dtype_bf16_width_2048_layout_contiguous` |
-| `UNISERVE_FIELDS` | the key's fields as the Build Server read them: a JSON object of dimension to value, such as `{"dtype": "bf16", "width": "2048", "layout": "contiguous"}` |
-| `UNISERVE_TARGET` | the target of the module's store path, such as `sm_100a` |
-| `UNISERVE_PACKAGE` | the package root |
-| `UNISERVE_OUT` | the build's output directory; the script writes `module.cubin` and its metadata JSON there, or `module.so` for a native module |
-| `MAX_JOBS` | the compile queue's limit on parallel compilers |
-
-The script takes the descriptor's values from `uniserve_build_server.package.fields()`: the Build Server reads the key against the package's `[kernel.descriptors]` once (`Descriptors::fields` in `crates/build-server/src/manifest.rs`, the one reader of the key grammar) and states the fields as a JSON object in `UNISERVE_FIELDS`, in the key's order, so no script reads a key's text. The keys a package accepts are exactly the descriptor range its `[kernel.descriptors]` declares: a dimension's enumerated values, or, for a dimension declared by a constraint table (`{ multiple = 16 }`, `{ power_of_two = true }`, `{ separator = "x" }`, `{ bits = 32 }`; the grammar is `Dimension` in the same file), the text up to the next `_` when it meets the constraint. A manifest with several `[[kernel.descriptors]]` shapes is read against each in turn. A direct run of a script states the object as `--fields`, which `uniserve build-server fields <package> <key>` prints; a tool that needs a key's fields outside a build asks that command (`package.read_fields`).
-
-A Triton or CuTe DSL package's script states only what one descriptor of its kernel needs, `spec(fields, parameters, target)`, and hands it to the shared driver:
-
-```python
-from uniserve_build_server import triton as driver   # or cute_dsl
-
-def spec(fields, parameters, target):
-    return {"kernel": ..., "signature": {...}, "constexprs": {...}, "options": {...}}
-
-if __name__ == "__main__":
-    driver.main(spec)
+```text
+<interpreter> -m uniserve_build_server compile
 ```
 
-`uniserve_build_server.triton` compiles the spec with `triton.compile` on an explicit target and writes `module.cubin` and `metadata.json` with the launch signature; `uniserve_build_server.cute_dsl` compiles it with `cute.compile`, exports the host launcher and links it with the package's `src/entry.cpp` into `module.so`. Both need no GPU. The drivers belong to this environment, not to a package's revision: like the compilers this lock fixes, a change to them is a change of the environment. Every file of `uniserve_build_server` (drivers, fetcher, pins) is an input of every module a package's compile script builds: an installation records its digest, a module is stored under it, and a server whose driver differs from a revision's record refuses to build that revision until the package is installed again.
+in the directory of the package's build module (`[source] script`, such as `src/build.py`), with the compile request as a JSON object on standard input (`uniserve_build_server.request.Request`); `-m` puts that directory first on the import path, so the build module and the sources beside it import as any program's own. The request is the whole interface, and a compilation reads no environment variable:
+
+| field | value |
+|---|---|
+| `op`, `backend`, `package` | the package and its installed root |
+| `descriptor`, `fields` | the descriptor key and its fields as the Build Server read them against the manifest's `[[kernel.descriptors]]` (`Descriptors::fields` in `crates/build-server/src/manifest.rs`, the one reader of the key grammar), in the key's order |
+| `parameters` | the manifest's `[parameters]` |
+| `source`, `module`, `unit` | the source kind, the build module's name, and the entry unit (`[source] unit`) a driver compiles |
+| `target` | the target's name and its architecture's hardware facts (`targets.toml`: capability, warp size, families, shared and tensor memory, dependent launch, FP8), so a package states requirements instead of hardware facts; `str(target)` is its name |
+| `output` | the directory the module's files are written into; a dot directory in it is the compilation's own scratch and is not published |
+| `jobs` | the compiler processes the compilation may run, the compile queue's limit |
+| `cache` | the Build Server's cache of pinned sources |
+| `toolchain` | the toolchain description the Build Server checked, as above |
+
+The source kind selects how the build module states its compilation:
+
+- **Triton**: the module states `spec(fields, parameters, target)`, which `uniserve_build_server.triton` compiles with `triton.compile` on the target and writes as `module.cubin` and `metadata.json` with the launch signature;
+- **CuTe DSL**: the module states `spec(fields, parameters, target)` returning the exported launcher's `name`, the C `entry`, a `compile` callable (`cute_dsl.kernel(kernel, args, options)` for a kernel the DSL compiles directly, or the vendor's own selection) and optional `defines`; `uniserve_build_server.cute_dsl` states the target to the DSL, exports the launcher and links it with the manifest's entry unit into `module.so`;
+- **CUDA**: the module states `compile(request)`, the whole compilation, with the CUDA toolkit the request describes.
+
+The Build Server then checks the module its manifest's form requires: a cubin whose metadata names its kernel, or a native library that defines every C entry it is launched through.
+
+`python -m uniserve_build_server` and `uniserve-build-server` are one program. Outside a build, `uniserve_build_server.triton.stated_for` computes what a Triton package's `spec` states for a key, with the fields the Build Server's reader gives (`uniserve build-server fields`), for a check that launches a package's kernel on Triton's interpreter.
 
 ## Pinned third-party sources
 
-A package that builds against code it does not own names that code by a pin of `uniserve_build_server.fetch` instead of carrying a copy. Every pin is addressed the same way: its identity is the sha256 of a manifest listing each file with its own sha256; the manifest is published beside the files or kept in `src/uniserve_build_server/pins/<name>.sha256`; every file is verified against it before use and cached content-addressed under `~/.cache/uniserve/build-server/artifacts/<identity>/` (or `$UNISERVE_ARTIFACT_CACHE`), so a cached file is reused offline and one that does not verify is fetched again. Pins differ only in where a file comes from.
+A package that builds against code it does not own names that code by a pin of `uniserve_build_server.fetch` instead of carrying a copy. Every pin is one data file, `src/uniserve_build_server/pins/<name>.toml`: its identity, the sha256 of a manifest listing each file with its own sha256, and its origin. The manifest is published beside the files or kept beside the pin's data file as `<name>.sha256`; every file is verified against it before use and cached content-addressed in the Build Server's cache (`<cache>/<identity>/<path>`), so a cached file is reused offline and one that does not verify is fetched again. A build stages a cached file into its own workspace as a hard link, both being directories of the Build Server's one cache root.
 
-| pin | what | origin | identity |
-|---|---|---|---|
-| `trtllm-gen-fmha` | TensorRT-LLM's FMHA cubins and generated table, as FlashInfer pins them (`ArtifactPath.TRTLLM_GEN_FMHA`) | NVIDIA's kernel artifact repository (`$UNISERVE_ARTIFACT_REPOSITORY`), its published `checksums.txt` | `d79b5c51…` |
-| `trtllm-gen-bmm` | trtllm-gen's batched-GEMM cubins, table and export headers (the routed NVFP4 MoE products) | the same repository | `011635d3…` |
-| `deepep` | DeepEP's elastic dispatch and combine kernels, deepseek-ai/DeepEP commit `b306af06afd4` | each file from the commit's raw tree | `ee22833b…` |
-| `nccl` | NCCL 2.30.4's headers, the device API DeepEP is built against | the `nvidia-nccl-cu13==2.30.4` wheel the serving environment locks, its sha256 pinned per architecture; read out of the archive, which is not kept | `67a3f54b…` |
-| `megamoe` | FlashInfer's fused MegaMoE CuTe DSL kernel | the `flashinfer-python==0.6.18` distribution this environment locks | `dae28b34…` |
+| pin | what | origin |
+|---|---|---|
+| `trtllm-gen-fmha` | TensorRT-LLM's FMHA cubins and generated table, as FlashInfer pins them | NVIDIA's kernel artifact repository, with its published `checksums.txt` |
+| `trtllm-gen-bmm` | trtllm-gen's batched-GEMM cubins, table and export headers (the routed NVFP4 MoE products) | the same repository |
+| `deepep` | DeepEP's elastic dispatch and combine kernels, deepseek-ai/DeepEP commit `b306af06afd4` | each file from the commit's raw tree |
+| `nccl` | NCCL 2.30.4's headers, the device API DeepEP is built against | the `nvidia-nccl-cu13==2.30.4` wheel the serving environment locks, whose headers are the same for every architecture; read out of the archive, which is not kept |
+| `megamoe` | FlashInfer's fused MegaMoE CuTe DSL kernel | the `flashinfer-python` distribution this environment locks |
 
 ```text
-.venv/bin/python -m uniserve_build_server.fetch PIN [--file NAME ...] [--all] [--out DIR] [--offline]
+uniserve-build-server provision PIN --cache DIR [--file NAME ...] [--all] [--jobs N] [--offline]
 ```
 
-fetches the named files (`--all`: all of them; the FMHA library has 35 324 cubins) into the cache, stages them into `DIR` as symbolic links, and prints a JSON description of the pin. A build calls the same functions in process: `fetch.fetch(pin)` returns the verified cache directory a compile includes from, `fetch.stage` links (or, for a build that patches them, copies) files into the build's staging directory, and `fetch.apply_patch` applies a package's own patch exactly, refusing a hunk that does not match where it says. The megamoe package carries `patches/megamoe.patch` (the tanh-approximated GELU gate and the token exchange's peer-metadata stride) and applies it to a staged copy.
+fetches the named files (`--all`: all of them; the FMHA library has 35 324 cubins) into a cache and prints a JSON description of the pin. A build calls the same functions with the request's cache: `fetch.fetch(pin, cache, names, jobs)`, `fetch.stage` (or, for a build that patches the files, a copy) and `fetch.apply_patch`, which applies a package's own unified diff to a staged copy and refuses one that does not apply. The megamoe package carries `patches/megamoe.patch` and applies it to a staged copy.
 
 ### The trtllm-gen packages
 
-`uniserve_build_server.trtllm` holds what the packages launching trtllm-gen kernels share: FlashInfer's data tree (the launch code), staging a pinned library, and the whole build of the routed NVFP4 products, which `gather_gemm_nvfp4` and `route_gemm_nvfp4` call with their entry symbol. The launch code compiles against the staged artifact with nvcc alone, without a GPU:
-
-```text
-nvcc -c -std=c++20 -arch=sm_100a \
-  -DTLLM_GEN_FMHA_CUBIN_PATH='"2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c/fmha/trtllm-gen/"' \
-  -DTLLM_GEN_FMHA_METAINFO_HASH='"d79b5c51fc8597fac57dae0da4afa114fb2014575e4ec3df099ad856d97cabc3"' \
-  -I <flashinfer>/data/include -I <staged>/include \
-  -I <flashinfer>/data/cutlass/include \
-  -I <flashinfer>/data/cccl/libcudacxx/include \
-  -I <flashinfer>/data/cccl/cub -I <flashinfer>/data/cccl/thrust \
-  -o probe.o probe.cu
-```
-
-The two `-D` macros are required (`fmhaKernels.cuh` static-asserts on them). The cubins are loaded at run time through `flashinfer::trtllm_cubin_loader::getCubin`, which the module implements: FlashInfer's `cubin_loader.h` provides the C callback mechanism (`FlashInferSetCubinCallback`/`FlashInferSetCurrentCubin`), and the module decides where the cubins are.
+`uniserve_build_server.trtllm` holds what the packages launching trtllm-gen kernels share: FlashInfer's data tree (the launch code, found through the locked distribution's metadata), the architecture families of a target as trtllm-gen spells them, staging a pinned library, and the whole build of the routed NVFP4 products, which `gather_gemm_nvfp4` and `route_gemm_nvfp4` call with their entry symbol. The launch code compiles against the staged artifact with nvcc alone, without a GPU; the cubins are loaded at run time through `flashinfer::trtllm_cubin_loader::getCubin`, which the module implements over the cubins it publishes beside itself.

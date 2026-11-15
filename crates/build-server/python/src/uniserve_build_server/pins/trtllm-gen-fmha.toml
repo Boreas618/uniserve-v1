@@ -1,0 +1,9 @@
+# trtllm-gen's FMHA library: the attention kernels behind FlashInfer's
+# `trtllm_batch_decode_with_kv_cache`, as FlashInfer 0.6.18 pins them
+# (`ArtifactPath.TRTLLM_GEN_FMHA`, `CheckSumHash.TRTLLM_GEN_FMHA`). NVIDIA
+# publishes the files and their manifest, `checksums.txt`, under one base.
+sha256 = "d79b5c51fc8597fac57dae0da4afa114fb2014575e4ec3df099ad856d97cabc3"
+manifest = "checksums.txt"
+
+[origin]
+files = "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local/2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c/fmha/trtllm-gen/"

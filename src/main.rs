@@ -141,10 +141,11 @@ fn host_targets() -> std::result::Result<Vec<build_server::Target>, String> {
         .map_err(|error| format!("counting this host's devices: {error}"))?;
     (0..count)
         .map(|ordinal| {
-            platform::DeviceId(ordinal)
+            let capability = platform::DeviceId(ordinal)
                 .compute_capability()
-                .map(build_server::Target::arch)
-                .map_err(|error| format!("reading device {ordinal}'s architecture: {error}"))
+                .map_err(|error| format!("reading device {ordinal}'s architecture: {error}"))?;
+            build_server::Target::arch(capability)
+                .map_err(|error| format!("device {ordinal}: {error}"))
         })
         .collect()
 }

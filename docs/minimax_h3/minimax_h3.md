@@ -24,10 +24,11 @@ export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$CUDA_HOME/bin:$PATH"
 
 uv sync --locked --python /usr/bin/python3.12 --extra gpu
 uv sync --locked --python /usr/bin/python3.12 --project crates/build-server/python
+export PATH="$PWD/crates/build-server/python/.venv/bin:$PATH"
 source .venv/bin/activate
 ```
 
-The first sync builds the `uniserve` executable and installs the NCCL and CUPTI libraries serving loads. The second creates the Build Server's own environment, the locked compilers of the kernel packages (Triton, the CuTe DSL, FlashInfer and FlashAttention-4); the Build Server compiles a kernel the first time a deployment asks for it, for the target GPU, with that environment and the host's CUDA toolkit.
+The first sync builds the `uniserve` executable and installs the NCCL and CUPTI libraries serving loads. The second creates the Build Server's own environment, the locked compilers of the kernel packages (Triton, the CuTe DSL, FlashInfer and FlashAttention-4), whose program `uniserve-build-server` the Build Server runs from the search path; the Build Server compiles a kernel the first time a deployment asks for it, for the target GPU, with that environment and the CUDA toolkit NVIDIA's packages register with pkg-config.
 
 ## Checkpoints
 
@@ -323,7 +324,7 @@ Each encoded element differs from its value by at most what its format's roundin
 
 | Symptom | Remedy |
 | --- | --- |
-| A kernel package's compile error in the Build Server's log | Check CUDA 13 `nvcc`, `CUDA_HOME` and the C++ build tools, and run the Build Server's `uv sync` above again. |
+| A kernel package's compile error in the Build Server's log | Check what `uniserve-build-server toolchain` reports (the CUDA 13 toolkit through `pkg-config cudart-13.0`, and the C++ compiler), and run the Build Server's `uv sync` above again. |
 | `unsupported FastH3 checkpoint` | Use a checkpoint from the table above; the message names the `fastvideo_inference.json` field it cannot serve. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `quantization` for a packed NVFP4 checkpoint. |
 | `the video VAE decoder computes in fp16` | Select `video_vae = "fp16"` or `"nvfp4"`. |

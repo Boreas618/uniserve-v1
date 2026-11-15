@@ -606,7 +606,6 @@ def second_host(
             "LD_LIBRARY_PATH",
             "PYTHONPATH",
             "MAX_JOBS",
-            "UNISERVE_BUILD_SERVER_PYTHON",
             "FLASHINFER_WORKSPACE_BASE",
             "UCX_NET_DEVICES",
         )

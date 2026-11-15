@@ -4,16 +4,16 @@
 //! One process per host and serving user, beside the Storage Server: a host
 //! service (the `service` crate) on [`default_socket`], started as
 //! `uniserve build-server serve`, and by a daemon whose host has none. It
-//! does three things: compile a package
-//! into the modules of its descriptors, keep those modules, and response
-//! `install`, `prepare`, `resolve`, `list` and `cover` on its Unix socket. It launches
-//! no kernel and allocates no device memory, and it is not on the serving
-//! path: a main process asks it for modules when it starts and when a package revision
-//! changes, so a Build Server restart delays only those two moments.
+//! does three things: compile a package into the modules of its descriptors,
+//! keep those modules, and answer `install`, `prepare`, `resolve`, `list` and
+//! `cover` on its Unix socket. It launches no kernel and allocates no device
+//! memory, and it is not on the serving path: a main process asks it for
+//! modules when it starts and when a package revision changes.
 //!
-//! `python/` holds the Build Server's own Python environment and the
-//! compile drivers of [`source`]: Triton and CuTe DSL compilation are the only
-//! Python in the system, and they run here, never in the main process.
+//! `python/` holds the Build Server's own Python environment: its toolchain
+//! description and the compile drivers of [`source`]. Triton, CuTe DSL and
+//! CUDA compilation are the only Python in the system, and they run there,
+//! never in the main process.
 //!
 //! The pieces of the design:
 //!
@@ -27,16 +27,20 @@
 //! - [`inputs`]: what a module is built from (the package's files, the
 //!   toolchain, the compile driver and its pins) and the digest that names it.
 //! - [`snapshot`]: the files an installation takes of a package, which for a
-//!   package cargo builds are its crate and the workspace crates it depends on.
+//!   package cargo builds is its whole workspace, and the vendored sources of
+//!   its lockfile.
 //! - [`build`]: `uniserve build-server build`, which fills a store from
 //!   descriptor key lists.
 //! - [`builder`]: the compile queue of section 6.2, with its urgencies, its
 //!   deduplication by module path and its host-memory limit.
 //! - [`source`] and [`toolchain`]: how a package's sources become a module,
-//!   by nvcc, Triton, CuTe DSL or a wasm32 build.
+//!   through a build module's typed compile request or a cargo build, and the
+//!   declared toolchains that compile them.
+//! - [`target`]: what a module is compiled for, and each GPU target's
+//!   hardware facts.
 //! - [`manifest`]: the `package.toml` of section 5.2.
-//! - [`protocol`]: the append-only Protobuf protocol and its client, which
-//!   the daemon and the main process use.
+//! - [`protocol`]: the Protobuf protocol and its client, which the daemon and
+//!   the main process use.
 //!
 //! The package revisions it serves, the slots they fill and their phases are
 //! `proto::module`'s (section 5.1), which the daemon and the main process
@@ -56,14 +60,15 @@ pub mod target;
 pub mod toolchain;
 
 pub use builder::{BuildState, Limits, Urgency};
-pub use manifest::{Manifest, ManifestError, ModuleForm, SourceKind, TargetKind, ToolchainKind};
+pub use manifest::{Manifest, ManifestError, ModuleForm, SourceKind, ToolchainKind};
 pub use protocol::{
     Client, CoverRequest, Coverage, Descriptors, Module, ModuleEntry, ModuleFile, PackageRequest,
     Preference, PrepareRequest, Progress, Selector,
 };
 pub use server::{BuildServer, ServerConfig};
 pub use store::{ModulePath, Root, Store};
-pub use target::{Device, Target};
+pub use target::Target;
+pub use toolchain::Toolchains;
 
 /// The socket of this host's Build Server for the calling user:
 /// `build-server.sock` in the user's service directory
@@ -71,7 +76,6 @@ pub use target::{Device, Target};
 pub fn default_socket() -> std::path::PathBuf {
     service::runtime_directory().join("build-server.sock")
 }
-pub use toolchain::{Toolchain, Toolchains};
 
 use std::path::PathBuf;
 
@@ -98,16 +102,6 @@ pub enum Error {
     /// The peer sent something this build does not expect.
     #[error("the build server responded out of protocol: {0}")]
     Protocol(String),
-    /// The Build Server was away for the whole of the wait (design section
-    /// 7.5): the client reconnected `attempts` times without a server
-    /// responding, so preparation is told a restart outlasted it.
-    #[error("the build server at {socket} was away for the whole {waited:?} wait")]
-    Restarted {
-        /// The socket no server served.
-        socket: String,
-        /// How long the client waited before it gave up.
-        waited: std::time::Duration,
-    },
     /// No such package revision was installed.
     #[error("no {op} package of backend {backend} at revision {revision}")]
     UnknownRevision {
@@ -162,28 +156,3 @@ pub enum Error {
 
 /// What an operation of the Build Server returns.
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl Error {
-    /// Whether this error says the Build Server was away: the transport
-    /// ended or nothing was listening, which is a restart rather than a
-    /// decision (design section 7.5).
-    ///
-    /// Only the transport's own failures count. Everything the server decided
-    /// — a refusal, a build failure, an unknown revision — is the server
-    /// having responded, and retrying it would repeat the decision.
-    pub fn away(&self) -> bool {
-        matches!(
-            self,
-            Error::Io(source)
-                if matches!(
-                    source.kind(),
-                    std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::NotConnected
-                )
-        )
-    }
-}

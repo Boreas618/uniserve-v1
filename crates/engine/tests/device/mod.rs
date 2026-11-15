@@ -52,7 +52,7 @@ impl Kernels {
         Ok(Self {
             device: platform::Device::new(DEVICE)?,
             client,
-            target: Target::arch(DEVICE.compute_capability()?),
+            target: Target::arch(DEVICE.compute_capability()?)?,
             backends,
         })
     }

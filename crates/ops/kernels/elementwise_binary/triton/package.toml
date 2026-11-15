@@ -39,10 +39,9 @@ files = ["src/elementwise_binary.py", "src/strided.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { function = ["add", "sub", "mul", "div", "maximum", "minimum", "eq", "ne", "lt", "le", "gt", "ge", "remainder", "bitwise_and", "bitwise_or", "bitwise_xor", "bitwise_left_shift", "bitwise_right_shift"], dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
 
 [parameters]

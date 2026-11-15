@@ -11,7 +11,6 @@ audio length follows the request's duration.
 """
 
 import activation1d as kernels
-from uniserve_build_server import triton as driver
 
 #: The element types the signal, the two filters and the output may have.
 DTYPES = {"f32": "fp32", "bf16": "bf16", "f16": "fp16"}
@@ -53,7 +52,3 @@ def spec(fields, parameters, target):
         },
         "options": {"num_warps": warps_of(block)},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

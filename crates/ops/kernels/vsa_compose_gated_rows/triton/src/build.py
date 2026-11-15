@@ -11,7 +11,6 @@ six strides and the member interval are launch words.
 """
 
 import vsa_compose_gated_rows as kernels
-from uniserve_build_server import triton as driver
 
 #: The floating dtypes a row may have, in the descriptor's vocabulary.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -64,7 +63,3 @@ def spec(fields, parameters, target):
         },
         "options": {"num_warps": 4},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

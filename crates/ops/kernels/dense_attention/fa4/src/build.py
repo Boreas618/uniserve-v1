@@ -7,7 +7,6 @@ vendor's configuration is chosen for.
 """
 
 import fa4
-from uniserve_build_server import cute_dsl as driver
 
 
 def spec(fields, parameters, target):
@@ -20,7 +19,3 @@ def spec(fields, parameters, target):
         "entry": "uniserve_dense_attention",
         "compile": compiler,
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

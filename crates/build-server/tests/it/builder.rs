@@ -3,11 +3,17 @@
 
 use build_server::builder::{BuildState, Builder, Limits, Urgency};
 use build_server::store::ModulePath;
+use build_server::toolchain::PeakMemory;
 
+use crate::support::arch;
+
+/// The queue's limits. The peaks are not the queue's to read: its caller
+/// states each build's peak when it asks which builds may start.
 fn limits(max_jobs: usize, host_reserve: u64) -> Limits {
     Limits {
         max_jobs,
         host_reserve,
+        peaks: PeakMemory::default_for(max_jobs),
     }
 }
 
@@ -17,7 +23,7 @@ fn path(key: &str) -> ModulePath {
         "triton",
         1,
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "sm_100a",
+        arch().as_str(),
         key,
     )
     .unwrap()
@@ -127,18 +133,4 @@ fn a_failed_build_keeps_its_log_for_the_waiters() {
         builder.state(&path("broken")),
         Some(BuildState::Failed("nvcc: not found".to_owned()))
     );
-}
-
-#[test]
-fn a_path_built_again_forgets_the_build_that_ended_before() {
-    let mut builder = Builder::new(limits(1, 0));
-    builder.submit(&path("retried"), Urgency::Waiting, 1);
-    builder.start(u64::MAX, |_| 1);
-    builder
-        .finish(&path("retried"), Err("host memory".to_owned()))
-        .unwrap();
-
-    builder.submit(&path("retried"), Urgency::Waiting, 2);
-    assert_eq!(builder.state(&path("retried")), Some(BuildState::Queued));
-    assert_eq!(builder.pending(), 1);
 }

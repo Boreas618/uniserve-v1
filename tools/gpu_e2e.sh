@@ -6,13 +6,14 @@
 #   tools/gpu_e2e.sh [--memcheck] [pytest arguments...]
 #
 # The script builds the release `uniserve` executable, which is a test deployment's daemon and
-# its host services, the scheduling policy precompiler and the `uniserve-manager` the admin API's
-# tests attach beside the executable, and exports them as `UNISERVE_BINARY` and
-# `UNISERVE_SCHEDULING_PRECOMPILE`; when the environment names both, as a host sharing another
-# host's build does, it uses them and builds nothing. A deployment's main processes run the engine
-# package (`crates/engine`), which each test module's Build Server installs and builds with cargo
-# from the installed snapshot: that build reads `UNISERVE_FFMPEG_DIR`, `LIBCLANG_PATH` and
-# `CUDA_HOME` from this environment, and cargo keeps what it compiled between runs. It puts the NCCL this project pins on the loader's path
+# its host services, and the `uniserve-manager` the admin API's tests attach beside the
+# executable, and exports the executable as `UNISERVE_BINARY`; when the environment names it, as a
+# host sharing another host's build does, it uses it and builds nothing. A deployment's main
+# processes run the engine package (`crates/engine`), which each test module's Build Server
+# installs and builds with cargo from the installed snapshot of the workspace: that build reads
+# `UNISERVE_FFMPEG_DIR` and `LIBCLANG_PATH` from this environment, and cargo keeps what it
+# compiled between runs. Each Build Server compiles kernels with its toolchain environment, whose
+# program `uniserve-build-server` must be on the search path. It puts the NCCL this project pins on the loader's path
 # (`tools/check_nccl.sh`), sets the gate `UNISERVE_RUN_GPU_E2E=1`, and runs pytest with one
 # worker per GPU (pytest-xdist); each case leases the GPUs it serves on
 # (`tests/python/e2e/conftest.py`). pytest's temporary directory, which holds every server's log,
@@ -43,16 +44,18 @@ if [ "${1:-}" = --memcheck ]; then
     shift
 fi
 
-# A run on a host that shares another host's build names that build's executables and builds
+if ! command -v uniserve-build-server > /dev/null; then
+    echo "no uniserve-build-server on the search path: install the Build Server's environment" \
+        "(uv sync --locked --project crates/build-server/python) with its program on the path" >&2
+    exit 1
+fi
+
+# A run on a host that shares another host's build names that build's executable and builds
 # nothing; otherwise the tree is built here.
-if [ -z "${UNISERVE_BINARY:-}" ] || [ -z "${UNISERVE_SCHEDULING_PRECOMPILE:-}" ]; then
+if [ -z "${UNISERVE_BINARY:-}" ]; then
     # The manager runs beside the executable: the admin API's tests attach it to a deployment.
-    # The engine executable precompiles the scheduling policy (`uniserve-engine precompile`).
-    "$cargo" build --release -p uniserve --bin uniserve -p engine --bin uniserve-engine \
-        -p manager --bin uniserve-manager
-    release=${CARGO_TARGET_DIR:-$root/target}/release
-    export UNISERVE_BINARY=$release/uniserve
-    export UNISERVE_SCHEDULING_PRECOMPILE=$release/uniserve-engine
+    "$cargo" build --release -p uniserve --bin uniserve -p manager --bin uniserve-manager
+    export UNISERVE_BINARY=${CARGO_TARGET_DIR:-$root/target}/release/uniserve
 fi
 export UNISERVE_RUN_GPU_E2E=1
 export MAX_JOBS=${MAX_JOBS:-16}

@@ -3,7 +3,7 @@
 # One native module per descriptor: the module's host code runs one dense
 # product through cuBLASLt, and the element types, the weight order and the
 # epilogue are compile-time choices `src/build.py` derives from
-# `UNISERVE_DESCRIPTOR` (design 9: the dense layers' GEMM).
+# the descriptor's fields (design 9: the dense layers' GEMM).
 #
 # The algorithm choice and its workspace are the package's tuning data (design
 # 5.4): each shape asks cuBLASLt's heuristic once when it is first used, and the
@@ -31,11 +31,10 @@ files = ["src/gemm.cpp", "src/uniserve_gemm.h", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `input_bf16_weight_bf16_accumulate_f32_output_bf16_order_nxk_epilogue_none_k_2048`.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { input = ["bf16", "f16", "f32"], weight = ["bf16", "f16", "f32"], accumulate = ["f32", "bf16", "f16"], output = ["bf16", "f16", "f32"], order = ["kxn", "nxk"], epilogue = ["none", "bias"] }
 
 [parameters]

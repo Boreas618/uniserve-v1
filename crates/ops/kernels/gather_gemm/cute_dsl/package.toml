@@ -25,9 +25,9 @@ entries = { launch = "uniserve_gather_gemm" }
 kind = "cute_dsl"
 files = ["src/gather_gemm.py", "src/build.py", "src/entry.cpp", "src/entry.h"]
 script = "src/build.py"
+unit = "src/entry.cpp"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a"]
 
 # `hidden_2048_intermediate_1536_experts_128_top_8_activation_silu_dtype_bf16_tile_128x128_cluster_1x1`.
@@ -35,7 +35,7 @@ architectures = ["sm_100a"]
 # values: the activation rows load in whole 64-element K steps with no K predicate, so
 # `hidden` is a multiple of 64, and the weights interleave 64-row up and gate blocks, so
 # `intermediate` is a multiple of 64.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { hidden = { multiple = 64 }, intermediate = { multiple = 64 }, experts = { min = 1 }, top = { min = 1 }, activation = ["silu", "gelu_tanh"], dtype = ["bf16"], tile = ["128x128", "256x128", "128x256", "256x256"], cluster = ["1x1", "2x1", "1x2", "2x2"] }
 
 [parameters]

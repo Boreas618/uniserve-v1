@@ -1,0 +1,8 @@
+# trtllm-gen's batched-GEMM library: the grouped and routed MoE products behind
+# FlashInfer's `trtllm_fp4_block_scale_routed_moe`, with their export headers.
+# NVIDIA publishes the files and their manifest, `checksums.txt`, under one base.
+sha256 = "011635d3c36756addcdc148eea90c984f2d7611ba375626aaaf466d355c80e50"
+manifest = "checksums.txt"
+
+[origin]
+files = "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local/8ec29a98612c3670f9f28825d1ed19f09496073b/batched_gemm-fa419f4-31ee4e5/"

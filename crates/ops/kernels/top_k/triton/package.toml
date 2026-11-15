@@ -27,11 +27,10 @@ files = ["src/top_k.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_f32_tile_2048_ids_i32_pdl_false`.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["f32", "bf16", "f16"], tile = { power_of_two = true, max = 8192 }, ids = ["i32", "i64"], pdl = ["true", "false"] }
 
 [parameters]

@@ -178,10 +178,9 @@ url = "2.5.8"
 uuid = { version = "1.22.0", features = ["v4"] }
 validator = { version = "0.20.0", features = ["derive"] }
 # The runtime of the scheduling policy modules: the engine's policy host
-# (`engine::scheduler::policy`) configures it, precompiles the modules (`uniserve-engine
-# precompile`), instantiates them and calls them. One pin, since a module precompiled by another
-# wasmtime version does not load (`engine::scheduler::policy::WASMTIME_VERSION`). Only the JIT,
-# the runtime and `std`: no WASI, no async.
+# (`engine::scheduler::policy`) configures it, compiles the wasm32 modules the Build Server
+# builds, instantiates them and calls them. Only the JIT, the runtime and `std`: no WASI, no
+# async.
 wasmtime = { version = "50.0.1", default-features = false, features = [
     "cranelift",
     "runtime",

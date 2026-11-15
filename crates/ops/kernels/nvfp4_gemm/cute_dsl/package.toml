@@ -25,9 +25,9 @@ entries = { launch = "uniserve_nvfp4_gemm" }
 kind = "cute_dsl"
 files = ["src/nvfp4_gemm.py", "src/build.py", "src/entry.cpp", "src/entry.h"]
 script = "src/build.py"
+unit = "src/entry.cpp"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
 # `packed_u8_scale_f8e4m3_accumulate_f32_output_bf16_layout_swizzled_128x4_epilogue_none_m_128_n_256_k_2048_pdl_true`.
@@ -44,7 +44,7 @@ architectures = ["sm_100a", "sm_100f"]
 #
 # The extents compile for any problem of whole 128x256 output tiles reducing over whole
 # 256-element steps (`src/build.py` refuses any other).
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { packed = ["u8"], scale = ["f8e4m3"], accumulate = ["f32"], output = ["bf16", "f16"], layout = ["swizzled_128x4"], epilogue = ["none"], m = { multiple = 128 }, n = { multiple = 256 }, k = { multiple = 256 } }
 
 [parameters]

@@ -51,32 +51,40 @@ def spec(fields, parameters, target):
         raise SystemExit(f"the {fields['layout']} scale layout is not served")
     if fields["epilogue"] != "none":
         raise SystemExit(f"the {fields['epilogue']} epilogue is not served")
-    if m % TILE_MN[0] != 0 or n % TILE_MN[1] != 0 or k % (MMA_INST_SHAPE_K * 4) != 0:
-        raise SystemExit(f"{m}x{n}x{k} is not whole {TILE_MN[0]}x{TILE_MN[1]} tiles of 256")
+    if (
+        m % TILE_MN[0] != 0
+        or n % TILE_MN[1] != 0
+        or k % (MMA_INST_SHAPE_K * 4) != 0
+    ):
+        raise SystemExit(
+            f"{m}x{n}x{k} is not whole {TILE_MN[0]}x{TILE_MN[1]} tiles of 256"
+        )
     out_dtype = OUTPUTS[fields["output"]]
     return {
         "name": "nvfp4_gemm",
         "entry": "uniserve_nvfp4_gemm",
-        "kernel": kernels.Nvfp4GemmKernel(
-            tile_mn=TILE_MN,
-            mma_inst_shape_k=MMA_INST_SHAPE_K,
-            acc_dtype=cutlass.Float32,
-            out_dtype=out_dtype,
-        ).launch,
-        # The operator packs the activation, the weight, both scale matrices, the
-        # alpha and the output, then the three extents.
-        "args": [
-            pointer(cutlass.Float4E2M1FN),
-            pointer(cutlass.Float4E2M1FN),
-            pointer(cutlass.Float8E4M3FN),
-            pointer(cutlass.Float8E4M3FN),
-            pointer(cutlass.Float32),
-            pointer(out_dtype),
-            m,
-            n,
-            k,
-        ],
-        "options": {},
+        "compile": driver.kernel(
+            kernels.Nvfp4GemmKernel(
+                tile_mn=TILE_MN,
+                mma_inst_shape_k=MMA_INST_SHAPE_K,
+                acc_dtype=cutlass.Float32,
+                out_dtype=out_dtype,
+            ).launch,
+            # The operator packs the activation, the weight, both scale
+            # matrices, the alpha and the output, then the three extents.
+            [
+                pointer(cutlass.Float4E2M1FN),
+                pointer(cutlass.Float4E2M1FN),
+                pointer(cutlass.Float8E4M3FN),
+                pointer(cutlass.Float8E4M3FN),
+                pointer(cutlass.Float32),
+                pointer(out_dtype),
+                m,
+                n,
+                k,
+            ],
+            {},
+        ),
         # The module states the problem it was compiled for, so a call of other
         # extents is refused instead of run against the compiled tiles.
         "defines": [
@@ -85,7 +93,3 @@ def spec(fields, parameters, target):
             f"UNISERVE_NVFP4_K={k}",
         ],
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

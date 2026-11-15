@@ -19,6 +19,7 @@ width: one table or one backend that cannot place the key must not end the run.
 """
 
 import importlib.util
+import os
 import pathlib
 import re
 import sys
@@ -32,7 +33,8 @@ KERNELS = REPOSITORY / 'crates/ops/kernels'
 # A package's `build.py` imports its compile driver from the Build Server's Python package, so
 # the package's source is importable from this tree whichever interpreter runs the tool.
 sys.path.insert(0, str(REPOSITORY / 'crates/build-server/python/src'))
-from uniserve_build_server import package as driver_package  # noqa: E402
+from uniserve_build_server import triton as driver  # noqa: E402
+from uniserve_build_server.request import Target  # noqa: E402
 
 
 def packs_pdl(operator):
@@ -84,13 +86,18 @@ def declares_pdl(operator, key):
             placed = False
             for dimensions in tables:
                 try:
-                    fields = driver_package.read_fields(source.parent, key)
+                    described = driver.stated_for(
+                        module.spec,
+                        source.parent,
+                        key,
+                        Target.named('sm_100a'),
+                        os.environ.get('UNISERVE_BINARY', 'uniserve'),
+                    )
                 # The Build Server's reader places the key against the package's shapes; a key
                 # none of them reads is not this package's.
                 except ValueError:
                     continue
                 placed = True
-                described = module.spec(fields, manifest.get('parameters', {}), 'sm_100a')
                 return any(
                     name.lower() == 'pdl' and ty != 'constexpr'
                     for name, ty in described['signature'].items()

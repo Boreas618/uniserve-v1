@@ -11,7 +11,6 @@ is an int32 launch argument.
 """
 
 import gated_residual as kernels
-from uniserve_build_server import triton as driver
 
 #: The tile one launch walks, the operator's `GATED_BLOCK`.
 BLOCK = 1024
@@ -52,7 +51,3 @@ def spec(fields, parameters, target):
             "enable_fp_fusion": False,
         },
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

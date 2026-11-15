@@ -48,7 +48,6 @@ files = [
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
 # `mode_dispatch_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_8192_ranks_2_attention_0_dtype_bf16`.
@@ -56,7 +55,7 @@ architectures = ["sm_100a", "sm_100f"]
 # them; `src/exchange.cu`'s create refuses a row that is not whole 16-byte vectors (`hidden`
 # a multiple of 8 two-byte elements), more than 64 ranks or more than 32 routes per token.
 # `intermediate` is the key's, not the exchange's. The backend has no attention ranks.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { mode = ["dispatch", "combine"], hidden = { multiple = 8 }, intermediate = { min = 1 }, top = { min = 1, max = 32 }, experts = { min = 1 }, max_tokens = { min = 1 }, ranks = { min = 1, max = 64 }, attention = ["0"], dtype = ["bf16", "f16"] }
 
 [parameters]

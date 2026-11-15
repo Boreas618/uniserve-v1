@@ -16,28 +16,30 @@
 //! - `fields <package> <key>`: prints the fields a package's declared
 //!   dimensions read a descriptor key into, for a tool that needs them outside
 //!   a build.
-//! - `build --keys <file> --package <dir>`: fills a store directory with the
-//!   modules of descriptor key lists and of single-module packages (a policy,
-//!   the engine), with a Build Server of its own for the length of the build
-//!   ([`crate::build`]). The store's `packages` and `modules` are then a
-//!   `serve`'s package root and store root, or the read-only store a release
-//!   ships.
+//! - `build --keys <file> --packages <dir> --package <dir>`: fills a store
+//!   directory with the modules of descriptor key lists and of single-module
+//!   packages (a policy, the engine), with a Build Server of its own for the
+//!   length of the build ([`crate::build`]). The store's `packages` and
+//!   `modules` are then a `serve`'s package root and store root, or the
+//!   read-only store a release ships.
 //!
 //! The server launches no kernel and allocates no device memory (design
 //! section 6.1). The targets it builds for are the `--target`s it is given,
 //! or else the architectures of this host's devices, read from the driver's
-//! device attributes without a context.
+//! device attributes without a context. Its toolchains are its own
+//! (`crate::toolchain`): no option names a compiler.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::builder::Limits;
+use crate::manifest::ToolchainKind;
 use crate::protocol::Client;
 use crate::server::{BuildServer, ServerConfig};
 use crate::store::Root;
-use crate::target::{Device, Target};
-use crate::toolchain::ToolchainConfig;
+use crate::target::Target;
+use crate::toolchain::PeakMemory;
 use crate::{Error, Manifest, Result, default_socket};
 
 /// The `build-server` command's arguments.
@@ -114,10 +116,11 @@ pub struct BuildArgs {
     /// module built for its own target; repeatable.
     #[arg(long = "package", value_name = "DIR")]
     pub package: Vec<PathBuf>,
-    /// The package tree: one directory per operator, one package directory
-    /// per backend. Relative to the directory the command runs in.
-    #[arg(long, value_name = "DIR", default_value = "crates/ops/kernels")]
-    pub packages: PathBuf,
+    /// The package tree the key lists' operators are installed from: one
+    /// directory per operator, one package directory per backend; required
+    /// with `--keys`.
+    #[arg(long, value_name = "DIR")]
+    pub packages: Option<PathBuf>,
     /// The target the kernel keys' modules are built for, such as `sm_100a`;
     /// required with `--keys`.
     #[arg(long, value_name = "NAME")]
@@ -126,24 +129,14 @@ pub struct BuildArgs {
     /// under `modules`. An existing store is extended.
     #[arg(long, value_name = "DIR")]
     pub store: PathBuf,
-    /// The interpreter of the Build Server's Python environment, which
-    /// Triton and CuTe DSL packages build with.
-    #[arg(long, value_name = "PATH")]
-    pub python: Option<PathBuf>,
-    /// The CUDA toolkit's nvcc; `$CUDA_HOME/bin/nvcc` when unset.
-    #[arg(long, value_name = "PATH")]
-    pub nvcc: Option<PathBuf>,
-    /// The precompiler that turns a scheduling policy into a module for this
-    /// host.
-    #[arg(long, value_name = "PATH")]
-    pub wasm: Option<PathBuf>,
-    /// cargo, which builds the engine package; the `cargo` on `PATH` when
-    /// unset.
-    #[arg(long, value_name = "PATH")]
-    pub cargo: Option<PathBuf>,
-    /// How many builds may run at once (4 when unset).
+    /// How many builds may run at once, and how many compiler processes each
+    /// may run (4 when unset).
     #[arg(long, value_name = "COUNT")]
     pub max_jobs: Option<usize>,
+    /// The peak host memory one build of a toolchain reserves, as
+    /// `KIND=BYTES`; repeatable.
+    #[arg(long = "peak-memory", value_name = "KIND=BYTES", value_parser = peak_memory)]
+    pub peak_memory: Vec<(ToolchainKind, u64)>,
 }
 
 /// The arguments of `serve`.
@@ -158,7 +151,7 @@ pub struct ServeArgs {
 }
 
 /// How a Build Server serves: its socket, its roots, its upstream, its
-/// targets, its limits and its toolchains.
+/// targets and its limits.
 ///
 /// The same settings are `serve`'s flags and a deployment's `build_config`
 /// table. A daemon prepares an epoch's package revisions at [`Settings::socket`], and
@@ -197,32 +190,62 @@ pub struct Settings {
     #[arg(long = "target", value_name = "NAME")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub targets: Vec<String>,
-    /// How many builds may run at once (4 when unset).
+    /// How many builds may run at once, and how many compiler processes each
+    /// may run (4 when unset).
     #[arg(long, value_name = "COUNT")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_jobs: Option<usize>,
-    /// Host memory, in bytes, that must stay free before a build starts.
+    /// Host memory, in bytes, that must stay free before a build starts
+    /// (8 GiB when unset).
     #[arg(long, value_name = "BYTES")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_reserve: Option<u64>,
-    /// The CUDA toolkit's nvcc; `$CUDA_HOME/bin/nvcc` when unset.
-    #[arg(long, value_name = "PATH")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nvcc: Option<PathBuf>,
-    /// The interpreter of the Build Server's Python environment, which
-    /// Triton and CuTe DSL packages build with.
-    #[arg(long, value_name = "PATH")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub python: Option<PathBuf>,
-    /// The precompiler that turns a scheduling policy into a module for this
-    /// host.
-    #[arg(long, value_name = "PATH")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wasm: Option<PathBuf>,
-    /// cargo, which builds a policy crate for wasm32.
-    #[arg(long, value_name = "PATH")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cargo: Option<PathBuf>,
+    /// The peak host memory one build of a toolchain reserves, in bytes, by
+    /// toolchain kind (`--peak-memory KIND=BYTES`, repeatable); a kind not
+    /// stated reserves its default ([`PeakMemory::default_for`]).
+    #[arg(long = "peak-memory", value_name = "KIND=BYTES", value_parser = peak_memory)]
+    #[serde(skip_serializing_if = "Vec::is_empty", with = "peaks")]
+    pub peak_memory: Vec<(ToolchainKind, u64)>,
+}
+
+/// `peak_memory` as a deployment states it: a table of toolchain kind to bytes.
+mod peaks {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::manifest::ToolchainKind;
+
+    pub(super) fn serialize<S: Serializer>(
+        peaks: &[(ToolchainKind, u64)],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let table: BTreeMap<&str, u64> = peaks
+            .iter()
+            .map(|(kind, bytes)| (kind.as_str(), *bytes))
+            .collect();
+        table.serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<(ToolchainKind, u64)>, D::Error> {
+        let table = BTreeMap::<ToolchainKind, u64>::deserialize(deserializer)?;
+        Ok(table.into_iter().collect())
+    }
+}
+
+/// Reads a `--peak-memory` value, `KIND=BYTES`.
+fn peak_memory(text: &str) -> std::result::Result<(ToolchainKind, u64), String> {
+    let (kind, bytes) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not KIND=BYTES"))?;
+    let kind: ToolchainKind = serde_json::from_value(serde_json::Value::String(kind.to_owned()))
+        .map_err(|error| format!("{kind:?} is no toolchain kind: {error}"))?;
+    let bytes = bytes
+        .parse::<u64>()
+        .map_err(|error| format!("{bytes:?} is no number of bytes: {error}"))?;
+    Ok((kind, bytes))
 }
 
 impl Settings {
@@ -263,26 +286,25 @@ impl Settings {
         if let Some(reserve) = self.host_reserve {
             push("host-reserve", reserve.to_string());
         }
-        for (flag, value) in [
-            ("nvcc", &self.nvcc),
-            ("python", &self.python),
-            ("wasm", &self.wasm),
-            ("cargo", &self.cargo),
-        ] {
-            if let Some(value) = value {
-                push(flag, path(value));
-            }
+        for (kind, bytes) in &self.peak_memory {
+            push("peak-memory", format!("{kind}={bytes}"));
         }
         arguments
     }
 
     /// The server configuration these settings describe for a server
-    /// building for `devices`.
+    /// building for `targets`.
     ///
-    /// Every path is made absolute, and an unset socket or root is this
-    /// user's default one.
-    pub fn config(&self, devices: Vec<Device>) -> ServerConfig {
-        let data = data_directory();
+    /// Every path is made absolute, and an unset root is this user's default
+    /// one: `build-server/packages` and `build-server/modules` in the user's
+    /// data directory. The server's cache is `build-server` in the user's
+    /// cache directory ([`service::cache_directory`]).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the user's data or cache directory cannot be resolved.
+    pub fn config(&self, targets: Vec<Target>) -> Result<ServerConfig> {
+        let data = service::data_directory()?.join("build-server");
         let package_root = self
             .package_root
             .clone()
@@ -307,13 +329,16 @@ impl Settings {
         let mut limits = Limits::default();
         if let Some(jobs) = self.max_jobs {
             limits.max_jobs = jobs;
+            limits.peaks = PeakMemory::default_for(jobs);
         }
         if let Some(reserve) = self.host_reserve {
             limits.host_reserve = reserve;
         }
+        for (kind, bytes) in &self.peak_memory {
+            limits.peaks.set(*kind, *bytes);
+        }
 
-        ServerConfig {
-            socket: self.socket(),
+        Ok(ServerConfig {
             package_root: absolute(package_root),
             store_roots,
             upstream: self.upstream.clone().map(absolute),
@@ -324,50 +349,29 @@ impl Settings {
                 .map(absolute)
                 .collect(),
             limits,
-            toolchains: ToolchainConfig {
-                nvcc: self.nvcc.clone().map(absolute),
-                python: self.python.clone().map(absolute),
-                wasm: self.wasm.clone().map(absolute),
-                cargo: self.cargo.clone().map(absolute),
-                max_jobs: limits.max_jobs,
-            },
-            devices,
-        }
+            targets,
+            cache: service::cache_directory()?.join("build-server"),
+        })
     }
 
-    /// The devices this server builds for: one per `--target`, or else this
-    /// host's devices by their architectures, which `host` reads.
-    ///
-    /// A `--target` names an architecture, and stands for the GPU model too:
-    /// the command line does not know the model.
+    /// The targets this server builds for: each `--target`, or else the
+    /// architecture of each of this host's devices, which `host` reads, once.
     ///
     /// # Errors
     ///
     /// Fails when no target is given and `host` cannot report the host's
     /// devices.
-    pub fn devices(&self, host: HostTargets<'_>) -> Result<Vec<Device>> {
+    pub fn targets(&self, host: HostTargets<'_>) -> Result<Vec<Target>> {
         if !self.targets.is_empty() {
-            return Ok(self
-                .targets
-                .iter()
-                .map(|target| Device {
-                    arch: Target::new(target.clone()),
-                    model: Target::new(target.clone()),
-                })
-                .collect());
+            return Ok(self.targets.iter().cloned().map(Target::new).collect());
         }
-
-        // The host's devices, each architecture once.
-        let mut devices: Vec<Device> = Vec::new();
+        let mut targets: Vec<Target> = Vec::new();
         for target in host().map_err(Error::Protocol)? {
-            if devices.iter().all(|device| device.arch != target) {
-                devices.push(Device {
-                    arch: target.clone(),
-                    model: target,
-                });
+            if !targets.contains(&target) {
+                targets.push(target);
             }
         }
-        Ok(devices)
+        Ok(targets)
     }
 }
 
@@ -476,17 +480,6 @@ fn run_build(args: BuildArgs, host: HostTargets<'_>) -> Result<()> {
             message.to_owned(),
         ))
     };
-    let python = args.python.map(absolute);
-    if let Some(python) = python.as_ref().filter(|python| !python.is_file()) {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "no interpreter at {}: `uv sync --project crates/build-server/python` \
-                 builds the Build Server's environment",
-                python.display()
-            ),
-        )));
-    }
     let keys = crate::build::read_keys(&args.keys)?;
     if keys.is_empty() && args.package.is_empty() {
         return Err(invalid(
@@ -498,37 +491,41 @@ fn run_build(args: BuildArgs, host: HostTargets<'_>) -> Result<()> {
             "kernel keys are built for a device's architecture: name it with --target",
         ));
     }
+    let packages = match args.packages {
+        Some(packages) => absolute(packages),
+        None if keys.is_empty() => PathBuf::new(),
+        None => {
+            return Err(invalid(
+                "kernel keys are built from a package tree: name it with --packages",
+            ));
+        }
+    };
 
-    // The store's two directories are the roots a `serve` is given; the
-    // build's own server listens on a socket inside the store while it runs.
+    // The store's two directories are the roots a `serve` is given.
     let store = absolute(args.store);
     std::fs::create_dir_all(&store)?;
     let settings = Settings {
-        socket: Some(store.join("build-server.sock")),
         package_root: Some(store.join(crate::build::PACKAGES)),
         store_roots: vec![store.join(crate::build::MODULES)],
         targets: args.target.iter().cloned().collect(),
         max_jobs: args.max_jobs,
-        nvcc: args.nvcc,
-        python,
-        wasm: args.wasm,
-        cargo: args.cargo,
+        peak_memory: args.peak_memory,
         ..Settings::default()
     };
     // A build of single-module packages alone names no device architecture and
     // reads none from the host.
-    let devices = match args.target {
-        Some(_) => settings.devices(host)?,
+    let targets = match args.target {
+        Some(_) => settings.targets(host)?,
         None => Vec::new(),
     };
-    let config = settings.config(devices);
+    let config = settings.config(targets)?;
 
     let single: Vec<PathBuf> = args.package.into_iter().map(absolute).collect();
     let total = keys.len() + single.len();
     let mut unbuilt = Vec::new();
     let failures = crate::build::build(
         &config,
-        &absolute(args.packages),
+        &packages,
         &keys,
         args.target.map(Target::new).as_ref(),
         &single,
@@ -576,7 +573,8 @@ fn run_serve(serve: ServeArgs, host: HostTargets<'_>) -> Result<()> {
         None
     };
     service::logging::init("BuildServer", None, None, service::logging::Output::Stderr);
-    let (_wake, stop) = service::stop_signals()?;
+    // A stop signal makes this descriptor readable, which ends the serving.
+    let (stop, _flag) = service::stop_signals()?;
 
     let Some((listener, lock)) = service::bind(&socket)? else {
         tracing::info!(socket = %socket.display(), "another build server serves this socket");
@@ -586,12 +584,13 @@ fn run_serve(serve: ServeArgs, host: HostTargets<'_>) -> Result<()> {
         return Ok(());
     };
 
-    let config = serve.settings.config(serve.settings.devices(host)?);
+    let config = serve.settings.config(serve.settings.targets(host)?)?;
     let server = std::sync::Arc::new(BuildServer::open(&config)?);
     if let Some(ready) = ready {
         ready.signal();
     }
-    let served = server.serve_on(listener, lock, stop);
+    tracing::info!(socket = %socket.display(), "build server serving");
+    let served = server.serve_on(listener, lock, &stop);
     tracing::info!("build server stopped");
     served
 }
@@ -601,28 +600,9 @@ fn socket_or_default(socket: Option<PathBuf>) -> PathBuf {
     socket.map(absolute).unwrap_or_else(default_socket)
 }
 
-/// The directory of this user's installed packages and module store:
-/// `$XDG_DATA_HOME/uniserve/build-server`, else `~/.local/share/uniserve/build-server`.
-fn data_directory() -> PathBuf {
-    let data = match std::env::var_os("XDG_DATA_HOME") {
-        Some(data) if !data.is_empty() => PathBuf::from(data),
-        _ => std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(".local/share"))
-            .unwrap_or_else(|| PathBuf::from(".")),
-    };
-    data.join("uniserve").join("build-server")
-}
-
-/// A path made absolute against the directory the command was started in.
-///
-/// Every path the command takes is absolute before it reaches the server, because a
-/// build runs with its working directory set to the store's copy of a package: a
-/// relative toolchain path would name that copy instead of this host's compiler, and
-/// the failure is an errno from a directory the caller never named.
-///
-/// `std::path::absolute` rather than `canonicalize`, which follows symlinks: the
-/// environment's `python` is a symlink, and canonicalizing it makes toolchain
-/// discovery read the host interpreter instead of the pinned one.
+/// A path made absolute against the directory the command was started in:
+/// every path the command takes is absolute before it reaches the server,
+/// whose builds run in other directories (the store's copy of a package).
 fn absolute(path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         return path;

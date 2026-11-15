@@ -43,10 +43,9 @@ files = ["src/modulated_rms_norm.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32", "f8e4m3"], indices = ["u32", "i32", "i64"], width = { min = 1 }, block = { power_of_two = true }, epsilon = { bits = 32 }, gate_stride = { min = 0, multiple = 16 }, shift_stride = { multiple = 16 }, scale_stride = { multiple = 16 }, update = ["true", "false"], retain = ["true", "false"] }
 
 [parameters]

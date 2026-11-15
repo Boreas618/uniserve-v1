@@ -34,9 +34,9 @@ entries = { launch = "uniserve_dense_attention" }
 kind = "cute_dsl"
 files = ["src/fa4.py", "src/build.py", "src/entry.cpp", "src/entry.h"]
 script = "src/build.py"
+unit = "src/entry.cpp"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
 # `dtype_bf16_kv_bf16_out_bf16_head_dim_128_q_heads_32_kv_heads_4_mask_causal_window_false`.
@@ -45,7 +45,7 @@ architectures = ["sm_100a", "sm_100f"]
 # launch and prints nothing for it, so a package that serves packed sequences names no such
 # field. `max_kv_len` is a bound the caller supplies, deliberately absent from the key, so it
 # is a build parameter here and not a dimension.
-[kernel.descriptors]
+[[kernel.descriptors]]
 # `head_dim` is the head widths FlashAttention-4 compiles on SM100: `_validate_head_dims` admits
 # every multiple of the alignment (16 bytes = 8 BF16 elements) in 8..128, and 256 for a square
 # head. The head counts are the call's shapes; the entry refuses `q_heads` that `kv_heads` does

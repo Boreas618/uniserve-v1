@@ -35,10 +35,9 @@ files = ["src/adaptive_pool.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a", "sm_100f"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 # The program unrolls any head count and window, so the three extents are any
 # positive integers; `block` is a `tl.arange` extent, so a power of two.
 dimensions = { dtype = ["f16", "bf16", "f32"], heads = { min = 1 }, width = { min = 1 }, output = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"] }

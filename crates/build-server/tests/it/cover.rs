@@ -1,20 +1,16 @@
 //! `cover` (design section 6.3): which installed package is selected for each
 //! of an operator's descriptor keys. Every fixture package declares its own
 //! descriptors in `[kernel.descriptors]`, so the response is read from the
-//! manifests alone and nothing is compiled.
+//! manifests alone and nothing is built.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::path::Path;
 
-use build_server::builder::Limits;
-use build_server::inputs::Inputs;
-use build_server::protocol::{Client, CoverRequest, Package, Preference};
-use build_server::server::{BuildServer, ServerConfig};
-use build_server::store::Root;
-use build_server::target::{Device, Target};
-use build_server::toolchain::ToolchainConfig;
+use build_server::protocol::{CoverRequest, Package, Preference};
+use build_server::server::BuildServer;
+use build_server::target::Target;
 use proto::module::PhaseKind;
+
+use crate::support::{self, arch, other_arch};
 
 /// The operator every fixture package implements.
 const OP: &str = "dense_attention";
@@ -24,102 +20,35 @@ const BF16: &str = "dtype_bf16_head_dim_128";
 const F32: &str = "dtype_f32_head_dim_128";
 const F16: &str = "dtype_f16_head_dim_128";
 
-/// The manifest of a Triton package of [`OP`] under `backend`, covering the
-/// dtypes `dtypes` at head width 128 and building for `architecture`.
-fn manifest(backend: &str, dtypes: &[&str], architecture: &str) -> String {
+/// The manifest of a package of [`OP`] under `backend` at `priority`,
+/// covering the element types `dtypes` at head width 128 and building for
+/// `architecture`.
+fn manifest(backend: &str, priority: u32, dtypes: &[&str], architecture: &Target) -> String {
     let dtypes: Vec<String> = dtypes.iter().map(|dtype| format!("\"{dtype}\"")).collect();
-    format!(
-        r#"
-op = "{OP}"
-backend = "{backend}"
-interface_version = 1
-
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
-[source]
-kind = "triton"
-files = ["src/kernel.py"]
-script = "src/compile.py"
-kernel = "attention"
-
-[kernel]
-architectures = ["{architecture}"]
-descriptors = {{ dimensions = {{ dtype = [{}], head_dim = ["128"] }} }}
-"#,
-        dtypes.join(", ")
+    support::vendor_manifest(
+        OP,
+        backend,
+        priority,
+        &format!(
+            "{{ dtype = [{}], head_dim = [\"128\"] }}",
+            dtypes.join(", ")
+        ),
+        architecture,
     )
 }
 
-/// `manifest` with the package's `priority` stated.
-fn prioritized(manifest: &str, priority: u32) -> String {
-    manifest.replacen(
-        "\n[toolchain]",
-        &format!("priority = {priority}\n\n[toolchain]"),
-        1,
-    )
+/// Installs the package `manifest` on `server` from a directory under
+/// `sources`, and returns the revision it was installed as.
+fn install(server: &BuildServer, sources: &Path, manifest: &str) -> u32 {
+    let directory = support::vendor_package(&sources.join("package"), manifest, &[]);
+    server.install(&directory).unwrap().revision
 }
 
-/// Writes the package `manifest` into `directory`.
-fn write_package(directory: &Path, manifest: &str) {
-    std::fs::create_dir_all(directory.join("src")).unwrap();
-    std::fs::write(directory.join("package.toml"), manifest).unwrap();
-    std::fs::write(directory.join("src/kernel.py"), b"# the kernel\n").unwrap();
-    std::fs::write(directory.join("src/compile.py"), b"# the driver\n").unwrap();
-}
-
-/// Installs a package of `backend` as revision `revision`, as an earlier
-/// installation would have left it under the package root.
-fn installed(configuration: &ServerConfig, backend: &str, revision: u32, manifest: &str) {
-    let directory = configuration
-        .package_root
-        .join(OP)
-        .join(backend)
-        .join(revision.to_string());
-    write_package(&directory, manifest);
-    Inputs::of(&directory, "triton 3.7.1".to_owned())
-        .unwrap()
-        .write(&directory)
-        .unwrap();
-}
-
-/// A server configuration over a fresh package root and module store, for a
-/// host of one `sm_100a` device.
-fn config(temporary: &Path) -> ServerConfig {
-    ServerConfig {
-        socket: temporary.join("build-server.sock"),
-        package_root: temporary.join("packages"),
-        store_roots: vec![Root {
-            path: temporary.join("store"),
-            writable: true,
-        }],
-        upstream: None,
-        read_only_stores: Vec::new(),
-        limits: Limits::default(),
-        toolchains: ToolchainConfig {
-            nvcc: None,
-            python: Some(PathBuf::from("/python/bin/python")),
-            wasm: None,
-            cargo: None,
-            max_jobs: 1,
-        },
-        devices: vec![Device {
-            arch: Target::new("sm_100a"),
-            model: Target::new("b200"),
-        }],
-    }
-}
-
-/// A `cover` of `keys` for `sm_100a`.
+/// A `cover` of `keys` for [`arch`].
 fn request(keys: &[&str]) -> CoverRequest {
     CoverRequest {
         op: OP.to_owned(),
-        targets: vec![Target::new("sm_100a")],
+        targets: vec![arch()],
         keys: keys.iter().map(|key| (*key).to_owned()).collect(),
         preferred: Vec::new(),
         fixed: Vec::new(),
@@ -135,59 +64,51 @@ fn named(phase: Option<PhaseKind>, backend: &str) -> Preference {
     }
 }
 
-/// The entry of a `cover` response that selects `backend`'s `revision` for `keys`.
+/// Revision `revision` of `backend`'s package of [`OP`].
+fn package(backend: &str, revision: u32) -> Package {
+    Package {
+        op: OP.to_owned(),
+        backend: backend.to_owned(),
+        revision,
+    }
+}
+
+/// The entry of a `cover` response that selects `backend`'s `revision` for
+/// `keys`.
 fn covered(backend: &str, revision: u32, keys: &[&str]) -> (Package, Vec<String>) {
     (
-        Package {
-            op: OP.to_owned(),
-            backend: backend.to_owned(),
-            revision,
-        },
+        package(backend, revision),
         keys.iter().map(|key| (*key).to_owned()).collect(),
     )
 }
 
-/// Connects to a socket being served, waiting for it to listen.
-fn connect(socket: &Path) -> Client {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match Client::connect(socket) {
-            Ok(client) => return client,
-            Err(_) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!(
-                "the build server never listened on {}: {error}",
-                socket.display()
-            ),
-        }
-    }
-}
-
 /// Two packages declaring disjoint descriptors each get their own keys, and a
-/// key neither declares is named as uncovered: the response a client reads over
-/// the socket after installing both.
+/// key neither declares is named as uncovered: the response a client reads
+/// over the socket after installing both.
 #[test]
 fn each_key_goes_to_the_package_that_declares_it_over_the_socket() {
+    let _exclusive = support::exclusive();
     let temporary = tempfile::tempdir().unwrap();
-    let configuration = config(temporary.path());
-    let server = Arc::new(BuildServer::open(&configuration).unwrap());
-    std::thread::spawn(move || {
-        if let Err(error) = server.serve() {
-            eprintln!("the server stopped: {error}");
-        }
-    });
-    let mut client = connect(&configuration.socket);
+    let server = BuildServer::open(&support::config(temporary.path())).unwrap();
+    let serving = support::serve(server, &temporary.path().join("build-server.sock"));
+    let mut client = serving.client();
 
-    let f32 = temporary.path().join("f32");
-    write_package(&f32, &manifest("f32", &["f32"], "sm_100a"));
-    let fa4 = temporary.path().join("fa4");
-    write_package(&fa4, &manifest("fa4", &["bf16"], "sm_100a"));
+    let f32 = support::vendor_package(
+        &temporary.path().join("f32"),
+        &manifest("f32", 0, &["f32"], &arch()),
+        &[],
+    );
+    let fa4 = support::vendor_package(
+        &temporary.path().join("fa4"),
+        &manifest("fa4", 0, &["bf16"], &arch()),
+        &[],
+    );
     client.install(&f32).unwrap();
     client.install(&fa4).unwrap();
 
     let coverage = client.cover(&request(&[BF16, F32, F16, BF16])).unwrap();
-    // `f32` sorts before `fa4` at the same priority, so it is listed first.
+    // `f32` sorts before `fa4` at the same priority, so it is listed first,
+    // and a key asked for twice is selected once.
     assert_eq!(
         coverage.covered,
         vec![covered("f32", 1, &[F32]), covered("fa4", 1, &[BF16])]
@@ -200,27 +121,23 @@ fn each_key_goes_to_the_package_that_declares_it_over_the_socket() {
 /// revision of another backend does not outrank them.
 #[test]
 fn a_key_several_packages_cover_goes_to_the_highest_priority() {
+    let _exclusive = support::exclusive();
     let temporary = tempfile::tempdir().unwrap();
-    let configuration = config(temporary.path());
-    installed(
-        &configuration,
-        "beta",
-        1,
-        &prioritized(&manifest("beta", &["bf16", "f16"], "sm_100a"), 2),
+    let server = BuildServer::open(&support::config(temporary.path())).unwrap();
+    let sources = temporary.path();
+    install(
+        &server,
+        sources,
+        &manifest("beta", 2, &["bf16", "f16"], &arch()),
     );
-    installed(
-        &configuration,
-        "alpha",
-        1,
-        &manifest("alpha", &["bf16", "f32"], "sm_100a"),
+    install(
+        &server,
+        sources,
+        &manifest("alpha", 0, &["bf16", "f32"], &arch()),
     );
-    installed(
-        &configuration,
-        "gamma",
-        3,
-        &manifest("gamma", &["f32"], "sm_100a"),
-    );
-    let server = BuildServer::open(&configuration).unwrap();
+    for _ in 0..3 {
+        install(&server, sources, &manifest("gamma", 0, &["f32"], &arch()));
+    }
 
     let coverage = server.cover(&request(&[BF16, F16, F32])).unwrap();
     assert_eq!(
@@ -233,25 +150,20 @@ fn a_key_several_packages_cover_goes_to_the_highest_priority() {
     assert!(coverage.uncovered.is_empty());
 }
 
-/// A named backend takes every key it covers before any priority, and a key it
-/// does not cover goes on to the packages that do.
+/// A named backend takes every key it covers before any priority, and a key
+/// it does not cover goes on to the packages that do.
 #[test]
 fn a_named_backend_takes_the_keys_it_covers() {
+    let _exclusive = support::exclusive();
     let temporary = tempfile::tempdir().unwrap();
-    let configuration = config(temporary.path());
-    installed(
-        &configuration,
-        "alpha",
-        1,
-        &prioritized(&manifest("alpha", &["bf16", "f32"], "sm_100a"), 5),
+    let server = BuildServer::open(&support::config(temporary.path())).unwrap();
+    let sources = temporary.path();
+    install(
+        &server,
+        sources,
+        &manifest("alpha", 5, &["bf16", "f32"], &arch()),
     );
-    installed(
-        &configuration,
-        "beta",
-        1,
-        &manifest("beta", &["bf16"], "sm_100a"),
-    );
-    let server = BuildServer::open(&configuration).unwrap();
+    install(&server, sources, &manifest("beta", 0, &["bf16"], &arch()));
 
     let mut asked = request(&[BF16, F32]);
     asked.preferred = vec![named(None, "beta")];
@@ -265,17 +177,20 @@ fn a_named_backend_takes_the_keys_it_covers() {
 /// A backend named for one phase is preferred for that phase's keys alone.
 #[test]
 fn a_backend_named_for_a_phase_takes_that_phase() {
+    let _exclusive = support::exclusive();
     let temporary = tempfile::tempdir().unwrap();
-    let configuration = config(temporary.path());
+    let server = BuildServer::open(&support::config(temporary.path())).unwrap();
     let phased = |backend: &str| {
-        manifest(backend, &["bf16"], "sm_100a").replace(
-            "descriptors = { dimensions = { dtype",
-            "descriptors = { dimensions = { phase = [\"prefill\", \"decode\"], dtype",
+        support::vendor_manifest(
+            OP,
+            backend,
+            0,
+            r#"{ phase = ["prefill", "decode"], dtype = ["bf16"], head_dim = ["128"] }"#,
+            &arch(),
         )
     };
-    installed(&configuration, "alpha", 1, &phased("alpha"));
-    installed(&configuration, "beta", 1, &phased("beta"));
-    let server = BuildServer::open(&configuration).unwrap();
+    install(&server, temporary.path(), &phased("alpha"));
+    install(&server, temporary.path(), &phased("beta"));
 
     let prefill = "phase_prefill_dtype_bf16_head_dim_128";
     let decode = "phase_decode_dtype_bf16_head_dim_128";
@@ -291,69 +206,51 @@ fn a_backend_named_for_a_phase_takes_that_phase() {
     );
 }
 
-/// Only a backend's latest revision is a candidate, as `prepare` selects it: a key
-/// an earlier revision declared and the latest does not is uncovered.
+/// Only a backend's latest revision is a candidate, as `prepare` selects it:
+/// a key an earlier revision declared and the latest does not is uncovered.
 #[test]
 fn only_the_latest_revision_of_a_backend_covers() {
+    let _exclusive = support::exclusive();
     let temporary = tempfile::tempdir().unwrap();
-    let configuration = config(temporary.path());
-    installed(
-        &configuration,
-        "fa4",
-        1,
-        &manifest("fa4", &["bf16", "f16"], "sm_100a"),
+    let server = BuildServer::open(&support::config(temporary.path())).unwrap();
+    let sources = temporary.path();
+    install(
+        &server,
+        sources,
+        &manifest("fa4", 0, &["bf16", "f16"], &arch()),
     );
-    installed(
-        &configuration,
-        "fa4",
-        2,
-        &manifest("fa4", &["bf16"], "sm_100a"),
-    );
-    let server = BuildServer::open(&configuration).unwrap();
+    install(&server, sources, &manifest("fa4", 0, &["bf16"], &arch()));
 
     let coverage = server.cover(&request(&[BF16, F16])).unwrap();
     assert_eq!(coverage.covered, vec![covered("fa4", 2, &[BF16])]);
     assert_eq!(coverage.uncovered, vec![F16.to_owned()]);
 }
 
-/// The response lists every candidate in selection order, which is what a module set fixes; and a
-/// request that states a module set's revisions selects among exactly those: a revision or a
-/// package installed since is no candidate, and a fixed revision the server lacks is refused.
+/// The response lists every candidate in selection order, which is what a
+/// module set fixes; and a request that states a module set's revisions
+/// selects among exactly those: a revision or a package installed since is no
+/// candidate, and a fixed revision the server lacks is refused.
 #[test]
 fn a_module_sets_revisions_are_the_only_candidates() {
+    let _exclusive = support::exclusive();
     let temporary = tempfile::tempdir().unwrap();
-    let configuration = config(temporary.path());
-    installed(
-        &configuration,
-        "fa4",
-        1,
-        &manifest("fa4", &["bf16"], "sm_100a"),
-    );
-    let server = BuildServer::open(&configuration).unwrap();
-    let package = |backend: &str, revision: u32| build_server::protocol::Package {
-        op: OP.to_owned(),
-        backend: backend.to_owned(),
-        revision,
-    };
+    let server = BuildServer::open(&support::config(temporary.path())).unwrap();
+    let sources = temporary.path();
+    install(&server, sources, &manifest("fa4", 0, &["bf16"], &arch()));
 
-    // What the daemon asks when a configuration is applied: no key, every candidate.
+    // What the daemon asks when a configuration is applied: no key, every
+    // candidate.
     let applied = server.cover(&request(&[])).unwrap();
     assert_eq!(applied.candidates, vec![package("fa4", 1)]);
 
-    // Installed after the set was fixed: a later revision of `fa4`, and another package.
-    installed(
-        &configuration,
-        "fa4",
-        2,
-        &manifest("fa4", &["bf16", "f16"], "sm_100a"),
+    // Installed after the set was fixed: a later revision of `fa4`, and
+    // another package.
+    install(
+        &server,
+        sources,
+        &manifest("fa4", 0, &["bf16", "f16"], &arch()),
     );
-    installed(
-        &configuration,
-        "f32",
-        1,
-        &manifest("f32", &["f32"], "sm_100a"),
-    );
-    let server = BuildServer::open(&configuration).unwrap();
+    install(&server, sources, &manifest("f32", 0, &["f32"], &arch()));
     let latest = server.cover(&request(&[BF16, F16, F32])).unwrap();
     assert_eq!(
         latest.candidates,
@@ -377,101 +274,17 @@ fn a_module_sets_revisions_are_the_only_candidates() {
 /// there, whatever its descriptors declare.
 #[test]
 fn a_package_for_another_target_covers_nothing() {
+    let _exclusive = support::exclusive();
     let temporary = tempfile::tempdir().unwrap();
-    let configuration = config(temporary.path());
-    installed(
-        &configuration,
-        "fa4",
-        1,
-        &manifest("fa4", &["bf16"], "sm_90a"),
+    let server = BuildServer::open(&support::config(temporary.path())).unwrap();
+    install(
+        &server,
+        temporary.path(),
+        &manifest("fa4", 0, &["bf16"], &other_arch()),
     );
-    let server = BuildServer::open(&configuration).unwrap();
 
     let coverage = server.cover(&request(&[BF16])).unwrap();
     assert!(coverage.covered.is_empty());
+    assert!(coverage.candidates.is_empty());
     assert_eq!(coverage.uncovered, vec![BF16.to_owned()]);
-}
-
-/// Copies the tree's package `crates/ops/kernels/<op>/<backend>` into the package root as revision
-/// 1, as an installation leaves it, with a record of its inputs.
-fn installed_from_tree(configuration: &ServerConfig, op: &str, backend: &str) {
-    fn copy(from: &Path, to: &Path) {
-        std::fs::create_dir_all(to).unwrap();
-        for entry in std::fs::read_dir(from).unwrap() {
-            let path = entry.unwrap().path();
-            let target = to.join(path.file_name().unwrap());
-            if path.is_dir() {
-                copy(&path, &target);
-            } else {
-                std::fs::copy(&path, &target).unwrap();
-            }
-        }
-    }
-
-    let tree = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../ops/kernels")
-        .join(op)
-        .join(backend);
-    let directory = configuration.package_root.join(op).join(backend).join("1");
-    copy(&tree, &directory);
-    Inputs::of(&directory, format!("{backend} toolchain"))
-        .unwrap()
-        .write(&directory)
-        .unwrap();
-}
-
-/// The tree's two paged attention packages: a deployment that names `trtllm` keeps the keys of a
-/// cache of the queries' own type there, and a BF16 model's FP16 cache and an E4M3 cache, which
-/// trtllm-gen's artifact has no kernel for, go to the Triton package at selection rather than to a
-/// build that fails. With no backend named the vendor package's priority keeps the keys both
-/// packages cover.
-#[test]
-fn the_tree_s_paged_attention_keys_go_to_the_package_that_holds_their_kernel() {
-    let temporary = tempfile::tempdir().unwrap();
-    let configuration = config(temporary.path());
-    let op = "paged_attention";
-    installed_from_tree(&configuration, op, "trtllm");
-    installed_from_tree(&configuration, op, "triton");
-    let server = BuildServer::open(&configuration).unwrap();
-
-    let key = |phase: &str, dtype: &str, kv: &str| {
-        format!(
-            "phase_{phase}_dtype_{dtype}_kv_{kv}_out_{dtype}_head_dim_128_page_64_q_heads_32\
-             _kv_heads_4_mask_causal_window_false_len_40960"
-        )
-    };
-    let own = [
-        key("decode", "bf16", "bf16"),
-        key("prefill", "bf16", "bf16"),
-    ];
-    let other = [
-        key("decode", "bf16", "f16"),
-        key("prefill", "bf16", "f16"),
-        key("decode", "bf16", "f8e4m3"),
-        key("decode", "f16", "bf16"),
-    ];
-    let package = |backend: &str| Package {
-        op: op.to_owned(),
-        backend: backend.to_owned(),
-        revision: 1,
-    };
-
-    for preferred in [vec![named(None, "trtllm")], Vec::new()] {
-        let asked = CoverRequest {
-            op: op.to_owned(),
-            targets: vec![Target::new("sm_100a")],
-            keys: own.iter().chain(&other).cloned().collect(),
-            preferred,
-            fixed: Vec::new(),
-        };
-        let coverage = server.cover(&asked).unwrap();
-        assert_eq!(
-            coverage.covered,
-            vec![
-                (package("trtllm"), own.to_vec()),
-                (package("triton"), other.to_vec()),
-            ]
-        );
-        assert!(coverage.uncovered.is_empty());
-    }
 }

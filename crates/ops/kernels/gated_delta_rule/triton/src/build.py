@@ -89,7 +89,3 @@ def spec(fields, parameters, target):
         # A chunk's tiles (its state, its keys, its triangular solve) need the wider warp set.
         "options": {"num_warps": 8 if chunk > 1 else 4},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

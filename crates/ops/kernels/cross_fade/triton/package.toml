@@ -29,10 +29,9 @@ files = ["src/cross_fade.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_f16_extent_5_axis_2_block_1024_pdl_false`.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], extent = { min = 1 }, axis = ["2", "3"], block = { power_of_two = true }, pdl = ["false", "true"] }
 [parameters]

@@ -38,10 +38,9 @@ files = [
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { block = ["64", "128"], dtype = ["bf16"], output = ["bf16"], head_dim = ["128"], lse = ["true", "false"] }
 
 [parameters]

@@ -62,7 +62,3 @@ def spec(fields, parameters, target):
             "launch_pdl": pdl,
         },
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

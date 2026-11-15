@@ -101,7 +101,3 @@ def spec(fields, parameters, target):
     if fields["function"] == "gather":
         return gather(fields, pdl)
     return scatter(fields, pdl)
-
-
-if __name__ == "__main__":
-    driver.main(spec)

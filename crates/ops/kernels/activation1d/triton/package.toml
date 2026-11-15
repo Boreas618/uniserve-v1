@@ -27,10 +27,9 @@ files = ["src/activation1d.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["f32", "bf16", "f16"], channels = { min = 1 }, kernel = { min = 1 }, ratio = { min = 1 }, block = { power_of_two = true }, pdl = ["false", "true"] }
 
 [parameters]

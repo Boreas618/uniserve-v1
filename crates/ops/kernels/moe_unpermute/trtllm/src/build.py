@@ -1,28 +1,32 @@
-"""The moe_unpermute package's compile script: one descriptor -> one module.
+"""The moe_unpermute package's build module: one descriptor -> one module.
 
 The module is trtllm-gen's combine kernel, compiled from the FlashInfer
-distribution's sources into a shared object with this package's C entry in front
-of it. A descriptor is the problem's hidden width, top-k expansion, expert count
-and the three element types; the kernel reads them at launch, so every
-descriptor of this package compiles the same module.
+distribution's sources into a shared object with this package's C entry in
+front of it. A descriptor is the problem's hidden width, top-k expansion,
+expert count and the three element types; the kernel reads them at launch, so
+every descriptor of this package compiles the same module.
 
 The sources come from the FlashInfer package the toolchain pins (its `data`
 tree holds the trtllm-gen kernels and their headers), not from this tree: the
-kernel is NVIDIA's, and the package's `[toolchain] packages` names where it comes
-from.
+kernel is NVIDIA's, and the package's `[toolchain] packages` names where it
+comes from.
+
+The Build Server compiles a descriptor by calling :func:`compile` with the
+compile request.
 """
 
-import argparse
-import importlib.util
 import json
-import os
 import pathlib
-import shutil
-import subprocess
-import sys
+import tempfile
+
+from uniserve_build_server import trtllm
+from uniserve_build_server.request import Request
 
 #: The element types the combine kernel is instantiated for.
 DTYPES = {"bf16": "bf16", "fp16": "f16", "f32": "f32"}
+
+#: The entry the module exports, which the package's `[module.entries]` names.
+ENTRY = "uniserve_moe_unpermute"
 
 #: The translation units of the FlashInfer distribution this module links: the
 #: combine kernel and the TensorRT-LLM common library its checks call.
@@ -42,41 +46,6 @@ DEFINES = [
     "ENABLE_FP4",
     "NDEBUG",
 ]
-
-
-def arguments():
-    """The package, descriptor, target and output directory of one build."""
-    reader = argparse.ArgumentParser(description=__doc__)
-    reader.add_argument("--package")
-    reader.add_argument("--descriptor")
-    reader.add_argument("--target")
-    reader.add_argument("--out")
-    known = reader.parse_args()
-    values = {
-        "package": known.package or os.environ.get("UNISERVE_PACKAGE"),
-        "descriptor": known.descriptor or os.environ.get("UNISERVE_DESCRIPTOR"),
-        "target": known.target or os.environ.get("UNISERVE_TARGET"),
-        "out": known.out or os.environ.get("UNISERVE_OUT"),
-    }
-    missing = [name for name, value in values.items() if not value]
-    if missing:
-        raise SystemExit(f"missing {', '.join(missing)}")
-    package = pathlib.Path(values["package"])
-    return package, values["descriptor"], values["target"], pathlib.Path(values["out"])
-
-
-def distribution():
-    """The FlashInfer `data` tree the kernels and their headers live in."""
-    found = importlib.util.find_spec("flashinfer")
-    roots = found.submodule_search_locations if found is not None else None
-    for root in roots or []:
-        data = pathlib.Path(root) / "data"
-        if (data / "csrc").is_dir():
-            return data
-    raise SystemExit(
-        f"no FlashInfer distribution with its data tree was found in the interpreter "
-        f"running this build ({sys.executable})"
-    )
 
 
 def includes(data):
@@ -108,61 +77,56 @@ def compile_unit(compiler, source, out, data, target):
         str(out),
         str(source),
     ]
-    built = subprocess.run(command, capture_output=True, text=True, check=False)
-    if built.returncode != 0:
-        raise SystemExit(f"compiling {source} failed:\n{built.stderr[-4000:]}")
+    trtllm.run(command, f"compiling {source}")
 
 
-def main():
-    """Compile one descriptor into ``module.so``."""
-    package, descriptor, target, out = arguments()
-    data = distribution()
-    out.mkdir(parents=True, exist_ok=True)
-    staging = out / "objects"
-    staging.mkdir(exist_ok=True)
+def compile(request: Request) -> None:
+    """Compile the request's descriptor into ``module.so``.
+
+    The objects are the build's own intermediates, in a dot directory of the
+    request's output that the Build Server does not publish, so only
+    ``module.so`` is.
+    """
+    package = request.package
+    target = request.target
+    data = trtllm.data_tree()
     # The nvcc the Build Server checked against this package's declared version.
-    compiler = os.environ["UNISERVE_NVCC"]
+    compiler = request.toolchain.require_cuda().nvcc
 
-    objects = []
-    for relative in SOURCES:
-        source = data / relative
-        if not source.is_file():
-            raise SystemExit(f"the distribution has no {relative}")
-        unit = staging / (source.stem + ".o")
-        print(f"compiling {relative}", file=sys.stderr)
-        compile_unit(compiler, source, unit, data, target)
-        objects.append(unit)
+    with tempfile.TemporaryDirectory(dir=request.output, prefix=".") as scratch:
+        staging = pathlib.Path(scratch)
+        objects = []
+        for relative in SOURCES:
+            source = data / relative
+            if not source.is_file():
+                raise SystemExit(f"the distribution has no {relative}")
+            unit = staging / (source.stem + ".o")
+            compile_unit(compiler, source, unit, data, target)
+            objects.append(unit)
 
-    entry = staging / "entry.o"
-    compile_unit(compiler, package / "src/entry.cpp", entry, data, target)
-    objects.append(entry)
+        entry = staging / "entry.o"
+        compile_unit(compiler, package / "src/entry.cpp", entry, data, target)
+        objects.append(entry)
 
-    module = out / "module.so"
-    linked = subprocess.run(
-        [
-            compiler,
-            "-shared",
-            f"-arch={target}",
-            *[str(one) for one in objects],
-            "-lcudart",
-            "-o",
-            str(module),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+        trtllm.run(
+            [
+                compiler,
+                "-shared",
+                f"-arch={target}",
+                *[str(one) for one in objects],
+                "-lcudart",
+                "-o",
+                str(request.output / "module.so"),
+            ],
+            "linking module.so",
+        )
+
+    print(
+        json.dumps(
+            {
+                "descriptor": request.descriptor,
+                "target": str(target),
+                "entry": ENTRY,
+            }
+        )
     )
-    if linked.returncode != 0:
-        raise SystemExit(f"linking module.so failed:\n{linked.stderr[-4000:]}")
-    shutil.rmtree(staging, ignore_errors=True)
-
-    exported = subprocess.run(
-        ["nm", "-D", "--defined-only", str(module)], capture_output=True, text=True, check=True
-    )
-    if "uniserve_moe_unpermute" not in {line.split()[-1] for line in exported.stdout.splitlines() if line.split()}:
-        raise SystemExit("module.so does not export uniserve_moe_unpermute")
-    print(json.dumps({"descriptor": descriptor, "target": target, "entry": "uniserve_moe_unpermute"}))
-
-
-if __name__ == "__main__":
-    main()

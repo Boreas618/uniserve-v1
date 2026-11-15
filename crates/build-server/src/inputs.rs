@@ -49,17 +49,17 @@ pub struct Inputs {
 }
 
 impl Inputs {
-    /// The inputs of the package in `directory`, built by `toolchain`: the
-    /// digest of what an installation of it holds
+    /// The inputs of the package in `directory`, whose manifest is `manifest`,
+    /// built by `toolchain`: the digest of what an installation of it holds
     /// ([`crate::snapshot::package_files`]).
     ///
     /// # Errors
     ///
     /// Fails when the package's files cannot be read.
-    pub fn of(directory: &Path, toolchain: String) -> Result<Inputs> {
-        let (files, generated) = crate::snapshot::package_files(directory)?;
+    pub fn of(directory: &Path, manifest: &crate::Manifest, toolchain: String) -> Result<Inputs> {
+        let files = crate::snapshot::package_files(directory, manifest)?;
         Ok(Inputs {
-            package: crate::snapshot::files_digest(&files, generated.as_deref())?,
+            package: crate::snapshot::files_digest(&files)?,
             toolchain,
         })
     }
@@ -71,22 +71,24 @@ impl Inputs {
         hasher.update(self.package.as_bytes());
         hasher.update([0]);
         hasher.update(self.toolchain.as_bytes());
-        hex(&hasher.finalize())
+        format!("{:x}", hasher.finalize())
     }
 
-    /// The record of the revision in `directory`, or `None` when it has none.
+    /// The record of the revision in `directory`, which every installed
+    /// revision holds.
     ///
     /// # Errors
     ///
-    /// Fails when the record exists and cannot be read or parsed.
-    pub fn read(directory: &Path) -> Result<Option<Inputs>> {
+    /// Fails when the record cannot be read or parsed.
+    pub fn read(directory: &Path) -> Result<Inputs> {
         let path = directory.join(RECORD);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(Error::Io(error)),
-        };
-        toml::from_str(&text).map(Some).map_err(|error| {
+        let text = fs::read_to_string(&path).map_err(|error| {
+            Error::Io(io::Error::new(
+                error.kind(),
+                format!("{}: {error}", path.display()),
+            ))
+        })?;
+        toml::from_str(&text).map_err(|error| {
             Error::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{}: {error}", path.display()),
@@ -113,10 +115,6 @@ impl Inputs {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,12 +127,9 @@ mod tests {
             package: "ab".repeat(32),
             toolchain: "triton 3.7.1; driver cd".to_owned(),
         };
-        assert_eq!(Inputs::read(directory.path()).unwrap(), None);
+        assert!(Inputs::read(directory.path()).is_err());
         inputs.write(directory.path()).unwrap();
-        assert_eq!(
-            Inputs::read(directory.path()).unwrap(),
-            Some(inputs.clone())
-        );
+        assert_eq!(Inputs::read(directory.path()).unwrap(), inputs);
 
         let other_toolchain = Inputs {
             toolchain: "triton 3.7.2; driver cd".to_owned(),

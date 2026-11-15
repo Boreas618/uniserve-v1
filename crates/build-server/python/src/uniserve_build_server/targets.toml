@@ -1,0 +1,69 @@
+# The targets the Build Server compiles modules for, by their names in the
+# module store, with the hardware facts of each one's architecture.
+#
+# This is the one description of those facts. The Build Server reads it when it
+# is compiled (`crates/build-server/src/target.rs`) to know the targets it may
+# build for and the target a device of a compute capability is built for, and
+# hands a target's facts to every compilation in its request
+# (`uniserve_build_server.request.Target`), so a package states what it
+# requires of a target instead of restating hardware facts or parsing names.
+#
+# Fields of each target:
+#
+# - `backend`: the code generator's backend.
+# - `capability`: the compute capability as one number, 100 for 10.0.
+# - `specific`: whether the target is the architecture-specific instruction set
+#   of exactly its capability (the `a` targets), which is what a device of that
+#   capability is built for; a family target (`f`) is code every device of the
+#   family runs.
+# - `families`: the targets whose code runs on this one, itself first.
+# - `warp_size`: the threads of a warp.
+# - `shared_memory`: the largest shared memory one block may opt into, in bytes.
+# - `tensor_memory`: whether the architecture has tensor memory (`tcgen05`).
+# - `dependent_launch`: whether a kernel may launch dependent grids
+#   (programmatic dependent launch).
+# - `fp8`: whether the tensor cores take FP8 operands.
+
+[sm_90a]
+backend = "cuda"
+capability = 90
+specific = true
+families = ["sm_90a"]
+warp_size = 32
+shared_memory = 232448
+tensor_memory = false
+dependent_launch = true
+fp8 = true
+
+[sm_100a]
+backend = "cuda"
+capability = 100
+specific = true
+families = ["sm_100a", "sm_100f"]
+warp_size = 32
+shared_memory = 232448
+tensor_memory = true
+dependent_launch = true
+fp8 = true
+
+[sm_100f]
+backend = "cuda"
+capability = 100
+specific = false
+families = ["sm_100f"]
+warp_size = 32
+shared_memory = 232448
+tensor_memory = true
+dependent_launch = true
+fp8 = true
+
+[sm_120a]
+backend = "cuda"
+capability = 120
+specific = true
+families = ["sm_120a", "sm_120f"]
+warp_size = 32
+shared_memory = 101376
+tensor_memory = false
+dependent_launch = true
+fp8 = true

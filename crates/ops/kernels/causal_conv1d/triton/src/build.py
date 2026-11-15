@@ -10,7 +10,6 @@ tile one program walks at a time is this package's.
 """
 
 import causal_conv1d as kernels
-from uniserve_build_server import triton as driver
 
 #: The floating dtypes of the inputs, the taps, the output and the state banks, as Triton spells
 #: them in an argument signature.
@@ -57,7 +56,3 @@ def spec(fields, parameters, target):
         },
         "options": {"num_warps": 4},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

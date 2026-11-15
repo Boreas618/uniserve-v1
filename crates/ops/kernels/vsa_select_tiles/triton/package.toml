@@ -29,10 +29,9 @@ files = ["src/vsa_select_tiles.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 # `block` is a `tl.arange` extent.
 dimensions = { block = { power_of_two = true } }
 

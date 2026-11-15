@@ -5,7 +5,6 @@ strides and the grid's numbers are the launch's words, and the grid itself arriv
 """
 
 import tile_stitch as kernels
-from uniserve_build_server import triton as driver
 
 #: The element types a decoded tile is stored in.
 DTYPES = {"f16": "fp16", "bf16": "bf16", "f32": "fp32"}
@@ -43,7 +42,3 @@ def spec(fields, parameters, target):
         },
         "options": {"num_warps": 8},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

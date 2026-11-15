@@ -27,10 +27,9 @@ files = ["src/snake.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], channels = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"] }
 
 [parameters]

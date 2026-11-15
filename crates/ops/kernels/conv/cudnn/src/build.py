@@ -1,11 +1,11 @@
-"""The convolution packages' compile script: one descriptor -> one module.
+"""The convolution packages' build module: one descriptor -> one module.
 
 The module is the convolution itself: cuDNN 9's backend API, asked once for an
-engine and then executed on the caller's stream. A descriptor is the three element
-types and nothing else: the geometry, the bias and the TF32 choice arrive in the
-call structure, which the entry reads, so one module serves every window, filter,
-group count and rank of its types. The script passes the types and the operator's
-entry name to the compiler as defines.
+engine and then executed on the caller's stream. A descriptor is the three
+element types and nothing else: the geometry, the bias and the TF32 choice
+arrive in the call structure, which the entry reads, so one module serves every
+window, filter, group count and rank of its types. The build passes the types
+and the operator's entry name to the compiler as defines.
 
 `tuning/engines.json`, when the package carries one, maps a descriptor key to
 the cuDNN engine's global index a tuning pass chose for it (design section 5.4);
@@ -14,19 +14,16 @@ among cuDNN's proposals or fails naming it. Without such data the module takes
 the heuristic's first proposal, which is stable for the cuDNN version the
 package's toolchain pins.
 
-The Build Server runs this script with its own Python environment, its working
-directory the package root, and `UNISERVE_OP`, `UNISERVE_BACKEND`,
-`UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE`, `UNISERVE_OUT` and
-`MAX_JOBS` in the environment.
+The Build Server compiles a descriptor by calling :func:`compile` with the
+compile request.
 """
 
-import argparse
 import json
-import os
-import pathlib
 import subprocess
 import sys
 import tomllib
+
+from uniserve_build_server.request import Request
 
 #: The translation unit of the module: the entry, the executable cache and the
 #: bias.
@@ -49,35 +46,10 @@ ELEMENT_TYPES = {
 UNTUNED = -1
 
 
-def arguments():
-    """The package, descriptor, target and output directory of one build."""
-    reader = argparse.ArgumentParser(description=__doc__)
-    reader.add_argument("--package")
-    reader.add_argument("--descriptor")
-    reader.add_argument("--target")
-    reader.add_argument("--out")
-    known = reader.parse_args()
-    values = {
-        "package": known.package or os.environ.get("UNISERVE_PACKAGE"),
-        "descriptor": known.descriptor or os.environ.get("UNISERVE_DESCRIPTOR"),
-        "target": known.target or os.environ.get("UNISERVE_TARGET"),
-        "out": known.out or os.environ.get("UNISERVE_OUT"),
-    }
-    missing = [name for name, value in values.items() if not value]
-    if missing:
-        raise SystemExit(f"missing {', '.join(missing)}")
-    return (
-        pathlib.Path(values["package"]).resolve(),
-        values["descriptor"],
-        values["target"],
-        pathlib.Path(values["out"]),
-    )
-
-
 def launch_entry(package):
     """The launch symbol the package's manifest declares.
 
-    The manifest and the module must name the same entry, so the script reads
+    The manifest and the module must name the same entry, so the build reads
     the symbol out of the manifest instead of building it from the operator's
     name.
     """
@@ -90,20 +62,9 @@ def launch_entry(package):
     return entry
 
 
-def descriptor_field(key, field):
-    """The value the descriptor's fields give one field, such as its input type.
-
-    The Build Server read the key and states its fields in ``UNISERVE_FIELDS``.
-    """
-    fields = json.loads(os.environ.get("UNISERVE_FIELDS") or "{}")
-    if field not in fields:
-        raise SystemExit(f"the descriptor {key} names no {field}")
-    return fields[field]
-
-
-def element_type(key, field):
+def element_type(request, field):
     """The `DType` number a descriptor's field names."""
-    token = descriptor_field(key, field)
+    token = request.field(field)
     if token not in ELEMENT_TYPES:
         raise SystemExit(
             f"{field} = {token!r} is not an element type the operator has"
@@ -120,58 +81,49 @@ def engine(package, descriptor):
     return recorded.get(descriptor, UNTUNED)
 
 
-def main():
-    """Compile the convolution for one descriptor into ``module.so``."""
-    package, descriptor, target, out = arguments()
-    out.mkdir(parents=True, exist_ok=True)
+def compile(request: Request) -> None:
+    """Compile the convolution for the request's descriptor into ``module.so``.
+
+    The module is written into the request's output directory; a compiler
+    failure refuses the build, with the compiler's output in the build log.
+    """
+    package = request.package
+    descriptor = request.descriptor
     # The nvcc the Build Server checked against this package's declared version.
-    compiler = os.environ["UNISERVE_NVCC"]
+    compiler = request.toolchain.require_cuda().nvcc
     entry = launch_entry(package)
 
     command = [
         compiler,
         "-O3",
         "-std=c++17",
-        f"-arch={target}",
+        f"-arch={request.target}",
         "--shared",
         "-Xcompiler",
         "-fPIC",
         f"-I{package / 'include'}",
         f"-DUNISERVE_CONV_ENTRY={entry}",
-        f"-DUNISERVE_CONV_INPUT_DTYPE={element_type(descriptor, 'input')}",
-        f"-DUNISERVE_CONV_WEIGHT_DTYPE={element_type(descriptor, 'weight')}",
-        f"-DUNISERVE_CONV_OUTPUT_DTYPE={element_type(descriptor, 'output')}",
+        f"-DUNISERVE_CONV_INPUT_DTYPE={element_type(request, 'input')}",
+        f"-DUNISERVE_CONV_WEIGHT_DTYPE={element_type(request, 'weight')}",
+        f"-DUNISERVE_CONV_OUTPUT_DTYPE={element_type(request, 'output')}",
         f"-DUNISERVE_CONV_ENGINE={engine(package, descriptor)}",
         *[str(package / source) for source in SOURCES],
         "-lcudart",
         "-ldl",
         "-o",
-        str(out / "module.so"),
+        str(request.output / "module.so"),
     ]
     print(" ".join(command), file=sys.stderr)
-    built = subprocess.run(command, capture_output=True, text=True, check=False)
+    built = subprocess.run(command, check=False)
     if built.returncode != 0:
-        raise SystemExit(
-            f"nvcc failed with {built.returncode}:\n{built.stderr[-4000:]}"
-        )
+        raise SystemExit(f"nvcc failed with {built.returncode}")
 
-    exported = subprocess.run(
-        ["nm", "-D", "--defined-only", str(out / "module.so")],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    symbols = {
-        line.split()[-1]
-        for line in exported.stdout.splitlines()
-        if line.split()
-    }
-    if entry not in symbols:
-        raise SystemExit(f"module.so does not export {entry}")
     print(
-        json.dumps({"descriptor": descriptor, "target": target, "entry": entry})
+        json.dumps(
+            {
+                "descriptor": descriptor,
+                "target": str(request.target),
+                "entry": entry,
+            }
+        )
     )
-
-
-if __name__ == "__main__":
-    main()

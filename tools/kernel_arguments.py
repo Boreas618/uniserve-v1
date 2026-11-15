@@ -33,6 +33,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -49,7 +50,8 @@ OPS = ROOT / "crates/ops/src"
 # (`uniserve_build_server.triton`), so that package is importable from this tree whichever
 # interpreter runs the tool.
 sys.path.insert(0, str(ROOT / "crates/build-server/python/src"))
-from uniserve_build_server import package as driver_package  # noqa: E402
+from uniserve_build_server import triton as driver  # noqa: E402
+from uniserve_build_server.request import Target  # noqa: E402
 
 #: The `Arguments` methods that pack one launch word. `flag` is a word like any other: Triton's
 #: `pdl` is a kernel parameter the entry reads, not a launch attribute.
@@ -844,17 +846,21 @@ def sweep(
                 f"{op}/{backend}: the package could not be read ({error})"
             )
             continue
+        parameters_of, first_target = parameters(package)
         try:
-            # The key is read as the package's build reads it, by the shared driver's parser.
-            fields = driver_package.read_fields(package, descriptor)
-        except SystemExit:
+            # The key is read as the package's build reads it, by the Build Server's reader.
+            stated = driver.stated_for(
+                spec,
+                package,
+                descriptor,
+                Target.named(target),
+                os.environ.get("UNISERVE_BINARY", "uniserve"),
+            )
+        except ValueError:
             gaps.append(
                 f"{op}/{backend} {descriptor}: no declared shape parses this key"
             )
             continue
-        parameters_of, first_target = parameters(package)
-        try:
-            stated = spec(fields, parameters_of, target)
         except BaseException as error:  # noqa: BLE001
             gaps.append(
                 f"{op}/{backend} {descriptor}: `spec` refused it ({error})"

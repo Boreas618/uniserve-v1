@@ -42,7 +42,6 @@ files = [
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a"]
 
 # `mode_dispatch_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_512_ranks_2_attention_0_dtype_bf16`.
@@ -50,7 +49,7 @@ architectures = ["sm_100a"]
 # assertions admit: a hidden row of whole 256-element combine vectors and at most 32
 # routes per token (DeepEP's `impls/combine.cuh`, `dispatch.cuh`). The expert
 # count's division over the expert ranks is the operator's to check.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { mode = ["dispatch", "combine"], hidden = { multiple = 256 }, intermediate = { min = 1 }, top = { min = 1, max = 32 }, experts = { min = 1 }, max_tokens = { min = 1 }, ranks = { min = 1 }, attention = { min = 0 }, dtype = ["bf16"] }
 
 [parameters]

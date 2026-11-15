@@ -1,10 +1,8 @@
-"""The deepep package's compile script: one descriptor -> one module.
+"""The deepep package's build module: one descriptor -> one module.
 
 The descriptor fixes every template argument of DeepEP's kernels, so this
-compiles them here, and a serving host compiles nothing. The Build Server runs
-this script with its working directory the package root and
-`UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE` and `UNISERVE_OUT`
-in the environment.
+compiles them here, and a serving host compiles nothing. The Build Server
+compiles a descriptor by calling :func:`compile` with the compile request.
 
 DeepEP's kernels and the NCCL device API they are built against are pinned
 sources (`uniserve_build_server.fetch`'s `deepep` and `nccl` pins): the
@@ -13,12 +11,12 @@ compile includes them from their verified cache directories.
 
 import json
 import pathlib
-import re
 import subprocess
 import sys
 import sysconfig
 
-from uniserve_build_server import fetch, package
+from uniserve_build_server import fetch
+from uniserve_build_server.request import Request
 
 SOURCES = ["src/exchange.cu"]
 
@@ -33,23 +31,19 @@ ENTRIES = [
 ]
 
 
-def constants(descriptor):
-    """The compile-time values a descriptor states."""
-    found = re.fullmatch(
-        r"mode_(?:dispatch|combine)_hidden_(\d+)_intermediate_\d+_top_(\d+)_experts_(\d+)"
-        r"_max_tokens_(\d+)_ranks_(\d+)_attention_(\d+)_dtype_bf16",
-        descriptor,
-    )
-    if found is None:
-        raise SystemExit(f"this package serves no descriptor {descriptor}")
-    hidden, top, experts, max_tokens, ranks, attention = found.groups()
+def constants(request):
+    """The compile-time values a descriptor states, by the macro each defines.
+
+    The direction and the element type are the manifest's single choices, so
+    only the extents reach the compile.
+    """
     return {
-        "UNISERVE_HIDDEN": hidden,
-        "UNISERVE_TOP": top,
-        "UNISERVE_EXPERTS": experts,
-        "UNISERVE_MAX_TOKENS": max_tokens,
-        "UNISERVE_RANKS": ranks,
-        "UNISERVE_ATTENTION_RANKS": attention,
+        "UNISERVE_HIDDEN": request.field("hidden"),
+        "UNISERVE_TOP": request.field("top"),
+        "UNISERVE_EXPERTS": request.field("experts"),
+        "UNISERVE_MAX_TOKENS": request.field("max_tokens"),
+        "UNISERVE_RANKS": request.field("ranks"),
+        "UNISERVE_ATTENTION_RANKS": request.field("attention"),
     }
 
 
@@ -67,24 +61,32 @@ def nccl_library():
     return directory
 
 
-def main():
-    """Compile the exchange for one descriptor into ``module.so``."""
-    root, descriptor, target, out = package.arguments()
-    out.mkdir(parents=True, exist_ok=True)
+def compile(request: Request) -> None:
+    """Compile the exchange for the request's descriptor into ``module.so``.
+
+    The pinned sources are fetched into the Build Server's cache of pins when
+    it does not hold them yet; a compiler failure refuses the build, with the
+    compiler's output in the build log.
+    """
+    root = request.package
     try:
-        deepep = fetch.fetch(fetch.pin("deepep"))
-        nccl = fetch.fetch(fetch.pin("nccl"))
+        deepep = fetch.fetch(
+            fetch.pin("deepep"), request.cache, jobs=request.jobs
+        )
+        nccl = fetch.fetch(fetch.pin("nccl"), request.cache, jobs=request.jobs)
     except fetch.FetchError as error:
         raise SystemExit(str(error)) from error
-    compiler, _ = package.nvcc()
+    # The nvcc the Build Server checked against this package's declared
+    # version, and its driver API stub: the kernels call the driver directly.
+    cuda = request.toolchain.require_cuda()
     defines = [
-        f"-D{name}={value}" for name, value in constants(descriptor).items()
+        f"-D{name}={value}" for name, value in constants(request).items()
     ]
     command = [
-        compiler,
+        cuda.nvcc,
         "-O3",
         "-std=c++20",
-        f"-arch={target}",
+        f"-arch={request.target}",
         "--shared",
         "-Xcompiler",
         "-fPIC",
@@ -99,27 +101,26 @@ def main():
         f"-I{nccl / 'nvidia' / 'nccl' / 'include'}",
         *[str(root / source) for source in SOURCES],
         "-lcudart",
+        f"-L{cuda.stubs}",
         "-lcuda",
         f"-L{nccl_library()}",
         "-Xlinker",
         "--no-as-needed",
         "-l:libnccl.so.2",
         "-o",
-        str(out / "module.so"),
+        str(request.output / "module.so"),
     ]
     print(" ".join(command), file=sys.stderr)
-    built = subprocess.run(command, capture_output=True, text=True, check=False)
+    built = subprocess.run(command, check=False)
     if built.returncode != 0:
-        raise SystemExit(
-            f"nvcc failed with {built.returncode}:\n{built.stderr[-6000:]}"
-        )
-    package.require_exports(out / "module.so", ENTRIES)
+        raise SystemExit(f"nvcc failed with {built.returncode}")
+
     print(
         json.dumps(
-            {"descriptor": descriptor, "target": target, "entries": ENTRIES}
+            {
+                "descriptor": request.descriptor,
+                "target": str(request.target),
+                "entries": ENTRIES,
+            }
         )
     )
-
-
-if __name__ == "__main__":
-    main()

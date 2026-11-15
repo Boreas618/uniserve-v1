@@ -1,28 +1,32 @@
-"""The CuTe DSL compile driver every CuTe DSL package's ``src/build.py`` calls.
+"""The CuTe DSL compile driver: a package's ``spec`` to a native ``module.so``.
 
-The Build Server's CuTe DSL source runs a package's ``build.py`` for one
-(descriptor key, target) pair and keeps what it writes into the build's output
-directory: ``module.so``, a shared object with the C ABI entry the package
-declares (``src/entry.h``) and the kernel's cubin embedded.
+The Build Server compiles a CuTe DSL package's descriptor by handing its request
+to :func:`build` with the package's ``spec``, and keeps what it writes into the
+request's output directory: ``module.so``, a shared object with the C entry the
+package declares and the kernel's cubin embedded.
 
-Steps: ``cute.compile`` the kernel for fake arguments on an explicit
-architecture (no GPU is needed: fake tensors from ``cutlass.cute.runtime`` and
-a fake stream describe the runtime signature, and the architecture comes from
-the target), ``export_to_c`` to emit the host launcher object and its header,
-then link the object with the package's entry translation unit and the CuTe
-DSL's ``libcuda_dialect_runtime_static.a`` plus the CUDA runtime. The archive
-carries the device-dialect runtime; the CUDA runtime must come with it, or the
-module loads with undefined ``cuda*`` symbols.
+Steps: compile the kernel for the request's target (no GPU is read: the target
+is stated to the DSL, and fake tensors and a fake stream describe the runtime
+signature), ``export_to_c`` to emit the host launcher object and its header,
+then compile the package's entry unit beside that header and link both with the
+CuTe DSL's ``libcuda_dialect_runtime_static.a`` and the CUDA runtime. The
+archive carries the device-dialect runtime; the CUDA runtime must come with it,
+or the module loads with undefined ``cuda*`` symbols.
 
-A package's ``build.py`` states only ``spec(fields, parameters, target)`` and
-ends with ``main(spec)``. The spec names:
+A package's build module states ``spec(fields, parameters, target)``, one shape
+for every package:
 
-- ``name``: the exported launcher's name, which ``entry.cpp`` calls;
-- ``entry``: the C entry symbol the module must export;
-- either ``kernel``, ``args`` and ``options`` for ``cute.compile``, or
-  ``compile``, a callable returning the compiled object, for a package whose
-  kernel is compiled through its vendor's own selection (FlashAttention-4);
+- ``name``: the exported launcher's name, which the entry unit calls;
+- ``entry``: the C entry symbol the module exports;
+- ``compile``: a callable that returns the compiled kernel. A kernel the DSL
+  compiles directly states :func:`kernel`; a package whose kernel is selected
+  and compiled by its vendor's own code states that code;
 - ``defines`` (optional): preprocessor definitions of the entry unit.
+
+The entry unit is the C++ translation unit the manifest names in ``[source]
+unit``, which defines the C entry ``[module.entries]`` names; it is compiled
+where it is, so the ABI header beside it is found as its own include, and the
+export's header through the include path.
 
 The module is a **shared library with an entry symbol**, not a cubin ``ops``
 launches: the call's parameters are the ``Call`` struct ``entry.h`` declares,
@@ -32,165 +36,150 @@ whose layout a ``static_assert`` fixes, so no launch signature is written to a
 
 from __future__ import annotations
 
-import importlib.util
+import importlib.metadata
 import json
-import os
 import pathlib
 import subprocess
 import tempfile
 from collections.abc import Callable
+from typing import Any
 
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
+from cutlass.cutlass_dsl import CuTeDSL
 
-from uniserve_build_server import package
+from uniserve_build_server.request import Request, Target
+from uniserve_build_server.toolchain import Cuda
 
 #: What a package's ``spec`` is: the descriptor's fields, the manifest's
 #: ``[parameters]`` and the target, to the compilation of one descriptor.
-Spec = Callable[[dict[str, str], dict, str], dict]
+Spec = Callable[[dict[str, str], dict[str, Any], Target], dict[str, Any]]
+
+#: The CuTe DSL's static device-dialect runtime, which every module links whole.
+DIALECT_RUNTIME = "libcuda_dialect_runtime_static.a"
+
+#: The flags every C++ translation unit of a module is compiled with.
+CXX_FLAGS = ["-O2", "-std=c++20", "-fPIC"]
 
 
-def cutlass_library() -> pathlib.Path:
-    """The CuTe DSL static runtime archive for this host's CUDA."""
-    found = importlib.util.find_spec("nvidia_cutlass_dsl")
-    # The distribution is a namespace package: its directory is in the search
-    # locations, not in an origin module's path.
-    locations = list(getattr(found, "submodule_search_locations", None) or ())
-    if not locations:
-        raise SystemExit(
-            "the CuTe DSL package nvidia_cutlass_dsl is not installed"
-        )
-    root = pathlib.Path(locations[0])
-    for major in ("cu13", "cu12"):
-        archive = root / major / "lib" / "libcuda_dialect_runtime_static.a"
-        if archive.exists():
-            return archive
-    raise SystemExit(
-        "no libcuda_dialect_runtime_static.a in nvidia_cutlass_dsl"
+def configure(target: Target) -> None:
+    """State ``target`` as the architecture this process compiles for.
+
+    The DSL reads its architecture from its configuration object when it
+    traces a kernel, decides whether a JIT engine can run the result and picks
+    the cubin's chip; stating it there means no device is probed, and a
+    package whose vendor compiles its kernel compiles for the same target.
+    """
+    CuTeDSL._get_dsl().envar.arch = target.name
+
+
+def kernel(
+    compiled: Any, args: list[Any], options: dict[str, Any]
+) -> Callable[[], Any]:
+    """The ``compile`` of a kernel the DSL compiles for fake arguments."""
+    return lambda: cute.compile(
+        compiled, *args, **options, stream=make_fake_stream()
     )
 
 
-def cuda_home() -> pathlib.Path:
-    """The CUDA toolkit `CUDA_HOME` names: the runtime's headers and library."""
-    home = os.environ.get("CUDA_HOME")
-    if not home:
-        raise SystemExit(
-            "CUDA_HOME names the CUDA toolkit whose runtime the module "
-            "links against"
-        )
-    return pathlib.Path(home)
+def dialect_runtime(cuda: Cuda) -> pathlib.Path:
+    """The dialect runtime archive of the toolkit's CUDA major release.
 
-
-def link(
-    out: pathlib.Path,
-    objects: list[pathlib.Path],
-    header_dir: pathlib.Path,
-    entry: str,
-    archive: pathlib.Path,
-) -> None:
-    """Link the exported object and the entry unit into ``out/module.so``.
-
-    The dialect runtime archive is linked whole and the CUDA runtime
-    dynamically with ``--no-as-needed``: without the runtime the module loads
-    with undefined ``cuda*`` symbols, and without ``--no-as-needed`` the linker
-    drops it because the archive references it only indirectly.
+    It is a file of the locked ``nvidia-cutlass-dsl-libs-cu<major>``
+    distribution, found through the distribution's own file list.
     """
-    command = [
-        os.environ.get("CXX", "g++"),
-        "-shared",
-        "-O2",
-        "-std=c++20",
-        "-fPIC",
-        "-o",
-        str(out / "module.so"),
-        *(str(one) for one in objects),
-        f"-I{header_dir}",
-        f"-I{cuda_home() / 'include'}",
-        "-Wl,--whole-archive",
-        str(archive),
-        "-Wl,--no-whole-archive",
-        "-Wl,--no-as-needed",
-        f"-L{cuda_home() / 'lib64'}",
-        "-lcudart",
-    ]
-    built = subprocess.run(command, capture_output=True, text=True, check=False)
-    if built.returncode != 0:
-        raise SystemExit(f"linking module.so failed:\n{built.stderr}")
-    package.require_exports(out / "module.so", [entry])
-
-
-def compile_one(
-    root: pathlib.Path, key: str, target: str, out: pathlib.Path, spec: Spec
-) -> None:
-    """Compile descriptor ``key`` of the package at ``root`` into ``out``."""
-    # The compile describes the architecture itself: the target names it, so
-    # no device is read and none is needed.
-    os.environ["CUTE_DSL_ARCH"] = target
-    fields = package.fields()
+    distribution = f"nvidia-cutlass-dsl-libs-cu{cuda.version.split('.')[0]}"
     try:
-        stated = spec(
-            fields, package.manifest(root).get("parameters", {}), target
-        )
-    except KeyError as missing:
-        raise SystemExit(f"{key}: the descriptor names no {missing}") from None
-    if "compile" in stated:
-        compiled = stated["compile"]()
-    else:
-        compiled = cute.compile(
-            stated["kernel"],
-            *stated["args"],
-            **stated["options"],
-            stream=make_fake_stream(),
-        )
+        listed = importlib.metadata.files(distribution) or []
+    except importlib.metadata.PackageNotFoundError:
+        raise SystemExit(
+            f"this environment has no {distribution} distribution"
+        ) from None
+    for file in listed:
+        if file.name == DIALECT_RUNTIME:
+            return pathlib.Path(file.locate())
+    raise SystemExit(f"{distribution} holds no {DIALECT_RUNTIME}")
 
-    out.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as staging:
-        staging = pathlib.Path(staging)
+
+def compile_cxx(compiler: str, arguments: list[str], what: str) -> None:
+    """Run the host C++ compiler; a failure refuses the build."""
+    built = subprocess.run(
+        [compiler, *CXX_FLAGS, *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if built.returncode != 0:
+        raise SystemExit(f"{what} failed:\n{built.stderr}")
+
+
+def build(request: Request, spec: Spec) -> None:
+    """Compile the descriptor ``request`` names into its output directory."""
+    configure(request.target)
+    try:
+        stated = spec(request.fields, request.parameters, request.target)
+    except KeyError as absent:
+        raise SystemExit(
+            f"{request.descriptor}: the descriptor names no {absent}"
+        ) from None
+    compiled = stated["compile"]()
+
+    cuda = request.toolchain.require_cuda()
+    compiler = request.toolchain.require_host_compiler()
+    if request.unit is None:
+        raise SystemExit(
+            "a CuTe DSL package names its entry unit in [source] unit"
+        )
+    out = request.output
+    # The export and the entry unit's object are the build's own intermediates:
+    # they live in a directory of the build's workspace the module does not
+    # publish (a dot directory).
+    with tempfile.TemporaryDirectory(dir=out, prefix=".") as scratch:
+        staging = pathlib.Path(scratch)
         name = stated["name"]
         compiled.export_to_c(str(staging), name)
-        # The package's entry unit is compiled beside the generated header, so
-        # it includes both the export's launcher declarations and its own ABI.
-        entry_unit = staging / "entry.cpp"
-        entry_unit.write_text((root / "src" / "entry.cpp").read_text())
-        (staging / "entry.h").write_text((root / "src" / "entry.h").read_text())
-        object_file = staging / f"{name}.o"
-        built = subprocess.run(
+        unit = staging / "entry.o"
+        compile_cxx(
+            compiler,
             [
-                os.environ.get("CXX", "g++"),
                 "-c",
-                "-O2",
-                "-std=c++20",
-                "-fPIC",
                 "-o",
-                str(entry_unit.with_suffix(".o")),
-                str(entry_unit),
+                str(unit),
+                str(request.package / request.unit),
                 *(f"-D{one}" for one in stated.get("defines", [])),
                 f"-I{staging}",
-                f"-I{cuda_home() / 'include'}",
+                f"-I{cuda.include}",
             ],
-            capture_output=True,
-            text=True,
-            check=False,
+            "compiling the entry unit",
         )
-        if built.returncode != 0:
-            raise SystemExit(
-                f"compiling the entry unit failed:\n{built.stderr}"
-            )
-        link(
-            out,
-            [object_file, entry_unit.with_suffix(".o")],
-            staging,
-            stated["entry"],
-            cutlass_library(),
+        # The dialect runtime archive is linked whole and the CUDA runtime
+        # dynamically with `--no-as-needed`: without the runtime the module
+        # loads with undefined `cuda*` symbols, and without `--no-as-needed`
+        # the linker drops it because the archive references it only
+        # indirectly.
+        compile_cxx(
+            compiler,
+            [
+                "-shared",
+                "-o",
+                str(out / "module.so"),
+                str(staging / f"{name}.o"),
+                str(unit),
+                "-Wl,--whole-archive",
+                str(dialect_runtime(cuda)),
+                "-Wl,--no-whole-archive",
+                "-Wl,--no-as-needed",
+                f"-L{cuda.lib}",
+                "-lcudart",
+            ],
+            "linking module.so",
         )
     print(
         json.dumps(
-            {"descriptor": key, "target": target, "entry": stated["entry"]}
+            {
+                "descriptor": request.descriptor,
+                "target": request.target.name,
+                "entry": stated["entry"],
+            }
         )
     )
-
-
-def main(spec: Spec) -> None:
-    """Compile the descriptor the build names into its output directory."""
-    root, key, target, out = package.arguments()
-    compile_one(root, key, target, out, spec)

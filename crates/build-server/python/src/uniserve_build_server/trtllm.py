@@ -19,7 +19,7 @@ attention package's kernel selection is its own.
 
 from __future__ import annotations
 
-import importlib.util
+import importlib.metadata
 import json
 import pathlib
 import re
@@ -29,53 +29,62 @@ import sys
 import tempfile
 from collections.abc import Callable, Iterable
 
-from uniserve_build_server import fetch, package
+from uniserve_build_server import fetch
+from uniserve_build_server.request import Request, Target
 
-#: The architecture families each target runs. A GB200 reports SM 100 and runs
-#: the family-conditional `Sm100f` kernels beside the specific `Sm100a` ones.
-FAMILIES = {"sm_100a": ("Sm100a", "Sm100f"), "sm_100f": ("Sm100f",)}
+#: The distribution whose data tree holds the launch code.
+FLASHINFER = "flashinfer-python"
 
 
-def distribution(marker: str) -> pathlib.Path:
-    """The FlashInfer distribution's data tree that holds ``marker``.
+def families(target: Target) -> tuple[str, ...]:
+    """The architecture families of ``target``, as trtllm-gen spells them.
 
-    ``marker`` is a launch-code header the package compiles against.
+    A device of ``sm_100a`` runs the family-conditional ``Sm100f`` kernels
+    beside the specific ``Sm100a`` ones: the target's families are both.
     """
-    found = importlib.util.find_spec("flashinfer")
-    roots = found.submodule_search_locations if found is not None else None
-    for root in roots or []:
-        data = pathlib.Path(root) / "data"
-        if (data / marker).is_file():
-            return data
-    raise SystemExit(
-        f"no FlashInfer distribution with {marker} was found in the "
-        "interpreter running this build "
-        f"({sys.executable})"
+    return tuple(
+        "Sm" + family.removeprefix("sm_") for family in target.families
     )
 
 
-def stage(library: str, staged: pathlib.Path, names: Iterable[str]) -> None:
+def data_tree() -> pathlib.Path:
+    """The locked FlashInfer distribution's data tree."""
+    try:
+        installed = importlib.metadata.distribution(FLASHINFER)
+    except importlib.metadata.PackageNotFoundError:
+        raise SystemExit(
+            f"{sys.executable} has no {FLASHINFER} distribution"
+        ) from None
+    return pathlib.Path(installed.locate_file("flashinfer/data"))
+
+
+def stage(
+    request: Request, library: str, staged: pathlib.Path, names: Iterable[str]
+) -> None:
     """Stages files of a pinned trtllm-gen library into ``staged``.
 
-    Each is verified against the pin and staged as a link into the artifact
-    cache.
+    Each is verified against the pin and staged as a link into the Build
+    Server's cache of pins.
     """
     names = list(names)
     try:
         pinned = fetch.pin(library)
-        fetch.fetch(pinned, names)
-        fetch.stage(pinned, staged, names)
+        fetch.fetch(pinned, request.cache, names, request.jobs)
+        fetch.stage(pinned, request.cache, staged, names)
     except fetch.FetchError as error:
         raise SystemExit(
             f"staging the {library} artifact failed: {error}"
         ) from error
 
 
-# The batched-GEMM library's routed NVFP4 products.
+def run(command: list[str], what: str) -> None:
+    """Run one compiler process; its whole output is the build's log."""
+    print(" ".join(command), file=sys.stderr, flush=True)
+    if subprocess.run(command, check=False).returncode != 0:
+        raise SystemExit(f"{what} failed")
 
-#: The batched-GEMM library's launch-code header, which marks the distribution's
-#: data tree.
-FUSED_MOE_RUNNER = "include/flashinfer/trtllm/fused_moe/runner.h"
+
+# The batched-GEMM library's routed NVFP4 products.
 
 #: The gated activation each of the operator's activations is, in the artifact's
 #: own enumeration (`gemmGatedAct::ActType`).
@@ -238,7 +247,7 @@ RENDERINGS: dict[str, Callable[[str], str]] = {
 }
 
 
-def selection(blocks, fields, selected, target, renderings):
+def selection(blocks, fields, selected, target: Target, renderings):
     """The kernel names this descriptor's options select.
 
     The filter is the options the kernels were built with, as the manifest's
@@ -248,9 +257,7 @@ def selection(blocks, fields, selected, target, renderings):
     descriptor's rather than the manifest's: the MMA tile's rows and columns and
     the cluster.
     """
-    families = FAMILIES.get(target)
-    if families is None:
-        raise SystemExit(f"{target} names no trtllm-gen architecture family")
+    runs = families(target)
     rows, columns = (int(one) for one in fields["tile"].split("x"))
     cluster_m, cluster_n = (int(one) for one in fields["cluster"].split("x"))
     expected = {}
@@ -259,7 +266,7 @@ def selection(blocks, fields, selected, target, renderings):
         expected[name] = render(value) if render is not None else str(value)
     kept = []
     for name, block in blocks:
-        if family_of(block) not in families:
+        if family_of(block) not in runs:
             continue
         if option(block, "mTileM") != str(rows) or option(
             block, "mTileN"
@@ -313,9 +320,9 @@ def filtered_header(original: str, blocks, kept) -> str:
     )
 
 
-def manifest_selected(root: pathlib.Path) -> dict:
+def manifest_selected(parameters: dict) -> dict:
     """The options the manifest states the package's kernels were built with."""
-    selected = package.manifest(root).get("parameters", {}).get("selected")
+    selected = parameters.get("selected")
     if not selected:
         raise SystemExit("the manifest states no [parameters.selected] options")
     return selected
@@ -357,28 +364,58 @@ def headers(artifact: pathlib.Path, data: pathlib.Path) -> list[pathlib.Path]:
 
 
 def geometry(fields: dict[str, str]) -> list[str]:
-    """The descriptor's own values, as the entry's compile-time constants."""
+    """The descriptor's own values, as the entry's compile-time definitions."""
     rows, columns = (int(one) for one in fields["tile"].split("x"))
     cluster_m, cluster_n = (int(one) for one in fields["cluster"].split("x"))
     return [
-        f"-DUNISERVE_HIDDEN={fields['hidden']}",
-        f"-DUNISERVE_INTERMEDIATE={fields['intermediate']}",
-        f"-DUNISERVE_EXPERTS={fields['experts']}",
-        f"-DUNISERVE_TOP={fields['top']}",
-        f"-DUNISERVE_TILE_TOKENS={rows}",
-        f"-DUNISERVE_TILE_COLUMNS={columns}",
-        f"-DUNISERVE_CLUSTER_ROWS={cluster_m}",
-        f"-DUNISERVE_CLUSTER_COLUMNS={cluster_n}",
+        f"UNISERVE_HIDDEN={fields['hidden']}",
+        f"UNISERVE_INTERMEDIATE={fields['intermediate']}",
+        f"UNISERVE_EXPERTS={fields['experts']}",
+        f"UNISERVE_TOP={fields['top']}",
+        f"UNISERVE_TILE_TOKENS={rows}",
+        f"UNISERVE_TILE_COLUMNS={columns}",
+        f"UNISERVE_CLUSTER_ROWS={cluster_m}",
+        f"UNISERVE_CLUSTER_COLUMNS={cluster_n}",
+    ]
+
+
+def nvcc_command(
+    request: Request,
+    defines: list[str],
+    includes: list[pathlib.Path],
+    source: pathlib.Path,
+    output: pathlib.Path,
+) -> list[str]:
+    """The nvcc command compiling one unit of a routed product."""
+    cuda = request.toolchain.require_cuda()
+    return [
+        cuda.nvcc,
+        "-c",
+        "-x",
+        "cu",
+        "-O3",
+        "-std=c++17",
+        f"-arch={request.target}",
+        "--expt-relaxed-constexpr",
+        "-Xcompiler",
+        "-fPIC",
+        *[f"-D{one}" for one in defines],
+        *[f"-I{one}" for one in includes],
+        "-o",
+        str(output),
+        str(source),
     ]
 
 
 def build_routed_gemm(
-    entry: str, renderings: dict[str, Callable[[str], str]] | None = None
+    request: Request,
+    entry: str,
+    renderings: dict[str, Callable[[str], str]] | None = None,
 ) -> None:
     """Compiles one descriptor of a routed NVFP4 batched-GEMM package.
 
-    This is the package's compile script: it writes ``module.so`` with its
-    cubins.
+    This is the package's whole compilation: it writes ``module.so`` with its
+    cubins into the request's output directory.
 
     Steps:
 
@@ -393,149 +430,116 @@ def build_routed_gemm(
        into the compile's include path, so the runner's configuration list is
        exactly this descriptor's tactics: a cubin that is not published cannot
        be selected;
-    4. compile the entry unit and the vendor units its runner resolves, and link
-       ``module.so``.
+    4. compile the entry unit (the manifest's ``[source] unit``) and the vendor
+       units its runner resolves, and link ``module.so``.
 
-    ``entry`` is the C entry the module must export; ``renderings`` adds the
-    enum renderings of options only one package's manifest selects. The module
+    ``entry`` is the C entry the module exports; ``renderings`` adds the enum
+    renderings of options only one package's manifest selects. The module
     needs the CUDA driver (`libcuda`) as well as the runtime: trtllm-gen's
     launcher calls `cuModuleLoadData`, `cuModuleGetFunction` and
     `cuLaunchKernelEx` directly, and the entry writes the padded route count
     with `cuMemsetD32Async`.
     """
-    root, descriptor, target, out = package.arguments()
-    fields = package.fields()
-    data = distribution(FUSED_MOE_RUNNER)
-    out.mkdir(parents=True, exist_ok=True)
-    staging = pathlib.Path(tempfile.mkdtemp(prefix="uniserve-trtllm-bmm-"))
-    try:
-        _build_routed_gemm(
-            root,
-            descriptor,
-            fields,
-            target,
-            out,
-            data,
-            staging,
-            entry,
-            {**RENDERINGS, **(renderings or {})},
-        )
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-
-
-def _build_routed_gemm(
-    root, descriptor, fields, target, out, data, staging, entry, renderings
-):
-    stage(
-        "trtllm-gen-bmm",
-        staging,
-        ["include/flashinferMetaInfo.h", *EXPORT_HEADERS],
-    )
-    header = (staging / "include/flashinferMetaInfo.h").read_text()
-    blocks = entry_blocks(header)
-    kept = selection(
-        blocks, fields, manifest_selected(root), target, renderings
-    )
-    stage("trtllm-gen-bmm", staging, [cubin_name(name) for name in kept])
-    published = out / "cubins"
-    published.mkdir(parents=True, exist_ok=True)
-    for name in kept:
-        source = staging / cubin_name(name)
-        if not source.is_file():
-            raise SystemExit(f"the fetcher staged no {source}")
-        shutil.copyfile(source, published / cubin_name(name))
-    print(f"published {len(kept)} cubins", file=sys.stderr)
-
-    # The compile reads a table of this descriptor's tactics and nothing else.
-    # The staging tree's files are links into the artifact cache, which every
-    # other module and host shares and which is content-addressed by the
-    # artifact's own hash, so a write through them would corrupt it. The
-    # filtered table therefore gets a file and an include directory of its own,
-    # searched first.
-    filtered = staging / "filtered/include"
-    filtered.mkdir(parents=True, exist_ok=True)
-    (filtered / "flashinferMetaInfo.h").write_text(
-        filtered_header(header, blocks, kept)
-    )
-
-    compiler, version = package.nvcc()
-    unit = out / "entry.o"
-    command = [
-        compiler,
-        "-c",
-        "-x",
-        "cu",
-        "-O3",
-        "-std=c++17",
-        f"-arch={target}",
-        "--expt-relaxed-constexpr",
-        "-Xcompiler",
-        "-fPIC",
-        *[f"-D{one}" for one in DEFINES],
-        *geometry(fields),
-        '-DTLLM_GEN_GEMM_CUBIN_PATH="."',
-        *[f"-I{one}" for one in headers(staging, data)],
-        "-o",
-        str(unit),
-        str(root / "src/entry.cpp"),
-    ]
-    compiled = subprocess.run(
-        command, capture_output=True, text=True, check=False
-    )
-    if compiled.returncode != 0:
+    if request.unit is None:
         raise SystemExit(
-            f"compiling the entry unit failed with {compiler} ({version}):\n"
-            f"{' '.join(command)}\n{compiled.stderr[-6000:]}"
+            "a routed product names its entry unit in [source] unit"
         )
-
-    objects = [unit]
-    for relative in SOURCES:
-        source = data / relative
-        if not source.is_file():
-            raise SystemExit(f"the distribution has no {relative}")
-        object_unit = out / (source.stem + ".o")
-        # The vendor units carry no descriptor: they are the launch code,
-        # compiled once.
-        vendor = [one for one in command if not one.startswith("-DUNISERVE_")]
-        vendor[vendor.index("-o") + 1] = str(object_unit)
-        vendor[vendor.index(str(root / "src/entry.cpp"))] = str(source)
-        built = subprocess.run(
-            vendor, capture_output=True, text=True, check=False
+    data = data_tree()
+    out = request.output
+    renderings = {**RENDERINGS, **(renderings or {})}
+    # The staged library, the filtered table and the objects are the build's
+    # own intermediates, in a directory of its workspace the module does not
+    # publish (a dot directory).
+    with tempfile.TemporaryDirectory(dir=out, prefix=".") as scratch:
+        staging = pathlib.Path(scratch)
+        stage(
+            request,
+            "trtllm-gen-bmm",
+            staging,
+            ["include/flashinferMetaInfo.h", *EXPORT_HEADERS],
         )
-        if built.returncode != 0:
-            raise SystemExit(
-                f"compiling {relative} failed with {compiler} ({version}):\n"
-                f"{' '.join(vendor)}\n{built.stderr[:8000]}"
+        header = (staging / "include/flashinferMetaInfo.h").read_text()
+        blocks = entry_blocks(header)
+        kept = selection(
+            blocks,
+            request.fields,
+            manifest_selected(request.parameters),
+            request.target,
+            renderings,
+        )
+        stage(
+            request,
+            "trtllm-gen-bmm",
+            staging,
+            [cubin_name(name) for name in kept],
+        )
+        published = out / "cubins"
+        published.mkdir(parents=True, exist_ok=True)
+        for name in kept:
+            shutil.copyfile(
+                staging / cubin_name(name), published / cubin_name(name)
             )
-        objects.append(object_unit)
+        print(f"published {len(kept)} cubins", file=sys.stderr)
 
-    # trtllm-gen's launcher calls the CUDA driver API directly, and the entry
-    # writes the padded route count through it; the toolkit's stub is a
-    # link-time input only, and nvcc's own profile puts the toolkit's
-    # `lib/stubs` on the link line.
-    module = out / "module.so"
-    linked = subprocess.run(
-        [
-            compiler,
-            "-shared",
-            f"-arch={target}",
-            *[str(one) for one in objects],
-            "-lcuda",
-            "-lcudart",
-            "-o",
-            str(module),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if linked.returncode != 0:
-        raise SystemExit(f"linking module.so failed:\n{linked.stderr[-6000:]}")
+        # The compile reads a table of this descriptor's tactics and nothing
+        # else. The staged files are links into the cache of pins, which every
+        # other build shares and which is content-addressed by the artifact's
+        # own hash, so a write through them would corrupt it. The filtered
+        # table therefore gets a file and an include directory of its own,
+        # searched first.
+        filtered = staging / "filtered/include"
+        filtered.mkdir(parents=True, exist_ok=True)
+        (filtered / "flashinferMetaInfo.h").write_text(
+            filtered_header(header, blocks, kept)
+        )
 
-    package.require_exports(module, [entry])
+        includes = headers(staging, data)
+        defines = [*DEFINES, 'TLLM_GEN_GEMM_CUBIN_PATH="."']
+        objects = [staging / "entry.o"]
+        run(
+            nvcc_command(
+                request,
+                [*defines, *geometry(request.fields)],
+                includes,
+                request.package / request.unit,
+                objects[0],
+            ),
+            "compiling the entry unit",
+        )
+        # The vendor units carry no descriptor: they are the launch code.
+        for relative in SOURCES:
+            objects.append(staging / (pathlib.Path(relative).stem + ".o"))
+            run(
+                nvcc_command(
+                    request, defines, includes, data / relative, objects[-1]
+                ),
+                f"compiling {relative}",
+            )
+
+        # trtllm-gen's launcher calls the CUDA driver API directly, and the
+        # entry writes the padded route count through it: the toolkit's stub is
+        # the link-time input, and the serving process loads the driver.
+        cuda = request.toolchain.require_cuda()
+        run(
+            [
+                cuda.nvcc,
+                "-shared",
+                f"-arch={request.target}",
+                *[str(one) for one in objects],
+                f"-L{cuda.stubs}",
+                "-lcuda",
+                "-lcudart",
+                "-o",
+                str(out / "module.so"),
+            ],
+            "linking module.so",
+        )
     print(
         json.dumps(
-            {"descriptor": descriptor, "target": target, "cubins": len(kept)}
+            {
+                "descriptor": request.descriptor,
+                "target": request.target.name,
+                "cubins": len(kept),
+            }
         )
     )

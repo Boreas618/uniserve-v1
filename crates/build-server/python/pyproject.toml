@@ -1,25 +1,27 @@
 # The Build Server's own Python environment (design section 6.2).
 #
 # Python appears in the system in one place: here, as the compiler of Triton
-# and CuTe DSL kernel packages. The Build Server runs every package's compile
-# script with this environment's interpreter, and the environment locks the
-# compiler distributions and the external packages the kernel packages import
-# (design section 5.2: a package names the packages it needs, and this lock
-# fixes their versions).
+# and CuTe DSL kernel packages. The environment locks the compiler
+# distributions and the external packages the kernel packages import (design
+# section 5.2: a package names the packages it needs, and this lock fixes their
+# versions), and installs the `uniserve-build-server` program, through which
+# the Build Server reads its toolchain description and runs every compilation.
 #
 # It is not the repository's `.venv`: that environment holds the development
 # tools and the evaluator, while this one holds only what compiles a kernel, so
 # a package's compile script cannot depend on their packages by accident.
 #
-#   uv sync --project crates/build-server/python --python /usr/bin/python3.12
+#   uv sync --locked --project crates/build-server/python
 #
-# creates `python/.venv` from this file and `python/uv.lock`; the Build
-# Server's `--python` option names its interpreter, which defaults to
-# `python/.venv/bin/python` under the repository root.
+# creates the environment from this file and `uv.lock` with an interpreter that
+# meets `requires-python` (uv installs one when the host has none). The Build
+# Server runs `uniserve-build-server` from its search path, so the environment's
+# `bin` directory is where the host's programs are found, as for any installed
+# program.
 [project]
 name = "uniserve-build-server"
 version = "2.0.0"
-description = "The compilers of UniServe's kernel and scheduling policy packages"
+description = "The compilers of UniServe's kernel packages"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     # Triton compiles a kernel package to a cubin and its metadata JSON
@@ -35,7 +37,23 @@ dependencies = [
     # them; they are pinned here, not in the serving environment.
     "flashinfer-python==0.6.18",
     "flash-attn-4[cu13]==4.0.0b30",
+    # The pinned sources' fetcher asks for each file through urllib3's retry
+    # policy, and applies a package's patch to a staged copy with patch-ng.
+    "urllib3==2.8.0",
+    "patch-ng==1.19.1",
 ]
+
+[project.scripts]
+uniserve-build-server = "uniserve_build_server.__main__:main"
+
+# The package's own tests (`tests/`), run in this environment:
+#   uv run --locked --project crates/build-server/python --group test \
+#     pytest crates/build-server/python/tests
+[dependency-groups]
+test = ["pytest==9.1.1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [build-system]
 requires = ["uv_build>=0.12,<0.13"]
@@ -47,11 +65,9 @@ module-root = "src"
 
 [tool.uv]
 # The environment holds the compilers and the packages a kernel package imports,
-# and one package of our own: `uniserve_build_server`, what the packages'
-# compile scripts share — the Triton and CuTe DSL compile drivers, the key
-# reader, the pinned third-party sources (`fetch`, with its manifests under
-# `pins/`) and the trtllm-gen build. Each kernel package's own `src/build.py`
-# states what is particular to it (design 5.2: a revision fixes the rule that
-# picks its kernel) and calls those drivers; this environment's interpreter
-# runs it.
+# and one package of our own: `uniserve_build_server`, the toolchain
+# description, the compile request, the Triton and CuTe DSL compile drivers, the
+# pinned third-party sources (`fetch`, one data file each under `pins/`) and the
+# trtllm-gen build. Each kernel package's build module states what is particular
+# to it (design 5.2: a revision fixes the rule that picks its kernel).
 package = true

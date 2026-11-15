@@ -29,11 +29,10 @@ files = ["src/vsa_compress_pooled.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_heads_56_width_128_max_tiles_1024_block_128_pdl_false`.
-[kernel.descriptors]
+[[kernel.descriptors]]
 # `max_tiles` is a **class**, not a count: the key names the bound's next power of two, so a bound
 # of 640 tiles and one of 1024 are one module. `block` is a `tl.arange` extent; `heads` and `width`
 # compile for any positive value, the lanes past `width` masked.

@@ -12,7 +12,6 @@ launch words, and the kernel indexes in int64 either way.
 """
 
 import value_first_swiglu as kernels
-from uniserve_build_server import triton as driver
 
 #: The floating dtypes the packed input, the bias and the output may have, as Triton spells them in
 #: an argument signature.
@@ -53,7 +52,3 @@ def spec(fields, parameters, target):
         # package is compiled: the launch states `width` and `input_stride` from the same key.
         "aligned": aligned,
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

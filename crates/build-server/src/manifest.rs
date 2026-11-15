@@ -10,8 +10,8 @@
 //!   own environment locks them, design section 5.2);
 //! - the module's form — a cubin with metadata, or a native library with a C
 //!   entry (design section 5.3);
-//! - the source files and the kind of source (Triton, CUDA C++, CuTe DSL, a
-//!   vendor cubin, a wasm module, an executable);
+//! - the source files and the kind of source (a build module of Triton, CUDA
+//!   C++ or CuTe DSL, a vendor cubin, a crate cargo builds, an executable);
 //! - the architectures it supports and the descriptors it covers, with the
 //!   tile constants and the rule that picks a kernel for a descriptor;
 //! - its parameters and their defaults;
@@ -27,8 +27,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-
-pub use crate::target::TargetKind;
 
 /// Why a package manifest is not usable.
 #[derive(Debug, thiserror::Error)]
@@ -59,10 +57,10 @@ pub enum ModuleForm {
     /// A native library with a C ABI, loaded with `dlopen`. The package's
     /// host code builds the launches, the TMA descriptors and the grid.
     Native,
-    /// A wasm32 module precompiled for this host's CPU, which wasmtime
-    /// loads. A scheduling policy is such a package revision (design section 5.3); it
-    /// is a flat byte blob, not a kernel, so it has neither launch metadata
-    /// nor a C entry.
+    /// A wasm32 module, which the engine's wasmtime compiles under its own
+    /// configuration when it loads it. A scheduling policy is such a package
+    /// revision (design section 5.3); it is a flat byte blob, not a kernel, so
+    /// it has neither launch metadata nor a C entry.
     Wasm,
     /// An executable the main process runs as its own process, rather
     /// than loading into itself. It is stored as it is, so it has neither
@@ -71,48 +69,79 @@ pub enum ModuleForm {
 }
 
 /// A kind of source: what compiles a package's files into a module.
+///
+/// The first three are a **build module**, the Python module the manifest's
+/// [`SourceSpec::script`] names, compiled through the Build Server's Python
+/// environment with a typed compile request (`crate::source`): the kind names
+/// how the module states its compilation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
-    /// CUDA C++ through nvcc: a cubin, or a native library when the package
-    /// brings a C ABI layer.
+    /// CUDA C++: the build module's `compile(request)` is the whole
+    /// compilation, to a cubin or a native library.
     Cuda,
     /// Triton through `triton.compile`, which writes a cubin and its
-    /// metadata JSON (design section 5.3).
+    /// metadata JSON (design section 5.3): the build module states the
+    /// descriptor's `spec`.
     Triton,
     /// CuTe DSL through its Python compiler and `export_to_c`, linked into a
-    /// native library with `libcuda_dialect_runtime_static.a`.
+    /// native library with `libcuda_dialect_runtime_static.a`: the build
+    /// module states the descriptor's `spec`, and the entry unit
+    /// [`SourceSpec::unit`] defines the C entry.
     CuteDsl,
     /// A vendor cubin the package carries, stored as it is.
     Cubin,
     /// A scheduling policy: a crate of a Cargo workspace, built for wasm32
-    /// from the snapshot an installation takes of it and then precompiled
-    /// for this host's CPU.
+    /// from the snapshot an installation takes of the whole workspace.
     Wasm,
     /// An executable: stored as it is.
     Executable,
     /// A crate of a Cargo workspace, built by cargo to the executable
     /// [`SourceSpec::binary`] names, from the snapshot an installation takes
-    /// of the crate and the workspace crates it depends on: the engine.
+    /// of the whole workspace: the engine.
     Cargo,
 }
 
+impl SourceKind {
+    /// Whether the source is a build module the Python environment compiles.
+    pub fn compiled_by_module(self) -> bool {
+        matches!(self, Self::Cuda | Self::Triton | Self::CuteDsl)
+    }
+
+    /// Whether the source is a crate cargo builds from a workspace snapshot.
+    pub fn builds_with_cargo(self) -> bool {
+        matches!(self, Self::Wasm | Self::Cargo)
+    }
+
+    /// The toolchains a source of this kind builds with: what a manifest's
+    /// `[toolchain] kind` may name for it.
+    pub fn toolchains(self) -> &'static [ToolchainKind] {
+        match self {
+            Self::Cuda | Self::Triton | Self::CuteDsl => &[
+                ToolchainKind::Nvcc,
+                ToolchainKind::Triton,
+                ToolchainKind::CuteDsl,
+            ],
+            Self::Wasm | Self::Cargo => &[ToolchainKind::Cargo],
+            Self::Cubin | Self::Executable => &[ToolchainKind::None],
+        }
+    }
+}
+
 /// The toolchain a package needs (design section 6.2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolchainKind {
     /// nvcc, the CUDA toolkit's compiler.
     Nvcc,
     /// Triton, from the Build Server's own Python environment.
     Triton,
-    /// CuTe DSL (the `cutlass-dsl` distribution), from the same environment.
+    /// CuTe DSL (the `nvidia-cutlass-dsl` distribution), from the same
+    /// environment.
     CuteDsl,
-    /// The WebAssembly toolchain: a wasm32 build, then the scheduling
-    /// precompiler's wasmtime for this host's CPU.
-    Wasm,
-    /// cargo, at the compiler version the package states: it builds a crate
-    /// from its snapshot with the lockfile and the toolchain's own crate
-    /// cache, offline.
+    /// cargo, at the compiler release the package states: it builds a crate
+    /// of its workspace snapshot, for the host or for wasm32, with the
+    /// lockfile and vendored registry sources, offline.
     Cargo,
     /// Nothing: a source that compiles nothing, such as a vendor cubin or an
     /// executable, has no toolchain version to match.
@@ -131,7 +160,6 @@ impl ToolchainKind {
             Self::Nvcc => "nvcc",
             Self::Triton => "triton",
             Self::CuteDsl => "cute_dsl",
-            Self::Wasm => "wasm",
             Self::Cargo => "cargo",
             Self::None => "none",
         }
@@ -190,9 +218,9 @@ pub struct PythonPackage {
 #[serde(deny_unknown_fields)]
 pub struct ModuleSpec {
     pub form: ModuleForm,
-    /// The metadata JSON's name inside the module directory, for a cubin
-    /// module: Triton's own file for a Triton package, or the file the
-    /// package writes in the same fields for nvcc (design section 5.3).
+    /// The metadata JSON's name inside the module directory, which every cubin
+    /// module carries: Triton's own file for a Triton package, or the file the
+    /// package writes in the same fields (design section 5.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<String>,
     /// A native module's C entry symbols, by role: what the main process
@@ -226,14 +254,25 @@ pub struct SourceSpec {
     /// and one metadata JSON per descriptor names them
     /// `cubin/{descriptor}.cubin` and `cubin/{descriptor}.json`.
     pub files: Vec<String>,
-    /// The compile script, for a source kind the Build Server drives with a
-    /// Python script; relative to the package root.
+    /// The build module of a source a build module compiles
+    /// ([`SourceKind::compiled_by_module`]), relative to the package root: the
+    /// compilation runs in its directory and imports it by its name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,
-    /// The kernel's name, for a Triton source: the function `triton.compile`
-    /// builds.
+    /// The C++ translation unit that defines a native module's C entries, for
+    /// a source whose driver compiles it (a CuTe DSL kernel's, or a shared
+    /// build's such as the routed trtllm-gen products'); relative to the
+    /// package root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kernel: Option<String>,
+    pub unit: Option<String>,
+    /// The cubin of a vendor cubin source, which the module carries as
+    /// `module.cubin`; it may hold [`DESCRIPTOR_PLACEHOLDER`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cubin: Option<String>,
+    /// The launch metadata of a vendor cubin source, which the module carries
+    /// under [`ModuleSpec::metadata`]; it may hold [`DESCRIPTOR_PLACEHOLDER`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
     /// The executable a cargo source builds and the module holds, such as
     /// `uniserve-engine`: a binary target of the package's crate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,76 +303,8 @@ pub const DESCRIPTOR_PLACEHOLDER: &str = "{descriptor}";
 
 /// The key of the one module a package without a `[kernel]` section builds:
 /// a scheduling policy and the engine each fill a whole interface, not a set
-/// of shapes.
+/// of shapes. No descriptor key is it: a key is `dimension_value` pairs.
 pub const SINGLE_KEY: &str = "default";
-
-/// The target of a scheduling policy's module: wasm32, precompiled for this
-/// host's CPU, not a GPU architecture.
-pub const WASM_TARGET: &str = "wasm32";
-
-/// The shapes a package covers: one descriptor table, or several.
-///
-/// An operator's key shape varies by variant — `qk_norm_rope` prints `rotated`
-/// only when its rotation is narrowed, `rotary_factors` prints `axes`,
-/// `sections` and `interleaved` only when it is sectioned — and a package serves
-/// an *operator*, not one key shape. A manifest writes either one table
-///
-/// ```toml
-/// [kernel.descriptors]
-/// dimensions = { dtype = ["bf16"], head_dim = ["128"], rotated = { multiple = 2 } }
-/// ```
-///
-/// or one table per shape
-///
-/// ```toml
-/// [[kernel.descriptors]]
-/// dimensions = { dtype = ["bf16"], head_dim = ["128"] }
-///
-/// [[kernel.descriptors]]
-/// dimensions = { dtype = ["bf16"], head_dim = ["128"], rotated = { multiple = 2 } }
-/// ```
-///
-/// A key is covered when it covers one of them, so a backend name keeps meaning
-/// what `prepare` selects by and a deployment's configuration names, rather
-/// than growing a shape vocabulary.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum DescriptorShapes {
-    /// The one table a package writes when its keys all have one shape.
-    One(Descriptors),
-    /// One table per shape.
-    Several(Vec<Descriptors>),
-}
-
-/// A package that declares nothing covers nothing.
-impl Default for DescriptorShapes {
-    fn default() -> Self {
-        Self::One(Descriptors::default())
-    }
-}
-
-impl DescriptorShapes {
-    /// Every shape the package covers, in the order the manifest writes them.
-    pub fn shapes(&self) -> &[Descriptors] {
-        match self {
-            Self::One(one) => std::slice::from_ref(one),
-            Self::Several(several) => several.as_slice(),
-        }
-    }
-
-    /// Whether the package covers the descriptor whose key this is: it covers
-    /// one of the package's shapes.
-    pub fn covers(&self, key: &str) -> bool {
-        self.fields(key).is_some()
-    }
-
-    /// The fields of the descriptor whose key this is, each a dimension and
-    /// its value in the key's order, as the first shape that reads the key
-    /// whole reads it; `None` when no shape does.
-    pub fn fields(&self, key: &str) -> Option<Vec<(String, String)>> {
-        self.shapes().iter().find_map(|shape| shape.fields(key))
-    }
-}
 
 /// The descriptors a package covers (design section 4.2 and 5.2).
 ///
@@ -578,24 +549,24 @@ fn admits_bits(bits: u32, text: &str) -> bool {
         && (digits == "0" || !digits.starts_with('0'))
 }
 
-/// The kernel package a package provides, and what picks a kernel for a
-/// descriptor: the supported architectures, the descriptors, the tile
-/// constants and the launch metadata an nvcc cubin needs.
+/// The kernel package a package provides: the architectures it supports and
+/// the descriptors it covers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelSpec {
-    /// How the target is named for this package (design section 5.3).
-    #[serde(default)]
-    pub target: TargetKind,
-    /// The architectures the package supports, such as `["sm_100a"]`.
+    /// The architectures the package supports, such as `["sm_100a"]`: GPU
+    /// targets of the Build Server's description (`crate::target`).
     pub architectures: Vec<String>,
-    /// The shapes the package covers, each a descriptor table.
-    pub descriptors: DescriptorShapes,
-    /// The tile constants and the rule that picks a kernel for a descriptor.
-    /// The package's own compile script and launch code read these; the
-    /// Build Server only keeps them with the revision.
-    #[serde(default)]
-    pub selection: BTreeMap<String, toml::Value>,
+    /// The shapes the package covers, one `[[kernel.descriptors]]` table each.
+    ///
+    /// An operator's key shape varies by variant — `qk_norm_rope` prints
+    /// `rotated` only when its rotation is narrowed, `rotary_factors` prints
+    /// `axes`, `sections` and `interleaved` only when it is sectioned — and a
+    /// package serves an *operator*, not one key shape. A key is covered when
+    /// it reads whole against one of the tables, so a backend name keeps
+    /// meaning what `prepare` selects by and a deployment's configuration
+    /// names, rather than growing a shape vocabulary.
+    pub descriptors: Vec<Descriptors>,
 }
 
 /// One package's manifest: `package.toml` at the package root.
@@ -643,9 +614,12 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// The manifest's file name at a package's root.
+    pub const FILE: &str = "package.toml";
+
     /// The manifest and the package root beside it.
     pub fn load(root: &Path) -> Result<Self, ManifestError> {
-        let path = root.join("package.toml");
+        let path = root.join(Self::FILE);
         let text = std::fs::read_to_string(&path).map_err(|source| ManifestError::Read {
             path: path.clone(),
             source,
@@ -684,6 +658,23 @@ impl Manifest {
                     "the package must name the architectures it supports".into(),
                 ));
             }
+            (Some(kernel), _) => {
+                let unknown: Vec<&String> = kernel
+                    .architectures
+                    .iter()
+                    .filter(|architecture| {
+                        crate::target::Target::new(architecture.as_str())
+                            .facts()
+                            .is_none()
+                    })
+                    .collect();
+                if !unknown.is_empty() {
+                    return Err(ManifestError::Invalid(format!(
+                        "the package names architectures the Build Server does not describe: \
+                         {unknown:?}"
+                    )));
+                }
+            }
             (None, ModuleForm::Wasm | ModuleForm::Executable) => {}
             (None, _) => {
                 return Err(ManifestError::Invalid(
@@ -692,12 +683,48 @@ impl Manifest {
                         .into(),
                 ));
             }
-            _ => {}
         }
-        if self.source.kind == SourceKind::Wasm && self.source.script.is_some() {
+        if !self.source.kind.toolchains().contains(&self.toolchain.kind) {
+            return Err(ManifestError::Invalid(format!(
+                "a {:?} source builds with {:?}, not with the {} toolchain",
+                self.source.kind,
+                self.source.kind.toolchains(),
+                self.toolchain.kind
+            )));
+        }
+        if self.source.kind.builds_with_cargo()
+            && (!self.source.files.is_empty() || !self.tuning.is_empty())
+        {
             return Err(ManifestError::Invalid(
-                "a scheduling policy is a crate the Build Server builds from its snapshot: it \
-                 names no build script"
+                "a crate's files are the ones cargo packages of its workspace: a cargo or wasm \
+                 source names no [source] files and no tuning"
+                    .into(),
+            ));
+        }
+        if self.source.kind.compiled_by_module() && self.source.script.is_none() {
+            return Err(ManifestError::Invalid(format!(
+                "a {:?} source is compiled by its build module: name it in [source] script",
+                self.source.kind
+            )));
+        }
+        if !self.source.kind.compiled_by_module() && self.source.script.is_some() {
+            return Err(ManifestError::Invalid(format!(
+                "a {:?} source has no build module: it names no [source] script",
+                self.source.kind
+            )));
+        }
+        if self.source.kind == SourceKind::CuteDsl && self.source.unit.is_none() {
+            return Err(ManifestError::Invalid(
+                "a CuTe DSL source names the C++ unit that defines its C entry in [source] unit"
+                    .into(),
+            ));
+        }
+        if self.source.kind == SourceKind::Cubin
+            && (self.source.cubin.is_none() || self.source.metadata.is_none())
+        {
+            return Err(ManifestError::Invalid(
+                "a vendor cubin source names its cubin and its launch metadata in [source] cubin \
+                 and metadata"
                     .into(),
             ));
         }
@@ -730,6 +757,10 @@ impl Manifest {
             .source
             .files
             .iter()
+            .chain(self.source.script.iter())
+            .chain(self.source.unit.iter())
+            .chain(self.source.cubin.iter())
+            .chain(self.source.metadata.iter())
             .chain(self.tuning.iter())
             // A file named per descriptor (`cubin/{descriptor}.cubin`) is
             // checked when that descriptor is built.
@@ -751,15 +782,12 @@ impl Manifest {
                 }
             }
             ModuleForm::Cubin | ModuleForm::Wasm | ModuleForm::Executable => {
-                // A Triton kernel's kernel symbol and parameters are in the metadata its compile
-                // writes. A package that does not name that file serves an image the main process
-                // cannot find the kernel of, which reads as a missing symbol on the first load.
-                if self.module.form == ModuleForm::Cubin
-                    && self.toolchain.kind == ToolchainKind::Triton
-                    && self.module.metadata.is_none()
-                {
+                // A cubin's kernel symbol and parameters are in its launch metadata. A package that
+                // does not name that file serves an image the main process cannot find the kernel
+                // of, which reads as a missing symbol on the first load.
+                if self.module.form == ModuleForm::Cubin && self.module.metadata.is_none() {
                     return Err(ManifestError::Invalid(
-                        "a Triton cubin module must name its metadata file in [module]".into(),
+                        "a cubin module must name its metadata file in [module] metadata".into(),
                     ));
                 }
                 if self.module.entries_file.is_some() {
@@ -785,7 +813,7 @@ impl Manifest {
     /// package whose operator's key varies by variant, and none for a policy.
     pub fn descriptors(&self) -> &[Descriptors] {
         match &self.kernel {
-            Some(kernel) => kernel.descriptors.shapes(),
+            Some(kernel) => &kernel.descriptors,
             None => &[],
         }
     }
@@ -793,10 +821,7 @@ impl Manifest {
     /// Whether this package covers a descriptor key: a kernel package by its
     /// declared dimensions, a package of one module by [`SINGLE_KEY`].
     pub fn covers(&self, key: &str) -> bool {
-        match &self.kernel {
-            Some(kernel) => kernel.descriptors.covers(key),
-            None => key == SINGLE_KEY,
-        }
+        self.fields(key).is_some()
     }
 
     /// The fields of the descriptor whose key this is, as the package's
@@ -805,7 +830,10 @@ impl Manifest {
     /// package does not cover; a package of one module has no field.
     pub fn fields(&self, key: &str) -> Option<Vec<(String, String)>> {
         match &self.kernel {
-            Some(kernel) => kernel.descriptors.fields(key),
+            Some(kernel) => kernel
+                .descriptors
+                .iter()
+                .find_map(|shape| shape.fields(key)),
             None => (key == SINGLE_KEY).then(Vec::new),
         }
     }
@@ -823,28 +851,20 @@ impl Manifest {
         }
     }
 
-    /// The one target a package without a `[kernel]` section builds for: wasm32
-    /// for a scheduling policy, and this host's platform for an executable.
+    /// The one target a package without a `[kernel]` section builds for: what
+    /// its module form runs on, wasm32 for a scheduling policy's module and
+    /// this host's Rust target triple for an executable.
     pub fn single_target(&self) -> crate::target::Target {
         match self.module.form {
-            ModuleForm::Wasm => crate::target::Target::new(WASM_TARGET),
+            ModuleForm::Wasm => crate::target::Target::wasm(),
             _ => crate::target::Target::host(),
         }
     }
 
-    /// How this package names its target.
-    pub fn target_kind(&self) -> TargetKind {
-        self.kernel
-            .as_ref()
-            .map_or(TargetKind::Arch, |kernel| kernel.target)
-    }
-
-    /// The source of this package, ready to build its descriptors.
-    ///
-    /// The kind the manifest names picks the [`Source`](crate::source::Source)
-    /// implementation; an unknown kind is a parse error, so this only fails
-    /// when a source kind's package files are inconsistent with it.
-    pub fn source(&self, root: &Path) -> crate::Result<Box<dyn crate::source::Source>> {
+    /// The source of this package in `root`, ready to build its descriptors:
+    /// the kind the manifest names picks the
+    /// [`Source`](crate::source::Source) implementation.
+    pub fn source(&self, root: &Path) -> Box<dyn crate::source::Source> {
         crate::source::open(self, root)
     }
 }

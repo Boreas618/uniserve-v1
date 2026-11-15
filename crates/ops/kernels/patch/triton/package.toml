@@ -27,10 +27,9 @@ files = ["src/patch.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 # One module per element type: the program reads the channels, the frames and the canvas as words,
 # so a raster is a launch value and never a reason to compile. A key cannot name a mode either,
 # because the operator has no mode to name.

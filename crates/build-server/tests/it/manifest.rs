@@ -1,27 +1,32 @@
 //! The package manifest, `package.toml` (design section 5.2): what it says,
-//! the descriptors it covers, and the packages it refuses.
+//! the descriptors it covers, the targets it builds for, and the packages it
+//! refuses.
 
 use std::fs;
-use std::path::{Path, PathBuf};
 
-use build_server::manifest::{Manifest, ModuleForm, SourceKind, ToolchainKind};
+use build_server::manifest::{Manifest, ModuleForm, SINGLE_KEY, SourceKind, ToolchainKind};
+use build_server::target::Target;
 
-/// Writes a package into a fresh directory and returns its root.
+use crate::support::{arch, for_arch, other_arch, write};
+
+/// Writes a package of manifest `text`, with `{arch}` named, and of `files`
+/// into a fresh directory, and returns its root.
 fn package(text: &str, files: &[&str]) -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("package.toml"), text).unwrap();
+    write(root.path(), &[(Manifest::FILE, for_arch(text).as_bytes())]);
     for file in files {
-        let path = root.path().join(file);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, b"# a source\n").unwrap();
+        write(root.path(), &[(file, b"# a source\n")]);
     }
     root
 }
 
-/// The manifest of a Triton `rms_norm` package: the shape every package of
-/// section 5.2 has.
+/// Loads the package of manifest `text` and `files`.
+fn load(text: &str, files: &[&str]) -> Result<Manifest, String> {
+    Manifest::load(package(text, files).path()).map_err(|error| error.to_string())
+}
+
+/// The manifest of a Triton `rms_norm` package: the shape every kernel
+/// package of section 5.2 has.
 const REASONABLE: &str = r#"
 op = "rms_norm"
 backend = "triton"
@@ -40,23 +45,21 @@ metadata = "metadata.json"
 kind = "triton"
 files = ["src/rms.py"]
 script = "src/compile.py"
-kernel = "rms_norm"
 
 [kernel]
-architectures = ["sm_100a"]
-descriptors = { dimensions = { dtype = ["bf16", "fp32"], hidden = ["2048"] } }
-selection = { tile = 1024 }
+architectures = ["{arch}"]
+descriptors = [{ dimensions = { dtype = ["bf16", "fp32"], hidden = ["2048"] } }]
 
 [parameters]
 tile = 1024
 "#;
 
+/// The files [`REASONABLE`] names.
+const REASONABLE_FILES: [&str; 3] = ["src/rms.py", "src/compile.py", "tuning/tactics.json"];
+
 #[test]
 fn a_manifest_says_what_the_package_is_and_how_it_is_built() {
-    let root = package(
-        REASONABLE,
-        &["src/rms.py", "src/compile.py", "tuning/tactics.json"],
-    );
+    let root = package(REASONABLE, &REASONABLE_FILES);
     let manifest = Manifest::load(root.path()).unwrap();
 
     assert_eq!(manifest.op, "rms_norm");
@@ -65,23 +68,80 @@ fn a_manifest_says_what_the_package_is_and_how_it_is_built() {
     assert_eq!(manifest.toolchain.version, "3.7.1");
     assert_eq!(manifest.module.form, ModuleForm::Cubin);
     assert_eq!(manifest.source.kind, SourceKind::Triton);
-    assert_eq!(manifest.source.kernel.as_deref(), Some("rms_norm"));
-    assert_eq!(manifest.kernel.as_ref().unwrap().architectures, ["sm_100a"]);
+    assert_eq!(manifest.source.script.as_deref(), Some("src/compile.py"));
     assert_eq!(manifest.tuning, ["tuning/tactics.json"]);
     assert_eq!(
         manifest.parameters.get("tile"),
         Some(&toml::Value::Integer(1024))
     );
+    // A kernel package builds for the architectures it names, and for no other.
+    assert_eq!(
+        manifest.kernel.as_ref().unwrap().architectures,
+        [arch().to_string()]
+    );
+    assert!(manifest.builds_for(arch().as_str()));
+    assert!(!manifest.builds_for(other_arch().as_str()));
+    assert!(!manifest.covers(SINGLE_KEY));
 }
 
-/// A key is read into its fields once, by the manifest: in the key's order, a value that holds
-/// an underscore or another dimension's name is one value, a constraint's value ends at the next
-/// underscore, and a key that does not read whole has no fields.
+#[test]
+fn a_package_covers_a_descriptor_by_its_enumerated_values() {
+    let manifest = load(REASONABLE, &REASONABLE_FILES).unwrap();
+
+    assert!(manifest.covers("dtype_bf16_hidden_2048"));
+    assert!(manifest.covers("dtype_fp32_hidden_2048"));
+    // A value the package does not declare is not covered.
+    assert!(!manifest.covers("dtype_bf16_hidden_2816"));
+    // Neither is a dimension the package does not declare.
+    assert!(!manifest.covers("dtype_bf16_page_64"));
+    // Nor a key that does not split into declared dimensions at all.
+    assert!(!manifest.covers("nonsense"));
+}
+
+/// The manifest of a Triton `cache_block_scatter` package whose one
+/// descriptor shape is `dimensions`.
+fn generic(dimensions: &str) -> String {
+    r#"
+op = "cache_block_scatter"
+backend = "triton"
+interface_version = 1
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/scatter.py"]
+script = "src/build.py"
+
+[kernel]
+architectures = ["{arch}"]
+descriptors = [{ dimensions = DIMENSIONS }]
+"#
+    .replace("DIMENSIONS", dimensions)
+}
+
+/// The files [`generic`] names.
+const GENERIC_FILES: [&str; 2] = ["src/scatter.py", "src/build.py"];
+
+/// A key is read into its fields once, by the manifest: in the key's order, a
+/// value that holds an underscore or another dimension's name is one value, a
+/// constraint's value ends at the next underscore, and a key that does not
+/// read whole has no fields.
 #[test]
 fn a_key_is_read_into_the_fields_a_build_script_is_handed() {
-    let descriptors = r#"{ dimensions = { dtype = ["bf16", "f32"], layout = ["contiguous", "block_major"], block = { power_of_two = true }, shape = { separator = "x" }, epsilon = { bits = 32 } } }"#;
-    let root = package(&generic(descriptors), &["src/scatter.py", "src/build.py"]);
-    let manifest = Manifest::load(root.path()).unwrap();
+    let manifest = load(
+        &generic(
+            r#"{ dtype = ["bf16", "f32"], layout = ["contiguous", "block_major"], block = { power_of_two = true }, shape = { separator = "x" }, epsilon = { bits = 32 } }"#,
+        ),
+        &GENERIC_FILES,
+    )
+    .unwrap();
     let fields = |key: &str| {
         manifest.fields(key).map(|fields| {
             fields
@@ -111,140 +171,17 @@ fn a_key_is_read_into_the_fields_a_build_script_is_handed() {
     assert!(!manifest.covers("dtype_bf16_block_48"));
 }
 
-/// The engine package of this tree: a crate cargo builds to one executable for the host's
-/// platform, under the one key of a package that fills a whole interface.
-#[test]
-fn the_engine_package_is_a_cargo_package_of_one_executable() {
-    let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine");
-    let manifest = Manifest::load(&package).unwrap();
-
-    assert_eq!(manifest.op, "engine");
-    assert_eq!(manifest.toolchain.kind, ToolchainKind::Cargo);
-    assert_eq!(manifest.source.kind, SourceKind::Cargo);
-    assert_eq!(manifest.module.form, ModuleForm::Executable);
-    assert_eq!(manifest.source.binary.as_deref(), Some("uniserve-engine"));
-    assert!(manifest.covers(build_server::manifest::SINGLE_KEY));
-    assert!(!manifest.covers("dtype_bf16"));
-    let host = build_server::Target::host();
-    assert!(manifest.builds_for(host.as_str()));
-    assert!(!manifest.builds_for("sm_100a"));
-}
-
-/// A cargo package names the executable it builds and no kernel: it builds one module, for the
-/// host.
-#[test]
-fn a_cargo_package_names_its_binary_and_no_kernel() {
-    let cargo = |source: &str, kernel: &str| {
-        format!(
-            r#"
-op = "engine"
-backend = "uniserve"
-interface_version = 1
-
-[toolchain]
-kind = "cargo"
-version = "1.99.1"
-
-[module]
-form = "executable"
-
-[source]
-kind = "cargo"
-files = []
-{source}
-{kernel}
-"#
-        )
-    };
-    let binary = r#"binary = "uniserve-engine""#;
-    Manifest::load(package(&cargo(binary, ""), &[]).path()).unwrap();
-
-    let error = Manifest::load(package(&cargo("", ""), &[]).path()).unwrap_err();
-    assert!(error.to_string().contains("binary"), "{error}");
-
-    let kernel = "[kernel]\narchitectures = [\"sm_100a\"]\ndescriptors = { dimensions = {} }";
-    let error = Manifest::load(package(&cargo(binary, kernel), &[]).path()).unwrap_err();
-    assert!(error.to_string().contains("no [kernel]"), "{error}");
-}
-
-/// A manifest states the version of the interface its package implements: one that states
-/// none, or states zero, is refused, because a loader could not tell what it would be loading.
-#[test]
-fn a_manifest_states_the_interface_version_it_implements() {
-    let files = ["src/rms.py", "src/compile.py", "tuning/tactics.json"];
-    let stated = Manifest::load(package(REASONABLE, &files).path()).unwrap();
-    assert_eq!(stated.interface_version, 1);
-
-    let later = REASONABLE.replace("interface_version = 1", "interface_version = 4");
-    let later = Manifest::load(package(&later, &files).path()).unwrap();
-    assert_eq!(later.interface_version, 4);
-
-    let unstated = REASONABLE.replace("interface_version = 1\n", "");
-    let error = Manifest::load(package(&unstated, &files).path()).unwrap_err();
-    assert!(error.to_string().contains("interface_version"), "{error}");
-
-    let zero = REASONABLE.replace("interface_version = 1", "interface_version = 0");
-    let error = Manifest::load(package(&zero, &files).path()).unwrap_err();
-    assert!(error.to_string().contains("start at 1"), "{error}");
-}
-
-#[test]
-fn a_package_covers_a_descriptor_by_its_enumerated_values() {
-    let root = package(
-        REASONABLE,
-        &["src/rms.py", "src/compile.py", "tuning/tactics.json"],
-    );
-    let manifest = Manifest::load(root.path()).unwrap();
-    let descriptors = &manifest.kernel.as_ref().unwrap().descriptors;
-
-    assert!(descriptors.covers("dtype_bf16_hidden_2048"));
-    assert!(descriptors.covers("dtype_fp32_hidden_2048"));
-    // A value the package does not declare is not covered.
-    assert!(!descriptors.covers("dtype_bf16_hidden_2816"));
-    // Neither is a dimension the package does not declare.
-    assert!(!descriptors.covers("dtype_bf16_page_64"));
-    // Nor a key that does not split into declared dimensions at all.
-    assert!(!descriptors.covers("nonsense"));
-}
-
-/// The manifest of a Triton `cache_block_scatter` package whose `descriptors`
-/// line is `descriptors`: width-generic dimensions declared by constraint.
-fn generic(descriptors: &str) -> String {
-    format!(
-        r#"
-op = "cache_block_scatter"
-backend = "triton"
-interface_version = 1
-
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
-[source]
-kind = "triton"
-files = ["src/scatter.py"]
-script = "src/build.py"
-
-[kernel]
-architectures = ["sm_100a"]
-descriptors = {descriptors}
-"#
-    )
-}
-
 /// A width the kernel handles generically is declared by the constraint the
 /// kernel imposes, and the package covers every key whose value meets it.
 #[test]
 fn a_package_covers_a_generic_dimension_by_its_constraint() {
-    let text = generic(
-        r#"{ dimensions = { dtype = ["bf16"], columns = { multiple = 16 }, block = { power_of_two = true, max = 8192 }, first = { min = 0 }, shape = { separator = "x" }, epsilon = { bits = 32 } } }"#,
-    );
-    let root = package(&text, &["src/scatter.py", "src/build.py"]);
-    let manifest = Manifest::load(root.path()).unwrap();
+    let manifest = load(
+        &generic(
+            r#"{ dtype = ["bf16"], columns = { multiple = 16 }, block = { power_of_two = true, max = 8192 }, first = { min = 0 }, shape = { separator = "x" }, epsilon = { bits = 32 } }"#,
+        ),
+        &GENERIC_FILES,
+    )
+    .unwrap();
     let key = |columns: &str, block: &str, first: &str, shape: &str, epsilon: &str| {
         format!(
             "dtype_bf16_columns_{columns}_block_{block}_first_{first}_shape_{shape}_epsilon_{epsilon}"
@@ -273,73 +210,274 @@ fn a_package_covers_a_generic_dimension_by_its_constraint() {
 /// not a statement about a kernel, and the manifest is refused.
 #[test]
 fn a_contradictory_constraint_is_refused() {
-    for descriptors in [
-        r#"{ dimensions = { columns = { multiple = 0 } } }"#,
-        r#"{ dimensions = { columns = { min = 8, max = 4 } } }"#,
-        r#"{ dimensions = { epsilon = { bits = 16 } } }"#,
-        r#"{ dimensions = { epsilon = { bits = 32, min = 0 } } }"#,
-        r#"{ dimensions = { shape = { separator = "_" } } }"#,
-        r#"{ dimensions = { columns = { step = 8 } } }"#,
+    for dimensions in [
+        r#"{ columns = { multiple = 0 } }"#,
+        r#"{ columns = { min = 8, max = 4 } }"#,
+        r#"{ epsilon = { bits = 16 } }"#,
+        r#"{ epsilon = { bits = 32, min = 0 } }"#,
+        r#"{ shape = { separator = "_" } }"#,
+        r#"{ columns = { step = 8 } }"#,
     ] {
-        let root = package(&generic(descriptors), &["src/scatter.py", "src/build.py"]);
         assert!(
-            Manifest::load(root.path()).is_err(),
-            "{descriptors} is refused"
+            load(&generic(dimensions), &GENERIC_FILES).is_err(),
+            "{dimensions} is refused"
         );
     }
 }
 
+/// A package whose operator's key shape varies by variant declares one table
+/// per shape, and covers each: an operator is served by one backend name, not
+/// by one per shape.
+///
+/// The two shapes here are `qk_norm_rope`'s: the wide rotation, whose key has
+/// no `rotated`, and the narrowed one, which does.
 #[test]
-fn a_manifest_that_names_a_file_the_package_lacks_is_refused() {
-    let root = package(REASONABLE, &["src/rms.py"]);
-    let refused = Manifest::load(root.path());
-    assert!(
-        refused.is_err(),
-        "compile.py and the tuning data are missing"
-    );
-}
-
-#[test]
-fn a_native_module_names_a_launch_entry_and_any_lifecycle_entries() {
-    let text = r#"
-op = "expert_exchange"
-backend = "deepep"
+fn a_package_may_declare_one_descriptor_table_per_key_shape() {
+    let manifest = load(
+        r#"
+op = "qk_norm_rope"
+backend = "triton"
 interface_version = 1
 
 [toolchain]
-kind = "nvcc"
-version = "13.0"
+kind = "triton"
+version = "3.7.1"
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/build.py"]
+script = "src/build.py"
+
+[kernel]
+architectures = ["{arch}"]
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16"], head_dim = ["128"], q_heads = ["56"], rotation = ["half"] }
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16"], head_dim = ["128"], q_heads = ["56"], rotation = ["interleaved"], rotated = ["96"] }
+"#,
+        &["src/build.py"],
+    )
+    .unwrap();
+
+    assert_eq!(
+        manifest.descriptors().len(),
+        2,
+        "both shapes are kept, in the manifest's order"
+    );
+    let wide = "dtype_bf16_head_dim_128_q_heads_56_rotation_half";
+    let narrow = "dtype_bf16_head_dim_128_q_heads_56_rotation_interleaved_rotated_96";
+    assert!(manifest.covers(wide), "the wide key is covered");
+    assert!(manifest.covers(narrow), "the narrowed key is covered");
+    assert!(
+        !manifest.covers("dtype_bf16_head_dim_128_q_heads_56_rotation_half_rotated_96"),
+        "a key that reads against neither shape is not covered"
+    );
+}
+
+/// A manifest states the version of the interface its package implements:
+/// one that states none, or states zero, is refused, because a loader could
+/// not tell what it would be loading.
+#[test]
+fn a_manifest_states_the_interface_version_it_implements() {
+    assert_eq!(
+        load(REASONABLE, &REASONABLE_FILES)
+            .unwrap()
+            .interface_version,
+        1
+    );
+    let later = REASONABLE.replace("interface_version = 1", "interface_version = 4");
+    assert_eq!(
+        load(&later, &REASONABLE_FILES).unwrap().interface_version,
+        4
+    );
+
+    let unstated = REASONABLE.replace("interface_version = 1\n", "");
+    let error = load(&unstated, &REASONABLE_FILES).unwrap_err();
+    assert!(error.contains("interface_version"), "{error}");
+
+    let zero = REASONABLE.replace("interface_version = 1", "interface_version = 0");
+    let error = load(&zero, &REASONABLE_FILES).unwrap_err();
+    assert!(error.contains("start at 1"), "{error}");
+}
+
+/// A kernel package names the architectures it supports, each a target the
+/// Build Server describes: none, or one the description lacks, is refused
+/// and the refusal names it.
+#[test]
+fn a_kernel_package_names_architectures_the_build_server_describes() {
+    let architectures = |names: &str| {
+        REASONABLE.replace(
+            r#"architectures = ["{arch}"]"#,
+            &format!("architectures = {names}"),
+        )
+    };
+    let both = format!(r#"["{}", "{}"]"#, arch(), other_arch());
+    let manifest = load(&architectures(&both), &REASONABLE_FILES).unwrap();
+    assert!(manifest.builds_for(arch().as_str()));
+    assert!(manifest.builds_for(other_arch().as_str()));
+
+    let error = load(&architectures("[]"), &REASONABLE_FILES).unwrap_err();
+    assert!(error.contains("must name the architectures"), "{error}");
+
+    let undescribed = format!(r#"["{}", "gpu_undescribed"]"#, arch());
+    let error = load(&architectures(&undescribed), &REASONABLE_FILES).unwrap_err();
+    assert!(
+        error.contains("does not describe") && error.contains("gpu_undescribed"),
+        "{error}"
+    );
+    assert!(Target::new("gpu_undescribed").facts().is_none());
+}
+
+/// The manifest of a CuTe DSL package, a native module its build module's
+/// kernel and its C++ entry unit link into, whose `SOURCE` stands for the
+/// `[source]` lines that name them.
+const CUTE_DSL: &str = r#"
+op = "gather_gemm"
+backend = "cute"
+interface_version = 1
+
+[toolchain]
+kind = "cute_dsl"
+version = "4.6.2"
 
 [module]
 form = "native"
 
 [module.entries]
-launch = "uniserve_exchange_launch"
-create = "uniserve_exchange_create"
-suspend = "uniserve_exchange_suspend"
-restore = "uniserve_exchange_restore"
+launch = "uniserve_gather_gemm"
 
 [source]
-kind = "cuda"
-files = ["src/exchange.cu"]
+kind = "cute_dsl"
+files = ["src/gemm.py", "src/entry.cpp"]
+SOURCE
 
 [kernel]
-architectures = ["sm_100a"]
-descriptors = { dimensions = { dtype = ["bf16"] } }
+architectures = ["{arch}"]
+descriptors = [{ dimensions = { dtype = ["bf16"] } }]
 "#;
-    let root = package(text, &["src/exchange.cu"]);
-    let manifest = Manifest::load(root.path()).unwrap();
-    assert_eq!(
-        manifest.module.entries.get("launch").map(String::as_str),
-        Some("uniserve_exchange_launch")
+
+/// A source a build module compiles (Triton, CUDA, CuTe DSL) names the module
+/// in `[source] script`, and a CuTe DSL source names its C++ entry unit too;
+/// a source that compiles nothing (a vendor cubin, an executable) names no
+/// build module.
+#[test]
+fn a_build_module_source_names_its_script_and_no_other_source_does() {
+    let files = ["src/gemm.py", "src/entry.cpp"];
+    let cute = |source: &str| CUTE_DSL.replace("SOURCE", source);
+    let manifest = load(
+        &cute("script = \"src/gemm.py\"\nunit = \"src/entry.cpp\""),
+        &files,
+    )
+    .unwrap();
+    assert_eq!(manifest.source.unit.as_deref(), Some("src/entry.cpp"));
+
+    let error = load(&cute("unit = \"src/entry.cpp\""), &files).unwrap_err();
+    assert!(error.contains("[source] script"), "{error}");
+    let error = load(&cute("script = \"src/gemm.py\""), &files).unwrap_err();
+    assert!(error.contains("[source] unit"), "{error}");
+    let unscripted = REASONABLE.replace("script = \"src/compile.py\"\n", "");
+    let error = load(&unscripted, &REASONABLE_FILES).unwrap_err();
+    assert!(error.contains("[source] script"), "{error}");
+
+    let scripted_executable = EXECUTABLE.replace(
+        "files = [\"bin/sampler\"]",
+        "files = [\"bin/sampler\"]\nscript = \"src/build.py\"",
     );
-    assert_eq!(manifest.module.entries.len(), 4);
+    let error = load(&scripted_executable, &["bin/sampler", "src/build.py"]).unwrap_err();
+    assert!(error.contains("no build module"), "{error}");
+    let scripted_cubin = VENDOR.replace(
+        "kind = \"cubin\"",
+        "kind = \"cubin\"\nscript = \"src/build.py\"",
+    );
+    let error = load(&scripted_cubin, &["src/build.py"]).unwrap_err();
+    assert!(error.contains("no build module"), "{error}");
 }
 
-/// A native package whose launch symbol differs per descriptor: the compile
-/// script writes the module's entries, and `[module.entries]` stays the
-/// package's default.
-const ENTRIES_FILE: &str = r#"
+/// A vendor cubin package: one cubin and its launch metadata per descriptor,
+/// which nothing compiles.
+const VENDOR: &str = r#"
+op = "paged_attention"
+backend = "trtllm"
+interface_version = 1
+
+[toolchain]
+kind = "none"
+version = ""
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "cubin"
+files = ["cubin/{descriptor}.cubin", "cubin/{descriptor}.json"]
+cubin = "cubin/{descriptor}.cubin"
+metadata = "cubin/{descriptor}.json"
+
+[kernel]
+architectures = ["{arch}"]
+descriptors = [{ dimensions = { dtype = ["bf16"], head_dim = ["128"] } }]
+"#;
+
+/// A vendor cubin source names its cubin and its launch metadata, which may
+/// be one file per descriptor: a source that leaves out either is refused,
+/// because no file's extension says which role it plays.
+#[test]
+fn a_vendor_cubin_source_names_its_cubin_and_its_launch_metadata() {
+    let manifest = load(VENDOR, &[]).expect("a per-descriptor vendor package");
+    assert!(manifest.source.per_descriptor());
+    assert_eq!(
+        manifest.source.files_for("dtype_bf16_head_dim_128"),
+        [
+            "cubin/dtype_bf16_head_dim_128.cubin",
+            "cubin/dtype_bf16_head_dim_128.json"
+        ]
+    );
+
+    for role in [
+        "cubin = \"cubin/{descriptor}.cubin\"\n",
+        "metadata = \"cubin/{descriptor}.json\"\n",
+    ] {
+        let error = load(&VENDOR.replacen(role, "", 1), &[]).unwrap_err();
+        assert!(error.contains("[source] cubin and metadata"), "{error}");
+    }
+}
+
+/// A cubin module's kernel symbol and parameters are in its launch metadata,
+/// so it names that file; and it has no C entry, by role or in an entries
+/// file.
+#[test]
+fn a_cubin_module_names_its_metadata_and_no_c_entry() {
+    let unnamed = REASONABLE.replace("metadata = \"metadata.json\"\n", "");
+    let error = load(&unnamed, &REASONABLE_FILES).unwrap_err();
+    assert!(
+        error.contains("a cubin module must name its metadata file"),
+        "{error}"
+    );
+
+    for entries in [
+        "metadata = \"metadata.json\"\nentries_file = \"entries.json\"",
+        "metadata = \"metadata.json\"\n[module.entries]\nlaunch = \"nope\"",
+    ] {
+        let text = REASONABLE.replace("metadata = \"metadata.json\"", entries);
+        let error = load(&text, &REASONABLE_FILES).unwrap_err();
+        assert!(
+            error.contains("only a native module has C entries"),
+            "{error}"
+        );
+    }
+}
+
+/// A native package of an expert exchange: a launch entry and the lifecycle
+/// entries around it, and a file its build writes the module's own entries
+/// into.
+const NATIVE: &str = r#"
 op = "expert_exchange"
 backend = "deepep"
 interface_version = 1
@@ -354,284 +492,152 @@ entries_file = "entries.json"
 
 [module.entries]
 launch = "uniserve_exchange_launch"
+create = "uniserve_exchange_create"
+suspend = "uniserve_exchange_suspend"
+restore = "uniserve_exchange_restore"
 
 [source]
 kind = "cuda"
 files = ["src/exchange.cu"]
+script = "src/build.py"
 
 [kernel]
-architectures = ["sm_100a"]
-descriptors = { dimensions = { dtype = ["bf16"] } }
+architectures = ["{arch}"]
+descriptors = [{ dimensions = { dtype = ["bf16"] } }]
 "#;
 
+/// A native module names the entry that launches its kernel and any
+/// lifecycle entries with the same calling convention, and may name a file its
+/// build writes the module's own entries into; one that names no launch entry
+/// is refused.
 #[test]
-fn a_native_module_may_name_a_file_its_build_writes_its_entries_into() {
-    let root = package(ENTRIES_FILE, &["src/exchange.cu"]);
-    let manifest = Manifest::load(root.path()).unwrap();
+fn a_native_module_names_its_launch_entry_and_any_lifecycle_entries() {
+    let files = ["src/exchange.cu", "src/build.py"];
+    let manifest = load(NATIVE, &files).unwrap();
+    assert_eq!(
+        manifest.module.entries.get("launch").map(String::as_str),
+        Some("uniserve_exchange_launch")
+    );
+    assert_eq!(manifest.module.entries.len(), 4);
     assert_eq!(
         manifest.module.entries_file.as_deref(),
         Some("entries.json")
     );
-    assert_eq!(
-        manifest.module.entries.get("launch").map(String::as_str),
-        Some("uniserve_exchange_launch"),
-        "the package keeps its default launch entry"
-    );
+
+    let unlaunched = NATIVE.replace("launch = \"uniserve_exchange_launch\"\n", "");
+    let error = load(&unlaunched, &files).unwrap_err();
+    assert!(error.contains("launch entry"), "{error}");
 }
 
-/// What a Triton compile writes beside its cubin: the kernel's symbol, in Triton's own field.
-const METADATA: &str = "{\"name\": \"kernel\"}\n";
-
-/// The manifest names its metadata file and the package holds a file by that name.
-fn assert_names_its_metadata(manifest: &Manifest, package: &std::path::Path) {
-    let name = manifest
-        .module
-        .metadata_name("any_descriptor")
-        .expect("a Triton cubin module names its metadata file");
-    assert!(
-        package.join(&name).is_file(),
-        "the package names {name} and does not hold it"
-    );
-}
-
-/// A Triton kernel's kernel symbol and parameters are in the metadata its compile writes, so a
-/// package that does not name that file serves an image the main process cannot find the kernel of.
-#[test]
-fn a_triton_cubin_module_must_name_its_metadata_file() {
-    let text = REASONABLE.replace("metadata = \"metadata.json\"\n", "");
-    let root = package(
-        &text,
-        &["src/rms.py", "src/compile.py", "tuning/tactics.json"],
-    );
-    let refused = Manifest::load(root.path()).expect_err("the rule refuses the manifest");
-    assert!(
-        refused
-            .to_string()
-            .contains("a Triton cubin module must name its metadata file"),
-        "the refusal was {refused}"
-    );
-}
-
-#[test]
-fn a_cubin_module_may_not_name_an_entries_file() {
-    let text = REASONABLE.replace(
-        "metadata = \"metadata.json\"",
-        "metadata = \"metadata.json\"\nentries_file = \"entries.json\"",
-    );
-    let root = package(
-        &text,
-        &["src/rms.py", "src/compile.py", "tuning/tactics.json"],
-    );
-    assert!(Manifest::load(root.path()).is_err());
-}
-
-#[test]
-fn a_cubin_module_with_a_c_entry_is_refused() {
-    let text = REASONABLE.replace(
-        "metadata = \"metadata.json\"",
-        "metadata = \"metadata.json\"\n[module.entries]\nlaunch = \"nope\"",
-    );
-    let root = package(
-        &text,
-        &["src/rms.py", "src/compile.py", "tuning/tactics.json"],
-    );
-    assert!(Manifest::load(root.path()).is_err());
-}
-
-#[test]
-fn a_native_module_without_a_c_entry_is_refused() {
-    let text = r#"
-op = "gather_gemm"
-backend = "cute"
+/// The manifest of an engine package with the `[source]` lines `source` and
+/// the `kernel` section.
+fn cargo(source: &str, kernel: &str) -> String {
+    format!(
+        r#"
+op = "engine"
+backend = "uniserve"
 interface_version = 1
 
 [toolchain]
-kind = "triton"
-version = "4.6.2"
+kind = "cargo"
+version = "1.99.1"
 
 [module]
-form = "native"
+form = "executable"
 
 [source]
-kind = "cute_dsl"
-files = ["src/gemm.py"]
-
-[kernel]
-architectures = ["sm_100a"]
-descriptors = { dimensions = { dtype = ["bf16"] } }
-"#;
-    let root = package(text, &["src/gemm.py"]);
-    assert!(Manifest::load(root.path()).is_err());
+kind = "cargo"
+files = []
+{source}
+{kernel}
+"#
+    )
 }
 
+/// A cargo package names the executable it builds and no kernel: it builds
+/// one module, under the one key of a package that fills a whole interface,
+/// for the host's platform.
 #[test]
-fn a_manifest_without_architectures_is_refused() {
-    let text = r#"
-op = "rms_norm"
-backend = "triton"
-interface_version = 1
+fn a_cargo_package_names_its_binary_and_no_kernel() {
+    let binary = r#"binary = "uniserve-engine""#;
+    let manifest = load(&cargo(binary, ""), &[]).unwrap();
+    assert_eq!(manifest.toolchain.kind, ToolchainKind::Cargo);
+    assert_eq!(manifest.source.binary.as_deref(), Some("uniserve-engine"));
+    assert!(manifest.covers(SINGLE_KEY));
+    assert!(!manifest.covers("dtype_bf16"));
+    assert_eq!(manifest.single_target(), Target::host());
+    assert!(manifest.builds_for(Target::host().as_str()));
+    assert!(!manifest.builds_for(arch().as_str()));
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
+    let error = load(&cargo("", ""), &[]).unwrap_err();
+    assert!(error.contains("[source] binary"), "{error}");
 
-[module]
-form = "cubin"
-
-[source]
-kind = "triton"
-files = ["src/rms.py"]
-
-[kernel]
-architectures = []
-descriptors = { dimensions = { dtype = ["bf16"] } }
-"#;
-    let root = package(text, &["src/rms.py"]);
-    assert!(Manifest::load(root.path()).is_err());
+    let kernel = "[kernel]\narchitectures = [\"{arch}\"]\ndescriptors = [{ dimensions = { dtype = [\"bf16\"] } }]";
+    let error = load(&cargo(binary, kernel), &[]).unwrap_err();
+    assert!(error.contains("no [kernel]"), "{error}");
 }
 
-#[test]
-fn a_manifest_of_an_unknown_source_kind_is_refused() {
-    let text = REASONABLE.replace("kind = \"triton\"", "kind = \"magic\"");
-    let root = package(
-        &text,
-        &["src/rms.py", "src/compile.py", "tuning/tactics.json"],
-    );
-    assert!(Manifest::load(root.path()).is_err());
-}
-
-#[test]
-fn a_package_may_carry_one_file_per_descriptor() {
-    let text = r#"
-op = "paged_attention"
-backend = "trtllm-gen"
-interface_version = 1
-
-[toolchain]
-kind = "nvcc"
-version = "13.0"
-
-[module]
-form = "native"
-
-[module.entries]
-launch = "uniserve_paged_attention_launch"
-
-[source]
-kind = "cubin"
-files = ["cubin/{descriptor}.cubin", "cubin/{descriptor}.json"]
-
-[kernel]
-architectures = ["sm_100a"]
-descriptors = { dimensions = { dtype = ["bf16"], head_dim = ["128"] } }
-"#;
-    let root = package(text, &[]);
-    let manifest = Manifest::load(root.path()).expect("a per-descriptor package");
-
-    assert!(manifest.source.per_descriptor());
-    assert_eq!(
-        manifest.source.files_for("dtype_bf16_head_dim_128"),
-        [
-            "cubin/dtype_bf16_head_dim_128.cubin",
-            "cubin/dtype_bf16_head_dim_128.json"
-        ]
-    );
-}
-
-#[test]
-fn a_scheduling_policy_is_a_wasm_package_without_metadata_or_entry() {
-    // The shape a policy package has: no kernel package, a build script that
-    // leaves the raw wasm, the precompiler's version, and the policy's own
-    // parameters (design sections 5.2 and 5.3).
-    let text = r#"
+/// A scheduling policy: a crate cargo builds for wasm32, which fills the
+/// whole policy interface with one module (design sections 5.2 and 5.3).
+const POLICY: &str = r#"
 op = "scheduling"
 backend = "fcfs"
 interface_version = 1
-tuning = ["tuning/weights.json"]
 
 [toolchain]
-kind = "wasm"
-version = "50.0.1"
+kind = "cargo"
+version = "1.99.1"
 
 [module]
 form = "wasm"
 
 [source]
 kind = "wasm"
-files = ["src/lib.rs"]
+files = []
 
 [parameters]
 bucket = 256
 "#;
-    let root = package(text, &["src/lib.rs", "tuning/weights.json"]);
-    let manifest = Manifest::load(root.path()).unwrap();
+
+/// A policy has no kernel package: one module, under the one key, for
+/// wasm32, with neither launch metadata nor a C entry, and its own
+/// parameters.
+#[test]
+fn a_scheduling_policy_is_a_wasm_package_of_one_module() {
+    let manifest = load(POLICY, &[]).unwrap();
     assert_eq!(manifest.module.form, ModuleForm::Wasm);
+    assert_eq!(manifest.toolchain.kind, ToolchainKind::Cargo);
     assert!(manifest.module.metadata.is_none());
     assert!(manifest.module.entries.is_empty());
-    // One module fills the whole interface, for the one target wasm has.
-    assert!(manifest.covers("default"));
-    assert!(manifest.builds_for("wasm32"));
-    assert!(!manifest.builds_for("sm_100a"));
-    assert_eq!(manifest.source.script, None);
+    assert!(manifest.covers(SINGLE_KEY));
+    assert_eq!(manifest.single_target(), Target::wasm());
+    assert!(manifest.builds_for(Target::wasm().as_str()));
+    assert!(!manifest.builds_for(arch().as_str()));
     assert_eq!(
         manifest.parameters.get("bucket"),
         Some(&toml::Value::Integer(256)),
         "a policy's parameters are its own"
     );
-    assert_eq!(manifest.tuning, ["tuning/weights.json"]);
+
+    let kernel = format!(
+        "{POLICY}\n[kernel]\narchitectures = [\"{{arch}}\"]\ndescriptors = [{{ dimensions = {{ mode = [\"default\"] }} }}]\n"
+    );
+    let error = load(&kernel, &[]).unwrap_err();
+    assert!(error.contains("names no kernel package"), "{error}");
+
+    let entry = POLICY.replace(
+        "form = \"wasm\"",
+        "form = \"wasm\"\n\n[module.entries]\nlaunch = \"uniserve_fcfs\"",
+    );
+    let error = load(&entry, &[]).unwrap_err();
+    assert!(
+        error.contains("only a native module has C entries"),
+        "{error}"
+    );
 }
 
-#[test]
-fn a_wasm_package_that_names_a_kernel_revision_is_refused() {
-    let text = r#"
-op = "scheduling"
-backend = "fcfs"
-interface_version = 1
-
-[toolchain]
-kind = "wasm"
-version = "50.0.1"
-
-[module]
-form = "wasm"
-
-[source]
-kind = "wasm"
-files = ["src/lib.rs"]
-
-[kernel]
-architectures = ["wasm32"]
-descriptors = { dimensions = { mode = ["default"] } }
-"#;
-    let root = package(text, &["src/lib.rs"]);
-    assert!(Manifest::load(root.path()).is_err());
-}
-
-#[test]
-fn a_wasm_module_with_a_c_entry_is_refused() {
-    let text = r#"
-op = "scheduling"
-backend = "fcfs"
-interface_version = 1
-
-[toolchain]
-kind = "wasm"
-version = "wasmtime-31"
-
-[module]
-form = "wasm"
-entry = "uniserve_fcfs"
-
-[source]
-kind = "wasm"
-files = ["src/lib.rs"]
-"#;
-    let root = package(text, &["src/lib.rs"]);
-    assert!(Manifest::load(root.path()).is_err());
-}
-
-/// An executable: a package revision the main process runs as its own process,
-/// stored as it is (design section 5.1).
+/// An executable: a package revision the main process runs as its own
+/// process, stored as it is (design section 5.1).
 const EXECUTABLE: &str = r#"
 op = "sampler"
 backend = "process"
@@ -649,195 +655,38 @@ kind = "executable"
 files = ["bin/sampler"]
 
 [kernel]
-architectures = ["sm_100a"]
-descriptors = { dimensions = { dtype = ["bf16"] } }
+architectures = ["{arch}"]
+descriptors = [{ dimensions = { dtype = ["bf16"] } }]
 "#;
 
 #[test]
 fn an_executable_package_stores_its_binary_and_compiles_nothing() {
-    let root = package(EXECUTABLE, &["bin/sampler"]);
-    let manifest = Manifest::load(root.path()).unwrap();
+    let manifest = load(EXECUTABLE, &["bin/sampler"]).unwrap();
     assert_eq!(manifest.module.form, ModuleForm::Executable);
     assert_eq!(manifest.toolchain.kind, ToolchainKind::None);
-    assert_eq!(
-        manifest.source(root.path()).unwrap().toolchain(),
-        ToolchainKind::None,
-        "an executable is stored as it is: nothing compiles it"
-    );
+    assert_eq!(manifest.source.kind, SourceKind::Executable);
     assert!(manifest.module.metadata.is_none());
     assert!(manifest.module.entries.is_empty());
 }
 
 #[test]
-fn a_package_missing_its_manifest_is_refused() {
-    let root: PathBuf = tempfile::tempdir().unwrap().keep();
-    assert!(Manifest::load(Path::new(&root)).is_err());
-}
-
-/// A package whose operator's key shape varies by variant declares one table per
-/// shape, and covers each: an operator is served by one backend name, not by one
-/// per shape.
-///
-/// The two shapes here are `qk_norm_rope`'s: the wide rotation, whose key has no
-/// `rotated`, and the narrowed one, which does. A key of either is covered; a key
-/// that parses against neither is refused exactly as it is refused today.
-#[test]
-fn a_package_may_declare_one_descriptor_table_per_key_shape() {
-    let directory = tempfile::tempdir().unwrap();
-    let package = directory.path();
-    std::fs::create_dir_all(package.join("src")).unwrap();
-    std::fs::write(package.join("src/build.py"), "print('built')\n").unwrap();
-    std::fs::write(package.join("metadata.json"), METADATA).unwrap();
-    std::fs::write(
-        package.join("package.toml"),
-        r#"op = "qk_norm_rope"
-backend = "triton"
-interface_version = 1
-
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
-[source]
-kind = "triton"
-files = ["src/build.py"]
-script = "src/build.py"
-
-[kernel]
-target = "arch"
-architectures = ["sm_100a"]
-
-[[kernel.descriptors]]
-dimensions = { dtype = ["bf16"], head_dim = ["128"], q_heads = ["56"], rotation = ["half"] }
-
-[[kernel.descriptors]]
-dimensions = { dtype = ["bf16"], head_dim = ["128"], q_heads = ["56"], rotation = ["interleaved"], rotated = ["96"] }
-"#,
-    )
-    .unwrap();
-
-    let manifest = build_server::manifest::Manifest::load(package).expect("the package loads");
-    assert_names_its_metadata(&manifest, package);
-    assert_eq!(
-        manifest.descriptors().len(),
-        2,
-        "both shapes are kept, in the manifest's order"
-    );
-    let wide = "dtype_bf16_head_dim_128_q_heads_56_rotation_half";
-    let narrow = "dtype_bf16_head_dim_128_q_heads_56_rotation_interleaved_rotated_96";
-    assert!(manifest.covers(wide), "the wide key is covered");
-    assert!(manifest.covers(narrow), "the narrowed key is covered");
+fn a_manifest_that_names_a_file_the_package_lacks_is_refused() {
+    let error = load(REASONABLE, &["src/rms.py"]).unwrap_err();
     assert!(
-        !manifest.covers("dtype_bf16_head_dim_128_q_heads_56_rotation_half_rotated_96"),
-        "a key that parses against neither shape is not covered"
+        error.contains("src/compile.py") && error.contains("tuning/tactics.json"),
+        "the refusal names the build module and the tuning data: {error}"
     );
 }
 
-/// A package whose keys all have one shape writes one `[kernel.descriptors]`
-/// table, and covers the keys its dimensions admit.
 #[test]
-fn a_package_may_declare_one_descriptor_table() {
-    let directory = tempfile::tempdir().unwrap();
-    let package = directory.path();
-    std::fs::create_dir_all(package.join("src")).unwrap();
-    std::fs::write(package.join("src/build.py"), "print('built')\n").unwrap();
-    std::fs::write(package.join("metadata.json"), METADATA).unwrap();
-    std::fs::write(
-        package.join("package.toml"),
-        r#"op = "channel_affine"
-backend = "triton"
-interface_version = 1
-
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
-[source]
-kind = "triton"
-files = ["src/build.py"]
-script = "src/build.py"
-
-[kernel]
-target = "arch"
-architectures = ["sm_100a"]
-
-[kernel.descriptors]
-dimensions = { dtype = ["bf16"], channels = ["512"] }
-"#,
-    )
-    .unwrap();
-
-    let manifest = build_server::manifest::Manifest::load(package).expect("the package loads");
-    assert_names_its_metadata(&manifest, package);
-    assert_eq!(manifest.descriptors().len(), 1);
-    assert!(manifest.covers("dtype_bf16_channels_512"));
-    assert!(!manifest.covers("dtype_bf16_channels_256"));
+fn a_manifest_of_an_unknown_source_kind_is_refused() {
+    let text = REASONABLE.replace("[source]\nkind = \"triton\"", "[source]\nkind = \"magic\"");
+    assert!(load(&text, &REASONABLE_FILES).is_err());
 }
 
-/// The Python distributions every kernel package and package fixture of this tree declares are the
-/// ones the Build Server's environment locks, by name and at the locked version: a build checks
-/// them against the installed environment (`Toolchains::check_packages`), which `uv sync --locked`
-/// makes the lock, so a declaration the lock disagrees with is a package no host builds.
 #[test]
-fn every_declared_distribution_is_the_locked_one() {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let lock: toml::Table =
-        fs::read_to_string(repository.join("crates/build-server/python/uv.lock"))
-            .expect("the Build Server's lock is in the tree")
-            .parse()
-            .expect("the lock is TOML");
-    let normalized = |name: &str| name.to_lowercase().replace(['_', '.'], "-");
-    let locked: std::collections::BTreeMap<String, String> = lock["package"]
-        .as_array()
-        .expect("the lock lists its packages")
-        .iter()
-        .map(|entry| {
-            (
-                normalized(entry["name"].as_str().unwrap()),
-                entry["version"].as_str().unwrap().to_owned(),
-            )
-        })
-        .collect();
-
-    let mut packages: Vec<PathBuf> = Vec::new();
-    for root in ["crates/ops/kernels", "crates/ops/package-fixtures"] {
-        let mut pending = vec![repository.join(root)];
-        while let Some(directory) = pending.pop() {
-            if directory.join("package.toml").is_file() {
-                packages.push(directory.clone());
-            }
-            for entry in fs::read_dir(&directory).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    pending.push(path);
-                }
-            }
-        }
-    }
-    assert!(!packages.is_empty(), "the tree holds kernel packages");
-
-    let mut disagreements = Vec::new();
-    for package in &packages {
-        let manifest = Manifest::load(package).expect("every package in the tree loads");
-        for declared in &manifest.toolchain.packages {
-            match locked.get(&normalized(&declared.name)) {
-                Some(version) if *version == declared.version => {}
-                found => disagreements.push(format!(
-                    "{} {}: {} {} (the lock has {found:?})",
-                    manifest.op, manifest.backend, declared.name, declared.version
-                )),
-            }
-        }
-    }
-    assert!(disagreements.is_empty(), "{disagreements:#?}");
+fn a_package_missing_its_manifest_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("kernel.py"), b"# a source\n").unwrap();
+    assert!(Manifest::load(root.path()).is_err());
 }

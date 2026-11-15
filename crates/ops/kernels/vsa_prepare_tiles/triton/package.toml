@@ -35,10 +35,9 @@ files = ["src/vsa_prepare_tiles.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 # `width` is a `tl.arange` extent that the stepwise rotation also walks in eight-feature word
 # groups, so it is a power of two of at least eight; that rotation reads rows as 16-byte vectors and
 # pairs of 16-bit features, so the Q/K/V strides are whole 16-byte steps, the factor stride is even

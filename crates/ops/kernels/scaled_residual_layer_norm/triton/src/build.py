@@ -11,7 +11,6 @@ the kernel's argument list, so each combination is its own module. The epsilon s
 """
 
 import scaled_residual_layer_norm as kernels
-from uniserve_build_server import triton as driver
 
 #: The floating dtypes a descriptor prints, and the Triton spelling of each: the vocabulary is
 #: `DType`'s, and Triton spells FP16 `fp16` and FP32 `fp32`.
@@ -63,7 +62,3 @@ def spec(fields, parameters, target):
         # fuse into one multiply-add.
         "options": {"num_warps": warps_of(columns), "enable_fp_fusion": False},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

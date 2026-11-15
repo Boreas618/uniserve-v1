@@ -7,7 +7,6 @@ Build Server's Triton source drives ``uniserve_build_server.triton`` with it.
 """
 
 import sigmoid_gated_add as kernels
-from uniserve_build_server import triton as driver
 
 #: The floating dtypes of the target, the update and the gate, as Triton spells them in an
 #: argument signature.
@@ -32,7 +31,3 @@ def spec(fields, parameters, target):
         "constexprs": {"BLOCK": int(fields["block"])},
         "options": {"num_warps": 4},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

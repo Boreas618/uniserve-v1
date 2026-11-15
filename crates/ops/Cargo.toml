@@ -21,5 +21,10 @@ thiserror.workspace = true
 # A host value's BF16 and F16 bytes, rounded as the tensor library's element types round.
 half = "2.5.0"
 
+[dev-dependencies]
+# `tests/packages.rs` loads every kernel package's manifest as the Build Server
+# reads it.
+build-server.workspace = true
+
 [lints]
 workspace = true

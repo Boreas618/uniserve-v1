@@ -8,7 +8,6 @@ one module serves every step of that shape.
 
 import slot_commit as kernels
 import triton.language as tl
-from uniserve_build_server import triton as driver
 
 #: The element types a descriptor may name, as Triton spells them.
 DTYPES = {
@@ -79,7 +78,3 @@ def spec(fields, parameters, target):
         # latency-bound state movement, not a throughput kernel.
         "options": {"num_warps": 4},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

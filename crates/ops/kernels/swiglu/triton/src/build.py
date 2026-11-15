@@ -10,7 +10,6 @@ int32 launch word, and the kernel checks its mask in int64.
 """
 
 import swiglu as kernels
-from uniserve_build_server import triton as driver
 
 #: The floating dtypes the halves, the biases and the output may have, as Triton spells them in an
 #: argument signature.
@@ -52,7 +51,3 @@ def spec(fields, parameters, target):
             "num_warps": 8,
         },
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

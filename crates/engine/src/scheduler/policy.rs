@@ -16,10 +16,9 @@
 //! skipped where it is used (§3.4, §3.6), never a fault; a fault is a trap, exhausted fuel, a reply
 //! that does not decode, or limits outside the ceilings.
 //!
-//! A policy module is compiled under the one wasmtime configuration of this module
-//! ([`runtime`]), which meters fuel: the Build Server precompiles a package with it
-//! ([`precompile`], `uniserve-engine precompile`) and a scheduler loads the artifact with it
-//! ([`load`]); a module of another configuration fails to load or to instantiate here.
+//! A policy module is the wasm32 binary the Build Server builds a policy package to, compiled
+//! here under the one wasmtime configuration of this module ([`runtime`]), which meters fuel,
+//! when a scheduler loads it ([`load`]).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -38,28 +37,14 @@ use scheduling::view::{
     CallView, RankView, ReplicaView, RequestStatus as Standing, RequestView, Snapshot,
 };
 use scheduling::wire::{self, Call};
-use wasmtime::{
-    Config, Memory, Module, OptLevel, Precompiled, Store, Trap, TypedFunc, WasmParams, WasmResults,
-};
+use wasmtime::{Config, Memory, Module, OptLevel, Store, Trap, TypedFunc, WasmParams, WasmResults};
 
 use super::view::view;
 use super::{Capacity, Error, Output, Request, RequestStatus, Scheduler, WorkerGroup};
 
-/// The wasmtime version the engine precompiles and loads policy modules with, which a policy
-/// package declares in its `[toolchain]` and `uniserve-engine precompile --version` reports.
-///
-/// A precompiled module carries wasmtime's own artifact format and the configuration it was
-/// compiled with, so a module precompiled by another wasmtime version, or under another
-/// configuration, is rejected at load. This constant and the `wasmtime` version the workspace's
-/// `Cargo.toml` pins are therefore one fact, and a test below fails if they drift.
-pub const WASMTIME_VERSION: &str = "50.0.1";
-
-/// The target a policy module is precompiled for: the host architecture's baseline Linux triple.
-///
-/// Naming the architecture and nothing finer is what makes the Build Server's artifact portable
-/// within it: the module store keeps one artifact per architecture, and any host of that
-/// architecture loads it whatever its CPU model. `None` on an architecture with no policy target,
-/// where [`runtime`] fails rather than compiling a module no other host can load.
+/// The target a policy module is compiled for: the host architecture's baseline Linux triple, so
+/// the code is the same on every host of the architecture whatever its CPU model. `None` on an
+/// architecture with no policy target, where [`runtime`] fails.
 pub(crate) fn target() -> Option<&'static str> {
     match std::env::consts::ARCH {
         "x86_64" => Some("x86_64-unknown-linux-gnu"),
@@ -71,11 +56,9 @@ pub(crate) fn target() -> Option<&'static str> {
 /// The wasmtime engine policy modules are compiled for and run in.
 ///
 /// Fuel metering is on for the whole engine (every call into a policy has a budget), backtraces
-/// are off because a failure is reported as its trap code alone, and the compiler runs at `Speed`
-/// because a module compiled at another optimisation level is not the artifact the Build Server
-/// stored. The target is [`target`], so an artifact precompiled for this architecture by another
-/// process loads here although the two engines are different objects. Each call builds a new
-/// engine; a module keeps the engine it was compiled with, and its instances run in that one.
+/// are off because a failure is reported as its trap code alone, and the compiler runs at
+/// `Speed`. The target is [`target`]. Each call builds a new engine; a module keeps the engine it
+/// was compiled with, and its instances run in that one.
 ///
 /// # Errors
 ///
@@ -106,50 +89,18 @@ fn runtime() -> Result<wasmtime::Engine, PolicyError> {
     })
 }
 
-/// Precompiles the wasm32 binary a policy crate compiled to for this host's architecture: the
-/// artifact the Build Server stores for a policy package and [`load`] loads. Text is accepted
-/// where wasmtime's `wat` feature is on, which is the tests.
-///
-/// # Errors
-///
-/// [`PolicyError::Load`] when the host has no policy engine or the bytes are not a module.
-pub fn precompile(wasm: &[u8]) -> Result<Vec<u8>, PolicyError> {
-    runtime()?
-        .precompile_module(wasm)
-        .map_err(|error| PolicyError::Load(format!("cannot precompile the policy module: {error}")))
-}
-
 /// The module a scheduler instantiates ([`Policy::new`]) from the bytes the Build Server serves
-/// for a policy package: the precompiled artifact when the bytes are one, the wasm32 binary
-/// otherwise, which is compiled here. The module carries the fuel-metering configuration of
-/// [`runtime`], so every instance of it is metered per call.
+/// for a policy package: the wasm32 binary its crate compiled to, compiled here. Text is accepted
+/// where wasmtime's `wat` feature is on, which is the tests. The module carries the fuel-metering
+/// configuration of [`runtime`], so every instance of it is metered per call.
 ///
 /// # Errors
 ///
 /// [`PolicyError::Load`] when the host has no policy engine, or the bytes are not a core wasm
-/// module: an artifact of another kind, engine or configuration, or no module at all.
+/// module.
 pub fn load(bytes: &[u8]) -> Result<Module, PolicyError> {
-    let runtime = runtime()?;
-    match wasmtime::Engine::detect_precompiled(bytes) {
-        Some(Precompiled::Module) => {
-            // SAFETY: wasmtime trusts an artifact's code and metadata. These bytes come from the
-            // Build Server's module store, whose paths name the package's backend, revision and
-            // target and whose content an installation put there, and an artifact of another
-            // engine or format is rejected by `deserialize`; the store is trusted exactly as the
-            // kernels loaded from it are.
-            unsafe { Module::deserialize(&runtime, bytes) }.map_err(|error| {
-                PolicyError::Load(format!(
-                    "cannot load the precompiled policy module: {error}"
-                ))
-            })
-        }
-        Some(Precompiled::Component) => Err(PolicyError::Load(
-            "a policy is a core wasm module, and these bytes are not one".into(),
-        )),
-        None => Module::new(&runtime, bytes).map_err(|error| {
-            PolicyError::Load(format!("cannot compile the policy module: {error}"))
-        }),
-    }
+    Module::new(&runtime()?, bytes)
+        .map_err(|error| PolicyError::Load(format!("cannot compile the policy module: {error}")))
 }
 
 /// The fuel one call into a policy module may consume, and each export the host enters for that
@@ -224,9 +175,8 @@ pub(crate) struct Policy {
 /// instance.
 #[derive(Debug)]
 pub enum PolicyError {
-    /// The module's bytes were rejected: not a core wasm32 module, or an artifact
-    /// precompiled for another engine or configuration; or this host has no engine to compile
-    /// them with.
+    /// The module's bytes were rejected: not a core wasm32 module; or this host has no engine
+    /// to compile them with.
     Load(String),
     /// The module does not instantiate as a policy: it does not link, lacks the memory or an
     /// export the interface calls, or its engine meters no fuel.
@@ -1270,52 +1220,28 @@ pub(crate) mod tests {
         assert_eq!(unbound.max_batch, usize::MAX);
     }
 
-    /// The declared wasmtime version is the one the workspace's `Cargo.toml` pins: a package's
-    /// `[toolchain]` names it, and a module precompiled against another version would not load.
+    /// The packaged policies declare the version of the policy interface this engine runs: the
+    /// engine refuses a module built for another version of the interface.
     #[test]
-    fn the_declared_wasmtime_version_is_the_one_cargo_pins() {
-        let manifest = include_str!("../../../../Cargo.toml");
-        let pin = format!("version = \"{WASMTIME_VERSION}\"");
-        assert!(
-            manifest.contains(&pin),
-            "Cargo.toml does not pin {pin}: the declared wasmtime version and the dependency drifted"
-        );
-    }
-
-    /// The packaged policies declare the version of the policy interface this engine runs, and
-    /// the default policies the wasmtime version it runs: the engine refuses a module built for
-    /// another version of the interface, the Build Server precompiles a package with the toolchain
-    /// its manifest names, and a module precompiled by another version does not load. The
-    /// fixture states no wasmtime version, so that it installs on any test host.
-    #[test]
-    fn the_packaged_policies_declare_this_engines_interface_and_wasmtime() {
+    fn the_packaged_policies_declare_this_engines_interface() {
         let interface = format!("interface_version = {}", scheduling::INTERFACE_VERSION);
-        let toolchain = format!("version = \"{WASMTIME_VERSION}\"");
-        for (backend, manifest, pinned) in [
+        for (backend, manifest) in [
             (
                 "fcfs",
                 include_str!("../../../scheduling/policies/fcfs/package.toml"),
-                true,
             ),
             (
                 "priority",
                 include_str!("../../../scheduling/policies/priority/package.toml"),
-                true,
             ),
             (
                 "fixture",
                 include_str!("../../../scheduling/policies/fixture/package.toml"),
-                false,
             ),
         ] {
-            let declares = |line: &str| manifest.lines().any(|stated| stated == line);
             assert!(
-                declares(&interface),
+                manifest.lines().any(|stated| stated == interface),
                 "the {backend} package does not declare {interface}"
-            );
-            assert!(
-                !pinned || declares(&toolchain),
-                "the {backend} package does not declare {toolchain}"
             );
         }
     }

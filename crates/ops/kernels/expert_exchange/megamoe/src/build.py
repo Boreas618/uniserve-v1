@@ -1,25 +1,22 @@
-"""The megamoe package's compile script: one descriptor -> one module.
+"""The megamoe package's build module: one descriptor -> one module.
 
-The Build Server runs this script with its working directory the package root
-and `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE` and
-`UNISERVE_OUT` in the environment. It compiles FlashInfer's MegaMoE kernel (the
-pinned `megamoe` source with `patches/megamoe.patch`, see `kernel_sources`) for
-one group and one shape with the CuTe DSL, exports the kernel with its host
-launcher, and links them with `src/entry.cpp` and `src/stage.cu` into
-`module.so`. No device is read: the target names the architecture, and the
-kernel's tuning is the table below.
+The Build Server compiles a descriptor by calling :func:`compile` with the
+compile request. It compiles FlashInfer's MegaMoE kernel (the pinned `megamoe`
+source with `patches/megamoe.patch`, see `kernel_sources`) for one group and
+one shape with the CuTe DSL, exports the kernel with its host launcher, and
+links them with `src/entry.cpp` and `src/stage.cu` into `module.so`. No device
+is read: the target names the architecture, and the kernel's tuning is the
+table below.
 """
 
 import json
-import os
 import pathlib
-import re
 import subprocess
 import sys
 import tempfile
 
-from uniserve_build_server import fetch
-from uniserve_build_server import package as build
+from uniserve_build_server import cute_dsl, fetch
+from uniserve_build_server.request import Request
 
 ENTRIES = [
     "uniserve_expert_exchange_launch",
@@ -69,17 +66,15 @@ def knobs_for(tokens):
     return LARGE_TOKENS
 
 
-def shape_of(descriptor):
-    """The extents a descriptor states."""
-    found = re.fullmatch(
-        r"mode_fused_hidden_(\d+)_intermediate_(\d+)_top_(\d+)_experts_(\d+)"
-        r"_max_tokens_(\d+)_ranks_(\d+)_attention_0_dtype_bf16",
-        descriptor,
-    )
-    if found is None:
-        raise SystemExit(f"this package serves no descriptor {descriptor}")
-    hidden, intermediate, top, experts, tokens, ranks = map(int, found.groups())
-    return hidden, intermediate, top, experts, tokens, ranks
+def shape_of(request):
+    """The extents a descriptor states.
+
+    The answer is `(hidden, intermediate, top, experts, max_tokens, ranks)`;
+    the mode, the attention ranks and the element type are the manifest's
+    single choices, so they shape nothing here.
+    """
+    names = ("hidden", "intermediate", "top", "experts", "max_tokens", "ranks")
+    return tuple(int(request.field(name)) for name in names)
 
 
 #: The kernel's entry, spelled per group size: the exported launcher takes
@@ -145,33 +140,35 @@ class Export:
 KERNEL_SOURCES = "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src"
 
 
-def kernel_sources(package, staging):
+def kernel_sources(request, staging):
     """The kernel's sources, staged as this package compiles them.
 
     They are the pinned FlashInfer copy (`uniserve_build_server.fetch`'s
     `megamoe` pin) with `patches/megamoe.patch` applied, which adds the
     tanh-approximated GELU gate and fixes the peer-metadata stride of the token
     exchange. The patch is applied to copies in the build's staging directory,
-    so neither the distribution nor the verified cache is changed.
+    so neither the distribution nor the Build Server's verified cache of pins
+    is changed.
     """
     pinned = fetch.pin("megamoe")
     staged = staging / "megamoe"
-    patch = package / "patches" / "megamoe.patch"
+    patch = request.package / "patches" / "megamoe.patch"
     try:
-        names = list(fetch.manifest(pinned))
-        fetch.fetch(pinned, names)
-        fetch.stage(pinned, staged, names, copy=True)
+        names = list(fetch.manifest(pinned, request.cache))
+        fetch.fetch(pinned, request.cache, names, request.jobs)
+        fetch.stage(pinned, request.cache, staged, names, copy=True)
         fetch.apply_patch(staged / KERNEL_SOURCES, patch)
     except fetch.FetchError as error:
         raise SystemExit(str(error)) from error
     return staged / KERNEL_SOURCES
 
 
-def compile_kernel(package, target, shape, staging):
+def compile_kernel(request, shape, staging):
     """Compile and export the kernel; answers its two workspace sizes."""
     hidden, intermediate, top, experts, tokens, ranks = shape
-    os.environ["CUTE_DSL_ARCH"] = target
-    sys.path.insert(0, str(kernel_sources(package, staging)))
+    # The kernel is traced for the request's target, never for a probed device.
+    cute_dsl.configure(request.target)
+    sys.path.insert(0, str(kernel_sources(request, staging)))
     import cutlass  # noqa: PLC0415
     import cutlass.cute as cute  # noqa: PLC0415
     import torch  # noqa: PLC0415
@@ -301,58 +298,30 @@ def compile_kernel(package, target, shape, staging):
     return kernel.get_workspace_sizes()
 
 
-def cutlass_library():
-    """The CuTe DSL static runtime archive for this host's CUDA."""
-    import importlib.util  # noqa: PLC0415
-
-    found = importlib.util.find_spec("nvidia_cutlass_dsl")
-    locations = list(getattr(found, "submodule_search_locations", None) or ())
-    if not locations:
-        raise SystemExit(
-            "the CuTe DSL package nvidia_cutlass_dsl is not installed"
-        )
-    root = pathlib.Path(locations[0])
-    for major in ("cu13", "cu12"):
-        archive = root / major / "lib" / "libcuda_dialect_runtime_static.a"
-        if archive.exists():
-            return archive
-    raise SystemExit(
-        "no libcuda_dialect_runtime_static.a in nvidia_cutlass_dsl"
-    )
-
-
-def cuda_home():
-    """The CUDA toolkit's directory, which `CUDA_HOME` names.
-
-    It holds the runtime's headers and library.
-    """
-    home = os.environ.get("CUDA_HOME")
-    if not home:
-        raise SystemExit(
-            "CUDA_HOME names the CUDA toolkit whose runtime the module links "
-            "against"
-        )
-    return pathlib.Path(home)
-
-
 def run(command, what):
-    """Runs one compile step and refuses with its output when it fails."""
-    built = subprocess.run(command, capture_output=True, text=True, check=False)
+    """Runs one compile step; its whole output is the build's log."""
+    built = subprocess.run(command, check=False)
     if built.returncode != 0:
-        raise SystemExit(f"{what} failed:\n{built.stderr[-6000:]}")
+        raise SystemExit(f"{what} failed with {built.returncode}")
 
 
-def main():
-    """Compile the fused exchange for one descriptor into ``module.so``."""
-    package, descriptor, target, out = build.arguments()
-    out.mkdir(parents=True, exist_ok=True)
-    shape = shape_of(descriptor)
+def compile(request: Request) -> None:
+    """Compile the fused exchange for the request's descriptor into a module.
+
+    Only ``module.so`` is written into the request's output directory: the
+    staged sources, the kernel's export and the objects are the build's own
+    intermediates, in a dot directory of the output the Build Server does not
+    publish.
+    """
+    package = request.package
+    target = request.target
+    shape = shape_of(request)
     hidden, intermediate, top, experts, tokens, ranks = shape
-    with tempfile.TemporaryDirectory() as directory:
-        staging = pathlib.Path(directory)
-        local_bytes, shared_bytes = compile_kernel(
-            package, target, shape, staging
-        )
+    cuda = request.toolchain.require_cuda()
+    compiler = request.toolchain.require_host_compiler()
+    with tempfile.TemporaryDirectory(dir=request.output, prefix=".") as scratch:
+        staging = pathlib.Path(scratch)
+        local_bytes, shared_bytes = compile_kernel(request, shape, staging)
         offsets = ", ".join(f"offsets[{rank}]" for rank in range(ranks))
         defines = [
             f"-DUNISERVE_RANKS={ranks}",
@@ -366,11 +335,10 @@ def main():
             f"-DUNISERVE_OFFSETS={ranks}",
             f"-DUNISERVE_OFFSET_ARGUMENTS={offsets}",
         ]
-        nvcc = str(cuda_home() / "bin" / "nvcc")
         stage = staging / "stage.o"
         run(
             [
-                nvcc,
+                cuda.nvcc,
                 "-c",
                 "-O3",
                 "-std=c++17",
@@ -388,7 +356,7 @@ def main():
         stage_link = staging / "stage_link.o"
         run(
             [
-                nvcc,
+                cuda.nvcc,
                 "-dlink",
                 f"-arch={target}",
                 "-Xcompiler",
@@ -402,7 +370,7 @@ def main():
         entry = staging / "entry.o"
         run(
             [
-                os.environ.get("CXX", "g++"),
+                compiler,
                 "-c",
                 "-O2",
                 "-std=c++20",
@@ -410,7 +378,7 @@ def main():
                 *defines,
                 f"-I{staging}",
                 f"-I{package / 'include'}",
-                f"-I{cuda_home() / 'include'}",
+                f"-I{cuda.include}",
                 f"-iquote{package / 'src'}",
                 str(package / "src" / "entry.cpp"),
                 "-o",
@@ -418,35 +386,38 @@ def main():
             ],
             "compiling the entry unit",
         )
+        # The CuTe DSL's dialect runtime archive is linked whole. The driver
+        # library is the toolkit's link-time stub: the serving process loads
+        # the driver itself.
         run(
             [
-                os.environ.get("CXX", "g++"),
+                compiler,
                 "-shared",
                 "-O2",
                 "-fPIC",
                 "-o",
-                str(out / "module.so"),
+                str(request.output / "module.so"),
                 str(staging / "mega.o"),
                 str(entry),
                 str(stage),
                 str(stage_link),
                 "-Wl,--whole-archive",
-                str(cutlass_library()),
+                str(cute_dsl.dialect_runtime(cuda)),
                 "-Wl,--no-whole-archive",
                 "-Wl,--no-as-needed",
-                f"-L{cuda_home() / 'lib64'}",
+                f"-L{cuda.lib}",
                 "-lcudart",
+                f"-L{cuda.stubs}",
                 "-lcuda",
             ],
             "linking module.so",
         )
-    build.require_exports(out / "module.so", ENTRIES)
     print(
         json.dumps(
-            {"descriptor": descriptor, "target": target, "entries": ENTRIES}
+            {
+                "descriptor": request.descriptor,
+                "target": str(target),
+                "entries": ENTRIES,
+            }
         )
     )
-
-
-if __name__ == "__main__":
-    main()

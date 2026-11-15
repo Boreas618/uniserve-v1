@@ -1,27 +1,26 @@
-"""The sparse_attention package's compile script: one descriptor -> one native module.
+"""The sparse_attention package's build module: one descriptor -> one module.
 
-The module is this package's kernel compiled with nvcc into a shared object exporting
-`uniserve_sparse_attention`. The kernel reads the geometry, the strides and the selection
-from the call structure, so the descriptor decides only what a compilation cannot vary:
+The module is this package's kernel compiled with nvcc into a shared object
+exporting `uniserve_sparse_attention`. The kernel reads the geometry, the
+strides and the selection from the call structure, so the descriptor decides
+only what a compilation cannot vary:
 
-* the sparse block size, which is a compile-time constant of the kernel (the vendor keeps
-  the 64-row and 128-row builds in separate namespaces for exactly this reason), taken
-  from the descriptor's `block`;
-* the tensor-map layout, which this package always takes as strided rows and heads
-  (`VSA_BHSD`), because the operator's call addresses rows and heads through strides.
+* the sparse block size, which is a compile-time constant of the kernel (the
+  vendor keeps the 64-row and 128-row builds in separate namespaces for exactly
+  this reason), taken from the descriptor's `block`;
+* the tensor-map layout, which this package always takes as strided rows and
+  heads (`VSA_BHSD`), because the operator's call addresses rows and heads
+  through strides.
 
-The Build Server runs this script with its own Python environment, its working directory the
-package root, and `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE` and
-`UNISERVE_OUT` in the environment; `--package`, `--descriptor`, `--target` and `--out` name
-the same values on the command line.
+The Build Server compiles a descriptor by calling :func:`compile` with the
+compile request.
 """
 
-import argparse
 import json
-import os
-import pathlib
 import subprocess
 import sys
+
+from uniserve_build_server.request import Request
 
 #: The translation unit of the module.
 SOURCE = "src/attention.cu"
@@ -33,64 +32,38 @@ ENTRY = "uniserve_sparse_attention"
 BLOCKS = (64, 128)
 
 
-def arguments():
-    """The package, descriptor, target and output directory of one build."""
-    reader = argparse.ArgumentParser(description=__doc__)
-    reader.add_argument("--package")
-    reader.add_argument("--descriptor")
-    reader.add_argument("--target")
-    reader.add_argument("--out")
-    known = reader.parse_args()
-    values = {
-        "package": known.package or os.environ.get("UNISERVE_PACKAGE"),
-        "descriptor": known.descriptor or os.environ.get("UNISERVE_DESCRIPTOR"),
-        "target": known.target or os.environ.get("UNISERVE_TARGET"),
-        "out": known.out or os.environ.get("UNISERVE_OUT"),
-    }
-    missing = [name for name, value in values.items() if not value]
-    if missing:
-        raise SystemExit(f"missing {', '.join(missing)}")
-    return (
-        pathlib.Path(values["package"]).resolve(),
-        values["descriptor"],
-        values["target"],
-        pathlib.Path(values["out"]),
-    )
-
-
-def block_of(descriptor):
-    """The sparse block size a descriptor names, from its `block` field.
-
-    The Build Server read the key and states its fields in ``UNISERVE_FIELDS``.
-    """
-    fields = json.loads(os.environ.get("UNISERVE_FIELDS") or "{}")
-    if "block" not in fields:
-        raise SystemExit(f"the descriptor {descriptor!r} names no block size")
-    block = int(fields["block"])
+def block_of(request):
+    """The sparse block size the request's descriptor names in `block`."""
+    block = int(request.field("block"))
     if block not in BLOCKS:
         raise SystemExit(f"the kernel knows block sizes {BLOCKS}, not {block}")
     return block
 
 
-def main():
-    """Compile the kernel for one descriptor into ``module.so``."""
-    package, descriptor, target, out = arguments()
-    out.mkdir(parents=True, exist_ok=True)
-    # The nvcc the Build Server checked against this package's declared version.
-    compiler = os.environ["UNISERVE_NVCC"]
-    block = block_of(descriptor)
+def compile(request: Request) -> None:
+    """Compile the kernel for the request's descriptor into ``module.so``.
 
-    # The kernel's own two choices: which block size, and that the maps take strided rows
-    # and heads. Both must precede the header that reads them.
+    The module is written into the request's output directory; a compiler
+    failure refuses the build, with the compiler's output in the build log.
+    """
+    package = request.package
+    # The nvcc the Build Server checked against this package's declared
+    # version, and its driver API stub: the kernel's tensor maps are encoded
+    # through the driver.
+    cuda = request.toolchain.require_cuda()
+    block = block_of(request)
+
+    # The kernel's own two choices: which block size, and that the maps take
+    # strided rows and heads. Both must precede the header that reads them.
     defines = [
         "-DVSA_BHSD=1",
         f"-DVSA_BLK128={1 if block == 128 else 0}",
     ]
     command = [
-        compiler,
+        cuda.nvcc,
         "-O3",
         "-std=c++17",
-        f"-arch={target}",
+        f"-arch={request.target}",
         "--shared",
         "-Xcompiler",
         "-fPIC",
@@ -98,27 +71,24 @@ def main():
         f"-I{package / 'src'}",
         f"-I{package / 'include'}",
         str(package / SOURCE),
+        f"-L{cuda.stubs}",
         "-lcuda",
         "-lcudart",
         "-o",
-        str(out / "module.so"),
+        str(request.output / "module.so"),
     ]
     print(" ".join(command), file=sys.stderr)
-    built = subprocess.run(command, capture_output=True, text=True, check=False)
+    built = subprocess.run(command, check=False)
     if built.returncode != 0:
-        raise SystemExit(f"nvcc failed with {built.returncode}:\n{built.stderr[-4000:]}")
+        raise SystemExit(f"nvcc failed with {built.returncode}")
 
-    exported = subprocess.run(
-        ["nm", "-D", "--defined-only", str(out / "module.so")],
-        capture_output=True,
-        text=True,
-        check=True,
+    print(
+        json.dumps(
+            {
+                "descriptor": request.descriptor,
+                "target": str(request.target),
+                "entry": ENTRY,
+                "block": block,
+            }
+        )
     )
-    symbols = {line.split()[-1] for line in exported.stdout.splitlines() if line.split()}
-    if ENTRY not in symbols:
-        raise SystemExit(f"module.so does not export {ENTRY}")
-    print(json.dumps({"descriptor": descriptor, "target": target, "entry": ENTRY, "block": block}))
-
-
-if __name__ == "__main__":
-    main()

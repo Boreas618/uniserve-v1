@@ -29,10 +29,9 @@ files = ["src/vsa_compose_gated_rows.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 # The width and the rows one program handles are `tl.arange` extents; the heads, the tile rows and
 # the members compile for any positive value, and the slots are the members' payload indices, one per
 # member, which the compile script holds to the member count.

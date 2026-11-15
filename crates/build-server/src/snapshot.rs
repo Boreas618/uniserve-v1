@@ -1,160 +1,124 @@
 //! The snapshot an installation takes of a package: the files a revision
 //! holds, and the digest that names them among a module's inputs.
 //!
-//! A package is its directory's files. A package cargo builds is more than its
-//! directory: its crate inherits from a workspace and depends on crates of it,
-//! so its revision holds `package.toml` and, under [`WORKSPACE`], the crate
-//! with every workspace crate it depends on, the workspace's lockfile and
-//! toolchain file, and a workspace manifest naming exactly those crates as
-//! members. A crate the workspace depends on by a path outside itself is
-//! copied beside the workspace, under [`VENDORED`], and the manifest names it
-//! there. The revision is then a workspace cargo builds offline with the
-//! lockfile, wherever the tree it was installed from is, and a change to any
-//! crate the package depends on is a change of the package's digest.
+//! A package is its directory's files. A package cargo builds (the engine, a
+//! scheduling policy) is a crate of a workspace, and its revision is the
+//! **whole workspace**: `package.toml` at the revision's root and, under
+//! [`WORKSPACE`], every file cargo packages of every workspace member
+//! (`cargo package --list`, which honours each crate's `include` and `exclude`
+//! and the repository's ignore rules) with the workspace's manifest, lockfile
+//! and toolchain file, exactly as they are. The revision is then the workspace
+//! cargo builds offline with its own lockfile, wherever the tree it was
+//! installed from is, and any change to the workspace is a change of the
+//! package's digest. Nothing is rewritten: no generated manifest, no reduced
+//! lockfile.
+//!
+//! The registry and git sources the lockfile names are vendored once per
+//! lockfile into the Build Server's cache ([`vendored`]), so a build reads no
+//! crate from a mutable registry cache and fetches nothing.
 
-use std::collections::BTreeSet;
-use std::ffi::OsStr;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::inputs::{BYTECODE_CACHE, RECORD};
+use crate::manifest::Manifest;
+use crate::source::Cache;
+use crate::toolchain::CARGO;
 use crate::{Error, Result};
 
 /// The directory of an installed cargo package's revision that holds the
 /// snapshot of its workspace.
 pub const WORKSPACE: &str = "workspace";
 
-/// The directory of an installed cargo package's revision that holds the
-/// crates its workspace depends on by a path outside itself, one directory per
-/// dependency name.
-pub const VENDORED: &str = "vendored";
+/// The files of a workspace root a snapshot always holds, beside its members'.
+const WORKSPACE_FILES: [&str; 3] = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"];
 
-/// The name of a cargo snapshot's workspace manifest inside the revision.
-const WORKSPACE_MANIFEST: &str = "workspace/Cargo.toml";
+/// The directory of a lockfile's vendored sources inside its provisioning.
+const VENDOR_SOURCES: &str = "sources";
 
-/// The source kinds whose packages cargo builds from a workspace snapshot, as
-/// a manifest's `[source] kind` spells them.
-const CARGO_KINDS: [&str; 2] = ["cargo", "wasm"];
+/// The cargo configuration of a lockfile's provisioning, which names its
+/// vendored sources.
+const VENDOR_CONFIG: &str = "config.toml";
 
 /// Named files: each by its name inside what holds it (an installed revision,
 /// a module's directory) and where it is now.
 pub type Files = Vec<(String, PathBuf)>;
 
-/// What an installation of the package in `directory` holds: each file as its
-/// name inside the installed revision and where it is now, and, for a package
-/// cargo builds, the text of the workspace manifest the revision is built
-/// under ([`workspace_manifest`]).
+/// What an installation of the package in `directory`, whose manifest is
+/// `manifest`, holds: each file as its name inside the installed revision and
+/// where it is now, in name order.
 ///
 /// # Errors
 ///
 /// Fails when the directory cannot be read, or a cargo package's workspace
-/// does not read: no workspace manifest at or above it, a manifest that does
-/// not parse, or a dependency outside the workspace.
-pub fn package_files(directory: &Path) -> Result<(Files, Option<String>)> {
+/// cannot be listed by cargo.
+pub fn package_files(directory: &Path, manifest: &Manifest) -> Result<Files> {
     let mut files = Vec::new();
-    if !builds_with_cargo(directory) {
-        tree_files(directory, Path::new(""), &|_, _| true, &mut files)?;
-        return Ok((files, None));
+    if !manifest.source.kind.builds_with_cargo() {
+        tree_files(directory, Path::new(""), &mut files)?;
+        return Ok(files);
     }
 
-    files.push(("package.toml".to_owned(), directory.join("package.toml")));
-    let root = workspace_root(directory)?;
-    let package = relative_to(&root, directory)?;
-    let (members, vendored) = workspace_members(&root, &package)?;
-    for name in ["Cargo.lock", "rust-toolchain.toml"] {
-        if root.join(name).is_file() {
-            files.push((format!("{WORKSPACE}/{name}"), root.join(name)));
+    files.push((Manifest::FILE.to_owned(), directory.join(Manifest::FILE)));
+    let workspace = metadata(directory)?;
+    let mut listed: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for name in WORKSPACE_FILES {
+        let path = workspace.workspace_root.join(name);
+        if path.is_file() {
+            listed.insert(format!("{WORKSPACE}/{name}"), path);
         }
     }
-    for member in &members {
-        crate_files(
-            &root.join(member),
-            &Path::new(WORKSPACE).join(member),
-            &mut files,
-        )?;
+    for member in &workspace.packages {
+        let crate_root = member.directory()?;
+        let relative = crate_root
+            .strip_prefix(&workspace.workspace_root)
+            .map_err(|_| invalid(format!("{} is outside its workspace", crate_root.display())))?;
+        for file in package_list(&workspace.workspace_root, &member.name)? {
+            // `cargo package` lists what it generates for a package (its VCS
+            // record, a normalized manifest's original, a lockfile of a crate
+            // with binaries) beside the crate's own files; only a file the crate
+            // holds is a source.
+            let path = crate_root.join(&file);
+            if path.is_file() {
+                let name = Path::new(WORKSPACE).join(relative).join(&file);
+                listed.insert(name.to_string_lossy().into_owned(), path);
+            }
+        }
     }
-    for (name, directory) in &vendored {
-        crate_files(directory, &Path::new(VENDORED).join(name), &mut files)?;
-    }
-    let manifest = workspace_manifest(&root, &members, &vendored, &package)?;
-    Ok((files, Some(manifest)))
-}
-
-/// Adds the files of the crate at `crate_root`, named below `prefix`.
-///
-/// A build writes its output under `target`, a dot entry is a tool's own
-/// state, and a directory holding its own `package.toml` is another package's
-/// source: none of them is the crate's.
-fn crate_files(crate_root: &Path, prefix: &Path, files: &mut Vec<(String, PathBuf)>) -> Result<()> {
-    let part_of_crate = |path: &Path, name: &OsStr| {
-        let name = name.to_string_lossy();
-        !(name == "target"
-            || name.starts_with('.')
-            || (path != crate_root && path.join("package.toml").is_file()))
-    };
-    tree_files(crate_root, prefix, &part_of_crate, files)
+    files.extend(listed);
+    Ok(files)
 }
 
 /// The SHA-256 of a snapshot, in hex: each file framed by its name and its
-/// length, in the order given, and the generated workspace manifest of a cargo
-/// package last, so no two snapshots hash one byte stream.
+/// length, in the order given, so no two snapshots hash one byte stream.
 ///
 /// # Errors
 ///
 /// Fails when a file cannot be read.
-pub fn files_digest(files: &[(String, PathBuf)], generated: Option<&str>) -> Result<String> {
+pub fn files_digest(files: &[(String, PathBuf)]) -> Result<String> {
     let mut hasher = Sha256::new();
-    let mut frame = |name: &str, bytes: &[u8]| {
+    for (name, path) in files {
+        let bytes = fs::read(path)?;
         hasher.update(name.as_bytes());
         hasher.update([0]);
         hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-    };
-    for (name, path) in files {
-        frame(name, &fs::read(path)?);
+        hasher.update(&bytes);
     }
-    if let Some(manifest) = generated {
-        frame(WORKSPACE_MANIFEST, manifest.as_bytes());
-    }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
-/// The SHA-256 of a directory tree's files, in hex.
-///
-/// Every file is hashed with its path relative to `root`, in path order, so a
-/// renamed or moved file changes the digest as a changed byte does. A symbolic
-/// link counts as what it names, as an install copies it. Python bytecode
-/// ([`BYTECODE_CACHE`]) and a revision's own record ([`RECORD`]) are not
-/// inputs and are skipped.
-///
-/// # Errors
-///
-/// Fails when the tree cannot be read.
-pub fn tree_digest(root: &Path) -> Result<String> {
-    let mut files = Vec::new();
-    tree_files(root, Path::new(""), &|_, _| true, &mut files)?;
-    files_digest(&files, None)
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Writes a snapshot into `staged`, the directory that becomes the revision:
-/// each file under its name with its mode, fsynced, and the generated
-/// workspace manifest of a cargo package.
+/// each file under its name with its mode, fsynced.
 ///
 /// # Errors
 ///
-/// Fails when a file cannot be copied or written.
-pub fn write_files(
-    files: &[(String, PathBuf)],
-    generated: Option<&str>,
-    staged: &Path,
-) -> Result<()> {
+/// Fails when a file cannot be copied.
+pub fn write_files(files: &[(String, PathBuf)], staged: &Path) -> Result<()> {
     for (name, source) in files {
         let destination = staged.join(name);
         if let Some(parent) = destination.parent() {
@@ -163,40 +127,14 @@ pub fn write_files(
         fs::copy(source, &destination)?;
         fs::File::open(&destination)?.sync_all()?;
     }
-
-    if let Some(manifest) = generated {
-        let path = staged.join(WORKSPACE_MANIFEST);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, manifest)?;
-        fs::File::open(&path)?.sync_all()?;
-    }
     Ok(())
 }
 
-/// Whether the package in `directory` states a source kind cargo builds.
-fn builds_with_cargo(directory: &Path) -> bool {
-    fs::read_to_string(directory.join("package.toml"))
-        .ok()
-        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
-        .and_then(|manifest| {
-            let kind = manifest.get("source")?.get("kind")?.as_str()?;
-            Some(CARGO_KINDS.contains(&kind))
-        })
-        .unwrap_or(false)
-}
-
 /// Adds every file below `directory`, named by `prefix` and its path below the
-/// directory, depth first in name order. An entry `keep` refuses, given its
-/// path and name, is left out with everything below it; Python bytecode and a
-/// revision's own record always are.
-fn tree_files(
-    directory: &Path,
-    prefix: &Path,
-    keep: &dyn Fn(&Path, &OsStr) -> bool,
-    files: &mut Vec<(String, PathBuf)>,
-) -> Result<()> {
+/// directory, depth first in name order. Python bytecode and a revision's own
+/// record are no inputs and are left out. A symbolic link counts as what it
+/// names, as an installation copies it.
+fn tree_files(directory: &Path, prefix: &Path, files: &mut Files) -> Result<()> {
     let mut entries: Vec<_> = fs::read_dir(directory)?
         .map(|entry| entry.map(|entry| entry.file_name()))
         .collect::<io::Result<_>>()?;
@@ -207,13 +145,9 @@ fn tree_files(
             continue;
         }
         let path = directory.join(&name);
-        if !keep(&path, &name) {
-            continue;
-        }
         let relative = prefix.join(&name);
-        // A symbolic link counts as what it names.
         if fs::metadata(&path)?.is_dir() {
-            tree_files(&path, &relative, keep, files)?;
+            tree_files(&path, &relative, files)?;
         } else {
             files.push((relative.to_string_lossy().into_owned(), path));
         }
@@ -221,188 +155,191 @@ fn tree_files(
     Ok(())
 }
 
-/// The root of the cargo workspace the crate in `directory` belongs to: the
-/// nearest directory at or above it whose `Cargo.toml` has a `[workspace]`.
-fn workspace_root(directory: &Path) -> Result<PathBuf> {
-    let directory = fs::canonicalize(directory)?;
-    directory
-        .ancestors()
-        .find(|candidate| {
-            cargo_manifest(candidate).is_ok_and(|manifest| manifest.contains_key("workspace"))
-        })
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
+/// The workspace cargo reports for a directory (`cargo metadata --no-deps`).
+#[derive(Debug, Deserialize)]
+struct Workspace {
+    workspace_root: PathBuf,
+    packages: Vec<Member>,
+}
+
+/// One member of a workspace, as cargo reports it.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Member {
+    /// cargo's package identifier, which its build messages name.
+    pub id: String,
+    pub name: String,
+    manifest_path: PathBuf,
+}
+
+impl Member {
+    /// The crate's directory.
+    fn directory(&self) -> Result<&Path> {
+        self.manifest_path
+            .parent()
+            .ok_or_else(|| invalid(format!("{} has no directory", self.manifest_path.display())))
+    }
+}
+
+/// Runs cargo in `directory` and returns its standard output.
+fn cargo(directory: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
+    let output = crate::toolchain::cargo(directory)
+        .args(arguments)
+        .output()
+        .map_err(|error| {
             invalid(format!(
-                "no cargo workspace holds {}: no Cargo.toml at or above it has a [workspace]",
+                "{CARGO} cannot be run in {}: {error}",
                 directory.display()
             ))
-        })
+        })?;
+    if !output.status.success() {
+        return Err(invalid(format!(
+            "{CARGO} {} failed in {}: {}",
+            arguments.join(" "),
+            directory.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output.stdout)
 }
 
-/// The `Cargo.toml` of `directory`, parsed.
-fn cargo_manifest(directory: &Path) -> Result<toml::Table> {
-    let path = directory.join("Cargo.toml");
-    let text = fs::read_to_string(&path)?;
-    toml::from_str(&text).map_err(|error| invalid(format!("{}: {error}", path.display())))
+/// The workspace the crate in `directory` belongs to, with its members.
+fn metadata(directory: &Path) -> Result<Workspace> {
+    let stdout = cargo(
+        directory,
+        &[
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+            "--locked",
+        ],
+    )?;
+    serde_json::from_slice(&stdout).map_err(|error| invalid(format!("cargo metadata: {error}")))
 }
 
-/// `path` relative to the workspace root `root`, which must hold it.
-fn relative_to(root: &Path, path: &Path) -> Result<PathBuf> {
-    let canonical = fs::canonicalize(path)?;
-    canonical
-        .strip_prefix(root)
-        .map(Path::to_path_buf)
-        .map_err(|_| {
-            invalid(format!(
-                "{} is outside the workspace at {}",
-                canonical.display(),
-                root.display()
-            ))
-        })
+/// The files cargo packages of the workspace member `name`, relative to its
+/// directory.
+fn package_list(workspace_root: &Path, name: &str) -> Result<Vec<String>> {
+    let stdout = cargo(
+        workspace_root,
+        &[
+            "package",
+            "--list",
+            "--allow-dirty",
+            "--offline",
+            "--quiet",
+            "--package",
+            name,
+        ],
+    )?;
+    Ok(String::from_utf8_lossy(&stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
 }
 
-/// The crates that building and resolving the crate at `package` of the
-/// workspace at `root` needs: the workspace's own, relative to the root and in
-/// path order, and those the workspace depends on by a path outside itself,
-/// each by its dependency name and its directory.
-///
-/// The workspace's own are the crate itself and, transitively, every path
-/// dependency of a crate already in the set, whether stated by `path` or
-/// inherited from the workspace. Development dependencies count: cargo
-/// resolves them for every member of a workspace, so a snapshot without them
-/// does not load.
+/// The member of the installed cargo package's revision at `revision` that is
+/// the package: the workspace crate whose `package.toml` is the revision's own,
+/// the file the installation copied from that crate.
 ///
 /// # Errors
 ///
-/// Fails when a manifest does not read, or a crate states a path outside the
-/// workspace itself: only a dependency the workspace states can be vendored,
-/// because only the workspace manifest is written for the snapshot.
-fn workspace_members(root: &Path, package: &Path) -> Result<(Vec<PathBuf>, Files)> {
-    let workspace = cargo_manifest(root)?;
-    let inherited = workspace
-        .get("workspace")
-        .and_then(|workspace| workspace.get("dependencies"))
-        .and_then(toml::Value::as_table);
-
-    let mut members = BTreeSet::new();
-    let mut vendored = std::collections::BTreeMap::new();
-    let mut pending = vec![package.to_path_buf()];
-    while let Some(member) = pending.pop() {
-        if !members.insert(member.clone()) {
-            continue;
-        }
-        let manifest = cargo_manifest(&root.join(&member))?;
-
-        // The dependency tables of a manifest: its own three, and the three of
-        // each `[target.<cfg>]`.
-        let mut tables = vec![&manifest];
-        if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
-            tables.extend(targets.values().filter_map(toml::Value::as_table));
-        }
-
-        for table in tables {
-            for kind in ["dependencies", "dev-dependencies", "build-dependencies"] {
-                let Some(dependencies) = table.get(kind).and_then(toml::Value::as_table) else {
-                    continue;
-                };
-                for (name, dependency) in dependencies {
-                    let inherits =
-                        dependency.get("workspace").and_then(toml::Value::as_bool) == Some(true);
-                    match dependency.get("path").and_then(toml::Value::as_str) {
-                        Some(path) => {
-                            pending.push(relative_to(root, &root.join(&member).join(path))?);
-                        }
-                        None if inherits => {
-                            let Some(path) = inherited
-                                .and_then(|inherited| inherited.get(name)?.get("path")?.as_str())
-                            else {
-                                continue;
-                            };
-                            // `join` keeps an absolute path as it is.
-                            let directory = fs::canonicalize(root.join(path))?;
-                            match directory.strip_prefix(root) {
-                                Ok(inside) => pending.push(inside.to_path_buf()),
-                                Err(_) => {
-                                    vendored.insert(name.clone(), directory);
-                                }
-                            }
-                        }
-                        None => {}
-                    }
-                }
-            }
+/// Fails when cargo cannot list the snapshot's workspace, or no member, or more
+/// than one, holds the revision's manifest.
+pub fn member(revision: &Path) -> Result<Member> {
+    let installed = fs::read(revision.join(Manifest::FILE))?;
+    let workspace = revision.join(WORKSPACE);
+    let mut found = Vec::new();
+    for member in metadata(&workspace)?.packages {
+        let stated = member.directory()?.join(Manifest::FILE);
+        if stated.is_file() && fs::read(&stated)? == installed {
+            found.push(member);
         }
     }
-    Ok((
-        members.into_iter().collect(),
-        vendored.into_iter().collect(),
-    ))
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        count => Err(invalid(format!(
+            "{count} members of the workspace at {} hold the package's {}",
+            workspace.display(),
+            Manifest::FILE
+        ))),
+    }
 }
 
-/// The workspace manifest a cargo package's revision is built under: the
-/// manifest of the workspace at `root` with `members` as its only members,
-/// the crate at `package` as the one cargo builds by default, and no root
-/// package.
+/// The cargo configuration that replaces every source the lockfile of the
+/// workspace snapshot at `workspace` names with its vendored copy, provisioned
+/// once per lockfile in the Build Server's cache ([`Cache::vendor`]).
 ///
-/// The workspace's shared package fields, dependency versions, lints and
-/// profiles are kept, so every member compiles as it does in its tree. A
-/// workspace dependency on a crate of `vendored` names the copy beside the
-/// workspace, and one on a crate the snapshot does not hold is dropped,
-/// because no member inherits it.
-fn workspace_manifest(
-    root: &Path,
-    members: &[PathBuf],
-    vendored: &[(String, PathBuf)],
-    package: &Path,
-) -> Result<String> {
-    let original = cargo_manifest(root)?;
-    let mut workspace = original
-        .get("workspace")
-        .and_then(toml::Value::as_table)
-        .cloned()
-        .unwrap_or_default();
-
-    let named = |path: &Path| toml::Value::String(path.to_string_lossy().into_owned());
-    workspace.insert(
-        "members".to_owned(),
-        toml::Value::Array(members.iter().map(|member| named(member)).collect()),
+/// The provisioning is `cargo vendor --locked --offline` into a staging
+/// directory beside the destination ([`crate::store::Staging`]), which holds
+/// the sources and the configuration cargo prints, rewritten to name the
+/// sources' final location, and is renamed into place whole: builds that
+/// provision one lockfile at once never read a partial copy, and a provisioning
+/// that died leaves a staging directory the next one removes. A lockfile that
+/// names no registry or git source has nothing to vendor, and its configuration
+/// replaces nothing.
+///
+/// # Errors
+///
+/// Fails when the lockfile cannot be read or cargo cannot vendor its sources.
+pub fn vendored(workspace: &Path, cache: &Cache) -> Result<PathBuf> {
+    let lock = format!(
+        "{:x}",
+        Sha256::digest(fs::read(workspace.join("Cargo.lock"))?)
     );
-    workspace.insert(
-        "default-members".to_owned(),
-        toml::Value::Array(vec![named(package)]),
-    );
-    workspace.remove("exclude");
-
-    if let Some(dependencies) = workspace
-        .get_mut("dependencies")
+    let destination = cache.vendor(&lock);
+    let config = destination.join(VENDOR_CONFIG);
+    if config.is_file() {
+        return Ok(config);
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| invalid(format!("{} has no directory", destination.display())))?;
+    let staging = crate::store::Staging::new(parent)?;
+    let printed = cargo(
+        workspace,
+        &[
+            "vendor",
+            "--locked",
+            "--offline",
+            "--versioned-dirs",
+            &staging.path().join(VENDOR_SOURCES).to_string_lossy(),
+        ],
+    )?;
+    let mut replacement: toml::Table = toml::from_str(&String::from_utf8_lossy(&printed))
+        .map_err(|error| invalid(format!("cargo vendor printed no configuration: {error}")))?;
+    if let Some(directory) = replacement
+        .get_mut("source")
+        .and_then(|source| source.get_mut("vendored-sources"))
         .and_then(toml::Value::as_table_mut)
     {
-        dependencies.retain(|name, dependency| {
-            let Some(table) = dependency.as_table_mut() else {
-                return true;
-            };
-            let Some(path) = table.get("path").and_then(toml::Value::as_str) else {
-                return true;
-            };
-            if vendored.iter().any(|(vendored, _)| vendored == name) {
-                table.insert(
-                    "path".to_owned(),
-                    toml::Value::String(format!("../{VENDORED}/{name}")),
-                );
-                return true;
-            }
-            members.iter().any(|member| member == Path::new(path))
-        });
+        directory.insert(
+            "directory".to_owned(),
+            toml::Value::String(
+                destination
+                    .join(VENDOR_SOURCES)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        );
     }
-
-    let mut manifest = toml::Table::new();
-    manifest.insert("workspace".to_owned(), toml::Value::Table(workspace));
-    for section in ["profile", "patch"] {
-        if let Some(value) = original.get(section) {
-            manifest.insert(section.to_owned(), value.clone());
+    let text = toml::to_string(&replacement).map_err(|error| invalid(error.to_string()))?;
+    fs::write(staging.path().join(VENDOR_CONFIG), text)?;
+    match staging.publish(&destination) {
+        Ok(()) => Ok(config),
+        // Another build provisioned the same lockfile first: its copy is the
+        // same sources.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty
+            ) && config.is_file() =>
+        {
+            Ok(config)
         }
+        Err(error) => Err(Error::Io(error)),
     }
-    toml::to_string(&manifest).map_err(|error| invalid(error.to_string()))
 }
 
 fn invalid(message: String) -> Error {
@@ -421,17 +358,23 @@ mod tests {
         }
     }
 
-    /// A changed byte, a renamed file and an added file each change a tree's digest; bytecode and
-    /// the revision's record do not.
+    fn digest(root: &Path) -> String {
+        let mut files = Vec::new();
+        tree_files(root, Path::new(""), &mut files).unwrap();
+        files_digest(&files).unwrap()
+    }
+
+    /// A changed byte, a renamed file and an added file each change a package's digest; bytecode
+    /// and the revision's record do not.
     #[test]
-    fn a_tree_digest_follows_the_files_a_build_reads() {
+    fn a_package_digest_follows_the_files_a_build_reads() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         tree(
             root,
-            &[("package.toml", "op = 1\n"), ("src/kernel.py", "x = 1\n")],
+            &[(Manifest::FILE, "op = 1\n"), ("src/kernel.py", "x = 1\n")],
         );
-        let base = tree_digest(root).unwrap();
+        let base = digest(root);
 
         tree(
             root,
@@ -440,143 +383,13 @@ mod tests {
                 (RECORD, "record"),
             ],
         );
-        assert_eq!(tree_digest(root).unwrap(), base);
+        assert_eq!(digest(root), base);
 
         tree(root, &[("src/kernel.py", "x = 2\n")]);
-        let edited = tree_digest(root).unwrap();
+        let edited = digest(root);
         assert_ne!(edited, base);
 
         fs::rename(root.join("src/kernel.py"), root.join("src/other.py")).unwrap();
-        assert_ne!(tree_digest(root).unwrap(), edited);
-
-        tree(root, &[("src/kernel.py", "x = 2\n")]);
-        assert_ne!(tree_digest(root).unwrap(), edited);
-    }
-
-    /// A workspace at `root` of an application crate that depends on `core` by inheritance, on
-    /// `tools` only for its tests and on `outer`, a crate beside the workspace, through the
-    /// workspace; and a crate nothing of it depends on.
-    fn workspace(root: &Path) {
-        tree(
-            root,
-            &[
-                ("../outer/Cargo.toml", "[package]\nname = \"outer\"\n"),
-                ("../outer/src/lib.rs", "\n"),
-                (
-                    "Cargo.toml",
-                    "[workspace]\nresolver = \"3\"\nmembers = [\"crates/app\", \"crates/core\", \
-                     \"crates/tools\", \"crates/other\"]\n\n[workspace.package]\nversion = \
-                     \"1.0.0\"\n\n[workspace.dependencies]\ncore = { path = \"crates/core\" }\n\
-                     other = { path = \"crates/other\" }\nlibc = \"0.2\"\nouter = { path = \
-                     \"../outer\" }\n\n[profile.release]\n\
-                     lto = \"thin\"\n\n[package]\nname = \"root\"\n",
-                ),
-                ("Cargo.lock", "version = 4\n"),
-                ("rust-toolchain.toml", "[toolchain]\nchannel = \"stable\"\n"),
-                (
-                    "crates/app/Cargo.toml",
-                    "[package]\nname = \"app\"\n\n[dependencies]\ncore.workspace = true\n\
-                     outer.workspace = true\n\n\
-                     [dev-dependencies]\ntools = { path = \"../tools\" }\n",
-                ),
-                ("crates/app/package.toml", "[source]\nkind = \"cargo\"\n"),
-                ("crates/app/src/main.rs", "fn main() {}\n"),
-                ("crates/app/target/release/app", "built"),
-                ("crates/app/.cache/state", "state"),
-                ("crates/core/Cargo.toml", "[package]\nname = \"core\"\n"),
-                ("crates/core/src/lib.rs", "\n"),
-                ("crates/core/kernels/package.toml", "another package\n"),
-                ("crates/core/kernels/kernel.py", "\n"),
-                ("crates/tools/Cargo.toml", "[package]\nname = \"tools\"\n"),
-                ("crates/tools/src/lib.rs", "\n"),
-                ("crates/other/Cargo.toml", "[package]\nname = \"other\"\n"),
-                ("crates/other/src/lib.rs", "\n"),
-            ],
-        );
-    }
-
-    /// A cargo package's snapshot is its crate and the workspace crates it depends on, tests
-    /// included, under a workspace manifest naming exactly them: not a crate it does not depend
-    /// on, a build's output, a tool's state or another package's source.
-    #[test]
-    fn a_cargo_package_is_its_crate_and_the_workspace_crates_it_depends_on() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("tree");
-        workspace(&root);
-
-        let (files, manifest) = package_files(&root.join("crates/app")).unwrap();
-        let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "package.toml",
-                "workspace/Cargo.lock",
-                "workspace/rust-toolchain.toml",
-                "workspace/crates/app/Cargo.toml",
-                "workspace/crates/app/package.toml",
-                "workspace/crates/app/src/main.rs",
-                "workspace/crates/core/Cargo.toml",
-                "workspace/crates/core/src/lib.rs",
-                "workspace/crates/tools/Cargo.toml",
-                "workspace/crates/tools/src/lib.rs",
-                "vendored/outer/Cargo.toml",
-                "vendored/outer/src/lib.rs",
-            ]
-        );
-
-        let manifest: toml::Table = toml::from_str(&manifest.unwrap()).unwrap();
-        let workspace = manifest["workspace"].as_table().unwrap();
-        let listed = |key: &str| -> Vec<&str> {
-            workspace[key]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .collect()
-        };
-        assert_eq!(
-            listed("members"),
-            ["crates/app", "crates/core", "crates/tools"]
-        );
-        assert_eq!(listed("default-members"), ["crates/app"]);
-        let dependencies = workspace["dependencies"].as_table().unwrap();
-        assert!(dependencies.contains_key("core") && dependencies.contains_key("libc"));
-        assert!(!dependencies.contains_key("other"));
-        assert_eq!(
-            dependencies["outer"]["path"].as_str(),
-            Some("../vendored/outer"),
-            "a crate outside the workspace is named where the snapshot holds it"
-        );
-        assert_eq!(workspace["package"]["version"].as_str(), Some("1.0.0"));
-        assert_eq!(manifest["profile"]["release"]["lto"].as_str(), Some("thin"));
-        assert!(!manifest.contains_key("package"));
-    }
-
-    /// A cargo package's digest follows every crate it depends on and nothing else of its tree.
-    #[test]
-    fn a_cargo_package_digest_follows_the_crates_it_depends_on() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = &directory.path().join("tree");
-        workspace(root);
-        let digest = || {
-            let (files, manifest) = package_files(&root.join("crates/app")).unwrap();
-            files_digest(&files, manifest.as_deref()).unwrap()
-        };
-        let base = digest();
-
-        tree(root, &[("crates/other/src/lib.rs", "// edited\n")]);
-        tree(root, &[("crates/core/kernels/kernel.py", "# edited\n")]);
-        assert_eq!(digest(), base);
-
-        tree(root, &[("crates/core/src/lib.rs", "// edited\n")]);
-        let edited = digest();
-        assert_ne!(edited, base);
-
-        tree(root, &[("Cargo.lock", "version = 4\n# edited\n")]);
-        let relocked = digest();
-        assert_ne!(relocked, edited);
-
-        tree(root, &[("../outer/src/lib.rs", "// edited\n")]);
-        assert_ne!(digest(), relocked);
+        assert_ne!(digest(root), edited);
     }
 }

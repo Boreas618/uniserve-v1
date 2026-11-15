@@ -33,8 +33,8 @@ when it is unset. The packages are the tree's fixtures under
 - ``UNISERVE_MODULE_TARGET``: the Build Server's target, derived from the
   served device (``sm_100a`` on Blackwell) when unset.
 
-The Build Server's interpreter, its precompiler and the binary are named by
-``UNISERVE_BUILD_SERVER_PYTHON``, ``UNISERVE_SCHEDULING_PRECOMPILE`` and
+The Build Server's toolchain environment is its program on the search path
+(``uniserve-build-server``), and the binary is named by
 ``UNISERVE_BINARY``.
 
 The admin surface is the operator socket's: `POST /admin/config/commit` and

@@ -7,7 +7,6 @@ Build Server's Triton source drives ``uniserve_build_server.triton`` with it.
 """
 
 import gated_rms_norm as kernels
-from uniserve_build_server import triton as driver
 
 #: The floating dtypes a row, its gate, its weight and its output may have, as Triton
 #: spells them in an argument signature.
@@ -42,7 +41,3 @@ def spec(fields, parameters, target):
         "constexprs": {"BLOCK": tile, "SIGMOID": fields.get("gate", "silu") == "sigmoid"},
         "options": {"num_warps": warps_of(tile)},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

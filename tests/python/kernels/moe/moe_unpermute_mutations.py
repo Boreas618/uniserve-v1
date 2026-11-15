@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """The two mutations `combine_check.py` exists to catch: build each one, require a red.
 
-    UNISERVE_NVCC=<nvcc> $UNISERVE_BUILD_SERVER_PYTHON mutations.py [--build-only] [--keep]
+    python mutations.py [--build-only] [--keep]
 
-`UNISERVE_NVCC` names the nvcc the mutants are compiled with, as the Build Server names it to a
-build, and the interpreter is the Build Server's own, which carries FlashInfer.
+Each mutant is a package of its own, which `uniserve build-server build` installs and builds into
+a store of its own, as the Build Server builds every package; the `uniserve` program and the Build
+Server's toolchain environment (`uniserve-build-server`) are on the search path.
 
 `combine_check.py` says the combine it measures is correct. That green is evidence only if a
 *plausible-wrong* combine reads red through the same script, so this builds two of them and runs
@@ -44,6 +45,9 @@ KERNELS = (
 )
 #: The package this check covers.
 PACKAGE = KERNELS / "moe_unpermute" / "trtllm"
+
+#: The target the mutants are built for: the device the check runs them on.
+TARGET = "sm_100a"
 
 #: The fixture's descriptor: the cell this package serves.
 FIXTURE_KEY = "hidden_2048_top_8_experts_128_input_bf16_scales_f32_output_bf16"
@@ -85,25 +89,21 @@ def package() -> pathlib.Path:
 
 
 def distribution() -> pathlib.Path:
-    """The FlashInfer `data` tree the build compiles from, resolved as the build resolves it."""
-    found = importlib.util.find_spec("flashinfer")
-    roots = found.submodule_search_locations if found is not None else None
-    for root in roots or []:
-        data = pathlib.Path(root) / "data"
-        if (data / "csrc").is_dir():
-            return data
-    raise SystemExit(
-        f"no FlashInfer distribution with its data tree was found in {sys.executable}"
-    )
+    """The FlashInfer `data` tree the build compiles from, as the build resolves it."""
+    from uniserve_build_server import trtllm
+
+    return trtllm.data_tree()
 
 
 def mutant(name: str, old: str, new: str, root: pathlib.Path) -> pathlib.Path:
-    """A copy of the package whose build compiles `old` -> `new` of the kernel instead.
+    """A package tree whose one package builds `old` -> `new` of the kernel instead.
 
-    The copy is the mutant's own package: its `src/build.py` is the one edited, so the tree's build
-    script keeps compiling the vendor's kernel unchanged.
+    The copy is the mutant's own package, under the operator and backend of the tree's: its
+    `src/build.py` is the one edited, so the tree's build module keeps compiling the vendor's kernel
+    unchanged. Returns the tree, `<root>/<name>`.
     """
-    copy = root / name
+    tree = root / name
+    copy = tree / PACKAGE.parent.name / PACKAGE.name
     shutil.copytree(
         package(),
         copy,
@@ -125,36 +125,45 @@ def mutant(name: str, old: str, new: str, root: pathlib.Path) -> pathlib.Path:
             f"{script} does not name {KERNEL}, so a mutation has nowhere to go"
         )
     script.write_text(build.replace(f'"{KERNEL}"', f'"{edited}"'))
-    return copy
+    return tree
 
 
-def build(copy: pathlib.Path, out: pathlib.Path) -> None:
-    """Compile a mutant through its own build script, into a directory the check can be given."""
-    out.mkdir(parents=True, exist_ok=True)
+def build(tree: pathlib.Path, store: pathlib.Path) -> pathlib.Path:
+    """Build the fixture key of a mutant's package tree into `store`; returns the module directory.
+
+    The store is the mutant's own, so its package is revision 1 there, and the module lies under
+    `modules/<op>/<backend>/1/<inputs digest>/<target>/<key>`.
+    """
+    keys = tree / "keys.tsv"
+    keys.write_text(f"{PACKAGE.parent.name}\t{FIXTURE_KEY}\n")
     built = subprocess.run(
         [
-            sys.executable,
-            str(copy / "src/build.py"),
-            "--package",
-            str(copy),
-            "--descriptor",
-            FIXTURE_KEY,
+            "uniserve",
+            "build-server",
+            "build",
+            "--keys",
+            str(keys),
+            "--packages",
+            str(tree),
             "--target",
-            "sm_100a",
-            "--out",
-            str(out),
+            TARGET,
+            "--store",
+            str(store),
         ],
         capture_output=True,
         text=True,
         check=False,
-        # nvcc writes its intermediates into `TMPDIR`; the mutant's own directory is certain to
-        # exist and be writable for the length of the build, which a shared temporary tree is not.
-        env={**os.environ, "TMPDIR": str(copy.parent)},
     )
     if built.returncode != 0:
-        raise SystemExit(
-            f"building {copy.name} failed:\n{built.stderr[-4000:]}"
+        raise SystemExit(f"building {tree.name} failed:\n{built.stdout}\n{built.stderr}")
+    found = list(
+        (store / "modules" / PACKAGE.parent.name / PACKAGE.name / "1").glob(
+            f"*/{TARGET}/{FIXTURE_KEY}"
         )
+    )
+    if len(found) != 1:
+        raise SystemExit(f"{store} holds {len(found)} modules of {FIXTURE_KEY}, not one")
+    return found[0]
 
 
 def check(module: pathlib.Path | None) -> tuple[int, str]:
@@ -198,10 +207,9 @@ def main() -> int:
     try:
         built = []
         for name, old, new, why in MUTATIONS:
-            copy = mutant(name, old, new, root)
-            out = root / "modules" / name / FIXTURE_KEY
+            tree = mutant(name, old, new, root)
             print(f"building {name}: {why}", file=sys.stderr)
-            build(copy, out)
+            out = build(tree, root / "stores" / name)
             built.append((name, why, out))
         if options.build_only:
             print(

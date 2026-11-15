@@ -26,11 +26,10 @@ files = ["src/logits_shape.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_vocabulary_151936_block_4096_extras_0_divide_true_pdl_false`.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], vocabulary = { min = 1 }, block = { power_of_two = true }, extras = { min = 0 }, divide = ["true", "false"], pdl = ["true", "false"] }
 
 [parameters]

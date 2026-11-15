@@ -35,9 +35,8 @@ files = ["src/act_and_mul.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], width = { multiple = 16 }, block = { power_of_two = true }, activation = ["gelu", "gelu_tanh", "silu", "sigmoid"], gate_stride = { multiple = 16 }, value_stride = { multiple = 16 }, wide = ["false", "true"], pdl = ["false", "true"], stepwise = ["false", "true"] }
 [parameters]

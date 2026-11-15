@@ -15,7 +15,6 @@ module compiles with `num_warps = 2` and `enable_fp_fusion = false`, as the oper
 import struct
 
 import vsa_prepare_tiles as kernels
-from uniserve_build_server import triton as driver
 
 #: The floating dtypes a row may have, in the descriptor's vocabulary.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -89,7 +88,3 @@ def spec(fields, parameters, target):
         },
         "options": {"num_warps": 2, "enable_fp_fusion": False},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

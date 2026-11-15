@@ -31,17 +31,15 @@
 //! store serves, and only a package of changed inputs is installed as a new
 //! revision, whose modules are built again.
 //!
-//! The builds are real: nvcc, Triton, CuTe DSL, wasm and cargo run with the
-//! host's toolchains, so a build of a deployment takes minutes. The server is
-//! driven as its own process would be, by a serving thread on the socket its
-//! configuration names, and a build whose socket another server owns is
-//! refused before it installs anything.
+//! The builds are real: nvcc, Triton, CuTe DSL and cargo run with the host's
+//! toolchains, so a build of a deployment takes minutes. The build runs a
+//! Build Server in process, which holds the store's package root for the
+//! build's length: a second build of the same store, or a server that installs
+//! into it, is refused before it installs anything.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::manifest::SINGLE_KEY;
 use crate::protocol::{Descriptors, PackageRequest, PrepareRequest, Selector};
@@ -144,16 +142,16 @@ pub fn key_list(keys: &BTreeMap<String, BTreeSet<String>>) -> Result<String> {
 /// failed prepare or resolve, and each key no backend built.
 ///
 /// `config` is a Build Server's configuration whose package root and first
-/// store root are the store's, and whose devices include `target`; its socket
-/// is where the build's own server listens while it runs. `packages` holds one
-/// directory per operator, with one package directory per backend. Every path
-/// must be absolute: a build runs in the installed copy of its package.
+/// store root are the store's, and whose targets include `target`. `packages`
+/// holds one directory per operator, with one package directory per backend.
+/// Every path must be absolute: a build runs in the installed copy of its
+/// package.
 ///
 /// # Errors
 ///
-/// Fails when the server cannot open or serve, or a package tree cannot be
-/// read or installed. A key that does not build is not an error here: it is
-/// reported with no backend and among the failures.
+/// Fails when the server cannot open, or a package tree cannot be read or
+/// installed. A key that does not build is not an error here: it is reported
+/// with no backend and among the failures.
 pub fn build(
     config: &ServerConfig,
     packages: &Path,
@@ -162,42 +160,9 @@ pub fn build(
     single: &[PathBuf],
     built: &mut Report<'_>,
 ) -> Result<Vec<String>> {
-    // The socket is bound before anything is installed, so a second build or
-    // a server already responding for this store stops this one before it
-    // writes a revision.
-    let Some((listener, lock)) = service::bind(&config.socket)? else {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            format!(
-                "a build server serves on {}: the store is in use",
-                config.socket.display()
-            ),
-        )));
-    };
-    let server = Arc::new(BuildServer::open(config)?);
-
-    // The compile queue is driven while the server serves, so the server runs
-    // as its own process would: one thread serving, this one asking it for
-    // modules.
-    let stop = Arc::new(AtomicBool::new(false));
-    let serving = std::thread::spawn({
-        let server = Arc::clone(&server);
-        let stop = Arc::clone(&stop);
-        move || server.serve_on(listener, lock, stop)
-    });
-
-    let failures =
-        build_kernels(&server, packages, keys, target, built).and_then(|mut failures| {
-            failures.extend(build_single(&server, single, built)?);
-            Ok(failures)
-        });
-
-    stop.store(true, Ordering::SeqCst);
-    let served = serving
-        .join()
-        .unwrap_or_else(|_| Err(Error::Protocol("the build's server panicked".into())));
-    let failures = failures?;
-    served?;
+    let server = BuildServer::open(config)?;
+    let mut failures = build_kernels(&server, packages, keys, target, built)?;
+    failures.extend(build_single(&server, single, built)?);
     Ok(failures)
 }
 
@@ -355,28 +320,22 @@ fn build_package(
 /// backend and manifest.
 ///
 /// A package whose files are those of its latest installed revision keeps that
-/// revision; any other is installed as a new one. An operator with no
-/// directory has no package, and its keys are reported unbuilt.
+/// revision; any other is installed as a new one. The package tree states the
+/// operators it has packages for as its directories: an operator it has no
+/// directory for has no package, and its keys are reported unbuilt.
 ///
 /// # Errors
 ///
 /// Fails when the directory cannot be read or a package cannot be installed:
 /// the tree, not one key, is then at fault.
 fn install(server: &BuildServer, directory: &Path) -> Result<Vec<(String, Manifest)>> {
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(Error::Io(std::io::Error::new(
-                error.kind(),
-                format!("reading {}: {error}", directory.display()),
-            )));
-        }
-    };
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
     let mut packages: Vec<PathBuf> = Vec::new();
-    for entry in entries {
+    for entry in std::fs::read_dir(directory)? {
         let path = entry?.path();
-        if path.is_dir() && path.join("package.toml").is_file() {
+        if path.is_dir() && path.join(Manifest::FILE).is_file() {
             packages.push(path);
         }
     }

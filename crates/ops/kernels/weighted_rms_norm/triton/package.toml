@@ -28,7 +28,6 @@ files = ["src/weighted_rms_norm.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [[kernel.descriptors]]

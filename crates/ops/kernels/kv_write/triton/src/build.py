@@ -45,7 +45,3 @@ def spec(fields, parameters, target):
         "constexprs": {"TILE": int(fields["tile"]), "PDL": pdl},
         "options": {"num_warps": 4, "launch_pdl": pdl},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

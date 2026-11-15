@@ -38,10 +38,9 @@ files = ["src/cast.py", "src/strided.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { input = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], output = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
 
 [parameters]

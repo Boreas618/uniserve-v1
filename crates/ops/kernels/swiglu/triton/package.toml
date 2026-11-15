@@ -33,10 +33,9 @@ files = ["src/swiglu.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], width = { min = 1 }, block = { power_of_two = true }, value_stride = { min = 1 }, gate_stride = { min = 1 }, value_bias = ["true", "false"], gate_bias = ["true", "false"], absmax = ["true", "false"] }
 
 [parameters]

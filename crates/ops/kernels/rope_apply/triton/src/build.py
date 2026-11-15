@@ -57,7 +57,3 @@ def spec(fields, parameters, target):
         },
         "options": {"num_warps": 4 if block <= 128 else 8, "launch_pdl": pdl},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

@@ -28,9 +28,9 @@ entries = { launch = "uniserve_route_gemm_nvfp4" }
 kind = "cuda"
 files = ["src/build.py", "src/entry.cpp", "src/entry.h"]
 script = "src/build.py"
+unit = "src/entry.cpp"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
 # `hidden_2048_intermediate_768_experts_128_top_8_dtype_bf16_scale_f8e4m3_layout_swizzled_128x4_tile_128x128_cluster_1x1`.
@@ -48,7 +48,7 @@ architectures = ["sm_100a", "sm_100f"]
 # `hidden` a multiple of 128, and the contraction's block scales are whole 128x4 atoms,
 # `intermediate` a multiple of 64; the runner refuses at launch a size no published
 # tactic divides.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { hidden = { multiple = 128 }, intermediate = { multiple = 64 }, experts = { min = 1 }, top = { min = 1 }, dtype = ["bf16"], scale = ["f8e4m3", "u8"], layout = ["swizzled_128x4", "linear"], tile = ["128x8", "128x16", "128x32", "128x64", "128x128", "128x192", "128x256"], cluster = ["1x1", "2x1", "1x2"] }
 
 [parameters]

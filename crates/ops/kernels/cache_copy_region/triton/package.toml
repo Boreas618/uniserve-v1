@@ -39,7 +39,6 @@ files = ["src/cache_copy_region.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a", "sm_100f"]
 
 # `field_key_columns_48_units_per_page_1_plane_bytes_65536_heads_4_head_dim_128_element_bf16_scaled_false`.
@@ -54,7 +53,7 @@ architectures = ["sm_100a", "sm_90a", "sm_100f"]
 #
 # The geometry's extents compile for any positive value: the row is walked through its next power of
 # two, and the compile script refuses a plane that is not whole elements and whole token rows.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { field = ["key", "value"], columns = { min = 1 }, units_per_page = { min = 1 }, plane_bytes = { min = 1 }, heads = { min = 1 }, head_dim = { min = 1 }, element = ["bf16", "f16", "f8e4m3"], scaled = ["false", "true"] }
 
 [parameters]

@@ -27,10 +27,9 @@ files = ["src/unpatchify_video.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 # The affine form is its own program because its launch carries two more pointers; everything else
 # the operator reads — the channels, the token grid and the patch — travels as words, so one module
 # of a form serves every raster.

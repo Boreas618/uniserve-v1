@@ -14,7 +14,6 @@ operator before it reaches the kernel.
 """
 
 import unpatchify_video as kernels
-from uniserve_build_server import triton as driver
 
 #: The element types the tokens, the scale, the bias and the raster may have.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -71,7 +70,3 @@ def spec(fields, parameters, target):
             "launch_pdl": fields["pdl"] == "true",
         },
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

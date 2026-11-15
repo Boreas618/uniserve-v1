@@ -104,10 +104,10 @@ pub(crate) fn install(
         return Ok(Vec::new());
     }
 
-    let target = device
+    let capability = device
         .compute_capability()
-        .map(Target::arch)
         .with_context(|| format!("reading device {}'s architecture", device.0))?;
+    let target = Target::arch(capability)?;
     let ordinal = device;
     let device =
         platform::Device::new(device).with_context(|| format!("opening device {}", ordinal.0))?;
@@ -241,7 +241,7 @@ pub(crate) fn policy(
     package: &PackageRevision,
 ) -> Result<(Arc<wasmtime::Module>, Parameters)> {
     let parameters = parameters(package)?;
-    let target = Target::new(build_server::manifest::WASM_TARGET);
+    let target = Target::wasm();
     let named = format!("the {}/{} policy", package.backend, package.revision);
 
     let started = std::time::Instant::now();

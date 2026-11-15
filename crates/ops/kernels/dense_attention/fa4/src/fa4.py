@@ -147,19 +147,9 @@ class DenseCompiler:
             # the absence of both bounds.
             window_size_left=None,
             window_size_right=None,
-            _arch=cute_arch(self.target),
+            _arch=self.target.capability,
         )
 
     def __call__(self):
         """Compile the configuration the vendor selects, exported to C."""
         return compile_selection(self.request, self.target)
-
-
-def cute_arch(target):
-    """The compute capability a target names, ``"sm_100a"`` -> ``100``."""
-    digits = target.removeprefix("sm_")
-    while digits and digits[-1].isalpha():
-        digits = digits[:-1]
-    if not digits.isdigit():
-        raise SystemExit(f"target {target!r} is not an sm_<capability> architecture")
-    return int(digits)

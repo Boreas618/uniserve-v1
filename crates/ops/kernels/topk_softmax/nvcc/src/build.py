@@ -1,22 +1,20 @@
-"""The topk_softmax package's compile script: one descriptor -> one cubin.
+"""The topk_softmax package's build module: one descriptor -> one cubin.
 
 The descriptor bakes the two values the kernel needs at compile time: the
 scores a lane walks (the expert count rounded up to whole warps) and the
-butterfly width of the renormalization (the top-k width rounded up to a power of
-two). One warp routes one token, so the module declares four warps and no
+butterfly width of the renormalization (the top-k width rounded up to a power
+of two). One warp routes one token, so the module declares four warps and no
 dynamic shared memory.
 
-The Build Server runs this script with the package, descriptor, target and
-output directory in `UNISERVE_PACKAGE`, `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`
-and `UNISERVE_OUT`; a direct run passes the same four as flags.
+The Build Server compiles a descriptor by calling :func:`compile` with the
+compile request.
 """
 
-import argparse
 import json
-import os
-import pathlib
 import subprocess
 import sys
+
+from uniserve_build_server.request import Request
 
 #: The warps one block holds, which the operator's grid counts tokens by.
 WARPS_PER_BLOCK = 4
@@ -31,83 +29,47 @@ KINDS = {
     "none": -1,
 }
 
-#: The element type each storage kind reads, spelled as a module's signature spells one.
-POINTERS = {"f32": "fp32", "fp32": "fp32", "bf16": "bf16", "f16": "fp16", "fp16": "fp16"}
+#: The element type each storage kind reads, spelled as a module's signature
+#: spells one.
+POINTERS = {
+    "f32": "fp32",
+    "fp32": "fp32",
+    "bf16": "bf16",
+    "f16": "fp16",
+    "fp16": "fp16",
+}
 
 
-def arguments():
-    """The package, descriptor, target and output directory of one build."""
-    reader = argparse.ArgumentParser(description=__doc__)
-    reader.add_argument("--package")
-    reader.add_argument("--descriptor")
-    reader.add_argument("--target")
-    reader.add_argument("--out")
-    known = reader.parse_args()
-    values = {
-        "package": known.package or os.environ.get("UNISERVE_PACKAGE"),
-        "descriptor": known.descriptor or os.environ.get("UNISERVE_DESCRIPTOR"),
-        "target": known.target or os.environ.get("UNISERVE_TARGET"),
-        "out": known.out or os.environ.get("UNISERVE_OUT"),
-    }
-    missing = [name for name, value in values.items() if not value]
-    if missing:
-        raise SystemExit(f"missing {', '.join(missing)}")
-    return pathlib.Path(values["package"]), values["descriptor"], values["target"], pathlib.Path(values["out"])
+def compile(request: Request) -> None:
+    """Compile the request's descriptor into `module.cubin` and its metadata.
 
-
-def fields_of(package, descriptor):
-    """The descriptor's fields, as the Build Server read them from its key.
-
-    The server hands a build ``{dimension: value}`` in ``UNISERVE_FIELDS``
-    (``--fields`` on a direct run); this kernel is specialized on every
-    dimension its manifest declares, so a key that leaves one out is refused.
+    This kernel is specialized on every dimension its manifest declares, so a
+    key that leaves one out is refused by name. The cubin, `metadata.json` and
+    `baked.json` are written into the request's output directory; a compiler
+    failure refuses the build, with the compiler's output in the build log.
     """
-    import json
-    import tomllib
-
-    stated = os.environ.get("UNISERVE_FIELDS")
-    if not stated:
-        raise SystemExit(
-            f"{descriptor}: missing fields: the Build Server states them in "
-            "UNISERVE_FIELDS"
-        )
-    fields = json.loads(stated)
-    manifest = tomllib.loads((package / "package.toml").read_text())
-    dimensions = manifest["kernel"]["descriptors"]["dimensions"]
-    missing = sorted(set(dimensions) - set(fields))
-    if missing:
-        raise SystemExit(f"{descriptor}: the descriptor names no {missing}")
-    return fields
-
-
-def capability(target):
-    """The SM number a target names (`sm_100a` -> 100)."""
-    digits = "".join(character for character in target.split("_", 1)[1] if character.isdigit())
-    return int(digits[:3])
-
-
-def main():
-    """Compile one descriptor into `module.cubin` and its metadata."""
-    package, descriptor, target, out = arguments()
-    fields = fields_of(package, descriptor)
-    experts = int(fields["experts"])
-    top = int(fields["top"])
+    package = request.package
+    out = request.output
+    experts = int(request.field("experts"))
+    top = int(request.field("top"))
+    renormalize = request.field("renormalize")
+    scores = request.field("scores")
+    scale = request.field("scale")
     iterations = max(1, -(-experts // 32))
     butterfly = 1 << max(0, (top - 1).bit_length())
-    if fields["renormalize"] not in ("true", "false"):
-        raise SystemExit(f"renormalize {fields['renormalize']!r} is not a flag")
-    if fields["scores"] not in KINDS:
-        raise SystemExit(f"scores {fields['scores']!r} has no storage kind")
-    if fields["scale"] not in KINDS:
-        raise SystemExit(f"scale {fields['scale']!r} has no storage kind")
+    if renormalize not in ("true", "false"):
+        raise SystemExit(f"renormalize {renormalize!r} is not a flag")
+    if scores not in KINDS:
+        raise SystemExit(f"scores {scores!r} has no storage kind")
+    if scale not in KINDS:
+        raise SystemExit(f"scale {scale!r} has no storage kind")
 
-    out.mkdir(parents=True, exist_ok=True)
     # The nvcc the Build Server checked against this package's declared version.
-    compiler = os.environ["UNISERVE_NVCC"]
+    compiler = request.toolchain.require_cuda().nvcc
     command = [
         compiler,
         "-cubin",
-        f"-arch={target}",
+        f"-arch={request.target}",
         "-O3",
         "-std=c++20",
         "--threads=1",
@@ -124,7 +86,9 @@ def main():
         str(package / "src" / "topk_softmax.cu"),
     ]
     print(" ".join(command), file=sys.stderr)
-    subprocess.run(command, check=True)
+    built = subprocess.run(command, check=False)
+    if built.returncode != 0:
+        raise SystemExit(f"nvcc failed with {built.returncode}")
 
     # The kernel routes one token per warp of a four-warp block in registers, so
     # its metadata is the fixed shape the operator's launch checks.
@@ -137,26 +101,29 @@ def main():
         "launch_cooperative_grid": False,
         "global_scratch_size": 0,
         "global_scratch_align": 1,
-        # The parameters the kernel takes at launch, in order and with their types, so `ops` can
-        # compare the operator's packed words against them: this cubin's list is hand-written on both
-        # sides and one word of it is optional, which is the kind that drifts. The last two are the
-        # scale, a pointer even when the call has none (the operator passes a null one), and its
-        # storage kind.
+        # The parameters the kernel takes at launch, in order and with their
+        # types, so `ops` can compare the operator's packed words against them:
+        # this cubin's list is hand-written on both sides and one word of it is
+        # optional, which is the kind that drifts. The last two are the scale,
+        # a pointer even when the call has none (the operator passes a null
+        # one), and its storage kind.
         "signature": {
-            "scores": "*" + POINTERS[fields["scores"]],
+            "scores": "*" + POINTERS[scores],
             "score_kind": "i32",
             "row_stride": "i64",
             "rows": "i32",
             "experts": "i32",
             "top": "i32",
             "renormalize": "i32",
-            # A pointer even when the call has no scale: the operator passes a null one, and a
-            # pointer slot filled with a scalar is exactly what `ops` refuses by name.
-            "scale": "*" + POINTERS.get(fields["scale"], "fp32"),
+            # A pointer even when the call has no scale: the operator passes a
+            # null one, and a pointer slot filled with a scalar is exactly what
+            # `ops` refuses by name.
+            "scale": "*" + POINTERS.get(scale, "fp32"),
             "scale_kind": "i32",
             "ids": "*i32",
             "weights": "*fp32",
-            # The logical-to-physical expert map, a pointer the operator passes null without one.
+            # The logical-to-physical expert map, a pointer the operator passes
+            # null without one.
             "map": "*i32",
         },
     }
@@ -181,8 +148,8 @@ def main():
     print(
         json.dumps(
             {
-                "descriptor": descriptor,
-                "target": target,
+                "descriptor": request.descriptor,
+                "target": str(request.target),
                 "symbol": metadata["name"],
                 "iterations": iterations,
                 "butterfly": butterfly,
@@ -191,7 +158,3 @@ def main():
             }
         )
     )
-
-
-if __name__ == "__main__":
-    main()

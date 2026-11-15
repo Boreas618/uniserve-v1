@@ -4,7 +4,7 @@
 //
 // The module is compiled once per descriptor: the element types, the weight
 // order and the epilogue are macros the package's compile script derives from
-// `UNISERVE_DESCRIPTOR`, so one module is one point of the operator's matrix of
+// the descriptor's fields, so one module is one point of the operator's matrix of
 // descriptors, as design 5.2 asks of a package.
 //
 // The product is row-major in `ops`' terms and cuBLASLt computes column-major,
@@ -42,7 +42,7 @@
 #include "uniserve_gemm.h"
 
 // The descriptor's compile-time choices, defined by `src/build.py` from
-// `UNISERVE_DESCRIPTOR`. The defaults make the file readable on its own and
+// the descriptor's fields. The defaults make the file readable on its own and
 // are never used by a module the Build Server builds.
 #ifndef UNISERVE_INPUT_TYPE
 #define UNISERVE_INPUT_TYPE CUDA_R_16BF

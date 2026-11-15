@@ -1,57 +1,70 @@
 //! The module store (design section 5.3): paths made of names, modules of a
-//! writable root and shared read-only roots, and the `.committed` mark that
-//! makes a directory a module.
+//! writable root and shared read-only roots, the `.committed` mark that makes
+//! a directory a module and records its interface version, and publication
+//! through a staging directory its writer owns.
 
 use std::fs;
+use std::io;
+use std::os::fd::AsRawFd as _;
+use std::path::{Path, PathBuf};
 
 use build_server::Error;
 use build_server::store::{COMMITTED, ModulePath, Root, Store};
 
-/// A store with one writable root under a fresh temporary directory.
-fn store(directory: &std::path::Path) -> Store {
+use crate::support::{arch, write};
+
+/// The inputs digest the paths of these tests name.
+const INPUTS: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// A store whose one root is the writable directory `root`.
+fn store(root: &Path) -> Store {
     Store::open(vec![Root {
-        path: directory.join("store"),
+        path: root.to_path_buf(),
         writable: true,
     }])
     .unwrap()
 }
 
-/// The inputs digest the paths of these tests name.
-const INPUTS: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-/// A path of one module of `rms_norm`, backend `triton`, revision 3.
-fn path() -> ModulePath {
+/// The path of a module of `rms_norm`, backend `triton`, at `revision`.
+fn path_at(revision: u32) -> ModulePath {
     ModulePath::new(
         "rms_norm",
         "triton",
-        3,
+        revision,
         INPUTS,
-        "sm_100a",
+        arch().as_str(),
         "dtype_bf16_hidden_2048",
     )
     .unwrap()
 }
 
-/// Writes a build's files into a fresh workspace directory and returns it.
-fn workspace(directory: &std::path::Path, files: &[(&str, &[u8])]) -> std::path::PathBuf {
-    let workspace = directory.join("workspace");
-    fs::create_dir_all(&workspace).unwrap();
-    for (name, bytes) in files {
-        let path = workspace.join(name);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, bytes).unwrap();
-    }
-    workspace
+fn path() -> ModulePath {
+    path_at(3)
+}
+
+/// Writes a build's files into the workspace directory `directory` and
+/// returns it.
+fn workspace(directory: &Path, files: &[(&str, &[u8])]) -> PathBuf {
+    write(directory, files);
+    directory.to_path_buf()
+}
+
+/// The names `directory` holds, sorted.
+fn names(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 #[test]
 fn a_published_module_is_found_with_its_files_and_the_mark_is_not_one_of_them() {
     let temporary = tempfile::tempdir().unwrap();
-    let store = store(temporary.path());
+    let store = store(&temporary.path().join("store"));
     let workspace = workspace(
-        temporary.path(),
+        &temporary.path().join("workspace"),
         &[("module.cubin", b"cubin bytes"), ("metadata.json", b"{}")],
     );
 
@@ -73,26 +86,66 @@ fn a_published_module_is_found_with_its_files_and_the_mark_is_not_one_of_them() 
     assert_eq!(fs::read(&files[1].1).unwrap(), b"cubin bytes");
 }
 
+/// Only a mark that records an interface version makes a directory a module:
+/// a directory without one, or whose mark states no version, is found by no
+/// lookup and listed by nothing.
 #[test]
-fn a_directory_without_the_mark_is_not_a_module() {
+fn a_directory_without_a_recorded_mark_is_not_a_module() {
     let temporary = tempfile::tempdir().unwrap();
-    let store = store(temporary.path());
-    let directory = temporary.path().join("store").join(path().relative());
-    fs::create_dir_all(&directory).unwrap();
-    fs::write(directory.join("module.cubin"), b"half written").unwrap();
+    let store = store(&temporary.path().join("store"));
 
-    assert!(!store.contains(&path()));
-    assert!(store.files(&path()).unwrap().is_none());
+    let unmarked = store.directory(&path_at(3));
+    write(&unmarked, &[("module.cubin", b"half written")]);
+    let unrecorded = store.directory(&path_at(4));
+    write(
+        &unrecorded,
+        &[("module.cubin", b"unrecorded"), (COMMITTED, b"")],
+    );
+
+    for path in [path_at(3), path_at(4)] {
+        assert!(!store.contains(&path), "{path} is no module");
+        assert!(store.files(&path).unwrap().is_none());
+        assert_eq!(store.interface_version(&path), None);
+    }
     assert!(store.list().unwrap().is_empty());
+}
+
+/// A module's mark records the version of the interface its package
+/// implements, which `resolve` hands to the loader with its files.
+#[test]
+fn a_module_records_the_interface_version_it_was_built_for() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = store(&temporary.path().join("store"));
+    let workspace = workspace(
+        &temporary.path().join("workspace"),
+        &[("module.cubin", b"recorded")],
+    );
+
+    store
+        .publish(&path(), &workspace, &["module.cubin".to_owned()], 2)
+        .unwrap();
+    assert_eq!(store.interface_version(&path()), Some(2));
+    assert_eq!(store.list().unwrap(), [path()]);
 }
 
 #[test]
 fn a_module_of_a_shared_read_only_root_is_found_and_never_written() {
     let temporary = tempfile::tempdir().unwrap();
     let shared = temporary.path().join("shared");
+    let built = temporary.path().join("built");
+
+    // Another host built this module into the root it shares.
+    let elsewhere = workspace(
+        &temporary.path().join("elsewhere"),
+        &[("module.cubin", b"shared cubin")],
+    );
+    self::store(&shared)
+        .publish(&path(), &elsewhere, &["module.cubin".to_owned()], 1)
+        .unwrap();
+
     let store = Store::open(vec![
         Root {
-            path: temporary.path().join("built"),
+            path: built.clone(),
             writable: true,
         },
         Root {
@@ -101,133 +154,165 @@ fn a_module_of_a_shared_read_only_root_is_found_and_never_written() {
         },
     ])
     .unwrap();
-
-    // Another host built this module into the shared root.
-    let elsewhere = shared.join(path().relative());
-    fs::create_dir_all(&elsewhere).unwrap();
-    fs::write(elsewhere.join("module.cubin"), b"shared cubin").unwrap();
-    fs::write(elsewhere.join(COMMITTED), b"interface_version = 1\n").unwrap();
-
     assert!(store.contains(&path()));
     let files = store.files(&path()).unwrap().expect("the shared module");
     assert_eq!(fs::read(&files[0].1).unwrap(), b"shared cubin");
 
     // Publishing goes to the writable root, and leaves the shared one alone.
-    let workspace = workspace(temporary.path(), &[("module.cubin", b"built cubin")]);
+    let here = workspace(
+        &temporary.path().join("here"),
+        &[("module.cubin", b"built cubin")],
+    );
     store
-        .publish(&path(), &workspace, &["module.cubin".to_owned()], 1)
+        .publish(&path(), &here, &["module.cubin".to_owned()], 1)
         .unwrap();
     assert_eq!(
-        fs::read(elsewhere.join("module.cubin")).unwrap(),
+        fs::read(shared.join(path().relative()).join("module.cubin")).unwrap(),
         b"shared cubin"
     );
-    let built = temporary.path().join("built").join(path().relative());
     assert_eq!(
-        fs::read(built.join("module.cubin")).unwrap(),
+        fs::read(built.join(path().relative()).join("module.cubin")).unwrap(),
         b"built cubin"
     );
 }
 
-/// A module's record states the interface version it was published for, and a directory whose
-/// mark states none is no module: nothing finds it, and a publish replaces it.
-#[test]
-fn a_module_records_the_interface_version_it_was_built_for() {
-    let temporary = tempfile::tempdir().unwrap();
-    let store = store(temporary.path());
-    assert_eq!(store.interface_version(&path()), None);
-
-    // A directory with an empty mark: what a store written without the record holds.
-    let directory = store.directory(&path());
-    fs::create_dir_all(&directory).unwrap();
-    fs::write(directory.join("module.cubin"), b"unrecorded").unwrap();
-    fs::write(directory.join(COMMITTED), b"").unwrap();
-    assert!(!store.contains(&path()));
-    assert_eq!(store.interface_version(&path()), None);
-
-    let workspace = workspace(temporary.path(), &[("module.cubin", b"recorded")]);
-    store
-        .publish(&path(), &workspace, &["module.cubin".to_owned()], 2)
-        .unwrap();
-    assert_eq!(store.interface_version(&path()), Some(2));
-    let files = store.files(&path()).unwrap().unwrap();
-    assert_eq!(fs::read(&files[0].1).unwrap(), b"recorded");
-}
-
+/// A path fixes a module's content, so a second publish of a committed path
+/// is refused, and the module keeps its files and its record.
 #[test]
 fn a_committed_module_is_never_replaced() {
     let temporary = tempfile::tempdir().unwrap();
-    let store = store(temporary.path());
-    let first = workspace(temporary.path(), &[("module.cubin", b"first")]);
+    let store = store(&temporary.path().join("store"));
+    let first = workspace(
+        &temporary.path().join("first"),
+        &[("module.cubin", b"first")],
+    );
     store
         .publish(&path(), &first, &["module.cubin".to_owned()], 1)
         .unwrap();
 
-    let workspace = workspace(temporary.path(), &[("module.cubin", b"second")]);
-    let replaced = store.publish(&path(), &workspace, &["module.cubin".to_owned()], 1);
-    assert!(replaced.is_err());
+    let second = workspace(
+        &temporary.path().join("second"),
+        &[("module.cubin", b"second")],
+    );
+    match store.publish(&path(), &second, &["module.cubin".to_owned()], 2) {
+        Err(Error::Io(error)) => assert_eq!(error.kind(), io::ErrorKind::AlreadyExists),
+        other => panic!("a second publish returned {other:?}"),
+    }
     let files = store.files(&path()).unwrap().unwrap();
     assert_eq!(fs::read(&files[0].1).unwrap(), b"first");
+    assert_eq!(store.interface_version(&path()), Some(1));
 }
 
+/// A writer stages a module beside its place, in a directory it owns through
+/// a lock it holds for the staging's life. A crashed writer's staging
+/// directory, whose lock no process holds, is removed by the next publish
+/// beside it; a live writer's is left alone; and a publish leaves nothing
+/// beside the module of its own.
 #[test]
-fn a_publish_that_died_before_the_mark_is_retried_over() {
+fn a_publish_sweeps_a_crashed_writers_staging_and_leaves_a_live_ones() {
     let temporary = tempfile::tempdir().unwrap();
-    let store = store(temporary.path());
-    let abandoned = temporary.path().join("store").join(path().relative());
-    fs::create_dir_all(&abandoned).unwrap();
-    fs::write(abandoned.join("module.cubin"), b"torn").unwrap();
+    let store = store(&temporary.path().join("store"));
+    let parent = store.directory(&path()).parent().unwrap().to_path_buf();
 
-    let workspace = workspace(temporary.path(), &[("module.cubin", b"whole")]);
+    // What a writer that crashed left: its staging directory and its lock.
+    write(
+        &parent,
+        &[
+            (".staged-crashed.lock", b""),
+            (".staged-crashed/module.cubin", b"partial"),
+        ],
+    );
+    // A writer still staging holds its lock.
+    let live = fs::File::create(parent.join(".staged-live.lock")).unwrap();
+    // SAFETY: flock on a descriptor this test owns for the call.
+    assert_eq!(unsafe { libc::flock(live.as_raw_fd(), libc::LOCK_EX) }, 0);
+    write(&parent, &[(".staged-live/module.cubin", b"in progress")]);
+
+    let workspace = workspace(
+        &temporary.path().join("workspace"),
+        &[("module.cubin", b"whole")],
+    );
     store
         .publish(&path(), &workspace, &["module.cubin".to_owned()], 1)
         .unwrap();
+
+    assert_eq!(
+        names(&parent),
+        [
+            ".staged-live",
+            ".staged-live.lock",
+            path().descriptor.as_str()
+        ]
+    );
     let files = store.files(&path()).unwrap().unwrap();
     assert_eq!(fs::read(&files[0].1).unwrap(), b"whole");
 }
 
+/// A listing names each committed module once, from whichever roots hold it.
 #[test]
 fn list_names_every_committed_module_of_every_root_once() {
     let temporary = tempfile::tempdir().unwrap();
-    let store = store(temporary.path());
-    let workspace = workspace(temporary.path(), &[("module.cubin", b"bytes")]);
-    let first = path();
-    let second = ModulePath::new(
-        "rms_norm",
-        "triton",
-        4,
-        INPUTS,
-        "sm_100a",
-        "dtype_bf16_hidden_2048",
-    )
-    .unwrap();
-    for path in [&first, &second] {
-        store
+    let built = temporary.path().join("built");
+    let shared = temporary.path().join("shared");
+    let workspace = workspace(
+        &temporary.path().join("workspace"),
+        &[("module.cubin", b"bytes")],
+    );
+    let publish = |root: &Path, path: &ModulePath| {
+        self::store(root)
             .publish(path, &workspace, &["module.cubin".to_owned()], 1)
             .unwrap();
-    }
+    };
+    // This host built revisions 3 and 4; another host built 3 and 5 into the
+    // shared root.
+    publish(&built, &path_at(3));
+    publish(&built, &path_at(4));
+    publish(&shared, &path_at(3));
+    publish(&shared, &path_at(5));
 
-    let listed = store.list().unwrap();
-    assert_eq!(listed, vec![first, second]);
+    let store = Store::open(vec![
+        Root {
+            path: built,
+            writable: true,
+        },
+        Root {
+            path: shared,
+            writable: false,
+        },
+    ])
+    .unwrap();
+    assert_eq!(store.list().unwrap(), [path_at(3), path_at(4), path_at(5)]);
 }
 
 #[test]
 fn a_module_path_is_made_of_names_that_cannot_leave_their_root() {
     for name in ["", ".", "..", "a/b", "../sibling"] {
-        let path = ModulePath::new("rms_norm", name, 1, INPUTS, "sm_100a", "dtype_bf16");
+        let path = ModulePath::new("rms_norm", name, 1, INPUTS, arch().as_str(), "dtype_bf16");
         assert!(path.is_err(), "{name:?} is not one name");
     }
-    let path = ModulePath::new("rms_norm", "triton", 1, INPUTS, "sm_100a", "dtype_bf16").unwrap();
+    let path = ModulePath::new(
+        "rms_norm",
+        "triton",
+        1,
+        INPUTS,
+        arch().as_str(),
+        "dtype_bf16",
+    )
+    .unwrap();
     assert_eq!(
         path.to_string(),
-        format!("rms_norm/triton/1/{INPUTS}/sm_100a/dtype_bf16")
+        format!("rms_norm/triton/1/{INPUTS}/{}/dtype_bf16", arch())
     );
 }
 
 #[test]
 fn a_build_may_not_publish_a_file_outside_the_module_directory() {
     let temporary = tempfile::tempdir().unwrap();
-    let store = store(temporary.path());
-    let cubin = workspace(temporary.path(), &[("module.cubin", b"bytes")]);
+    let store = store(&temporary.path().join("store"));
+    let cubin = workspace(
+        &temporary.path().join("cubin"),
+        &[("module.cubin", b"bytes")],
+    );
 
     for name in ["/etc/passwd", "../escape", "tuning/../../escape"] {
         let refused = store.publish(&path(), &cubin, &[name.to_owned()], 1);
@@ -235,7 +320,10 @@ fn a_build_may_not_publish_a_file_outside_the_module_directory() {
         assert!(!store.contains(&path()));
     }
     // A file in a subdirectory of the module is a name, not an escape.
-    let tuning = workspace(temporary.path(), &[("tuning/tactics.json", b"{}")]);
+    let tuning = workspace(
+        &temporary.path().join("tuning"),
+        &[("tuning/tactics.json", b"{}")],
+    );
     store
         .publish(&path(), &tuning, &["tuning/tactics.json".to_owned()], 1)
         .unwrap();
@@ -243,62 +331,53 @@ fn a_build_may_not_publish_a_file_outside_the_module_directory() {
     assert_eq!(files[0].0, "tuning/tactics.json");
 }
 
+/// A store has exactly one writable root, the first: an empty set, a second
+/// writable root and a read-only first root are refused.
 #[test]
-fn an_empty_store_root_set_is_refused() {
-    assert!(matches!(Store::open(Vec::new()), Err(Error::Io(_))));
-}
-
-#[test]
-fn a_store_with_two_writable_roots_is_refused() {
+fn a_store_has_one_writable_root_and_it_comes_first() {
     let temporary = tempfile::tempdir().unwrap();
-    let refused = Store::open(vec![
-        Root {
-            path: temporary.path().join("one"),
-            writable: true,
-        },
-        Root {
-            path: temporary.path().join("two"),
-            writable: true,
-        },
-    ]);
-    assert!(matches!(refused, Err(Error::Io(_))));
+    let root = |name: &str, writable: bool| Root {
+        path: temporary.path().join(name),
+        writable,
+    };
+
+    assert!(matches!(Store::open(Vec::new()), Err(Error::Io(_))));
+    assert!(matches!(
+        Store::open(vec![root("one", true), root("two", true)]),
+        Err(Error::Io(_))
+    ));
+    assert!(matches!(
+        Store::open(vec![root("shared", false), root("built", true)]),
+        Err(Error::Io(_))
+    ));
 }
 
-/// A descriptor key names a module's last path segment, so it must be one file name.
-///
-/// The design puts every module under
-/// `<operator>/<backend>/<revision>/<inputs>/<target>/<descriptor key>`, and a filesystem caps one file name at 255 bytes. A key longer than the store's own bound cannot
-/// name a directory at all — the write fails with `File name too long` — so the store refuses it
-/// when the path is made, with a message that says both numbers, rather than failing later in a
-/// build whose log cannot explain it.
+/// A descriptor key names a module's last path segment, so it must be one
+/// file name: a key longer than a filesystem allows one name is refused when
+/// the path is made, with both lengths in the refusal, rather than failing
+/// later in a build whose log cannot explain it.
 #[test]
 fn a_descriptor_key_too_long_to_name_a_directory_is_refused() {
     let longest = build_server::store::DESCRIPTOR_NAME_LIMIT;
     let at_limit = "d".repeat(longest);
-    assert!(
+    let module = |key: &str| {
         ModulePath::new(
             "attention_gather_rows",
             "triton",
             0,
             INPUTS,
-            "sm_100a",
-            at_limit.clone()
+            arch().as_str(),
+            key,
         )
-        .is_ok(),
+        .map_err(|error| error.to_string())
+    };
+    assert!(
+        module(&at_limit).is_ok(),
         "a key of exactly the limit names a directory"
     );
 
     let over = format!("{at_limit}d");
-    let error = ModulePath::new(
-        "attention_gather_rows",
-        "triton",
-        0,
-        INPUTS,
-        "sm_100a",
-        over.clone(),
-    )
-    .expect_err("a key over the limit names no directory");
-    let message = error.to_string();
+    let message = module(&over).expect_err("a key over the limit names no directory");
     assert!(
         message.contains(&format!("{} bytes", over.len()))
             && message.contains(&longest.to_string()),

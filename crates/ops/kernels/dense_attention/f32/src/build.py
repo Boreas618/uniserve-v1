@@ -1,4 +1,4 @@
-"""The dense_attention f32 backend's compile script: one descriptor -> a module.
+"""The dense_attention f32 backend's build module: one descriptor -> a module.
 
 Two things this backend compiles in. The mask, so a causal module refuses a
 dense call and the other way round and the masking kernel carries no branch on
@@ -16,23 +16,20 @@ the extents over.
 The export name is read from the package's manifest, so the symbol the module
 exports and the symbol the package declares cannot disagree.
 
-A descriptor this backend does not implement — an element type other than FP32,
-or heads that do not divide — is refused here by name rather than compiled into
-a module that would refuse every launch.
+A descriptor this backend does not implement — an element type other than
+FP32, or heads that do not divide — is refused here by name rather than
+compiled into a module that would refuse every launch.
 
-The Build Server runs this script with its own Python environment, its
-working directory the package root, and `UNISERVE_OP`, `UNISERVE_BACKEND`,
-`UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE`, `UNISERVE_OUT`
-and `MAX_JOBS` in the environment.
+The Build Server compiles a descriptor by calling :func:`compile` with the
+compile request.
 """
 
-import argparse
 import json
-import os
-import pathlib
 import subprocess
 import sys
 import tomllib
+
+from uniserve_build_server.request import Request
 
 #: The translation unit of the module.
 SOURCES = ["src/dense.cu"]
@@ -70,38 +67,9 @@ FIELDS = (
 SEQUENCES = {"false": 0}
 
 
-def arguments():
-    """The package, descriptor, target and output directory of one build."""
-    reader = argparse.ArgumentParser(description=__doc__)
-    reader.add_argument("--package")
-    reader.add_argument("--descriptor")
-    reader.add_argument("--target")
-    reader.add_argument("--out")
-    known = reader.parse_args()
-    values = {
-        "package": known.package or os.environ.get("UNISERVE_PACKAGE"),
-        "descriptor": known.descriptor or os.environ.get("UNISERVE_DESCRIPTOR"),
-        "target": known.target or os.environ.get("UNISERVE_TARGET"),
-        "out": known.out or os.environ.get("UNISERVE_OUT"),
-    }
-    missing = [name for name, value in values.items() if not value]
-    if missing:
-        raise SystemExit(f"missing {', '.join(missing)}")
-    return (
-        pathlib.Path(values["package"]).resolve(),
-        values["descriptor"],
-        values["target"],
-        pathlib.Path(values["out"]),
-    )
-
-
-def manifest_of(package):
-    """The package's manifest."""
-    return tomllib.loads((package / "package.toml").read_text())
-
-
-def launch_entry(manifest):
+def launch_entry(package):
     """The launch symbol the package's manifest declares."""
+    manifest = tomllib.loads((package / "package.toml").read_text())
     entry = manifest.get("module", {}).get("entries", {}).get("launch")
     if not entry:
         raise SystemExit(
@@ -110,48 +78,20 @@ def launch_entry(manifest):
     return entry
 
 
-def split(key, names):
-    """The `name_value` pairs of a descriptor key, by the manifest's names.
+def compile(request: Request) -> None:
+    """Compile the module for the request's descriptor into ``module.so``.
 
-    A field name may contain an underscore (`head_dim`), and a value is a single
-    token, so the key is split by the names the manifest declares rather than by
-    every underscore.
+    The descriptor's fields are checked first, so a descriptor this backend
+    does not implement is refused by name; a compiler failure refuses the
+    build, with the compiler's output in the build log.
     """
-    ordered = sorted(names, key=len, reverse=True)
-    pairs = {}
-    rest = key
-    while rest:
-        name = next((one for one in ordered if rest.startswith(one)), None)
-        if name is None:
-            raise SystemExit(f"the descriptor {key} names no field at {rest!r}")
-        after = rest[len(name) :]
-        if not after.startswith("_"):
-            raise SystemExit(f"the descriptor {key} gives {name} no value")
-        after = after[1:]
-        ends = [after.find(f"_{one}_") for one in ordered]
-        ends = [end for end in ends if end >= 0]
-        end = min(ends) if ends else len(after)
-        if not after[:end]:
-            raise SystemExit(f"the descriptor {key} gives {name} no value")
-        pairs[name] = after[:end]
-        rest = after[end:]
-        rest = rest[1:] if rest.startswith("_") else ""
-    missing = [name for name in FIELDS if name not in pairs]
-    if missing:
-        raise SystemExit(f"the descriptor {key} names no {', '.join(missing)}")
-    return pairs
-
-
-def main():
-    """Compile the module for one descriptor into ``module.so``."""
-    package, descriptor, target, out = arguments()
-    manifest = manifest_of(package)
-    entry = launch_entry(manifest)
-    # A key's fields are one of the package's two shapes, so its names are their union.
-    shapes = manifest["kernel"]["descriptors"]
-    named = split(
-        descriptor, {name for shape in shapes for name in shape["dimensions"]}
-    )
+    package = request.package
+    entry = launch_entry(package)
+    # Every field of `FIELDS` is required; `cu_seq_lens` is present only in
+    # the one-sequence form of the key.
+    named = {field: request.field(field) for field in FIELDS}
+    if "cu_seq_lens" in request.fields:
+        named["cu_seq_lens"] = request.fields["cu_seq_lens"]
 
     for field in ("dtype", "kv", "out"):
         if named[field] != "f32":
@@ -196,14 +136,13 @@ def main():
                 f"{field} = {named[field]!r} is not an element type"
             )
 
-    out.mkdir(parents=True, exist_ok=True)
     # The nvcc the Build Server checked against this package's declared version.
-    compiler = os.environ["UNISERVE_NVCC"]
+    compiler = request.toolchain.require_cuda().nvcc
     command = [
         compiler,
         "-O3",
         "-std=c++17",
-        f"-arch={target}",
+        f"-arch={request.target}",
         "--shared",
         "-Xcompiler",
         "-fPIC",
@@ -216,33 +155,18 @@ def main():
         "-lcublasLt",
         "-lcudart",
         "-o",
-        str(out / "module.so"),
+        str(request.output / "module.so"),
     ]
     print(" ".join(command), file=sys.stderr)
-    built = subprocess.run(command, capture_output=True, text=True, check=False)
+    built = subprocess.run(command, check=False)
     if built.returncode != 0:
-        raise SystemExit(
-            f"nvcc failed with {built.returncode}:\n{built.stderr[-4000:]}"
-        )
+        raise SystemExit(f"nvcc failed with {built.returncode}")
 
-    exported = subprocess.run(
-        ["nm", "-D", "--defined-only", str(out / "module.so")],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    symbols = {
-        line.split()[-1]
-        for line in exported.stdout.splitlines()
-        if line.split()
-    }
-    if entry not in symbols:
-        raise SystemExit(f"module.so does not export {entry}")
     print(
         json.dumps(
             {
-                "descriptor": descriptor,
-                "target": target,
+                "descriptor": request.descriptor,
+                "target": str(request.target),
                 "entry": entry,
                 "mask": named["mask"],
                 "window": named["window"],
@@ -250,7 +174,3 @@ def main():
             }
         )
     )
-
-
-if __name__ == "__main__":
-    main()

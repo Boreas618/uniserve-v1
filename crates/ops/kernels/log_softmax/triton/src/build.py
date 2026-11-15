@@ -32,7 +32,3 @@ def spec(fields, parameters, target):
         "constexprs": {"STEP": min(tile, LANES), "PDL": pdl},
         "options": {"num_warps": 8 if min(tile, LANES) >= 2048 else 4, "launch_pdl": pdl},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

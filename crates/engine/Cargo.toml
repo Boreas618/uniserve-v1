@@ -70,9 +70,8 @@ tokio = { workspace = true, features = ["sync"] }
 # (`proto::module::PackageRevision::arguments`).
 toml.workspace = true
 tracing.workspace = true
-# The runtime a scheduler instantiates its policy module in, configured by the policy host
-# (`scheduler::policy`) at the workspace's one pin, which also precompiles a policy package for
-# the Build Server (`uniserve-engine precompile`).
+# The runtime a scheduler compiles and instantiates its policy module in, configured by the
+# policy host (`scheduler::policy`).
 wasmtime.workspace = true
 
 [dev-dependencies]

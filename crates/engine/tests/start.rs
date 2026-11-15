@@ -13,8 +13,8 @@
 //! place them, a replica on each host, and one replica across both whose products cross between
 //! the two processes.
 //!
-//! No GPU is touched. The Build Server builds the `fcfs` module from its installed snapshot and
-//! precompiles it with the engine executable under test (`uniserve-engine precompile`).
+//! No GPU is touched. The Build Server builds the `fcfs` module for wasm32 from its installed
+//! snapshot of the workspace, and the engine compiles the module when it loads it.
 #![cfg(test)]
 
 mod support;
@@ -36,15 +36,15 @@ use support::{DEPLOYMENT, StorageServer, workspace};
 /// A bound on a read only a defect reaches.
 const READ: Duration = Duration::from_secs(60);
 
-/// A bound on the engine's start: the Build Server builds the policy module from its snapshot on
-/// the first resolve.
+/// A bound on the engine's start: the Build Server vendors the snapshot's registry sources and
+/// builds the policy module from its snapshot on the first resolve.
 const START: Duration = Duration::from_secs(900);
 
 /// A Build Server on a thread of the test process at `directory`'s socket, holding the tree's
-/// `fcfs` policy package as revision 1. Returns its socket.
-fn build_server(directory: &Path) -> PathBuf {
+/// `fcfs` policy package as revision 1, which serves until the returned stop end is dropped.
+/// Returns its socket and that end.
+fn build_server(directory: &Path) -> (PathBuf, std::os::unix::net::UnixStream) {
     let config = build_server::server::ServerConfig {
-        socket: directory.join("build-server.sock"),
         package_root: directory.join("packages"),
         store_roots: vec![build_server::store::Root {
             path: directory.join("store"),
@@ -53,43 +53,26 @@ fn build_server(directory: &Path) -> PathBuf {
         upstream: None,
         read_only_stores: Vec::new(),
         limits: build_server::builder::Limits::default(),
-        toolchains: build_server::toolchain::ToolchainConfig {
-            nvcc: None,
-            python: None,
-            wasm: Some(PathBuf::from(env!("CARGO_BIN_EXE_uniserve-engine"))),
-            cargo: std::env::var_os("CARGO").map(PathBuf::from),
-            max_jobs: 4,
-        },
-        devices: Vec::new(),
+        targets: Vec::new(),
+        cache: directory.join("cache"),
     };
-    std::fs::create_dir_all(&config.package_root).unwrap();
-    std::fs::create_dir_all(&config.store_roots[0].path).unwrap();
-
+    let socket = directory.join("build-server.sock");
+    // The socket is bound before the server serves, so a client connects at once.
+    let (listener, lock) = service::bind(&socket).unwrap().unwrap();
     let server = Arc::new(build_server::server::BuildServer::open(&config).unwrap());
+    let (stop, stopped) = std::os::unix::net::UnixStream::pair().unwrap();
     std::thread::spawn(move || {
-        if let Err(error) = server.serve() {
+        if let Err(error) = server.serve_on(listener, lock, &stopped) {
             eprintln!("the Build Server stopped: {error}");
         }
     });
 
-    let deadline = Instant::now() + READ;
-    let mut client = loop {
-        match build_server::protocol::Client::connect(&config.socket) {
-            Ok(client) => break client,
-            Err(error) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "the Build Server never listened: {error}"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    };
+    let mut client = build_server::protocol::Client::connect(&socket).unwrap();
     let installed = client
         .install(&workspace().join("crates/scheduling/policies/fcfs"))
         .unwrap();
     assert_eq!(installed.revision, 1);
-    config.socket
+    (socket, stop)
 }
 
 /// The launch of epoch 1's one main process, serving the Qwen3-MoE fixture on one rank of one
@@ -335,7 +318,7 @@ fn hooked(requests: &mut Connection, id: u64, kind: wire::engine_command::Kind) 
 fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
     let directory = tempfile::tempdir().unwrap();
     let storage = StorageServer::start();
-    let build_server = build_server(directory.path());
+    let (build_server, _serving) = build_server(directory.path());
     let launch = launch(directory.path(), &build_server);
     let Daemon {
         mut engine,
@@ -593,7 +576,7 @@ fn an_epoch_of_two_processes_of_one_host_standing_for_two_hosts_serves_and_shuts
     std::fs::create_dir_all(&there).unwrap();
     // Each host's Storage Server.
     let (storage_a, storage_b) = (StorageServer::start(), StorageServer::start());
-    let build_server = build_server(directory.path());
+    let (build_server, _serving) = build_server(directory.path());
 
     let reserved = Reserved::new();
     let inherited = reserved.inherited();
@@ -679,7 +662,7 @@ fn media_epoch_serves_and_shuts_down(deployment: (&str, &str), peer_rank: u32) {
     std::fs::create_dir_all(&here).unwrap();
     std::fs::create_dir_all(&there).unwrap();
     let (storage_a, storage_b) = (StorageServer::start(), StorageServer::start());
-    let build_server = build_server(directory.path());
+    let (build_server, _serving) = build_server(directory.path());
 
     let reserved = Reserved::new();
     let inherited = reserved.inherited();

@@ -85,7 +85,3 @@ def spec(fields, parameters, target):
         },
         "options": {"num_warps": warps_of(row_size), "launch_pdl": pdl},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

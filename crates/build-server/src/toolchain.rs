@@ -1,707 +1,376 @@
 //! Toolchains: what compiles a package (design section 6.2).
 //!
+//! The Build Server compiles with two declared toolchains, and finds neither by
+//! guessing a path:
+//!
+//! - **Its Python environment** (`python/`, locked by `python/uv.lock`), which
+//!   holds the Triton and CuTe DSL compilers and describes the CUDA toolkit and
+//!   the host C++ compiler it resolved. The server runs the environment's
+//!   program, `uniserve-build-server toolchain --json`, from its search path
+//!   once when it starts and keeps the description ([`Report`]): the versions,
+//!   the environment's distributions, its interpreter and the digest of its
+//!   compile driver. Every compilation of a Triton, CuTe DSL or CUDA package
+//!   runs through that interpreter with the description handed back in its
+//!   request (`crate::source`).
+//! - **cargo**, from rustup: the `cargo` program runs the toolchain the
+//!   workspace's pinned `rust-toolchain.toml` names, and its release is read
+//!   from the structured fields of `cargo -vV` in the workspace it builds.
+//!
 //! A toolchain reports its version, which is compared with the version a
-//! package declares before the package is built; a peak host memory, which the
-//! compile queue reserves before it starts the build; and how to run a
-//! compiler process, which every toolchain process caps with `MAX_JOBS`.
+//! package declares before the package is built, and an identity, which an
+//! installed revision records with its inputs (`crate::inputs`). A source that
+//! compiles nothing, a vendor cubin or an executable, needs no toolchain
+//! ([`ToolchainKind::None`]).
 //!
-//! Design section 5.2 names four compilers, and each is one toolchain:
-//!
-//! - nvcc, the CUDA toolkit's compiler, for CUDA C++ ([`ToolchainKind::Nvcc`]).
-//! - Triton, from the Build Server's own Python environment under `python/`
-//!   ([`ToolchainKind::Triton`]).
-//! - CuTe DSL, from the same Python environment
-//!   ([`ToolchainKind::CuteDsl`]).
-//! - wasmtime, which precompiles a scheduling policy for this host's CPU through
-//!   the engine executable's `precompile` command ([`ToolchainKind::Wasm`]).
-//!
-//! A source that compiles nothing — a vendor cubin, an executable — needs no
-//! toolchain and asks for [`ToolchainKind::None`], which always reports the
-//! version the package declares.
-//!
-//! A compiler the host does not have is not an error of the server: it is
-//! discovered as missing, and only a build that needs it fails. That keeps a
-//! host without a CUDA toolkit able to serve the packages it already has.
+//! A toolchain the host does not have is not an error of the server: it is
+//! discovered as missing, with the reason, and only a build that needs it
+//! fails. That keeps a host without a CUDA toolkit able to serve the packages
+//! it already has.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
+
 use crate::manifest::{PythonPackage, ToolchainDeps, ToolchainKind};
 use crate::{Error, Result};
 
-/// The peak host memory of one Triton compile, in bytes.
-///
-/// Triton's compiler holds the kernel's IR, its LLVM module and the ptxas
-/// process at once; measured Triton builds of these kernels sit below four
-/// gigabytes, and eight leaves room for the compiler's own parallelism
-/// (`MAX_JOBS` caps the jobs, each of which may start a worker). It is the
-/// reservation the queue makes, not a measurement of one build.
-const TRITON_PEAK_HOST_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// The program of the Build Server's Python environment.
+pub const ENVIRONMENT_PROGRAM: &str = "uniserve-build-server";
 
-/// The peak host memory of one CuTe DSL compile, in bytes: the DSL's Python
-/// interpreter, the traced module, `ptxas` and the link of the host launcher.
-/// Ten gigabytes leaves room above the largest attention kernel's trace.
-const CUTE_DSL_PEAK_HOST_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// cargo, as rustup installs it: a proxy that runs the toolchain the
+/// directory's `rust-toolchain.toml` names.
+pub const CARGO: &str = "cargo";
 
-/// The peak host memory of one nvcc compile, in bytes: nvcc, cicc and ptxas
-/// over one translation unit. Four gigabytes covers the attention and MoE
-/// translation units, whose ptxas step dominates.
-const NVCC_PEAK_HOST_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// A toolchain entry of the environment's description: what the host has, or
+/// why it has none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Entry<T> {
+    Available(T),
+    Missing(String),
+}
 
-/// The peak host memory of one wasm32 build and precompilation, in bytes:
-/// `cargo build` of one policy crate plus its precompilation. Two gigabytes
-/// covers both.
-const WASM_PEAK_HOST_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-/// The command of the engine executable that precompiles a policy module (`uniserve-engine
-/// precompile --wasm <raw> --out <module>`) and reports its wasmtime version (`uniserve-engine
-/// precompile --version`).
-pub(crate) const PRECOMPILE: &str = "precompile";
-
-/// The peak host memory of one compiler process of a cargo build, in bytes:
-/// one rustc over a crate of the engine's workspace in release. A cargo build
-/// runs as many of them at once as its job count.
-const CARGO_JOB_PEAK_HOST_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-/// The peak host memory of a cargo build's last step, in bytes: the link of
-/// the executable under thin LTO, which holds the code of every crate it
-/// links while the compiler processes before it have ended.
-const CARGO_LINK_PEAK_HOST_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-
-/// What compiles a package.
-pub trait Toolchain: Send + Sync {
-    /// The compiler's version, such as nvcc's `13.0.48`, Triton's `3.7.1` or
-    /// CuTe DSL's `4.6.2`. A package declares the version it is written for;
-    /// a mismatch refuses the build (design section 6.2). A toolchain that
-    /// compiles nothing returns the empty string, which such a package
-    /// declares.
-    fn version(&self) -> &str;
-
-    /// The peak host memory a build of this descriptor would use, in bytes.
-    /// The compile queue starts a build only when this much stays free after
-    /// `limits.host_reserve` (design section 6.2).
-    fn peak_host_bytes(&self, op: &str, key: &str) -> u64;
-
-    /// Runs one compiler process to its end, capping the compilers it may
-    /// start itself with `MAX_JOBS`. `command` states the executable, its
-    /// arguments, the directory it runs in and the variables a source adds to
-    /// the server's environment; the process's standard output and error are
-    /// written to `log`, which a failed build carries as its log.
-    fn run(&self, command: Command, log: &Path) -> Result<()>;
-
-    /// The number of compilers a toolchain process may start, which is the
-    /// queue's `limits.max_jobs`.
-    fn max_jobs(&self) -> usize;
-
-    /// The toolchain's principal executable: nvcc, or the engine executable
-    /// whose `precompile` command precompiles a policy module. `None` for a
-    /// toolchain that compiles nothing.
-    fn executable(&self) -> Option<&Path> {
-        None
+impl<T> Entry<T> {
+    /// What the host has, or a [`Error::Toolchain`] naming why it has none.
+    fn require(&self, kind: ToolchainKind) -> Result<&T> {
+        match self {
+            Entry::Available(value) => Ok(value),
+            Entry::Missing(reason) => Err(Error::Toolchain {
+                kind,
+                message: reason.clone(),
+            }),
+        }
     }
+}
 
-    /// The interpreter that runs a package's Python compile script, when this
-    /// toolchain has one.
+/// The CUDA toolkit the environment resolved through the pkg-config modules of
+/// the CUDA release its lock fixes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cuda {
+    /// nvcc's release and build, such as `13.0.48`.
+    pub version: String,
+    pub root: PathBuf,
+    pub nvcc: PathBuf,
+    pub include: PathBuf,
+    pub lib: PathBuf,
+    /// The driver API's link-time stub library's directory.
+    pub stubs: PathBuf,
+}
+
+/// The toolchain description `uniserve-build-server toolchain --json` prints
+/// (`uniserve_build_server.toolchain.Toolchain`), which a compilation is
+/// handed back in its request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Report {
+    /// The environment's interpreter, which runs every compilation.
+    pub interpreter: PathBuf,
+    /// The SHA-256 of the compile driver's files, in hex.
+    pub driver: String,
+    /// Every installed distribution by its normalized name, with its version.
+    pub distributions: BTreeMap<String, String>,
+    pub triton: Entry<String>,
+    pub cute_dsl: Entry<String>,
+    pub cuda: Entry<Cuda>,
+    pub host_compiler: Entry<PathBuf>,
+}
+
+impl Report {
+    /// The environment's own toolchain description, read from its program.
     ///
-    /// The Python toolchains are that interpreter. nvcc also runs a
-    /// package's compile script, because a CUDA C++ package may state its
-    /// command line in a Python driver (design section 6.2: a source drives
-    /// the package's compile script), so it carries the Python environment's
-    /// interpreter when the host has it.
-    fn script_interpreter(&self) -> Option<&Path> {
-        None
-    }
-
-    /// cargo, which builds a policy's crate for wasm32, when this toolchain
-    /// has it.
-    fn cargo(&self) -> Option<&Path> {
-        None
-    }
-
-    /// The directory this toolchain keeps what it compiled between builds:
-    /// cargo's target directory, where the dependencies one revision compiled
-    /// are found by the next. `None` for a toolchain that keeps nothing.
-    fn build_directory(&self) -> Option<&Path> {
-        None
-    }
-}
-
-/// Where each toolchain is on this host.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolchainConfig {
-    /// nvcc, which a CUDA package needs. `None` takes `$CUDA_HOME/bin/nvcc`, and refuses such a
-    /// package when `CUDA_HOME` is not set either.
-    pub nvcc: Option<PathBuf>,
-    /// The interpreter of the Build Server's Python environment, created from
-    /// `python/pyproject.toml` and `python/uv.lock`. Triton and CuTe DSL are the
-    /// environment's two toolchains; `None` refuses their packages and runs no
-    /// package's Python compile script.
-    pub python: Option<PathBuf>,
-    /// The wasm precompiler: a `uniserve-engine` executable, whose `precompile` command builds
-    /// a policy module under the wasmtime configuration the engine loads it with. `None` refuses
-    /// a policy package.
-    pub wasm: Option<PathBuf>,
-    /// cargo, which builds a cargo package (the engine) and a policy's crate from their
-    /// snapshots. `None` takes the `cargo` on this process's `PATH`, and refuses such a
-    /// package when there is none.
-    pub cargo: Option<PathBuf>,
-    /// The number of compilers that may run at once (`limits.max_jobs`).
-    pub max_jobs: usize,
-}
-
-/// The host's toolchains, each discovered with its version, or the reason it
-/// is missing.
-#[derive(Debug)]
-pub struct Toolchains {
-    nvcc: Discovered<Nvcc>,
-    triton: Discovered<Triton>,
-    cute_dsl: Discovered<CuteDsl>,
-    wasm: Discovered<Wasm>,
-    cargo: Discovered<Cargo>,
-    /// The distributions the Build Server's Python environment has installed, by normalized
-    /// name (PEP 503), with their versions: what a package's `[toolchain] packages` is compared
-    /// with before it is built.
-    distributions: Discovered<BTreeMap<String, String>>,
-    /// The directory of the compile driver package (`uniserve_build_server`) the Python
-    /// environment imports: the Triton and CuTe DSL drivers, the fetcher and its pins, which every
-    /// package's compile script runs through. Its files are an input of every module a script
-    /// builds ([`Self::identity`]).
-    driver: Discovered<PathBuf>,
-}
-
-/// A toolchain the host may not have.
-type Discovered<T> = std::result::Result<T, String>;
-
-impl Toolchains {
-    /// Discovers the host's toolchains and their versions.
+    /// # Errors
     ///
-    /// A missing toolchain is recorded with its reason; it does not fail the
-    /// server, because only a build that needs it does.
-    pub fn discover(config: &ToolchainConfig) -> Result<Toolchains> {
-        let interpreter = config.python.as_deref().map(resolve);
-        let interpreter = interpreter.as_deref();
-        Ok(Toolchains {
-            nvcc: Nvcc::discover(config),
-            triton: Triton::discover(config, interpreter),
-            cute_dsl: CuteDsl::discover(config, interpreter),
-            wasm: Wasm::discover(config),
-            cargo: Cargo::discover(config),
-            distributions: named_interpreter(interpreter).and_then(python_distributions),
-            driver: named_interpreter(interpreter).and_then(driver_directory),
+    /// Why the environment cannot describe itself: its program is not on this
+    /// host's search path, fails, or prints no description.
+    pub fn read() -> std::result::Result<Report, String> {
+        let described = Command::new(ENVIRONMENT_PROGRAM)
+            .args(["toolchain", "--json"])
+            .output()
+            .map_err(|error| {
+                format!(
+                    "the Build Server's Python environment cannot be run ({ENVIRONMENT_PROGRAM}: \
+                     {error}): install the `uniserve-build-server` distribution with its lock and \
+                     put its program on the search path"
+                )
+            })?;
+        if !described.status.success() {
+            return Err(format!(
+                "{ENVIRONMENT_PROGRAM} toolchain --json failed with {}: {}",
+                described.status,
+                String::from_utf8_lossy(&described.stderr).trim()
+            ));
+        }
+        serde_json::from_slice(&described.stdout).map_err(|error| {
+            format!("{ENVIRONMENT_PROGRAM} printed no toolchain description: {error}")
         })
     }
 
-    /// What builds a package of toolchain `kind` on this host, as one line: the toolchain's kind
-    /// and version and, for a toolchain that runs a package's Python compile script, the digest of
-    /// the compile driver's files, read now. Two hosts, or one host before and after an upgrade or
-    /// an edit of the driver or of a pin, response the same line only when they build the same bytes
-    /// from the same package (`crate::inputs`).
-    ///
-    /// # Errors
-    ///
-    /// Fails with [`Error::Toolchain`] when the host has no toolchain of that kind, or its
-    /// compile driver cannot be found or read.
-    pub fn identity(&self, kind: ToolchainKind) -> Result<String> {
-        if kind == ToolchainKind::None {
-            return Ok(kind.to_string());
-        }
-        let toolchain = self.get(kind)?;
-        let mut identity = format!("{kind} {}", toolchain.version());
-        if kind == ToolchainKind::Wasm {
-            // A policy's module is cargo's output before it is the
-            // precompiler's, so the compiler is part of what built it.
-            let cargo = self.get(ToolchainKind::Cargo)?;
-            identity.push_str("; cargo ");
-            identity.push_str(cargo.version());
-        }
-        if toolchain.script_interpreter().is_some() {
-            let driver = self.driver.as_ref().map_err(|reason| Error::Toolchain {
+    /// The version of a toolchain of this environment.
+    fn version(&self, kind: ToolchainKind) -> Result<&str> {
+        match kind {
+            ToolchainKind::Triton => self.triton.require(kind).map(String::as_str),
+            ToolchainKind::CuteDsl => self.cute_dsl.require(kind).map(String::as_str),
+            ToolchainKind::Nvcc => self.cuda.require(kind).map(|cuda| cuda.version.as_str()),
+            ToolchainKind::Cargo | ToolchainKind::None => Err(Error::Toolchain {
                 kind,
-                message: reason.clone(),
-            })?;
-            identity.push_str("; driver ");
-            identity.push_str(&crate::snapshot::tree_digest(driver)?);
+                message: "not a toolchain of the Python environment".into(),
+            }),
         }
-        Ok(identity)
     }
 
-    /// Refuses a build whose package imports a Python distribution this host's environment does
-    /// not have at the version the package declares (design section 5.2: a package names the
-    /// distributions its sources import, and the environment's lock fixes their versions).
+    /// What a module built through this environment is built by, as one line:
+    /// the compile driver's digest and the version of every compiler the
+    /// environment describes. A build module may use any of them (a CuTe DSL
+    /// kernel linked by nvcc), so a change of any is another identity.
+    fn identity(&self) -> String {
+        let entry = |entry: &Entry<String>| match entry {
+            Entry::Available(version) => version.clone(),
+            Entry::Missing(_) => "none".to_owned(),
+        };
+        let cuda = match &self.cuda {
+            Entry::Available(cuda) => cuda.version.clone(),
+            Entry::Missing(_) => "none".to_owned(),
+        };
+        format!(
+            "driver {}; triton {}; cute_dsl {}; cuda {cuda}",
+            self.driver,
+            entry(&self.triton),
+            entry(&self.cute_dsl)
+        )
+    }
+}
+
+/// The peak host memory of one build of each toolchain, in bytes: what the
+/// compile queue reserves before it starts a build (design section 6.2).
+/// Each is a declared option (`--peak-memory KIND=BYTES`) with the default
+/// [`PeakMemory::default`] documents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeakMemory {
+    pub triton: u64,
+    pub cute_dsl: u64,
+    pub nvcc: u64,
+    pub cargo: u64,
+}
+
+impl PeakMemory {
+    /// The defaults for builds of `jobs` compiler processes each.
     ///
-    /// A package that declares none needs no environment for this. Names are compared as PEP 503
-    /// normalizes them, so `flash_attn_4` and `flash-attn-4` are one distribution.
+    /// Triton holds a kernel's IR, its LLVM module and ptxas at once: 8 GiB.
+    /// The CuTe DSL traces the kernel in its interpreter and runs ptxas and the
+    /// host link: 10 GiB. nvcc, cicc and ptxas over one translation unit:
+    /// 4 GiB. cargo runs `jobs` rustc processes of up to 2 GiB each and then
+    /// the thin-LTO link of the executable, which holds every crate's code:
+    /// the larger of `jobs` × 2 GiB and 16 GiB.
+    pub fn default_for(jobs: usize) -> Self {
+        const GIB: u64 = 1 << 30;
+        Self {
+            triton: 8 * GIB,
+            cute_dsl: 10 * GIB,
+            nvcc: 4 * GIB,
+            cargo: (jobs as u64 * 2 * GIB).max(16 * GIB),
+        }
+    }
+
+    /// The reservation of one build of toolchain `kind`.
+    pub fn of(&self, kind: ToolchainKind) -> u64 {
+        match kind {
+            ToolchainKind::Triton => self.triton,
+            ToolchainKind::CuteDsl => self.cute_dsl,
+            ToolchainKind::Nvcc => self.nvcc,
+            ToolchainKind::Cargo => self.cargo,
+            ToolchainKind::None => 0,
+        }
+    }
+
+    /// Replaces the reservation of toolchain `kind`.
+    pub fn set(&mut self, kind: ToolchainKind, bytes: u64) {
+        match kind {
+            ToolchainKind::Triton => self.triton = bytes,
+            ToolchainKind::CuteDsl => self.cute_dsl = bytes,
+            ToolchainKind::Nvcc => self.nvcc = bytes,
+            ToolchainKind::Cargo => self.cargo = bytes,
+            ToolchainKind::None => {}
+        }
+    }
+}
+
+/// The host's toolchains: the Python environment's description, or why the
+/// host has none.
+#[derive(Debug)]
+pub struct Toolchains {
+    environment: std::result::Result<Report, String>,
+}
+
+impl Toolchains {
+    /// Reads the Python environment's description once.
+    ///
+    /// A missing environment is recorded with its reason; it does not fail the
+    /// server, because only a build that needs it does.
+    pub fn discover() -> Toolchains {
+        Toolchains::from_report(Report::read())
+    }
+
+    /// The toolchains a given description states, or none with the reason.
+    pub fn from_report(environment: std::result::Result<Report, String>) -> Toolchains {
+        Toolchains { environment }
+    }
+
+    /// The Python environment's description, which a compilation is handed.
     ///
     /// # Errors
     ///
-    /// Fails with [`Error::Toolchain`], naming every distribution that is missing or at another
-    /// version, or why the environment's distributions could not be read.
+    /// [`Error::Toolchain`] naming why the host has no environment.
+    pub fn environment(&self, kind: ToolchainKind) -> Result<&Report> {
+        self.environment
+            .as_ref()
+            .map_err(|reason| Error::Toolchain {
+                kind,
+                message: reason.clone(),
+            })
+    }
+
+    /// The version of toolchain `kind` on this host: cargo's release in
+    /// `workspace`, whose `rust-toolchain.toml` selects it, or the version the
+    /// environment describes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Toolchain`] when the host has no toolchain of that kind.
+    pub fn version(&self, kind: ToolchainKind, workspace: &Path) -> Result<String> {
+        match kind {
+            ToolchainKind::None => Ok(String::new()),
+            ToolchainKind::Cargo => cargo_release(workspace),
+            _ => self.environment(kind)?.version(kind).map(str::to_owned),
+        }
+    }
+
+    /// What builds a package of toolchain `kind` on this host, as one line,
+    /// read now: the toolchain's kind and version and, for the Python
+    /// environment, its identity ([`Report`]). Two hosts, or one host before
+    /// and after an upgrade or an edit of the driver or of a pin, state the
+    /// same line only when they build the same bytes from the same package
+    /// (`crate::inputs`). `workspace` is where a cargo package is built.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Toolchain`] when the host has no toolchain of that kind.
+    pub fn identity(&self, kind: ToolchainKind, workspace: &Path) -> Result<String> {
+        match kind {
+            ToolchainKind::None => Ok(kind.to_string()),
+            ToolchainKind::Cargo => Ok(format!("{kind} {}", cargo_release(workspace)?)),
+            _ => {
+                let environment = self.environment(kind)?;
+                Ok(format!(
+                    "{kind} {}; {}",
+                    environment.version(kind)?,
+                    environment.identity()
+                ))
+            }
+        }
+    }
+
+    /// Refuses a build whose package imports a Python distribution this host's
+    /// environment does not have at the version the package declares (design
+    /// section 5.2: a package names the distributions its sources import, and
+    /// the environment's lock fixes their versions).
+    ///
+    /// A package that declares none needs no environment for this. Names are
+    /// compared as PEP 503 normalizes them, so `flash_attn_4` and
+    /// `flash-attn-4` are one distribution.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::Toolchain`], naming every distribution that is
+    /// missing or at another version, or why the environment's distributions
+    /// could not be read.
     pub fn check_packages(&self, op: &str, backend: &str, toolchain: &ToolchainDeps) -> Result<()> {
         if toolchain.packages.is_empty() {
             return Ok(());
         }
-        let refuse = |message: String| Error::Toolchain {
-            kind: toolchain.kind,
-            message: format!("the package {op} {backend} {message}"),
-        };
-        let installed = self
-            .distributions
-            .as_ref()
-            .map_err(|reason| refuse(format!("imports Python distributions, and {reason}")))?;
+        let installed = &self.environment(toolchain.kind)?.distributions;
         let disagreements = disagreements(&toolchain.packages, installed);
         if disagreements.is_empty() {
             Ok(())
         } else {
-            Err(refuse(format!(
-                "imports {} that this host's Python environment does not have",
-                disagreements.join(", ")
-            )))
-        }
-    }
-
-    /// The toolchain of a kind, with the host's configuration.
-    ///
-    /// # Errors
-    ///
-    /// Fails with [`Error::Toolchain`] when the host has no toolchain of that
-    /// kind, or it cannot report its version.
-    pub fn get(&self, kind: ToolchainKind) -> Result<&dyn Toolchain> {
-        match kind {
-            ToolchainKind::Nvcc => self
-                .nvcc
-                .as_ref()
-                .map(|toolchain| toolchain as &dyn Toolchain),
-            ToolchainKind::Triton => self
-                .triton
-                .as_ref()
-                .map(|toolchain| toolchain as &dyn Toolchain),
-            ToolchainKind::CuteDsl => self
-                .cute_dsl
-                .as_ref()
-                .map(|toolchain| toolchain as &dyn Toolchain),
-            ToolchainKind::Wasm => self
-                .wasm
-                .as_ref()
-                .map(|toolchain| toolchain as &dyn Toolchain),
-            ToolchainKind::Cargo => self
-                .cargo
-                .as_ref()
-                .map(|toolchain| toolchain as &dyn Toolchain),
-            ToolchainKind::None => Ok(&NOTHING as &dyn Toolchain),
-        }
-        .map_err(|reason| Error::Toolchain {
-            kind,
-            message: reason.clone(),
-        })
-    }
-
-    /// The toolchain's version, for `list` and the logs; a missing toolchain
-    /// returns its reason.
-    pub fn version(&self, kind: ToolchainKind) -> std::result::Result<&str, &str> {
-        match kind {
-            ToolchainKind::Nvcc => self
-                .nvcc
-                .as_ref()
-                .map(|toolchain| toolchain.version())
-                .map_err(String::as_str),
-            ToolchainKind::Triton => self
-                .triton
-                .as_ref()
-                .map(|toolchain| toolchain.version())
-                .map_err(String::as_str),
-            ToolchainKind::CuteDsl => self
-                .cute_dsl
-                .as_ref()
-                .map(|toolchain| toolchain.version())
-                .map_err(String::as_str),
-            ToolchainKind::Wasm => self
-                .wasm
-                .as_ref()
-                .map(|toolchain| toolchain.version())
-                .map_err(String::as_str),
-            ToolchainKind::Cargo => self
-                .cargo
-                .as_ref()
-                .map(|toolchain| toolchain.version())
-                .map_err(String::as_str),
-            ToolchainKind::None => Ok(""),
-        }
-    }
-}
-
-/// nvcc, the CUDA toolkit's compiler.
-#[derive(Debug)]
-struct Nvcc {
-    path: PathBuf,
-    version: String,
-    max_jobs: usize,
-    /// The interpreter of the Build Server's Python environment, which runs
-    /// a CUDA package's compile script when the package names one.
-    interpreter: Option<PathBuf>,
-}
-
-impl Nvcc {
-    fn discover(config: &ToolchainConfig) -> Discovered<Nvcc> {
-        let path = config
-            .nvcc
-            .clone()
-            .or_else(|| {
-                std::env::var_os("CUDA_HOME").map(|home| PathBuf::from(home).join("bin/nvcc"))
+            Err(Error::Toolchain {
+                kind: toolchain.kind,
+                message: format!(
+                    "the package {op} {backend} imports {} that this host's Python environment \
+                     does not have",
+                    disagreements.join(", ")
+                ),
             })
-            .ok_or_else(|| "no nvcc named: pass --nvcc <path> or set CUDA_HOME".to_owned())?;
-        // A configured path may be relative to where the server was started; a build
-        // runs elsewhere (the store's copy of a package), so it is made absolute once.
-        let path = resolve(&path);
-        let reported = Command::new(&path)
-            .arg("--version")
-            .output()
-            .map_err(|error| format!("running {}: {error}", path.display()))?;
-        let text = String::from_utf8_lossy(&reported.stdout);
-        if !reported.status.success() {
-            return Err(format!(
-                "{} --version failed: {}",
-                path.display(),
-                text.trim()
-            ));
         }
-        let version = parse_nvcc_version(&text)
-            .ok_or_else(|| format!("{} --version names no release: {text}", path.display()))?;
-        Ok(Nvcc {
-            path,
-            version,
-            max_jobs: config.max_jobs,
-            interpreter: config
-                .python
-                .as_deref()
-                .map(resolve)
-                .filter(|interpreter| interpreter.is_file()),
-        })
     }
 }
 
-impl Toolchain for Nvcc {
-    fn version(&self) -> &str {
-        &self.version
-    }
-
-    fn peak_host_bytes(&self, _op: &str, _key: &str) -> u64 {
-        NVCC_PEAK_HOST_BYTES
-    }
-
-    fn run(&self, command: Command, log: &Path) -> Result<()> {
-        execute(command, log, self.max_jobs)
-    }
-
-    fn max_jobs(&self) -> usize {
-        self.max_jobs
-    }
-
-    fn executable(&self) -> Option<&Path> {
-        Some(&self.path)
-    }
-
-    fn script_interpreter(&self) -> Option<&Path> {
-        self.interpreter.as_deref()
-    }
+/// A cargo command run in `directory`, whose `rust-toolchain.toml` selects the
+/// release rustup runs.
+///
+/// A toolchain the server's own environment names (`RUSTUP_TOOLCHAIN`, which
+/// `cargo run` and `cargo test` set for their children) would override that
+/// file, so the command does not inherit it.
+pub fn cargo(directory: &Path) -> Command {
+    let mut command = Command::new(CARGO);
+    command
+        .current_dir(directory)
+        .env_remove("RUSTUP_TOOLCHAIN");
+    command
 }
 
-/// Triton, from the Build Server's Python environment.
-#[derive(Debug)]
-struct Triton {
-    interpreter: PathBuf,
-    version: String,
-    max_jobs: usize,
-}
-
-impl Triton {
-    fn discover(config: &ToolchainConfig, interpreter: Option<&Path>) -> Discovered<Triton> {
-        let interpreter = named_interpreter(interpreter)?;
-        let version = python_version(interpreter, "triton")?;
-        Ok(Triton {
-            interpreter: interpreter.to_path_buf(),
-            version,
-            max_jobs: config.max_jobs,
-        })
-    }
-}
-
-impl Toolchain for Triton {
-    fn version(&self) -> &str {
-        &self.version
-    }
-
-    fn peak_host_bytes(&self, _op: &str, _key: &str) -> u64 {
-        TRITON_PEAK_HOST_BYTES
-    }
-
-    fn run(&self, command: Command, log: &Path) -> Result<()> {
-        execute(command, log, self.max_jobs)
-    }
-
-    fn max_jobs(&self) -> usize {
-        self.max_jobs
-    }
-
-    fn script_interpreter(&self) -> Option<&Path> {
-        Some(&self.interpreter)
-    }
-}
-
-/// CuTe DSL, from the Build Server's Python environment.
-#[derive(Debug)]
-struct CuteDsl {
-    interpreter: PathBuf,
-    version: String,
-    max_jobs: usize,
-}
-
-impl CuteDsl {
-    fn discover(config: &ToolchainConfig, interpreter: Option<&Path>) -> Discovered<CuteDsl> {
-        let interpreter = named_interpreter(interpreter)?;
-        let version = python_version(interpreter, "cutlass")?;
-        Ok(CuteDsl {
-            interpreter: interpreter.to_path_buf(),
-            version,
-            max_jobs: config.max_jobs,
-        })
-    }
-}
-
-impl Toolchain for CuteDsl {
-    fn version(&self) -> &str {
-        &self.version
-    }
-
-    fn peak_host_bytes(&self, _op: &str, _key: &str) -> u64 {
-        CUTE_DSL_PEAK_HOST_BYTES
-    }
-
-    fn run(&self, command: Command, log: &Path) -> Result<()> {
-        execute(command, log, self.max_jobs)
-    }
-
-    fn max_jobs(&self) -> usize {
-        self.max_jobs
-    }
-
-    fn script_interpreter(&self) -> Option<&Path> {
-        Some(&self.interpreter)
-    }
-}
-
-/// The WebAssembly toolchain of a scheduling policy: cargo, which builds the
-/// policy's crate for wasm32, and the engine executable's `precompile`
-/// command, which serializes the module for this host's CPU (design section
-/// 5.3).
-#[derive(Debug)]
-struct Wasm {
-    precompiler: PathBuf,
-    /// The precompiler's wasmtime version, which a policy package declares: a
-    /// serialized module loads only in the wasmtime that wrote it.
-    version: String,
-    max_jobs: usize,
-    /// cargo, or why this host has none.
-    cargo: Discovered<Cargo>,
-}
-
-impl Wasm {
-    fn discover(config: &ToolchainConfig) -> Discovered<Wasm> {
-        let precompiler = config
-            .wasm
-            .clone()
-            .ok_or_else(|| "no wasm precompiler named: pass --wasm <uniserve-engine>".to_owned())?;
-        let precompiler = resolve(&precompiler);
-        let version = wasmtime_version(&precompiler)?;
-        Ok(Wasm {
-            precompiler,
-            version,
-            max_jobs: config.max_jobs,
-            cargo: Cargo::discover(config),
-        })
-    }
-}
-
-impl Toolchain for Wasm {
-    fn version(&self) -> &str {
-        &self.version
-    }
-
-    fn peak_host_bytes(&self, _op: &str, _key: &str) -> u64 {
-        WASM_PEAK_HOST_BYTES
-    }
-
-    fn run(&self, command: Command, log: &Path) -> Result<()> {
-        execute(command, log, self.max_jobs())
-    }
-
-    fn max_jobs(&self) -> usize {
-        self.cargo
-            .as_ref()
-            .map_or(self.max_jobs, |cargo| cargo.jobs)
-    }
-
-    fn executable(&self) -> Option<&Path> {
-        Some(&self.precompiler)
-    }
-
-    fn cargo(&self) -> Option<&Path> {
-        self.cargo.as_ref().ok().map(|cargo| cargo.path.as_path())
-    }
-
-    fn build_directory(&self) -> Option<&Path> {
-        self.cargo
-            .as_ref()
-            .ok()
-            .map(|cargo| cargo.target_directory.as_path())
-    }
-}
-
-/// cargo and the compiler it drives: what builds a cargo package, the engine,
-/// from its snapshot, and a policy's crate for wasm32.
-#[derive(Clone, Debug)]
-struct Cargo {
-    path: PathBuf,
-    version: String,
-    /// The compiler processes one build runs at once: `CARGO_BUILD_JOBS` of
-    /// the server's environment, else the queue's `limits.max_jobs`.
-    jobs: usize,
-    /// cargo's target directory: `CARGO_TARGET_DIR` of the server's
-    /// environment, else `build-server/cargo` in this user's cache directory.
-    target_directory: PathBuf,
-}
-
-impl Cargo {
-    fn discover(config: &ToolchainConfig) -> Discovered<Cargo> {
-        let path = match &config.cargo {
-            Some(path) => resolve(path),
-            None => std::env::var_os("PATH")
-                .and_then(|paths| {
-                    std::env::split_paths(&paths)
-                        .map(|directory| directory.join("cargo"))
-                        .find(|candidate| candidate.is_file())
-                })
-                .ok_or_else(|| "no cargo named: pass --cargo <path>".to_owned())?,
-        };
-        let reported = Command::new(&path)
-            .arg("--version")
-            .output()
-            .map_err(|error| format!("running {}: {error}", path.display()))?;
-        let text = String::from_utf8_lossy(&reported.stdout);
-        // `cargo 1.99.1 (5f94df478 2026-08-27)`: the release is the second word.
-        let version = text
-            .split_whitespace()
-            .nth(1)
-            .filter(|_| reported.status.success())
-            .ok_or_else(|| format!("{} --version names no release: {text}", path.display()))?
-            .to_owned();
-
-        let jobs = std::env::var("CARGO_BUILD_JOBS")
-            .ok()
-            .and_then(|jobs| jobs.parse::<usize>().ok())
-            .filter(|jobs| *jobs > 0)
-            .unwrap_or(config.max_jobs);
-        let target_directory = match std::env::var_os("CARGO_TARGET_DIR") {
-            Some(directory) if !directory.is_empty() => resolve(Path::new(&directory)),
-            _ => cache_directory().join("cargo"),
-        };
-        Ok(Cargo {
-            path,
-            version,
-            jobs,
-            target_directory,
-        })
-    }
-}
-
-impl Toolchain for Cargo {
-    fn version(&self) -> &str {
-        &self.version
-    }
-
-    fn peak_host_bytes(&self, _op: &str, _key: &str) -> u64 {
-        // The compiler processes run first and the link after them, so the
-        // build's peak is the larger of the two, not their sum.
-        (self.jobs as u64 * CARGO_JOB_PEAK_HOST_BYTES).max(CARGO_LINK_PEAK_HOST_BYTES)
-    }
-
-    fn run(&self, command: Command, log: &Path) -> Result<()> {
-        execute(command, log, self.jobs)
-    }
-
-    fn max_jobs(&self) -> usize {
-        self.jobs
-    }
-
-    fn executable(&self) -> Option<&Path> {
-        Some(&self.path)
-    }
-
-    fn build_directory(&self) -> Option<&Path> {
-        Some(&self.target_directory)
-    }
-}
-
-/// The directory of this user's Build Server caches:
-/// `$XDG_CACHE_HOME/uniserve/build-server`, else
-/// `~/.cache/uniserve/build-server`.
-fn cache_directory() -> PathBuf {
-    let cache = match std::env::var_os("XDG_CACHE_HOME") {
-        Some(cache) if !cache.is_empty() => PathBuf::from(cache),
-        _ => std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(".cache"))
-            .unwrap_or_else(std::env::temp_dir),
+/// cargo's release in `workspace`, from the `release:` field of `cargo -vV`.
+fn cargo_release(workspace: &Path) -> Result<String> {
+    let missing = |message: String| Error::Toolchain {
+        kind: ToolchainKind::Cargo,
+        message,
     };
-    cache.join("uniserve").join("build-server")
+    let reported = cargo(workspace).arg("-vV").output().map_err(|error| {
+        missing(format!(
+            "{CARGO} cannot be run in {}: {error}; rustup installs it",
+            workspace.display()
+        ))
+    })?;
+    if !reported.status.success() {
+        return Err(missing(format!(
+            "{CARGO} -vV failed in {} with {}: {}",
+            workspace.display(),
+            reported.status,
+            String::from_utf8_lossy(&reported.stderr).trim()
+        )));
+    }
+    String::from_utf8_lossy(&reported.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .map(|release| release.trim().to_owned())
+        .ok_or_else(|| missing(format!("{CARGO} -vV states no release")))
 }
 
-/// A toolchain for a source that compiles nothing: a vendor cubin, or an
-/// executable stored as it is. It reports the empty version, which such a
-/// package declares, and runs nothing.
-#[derive(Debug)]
-struct Nothing;
-
-static NOTHING: Nothing = Nothing;
-
-impl Toolchain for Nothing {
-    fn version(&self) -> &str {
-        ""
-    }
-
-    fn peak_host_bytes(&self, _op: &str, _key: &str) -> u64 {
-        0
-    }
-
-    fn run(&self, command: Command, _log: &Path) -> Result<()> {
-        Err(Error::Build {
-            op: String::new(),
-            backend: String::new(),
-            revision: 0,
-            target: String::new(),
-            descriptor: String::new(),
-            message: format!(
-                "nothing to run: this source compiles nothing ({} was asked)",
-                Path::new(command.get_program()).display()
-            ),
-        })
-    }
-
-    fn max_jobs(&self) -> usize {
-        1
-    }
-}
-
-/// The interpreter the configuration names, or why a Python toolchain is
-/// missing without one.
-fn named_interpreter(interpreter: Option<&Path>) -> Discovered<&Path> {
-    interpreter.ok_or_else(|| {
-        "no Python interpreter named: pass --python <the Build Server's interpreter>".to_owned()
-    })
-}
-
-/// A distribution name as PEP 503 normalizes it: lowercase, with every run of `-`, `_` and `.`
-/// one `-`.
-fn normalized(name: &str) -> String {
+/// A distribution name as PEP 503 normalizes it: lowercase, with every run of
+/// `-`, `_` and `.` one `-`.
+pub fn normalized(name: &str) -> String {
     let mut normal = String::with_capacity(name.len());
     let mut separated = false;
     for character in name.chars() {
@@ -718,8 +387,8 @@ fn normalized(name: &str) -> String {
     normal
 }
 
-/// The declared distributions `installed` does not hold at their declared version, each as
-/// `name version (it has ...)`.
+/// The declared distributions `installed` does not hold at their declared
+/// version, each as `name version (it has ...)`.
 fn disagreements(declared: &[PythonPackage], installed: &BTreeMap<String, String>) -> Vec<String> {
     declared
         .iter()
@@ -737,169 +406,15 @@ fn disagreements(declared: &[PythonPackage], installed: &BTreeMap<String, String
         .collect()
 }
 
-/// Every distribution the Python environment has installed, by normalized name, with its version.
-fn python_distributions(interpreter: &Path) -> Discovered<BTreeMap<String, String>> {
-    if !interpreter.is_file() {
-        return Err(format!(
-            "no Python interpreter at {}: pass --python <the Build Server's interpreter>",
-            interpreter.display()
-        ));
-    }
-    let reported = Command::new(interpreter)
-        .args([
-            "-c",
-            "import importlib.metadata as m, json; \
-             print(json.dumps({d.metadata['Name']: d.version for d in m.distributions()}))",
-        ])
-        .output()
-        .map_err(|error| format!("running {}: {error}", interpreter.display()))?;
-    if !reported.status.success() {
-        return Err(format!(
-            "{} cannot list its distributions: {}",
-            interpreter.display(),
-            String::from_utf8_lossy(&reported.stderr).trim()
-        ));
-    }
-    let listed: BTreeMap<String, String> = serde_json::from_slice(&reported.stdout)
-        .map_err(|error| format!("{} listed no distributions: {error}", interpreter.display()))?;
-    Ok(listed
-        .into_iter()
-        .map(|(name, version)| (normalized(&name), version))
-        .collect())
-}
-
-/// The directory of the compile driver package the Python environment imports.
-fn driver_directory(interpreter: &Path) -> Discovered<PathBuf> {
-    if !interpreter.is_file() {
-        return Err(format!(
-            "no Python interpreter at {}: pass --python <the Build Server's interpreter>",
-            interpreter.display()
-        ));
-    }
-    let reported = Command::new(interpreter)
-        .args([
-            "-c",
-            "import pathlib, uniserve_build_server as d; \
-             print(pathlib.Path(d.__file__).resolve().parent)",
-        ])
-        .output()
-        .map_err(|error| format!("running {}: {error}", interpreter.display()))?;
-    if !reported.status.success() {
-        return Err(format!(
-            "{} cannot import the compile driver uniserve_build_server: {}",
-            interpreter.display(),
-            String::from_utf8_lossy(&reported.stderr).trim()
-        ));
-    }
-    Ok(PathBuf::from(
-        String::from_utf8_lossy(&reported.stdout).trim(),
-    ))
-}
-
-/// Asks the Python environment for the version of one of its distributions.
-fn python_version(interpreter: &Path, module: &str) -> Discovered<String> {
-    if !interpreter.is_file() {
-        return Err(format!(
-            "no Python interpreter at {}: pass --python <the Build Server's interpreter>",
-            interpreter.display()
-        ));
-    }
-    let reported = Command::new(interpreter)
-        .args([
-            "-c",
-            &format!("import {module}; print({module}.__version__)"),
-        ])
-        .output()
-        .map_err(|error| format!("running {}: {error}", interpreter.display()))?;
-    let text = String::from_utf8_lossy(&reported.stdout).trim().to_owned();
-    let error = String::from_utf8_lossy(&reported.stderr).trim().to_owned();
-    if !reported.status.success() {
-        return Err(format!(
-            "{} cannot import {module}: {error}",
-            interpreter.display()
-        ));
-    }
-    if text.is_empty() {
-        return Err(format!(
-            "{} reported no {module} version",
-            interpreter.display()
-        ));
-    }
-    Ok(text)
-}
-
-/// The wasmtime version the engine executable `precompiler` precompiles with:
-/// the last word `precompile --version` prints. A precompiled module is only
-/// loadable by the wasmtime that wrote it, so this string is what a policy
-/// package declares.
-fn wasmtime_version(precompiler: &Path) -> Discovered<String> {
-    if let Ok(reported) = Command::new(precompiler)
-        .args([PRECOMPILE, "--version"])
-        .output()
-        && reported.status.success()
-    {
-        let text = String::from_utf8_lossy(&reported.stdout);
-        if let Some(version) = text.split_whitespace().last() {
-            return Ok(version.to_owned());
-        }
-    }
-    Err(format!(
-        "{} does not report a wasmtime version; it must print one for `precompile --version`",
-        precompiler.display()
-    ))
-}
-
-/// The version nvcc reports, such as `13.0.48` from
-/// `Cuda compilation tools, release 13.0, V13.0.48`.
-fn parse_nvcc_version(text: &str) -> Option<String> {
-    let release = text.split("release ").nth(1)?;
-    let after = release.split(',').nth(1)?.trim();
-    // `nvcc --version` follows the release with a second line ("Build
-    // cuda_13.0.r13.0/compiler.…"), so the version is the first word after
-    // the `V`, not everything to the end of the output.
-    let version = after
-        .strip_prefix('V')
-        .unwrap_or(after)
-        .split_whitespace()
-        .next()
-        .unwrap_or_default();
-    if version.is_empty() {
-        None
-    } else {
-        Some(version.to_owned())
-    }
-}
-
-/// A configured executable as an absolute path, against the directory the server runs in.
-///
-/// A build runs with its working directory set to the store's copy of a package, so a path left
-/// relative would name that copy instead of the executable the caller named.
-fn resolve(configured: &Path) -> PathBuf {
-    match std::env::current_dir() {
-        Ok(current) => resolve_in(configured, &current),
-        Err(_) => configured.to_path_buf(),
-    }
-}
-
-/// [`resolve`] against an explicit starting directory, which is what makes it a function a test
-/// can call without moving the process's working directory.
-fn resolve_in(configured: &Path, current: &Path) -> PathBuf {
-    if configured.is_absolute() {
-        configured.to_path_buf()
-    } else {
-        current.join(configured)
-    }
-}
-
 /// Runs a compiler process to its end, writing its output to `log`.
 ///
-/// The process runs with the server's environment, `MAX_JOBS` set to
-/// `max_jobs` unless the command states its own, and the command's variables.
-pub fn execute(mut command: Command, log: &Path, max_jobs: usize) -> Result<()> {
-    if !command.get_envs().any(|(name, _)| name == "MAX_JOBS") {
-        command.env("MAX_JOBS", max_jobs.to_string());
-    }
-
+/// # Errors
+///
+/// [`Error::Build`] naming the executable, its arguments and the directory it
+/// ran in when it cannot start (an errno alone says none of them, and the log
+/// is empty because the process never ran), or its exit status and log when it
+/// fails.
+pub fn execute(mut command: Command, log: &Path) -> Result<()> {
     let output = std::fs::File::create(log)?;
     let error_output = output.try_clone()?;
     let executable = command.get_program().to_owned();
@@ -913,9 +428,6 @@ pub fn execute(mut command: Command, log: &Path, max_jobs: usize) -> Result<()> 
             revision: 0,
             target: String::new(),
             descriptor: String::new(),
-            // A build that cannot find its compiler names the executable, its arguments
-            // and the directory it was started in: an errno alone says none of them,
-            // and the log is empty because the process never ran.
             message: format!(
                 "could not run {} {} in {}: {error}",
                 Path::new(&executable).display(),
@@ -951,13 +463,25 @@ pub fn execute(mut command: Command, log: &Path, max_jobs: usize) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ToolchainConfig, Toolchains, disagreements, execute, normalized, parse_nvcc_version,
-        resolve_in,
-    };
-    use crate::manifest::{PythonPackage, ToolchainKind};
-    use std::collections::BTreeMap;
-    use std::path::Path;
+    use super::*;
+
+    /// A description as the environment's program prints it, with every
+    /// toolchain available.
+    fn report() -> Report {
+        serde_json::from_value(serde_json::json!({
+            "interpreter": "/env/bin/python",
+            "driver": "ab".repeat(32),
+            "distributions": {"triton": "3.7.1", "flash-attn-4": "4.0.0b30"},
+            "triton": {"available": "3.7.1"},
+            "cute_dsl": {"available": "4.6.2"},
+            "cuda": {"available": {
+                "version": "13.0.48", "root": "/cuda", "nvcc": "/cuda/bin/nvcc",
+                "include": "/cuda/include", "lib": "/cuda/lib", "stubs": "/cuda/lib/stubs"
+            }},
+            "host_compiler": {"missing": "no c++ on this host's search path"}
+        }))
+        .unwrap()
+    }
 
     /// A declared distribution is compared by its normalized name and its exact version: the
     /// environment's spelling of a name does not matter, its version does, and a distribution it
@@ -998,98 +522,61 @@ mod tests {
         );
     }
 
-    /// A Python toolchain's identity names its compile driver's files as they are when it is
-    /// asked: an edited driver or pin is another identity, so its modules are other modules.
+    /// A toolchain's identity names its version and everything else the environment builds
+    /// with: another driver or another compiler version is another identity, a missing
+    /// toolchain is refused with the reason the environment gave, and a source that compiles
+    /// nothing is `none` on any host.
     #[test]
-    fn a_python_toolchain_identity_follows_its_compile_driver() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let temporary = tempfile::tempdir().unwrap();
-        let driver = temporary.path().join("uniserve_build_server");
-        std::fs::create_dir_all(driver.join("pins")).unwrap();
-        std::fs::write(driver.join("triton.py"), "# the driver\n").unwrap();
-        std::fs::write(driver.join("pins/artifact.sha256"), "ab  file\n").unwrap();
-        // The Python environment is outside the server: a script returns the questions discovery
-        // asks an interpreter (the driver's directory, a version, the distributions).
-        let python = temporary.path().join("python");
-        std::fs::write(
-            &python,
-            format!(
-                "#!/bin/sh\ncase \"$2\" in\n  *uniserve_build_server*) echo {};;\n  \
-                 *distributions*) echo '{{}}';;\n  *) echo 3.7.1;;\nesac\n",
-                driver.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let toolchains = Toolchains::discover(&ToolchainConfig {
-            nvcc: None,
-            python: Some(python),
-            wasm: None,
-            cargo: None,
-            max_jobs: 1,
-        })
-        .unwrap();
-
-        let first = toolchains.identity(ToolchainKind::Triton).unwrap();
+    fn an_environment_identity_follows_its_driver_and_compilers() {
+        let toolchains = Toolchains::from_report(Ok(report()));
+        let here = Path::new(".");
+        let first = toolchains.identity(ToolchainKind::Triton, here).unwrap();
         assert!(first.starts_with("triton 3.7.1; driver "), "{first}");
-        assert_eq!(toolchains.identity(ToolchainKind::Triton).unwrap(), first);
-        std::fs::write(driver.join("triton.py"), "# the driver, edited\n").unwrap();
-        let edited = toolchains.identity(ToolchainKind::Triton).unwrap();
-        assert_ne!(edited, first);
-        std::fs::write(driver.join("pins/artifact.sha256"), "cd  file\n").unwrap();
-        assert_ne!(toolchains.identity(ToolchainKind::Triton).unwrap(), edited);
-        assert_eq!(toolchains.identity(ToolchainKind::None).unwrap(), "none");
+        assert_eq!(
+            toolchains.version(ToolchainKind::Nvcc, here).unwrap(),
+            "13.0.48"
+        );
+
+        let edited = Toolchains::from_report(Ok(Report {
+            driver: "cd".repeat(32),
+            ..report()
+        }));
+        assert_ne!(edited.identity(ToolchainKind::Triton, here).unwrap(), first);
+        let upgraded = Toolchains::from_report(Ok(Report {
+            cute_dsl: Entry::Available("4.7.0".into()),
+            ..report()
+        }));
+        assert_ne!(
+            upgraded.identity(ToolchainKind::Triton, here).unwrap(),
+            first
+        );
+
+        let none = Toolchains::from_report(Err("no environment".into()));
+        let refused = none
+            .identity(ToolchainKind::CuteDsl, here)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("no environment"), "{refused}");
+        assert_eq!(none.identity(ToolchainKind::None, here).unwrap(), "none");
     }
 
-    /// A build whose compiler is not where the host said names the executable, its
-    /// arguments and the directory it ran in. An errno alone says none of them and the
-    /// log is empty, because the process never started: that combination is what made
-    /// a relative toolchain path cost an hour to diagnose.
+    /// A build whose compiler is not where the host said names the executable, its arguments and
+    /// the directory it ran in: an errno alone says none of them and the log is empty, because
+    /// the process never started.
     #[test]
     fn a_build_that_cannot_find_its_compiler_names_the_executable_and_where_it_ran() {
-        let temporary =
-            std::env::temp_dir().join(format!("uniserve-tooljob-{}", std::process::id()));
-        std::fs::create_dir_all(&temporary).unwrap();
-        let log = temporary.join("build.log");
-        let mut command = std::process::Command::new("/no-such-toolchain/python");
-        command.current_dir(&temporary).arg("--version");
-        let error = execute(command, &log, 2).expect_err("a missing executable cannot run");
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("build.log");
+        let missing = directory.path().join("missing-compiler");
+        let mut command = Command::new(&missing);
+        command.current_dir(directory.path()).arg("--version");
+        let error = execute(command, &log).expect_err("a missing executable cannot run");
         let text = error.to_string();
-        assert!(text.contains("/no-such-toolchain/python"), "{text}");
+        assert!(text.contains(&missing.display().to_string()), "{text}");
         assert!(text.contains("--version"), "{text}");
-        assert!(text.contains(&temporary.display().to_string()), "{text}");
-        let _ = std::fs::remove_dir_all(&temporary);
-    }
-
-    /// A relative toolchain path is returned absolute, against the directory it is resolved in: a
-    /// build runs with its working directory set to the store's copy of a package, so a path that
-    /// stayed relative would name that copy instead of the executable the caller named.
-    #[test]
-    fn a_relative_toolchain_path_is_resolved_absolute() {
-        let root = Path::new("/srv/host");
-        assert_eq!(
-            resolve_in(Path::new("bin/nvcc"), root),
-            root.join("bin/nvcc")
+        assert!(
+            text.contains(&directory.path().display().to_string()),
+            "{text}"
         );
-        assert_eq!(
-            resolve_in(Path::new("/opt/nvcc"), root),
-            Path::new("/opt/nvcc")
-        );
-    }
-
-    #[test]
-    fn nvcc_version_is_the_v_token() {
-        let text = "\nnvcc: NVIDIA (R) Cuda compiler driver\n\
-                    Copyright (c) 2005-2025 NVIDIA Corporation\n\
-                    Built on Fri_Aug__1_00:00:00_PDT_2025\n\
-                    Cuda compilation tools, release 13.0, V13.0.48\n\
-                    Build cuda_13.0.r13.0/compiler.36260728_0\n";
-        assert_eq!(parse_nvcc_version(text).as_deref(), Some("13.0.48"));
-    }
-
-    #[test]
-    fn an_unknown_nvcc_output_has_no_version() {
-        assert_eq!(parse_nvcc_version("not nvcc"), None);
     }
 }

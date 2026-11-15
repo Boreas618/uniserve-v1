@@ -1,0 +1,10 @@
+# NCCL 2.30.4's headers, the device API DeepEP's kernels are built against, read
+# out of the `nvidia-nccl-cu13` 2.30.4 wheel the serving environment locks. This
+# environment cannot install that wheel beside its torch, which requires another
+# NCCL. The headers are the same in the wheel of every architecture, so one
+# wheel is the origin on every host. The manifest is `nccl.sha256`.
+sha256 = "67a3f54b593e8361db3c3bc8d3b00cfc0cf36930f60d52a34b7e1b2012551301"
+
+[origin]
+archive = "https://files.pythonhosted.org/packages/65/32/ff4e28cbed87f99fed63df446ef1986e0617842258a3535eaa2ee92d6226/nvidia_nccl_cu13-2.30.4-py3-none-manylinux_2_18_aarch64.whl"
+archive_sha256 = "e99308a3a89fba78918d50886e81072a6c8b0b4199feb02c3903e63713a6525a"

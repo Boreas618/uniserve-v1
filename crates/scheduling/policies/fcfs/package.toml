@@ -8,9 +8,10 @@ op = "scheduling"
 backend = "fcfs"
 interface_version = 4
 
+# The policy is built with the workspace's pinned Rust toolchain.
 [toolchain]
-kind = "wasm"
-version = "50.0.1"
+kind = "cargo"
+version = "1.99.1"
 
 [module]
 form = "wasm"
@@ -27,10 +28,10 @@ chunked_prefill_size = 8192
 max_batch = 128
 prefetch_min_tokens = 256
 
-# The package is this crate: the Build Server snapshots it with the `scheduling` crate
-# it depends on when it is installed, builds it for wasm32 from that snapshot
-# and precompiles the module for the host's CPU. The crate's files are the ones
-# cargo resolves from `Cargo.toml`, so none is listed here.
+# The package is this crate: the Build Server snapshots its whole workspace when
+# it is installed and builds the crate for wasm32 from that snapshot; the engine
+# compiles the module when it loads it. The crate's files are the ones cargo
+# packages, so none is listed here.
 [source]
 kind = "wasm"
 files = []

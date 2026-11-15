@@ -25,13 +25,12 @@ files = ["src/log_softmax.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_fp32_columns_151936_tile_4096_pdl_true`.
 # The program walks a row in steps of `min(tile, 4096)` lanes, a `tl.arange`
 # extent, so a tile below 4096 must be a power of two; a wider one is any width.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["f32", "bf16", "f16"], columns = { min = 1 }, tile = { min = 1 }, pdl = ["true", "false"] }
 
 [parameters]

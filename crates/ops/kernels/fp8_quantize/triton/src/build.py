@@ -33,7 +33,3 @@ def spec(fields, parameters, target):
         # whole vectors of a row are loaded and stored.
         "aligned": ["x_ptr", "out_ptr", "k", "x_row_stride"],
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

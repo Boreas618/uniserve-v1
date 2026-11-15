@@ -9,10 +9,8 @@
 //! files travel as descriptors with `SCM_RIGHTS`, attached to the frame that
 //! names them, in the order it lists them.
 //!
-//! The schema is append-only and lives in `proto/build_server.proto`: a
-//! field is never renumbered, retyped or removed, and a new request or response
-//! is a new field of its oneof. The daemon and the main process therefore
-//! keep speaking a Build Server of a later build.
+//! The schema lives in `proto/build_server.proto` and is one release's: the
+//! Build Server and its clients of one release speak it.
 //!
 //! [`Client`] is the half the daemon and the main process use: the daemon
 //! calls [`Client::prepare`] before a deployment starts and before an update,
@@ -95,11 +93,6 @@ pub struct Progress {
     /// On a failure, the build's log.
     pub detail: String,
 }
-
-// A `prepare` that waited through a Build Server restart (design section 7.5)
-// may report the same step again: the steps of an attempt the restart
-// abandoned are not undone, and the attempt that follows finds the modules it
-// committed. A consumer shows progress monotonically and never counts frames.
 
 /// One file of a module, over the descriptor it arrived on.
 #[derive(Debug)]
@@ -373,26 +366,6 @@ fn prepare_message(request: &PrepareRequest) -> Result<wire::Prepare> {
     })
 }
 
-/// How long a `prepare` or a `resolve` waits through a restart, and how often
-/// it looks for the server again (design section 7.5 bounds the wait).
-///
-/// The wait is a wall-clock budget: an attempt costs its own time, and the
-/// pauses are what is left of the budget, so a slow attempt shortens the pause
-/// rather than the budget. A caller needing a hard deadline of its own wraps
-/// the call.
-const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-const WAIT_BETWEEN: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Pauses before the next attempt, and returns whether there is time left.
-fn pause_until(deadline: std::time::Instant) -> bool {
-    let now = std::time::Instant::now();
-    if now >= deadline {
-        return false;
-    }
-    std::thread::sleep(WAIT_BETWEEN.min(deadline - now));
-    true
-}
-
 /// Reads one response frame on `connection`, with the descriptors that rode on it: a `resolve`
 /// response's files, which the client pairs with the names the response lists.
 fn response_on(
@@ -409,7 +382,7 @@ fn response_on(
 ///
 /// # Errors
 ///
-/// Fails when nothing listens there, which [`Error::away`] reads as a server that is away.
+/// Fails when nothing listens there.
 pub fn connect(socket: &Path) -> Result<Connection> {
     Ok(Connection::new(UnixStream::connect(socket)?)?)
 }
@@ -445,12 +418,12 @@ messages!(wire::Request, wire::ServerMessage);
 
 /// A connection to a Build Server, as its clients speak it: the daemon
 /// prepares package revisions with it, and the main process resolves them.
+///
+/// A Build Server that stops while a request is in flight ends the request with
+/// the connection's error: the Build Server is not on the serving path, and the
+/// daemon starts the host's Build Server again when it next prepares an epoch.
 pub struct Client {
     connection: Connection,
-    /// The socket this client was opened on, when it was opened by its path.
-    /// A client that wraps an existing connection has no path and does not
-    /// wait through a restart.
-    socket: Option<std::path::PathBuf>,
 }
 
 impl Client {
@@ -458,16 +431,12 @@ impl Client {
     pub fn connect(socket: &Path) -> Result<Client> {
         Ok(Client {
             connection: connect(socket)?,
-            socket: Some(socket.to_path_buf()),
         })
     }
 
     /// Wraps an open connection.
     pub fn new(connection: Connection) -> Client {
-        Client {
-            connection,
-            socket: None,
-        }
+        Client { connection }
     }
 
     /// Installs a package and returns its revision.
@@ -512,15 +481,7 @@ impl Client {
         request: &PrepareRequest,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<(ModuleSlot, PackageRevision)>> {
-        self.call(|connection| Self::prepare_on(connection, request, &mut *progress))
-    }
-
-    /// One attempt at a `prepare`: the whole exchange on one connection.
-    fn prepare_on(
-        connection: &mut Connection,
-        request: &PrepareRequest,
-        progress: &mut dyn FnMut(Progress),
-    ) -> Result<Vec<(ModuleSlot, PackageRevision)>> {
+        let connection = &mut self.connection;
         connection.deliver(&wire::Request {
             request: Some(wire::request::Request::Prepare(prepare_message(request)?)),
         })?;
@@ -556,20 +517,7 @@ impl Client {
         descriptor: &str,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Module> {
-        self.call(|connection| {
-            Self::resolve_on(connection, op, revision, target, descriptor, &mut *progress)
-        })
-    }
-
-    /// One attempt at a `resolve`: the whole exchange on one connection.
-    fn resolve_on(
-        connection: &mut Connection,
-        op: &str,
-        revision: &PackageRevision,
-        target: &Target,
-        descriptor: &str,
-        progress: &mut dyn FnMut(Progress),
-    ) -> Result<Module> {
+        let connection = &mut self.connection;
         connection.deliver(&wire::Request {
             request: Some(wire::request::Request::Resolve(wire::Resolve {
                 op: op.to_owned(),
@@ -726,68 +674,7 @@ impl Client {
         }
     }
 
-    /// The next frame, with the descriptors that rode on it held for the
-    /// response it belongs to.
-    ///
-    /// Progress reports are frames like any other: the requests that report
-    /// builds read them in their own loop, so dropping them here would lose
-    /// every report a caller asked for.
-    /// Runs one call, waiting through a Build Server restart (design section
-    /// 7.5).
-    ///
-    /// The calls that wait are `prepare` and `resolve`: the Build Server is
-    /// not on the serving path, so a restart may only make an epoch's
-    /// preparation wait. An attempt that ends because the server was away is
-    /// retried on a fresh connection, because a restart ends the old one;
-    /// anything the server itself decided — a refusal, a build failure, an
-    /// unknown revision, an unsupported descriptor — is returned at once,
-    /// since retrying would repeat the decision. A call that timed out or read
-    /// something out of protocol is not a restart either: the server was there.
-    ///
-    /// A retry re-asks for the same content: package revision revisions name their
-    /// content and are never overwritten, so a second attempt selects the same
-    /// package revisions and finds the modules an abandoned attempt committed. Steps
-    /// may therefore be reported twice.
-    fn call<T>(&mut self, mut attempt: impl FnMut(&mut Connection) -> Result<T>) -> Result<T> {
-        let Some(socket) = self.socket.clone() else {
-            return attempt(&mut self.connection);
-        };
-        let deadline = std::time::Instant::now() + WAIT;
-        let restarted = || Error::Restarted {
-            socket: socket.display().to_string(),
-            waited: WAIT,
-        };
-        // Until the wait is over: run the attempt; when it ended because the
-        // server was away, take a fresh connection after a pause and run it
-        // again. Each attempt costs its own time, so the pause is what is left
-        // of the budget rather than a fixed step.
-        loop {
-            match attempt(&mut self.connection) {
-                Ok(response) => return Ok(response),
-                Err(error) if error.away() => {
-                    if !pause_until(deadline) {
-                        return Err(restarted());
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-            loop {
-                match connect(&socket) {
-                    Ok(connection) => {
-                        self.connection = connection;
-                        break;
-                    }
-                    Err(error) if error.away() => {
-                        if !pause_until(deadline) {
-                            return Err(restarted());
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-    }
-
+    /// The next frame of the response to the request this client sent.
     fn response(&mut self) -> Result<wire::server_message::Message> {
         response_on(&mut self.connection).map(|(response, _)| response)
     }

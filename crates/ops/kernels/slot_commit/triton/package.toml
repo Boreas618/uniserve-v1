@@ -25,11 +25,10 @@ files = ["src/slot_commit.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `index_i32_verified_i32_penalties_i32_stride_8_future_stride_1_vocab_151936_block_8`.
-[kernel.descriptors]
+[[kernel.descriptors]]
 # The descriptor a launch passes: the table and the sampled ids are i32 end to end
 # (`nn::Sampler` emits i32), one next-input token per slot, and the block is the
 # smallest power of two covering a bucket's rows (`tl.arange`'s extent). `stride`

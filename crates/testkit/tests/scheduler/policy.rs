@@ -322,11 +322,15 @@ fn chunks(harness: &Harness, id: RequestId) -> Vec<u32> {
         .collect()
 }
 
-/// Steps until the scheduler sent its first statistics report, which it sends once a second has
-/// passed since it started, and returns it.
-fn first_report(harness: &mut Harness) -> SchedulerStats {
+/// Steps until the scheduler sends its next statistics report, which it sends once a second, and
+/// returns it.
+fn next_report(harness: &mut Harness) -> SchedulerStats {
+    // The counters are lifetime counts and a report is sent on the scheduler's own clock, so a
+    // report sent before the calls a test made would leave some of them out: the report read is
+    // the first one sent after this call.
+    let earlier = harness.reports().len();
     let started = Instant::now();
-    while harness.reports().is_empty() {
+    while harness.reports().len() == earlier {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "no report was sent"
@@ -334,7 +338,7 @@ fn first_report(harness: &mut Harness) -> SchedulerStats {
         std::thread::sleep(Duration::from_millis(50));
         harness.step();
     }
-    harness.reports()[0].clone()
+    harness.reports()[earlier].clone()
 }
 
 /// The policy's id of the block under `key`, and how its view begins in a snapshot: the leading
@@ -359,7 +363,7 @@ fn observe_and_dispatch_are_called_once_per_step_and_limits_once_per_instance() 
     harness.settle(100);
     assert_eq!(harness.tokens(id).len(), 20);
 
-    let report = first_report(&mut harness);
+    let report = next_report(&mut harness);
     assert!(report.steps > 0);
     assert_eq!(report.policy_calls, 2 * 3 + 2 * report.steps);
     assert!(report.policy_fuel > 0, "every call is metered");

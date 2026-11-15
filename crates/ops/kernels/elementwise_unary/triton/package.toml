@@ -34,7 +34,6 @@ files = ["src/elementwise_unary.py", "src/strided.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # Every function exists on a floating element.

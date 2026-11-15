@@ -1,0 +1,6 @@
+# FlashInfer's fused MegaMoE CuTe DSL kernel, from the `flashinfer-python`
+# distribution this environment locks. The manifest is `megamoe.sha256`.
+sha256 = "dae28b342e055af61128a79efbce8727bbed54228613b8a547ad37134ecf2d97"
+
+[origin]
+distribution = "flashinfer-python"

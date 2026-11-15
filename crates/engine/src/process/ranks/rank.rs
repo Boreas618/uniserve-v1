@@ -776,10 +776,10 @@ impl ModelRunner {
     pub(crate) fn targets(&self) -> Result<Vec<Target>> {
         let mut targets: Vec<Target> = Vec::with_capacity(self.devices.len());
         for device in &self.devices {
-            let target = device
+            let capability = device
                 .compute_capability()
-                .map(Target::arch)
                 .with_context(|| format!("reading device {}'s architecture", device.0))?;
+            let target = Target::arch(capability)?;
             if !targets.contains(&target) {
                 targets.push(target);
             }

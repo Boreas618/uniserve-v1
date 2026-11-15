@@ -25,12 +25,11 @@ files = ["src/build.py", "src/entry.cpp", "src/entry.h"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
 # `hidden_2048_top_8_experts_128_input_bf16_scales_f32_output_bf16`.
 # The extents are launch values; the entry reads a row in whole 8-element groups.
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { layout = ["permuted", "expanded"], hidden = { multiple = 8 }, top = { min = 1 }, experts = { min = 1 }, input = ["bf16", "f16"], scales = ["f32", "bf16", "f16"], output = ["bf16", "f16"] }
 
 [parameters]

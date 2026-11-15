@@ -1,11 +1,12 @@
-"""The paged_attention package's trtllm compile script.
+"""The paged_attention package's trtllm build module.
 
 One descriptor -> one module.
 
 The module is trtllm-gen's FMHA launch code — the artifact's kernel table plus
 `TllmGenFmhaRunner` — compiled against the generated header, with the cubins
 the descriptor's configurations can select published beside the module in
-`cubins/`.
+`cubins/`. The Build Server compiles a descriptor by calling :func:`compile`
+with the compile request.
 
 Steps:
 1. stage the pinned `trtllm-gen-fmha` artifact's generated
@@ -36,23 +37,23 @@ import json
 import pathlib
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 
-from uniserve_build_server import package, trtllm
+from uniserve_build_server import trtllm
+from uniserve_build_server.request import Request
 
 #: The operator's element types, as the artifact names them in a kernel.
 NAMES = {"bf16": "Bfloat16", "f16": "Fp16", "f8e4m3": "E4m3", "f4e2m1": "E2m1"}
-
-#: The launch-code header that marks FlashInfer's data tree.
-FMHA_RUNNER = "include/flashinfer/trtllm/fmha/fmhaRunner.cuh"
 
 #: The pinned trtllm-gen library this package launches.
 LIBRARY = "trtllm-gen-fmha"
 
 #: The artifact's generated kernel table.
 METADATA_HEADER = "include/flashInferMetaInfo.h"
+
+#: The entry the module exports, which the package's `[module.entries]` names.
+ENTRY = "uniserve_paged_attention"
 
 #: The compile defines the artifact's own build uses.
 DEFINES = [
@@ -75,15 +76,14 @@ def matching_kernels(header, fields, target):
 
     The table is the artifact's own: an entry names its element types, head
     width, page size, mask, phase and architecture family, so the filter is the
-    descriptor's values, not a guess.
+    descriptor's values, not a guess. A target none of whose families the
+    artifact was built for matches no kernel, which refuses the descriptor.
     """
     if fields["window"] != "false":
         raise SystemExit(
             "the trtllm package is compiled without an attention window"
         )
-    families = trtllm.FAMILIES.get(target)
-    if families is None:
-        raise SystemExit(f"{target} names no trtllm-gen architecture family")
+    families = trtllm.families(target)
     query = NAMES[fields["dtype"]]
     key_value = NAMES[fields["kv"]]
     out_type = NAMES[fields["out"]]
@@ -138,45 +138,55 @@ def matching_kernels(header, fields, target):
     return sorted(set(kept))
 
 
-def publish_cubins(names, artifact, out):
+def publish_cubins(request, names, artifact):
     """Publish the named cubins beside the module, as bytes, not links."""
-    trtllm.stage(LIBRARY, artifact, [f"{name}.cubin" for name in names])
+    trtllm.stage(
+        request, LIBRARY, artifact, [f"{name}.cubin" for name in names]
+    )
     for name in names:
         staged = artifact / f"{name}.cubin"
         if not staged.is_file():
             raise SystemExit(f"the fetcher staged no {staged}")
-        target = out / "cubins" / f"{name}.cubin"
+        target = request.output / "cubins" / f"{name}.cubin"
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(staged.resolve(), target)
 
 
-def main():
-    """Compile one descriptor into ``module.so`` with its cubins."""
-    root, descriptor, target, out = package.arguments()
-    fields = package.fields()
-    data = trtllm.distribution(FMHA_RUNNER)
-    out.mkdir(parents=True, exist_ok=True)
-    # The artifact is the build's input, not the module: it is staged where the
-    # fetcher puts it, compiled against, and never enters the directory a runner
-    # is handed.
-    staging = pathlib.Path(tempfile.mkdtemp(prefix="uniserve-trtllm-gen-"))
-    try:
-        trtllm.stage(LIBRARY, staging, [METADATA_HEADER])
-        build(root, descriptor, fields, target, out, data, staging)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
+def compile(request: Request) -> None:
+    """Compile the request's descriptor into ``module.so`` with its cubins.
+
+    The artifact is the build's input, not the module: it is staged into a dot
+    directory of the request's output, which the Build Server does not
+    publish, compiled against, and never enters the directory a runner is
+    handed. The objects are staged there too.
+    """
+    data = trtllm.data_tree()
+    with tempfile.TemporaryDirectory(dir=request.output, prefix=".") as scratch:
+        staging = pathlib.Path(scratch)
+        trtllm.stage(request, LIBRARY, staging, [METADATA_HEADER])
+        build(request, data, staging)
 
 
-def build(root, descriptor, fields, target, out, data, artifact):
-    """Compile one descriptor's module and publish the cubins it can select."""
+def build(request, data, artifact):
+    """Compile one descriptor's module and publish the cubins it can select.
+
+    ``artifact`` is the scratch directory the artifact's header is staged in;
+    the cubins and the objects are staged beside it.
+    """
+    package = request.package
+    target = request.target
     header_path = artifact / METADATA_HEADER
     header = header_path.read_text()
-    names = matching_kernels(header, fields, target)
-    publish_cubins(names, artifact, out)
+    names = matching_kernels(header, request.fields, target)
+    publish_cubins(request, names, artifact)
     print(f"published {len(names)} cubins", file=sys.stderr)
 
     metainfo_hash = hashlib.sha256(header_path.read_bytes()).hexdigest()
-    compiler, version = package.nvcc()
+    cuda = request.toolchain.require_cuda()
+    # The compiler's identity is part of a failure: a module that builds on one
+    # host and not another is a defect of the package, and this is what the
+    # next reader needs to see it, beside the command `trtllm.run` logs.
+    identity = f"{cuda.nvcc} ({cuda.version})"
     includes = [
         artifact / "include",
         data / "include",
@@ -189,9 +199,9 @@ def build(root, descriptor, fields, target, out, data, artifact):
         data / "cccl/cub",
         data / "cccl/thrust",
     ]
-    unit = out / "entry.o"
+    unit = artifact / "entry.o"
     command = [
-        compiler,
+        cuda.nvcc,
         "-c",
         "-x",
         "cu",
@@ -207,82 +217,55 @@ def build(root, descriptor, fields, target, out, data, artifact):
         *[f"-I{one}" for one in includes],
         "-o",
         str(unit),
-        str(root / "src/entry.cpp"),
+        str(package / "src/entry.cpp"),
     ]
-    compiled = subprocess.run(
-        command, capture_output=True, text=True, check=False
-    )
-    if compiled.returncode != 0:
-        # The command and the compiler's identity are part of the failure: a
-        # module that builds on one host and not another is a defect of the
-        # package, and this is what the next reader needs to see it.
-        raise SystemExit(
-            f"compiling the entry unit failed with {compiler} ({version}):\n"
-            f"{' '.join(command)}\n{compiled.stderr[-6000:]}"
-        )
+    trtllm.run(command, f"compiling the entry unit with {identity}")
 
     # trtllm-gen's launcher also calls the vendor's own reduction
     # (`tensorrt_llm::kernels::runFmhaReduction`), whose definition ships in the
     # same data tree as the headers: it is compiled beside the entry, with the
     # entry's own flags, and linked into the module.
-    reduction = out / "fmhaReduction.o"
+    reduction = artifact / "fmhaReduction.o"
     reduction_command = [
         *command[:-3],
         "-o",
         str(reduction),
         str(data / "csrc/fmhaReduction.cu"),
     ]
-    compiled = subprocess.run(
-        reduction_command, capture_output=True, text=True, check=False
+    trtllm.run(
+        reduction_command,
+        f"compiling the vendor's reduction unit with {identity}",
     )
-    if compiled.returncode != 0:
-        raise SystemExit(
-            "compiling the vendor's reduction unit failed with "
-            f"{compiler} ({version}):\n{' '.join(reduction_command)}\n"
-            f"{compiled.stderr[-6000:]}"
-        )
 
     # trtllm-gen's launcher calls the CUDA driver API directly
     # (`cuModuleLoadData`, `cuModuleGetFunction`, `cuLaunchKernelEx`), so the
     # module links against `libcuda` as well as the runtime. The toolkit's stub
-    # `libcuda.so` is a link-time input only: nvcc's own profile puts the
-    # toolkit's `lib/stubs` on the link line, the module carries no dependency
-    # of that name, and the host's own driver satisfies the symbols when the
-    # module is loaded.
-    module = out / "module.so"
-    linked = subprocess.run(
+    # `libcuda.so` is a link-time input only, named by its directory: the
+    # module carries no dependency of that name, and the host's own driver
+    # satisfies the symbols when the module is loaded.
+    trtllm.run(
         [
-            compiler,
+            cuda.nvcc,
             "-shared",
             f"-arch={target}",
             str(unit),
             str(reduction),
+            f"-L{cuda.stubs}",
             "-lcuda",
             "-lcudart",
             "-o",
-            str(module),
+            str(request.output / "module.so"),
         ],
-        capture_output=True,
-        text=True,
-        check=False,
+        "linking module.so",
     )
-    if linked.returncode != 0:
-        raise SystemExit(f"linking module.so failed:\n{linked.stderr[-4000:]}")
-    unit.unlink()
-    reduction.unlink()
 
-    package.require_exports(module, ["uniserve_paged_attention"])
     print(
         json.dumps(
             {
-                "descriptor": descriptor,
-                "target": target,
-                "entry": "uniserve_paged_attention",
+                "descriptor": request.descriptor,
+                "target": str(target),
+                "entry": ENTRY,
                 "cubins": len(names),
             }
         )
     )
-
-
-if __name__ == "__main__":
-    main()

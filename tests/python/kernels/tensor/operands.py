@@ -57,8 +57,8 @@ KERNELS = (
 #: The packages' compile driver is the Build Server's Python package.
 sys.path.insert(0, str(KERNELS.parents[1] / "build-server" / "python" / "src"))
 
-from uniserve_build_server import package  # noqa: E402
 from uniserve_build_server import triton as driver  # noqa: E402
+from uniserve_build_server.request import Target  # noqa: E402
 
 #: The architecture a check asks a compile script about. It has no
 #: programmatic dependent launch, so a key's ``pdl`` compiles to nothing and a
@@ -145,8 +145,13 @@ def described(op: str, key: str) -> dict:
     )
     build = importlib.util.module_from_spec(found)
     found.loader.exec_module(build)
-    fields = package.read_fields(root, key)
-    return driver.described(build.spec, root, key, ARCHITECTURE, fields)
+    return driver.stated_for(
+        build.spec,
+        root,
+        key,
+        Target.named(ARCHITECTURE),
+        os.environ.get("UNISERVE_BINARY", "uniserve"),
+    )
 
 
 def launch(op: str, key: str, programs: tuple, *words) -> None:

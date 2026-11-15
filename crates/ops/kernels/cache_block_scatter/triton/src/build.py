@@ -7,7 +7,6 @@ and the field's shape — so one module serves every copy of that geometry.
 """
 
 import cache_block_scatter as kernels
-from uniserve_build_server import triton as driver
 
 #: The storage's element type, as Triton spells it.
 DTYPES = {"u8": "u8", "bf16": "bf16", "f16": "fp16", "fp32": "fp32", "i32": "i32"}
@@ -48,7 +47,3 @@ def spec(fields, parameters, target):
         },
         "options": {"num_warps": 4},
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

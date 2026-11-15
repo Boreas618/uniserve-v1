@@ -7,7 +7,6 @@ dimensions give, and the compilation options. The Build Server's Triton source d
 """
 
 import vsa_add_gated_tiles as kernels
-from uniserve_build_server import triton as driver
 
 #: The floating dtypes a row may have: the descriptor prints `DType`'s names and Triton
 #: spells FP16 `fp16` and FP32 `fp32`.
@@ -39,6 +38,3 @@ def spec(fields, parameters, target):
         },
         "options": {"num_warps": 4},
     }
-
-if __name__ == "__main__":
-    driver.main(spec)

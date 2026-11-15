@@ -13,7 +13,6 @@ the descriptor a compilation.
 import struct
 
 import modulated_rms_norm as kernels
-from uniserve_build_server import triton as driver
 
 #: The floating dtypes an activation, its weight and its modulation vectors may have, as Triton
 #: spells them in an argument signature.
@@ -85,7 +84,3 @@ def spec(fields, parameters, target):
             "enable_fp_fusion": False,
         },
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

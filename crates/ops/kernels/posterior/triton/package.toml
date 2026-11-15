@@ -34,10 +34,9 @@ files = ["src/posterior.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a", "sm_100f"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { block = { power_of_two = true }, pdl = ["true", "false"] }
 
 [parameters]

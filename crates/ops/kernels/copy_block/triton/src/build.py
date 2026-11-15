@@ -6,7 +6,6 @@ types, and they are equal at launch: a copy converts nothing.
 """
 
 import copy_block as kernels
-from uniserve_build_server import triton as driver
 
 #: The element types a block is stored in.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -54,7 +53,3 @@ def spec(fields, parameters, target):
         if wide
         else [],
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

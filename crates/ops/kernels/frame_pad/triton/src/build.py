@@ -10,7 +10,6 @@ every stride and every extent is an int32 launch word, as the eager launch casts
 """
 
 import frame_pad as kernels
-from uniserve_build_server import triton as driver
 
 #: The floating dtypes a video frame may have, as Triton spells them in an argument signature.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
@@ -59,7 +58,3 @@ def spec(fields, parameters, target):
             "num_warps": 4,
         },
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)

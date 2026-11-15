@@ -29,11 +29,10 @@ files = ["src/causal_conv1d.py", "src/build.py"]
 script = "src/build.py"
 
 [kernel]
-target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_channels_8192_width_4_block_256`.
-[kernel.descriptors]
+[[kernel.descriptors]]
 # A channel count of any multiple of sixteen (each row's channels start on a sixteen-byte bound),
 # any tap count of at least two, and a channel block that is a `tl.arange` extent.
 dimensions = { dtype = ["bf16", "f16", "f32"], channels = { multiple = 16 }, width = { min = 2 }, block = { power_of_two = true } }

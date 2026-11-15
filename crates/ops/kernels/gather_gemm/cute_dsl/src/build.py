@@ -58,27 +58,25 @@ def spec(fields, parameters, target):
     return {
         "name": "gather_gemm",
         "entry": "uniserve_gather_gemm",
-        "kernel": kernel.wrapper,
-        "args": [
-            pointer(element),
-            pointer(element),
-            pointer(element),
-            pointer(cutlass.Int32),
-            pointer(cutlass.Int32),
-            pointer(cutlass.Int32),
-            pointer(cutlass.Int32),
-            tokens,
-            permuted_rows,
-            2 * intermediate,
-            hidden,
-            experts,
-        ],
-        "options": {
-            "tile_size": tiler[0],
-            "max_active_clusters": int(parameters["max_active_clusters"]),
-        },
+        "compile": driver.kernel(
+            kernel.wrapper,
+            [
+                pointer(element),
+                pointer(element),
+                pointer(element),
+                pointer(cutlass.Int32),
+                pointer(cutlass.Int32),
+                pointer(cutlass.Int32),
+                pointer(cutlass.Int32),
+                tokens,
+                permuted_rows,
+                2 * intermediate,
+                hidden,
+                experts,
+            ],
+            {
+                "tile_size": tiler[0],
+                "max_active_clusters": int(parameters["max_active_clusters"]),
+            },
+        ),
     }
-
-
-if __name__ == "__main__":
-    driver.main(spec)
