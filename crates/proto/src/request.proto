@@ -720,6 +720,9 @@ message CacheResume {
 message DiffusionRequest {
   reserved 1;
   repeated uint32 prompt_token_ids = 2;
+  // The request's conditions as its model's request processing prepared
+  // them: the encoding of a `VideoConditions` message, which the engine
+  // carries to its workers without reading and the workers decode.
   bytes conditioning = 3;
   repeated ConditionExtent conditions = 4;
   DiffusionSamplingParams sampling = 5;
@@ -734,6 +737,102 @@ message DiffusionRequest {
   optional EncoderInputs encoder_inputs = 9;
   // The stored ranks' page locations and numerical layouts, read by engines.
   bytes stored_layout = 10;
+}
+
+// The conditions of a video request (`proto::video::Conditions`): each
+// condition in request order, the prompt tokens the text encoder encodes and
+// the prompt rows each block of vision content occupies.
+message VideoConditions {
+  repeated VideoCondition conditions = 1;
+  uint32 prompt_tokens = 2;
+  repeated VisionSpan vision_spans = 3;
+}
+
+// The prompt rows `[first, first + rows)` one block of vision content
+// occupies.
+message VisionSpan {
+  uint32 first = 1;
+  uint32 rows = 2;
+}
+
+// One condition of a video request, as its model planned it.
+message VideoCondition {
+  ConditionRole role = 1;
+  // The fetched media bytes.
+  MediaSource source = 2;
+  // What the media reader decodes them into.
+  oneof media {
+    ImageFit image = 3;
+    VideoReference video = 4;
+    AudioClip audio = 5;
+  }
+  // What the conditioner reads, for a condition it reads.
+  optional ConditionVision vision = 6;
+  // Denoiser rows each temporal unit of the condition's pixels encodes to.
+  repeated uint32 latent_units = 7;
+  // Denoiser audio rows of the condition's audio track.
+  uint32 audio_rows = 8;
+}
+
+enum ConditionRole {
+  // States no role: refused.
+  CONDITION_ROLE_UNSPECIFIED = 0;
+  CONDITION_ROLE_FIRST_FRAME = 1;
+  CONDITION_ROLE_LAST_FRAME = 2;
+  CONDITION_ROLE_REFERENCE = 3;
+}
+
+// Where a condition's fetched bytes are published on the leader's host.
+message MediaSource {
+  // The shared-memory object's name without its leading `/`.
+  string name = 1;
+  uint64 bytes = 2;
+}
+
+message Canvas {
+  uint32 width = 1;
+  uint32 height = 2;
+}
+
+// A still image resized to `resized`, then the `size` window at
+// (`left`, `top`) kept.
+message ImageFit {
+  Canvas resized = 1;
+  uint32 left = 2;
+  uint32 top = 3;
+  Canvas size = 4;
+}
+
+message VideoClip {
+  Canvas canvas = 1;
+  uint32 start_frame = 2;
+  uint32 frames = 3;
+  uint32 vae_frames = 4;
+}
+
+message AudioClip {
+  uint32 sample_rate = 1;
+  uint64 start_sample = 2;
+  uint64 source_samples = 3;
+  uint64 samples = 4;
+}
+
+// A reference video and, when the request conditions on it, its soundtrack.
+message VideoReference {
+  VideoClip clip = 1;
+  optional AudioClip soundtrack = 2;
+}
+
+message ConditionVision {
+  VisionGrid grid = 1;
+  uint32 tokens = 2;
+  repeated uint32 frame_indices = 3;
+}
+
+message VisionGrid {
+  uint32 t = 1;
+  uint32 h = 2;
+  uint32 w = 3;
 }
 
 // The SHA-256 digests of what each encoder computation of a video request

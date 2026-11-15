@@ -1561,7 +1561,11 @@ pub(crate) fn video(id: u64, units: u32) -> DiffusionRequest {
     DiffusionRequest {
         request_id: RequestId(id),
         prompt_token_ids: prompt(id, 40),
-        conditioning: b"{}".to_vec(),
+        conditioning: proto::video::Conditions {
+            prompt_tokens: 40,
+            ..proto::video::Conditions::default()
+        }
+        .encode(),
         conditions: Vec::new(),
         priority: 0,
         sampling: DiffusionSamplingParams {

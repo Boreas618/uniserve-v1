@@ -1833,7 +1833,11 @@ mod tests {
         let input = DiffusionRequest {
             request_id: RequestId(id),
             prompt_token_ids: vec![5, 6, 7],
-            conditioning: b"{}".to_vec(),
+            conditioning: proto::video::Conditions {
+                prompt_tokens: 3,
+                ..proto::video::Conditions::default()
+            }
+            .encode(),
             conditions: vec![ConditionExtent {
                 pixel_bytes: 300,
                 audio_samples: 10,

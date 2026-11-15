@@ -4,17 +4,22 @@
 //! fetched bytes are ([`MediaLocator`]), what the media reader decodes them into
 //! ([`ConditionMedia`]), what the text encoder's vision tower reads of it ([`ConditionVision`])
 //! and the denoiser rows its latent encoders write. The engine carries a request's
-//! [`Conditions`] JSON-encoded beside the sizes it schedules by and never decodes them; the
-//! workers decode them and hand each stage its part. The vocabulary is the video pipeline's, not
+//! [`Conditions`] encoded as their Protobuf message (`request.proto`'s `VideoConditions`,
+//! converted by `wire`) beside the sizes it schedules by and never decodes them; the workers decode
+//! them and hand each stage its part. The vocabulary is the video pipeline's, not
 //! one model's: any video model whose request processing prepares a condition states it in these
 //! terms.
 //!
 //! The latent [`Layout`] a denoiser prepares for one request is stated here too: the model states
 //! it, the worker captures a graph for it and the scheduler names it in the batch it submits.
 
+mod wire;
+
 use serde::{Deserialize, Serialize};
 
 use crate::MediaLocator;
+
+pub use wire::ConditionsError;
 
 /// A video raster in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -300,9 +305,6 @@ impl Condition {
 
 /// What a video request brings to the workers beyond its sampling: its conditions in request
 /// order, and where its prompt presents their vision content.
-///
-/// JSON keeps the encoding readable by request processing and workers of different builds as
-/// long as fields are only added.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conditions {
     /// The conditions in request order.
@@ -315,22 +317,21 @@ pub struct Conditions {
 }
 
 impl Conditions {
-    /// The JSON encoding the engine carries.
-    ///
-    /// # Errors
-    ///
-    /// Fails only when serialization fails, which these plain values do not.
-    pub fn encode(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
+    /// The encoding the engine carries: the conditions' Protobuf message.
+    pub fn encode(&self) -> Vec<u8> {
+        prost::Message::encode_to_vec(&crate::request::wire::VideoConditions::from(self))
     }
 
     /// Decodes [`Self::encode`]'s encoding.
     ///
     /// # Errors
     ///
-    /// Fails when `bytes` are not conditions.
-    pub fn decode(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+    /// Fails when `bytes` are no conditions message, or one that leaves out a part every
+    /// condition states.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ConditionsError> {
+        let message: crate::request::wire::VideoConditions = prost::Message::decode(bytes)
+            .map_err(|error| ConditionsError::Undecodable(error.to_string()))?;
+        message.try_into()
     }
 
     /// Checks the conditions: every condition is consistent ([`Condition::validate`]), and every
@@ -493,7 +494,7 @@ mod tests {
             prompt_tokens: 4,
             vision_spans: vec![(1, 2)],
         };
-        let decoded = Conditions::decode(&conditions.encode().unwrap()).unwrap();
+        let decoded = Conditions::decode(&conditions.encode()).unwrap();
         assert_eq!(decoded, conditions);
     }
 

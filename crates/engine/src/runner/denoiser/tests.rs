@@ -260,7 +260,7 @@ fn batch(variant: Variant, step: u32, results: Vec<u32>, reads: u32) -> Batch {
         media: vec![MediaRow {
             request: RequestId(1),
             slot: SLOT,
-            conditioning: conditioning.encode().unwrap(),
+            conditioning: conditioning.encode(),
             step,
             steps: 2,
             seed: 7,

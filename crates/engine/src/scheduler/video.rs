@@ -1286,7 +1286,11 @@ mod tests {
         DiffusionRequest {
             request_id: RequestId(1),
             prompt_token_ids: vec![1; prompt],
-            conditioning: b"{}".to_vec(),
+            conditioning: proto::video::Conditions {
+                prompt_tokens: prompt as u32,
+                ..proto::video::Conditions::default()
+            }
+            .encode(),
             conditions,
             priority: 0,
             sampling: DiffusionSamplingParams {

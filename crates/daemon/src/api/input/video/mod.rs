@@ -323,9 +323,7 @@ fn submission(
             .iter()
             .map(|condition| condition.extent())
             .collect(),
-        conditioning: conditions.encode().map_err(|error| {
-            InputError::Internal(format!("encoding the conditions failed: {error}"))
-        })?,
+        conditioning: conditions.encode(),
         priority: 0,
         sampling: DiffusionSamplingParams {
             num_frames: input.num_frames,

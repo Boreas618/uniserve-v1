@@ -88,7 +88,11 @@ fn requests_come_back_from_their_messages_unchanged() {
         Request::Diffusion(DiffusionRequest {
             request_id: RequestId(42),
             prompt_token_ids: vec![5, 6],
-            conditioning: b"{\"task\":\"ref2va\"}".to_vec(),
+            conditioning: proto::video::Conditions {
+                prompt_tokens: 2,
+                ..proto::video::Conditions::default()
+            }
+            .encode(),
             conditions: vec![ConditionExtent {
                 pixel_bytes: 3 * 64 * 32,
                 audio_samples: 100,
