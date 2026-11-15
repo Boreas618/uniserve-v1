@@ -129,15 +129,15 @@ impl Op for AdaptivePool {
         stream: &Stream,
     ) -> Result<()> {
         let outputs = args.x.dim(0) * u64::from(descriptor.output);
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.out)
-            .u64(args.x.dim(0))
-            .u32(descriptor.heads)
-            .u32(descriptor.width)
-            .u32(descriptor.output)
-            .flag(descriptor.pdl);
+            .view("x", &args.x)
+            .view("out", &args.out)
+            .u64("rows", args.x.dim(0))
+            .u32("heads", descriptor.heads)
+            .u32("width", descriptor.width)
+            .u32("output", descriptor.output)
+            .flag("pdl", descriptor.pdl);
         kernel.launch(
             LaunchGrid::covering(outputs, u64::from(descriptor.block))?,
             &mut arguments,

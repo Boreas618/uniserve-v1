@@ -141,13 +141,13 @@ impl Op for Fp8Quantize {
     ) -> Result<()> {
         let (m, k) = (args.input.dim(0), args.input.dim(1));
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.input)
-            .view(&args.out)
-            .u64(k)
-            .u64(args.input.stride(0))
-            .view(&args.encode);
+            .view("x_ptr", &args.input)
+            .view("out_ptr", &args.out)
+            .u64("k", k)
+            .u64("x_row_stride", args.input.stride(0))
+            .view("encode_ptr", &args.encode);
 
         // One row a grid row, its blocks across the grid's columns.
         kernel.launch(
@@ -284,18 +284,18 @@ impl Op for Fp8Gemm {
         let (m, k) = (args.input.dim(0), args.input.dim(1));
         let n = args.weight.dim(0);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         // A program compiled without a bias never reads its bias port; the output stands in.
         arguments
-            .view(&args.input)
-            .view(&args.weight)
-            .view(args.bias.as_ref().unwrap_or(&args.out))
-            .view(&args.out)
-            .i32(m as i32)
-            .i32(n as i32)
-            .i32(k as i32)
-            .i32(args.input.stride(0) as i32)
-            .view(&args.alpha);
+            .view("x_ptr", &args.input)
+            .view("w_ptr", &args.weight)
+            .view("bias_ptr", args.bias.as_ref().unwrap_or(&args.out))
+            .view("out_ptr", &args.out)
+            .u64("m", m)
+            .u64("n", n)
+            .u64("k", k)
+            .u64("x_row_stride", args.input.stride(0))
+            .view("alpha_ptr", &args.alpha);
         kernel.launch(
             LaunchGrid::new([
                 m.div_ceil(u64::from(descriptor.block_m)),

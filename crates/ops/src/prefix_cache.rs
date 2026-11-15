@@ -250,13 +250,13 @@ impl Op for PageConversion {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.scratch)
-            .u64(args.elements)
-            .u64(args.scales)
-            .u32(args.block_size)
-            .u32(args.scale_heads);
+            .view("scratch", &args.scratch)
+            .u64("elements", args.elements)
+            .u64("scales", args.scales)
+            .u32("block_size", args.block_size)
+            .u32("scale_heads", args.scale_heads);
         // One program per (layer, token) row of the page, every head of it.
         kernel.launch(
             LaunchGrid::new([
@@ -487,20 +487,20 @@ impl Op for CacheCopyRegion {
         stream: &Stream,
     ) -> Result<()> {
         let scale = args.scale.as_ref().unwrap_or(&args.initialized);
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.values)
-            .view(scale)
-            .view(&args.initialized)
-            .view(&args.source)
-            .view(&args.units)
-            .u64(args.offset)
-            .u64(args.count)
+            .view("values_ptr", &args.values)
+            .view("scale_ptr", scale)
+            .view("initialized_ptr", &args.initialized)
+            .view("source_ptr", &args.source)
+            .view("units_ptr", &args.units)
+            .u64("offset", args.offset)
+            .u64("count", args.count)
             // The field's units *per column*. `values` and `initialized` are addressed as
             // `[column, unit, …]` and the unit ids arrive per page, so a program needs the pool's own
             // shape to turn (column, unit) into an offset; the views do not carry extents into the
             // kernel.
-            .u32(args.values.dim(1) as u32);
+            .u64("units_total", args.values.dim(1));
         // One program per (column, unit slot): it owns the whole written span of that cell, so the
         // FP8 path's amax is one reduction over the span rather than one per token - the write
         // takes `max(scale, max(abs(span), 1e-12) / 448)` once and rescales the unit's resident

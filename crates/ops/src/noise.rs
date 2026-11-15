@@ -201,17 +201,17 @@ impl Op for PhiloxNoise {
     ) -> Result<()> {
         let addressing = addressing(descriptor, &args)?;
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.out)
-            .pointer(DevicePtr::from_address(addressing.keys))
-            .u64(addressing.elements)
-            .u32(args.stage)
-            .u32(args.draw)
-            // Last, so the per-row form's leading arguments are the ones it always had.
-            .u64(args.key)
-            // And the offset after it: an existing package that reads neither is correct at 0.
-            .u64(args.offset);
+            .view("out_ptr", &args.out)
+            .pointer("keys_ptr", DevicePtr::from_address(addressing.keys))
+            .u64("elements", addressing.elements)
+            .u32("stage", args.stage)
+            .u32("draw", args.draw)
+            // The key is a bit pattern, which the program reads as the bits of an `i64`: the same
+            // sixty-four bits, whatever number they make.
+            .i64("key", args.key as i64)
+            .u64("offset", args.offset);
         kernel.launch(addressing.grid, &mut arguments, stream)
     }
 

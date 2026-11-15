@@ -182,16 +182,15 @@ impl Op for Rows {
         let count = args.indices.numel();
 
         let block = u64::from(descriptor.block);
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.source)
-            .view(&args.destination)
-            .view(&args.indices)
-            // `check` keeps the row count within a kernel parameter.
-            .u32(count as u32)
-            .u32(descriptor.columns)
-            .u32(descriptor.block)
-            .flag(descriptor.pdl);
+            .view("source_ptr", &args.source)
+            .view("destination_ptr", &args.destination)
+            .view("indices_ptr", &args.indices)
+            .u64("count", count)
+            .u32("columns", descriptor.columns)
+            .u32("block", descriptor.block)
+            .flag("pdl", descriptor.pdl);
         // One block covers one row's element block, so the row's writes are ordered inside a block
         // and two blocks never touch the same destination element.
         kernel.launch(

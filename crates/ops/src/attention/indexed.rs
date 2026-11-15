@@ -185,16 +185,16 @@ impl Op for IndexScores {
         let max_pages = args.page_table.dim(1);
         let columns = max_pages * u64::from(descriptor.groups);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.query)
-            .view(&args.keys)
-            .view(&args.page_table)
-            .view(&args.rows)
-            .view(&args.visible)
-            .view(&args.out)
-            .u64(tokens)
-            .u64(max_pages);
+            .view("query", &args.query)
+            .view("keys", &args.keys)
+            .view("page_table", &args.page_table)
+            .view("rows", &args.rows)
+            .view("visible", &args.visible)
+            .view("out", &args.out)
+            .u64("tokens", tokens)
+            .u64("max_pages", max_pages);
         kernel.launch(
             LaunchGrid::new([columns.div_ceil(u64::from(descriptor.block)), tokens, 1])?,
             &mut arguments,
@@ -356,17 +356,17 @@ impl Op for IndexedAttention {
     ) -> Result<()> {
         let tokens = args.query.dim(0);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.query)
-            .view(&args.key)
-            .view(&args.value)
-            .view(&args.page_table)
-            .view(&args.rows)
-            .view(&args.selection)
-            .view(&args.out)
-            .u64(tokens)
-            .u64(args.page_table.dim(1));
+            .view("query", &args.query)
+            .view("key", &args.key)
+            .view("value", &args.value)
+            .view("page_table", &args.page_table)
+            .view("rows", &args.rows)
+            .view("selection", &args.selection)
+            .view("out", &args.out)
+            .u64("tokens", tokens)
+            .u64("max_pages", args.page_table.dim(1));
         kernel.launch(
             LaunchGrid::new([u64::from(descriptor.heads), tokens, 1])?,
             &mut arguments,

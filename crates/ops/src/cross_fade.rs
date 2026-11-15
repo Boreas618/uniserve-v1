@@ -258,34 +258,33 @@ impl Op for CrossFade {
         let previous_strides = crate::operand::outer_strides(&args.previous);
         let current_strides = crate::operand::outer_strides(&args.current);
 
-        // Every narrowing below is of a value `check` holds within its kernel parameter.
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.previous)
-            .view(&args.current)
-            .view(&args.out)
-            .u32(descriptor.extent)
-            .u32(descriptor.axis)
-            .u32(dims[0] as u32)
-            .u32(dims[1] as u32)
+            .view("previous_ptr", &args.previous)
+            .view("current_ptr", &args.current)
+            .view("out_ptr", &args.out)
+            .u32("extent", descriptor.extent)
+            .u32("axis", descriptor.axis)
+            .u64("channels", dims[0] as u64)
+            .u64("frames", dims[1] as u64)
             // The two frame-grid extents the blend walks: the C ABI hands a program raw slots, so
             // the rows and columns the kernel loops over travel as scalars rather than as extents a
             // view carries. They are the axis the overlap does not run along, one per position.
-            .u32(dims[2] as u32)
-            .u32(dims[3] as u32)
+            .u64("rows", dims[2] as u64)
+            .u64("columns", dims[3] as u64)
             // The destination's outer strides, then its block and PDL flag. Its base is addressed
             // with these, which is what lets a tile land inside a larger raster.
-            .u32(previous_strides[0] as u32)
-            .u32(previous_strides[1] as u32)
-            .u32(previous_strides[2] as u32)
-            .u32(current_strides[0] as u32)
-            .u32(current_strides[1] as u32)
-            .u32(current_strides[2] as u32)
-            .u32(out_strides[0] as u32)
-            .u32(out_strides[1] as u32)
-            .u32(out_strides[2] as u32)
-            .u32(descriptor.block)
-            .flag(descriptor.pdl);
+            .u64("previous_stride0", previous_strides[0])
+            .u64("previous_stride1", previous_strides[1])
+            .u64("previous_stride2", previous_strides[2])
+            .u64("current_stride0", current_strides[0])
+            .u64("current_stride1", current_strides[1])
+            .u64("current_stride2", current_strides[2])
+            .u64("out_stride0", out_strides[0])
+            .u64("out_stride1", out_strides[1])
+            .u64("out_stride2", out_strides[2])
+            .u32("block", descriptor.block)
+            .flag("pdl", descriptor.pdl);
         // One thread per output voxel: the leading band blends and everything after it copies, and
         // both branches write the position they read `current` at, which is what lets `out` alias it.
         kernel.launch(

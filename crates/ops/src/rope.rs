@@ -269,22 +269,22 @@ impl Op for RotaryFactors {
         let columns = u64::from(descriptor.columns);
         let tokens = args.positions.numel() / u64::from(descriptor.axes.max(1));
         let total = tokens * columns;
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.positions)
-            .view(&args.frequencies)
-            .view(&args.cosine)
-            .view(&args.sine)
-            .u64(total)
-            .u32(descriptor.columns)
-            .f32(f32::from_bits(descriptor.scale.0 as u32));
+            .view("positions", &args.positions)
+            .view("frequencies", &args.frequencies)
+            .view("cosine", &args.cosine)
+            .view("sine", &args.sine)
+            .u64("total", total)
+            .u32("columns", descriptor.columns)
+            .f32("scale", f32::from_bits(descriptor.scale.0 as u32));
         // A sectioned rotation's program takes one more pair: how many axes the positions carry
-        // and the rotated width each one owns. A one-dimensional program's arguments end at
-        // `scale`, so its existing packages stay valid.
+        // and the rotated width each one owns (`section_0` to `section_3`). A one-dimensional
+        // program's arguments end at `scale`.
         if descriptor.axes > 1 {
-            arguments.u32(descriptor.axes);
-            for width in descriptor.sections.iter().take(MAX_AXES) {
-                arguments.u32(*width);
+            arguments.u32("axes", descriptor.axes);
+            for (section, width) in descriptor.sections.iter().enumerate() {
+                arguments.u32(format!("section_{section}"), *width);
             }
         }
         kernel.launch(
@@ -475,17 +475,17 @@ fn launch_strided(
     let query_row = args.query.stride(0);
 
     let blocks = tokens.div_ceil(u64::from(descriptor.rows));
-    let mut arguments = Arguments::new();
+    let mut arguments = Arguments::new(QkNormRope::NAME);
     arguments
-        .view(&args.query)
-        .view(&args.key)
-        .view(&args.cosine)
-        .view(&args.sine)
-        .u64(tokens)
-        .u64(query_row)
-        .u64(table)
-        .f32(f32::from_bits(descriptor.epsilon.0 as u32))
-        .flag(descriptor.pdl);
+        .view("query_ptr", &args.query)
+        .view("key_ptr", &args.key)
+        .view("cosine_ptr", &args.cosine)
+        .view("sine_ptr", &args.sine)
+        .u64("tokens", tokens)
+        .u64("row_stride", query_row)
+        .u64("table_rows", table)
+        .f32("epsilon", f32::from_bits(descriptor.epsilon.0 as u32))
+        .flag("pdl", descriptor.pdl);
     kernel.launch(
         LaunchGrid::linear(blocks * u64::from(descriptor.q_heads))?,
         &mut arguments,
@@ -645,23 +645,27 @@ impl Op for QkNormRope {
         let rows = u64::from(descriptor.rows);
         let programs = (tokens * u64::from(descriptor.q_heads)).div_ceil(rows)
             + (tokens * u64::from(descriptor.k_heads)).div_ceil(rows);
-        let mut arguments = Arguments::new();
-        arguments.view(&args.query).view(&args.key);
+        let mut arguments = Arguments::new(Self::NAME);
+        arguments
+            .view("query_ptr", &args.query)
+            .view("key_ptr", &args.key);
         if let Some((q_weight, k_weight)) = weights {
-            arguments.view(&q_weight).view(&k_weight);
+            arguments
+                .view("q_weight_ptr", &q_weight)
+                .view("k_weight_ptr", &k_weight);
         }
         arguments
-            .view(&args.cosine)
-            .view(&args.sine)
-            .view(&args.q_out)
-            .view(&args.k_out)
-            .u64(tokens)
-            .f32(f32::from_bits(descriptor.epsilon.0 as u32))
-            .flag(descriptor.pdl);
+            .view("cosine_ptr", &args.cosine)
+            .view("sine_ptr", &args.sine)
+            .view("q_out_ptr", &args.q_out)
+            .view("k_out_ptr", &args.k_out)
+            .u64("tokens", tokens)
+            .f32("epsilon", f32::from_bits(descriptor.epsilon.0 as u32))
+            .flag("pdl", descriptor.pdl);
         // A full rotation's arguments end at `pdl`, so its existing packages stay valid; a partial
         // one names how many channels rotate.
         if descriptor.rotated != descriptor.head_dim {
-            arguments.u32(descriptor.rotated);
+            arguments.u32("rotated", descriptor.rotated);
         }
         kernel.launch(LaunchGrid::linear(programs)?, &mut arguments, stream)
     }
@@ -814,17 +818,17 @@ impl Op for RopeApply {
     ) -> Result<()> {
         let tokens = args.x.dim(0);
         let programs = tokens.div_ceil(u64::from(descriptor.rows));
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.cosine)
-            .view(&args.sine)
-            .view(&args.out)
-            .u64(tokens)
-            .flag(descriptor.pdl);
+            .view("x", &args.x)
+            .view("cosine", &args.cosine)
+            .view("sine", &args.sine)
+            .view("out", &args.out)
+            .u64("tokens", tokens)
+            .flag("pdl", descriptor.pdl);
         // A full rotation's arguments end at `pdl`; a partial one names how many channels rotate.
         if descriptor.rotated != descriptor.head_dim {
-            arguments.u32(descriptor.rotated);
+            arguments.u32("rotated", descriptor.rotated);
         }
         kernel.launch(LaunchGrid::linear(programs)?, &mut arguments, stream)
     }

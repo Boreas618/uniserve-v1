@@ -106,16 +106,16 @@ impl Op for ChannelAffine {
         stream: &Stream,
     ) -> Result<()> {
         let elements = args.x.numel();
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.scale)
-            .view(&args.shift)
-            .view(&args.out)
-            .u64(args.x.dim(1))
-            .u64(args.x.dim(2))
-            .u64(elements)
-            .flag(descriptor.pdl);
+            .view("x", &args.x)
+            .view("scale", &args.scale)
+            .view("shift", &args.shift)
+            .view("out", &args.out)
+            .u64("channels", args.x.dim(1))
+            .u64("positions", args.x.dim(2))
+            .u64("elements", elements)
+            .flag("pdl", descriptor.pdl);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
             &mut arguments,

@@ -361,27 +361,35 @@ pub(crate) fn select_axes(operand: &Operand, keep: impl Fn(usize) -> bool) -> Op
 }
 
 /// Pack the extents of an index space: the words of slots 1 to `SLOTS − 1`, right-aligned,
-/// unit before the first axis. The caller's check refused more than [`SLOTS`] axes.
-pub(crate) fn pack_extents(arguments: &mut Arguments, operand: &Operand) {
+/// unit before the first axis, each named `<prefix><slot>` as the packages' kernels name them
+/// (`d1` to `d5`). The caller's check refused more than [`SLOTS`] axes.
+pub(crate) fn pack_extents(arguments: &mut Arguments, prefix: &str, operand: &Operand) {
     let pad = SLOTS - operand.rank();
-    for word in 1..SLOTS {
-        arguments.u64(if word < pad {
-            1
-        } else {
-            operand.dim(word - pad)
-        });
+    for slot in 1..SLOTS {
+        arguments.u64(
+            format!("{prefix}{slot}"),
+            if slot < pad {
+                1
+            } else {
+                operand.dim(slot - pad)
+            },
+        );
     }
 }
 
-/// Pack an operand's strides: `SLOTS` words, right-aligned, zero before the first axis. The
-/// caller's check refused more than [`SLOTS`] axes.
-pub(crate) fn pack_strides(arguments: &mut Arguments, operand: &Operand) {
+/// Pack an operand's strides: `SLOTS` words, right-aligned, zero before the first axis, each
+/// named `<prefix><slot>` as the packages' kernels name them (`s0` to `s5`). The caller's check
+/// refused more than [`SLOTS`] axes.
+pub(crate) fn pack_strides(arguments: &mut Arguments, prefix: &str, operand: &Operand) {
     let pad = SLOTS - operand.rank();
-    for word in 0..SLOTS {
-        arguments.u64(if word < pad {
-            0
-        } else {
-            operand.stride(word - pad)
-        });
+    for slot in 0..SLOTS {
+        arguments.u64(
+            format!("{prefix}{slot}"),
+            if slot < pad {
+                0
+            } else {
+                operand.stride(slot - pad)
+            },
+        );
     }
 }

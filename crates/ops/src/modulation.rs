@@ -311,21 +311,21 @@ impl Op for ModulatedRmsNorm {
         let output_scale = args.output_scale.as_ref().unwrap_or(&args.out);
         let retain = args.retain.as_ref().unwrap_or(&args.out);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.value)
-            .view(update)
-            .view(gate)
-            .view(&args.weight)
-            .view(&args.shift)
-            .view(&args.scale)
-            .view(&args.row_indices)
-            .view(&args.out)
-            .view(output_scale)
-            .view(retain)
-            .i32(descriptor.gate_stride as i32)
-            .i32(descriptor.shift_stride as i32)
-            .i32(descriptor.scale_stride as i32);
+            .view("hidden_ptr", &args.value)
+            .view("update_ptr", update)
+            .view("gate_ptr", gate)
+            .view("weight_ptr", &args.weight)
+            .view("shift_ptr", &args.shift)
+            .view("scale_ptr", &args.scale)
+            .view("row_indices_ptr", &args.row_indices)
+            .view("output_ptr", &args.out)
+            .view("output_scale_ptr", output_scale)
+            .view("retain_ptr", retain)
+            .u64("gate_row_stride", descriptor.gate_stride)
+            .u64("shift_row_stride", descriptor.shift_stride)
+            .u64("scale_row_stride", descriptor.scale_stride);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -450,17 +450,17 @@ impl Op for GatedResidual {
         let width = u64::from(descriptor.width);
         let rows = args.hidden.dim(0);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.hidden)
-            .view(&args.update)
-            .view(&args.gate)
-            .view(&args.row_indices)
-            .i32(descriptor.gate_stride as i32)
+            .view("hidden_ptr", &args.hidden)
+            .view("update_ptr", &args.update)
+            .view("gate_ptr", &args.gate)
+            .view("row_indices_ptr", &args.row_indices)
+            .u64("gate_row_stride", descriptor.gate_stride)
             // Appended rather than inserted, so every parameter before it keeps its offset: the
             // row count is the one thing a request changes, and the kernel multiplies it by the
             // width it was compiled for.
-            .u64(rows);
+            .u64("rows", rows);
         kernel.launch(
             LaunchGrid::covering(rows * width, GATED_BLOCK)?,
             &mut arguments,

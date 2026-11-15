@@ -129,13 +129,13 @@ impl Op for Gelu {
         stream: &Stream,
     ) -> Result<()> {
         let elements = args.x.numel();
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.out)
-            .u64(elements)
-            .u32(descriptor.columns)
-            .flag(descriptor.pdl);
+            .view("x_ptr", &args.x)
+            .view("out_ptr", &args.out)
+            .u64("elements", elements)
+            .u32("columns", descriptor.columns)
+            .flag("pdl", descriptor.pdl);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
             &mut arguments,

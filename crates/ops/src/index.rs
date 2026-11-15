@@ -289,41 +289,43 @@ impl Op for Index {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.source)
-            .view(&args.indices)
-            .view(&args.destination);
+            .view("source", &args.source)
+            .view("indices", &args.indices)
+            .view("destination", &args.destination);
 
         let work = match descriptor.function {
             Function::Gather => {
                 let [destination, repeated, indices] = gathered(&args);
                 let elements = destination.numel();
 
-                arguments.u64(elements);
-                strided::pack_extents(&mut arguments, &destination);
-                strided::pack_strides(&mut arguments, &repeated);
-                strided::pack_strides(&mut arguments, &indices);
-                arguments.u64(args.source.stride(args.axis));
+                arguments.u64("elements", elements);
+                strided::pack_extents(&mut arguments, "d", &destination);
+                strided::pack_strides(&mut arguments, "s", &repeated);
+                strided::pack_strides(&mut arguments, "i", &indices);
+                arguments.u64("step", args.source.stride(args.axis));
                 elements
             }
             Function::ScatterSet | Function::ScatterAdd => {
                 let [source, indices, destination] = columns(&args);
                 let count = source.numel();
 
-                arguments.u64(count).u64(args.source.dim(args.axis));
-                strided::pack_extents(&mut arguments, &source);
-                strided::pack_strides(&mut arguments, &source);
-                strided::pack_strides(&mut arguments, &indices);
-                strided::pack_strides(&mut arguments, &destination);
                 arguments
-                    .u64(args.source.stride(args.axis))
-                    .u64(args.indices.stride(args.axis))
-                    .u64(args.destination.stride(args.axis));
+                    .u64("columns", count)
+                    .u64("length", args.source.dim(args.axis));
+                strided::pack_extents(&mut arguments, "c", &source);
+                strided::pack_strides(&mut arguments, "s", &source);
+                strided::pack_strides(&mut arguments, "i", &indices);
+                strided::pack_strides(&mut arguments, "t", &destination);
+                arguments
+                    .u64("source_step", args.source.stride(args.axis))
+                    .u64("indices_step", args.indices.stride(args.axis))
+                    .u64("destination_step", args.destination.stride(args.axis));
                 count
             }
         };
-        arguments.flag(descriptor.pdl);
+        arguments.flag("pdl", descriptor.pdl);
 
         // One program gathers a block of destination elements, or scatters a block of columns.
         kernel.launch(

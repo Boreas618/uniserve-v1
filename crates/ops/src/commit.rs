@@ -302,21 +302,21 @@ impl Op for SlotCommit {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.columns)
-            .view(&args.tokens)
-            .view(&args.valid)
-            .view(&args.active)
-            .view(&args.continuation)
-            .view(&args.points)
-            .view(&args.future)
-            .view(&args.predicates)
-            .view(&args.logical)
-            .view(&args.sampling)
-            .view(&args.verified)
-            .view(&args.penalties)
-            .i64(args.count as i64);
+            .view("columns", &args.columns)
+            .view("tokens", &args.tokens)
+            .view("valid", &args.valid)
+            .view("active", &args.active)
+            .view("continuation", &args.continuation)
+            .view("points", &args.points)
+            .view("future", &args.future)
+            .view("predicates", &args.predicates)
+            .view("logical", &args.logical)
+            .view("sampling", &args.sampling)
+            .view("verified", &args.verified)
+            .view("penalties", &args.penalties)
+            .u64("count", args.count);
         kernel.launch(LaunchGrid::linear(1)?, &mut arguments, stream)
     }
 

@@ -241,28 +241,27 @@ impl Op for Unpatchify {
         // The outer strides of the layout `check` accepted.
         let strides = crate::operand::outer_strides(&args.out);
 
-        let mut arguments = Arguments::new();
-        arguments.view(&args.tokens);
+        let mut arguments = Arguments::new(Self::NAME);
+        arguments.view("tokens_ptr", &args.tokens);
         if let (Some(scale), Some(bias)) = (args.scale, args.bias) {
-            arguments.view(&scale).view(&bias);
+            arguments.view("scale_ptr", &scale).view("bias_ptr", &bias);
         }
-        // The affine operand pair and the raster's form are the compilation's, not the launch's: the
-        // descriptor says which program this is, so naming it here would only shift the two scratch
-        // addresses the compiler's launcher appends after these parameters.
+        // Whether the affine pair is read, and the raster's form, are the compilation's, not the
+        // launch's: the descriptor says which program this is, and only its operands travel.
         arguments
-            .view(&args.out)
-            .u32(args.channels)
-            .u32(args.frames)
-            .u32(args.height)
-            .u32(args.width)
-            .u32(args.patch_frames)
-            .u32(args.patch_height)
-            .u32(args.patch_width)
-            .u64(strides[0])
-            .u64(strides[1])
-            .u64(strides[2])
-            .u32(descriptor.block)
-            .flag(descriptor.pdl);
+            .view("out_ptr", &args.out)
+            .u32("channels", args.channels)
+            .u32("frames", args.frames)
+            .u32("height", args.height)
+            .u32("width", args.width)
+            .u32("patch_frames", args.patch_frames)
+            .u32("patch_height", args.patch_height)
+            .u32("patch_width", args.patch_width)
+            .u64("out_stride0", strides[0])
+            .u64("out_stride1", strides[1])
+            .u64("out_stride2", strides[2])
+            .u32("block", descriptor.block)
+            .flag("pdl", descriptor.pdl);
         // The grid walks the output's elements: one thread writes one voxel, so a token's voxels are
         // written by the threads that own them and no thread waits for another.
         kernel.launch(

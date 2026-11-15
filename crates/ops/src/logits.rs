@@ -93,13 +93,13 @@ impl Op for LogitsGather {
         let columns = u64::from(descriptor.columns);
         let count = args.rows.dim(0);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.hidden)
-            .view(&args.rows)
-            .view(&args.out)
-            .u64(count)
-            .u32(descriptor.columns);
+            .view("hidden_ptr", &args.hidden)
+            .view("rows_ptr", &args.rows)
+            .view("out_ptr", &args.out)
+            .u64("count", count)
+            .u32("columns", descriptor.columns);
         kernel.launch(
             LaunchGrid::covering(count * columns, u64::from(descriptor.block))?,
             &mut arguments,
@@ -222,14 +222,14 @@ impl Op for VocabUnpad {
         let vocabulary = u64::from(descriptor.vocabulary);
         let rows = args.gathered.rows();
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.gathered)
-            .view(&args.out)
-            .u64(rows)
-            .u32(descriptor.padded)
-            .u32(descriptor.vocabulary)
-            .u32(args.ranks);
+            .view("gathered_ptr", &args.gathered)
+            .view("out_ptr", &args.out)
+            .u64("rows", rows)
+            .u32("padded", descriptor.padded)
+            .u32("vocabulary", descriptor.vocabulary)
+            .u32("ranks", args.ranks);
         kernel.launch(
             LaunchGrid::covering(rows * vocabulary, u64::from(descriptor.block))?,
             &mut arguments,

@@ -186,11 +186,11 @@ impl Op for CacheBlockSnapshot {
         // One block per selected index: `check` holds the index vector to one axis.
         let count = args.blocks.dim(0);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.field)
-            .view(&args.blocks)
-            .view(&args.snapshot);
+            .view("field", &args.field)
+            .view("blocks", &args.blocks)
+            .view("snapshot", &args.snapshot);
         kernel.launch(
             LaunchGrid::new([
                 count,
@@ -270,11 +270,11 @@ impl Op for CacheBlockScatter {
         // One block per selected index: `check` holds the index vector to one axis.
         let count = args.blocks.dim(0);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.field)
-            .view(&args.blocks)
-            .view(&args.snapshot);
+            .view("field", &args.field)
+            .view("blocks", &args.blocks)
+            .view("snapshot", &args.snapshot);
         kernel.launch(
             LaunchGrid::new([
                 count,

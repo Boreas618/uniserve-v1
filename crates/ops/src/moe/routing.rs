@@ -226,18 +226,20 @@ impl Op for TopkSoftmax {
             actual: "native",
         })?;
         let grid = LaunchGrid::covering(tokens, u64::from(metadata.num_warps))?;
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.scores)
-            .i32(Self::score_kind(descriptor.scores))
-            .i64(to_i64(Self::NAME, row_stride(&args.scores))?)
-            .i32(to_i32(Self::NAME, tokens)?)
-            .i32(to_i32(Self::NAME, experts)?)
-            .i32(to_i32(Self::NAME, top)?)
-            .i32(i32::from(descriptor.renormalize));
+            .view("scores", &args.scores)
+            .i32("score_kind", Self::score_kind(descriptor.scores))
+            .i64("row_stride", to_i64(Self::NAME, row_stride(&args.scores))?)
+            .i32("rows", to_i32(Self::NAME, tokens)?)
+            .i32("experts", to_i32(Self::NAME, experts)?)
+            .i32("top", to_i32(Self::NAME, top)?)
+            .i32("renormalize", i32::from(descriptor.renormalize));
         match scale {
             Some(pointer) => {
-                arguments.pointer(pointer).i32(scale_kind);
+                arguments
+                    .pointer("scale", pointer)
+                    .i32("scale_kind", scale_kind);
             }
             None => {
                 // The module's parameter is a device address whatever the scale kind says: an
@@ -246,12 +248,17 @@ impl Op for TopkSoftmax {
                 // module declares a pointer there, so a scalar in that slot is refused before the
                 // launch — and if it were not, the program would read address zero.
                 arguments
-                    .pointer(DevicePtr::from_address(0))
-                    .i32(scale_kind);
+                    .pointer("scale", DevicePtr::from_address(0))
+                    .i32("scale_kind", scale_kind);
             }
         }
-        arguments.view(&args.ids).view(&args.weights);
-        arguments.pointer(args.map.map_or(DevicePtr::from_address(0), |map| map.ptr));
+        arguments
+            .view("ids", &args.ids)
+            .view("weights", &args.weights);
+        arguments.pointer(
+            "map",
+            args.map.map_or(DevicePtr::from_address(0), |map| map.ptr),
+        );
         kernel.launch(grid, &mut arguments, stream)
     }
 

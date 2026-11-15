@@ -204,20 +204,20 @@ impl Op for KvWrite {
         // The token count is the first extent of the `[tokens, heads, head_dim]` key view.
         let tokens = args.key.dim(0);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.key)
-            .view(&args.value)
-            .view(&args.key_cache)
-            .view(&args.value_cache)
-            .view(&args.slots)
-            .view(&args.key_initialized)
-            .view(&args.value_initialized)
-            .u64(tokens)
-            .u32(descriptor.page)
-            .u32(descriptor.heads)
-            .u32(descriptor.head_dim)
-            .flag(descriptor.pdl);
+            .view("key_ptr", &args.key)
+            .view("value_ptr", &args.value)
+            .view("key_cache_ptr", &args.key_cache)
+            .view("value_cache_ptr", &args.value_cache)
+            .view("slots_ptr", &args.slots)
+            .view("key_initialized_ptr", &args.key_initialized)
+            .view("value_initialized_ptr", &args.value_initialized)
+            .u64("tokens", tokens)
+            .u32("page", descriptor.page)
+            .u32("heads", descriptor.heads)
+            .u32("head_dim", descriptor.head_dim)
+            .flag("pdl", descriptor.pdl);
         kernel.launch(
             LaunchGrid::new([tokens, row.div_ceil(u64::from(descriptor.tile)), 1])?,
             &mut arguments,
@@ -437,18 +437,18 @@ impl Op for KvWriteScaled {
     ) -> Result<()> {
         let tokens = args.source.rows();
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.source)
-            .view(&args.slots)
-            .view(&args.scales)
-            .view(&args.cache)
-            .view(&args.initialized)
-            .u64(tokens)
-            .u32(descriptor.page)
-            .u32(descriptor.heads)
-            .u32(descriptor.head_dim)
-            .flag(descriptor.pdl);
+            .view("source_ptr", &args.source)
+            .view("slots_ptr", &args.slots)
+            .view("scales_ptr", &args.scales)
+            .view("cache_ptr", &args.cache)
+            .view("initialized_ptr", &args.initialized)
+            .u64("tokens", tokens)
+            .u32("page", descriptor.page)
+            .u32("heads", descriptor.heads)
+            .u32("head_dim", descriptor.head_dim)
+            .flag("pdl", descriptor.pdl);
         // One program per token, so the work follows the tokens this launch writes and not the
         // pages the cache has: a page's maximum is over every row the launch brings to it and its
         // re-encode over every row already written, so one program writes each page, the program

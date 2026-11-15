@@ -29,6 +29,7 @@
 //! is given, never allocates, synchronizes or reads device memory on the host, and is safe to call
 //! while the stream is capturing.
 
+use std::borrow::Cow;
 use std::ffi::c_void;
 
 use platform::{
@@ -238,22 +239,27 @@ impl LaunchGrid {
     }
 }
 
-/// The arguments of one launch, packed into the array a driver launch takes.
+/// The arguments of one launch: each word named for the kernel parameter the operator means, and
+/// packed into the array a driver launch takes once the kernel's own signature has accepted them.
 ///
-/// Every parameter is one machine word: a device address for a tensor or a pointer, or a scalar.
-/// The array handed to the driver points at those words, so the packing owns them and the operator
-/// can build a call in one expression without naming a stack variable per argument.
-#[derive(Default)]
+/// The operator states every word with the name of the parameter it fills and its value in the
+/// operator's own type. [`Arguments::parameters`] holds that list to the module's signature (the
+/// same names in the same order, each value one its parameter's type holds) and only then writes
+/// each word as the parameter's type lays it out, so the order and the names a launch packs are
+/// checked by the module itself, and a disagreement is refused naming the operator, the position
+/// and both names instead of reaching the driver as a misread word.
 pub struct Arguments {
+    /// The operator whose launch this is ([`crate::Op::NAME`]), for the refusal.
+    operator: &'static str,
+    /// The words in the order the operator packed them.
+    stated: Vec<Word>,
     // One allocation per parameter on purpose: the driver's parameter array points into these
-    // words, so their addresses must not change when a later parameter is packed.
+    // words, so their addresses must not change when a later parameter is written.
     #[expect(
         clippy::vec_box,
         reason = "the driver reads the words through pointers, so each word keeps its address"
     )]
     words: Vec<Box<u64>>,
-    /// For each word, whether the driver reads a device address out of it.
-    kinds: Vec<Word>,
     /// The global scratch address, for a kernel whose metadata asks for one.
     scratch: Option<DevicePtr>,
     /// The word the scratch address is read from at launch.
@@ -263,64 +269,157 @@ pub struct Arguments {
     parameters: Vec<*mut c_void>,
 }
 
-/// What the driver reads out of one packed parameter.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Word {
+/// One word an operator packs: the parameter it means and the value it gives it.
+struct Word {
+    /// The kernel parameter's name, as the kernel's `def` spells it.
+    name: Cow<'static, str>,
+    value: Value,
+}
+
+/// A packed value, in the type the operator holds it in.
+///
+/// It is laid out in the parameter's own type only once the signature has accepted it, so an
+/// integer packed from a `u32` fills an `i32` parameter exactly when the `i32` holds it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Value {
     /// A device address.
-    Pointer,
-    /// A scalar value, in the low bytes of the word.
-    Scalar,
+    Address(u64),
+    /// An integer: every `u64` and every `i64` is one.
+    Integer(i128),
+    /// A single-precision float.
+    F32(f32),
+    /// A double-precision float.
+    F64(f64),
+}
+
+impl Value {
+    /// The value, for error text.
+    fn describe(self) -> String {
+        match self {
+            Self::Address(address) => format!("the device address {address:#x}"),
+            Self::Integer(value) => format!("the integer {value}"),
+            Self::F32(value) => format!("the f32 {value}"),
+            Self::F64(value) => format!("the f64 {value}"),
+        }
+    }
+}
+
+/// What a parameter of a module's signature reads, by its type's spelling.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Reads {
+    /// A device address: `*bf16`, `*i32`, ...
+    Address,
+    /// An integer of the range a type of that many bits and signedness holds.
+    Integer { min: i128, max: i128 },
+    /// `fp32`.
+    F32,
+    /// `fp64`.
+    F64,
+}
+
+impl Reads {
+    /// What a parameter of type `ty` reads, or `None` for a type no launch word fills.
+    fn of(ty: &str) -> Option<Self> {
+        if ty.starts_with('*') {
+            return Some(Self::Address);
+        }
+        let integer = |bits: u32, signed: bool| {
+            let (min, max) = if signed {
+                (-(1_i128 << (bits - 1)), (1_i128 << (bits - 1)) - 1)
+            } else {
+                (0, (1_i128 << bits) - 1)
+            };
+            Some(Self::Integer { min, max })
+        };
+        match ty {
+            "i8" => integer(8, true),
+            "i16" => integer(16, true),
+            "i32" => integer(32, true),
+            "i64" => integer(64, true),
+            "u8" => integer(8, false),
+            "u16" => integer(16, false),
+            "u32" => integer(32, false),
+            "u64" => integer(64, false),
+            "fp32" => Some(Self::F32),
+            "fp64" => Some(Self::F64),
+            _ => None,
+        }
+    }
+
+    /// The word a parameter reading this holds for `value`, laid out as the driver reads it (the
+    /// parameter's bytes are the word's low bytes), or `None` when the parameter cannot hold it.
+    fn encode(self, value: Value) -> Option<u64> {
+        match (self, value) {
+            (Self::Address, Value::Address(address)) => Some(address),
+            // Two's complement truncated to the word: the low bytes of a value the range holds are
+            // the parameter's bytes, whatever its width.
+            (Self::Integer { min, max }, Value::Integer(value)) => {
+                (min..=max).contains(&value).then_some(value as u64)
+            }
+            (Self::F32, Value::F32(value)) => Some(u64::from(value.to_bits())),
+            (Self::F64, Value::F64(value)) => Some(value.to_bits()),
+            _ => None,
+        }
+    }
 }
 
 impl Arguments {
-    /// No arguments yet.
-    pub fn new() -> Self {
-        Self::default()
+    /// No arguments yet, of a launch of `operator`.
+    pub fn new(operator: &'static str) -> Self {
+        Self {
+            operator,
+            stated: Vec::new(),
+            words: Vec::new(),
+            scratch: None,
+            scratch_slot: Box::new(0),
+            profile_slot: Box::new(0),
+            parameters: Vec::new(),
+        }
     }
 
-    /// A device address.
-    pub fn pointer(&mut self, pointer: DevicePtr) -> &mut Self {
-        self.packed(Word::Pointer, pointer.address())
+    /// The device address of the parameter `name`.
+    pub fn pointer(&mut self, name: impl Into<Cow<'static, str>>, pointer: DevicePtr) -> &mut Self {
+        self.packed(name, Value::Address(pointer.address()))
     }
 
-    /// The address a tensor view starts at.
-    pub fn view(&mut self, view: &Operand) -> &mut Self {
-        self.pointer(view.ptr)
+    /// The address a tensor view starts at, for the parameter `name`.
+    pub fn view(&mut self, name: impl Into<Cow<'static, str>>, view: &Operand) -> &mut Self {
+        self.pointer(name, view.ptr)
     }
 
-    /// An `u64` scalar.
-    pub fn u64(&mut self, value: u64) -> &mut Self {
-        self.word(value)
+    /// An `u64` value of the parameter `name`.
+    pub fn u64(&mut self, name: impl Into<Cow<'static, str>>, value: u64) -> &mut Self {
+        self.packed(name, Value::Integer(i128::from(value)))
     }
 
-    /// An `i64` scalar.
-    pub fn i64(&mut self, value: i64) -> &mut Self {
-        self.word(value as u64)
+    /// An `i64` value of the parameter `name`.
+    pub fn i64(&mut self, name: impl Into<Cow<'static, str>>, value: i64) -> &mut Self {
+        self.packed(name, Value::Integer(i128::from(value)))
     }
 
-    /// An `u32` scalar.
-    pub fn u32(&mut self, value: u32) -> &mut Self {
-        self.word(u64::from(value))
+    /// An `u32` value of the parameter `name`.
+    pub fn u32(&mut self, name: impl Into<Cow<'static, str>>, value: u32) -> &mut Self {
+        self.packed(name, Value::Integer(i128::from(value)))
     }
 
-    /// An `i32` scalar.
-    pub fn i32(&mut self, value: i32) -> &mut Self {
-        self.word(u64::from(value as u32))
+    /// An `i32` value of the parameter `name`.
+    pub fn i32(&mut self, name: impl Into<Cow<'static, str>>, value: i32) -> &mut Self {
+        self.packed(name, Value::Integer(i128::from(value)))
     }
 
-    /// An `f32` scalar, in the low word of a 64-bit slot as the ABI requires.
-    pub fn f32(&mut self, value: f32) -> &mut Self {
-        self.word(u64::from(value.to_bits()))
+    /// An `f32` value of the parameter `name`.
+    pub fn f32(&mut self, name: impl Into<Cow<'static, str>>, value: f32) -> &mut Self {
+        self.packed(name, Value::F32(value))
     }
 
-    /// An `f64` scalar.
-    pub fn f64(&mut self, value: f64) -> &mut Self {
-        self.word(value.to_bits())
+    /// An `f64` value of the parameter `name`.
+    pub fn f64(&mut self, name: impl Into<Cow<'static, str>>, value: f64) -> &mut Self {
+        self.packed(name, Value::F64(value))
     }
 
-    /// A boolean scalar, as the `i32` a C `_Bool` parameter takes.
-    pub fn flag(&mut self, value: bool) -> &mut Self {
-        self.i32(i32::from(value))
+    /// A boolean of the parameter `name`, as the integer 0 or 1 a C `_Bool` parameter takes.
+    pub fn flag(&mut self, name: impl Into<Cow<'static, str>>, value: bool) -> &mut Self {
+        self.packed(name, Value::Integer(i128::from(value)))
     }
 
     /// The global scratch the kernel's metadata asks for.
@@ -337,24 +436,29 @@ impl Arguments {
     ///
     /// # Errors
     ///
-    /// [`Error::Metadata`] when the packed words disagree with the kernel's signature, or the
+    /// [`Error::Signature`] when the packed words disagree with the kernel's signature (their
+    /// number, a name at a position, or a value its parameter's type does not hold), or the
     /// global scratch with what the metadata declares.
     pub fn parameters(&mut self, metadata: &CubinMetadata) -> Result<&mut [*mut c_void]> {
         match (metadata.needs_scratch(), self.scratch) {
             (true, None) => {
-                return Err(Error::Metadata(
+                return Err(self.refused(
+                    metadata,
                     "the kernel declares global scratch and the operator passed none".to_owned(),
                 ));
             }
             (false, Some(_)) => {
-                return Err(Error::Metadata(
+                return Err(self.refused(
+                    metadata,
                     "the operator passed global scratch to a kernel that declares none".to_owned(),
                 ));
             }
             _ => {}
         }
 
-        self.check(metadata)?;
+        let words = self.check(metadata)?;
+        self.words.clear();
+        self.words.extend(words.into_iter().map(Box::new));
         self.parameters.clear();
         self.parameters.extend(
             self.words
@@ -380,12 +484,15 @@ impl Arguments {
         matches!(name, "global_scratch" | "profile_scratch")
     }
 
-    /// Refuse a parameter list that disagrees with the program's own signature.
+    /// The words of a launch of the kernel `metadata` describes, each laid out in its parameter's
+    /// type, or the refusal of a list that disagrees with the program's own signature.
     ///
-    /// The driver reads one value per parameter at the address it is handed, so a list that is short,
-    /// long, or has a scalar where the program reads a pointer is not a near miss: the launch dies in
-    /// the driver, or reads a device address it was never given, and neither names the operator.
-    fn check(&self, metadata: &CubinMetadata) -> Result<()> {
+    /// The driver reads one value per parameter at the address it is handed, so a list that is
+    /// short, long, names another parameter at a position, or holds a value its parameter's type
+    /// does not (a scalar where the program reads an address, a float where it reads an integer,
+    /// an integer beyond the parameter's range) is not a near miss: the launch dies in the driver,
+    /// or the program reads another value than the operator meant, and neither names the operator.
+    fn check(&self, metadata: &CubinMetadata) -> Result<Vec<u64>> {
         // `parameters` appends the global and the profile scratch address after the packed words, so
         // the launch passes two more words than the operator packed, whatever the scratch sizes are.
         //
@@ -401,35 +508,68 @@ impl Arguments {
             .iter()
             .filter(|parameter| !Self::is_scratch(&parameter.name))
             .collect();
-        let expected = declared.len();
-        let supplied = self.kinds.len();
-        if expected != supplied {
-            return Err(Error::Metadata(format!(
-                "{} declares {expected} parameters ({}) and the operator packed {supplied} ({})",
-                metadata.name,
-                Self::describe(&metadata.signature),
-                Self::describe_packed(&self.kinds),
-            )));
+        if declared.len() != self.stated.len() {
+            return Err(self.refused(
+                metadata,
+                format!(
+                    "the operator packs {} words ({}) and the kernel takes {} parameters ({})",
+                    self.stated.len(),
+                    self.describe_packed(),
+                    declared.len(),
+                    Self::describe(&declared),
+                ),
+            ));
         }
-        for (position, (parameter, word)) in declared.iter().zip(&self.kinds).enumerate() {
-            if parameter.is_pointer() != (*word == Word::Pointer) {
-                return Err(Error::Metadata(format!(
-                    "{} parameter {position} `{}` is `{}` and the operator packed a {} there",
-                    metadata.name,
-                    parameter.name,
-                    parameter.ty,
-                    match word {
-                        Word::Pointer => "device address",
-                        Word::Scalar => "scalar",
-                    }
-                )));
+
+        let mut words = Vec::with_capacity(declared.len());
+        for (position, (parameter, word)) in declared.iter().zip(&self.stated).enumerate() {
+            if parameter.name != word.name {
+                return Err(self.refused(
+                    metadata,
+                    format!(
+                        "the operator packs `{}` at position {position}, where the kernel takes \
+                         `{}`",
+                        word.name, parameter.name
+                    ),
+                ));
             }
+            let Some(reads) = Reads::of(&parameter.ty) else {
+                return Err(self.refused(
+                    metadata,
+                    format!(
+                        "parameter {position} `{}` is `{}`, which no launch word fills",
+                        parameter.name, parameter.ty
+                    ),
+                ));
+            };
+            let Some(encoded) = reads.encode(word.value) else {
+                return Err(self.refused(
+                    metadata,
+                    format!(
+                        "the operator packs {} for `{}` at position {position}, which the \
+                         kernel's `{}` parameter does not hold",
+                        word.value.describe(),
+                        word.name,
+                        parameter.ty
+                    ),
+                ));
+            };
+            words.push(encoded);
         }
-        Ok(())
+        Ok(words)
+    }
+
+    /// The refusal of this launch of the kernel `metadata` describes.
+    fn refused(&self, metadata: &CubinMetadata, problem: String) -> Error {
+        Error::Signature {
+            operator: self.operator,
+            kernel: metadata.name.clone(),
+            problem,
+        }
     }
 
     /// The parameters of a signature, for error text.
-    fn describe(signature: &[Parameter]) -> String {
+    fn describe(signature: &[&Parameter]) -> String {
         signature
             .iter()
             .map(|parameter| format!("`{}`: {}", parameter.name, parameter.ty))
@@ -438,24 +578,19 @@ impl Arguments {
     }
 
     /// The packed words, for error text.
-    fn describe_packed(kinds: &[Word]) -> String {
-        kinds
+    fn describe_packed(&self) -> String {
+        self.stated
             .iter()
-            .map(|word| match word {
-                Word::Pointer => "address".to_owned(),
-                Word::Scalar => "scalar".to_owned(),
-            })
+            .map(|word| format!("`{}`", word.name))
             .collect::<Vec<_>>()
             .join(", ")
     }
 
-    fn word(&mut self, value: u64) -> &mut Self {
-        self.packed(Word::Scalar, value)
-    }
-
-    fn packed(&mut self, kind: Word, value: u64) -> &mut Self {
-        self.words.push(Box::new(value));
-        self.kinds.push(kind);
+    fn packed(&mut self, name: impl Into<Cow<'static, str>>, value: Value) -> &mut Self {
+        self.stated.push(Word {
+            name: name.into(),
+            value,
+        });
         self
     }
 }
@@ -724,7 +859,7 @@ mod tests {
     use super::{Arguments, CubinMetadata, DevicePtr, Kernel, NativeLibrary};
     use crate::Error;
 
-    /// A metadata record of a kernel taking `signature` (a JSON object, in parameter order) and
+    /// A metadata record of `_kernel` taking `signature` (a JSON object, in parameter order) and
     /// `global_scratch_size` bytes of global scratch, the other fields as Triton writes them for a
     /// plain kernel.
     fn metadata(signature: &str, global_scratch_size: u64) -> CubinMetadata {
@@ -746,81 +881,213 @@ mod tests {
         CubinMetadata::parse(record.to_string().as_bytes()).expect("the metadata parses")
     }
 
+    /// The words the driver reads at each of `parameters`' addresses.
+    fn read(parameters: &[*mut std::ffi::c_void]) -> Vec<u64> {
+        parameters
+            .iter()
+            // SAFETY: every entry points at a word the arguments own and keep while borrowed.
+            .map(|&parameter| unsafe { *(parameter as *const u64) })
+            .collect()
+    }
+
+    /// The refusal of `arguments` launching `module`: the operator, the kernel and the problem.
+    fn refusal(
+        arguments: &mut Arguments,
+        module: &CubinMetadata,
+    ) -> (&'static str, String, String) {
+        match arguments.parameters(module) {
+            Err(Error::Signature {
+                operator,
+                kernel,
+                problem,
+            }) => (operator, kernel, problem),
+            Err(other) => panic!("a disagreement is a signature refusal, not {other}"),
+            Ok(_) => panic!("the words disagree with the signature and were accepted"),
+        }
+    }
+
     #[test]
-    fn a_module_takes_its_own_parameters_and_then_the_two_scratch_addresses() {
-        let module = metadata(r#"{"x":"*bf16","rows":"i32"}"#, 0);
-        let mut arguments = Arguments::new();
-        arguments.pointer(DevicePtr::from_address(0x1000)).u32(7);
-        // The program's two parameters, then the global and the profile scratch address Triton's
-        // launcher appends and its PTX declares whatever their size is.
-        assert_eq!(arguments.parameters(&module).unwrap().len(), 4);
+    fn a_launch_passes_each_named_word_in_its_parameters_type_then_the_two_scratch_addresses() {
+        let module = metadata(
+            r#"{"x":"*bf16","rows":"i32","offset":"i64","eps":"fp32","wide":"fp64","bits":"u8"}"#,
+            0,
+        );
+        let mut arguments = Arguments::new("operator");
+        arguments
+            .pointer("x", DevicePtr::from_address(0x1000))
+            .u32("rows", 7)
+            .i32("offset", -3)
+            .f32("eps", 0.5)
+            .f64("wide", 0.25)
+            .flag("bits", true);
+
+        // The program's six parameters, then the global and the profile scratch address Triton's
+        // launcher appends and its PTX declares whatever their size is. The driver reads each
+        // parameter's bytes from the low bytes of its word: `-3` is the `i64` two's complement.
+        let words = read(arguments.parameters(&module).unwrap());
+        assert_eq!(
+            words,
+            [
+                0x1000,
+                7,
+                (-3_i64) as u64,
+                u64::from(0.5_f32.to_bits()),
+                0.25_f64.to_bits(),
+                1,
+                0,
+                0
+            ]
+        );
     }
 
     #[test]
     fn a_signature_that_names_its_scratch_is_not_counted_twice() {
-        // Triton 3.7's metadata records the two scratch addresses inside the signature, and the launch
-        // appends those two slots itself. A module of two parameters therefore takes two packed
-        // words, not four: counting the named entries again refused every module built that way.
+        // Triton 3.7's metadata may record the two scratch addresses inside the signature, and the
+        // launch appends those two slots itself. A module of two parameters therefore takes two
+        // packed words, not four.
         let module = metadata(
             r#"{"x":"*bf16","rows":"i32","global_scratch":"*i8","profile_scratch":"*i8"}"#,
             0,
         );
-        let mut arguments = Arguments::new();
-        arguments.pointer(DevicePtr::from_address(0x1000)).u32(7);
+        let mut arguments = Arguments::new("operator");
+        arguments
+            .pointer("x", DevicePtr::from_address(0x1000))
+            .u32("rows", 7);
         assert_eq!(arguments.parameters(&module).unwrap().len(), 4);
-        let mut long = Arguments::new();
-        long.pointer(DevicePtr::from_address(0x1000)).u32(7).u32(1);
-        let error = long.parameters(&module).unwrap_err().to_string();
-        assert!(error.contains("declares 2 parameters"), "{error}");
-        assert!(error.contains("packed 3"), "{error}");
     }
 
     #[test]
-    fn the_parameter_list_must_hold_one_word_per_parameter() {
+    fn a_list_of_another_length_is_refused_with_both_lists() {
         let module = metadata(r#"{"x":"*bf16","rows":"i32","eps":"fp32"}"#, 0);
-        let mut short = Arguments::new();
-        short.pointer(DevicePtr::from_address(0x1000)).u32(7);
-        let error = short.parameters(&module).unwrap_err().to_string();
-        assert!(error.contains("_kernel"), "{error}");
-        assert!(error.contains("declares 3 parameters"), "{error}");
-        assert!(error.contains("packed 2"), "{error}");
-        assert!(error.contains("`eps`: fp32"), "{error}");
+        let mut short = Arguments::new("rms_norm");
+        short
+            .pointer("x", DevicePtr::from_address(0x1000))
+            .u32("rows", 7);
+
+        let (operator, kernel, problem) = refusal(&mut short, &module);
+        assert_eq!((operator, kernel.as_str()), ("rms_norm", "_kernel"));
+        assert!(problem.contains("packs 2 words (`x`, `rows`)"), "{problem}");
+        assert!(problem.contains("takes 3 parameters"), "{problem}");
+        assert!(problem.contains("`eps`: fp32"), "{problem}");
     }
 
     #[test]
-    fn a_scalar_where_the_program_reads_an_address_is_refused_by_position() {
+    fn a_word_named_for_another_parameter_is_refused_by_position_and_both_names() {
+        // Two words of one type packed in each other's place: the count and every kind agree, and
+        // only the names tell the program would read the row count as the column count.
+        let module = metadata(r#"{"x":"*bf16","rows":"i32","columns":"i32"}"#, 0);
+        let mut swapped = Arguments::new("operator");
+        swapped
+            .pointer("x", DevicePtr::from_address(0x1000))
+            .u32("columns", 64)
+            .u32("rows", 7);
+
+        let (operator, kernel, problem) = refusal(&mut swapped, &module);
+        assert_eq!((operator, kernel.as_str()), ("operator", "_kernel"));
+        assert!(
+            problem.contains("packs `columns` at position 1, where the kernel takes `rows`"),
+            "{problem}"
+        );
+    }
+
+    #[test]
+    fn a_scalar_where_the_program_reads_an_address_is_refused_and_so_is_the_reverse() {
         let module = metadata(r#"{"x":"*bf16","rows":"i32"}"#, 0);
-        let mut arguments = Arguments::new();
-        arguments.u64(0).u32(7);
-        let error = arguments.parameters(&module).unwrap_err().to_string();
-        assert!(error.contains("parameter 0 `x` is `*bf16`"), "{error}");
-        assert!(error.contains("scalar"), "{error}");
+
+        let mut scalar = Arguments::new("operator");
+        scalar.u64("x", 0x1000).u32("rows", 7);
+        let (_, _, problem) = refusal(&mut scalar, &module);
+        assert!(
+            problem.contains("the integer 4096 for `x` at position 0"),
+            "{problem}"
+        );
+        assert!(problem.contains("`*bf16`"), "{problem}");
+
+        let mut address = Arguments::new("operator");
+        address
+            .pointer("x", DevicePtr::from_address(0x1000))
+            .pointer("rows", DevicePtr::from_address(0x2000));
+        let (_, _, problem) = refusal(&mut address, &module);
+        assert!(
+            problem.contains("the device address 0x2000 for `rows` at position 1"),
+            "{problem}"
+        );
+    }
+
+    #[test]
+    fn an_integer_the_parameters_type_does_not_hold_is_refused() {
+        // A `u32` fills an `i32` parameter while the `i32` holds it; beyond `i32::MAX` the program
+        // would read a negative number.
+        let module = metadata(r#"{"rows":"i32","bits":"u16"}"#, 0);
+
+        let mut wide = Arguments::new("operator");
+        wide.u32("rows", 3_000_000_000).u32("bits", 1);
+        let (_, _, problem) = refusal(&mut wide, &module);
+        assert!(
+            problem.contains("the integer 3000000000 for `rows` at position 0"),
+            "{problem}"
+        );
+        assert!(
+            problem.contains("`i32` parameter does not hold"),
+            "{problem}"
+        );
+
+        let mut negative = Arguments::new("operator");
+        negative.i32("rows", 1).i64("bits", -1);
+        let (_, _, problem) = refusal(&mut negative, &module);
+        assert!(problem.contains("the integer -1 for `bits`"), "{problem}");
+        assert!(problem.contains("`u16`"), "{problem}");
+    }
+
+    #[test]
+    fn a_float_and_an_integer_never_fill_each_others_parameters() {
+        let module = metadata(r#"{"eps":"fp32","rows":"i32"}"#, 0);
+
+        let mut integer = Arguments::new("operator");
+        integer.u32("eps", 1).u32("rows", 7);
+        let (_, _, problem) = refusal(&mut integer, &module);
+        assert!(problem.contains("`eps` at position 0"), "{problem}");
+
+        let mut float = Arguments::new("operator");
+        float.f32("eps", 1e-6).f32("rows", 7.0);
+        let (_, _, problem) = refusal(&mut float, &module);
+        assert!(problem.contains("the f32 7 for `rows`"), "{problem}");
+
+        // An `f64` is no `fp32`: the program would read half of it.
+        let mut double = Arguments::new("operator");
+        double.f64("eps", 1e-6).u32("rows", 7);
+        let (_, _, problem) = refusal(&mut double, &module);
+        assert!(problem.contains("the f64"), "{problem}");
+    }
+
+    #[test]
+    fn a_parameter_of_a_type_no_word_fills_is_refused_by_name() {
+        let module = metadata(r#"{"descriptor":"nvTmaDesc"}"#, 0);
+        let mut arguments = Arguments::new("operator");
+        arguments.u64("descriptor", 0);
+        let (_, _, problem) = refusal(&mut arguments, &module);
+        assert!(
+            problem.contains("parameter 0 `descriptor` is `nvTmaDesc`"),
+            "{problem}"
+        );
     }
 
     #[test]
     fn global_scratch_is_a_value_the_caller_supplies_and_its_absence_is_refused() {
         let module = metadata(r#"{"x":"*bf16"}"#, 4096);
-        let mut arguments = Arguments::new();
-        arguments.pointer(DevicePtr::from_address(0x1000));
+        let mut arguments = Arguments::new("operator");
+        arguments.pointer("x", DevicePtr::from_address(0x1000));
         arguments.scratch(Some(DevicePtr::from_address(0x2000)));
-        // One declared parameter and the two scratch addresses.
-        assert_eq!(arguments.parameters(&module).unwrap().len(), 3);
+        // One declared parameter and the two scratch addresses, the global one supplied.
+        assert_eq!(
+            read(arguments.parameters(&module).unwrap()),
+            [0x1000, 0x2000, 0]
+        );
 
-        let mut without = Arguments::new();
-        without.pointer(DevicePtr::from_address(0x1000));
-        let error = without.parameters(&module).unwrap_err().to_string();
-        assert!(error.contains("global scratch"), "{error}");
-    }
-
-    #[test]
-    fn a_matching_list_packs_one_address_per_word() {
-        let module = metadata(r#"{"x":"*fp32","out":"*fp32","rows":"i64"}"#, 0);
-        let mut arguments = Arguments::new();
-        arguments
-            .pointer(DevicePtr::from_address(0x1000))
-            .pointer(DevicePtr::from_address(0x2000))
-            .u64(4);
-        assert_eq!(arguments.parameters(&module).unwrap().len(), 5);
+        let mut without = Arguments::new("operator");
+        without.pointer("x", DevicePtr::from_address(0x1000));
+        let (_, _, problem) = refusal(&mut without, &module);
+        assert!(problem.contains("global scratch"), "{problem}");
     }
 
     /// A load entry that refuses the module's directory refuses the module, with the entry's

@@ -132,16 +132,15 @@ impl Op for Snake {
 
         // One thread per element; the plane stride is the row-major one the check above pins.
         let elements = args.x.numel();
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.alpha)
-            .view(&args.out)
-            .u64(rows)
-            .u32(descriptor.channels)
-            // `check` keeps the width within a kernel parameter.
-            .u32(width as u32)
-            .flag(descriptor.pdl);
+            .view("x_ptr", &args.x)
+            .view("alpha_ptr", &args.alpha)
+            .view("out_ptr", &args.out)
+            .u64("rows", rows)
+            .u32("channels", descriptor.channels)
+            .u64("width", width)
+            .flag("pdl", descriptor.pdl);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
             &mut arguments,

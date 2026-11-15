@@ -264,15 +264,15 @@ pub struct ElementwiseUnary;
 ///
 /// An integer element takes the scalar converted as a host cast converts it, saturating at the
 /// element type's bounds, which is the value the tensor library's host arithmetic uses.
-fn pack_scalar(arguments: &mut Arguments, dtype: DType, scalar: f64) {
+fn pack_scalar(arguments: &mut Arguments, name: &'static str, dtype: DType, scalar: f64) {
     match dtype {
-        DType::F64 => arguments.f64(scalar),
-        DType::U8 => arguments.i64(i64::from(scalar as u8)),
-        DType::U32 => arguments.i64(i64::from(scalar as u32)),
-        DType::I16 => arguments.i64(i64::from(scalar as i16)),
-        DType::I32 => arguments.i64(i64::from(scalar as i32)),
-        DType::I64 => arguments.i64(scalar as i64),
-        _ => arguments.f32(scalar as f32),
+        DType::F64 => arguments.f64(name, scalar),
+        DType::U8 => arguments.i64(name, i64::from(scalar as u8)),
+        DType::U32 => arguments.i64(name, i64::from(scalar as u32)),
+        DType::I16 => arguments.i64(name, i64::from(scalar as i16)),
+        DType::I32 => arguments.i64(name, i64::from(scalar as i32)),
+        DType::I64 => arguments.i64(name, scalar as i64),
+        _ => arguments.f32(name, scalar as f32),
     };
 }
 
@@ -315,14 +315,17 @@ impl Op for ElementwiseUnary {
         let [x, out] = strided::merge_axes([&args.x, &args.out]);
         let elements = out.numel();
 
-        let mut arguments = Arguments::new();
-        arguments.view(&x).view(&out).u64(elements);
-        strided::pack_extents(&mut arguments, &out);
-        strided::pack_strides(&mut arguments, &x);
-        for scalar in args.scalars {
-            pack_scalar(&mut arguments, descriptor.dtype, scalar);
+        let mut arguments = Arguments::new(Self::NAME);
+        arguments
+            .view("x", &x)
+            .view("out", &out)
+            .u64("elements", elements);
+        strided::pack_extents(&mut arguments, "d", &out);
+        strided::pack_strides(&mut arguments, "s", &x);
+        for (name, scalar) in ["a", "b"].into_iter().zip(args.scalars) {
+            pack_scalar(&mut arguments, name, descriptor.dtype, scalar);
         }
-        arguments.flag(descriptor.pdl);
+        arguments.flag("pdl", descriptor.pdl);
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
@@ -567,12 +570,16 @@ impl Op for ElementwiseBinary {
         let [lhs, rhs, out] = strided::merge_axes([&args.lhs, &args.rhs, &args.out]);
         let elements = out.numel();
 
-        let mut arguments = Arguments::new();
-        arguments.view(&lhs).view(&rhs).view(&out).u64(elements);
-        strided::pack_extents(&mut arguments, &out);
-        strided::pack_strides(&mut arguments, &lhs);
-        strided::pack_strides(&mut arguments, &rhs);
-        arguments.flag(descriptor.pdl);
+        let mut arguments = Arguments::new(Self::NAME);
+        arguments
+            .view("lhs", &lhs)
+            .view("rhs", &rhs)
+            .view("out", &out)
+            .u64("elements", elements);
+        strided::pack_extents(&mut arguments, "d", &out);
+        strided::pack_strides(&mut arguments, "l", &lhs);
+        strided::pack_strides(&mut arguments, "r", &rhs);
+        arguments.flag("pdl", descriptor.pdl);
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
@@ -714,18 +721,18 @@ impl Op for ElementwiseWhere {
             strided::merge_axes([&args.condition, &args.on_true, &args.on_false, &args.out]);
         let elements = out.numel();
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&condition)
-            .view(&on_true)
-            .view(&on_false)
-            .view(&out)
-            .u64(elements);
-        strided::pack_extents(&mut arguments, &out);
-        strided::pack_strides(&mut arguments, &condition);
-        strided::pack_strides(&mut arguments, &on_true);
-        strided::pack_strides(&mut arguments, &on_false);
-        arguments.flag(descriptor.pdl);
+            .view("condition", &condition)
+            .view("on_true", &on_true)
+            .view("on_false", &on_false)
+            .view("out", &out)
+            .u64("elements", elements);
+        strided::pack_extents(&mut arguments, "d", &out);
+        strided::pack_strides(&mut arguments, "c", &condition);
+        strided::pack_strides(&mut arguments, "t", &on_true);
+        strided::pack_strides(&mut arguments, "f", &on_false);
+        arguments.flag("pdl", descriptor.pdl);
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,

@@ -261,23 +261,23 @@ impl Op for Posterior {
         let channels = args.mean.dim(1);
 
         // Every narrowing below is of a value `check` holds within its kernel parameter.
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.mean)
-            .view(&args.log_variance)
-            .view(&args.noise)
-            .view(&args.out)
-            .u32(channels as u32)
-            .u32(args.mean.stride(0) as u32)
-            .u32(args.mean.stride(1) as u32)
-            .u32(args.log_variance.stride(0) as u32)
-            .u32(args.log_variance.stride(1) as u32)
-            .u32(args.noise.stride(0) as u32)
-            .u32(args.noise.stride(1) as u32)
-            .u32(args.out.stride(0) as u32)
-            .u32(args.out.stride(1) as u32)
-            .u64(positions * channels)
-            .flag(descriptor.pdl);
+            .view("mean_ptr", &args.mean)
+            .view("log_variance_ptr", &args.log_variance)
+            .view("noise_ptr", &args.noise)
+            .view("out_ptr", &args.out)
+            .u64("channels", channels)
+            .u64("mean_row", args.mean.stride(0))
+            .u64("mean_channel", args.mean.stride(1))
+            .u64("log_variance_row", args.log_variance.stride(0))
+            .u64("log_variance_channel", args.log_variance.stride(1))
+            .u64("noise_row", args.noise.stride(0))
+            .u64("noise_channel", args.noise.stride(1))
+            .u64("out_row", args.out.stride(0))
+            .u64("out_channel", args.out.stride(1))
+            .u64("total", positions * channels)
+            .flag("pdl", descriptor.pdl);
         kernel.launch(
             LaunchGrid::linear((positions * channels).div_ceil(u64::from(descriptor.block)))?,
             &mut arguments,

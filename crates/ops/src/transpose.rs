@@ -170,14 +170,14 @@ impl Op for Transpose {
         // `check` holds the input to a nonempty contiguous matrix.
         let (rows, columns) = (args.input.dim(0), args.input.dim(1));
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.input)
-            .view(&args.out)
-            .u64(rows)
-            .u64(columns)
-            .u32(descriptor.block)
-            .flag(descriptor.pdl);
+            .view("input", &args.input)
+            .view("out", &args.out)
+            .u64("rows", rows)
+            .u64("columns", columns)
+            .u32("block", descriptor.block)
+            .flag("pdl", descriptor.pdl);
         // One program per tile: the source is read a tile of columns at a time and the destination is
         // written a tile of rows at a time, so the grid is the tile grid and no axis needs a second
         // pass.

@@ -101,18 +101,17 @@ impl Op for Embedding {
     ) -> Result<()> {
         let tokens = args.ids.dim(0);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.ids)
-            .view(&args.weight)
-            .view(&args.out)
-            .u64(tokens)
-            .u32(descriptor.hidden)
-            .u32(descriptor.first)
-            .u32(descriptor.rows);
+            .view("ids_ptr", &args.ids)
+            .view("weight_ptr", &args.weight)
+            .view("out_ptr", &args.out)
+            .u64("tokens", tokens)
+            .u32("hidden", descriptor.hidden)
+            .u32("first", descriptor.first)
+            .u32("rows", descriptor.rows);
         // No dependent-launch word: the module takes that flag as a constexpr and the driver takes it
-        // as a launch attribute, and a parameter the module does not declare would push the two
-        // scratch addresses the compiler's launcher appends out of place.
+        // as a launch attribute.
         kernel.launch(
             LaunchGrid::covering(tokens, u64::from(descriptor.block))?,
             &mut arguments,

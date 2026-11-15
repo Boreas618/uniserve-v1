@@ -135,14 +135,14 @@ impl Op for RmsNorm {
         stream: &Stream,
     ) -> Result<()> {
         // The gain's row count is compiled in: a program reads gain row `row mod groups`.
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.weight)
-            .view(&args.out)
-            .u32(descriptor.columns)
-            .f32(args.eps)
-            .flag(descriptor.pdl);
+            .view("x_ptr", &args.x)
+            .view("w_ptr", &args.weight)
+            .view("y_ptr", &args.out)
+            .u32("columns", descriptor.columns)
+            .f32("eps", args.eps)
+            .flag("pdl", descriptor.pdl);
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
@@ -242,16 +242,16 @@ impl Op for AddRmsNorm {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.residual)
-            .view(&args.weight)
-            .view(&args.out)
-            .view(&args.residual_out)
-            .u32(descriptor.columns)
-            .f32(args.eps)
-            .flag(descriptor.pdl);
+            .view("x_ptr", &args.x)
+            .view("r_ptr", &args.residual)
+            .view("w_ptr", &args.weight)
+            .view("y_ptr", &args.out)
+            .view("c_ptr", &args.residual_out)
+            .u32("columns", descriptor.columns)
+            .f32("eps", args.eps)
+            .flag("pdl", descriptor.pdl);
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
@@ -375,14 +375,14 @@ impl Op for GatedRmsNorm {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.gate)
-            .view(&args.weight)
-            .view(&args.out)
-            .u32(descriptor.columns)
-            .f32(args.eps);
+            .view("x_ptr", &args.x)
+            .view("gate_ptr", &args.gate)
+            .view("w_ptr", &args.weight)
+            .view("y_ptr", &args.out)
+            .u32("columns", descriptor.columns)
+            .f32("eps", args.eps);
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
@@ -502,16 +502,16 @@ impl Op for LayerNorm {
         // holds the weight's address, which the program never reads under a false bias flag.
         let bias = args.bias.as_ref().unwrap_or(&args.weight);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.weight)
-            .view(bias)
-            .view(&args.out)
-            .u32(descriptor.columns)
-            .f32(args.eps)
-            .flag(args.bias.is_some())
-            .flag(descriptor.pdl);
+            .view("x_ptr", &args.x)
+            .view("weight_ptr", &args.weight)
+            .view("bias_ptr", bias)
+            .view("out_ptr", &args.out)
+            .u32("columns", descriptor.columns)
+            .f32("eps", args.eps)
+            .flag("has_bias", args.bias.is_some())
+            .flag("pdl", descriptor.pdl);
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
@@ -599,12 +599,12 @@ impl Op for Softmax {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.out)
-            .u32(descriptor.columns)
-            .flag(descriptor.pdl);
+            .view("x_ptr", &args.x)
+            .view("out_ptr", &args.out)
+            .u32("columns", descriptor.columns)
+            .flag("pdl", descriptor.pdl);
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 

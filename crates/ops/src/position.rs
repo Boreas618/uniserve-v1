@@ -178,17 +178,16 @@ impl Op for PositionInterpolate {
         // the program never divides by a side.
         let points = args.out.rows();
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.table)
-            .view(&args.indices)
-            .view(&args.weights)
-            .view(&args.out)
-            // `check` keeps the point count within a kernel parameter.
-            .u32(points as u32)
-            .u32(descriptor.channels)
-            .u32(descriptor.block)
-            .flag(descriptor.pdl);
+            .view("table_ptr", &args.table)
+            .view("indices_ptr", &args.indices)
+            .view("weights_ptr", &args.weights)
+            .view("out_ptr", &args.out)
+            .u64("points", points)
+            .u32("channels", descriptor.channels)
+            .u32("block", descriptor.block)
+            .flag("pdl", descriptor.pdl);
         // One block per (output point, element block): the four taps of a point are read and summed
         // by one block, so the sum's order is fixed and two blocks never write the same element.
         kernel.launch(

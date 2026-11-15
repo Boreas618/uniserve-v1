@@ -164,21 +164,21 @@ impl Op for TileStitch {
         let strides = crate::operand::outer_strides(&args.out);
 
         // `check` keeps the frame count and the width within kernel parameters.
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.tokens)
-            .view(&args.rows)
-            .view(&args.columns)
-            .view(&args.out)
-            .u32(frames as u32)
-            .u32(width as u32)
-            .u64(strides[0])
-            .u64(strides[1])
-            .u64(strides[2])
-            .u32(args.tile_columns)
-            .u32(args.token_rows)
-            .u32(args.tile_height)
-            .u32(args.tile_width);
+            .view("tokens_ptr", &args.tokens)
+            .view("rows_ptr", &args.rows)
+            .view("columns_ptr", &args.columns)
+            .view("out_ptr", &args.out)
+            .u64("frames", frames)
+            .u64("width", width)
+            .u64("out_stride0", strides[0])
+            .u64("out_stride1", strides[1])
+            .u64("out_stride2", strides[2])
+            .u32("tile_columns", args.tile_columns)
+            .u32("token_rows", args.token_rows)
+            .u32("tile_height", args.tile_height)
+            .u32("tile_width", args.tile_width);
         kernel.launch(
             LaunchGrid::new([
                 width.div_ceil(u64::from(descriptor.block)),

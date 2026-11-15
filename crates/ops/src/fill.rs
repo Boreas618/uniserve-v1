@@ -134,11 +134,13 @@ impl Op for Fill {
         let [destination] = strided::merge_axes([&args.destination]);
         let elements = destination.numel();
 
-        let mut arguments = Arguments::new();
-        arguments.view(&destination).u64(elements);
-        strided::pack_extents(&mut arguments, &destination);
-        strided::pack_strides(&mut arguments, &destination);
-        arguments.u64(args.bits).flag(descriptor.pdl);
+        let mut arguments = Arguments::new(Self::NAME);
+        arguments
+            .view("destination", &destination)
+            .u64("elements", elements);
+        strided::pack_extents(&mut arguments, "d", &destination);
+        strided::pack_strides(&mut arguments, "t", &destination);
+        arguments.u64("bits", args.bits).flag("pdl", descriptor.pdl);
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,

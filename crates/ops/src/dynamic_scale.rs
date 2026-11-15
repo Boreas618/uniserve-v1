@@ -156,15 +156,15 @@ impl Op for DynamicScale {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.partials)
-            .view(&args.weight_amax)
-            .view(&args.encode)
-            .view(&args.alpha)
-            .u64(args.partials.numel())
-            .f32(args.range)
-            .f32(args.floor);
+            .view("partials", &args.partials)
+            .view("weight_amax", &args.weight_amax)
+            .view("encode", &args.encode)
+            .view("alpha", &args.alpha)
+            .u64("count", args.partials.numel())
+            .f32("range_", args.range)
+            .f32("floor", args.floor);
 
         // One program: the result is one pair of words.
         kernel.launch(LaunchGrid::new([1, 1, 1])?, &mut arguments, stream)

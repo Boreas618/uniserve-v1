@@ -50,6 +50,19 @@ pub enum Error {
     #[error("kernel metadata: {0}")]
     Metadata(String),
 
+    /// An operator's launch words disagree with the kernel's own signature: their number, the
+    /// parameter a word names at a position, a value its parameter's type does not hold, or the
+    /// global scratch.
+    #[error("operator `{operator}` launching `{kernel}`: {problem}")]
+    Signature {
+        /// The operator whose launch packed the words ([`crate::Op::NAME`]).
+        operator: &'static str,
+        /// The kernel's symbol, as its metadata names it.
+        kernel: String,
+        /// The disagreement, by position and by both names.
+        problem: String,
+    },
+
     /// A launch grid does not fit the driver's limits.
     #[error("grid: {0}")]
     Grid(String),

@@ -412,27 +412,27 @@ impl Op for CausalConv1d {
         let rows = args.rows.seq_lens.dim(0);
         let (trail, trailing) = trail_operand(args.trail.as_ref(), &args.state);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.weight)
-            .view(&args.out)
-            .view(&args.rows.query_offsets)
-            .view(&args.rows.seq_lens)
-            .view(&args.rows.slots)
-            .view(&args.rows.checkpoints)
-            .view(&args.state)
-            .view(&args.checkpoint)
-            .view(trail)
-            .i32(args.x.stride(0) as i32)
-            .i32(trailing);
+            .view("x_ptr", &args.x)
+            .view("weight_ptr", &args.weight)
+            .view("out_ptr", &args.out)
+            .view("offsets_ptr", &args.rows.query_offsets)
+            .view("seq_lens_ptr", &args.rows.seq_lens)
+            .view("slots_ptr", &args.rows.slots)
+            .view("checkpoints_ptr", &args.rows.checkpoints)
+            .view("state_ptr", &args.state)
+            .view("checkpoint_ptr", &args.checkpoint)
+            .view("trail_ptr", trail)
+            .u64("x_row_stride", args.x.stride(0))
+            .i32("trailing", trailing);
 
         // A program compiled for requests of several slots reads their two columns after the
         // plain convolution's parameters; the dilation, the window and the form are compiled in.
         if let Some(slots) = args.slots {
             arguments
-                .view(&slots.state_indices)
-                .view(&slots.num_accepted);
+                .view("state_indices_ptr", &slots.state_indices)
+                .view("num_accepted_ptr", &slots.num_accepted);
         }
         kernel.launch(
             LaunchGrid::new([
@@ -762,33 +762,33 @@ impl Op for GatedDeltaRule {
         let scale = (f64::from(descriptor.key_dim).sqrt().recip()) as f32;
         let (trail, trailing) = trail_operand(args.trail.as_ref(), &args.state);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.query)
-            .view(&args.key)
-            .view(&args.value)
-            .view(&args.a)
-            .view(&args.b)
-            .view(&args.a_log)
-            .view(&args.dt_bias)
-            .view(&args.rows.query_offsets)
-            .view(&args.rows.seq_lens)
-            .view(&args.rows.slots)
-            .view(&args.rows.checkpoints)
-            .view(&args.state)
-            .view(&args.checkpoint)
-            .view(trail)
-            .view(&args.out)
-            .i32(args.query.stride(0) as i32)
-            .i32(args.a.stride(0) as i32)
-            .f32(scale)
-            .i32(trailing);
+            .view("query_ptr", &args.query)
+            .view("key_ptr", &args.key)
+            .view("value_ptr", &args.value)
+            .view("a_ptr", &args.a)
+            .view("b_ptr", &args.b)
+            .view("a_log_ptr", &args.a_log)
+            .view("dt_bias_ptr", &args.dt_bias)
+            .view("offsets_ptr", &args.rows.query_offsets)
+            .view("seq_lens_ptr", &args.rows.seq_lens)
+            .view("slots_ptr", &args.rows.slots)
+            .view("checkpoints_ptr", &args.rows.checkpoints)
+            .view("state_ptr", &args.state)
+            .view("checkpoint_ptr", &args.checkpoint)
+            .view("trail_ptr", trail)
+            .view("out_ptr", &args.out)
+            .u64("row_stride", args.query.stride(0))
+            .u64("gate_stride", args.a.stride(0))
+            .f32("scale", scale)
+            .i32("trailing", trailing);
 
         // A program compiled for requests of several slots reads their two columns last.
         if let Some(slots) = args.slots {
             arguments
-                .view(&slots.state_indices)
-                .view(&slots.num_accepted);
+                .view("state_indices_ptr", &slots.state_indices)
+                .view("num_accepted_ptr", &slots.num_accepted);
         }
         kernel.launch(
             LaunchGrid::new([

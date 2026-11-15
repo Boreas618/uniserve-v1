@@ -252,21 +252,21 @@ impl Op for Activation1d {
         let out_length = descriptor.output(length)?;
 
         // Every narrowing below is of a value `check` holds within its kernel parameter.
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.values)
-            .view(&args.alpha)
-            .view(&args.beta)
-            .view(&args.filter_up)
-            .view(&args.filter_down)
-            .view(&args.out)
-            .u32(descriptor.channels)
-            .u32(descriptor.kernel)
-            .u32(descriptor.ratio)
-            .u32(args.length)
-            .u32(out_length as u32)
-            .u32(descriptor.block)
-            .flag(descriptor.pdl);
+            .view("values_ptr", &args.values)
+            .view("alpha_ptr", &args.alpha)
+            .view("beta_ptr", &args.beta)
+            .view("filter_up_ptr", &args.filter_up)
+            .view("filter_down_ptr", &args.filter_down)
+            .view("out_ptr", &args.out)
+            .u32("channels", descriptor.channels)
+            .u32("kernel", descriptor.kernel)
+            .u32("ratio", descriptor.ratio)
+            .u32("length", args.length)
+            .u64("out_length", out_length)
+            .u32("block", descriptor.block)
+            .flag("pdl", descriptor.pdl);
         // One block owns a channel's whole length: the upsampled signal between stages never leaves
         // the block, so no intermediate buffer exists to allocate, and the low-pass's sum order is
         // fixed by the block's own walk.

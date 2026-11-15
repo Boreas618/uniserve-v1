@@ -233,22 +233,28 @@ impl Op for CopyBlock {
             strides[3] as i64,
         ];
 
-        let mut arguments = Arguments::new();
-        arguments.view(&args.source).view(&args.out);
-        for extent in extents {
-            arguments.u64(extent);
+        let mut arguments = Arguments::new(Self::NAME);
+        arguments
+            .view("source_ptr", &args.source)
+            .view("out_ptr", &args.out);
+        for (name, extent) in ["e0", "e1", "e2", "e3"].into_iter().zip(extents) {
+            arguments.u64(name, extent);
         }
-        for stride in source_strides.iter().chain(args.out_strides.iter()) {
-            arguments.i64(*stride);
+        for (name, stride) in ["s0", "s1", "s2", "s3"].into_iter().zip(source_strides) {
+            arguments.i64(name, stride);
+        }
+        for (name, &stride) in ["d0", "d1", "d2", "d3"].into_iter().zip(args.out_strides) {
+            arguments.i64(name, stride);
         }
         let elements = extents.iter().product::<u64>();
-        // `total`, the elements one program moves, and the PDL flag -- and nothing after them. The
-        // block width is NOT the last word a module takes: it is a `tl.constexpr`, fixed by the
-        // module's launch options and never passed in the argument list. A trailing block word here
-        // is one parameter more than the kernel has, which reaches the driver as an unnamed argument
-        // rather than as a refusal.
+        // `total`, then the elements one program moves and the dependent launch, two words the
+        // program takes and does not read: its block is the `BLOCK` constexpr and its dependent
+        // launch the `PDL` one.
         let copy = if descriptor.wide { WIDE_COPY } else { COPY };
-        arguments.u64(elements).u32(copy).flag(false);
+        arguments
+            .u64("total", elements)
+            .u32("block", copy)
+            .flag("pdl", false);
         // A last axis one program wide or more is walked a row at a time (the package's fast path),
         // so the grid counts each row's blocks rather than the elements.
         let grid = if descriptor.wide || extents[3] >= u64::from(copy) {

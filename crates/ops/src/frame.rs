@@ -211,24 +211,41 @@ impl Op for FramePad {
         let (height, width) = (args.values.dim(3), args.values.dim(4));
         let (out_width, out_height) = (args.out.dim(4), args.out.dim(3));
 
-        let mut arguments = Arguments::new();
-        arguments.view(&args.values).view(&args.out);
-        for stride in args.values.strides() {
-            arguments.i32(*stride as i32);
+        let mut arguments = Arguments::new(Self::NAME);
+        arguments
+            .view("values", &args.values)
+            .view("out", &args.out);
+        // The two `[batch, channels, frames, height, width]` views' strides, axis by axis.
+        let input = [
+            "stride_batch",
+            "stride_channel",
+            "stride_frame",
+            "stride_height",
+            "stride_width",
+        ];
+        for (name, stride) in input.into_iter().zip(args.values.strides()) {
+            arguments.u64(name, *stride as u64);
         }
-        for stride in args.out.strides() {
-            arguments.i32(*stride as i32);
+        let output = [
+            "out_batch",
+            "out_channel",
+            "out_frame_stride",
+            "out_height_stride",
+            "out_width_stride",
+        ];
+        for (name, stride) in output.into_iter().zip(args.out.strides()) {
+            arguments.u64(name, *stride as u64);
         }
         arguments
-            .i32(height as i32)
-            .i32(width as i32)
-            .i32(args.out.dim(2) as i32)
-            .i32(out_height as i32)
-            .i32(out_width as i32)
-            .i32(channels as i32)
-            .i32(args.top as i32)
-            .i32(args.left as i32)
-            .i32(args.front as i32);
+            .u64("height", height)
+            .u64("width", width)
+            .u64("out_frames", args.out.dim(2))
+            .u64("out_height", out_height)
+            .u64("out_width", out_width)
+            .u64("channels", channels)
+            .u64("pad_top", args.top)
+            .u64("pad_left", args.left)
+            .u64("pad_front", args.front);
 
         let columns = u64::from(descriptor.block_pixels);
         let rows = batch * args.out.dim(2) * out_height;

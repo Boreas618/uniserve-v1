@@ -268,23 +268,23 @@ impl Op for RgbBytes {
         let input = outer_strides(&args.input);
         let out = outer_strides(&args.out);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.input)
-            .view(&args.mean)
-            .view(&args.std)
-            .view(&args.out)
-            .u64(frames)
-            .u64(rows)
-            .u64(columns)
-            .u32(descriptor.channels)
-            .u64(input[0])
-            .u64(input[1])
-            .u64(input[2])
-            .u64(out[0])
-            .u64(out[1])
-            .u64(out[2])
-            .flag(descriptor.pdl);
+            .view("input", &args.input)
+            .view("mean", &args.mean)
+            .view("std", &args.std)
+            .view("out", &args.out)
+            .u64("frames", frames)
+            .u64("rows", rows)
+            .u64("columns", columns)
+            .u32("channels", descriptor.channels)
+            .u64("in0", input[0])
+            .u64("in1", input[1])
+            .u64("in2", input[2])
+            .u64("out0", out[0])
+            .u64("out1", out[1])
+            .u64("out2", out[2])
+            .flag("pdl", descriptor.pdl);
         kernel.launch(
             LaunchGrid::linear(args.out.numel().div_ceil(u64::from(descriptor.block)))?,
             &mut arguments,

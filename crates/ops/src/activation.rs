@@ -236,19 +236,17 @@ impl Op for ActAndMul {
     ) -> Result<()> {
         let elements = args.out.rows() * u64::from(descriptor.width);
 
-        let mut arguments = Arguments::new();
-        arguments.view(&args.gate).view(&args.value).view(&args.out);
-        if descriptor.wide {
-            arguments
-                .u64(elements)
-                .u64(descriptor.gate_stride)
-                .u64(descriptor.value_stride);
-        } else {
-            arguments
-                .i32(elements as i32)
-                .i32(descriptor.gate_stride as i32)
-                .i32(descriptor.value_stride as i32);
-        }
+        // The module's signature states the extents in 64 bits for a `wide` descriptor and in 32
+        // otherwise, and lays each word out in that width; `check` held a narrow call's extents
+        // to what 32 bits hold.
+        let mut arguments = Arguments::new(Self::NAME);
+        arguments
+            .view("gate_ptr", &args.gate)
+            .view("value_ptr", &args.value)
+            .view("out_ptr", &args.out)
+            .u64("elements", elements)
+            .u64("gate_row_stride", descriptor.gate_stride)
+            .u64("value_row_stride", descriptor.value_stride);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
             &mut arguments,
@@ -428,14 +426,14 @@ impl Op for ValueFirstSwiglu {
         // A flag is off, so its slot is never dereferenced; the kernel still takes the argument.
         let bias = args.bias.as_ref().unwrap_or(&args.out);
         let partials = args.partials.as_ref().unwrap_or(&args.out);
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.value_gate)
-            .view(bias)
-            .view(&args.out)
-            .view(partials)
-            .i32(elements as i32)
-            .i32(descriptor.input_stride as i32);
+            .view("value_gate_ptr", &args.value_gate)
+            .view("bias_ptr", bias)
+            .view("output_ptr", &args.out)
+            .view("partials_ptr", partials)
+            .u64("elements", elements)
+            .u64("input_row_stride", descriptor.input_stride);
         kernel.launch(LaunchGrid::linear(programs)?, &mut arguments, stream)
     }
 
@@ -618,15 +616,15 @@ impl Op for Swiglu {
         let value_bias = args.value_bias.as_ref().unwrap_or(&args.out);
         let gate_bias = args.gate_bias.as_ref().unwrap_or(&args.out);
         let partials = args.partials.as_ref().unwrap_or(&args.out);
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.value)
-            .view(&args.gate)
-            .view(value_bias)
-            .view(gate_bias)
-            .view(&args.out)
-            .view(partials)
-            .i32(elements as i32);
+            .view("value_ptr", &args.value)
+            .view("gate_ptr", &args.gate)
+            .view("value_bias_ptr", value_bias)
+            .view("gate_bias_ptr", gate_bias)
+            .view("output_ptr", &args.out)
+            .view("partials_ptr", partials)
+            .u64("elements", elements);
         kernel.launch(LaunchGrid::linear(programs)?, &mut arguments, stream)
     }
 
@@ -725,13 +723,13 @@ impl Op for Silu {
         stream: &Stream,
     ) -> Result<()> {
         let elements = args.x.numel();
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.out)
-            .u64(elements)
-            .u32(descriptor.columns)
-            .flag(descriptor.pdl);
+            .view("x_ptr", &args.x)
+            .view("out_ptr", &args.out)
+            .u64("elements", elements)
+            .u32("columns", descriptor.columns)
+            .flag("pdl", descriptor.pdl);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
             &mut arguments,

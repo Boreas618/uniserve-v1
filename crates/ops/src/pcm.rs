@@ -127,14 +127,14 @@ impl Op for PcmInterleave {
     ) -> Result<()> {
         let samples = u64::from(args.samples);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.left)
-            .view(&args.right)
-            .view(&args.out)
-            .u32(args.samples)
-            .u32(descriptor.block)
-            .flag(descriptor.pdl);
+            .view("left", &args.left)
+            .view("right", &args.right)
+            .view("out", &args.out)
+            .u32("samples", args.samples)
+            .u32("block", descriptor.block)
+            .flag("pdl", descriptor.pdl);
         // One block per range of samples: a sample's two outputs are written by the same block beside
         // each other, so the interleaving needs no second pass.
         kernel.launch(

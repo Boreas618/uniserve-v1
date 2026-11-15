@@ -187,18 +187,17 @@ impl Op for Patch {
         let rows = frames * args.rows_per_frame();
         let row_width = args.row_width();
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.out)
-            .u32(args.frames)
-            // `check` keeps the row count within a kernel parameter.
-            .u32(rows as u32)
-            .u32(args.channels)
-            .u32(args.height)
-            .u32(args.width)
-            .u32(descriptor.block)
-            .flag(descriptor.pdl);
+            .view("x_ptr", &args.x)
+            .view("out_ptr", &args.out)
+            .u32("frames", args.frames)
+            .u64("rows", rows)
+            .u32("channels", args.channels)
+            .u32("height", args.height)
+            .u32("width", args.width)
+            .u32("block", descriptor.block)
+            .flag("pdl", descriptor.pdl);
         // The grid walks the rows: one block per (row, element block). A row element is written by
         // exactly one block and reads a single latent element, so the order between blocks never
         // matters and a replay is deterministic.

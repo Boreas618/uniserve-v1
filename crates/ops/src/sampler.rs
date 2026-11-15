@@ -188,20 +188,20 @@ impl Op for LogitsShape {
         // A descriptor without extra tokens reads the slots in their place.
         let extras = args.extras.as_ref().unwrap_or(&args.slots);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.logits)
-            .view(&args.counts)
-            .view(&args.slots)
-            .view(&args.parameters)
-            .view(extras)
-            .view(&args.bias)
-            .view(&args.adjustments)
-            .view(&args.bans)
-            .view(&args.out)
-            .u64(rows)
-            .u32(descriptor.vocabulary)
-            .flag(descriptor.divide);
+            .view("logits_ptr", &args.logits)
+            .view("counts_ptr", &args.counts)
+            .view("slots_ptr", &args.slots)
+            .view("parameters_ptr", &args.parameters)
+            .view("extras_ptr", extras)
+            .view("bias_ptr", &args.bias)
+            .view("adjustments_ptr", &args.adjustments)
+            .view("bans_ptr", &args.bans)
+            .view("out_ptr", &args.out)
+            .u64("rows", rows)
+            .u32("vocabulary", descriptor.vocabulary)
+            .flag("divide", descriptor.divide);
         kernel.launch(
             LaunchGrid::new([rows, vocabulary.div_ceil(u64::from(descriptor.block)), 1])?,
             &mut arguments,
@@ -369,15 +369,15 @@ impl Op for TopK {
     ) -> Result<()> {
         let rows = args.logits.rows();
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.logits)
-            .view(&args.values)
-            .view(&args.ids)
-            .view(&args.workspace)
-            .u64(rows)
-            .u32(descriptor.vocabulary)
-            .u32(descriptor.width);
+            .view("logits_ptr", &args.logits)
+            .view("values_ptr", &args.values)
+            .view("ids_ptr", &args.ids)
+            .view("workspace_ptr", &args.workspace)
+            .u64("rows", rows)
+            .u32("vocabulary", descriptor.vocabulary)
+            .u32("width", descriptor.width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -484,14 +484,14 @@ impl Op for FilterCandidates {
         let width = u64::from(descriptor.width);
         let rows = args.values.rows();
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.values)
-            .view(&args.ids)
-            .view(&args.parameters)
-            .view(&args.valid)
-            .u64(rows)
-            .u64(width);
+            .view("values_ptr", &args.values)
+            .view("ids_ptr", &args.ids)
+            .view("parameters_ptr", &args.parameters)
+            .view("valid_ptr", &args.valid)
+            .u64("rows", rows)
+            .u64("width", width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -607,17 +607,17 @@ impl Op for InverseCdf {
     ) -> Result<()> {
         let rows = args.probabilities.rows();
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         // The row count and the width are both runtime values: the program walks the row in tiles
         // of the descriptor's `tile` lanes, so no block covers the row and nothing in the
         // signature depends on its width.
         arguments
-            .view(&args.probabilities)
-            .view(&args.ids)
-            .view(&args.draws)
-            .view(&args.tokens)
-            .u64(rows)
-            .u32(descriptor.width);
+            .view("probabilities_ptr", &args.probabilities)
+            .view("ids_ptr", &args.ids)
+            .view("draws_ptr", &args.draws)
+            .view("tokens_ptr", &args.tokens)
+            .u64("rows", rows)
+            .u32("width", descriptor.width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -712,11 +712,12 @@ impl Op for ArgMax {
     ) -> Result<()> {
         let rows = args.values.rows();
 
-        let mut arguments = Arguments::new();
-        arguments.view(&args.values).view(&args.out).u64(rows);
-        // The candidate width is compiled into the program, so it is not a parameter here: a word the
-        // module does not declare would push the two scratch addresses the compiler's launcher appends
-        // out of place.
+        let mut arguments = Arguments::new(Self::NAME);
+        arguments
+            .view("values_ptr", &args.values)
+            .view("out_ptr", &args.out)
+            .u64("rows", rows);
+        // The candidate width is compiled into the program, so it is no launch word.
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -799,12 +800,12 @@ impl Op for LogSoftmax {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.x)
-            .view(&args.out)
-            .u32(descriptor.columns)
-            .flag(descriptor.pdl);
+            .view("x_ptr", &args.x)
+            .view("out_ptr", &args.out)
+            .u32("columns", descriptor.columns)
+            .flag("pdl", descriptor.pdl);
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
@@ -918,14 +919,14 @@ impl Op for LogprobGather {
     ) -> Result<()> {
         let rows = args.logprobabilities.rows();
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.logprobabilities)
-            .view(&args.tokens)
-            .view(&args.out)
-            .view(&args.ranks)
-            .u64(rows)
-            .u32(descriptor.columns);
+            .view("logprobabilities_ptr", &args.logprobabilities)
+            .view("tokens_ptr", &args.tokens)
+            .view("out_ptr", &args.out)
+            .view("ranks_ptr", &args.ranks)
+            .u64("rows", rows)
+            .u32("columns", descriptor.columns);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -1061,18 +1062,15 @@ impl Op for TopLogprobs {
         let width = args.values.last();
         let chunks = top_logprobs_chunks(width, descriptor.tile);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.values)
+            .view("values_ptr", &args.values)
             // A direct launch reads no ids; the slot still takes a device address.
-            .view(args.ids.as_ref().unwrap_or(&args.out_ids))
-            .view(&args.out_values)
-            .view(&args.out_ids)
-            .u32(u32::try_from(width).map_err(|_| Error::argument(Self::NAME, "a row past u32"))?)
-            .u32(
-                u32::try_from(chunks)
-                    .map_err(|_| Error::argument(Self::NAME, "chunks past u32"))?,
-            );
+            .view("ids_ptr", args.ids.as_ref().unwrap_or(&args.out_ids))
+            .view("out_values_ptr", &args.out_values)
+            .view("out_ids_ptr", &args.out_ids)
+            .u64("width", width)
+            .u64("tiles", chunks);
         kernel.launch(LaunchGrid::new([rows, chunks, 1])?, &mut arguments, stream)
     }
 
@@ -1237,14 +1235,14 @@ impl Op for CandidateOrder {
                 ),
             ));
         }
-        // The kernel takes the candidate count and the id space as 32-bit parameters.
-        u32::try_from(width).map_err(|_| {
+        // The kernel takes the candidate count and the id space as signed 32-bit parameters.
+        i32::try_from(width).map_err(|_| {
             Error::argument(
                 Self::NAME,
                 format!("{width} candidates do not fit a kernel parameter"),
             )
         })?;
-        u32::try_from(args.vocabulary).map_err(|_| {
+        i32::try_from(args.vocabulary).map_err(|_| {
             Error::argument(
                 Self::NAME,
                 format!(
@@ -1265,18 +1263,18 @@ impl Op for CandidateOrder {
         let rows = args.values.rows();
         let width = args.values.last();
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         // The scratch is the program's own: neither twin rule applies to it, and a shadow run gets
         // its own buffer only if the caller gives it one.
         arguments
-            .view(&args.values)
-            .view(&args.ids)
-            .view(&args.ordered_values)
-            .view(&args.ordered_ids)
-            .view(&args.counts)
-            .u64(rows)
-            .u32(width as u32)
-            .u32(args.vocabulary as u32);
+            .view("values_ptr", &args.values)
+            .view("ids_ptr", &args.ids)
+            .view("ordered_values_ptr", &args.ordered_values)
+            .view("ordered_ids_ptr", &args.ordered_ids)
+            .view("counts_ptr", &args.counts)
+            .u64("rows", rows)
+            .u64("width", width)
+            .u64("vocabulary", args.vocabulary);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 

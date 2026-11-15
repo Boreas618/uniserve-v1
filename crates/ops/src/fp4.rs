@@ -265,14 +265,14 @@ impl Op for Nvfp4Quantize {
         // state the factor its blocks are relative to. The block size is the chunk a program walks
         // the row in, not the grid's extent.
         let elements = rows;
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.input)
-            .view(&args.values)
-            .view(&args.scales)
-            .u64(rows)
-            .view(&args.global_scale)
-            .view(&args.token_scale);
+            .view("input_ptr", &args.input)
+            .view("values_ptr", &args.values)
+            .view("scales_ptr", &args.scales)
+            .u64("rows", rows)
+            .view("global_scale", &args.global_scale)
+            .view("token_scale_ptr", &args.token_scale);
         kernel.launch(LaunchGrid::covering(elements, 1)?, &mut arguments, stream)
     }
 

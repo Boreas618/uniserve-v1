@@ -117,12 +117,12 @@ impl Op for VsaZeroPadding {
     ) -> Result<()> {
         let tiles = args.values.dim(0) / u64::from(descriptor.tile_rows);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.values)
-            .view(&args.sizes)
-            .i32(stride(&args.values, 0)?)
-            .i32(stride(&args.values, 1)?);
+            .view("values", &args.values)
+            .view("variable_block_sizes", &args.sizes)
+            .u64("stride_row", args.values.stride(0))
+            .u64("stride_head", args.values.stride(1));
         kernel.launch(
             LaunchGrid::new([
                 tiles,
@@ -227,17 +227,17 @@ impl Op for VsaAddGatedTiles {
     ) -> Result<()> {
         let (rows, heads) = (args.output.dim(0), args.output.dim(1));
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.output)
-            .view(&args.compressed)
-            .view(&args.gate)
-            .i32(stride(&args.output, 0)?)
-            .i32(stride(&args.output, 1)?)
-            .i32(stride(&args.gate, 0)?)
-            .i32(stride(&args.gate, 1)?)
-            .i32(stride(&args.compressed, 0)?)
-            .i32(stride(&args.compressed, 1)?);
+            .view("output", &args.output)
+            .view("compressed", &args.compressed)
+            .view("gate", &args.gate)
+            .u64("output_stride_row", args.output.stride(0))
+            .u64("output_stride_head", args.output.stride(1))
+            .u64("gate_stride_row", args.gate.stride(0))
+            .u64("gate_stride_head", args.gate.stride(1))
+            .u64("compressed_stride_head", args.compressed.stride(0))
+            .u64("compressed_stride_tile", args.compressed.stride(1));
         kernel.launch(
             LaunchGrid::new([rows / u64::from(descriptor.block_rows), heads, 1])?,
             &mut arguments,
@@ -460,21 +460,21 @@ impl Op for VsaComposeGatedRows {
         let members = u64::from(descriptor.members);
         let heads = args.output.dim(2);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.output)
-            .view(&args.fine)
-            .view(&args.compressed)
-            .view(&args.gate)
-            .i32(stride(&args.fine, 0)?)
-            .i32(stride(&args.fine, 1)?)
-            .i32(stride(&args.gate, 0)?)
-            .i32(stride(&args.gate, 1)?)
-            .i32(stride(&args.compressed, 0)?)
-            .i32(stride(&args.compressed, 1)?)
-            .i64(args.owner_rows as i64)
-            .i64(args.start as i64)
-            .i64(args.count as i64);
+            .view("output", &args.output)
+            .view("fine", &args.fine)
+            .view("compressed", &args.compressed)
+            .view("gate", &args.gate)
+            .u64("fine_stride_row", args.fine.stride(0))
+            .u64("fine_stride_head", args.fine.stride(1))
+            .u64("gate_stride_row", args.gate.stride(0))
+            .u64("gate_stride_head", args.gate.stride(1))
+            .u64("compressed_stride_head", args.compressed.stride(0))
+            .u64("compressed_stride_tile", args.compressed.stride(1))
+            .u64("owner_rows", args.owner_rows)
+            .u64("start", args.start)
+            .u64("count", args.count);
         kernel.launch(
             LaunchGrid::new([
                 args.count / u64::from(descriptor.block_rows),
@@ -680,17 +680,17 @@ impl Op for VsaSelectTiles {
         let (heads, query_tiles, tiles) =
             (args.scores.dim(0), args.scores.dim(1), args.scores.dim(2));
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.scores)
-            .view(&args.segments)
-            .view(&args.sizes)
-            .view(&args.keep)
-            .view(&args.indices)
-            .view(&args.counts)
-            .i32(query_tiles as i32)
-            .i32(tiles as i32)
-            .i32(args.query_offset as i32);
+            .view("scores", &args.scores)
+            .view("tile_segments", &args.segments)
+            .view("variable_block_sizes", &args.sizes)
+            .view("segment_keep", &args.keep)
+            .view("indices", &args.indices)
+            .view("counts", &args.counts)
+            .u64("query_tiles", query_tiles)
+            .u64("tiles", tiles)
+            .u64("query_offset", args.query_offset);
         kernel.launch(
             LaunchGrid::new([query_tiles, heads, 1])?,
             &mut arguments,
@@ -968,19 +968,19 @@ impl Op for VsaPrepareTiles {
         let key_weight = args.key_weight.as_ref().unwrap_or(&args.key);
         let cosine = args.cosine.as_ref().unwrap_or(&args.query);
         let sine = args.sine.as_ref().unwrap_or(&args.query);
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.query)
-            .view(&args.key)
-            .view(&args.value)
-            .view(query_weight)
-            .view(key_weight)
-            .view(cosine)
-            .view(sine)
-            .view(&args.sizes)
-            .view(&args.pooled_query)
-            .view(&args.pooled_key)
-            .view(&args.pooled_value);
+            .view("query", &args.query)
+            .view("key", &args.key)
+            .view("value", &args.value)
+            .view("query_weight", query_weight)
+            .view("key_weight", key_weight)
+            .view("cosine", cosine)
+            .view("sine", sine)
+            .view("variable_block_sizes", &args.sizes)
+            .view("pooled_query", &args.pooled_query)
+            .view("pooled_key", &args.pooled_key)
+            .view("pooled_value", &args.pooled_value);
         kernel.launch(LaunchGrid::new([tiles, heads, 1])?, &mut arguments, stream)
     }
 
@@ -1292,14 +1292,14 @@ impl Op for VsaScores {
         let query_tiles = args.pooled_query.dim(0);
         let key_tiles = args.pooled_key.dim(0);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.pooled_query)
-            .view(&args.pooled_key)
-            .view(&args.out)
-            .i32(query_tiles as i32)
-            .i32(key_tiles as i32)
-            .flag(descriptor.pdl);
+            .view("query_ptr", &args.pooled_query)
+            .view("key_ptr", &args.pooled_key)
+            .view("out_ptr", &args.out)
+            .u64("query_tiles", query_tiles)
+            .u64("key_tiles", key_tiles)
+            .flag("pdl", descriptor.pdl);
         // One program per (head, query tile): it walks the key tiles and writes one row of scores.
         kernel.launch(
             LaunchGrid::new([query_tiles.div_ceil(POOLED_QUERIES), heads, 1])?,
@@ -1564,15 +1564,15 @@ impl Op for VsaCompressPooled {
         let query_tiles = args.scores.dim(1);
         let tiles = args.scores.dim(2);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.scores)
-            .view(&args.values)
-            .view(&args.sizes)
-            .view(&args.out)
-            .i32(query_tiles as i32)
-            .i32(tiles as i32)
-            .flag(descriptor.pdl);
+            .view("scores_ptr", &args.scores)
+            .view("values_ptr", &args.values)
+            .view("sizes_ptr", &args.sizes)
+            .view("out_ptr", &args.out)
+            .u64("query_tiles", query_tiles)
+            .u64("tiles", tiles)
+            .flag("pdl", descriptor.pdl);
         // One program per (head, query tile): it reduces the key tiles and writes one row.
         kernel.launch(
             LaunchGrid::new([query_tiles.div_ceil(POOLED_QUERIES), heads, 1])?,

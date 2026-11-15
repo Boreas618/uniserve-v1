@@ -136,12 +136,15 @@ impl Op for WeightedRmsNorm {
         // The descriptor's flag and this operand agree, as `check` states.
         let partials = args.partials;
 
-        let mut arguments = Arguments::new();
-        arguments.view(&args.x).view(&args.weight).view(&args.out);
+        let mut arguments = Arguments::new(Self::NAME);
+        arguments
+            .view("hidden_ptr", &args.x)
+            .view("weight_ptr", &args.weight)
+            .view("output_ptr", &args.out);
         if let Some(partials) = partials {
-            arguments.view(&partials);
+            arguments.view("partials_ptr", &partials);
         }
-        arguments.f32(args.eps);
+        arguments.f32("eps", args.eps);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -289,18 +292,18 @@ impl Op for ScaledResidualRmsNorm {
         // A scale of one element broadcasts; the kernel reads its width as a launch argument.
         let width = args.scale.numel() as u32;
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.hidden)
-            .view(&args.update)
-            .view(bias.as_ref().unwrap_or(&args.update))
-            .view(&args.scale)
-            .view(&args.weight)
-            .view(&args.out);
+            .view("hidden_ptr", &args.hidden)
+            .view("update_ptr", &args.update)
+            .view("update_bias_ptr", bias.as_ref().unwrap_or(&args.update))
+            .view("scale_ptr", &args.scale)
+            .view("weight_ptr", &args.weight)
+            .view("output_ptr", &args.out);
         if let Some(partials) = partials {
-            arguments.view(&partials);
+            arguments.view("partials_ptr", &partials);
         }
-        arguments.f32(args.eps).u32(width);
+        arguments.f32("eps", args.eps).u32("scale_width", width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -456,19 +459,22 @@ impl Op for ScaledResidualLayerNorm {
         // A scale of one element broadcasts; the kernel reads its width as a launch argument.
         let width = args.scale.numel() as u32;
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.hidden)
-            .view(&args.update)
-            .view(update_bias.as_ref().unwrap_or(&args.update))
-            .view(&args.scale)
-            .view(&args.weight)
-            .view(&args.bias)
-            .view(&args.out);
+            .view("hidden_ptr", &args.hidden)
+            .view("update_ptr", &args.update)
+            .view(
+                "update_bias_ptr",
+                update_bias.as_ref().unwrap_or(&args.update),
+            )
+            .view("scale_ptr", &args.scale)
+            .view("weight_ptr", &args.weight)
+            .view("bias_ptr", &args.bias)
+            .view("output_ptr", &args.out);
         if let Some(partials) = partials {
-            arguments.view(&partials);
+            arguments.view("partials_ptr", &partials);
         }
-        arguments.f32(args.eps).u32(width);
+        arguments.f32("eps", args.eps).u32("scale_width", width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -601,16 +607,15 @@ impl Op for ScaledResidual {
         let bias = args.update_bias;
         let elements = args.hidden.numel();
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.hidden)
-            .view(&args.update)
-            .view(bias.as_ref().unwrap_or(&args.update))
-            .view(&args.scale)
-            .i32(elements as i32);
-        // The channel count is compiled into the program (the package's `WIDTH`), so it is not a
-        // parameter: a word the module does not declare takes the position of the global scratch
-        // address the compiler's launcher appends after the kernel's own parameters.
+            .view("hidden_ptr", &args.hidden)
+            .view("update_ptr", &args.update)
+            .view("update_bias_ptr", bias.as_ref().unwrap_or(&args.update))
+            .view("scale_ptr", &args.scale)
+            .u64("elements", elements);
+        // The channel count is compiled into the program (the package's `WIDTH`), so it is no
+        // launch word.
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
             &mut arguments,
@@ -787,12 +792,12 @@ impl Op for SigmoidGatedAdd {
     ) -> Result<()> {
         let rows = args.target.dim(0);
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.target)
-            .view(&args.update)
-            .view(&args.gate)
-            .u32(descriptor.columns);
+            .view("target_ptr", &args.target)
+            .view("update_ptr", &args.update)
+            .view("gate_ptr", &args.gate)
+            .u32("columns", descriptor.columns);
         kernel.launch(
             LaunchGrid::new([
                 u64::from(descriptor.columns).div_ceil(u64::from(descriptor.block)),
@@ -952,13 +957,13 @@ impl Op for ScaledAdd {
         // `check` keeps the count within the kernel's `int64`.
         let elements = args.target.numel() as i64;
 
-        let mut arguments = Arguments::new();
+        let mut arguments = Arguments::new(Self::NAME);
         arguments
-            .view(&args.target)
-            .view(&args.source)
-            .f32(args.alpha)
-            .f32(args.beta)
-            .i64(elements);
+            .view("target_ptr", &args.target)
+            .view("source_ptr", &args.source)
+            .f32("alpha", args.alpha)
+            .f32("beta", args.beta)
+            .i64("elements", elements);
         kernel.launch(
             LaunchGrid::covering(elements as u64, u64::from(descriptor.block))?,
             &mut arguments,
