@@ -707,8 +707,8 @@ pub(crate) mod tests {
             }
         }
 
-        fn state(&self) -> Option<StateShape> {
-            None
+        fn state_layers(&self) -> Vec<StateShape> {
+            Vec::new()
         }
 
         fn experts(&self) -> Option<ExpertShape> {

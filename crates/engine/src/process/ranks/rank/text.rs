@@ -87,7 +87,7 @@ impl ModelRunner {
         let stateless = model.state_layers().is_empty()
             && model
                 .drafter()
-                .is_none_or(|drafter| drafter.state().is_empty());
+                .is_none_or(|drafter| drafter.state_layers().is_empty());
         let phases = served_phases(&self.buckets)
             .into_iter()
             .filter(|phase| *phase != Phase::Refill || stateless)

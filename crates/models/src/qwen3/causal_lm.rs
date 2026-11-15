@@ -464,13 +464,18 @@ impl TextModel for Qwen3ForCausalLm {
         }
     }
 
-    fn state(&self) -> Option<StateShape> {
-        let network = self.config.text.gated_delta_net?;
-
-        Some(StateShape {
-            layers: self.held_layers(true),
-            fields: network.state_fields(self.dtype()),
-        })
+    /// The gated delta networks' fields, every linear layer the rank holds keeping the same;
+    /// none for a stack whose every layer attends.
+    fn state_layers(&self) -> Vec<StateShape> {
+        self.config
+            .text
+            .gated_delta_net
+            .map(|network| StateShape {
+                layers: self.held_layers(true),
+                fields: network.state_fields(self.dtype()),
+            })
+            .into_iter()
+            .collect()
     }
 
     fn experts(&self) -> Option<ExpertShape> {

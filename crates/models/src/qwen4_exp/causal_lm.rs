@@ -475,11 +475,6 @@ impl TextModel for Qwen4ExpForCausalLm {
         cache_shape(&self.config, self.tensor, self.config.attention_layers())
     }
 
-    /// The gated delta networks' fields: the first of [`Self::state_layers`].
-    fn state(&self) -> Option<StateShape> {
-        self.state_layers().into_iter().next()
-    }
-
     fn state_layers(&self) -> Vec<StateShape> {
         let (config, dtype, drafts) = (&self.config, self.dtype(), self.draft_tokens);
         let network = nn::modules::GatedDeltaNetConfig {

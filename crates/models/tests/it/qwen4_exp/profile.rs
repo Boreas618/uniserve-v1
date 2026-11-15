@@ -358,7 +358,7 @@ fn drafter_and_tower(name: &str, model: &dyn TextModel, group: &[Split]) {
     let drafter = model.drafter().expect("the drafter");
     let draft = drafter.cache();
     assert_eq!((draft.layers, draft.head_dim), (1, 256));
-    let shapes = drafter.state();
+    let shapes = drafter.state_layers();
     assert_eq!(shapes.len(), 1);
 
     for (rows, tokens, requests) in [(STEP_ROWS, STEP_ROWS, 1), (1, 1, 1)] {
@@ -390,7 +390,7 @@ fn drafter_and_tower(name: &str, model: &dyn TextModel, group: &[Split]) {
             );
 
             let drafted = drafter
-                .forward_stateful(
+                .forward(
                     &batch,
                     &cache,
                     Some(&state),

@@ -230,7 +230,7 @@ impl Drafter for TinyDrafter {
         }
     }
 
-    fn state(&self) -> Vec<StateShape> {
+    fn state_layers(&self) -> Vec<StateShape> {
         if self.stateful {
             vec![drafter_ring()]
         } else {
@@ -238,24 +238,10 @@ impl Drafter for TinyDrafter {
         }
     }
 
-    fn forward(
-        &self,
-        batch: &TokenBatch,
-        cache: &KvCache,
-        embedded: &Tensor,
-        hidden: &Tensor,
-    ) -> nn::Result<Tensor> {
-        if self.stateful {
-            return Err(nn::Error::Unsupported(
-                "the drafter keeps a state: it runs through forward_stateful".to_owned(),
-            ));
-        }
-        self.attend(batch, cache, embedded, hidden)
-    }
-
     /// A drafter that keeps a state asks for its live rows alone, a state row per row of the
-    /// batch: no checkpoint, trail or verify slots, and no row kept.
-    fn forward_stateful(
+    /// batch: no checkpoint, trail or verify slots, and no row kept; one that keeps none is
+    /// lent none.
+    fn forward(
         &self,
         batch: &TokenBatch,
         cache: &KvCache,
@@ -264,7 +250,12 @@ impl Drafter for TinyDrafter {
         hidden: &Tensor,
     ) -> nn::Result<Tensor> {
         if !self.stateful {
-            return self.forward(batch, cache, embedded, hidden);
+            if state.is_some() {
+                return Err(nn::Error::Unsupported(
+                    "the drafter keeps no state, and was lent one".to_owned(),
+                ));
+            }
+            return self.attend(batch, cache, embedded, hidden);
         }
 
         let rows = batch.rows();
@@ -419,12 +410,8 @@ impl TextModel for Tiny {
         }
     }
 
-    fn state(&self) -> Option<StateShape> {
-        self.stateful.then(state_shape)
-    }
-
     fn state_layers(&self) -> Vec<StateShape> {
-        let mut runs: Vec<StateShape> = self.state().into_iter().collect();
+        let mut runs: Vec<StateShape> = self.stateful.then(state_shape).into_iter().collect();
         if self.stepwise {
             runs.push(stepwise_shape());
         }

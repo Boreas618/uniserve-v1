@@ -805,25 +805,26 @@ fn the_drafter_is_the_references() {
     let vectors = fixture.tensors("reference.safetensors");
     let model = reference_model(&fixture);
     let drafter = model.drafter().expect("the drafter");
-    assert_eq!(drafter.state().len(), 1);
+    assert_eq!(drafter.state_layers().len(), 1);
 
     let step = attention_step(&vectors, "mtp");
     let tokens = vector(&vectors, "mtp.tokens").to_dtype(DType::U32).unwrap();
     let embedded = model.embed_input_ids(&tokens).expect("the embeddings");
 
-    // The stateless forward names the one that takes the ring.
+    // A forward lent no ring is refused: the layer keeps one per request.
     assert!(
         drafter
             .forward(
                 &step.batch,
                 &step.cache,
+                None,
                 &embedded,
                 &vector(&vectors, "mtp.streams")
             )
             .is_err()
     );
     let drafted = drafter
-        .forward_stateful(
+        .forward(
             &step.batch,
             &step.cache,
             Some(&step.state),
@@ -854,7 +855,7 @@ fn the_drafter_is_the_references() {
 /// The drafter's state carries its step across two forwards: the drafter over the first half
 /// of each request's tokens, then over the second half, which pools a group whose first tokens
 /// the first round left in the ring, computes the reference's streams, logits, caches and
-/// ring. The state is lent as execution lends a drafter's (`nn::Drafter::state`): the live
+/// ring. The state is lent as execution lends a drafter's (`nn::Drafter::state_layers`): the live
 /// ring alone, which no checkpoint keeps.
 #[test]
 fn the_drafter_over_two_rounds_is_the_references() {
@@ -921,7 +922,7 @@ fn the_drafter_over_two_rounds_is_the_references() {
 
         drafted.push(
             drafter
-                .forward_stateful(
+                .forward(
                     &batch,
                     &cache,
                     Some(&state),

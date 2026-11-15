@@ -347,17 +347,12 @@ pub trait TextModel: CausalLm + Send + Sync {
     /// The key/value cache its layers read, as this rank holds it.
     fn cache(&self) -> CacheShape;
 
-    /// The recurrent state its layers keep per request slot, as this rank holds it; `None` for a
-    /// model whose every layer attends over the key/value cache.
-    fn state(&self) -> Option<StateShape>;
-
-    /// The recurrent state of a model whose layers do not all keep the same fields: one entry
-    /// per run of layers that do, in the order [`crate::capability::RecurrentState::live`]
-    /// holds their buffers (every layer of the first entry, then of the second). The one entry
-    /// of [`Self::state`] for every other model.
-    fn state_layers(&self) -> Vec<StateShape> {
-        self.state().into_iter().collect()
-    }
+    /// The recurrent state its layers keep per request slot, as this rank holds it: one entry
+    /// per run of consecutive recurrent layers that keep the same fields, in the order
+    /// [`crate::capability::RecurrentState::live`] holds their buffers (every layer of the first
+    /// entry, then of the second). Empty for a model whose every layer attends over the
+    /// key/value cache.
+    fn state_layers(&self) -> Vec<StateShape>;
 
     /// The width of the rows [`CausalLm::forward`] returns, which [`CausalLm::compute_logits`]
     /// and the drafter read: [`Self::hidden`], or the residual streams' joint width for a model

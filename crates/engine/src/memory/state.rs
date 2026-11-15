@@ -20,7 +20,7 @@
 //!
 //! ## The drafter's state
 //!
-//! A deployment that speculates with a drafter whose layers keep a state (`nn::Drafter::state`)
+//! A deployment that speculates with a drafter whose layers keep a state (`nn::Drafter::state_layers`)
 //! keeps it here too ([`StateConfig::drafter`], [`StateMemory::drafter`]): one **live** buffer
 //! per field of every drafter layer, a home row per request slot, which the drafter's forwards
 //! read and advance in place. It has no checkpoint, no trail and no verify slots, and no copy
@@ -111,7 +111,7 @@ pub struct StateConfig {
     /// the tokens a verification holds, `draft_tokens + 1`, for a deployment that speculates,
     /// and one for every other.
     pub owned: u32,
-    /// The runs of the drafter's layers that keep a state (`nn::Drafter::state`), in its order
+    /// The runs of the drafter's layers that keep a state (`nn::Drafter::state_layers`), in its order
     /// of them: a live home row per request slot of each field, and nothing else (module
     /// documentation, the drafter's state). Empty for a deployment that does not speculate or
     /// whose drafter keeps none.

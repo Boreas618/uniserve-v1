@@ -75,8 +75,8 @@
 //!
 //! ## The drafter's state and its proposals
 //!
-//! A drafter whose layers keep a state (`nn::Drafter::state`) is run through
-//! `nn::Drafter::forward_stateful`, every other through `nn::Drafter::forward`. Its state is
+//! A drafter whose layers keep a state (`nn::Drafter::state_layers`) is lent it by its
+//! forward (`nn::Drafter::forward`). Its state is
 //! a live home row per request slot of each field (`StateMemory::drafter`), and its state rows
 //! are its batch's rows: a drafter row's entries, then each chained step's one token, on the
 //! row's request slot. A row with no entry names no slot, and so leaves its slot's state as it
@@ -1456,21 +1456,20 @@ impl CausalLmRunner {
             None => None,
         };
         let run = |batch: &TokenBatch, embedded: &Tensor, hidden: &Tensor| -> Result<Tensor> {
-            let Some((live, slots, keeps_none)) = &lent else {
-                return Ok(drafter.forward(batch, &cache, embedded, hidden)?);
-            };
-            let state = RecurrentState {
-                query_offsets: batch.query_offsets.clone(),
-                seq_lens: batch.seq_lens.clone(),
-                slots: slots.clone(),
-                checkpoints: keeps_none.clone(),
-                live: (*live).clone(),
-                checkpoint: Vec::new(),
-                trail: None,
-                verify: None,
-            };
+            let state = lent
+                .as_ref()
+                .map(|(live, slots, keeps_none)| RecurrentState {
+                    query_offsets: batch.query_offsets.clone(),
+                    seq_lens: batch.seq_lens.clone(),
+                    slots: slots.clone(),
+                    checkpoints: keeps_none.clone(),
+                    live: (*live).clone(),
+                    checkpoint: Vec::new(),
+                    trail: None,
+                    verify: None,
+                });
 
-            Ok(drafter.forward_stateful(batch, &cache, Some(&state), embedded, hidden)?)
+            Ok(drafter.forward(batch, &cache, state.as_ref(), embedded, hidden)?)
         };
 
         let drafted = {

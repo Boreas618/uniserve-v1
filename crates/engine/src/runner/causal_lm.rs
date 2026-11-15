@@ -139,7 +139,7 @@
 //! its samples agree with and commits them, and the drafter's, which writes the draft cache
 //! and proposes each row's next drafts. Nothing is read back between them: what the second
 //! graph and the completion read of the first is kept in the runner's memory. A drafter whose
-//! layers keep a state (`nn::Drafter::state`) is lent its live rows by each of its forwards,
+//! layers keep a state (`nn::Drafter::state_layers`) is lent its live rows by each of its forwards,
 //! and every proposal is the argmax of the model's head over the drafter's own read of its
 //! output (`nn::Drafter::logits_rows`).
 
@@ -635,7 +635,7 @@ impl CausalLmRunner {
     ///   `nn::RecurrentState::trail`, with a row for each token of the largest verification
     ///   bucket. A runner whose forwards lend verify slots keeps the state after each token in
     ///   its requests' slots, and is lent none.
-    /// - `drafter` is the live buffers of the drafter's state (`nn::Drafter::state`), in the
+    /// - `drafter` is the live buffers of the drafter's state (`nn::Drafter::state_layers`), in the
     ///   layout of `nn::RecurrentState::live`, a home row per request slot of each field
     ///   (`StateMemory::drafter`); `None` for a drafter that keeps no state. The drafter's
     ///   forwards are lent them and advance them in place.
@@ -655,7 +655,7 @@ impl CausalLmRunner {
         drafter: Option<StateBuffers>,
     ) -> Result<()> {
         let (layers, drafter_runs) = match self.model.drafter() {
-            Some(drafter) => (Some(drafter.cache().layers), drafter.state()),
+            Some(drafter) => (Some(drafter.cache().layers), drafter.state_layers()),
             None => (None, Vec::new()),
         };
         let Some(speculation) = self.speculation.as_mut() else {
@@ -2231,7 +2231,7 @@ fn check_state(
 }
 
 /// Refuses the live buffers of a drafter's state that are not those of `runs`, the drafter's
-/// (`nn::Drafter::state`), over `slots` request slots: a home row per slot of each field of
+/// (`nn::Drafter::state_layers`), over `slots` request slots: a home row per slot of each field of
 /// every layer of the runs, and nothing for a drafter that keeps no state. A drafter's field
 /// keeps one slot per request, so a field that keeps one per verified token is refused.
 fn check_drafter_state(

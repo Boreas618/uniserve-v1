@@ -98,10 +98,15 @@ impl Drafter for TinyDrafter {
         }
     }
 
+    fn state_layers(&self) -> Vec<StateShape> {
+        Vec::new()
+    }
+
     fn forward(
         &self,
         _batch: &TokenBatch,
         _cache: &KvCache,
+        _state: Option<&RecurrentState>,
         embedded: &Tensor,
         hidden: &Tensor,
     ) -> nn::Result<Tensor> {
@@ -209,8 +214,8 @@ impl TextModel for Tiny {
         }
     }
 
-    fn state(&self) -> Option<StateShape> {
-        None
+    fn state_layers(&self) -> Vec<StateShape> {
+        Vec::new()
     }
 
     fn experts(&self) -> Option<ExpertShape> {

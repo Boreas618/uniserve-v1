@@ -110,14 +110,11 @@ fn step(
 
     let (stepped, recording) = record(group, || {
         let cache = cache(model.cache(), model.dtype(), rows, row_pages);
-        let state = model.state().map(|shape| {
+        let runs = model.state_layers();
+        let state = (!runs.is_empty()).then(|| {
             let buffers = || {
-                RecurrentState::buffers(
-                    std::slice::from_ref(&shape),
-                    |_| SLOTS,
-                    |shape, dtype| Ok(meta(shape, dtype)),
-                )
-                .expect("the state buffers")
+                RecurrentState::buffers(&runs, |_| SLOTS, |shape, dtype| Ok(meta(shape, dtype)))
+                    .expect("the state buffers")
             };
             text::state(
                 [
@@ -216,7 +213,7 @@ fn qwen3_moe_profiles_a_decode_and_a_prefill_bucket() {
 
     let cache = model.cache();
     assert_eq!((cache.layers, cache.kv_heads, cache.head_dim), (48, 4, 128));
-    assert!(model.state().is_none());
+    assert!(model.state_layers().is_empty());
     assert!(model.drafter().is_none() && model.vision().is_none());
     let experts = model.experts().expect("routed experts");
     assert_eq!(
@@ -471,7 +468,7 @@ fn assert_hybrid_shapes(model: &dyn TextModel) {
     let cache = model.cache();
     assert_eq!((cache.layers, cache.kv_heads, cache.head_dim), (10, 2, 256));
 
-    let state = model.state().expect("a recurrent state");
+    let [state] = <[_; 1]>::try_from(model.state_layers()).expect("one run of recurrent layers");
     assert_eq!(state.layers, 30);
     assert_eq!(state.fields[0].dims, [3, 8192]);
     assert_eq!(state.fields[0].dtype, model.dtype());
@@ -545,6 +542,7 @@ fn qwen3_6_profiles_its_buckets_its_drafter_and_its_tower() {
             drafter.forward(
                 &batch(phase, rows, tokens, row_pages),
                 &cache,
+                None,
                 &rows_of(),
                 &rows_of(),
             )

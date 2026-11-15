@@ -444,7 +444,8 @@ pub struct RecurrentState {
     /// follow the runs in order.
     pub live: Vec<Vec<Tensor>>,
     /// The checkpoint buffers, in the same order and extents. Empty for a drafter's state
-    /// ([`Drafter::state`]), which execution keeps live alone: its `checkpoints` are then zero.
+    /// ([`Drafter::state_layers`]), which execution keeps live alone: its `checkpoints` are then
+    /// zero.
     pub checkpoint: Vec<Vec<Tensor>>,
     /// The trail buffers of a batch that keeps one, in the same order: `[tokens, …]` per field,
     /// row `t` receiving the layer's state after the batch's token `t`. A speculative
@@ -1351,8 +1352,8 @@ pub trait CausalLm {
     ///
     /// `cache` holds the model's attention groups, in the order its attention layers index
     /// them, whose pages the batch's slot mapping writes in place. `state` is the recurrent
-    /// state of a model whose [`crate::family::TextModel::state`] declares one, advanced in
-    /// place, and `None` for a model that keeps none. `exchange` is lent to a model whose
+    /// state of a model whose [`crate::family::TextModel::state_layers`] declares one, advanced
+    /// in place, and `None` for a model that keeps none. `exchange` is lent to a model whose
     /// routed experts are split across ranks, and is `None` otherwise.
     ///
     /// # Errors
@@ -1411,23 +1412,32 @@ pub trait Drafter: Send + Sync {
     fn cache(&self) -> crate::family::CacheShape;
 
     /// Runs the drafter over `batch`: `embedded [tokens, hidden]` holds the embedding of each
-    /// entry's next token and `hidden [tokens, hidden]` the hidden state each entry reads;
-    /// returns the drafter's own normalized hidden state, `[tokens, hidden]`. `cache` is the
-    /// draft cache's one attention group, which the batch's slot mapping writes in place.
+    /// entry's next token and `hidden` the rows each entry reads, rows of the model's
+    /// [`crate::family::TextModel::stream_width`]; returns the drafter's own rows, of the same
+    /// width. `cache` is the draft cache's one attention group, which the batch's slot mapping
+    /// writes in place.
+    ///
+    /// `state` holds the live buffers of the drafter's layers ([`Self::state_layers`]),
+    /// advanced in place, with no checkpoint buffer, no trail and no verify slots; its rows are
+    /// the batch's. Execution lends it exactly when the drafter declares a state, and `None`
+    /// otherwise.
     ///
     /// # Errors
     ///
-    /// Tensors a module refuses.
+    /// Tensors a module refuses, a stateful drafter run without its state, or a stateless one
+    /// lent a state.
     fn forward(
         &self,
         batch: &TokenBatch,
         cache: &KvCache,
+        state: Option<&RecurrentState>,
         embedded: &Tensor,
         hidden: &Tensor,
     ) -> Result<Tensor>;
 
-    /// The state its layers keep per request slot beside the draft cache, in the order
-    /// [`Self::forward_stateful`] is lent their buffers; empty for a drafter that keeps none.
+    /// The state its layers keep per request slot beside the draft cache, as runs of layers
+    /// that keep the same fields ([`crate::family::TextModel::state_layers`]), in the order
+    /// [`Self::forward`] is lent their buffers; empty for a drafter that keeps none.
     ///
     /// Execution keeps one live row of each field per request slot and nothing else: no field
     /// is stepwise ([`crate::family::StateField::stepwise`]), and the state is neither kept in
@@ -1440,30 +1450,7 @@ pub trait Drafter: Send + Sync {
     /// overwrites at a position before any later forward reads them there, such as a ring of
     /// the recent rows of an index group the page divides; a field that summarizes every
     /// earlier token, as a recurrent layer's does, has no place here.
-    fn state(&self) -> Vec<crate::family::StateShape> {
-        Vec::new()
-    }
-
-    /// [`Self::forward`] for a drafter whose layers keep a state ([`Self::state`]): `state`
-    /// holds the live buffers of its layers, advanced in place, with no checkpoint buffer, no
-    /// trail and no verify slots; its rows are the batch's. `hidden` and the result are rows
-    /// of the model's [`crate::family::TextModel::stream_width`]. A drafter that keeps none
-    /// ignores `state`.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::forward`], and a stateful drafter run without its state.
-    fn forward_stateful(
-        &self,
-        batch: &TokenBatch,
-        cache: &KvCache,
-        state: Option<&RecurrentState>,
-        embedded: &Tensor,
-        hidden: &Tensor,
-    ) -> Result<Tensor> {
-        let _ = state;
-        self.forward(batch, cache, embedded, hidden)
-    }
+    fn state_layers(&self) -> Vec<crate::family::StateShape>;
 
     /// The rows [`CausalLm::compute_logits`] reads of `hidden`, rows of the drafter's output:
     /// the output itself, or what the drafter's own read of it computes when the model's head

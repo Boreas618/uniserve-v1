@@ -21,9 +21,9 @@
 //! `step mod layers` of a speculation's steps (`qwen3_5_mtp.py:172-173`). A forward here is
 //! not told its step, so a checkpoint of more than one layer is refused at load.
 
-use nn::family::{CacheShape, SequenceSplit, TextPlacement};
+use nn::family::{CacheShape, SequenceSplit, StateShape, TextPlacement};
 use nn::modules::{Linear, LinearConfig, Parallel, RmsNorm, Rotary};
-use nn::{D, Drafter, KvCache, Result, Tensor, TokenBatch, VarBuilder, functional};
+use nn::{D, Drafter, KvCache, RecurrentState, Result, Tensor, TokenBatch, VarBuilder, functional};
 
 use crate::qwen3::ID;
 use crate::qwen3::causal_lm::text_rotary;
@@ -128,13 +128,24 @@ impl Drafter for Mtp {
         self.cache
     }
 
+    /// The layers attend over the draft cache alone and keep no state.
+    fn state_layers(&self) -> Vec<StateShape> {
+        Vec::new()
+    }
+
     fn forward(
         &self,
         batch: &TokenBatch,
         cache: &KvCache,
+        state: Option<&RecurrentState>,
         embedded: &Tensor,
         hidden: &Tensor,
     ) -> nn::Result<Tensor> {
+        if state.is_some() {
+            return Err(ID.config(
+                "the drafter's layers keep no state, and the forward was lent one".to_owned(),
+            ));
+        }
         let tokens = batch.tokens();
         for (name, rows) in [("embedded", embedded), ("hidden", hidden)] {
             if rows.dims() != [tokens, self.hidden] {

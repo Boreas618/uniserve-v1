@@ -236,7 +236,7 @@ impl ModelRunner {
         let drafter = model
             .drafter()
             .filter(|_| drafts > 0)
-            .map(|drafter| drafter.state())
+            .map(|drafter| drafter.state_layers())
             .unwrap_or_default();
 
         Some(StateConfig {

@@ -280,8 +280,9 @@ fn cache(shape: CacheShape, rows: usize) -> KvCache {
 
 /// The state buffers of `model`, zeroed, when it keeps a state.
 fn buffers(model: &dyn TextModel) -> Option<Vec<Vec<Tensor>>> {
-    model.state().map(|shape| {
-        RecurrentState::buffers(&[shape], |_| SLOTS, |shape, dtype| Ok(zeros(shape, dtype)))
+    let runs = model.state_layers();
+    (!runs.is_empty()).then(|| {
+        RecurrentState::buffers(&runs, |_| SLOTS, |shape, dtype| Ok(zeros(shape, dtype)))
             .expect("the state buffers")
     })
 }
@@ -520,6 +521,7 @@ fn the_drafter_computes_the_references_hidden_states() {
                 .forward(
                     &batch(phase, std::slice::from_ref(&range)),
                     cache,
+                    None,
                     &embedded.narrow(0, first, count).expect("the entries"),
                     &hidden.narrow(0, first, count).expect("the entries"),
                 )
