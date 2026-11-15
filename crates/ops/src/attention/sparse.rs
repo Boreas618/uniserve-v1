@@ -43,7 +43,7 @@
 //!
 //! so two implementations differ by at most `2(γₙ + u) V + 2 u_out |out|`. The `V` term does not
 //! scale with the result, so it enters the tolerance as an absolute term over the declared element
-//! envelope [`VALUE_ENVELOPE`], and the reduction length is the descriptor's
+//! envelope [`tolerance::VALUE_ENVELOPE`], and the reduction length is the descriptor's
 //! [`SparseDescriptor::keys`]: the largest key extent a module serves, which bounds every launch
 //! because a query attends at most every key row.
 //!
@@ -74,13 +74,6 @@ use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 use tensor::DType;
-
-/// The largest value magnitude the sparse attention bound's absolute term is written for.
-///
-/// VSA reads the value projection of a normalized residual stream, as paged attention does; an
-/// element stays below 8 in the models served here (BF16 serving). The envelope is a declaration
-/// about that data, not something the descriptor can state.
-pub const VALUE_ENVELOPE: f32 = 8.0;
 
 /// The smallest alignment a query, key, value or output base address must have.
 ///
@@ -550,7 +543,7 @@ impl Op for SparseAttention {
         let gamma = tolerance::gamma(reduction, accumulate);
         let value_term = 2.0 * gamma + tolerance::unit_roundoff(accumulate);
         Tolerance::rounding(reduction, accumulate, descriptor.output)
-            .with_atol((value_term * f64::from(VALUE_ENVELOPE)) as f32)
+            .with_atol((value_term * f64::from(tolerance::VALUE_ENVELOPE)) as f32)
     }
 }
 

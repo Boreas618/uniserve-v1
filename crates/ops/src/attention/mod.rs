@@ -61,7 +61,7 @@
 //! `γₙ` and `u_out`). Two implementations therefore differ by at most
 //! `2(γₙ + u) V + 2 u_out |out|`. The `V` term does not scale with the result — a row whose output
 //! cancels can be smaller than `V` — so it enters the tolerance as an absolute term over the element
-//! envelope [`VALUE_ENVELOPE`] documented below, and the result-scaled part as `rtol`. The reduction
+//! envelope [`tolerance::VALUE_ENVELOPE`], and the result-scaled part as `rtol`. The reduction
 //! length `n` is the descriptor's [`Descriptor::max_kv_len`], the largest key count a module serves,
 //! which bounds every launch: a longer reduction would only widen the bound.
 //!
@@ -104,14 +104,6 @@ use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
-
-/// The largest value magnitude the attention bound's absolute term is written for.
-///
-/// Attention reads the value projection of a normalized residual stream: in the models served here
-/// (BF16 hidden states after an RMSNorm whose weight is near one) an element of `v` stays below 8 in
-/// magnitude. The bound's `V` term is a declaration about that data — it cannot be derived from the
-/// descriptor — and rows that exceed the envelope are outside what a data-free tolerance can cover.
-pub const VALUE_ENVELOPE: f32 = 8.0;
 
 /// The most (query token, query head) pairs one prefill program of the Triton package holds.
 ///
@@ -866,7 +858,7 @@ impl Op for PagedAttention {
         let gamma = tolerance::gamma(reduction, accumulate);
         let value_term = 2.0 * gamma + tolerance::unit_roundoff(accumulate);
         Tolerance::rounding(reduction, accumulate, descriptor.output)
-            .with_atol((value_term * f64::from(VALUE_ENVELOPE)) as f32)
+            .with_atol((value_term * f64::from(tolerance::VALUE_ENVELOPE)) as f32)
     }
 }
 
@@ -1413,7 +1405,7 @@ mod tests {
         assert_eq!(stated("TILE_ROWS"), Some(PREFILL_TILE_ROWS));
         assert_eq!(stated("TILE_ELEMENTS"), Some(PREFILL_TILE_ELEMENTS));
 
-        // Qwen3-30B-A3B's group of eight heads of 128 holds sixteen tokens a tile, eight at a head
+        // A group of eight query heads of 128 holds sixteen tokens a tile, eight at a head
         // of 256 and four at 512; a group wider than the tile holds one.
         assert_eq!(prefill_query_tile(32, 4, 128), 16);
         assert_eq!(prefill_query_tile(32, 4, 256), 8);
@@ -1561,7 +1553,7 @@ mod tests {
         assert!(short.rtol > 0.0 && short.rtol < long.rtol);
         assert!(long.rtol < 0.01, "rtol {} is above one percent", long.rtol);
         assert!(
-            long.atol > 0.0 && long.atol <= VALUE_ENVELOPE,
+            long.atol > 0.0 && long.atol <= tolerance::VALUE_ENVELOPE,
             "atol {}",
             long.atol
         );

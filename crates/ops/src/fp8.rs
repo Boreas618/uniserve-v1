@@ -11,8 +11,8 @@
 //! (`scaled_fp8_quant` followed by a scaled `fp8 × fp8 → fp32` product), in two launches: the
 //! activation is encoded once into a buffer of codes, and the product loads both operands as
 //! stored E4M3 tiles, which runs at twice the rate of a loop that encodes each tile it loads (a
-//! 32768 × 28672 × 5376 product on a B200: 1525 TFLOPS against 671 to 721) for one more byte
-//! written and read per activation element.
+//! 32768 × 28672 × 5376 product: 1525 TFLOPS against 671 to 721) for one more byte written and
+//! read per activation element.
 //!
 //! Both operators load whole vectors of a row along the contraction, so a contraction and a row
 //! stride are multiples of sixteen elements (one vector of E4M3, two of a 16-bit type): their
@@ -318,7 +318,7 @@ impl Op for Fp8Gemm {
         // Both implementations multiply the same E4M3 codes, so they differ only by their FP32
         // association of the k products and by the one rounding into the output; the reduction
         // length is a launch value, so the bound is stated for the widest contraction a served
-        // projection has (the MiniMax-H3 text encoder's 25600-element down projection).
+        // projection has (a down projection of 25600 elements).
         Tolerance::dot(32_768, DType::F32, descriptor.dtype)
     }
 }

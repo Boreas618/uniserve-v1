@@ -127,8 +127,8 @@ extern "C" int32_t uniserve_frame_moments(const uniserve_frame_moments_call* cal
   // A frame must span at least one channel's pixels of the group: the kernel walks a frame by
   // `channels_per_group` steps of `stride_channel` and reads `pixels` of each, so a frame that is
   // shorter than one row would read past the tensor. It must *not* be required to hold the whole
-  // group, which only a frame-major layout satisfies: H3's video tensors are [B, C, T, H, W], where
-  // `values_frame` is one frame of one channel (H·W) and `values_channel` is a whole frame of the
+  // group, which only a frame-major layout satisfies: a video tensor of [B, C, T, H, W] has
+  // `values_frame` one frame of one channel (H·W) and `values_channel` a whole frame of the
   // sequence (T·H·W).
   if (call->values_pixel <= 0) {
     return refuse(call, "frame_moments needs a positive step between a frame's pixels");

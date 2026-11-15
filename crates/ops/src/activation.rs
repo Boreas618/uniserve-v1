@@ -42,8 +42,8 @@ pub enum Activation {
     Gelu,
     /// The tanh approximation of GELU.
     GeluTanh,
-    /// The logistic sigmoid alone, `1 / (1 + exp(−x))`: an attention's output gate
-    /// (Qwen3-Next, Qwen3.5), which no checkpoint names as an MLP activation.
+    /// The logistic sigmoid alone, `1 / (1 + exp(−x))`: an attention's output gate, which no
+    /// checkpoint names as an MLP activation.
     Sigmoid,
 }
 
@@ -645,9 +645,6 @@ impl Op for Swiglu {
     }
 }
 
-/// The envelope of `|x|` a single-input activation's tolerance follows.
-const SILU_VALUE_ENVELOPE: f32 = 8.0;
-
 /// One compilation of `silu`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SiluDescriptor {
@@ -754,7 +751,7 @@ impl Op for Silu {
         // part: over `|x| ≤ 8` the sigmoid's few FP32 ulps, carried through one product by `|x|`,
         // stay far below the narrowest output type's own half ulp.
         Tolerance::rounding(1, DType::F32, descriptor.dtype)
-            .with_atol(4.0 * SILU_VALUE_ENVELOPE * f32::EPSILON)
+            .with_atol(4.0 * tolerance::VALUE_ENVELOPE * f32::EPSILON)
     }
 }
 

@@ -40,9 +40,6 @@ use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
-/// The envelope of `|α · x|`: the absolute part of the tolerance follows it.
-const VALUE_ENVELOPE: f32 = 8.0;
-
 /// One compilation of `snake`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Descriptor {
@@ -163,7 +160,8 @@ impl Op for Snake {
         // `sin`, its square and the reciprocal are three roundings in FP32 before the output's own;
         // the envelope above bounds the addend by the value 1.
         let unit = tolerance::unit_roundoff(descriptor.dtype) as f32;
-        Tolerance::rounding(3, DType::F32, descriptor.dtype).with_atol(8.0 * VALUE_ENVELOPE * unit)
+        Tolerance::rounding(3, DType::F32, descriptor.dtype)
+            .with_atol(8.0 * tolerance::VALUE_ENVELOPE * unit)
     }
 }
 

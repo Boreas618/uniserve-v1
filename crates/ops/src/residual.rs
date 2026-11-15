@@ -733,7 +733,7 @@ pub struct SigmoidGatedAddArgs {
 }
 
 /// `target[r] ← target[r] + sigmoid(gate[r]) · update[r]`: a row's update scaled by the sigmoid of
-/// its own scalar logit, as a shared expert joins the routed ones (Qwen2-MoE, Qwen3-Next, Qwen3.5).
+/// its own scalar logit, as a gated shared expert joins the routed ones.
 ///
 /// The sigmoid, the product and the sum are FP32 and the target rounds once.
 pub struct SigmoidGatedAdd;

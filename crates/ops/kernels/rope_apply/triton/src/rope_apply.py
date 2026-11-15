@@ -4,8 +4,8 @@ One program rotates ``ROWS`` tokens' heads. A head's leading ``ROTATED``
 channels turn by the token's own cosine and sine factors — split-half pairing
 ("half": channel ``j`` with ``j + ROTATED/2``) or adjacent-pair ("interleaved":
 ``2j`` with ``2j + 1``) — and the rest pass through: a multimodal transformer
-rotates part of a head, and a head need not be a power of two (H3's audio path
-rotates all 72 channels of its heads). The arithmetic is FP32 and the store
+rotates part of a head, and a head need not be a power of two (a head of 72
+channels rotated whole). The arithmetic is FP32 and the store
 rounds once into the output type.
 
 The tables arrive already evaluated, ``[tokens, ROTATED/2]`` FP32 each, and the

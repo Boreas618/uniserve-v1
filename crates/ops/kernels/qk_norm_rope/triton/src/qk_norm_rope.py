@@ -7,7 +7,7 @@ statistics — over the whole head, so the channels that do not rotate are
 normalized too — and then rotated by the token's cosine and sine factors:
 split-half rotation ("half") or adjacent-pair rotation ("interleaved"). Only the
 leading ``ROTATED`` channels of a head turn; a multimodal transformer rotates
-part of a head (H3 rotates 96 of 128) and the rest keeps its normalized value.
+part of a head (96 of 128, say) and the rest keeps its normalized value.
 The result is rounded once into the output dtype.
 
 The learned scale is **one weight per channel**, a `[head_dim]` vector shared by every head of that

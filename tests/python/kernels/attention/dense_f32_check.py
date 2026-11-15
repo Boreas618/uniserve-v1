@@ -44,7 +44,7 @@ import torch
 # The operator crate's package ABI numbering (`ops::abi::code`).
 F32 = 5
 
-# The operator's bound: `dense.rs`'s `VALUE_ENVELOPE`.
+# The operator's bound: `ops::tolerance::VALUE_ENVELOPE`.
 VALUE_ENVELOPE = 8.0
 
 # `DType::F32.unit_roundoff()`.

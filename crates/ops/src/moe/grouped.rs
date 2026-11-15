@@ -24,8 +24,8 @@
 //! A row of FC1 or FC2 is a dot product of length `H` or `I` accumulated in FP32 and rounded once to
 //! BF16. Two correct implementations therefore differ by at most `2γₙ Σ|aᵢbᵢ| + u_out|result|`
 //! (Higham §3.1); with a sum of mixed-sign products the result can cancel, so
-//! [`Tolerance::dot`] states the bound relative to the result and [`ACTIVATION_ENVELOPE`] gives the
-//! absolute term for rows that cancel harder, over the data this operator sees.
+//! [`Tolerance::dot`] states the bound relative to the result and the activation envelope
+//! ([`tolerance::VALUE_ENVELOPE`]) gives the absolute term for rows that cancel harder.
 
 use std::ffi::c_void;
 use std::fmt;
@@ -39,17 +39,10 @@ use crate::descriptor::Key;
 use crate::fp4::ScaleLayout;
 use crate::kernel::{Kernel, NativeCall};
 use crate::operand::Operand;
-use crate::tolerance::Tolerance;
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 use super::{address, to_i64};
-
-/// The largest magnitude one activation element of a grouped GEMM is written for.
-///
-/// The rows are normalized hidden states (RMSNorm output, weight near one) for FC1, and gated
-/// products of them for FC2; an element stays below 8 in the models served here. The envelope is a
-/// declaration about that data, not something the descriptor can state.
-pub const ACTIVATION_ENVELOPE: f32 = 8.0;
 
 /// Refuses the exact GELU: a FC1 gates with `silu` or `gelu_tanh`, the two its kernels compile.
 fn require_gate(operator: &'static str, activation: Activation) -> Result<()> {
@@ -379,15 +372,16 @@ impl Op for GatherGemm {
     ///
     /// The `atol` is the term the reduction does not cover: **the activation's envelope**. This
     /// operator is the first half of the gated product, so its output is what `silu` and the
-    /// multiply then amplify, and the reference compares the *gated* result. `ACTIVATION_ENVELOPE`
-    /// is the bound on that factor and `2 · γₙ · envelope² · 2` is what survives it — the same
-    /// sentence for `route_gemm`, whose input is already one.
+    /// multiply then amplify, and the reference compares the *gated* result.
+    /// [`tolerance::VALUE_ENVELOPE`] is the bound on that factor and `2 · γₙ · envelope² · 2` is
+    /// what survives it — the same sentence for `route_gemm`, whose input is already one.
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         let reduction = u64::from(descriptor.hidden);
         let accumulate = DType::F32;
         let gamma = crate::tolerance::gamma(reduction, accumulate);
         let atol =
-            (2.0 * gamma * f64::from(ACTIVATION_ENVELOPE * ACTIVATION_ENVELOPE * 2.0)) as f32;
+            (2.0 * gamma * f64::from(tolerance::VALUE_ENVELOPE * tolerance::VALUE_ENVELOPE * 2.0))
+                as f32;
         Tolerance::dot(reduction, accumulate, descriptor.dtype).with_atol(atol)
     }
 }
@@ -520,7 +514,8 @@ impl Op for RouteGemm {
         let accumulate = DType::F32;
         let gamma = crate::tolerance::gamma(reduction, accumulate);
         let atol =
-            (2.0 * gamma * f64::from(ACTIVATION_ENVELOPE * ACTIVATION_ENVELOPE * 2.0)) as f32;
+            (2.0 * gamma * f64::from(tolerance::VALUE_ENVELOPE * tolerance::VALUE_ENVELOPE * 2.0))
+                as f32;
         Tolerance::dot(reduction, accumulate, descriptor.dtype).with_atol(atol)
     }
 }
@@ -1186,7 +1181,8 @@ impl Op for GatherGemmNvfp4 {
         let accumulate = DType::F32;
         let gamma = crate::tolerance::gamma(reduction, accumulate);
         let atol =
-            (2.0 * gamma * f64::from(ACTIVATION_ENVELOPE * ACTIVATION_ENVELOPE * 2.0)) as f32;
+            (2.0 * gamma * f64::from(tolerance::VALUE_ENVELOPE * tolerance::VALUE_ENVELOPE * 2.0))
+                as f32;
         Tolerance::dot(reduction, accumulate, descriptor.dtype).with_atol(atol)
     }
 }
@@ -1595,7 +1591,8 @@ impl Op for RouteGemmNvfp4 {
         let accumulate = DType::F32;
         let gamma = crate::tolerance::gamma(reduction, accumulate);
         let atol =
-            (2.0 * gamma * f64::from(ACTIVATION_ENVELOPE * ACTIVATION_ENVELOPE * 2.0)) as f32;
+            (2.0 * gamma * f64::from(tolerance::VALUE_ENVELOPE * tolerance::VALUE_ENVELOPE * 2.0))
+                as f32;
         Tolerance::dot(reduction, accumulate, descriptor.dtype).with_atol(atol)
     }
 }

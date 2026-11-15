@@ -3,9 +3,7 @@
 //! A sparse attention layer keeps, beside each page of keys and values, one compressed **index
 //! key** per `ratio` consecutive tokens. A query row scores the index keys of its request with a
 //! few index heads, keeps the best groups, and attends only the tokens of those groups and of its
-//! own unfinished group (vLLM's Qwen sparse attention,
-//! `refs/vllm/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py:20-219` and
-//! `refs/vllm/vllm/models/qwen4_exp/nvidia/ops/qsa.py:75-330`):
+//! own unfinished group:
 //!
 //! ```text
 //! index_scores        s[t, g] = Σ_h relu(q[t, h] · key[g])        g < visible[t], −inf otherwise
@@ -36,9 +34,10 @@ use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
-/// The largest magnitude a cached value is declared to have, for the attention's absolute bound:
-/// the envelope paged attention declares for the same caches.
-const VALUE_ENVELOPE: f32 = 64.0;
+/// The largest magnitude a cached value is declared to have, for the indexed attention's absolute
+/// bound: a declaration about the cache's data, as `tolerance::VALUE_ENVELOPE` is about the
+/// activations.
+const CACHED_VALUE_ENVELOPE: f32 = 64.0;
 
 /// Checks the columns both operators address a request's pages by: the `[rows, max_pages]` u32
 /// page table and the `[tokens]` u32 table row of each token.
@@ -396,7 +395,7 @@ impl Op for IndexedAttention {
             rtol: rounded.rtol + tolerance::unit_roundoff(descriptor.cache) as f32,
             ..rounded
         }
-        .with_atol((value_term * f64::from(VALUE_ENVELOPE)) as f32)
+        .with_atol((value_term * f64::from(CACHED_VALUE_ENVELOPE)) as f32)
     }
 }
 

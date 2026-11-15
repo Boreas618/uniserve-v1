@@ -365,7 +365,7 @@ pub struct QkNormRopeDescriptor {
     /// when set.
     pub strided: bool,
     /// Whether the learned scales are stored zero-centred: each normalized head is multiplied by
-    /// `1 + weight`, the one added in FP32 (Qwen3-Next and Qwen3.5 store their q/k norms so). Only an
+    /// `1 + weight`, the one added in FP32. Only an
     /// affine form has scales to centre, and a key names it only when set.
     pub centred: bool,
 }

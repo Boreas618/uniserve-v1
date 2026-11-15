@@ -10,8 +10,8 @@
 //! softmax          out = exp(x − max(x)) / Σ exp(x − max(x))
 //! ```
 //!
-//! A checkpoint may store an RMS normalization's weight zero-centred (Gemma, Qwen3-Next and
-//! Qwen3.5 write `x̂ · (1 + w)`): `rms_norm` and `add_rms_norm` read such a weight unchanged and add
+//! A checkpoint may store an RMS normalization's weight zero-centred, the normalized row scaled
+//! by `x̂ · (1 + w)`: `rms_norm` and `add_rms_norm` read such a weight unchanged and add
 //! the one in FP32 when their descriptor says [`centred`](RmsNormDescriptor::centred), so the
 //! product is the reference's and no rounded `1 + w` is ever stored.
 //!
@@ -45,8 +45,7 @@ pub struct RmsNormDescriptor {
     /// Whether the weight is stored zero-centred: the row is scaled by `1 + weight`.
     pub centred: bool,
     /// Rows of the gain: row `i` of the input is scaled by gain row `i mod groups`. One for a
-    /// gain every row shares; the streams of a hyper-connected residual each have their own
-    /// (`refs/vllm/vllm/models/qwen4_exp/nvidia/ops/hc.py:12-51`).
+    /// gain every row shares; the streams of a hyper-connected residual each have their own.
     pub groups: u32,
 }
 
@@ -283,9 +282,8 @@ pub struct GatedRmsNormDescriptor {
     pub columns: u32,
     /// The tile one program loads at a time; at least `columns` rounds up to the next power of two.
     pub tile: u32,
-    /// Whether the gate passes through a sigmoid in place of the SiLU (`output_gate_type:
-    /// "sigmoid"`,
-    /// `refs/vllm/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:817-831`).
+    /// Whether the gate passes through a sigmoid in place of the SiLU: `x̂ · w · sigmoid(z)`
+    /// rather than `x̂ · w · silu(z)`.
     pub sigmoid: bool,
 }
 

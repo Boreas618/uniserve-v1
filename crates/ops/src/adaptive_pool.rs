@@ -34,9 +34,6 @@ use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
-/// The envelope of one row's mean, which the absolute part of the tolerance follows.
-const VALUE_ENVELOPE: f32 = 8.0;
-
 /// One compilation of `adaptive_pool`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Descriptor {
@@ -169,7 +166,7 @@ impl Op for AdaptivePool {
         let reduction = u64::from(descriptor.heads) * window;
         let unit = tolerance::unit_roundoff(descriptor.dtype) as f32;
         Tolerance::rounding(reduction, DType::F32, descriptor.dtype)
-            .with_atol(8.0 * VALUE_ENVELOPE * unit)
+            .with_atol(8.0 * tolerance::VALUE_ENVELOPE * unit)
     }
 }
 

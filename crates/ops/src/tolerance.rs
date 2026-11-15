@@ -47,6 +47,16 @@
 
 use tensor::DType;
 
+/// The largest magnitude an activation element is declared to have, for the absolute part of a
+/// data-free bound.
+///
+/// The operators read the hidden states of a normalized residual stream (an RMS normalization's
+/// output, whose weight is near one), the products a gated layer forms of them, and the value
+/// projections attention reads of them; their elements stay below 8. The envelope is a declaration
+/// about that data, which no descriptor states, and an element beyond it is outside what a
+/// data-free tolerance covers.
+pub const VALUE_ENVELOPE: f32 = 8.0;
+
 /// How far one implementation of an operator may be from another.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Tolerance {

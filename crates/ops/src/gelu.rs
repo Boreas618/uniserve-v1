@@ -32,9 +32,6 @@ use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
-/// The envelope of `|x|` the tolerance's absolute part follows.
-const VALUE_ENVELOPE: f32 = 8.0;
-
 /// Which of PyTorch's two GELU formulas a compilation evaluates.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Approximation {
@@ -157,7 +154,8 @@ impl Op for Gelu {
         // One rounding from FP32 into the output type; the `erf` or the `exp` is the transcendental
         // whose last place the envelope covers.
         let unit = tolerance::unit_roundoff(descriptor.dtype) as f32;
-        Tolerance::rounding(1, DType::F32, descriptor.dtype).with_atol(8.0 * VALUE_ENVELOPE * unit)
+        Tolerance::rounding(1, DType::F32, descriptor.dtype)
+            .with_atol(8.0 * tolerance::VALUE_ENVELOPE * unit)
     }
 }
 

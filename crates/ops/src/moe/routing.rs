@@ -46,9 +46,9 @@ pub const WARPS_PER_BLOCK: u64 = 4;
 /// The tokens one `topk_softmax` thread block routes.
 pub const TOKENS_PER_BLOCK: u64 = WARPS_PER_BLOCK;
 
-/// The largest expert count a router of this build selects over: the widest served block's
-/// (512, Qwen3.8 Flash Next). The kernel holds `ceil(experts / 32)` scores per lane, compiled
-/// in, up to 1024 experts.
+/// The largest expert count a router of this build selects over: the widest block a served
+/// checkpoint routes over. The kernel holds `ceil(experts / 32)` scores per lane, compiled in, up
+/// to 1024 experts.
 pub const MAX_EXPERTS: u32 = 512;
 
 /// The largest top-k a router of this build keeps: the widest served block's (10). The kernel's

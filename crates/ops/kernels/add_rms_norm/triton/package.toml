@@ -38,7 +38,7 @@ CENTRED = { field = "centred", absent = false }
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true }, pdl = ["true", "false"] }
 
-# A zero-centred weight (Gemma, Qwen3-Next, Qwen3.5): the row is scaled by `1 + w`, the one added in
+# A zero-centred weight: the row is scaled by `1 + w`, the one added in
 # FP32. The operator names `centred` only when set, so the plain key keeps its shape.
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true }, pdl = ["true", "false"], centred = ["true"] }

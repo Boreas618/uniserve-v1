@@ -1,7 +1,7 @@
 //! The operators of a linear-attention layer that keeps a recurrent state per request slot: the
 //! short causal convolution and the gated delta rule.
 //!
-//! A gated delta network (Yang et al., "Gated Delta Networks", 2024; Qwen3-Next and Qwen3.5) mixes
+//! A gated delta network (Yang et al., "Gated Delta Networks", 2024) mixes
 //! tokens through a depthwise causal convolution of a few taps and a matrix-valued state updated by
 //! the delta rule under a scalar decay per value head:
 //!
@@ -498,8 +498,7 @@ pub enum StateAxes {
     /// `[value_heads, key_dim, value_dim]`: a key's row holds what it recalls.
     KeyValue,
     /// `[value_heads, value_dim, key_dim]`: a value's row holds its weights over the keys, the
-    /// order vLLM stores
-    /// (`refs/vllm/vllm/model_executor/layers/mamba/mamba_utils.py:296-300`).
+    /// transpose of `KeyValue`.
     ValueKey,
 }
 

@@ -40,7 +40,7 @@
 //! reads, so the standard bound (Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed.,
 //! §3.1) gives `|out − out_exact| ≤ (γₙ + u) V + u_out |out|` for `n` visible keys, and two
 //! implementations differ by twice that. The `V` term enters as an absolute term over the declared
-//! envelope [`VALUE_ENVELOPE`]; the reduction length is the descriptor's
+//! envelope [`tolerance::VALUE_ENVELOPE`]; the reduction length is the descriptor's
 //! [`DenseDescriptor::max_kv_len`], the longest key extent a launch may declare. It is a bound and
 //! not a compiled value, so it is absent from the key: a bidirectional attention may run over a
 //! `padded_tokens` bucket that varies per layout, and naming it would compile a program per bucket.
@@ -67,13 +67,6 @@ use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 use tensor::DType;
-
-/// The largest value magnitude the attention bound's absolute term is written for.
-///
-/// Dense attention reads the value projection of a normalized residual stream; an element stays
-/// below 8 in the models served here. The envelope is a declaration about that data, not something
-/// the descriptor can state.
-pub const VALUE_ENVELOPE: f32 = 8.0;
 
 /// One compilation of `dense_attention`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -536,7 +529,7 @@ impl Op for DenseAttention {
         let gamma = tolerance::gamma(reduction, accumulate);
         let value_term = 2.0 * gamma + tolerance::unit_roundoff(accumulate);
         Tolerance::rounding(reduction, accumulate, descriptor.output)
-            .with_atol((value_term * f64::from(VALUE_ENVELOPE)) as f32)
+            .with_atol((value_term * f64::from(tolerance::VALUE_ENVELOPE)) as f32)
     }
 }
 

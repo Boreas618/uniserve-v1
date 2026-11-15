@@ -71,11 +71,6 @@ use crate::strided;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
-/// The bound on `|x|`, and on elu's `|a|`, that the absolute part of `gelu`'s, `gelu_erf`'s and
-/// `elu`'s tolerance is stated for: the activations a normalized layer feeds an activation
-/// function.
-const VALUE_ENVELOPE: f32 = 8.0;
-
 /// The function one compilation of `elementwise_unary` evaluates.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum UnaryFunction {
@@ -363,8 +358,9 @@ impl Op for ElementwiseUnary {
             // product with the value scales either by at most the envelope, once per
             // implementation.
             UnaryFunction::Gelu | UnaryFunction::GeluErf | UnaryFunction::Elu => {
-                Tolerance::rounding(roundings, compute, dtype)
-                    .with_atol(2.0 * VALUE_ENVELOPE * tolerance::unit_roundoff(compute) as f32)
+                Tolerance::rounding(roundings, compute, dtype).with_atol(
+                    2.0 * tolerance::VALUE_ENVELOPE * tolerance::unit_roundoff(compute) as f32,
+                )
             }
             // Products, quotients, sums of one sign and library functions accurate to their last
             // place: each rounds relative to its own result.
