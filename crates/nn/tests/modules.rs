@@ -19,10 +19,12 @@ use nn::modules::{
     QkvLinear, QkvLinearConfig, QkvNames, RmsNorm, RmsNormConfig,
 };
 use nn::quantization::Declaration;
-use nn::{Adapter, Checkpoint, CpuWeights, DType, Device, MetaWeights, Tensor, WeightLoader};
+use nn::{
+    Adapter, Checkpoint, CpuWeights, DType, Device, MetaWeights, Source, Tensor, WeightLoader,
+};
 use support::{
-    assert_close, encode, f32_bytes, meta, operators, recorded, recorded_split, sequence, shard,
-    shard_stating, tensor, values,
+    Stated, assert_close, encode, f32_bytes, meta, operators, recorded, recorded_split, sequence,
+    shard, shard_stating, tensor, values,
 };
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
@@ -536,38 +538,33 @@ fn a_projection_an_adapter_edits_is_loaded_fused() {
     let adapters = tempfile::tempdir().unwrap();
     shard_stating(
         adapters.path(),
-        "adapter_model.safetensors",
-        &[
-            ("format", "fastvideo-lora-v2"),
-            ("rank", "1"),
-            ("low_rank_tensors", "2"),
-            ("diff_tensors", "1"),
-            ("set_weight_tensors", "0"),
-        ],
+        "adapter.safetensors",
+        &[("carries", "2,1,0")],
         &[
             (
-                "proj.lora_A.weight",
+                "proj.weight.down",
                 DType::BF16,
                 vec![1, 3],
                 encode(DType::BF16, &[1.0, 2.0, 3.0]),
             ),
             (
-                "proj.lora_B.weight",
+                "proj.weight.up",
                 DType::BF16,
                 vec![2, 1],
                 encode(DType::BF16, &[0.5, -1.0]),
             ),
             (
-                "proj.diff_b",
+                "proj.bias.diff",
                 DType::BF16,
                 vec![2],
                 encode(DType::BF16, &[0.25, 0.25]),
             ),
         ],
     );
+    let adapter = Adapter::open(&Source::Local(adapters.path().to_path_buf()), &Stated).unwrap();
     let adapted = Checkpoint::open(directory.path())
         .unwrap()
-        .attach(None, Adapter::open(adapters.path()).unwrap())
+        .attach(adapter)
         .unwrap();
 
     let store = CpuWeights::new();

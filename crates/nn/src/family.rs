@@ -21,9 +21,11 @@
 //!
 //! ## One shape for every family
 //!
-//! Execution opens a [`Checkpoint`] and gives it to the family: `open` reads and normalizes the
-//! configuration once, from the checkpoint's own sidecars, into the opened checkpoint value that
-//! holds it, and interprets the deployment's precision policy (`quantization`) against it, so a
+//! Execution opens a [`Checkpoint`] and gives it to the family (a video family composes its
+//! checkpoint from the deployment's [`Sources`] itself, [`VideoFamily::open`]): `open` reads and
+//! normalizes the configuration once, from the checkpoint's own sidecars, into the opened
+//! checkpoint value that holds it, and interprets the deployment's precision policy
+//! (`quantization`) against it, so a
 //! policy the family does not serve for that checkpoint is refused before any weight is read;
 //! `load` builds the deployment's share from that configuration, the same checkpoint and a
 //! loader, and takes no path. Nothing between the two reads a configuration file again.
@@ -42,7 +44,7 @@ use crate::capability::{
     VideoRequest, Vision,
 };
 use crate::collective::Split;
-use crate::{Checkpoint, Result, WeightLoader};
+use crate::{Checkpoint, Result, Sources, WeightLoader};
 
 /// One model family a build serves: what execution loads of its checkpoints, beside how they
 /// declare it and what request processing serves ([`processing::Family`]).
@@ -473,46 +475,26 @@ pub struct ExpertShape {
 
 /// A video generation pipeline family.
 pub trait VideoFamily: Send + Sync {
-    /// Reads and normalizes `checkpoint`'s configuration, once, from its sidecars.
+    /// Composes the checkpoint a deployment names from `sources` and reads and normalizes its
+    /// configuration, once, from its sidecars; returns the composed checkpoint and its reading.
     ///
-    /// `checkpoint` may span several roots, an export first and the base release it continues
-    /// after it ([`Checkpoint::open_roots`]); each sidecar is read from the first root that holds
-    /// it. The deployment's precision policy `quantization` is interpreted against what the
-    /// checkpoint declares.
+    /// Composition is the family's checkpoint mapping: which components its pipeline has, and
+    /// which source each comes from (the checkpoint, the base release it continues, an adapter
+    /// fused into one of its stages), as the checkpoint's index and manifests declare it. The
+    /// deployment's precision policy `quantization` is interpreted against what the checkpoint
+    /// declares.
     ///
     /// # Errors
     ///
-    /// Fails when the configuration cannot be read or states a pipeline this family cannot build,
-    /// or when the policy is one the family does not serve for this checkpoint.
+    /// Fails when the sources do not compose to a checkpoint this family serves (a component
+    /// absent from its declared source, a base or an adapter the checkpoint does not take), when
+    /// the configuration cannot be read or states a pipeline this family cannot build, or when
+    /// the policy is one the family does not serve for this checkpoint.
     fn open(
         &self,
-        checkpoint: &Checkpoint,
+        sources: &Sources,
         quantization: &Quantization,
-    ) -> Result<Box<dyn VideoCheckpoint>>;
-
-    /// The stage of `checkpoint` whose tensors `adapter` edits, or `None` for a flat
-    /// checkpoint's own shard set: where the loading boundary fuses it
-    /// ([`Checkpoint::attach`]) before [`VideoFamily::open`] reads the adapted checkpoint.
-    ///
-    /// Recognizing an adapter is the family's checkpoint mapping: a pipeline may hold several
-    /// networks of one architecture, and only the family knows which one an adapter was trained
-    /// from.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the family does not recognize `adapter` as an adapter of its checkpoints,
-    /// which is every adapter for a family that serves none.
-    fn adapter_stage(
-        &self,
-        checkpoint: &Checkpoint,
-        adapter: &crate::Adapter,
-    ) -> Result<Option<&'static str>> {
-        let _ = checkpoint;
-        Err(crate::Error::Unsupported(format!(
-            "{} is not an adapter of a checkpoint this model family serves",
-            adapter.path().display()
-        )))
-    }
+    ) -> Result<(Checkpoint, Box<dyn VideoCheckpoint>)>;
 }
 
 /// A video generation checkpoint, read but not loaded.

@@ -207,3 +207,44 @@ pub(crate) fn recorded_split<T>(
 pub(crate) fn operators(launches: &[(&'static str, String)]) -> Vec<&'static str> {
     launches.iter().map(|(operator, _)| *operator).collect()
 }
+
+/// The adapter container the tests declare, as a model family declares its own: the adapter
+/// is a directory's `adapter.safetensors`, each tensor is named `<parameter>.<role>` (`down`,
+/// `up`, `diff` or `assign`), and the header metadata states what the file carries as
+/// `carries = "<low-rank tensors>,<diff tensors>,<assigned tensors>"`.
+pub(crate) struct Stated;
+
+impl nn::adapter::Format for Stated {
+    fn file(&self) -> &'static str {
+        "adapter.safetensors"
+    }
+
+    fn role(&self, name: &str) -> Option<(String, nn::adapter::Role)> {
+        let (parameter, role) = name.rsplit_once('.')?;
+        let role = match role {
+            "down" => nn::adapter::Role::Down,
+            "up" => nn::adapter::Role::Up,
+            "diff" => nn::adapter::Role::Diff,
+            "assign" => nn::adapter::Role::Assign,
+            _ => return None,
+        };
+        Some((parameter.to_owned(), role))
+    }
+
+    fn check(
+        &self,
+        metadata: &std::collections::BTreeMap<String, String>,
+        contents: &nn::adapter::Contents,
+    ) -> Result<(), String> {
+        let carried = format!(
+            "{},{},{}",
+            contents.low_rank, contents.diffs, contents.assigned
+        );
+        match metadata.get("carries") {
+            Some(stated) if *stated == carried => Ok(()),
+            stated => Err(format!(
+                "states it carries {stated:?} and carries {carried}"
+            )),
+        }
+    }
+}

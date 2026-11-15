@@ -1386,9 +1386,10 @@ pub struct ModelConfig {
     /// omits; `None` for a checkpoint that holds every directory. The leader resolves it when it
     /// reads the checkpoint, and an engine opens the checkpoint and its base as one.
     pub base: Option<String>,
-    /// The weight adapter fused into the checkpoint at load (`lora_path`): an adapter file, or a
-    /// directory holding one. The model family names the module it edits, and every request of
-    /// the deployment is served by the adapted weights; `None` serves the checkpoint as it is.
+    /// The directory of the weight adapter fused into the checkpoint at load (`lora_path`): the
+    /// adapter beside the contract of the student it is, from which the model family reads the
+    /// module it edits, and every request of the deployment is served by the adapted weights;
+    /// `None` serves the checkpoint as it is.
     pub lora_path: Option<String>,
     /// Longest sequence a request may reach, in tokens: the configured `max_model_len`, else
     /// what the model's files allow. The options state only the configured one (zero when

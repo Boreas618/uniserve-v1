@@ -26,7 +26,7 @@ use nn::family::{
     VideoServing,
 };
 use nn::{
-    Checkpoint, Clip, ConditionRole, ConditionShape, Conditioning, DType, MetaWeights, Split,
+    Clip, ConditionRole, ConditionShape, Conditioning, DType, MetaWeights, Source, Sources, Split,
     VideoRequest, WeightLoader,
 };
 use proto::config::{PrecisionMode, Quantization, WeightFormat};
@@ -73,11 +73,15 @@ fn load_under(
         Path::new(root).is_dir(),
         "the profile runs read the headers of {root}, which is missing"
     );
-    let checkpoint = Checkpoint::open(Path::new(root))?;
     let Model::Video(family) = models::minimax_h3::FAMILY.model else {
         panic!("MiniMax-H3 is a video family");
     };
-    let opened = family.open(&checkpoint, quantization)?;
+    let sources = Sources {
+        checkpoint: Source::Local(Path::new(root).to_path_buf()),
+        base: None,
+        adapter: None,
+    };
+    let (checkpoint, opened) = family.open(&sources, quantization)?;
 
     let stages: BTreeSet<String> = [network.name().to_owned()].into();
     let placement = VideoPlacement {

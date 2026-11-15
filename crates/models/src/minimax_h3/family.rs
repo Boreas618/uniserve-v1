@@ -1,12 +1,30 @@
 //! MiniMax-H3 and FastH3 as execution loads them and request processing serves them
 //! ([`nn::family`]).
 //!
-//! [`FAMILY`] claims the `MiniMaxH3ModularPipeline` class. A checkpoint opens to its
-//! [`Config`] (an export and the base release it continues read as one), a load builds the
-//! stages the deployment places on a rank with the deployment's sequence and tensor splits, and
-//! the loaded [`MinimaxH3`] states the pipeline's own rules to execution: the `17n + 5` frame
-//! rule, its resolutions, the requests its denoiser's graphs are captured for, and the
-//! description its request processing admits requests against.
+//! [`FAMILY`] claims the `MiniMaxH3ModularPipeline` class. A deployment's sources compose to one
+//! checkpoint and its [`Config`], a load builds the stages the deployment places on a rank with
+//! the deployment's sequence and tensor splits, and the loaded [`MinimaxH3`] states the
+//! pipeline's own rules to execution: the `17n + 5` frame rule, its resolutions, the requests its
+//! denoiser's graphs are captured for, and the description its request processing admits
+//! requests against.
+//!
+//! ## Composition
+//!
+//! A deployment names a checkpoint, and may name the base release it continues (`base`) and an
+//! adapter directory (`lora_path`) ([`Sources`]). The family composes them by what the
+//! checkpoint's own files declare, and each component ([`Component`]) comes from exactly one
+//! source:
+//!
+//! | Checkpoint | Declared by | Network | Schedulers | Text encoder, processor, VAEs |
+//! | --- | --- | --- | --- | --- |
+//! | Base release | its pipeline index, and no contract | each the index declares, on the full-step grid | the release | the release |
+//! | Student export | its contract ([`Contract`]) | the contract's | the export | the base the contract names, which the deployment's `base` supplies; the export when it names none |
+//! | Base release and adapter | the contract beside the adapter | the contract's: the release's network with the adapter fused | the release | the release |
+//!
+//! A component's directory is the one the checkpoint's pipeline index declares for it, wherever
+//! its source lies. A component absent from its source, a component an export holds that its
+//! contract takes from the base, a base the checkpoint does not continue, and an adapter without
+//! a contract are refused.
 //!
 //! ## Stages
 //!
@@ -18,7 +36,7 @@
 //! holds no weights and is placed wherever `video_decoder` is). A stage this rank does not place
 //! is absent from the loaded pipeline.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -28,19 +46,20 @@ use nn::family::{
 };
 use nn::pipeline::{Block, Extent, Phase, Pipeline, Product, ProductSpec};
 use nn::{
-    Checkpoint, ConditionRole, ConditionShape, DType, Decoder, Encoder, MediaFormat, Splicer,
-    VideoRequest, WeightLoader,
+    Adapter, Checkpoint, ConditionRole, ConditionShape, DType, Decoder, Encoder, MediaFormat,
+    PipelineIndex, Source, Sources, Splicer, VideoRequest, WeightLoader,
 };
 use processing::minimax_h3::{
-    CANVAS_RULE, ConditionPacking, DenoiserInfo, MIN_SECONDS, PreparedCondition, REFERENCE_LIMITS,
-    ReferenceLimits, ServedCanvas, named_canvases,
+    CANVAS_RULE, ConditionPacking, DenoiserInfo, MIN_SECONDS, PIPELINE_CLASS, PreparedCondition,
+    REFERENCE_LIMITS, ReferenceLimits, ServedCanvas, named_canvases,
 };
 use proto::config::{Partition, Quantization};
 
+use crate::minimax_h3::adapter::FastVideoLora;
 use crate::minimax_h3::audio_vae::{AudioDecoder, AudioEncoder};
 use crate::minimax_h3::config::{
-    AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, FPS, FRAMES, NETWORKS, RETAINED_LAYERS,
-    VIDEO_VAE, network, precision,
+    AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, BaseRevision, Component, Contract, FPS, FRAMES,
+    NETWORKS, Networks, RETAINED_LAYERS, network, precision, released_networks,
 };
 use crate::minimax_h3::denoiser::{Denoiser, SAMPLE_DTYPE};
 use crate::minimax_h3::splice::VideoPostprocessor;
@@ -56,74 +75,202 @@ pub const FAMILY: Family = Family {
     step_stack: crate::minimax_h3::transformer::TRANSFORMER,
 };
 
-/// The release a FastH3 adapter is fused into.
-const FASTH3_BASE_MODEL: &str = "MiniMaxAI/MiniMax-H3";
-
 /// The family's value, which [`FAMILY`] refers to.
 struct MinimaxH3Family;
-
-/// Whether `metadata` is the header of a FastH3 adapter over the base release: the FastVideo
-/// adapter format, a `FastVideo/…FastH3…` student, and the base release as its base model.
-fn fasth3_adapter(metadata: &std::collections::BTreeMap<String, String>) -> bool {
-    let student = metadata
-        .get("finetuned_model")
-        .map(|name| name.to_lowercase())
-        .unwrap_or_default();
-    let base = metadata.get("base_model").map(String::as_str);
-
-    metadata.get("format").map(String::as_str) == Some(nn::adapter::FASTVIDEO_FORMAT)
-        && student.starts_with("fastvideo/")
-        && student.contains("fasth3")
-        && base.is_some_and(|base| base.eq_ignore_ascii_case(FASTH3_BASE_MODEL))
-}
 
 impl VideoFamily for MinimaxH3Family {
     fn open(
         &self,
-        checkpoint: &Checkpoint,
+        sources: &Sources,
         quantization: &Quantization,
-    ) -> nn::Result<Box<dyn VideoCheckpoint>> {
-        // A checkpoint is one directory, or an export and the base release it continues.
-        if checkpoint.roots().len() > 2 {
-            return Err(nn::Error::Unsupported(format!(
-                "a MiniMax-H3 checkpoint is one directory and the base release it continues, \
-                 not {} directories",
-                checkpoint.roots().len()
-            )));
-        }
-
-        let mut config = Config::open(checkpoint)?;
+    ) -> nn::Result<(Checkpoint, Box<dyn VideoCheckpoint>)> {
+        let (checkpoint, networks) = compose(sources)?;
+        let mut config = Config::open(&checkpoint, &networks)?;
         precision::apply(quantization, &mut config)?;
-        Ok(Box::new(config))
+        Ok((checkpoint, Box::new(config)))
     }
+}
 
-    /// A FastH3 adapter edits the base release's `transformer`, the network its student was
-    /// distilled from; fused there, the checkpoint reads as that student.
-    fn adapter_stage(
-        &self,
-        checkpoint: &Checkpoint,
-        adapter: &nn::Adapter,
-    ) -> nn::Result<Option<&'static str>> {
-        if !fasth3_adapter(adapter.metadata()) {
-            return Err(nn::Error::Unsupported(format!(
-                "{} is not a FastH3 adapter (its metadata names the student {:?} over {:?}); \
-                 MiniMax-H3 fuses the FastH3 releases of FastVideo over {FASTH3_BASE_MODEL}",
-                adapter.path().display(),
-                adapter.metadata().get("finetuned_model"),
-                adapter.metadata().get("base_model"),
+/// The components every deployment reads besides its networks.
+const PIPELINE: [Component; 6] = [
+    Component::TextEncoder,
+    Component::Processor,
+    Component::Vae,
+    Component::AudioVae,
+    Component::Scheduler,
+    Component::AudioScheduler,
+];
+
+/// The components a student export holds besides its network: the schedulers its contract's
+/// schedule is stated over.
+const STUDENT: [Component; 2] = [Component::Scheduler, Component::AudioScheduler];
+
+/// The checkpoint `sources` compose to, with the networks it serves, which its configuration is
+/// read for ([`Config::open`]; [module documentation](self)).
+///
+/// # Errors
+///
+/// When the checkpoint declares another pipeline, its contract or the adapter's does not parse,
+/// a base or an adapter is stated that the checkpoint does not take (or a base it continues is
+/// not stated), a component is absent from its source or held by an export that takes it from
+/// the base, or the adapter does not fuse into the network it edits.
+pub fn compose(sources: &Sources) -> Result<(Checkpoint, Networks)> {
+    let checkpoint = &sources.checkpoint;
+    let index = pipeline_index(checkpoint)?;
+    let export = Contract::read(checkpoint)?;
+    let adapter = sources.adapter.as_ref().map(open_adapter).transpose()?;
+
+    // The networks the checkpoint serves, and the base release its other components come from.
+    let (networks, base) = match (export, &adapter) {
+        (Some(_), Some(_)) => {
+            return Err(Error::checkpoint(format!(
+                "{} is a FastH3 student export (it states {}), and an adapter is fused into \
+                 the base release",
+                checkpoint.directory().display(),
+                Contract::FILE
             )));
         }
-
-        // An adapter edits the base release: a FastH3 export is already a student.
-        if checkpoint.sidecar("fastvideo_inference.json")?.is_some() {
-            return Err(nn::Error::Unsupported(format!(
-                "{} is a FastH3 export, and a FastH3 adapter is fused into the base release \
-                 {FASTH3_BASE_MODEL} it was extracted from",
-                checkpoint.root().display(),
-            )));
+        (Some(contract), None) => {
+            let base = match (&contract.base, &sources.base) {
+                (Some(revision), Some(base)) => {
+                    continues(revision, base)?;
+                    Some(base)
+                }
+                (Some(revision), None) => {
+                    return Err(Error::checkpoint(format!(
+                        "{} continues the base release {revision}, and the deployment states \
+                         no snapshot of it (`base`)",
+                        checkpoint.directory().display()
+                    )));
+                }
+                (None, Some(base)) => {
+                    return Err(Error::checkpoint(format!(
+                        "the deployment states the base {}, and {} continues none: its {} \
+                         states no base_model_revision",
+                        base.directory().display(),
+                        checkpoint.directory().display(),
+                        Contract::FILE
+                    )));
+                }
+                (None, None) => None,
+            };
+            (Networks::Student(contract), base)
         }
-        Ok(Some(Stage::Transformer.name()))
+        (None, adapter) => {
+            if let Some(base) = &sources.base {
+                return Err(Error::checkpoint(format!(
+                    "{} is a base release, which continues none, and the deployment states \
+                     the base {}",
+                    checkpoint.directory().display(),
+                    base.directory().display()
+                )));
+            }
+            match adapter {
+                Some((contract, _)) => {
+                    if let Some(revision) = &contract.base {
+                        continues(revision, checkpoint)?;
+                    }
+                    (Networks::Student(contract.clone()), None)
+                }
+                None => (Networks::Released(released_networks(&index)?), None),
+            }
+        }
+    };
+
+    // Each component from the one source that holds it: a student's network and schedulers
+    // from the export, the rest of the pipeline from the base it continues.
+    let held: Vec<Stage> = match &networks {
+        Networks::Released(stages) => stages.clone(),
+        Networks::Student(contract) => vec![contract.network],
+    };
+    let mut components = PIPELINE.to_vec();
+    for stage in held {
+        components.push(Component::holding(stage)?);
     }
+
+    let mut stages = BTreeMap::new();
+    let mut directories = BTreeMap::new();
+    for component in components {
+        let name = component.name();
+        let source = match base {
+            Some(base) if component.network().is_none() && !STUDENT.contains(&component) => {
+                // An export that also holds what its contract takes from the base would be
+                // served half from files it does not name.
+                if index.place(name, checkpoint)?.directory().exists() {
+                    return Err(Error::checkpoint(format!(
+                        "{} holds `{name}`, which its {} takes from the base release it \
+                         continues",
+                        checkpoint.directory().display(),
+                        Contract::FILE
+                    )));
+                }
+                base
+            }
+            _ => checkpoint,
+        };
+
+        if component.weights() {
+            stages.insert(name.to_owned(), index.stage(name, source)?);
+        } else {
+            directories.insert(name.to_owned(), index.directory(name, source)?);
+        }
+    }
+
+    // An adapter edits the network its contract names, and the fusion checks every edit against
+    // the network's own tensors.
+    if let Some((contract, adapter)) = adapter {
+        let name = Component::holding(contract.network)?.name();
+        let network = stages.remove(name).ok_or_else(|| {
+            Error::checkpoint(format!("the adapter edits `{name}`, which is not composed"))
+        })?;
+        stages.insert(name.to_owned(), network.attach(adapter)?);
+    }
+
+    let composed = Checkpoint::compose(checkpoint.clone(), stages, directories)?;
+    Ok((composed, networks))
+}
+
+/// The pipeline index of the checkpoint at `source`, which declares this family's pipeline.
+fn pipeline_index(source: &Source) -> Result<PipelineIndex> {
+    let index = PipelineIndex::read(source)?;
+    if index.class() != PIPELINE_CLASS {
+        return Err(Error::checkpoint(format!(
+            "{} declares a {} pipeline, and this family serves {PIPELINE_CLASS}",
+            source.directory().display(),
+            index.class()
+        )));
+    }
+    Ok(index)
+}
+
+/// The adapter the directory `directory` holds and the contract of the student it is.
+fn open_adapter(directory: &Source) -> Result<(Contract, Adapter)> {
+    let contract = Contract::read(directory)?.ok_or_else(|| {
+        Error::checkpoint(format!(
+            "the adapter directory {} holds no {}: an adapter states the student it is (its \
+             task, schedule and attention) in the contract its release publishes",
+            directory.directory().display(),
+            Contract::FILE
+        ))
+    })?;
+    Ok((contract, Adapter::open(directory, &FastVideoLora)?))
+}
+
+/// Checks that `source` is a snapshot of `revision`, when its caller resolved it as one.
+///
+/// A local directory states no commit, so the deployment that names it vouches for it.
+fn continues(revision: &BaseRevision, source: &Source) -> Result<()> {
+    let Source::Snapshot(snapshot) = source else {
+        return Ok(());
+    };
+    if snapshot.repository() != revision.repository || snapshot.revision() != revision.revision {
+        return Err(Error::checkpoint(format!(
+            "the student continues {revision}, and the deployment's snapshot is {}@{}",
+            snapshot.repository(),
+            snapshot.revision()
+        )));
+    }
+    Ok(())
 }
 
 impl VideoCheckpoint for Config {
@@ -308,7 +455,7 @@ impl MinimaxH3 {
                         .to_owned(),
                 )
             })?;
-            let mut stage = loader.reborrow(checkpoint.stage(Stage::TextEncoder.name())?)?;
+            let mut stage = loader.reborrow(checkpoint.stage(Component::TextEncoder.name())?)?;
             stage.declare(&config.text_encoder.quantization)?;
 
             model.text_encoder = Some(Arc::new(Qwen3VlModel::load(
@@ -331,9 +478,9 @@ impl MinimaxH3 {
 
             // The two condition encoders are the denoiser's conditioning half.
             let encoders = if stages.contains(Stage::LatentEncoder) {
-                let mut video = loader.reborrow(checkpoint.stage(VIDEO_VAE)?)?;
+                let mut video = loader.reborrow(checkpoint.stage(Component::Vae.name())?)?;
                 video.declare(&config.video_vae.quantization)?;
-                let audio = loader.reborrow(checkpoint.stage("audio_vae")?)?;
+                let audio = loader.reborrow(checkpoint.stage(Component::AudioVae.name())?)?;
 
                 Some((
                     VideoEncoder::load(&config.video_vae, video.root())?,
@@ -343,7 +490,8 @@ impl MinimaxH3 {
                 None
             };
 
-            let mut network = loader.reborrow(checkpoint.stage(stage.name())?)?;
+            let mut network =
+                loader.reborrow(checkpoint.stage(Component::holding(stage)?.name())?)?;
             network.declare(&denoiser.quantization)?;
 
             model.denoiser = Some((
@@ -365,7 +513,7 @@ impl MinimaxH3 {
             )?));
         }
         if stages.contains(Stage::AudioDecoder) {
-            let stage = loader.reborrow(checkpoint.stage("audio_vae")?)?;
+            let stage = loader.reborrow(checkpoint.stage(Component::AudioVae.name())?)?;
 
             model.audio_decoder = Some(Arc::new(AudioDecoder::load(
                 &config.audio_vae,
@@ -376,7 +524,7 @@ impl MinimaxH3 {
             // The deployment's sizes are checked here, where a size the checkpoint does not
             // generate would otherwise be found at the first decode.
             served_resolutions(&serving.sizes)?;
-            let mut stage = loader.reborrow(checkpoint.stage(VIDEO_VAE)?)?;
+            let mut stage = loader.reborrow(checkpoint.stage(Component::Vae.name())?)?;
             stage.declare(&config.video_vae.quantization)?;
 
             model.video_decoder = Some(Arc::new(VideoDecoder::load(
@@ -1643,32 +1791,5 @@ mod tests {
                 keyframe(ConditionRole::LastFrame, resolution),
             ]]
         );
-    }
-
-    #[test]
-    fn a_fasth3_adapter_names_its_student_and_the_base_release() {
-        let metadata = |student: &str, base: &str| {
-            std::collections::BTreeMap::from([
-                (
-                    "format".to_owned(),
-                    nn::adapter::FASTVIDEO_FORMAT.to_owned(),
-                ),
-                ("finetuned_model".to_owned(), student.to_owned()),
-                ("base_model".to_owned(), base.to_owned()),
-            ])
-        };
-
-        assert!(fasth3_adapter(&metadata(
-            "FastVideo/FastVideo-FastH3-4-step-v1",
-            FASTH3_BASE_MODEL
-        )));
-        assert!(!fasth3_adapter(&metadata(
-            "someone/h3-style",
-            FASTH3_BASE_MODEL
-        )));
-        assert!(!fasth3_adapter(&metadata(
-            "FastVideo/FastVideo-FastH3-4-step-v1",
-            "other/base"
-        )));
     }
 }

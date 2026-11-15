@@ -318,6 +318,10 @@ enum Experts {
     Ready(Replacement),
 }
 
+/// The file of a PEFT adapter directory that holds its tensors, beside its `adapter_config.json`:
+/// the directory a `load_lora_adapter` request names is one, as vLLM's endpoint reads it.
+const PEFT_ADAPTER_FILE: &str = "adapter_model.safetensors";
+
 /// What a rank holds of a loaded LoRA adapter: its tensors, published and mapped read-only.
 struct Adapter {
     /// The store that maps the adapter's tensors, which lives as long as they are lent.
@@ -2216,13 +2220,15 @@ impl WeightBinding {
 
     /// Publishes the LoRA adapter `payload` names into its slot, on every rank.
     ///
-    /// The adapter's tensors take the path every weight takes: the Storage Server retains them
-    /// under a key of their file and the rank maps them read-only, so a second engine of the
-    /// deployment loading the same file shares them, and an unload returns them.
+    /// `path` is a PEFT adapter directory, as vLLM's `load_lora_adapter` names one, and its
+    /// tensors are its [`PEFT_ADAPTER_FILE`]. They take the path every weight takes: the Storage
+    /// Server retains them under a key of their file and the rank maps them read-only, so a second
+    /// engine of the deployment loading the same file shares them, and an unload returns them.
     ///
     /// # Errors
     ///
-    /// When the payload names no path or slot, or the path holds no adapter; nothing stays loaded.
+    /// When the payload names no path or slot, or the directory holds no adapter file; nothing
+    /// stays loaded.
     pub(crate) fn load_adapter(
         &self,
         slot: u32,
@@ -2231,8 +2237,8 @@ impl WeightBinding {
         if path.as_os_str().is_empty() {
             return Err(Error::Invalid("an adapter's load names no path".into()));
         }
-        let checkpoint =
-            nn::Checkpoint::open(path).map_err(|error| rejected("reading the adapter", error))?;
+        let checkpoint = nn::Checkpoint::open_file(&path.join(PEFT_ADAPTER_FILE))
+            .map_err(|error| rejected("reading the adapter", error))?;
         if checkpoint.is_empty() {
             return Err(Error::Invalid(format!(
                 "{} holds no adapter tensors",

@@ -17,12 +17,15 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 use super::support;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use models::minimax_h3::audio_vae::{AudioDecoder, AudioEncoder, padded_samples};
 use models::minimax_h3::video_vae::{self, VideoDecoder, VideoEncoder};
 use models::minimax_h3::{AudioVaeConfig, VideoVaeConfig};
-use nn::{Checkpoint, Clip, DType, Decoder, LatentShape, MetaWeights, WeightLoader};
+use nn::{
+    Checkpoint, Clip, DType, Decoder, LatentShape, MetaWeights, PipelineIndex, Source, Sources,
+    WeightLoader,
+};
 use processing::minimax_h3::{
     AUDIO_LATENTS_PER_SECOND, FRAMES, MAX_SECONDS, MIN_SECONDS, named_canvases,
 };
@@ -37,15 +40,18 @@ const CHECKPOINT: &str = "/workspace/models/MiniMax-H3";
 const NVFP4_EXPORT: &str =
     "/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4";
 
-/// The stage `name` of the released checkpoint, opened by its headers.
+/// The stage `name` of the released checkpoint, opened by its headers where its pipeline index
+/// declares it.
 fn stage(name: &str) -> Checkpoint {
-    let directory = Path::new(CHECKPOINT).join(name);
     assert!(
-        directory.is_dir(),
-        "the profile runs read the headers of {CHECKPOINT}, which holds no {name} stage"
+        Path::new(CHECKPOINT).is_dir(),
+        "the profile runs read the headers of {CHECKPOINT}, which is missing"
     );
+    let source = Source::Local(PathBuf::from(CHECKPOINT));
 
-    Checkpoint::open(&directory).unwrap()
+    PipelineIndex::read(&source)
+        .and_then(|index| index.stage(name, &source))
+        .unwrap()
 }
 
 /// The video VAE's stage and its config.
@@ -140,8 +146,13 @@ fn the_nvfp4_export_s_video_decoder_profiles_one_clip_at_a_small_and_a_large_res
         root.is_dir(),
         "the profile run reads the headers of {NVFP4_EXPORT}, which is missing"
     );
-    let checkpoint = Checkpoint::open(root).unwrap();
-    let config = models::minimax_h3::Config::open(&checkpoint)
+    let sources = Sources {
+        checkpoint: Source::Local(root.to_path_buf()),
+        base: None,
+        adapter: None,
+    };
+    let (checkpoint, networks) = models::minimax_h3::family::compose(&sources).unwrap();
+    let config = models::minimax_h3::Config::open(&checkpoint, &networks)
         .unwrap()
         .video_vae;
 

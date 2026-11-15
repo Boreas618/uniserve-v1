@@ -108,7 +108,7 @@ impl Source {
     }
 
     /// The directory `name` below this one, from the same place.
-    pub fn join(&self, name: impl AsRef<Path>) -> Self {
+    pub(crate) fn join(&self, name: impl AsRef<Path>) -> Self {
         let name = name.as_ref();
         match self {
             Self::Local(directory) => Self::Local(directory.join(name)),
@@ -118,6 +118,28 @@ impl Source {
                 ..snapshot.clone()
             }),
         }
+    }
+
+    /// The JSON document at `relative` below this directory, or `None` when it is absent.
+    ///
+    /// # Errors
+    ///
+    /// When the file exists and cannot be read or is not JSON.
+    pub fn sidecar(&self, relative: &str) -> Result<Option<serde_json::Value>> {
+        let path = self.directory().join(relative);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path).map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })?;
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|error| Error::Checkpoint {
+                path,
+                problem: format!("is not JSON: {error}"),
+            })
     }
 
     /// The identity of `file`, a file of this directory or of a directory below it.
@@ -147,6 +169,20 @@ impl Source {
             }
         }
     }
+}
+
+/// What a deployment names of one model's files, each where its caller resolved it: the
+/// checkpoint, the base release the checkpoint continues, and the adapter fused into it. A model
+/// family composes them into one [`Checkpoint`] by what the checkpoint's manifests declare.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sources {
+    /// The checkpoint the deployment serves.
+    pub checkpoint: Source,
+    /// The base release the checkpoint continues, `None` when the deployment states none.
+    pub base: Option<Source>,
+    /// The directory of the adapter fused into the checkpoint, `None` when the deployment states
+    /// none.
+    pub adapter: Option<Source>,
 }
 
 /// The identity of one checkpoint file, as retained weights are keyed by it.
@@ -246,23 +282,92 @@ pub struct TensorLocation {
     pub bytes: (u64, u64),
 }
 
-/// A checkpoint: its mapped shards and the tensors they hold, or a pipeline's stages.
+/// The library whose file names a shard set follows, as a pipeline index states it for each
+/// component (`["diffusers", "AutoencoderKL…", …]`).
 ///
-/// A flat checkpoint is one shard set; a *pipeline* root holds one subdirectory per stage
-/// (`transformer/`, `vae/`, `text_encoder/`, …), each with its own index and therefore its own file
-/// identities, which §8's retained keys name. Opening a root discovers which of the two it is: a
-/// root with a shard set of its own is flat and behaves as it always has, and a root without one is
-/// read as the stages its subdirectories hold.
+/// A directory declares its shard set by the library's names alone: one shard as
+/// `<stem>.safetensors`, or several named by `<stem>.safetensors.index.json`, the stem being
+/// `model` for transformers and `diffusion_pytorch_model` for diffusers. A directory that holds
+/// neither name, or both, declares no shard set and is refused; no other file is read as one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Library {
+    /// Hugging Face transformers: `model.safetensors[.index.json]`.
+    Transformers,
+    /// Hugging Face diffusers: `diffusion_pytorch_model.safetensors[.index.json]`.
+    Diffusers,
+}
+
+impl Library {
+    /// The library a pipeline index names `name`, or `None` for a library whose components hold
+    /// no shard set this loader reads.
+    pub(crate) fn named(name: &str) -> Option<Self> {
+        match name {
+            "transformers" => Some(Self::Transformers),
+            "diffusers" => Some(Self::Diffusers),
+            _ => None,
+        }
+    }
+
+    /// The stem of the library's weights files.
+    fn stem(self) -> &'static str {
+        match self {
+            Self::Transformers => "model",
+            Self::Diffusers => "diffusion_pytorch_model",
+        }
+    }
+
+    /// The shard files the directory `directory` declares under this library's names, in order
+    /// of first mention in its index.
+    ///
+    /// # Errors
+    ///
+    /// When the directory holds neither the single shard's name nor the index's, or both, or its
+    /// index does not parse or names no file.
+    fn shards(self, directory: &Path) -> Result<Vec<PathBuf>> {
+        let single = directory.join(format!("{}.safetensors", self.stem()));
+        let index = directory.join(format!("{}.safetensors.index.json", self.stem()));
+
+        match (single.is_file(), index.is_file()) {
+            (true, false) => Ok(vec![single]),
+            (false, true) => shards_from_index(&index),
+            (true, true) => Err(Error::Checkpoint {
+                path: directory.to_path_buf(),
+                problem: format!(
+                    "declares its shard set twice, as {} and as {}",
+                    single.display(),
+                    index.display()
+                ),
+            }),
+            (false, false) => Err(Error::Checkpoint {
+                path: directory.to_path_buf(),
+                problem: format!(
+                    "declares no {self:?} shard set: it holds neither {} nor {}",
+                    single.display(),
+                    index.display()
+                ),
+            }),
+        }
+    }
+}
+
+/// A checkpoint: its mapped shards and the tensors they hold, or a pipeline of components.
+///
+/// A flat checkpoint is one shard set ([`Checkpoint::open`], [`Checkpoint::shards`]). A
+/// *pipeline* is composed of components ([`Checkpoint::compose`]): the stages that hold weights,
+/// each a flat checkpoint with its own shards and therefore its own file identities, and the
+/// directories that hold only configuration (a processor, a scheduler). Which components a
+/// pipeline has, and where each comes from, is its model family's statement read from the
+/// pipeline's index ([`PipelineIndex`]) and its manifests; nothing is discovered by scanning.
 pub struct Checkpoint {
-    /// The directory this checkpoint was opened at, and where its files come from.
+    /// The directory this checkpoint was opened at, and where its files come from: for a
+    /// pipeline, the directory of its own statements (its index and manifests).
     source: Source,
-    /// Every root this checkpoint's tensors came from, in precedence order; one entry unless it was
-    /// opened over several roots ([`Checkpoint::open_roots`]). A missing tensor names them, because
-    /// a union that spans an export and a base is where "not found" costs the most to chase.
-    roots: Vec<PathBuf>,
     files: Vec<CheckpointFile>,
     tensors: BTreeMap<String, TensorLocation>,
+    /// A pipeline's stages, by component name.
     stages: BTreeMap<String, Checkpoint>,
+    /// A pipeline's components that hold no weights, by component name, each with its directory.
+    directories: BTreeMap<String, Source>,
     /// The tensors a `read` has asked this checkpoint for, so [`Checkpoint::reading`] can tell the
     /// other half of the question: what the load never touched.
     read: Mutex<BTreeSet<String>>,
@@ -271,26 +376,77 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    /// Open the checkpoint in the local directory `root`.
+    /// Open the transformers checkpoint in the local directory `root`: the shard set it declares
+    /// as `model.safetensors` or `model.safetensors.index.json` ([`Library`]). A checkpoint whose
+    /// caller resolved another source is opened with [`Checkpoint::shards`].
     ///
-    /// A `model.safetensors.index.json` names each tensor's shard; without one every
-    /// `*.safetensors` file of the directory is read and its tensors are taken from its header.
+    /// # Errors
+    ///
+    /// When the directory declares no shard set, or a shard does not parse.
     pub fn open(root: &Path) -> Result<Self> {
-        Self::open_at(Source::Local(root.to_path_buf()))
+        Self::shards(&Source::Local(root.to_path_buf()), Library::Transformers)
     }
 
-    /// Open the checkpoint at `source`, a directory whose files' identities it states.
-    fn open_at(source: Source) -> Result<Self> {
-        let root = source.directory();
-        let index = root.join("model.safetensors.index.json");
-        let paths = if index.is_file() {
-            shards_from_index(&index)?
-        } else if let Some(paths) = shards_in(root)? {
-            paths
-        } else {
-            return Self::pipeline(source);
-        };
-        Self::from_shards(&source, paths)
+    /// Open the shard set the directory `source` declares under `library`'s names.
+    ///
+    /// # Errors
+    ///
+    /// When the directory declares no shard set, or a shard does not parse.
+    pub fn shards(source: &Source, library: Library) -> Result<Self> {
+        let paths = library.shards(source.directory())?;
+        Self::from_shards(source, paths)
+    }
+
+    /// Open the one safetensors file `path` as a flat checkpoint of the local directory it lies
+    /// in.
+    ///
+    /// # Errors
+    ///
+    /// When the file does not parse.
+    pub fn open_file(path: &Path) -> Result<Self> {
+        let directory = path.parent().unwrap_or(Path::new("."));
+        Self::from_shards(
+            &Source::Local(directory.to_path_buf()),
+            vec![path.to_path_buf()],
+        )
+    }
+
+    /// The pipeline whose own statements lie at `root`, composed of `stages` (each component
+    /// that holds weights, opened from the one source its family states) and `directories`
+    /// (each component that holds only configuration, with its directory).
+    ///
+    /// # Errors
+    ///
+    /// When one name is both a stage and a directory, or the pipeline has no stage.
+    pub fn compose(
+        root: Source,
+        stages: BTreeMap<String, Checkpoint>,
+        directories: BTreeMap<String, Source>,
+    ) -> Result<Self> {
+        if let Some(name) = stages.keys().find(|name| directories.contains_key(*name)) {
+            return Err(Error::Checkpoint {
+                path: root.directory().to_path_buf(),
+                problem: format!(
+                    "the component `{name}` is composed both as a stage and as a directory"
+                ),
+            });
+        }
+        if stages.is_empty() {
+            return Err(Error::Checkpoint {
+                path: root.directory().to_path_buf(),
+                problem: "a pipeline is composed of no stage".to_owned(),
+            });
+        }
+
+        Ok(Self {
+            source: root,
+            files: Vec::new(),
+            tensors: BTreeMap::new(),
+            stages,
+            directories,
+            read: Mutex::new(BTreeSet::new()),
+            adapter: None,
+        })
     }
 
     /// Open the shard set `paths`, files of the directory `source`, as one flat checkpoint.
@@ -359,134 +515,27 @@ impl Checkpoint {
 
         Ok(Self {
             source: source.clone(),
-            roots: vec![source.directory().to_path_buf()],
             files,
             tensors: locations,
             stages: BTreeMap::new(),
+            directories: BTreeMap::new(),
             read: Mutex::new(BTreeSet::new()),
             adapter: None,
         })
     }
 
-    /// Open `roots` as **one** checkpoint: the first root's tensors shadow the later ones'.
-    ///
-    /// A deployment that ships a delta export over a base is one checkpoint whose file set spans
-    /// both, so the union is per tensor and not per stage: stages are enumerated in each
-    /// root as [`Checkpoint::open`] already does; a stage present in several roots is one
-    /// unioned stage whose tensors come from the earliest root that holds each name; a
-    /// stage that only a later root holds is that root's; and the same shadowing applies at the
-    /// top level, where an export's tensor replaces the base's.
-    ///
-    /// A shadowed tensor is expected and is **not** a byte comparison: a delta export legitimately
-    /// differs from the base it was trained from, and refusing the difference would refuse the
-    /// deployment. Two roots of *one* root's shard set disagreeing is still an error, because that
-    /// is a malformed checkpoint and no precedence can say which is meant.
-    ///
-    /// [`Checkpoint::root`] returns the first root: the export's, which is the one a log names.
-    pub fn open_roots(roots: &[&Path]) -> Result<Self> {
-        let mut roots = roots.iter();
-        let first = roots.next().ok_or_else(|| Error::Checkpoint {
-            path: PathBuf::new(),
-            problem: "a checkpoint needs at least one root".to_owned(),
-        })?;
-        let mut held = Self::open(first)?;
-        for root in roots {
-            held = held.merge(Self::open(root)?);
-        }
-        Ok(held)
-    }
-
-    /// The union of `self` (earlier, shadowing) and `later`, as [`Checkpoint::open_roots`] defines
-    /// it. File indices of the later root are rebased onto the union's file list, so a tensor
-    /// location keeps naming the shard it was read from.
-    fn merge(mut self, later: Self) -> Self {
-        let base = self.files.len();
-        self.roots.extend(later.roots);
-        for (name, mut location) in later.tensors {
-            // The earlier root wins: a name the union already holds keeps its own bytes.
-            if self.tensors.contains_key(&name) {
-                continue;
-            }
-            location.file += base;
-            self.tensors.insert(name, location);
-        }
-        self.files.extend(later.files);
-        for (name, stage) in later.stages {
-            let union = match self.stages.remove(&name) {
-                Some(held) => held.merge(stage),
-                None => stage,
-            };
-            self.stages.insert(name, union);
-        }
-        self
-    }
-
-    /// Open a pipeline root: one stage per subdirectory that holds a shard set.
-    fn pipeline(source: Source) -> Result<Self> {
-        let root = source.directory();
-        let entries = std::fs::read_dir(root).map_err(|source| Error::Io {
-            path: root.to_path_buf(),
-            source,
-        })?;
-        let mut stages = BTreeMap::new();
-        for entry in entries {
-            let entry = entry.map_err(|source| Error::Io {
-                path: root.to_path_buf(),
-                source,
-            })?;
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            if shards_in(&path)?.is_none() {
-                continue;
-            }
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            stages.insert(name.clone(), Self::open_at(source.join(&name))?);
-        }
-        if stages.is_empty() {
-            return Err(Error::Checkpoint {
-                path: root.to_path_buf(),
-                problem: "no shard set here and none in a stage below it".to_owned(),
-            });
-        }
-        Ok(Self {
-            roots: vec![root.to_path_buf()],
-            source,
-            files: Vec::new(),
-            tensors: BTreeMap::new(),
-            stages,
-            read: Mutex::new(BTreeSet::new()),
-            adapter: None,
-        })
-    }
-
-    /// The directory this checkpoint was opened with — and, for a union of roots, the **first** of
-    /// them: the export's, which is the one a log names.
-    ///
-    /// A pipeline's stages are opened under it, so a model's `load()` can reach each stage
-    /// without a second copy of the path being threaded through the engine.
+    /// The directory this checkpoint was opened at: a pipeline's, the directory of its own
+    /// statements.
     pub fn root(&self) -> &Path {
         self.source.directory()
     }
 
-    /// Every directory this checkpoint spans, the first root's first.
-    ///
-    /// A pipeline's sidecars live in these directories rather than in a shard set: a processor has
-    /// no weights, so no stage holds it.
-    pub fn roots(&self) -> &[PathBuf] {
-        &self.roots
-    }
-
-    /// Whether this checkpoint is a pipeline of stages rather than one model's shards.
+    /// Whether this checkpoint is a pipeline of components rather than one model's shards.
     pub fn is_pipeline(&self) -> bool {
         !self.stages.is_empty()
     }
 
-    /// The stage numbered `name`, with its own shards and file identities.
+    /// The stage `name`, with its own shards and file identities.
     pub fn stage(&self, name: &str) -> Result<&Checkpoint> {
         self.stages.get(name).ok_or_else(|| Error::Checkpoint {
             path: PathBuf::from(name),
@@ -578,36 +627,27 @@ impl Checkpoint {
         }
     }
 
-    /// The JSON document `relative` names under the first of this checkpoint's roots that holds
-    /// it, or `None` when no root does.
+    /// The JSON document at the checkpoint-relative path `relative`, or `None` when it is absent.
     ///
     /// A checkpoint's configuration lives beside its shards rather than in them (`config.json`, a
-    /// pipeline's `model_index.json`, a stage's `vae/config.json`, a quantization
-    /// declaration), and a checkpoint opened over an export and the base it continues reads each
-    /// document from the export first. Whether an absent document is a refusal is the reader's
-    /// question, so absence is `None`.
+    /// stage's `vae/config.json`, a quantization declaration). A path whose first directory names
+    /// a component of a pipeline is read from that component's directory, wherever its source
+    /// put it; any other path from the checkpoint's own directory. Whether an absent document is a
+    /// refusal is the reader's question, so absence is `None`.
     ///
     /// # Errors
     ///
-    /// When a root holds the file and it cannot be read or is not JSON.
+    /// When the file exists and cannot be read or is not JSON.
     pub fn sidecar(&self, relative: &str) -> Result<Option<serde_json::Value>> {
-        for root in &self.roots {
-            let path = root.join(relative);
-            if !path.is_file() {
-                continue;
+        if let Some((component, file)) = relative.split_once('/') {
+            if let Some(stage) = self.stages.get(component) {
+                return stage.source.sidecar(file);
             }
-            let text = std::fs::read_to_string(&path).map_err(|source| Error::Io {
-                path: path.clone(),
-                source,
-            })?;
-            return serde_json::from_str(&text)
-                .map(Some)
-                .map_err(|error| Error::Checkpoint {
-                    path,
-                    problem: format!("is not JSON: {error}"),
-                });
+            if let Some(directory) = self.directories.get(component) {
+                return directory.sidecar(file);
+            }
         }
-        Ok(None)
+        self.source.sidecar(relative)
     }
 
     /// The checkpoint's shards.
@@ -653,28 +693,11 @@ impl Checkpoint {
 
     /// The location of the tensor named `name`, as its shard's header states it.
     ///
-    /// Unlike [`Checkpoint::tensor`], an absent name is an error, and for a union of several roots
-    /// the error lists the roots searched in precedence order. No payload byte is touched.
+    /// Unlike [`Checkpoint::tensor`], an absent name is an error. No payload byte is touched.
     pub fn locate(&self, name: &str) -> Result<&TensorLocation> {
-        self.tensors.get(name).ok_or_else(|| {
-            if self.roots.len() == 1 {
-                return Error::MissingTensor(name.to_owned());
-            }
-            // A union that spans several roots is where a bare "not found" is least useful: the
-            // caller needs to know what was searched, and in which order precedence ran.
-            let tried = self
-                .roots
-                .iter()
-                .map(|root| root.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            Error::Checkpoint {
-                path: self.root().to_path_buf(),
-                problem: format!(
-                    "no root holds a tensor `{name}`; searched, in precedence order: {tried}"
-                ),
-            }
-        })
+        self.tensors
+            .get(name)
+            .ok_or_else(|| Error::MissingTensor(name.to_owned()))
     }
 
     /// Reads the bytes of the tensor named `name` into host memory, row-major, in the element
@@ -735,30 +758,20 @@ impl Checkpoint {
         Ok(gathered)
     }
 
-    /// Fuse `adapter` into this checkpoint's tensors, or into the stage `stage` of a
-    /// pipeline root, and return the adapted checkpoint.
+    /// Fuse `adapter` into this flat checkpoint's tensors and return the adapted checkpoint.
     ///
     /// From then on every byte read of a tensor the adapter edits is its fused value, a tensor the
     /// adapter assigns is one of the checkpoint's tensors, and every other tensor reads as it did
-    /// ([`crate::adapter`]). Which stage an adapter edits is the model family's statement, as
-    /// its checkpoint mapping is ([`crate::family::VideoFamily::adapter_stage`]).
+    /// ([`crate::adapter`]). Which stage of a pipeline an adapter edits is its model family's
+    /// statement, so the family fuses it into that stage before composing the pipeline.
     ///
     /// # Errors
     ///
-    /// Fails when the stage does not exist or already holds an adapter, when the adapter edits
+    /// Fails when the checkpoint is a pipeline or already holds an adapter, when the adapter edits
     /// a tensor the checkpoint does not hold, a non-floating-point tensor, or one whose extents its
     /// delta does not match, or when it assigns a tensor the checkpoint already holds.
-    pub fn attach(mut self, stage: Option<&str>, adapter: Adapter) -> Result<Self> {
-        if let Some(name) = stage {
-            let held = self.stages.remove(name).ok_or_else(|| Error::Checkpoint {
-                path: self.root().to_path_buf(),
-                problem: format!("an adapter edits the stage `{name}`, which is not here"),
-            })?;
-            let adapted = held.attach(None, adapter)?;
-            self.stages.insert(name.to_owned(), adapted);
-            return Ok(self);
-        }
-        if self.adapter.is_some() || !self.stages.is_empty() {
+    pub fn attach(mut self, adapter: Adapter) -> Result<Self> {
+        if self.adapter.is_some() || self.is_pipeline() {
             return Err(Error::Checkpoint {
                 path: self.root().to_path_buf(),
                 problem: "an adapter is fused into one shard set that holds none yet".to_owned(),
@@ -890,35 +903,179 @@ fn shards_from_index(index: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// The `*.safetensors` shards of a directory in name order, or `None` when it holds none.
+/// A pipeline's index, as diffusers writes it: the pipeline's class and each component's
+/// library, class and directory.
 ///
-/// The index, when the directory has one, is what names the shards; a directory with neither is not
-/// a shard set at all, which a pipeline root's discovery uses to tell stages from other files.
-fn shards_in(root: &Path) -> Result<Option<Vec<PathBuf>>> {
-    let index = root.join("model.safetensors.index.json");
-    if index.is_file() {
-        return shards_from_index(&index).map(Some);
-    }
-    let mut paths = Vec::new();
-    let entries = std::fs::read_dir(root).map_err(|source| Error::Io {
-        path: root.to_path_buf(),
-        source,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| Error::Io {
-            path: root.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "safetensors")
-        {
-            paths.push(path);
+/// A component is a key whose value is `[library, class]` or `[library, class, options]`; its
+/// directory is the options' `subfolder` when stated and the key otherwise. A key beginning with
+/// `_` is the index's own metadata, a key of another value an attribute of the pipeline's
+/// configuration, and a component declared `[null, null]` is declared absent.
+///
+/// The index states each component's layout, not which directory holds it: a modular index's
+/// `pretrained_model_name_or_path` is its exporter's free text, and the released exports name the
+/// base release there for components they hold themselves. Which source holds each component is
+/// the model family's statement, read from the pipeline's manifests ([`Checkpoint::compose`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipelineIndex {
+    /// The file the index was read from, which refusals name.
+    path: PathBuf,
+    /// The pipeline class it declares (`_class_name`).
+    class: String,
+    /// Each component it declares, by name.
+    components: BTreeMap<String, Component>,
+}
+
+/// One component a pipeline index declares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Component {
+    /// The library that names its files (`transformers`, `diffusers`).
+    library: String,
+    /// Its directory below the pipeline's root.
+    directory: String,
+}
+
+impl PipelineIndex {
+    /// The index of the pipeline at `source`: the first of [`processing::PIPELINE_INDEX_FILES`]
+    /// its directory publishes, the files a pipeline declares its class in.
+    ///
+    /// # Errors
+    ///
+    /// When the directory publishes no index, or the index is not one.
+    pub fn read(source: &Source) -> Result<Self> {
+        for file in processing::PIPELINE_INDEX_FILES {
+            if let Some(value) = source.sidecar(file)? {
+                return Self::parse(&source.directory().join(file), &value);
+            }
         }
+        Err(Error::Checkpoint {
+            path: source.directory().to_path_buf(),
+            problem: format!(
+                "declares no pipeline: it publishes no {}",
+                processing::PIPELINE_INDEX_FILES.join(" or ")
+            ),
+        })
     }
-    paths.sort();
-    Ok((!paths.is_empty()).then_some(paths))
+
+    /// The index `value`, read from the file `path`.
+    ///
+    /// # Errors
+    ///
+    /// When `value` is not an object, states no `_class_name`, or declares a component that is
+    /// not `[library, class, options?]`.
+    pub fn parse(path: &Path, value: &serde_json::Value) -> Result<Self> {
+        let refuse = |problem: String| Error::Checkpoint {
+            path: path.to_path_buf(),
+            problem,
+        };
+        let object = value
+            .as_object()
+            .ok_or_else(|| refuse("a pipeline index is a JSON object".to_owned()))?;
+        let class = object
+            .get("_class_name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| refuse("states no pipeline class `_class_name`".to_owned()))?
+            .to_owned();
+
+        let mut components = BTreeMap::new();
+        for (name, declared) in object.iter().filter(|(name, _)| !name.starts_with('_')) {
+            // A key whose value is not an array is an attribute of the pipeline's own
+            // configuration (`force_zeros_for_empty_prompt`), not a component.
+            let Some(parts) = declared.as_array() else {
+                continue;
+            };
+            let malformed = || {
+                refuse(format!(
+                    "declares `{name}` as {declared}, not [library, class, options?]"
+                ))
+            };
+            let (library, class) = match parts.as_slice() {
+                [library, class] | [library, class, _] => (library, class),
+                _ => return Err(malformed()),
+            };
+            if library.is_null() && class.is_null() {
+                continue;
+            }
+            let library = library.as_str().ok_or_else(malformed)?.to_owned();
+            class.as_str().ok_or_else(malformed)?;
+
+            let directory = match parts.get(2).and_then(|options| options.get("subfolder")) {
+                None | Some(serde_json::Value::Null) => name.clone(),
+                Some(subfolder) => subfolder.as_str().ok_or_else(malformed)?.to_owned(),
+            };
+            components.insert(name.clone(), Component { library, directory });
+        }
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            class,
+            components,
+        })
+    }
+
+    /// The pipeline class the index declares.
+    pub fn class(&self) -> &str {
+        &self.class
+    }
+
+    /// Whether the index declares the component `name`.
+    pub fn declares(&self, name: &str) -> bool {
+        self.components.contains_key(name)
+    }
+
+    /// The directory below `source` that the component `name` lies in, whether or not `source`
+    /// holds it.
+    ///
+    /// # Errors
+    ///
+    /// When the index does not declare the component.
+    pub fn place(&self, name: &str, source: &Source) -> Result<Source> {
+        Ok(source.join(&self.component(name)?.directory))
+    }
+
+    /// The component `name`'s directory under `source`, which holds only configuration.
+    ///
+    /// # Errors
+    ///
+    /// When the index does not declare the component, or `source` does not hold its directory.
+    pub fn directory(&self, name: &str, source: &Source) -> Result<Source> {
+        let directory = self.place(name, source)?;
+        if !directory.directory().is_dir() {
+            return Err(Error::Checkpoint {
+                path: directory.directory().to_path_buf(),
+                problem: format!(
+                    "is the directory {} declares for `{name}`, and it is not here",
+                    self.path.display()
+                ),
+            });
+        }
+        Ok(directory)
+    }
+
+    /// The component `name`'s shard set under `source`, read by the names its library declares.
+    ///
+    /// # Errors
+    ///
+    /// When the index does not declare the component, declares it with a library whose shard set
+    /// this loader does not read, or its directory under `source` declares no shard set.
+    pub fn stage(&self, name: &str, source: &Source) -> Result<Checkpoint> {
+        let component = self.component(name)?;
+        let library = Library::named(&component.library).ok_or_else(|| Error::Checkpoint {
+            path: self.path.clone(),
+            problem: format!(
+                "declares `{name}` of the library `{}`, whose shard set this loader does not read",
+                component.library
+            ),
+        })?;
+        Checkpoint::shards(&source.join(&component.directory), library)
+    }
+
+    /// The component `name` as the index declares it.
+    fn component(&self, name: &str) -> Result<&Component> {
+        self.components.get(name).ok_or_else(|| Error::Checkpoint {
+            path: self.path.clone(),
+            problem: format!("declares no component `{name}`"),
+        })
+    }
 }
 
 /// The index file's shape: the metadata block is not read.

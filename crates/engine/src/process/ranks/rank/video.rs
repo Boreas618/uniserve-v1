@@ -295,8 +295,7 @@ impl ModelRunner {
         weights: &dyn nn::RetainedWeights,
         sized: bool,
     ) -> Result<Arc<dyn VideoModel>> {
-        let opened = self.open_video_checkpoint()?;
-        let checkpoint = self.open_video_family(&opened)?;
+        let (opened, checkpoint) = self.open_video_checkpoint()?;
         let (denoiser, tensor) = self.video_split()?;
         let stages = match sized {
             true => self.profiled_stages()?,

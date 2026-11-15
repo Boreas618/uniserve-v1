@@ -278,8 +278,9 @@ pub struct ServerArgs {
     pub max_model_len: Option<NonZeroU32>,
     /// A weight adapter fused into the checkpoint's weights at load, for
     /// every request of the deployment: the Hugging Face repository, or the
-    /// folder of one, that holds it (`<owner>/<name>[@<revision>][/<folder>]`,
-    /// as `model`). The model family must recognize it; video families only.
+    /// folder of one (`<owner>/<name>[@<revision>][/<folder>]`, as `model`),
+    /// that holds the adapter in its family's declared file beside the
+    /// contract of the student it is. Video families only.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "REPOSITORY")]
     pub lora: Option<String>,

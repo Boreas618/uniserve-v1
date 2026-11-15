@@ -26,10 +26,9 @@
 //! activation scale. A stage the manifest lists nothing for (the text encoder and the audio
 //! VAE of the released exports) is dense.
 
-use nn::family::Stage;
 use nn::quantization::{Declaration, ModeloptManifest};
 
-use super::VIDEO_VAE;
+use super::Component;
 use crate::minimax_h3::{Error, Result, transformer, video_vae};
 
 /// The stored projection of a gated feed-forward the exporter lists as `listed`, its path
@@ -56,16 +55,16 @@ fn stored_module(listed: &str) -> Option<(&'static str, String)> {
             "mlp",
             projection @ ..,
         ] => {
-            let stage = if *root == "denoiser" {
-                Stage::Transformer
+            let network = if *root == "denoiser" {
+                Component::Transformer
             } else {
-                Stage::TransformerRef
+                Component::TransformerRef
             };
             let block: u32 = block.parse().ok()?;
             let projection = feed_forward(projection, transformer::FEED_FORWARD)?;
 
             Some((
-                stage.name(),
+                network.name(),
                 format!("{}.{block}.{projection}", transformer::BLOCKS),
             ))
         }
@@ -95,7 +94,7 @@ fn stored_module(listed: &str) -> Option<(&'static str, String)> {
             };
 
             Some((
-                VIDEO_VAE,
+                Component::Vae.name(),
                 format!("{}.{block}.{module}.{projection}", video_vae::BLOCKS),
             ))
         }

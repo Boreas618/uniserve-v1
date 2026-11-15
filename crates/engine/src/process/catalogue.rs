@@ -72,9 +72,9 @@ mod tests {
     impl VideoFamily for Unopened {
         fn open(
             &self,
-            _: &nn::Checkpoint,
+            _: &nn::Sources,
             _: &proto::config::Quantization,
-        ) -> nn::Result<Box<dyn VideoCheckpoint>> {
+        ) -> nn::Result<(nn::Checkpoint, Box<dyn VideoCheckpoint>)> {
             Err(nn::Error::Unsupported("no checkpoint".to_owned()))
         }
     }

@@ -10,16 +10,27 @@
 
 mod support;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use nn::quantization::{ModeloptManifest, Nvfp4Names, UNIFIED_EXPORT, ValueLayout};
 use nn::weights::PartBlock;
 use nn::{
-    Checkpoint, CpuWeights, DType, Device, MetaWeights, Shape, Source, Tensor, WeightKey,
-    WeightLayout, WeightLoader, WeightSource,
+    Checkpoint, CpuWeights, DType, Device, Library, MetaWeights, PipelineIndex, Shape, Source,
+    Tensor, WeightKey, WeightLayout, WeightLoader, WeightSource,
 };
 use ops::fp4::ScaleLayout;
 use support::{encode, f32_bytes, shard, values};
+
+/// The local directory `directory`.
+fn local(directory: &Path) -> Source {
+    Source::Local(directory.to_path_buf())
+}
+
+/// The BF16 values of the tensor `name` of `checkpoint`, as a read returns them.
+fn read_bf16(checkpoint: &Checkpoint, name: &str) -> Vec<f32> {
+    ops::values::decode(DType::BF16, &checkpoint.read(name).unwrap()).unwrap()
+}
 
 /// Writes one shard holding BF16 tensors (name, extents, values) and returns its path.
 fn bf16_shard(directory: &Path, tensors: &[(&str, Vec<usize>, Vec<f32>)]) -> std::path::PathBuf {
@@ -137,9 +148,11 @@ fn a_file_is_identified_by_the_source_its_caller_states() {
         bf16_shard(directory.path(), &[("weight", vec![2], vec![1.0, 2.0])]);
     }
     let identity = |source: Source| {
-        source
-            .identity(&source.directory().join("model.safetensors"))
+        Checkpoint::shards(&source, Library::Transformers)
             .unwrap()
+            .identity("weight")
+            .unwrap()
+            .clone()
     };
     let snapshot = |revision: &str, directory: &Path| {
         Source::snapshot("owner/model", revision, directory.to_path_buf())
@@ -157,7 +170,6 @@ fn a_file_is_identified_by_the_source_its_caller_states() {
     );
 
     // A local file just written is one file however often it is read, and its copy another.
-    let local = |directory: &Path| Source::Local(directory.to_path_buf());
     assert_eq!(identity(local(first.path())), identity(local(first.path())));
     assert_ne!(
         identity(local(first.path())),
@@ -188,7 +200,7 @@ fn a_reading_names_the_tensors_a_load_never_asked_for() {
     checkpoint.read("c").unwrap();
     assert!(checkpoint.reading().1.is_empty());
 
-    // A pipeline root lists its stages' names qualified, and a stage that was not read whole.
+    // A pipeline lists its stages' names qualified, and a stage that was not read whole.
     let root = tempfile::tempdir().unwrap();
     let (transformer, vae) = (root.path().join("transformer"), root.path().join("vae"));
     std::fs::create_dir_all(&transformer).unwrap();
@@ -196,7 +208,14 @@ fn a_reading_names_the_tensors_a_load_never_asked_for() {
     bf16_shard(&transformer, &[("weight", vec![2], vec![1.0, 2.0])]);
     bf16_shard(&vae, &[("weight", vec![2], vec![3.0, 4.0])]);
 
-    let pipeline = Checkpoint::open(root.path()).unwrap();
+    let stages = BTreeMap::from([
+        (
+            "transformer".to_owned(),
+            Checkpoint::open(&transformer).unwrap(),
+        ),
+        ("vae".to_owned(), Checkpoint::open(&vae).unwrap()),
+    ]);
+    let pipeline = Checkpoint::compose(local(root.path()), stages, BTreeMap::new()).unwrap();
     assert!(pipeline.is_pipeline());
     pipeline
         .stage("transformer")
@@ -210,6 +229,194 @@ fn a_reading_names_the_tensors_a_load_never_asked_for() {
             vec!["vae/weight".to_owned()]
         )
     );
+}
+
+/// A shard set is read through the names its library declares, one shard or an index of
+/// several; another file is no shard set, and a directory that states both is refused.
+#[test]
+fn a_shard_set_is_read_only_through_its_librarys_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let tensors = [(
+        "weight",
+        DType::BF16,
+        vec![2],
+        encode(DType::BF16, &[1.0, 2.0]),
+    )];
+
+    shard(directory.path(), "weights.safetensors", &tensors);
+    let error = Checkpoint::open(directory.path()).err().expect("refused");
+    assert!(error.to_string().contains("model.safetensors"), "{error}");
+
+    // A diffusers shard set is read by the diffusers names alone.
+    shard(
+        directory.path(),
+        "diffusion_pytorch_model.safetensors",
+        &tensors,
+    );
+    assert!(Checkpoint::open(directory.path()).is_err());
+    let diffusers = Checkpoint::shards(&local(directory.path()), Library::Diffusers).unwrap();
+    assert!(diffusers.tensor("weight").is_some());
+
+    // One shard and an index of several are two statements of one set.
+    shard(directory.path(), "model.safetensors", &tensors);
+    std::fs::write(
+        directory.path().join("model.safetensors.index.json"),
+        r#"{"weight_map": {"weight": "model.safetensors"}}"#,
+    )
+    .unwrap();
+    let error = Checkpoint::open(directory.path()).err().expect("refused");
+    assert!(error.to_string().contains("twice"), "{error}");
+}
+
+/// A pipeline's stages are the components its index declares, each in the directory the index
+/// names and read by its library's names; a directory the index does not declare is not one.
+#[test]
+fn a_pipelines_stages_are_the_components_its_index_declares() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("modular_model_index.json"),
+        r#"{
+            "_class_name": "Pipeline",
+            "_diffusers_version": "0.36.0",
+            "transformer": ["diffusers", "Network", {"subfolder": "network"}],
+            "text_encoder": ["transformers", "Encoder"],
+            "scheduler": ["diffusers", "Scheduler"],
+            "tokenizer": [null, null]
+        }"#,
+    )
+    .unwrap();
+    for directory in ["network", "text_encoder", "scheduler", "extra"] {
+        std::fs::create_dir_all(root.path().join(directory)).unwrap();
+    }
+    let tensors = |value: f32| {
+        [(
+            "weight",
+            DType::BF16,
+            vec![1],
+            encode(DType::BF16, &[value]),
+        )]
+    };
+    shard(
+        &root.path().join("network"),
+        "diffusion_pytorch_model.safetensors",
+        &tensors(1.0),
+    );
+    shard(
+        &root.path().join("text_encoder"),
+        "model.safetensors",
+        &tensors(2.0),
+    );
+    shard(
+        &root.path().join("extra"),
+        "model.safetensors",
+        &tensors(3.0),
+    );
+
+    let source = local(root.path());
+    let index = PipelineIndex::read(&source).unwrap();
+    assert_eq!(index.class(), "Pipeline");
+    assert!(index.declares("transformer") && index.declares("scheduler"));
+    assert!(!index.declares("tokenizer"), "declared absent");
+    assert!(!index.declares("extra"), "a directory is not a declaration");
+
+    let network = index.stage("transformer", &source).unwrap();
+    assert_eq!(network.root(), root.path().join("network"));
+    assert_eq!(read_bf16(&network, "weight"), [1.0]);
+    assert!(index.stage("extra", &source).is_err());
+    assert!(
+        index.stage("scheduler", &source).is_err(),
+        "it holds no shard set"
+    );
+    assert!(index.directory("scheduler", &source).is_ok());
+
+    // A declared directory its source does not hold is refused, not skipped.
+    let empty = tempfile::tempdir().unwrap();
+    assert!(index.directory("scheduler", &local(empty.path())).is_err());
+    let error = PipelineIndex::read(&local(empty.path())).unwrap_err();
+    assert!(error.to_string().contains("model_index.json"), "{error}");
+}
+
+/// A composed pipeline reads each component's files from the one source it was composed from,
+/// and its own statements from its root, whatever another directory holds.
+#[test]
+fn a_composed_pipeline_reads_each_component_from_its_source() {
+    let (export, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    std::fs::write(
+        export.path().join("model_index.json"),
+        r#"{"_class_name": "Pipeline", "transformer": ["diffusers", "Network"],
+            "text_encoder": ["transformers", "Encoder"], "scheduler": ["diffusers", "Scheduler"]}"#,
+    )
+    .unwrap();
+    std::fs::write(export.path().join("manifest.json"), r#"{"from": "export"}"#).unwrap();
+    for (root, directory) in [
+        (export.path(), "transformer"),
+        (export.path(), "text_encoder"),
+        (base.path(), "text_encoder"),
+        (base.path(), "scheduler"),
+    ] {
+        let directory = root.join(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let from = if root == export.path() {
+            "export"
+        } else {
+            "base"
+        };
+        std::fs::write(
+            directory.join("config.json"),
+            format!(r#"{{"from": "{from}"}}"#),
+        )
+        .unwrap();
+    }
+    let tensors = [("weight", DType::BF16, vec![1], encode(DType::BF16, &[1.0]))];
+    shard(
+        &export.path().join("transformer"),
+        "diffusion_pytorch_model.safetensors",
+        &tensors,
+    );
+    shard(
+        &base.path().join("text_encoder"),
+        "model.safetensors",
+        &tensors,
+    );
+
+    let (export_source, base_source) = (local(export.path()), local(base.path()));
+    let index = PipelineIndex::read(&export_source).unwrap();
+    let stages = BTreeMap::from([
+        (
+            "transformer".to_owned(),
+            index.stage("transformer", &export_source).unwrap(),
+        ),
+        (
+            "text_encoder".to_owned(),
+            index.stage("text_encoder", &base_source).unwrap(),
+        ),
+    ]);
+    let directories = BTreeMap::from([(
+        "scheduler".to_owned(),
+        index.directory("scheduler", &base_source).unwrap(),
+    )]);
+    let pipeline = Checkpoint::compose(export_source.clone(), stages, directories).unwrap();
+
+    let from = |relative: &str| pipeline.sidecar(relative).unwrap().unwrap()["from"].clone();
+    assert_eq!(from("manifest.json"), "export");
+    assert_eq!(from("transformer/config.json"), "export");
+    assert_eq!(
+        from("text_encoder/config.json"),
+        "base",
+        "not the export's stray copy"
+    );
+    assert_eq!(from("scheduler/config.json"), "base");
+
+    // A component is a stage or a directory, not both.
+    let twice = Checkpoint::compose(
+        export_source.clone(),
+        BTreeMap::from([(
+            "scheduler".to_owned(),
+            index.stage("transformer", &export_source).unwrap(),
+        )]),
+        BTreeMap::from([("scheduler".to_owned(), base_source.clone())]),
+    );
+    assert!(twice.is_err());
 }
 
 // ---- Dense loads ------------------------------------------------------------------------------

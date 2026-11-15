@@ -1,11 +1,12 @@
 //! MiniMax-H3's typed configuration: the checkpoint's sidecars, read once at the loading
 //! boundary and immutable afterwards.
 //!
-//! A checkpoint is normalized into one [`Config`] before any module is built: the base release
-//! (a pipeline index over the networks, the text encoder, the video VAE and the audio VAE it
-//! holds), or a FastH3 export or adapter (one network whose schedule and attention its
-//! `fastvideo_inference.json`, or the release it was extracted from, states). Every module's
-//! `load` consumes the typed struct of its own submodule and reparses nothing.
+//! A composed checkpoint is normalized into one [`Config`] before any module is built: the base
+//! release (the networks its pipeline index declares, each on the released full-step grid), or a
+//! FastH3 student, an export or an adapter fused into the base release (one network on the
+//! schedule and attention its contract states, [`Contract`]). The components each comes from are
+//! named by [`Component`]. Every module's `load` consumes the typed struct of its own submodule
+//! and reparses nothing.
 //!
 //! A packed ModelOpt export states its calibration in a manifest at its root; it is read here
 //! into the quantization each stage's configuration declares ([`modelopt`]), which the stage's
@@ -19,6 +20,7 @@
 //! them.
 
 mod audio_vae;
+mod contract;
 mod denoiser;
 mod modelopt;
 pub(crate) mod precision;
@@ -27,14 +29,15 @@ mod video_vae;
 
 use std::collections::BTreeMap;
 
-use nn::PixelNorm;
 use nn::config::Fields;
 use nn::family::Stage;
 use nn::quantization::ModeloptManifest;
+use nn::{PipelineIndex, PixelNorm};
 use processing::qwen_vl::ProcessorConfig;
 use serde_json::Value;
 
 pub use audio_vae::AudioVaeConfig;
+pub use contract::{BaseRevision, Contract, StudentSchedule};
 pub use denoiser::{DenoiserConfig, ScheduleConfig, TransformerConfig, VsaConfig};
 pub use processing::minimax_h3::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_LATENTS_PER_SECOND, AUDIO_SAMPLE_RATE, FPS, FRAMES,
@@ -60,17 +63,128 @@ pub const UNIFORM_GRID_POINTS: u32 = 50;
 /// The networks a release may hold, of which a deployment places one.
 pub const NETWORKS: [Stage; 2] = [Stage::Transformer, Stage::TransformerRef];
 
-/// The directory of the video VAE, which holds the decoder's weights and the encoder's.
-pub const VIDEO_VAE: &str = "vae";
+/// A component of a MiniMax-H3 pipeline, by the name its index declares it under: a stage that
+/// holds a shard set, or a directory that holds only configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Component {
+    /// The Qwen3-VL text encoder.
+    TextEncoder,
+    /// The text encoder's Qwen-VL processor.
+    Processor,
+    /// The base network, of `t2va` and `fl2va`.
+    Transformer,
+    /// The reference network, of `ref2va`.
+    TransformerRef,
+    /// The video VAE, which holds the decoder's weights and the encoder's.
+    Vae,
+    /// The audio VAE, which holds the vocoder's weights and the encoder's.
+    AudioVae,
+    /// The video scheduler.
+    Scheduler,
+    /// The audio scheduler.
+    AudioScheduler,
+}
 
-/// The rungs a fused FastH3 adapter's student was distilled with: the four DMD rungs of the
-/// `t2av` network at the base release's shifts
-/// (`FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`).
-const ADAPTER_RUNGS: [u32; 4] = [999, 749, 500, 250];
+impl Component {
+    /// Every component, in the order a pipeline index lists them.
+    pub const ALL: [Self; 8] = [
+        Self::TextEncoder,
+        Self::Processor,
+        Self::Vae,
+        Self::AudioVae,
+        Self::Transformer,
+        Self::TransformerRef,
+        Self::Scheduler,
+        Self::AudioScheduler,
+    ];
 
-/// The sparse attention of a fused FastH3 adapter that assigns the blocks' compression gates:
-/// 64-row tiles at a sparsity of 0.9.
-const ADAPTER_VSA: (u32, f64) = (64, 0.9);
+    /// The component's name in a pipeline index.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::TextEncoder => "text_encoder",
+            Self::Processor => "processor",
+            Self::Transformer => "transformer",
+            Self::TransformerRef => "transformer_ref",
+            Self::Vae => "vae",
+            Self::AudioVae => "audio_vae",
+            Self::Scheduler => "scheduler",
+            Self::AudioScheduler => "audio_scheduler",
+        }
+    }
+
+    /// The component a pipeline index names `name`, `None` for one this family reads nothing of.
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|component| component.name() == name)
+    }
+
+    /// Whether the component holds a shard set.
+    pub const fn weights(self) -> bool {
+        matches!(
+            self,
+            Self::TextEncoder
+                | Self::Transformer
+                | Self::TransformerRef
+                | Self::Vae
+                | Self::AudioVae
+        )
+    }
+
+    /// The deployment stage of the network the component holds, `None` for one that holds none.
+    pub const fn network(self) -> Option<Stage> {
+        match self {
+            Self::Transformer => Some(Stage::Transformer),
+            Self::TransformerRef => Some(Stage::TransformerRef),
+            _ => None,
+        }
+    }
+
+    /// The component that holds the network a deployment places as `stage`.
+    ///
+    /// # Errors
+    ///
+    /// When `stage` places no network.
+    pub fn holding(stage: Stage) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|component| component.network() == Some(stage))
+            .ok_or_else(|| Error::config(format!("{} places no MiniMax-H3 network", stage.name())))
+    }
+
+    /// The checkpoint-relative path of `file` in the component's directory.
+    pub fn file(self, file: &str) -> String {
+        format!("{}/{file}", self.name())
+    }
+}
+
+/// The networks a composed checkpoint serves, as its composition states them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Networks {
+    /// A base release's networks, each on the released full-step grid.
+    Released(Vec<Stage>),
+    /// One student's network, on the schedule and attention its contract states.
+    Student(Contract),
+}
+
+/// The networks a base release serves: those its pipeline index declares.
+///
+/// # Errors
+///
+/// When the index declares no network.
+pub fn released_networks(index: &PipelineIndex) -> Result<Vec<Stage>> {
+    let networks: Vec<Stage> = Component::ALL
+        .into_iter()
+        .filter(|component| index.declares(component.name()))
+        .filter_map(Component::network)
+        .collect();
+    if networks.is_empty() {
+        return Err(Error::checkpoint(
+            "the pipeline index declares no MiniMax-H3 network".to_owned(),
+        ));
+    }
+    Ok(networks)
+}
 
 /// The network that serves `task`: the base `transformer` for `t2va` and `fl2va`, the
 /// `transformer_ref` for `ref2va`.
@@ -100,47 +214,39 @@ pub struct Config {
 }
 
 impl Config {
-    /// Reads and normalizes the configuration of `checkpoint`, once.
+    /// Reads and normalizes the configuration of the composed `checkpoint`, whose networks
+    /// `networks` states, once.
     ///
-    /// Each sidecar is read from the first root of the checkpoint that holds it, so an export
-    /// that continues a base release reads what it omits from the base. A FastH3 adapter fused
-    /// into the base `transformer` reads as the student it was extracted from.
+    /// Each sidecar is read from the directory of the component that holds it, as the
+    /// checkpoint's composition placed it ([`nn::Checkpoint::sidecar`]).
     ///
     /// # Errors
     ///
     /// A sidecar that is missing or states a value this family does not serve.
-    pub fn open(checkpoint: &nn::Checkpoint) -> Result<Self> {
-        let adapter = checkpoint
-            .stage(Stage::Transformer.name())
-            .ok()
-            .and_then(nn::Checkpoint::adapter)
-            .map(|fusion| {
-                fusion
-                    .assigned()
-                    .any(|name| name.ends_with(".attn.to_gate_compress.weight"))
-            });
+    pub fn open(checkpoint: &nn::Checkpoint, networks: &Networks) -> Result<Self> {
         let root = checkpoint.root().display().to_string();
 
-        Self::read(|relative| Ok(checkpoint.sidecar(relative)?), adapter, &root)
+        Self::read(
+            |relative| Ok(checkpoint.sidecar(relative)?),
+            networks,
+            &root,
+        )
     }
 
-    /// The configuration of the sidecars `sidecar` returns by checkpoint-relative path.
+    /// The configuration of the sidecars `sidecar` returns by checkpoint-relative path, for the
+    /// networks `networks` states.
     ///
-    /// `adapter` is whether a fused FastH3 adapter assigns compression gates, `None` when none
-    /// is fused; `root` names the checkpoint in refusals. Everything is checked here (the text
-    /// encoder against the networks' conditioning width, the VAEs' compression against the
-    /// frame rule, the student's statement against its schedulers), so no module sees a value
-    /// it cannot use.
+    /// `root` names the checkpoint in refusals. Everything is checked here (the text encoder
+    /// against the networks' conditioning width, the VAEs' compression against the frame rule,
+    /// the student's contract against its schedulers), so no module sees a value it cannot use.
     pub(crate) fn read(
         sidecar: impl Fn(&str) -> Result<Option<Value>>,
-        adapter: Option<bool>,
+        networks: &Networks,
         root: &str,
     ) -> Result<Self> {
         let require = |relative: &str| -> Result<Value> {
             sidecar(relative)?.ok_or_else(|| {
-                Error::checkpoint(format!(
-                    "no root of the checkpoint at {root} holds {relative}"
-                ))
+                Error::checkpoint(format!("the checkpoint at {root} holds no {relative}"))
             })
         };
 
@@ -153,58 +259,46 @@ impl Config {
         }
         let declared = |directory: &str| modelopt::declaration(manifest.as_ref(), directory);
 
-        let mut text_encoder = text::text_encoder(&require("text_encoder/config.json")?)?;
-        text_encoder.quantization = declared(Stage::TextEncoder.name())?;
-        let image_processor = require("processor/preprocessor_config.json")?;
-        let pixels =
-            Fields::of("processor/preprocessor_config.json", &image_processor)?.pixel_norm()?;
-        let processor = sidecar("processor/video_preprocessor_config.json")?
+        let text_file = Component::TextEncoder.file("config.json");
+        let mut text_encoder = text::text_encoder(&require(&text_file)?)?;
+        text_encoder.quantization = declared(Component::TextEncoder.name())?;
+        let image_file = Component::Processor.file("preprocessor_config.json");
+        let image_processor = require(&image_file)?;
+        let pixels = Fields::of(&image_file, &image_processor)?.pixel_norm()?;
+        let processor = sidecar(&Component::Processor.file("video_preprocessor_config.json"))?
             .map(|video| ProcessorConfig::from_values(&image_processor, &video))
             .transpose()
             .map_err(|error| Error::config(format!("the checkpoint's processor: {error}")))?;
 
-        let mut video_vae = VideoVaeConfig::parse(&require(&format!("{VIDEO_VAE}/config.json"))?)?;
-        video_vae.quantization = declared(VIDEO_VAE)?;
-        let audio_vae = AudioVaeConfig::parse(&require("audio_vae/config.json")?)?;
+        let mut video_vae = VideoVaeConfig::parse(&require(&Component::Vae.file("config.json"))?)?;
+        video_vae.quantization = declared(Component::Vae.name())?;
+        let audio_vae = AudioVaeConfig::parse(&require(&Component::AudioVae.file("config.json"))?)?;
         let shifts = (
-            shift(&require("scheduler/scheduler_config.json")?, "scheduler")?,
             shift(
-                &require("audio_scheduler/scheduler_config.json")?,
-                "audio_scheduler",
+                &require(&Component::Scheduler.file("scheduler_config.json"))?,
+                Component::Scheduler,
+            )?,
+            shift(
+                &require(&Component::AudioScheduler.file("scheduler_config.json"))?,
+                Component::AudioScheduler,
             )?,
         );
 
-        let student = sidecar("fastvideo_inference.json")?;
-        let student = student
-            .as_ref()
-            .map(|value| Fields::of("fastvideo_inference.json", value))
-            .transpose()?;
-        let networks = match (&student, adapter) {
-            (Some(student), _) => vec![student_network(student)?],
-            (None, Some(_)) => vec![Stage::Transformer],
-            (None, None) => released_networks(&sidecar, root)?,
+        let (stages, student) = match networks {
+            Networks::Released(stages) => (stages.clone(), None),
+            Networks::Student(contract) => (vec![contract.network], Some(contract)),
         };
 
         let mut denoisers = BTreeMap::new();
-        for stage in networks {
-            let relative = format!("{}/config.json", stage.name());
+        for stage in stages {
+            let component = Component::holding(stage)?;
+            let relative = component.file("config.json");
             let transformer =
                 TransformerConfig::parse(&Fields::of(&relative, &require(&relative)?)?)?;
 
-            let (schedule, vsa) = match (&student, adapter) {
-                (Some(student), _) => student_denoising(student, &transformer, shifts)?,
-                (None, Some(gated)) => (
-                    ScheduleConfig::ladder(
-                        &ADAPTER_RUNGS,
-                        NUM_TRAIN_TIMESTEPS,
-                        shifts.0,
-                        shifts.1,
-                    )?,
-                    gated
-                        .then(|| VsaConfig::new(ADAPTER_VSA.0, ADAPTER_VSA.1, None))
-                        .transpose()?,
-                ),
-                (None, None) => (
+            let (schedule, vsa) = match student {
+                Some(contract) => student_denoising(contract, &transformer, shifts)?,
+                None => (
                     ScheduleConfig::uniform(UNIFORM_GRID_POINTS, shifts.0, shifts.1)?,
                     None,
                 ),
@@ -215,7 +309,7 @@ impl Config {
                 .filter(|task| network(*task) == stage)
                 .collect();
             let mut denoiser = DenoiserConfig::new(transformer, schedule, vsa, tasks)?;
-            denoiser.quantization = declared(stage.name())?;
+            denoiser.quantization = declared(component.name())?;
             denoisers.insert(stage, denoiser);
         }
 
@@ -332,138 +426,50 @@ impl Config {
     }
 }
 
-/// The networks a base release holds: those its pipeline index names and whose configuration
-/// the checkpoint holds.
-fn released_networks(
-    sidecar: &impl Fn(&str) -> Result<Option<Value>>,
-    root: &str,
-) -> Result<Vec<Stage>> {
-    let class = processing::minimax_h3::PIPELINE_CLASS;
-
-    let index = sidecar("model_index.json")?.ok_or_else(|| {
-        Error::checkpoint(format!(
-            "{root} holds neither fastvideo_inference.json nor model_index.json"
-        ))
-    })?;
-    let index = Fields::of("model_index.json", &index)?;
-    if let Some(stated) = index.optional_text("_class_name")?
-        && stated != class
-    {
-        return Err(Error::checkpoint(format!(
-            "{root} is a {stated} checkpoint, not a {class} pipeline root; the task exports \
-             under FL2VA/ are not pipeline roots"
-        )));
-    }
-
-    let mut networks = Vec::new();
-    for stage in NETWORKS {
-        let held = sidecar(&format!("{}/config.json", stage.name()))?.is_some();
-        if index.contains(stage.name()) && held {
-            networks.push(stage);
-        }
-    }
-    if networks.is_empty() {
-        return Err(Error::checkpoint(format!(
-            "{root}/model_index.json names no network the checkpoint holds"
-        )));
-    }
-    Ok(networks)
-}
-
-/// The network a FastH3 export distils: the base network of the task it states (`task`, or
-/// `model_type` in the OmniRef exports).
-fn student_network(student: &Fields<'_>) -> Result<Stage> {
-    let stated = match student.optional_text("task")? {
-        Some(task) => task,
-        None => student.optional_text("model_type")?.ok_or_else(|| {
-            Error::checkpoint("fastvideo_inference.json states no task or model_type".to_owned())
-        })?,
-    };
-
-    match stated {
-        "t2av" => Ok(network(VideoTask::TextToVideoAudio)),
-        "ref2va" => Ok(network(VideoTask::ReferenceToVideoAudio)),
-        other => Err(Error::checkpoint(format!(
-            "unsupported FastH3 checkpoint: its task must be t2av or ref2va, got {other:?}"
-        ))),
-    }
-}
-
-/// A FastH3 export's schedule and sparse attention, from its `fastvideo_inference.json`.
+/// A FastH3 student's schedule and sparse attention, as its contract states them.
 ///
-/// The shifts are the scheduler sidecars'; an export that states them too must state the same
-/// two, and one whose statements disagree is refused. Its schedule is a DMD ladder (`dmd_denoising_steps`) or a
-/// parallel-decoding block grid (`pdd_step_indices` with `grid_max_t`), exactly one of them;
-/// its attention backend is `DENSE` (or unstated) or `VIDEO_SPARSE_ATTN_H3` with the `vsa_*`
-/// values.
+/// The shifts are the scheduler sidecars'; a contract that states them too must state the same
+/// two, and one whose statements disagree is refused. A DMD ladder's rungs are timesteps of the
+/// training schedule; a parallel-decoding block grid spans the network's output heads.
 fn student_denoising(
-    student: &Fields<'_>,
+    contract: &Contract,
     transformer: &TransformerConfig,
     shifts: (f32, f32),
 ) -> Result<(ScheduleConfig, Option<VsaConfig>)> {
-    for (key, shift) in [
-        ("video_scheduler_shift", shifts.0),
-        ("audio_scheduler_shift", shifts.1),
-    ] {
-        if let Some(stated) = student.optional_number(key)?
+    for ((key, stated), shift) in ["video_scheduler_shift", "audio_scheduler_shift"]
+        .into_iter()
+        .zip(contract.shifts)
+        .zip([shifts.0, shifts.1])
+    {
+        if let Some(stated) = stated
             && stated as f32 != shift
         {
             return Err(Error::config(format!(
-                "fastvideo_inference.json.{key} is {stated}, which disagrees with the \
-                 scheduler sidecar's shift of {shift}"
+                "{}.{key} is {stated}, which disagrees with the scheduler sidecar's shift of \
+                 {shift}",
+                Contract::FILE
             )));
         }
     }
 
-    let schedule = match (
-        student.optional_indices("dmd_denoising_steps")?,
-        student.optional_indices("pdd_step_indices")?,
-    ) {
-        (Some(rungs), None) => {
-            ScheduleConfig::ladder(&rungs, NUM_TRAIN_TIMESTEPS, shifts.0, shifts.1)?
+    let schedule = match &contract.schedule {
+        StudentSchedule::Ladder(rungs) => {
+            ScheduleConfig::ladder(rungs, NUM_TRAIN_TIMESTEPS, shifts.0, shifts.1)?
         }
-        (None, Some(nodes)) => ScheduleConfig::blocks(
+        StudentSchedule::Blocks { nodes, grid_max_t } => ScheduleConfig::blocks(
             transformer.output_heads,
-            nodes,
-            student.number("grid_max_t")? as f32,
+            nodes.clone(),
+            *grid_max_t as f32,
             shifts.0,
             shifts.1,
         )?,
-        (Some(_), Some(_)) => {
-            return Err(Error::checkpoint(
-                "fastvideo_inference.json states both dmd_denoising_steps and pdd_step_indices"
-                    .to_owned(),
-            ));
-        }
-        (None, None) => {
-            return Err(Error::checkpoint(
-                "unsupported FastH3 checkpoint: fastvideo_inference.json states neither \
-                 dmd_denoising_steps nor pdd_step_indices"
-                    .to_owned(),
-            ));
-        }
     };
-
-    let vsa = match student.optional_text("attention_backend")? {
-        None | Some("DENSE") => None,
-        Some("VIDEO_SPARSE_ATTN_H3") => Some(VsaConfig::new(
-            student.index("vsa_tile_size")?,
-            student.number("vsa_sparsity")?,
-            student.optional_number("vsa_ref_keep_rate")?,
-        )?),
-        Some(other) => {
-            return Err(Error::checkpoint(format!(
-                "fastvideo_inference.json states the attention backend {other:?}, which this \
-                 build does not serve: it serves DENSE and VIDEO_SPARSE_ATTN_H3"
-            )));
-        }
-    };
-    Ok((schedule, vsa))
+    Ok((schedule, contract.vsa))
 }
 
-/// The noise level shift the scheduler sidecar of `stage` states.
-fn shift(sidecar: &Value, stage: &str) -> Result<f32> {
-    let owner = format!("{stage}/scheduler_config.json");
+/// The noise level shift the scheduler sidecar of `component` states.
+fn shift(sidecar: &Value, component: Component) -> Result<f32> {
+    let owner = component.file("scheduler_config.json");
 
     Ok(Fields::of(owner, sidecar)?.positive("shift")? as f32)
 }
@@ -625,7 +631,8 @@ pub(crate) mod tests_support {
     /// networks.
     pub(crate) fn release() -> BTreeMap<String, Value> {
         let index = r#"{"_class_name": "MiniMaxH3ModularPipeline",
-                        "transformer": [], "transformer_ref": []}"#;
+                        "transformer": ["diffusers", "MiniMaxH3Transformer3DModel"],
+                        "transformer_ref": ["diffusers", "MiniMaxH3Transformer3DModel"]}"#;
 
         [
             ("model_index.json", json(index)),
@@ -649,38 +656,57 @@ pub(crate) mod tests_support {
         .collect()
     }
 
-    /// A FastH3 DMD export of the base network over `files`: its inference file, its
-    /// scheduler's shift and no reference network.
+    /// A FastH3 DMD export of the base network over `files`: its contract, its scheduler's
+    /// shift and no reference network.
     pub(crate) fn dmd_export(
         mut files: BTreeMap<String, Value>,
         backend: &str,
     ) -> BTreeMap<String, Value> {
-        files.remove("model_index.json");
         files.remove("transformer_ref/config.json");
         files.insert(
             "scheduler/scheduler_config.json".to_owned(),
             json(r#"{"shift": 10.0}"#),
         );
-        files.insert(
-            "fastvideo_inference.json".to_owned(),
-            serde_json::json!({
-                "task": "t2av",
-                "video_scheduler_shift": 10.0,
-                "audio_scheduler_shift": 3.0,
-                "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
-                "attention_backend": backend,
-                "vsa_tile_size": 64,
-                "vsa_sparsity": 0.8,
-            }),
-        );
+        files.insert(Contract::FILE.to_owned(), dmd_contract(backend));
         files
     }
 
-    /// The configuration of `files`, with a fused adapter's gating when one is stated.
-    pub(crate) fn read(files: &BTreeMap<String, Value>, adapter: Option<bool>) -> Result<Config> {
+    /// The contract of an eight-rung DMD student of the base network, attending with `backend`.
+    pub(crate) fn dmd_contract(backend: &str) -> Value {
+        serde_json::json!({
+            "schema_version": Contract::SCHEMA,
+            "task": "t2av",
+            "video_scheduler_shift": 10.0,
+            "audio_scheduler_shift": 3.0,
+            "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
+            "attention_backend": backend,
+            "vsa_tile_size": 64,
+            "vsa_sparsity": 0.8,
+        })
+    }
+
+    /// The configuration the family composes of `files`, a checkpoint's sidecars: the student
+    /// `adapter` contracts when an adapter is fused, else the student the checkpoint's own
+    /// contract states, else the networks its pipeline index declares.
+    pub(crate) fn read(
+        files: &BTreeMap<String, Value>,
+        adapter: Option<&Contract>,
+    ) -> Result<Config> {
+        let networks = match (adapter, files.get(Contract::FILE)) {
+            (Some(contract), _) => Networks::Student(contract.clone()),
+            (None, Some(contract)) => Networks::Student(Contract::parse(contract)?),
+            (None, None) => {
+                let index = files.get("model_index.json").ok_or_else(|| {
+                    Error::checkpoint("the fixture states no model_index.json".to_owned())
+                })?;
+                let index = PipelineIndex::parse(std::path::Path::new("model_index.json"), index)?;
+                Networks::Released(released_networks(&index)?)
+            }
+        };
+
         Config::read(
             |relative| Ok(files.get(relative).cloned()),
-            adapter,
+            &networks,
             "fixture",
         )
     }
@@ -724,36 +750,30 @@ mod tests {
     }
 
     #[test]
-    fn a_task_export_or_an_empty_root_is_not_a_pipeline_root() {
-        let mut export = release();
-        export.insert(
-            "model_index.json".to_owned(),
-            json(r#"{"_class_name": "MiniMaxH3Pipeline", "transformer": []}"#),
-        );
-        let error = read(&export, None).unwrap_err();
-        assert!(
-            error.to_string().contains("not a MiniMaxH3ModularPipeline"),
-            "{error}"
-        );
-
-        let mut empty = release();
-        empty.remove("model_index.json");
-        let error = read(&empty, None).unwrap_err();
-        assert!(error.to_string().contains("model_index.json"), "{error}");
-    }
-
-    #[test]
-    fn a_release_holds_the_networks_its_index_names_and_its_root_holds() {
+    fn a_release_serves_the_networks_its_index_declares() {
         let mut files = release();
-        files.remove("transformer_ref/config.json");
+        files.insert(
+            "model_index.json".to_owned(),
+            json(
+                r#"{"_class_name": "MiniMaxH3ModularPipeline",
+                    "transformer": ["diffusers", "MiniMaxH3Transformer3DModel"]}"#,
+            ),
+        );
         let config = read(&files, None).unwrap();
         assert_eq!(
             config.denoisers.keys().collect::<Vec<_>>(),
             [&Stage::Transformer]
         );
 
-        files.remove("transformer/config.json");
-        assert!(read(&files, None).is_err(), "no network is held");
+        files.insert(
+            "model_index.json".to_owned(),
+            json(r#"{"_class_name": "MiniMaxH3ModularPipeline"}"#),
+        );
+        let error = read(&files, None).unwrap_err();
+        assert!(
+            error.to_string().contains("no MiniMax-H3 network"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -785,22 +805,36 @@ mod tests {
     #[test]
     fn an_export_states_one_schedule_of_a_served_task() {
         let mut files = dmd_export(release(), "DENSE");
-        files.get_mut("fastvideo_inference.json").unwrap()["task"] = json(r#""t2v""#);
+        files.get_mut(Contract::FILE).unwrap()["task"] = json(r#""t2v""#);
         assert!(read(&files, None).is_err(), "t2v is not served");
 
         let mut files = dmd_export(release(), "DENSE");
-        let student = files.get_mut("fastvideo_inference.json").unwrap();
+        let student = files.get_mut(Contract::FILE).unwrap();
         student["pdd_step_indices"] = json("[0, 8, 16, 32]");
         assert!(read(&files, None).is_err(), "two schedules");
     }
 
+    /// A fused adapter serves the student its contract states, on the base release's
+    /// schedulers: its network alone, its rungs and its attention.
     #[test]
-    fn a_fused_adapter_is_the_four_rung_student_it_was_extracted_from() {
-        for (gated, vsa) in [
-            (true, Some(VsaConfig::new(64, 0.9, None).unwrap())),
-            (false, None),
+    fn a_fused_adapter_serves_the_student_its_contract_states() {
+        for (backend, vsa) in [
+            (
+                "VIDEO_SPARSE_ATTN_H3",
+                Some(VsaConfig::new(64, 0.9, None).unwrap()),
+            ),
+            ("DENSE", None),
         ] {
-            let config = read(&release(), Some(gated)).unwrap();
+            let contract = Contract::parse(&serde_json::json!({
+                "schema_version": Contract::SCHEMA,
+                "task": "t2av",
+                "dmd_denoising_steps": [999, 749, 500, 250],
+                "attention_backend": backend,
+                "vsa_tile_size": 64,
+                "vsa_sparsity": 0.9,
+            }))
+            .unwrap();
+            let config = read(&release(), Some(&contract)).unwrap();
             assert_eq!(
                 config.denoisers.keys().collect::<Vec<_>>(),
                 [&Stage::Transformer]
@@ -808,6 +842,10 @@ mod tests {
 
             let denoiser = &config.denoisers[&Stage::Transformer];
             assert_eq!(denoiser.schedule.num_steps(), 4);
+            assert_eq!(
+                (denoiser.schedule.video_shift, denoiser.schedule.audio_shift),
+                (12.0, 3.0)
+            );
             assert_eq!(denoiser.vsa, vsa);
         }
     }
@@ -863,7 +901,7 @@ mod tests {
     #[test]
     fn an_export_that_states_no_shift_takes_its_schedulers() {
         let mut files = dmd_export(release(), "DENSE");
-        let student = files.get_mut("fastvideo_inference.json").unwrap();
+        let student = files.get_mut(Contract::FILE).unwrap();
         let student = student.as_object_mut().unwrap();
         student.remove("video_scheduler_shift");
         student.remove("audio_scheduler_shift");

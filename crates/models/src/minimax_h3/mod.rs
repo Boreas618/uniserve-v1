@@ -11,14 +11,16 @@
 //!   ([`splice`]). Every `forward` composes tensor operations and `nn` modules;
 //! - **the packed sequence** ([`packing`]): the row layout a request's latents, prompt and
 //!   conditions are laid out in, as CPU tensor expressions a forward moves to its device;
-//! - **the family value** ([`family`]): how a checkpoint opens, which stages a deployment places
-//!   on a rank, and what the loaded pipeline states to execution.
+//! - **the family value** ([`family`]): how a deployment's checkpoint, base release and adapter
+//!   ([`adapter`]) compose, which stages a deployment places on a rank, and what the loaded
+//!   pipeline states to execution.
 //!
 //! The request side of the family (the resolution and frame rules, the prompt, the prepared
 //! conditions) is [`processing::minimax_h3`]'s; a model consumes those values and redefines
 //! none. A model holds no runtime object: the execution context a forward computes under is the
 //! thread's, installed by execution (`AGENTS.md`, Model Library Boundary).
 
+pub mod adapter;
 pub mod audio_vae;
 pub mod config;
 pub mod denoiser;

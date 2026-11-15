@@ -228,8 +228,8 @@ impl ModelRunner {
         // a part of, and what every block the deployment places must be a part of, of a form the
         // block's owner admits.
         if runner.is_video() {
-            let opened = runner.open_video_checkpoint()?;
-            let pipeline = runner.open_video_family(&opened)?.pipeline();
+            let (_, opened) = runner.open_video_checkpoint()?;
+            let pipeline = opened.pipeline();
             pipeline
                 .check()
                 .context("the model family declares a pipeline execution cannot run")?;
