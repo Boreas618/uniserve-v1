@@ -57,10 +57,6 @@ const PAGES: usize = 4;
 const SLOTS: usize = 3;
 const ROW_SLOTS: [u32; 2] = [2, 0];
 
-/// The placeholder tokens of the vision fixtures.
-const IMAGE_TOKEN: u32 = 30;
-const VIDEO_TOKEN: u32 = 31;
-
 /// The unit roundoff of FP32.
 const UNIT_ROUNDOFF: f32 = f32::EPSILON / 2.0;
 
@@ -559,13 +555,13 @@ fn a_prompt_with_an_image_computes_the_references_hidden_states() {
     let tokens = ids.len() as u32;
     let first = ids
         .iter()
-        .position(|id| *id == IMAGE_TOKEN)
+        .position(|id| *id == vision.image_token_id)
         .expect("an image");
     let coordinates = positions::rope_index(
         &ids,
         &[grid],
-        IMAGE_TOKEN,
-        VIDEO_TOKEN,
+        vision.image_token_id,
+        vision.video_token_id,
         vision.spatial_merge_size,
     )
     .expect("the prompt's coordinates");
