@@ -16,6 +16,7 @@ The executable serves two model families, Qwen3-MoE (chat) and MiniMax-H3 (video
 | NCCL | `libnccl.so.2` of release 2.30.4 or later on the default loader path |
 | CUPTI | `libcupti.so.13` of release 13.4.92 or later on the default loader path |
 | FFmpeg | FFmpeg 8.1 with libx264, as shared libraries that pkg-config and the loader find |
+| libclang | libclang 18 or later with its headers, which bindgen loads at build time (`libclang-18-dev` on Ubuntu 24.04) |
 | Python | Python 3.12 |
 | Rust | Stable Rust toolchain with edition 2024 support |
 
