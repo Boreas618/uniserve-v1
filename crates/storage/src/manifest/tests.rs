@@ -657,6 +657,47 @@ fn running_target_ranks_keep_their_gpus() {
     assert!(Manifest::compute(&partial).is_err());
 }
 
+/// Of GPUs on which a rank finds equally many bytes, it takes the one its sources reach
+/// fastest: a tie of local bytes is broken by the load of the links into each GPU.
+#[test]
+fn a_tie_of_local_bytes_goes_to_the_gpu_the_sources_reach_fastest() {
+    let holds = || {
+        vec![storage(vec![field(
+            "weight",
+            0,
+            &[1024],
+            vec![whole(1024)],
+            vec![1],
+        )])]
+    };
+    let source = epoch(vec![(Some(gpu(0)), holds())]);
+    let target = epoch(vec![(None, holds())]);
+    let link = |source: usize, destination: usize, bytes_per_second: u64| LinkBandwidth {
+        link: Link {
+            source: LinkEnd::Device { gpu: gpu(source) },
+            destination: LinkEnd::Device {
+                gpu: gpu(destination),
+            },
+        },
+        bytes_per_second,
+    };
+    // Neither GPU 1 nor GPU 2 holds the weight; GPU 0 reaches GPU 2 four times faster.
+    for (slow, fast) in [(1, 2), (2, 1)] {
+        let request = Request {
+            source: source.clone(),
+            target: target.clone(),
+            gpus: vec![gpu(1), gpu(2)],
+            links: vec![
+                link(0, slow, 100_000_000_000),
+                link(0, fast, 400_000_000_000),
+            ],
+        };
+        let manifest = Manifest::compute(&request).unwrap();
+        assert_eq!(manifest.gpus, [gpu(fast)]);
+        assert_fields_equal(&request, &apply(&request, &manifest));
+    }
+}
+
 #[test]
 fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
     // Two expert-parallel ranks on GPUs 0 and 1 of one host grow to four

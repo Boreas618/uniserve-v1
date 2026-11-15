@@ -13,16 +13,6 @@ use super::{
 use crate::Key;
 use crate::protocol::LinkEnd;
 
-/// The most tied GPU assignments whose transfers are computed to find the
-/// one whose busiest link finishes first: every assignment of up to five
-/// ranks to five GPUs.
-const TIED_ASSIGNMENTS: usize = 120;
-
-/// The most target ranks whose GPU assignments are enumerated; larger
-/// epochs take the assignment of most local bytes the Hungarian method
-/// finds.
-const ENUMERATED_RANKS: usize = 8;
-
 /// Where an affine view of a field lies on its rank: the field itself in
 /// its storage, or an encoded field's canonical form in a staging space.
 #[derive(Clone, Copy)]
@@ -265,6 +255,53 @@ impl<'r> Context<'r> {
         }
         bytes
     }
+
+    /// How long the busiest link into GPU `gpu` takes to carry the bytes of target rank `rank`'s
+    /// regions that its sources hold elsewhere: each source's shared bytes over the links from
+    /// where its chunks lie, split by the chunks' lengths, at the links' measured bandwidths. A
+    /// link no bandwidth is measured for carries nothing a manifest can use and adds nothing.
+    /// It is what placing the rank on `gpu` loads the links into `gpu` with, and the GPU
+    /// assignment breaks ties of local bytes by it.
+    fn inbound_seconds(&self, rank: usize, gpu: Gpu) -> f64 {
+        let receiver = LinkEnd::Device { gpu };
+        let mut loads: BTreeMap<LinkEnd, f64> = BTreeMap::new();
+        for held in &self.request.target.ranks[rank].storages {
+            for field in &held.layout.fields {
+                let Some(sources) = self.sources.get(field.tensor.as_str()) else {
+                    continue;
+                };
+                for source in sources {
+                    let source_rank = &self.request.source.ranks[source.rank as usize];
+                    let storage = &source_rank.storages[source.storage as usize];
+                    let other = self.field(Side::Source, *source);
+                    let shared = shared_elements(&field.logical, &other.logical) * field.element;
+                    let total: u64 = storage.chunks.iter().map(|chunk| chunk.length).sum();
+                    if shared == 0 || total == 0 {
+                        continue;
+                    }
+                    for chunk in &storage.chunks {
+                        let Ok(end) = chunk.binding.end(source_rank.gpu) else {
+                            continue;
+                        };
+                        // Bytes already on the GPU cross no link.
+                        if end == receiver {
+                            continue;
+                        }
+                        let Some(bandwidth) = self
+                            .bandwidth
+                            .get(&(end.clone(), receiver.clone()))
+                            .filter(|bandwidth| **bandwidth > 0.0)
+                        else {
+                            continue;
+                        };
+                        let bytes = shared as f64 * chunk.length as f64 / total as f64;
+                        *loads.entry(end).or_insert(0.0) += bytes / bandwidth;
+                    }
+                }
+            }
+        }
+        loads.into_values().fold(0.0, f64::max)
+    }
 }
 
 /// The number of logical elements both parts hold.
@@ -285,53 +322,60 @@ fn shared_elements(one: &Logical, other: &Logical) -> u64 {
         .product()
 }
 
-/// The GPU assignments (target rank to index of a GPU) that maximize the
-/// bytes each rank finds on its GPU, at most [`TIED_ASSIGNMENTS`] of them.
-fn assignments(local: &[Vec<u64>], gpus: usize) -> Vec<Vec<usize>> {
-    let ranks = local.len();
-    if ranks > ENUMERATED_RANKS {
-        return vec![hungarian(local, gpus)];
+/// The GPU assignment (target rank to index of a GPU) of the most bytes the ranks find on their
+/// GPUs, and among the assignments of that many, of the least link load: the least sum over the
+/// ranks of the busiest link into each one's GPU (`seconds[rank][gpu]`). One Hungarian solve over
+/// the lexicographic cost `(−local bytes, link seconds)`: the seconds, in nanoseconds, are
+/// weighted below the bytes by more than any assignment's total seconds, so they decide only
+/// between assignments of equal local bytes.
+///
+/// # Errors
+///
+/// Fails when the costs exceed 128-bit arithmetic, which no request's bytes and seconds reach.
+fn assignment(local: &[Vec<u64>], seconds: &[Vec<f64>], gpus: usize) -> Result<Vec<usize>> {
+    let nanoseconds: Vec<Vec<i128>> = seconds
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|seconds| i128::from(saturating_nanoseconds(*seconds)))
+                .collect()
+        })
+        .collect();
+    // An upper bound on any assignment's total nanoseconds: every rank's largest.
+    let weight = nanoseconds
+        .iter()
+        .map(|row| row.iter().copied().max().unwrap_or(0))
+        .try_fold(1_i128, i128::checked_add);
+    let overflow = || Error::Manifest("the GPU assignment's costs exceed 128 bits".into());
+    let weight = weight.ok_or_else(overflow)?;
+    let mut cost = Vec::with_capacity(local.len());
+    for (bytes, nanoseconds) in local.iter().zip(&nanoseconds) {
+        let row = bytes
+            .iter()
+            .zip(nanoseconds)
+            .map(|(bytes, nanoseconds)| {
+                i128::from(*bytes)
+                    .checked_mul(weight)
+                    .and_then(|primary| nanoseconds.checked_sub(primary))
+            })
+            .collect::<Option<Vec<i128>>>()
+            .ok_or_else(overflow)?;
+        cost.push(row);
     }
-    let mut best = (0_u64, Vec::new());
-    let mut chosen = Vec::with_capacity(ranks);
-    let mut used = vec![false; gpus];
-    enumerate(local, &mut chosen, &mut used, 0, &mut best);
-    best.1
+    Ok(hungarian(&cost, gpus))
 }
 
-fn enumerate(
-    local: &[Vec<u64>],
-    chosen: &mut Vec<usize>,
-    used: &mut [bool],
-    bytes: u64,
-    best: &mut (u64, Vec<Vec<usize>>),
-) {
-    let rank = chosen.len();
-    if rank == local.len() {
-        if bytes > best.0 || best.1.is_empty() {
-            *best = (bytes, vec![chosen.clone()]);
-        } else if bytes == best.0 && best.1.len() < TIED_ASSIGNMENTS {
-            best.1.push(chosen.clone());
-        }
-        return;
-    }
-    for gpu in 0..used.len() {
-        if used[gpu] {
-            continue;
-        }
-        used[gpu] = true;
-        chosen.push(gpu);
-        enumerate(local, chosen, used, bytes + local[rank][gpu], best);
-        chosen.pop();
-        used[gpu] = false;
-    }
+/// `seconds` in whole nanoseconds, rounded up, at most `u64::MAX`.
+fn saturating_nanoseconds(seconds: f64) -> u64 {
+    // A float cast saturates: NaN and negative values become 0, overlarge ones `u64::MAX`.
+    (seconds * 1e9).ceil() as u64
 }
 
-/// The assignment of ranks to distinct GPUs of the most local bytes, by
-/// the Hungarian method on the negated bytes.
-fn hungarian(local: &[Vec<u64>], gpus: usize) -> Vec<usize> {
-    let ranks = local.len();
-    let cost = |rank: usize, gpu: usize| -> i128 { -i128::from(local[rank][gpu]) };
+/// The assignment of ranks (rows of `cost`) to distinct GPUs (its columns) of the least total
+/// cost, by the Hungarian method.
+fn hungarian(cost: &[Vec<i128>], gpus: usize) -> Vec<usize> {
+    let ranks = cost.len();
+    let cost = |rank: usize, gpu: usize| -> i128 { cost[rank][gpu] };
     // Potentials and matching with 1-based sentinels (rows: ranks, columns:
     // GPUs).
     let (mut u, mut v) = (vec![0_i128; ranks + 1], vec![0_i128; gpus + 1]);
@@ -406,8 +450,8 @@ pub(super) fn compute(request: &Request) -> Result<Manifest> {
                 .and_then(|gpu| request.gpus.iter().position(|candidate| *candidate == gpu))
         })
         .collect();
-    let candidates = match fixed {
-        Some(assignment) => vec![assignment],
+    let assignment = match fixed {
+        Some(assignment) => assignment,
         None if request.target.ranks.iter().any(|rank| rank.gpu.is_some()) => {
             return Err(Error::Manifest(
                 "target ranks name GPUs for some ranks only, or GPUs outside the request's".into(),
@@ -423,23 +467,20 @@ pub(super) fn compute(request: &Request) -> Result<Manifest> {
                         .collect()
                 })
                 .collect();
-            assignments(&local, request.gpus.len())
+            let seconds: Vec<Vec<f64>> = (0..ranks)
+                .map(|rank| {
+                    request
+                        .gpus
+                        .iter()
+                        .map(|gpu| context.inbound_seconds(rank, *gpu))
+                        .collect()
+                })
+                .collect();
+            assignment(&local, &seconds, request.gpus.len())?
         }
     };
-    let mut best: Option<(f64, Manifest)> = None;
-    for assignment in candidates {
-        let gpus: Vec<Gpu> = assignment.iter().map(|&gpu| request.gpus[gpu]).collect();
-        let manifest = Draft::new(&context, gpus).build()?;
-        let busiest = manifest
-            .links
-            .iter()
-            .map(|link| link.seconds)
-            .fold(0.0, f64::max);
-        if best.as_ref().is_none_or(|(seconds, _)| busiest < *seconds) {
-            best = Some((busiest, manifest));
-        }
-    }
-    let (_, mut manifest) = best.ok_or_else(|| Error::Manifest("no GPU assignment".into()))?;
+    let gpus: Vec<Gpu> = assignment.iter().map(|&gpu| request.gpus[gpu]).collect();
+    let mut manifest = Draft::new(&context, gpus).build()?;
     manifest.request = request.digest()?;
     manifest.digest = manifest.compute_digest()?;
     Ok(manifest)
