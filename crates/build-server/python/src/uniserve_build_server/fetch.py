@@ -22,10 +22,7 @@ distribution this environment's lock installs (``distribution``).
 
 A pin of Python sources states the directories among its files that are
 packages a build imports under their own names (``packages``), and
-:func:`load` imports them from a build's staged copy of the files. A pin of
-C++ sources states the directories among its files a compilation includes
-(``include``), and :func:`includes` names them in the cache or in a staged
-copy.
+:func:`load` imports them from a build's staged copy of the files.
 
 A header set that a distribution of this environment's lock installs (ATen's
 headers in ``torch``, CUTLASS in ``flashinfer-python``) is used where the
@@ -33,6 +30,21 @@ distribution installs it (:func:`installed`) rather than pinned again: the
 lock fixes the distribution's content by its wheel's hash, and the package
 that includes it names the distribution in its manifest's ``[toolchain]
 packages``.
+
+A pin of C++ sources states what a compilation against it is given, so no
+build restates the layout of a tree it does not own: the directories of its
+files that are include roots (``include``, :func:`includes`), the shared
+library among its files a module that calls it links against (``library``,
+:func:`library`; the module then needs the library by the soname the file
+states), and how upstream compiles its sources (``[compile]``, options of a
+translation unit of :class:`uniserve_build_server.cuda.Unit`, each with its
+provenance in the data file).
+
+A pin whose files differ between machines, as a native library does, states
+its identity and origin per machine (``[machine.<name>]``, by the name
+:func:`platform.machine` gives), each with its own packaged manifest
+``pins/<name>.<machine>.sha256``; a machine the pin states nothing for has no
+such pin.
 
 The cache is the Build Server's: a build is handed its root in its request
 (:attr:`uniserve_build_server.request.Request.cache`), and
@@ -50,6 +62,7 @@ import importlib.metadata
 import importlib.resources
 import importlib.util
 import os
+import platform
 import shutil
 import sys
 import tempfile
@@ -57,6 +70,7 @@ import tomllib
 import zipfile
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from typing import Any
 
 import patch_ng
 import urllib3
@@ -93,9 +107,18 @@ class Pin:
     #: The directories of the pin's files that are Python packages, each
     #: imported under its directory's name (:func:`load`).
     packages: tuple[str, ...] = ()
-    #: The directories of the pin's files a C++ compilation searches for the
-    #: headers it includes (:func:`includes`).
+    #: The file name of a packaged manifest in ``pins/``: ``<name>.sha256``,
+    #: or ``<name>.<machine>.sha256`` for a pin stated per machine.
+    listing: str = ""
+    #: The directories of the pin's files that are include roots
+    #: (:func:`includes`).
     include: tuple[str, ...] = ()
+    #: The pin's shared library a module that calls it links against
+    #: (:func:`library`), a manifest path; ``None`` for a pin with none.
+    library: str | None = None
+    #: How upstream compiles the pin's sources: the options of a translation
+    #: unit of :class:`uniserve_build_server.cuda.Unit`.
+    compile: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def directory(self, cache: Path) -> Path:
         """The pin's cache directory, content-addressed by its manifest."""
@@ -238,24 +261,48 @@ def _origin(stated: dict[str, str]) -> Files | Archive | Distribution:
 
 
 @functools.cache
-def pins() -> dict[str, Pin]:
-    """Every pin this package declares, by name."""
+def _declared() -> dict[str, dict[str, Any]]:
+    """Every pin's data file, by the pin's name."""
     declared = importlib.resources.files(__package__).joinpath("pins")
-    found = {}
-    for entry in declared.iterdir():
-        if not entry.name.endswith(".toml"):
-            continue
-        name = entry.name.removesuffix(".toml")
-        stated = tomllib.loads(entry.read_text())
-        found[name] = Pin(
-            name=name,
-            sha256=stated["sha256"],
-            origin=_origin(stated["origin"]),
-            manifest=stated.get("manifest"),
-            packages=tuple(stated.get("packages", ())),
-            include=tuple(stated.get("include", ())),
-        )
-    return found
+    return {
+        entry.name.removesuffix(".toml"): tomllib.loads(entry.read_text())
+        for entry in declared.iterdir()
+        if entry.name.endswith(".toml")
+    }
+
+
+def _pin(name: str, stated: dict[str, Any], machine: str) -> Pin | None:
+    """The pin a data file states for ``machine``, or ``None`` when it states
+    its files per machine and none for this one.
+    """  # noqa: D205
+    listing = f"{name}.sha256"
+    machines = stated.get("machine")
+    if machines is not None:
+        if machine not in machines:
+            return None
+        stated = {**stated, **machines[machine]}
+        listing = f"{name}.{machine}.sha256"
+    return Pin(
+        name=name,
+        sha256=stated["sha256"],
+        origin=_origin(stated["origin"]),
+        manifest=stated.get("manifest"),
+        packages=tuple(stated.get("packages", ())),
+        listing=listing,
+        include=tuple(stated.get("include", ())),
+        library=stated.get("library"),
+        compile=dict(stated.get("compile", {})),
+    )
+
+
+@functools.cache
+def pins() -> dict[str, Pin]:
+    """Every pin this package declares for this machine, by name."""
+    found = {
+        name: _pin(name, stated, platform.machine())
+        for name, stated in _declared().items()
+    }
+    return {name: one for name, one in found.items() if one is not None}
 
 
 def pin(name: str) -> Pin:
@@ -263,9 +310,28 @@ def pin(name: str) -> Pin:
     try:
         return pins()[name]
     except KeyError:
+        machines = _declared().get(name, {}).get("machine")
+        if machines is not None:
+            raise FetchError(
+                f"the {name} pin states no files for {platform.machine()}; "
+                f"its machines are {sorted(machines)}"
+            ) from None
         raise FetchError(
             f"no pin {name!r}; the pins are {sorted(pins())}"
         ) from None
+
+
+def library(source: Pin, tree: Path) -> Path:
+    """The pin's shared library under ``tree``, which a module that calls it
+    links against; a refusal for a pin that states none.
+
+    ``tree`` holds the pin's files under their manifest paths, as for
+    :func:`includes`: the pin's cache directory (``source.directory(cache)``,
+    filled by :func:`fetch`) or a build's staged copy.
+    """  # noqa: D205
+    if source.library is None:
+        raise FetchError(f"the {source.name} pin states no library")
+    return tree / source.library
 
 
 def sha256_of_file(path: Path) -> str:
@@ -353,7 +419,7 @@ def manifest(source: Pin, cache: Path, offline: bool = False) -> dict[str, str]:
     """
     if source.manifest is None:
         packaged = importlib.resources.files(__package__).joinpath(
-            "pins", f"{source.name}.sha256"
+            "pins", source.listing
         )
         data = packaged.read_bytes()
         if hashlib.sha256(data).hexdigest() != source.sha256:

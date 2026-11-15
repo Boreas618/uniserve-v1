@@ -79,6 +79,14 @@ class Unit:
     ``relaxed_constexpr`` lets device code call constexpr host functions, as
     CuTe's host helpers need; ``host_contraction = False`` compiles host code
     with every floating-point operation rounded.
+
+    The last three state how a pinned source's upstream compiles it (a pin's
+    ``[compile]``, :class:`uniserve_build_server.fetch.Pin`):
+    ``extended_lambda`` admits ``__device__`` lambdas in host code;
+    ``register_usage_level`` is ptxas's register usage level (0 to 10, higher
+    trading occupancy for fewer spills), ptxas's own default when ``None``;
+    ``suppressed`` are the front end's diagnostics, by number, the sources
+    are known to raise.
     """
 
     source: pathlib.Path
@@ -90,6 +98,9 @@ class Unit:
     cuda: bool = False
     relaxed_constexpr: bool = False
     host_contraction: bool = True
+    extended_lambda: bool = False
+    register_usage_level: int | None = None
+    suppressed: Sequence[int] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -191,6 +202,14 @@ def compile_command(
         command += ["-x", "cu"]
     if unit.relaxed_constexpr:
         command.append("--expt-relaxed-constexpr")
+    if unit.extended_lambda:
+        command.append("--extended-lambda")
+    if unit.register_usage_level is not None:
+        level = unit.register_usage_level
+        command.append(f"--ptxas-options=--register-usage-level={level}")
+    if unit.suppressed:
+        numbers = ",".join(str(number) for number in unit.suppressed)
+        command.append(f"--diag-suppress={numbers}")
     if not cubin:
         command += ["-Xcompiler", "-fPIC"]
         if not unit.host_contraction:
@@ -256,14 +275,21 @@ def link(
     *,
     standard: str,
     libraries: Sequence[str] = (),
+    shared: Sequence[pathlib.Path] = (),
 ) -> None:
     """Link objects into the shared library ``output`` with the named
-    libraries (:func:`library`) and the CUDA runtime.
+    libraries (:func:`library`), the shared library files ``shared`` and the
+    CUDA runtime.
 
     nvcc compiles a registration stub of its own into every shared library it
     links, with the optimization, the standard and the position independence
     the link states, so those are the units' (``standard``): a module linked
     from objects is then the module one nvcc command would have compiled.
+
+    A file of ``shared``, such as a pin's library
+    (:func:`uniserve_build_server.fetch.library`), is found by the linker in
+    its own directory by its exact name, after the objects that call it, so
+    the module needs it by the soname the file states.
     """  # noqa: D205
     found = [library(request, name) for name in libraries]
     command = [
@@ -277,6 +303,8 @@ def link(
         *[str(one) for one in linked],
         *[f"-L{directory}" for one in found for directory in one.directories],
         *[f"-l{one.name}" for one in found],
+        *[f"-L{file.parent}" for file in shared],
+        *[f"-l:{file.name}" for file in shared],
         "-lcudart",
         "-o",
         str(output),

@@ -1,16 +1,20 @@
-"""Pinned sources: the declared pins, and a build's staged copy of one.
+"""Pinned sources: what a pin states, a build's staged copy of one, and
+importing its packages.
 
 A pin of Python sources states which of its directories are packages, and a
 build imports them from its own staged copy of the files under their own names
-(``fetch.load``); a pin of C++ sources states the directories a compilation
-includes (``fetch.includes``). A header set of a locked distribution is used
-where the distribution installs it (``fetch.installed``). These tests stage
-small trees of their own and read the packaged pins, so no pin is fetched.
+(``fetch.load``). A pin of native sources states its include roots
+(``fetch.includes``) and its library (``fetch.library``), per machine where its
+files differ. A header set of a locked distribution is used where the
+distribution installs it (``fetch.installed``). These tests stage small trees
+of their own and read the packaged pins and their manifests; no pin is
+fetched.
 """
 
 from __future__ import annotations
 
 import importlib
+import platform
 import sys
 
 import pytest
@@ -114,3 +118,45 @@ def test_a_locked_distribution_is_used_where_it_installs_a_path():
         fetch.installed("urllib3", "urllib3/absent")
     with pytest.raises(fetch.FetchError, match="has no"):
         fetch.installed("uniserve-absent-distribution", "include")
+
+
+@pytest.fixture
+def machine(monkeypatch):
+    """Sets the machine the pins are read for, as `platform.machine` names."""
+
+    def set_machine(name: str) -> None:
+        monkeypatch.setattr(platform, "machine", lambda: name)
+        fetch.pins.cache_clear()
+
+    yield set_machine
+    fetch.pins.cache_clear()
+
+
+@pytest.mark.parametrize("name", ["aarch64", "x86_64"])
+def test_a_pin_stated_per_machine_is_the_machines_own(machine, name, tmp_path):
+    machine(name)
+
+    nccl = fetch.pin("nccl")
+    # The machine's packaged manifest verifies against the machine's identity,
+    # and the library and the include roots the pin states are its files.
+    files = fetch.manifest(nccl, tmp_path)
+    assert nccl.library in files
+    tree = nccl.directory(tmp_path)
+    assert fetch.library(nccl, tree) == tree / nccl.library
+    for root in fetch.includes(nccl, tree):
+        relative = root.relative_to(tree).as_posix()
+        assert any(file.startswith(f"{relative}/") for file in files)
+
+
+def test_a_machine_a_pin_states_nothing_for_has_no_such_pin(machine):
+    machine("riscv64")
+
+    with pytest.raises(fetch.FetchError, match="aarch64"):
+        fetch.pin("nccl")
+    # A pin whose files are the same everywhere is every machine's.
+    assert fetch.pin("deepep").include == ("deep_ep/include",)
+
+
+def test_a_pin_without_a_library_refuses_to_name_one(tmp_path):
+    with pytest.raises(fetch.FetchError, match="states no library"):
+        fetch.library(fetch.pin("deepep"), tmp_path)

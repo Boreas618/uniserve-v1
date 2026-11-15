@@ -3,5 +3,21 @@
 # `deepep.sha256` beside this file.
 sha256 = "ee22833b7bf83ebf3da46056dcbe0b936cdb4e5442d22b583f1a0be0eda36a31"
 
+# The kernels' headers include one another as `<deep_ep/...>` from this root.
+include = ["deep_ep/include"]
+
 [origin]
 files = "https://raw.githubusercontent.com/deepseek-ai/DeepEP/b306af06afd412c88e51e71802951606e40b7358/"
+
+# How DeepEP compiles these kernels: the flags its run-time compiler gives every
+# kernel at this commit (`csrc/jit/compiler.hpp`, the constructors of `Compiler` and
+# `NVCCCompiler`): `-std=c++20` (its `EP_JIT_CPP_STANDARD` default),
+# `--expt-relaxed-constexpr`, `--expt-extended-lambda`,
+# `--ptxas-options=--register-usage-level=10` and
+# `--diag-suppress=39,161,174,177,186,940,3012`.
+[compile]
+standard = "c++20"
+relaxed_constexpr = true
+extended_lambda = true
+register_usage_level = 10
+suppressed = [39, 161, 174, 177, 186, 940, 3012]

@@ -4,23 +4,22 @@ The descriptor fixes every template argument of DeepEP's kernels, so this
 compiles them here, and a serving host compiles nothing. The Build Server
 compiles a descriptor by calling :func:`compile` with the compile request.
 
-DeepEP's kernels and the NCCL device API they are built against are pinned
-sources (`uniserve_build_server.fetch`'s `deepep` and `nccl` pins): the
-compile includes them from their verified cache directories.
+DeepEP's kernels and the NCCL they are built against are pinned sources
+(`uniserve_build_server.fetch`'s `deepep` and `nccl` pins). The pins state
+what a compilation against them is given: their include roots, NCCL's library
+and how DeepEP compiles its kernels. The CUDA driver
+(`uniserve_build_server.cuda`) compiles the package's one unit with them and
+links it against the pinned NCCL and the CUDA runtime.
 """
 
-import pathlib
-import subprocess
-import sys
-import sysconfig
-
-from uniserve_build_server import fetch
+from uniserve_build_server import cuda, fetch
 from uniserve_build_server.request import Request
 
-SOURCES = ["src/exchange.cu"]
+#: The translation unit of the module: every entry, and the kernels' launches.
+UNIT = "src/exchange.cu"
 
 
-def constants(request):
+def definitions(request):
     """The compile-time values a descriptor states, by the macro each defines.
 
     The direction and the element type are the manifest's single choices, so
@@ -36,20 +35,6 @@ def constants(request):
     }
 
 
-def nccl_library():
-    """The directory of a `libnccl.so.2` to name in the module's needed list.
-
-    The module takes the serving process's NCCL at run time, which
-    `crates/platform` loads by soname and refuses when it is older than the
-    project's pin; this one only states the library's name to the linker.
-    """
-    site = pathlib.Path(sysconfig.get_paths()["purelib"])
-    directory = site / "nvidia" / "nccl" / "lib"
-    if not (directory / "libnccl.so.2").exists():
-        raise SystemExit(f"no libnccl.so.2 in {directory}")
-    return directory
-
-
 def compile(request: Request) -> None:
     """Compile the exchange for the request's descriptor into ``module.so``.
 
@@ -57,49 +42,37 @@ def compile(request: Request) -> None:
     it does not hold them yet; a compiler failure refuses the build, with the
     compiler's output in the build log.
     """
-    root = request.package
+    cache = request.cache
     try:
-        deepep = fetch.fetch(
-            fetch.pin("deepep"), request.cache, jobs=request.jobs
-        )
-        nccl = fetch.fetch(fetch.pin("nccl"), request.cache, jobs=request.jobs)
+        deepep = fetch.pin("deepep")
+        nccl = fetch.pin("nccl")
+        fetch.fetch(deepep, cache, jobs=request.jobs)
+        fetch.fetch(nccl, cache, jobs=request.jobs)
+        library = fetch.library(nccl, nccl.directory(cache))
     except fetch.FetchError as error:
         raise SystemExit(str(error)) from error
-    # The nvcc the Build Server checked against this package's declared
-    # version, and its driver API stub: the kernels call the driver directly.
-    cuda = request.toolchain.require_cuda()
-    defines = [
-        f"-D{name}={value}" for name, value in constants(request).items()
-    ]
-    command = [
-        cuda.nvcc,
-        "-O3",
-        "-std=c++20",
-        f"-arch={request.target}",
-        "--shared",
-        "-Xcompiler",
-        "-fPIC",
-        "--extended-lambda",
-        "--expt-relaxed-constexpr",
-        "--diag-suppress=39,128,161,174,177,186,940,2417,3012",
-        "--ptxas-options=--register-usage-level=10",
-        "-DDISABLE_AGGRESSIVE_PTX_INSTRS",
-        *defines,
-        f"-I{root / 'include'}",
-        f"-I{deepep / 'deep_ep' / 'include'}",
-        f"-I{nccl / 'nvidia' / 'nccl' / 'include'}",
-        *[str(root / source) for source in SOURCES],
-        "-lcudart",
-        f"-L{cuda.stubs}",
-        "-lcuda",
-        f"-L{nccl_library()}",
-        "-Xlinker",
-        "--no-as-needed",
-        "-l:libnccl.so.2",
-        "-o",
-        str(request.output / "module.so"),
-    ]
-    print(" ".join(command), file=sys.stderr)
-    built = subprocess.run(command, check=False)
-    if built.returncode != 0:
-        raise SystemExit(f"nvcc failed with {built.returncode}")
+
+    # The unit is compiled as DeepEP compiles its kernels, which its headers
+    # are written for.
+    unit = cuda.Unit(
+        source=request.package / UNIT,
+        definitions=definitions(request),
+        includes=[
+            *fetch.includes(deepep, deepep.directory(cache)),
+            *fetch.includes(nccl, nccl.directory(cache)),
+        ],
+        **deepep.compile,
+    )
+
+    with cuda.scratch(request) as directory:
+        objects = cuda.objects(request, [unit], directory)
+        # The module needs NCCL by the soname the pinned library states: the
+        # serving process's loader resolves it to the NCCL `crates/platform`
+        # opens.
+        cuda.link(
+            request,
+            objects,
+            request.output / cuda.MODULE_SO,
+            standard=unit.standard,
+            shared=[library],
+        )

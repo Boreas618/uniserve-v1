@@ -1,10 +1,28 @@
-# NCCL 2.30.4's headers, the device API DeepEP's kernels are built against, read
-# out of the `nvidia-nccl-cu13` 2.30.4 wheel the serving environment locks. This
-# environment cannot install that wheel beside its torch, which requires another
-# NCCL. The headers are the same in the wheel of every architecture, so one
-# wheel is the origin on every host. The manifest is `nccl.sha256`.
-sha256 = "67a3f54b593e8361db3c3bc8d3b00cfc0cf36930f60d52a34b7e1b2012551301"
+# NCCL 2.30.4, read out of the `nvidia-nccl-cu13` 2.30.4 wheels the serving environment
+# locks: the headers of its device API, which DeepEP's kernels are built against, and the
+# library a module that calls NCCL links against. This environment cannot install those
+# wheels beside its torch, which requires another NCCL.
+#
+# A module linked against the library needs it by the soname the file states, the
+# library `crates/platform` opens in the serving process and refuses there when it is
+# older than this release; the serving host provides it on the loader's default search
+# path.
 
-[origin]
+include = ["nvidia/nccl/include"]
+library = "nvidia/nccl/lib/libnccl.so.2"
+
+# The wheel of each machine. The headers are the same in both wheels and the library is
+# the machine's, so each machine has its own manifest, `nccl.<machine>.sha256`.
+[machine.aarch64]
+sha256 = "68a7ae852237bccef76a6c0f4f3ca03e62c505cb4a69dcb9bd95cefb1361403b"
+
+[machine.aarch64.origin]
 archive = "https://files.pythonhosted.org/packages/65/32/ff4e28cbed87f99fed63df446ef1986e0617842258a3535eaa2ee92d6226/nvidia_nccl_cu13-2.30.4-py3-none-manylinux_2_18_aarch64.whl"
 archive_sha256 = "e99308a3a89fba78918d50886e81072a6c8b0b4199feb02c3903e63713a6525a"
+
+[machine.x86_64]
+sha256 = "a37f70dceb11fad0ddb8051144912aae344c67706020744a71efeb8a9e6a69e7"
+
+[machine.x86_64.origin]
+archive = "https://files.pythonhosted.org/packages/3e/93/6d020a69fc37e57fae8a96ab0c53102d96538db256e933e914d100e5a430/nvidia_nccl_cu13-2.30.4-py3-none-manylinux_2_18_x86_64.whl"
+archive_sha256 = "534dbf3058cadb625f08ab0d17f1dffad3b961a2bfa360d66633fcf21be53f57"
