@@ -24,7 +24,7 @@ use engine::memory::weights::WeightStore;
 use nn::{Checkpoint, DType, RetainedWeights, Shape, Tensor, WeightKey, WeightLoader};
 use platform::DeviceId;
 use proto::request::PrefixCacheDtype;
-use storage::{Claim, Client, Role, Scope};
+use storage::{Claim, Claimant, Client, Role, Scope};
 use storage_server::Server;
 use tensor::DeviceLocation;
 
@@ -246,7 +246,9 @@ fn launch(
 /// head is connected.
 fn rank(server: &StorageServer) -> (Client, Arc<StorageClient>) {
     let mut head = head(server);
-    let claim = head.claim(EPOCH, vec![scope()], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, EPOCH, vec![scope()], Vec::new())
+        .unwrap();
 
     let client =
         StorageClient::connect_rank(&launch(server, claim, EPOCH, false), GROUP, 0, 1).unwrap();
@@ -422,11 +424,14 @@ fn two_epochs_of_one_region_address_the_same_flags_and_scales() {
     let stream = platform::Stream::new(device).unwrap();
     let server = StorageServer::start();
     let mut head = head(&server);
-    let claim = head.claim(EPOCH, vec![scope()], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, EPOCH, vec![scope()], Vec::new())
+        .unwrap();
     // The serving epoch is committed, so the epoch on trial beside it sees what it published.
     head.publish(vec![EPOCH]).unwrap();
     let next = EPOCH + 1;
-    head.claim(next, vec![scope()], Vec::new()).unwrap();
+    head.claim(Claimant::Head, next, vec![scope()], Vec::new())
+        .unwrap();
     let serving =
         StorageClient::connect_rank(&launch(&server, claim, EPOCH, false), GROUP, 0, 1).unwrap();
     let target =

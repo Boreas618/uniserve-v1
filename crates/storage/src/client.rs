@@ -25,10 +25,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    ANSWER, Claim, ClientMessage, Event, Hello, HostCopy, Item, Key, Link, Listing, Location, Mode,
-    Priority, Quota, Refusal, Region, RegionPart, Registration, Request, Response, Role, Scope,
-    Segment, ServerMessage, Span, StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle,
-    UnitRun, Usage, VERSION, Welcome,
+    ANSWER, Claim, Claimant, ClientMessage, Event, Hello, HostCopy, Item, Key, Link, Listing,
+    Location, Mode, Priority, Quota, Refusal, Region, RegionPart, Registration, Request, Response,
+    Role, Scope, Segment, ServerMessage, Span, StorageRecord, TaskStatus, TensorRecord, Tensors,
+    Throttle, UnitRun, Usage, VERSION, Welcome,
 };
 use crate::runtime::{Open, Opened};
 use service::Connection;
@@ -337,10 +337,18 @@ impl Client {
         }
     }
 
-    /// See [`Request::Claim`]: become the deployment's head, `epoch`
-    /// placing `scopes` on the host, and end every epoch of `retire` there.
-    pub fn claim(&mut self, epoch: u64, scopes: Vec<Scope>, retire: Vec<u64>) -> Result<Claim> {
+    /// See [`Request::Claim`]: become the deployment's head, `claimant`
+    /// placing `scopes` on the host for `epoch`, and end every epoch of
+    /// `retire` there.
+    pub fn claim(
+        &mut self,
+        claimant: Claimant,
+        epoch: u64,
+        scopes: Vec<Scope>,
+        retire: Vec<u64>,
+    ) -> Result<Claim> {
         let request = Request::Claim {
+            claimant,
             scopes,
             epoch,
             retire,
@@ -848,14 +856,17 @@ fn unexpected(request: &str, response: &Response) -> Error {
 /// deployment's head, so the claim outlives every engine and every epoch. An
 /// engine that succeeds another claims the scopes of its own epoch under the
 /// same claim, and its workers state the same token as the serving epoch's,
-/// so neither epoch's storage is touched by the other's claim.
+/// so neither epoch's storage is touched by the other's claim. Each engine
+/// of an epoch claims as its own [`Claimant`], so one engine's claim never
+/// ends the retention of another's storage.
 pub struct ClaimClient {
     client: Client,
     deployment: String,
     /// The claim's token, once the first epoch claimed.
     claim: Option<Claim>,
-    /// The scopes each epoch claimed and did not retire, sorted.
-    epochs: BTreeMap<u64, Vec<Scope>>,
+    /// The scopes each claimant of each epoch claimed last, sorted, for the
+    /// epochs not retired.
+    claimed: BTreeMap<(u64, Claimant), Vec<Scope>>,
 }
 
 /// A [`ClaimClient`]'s state as it crosses to the daemon's successor in a
@@ -865,7 +876,9 @@ pub struct ClaimClient {
 pub struct ClaimHandoff {
     pub deployment: String,
     pub claim: Option<Claim>,
-    pub epochs: BTreeMap<u64, Vec<Scope>>,
+    /// The scopes each claimant of each epoch claimed last, as a list,
+    /// since the map's key is no string.
+    pub claimed: Vec<((u64, Claimant), Vec<Scope>)>,
     /// The connection's next request identity.
     pub next: u64,
 }
@@ -884,47 +897,48 @@ impl ClaimClient {
             client: Client::connect(socket, role)?,
             deployment: deployment.to_owned(),
             claim: None,
-            epochs: BTreeMap::new(),
+            claimed: BTreeMap::new(),
         })
     }
 
-    /// Claim the deployment for `epoch`, which places `scopes` on the host
-    /// beside the scopes earlier claims of `epoch` named, and end every epoch
-    /// of `retire` there ([`Request::Claim`]). The engines of one epoch on a
-    /// host each claim the scopes they place: the independent replicas of
-    /// the epoch's configuration, each a process of its own, and a process
-    /// that replaces one of them or stands by for it. So the server is asked
-    /// for every scope the epoch's claims named, and one engine's claim never
-    /// ends the retention of another's storage (the server ends the epoch's
-    /// retention of the scopes a claim does not name). An epoch whose scopes
-    /// the claims named already and that retires nothing keeps the claim
-    /// held, without asking the server. Returns the claim's token, which the
+    /// Claim the deployment for `epoch` as `claimant`, which places `scopes`
+    /// on the host in place of the scopes it claimed before, and end every
+    /// epoch of `retire` there ([`Request::Claim`]). The engines of one epoch
+    /// on a host each claim the scopes they place, each as its own claimant:
+    /// the independent replicas of the epoch's configuration, and a process
+    /// that replaces one of them or stands by for it. The server retains the
+    /// epoch's storage of every scope some claimant names, so one engine's
+    /// claim never ends the retention of another's. A claimant that claims
+    /// the scopes it claimed already, retiring nothing, keeps the claim held
+    /// without asking the server. Returns the claim's token, which the
     /// deployment's workers state.
     ///
     /// # Errors
     ///
     /// Fails when the server cannot be reached, or refuses the claim
     /// because another head of the deployment is connected.
-    pub fn claim(&mut self, epoch: u64, mut scopes: Vec<Scope>, retire: Vec<u64>) -> Result<Claim> {
-        if let Some(claimed) = self.epochs.get(&epoch)
-            && !retire.contains(&epoch)
-        {
-            scopes.extend(claimed.iter().cloned());
-        }
+    pub fn claim(
+        &mut self,
+        claimant: Claimant,
+        epoch: u64,
+        mut scopes: Vec<Scope>,
+        retire: Vec<u64>,
+    ) -> Result<Claim> {
         scopes.sort();
         scopes.dedup();
         if let Some(claim) = self.claim
             && retire.is_empty()
-            && self.epochs.get(&epoch) == Some(&scopes)
+            && self.claimed.get(&(epoch, claimant)) == Some(&scopes)
         {
             return Ok(claim);
         }
 
-        let claim = self.client.claim(epoch, scopes.clone(), retire.clone())?;
-        for retired in &retire {
-            self.epochs.remove(retired);
-        }
-        self.epochs.insert(epoch, scopes);
+        let claim = self
+            .client
+            .claim(claimant, epoch, scopes.clone(), retire.clone())?;
+        self.claimed
+            .retain(|(claimed, _), _| !retire.contains(claimed));
+        self.claimed.insert((epoch, claimant), scopes);
         self.claim = Some(claim);
         Ok(claim)
     }
@@ -991,7 +1005,7 @@ impl ClaimClient {
         let handoff = ClaimHandoff {
             deployment: self.deployment,
             claim: self.claim,
-            epochs: self.epochs,
+            claimed: self.claimed.into_iter().collect(),
             next,
         };
         Ok((handoff, descriptor))
@@ -1008,7 +1022,7 @@ impl ClaimClient {
             client: Client::resume(descriptor, handoff.next)?,
             deployment: handoff.deployment,
             claim: handoff.claim,
-            epochs: handoff.epochs,
+            claimed: handoff.claimed.into_iter().collect(),
         })
     }
 }

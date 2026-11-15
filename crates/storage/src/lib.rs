@@ -61,6 +61,6 @@ pub fn default_socket() -> std::io::Result<std::path::PathBuf> {
     Ok(service::RuntimeDirectory::of_user()?.socket(SERVICE))
 }
 pub use protocol::{
-    Access, Claim, HostStorage, Item, Key, Listing, Location, Mode, Quota, Reservation, Role,
-    Scope, Segment, StorageRecord, TensorRecord,
+    Access, Claim, Claimant, HostStorage, Item, Key, Listing, Location, Mode, Quota, Reservation,
+    Role, Scope, Segment, StorageRecord, TensorRecord,
 };

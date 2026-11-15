@@ -60,7 +60,7 @@ use std::time::Duration;
 use rustix::event::{PollFd, PollFlags, poll};
 
 use ::storage::protocol::{
-    Access, Allocation, Claim, ClientMessage, DeploymentListing, ErrorKind, Event, Hello,
+    Access, Allocation, Claim, Claimant, ClientMessage, DeploymentListing, ErrorKind, Event, Hello,
     HostStorage, Item, Key, Listing, Location, Mode, Quota, Refusal, Request, Response, Retainer,
     Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorListing, TensorRecord, Tensors,
     Usage, VERSION, Welcome,
@@ -172,6 +172,10 @@ struct Deployment {
     head: Option<ClientId>,
     /// The epochs claimed and not retired.
     epochs: BTreeSet<u64>,
+    /// Per epoch claimed and not retired, the scopes each of its claimants
+    /// named last ([`Request::Claim`]): the epoch retains its storage of
+    /// every scope one of them names.
+    claimed: BTreeMap<u64, BTreeMap<Claimant, BTreeSet<Scope>>>,
     /// Committed epochs whose tensors every replica may read.
     published: BTreeSet<u64>,
     /// The epochs a rollback retired while on trial: what they publish
@@ -871,12 +875,13 @@ impl Server {
                 .map_err(resource),
             (
                 Request::Claim {
+                    claimant,
                     scopes,
                     epoch,
                     retire,
                 },
                 Role::Head { deployment, .. },
-            ) => self.claim(id, &deployment, scopes, *epoch, retire),
+            ) => self.claim(id, &deployment, (*claimant, scopes), *epoch, retire),
             (Request::Publish { epochs }, Role::Head { deployment, .. }) => {
                 self.publish_epochs(id, &deployment, epochs)
             }
@@ -1012,12 +1017,12 @@ impl Server {
         }
     }
 
-    /// `claim`: see [`Request::Claim`].
+    /// `claim`: see [`Request::Claim`], by `claimant` for `scopes`.
     fn claim(
         &mut self,
         id: ClientId,
         deployment: &str,
-        scopes: &[Scope],
+        (claimant, scopes): (Claimant, &[Scope]),
         epoch: u64,
         retire: &[u64],
     ) -> Result<Handling, (ErrorKind, String)> {
@@ -1098,30 +1103,44 @@ impl Server {
         // trial are discarded with that head, never committed, and the
         // epochs discarded before are forgotten, so that the new head's
         // epochs may take their numbers.
-        let (trial, mut discarded, mut epochs, mut published) =
-            match self.deployments.get(deployment) {
-                Some(entry) => (
-                    entry.epochs.difference(&entry.published).copied().collect(),
+        let previous = self.deployments.get(deployment);
+        let trial: BTreeSet<u64> = previous
+            .map(|entry| entry.epochs.difference(&entry.published).copied().collect())
+            .unwrap_or_default();
+        let (mut discarded, mut epochs, mut published, mut claimed) = previous
+            .map(|entry| {
+                (
                     entry.discarded.clone(),
                     entry.epochs.clone(),
                     entry.published.clone(),
-                ),
-                None => (
-                    BTreeSet::new(),
-                    BTreeSet::new(),
-                    BTreeSet::new(),
-                    BTreeSet::new(),
-                ),
-            };
+                    entry.claimed.clone(),
+                )
+            })
+            .unwrap_or_default();
         let mut retired: BTreeSet<u64> = retire.iter().copied().collect();
         if held.is_none() {
             retired.extend(trial.iter().filter(|&&old| old != epoch));
             epochs.clear();
             published.clear();
+            claimed.clear();
         }
         epochs.insert(epoch);
         epochs.retain(|epoch| !retired.contains(epoch));
         published.retain(|epoch| epochs.contains(epoch));
+        claimed.retain(|epoch, _| epochs.contains(epoch));
+        // The claimant's scopes replace those it named before; the epoch
+        // keeps every scope one of its claimants names.
+        claimed
+            .entry(epoch)
+            .or_default()
+            .insert(claimant, scopes.iter().cloned().collect());
+        let named: BTreeSet<Scope> = claimed
+            .get(&epoch)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .flatten()
+            .cloned()
+            .collect();
         // Retiring an uncommitted epoch rolls its update back.
         for &old in &trial {
             if retired.contains(&old) {
@@ -1138,13 +1157,13 @@ impl Server {
                 claim,
                 head: Some(id),
                 epochs,
+                claimed,
                 published,
                 discarded,
             },
         );
-        // The epoch's retention of the scopes it no longer places ends, and
-        // every retired epoch's retention ends.
-        let listed: BTreeSet<&Scope> = scopes.iter().collect();
+        // The epoch's retention of the scopes no claimant of it names ends,
+        // and every retired epoch's retention ends.
         let released: Vec<TensorId> = self
             .tensors
             .iter_mut()
@@ -1152,7 +1171,7 @@ impl Server {
                 tensor.retainers.retain(|retainer| {
                     retainer.scope.deployment != deployment
                         || !(retired.contains(&retainer.epoch)
-                            || (retainer.epoch == epoch && !listed.contains(&retainer.scope)))
+                            || (retainer.epoch == epoch && !named.contains(&retainer.scope)))
                 });
                 tensor.retainers.is_empty().then_some(*id)
             })
@@ -1167,6 +1186,7 @@ impl Server {
         tracing::info!(
             deployment,
             epoch,
+            ?claimant,
             ?retire,
             released = count,
             "a head claimed the deployment"

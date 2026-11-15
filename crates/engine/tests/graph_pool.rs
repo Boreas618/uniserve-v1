@@ -17,7 +17,7 @@ use engine::memory::client::{StorageClient, quota_limit};
 use engine::memory::graph_pool::GraphPool;
 use engine::runner::RunnerId;
 use platform::{DeviceId, DeviceRange, PinnedBuffer, PoolKind, Stream};
-use storage::{Client, Item, Role, Scope};
+use storage::{Claimant, Client, Item, Role, Scope};
 use storage_server::Server;
 
 const DEPLOYMENT: &str = "model";
@@ -94,7 +94,9 @@ fn rank(server: &StorageServer) -> (Client, Arc<StorageClient>) {
         },
     )
     .unwrap();
-    let claim = head.claim(EPOCH, vec![scope], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, EPOCH, vec![scope], Vec::new())
+        .unwrap();
 
     let launch = engine::memory::client::StorageLaunch {
         socket: server.socket.to_string_lossy().into_owned(),

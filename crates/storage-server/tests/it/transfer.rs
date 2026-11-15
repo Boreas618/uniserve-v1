@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use ::storage::protocol::{
     ErrorKind, Event, Link, LinkEnd, Priority, Region, Span, TaskStatus, TaskTotal, Throttle,
 };
-use ::storage::{Access, Client, Role};
+use ::storage::{Access, Claimant, Client, Role};
 use storage_server::Launch;
 
 use crate::server::{
@@ -208,7 +208,9 @@ pub(crate) fn read(file: &std::fs::File, offset: u64, bytes: usize) -> Vec<u8> {
 fn a_transfer_copies_host_regions_and_ends_complete() {
     let server = serving(Gpus::Hidden);
     let mut head = head(&server.socket);
-    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
 
     // A read-only source, an exclusive destination and an exclusive scratch
@@ -357,7 +359,9 @@ fn a_request_transfer_overtakes_a_promotion_on_its_link() {
 fn concurrent_transfers_can_be_collected_in_reverse_order() {
     let server = serving(Gpus::Hidden);
     let mut head = head(&server.socket);
-    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
     let source_bytes = pattern(64, 13);
     let source = memfd(&source_bytes);
@@ -399,7 +403,9 @@ fn concurrent_transfers_can_be_collected_in_reverse_order() {
 fn a_span_of_rows_copies_each_row_at_its_pitches() {
     let server = serving(Gpus::Hidden);
     let mut head = head(&server.socket);
-    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
     let source_bytes = pattern(64, 3);
     let source = memfd(&source_bytes);
@@ -447,7 +453,9 @@ fn a_span_of_rows_copies_each_row_at_its_pitches() {
 fn a_transfer_is_refused_whole_unless_every_span_fits_storage_of_its_deployment() {
     let server = serving(Gpus::Hidden);
     let mut head = head(&server.socket);
-    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
     let source = memfd(&pattern(32, 1));
     let destination = memfd(&[0; 32]);
@@ -538,7 +546,7 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_storage_of_its_deployment(
     // unavailable.
     let bare = Running::with_transfer(|_| None);
     let claim = crate::server::head(&bare.socket)
-        .claim(0, vec![scope("text", 0)], Vec::new())
+        .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
         .unwrap();
     let mut worker = crate::server::worker(&bare.socket, scope("text", 0), 1, claim);
     worker
@@ -568,7 +576,9 @@ pub(crate) struct Slow {
 
 pub(crate) fn slow(server: &Running, bytes: u64) -> Slow {
     let mut head = head(&server.socket);
-    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
     let source = memfd(&pattern(bytes as usize, 3));
     let destination = memfd(&vec![0; bytes as usize]);
@@ -654,7 +664,9 @@ fn a_promotion_transfer_overtakes_background_transfers_on_its_link() {
 fn a_throttle_without_links_takes_the_deployments_tasks_links() {
     let server = serving(Gpus::Hidden);
     let mut head = head(&server.socket);
-    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
     let bytes: u64 = 256 << 20;
     let source = memfd(&pattern(bytes as usize, 3));
@@ -823,7 +835,9 @@ fn an_offload_the_host_cannot_hold_is_refused_and_moves_nothing() {
 
     let server = serving(Gpus::Hidden);
     let mut head = head(&server.socket);
-    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut first = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     // A storage's record states its size; no host holds an exbibyte.
     let bytes = 1 << 60;
@@ -855,10 +869,10 @@ pub(crate) mod device {
 
     use std::time::{Duration, Instant};
 
-    use ::storage::Access;
     use ::storage::protocol::{
         Event, Link, LinkEnd, Location, Priority, Region, StorageRecord, TaskStatus, Throttle,
     };
+    use ::storage::{Access, Claimant};
     use platform::{
         CopyBatch, DeviceAllocation, DeviceId, HandleType, Nvml, PinnedBuffer, ShareableHandle,
         SourceOrder, Stream,
@@ -929,7 +943,9 @@ pub(crate) mod device {
         let (destination, destination_fd) = device_storage(device, &vec![0; granularity]);
         let staging = memfd(&vec![0; granularity]);
         let mut head = head(&server.socket);
-        let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+        let claim = head
+            .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+            .unwrap();
         let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
         worker
             .put(
@@ -1101,7 +1117,9 @@ pub(crate) mod device {
         assert!(!holds_context(&nvml, first, pid));
 
         let mut head = head(&server.socket);
-        let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+        let claim = head
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+            .unwrap();
         let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
         let bytes = 1 << 30;
         let source_bytes = pattern(bytes, 17);
@@ -1214,7 +1232,9 @@ pub(crate) mod device {
         let context = measured_context(&server.socket, gpu);
 
         let mut head = head(&server.socket);
-        let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+        let claim = head
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+            .unwrap();
         let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
         let granularity = DeviceAllocation::granularity(first).unwrap();
         let source = memfd(&pattern(granularity, 5));
@@ -1301,7 +1321,9 @@ pub(crate) mod device {
         let shared_bytes = pattern(granularity, 13);
 
         let mut head = head(&server.socket);
-        let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+        let claim = head
+            .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+            .unwrap();
         head.publish(vec![1]).unwrap();
         let mut previous = epoch_worker(&server.socket, scope("text", 0), 1, claim);
         let (own, own_fd) = device_storage(first, &own_bytes);
@@ -1318,7 +1340,8 @@ pub(crate) mod device {
                 ],
             )
             .unwrap();
-        head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+        head.claim(Claimant::Head, 2, vec![scope("text", 0)], Vec::new())
+            .unwrap();
         let mut successor = epoch_worker(&server.socket, scope("text", 0), 2, claim);
         successor
             .get(vec![key(2)], ::storage::Mode::Read, Vec::new())
@@ -1379,7 +1402,9 @@ pub(crate) mod device {
     fn a_transfer_copies_within_a_gpu_between_gpus_and_with_the_host() {
         let server = serving(Gpus::Visible);
         let mut head = head(&server.socket);
-        let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+        let claim = head
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+            .unwrap();
         let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
 
         let first = DeviceId(0);
@@ -1509,7 +1534,9 @@ pub(crate) mod device {
         assert_eq!(HandleType::probe(first).unwrap(), HandleType::Fabric);
         let server = serving(Gpus::Visible);
         let mut head = head(&server.socket);
-        let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+        let claim = head
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+            .unwrap();
         let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
 
         // The destination lies on the last GPU this process sees, which

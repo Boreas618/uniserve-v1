@@ -22,7 +22,7 @@ use std::os::fd::AsFd;
 use std::path::Path;
 
 use ::storage::protocol::{Priority, TaskStatus};
-use ::storage::{Access, Client, Role};
+use ::storage::{Access, Claimant, Client, Role};
 
 use crate::server::{FORKING, Running, head, host, key, memfd, scope, tensor, worker};
 use crate::transfer::{
@@ -76,7 +76,9 @@ fn first_difference(actual: &[u8], expected: &[u8]) -> Option<usize> {
 fn a_read_from_another_host_fails_when_that_host_cannot_expose_its_source() {
     let destination_host = serving(Gpus::Hidden);
     let mut head = head(&destination_host.socket);
-    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut worker = worker(&destination_host.socket, scope("text", 0), 1, claim);
     let destination = memfd(&[0; 64]);
     worker
@@ -96,7 +98,7 @@ fn a_read_from_another_host_fails_when_that_host_cannot_expose_its_source() {
     let bare = Running::with_transfer(|_| None);
     let mut bare_head = crate::server::head(&bare.socket);
     let bare_claim = bare_head
-        .claim(0, vec![scope("text", 0)], Vec::new())
+        .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
         .unwrap();
     let mut bare_worker = crate::server::worker(&bare.socket, scope("text", 0), 1, bare_claim);
     let source = memfd(&sequence(64, 1));
@@ -147,7 +149,7 @@ mod device {
     use ::storage::protocol::{
         FabricExport, FabricHandle, Link, LinkEnd, Priority, Span, TaskStatus,
     };
-    use ::storage::{Access, Client};
+    use ::storage::{Access, Claimant, Client};
     use platform::{DeviceAllocation, DeviceId, HandleType, ShareableHandle};
 
     use super::{endpoint, first_difference, rdma_host, sequence};
@@ -172,7 +174,7 @@ mod device {
         // their storage, and an exclusive tensor in host storage.
         let mut source_head = head(&source_host.socket);
         let claim = source_head
-            .claim(0, vec![scope("text", 0)], Vec::new())
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
             .unwrap();
         let mut source_worker = worker(&source_host.socket, scope("text", 0), 1, claim);
         let device_len = BYTES + granularity;
@@ -197,7 +199,7 @@ mod device {
         // The destination host: one exclusive tensor on the last GPU.
         let mut destination_head = head(&destination_host.socket);
         let claim = destination_head
-            .claim(0, vec![scope("text", 0)], Vec::new())
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
             .unwrap();
         let mut destination_worker = worker(&destination_host.socket, scope("text", 0), 1, claim);
         let destination_len = 2 * BYTES + granularity;
@@ -329,7 +331,7 @@ mod device {
 
         let mut source_head = head(&source_host.socket);
         let claim = source_head
-            .claim(0, vec![scope("text", 0)], Vec::new())
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
             .unwrap();
         let mut source_worker = worker(&source_host.socket, scope("text", 0), 1, claim);
         let source_bytes = sequence(granularity, 3);
@@ -343,7 +345,7 @@ mod device {
 
         let mut destination_head = head(&destination_host.socket);
         let claim = destination_head
-            .claim(0, vec![scope("text", 0)], Vec::new())
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
             .unwrap();
         let mut destination_worker = worker(&destination_host.socket, scope("text", 0), 1, claim);
         let (destination, destination_fd) = device_storage(last, &vec![0; 2 * granularity]);
@@ -430,7 +432,7 @@ mod device {
         // names no allocation.
         let mut source_head = head(&source_host.socket);
         let claim = source_head
-            .claim(0, vec![scope("text", 0)], Vec::new())
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
             .unwrap();
         let mut source_worker = worker(&source_host.socket, scope("text", 0), 1, claim);
         let fabric_bytes = sequence(bytes, 11);
@@ -483,7 +485,7 @@ mod device {
 
         let mut destination_head = head(&destination_host.socket);
         let claim = destination_head
-            .claim(0, vec![scope("text", 0)], Vec::new())
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
             .unwrap();
         let mut destination_worker = worker(&destination_host.socket, scope("text", 0), 1, claim);
         let (destination, destination_fd) = device_storage(last, &vec![0; 2 * bytes]);
@@ -568,7 +570,7 @@ mod device {
         // names no allocation, which is READ.
         let mut source_head = head(&source_host.socket);
         let claim = source_head
-            .claim(0, vec![scope("text", 0)], Vec::new())
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
             .unwrap();
         let mut source_worker = worker(&source_host.socket, scope("text", 0), 1, claim);
         let host_source = sequence(granularity, 17);
@@ -603,7 +605,7 @@ mod device {
         // each source.
         let mut destination_head = head(&destination_host.socket);
         let claim = destination_head
-            .claim(0, vec![scope("text", 0)], Vec::new())
+            .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
             .unwrap();
         let mut destination_worker = worker(&destination_host.socket, scope("text", 0), 1, claim);
         let (destination, destination_fd) = device_storage(last, &vec![0; granularity]);

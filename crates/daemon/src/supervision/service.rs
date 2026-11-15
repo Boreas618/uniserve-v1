@@ -199,7 +199,7 @@ impl Local {
                     Err(error) => reply.error = error,
                 }
             }
-            Some(request::Kind::Claim(claim)) => match self.claims.claim(claim) {
+            Some(request::Kind::Claim(claim)) => match self.claims.claim(claimant(engine), claim) {
                 Ok(claimed) => reply.kind = Some(reply::Kind::Claimed(claimed)),
                 Err(error) => reply.error = format!("{error:#}"),
             },
@@ -1819,6 +1819,17 @@ pub(crate) fn resume(
             tracing::info!("the service goes on from the previous daemon");
             serve_member(local, leader, stop)
         }
+    }
+}
+
+/// The claimant a claim served for `owner` is made as: the updater's own
+/// requests, served for [`EPOCH_ENGINE`], claim on the epoch's behalf; any
+/// other owner is the engine of that number.
+fn claimant(owner: u64) -> storage::Claimant {
+    if owner == EPOCH_ENGINE {
+        storage::Claimant::Head
+    } else {
+        storage::Claimant::Engine(owner)
     }
 }
 

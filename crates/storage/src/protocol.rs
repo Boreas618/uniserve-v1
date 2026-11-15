@@ -30,9 +30,13 @@
 //! is what the deployment's workers state in their [`Role`]. Storage belongs
 //! to epochs: an epoch is the set of processes that executes one
 //! configuration of a deployment, and a deployment runs at most two at once
-//! while it updates. A claim names the scopes its epoch places on the host
-//! and the epochs it retires; what an epoch publishes stays private to it
-//! until the head publishes the epoch ([`Request::Publish`]). The head also
+//! while it updates. Each claim is made by one [`Claimant`] of its epoch (an
+//! engine of the epoch, or the head on the epoch's behalf) and names the
+//! scopes that claimant places on the host and the epochs it retires: the
+//! server retains an epoch's storage of every scope some claimant of the
+//! epoch names, so one claimant's claim never ends another's retention. What
+//! an epoch publishes stays private to it until the head publishes the epoch
+//! ([`Request::Publish`]). The head also
 //! keeps a previous epoch as its weights alone ([`Request::KeepWeights`]) and
 //! moves them to host storage and back ([`Request::Offload`],
 //! [`Request::Restore`]).
@@ -193,6 +197,23 @@ impl std::fmt::Display for Scope {
 /// a previous head of the deployment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Claim(pub [u8; 16]);
+
+/// Who makes a claim of an epoch ([`Request::Claim`]): the server retains an
+/// epoch's storage of each scope that some claimant of the epoch names, so a
+/// claimant's claim ends no other claimant's retention, and a claimant ends
+/// its own by claiming again without the scope (or the epoch's retirement
+/// ends every claimant's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Claimant {
+    /// The head itself, on behalf of the epoch as a whole: an update's claims,
+    /// which name the scopes of every engine the epoch keeps on the host.
+    Head,
+    /// One engine process of the epoch, by the number its head started it
+    /// under: each independent replica, a relaunch of a lost engine and a
+    /// standby claim the scopes they place.
+    Engine(u64),
+}
 
 /// What a client is to the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -953,15 +974,17 @@ pub struct ContextBytes {
 #[serde(rename_all = "snake_case")]
 pub enum Request {
     /// Make the caller the head of its deployment, keeping the claim it holds
-    /// already, and state the scopes `epoch` places on the host: the epoch's
-    /// retention of every other scope ends. Every epoch of `retire` ends on
-    /// the host: its retention of every tensor ends, and a tensor no epoch
-    /// retains is released. Refused while a previous head of the deployment
-    /// is connected. Every process of the deployment that belongs to no
-    /// current worker is shot down. Every other deployment whose head is not
-    /// connected is retired: a host serves the deployments whose heads run
-    /// on it.
+    /// already, and state the scopes `claimant` places on the host for
+    /// `epoch`, replacing those it stated before: the epoch's retention of a
+    /// scope ends once no claimant of the epoch names it. Every epoch of
+    /// `retire` ends on the host: its retention of every tensor ends, and a
+    /// tensor no epoch retains is released. Refused while a previous head of
+    /// the deployment is connected. Every process of the deployment that
+    /// belongs to no current worker is shot down. Every other deployment
+    /// whose head is not connected is retired: a host serves the deployments
+    /// whose heads run on it.
     Claim {
+        claimant: Claimant,
         scopes: Vec<Scope>,
         epoch: u64,
         retire: Vec<u64>,

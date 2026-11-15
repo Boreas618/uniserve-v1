@@ -3,7 +3,7 @@
 //! connection.
 
 use ::storage::protocol::ErrorKind;
-use ::storage::{ClaimClient, ClaimHandoff, Error, Mode};
+use ::storage::{ClaimClient, ClaimHandoff, Claimant, Error, Mode};
 
 use crate::server::{Running, key, scope, worker};
 
@@ -15,20 +15,31 @@ fn a_claim_lasts_as_long_as_its_client_and_holds_every_epoch() {
     let server = Running::with_transfer(|_| None);
     let mut claim = ClaimClient::connect(&server.socket, "model").unwrap();
 
-    let token = claim.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    let again = claim.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let token = claim
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
+    let again = claim
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     assert_eq!(again, token);
 
     // The scopes of an epoch are compared whatever their order.
     let scopes = vec![scope("text", 1), scope("text", 0)];
-    let second = claim.claim(2, scopes.clone(), Vec::new()).unwrap();
+    let second = claim
+        .claim(Claimant::Head, 2, scopes.clone(), Vec::new())
+        .unwrap();
     assert_eq!(second, token);
     let reordered = scopes.into_iter().rev().collect();
-    assert_eq!(claim.claim(2, reordered, Vec::new()).unwrap(), token);
+    assert_eq!(
+        claim
+            .claim(Claimant::Head, 2, reordered, Vec::new())
+            .unwrap(),
+        token
+    );
 
     // Another daemon cannot take the deployment while this claim lives.
     let mut rival = ClaimClient::connect(&server.socket, "model").unwrap();
-    match rival.claim(3, vec![scope("text", 0)], Vec::new()) {
+    match rival.claim(Claimant::Head, 3, vec![scope("text", 0)], Vec::new()) {
         Err(Error::Server {
             kind: ErrorKind::Claimed,
             ..
@@ -49,7 +60,9 @@ fn a_claim_lasts_as_long_as_its_client_and_holds_every_epoch() {
 fn a_claim_crosses_to_a_successor_with_its_connection() {
     let server = Running::with_transfer(|_| None);
     let mut claim = ClaimClient::connect(&server.socket, "model").unwrap();
-    let token = claim.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let token = claim
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
 
     let (handoff, descriptor) = claim.handoff().unwrap();
     assert_eq!(handoff.claim, Some(token));
@@ -63,10 +76,12 @@ fn a_claim_crosses_to_a_successor_with_its_connection() {
     // The epoch the predecessor claimed is held, and a new one claims under
     // the same token, which a new head would not be given.
     let held = successor
-        .claim(1, vec![scope("text", 0)], Vec::new())
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
         .unwrap();
     assert_eq!(held, token);
-    let next = successor.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
+    let next = successor
+        .claim(Claimant::Head, 2, vec![scope("text", 0)], vec![1])
+        .unwrap();
     assert_eq!(next, token);
 
     let usage = successor.usage().unwrap();

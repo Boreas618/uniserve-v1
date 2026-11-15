@@ -7,9 +7,12 @@
 //! The claim therefore outlives every engine and every epoch: an engine that
 //! succeeds another claims the scopes of its own epoch under the same claim,
 //! and its workers hold the same token as the running epoch's, so neither
-//! epoch's storage is touched by the other's claim. A claim names the epochs
-//! whose storage on the node ends (`retire`): the epoch a commit superseded,
-//! or the epoch a rollback discarded.
+//! epoch's storage is touched by the other's claim. Each claim is made for
+//! its claimant ([`storage::Claimant`]): the engine that asked, by its
+//! number, or the updater on its epoch's behalf, so one engine's claim never
+//! ends the retention of another's storage. A claim names the epochs whose
+//! storage on the node ends (`retire`): the epoch a commit superseded, or the
+//! epoch a rollback discarded.
 //!
 //! A previous epoch kept in host storage on trial (`KeepWeights` with
 //! `to_host`) has its weights moved there by the server's Transfer Server
@@ -82,16 +85,20 @@ impl ClaimHolder {
     }
 
     /// Claims `claim`'s deployment for its epoch at this node's Storage
-    /// Server, starting the server when the node has none; an epoch that
-    /// claimed the same scopes and retires nothing keeps the claim held.
-    /// Either way the epoch's weights an offload left in host storage
-    /// return to their GPUs first.
+    /// Server as `claimant`, starting the server when the node has none; a
+    /// claimant that claimed the same scopes and retires nothing keeps the
+    /// claim held. Either way the epoch's weights an offload left in host
+    /// storage return to their GPUs first.
     ///
     /// # Errors
     ///
     /// Fails when the server cannot be started or reached, or refuses the
     /// claim because another head of the deployment holds it.
-    pub(crate) fn claim(&mut self, claim: &Claim) -> anyhow::Result<Claimed> {
+    pub(crate) fn claim(
+        &mut self,
+        claimant: storage::Claimant,
+        claim: &Claim,
+    ) -> anyhow::Result<Claimed> {
         use anyhow::Context as _;
 
         let socket =
@@ -149,12 +156,13 @@ impl ClaimHolder {
         };
 
         let token = client
-            .claim(claim.epoch, scopes, claim.retire.clone())
+            .claim(claimant, claim.epoch, scopes, claim.retire.clone())
             .with_context(|| format!("claiming deployment {}", claim.deployment))?;
         restore(client, claim.epoch)?;
         tracing::info!(
             deployment = %claim.deployment,
             epoch = claim.epoch,
+            ?claimant,
             scopes = claim.scopes.len(),
             retired = ?claim.retire,
             "claimed the deployment's storage for an epoch"

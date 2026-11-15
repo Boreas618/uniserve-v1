@@ -69,7 +69,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ::storage::protocol::{Event, FabricHandle, LinkEnd, Priority, Region, Span, TaskStatus};
-use ::storage::{Access, Client, Key, Location, Role, Scope, StorageRecord, TensorRecord};
+use ::storage::{
+    Access, Claimant, Client, Key, Location, Role, Scope, StorageRecord, TensorRecord,
+};
 use anyhow::{Context, bail, ensure};
 use clap::Parser as _;
 use platform::{
@@ -338,7 +340,7 @@ fn connect(options: &Options) -> anyhow::Result<(Client, Client)> {
         },
     )
     .with_context(|| format!("connecting to {}", options.socket.display()))?;
-    let claim = head.claim(0, vec![scope.clone()], Vec::new())?;
+    let claim = head.claim(Claimant::Head, 0, vec![scope.clone()], Vec::new())?;
     let worker = Client::connect(
         &options.socket,
         Role::Worker {

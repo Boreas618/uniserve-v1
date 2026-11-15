@@ -28,7 +28,7 @@ use ::storage::protocol::{
 use ::storage::runtime::{
     Class, Completion, Group, GroupId, Open, OwnerId, Request, Source, Tier, VERSION,
 };
-use ::storage::{Access, Client, Key, Location, Role};
+use ::storage::{Access, Claimant, Client, Key, Location, Role};
 use storage_server::Launch;
 
 use crate::server::{FORKING, Running, engine_head, head, host, key, memfd, scope, tensor};
@@ -270,6 +270,7 @@ fn a_prefetch_from_the_peers_reads_the_host_copies_a_peer_held_throughout() {
     let reading = network_server(network.path(), None, None);
     let claim = head(&reading.socket)
         .claim(
+            Claimant::Head,
             0,
             vec![scope("prefill", 0), scope("prefill", 1)],
             Vec::new(),
@@ -338,6 +339,7 @@ fn a_prefetch_from_the_peers_reads_a_copy_of_the_source_encoding_into_the_source
     let reading = network_server(network.path(), None, None);
     let claim = head(&reading.socket)
         .claim(
+            Claimant::Head,
             0,
             vec![scope("prefill", 0), scope("prefill", 1)],
             Vec::new(),
@@ -489,6 +491,7 @@ fn a_prefetch_from_a_peer_lost_during_the_read_caches_nothing() {
     let reading = network_server(network.path(), Some(&gate), None);
     let claim = head(&reading.socket)
         .claim(
+            Claimant::Head,
             0,
             vec![scope("prefill", 0), scope("prefill", 1)],
             Vec::new(),
@@ -538,7 +541,7 @@ fn a_transfer_reaches_a_rank_of_another_host_through_that_host_s_transfer_server
     // own, retained by its host's Storage Server.
     let prefill_planes = memfd(&[0; 144]);
     let claim = head(&here.socket)
-        .claim(0, vec![scope("prefill", 0)], Vec::new())
+        .claim(Claimant::Head, 0, vec![scope("prefill", 0)], Vec::new())
         .unwrap();
     let mut prefill_rank = rank(&here.socket, "prefill", 0, claim);
     let prefill_tensor = tensor(key(10), "values", 0, 0, Access::Exclusive);
@@ -550,7 +553,7 @@ fn a_transfer_reaches_a_rank_of_another_host_through_that_host_s_transfer_server
         .unwrap();
     let decode_planes = memfd(&[0; 144]);
     let there_claim = head(&there.socket)
-        .claim(0, vec![scope("decode", 0)], Vec::new())
+        .claim(Claimant::Head, 0, vec![scope("decode", 0)], Vec::new())
         .unwrap();
     let mut decode_rank = rank(&there.socket, "decode", 0, there_claim);
     let decode_tensor = tensor(key(11), "values", 0, 0, Access::Exclusive);
@@ -746,7 +749,7 @@ fn a_crossing_copies_a_product_into_a_main_process_of_another_host_through_that_
         .zip(&buffers)
     {
         let claim = head(&server.socket)
-            .claim(0, vec![scope(group, 0)], Vec::new())
+            .claim(Claimant::Head, 0, vec![scope(group, 0)], Vec::new())
             .unwrap();
         let mut worker = rank(&server.socket, group, 0, claim);
         let buffer_tensor = tensor(key(name), "products", 0, 0, Access::Exclusive);
@@ -829,7 +832,12 @@ fn a_transfer_past_the_server_s_deadline_fails_and_leaves_the_owner_where_it_was
     let deadlines = (Duration::from_millis(200), Duration::from_secs(60));
     let server = network_server(network.path(), Some(&gate), Some(deadlines));
     let claim = head(&server.socket)
-        .claim(0, vec![scope("prefill", 0), scope("decode", 0)], Vec::new())
+        .claim(
+            Claimant::Head,
+            0,
+            vec![scope("prefill", 0), scope("decode", 0)],
+            Vec::new(),
+        )
         .unwrap();
     let planes = [memfd(&[0; 144]), memfd(&[0; 144])];
     for (name, memory, group, planes) in [

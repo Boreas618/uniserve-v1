@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use ::storage::protocol::{ClientMessage, ErrorKind, Hello, Item, ServerMessage, Welcome};
 use ::storage::{
-    Access, Claim, Client, Error, Key, Location, Mode, Role, Scope, StorageRecord, TensorRecord,
+    Access, Claim, Claimant, Client, Error, Key, Location, Mode, Role, Scope, StorageRecord,
+    TensorRecord,
 };
 use storage_server::{Launch, Server};
 
@@ -255,7 +256,12 @@ fn a_published_read_only_tensor_is_shared_with_other_workers_and_retained_by_sco
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head
-        .claim(0, vec![scope("text", 0), scope("text", 1)], Vec::new())
+        .claim(
+            Claimant::Head,
+            0,
+            vec![scope("text", 0), scope("text", 1)],
+            Vec::new(),
+        )
         .unwrap();
 
     // Two tensors packed in one storage, published by rank 0.
@@ -306,7 +312,12 @@ fn a_published_read_only_tensor_is_shared_with_other_workers_and_retained_by_sco
 fn putting_a_retained_read_only_key_again_keeps_the_retained_bytes_for_both_scopes() {
     let server = Running::start();
     let claim = head(&server.socket)
-        .claim(0, vec![scope("text", 0), scope("text", 1)], Vec::new())
+        .claim(
+            Claimant::Head,
+            0,
+            vec![scope("text", 0), scope("text", 1)],
+            Vec::new(),
+        )
         .unwrap();
     let mut first = worker(&server.socket, scope("text", 0), 1, claim);
     let storage = memfd(b"abcd");
@@ -365,7 +376,12 @@ fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
     // one.
     let mut model_head = head(&server.socket);
     let claim = model_head
-        .claim(0, vec![scope("text", 0), scope("text", 1)], Vec::new())
+        .claim(
+            Claimant::Head,
+            0,
+            vec![scope("text", 0), scope("text", 1)],
+            Vec::new(),
+        )
         .unwrap();
     model_head.publish(vec![0]).unwrap();
     let mut first = worker(&server.socket, scope("text", 0), 1, claim);
@@ -429,7 +445,7 @@ fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
     // A tensor another deployment holds as well is not the caller's to move.
     let other = scope_of("other");
     let other_claim = head_of(&server.socket, "other")
-        .claim(0, vec![other.clone()], Vec::new())
+        .claim(Claimant::Head, 0, vec![other.clone()], Vec::new())
         .unwrap();
     let mut stranger = worker(&server.socket, other, 1, other_claim);
     stranger.get(vec![key(12)], Mode::Read, Vec::new()).unwrap();
@@ -443,7 +459,7 @@ fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
 fn write_access_to_an_exclusive_tensor_passes_on_by_release() {
     let server = Running::start();
     let claim = head(&server.socket)
-        .claim(0, vec![scope("flow", 0)], Vec::new())
+        .claim(Claimant::Head, 0, vec![scope("flow", 0)], Vec::new())
         .unwrap();
     let mut writer = worker(&server.socket, scope("flow", 0), 1, claim);
     let storage = memfd(&[0; 4]);
@@ -484,7 +500,12 @@ fn a_new_head_is_refused_while_the_previous_one_is_connected_and_drops_unlisted_
     let server = Running::start();
     let mut first = head(&server.socket);
     let claim = first
-        .claim(0, vec![scope("text", 0), scope("old", 0)], Vec::new())
+        .claim(
+            Claimant::Head,
+            0,
+            vec![scope("text", 0), scope("old", 0)],
+            Vec::new(),
+        )
         .unwrap();
     for group in ["text", "old"] {
         let mut client = worker(&server.socket, scope(group, 0), 1, claim);
@@ -500,12 +521,12 @@ fn a_new_head_is_refused_while_the_previous_one_is_connected_and_drops_unlisted_
 
     let mut second = head(&server.socket);
     assert_eq!(
-        server_error(second.claim(0, Vec::new(), Vec::new())),
+        server_error(second.claim(Claimant::Head, 0, Vec::new(), Vec::new())),
         ErrorKind::Claimed
     );
     drop(first);
     // The server notices the disconnect on its next turn.
-    let claim = retry(|| second.claim(0, vec![scope("text", 0)], Vec::new()));
+    let claim = retry(|| second.claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new()));
     let names: Vec<String> = second
         .list()
         .unwrap()
@@ -560,7 +581,7 @@ fn stand_in_writer() {
 fn a_relaunched_worker_takes_write_access_by_shooting_down_its_predecessor() {
     let server = Running::start();
     let claim = head(&server.socket)
-        .claim(0, vec![scope("flow", 0)], Vec::new())
+        .claim(Claimant::Head, 0, vec![scope("flow", 0)], Vec::new())
         .unwrap();
     let encoded: Vec<String> = claim.0.iter().map(u8::to_string).collect();
     let forking = FORKING
@@ -647,7 +668,9 @@ fn a_claim_retires_every_deployment_whose_head_is_gone() {
     let server = Running::start();
     // A deployment whose head leaves keeps a tensor.
     let mut gone = head_of(&server.socket, "gone");
-    let claim = gone.claim(0, vec![scope_of("gone")], Vec::new()).unwrap();
+    let claim = gone
+        .claim(Claimant::Head, 0, vec![scope_of("gone")], Vec::new())
+        .unwrap();
     let mut gone_worker = worker(&server.socket, scope_of("gone"), 1, claim);
     let storage = memfd(&[1; 4]);
     gone_worker
@@ -660,7 +683,9 @@ fn a_claim_retires_every_deployment_whose_head_is_gone() {
     drop(gone);
     // A deployment whose head stays keeps its tensor.
     let mut kept = head_of(&server.socket, "kept");
-    let kept_claim = kept.claim(0, vec![scope_of("kept")], Vec::new()).unwrap();
+    let kept_claim = kept
+        .claim(Claimant::Head, 0, vec![scope_of("kept")], Vec::new())
+        .unwrap();
     let mut kept_worker = worker(&server.socket, scope_of("kept"), 1, kept_claim);
     let kept_storage = memfd(&[2; 4]);
     kept_worker
@@ -685,7 +710,7 @@ fn a_claim_retires_every_deployment_whose_head_is_gone() {
         std::thread::sleep(Duration::from_millis(10));
     }
     head_of(&server.socket, "new")
-        .claim(0, vec![scope_of("new")], Vec::new())
+        .claim(Claimant::Head, 0, vec![scope_of("new")], Vec::new())
         .unwrap();
     let listing = operator.list().unwrap();
     let tensors: Vec<&str> = listing
@@ -731,17 +756,22 @@ fn retained_names(client: &mut Client) -> Vec<String> {
 }
 
 /// The engines of one epoch on a host each claim, through the node's daemon,
-/// the scopes they place (the independent replicas of the epoch's
-/// configuration, and a process that replaces one of them): one engine's
-/// claim leaves the storage another engine of the epoch retains under its own
-/// scope, and a claim that retires the epoch ends it.
+/// the scopes they place, each as its own claimant (the independent replicas
+/// of the epoch's configuration, and a process that replaces one of them):
+/// one engine's claim leaves the storage another engine of the epoch retains
+/// under its own scope, and a claim that retires the epoch ends it.
 #[test]
 fn an_engine_s_claim_keeps_another_engine_of_its_epoch_retained() {
     let server = Running::start();
     let mut claim = ::storage::ClaimClient::connect(&server.socket, "model").unwrap();
     let mut observer = head(&server.socket);
     let token = claim
-        .claim(1, vec![scope("model-0", 0)], Vec::new())
+        .claim(
+            Claimant::Engine(1),
+            1,
+            vec![scope("model-0", 0)],
+            Vec::new(),
+        )
         .unwrap();
 
     // The first replica's worker publishes its exclusive planes.
@@ -756,21 +786,80 @@ fn an_engine_s_claim_keeps_another_engine_of_its_epoch_retained() {
     assert_eq!(retained_names(&mut observer), vec!["planes"]);
 
     // The second replica of the same epoch claims its own scope, and the
-    // first replica's next process claims its own again, as a relaunch does.
+    // first replica's relaunch, another engine, claims the first one's again.
     let second = claim
-        .claim(1, vec![scope("model-1", 0)], Vec::new())
+        .claim(
+            Claimant::Engine(2),
+            1,
+            vec![scope("model-1", 0)],
+            Vec::new(),
+        )
         .unwrap();
     assert_eq!(second, token);
     assert_eq!(retained_names(&mut observer), vec!["planes"]);
     let relaunch = claim
-        .claim(1, vec![scope("model-0", 0)], Vec::new())
+        .claim(
+            Claimant::Engine(3),
+            1,
+            vec![scope("model-0", 0)],
+            Vec::new(),
+        )
         .unwrap();
     assert_eq!(relaunch, token);
     assert_eq!(retained_names(&mut observer), vec!["planes"]);
 
     // The next epoch's claim that retires epoch 1 ends its storage.
-    claim.claim(2, vec![scope("model-0", 0)], vec![1]).unwrap();
+    claim
+        .claim(Claimant::Head, 2, vec![scope("model-0", 0)], vec![1])
+        .unwrap();
     assert!(retained_names(&mut observer).is_empty());
+}
+
+/// The server keeps an epoch's storage of a scope while any claimant of the
+/// epoch names it: another claimant's claim that does not name the scope
+/// ends nothing, and the storage ends once its own claimant claims again
+/// without it.
+#[test]
+fn a_claimant_s_claim_never_ends_another_claimant_s_retention() {
+    let server = Running::start();
+    let mut daemon = head(&server.socket);
+    let token = daemon
+        .claim(
+            Claimant::Engine(1),
+            1,
+            vec![scope("model-0", 0)],
+            Vec::new(),
+        )
+        .unwrap();
+    let mut first = epoch_worker(&server.socket, scope("model-0", 0), 1, token);
+    let planes = memfd(&[1; 4]);
+    first
+        .put(
+            vec![tensor(key(1), "planes", 0, 0, Access::Exclusive)],
+            &[(host(4), planes.as_fd())],
+        )
+        .unwrap();
+
+    // Another claimant of the epoch names other scopes alone, and the head on
+    // the epoch's behalf names none: the first claimant's storage stays.
+    daemon
+        .claim(
+            Claimant::Engine(2),
+            1,
+            vec![scope("model-1", 0)],
+            Vec::new(),
+        )
+        .unwrap();
+    daemon
+        .claim(Claimant::Head, 1, Vec::new(), Vec::new())
+        .unwrap();
+    assert_eq!(retained_names(&mut daemon), vec!["planes"]);
+
+    // Its own claimant claims again without the scope: the storage ends.
+    daemon
+        .claim(Claimant::Engine(1), 1, Vec::new(), Vec::new())
+        .unwrap();
+    assert!(retained_names(&mut daemon).is_empty());
 }
 
 /// Two epochs of one deployment share a scope without touching each other's
@@ -781,7 +870,9 @@ fn an_engine_s_claim_keeps_another_engine_of_its_epoch_retained() {
 fn epochs_retain_their_own_storage_and_a_claim_retires_one() {
     let server = Running::start();
     let mut head = head(&server.socket);
-    let first_claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let first_claim = head
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     head.publish(vec![1]).unwrap();
 
     // Epoch 1's worker publishes shared weights, its exclusive planes and a
@@ -805,7 +896,9 @@ fn epochs_retain_their_own_storage_and_a_claim_retires_one() {
 
     // Epoch 2 claims the same scope under the same token: epoch 1's worker
     // stays current.
-    let second_claim = head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    let second_claim = head
+        .claim(Claimant::Head, 2, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     assert_eq!(first_claim, second_claim);
     let mut second = epoch_worker(&server.socket, scope("text", 0), 2, second_claim);
     let (got, _) = second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
@@ -852,7 +945,8 @@ fn epochs_retain_their_own_storage_and_a_claim_retires_one() {
 
     // The commit of epoch 2 retires epoch 1: its buffer goes, what epoch 2
     // retains stays.
-    head.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
+    head.claim(Claimant::Head, 2, vec![scope("text", 0)], vec![1])
+        .unwrap();
     assert_eq!(
         retained_names(&mut head),
         vec!["buffer", "planes", "weights"]
@@ -915,8 +1009,12 @@ fn readable(worker: &mut Client, keys: &[Key]) -> Vec<Key> {
 fn independent_replicas_publish_successors_as_a_group() {
     let server = Running::start();
     let mut daemon = head(&server.socket);
-    let claim = daemon.claim(9, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.claim(3, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = daemon
+        .claim(Claimant::Head, 9, vec![scope("text", 0)], Vec::new())
+        .unwrap();
+    daemon
+        .claim(Claimant::Head, 3, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     daemon.publish(vec![9, 3]).unwrap();
     let mut first = epoch_worker(&server.socket, scope("text", 0), 9, claim);
     let mut second = epoch_worker(&server.socket, scope("text", 0), 3, claim);
@@ -925,8 +1023,12 @@ fn independent_replicas_publish_successors_as_a_group() {
     assert_eq!(readable(&mut first, &[key(1), key(2)]), [key(1), key(2)]);
     assert_eq!(readable(&mut second, &[key(1), key(2)]), [key(1), key(2)]);
 
-    daemon.claim(4, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.claim(8, vec![scope("text", 0)], Vec::new()).unwrap();
+    daemon
+        .claim(Claimant::Head, 4, vec![scope("text", 0)], Vec::new())
+        .unwrap();
+    daemon
+        .claim(Claimant::Head, 8, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut candidate = epoch_worker(&server.socket, scope("text", 0), 4, claim);
     let mut peer = epoch_worker(&server.socket, scope("text", 0), 8, claim);
     put_read_only(&mut candidate, &[key(3)]);
@@ -956,10 +1058,14 @@ fn independent_replicas_publish_successors_as_a_group() {
 fn a_rollback_discards_what_the_epoch_on_trial_published() {
     let server = Running::start();
     let mut daemon = head(&server.socket);
-    let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = daemon
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     daemon.publish(vec![1]).unwrap();
     let mut serving_worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
-    daemon.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    daemon
+        .claim(Claimant::Head, 2, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut trial_worker = epoch_worker(&server.socket, scope("text", 0), 2, claim);
 
     // Epoch 2 publishes two read-only tensors.
@@ -998,7 +1104,9 @@ fn a_rollback_discards_what_the_epoch_on_trial_published() {
     assert_eq!(contents(descriptors.remove(0)), b"good");
 
     // The rollback retires epoch 2: what it alone put leaves the server.
-    daemon.claim(1, vec![scope("text", 0)], vec![2]).unwrap();
+    daemon
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], vec![2])
+        .unwrap();
     assert_eq!(retained_names(&mut daemon), vec!["weights"]);
     let (_, mut descriptors) = serving_worker
         .get(vec![key(6)], Mode::Read, Vec::new())
@@ -1013,7 +1121,9 @@ fn a_rollback_discards_what_the_epoch_on_trial_published() {
 fn a_epoch_reads_what_it_published_that_only_a_epoch_on_trial_retains() {
     let server = Running::start();
     let mut daemon = head(&server.socket);
-    let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = daemon
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     daemon.publish(vec![1]).unwrap();
     let mut serving = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let planes = memfd(&[1; 4]);
@@ -1023,7 +1133,9 @@ fn a_epoch_reads_what_it_published_that_only_a_epoch_on_trial_retains() {
             &[(host(4), planes.as_fd())],
         )
         .unwrap();
-    daemon.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    daemon
+        .claim(Claimant::Head, 2, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut trial = epoch_worker(&server.socket, scope("text", 0), 2, claim);
     trial.get(vec![key(10)], Mode::Standby, Vec::new()).unwrap();
     serving.retain(Vec::new(), Vec::new()).unwrap();
@@ -1041,7 +1153,9 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
     for refused in [true, false] {
         let server = Running::reserving(if refused { u64::MAX } else { 0 });
         let mut head = head(&server.socket);
-        let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+        let claim = head
+            .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+            .unwrap();
         let mut worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
         let result = worker.allocate_host(key(42), "staged cache".into(), 4096);
         if refused {
@@ -1136,7 +1250,12 @@ fn one_key_keeps_a_copy_at_each_location() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head
-        .claim(0, vec![scope("text", 0), scope("text", 1)], Vec::new())
+        .claim(
+            Claimant::Head,
+            0,
+            vec![scope("text", 0), scope("text", 1)],
+            Vec::new(),
+        )
         .unwrap();
     let near = Location::Host { numa_node: Some(0) };
     let far = Location::Host { numa_node: Some(1) };
@@ -1275,7 +1394,9 @@ fn await_usage(client: &mut Client, usage: u64) {
 fn two_epochs_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
     let server = Running::start();
     let mut head = head(&server.socket);
-    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     head.publish(vec![1]).unwrap();
 
     // Epoch 1 states its quota of 700 bytes of the GPU's 1000 and reserves its
@@ -1315,7 +1436,8 @@ fn two_epochs_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
 
     // Epoch 2 maps the weights and the segment: each is reserved once, held
     // by both epochs, beside the process and graph pool epoch 2 reserves.
-    head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    head.claim(Claimant::Head, 2, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut second = epoch_worker(&server.socket, scope("text", 0), 2, claim);
     second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
     second.get(vec![key(2)], Mode::Standby, Vec::new()).unwrap();
@@ -1378,7 +1500,8 @@ fn two_epochs_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
         .unwrap();
     drop(first);
     await_usage(&mut head, 500);
-    head.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
+    head.claim(Claimant::Head, 2, vec![scope("text", 0)], vec![1])
+        .unwrap();
     let quota = quota_of(&mut head);
     assert_eq!(quota.usage(), 480);
     assert_eq!(reserved(&quota, Item::CacheSegment, &[2]), 80);
@@ -1397,7 +1520,9 @@ fn two_epochs_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
 fn a_epoch_kept_as_its_weights_leaves_its_successor_the_rest() {
     let server = Running::start();
     let mut head = head(&server.socket);
-    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     head.publish(vec![1]).unwrap();
     let mut first = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     first
@@ -1418,7 +1543,8 @@ fn a_epoch_kept_as_its_weights_leaves_its_successor_the_rest() {
             ],
         )
         .unwrap();
-    head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    head.claim(Claimant::Head, 2, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let mut second = epoch_worker(&server.socket, scope("text", 0), 2, claim);
     second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
     second.get(vec![key(2)], Mode::Standby, Vec::new()).unwrap();
@@ -1477,7 +1603,9 @@ fn a_epoch_kept_as_its_weights_keeps_nothing_its_stopped_processes_reserved() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let scopes = vec![scope("text", 0), scope("text", 1)];
-    let claim = head.claim(1, scopes.clone(), Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 1, scopes.clone(), Vec::new())
+        .unwrap();
     head.publish(vec![1]).unwrap();
     let mut stopped = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     stopped
@@ -1492,7 +1620,7 @@ fn a_epoch_kept_as_its_weights_keeps_nothing_its_stopped_processes_reserved() {
     later
         .reserve(GPU, 1000, Some(700), vec![(Item::Process, 100)])
         .unwrap();
-    head.claim(2, scopes, Vec::new()).unwrap();
+    head.claim(Claimant::Head, 2, scopes, Vec::new()).unwrap();
 
     // One process is stopped before the request: its 500 bytes are kept as a
     // lost process's until the epoch keeps its weights alone.
@@ -1529,7 +1657,9 @@ fn a_epoch_kept_as_its_weights_keeps_nothing_its_stopped_processes_reserved() {
 fn a_retired_epoch_s_process_keeps_nothing_reserved_when_it_ends() {
     let server = Running::start();
     let mut head = head(&server.socket);
-    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     head.publish(vec![1]).unwrap();
     let mut stopped = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     stopped
@@ -1540,9 +1670,11 @@ fn a_retired_epoch_s_process_keeps_nothing_reserved_when_it_ends() {
             vec![(Item::Process, 300), (Item::GraphPool, 200)],
         )
         .unwrap();
-    head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    head.claim(Claimant::Head, 2, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     head.publish(vec![2]).unwrap();
-    head.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
+    head.claim(Claimant::Head, 2, vec![scope("text", 0)], vec![1])
+        .unwrap();
     assert_eq!(usage_on_gpu(&mut head), 500);
 
     drop(stopped);
@@ -1564,7 +1696,9 @@ fn a_retired_epoch_s_process_keeps_nothing_reserved_when_it_ends() {
 fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
     let server = Running::start();
     let mut head = head(&server.socket);
-    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     head.publish(vec![1]).unwrap();
     let mut first = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let storages = [memfd(&[1; 4]), memfd(&[2; 4])];
@@ -1610,7 +1744,9 @@ fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
 fn the_processes_of_one_scope_count_as_their_largest_reservation() {
     let server = Running::start();
     let mut head = head(&server.socket);
-    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     head.publish(vec![1]).unwrap();
     let mut rank = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     rank.reserve(GPU, 1000, Some(700), vec![(Item::Process, 300)])
@@ -1632,7 +1768,12 @@ fn a_lost_rank_s_reservation_is_kept_for_its_relaunch() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head
-        .claim(1, vec![scope("text", 0), scope("text", 1)], Vec::new())
+        .claim(
+            Claimant::Head,
+            1,
+            vec![scope("text", 0), scope("text", 1)],
+            Vec::new(),
+        )
         .unwrap();
     head.publish(vec![1]).unwrap();
     let mut rank = epoch_worker(&server.socket, scope("text", 0), 1, claim);
@@ -1674,7 +1815,12 @@ fn reservations_end_with_a_withdrawal_or_the_epoch_s_retirement() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head
-        .claim(1, vec![scope("text", 0), scope("text", 1)], Vec::new())
+        .claim(
+            Claimant::Head,
+            1,
+            vec![scope("text", 0), scope("text", 1)],
+            Vec::new(),
+        )
         .unwrap();
     head.publish(vec![1]).unwrap();
     let mut closed = epoch_worker(&server.socket, scope("text", 0), 1, claim);
@@ -1692,9 +1838,11 @@ fn reservations_end_with_a_withdrawal_or_the_epoch_s_retirement() {
         .unwrap();
     drop(lost);
     assert_eq!(quota_of(&mut head).usage(), 300);
-    head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
+    head.claim(Claimant::Head, 2, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     head.publish(vec![2]).unwrap();
-    head.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
+    head.claim(Claimant::Head, 2, vec![scope("text", 0)], vec![1])
+        .unwrap();
     // Nothing is reserved on the GPU any more: it has no quota, or an empty
     // one.
     let quotas = head.usage(vec![GPU]).unwrap().quotas;
@@ -1708,7 +1856,9 @@ fn reservations_end_with_a_withdrawal_or_the_epoch_s_retirement() {
 fn a_usage_past_its_quota_shrinks_but_never_grows() {
     let server = Running::start();
     let mut head = head(&server.socket);
-    let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
+    let claim = head
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     head.publish(vec![1]).unwrap();
     let mut worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     worker
@@ -1739,7 +1889,12 @@ fn a_usage_past_its_quota_shrinks_but_never_grows() {
 fn a_standby_of_the_scope_adopts_its_storage_by_promotion() {
     let server = Running::start();
     let claim = head(&server.socket)
-        .claim(0, vec![scope("flow", 0), scope("flow", 1)], Vec::new())
+        .claim(
+            Claimant::Head,
+            0,
+            vec![scope("flow", 0), scope("flow", 1)],
+            Vec::new(),
+        )
         .unwrap();
 
     let mut writer = worker(&server.socket, scope("flow", 0), 1, claim);

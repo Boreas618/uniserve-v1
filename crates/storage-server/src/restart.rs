@@ -819,8 +819,8 @@ mod tests {
     use std::os::fd::IntoRawFd as _;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use ::storage::Client;
     use ::storage::protocol::{Item, Location, Mode, TensorRecord};
+    use ::storage::{Claimant, Client};
 
     use super::*;
 
@@ -877,7 +877,9 @@ mod tests {
             },
         )
         .unwrap();
-        let claim = head.claim(0, vec![scope.clone()], Vec::new()).unwrap();
+        let claim = head
+            .claim(Claimant::Head, 0, vec![scope.clone()], Vec::new())
+            .unwrap();
         head.publish(vec![0]).unwrap();
         let mut worker = Client::connect(
             &path,
@@ -923,7 +925,8 @@ mod tests {
         // Committed replicas share their outputs; a candidate's output is
         // still private when both kinds cross the restart.
         for epoch in [2, 3] {
-            head.claim(epoch, vec![scope.clone()], Vec::new()).unwrap();
+            head.claim(Claimant::Head, epoch, vec![scope.clone()], Vec::new())
+                .unwrap();
             let mut replica = Client::connect(
                 &path,
                 Role::Worker {

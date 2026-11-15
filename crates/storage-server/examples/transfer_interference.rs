@@ -69,7 +69,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ::storage::protocol::{Event, Link, LinkEnd, Priority, Region, Span, TaskStatus, Throttle};
-use ::storage::{Access, Client, Key, Location, Quota, Role, Scope, StorageRecord, TensorRecord};
+use ::storage::{
+    Access, Claimant, Client, Key, Location, Quota, Role, Scope, StorageRecord, TensorRecord,
+};
 use anyhow::{Context, bail, ensure};
 use platform::{DeviceAllocation, DeviceAttribute, DeviceId};
 use rustix::event::{PollFd, PollFlags, poll};
@@ -720,7 +722,7 @@ fn run(options: &Options) -> anyhow::Result<()> {
             generation: 0,
         },
     )?;
-    let claim = head.claim(0, vec![scope.clone()], Vec::new())?;
+    let claim = head.claim(Claimant::Head, 0, vec![scope.clone()], Vec::new())?;
     let mut worker = Client::connect(
         &options.socket,
         Role::Worker {

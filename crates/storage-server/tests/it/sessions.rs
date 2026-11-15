@@ -20,7 +20,7 @@ use ::storage::runtime::{
     Cause, Class, Completion, Group, GroupId, Open, Opened, OwnerId, Region, Registers, Request,
     RequestId, Source, Tier, VERSION,
 };
-use ::storage::{Access, Claim, Client, Key, Location, Mode, QueuePair, Role, Segment};
+use ::storage::{Access, Claim, Claimant, Client, Key, Location, Mode, QueuePair, Role, Segment};
 
 use crate::server::{
     FORKING, Running, engine_head, head, host, key, memfd, scope, server_error, tensor, worker,
@@ -541,7 +541,12 @@ pub(crate) fn values(key: Key) -> Vec<UnitRun> {
 fn a_transfer_copies_an_owner_s_units_between_its_groups_ranks_through_the_transfer_server() {
     let server = serving(Gpus::Hidden);
     let claim = head(&server.socket)
-        .claim(0, vec![scope("prefill", 0), scope("decode", 1)], Vec::new())
+        .claim(
+            Claimant::Head,
+            0,
+            vec![scope("prefill", 0), scope("decode", 1)],
+            Vec::new(),
+        )
         .unwrap();
 
     // Each group's rank holds the KV region's values in storage of its own,
@@ -616,7 +621,7 @@ fn a_region_s_storage_is_mapped_writable_by_another_epoch_without_taking_its_wri
     let server = Running::with_transfer(|_| None);
     let mut daemon = head(&server.socket);
     let claim = daemon
-        .claim(0, vec![scope("prefill", 0)], Vec::new())
+        .claim(Claimant::Head, 0, vec![scope("prefill", 0)], Vec::new())
         .unwrap();
     daemon.publish(vec![0]).unwrap();
     let mut serving = rank(&server.socket, "prefill", 0, claim);
@@ -629,7 +634,7 @@ fn a_region_s_storage_is_mapped_writable_by_another_epoch_without_taking_its_wri
     // A rank of the next epoch, of the same scope and a later launch, maps
     // it: no writer passes on, so the serving rank is not shot down.
     daemon
-        .claim(1, vec![scope("prefill", 0)], Vec::new())
+        .claim(Claimant::Head, 1, vec![scope("prefill", 0)], Vec::new())
         .unwrap();
     let mut target = Client::connect(
         &server.socket,
@@ -673,6 +678,7 @@ fn connector_event(connector: &mut Client) -> Event {
 pub(crate) fn host_copy(server: &Running) -> (Client, Vec<Scheduler>, Opened, Vec<OwnedFd>) {
     let claim = head(&server.socket)
         .claim(
+            Claimant::Head,
             0,
             vec![scope("prefill", 0), scope("prefill", 1)],
             Vec::new(),
@@ -702,7 +708,7 @@ pub(crate) fn split_host_region(
     let mut open = layout(0);
     open.peers = peers;
     let claim = head(&here.socket)
-        .claim(0, vec![scope("prefill", 0)], Vec::new())
+        .claim(Claimant::Head, 0, vec![scope("prefill", 0)], Vec::new())
         .unwrap();
     let mut engine = engine_head(&here.socket, 0);
     let (opened, descriptors) = engine.open_pool(open.clone()).unwrap();
@@ -718,7 +724,7 @@ pub(crate) fn split_host_region(
     hosts.schedulers.clear();
     hosts.peers.clear();
     let there_claim = head(&there.socket)
-        .claim(0, vec![scope("prefill", 1)], Vec::new())
+        .claim(Claimant::Head, 0, vec![scope("prefill", 1)], Vec::new())
         .unwrap();
     let mut peer = engine_head(&there.socket, 0);
     peer.open_pool(hosts).unwrap();
@@ -804,7 +810,9 @@ fn the_ranks_of_one_index_in_two_groups_share_a_part_of_a_host_region() {
         scope("decode", 2),
         scope("decode", 3),
     ];
-    let claim = head(&server.socket).claim(0, scopes, Vec::new()).unwrap();
+    let claim = head(&server.socket)
+        .claim(Claimant::Head, 0, scopes, Vec::new())
+        .unwrap();
     let mut engine = engine_head(&server.socket, 0);
     engine.open_pool(layout(0)).unwrap();
 
@@ -880,7 +888,7 @@ fn a_host_region_is_admitted_part_by_part_as_its_ranks_take_them() {
         // admits no new host storage.
         let server = Running::reserving(if refused { u64::MAX } else { 0 });
         let claim = head(&server.socket)
-            .claim(0, vec![scope("prefill", 0)], Vec::new())
+            .claim(Claimant::Head, 0, vec![scope("prefill", 0)], Vec::new())
             .unwrap();
         let mut engine = engine_head(&server.socket, 0);
         engine.open_pool(layout(0)).unwrap();
@@ -1110,7 +1118,7 @@ fn host_parts_of_one_index_on_two_hosts_are_kept_apart() {
     open.groups[1].parts = vec![vec![("b".into(), 0), ("b".into(), 1)]];
     let scopes = |group| vec![scope(group, 0), scope(group, 1)];
     let claim = head(&here.socket)
-        .claim(0, scopes("prefill"), Vec::new())
+        .claim(Claimant::Head, 0, scopes("prefill"), Vec::new())
         .unwrap();
     let mut engine = engine_head(&here.socket, 0);
     let (opened, descriptors) = engine.open_pool(open.clone()).unwrap();
@@ -1120,7 +1128,7 @@ fn host_parts_of_one_index_on_two_hosts_are_kept_apart() {
     hosts.groups.clear();
     hosts.schedulers.clear();
     let there_claim = head(&there.socket)
-        .claim(0, scopes("decode"), Vec::new())
+        .claim(Claimant::Head, 0, scopes("decode"), Vec::new())
         .unwrap();
     let mut peer = engine_head(&there.socket, 0);
     peer.open_pool(hosts).unwrap();
@@ -1350,9 +1358,13 @@ fn an_engine_s_session_closes_once_its_processes_are_out() {
 fn what_an_epoch_on_trial_commits_is_its_own_until_its_head_publishes_it() {
     let server = Running::with_transfer(|_| None);
     let mut daemon = head(&server.socket);
-    daemon.claim(0, Vec::new(), Vec::new()).unwrap();
+    daemon
+        .claim(Claimant::Head, 0, Vec::new(), Vec::new())
+        .unwrap();
     daemon.publish(vec![0]).unwrap();
-    daemon.claim(1, Vec::new(), Vec::new()).unwrap();
+    daemon
+        .claim(Claimant::Head, 1, Vec::new(), Vec::new())
+        .unwrap();
 
     // The serving epoch and the target on trial, of one layout.
     let mut serving = engine_head(&server.socket, 0);
