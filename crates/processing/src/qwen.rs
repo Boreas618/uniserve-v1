@@ -23,6 +23,12 @@ use crate::image::{ImageFamily, ImageProcessor};
 use crate::qwen_vl::ProcessorConfig;
 use crate::serving::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
 
+/// How every Qwen chat model since Qwen3 delimits its reasoning.
+const THINK: ReasoningFormat = ReasoningFormat {
+    open: "<think>",
+    close: "</think>",
+};
+
 /// The model class of a Qwen3-MoE checkpoint.
 pub const QWEN3_MOE_CLASS: &str = "Qwen3MoeForCausalLM";
 
@@ -35,7 +41,7 @@ pub const QWEN3: Family = Family {
     root: RootFile::Config,
     classes: &[QWEN3_MOE_CLASS],
     serving: Serving::Chat(ChatProfile {
-        reasoning: Some(ReasoningFormat::Think),
+        reasoning: Some(THINK),
         tool_calls: Some(ToolCallFormat::Json),
         images: None,
     }),
@@ -48,7 +54,7 @@ pub const QWEN3_5_MOE: Family = Family {
     root: RootFile::Config,
     classes: &[QWEN3_5_MOE_CLASS],
     serving: Serving::Chat(ChatProfile {
-        reasoning: Some(ReasoningFormat::Think),
+        reasoning: Some(THINK),
         tool_calls: Some(ToolCallFormat::Xml),
         images: Some(&Images),
     }),
@@ -61,7 +67,7 @@ pub const QWEN4_EXP: Family = Family {
     root: RootFile::Config,
     classes: &["Qwen4ExpForConditionalGeneration"],
     serving: Serving::Chat(ChatProfile {
-        reasoning: Some(ReasoningFormat::Think),
+        reasoning: Some(THINK),
         tool_calls: Some(ToolCallFormat::Xml),
         images: Some(&Images),
     }),
@@ -110,7 +116,7 @@ mod tests {
             registry.resolve([(crate::RootFile::Config, config)]),
             Ok(QWEN4_EXP)
         );
-        assert_eq!(profile(QWEN4_EXP).reasoning, Some(ReasoningFormat::Think));
+        assert_eq!(profile(QWEN4_EXP).reasoning, Some(THINK));
         assert_eq!(profile(QWEN4_EXP).tool_calls, Some(ToolCallFormat::Xml));
     }
 
@@ -121,7 +127,7 @@ mod tests {
         assert_eq!(profile(QWEN3).tool_calls, Some(ToolCallFormat::Json));
         assert_eq!(profile(QWEN3_5_MOE).tool_calls, Some(ToolCallFormat::Xml));
         assert_eq!(profile(QWEN3).reasoning, profile(QWEN3_5_MOE).reasoning);
-        assert_eq!(ReasoningFormat::Think.delimiters(), ("<think>", "</think>"));
+        assert_eq!((THINK.open, THINK.close), ("<think>", "</think>"));
 
         assert!(profile(QWEN3).images.is_none());
         assert!(profile(QWEN3_5_MOE).images.is_some());

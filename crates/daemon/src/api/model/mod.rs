@@ -311,7 +311,10 @@ mod tests {
         root: RootFile::Config,
         classes: &["ChatForCausalLM"],
         serving: Serving::Chat(ChatProfile {
-            reasoning: Some(ReasoningFormat::Think),
+            reasoning: Some(ReasoningFormat {
+                open: "<think>",
+                close: "</think>",
+            }),
             tool_calls: Some(ToolCallFormat::Json),
             images: None,
         }),

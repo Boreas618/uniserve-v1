@@ -60,7 +60,10 @@ const CHAT: Family = Family {
     root: RootFile::Config,
     classes: &["ChatForCausalLM"],
     serving: Serving::Chat(ChatProfile {
-        reasoning: Some(ReasoningFormat::Think),
+        reasoning: Some(ReasoningFormat {
+            open: "<think>",
+            close: "</think>",
+        }),
         tool_calls: Some(ToolCallFormat::Json),
         images: None,
     }),
@@ -467,10 +470,12 @@ fn the_profile_declares_the_tool_call_format() {
         .unwrap();
 
         let parser = lowering.parser.unwrap();
+        let reasoning = parser.reasoning_delimiters.as_ref().unwrap();
         assert_eq!(
-            (parser.reasoning.as_str(), parser.tool_calls.as_str()),
-            ("think", "json")
+            (reasoning.open.as_str(), reasoning.close.as_str()),
+            ("<think>", "</think>")
         );
+        assert_eq!(parser.tool_calls, "json");
         let tools: serde_json::Value = serde_json::from_str(&parser.tools).unwrap();
         assert_eq!(tools[0]["function"]["name"], "weather");
     }

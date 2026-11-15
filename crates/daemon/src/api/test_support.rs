@@ -77,7 +77,10 @@ pub const CHAT: processing::Family = processing::Family {
     root: processing::RootFile::Config,
     classes: &["ChatForCausalLM"],
     serving: processing::Serving::Chat(processing::ChatProfile {
-        reasoning: Some(processing::ReasoningFormat::Think),
+        reasoning: Some(processing::ReasoningFormat {
+            open: "<think>",
+            close: "</think>",
+        }),
         tool_calls: Some(processing::ToolCallFormat::Json),
         images: None,
     }),

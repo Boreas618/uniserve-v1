@@ -37,19 +37,24 @@ fn qwen3(
     tokenizer: DynTokenizer,
     reasoning: bool,
 ) -> Result<ChatParser, Box<dyn std::error::Error + Send + Sync>> {
-    let named = |parsed: bool, name: &str| {
-        if parsed {
-            name.to_owned()
+    let parser = handoff::Parser {
+        reasoning_delimiters: reasoning.then(think),
+        tool_calls: if tools {
+            "json".to_owned()
         } else {
             String::new()
-        }
-    };
-    let parser = handoff::Parser {
-        reasoning: named(reasoning, "think"),
-        tool_calls: named(tools, "json"),
+        },
         tools: String::new(),
     };
     Ok(ChatParser::new(&parser, tokenizer)?)
+}
+
+/// The delimiters of reasoning written between `<think>` and `</think>`.
+fn think() -> handoff::ReasoningDelimiters {
+    handoff::ReasoningDelimiters {
+        open: "<think>".to_owned(),
+        close: "</think>".to_owned(),
+    }
 }
 
 /// Runs `processor` over `prompt` and `deltas`, then finishes it.
@@ -222,7 +227,7 @@ fn disabled_reasoning_parsing_streams_delimiters_as_content() -> TestResult {
 #[test]
 fn function_and_parameter_tags_become_typed_tool_calls() -> TestResult {
     let parser = handoff::Parser {
-        reasoning: "think".to_owned(),
+        reasoning_delimiters: Some(think()),
         tool_calls: "xml".to_owned(),
         tools: serde_json::json!([{
             "type": "function",

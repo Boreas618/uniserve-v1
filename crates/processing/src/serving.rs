@@ -16,10 +16,10 @@ pub enum Serving {
 
 /// The output formats a chat family's checkpoints write, and the image input it takes.
 ///
-/// A format is named for what the model writes, never for a model: request processing holds one
-/// parser per format, and several families may write one format. What a checkpoint's template
-/// instructs is the family's to state here; request processing does not read a template to
-/// find out.
+/// A format is stated for what the model writes, never for a model: request processing holds one
+/// parser per tool-call grammar and one reasoning parser, which reads the delimiters a family
+/// states, and several families may write one format. What a checkpoint's template instructs is
+/// the family's to state here; request processing does not read a template to find out.
 #[derive(Clone, Copy)]
 pub struct ChatProfile {
     /// How the model delimits its reasoning, when it reasons.
@@ -55,35 +55,17 @@ impl PartialEq for ChatProfile {
 
 impl Eq for ChatProfile {}
 
-/// A reasoning output format.
+/// A reasoning output format: the reasoning a model writes between two delimiters, each one token
+/// of the vocabulary.
+///
+/// The delimiters are the family's data, and request processing reads every family's reasoning
+/// with one parser parameterized by them; a response's handoff carries them as they are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReasoningFormat {
-    /// Reasoning between `<think>` and `</think>`, each one token of the vocabulary.
-    Think,
-}
-
-impl ReasoningFormat {
-    /// Every reasoning format.
-    pub const ALL: [Self; 1] = [Self::Think];
-
-    /// The format's name, which a response's handoff states it by.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Think => "think",
-        }
-    }
-
-    /// The format named `name` ([`Self::name`]); `None` for no format's name.
-    pub fn named(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|format| format.name() == name)
-    }
-
-    /// The text that opens a reasoning section and the text that closes it.
-    pub const fn delimiters(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Think => ("<think>", "</think>"),
-        }
-    }
+pub struct ReasoningFormat {
+    /// The text that opens a reasoning section.
+    pub open: &'static str,
+    /// The text that closes it.
+    pub close: &'static str,
 }
 
 /// A tool-call output format.

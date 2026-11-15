@@ -555,9 +555,10 @@ impl Processor {
             .filter(|_| profile.tool_calls.is_some());
 
         handoff::Parser {
-            reasoning: reasoning
-                .map(|format| format.name().to_owned())
-                .unwrap_or_default(),
+            reasoning_delimiters: reasoning.map(|format| handoff::ReasoningDelimiters {
+                open: format.open.to_owned(),
+                close: format.close.to_owned(),
+            }),
             tool_calls: profile
                 .tool_calls
                 .filter(|_| tools.is_some())

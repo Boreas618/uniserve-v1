@@ -187,15 +187,16 @@ message TextDecode {
 }
 
 // The output parsers of a request: the formats of its model family's chat
-// profile its output is read with, each by the name the request-processing
-// vocabulary gives it (`processing::ReasoningFormat::name`,
-// `processing::ToolCallFormat::name`), which this schema does not enumerate.
+// profile its output is read with: the delimiters of its reasoning, and its
+// tool-call format by the name the request-processing vocabulary gives it
+// (`processing::ToolCallFormat::name`), which this schema does not
+// enumerate.
 message Parser {
-  reserved 1, 2, 3;
-  reserved "kind", "parse_reasoning", "parse_tools";
-  // The reasoning format the output's reasoning is parsed in; empty when
-  // reasoning is not parsed.
-  string reasoning = 5;
+  reserved 1, 2, 3, 5;
+  reserved "kind", "parse_reasoning", "parse_tools", "reasoning";
+  // The delimiters the output's reasoning is written between
+  // (`processing::ReasoningFormat`); absent when reasoning is not parsed.
+  ReasoningDelimiters reasoning_delimiters = 7;
   // The tool-call format the output's tool calls are parsed in; empty when
   // tool calls are not parsed.
   string tool_calls = 6;
@@ -203,6 +204,13 @@ message Parser {
   // in: a parser that types a call's values by its tool's schema reads them.
   // Empty when tool calls are not parsed.
   string tools = 4;
+}
+
+// The text that opens a model's reasoning and the text that closes it, each
+// one token of the model's vocabulary.
+message ReasoningDelimiters {
+  string open = 1;
+  string close = 2;
 }
 
 // The OpenAI fields every chunk and the final body of a chat response carry.

@@ -16,7 +16,7 @@ use crate::api::output::chat::{AssistantBlockKind, Error, Result};
 use crate::api::output::reasoning::{DelimitedReasoningParser, ReasoningDelta};
 use crate::api::output::tools::{JsonToolParser, ToolParser, XmlToolParser};
 use crate::api::tokenizer::DynTokenizer;
-use processing::{ReasoningFormat, ToolCallFormat};
+use processing::ToolCallFormat;
 
 use super::tool::ToolStage;
 
@@ -57,12 +57,12 @@ pub struct ChatParser {
 }
 
 impl ChatParser {
-    /// The parsers `parser` states for a request: the parser of its reasoning format when
+    /// The parsers `parser` states for a request: the reasoning parser over its delimiters when
     /// reasoning is parsed, and the parser of its tool-call format when tool calls are.
     ///
     /// # Errors
     ///
-    /// Returns `Error::ParserInitialization` when a format's name is no format's, the
+    /// Returns `Error::ParserInitialization` when a tool-call format's name is no format's, the
     /// tokenizer lacks a reasoning delimiter as one token, or the request's tools are not the
     /// JSON array a request states.
     pub fn new(parser: &handoff::Parser, tokenizer: DynTokenizer) -> Result<Self> {
@@ -72,18 +72,20 @@ impl ChatParser {
             error: format!("no {kind} format is named {name:?}").into(),
         };
 
-        let reasoning = match parser.reasoning.as_str() {
-            "" => None,
-            name => {
-                let format =
-                    ReasoningFormat::named(name).ok_or_else(|| unknown("reasoning", name))?;
-                let (start, end) = format.delimiters();
-                let reasoning = DelimitedReasoningParser::new(tokenizer, start, end, false)
-                    .map_err(|error| Error::ParserInitialization {
-                        kind: "reasoning",
-                        name: format.name().to_owned(),
-                        error: Box::new(error),
-                    })?;
+        let reasoning = match &parser.reasoning_delimiters {
+            None => None,
+            Some(delimiters) => {
+                let reasoning = DelimitedReasoningParser::new(
+                    tokenizer,
+                    &delimiters.open,
+                    &delimiters.close,
+                    false,
+                )
+                .map_err(|error| Error::ParserInitialization {
+                    kind: "reasoning",
+                    name: format!("{} {}", delimiters.open, delimiters.close),
+                    error: Box::new(error),
+                })?;
                 Some(reasoning)
             }
         };
