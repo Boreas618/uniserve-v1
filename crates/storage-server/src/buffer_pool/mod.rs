@@ -659,12 +659,6 @@ impl BufferPool {
         }
     }
 
-    /// How long a transfer and a put to the remote store may take from now
-    /// on, in nanoseconds; the tasks under way keep their deadlines.
-    pub fn set_limits(&mut self, limits: (u64, u64)) {
-        self.limits = limits;
-    }
-
     /// Whether deferred work waits for a group's `completed` word: the
     /// buffer pool's thread then keeps reading the words.
     pub fn deferred(&self) -> bool {

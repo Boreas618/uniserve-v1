@@ -11,7 +11,7 @@
 //! before any input that follows a change of the clock, since the clock sets
 //! the deadlines of the tasks that start; each task handed to whoever runs
 //! it, each key a task reports done and each task's end; and what else the
-//! server tells the pool: the limits of tasks, an update committed or rolled
+//! server tells the pool: an update committed or rolled
 //! back, a peer's holds, a segment granted or withdrawn. A second file beside
 //! it keeps every completion the pool produced, in the order it produced
 //! them.
@@ -44,7 +44,6 @@ pub(super) const TICK: u8 = 5;
 pub(super) const START: u8 = 6;
 pub(super) const DONE: u8 = 7;
 pub(super) const ENDED: u8 = 8;
-pub(super) const LIMITS: u8 = 9;
 pub(super) const PUBLISH: u8 = 10;
 pub(super) const ROLL_BACK: u8 = 11;
 pub(super) const HOLD: u8 = 12;
@@ -73,8 +72,6 @@ pub(crate) enum Input {
     /// A task's next key is done, with the tokens its block holds.
     Done(Task, u16),
     Ended(Task, bool),
-    /// How long a transfer and a put to the remote store may take.
-    Limits((u64, u64)),
     /// The update of an epoch on trial is committed, or rolled back.
     Publish(u64),
     RollBack(u64),
@@ -136,11 +133,6 @@ impl Input {
                 tasked(&mut body, *task);
                 body.push(u8::from(*ok));
                 ENDED
-            }
-            Self::Limits((transfer, put)) => {
-                body.extend_from_slice(&transfer.to_le_bytes());
-                body.extend_from_slice(&put.to_le_bytes());
-                LIMITS
             }
             Self::Publish(epoch) | Self::RollBack(epoch) => {
                 body.extend_from_slice(&epoch.to_le_bytes());
@@ -364,7 +356,6 @@ mod tests {
             Input::Start(task),
             Input::Done(task, 64),
             Input::Ended(task, true),
-            Input::Limits((10, 11)),
             Input::Publish(12),
             Input::RollBack(13),
             Input::Hold(14, vec![Key([1; 32]), Key([2; 32])]),

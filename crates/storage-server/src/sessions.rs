@@ -77,6 +77,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use storage::ServerSettings;
 use storage::protocol::{
     Allocation, ErrorKind, Event, HostCopy, Key, Location, PageShape, Priority, Region, RegionPart,
     Response, Role, Segment, Span, StorageRecord, UnitRun,
@@ -93,14 +94,6 @@ use polling::{Copied, HostPart, NamedRun};
 
 #[cfg(doc)]
 use storage::protocol::Request;
-
-/// How long a transfer between worker groups may take unless the server's
-/// options say otherwise (`--transfer-deadline-s`).
-pub(crate) const TRANSFER_DEADLINE: Duration = Duration::from_secs(60);
-
-/// How long a put to the remote store may take unless the server's options
-/// say otherwise (`--put-deadline-s`).
-pub(crate) const PUT_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The tokens a block brought from the remote store holds: the store keeps
 /// no count, and it keeps whole blocks.
@@ -280,19 +273,12 @@ fn limits(transfer: Duration, put: Duration) -> (u64, u64) {
 }
 
 impl Sessions {
-    /// No session, and the buffer pool's thread started.
-    pub(crate) fn new() -> std::io::Result<Self> {
-        let limits = limits(TRANSFER_DEADLINE, PUT_DEADLINE);
-        Self::with(polling::Thread::start(limits, None)?)
-    }
-
-    /// How long a transfer between worker groups and a put to the remote
-    /// store may take from now on.
-    pub(crate) fn set_deadlines(&mut self, transfer: Duration, put: Duration) {
-        self.transfer_deadline = transfer;
-        self.put_deadline = put;
-        let limits = limits(transfer, put);
-        self.thread.send(move |pools| pools.set_limits(limits));
+    /// No session, and the buffer pool's thread started, its transfers between worker groups
+    /// and its puts to the remote store bounded as `settings` states
+    /// (`transfer_deadline_s`, `put_deadline_s`).
+    pub(crate) fn new(settings: &ServerSettings) -> std::io::Result<Self> {
+        let limits = limits(settings.transfer_deadline(), settings.put_deadline());
+        Self::with(polling::Thread::start(limits, None)?, settings)
     }
 
     /// From now on, records the trace of every buffer pool's inputs in the
@@ -302,7 +288,7 @@ impl Sessions {
         self.thread.send(move |pools| pools.watch(trace));
     }
 
-    fn with(thread: polling::Thread) -> std::io::Result<Self> {
+    fn with(thread: polling::Thread, settings: &ServerSettings) -> std::io::Result<Self> {
         Ok(Self {
             thread,
             open: BTreeMap::new(),
@@ -317,17 +303,21 @@ impl Sessions {
             next: 1,
             lost: Vec::new(),
             rolled: BTreeSet::new(),
-            transfer_deadline: TRANSFER_DEADLINE,
-            put_deadline: PUT_DEADLINE,
+            transfer_deadline: settings.transfer_deadline(),
+            put_deadline: settings.put_deadline(),
         })
     }
 
     /// Whether no pool task runs on a child and the buffer pool's thread
     /// is frozen with no task outstanding: a restart may hand it over.
-    pub(crate) fn quiet(&self) -> bool {
-        self.running.is_empty()
+    ///
+    /// # Errors
+    ///
+    /// The buffer pool's thread ended, so nothing can be handed over.
+    pub(crate) fn quiet(&self) -> std::io::Result<bool> {
+        Ok(self.running.is_empty()
             && self.lost.is_empty()
-            && self.thread.call(|pools| pools.quiet()).unwrap_or(true)
+            && self.thread.call(|pools| pools.quiet())?)
     }
 
     /// The sessions for a successor, with the queue pairs' descriptors; the
@@ -336,10 +326,7 @@ impl Sessions {
         &mut self,
         mut pidfd: impl FnMut(&Arc<OwnedFd>) -> usize,
     ) -> std::io::Result<(SessionsHandoff, Vec<OwnedFd>)> {
-        let (image, descriptors) = self
-            .thread
-            .call(|pools| pools.hand_off())
-            .ok_or_else(|| std::io::Error::other("the buffer pool's thread ended"))??;
+        let (image, descriptors) = self.thread.call(|pools| pools.hand_off())??;
         let handoff = SessionsHandoff {
             image,
             queues: descriptors.len(),
@@ -368,11 +355,12 @@ impl Sessions {
         handoff: SessionsHandoff,
         queues: Vec<OwnedFd>,
         pidfd: impl Fn(usize) -> std::io::Result<Arc<OwnedFd>>,
+        settings: &ServerSettings,
     ) -> std::io::Result<Self> {
         let image = Some((handoff.image, queues));
-        let limits = limits(TRANSFER_DEADLINE, PUT_DEADLINE);
+        let limits = limits(settings.transfer_deadline(), settings.put_deadline());
         let thread = polling::Thread::start(limits, image)?;
-        let mut sessions = Self::with(thread)?;
+        let mut sessions = Self::with(thread, settings)?;
         sessions.open = handoff.open.into_iter().collect();
         for (engine, (pool, indices)) in handoff.gone {
             let pidfds = indices
@@ -617,7 +605,7 @@ impl Server {
             .sessions
             .thread
             .call(move |pools| pools.open(&named, &layout))
-            .ok_or_else(|| resource(std::io::Error::other("the buffer pool's thread ended")))?;
+            .map_err(resource)?;
         let (pool, opened, descriptors) = opened.map_err(|refusal| invalid(&refusal))?;
         for region in new {
             self.sessions.hosts.insert(
@@ -694,7 +682,7 @@ impl Server {
         self.sessions
             .thread
             .call(move |pools| pools.grant(&named, &region_name, segment, first, units))
-            .ok_or_else(|| resource(std::io::Error::other("the buffer pool's thread ended")))?
+            .map_err(resource)?
             .map_err(|refusal| invalid(&format!("{region}: {refusal}")))?;
         // A region's memory is hundreds of segments of one granule a column each, granted one by
         // one: each is a debug line, and the head states what it granted at once.
@@ -724,7 +712,7 @@ impl Server {
         self.sessions
             .thread
             .call(move |pools| pools.withdraw(&named, &region_name, segment))
-            .ok_or_else(|| resource(std::io::Error::other("the buffer pool's thread ended")))?
+            .map_err(resource)?
             .map_err(|refusal| invalid(&format!("{region}: {refusal}")))?;
         tracing::debug!(
             deployment,
@@ -763,7 +751,7 @@ impl Server {
                     pools.roll_back(&named, epoch);
                 }
             })
-            .ok_or_else(|| resource(std::io::Error::other("the buffer pool's thread ended")))?;
+            .map_err(resource)?;
         Ok(Handling::Response(Response::Closed, Vec::new()))
     }
 
@@ -995,6 +983,16 @@ impl Server {
         Some((part.storage, storage.record.bytes))
     }
 
+    /// How many parts a unit of the host region `region` of `deployment` has, and the bytes of
+    /// a part; `None` for a region the deployment's sessions state no host region by. Admission
+    /// refused a part that does not divide its unit.
+    fn host_parts(&self, deployment: &str, region: &str) -> Option<(u32, u64)> {
+        let key = (deployment.to_owned(), region.to_owned());
+        let &(_, unit_bytes, part_bytes) = self.sessions.hosts.get(&key)?;
+        let count = u32::try_from(unit_bytes.checked_div(part_bytes)?).ok()?;
+        Some((count, part_bytes))
+    }
+
     /// Where the parts of the host region `region` of `deployment` lie, as
     /// far as this server knows, and how many parts a unit has. Each is
     /// stated by part (the index in their groups of the ranks that share it)
@@ -1009,14 +1007,9 @@ impl Server {
         session: Option<PoolSession>,
         region: &str,
     ) -> PartHosts {
-        let Some(&(_, unit_bytes, part_bytes)) = self
-            .sessions
-            .hosts
-            .get(&(deployment.to_owned(), region.to_owned()))
-        else {
+        let Some((count, part_bytes)) = self.host_parts(deployment, region) else {
             return (0, Vec::new());
         };
-        let count = u32::try_from(unit_bytes / part_bytes.max(1)).unwrap_or(u32::MAX);
 
         let mut hosts: Vec<(u32, Option<String>, u64)> = self
             .sessions
@@ -1073,14 +1066,9 @@ impl Server {
         if named.is_empty() {
             return self.part_hosts(deployment, session, region);
         }
-        let Some(&(_, unit_bytes, part_bytes)) = self
-            .sessions
-            .hosts
-            .get(&(deployment.to_owned(), region.to_owned()))
-        else {
+        let Some((count, part_bytes)) = self.host_parts(deployment, region) else {
             return (0, Vec::new());
         };
-        let count = u32::try_from(unit_bytes / part_bytes.max(1)).unwrap_or(u32::MAX);
 
         let placed = |(host, part): &HostPart| {
             let place = (
@@ -1171,7 +1159,7 @@ impl Server {
             .sessions
             .thread
             .call(move |pools| pools.hold(&named, id, &held))
-            .unwrap_or_default();
+            .map_err(resource)?;
 
         // Per region, whether its copies lie in named host parts, and the
         // parts the peer reads them from.
@@ -1221,7 +1209,7 @@ impl Server {
             .sessions
             .thread
             .call(move |pools| pools.release_peer(&named, id))
-            .unwrap_or(false);
+            .map_err(resource)?;
         let response = if held {
             Response::Valid
         } else {
@@ -1424,9 +1412,11 @@ impl Server {
         let started = if copies.iter().all(|(key, ..)| key.is_none()) {
             self.transfer_blocks(&session, number, &copies)
         } else if copies.iter().all(|(_, reads, ..)| reads.is_empty()) {
+            // Copies that read nothing are a prefetch's, whose request named its source.
             match source {
                 Some(Source::Remote) => self.move_pages(&session, number, &copies, false),
-                Some(Source::Peers) | None => self.read_from_peers(&session, number, &copies),
+                Some(Source::Peers) => self.read_from_peers(&session, number, &copies),
+                None => Err("a prefetch's task states no source".to_owned()),
             }
         } else {
             self.move_pages(&session, number, &copies, true)
@@ -1572,11 +1562,7 @@ impl Server {
         if let Some(running) = self.sessions.running.get_mut(&number) {
             running.waiting = parts;
         }
-        let port = self
-            .tcp
-            .as_ref()
-            .and_then(|(_, address)| address.rsplit_once(':'))
-            .and_then(|(_, port)| port.parse().ok());
+        let port = self.tcp.as_ref().map(|(_, address)| address.port());
         let mut failed = 0;
         for (endpoint, spans) in tasks {
             let Some(endpoint) = endpoint else {
@@ -1606,8 +1592,9 @@ impl Server {
                 }
             }
         }
-        for _ in 0..failed {
-            self.end_pool_task(number, false);
+        // The parts that could not start have ended, as failed.
+        if failed > 0 {
+            self.end_pool_parts(number, failed, false);
         }
         Ok(())
     }
@@ -1677,7 +1664,8 @@ impl Server {
         } else {
             running.parts.clone()
         };
-        let here = self.tcp.as_ref().map(|(_, address)| address.as_str());
+        let here = self.tcp_endpoint().map(|endpoint| endpoint.to_string());
+        let here = here.as_deref();
 
         // The block each copy is read into follows the encoding of the peer's
         // copy, which the buffer pool weighs against its class.
@@ -1694,10 +1682,20 @@ impl Server {
             Vec::new()
         } else {
             let deployment = session.0.clone();
-            self.sessions
+            let chosen = self
+                .sessions
                 .thread
-                .call(move |pools| pools.peer_copies(&deployment, task, &encodings))
-                .unwrap_or_default()
+                .call(move |pools| pools.peer_copies(&deployment, task, &encodings));
+            match chosen {
+                Ok(writes) => writes,
+                // The pools are gone with their thread: the read fails, which is all a notice's
+                // handler can answer.
+                Err(error) => {
+                    tracing::error!(%error, number, "a read from the peers has no blocks to fill");
+                    self.end_pool_task(number, false);
+                    return;
+                }
+            }
         };
 
         // By the host of the parts they write, `None` for this one: the spans,
@@ -1951,11 +1949,17 @@ impl Server {
     /// having copied everything when every part did. A read from the peers
     /// releases its holds first ([`Self::peers_released`]).
     pub(crate) fn end_pool_task(&mut self, number: u64, ok: bool) {
+        self.end_pool_parts(number, 1, ok);
+    }
+
+    /// `parts` of the pool task `number` ended, all well or not; the task ends with its last
+    /// part ([`Self::end_pool_task`]).
+    fn end_pool_parts(&mut self, number: u64, parts: usize, ok: bool) {
         let Some(running) = self.sessions.running.get_mut(&number) else {
             return;
         };
         running.ok &= ok;
-        running.waiting = running.waiting.saturating_sub(1);
+        running.waiting = running.waiting.saturating_sub(parts);
         if running.waiting > 0 {
             return;
         }

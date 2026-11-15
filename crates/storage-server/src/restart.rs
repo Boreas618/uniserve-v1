@@ -140,7 +140,8 @@ struct Handoff {
     socket: PathBuf,
     /// What the server serves with.
     settings: ::storage::Settings,
-    tcp: Option<String>,
+    /// The address the TCP listener for other hosts is bound to, whose descriptor travels.
+    tcp: Option<std::net::SocketAddr>,
     /// How many pidfds travel; holders and clients name theirs by index.
     pidfds: usize,
     clients: Vec<ClientHandoff>,
@@ -341,8 +342,13 @@ impl Server {
 
     /// Whether the restart under way may pass the server on now: its successor speaks the
     /// server's versions, and nothing is in flight.
-    pub(crate) fn ready_to_hand_over(&self) -> bool {
-        self.restart.as_ref().is_some_and(|pending| pending.agreed) && self.quiescent()
+    ///
+    /// # Errors
+    ///
+    /// The buffer pools' thread ended ([`Self::quiescent`]).
+    pub(crate) fn ready_to_hand_over(&self) -> io::Result<bool> {
+        let agreed = self.restart.as_ref().is_some_and(|pending| pending.agreed);
+        Ok(agreed && self.quiescent()?)
     }
 
     /// The descriptors the loop waits on for the restart under way: its handoff socket and its
@@ -358,8 +364,12 @@ impl Server {
     /// task (nor a lost connector may still run one), the buffer pools have
     /// no task outstanding, and every reply was
     /// written. The processes followed for a session pass over.
-    pub(crate) fn quiescent(&self) -> bool {
-        !self.shootdowns.killing()
+    ///
+    /// # Errors
+    ///
+    /// The buffer pools' thread ended, which leaves nothing to hand over.
+    pub(crate) fn quiescent(&self) -> io::Result<bool> {
+        Ok(!self.shootdowns.killing()
             && self.kv_storage.tasks.is_empty()
             && self.kv_storage.lost.is_empty()
             && self.transfers.tasks.is_empty()
@@ -367,7 +377,7 @@ impl Server {
             && self.clients.values().all(|client| {
                 !client.held && client.queue.is_empty() && !client.connection.wants_write()
             })
-            && self.sessions.quiet()
+            && self.sessions.quiet()?)
     }
 
     /// Passes everything to the successor of `pending`, and returns once it
@@ -712,7 +722,7 @@ impl Server {
         let queues = (0..handoff.sessions.queues)
             .map(|_| next())
             .collect::<io::Result<Vec<_>>>()?;
-        let sessions = Sessions::resume(handoff.sessions, queues, pidfd)?;
+        let sessions = Sessions::resume(handoff.sessions, queues, pidfd, &handoff.settings.server)?;
         let mut shootdowns = crate::shoot::ShootDowns::default();
         for index in handoff.shot_finished {
             shootdowns.note_finished(pidfd(index)?);
@@ -753,12 +763,7 @@ impl Server {
             stopping: None,
             settings: handoff.settings.clone(),
         };
-        let server_settings = &handoff.settings.server;
-        server.set_deadlines(
-            server_settings.transfer_deadline(),
-            server_settings.put_deadline(),
-        );
-        server.watch_pools(server_settings.buffer_pool_trace.clone());
+        server.watch_pools(handoff.settings.server.buffer_pool_trace.clone());
         tracing::info!(
             clients = server.clients.len(),
             tensors = server.tensors.len(),

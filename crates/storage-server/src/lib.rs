@@ -227,7 +227,7 @@ pub struct Server {
     listener: UnixListener,
     /// The TCP listener other hosts reach the server through (heads, peers
     /// and other hosts' Transfer Servers), with the address it is bound to.
-    tcp: Option<(TcpListener, String)>,
+    tcp: Option<(TcpListener, std::net::SocketAddr)>,
     clients: BTreeMap<ClientId, Client>,
     next_client: ClientId,
     storages: HashMap<StorageId, StorageEntry>,
@@ -301,18 +301,12 @@ impl Server {
             moves: moves::Moves::default(),
             events: Vec::new(),
             restart: None,
-            sessions: sessions::Sessions::new()?,
+            sessions: sessions::Sessions::new(&settings.server)?,
             readiness: None,
             stopping: None,
             settings,
         };
-        let server_settings = &server.settings.server;
-        let deadlines = (
-            server_settings.transfer_deadline(),
-            server_settings.put_deadline(),
-        );
-        let trace = server_settings.buffer_pool_trace.clone();
-        server.set_deadlines(deadlines.0, deadlines.1);
+        let trace = server.settings.server.buffer_pool_trace.clone();
         server.watch_pools(trace);
         Ok(server)
     }
@@ -328,19 +322,12 @@ impl Server {
     pub fn tcp_endpoint(&self) -> Option<service::Endpoint> {
         self.tcp
             .as_ref()
-            .and_then(|(_, address)| address.parse().ok())
-    }
-
-    /// How long a transfer between worker groups and a put to the remote
-    /// store may take before the buffer pools stop them, from now on; a
-    /// minute each unless set.
-    fn set_deadlines(&mut self, transfer: Duration, put: Duration) {
-        self.sessions.set_deadlines(transfer, put);
+            .map(|(_, address)| service::Endpoint::tcp(*address))
     }
 
     /// From now on, records the trace of every buffer pool's inputs in the
     /// directory `trace` (`specs/buffer-pool.md` §18;
-    /// [`buffer_pool::trace::replay`] replays it and checks the pool's tables after every input).
+    /// `buffer_pool::replay` replays it and checks the pool's tables after every input).
     pub fn watch_pools(&mut self, trace: Option<std::path::PathBuf>) {
         self.sessions.watch_pools(trace);
     }
@@ -353,9 +340,9 @@ impl Server {
     /// Fails when the listener's address cannot be read or it cannot be made non-blocking.
     pub fn listen_tcp(&mut self, listener: TcpListener) -> io::Result<service::Endpoint> {
         listener.set_nonblocking(true)?;
-        let bound = service::Endpoint::tcp(listener.local_addr()?);
-        self.tcp = Some((listener, bound.to_string()));
-        Ok(bound)
+        let address = listener.local_addr()?;
+        self.tcp = Some((listener, address));
+        Ok(service::Endpoint::tcp(address))
     }
 
     /// Serve until `stop` reads true. `stop` is checked after every wake;
@@ -372,7 +359,7 @@ impl Server {
     ) -> io::Result<Option<restart::Pending>> {
         while !stop() && self.stopping.is_none() {
             self.turn(wake)?;
-            if self.ready_to_hand_over() {
+            if self.ready_to_hand_over()? {
                 return Ok(self.restart.take());
             }
         }

@@ -563,6 +563,18 @@ impl BufferPool {
             if !names.insert(region.name.as_str()) {
                 return Err(format!("region {} is stated twice", region.name));
             }
+            // A unit is a whole number of parts, one per rank that holds a part of it, and a
+            // completion numbers parts by a word.
+            let parts = region.unit_bytes.checked_div(region.part_bytes);
+            if region.part_bytes == 0
+                || region.unit_bytes % region.part_bytes != 0
+                || parts.is_none_or(|parts| u32::try_from(parts).is_err())
+            {
+                return Err(format!(
+                    "region {} states parts of {} bytes, which do not divide its units of {} bytes",
+                    region.name, region.part_bytes, region.unit_bytes
+                ));
+            }
             // The units a layout asks for lie in the numbering it states; of a region the pool
             // holds, it gets those its own numbering has.
             let end = region.reserved.checked_add(region.units);

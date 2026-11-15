@@ -19,8 +19,8 @@ use storage::protocol::{Key, Segment};
 use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Stamps, Tier};
 
 use super::trace::{
-    CLOSE, COMPLETED, COMPLETION, DONE, ENDED, GRANT, HOLD, IMAGE, Input, LIMITS, OPEN,
-    PEER_COPIES, PUBLISH, RELEASE_PEER, REQUEST, ROLL_BACK, START, TICK, Task, WITHDRAW,
+    CLOSE, COMPLETED, COMPLETION, DONE, ENDED, GRANT, HOLD, IMAGE, Input, OPEN, PEER_COPIES,
+    PUBLISH, RELEASE_PEER, REQUEST, ROLL_BACK, START, TICK, Task, WITHDRAW,
 };
 use super::{Block, BufferPool, ClientId, Copy, Deferred, Held, Memories, QueueId, Target};
 
@@ -53,7 +53,6 @@ pub(crate) fn apply(pool: &mut BufferPool, input: &Input) -> Result<(), String> 
         Input::Start(_) => {}
         Input::Done(task, tokens) => pool.done(*task, *tokens),
         Input::Ended(task, ok) => pool.ended(*task, *ok),
-        Input::Limits(limits) => pool.set_limits(*limits),
         Input::Publish(epoch) => pool.commit_update(*epoch),
         Input::RollBack(epoch) => pool.roll_back(*epoch),
         Input::Hold(peer, keys) => {
@@ -329,7 +328,6 @@ pub(crate) fn stated_input(pool: &BufferPool, names: &SessionNames, input: &Inpu
         Input::Start(_) => "start".into(),
         Input::Done(..) => "done".into(),
         Input::Ended(_, ok) => format!("ended ok={}", u8::from(*ok)),
-        Input::Limits(_) => "limits".into(),
         Input::Publish(epoch) => format!("publish e=e{epoch}"),
         Input::RollBack(epoch) => format!("roll-back e=e{epoch}"),
         Input::Hold(..) => "hold".into(),
@@ -1130,10 +1128,6 @@ impl Input {
             START => Self::Start(task(body)?),
             DONE => Self::Done(task(body)?, u16::from_le_bytes(field(body)?)),
             ENDED => Self::Ended(task(body)?, field::<1>(body)? != [0]),
-            LIMITS => Self::Limits((
-                u64::from_le_bytes(field(body)?),
-                u64::from_le_bytes(field(body)?),
-            )),
             PUBLISH => Self::Publish(u64::from_le_bytes(field(body)?)),
             ROLL_BACK => Self::RollBack(u64::from_le_bytes(field(body)?)),
             HOLD => {

@@ -229,12 +229,15 @@ impl Thread {
     pub(crate) fn call<T: Send + 'static>(
         &self,
         work: impl FnOnce(&mut Pools) -> T + Send + 'static,
-    ) -> Option<T> {
+    ) -> io::Result<T> {
         let (sender, receiver) = mpsc::channel();
         self.send(move |pools| {
             let _ = sender.send(work(pools));
         });
-        receiver.recv().ok()
+        // The answer's channel closes unanswered only when the thread ended.
+        receiver
+            .recv()
+            .map_err(|_| io::Error::other("the buffer pool's thread ended"))
     }
 
     /// The descriptor that is readable when notices wait.
@@ -773,17 +776,6 @@ impl Pools {
     /// Sends the main loop a notice and wakes it.
     fn notify(&self, notice: Notice) {
         self.notifier.send(notice);
-    }
-
-    /// How long a transfer and a put to the remote store may take from now
-    /// on, in nanoseconds, in every pool.
-    pub(crate) fn set_limits(&mut self, limits: (u64, u64)) {
-        self.limits = limits;
-        for (deployment, hosted) in &mut self.deployments {
-            hosted.pool.set_limits(limits);
-            let input = || Input::Limits(limits);
-            hosted.watch.acted(deployment, input);
-        }
     }
 
     /// See [`BufferPool::grant_segment`], for the region `region` of the
