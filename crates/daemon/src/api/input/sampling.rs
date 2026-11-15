@@ -16,16 +16,20 @@ use crate::api::tokenizer::HuggingFaceTokenizer;
 /// Temperature, top-k, top-p, min-p and repetition penalty fall back to the
 /// model's defaults, then to the neutral value; every other control is the
 /// request's own. A streamed request's prompt logprobs are not computed: a
-/// stream chunk has no field for them.
+/// stream chunk has no field for them. `max_logprobs` is how many candidates of
+/// a position the workers compute, which a logprob count of the request may not
+/// exceed ([`logprob_count`]).
 ///
 /// # Errors
 ///
-/// Fails when a `logit_bias` key is not a token ID, a bad word cannot be
-/// tokenized or the parameters fail `SamplingParams::validate`.
+/// Fails when a `logit_bias` key is not a token ID, a logprob count asks for
+/// every candidate of the vocabulary, a bad word cannot be tokenized or the
+/// parameters fail `SamplingParams::validate`.
 pub(super) fn lower(
     request: &ChatCompletionRequest,
     defaults: &SamplingDefaults,
     tokenizer: &HuggingFaceTokenizer,
+    max_logprobs: u32,
 ) -> Result<SamplingParams, TokenizeError> {
     let logit_bias = logit_bias(request.logit_bias.as_ref())?;
     let logprobs = request
@@ -50,11 +54,11 @@ pub(super) fn lower(
         presence_penalty: request.presence_penalty.unwrap_or(0.0),
         logit_bias,
         return_logprobs: logprobs.is_some(),
-        n_logprobs: logprob_count(logprobs),
+        n_logprobs: logprob_count(logprobs, "top_logprobs", max_logprobs)?,
         return_prompt_logprobs: prompt_logprobs.is_some(),
-        n_prompt_logprobs: logprob_count(prompt_logprobs),
+        n_prompt_logprobs: logprob_count(prompt_logprobs, "prompt_logprobs", max_logprobs)?,
         allowed_token_ids: request.allowed_token_ids.clone(),
-        bad_words_ids: tokenize_bad_words(bad_words, tokenizer)?.unwrap_or_default(),
+        bad_words_ids: tokenize_bad_words(bad_words, tokenizer)?,
         ..SamplingParams::default()
     };
     sampling.validate()?;
@@ -87,85 +91,85 @@ fn logit_bias(
     Ok(pairs)
 }
 
-/// Converts a wire logprob count into the engine count.
+/// The engine's candidate count of the request field `parameter`, which states `value`.
 ///
-/// The chat request validation admits a non-negative count or `-1`, which
-/// asks for every candidate of the vocabulary and maps to `u32::MAX`; an
-/// absent count is zero. The deployment's `max_logprobs` then bounds the
-/// count (`GenerationLimits::covers_logprobs`), as vLLM's does: a deployment
-/// computes that many candidates a position, so a larger count, `-1`
-/// included, is refused.
-fn logprob_count(value: Option<i32>) -> u32 {
-    value.map_or(0, |value| u32::try_from(value).unwrap_or(u32::MAX))
+/// An absent count is zero, and a non-negative count is itself. `-1` asks for every candidate
+/// of the vocabulary, as OpenAI's and vLLM's APIs read it: the workers compute `max_logprobs`
+/// candidates of each position, a count fixed by their captured graphs, so no deployment
+/// computes the vocabulary and the request is refused naming the count it may ask for. A count
+/// above `max_logprobs` is refused by the workers' limits (`GenerationLimits::covers_logprobs`).
+///
+/// # Errors
+///
+/// `TokenizeError::InvalidParameter`, naming `parameter`, for `-1` or a count below it.
+fn logprob_count(
+    value: Option<i32>,
+    parameter: &'static str,
+    max_logprobs: u32,
+) -> Result<u32, TokenizeError> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    u32::try_from(value).map_err(|_| TokenizeError::InvalidParameter {
+        param: Some(parameter),
+        message: if value == -1 {
+            format!(
+                "{parameter} of -1 asks for every candidate of the vocabulary; this deployment \
+                 computes at most {max_logprobs} candidates of a position"
+            )
+        } else {
+            format!("{parameter} must be a non-negative value or -1")
+        },
+    })
 }
 
-/// Converts bad-word strings into sorted, deduplicated token-ID sequences.
+/// The token-ID sequences a request's bad words ban, sorted and deduplicated.
 ///
-/// Each word is encoded as written. It is also encoded with a single leading
-/// space (after trimming existing leading whitespace), and that non-empty
-/// variant is kept only when the as-written encoding is empty, or when both
-/// encodings have the same length and different first tokens. Empty
-/// encodings are dropped. Returns `None` when no sequence remains.
+/// A word is banned wherever it occurs as text: written as the request states it, and after a
+/// word boundary, where a tokenizer whose pre-tokenizer marks word starts (byte-level or
+/// metaspace) encodes it with its leading space. Each word therefore bans its encoding as
+/// written and its encoding with one leading space (its own leading whitespace replaced), the
+/// non-empty ones; the two are one sequence for a tokenizer that marks no word start.
 fn tokenize_bad_words(
     bad_words: &[String],
     tokenizer: &crate::api::tokenizer::HuggingFaceTokenizer,
-) -> std::result::Result<Option<Vec<Vec<u32>>>, crate::api::tokenizer::TokenizerError> {
-    if bad_words.is_empty() {
-        return Ok(None);
-    }
-    let mut all_token_ids = Vec::new();
+) -> std::result::Result<Vec<Vec<u32>>, crate::api::tokenizer::TokenizerError> {
+    let mut sequences = Vec::with_capacity(bad_words.len() * 2);
     for bad_word in bad_words {
-        let without_space = tokenizer.encode(bad_word, false)?;
-        let with_space = tokenizer.encode(&format!(" {}", bad_word.trim_start()), false)?;
-        let keep_with_space = !with_space.is_empty()
-            && (without_space.is_empty()
-                || (with_space[0] != without_space[0] && with_space.len() == without_space.len()));
-        if !without_space.is_empty() {
-            all_token_ids.push(without_space);
-        }
-        if keep_with_space {
-            all_token_ids.push(with_space);
-        }
+        sequences.push(tokenizer.encode(bad_word, false)?);
+        sequences.push(tokenizer.encode(&format!(" {}", bad_word.trim_start()), false)?);
     }
-    all_token_ids.sort();
-    all_token_ids.dedup();
-    Ok((!all_token_ids.is_empty()).then_some(all_token_ids))
+    sequences.retain(|sequence| !sequence.is_empty());
+    sequences.sort();
+    sequences.dedup();
+    Ok(sequences)
 }
 
 /// Resolves the effective `max_tokens` for generation.
 ///
-/// The request's `user_max_tokens` replaces `default_max_tokens` when set, and
-/// when `max_model_len` is known the result is capped by the remaining
-/// context, `max_model_len - prompt_len`. Returns `u32::MAX` when no limit is
-/// known.
+/// The request's `user_max_tokens` replaces `default_max_tokens` when set, and the result is
+/// capped by the remaining context, `max_model_len - prompt_len`.
 ///
 /// # Errors
 ///
-/// Returns `TokenizeError::PromptTooLong` when `max_model_len` is set and
-/// `prompt_len >= max_model_len`.
+/// Returns `TokenizeError::PromptTooLong` when `prompt_len >= max_model_len`: the prompt leaves
+/// no room for a generated token.
 pub(super) fn resolve_max_tokens(
     user_max_tokens: Option<u32>,
     default_max_tokens: Option<u32>,
-    max_model_len: Option<u32>,
+    max_model_len: u32,
     prompt_len: u32,
 ) -> Result<u32, TokenizeError> {
-    let model_max_tokens = match max_model_len {
-        Some(max_model_len) if prompt_len >= max_model_len => {
-            return Err(TokenizeError::PromptTooLong {
-                max_model_len,
-                prompt_len,
-            });
-        }
-        Some(max_model_len) => Some(max_model_len - prompt_len),
-        None => None,
-    };
-
-    let fallback_max_tokens = user_max_tokens.or(default_max_tokens);
-    Ok([fallback_max_tokens, model_max_tokens]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(u32::MAX))
+    let room = max_model_len
+        .checked_sub(prompt_len)
+        .filter(|room| *room > 0)
+        .ok_or(TokenizeError::PromptTooLong {
+            max_model_len,
+            prompt_len,
+        })?;
+    Ok(user_max_tokens
+        .or(default_max_tokens)
+        .map_or(room, |requested| requested.min(room)))
 }
 
 #[cfg(test)]
@@ -174,33 +178,45 @@ mod tests {
 
     #[test]
     fn resolve_max_tokens_caps_by_model_len() {
-        assert_eq!(
-            resolve_max_tokens(Some(150), None, Some(200), 100).unwrap(),
-            100
-        );
+        assert_eq!(resolve_max_tokens(Some(150), None, 200, 100).unwrap(), 100);
     }
 
     #[test]
     fn resolve_max_tokens_uses_default_when_user_omits() {
-        assert_eq!(
-            resolve_max_tokens(None, Some(64), Some(200), 100).unwrap(),
-            64
-        );
+        assert_eq!(resolve_max_tokens(None, Some(64), 200, 100).unwrap(), 64);
     }
 
+    /// A request that states no length, of a model that states no default, generates to the end
+    /// of the context.
     #[test]
-    fn resolve_max_tokens_no_limits_known_falls_back_to_u32_max() {
-        assert_eq!(resolve_max_tokens(None, None, None, 100).unwrap(), u32::MAX);
+    fn resolve_max_tokens_fills_the_context_without_a_stated_length() {
+        assert_eq!(resolve_max_tokens(None, None, 200, 100).unwrap(), 100);
     }
 
     #[test]
     fn resolve_max_tokens_prompt_too_long() {
         assert!(matches!(
-            resolve_max_tokens(Some(10), None, Some(100), 100),
+            resolve_max_tokens(Some(10), None, 100, 100),
             Err(TokenizeError::PromptTooLong {
                 max_model_len: 100,
                 prompt_len: 100,
             })
         ));
+    }
+
+    /// A bad word bans its encoding as written and at a word boundary, once each.
+    #[test]
+    fn a_bad_word_bans_its_encodings_as_written_and_after_a_space() {
+        let tokenizer = crate::api::test_support::configured_tokenizer();
+        let mut expected = ["ab", " ab", "  ab"]
+            .map(|text| tokenizer.encode(text, false).unwrap())
+            .to_vec();
+        expected.retain(|sequence| !sequence.is_empty());
+        expected.sort();
+        expected.dedup();
+
+        let banned = tokenize_bad_words(&["ab".to_owned(), "  ab".to_owned()], &tokenizer).unwrap();
+        assert_eq!(banned, expected);
+        assert!(tokenize_bad_words(&[], &tokenizer).unwrap().is_empty());
     }
 }

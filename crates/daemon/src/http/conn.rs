@@ -2932,6 +2932,7 @@ mod tests {
         let output = crate::api::output::OutputProcessor::new(
             configured_tokenizer(),
             lowering,
+            0,
             Box::new(Unrecorded(std::time::Instant::now())),
         )
         .expect("an output processor");

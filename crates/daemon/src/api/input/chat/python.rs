@@ -1,14 +1,113 @@
-//! Hugging Face-compatible JSON serialization filter for chat templates.
+//! The compatibility of the template environment with the Python Jinja that Hugging Face chat
+//! templates are written for, in one place.
 //!
-//! `build_environment` registers [`hf_tojson_filter`] as `tojson`, replacing
-//! MiniJinja's built-in filter of that name.
+//! [`install`] gives an environment the two Python behaviours templates depend on: Python's
+//! string and dict methods (`startswith`, `items`, ...), resolved by `minijinja_contrib`'s
+//! `pycompat` callback, and a `tojson` filter with Python `json.dumps` semantics
+//! ([`hf_tojson_filter`]), which replaces MiniJinja's built-in filter of that name. JSON objects a
+//! render passes to the template (tool parameter schemas, assistant tool-call arguments) are
+//! [`TemplateValue`]s, maps that keep their key order and leave every method call to the
+//! `pycompat` callback, as Python dicts behave.
 
-use minijinja::value::{Kwargs, ViaDeserialize};
-use minijinja::{Error as MinijinjaError, ErrorKind, Value};
-use serde::Deserialize;
+use std::sync::Arc;
+
+use indexmap::IndexMap;
+use minijinja::value::{Enumerator, Kwargs, Object, ObjectExt, ObjectRepr, ViaDeserialize};
+use minijinja::{Environment, Error as MinijinjaError, ErrorKind, State, Value};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use serde_json_fmt::{JsonFormat, JsonSyntaxError};
 use thiserror_ext::AsReport;
+
+/// Installs the Python compatibility of `env`: Python string and dict methods through
+/// `pycompat`, and the `json.dumps`-compatible `tojson` filter.
+///
+/// [`TemplateValue`]'s maps decline every method call, so `pycompat` answers dict methods such
+/// as `items` for them too.
+pub(super) fn install(env: &mut Environment<'_>) {
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_filter("tojson", hf_tojson_filter);
+}
+
+/// A wrapper around `Value` that can be constructed with `to_template_value` and used
+/// as a value in the chat template.
+///
+/// It serializes transparently as the wrapped value. When MiniJinja itself
+/// serializes the render context, `Value`'s `Serialize` impl passes
+/// the value through by handle, so its `TemplateMap` objects reach the template
+/// intact instead of being rebuilt as MiniJinja's default map.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub(super) struct TemplateValue(Value);
+
+/// Wraps a JSON value while preserving ordered-object template semantics.
+pub(super) fn to_template_value(value: JsonValue) -> TemplateValue {
+    TemplateValue(match value {
+        JsonValue::Array(values) => values
+            .into_iter()
+            .map(to_template_value)
+            .map(|value| value.0)
+            .collect::<Value>(),
+        JsonValue::Object(values) => Value::from_object(TemplateMap(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, to_template_value(value).0))
+                .collect(),
+        )),
+        // For primitive values, directly convert them to `Value` using `from_serialize`.
+        value => Value::from_serialize(value),
+    })
+}
+
+/// A custom map type that always returns `UnknownMethod` for method calls, so that pycompat can
+/// always handle dict methods through the unknown-method callback.
+///
+/// Uses `IndexMap` to preserve the original key order when iterating.
+///
+/// MiniJinja's default map can resolve a same-named field before Python dict methods. HF templates
+/// commonly call `dict.items`, which would fail if the map had an `items` field.
+#[derive(Debug)]
+struct TemplateMap(IndexMap<String, Value>);
+
+impl Object for TemplateMap {
+    /// Returns the template representation of the value.
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Map
+    }
+
+    /// Looks up a string key; any other key type is absent.
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        self.0.get(key.as_str()?).cloned()
+    }
+
+    /// Returns a named child value.
+    fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<Value> {
+        self.0.get(key).cloned()
+    }
+
+    /// Enumerates the keys in insertion order, as Python dict iteration does.
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        self.mapped_rev_enumerator(|this| {
+            Box::new(this.0.keys().map(|key| Value::from(key.as_str())))
+        })
+    }
+
+    /// Returns the number of enumerable elements.
+    fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
+        Some(self.0.len())
+    }
+
+    /// Rejects every method call as `UnknownMethod`, so the environment's
+    /// pycompat unknown-method callback handles dict methods such as `items`.
+    fn call_method(
+        self: &Arc<Self>,
+        _state: &State<'_, '_>,
+        _method: &str,
+        _args: &[Value],
+    ) -> std::result::Result<Value, MinijinjaError> {
+        Err(MinijinjaError::from(ErrorKind::UnknownMethod))
+    }
+}
 
 /// Serializes a template value using Hugging Face `tojson` semantics.
 ///
@@ -25,7 +124,7 @@ use thiserror_ext::AsReport;
 ///
 /// Fails on an unknown or mistyped kwarg, an `indent` or separator string that
 /// `serde_json_fmt` rejects, or a value that cannot be serialized as JSON.
-pub(super) fn hf_tojson_filter(
+fn hf_tojson_filter(
     ViaDeserialize(value): ViaDeserialize<JsonValue>,
     kwargs: Kwargs,
 ) -> std::result::Result<Value, MinijinjaError> {
@@ -173,11 +272,9 @@ mod tests {
     use minijinja::Environment;
     use serde_json::json;
 
-    use super::hf_tojson_filter;
-
     fn render(template: &str, payload: serde_json::Value) -> String {
         let mut env = Environment::new();
-        env.add_filter("tojson", hf_tojson_filter);
+        super::install(&mut env);
         env.render_str(template, json!({ "payload": payload }))
             .unwrap()
     }

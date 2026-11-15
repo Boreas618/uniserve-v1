@@ -1067,7 +1067,9 @@ mod tests {
                 |config: &mut ServerArgs| config.server_config.request_id_headers = true,
             ),
             ("chat_config", |config: &mut ServerArgs| {
-                config.chat_config.template = Some("{{messages}}".to_owned())
+                config.chat_config.template = Some(proto::config::ChatTemplateSource::Inline(
+                    "{{messages}}".to_owned(),
+                ))
             }),
             ("mm_processor_kwargs", |config: &mut ServerArgs| {
                 config

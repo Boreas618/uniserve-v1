@@ -61,98 +61,69 @@ fn is_var_or_elems_access(expr: &Expr, varname: &str, key: Option<&str>) -> bool
     }
 }
 
-/// Traverses a template AST and collects assignments and loops in encounter order.
-fn visit_stmt<'a>(
-    stmt: &'a Stmt<'a>,
-    assignments: &mut Vec<&'a Set<'a>>,
-    loops: &mut Vec<&'a ForLoop<'a>>,
-) {
-    match stmt {
-        Stmt::Template(t) => {
-            for child in &t.children {
-                visit_stmt(child, assignments, loops);
-            }
-        }
-        Stmt::ForLoop(fl) => {
-            loops.push(fl);
-            for child in &fl.body {
-                visit_stmt(child, assignments, loops);
-            }
-            for child in &fl.else_body {
-                visit_stmt(child, assignments, loops);
-            }
-        }
-        Stmt::IfCond(ic) => {
-            for child in &ic.true_body {
-                visit_stmt(child, assignments, loops);
-            }
-            for child in &ic.false_body {
-                visit_stmt(child, assignments, loops);
-            }
-        }
-        Stmt::WithBlock(wb) => {
-            for child in &wb.body {
-                visit_stmt(child, assignments, loops);
-            }
-        }
-        Stmt::Set(set_stmt) => assignments.push(set_stmt),
-        Stmt::SetBlock(sb) => {
-            for child in &sb.body {
-                visit_stmt(child, assignments, loops);
-            }
-        }
-        Stmt::AutoEscape(ae) => {
-            for child in &ae.body {
-                visit_stmt(child, assignments, loops);
-            }
-        }
-        Stmt::FilterBlock(fb) => {
-            for child in &fb.body {
-                visit_stmt(child, assignments, loops);
-            }
-        }
-        Stmt::Block(b) => {
-            for child in &b.body {
-                visit_stmt(child, assignments, loops);
-            }
-        }
-        Stmt::Macro(m) => {
-            for child in &m.body {
-                visit_stmt(child, assignments, loops);
-            }
-        }
-        Stmt::CallBlock(cb) => {
-            for child in &cb.macro_decl.body {
-                visit_stmt(child, assignments, loops);
-            }
-        }
-        _ => {}
+/// The statements of a template, each before the statements its bodies hold: the one traversal
+/// every analysis of this module reads.
+///
+/// Every statement that holds a body is descended into: loops (and their `else` bodies), both
+/// branches of a condition, `with`, `set` blocks, `autoescape` and `filter` blocks, blocks, and
+/// the bodies of macros and `call` blocks.
+fn statements<'a>(root: &'a Stmt<'a>) -> Vec<&'a Stmt<'a>> {
+    let mut statements = Vec::new();
+    let mut pending = vec![root];
+    while let Some(statement) = pending.pop() {
+        statements.push(statement);
+        let bodies: [&[Stmt<'a>]; 2] = match statement {
+            Stmt::Template(template) => [&template.children, &[]],
+            Stmt::ForLoop(for_loop) => [&for_loop.body, &for_loop.else_body],
+            Stmt::IfCond(if_cond) => [&if_cond.true_body, &if_cond.false_body],
+            Stmt::WithBlock(with_block) => [&with_block.body, &[]],
+            Stmt::SetBlock(set_block) => [&set_block.body, &[]],
+            Stmt::AutoEscape(auto_escape) => [&auto_escape.body, &[]],
+            Stmt::FilterBlock(filter_block) => [&filter_block.body, &[]],
+            Stmt::Block(block) => [&block.body, &[]],
+            Stmt::Macro(macro_stmt) => [&macro_stmt.body, &[]],
+            Stmt::CallBlock(call_block) => [&call_block.macro_decl.body, &[]],
+            _ => [&[], &[]],
+        };
+        // Pushed in reverse, so that the stack yields them in the template's order.
+        pending.extend(bodies.into_iter().flatten().rev());
     }
+    statements
 }
 
-/// Collects every `set` statement and `for` loop in the template.
-fn collect_assignments_and_loops<'a>(
-    root: &'a Stmt<'a>,
-) -> (Vec<&'a Set<'a>>, Vec<&'a ForLoop<'a>>) {
-    let mut assignments = Vec::new();
-    let mut loops = Vec::new();
-    visit_stmt(root, &mut assignments, &mut loops);
-    (assignments, loops)
+/// Every `set` statement of `statements`.
+fn assignments<'a>(statements: &[&'a Stmt<'a>]) -> Vec<&'a Set<'a>> {
+    statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Stmt::Set(set) => Some(&**set),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every `for` loop of `statements`.
+fn loops<'a>(statements: &[&'a Stmt<'a>]) -> Vec<&'a ForLoop<'a>> {
+    statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Stmt::ForLoop(for_loop) => Some(&**for_loop),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Finds variables transitively assigned from a source variable or its elements.
 ///
 /// Returns `varname` itself followed by every alias discovered breadth-first,
 /// e.g. `loop_messages` for `{% set loop_messages = messages[1:] %}`.
-fn iter_nodes_assign_var_or_elems(root: &Stmt<'_>, varname: &str) -> Vec<String> {
-    let (assignments, _) = collect_assignments_and_loops(root);
-
+fn aliases(assignments: &[&Set<'_>], varname: &str) -> Vec<String> {
     let mut discovered = vec![varname.to_string()];
     let mut seen = HashSet::from([varname.to_string()]);
     let mut related = VecDeque::from([varname.to_string()]);
 
     while let Some(related_varname) = related.pop_front() {
-        for assign in &assignments {
+        for assign in assignments {
             let Expr::Var(lhs) = &assign.target else {
                 continue;
             };
@@ -173,14 +144,12 @@ fn iter_nodes_assign_var_or_elems(root: &Stmt<'_>, varname: &str) -> Vec<String>
 }
 
 /// Finds loop variables that iterate over the template's message collection.
-fn iter_nodes_assign_messages_item(root: &Stmt<'_>) -> Vec<String> {
-    let message_varnames = iter_nodes_assign_var_or_elems(root, "messages");
-    let (_, loops) = collect_assignments_and_loops(root);
+fn message_items(statements: &[&Stmt<'_>]) -> Vec<String> {
+    let message_varnames = aliases(&assignments(statements), "messages");
 
     let mut discovered = Vec::new();
     let mut seen = HashSet::new();
-
-    for loop_ast in loops {
+    for loop_ast in loops(statements) {
         let Expr::Var(target) = &loop_ast.target else {
             continue;
         };
@@ -200,11 +169,8 @@ fn iter_nodes_assign_messages_item(root: &Stmt<'_>) -> Vec<String> {
 }
 
 /// Returns whether some loop iterates over a message item's `content`.
-fn has_content_item_loop(root: &Stmt<'_>) -> bool {
-    let message_varnames = iter_nodes_assign_messages_item(root);
-    let (_, loops) = collect_assignments_and_loops(root);
-
-    loops.into_iter().any(|loop_ast| {
+fn has_content_item_loop(statements: &[&Stmt<'_>], message_varnames: &[String]) -> bool {
+    loops(statements).into_iter().any(|loop_ast| {
         matches!(loop_ast.target, Expr::Var(_))
             && message_varnames
                 .iter()
@@ -246,67 +212,39 @@ fn expression_tests_content_string(expr: &Expr<'_>, message_varnames: &[String])
     }
 }
 
-/// Returns whether a statement subtree tests message content for string representation.
+/// Returns whether some `if` condition tests a message item's `content` with `is string`.
 ///
-/// Only `if` statement conditions are inspected; expressions in `set`
-/// statements, output blocks, and loop filters are not.
-fn statement_tests_content_string(stmt: &Stmt<'_>, message_varnames: &[String]) -> bool {
-    let children_test = |children: &[Stmt<'_>]| {
-        children
-            .iter()
-            .any(|child| statement_tests_content_string(child, message_varnames))
-    };
-    match stmt {
-        Stmt::Template(template) => children_test(&template.children),
-        Stmt::ForLoop(for_loop) => {
-            children_test(&for_loop.body) || children_test(&for_loop.else_body)
-        }
-        Stmt::IfCond(if_cond) => {
-            expression_tests_content_string(&if_cond.expr, message_varnames)
-                || children_test(&if_cond.true_body)
-                || children_test(&if_cond.false_body)
-        }
-        Stmt::WithBlock(with_block) => children_test(&with_block.body),
-        Stmt::SetBlock(set_block) => children_test(&set_block.body),
-        Stmt::AutoEscape(auto_escape) => children_test(&auto_escape.body),
-        Stmt::FilterBlock(filter_block) => children_test(&filter_block.body),
-        Stmt::Block(block) => children_test(&block.body),
-        Stmt::Macro(macro_stmt) => children_test(&macro_stmt.body),
-        Stmt::CallBlock(call_block) => children_test(&call_block.macro_decl.body),
+/// Only `if` statement conditions are inspected; expressions in `set` statements, output blocks
+/// and loop filters are not.
+fn has_content_string_test(statements: &[&Stmt<'_>], message_varnames: &[String]) -> bool {
+    statements.iter().any(|statement| match statement {
+        Stmt::IfCond(if_cond) => expression_tests_content_string(&if_cond.expr, message_varnames),
         _ => false,
-    }
+    })
 }
 
-/// Returns whether some `if` condition tests a message item's `content` with
-/// `is string`.
-fn has_content_string_test(root: &Stmt<'_>) -> bool {
-    let message_varnames = iter_nodes_assign_messages_item(root);
-    statement_tests_content_string(root, &message_varnames)
-}
+/// Detects the content format a Jinja chat template expects from its parsed form, read with the
+/// `whitespace` handling it compiles with.
+///
+/// # Errors
+///
+/// MiniJinja's parse error when the template does not parse: the format of a template that
+/// cannot compile is not guessed.
+pub(super) fn detect_chat_template_content_format(
+    template: &str,
+    whitespace: WhitespaceConfig,
+) -> Result<ChatTemplateContentFormat, minijinja::Error> {
+    let ast = parse(template, "chat", SyntaxConfig {}, whitespace)?;
+    let statements = statements(&ast);
+    let message_varnames = message_items(&statements);
 
-/// Detects the content format expected by a Jinja2 chat template from AST
-/// analysis.
-pub(super) fn detect_chat_template_content_format(template: &str) -> ChatTemplateContentFormat {
-    let ast = match parse(
-        template,
-        "template",
-        SyntaxConfig {},
-        WhitespaceConfig::default(),
-    ) {
-        Ok(ast) => ast,
-        // `CompiledChatTemplate::new` compiles the same source right after
-        // detection, so a template that fails to parse here fails renderer
-        // construction there.
-        Err(_) => return ChatTemplateContentFormat::String,
-    };
-
-    if has_content_item_loop(&ast) {
-        if has_content_string_test(&ast) {
+    Ok(if has_content_item_loop(&statements, &message_varnames) {
+        if has_content_string_test(&statements, &message_varnames) {
             ChatTemplateContentFormat::Preserve
         } else {
             ChatTemplateContentFormat::OpenAi
         }
     } else {
         ChatTemplateContentFormat::String
-    }
+    })
 }

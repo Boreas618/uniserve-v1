@@ -44,17 +44,13 @@ impl StreamClock {
         }
     }
 
-    /// Continues the clock `state` records, whose response entered the server
-    /// at `started_unix_us` and took `compile_us` to reach the engine.
-    pub(super) fn resume(
-        state: &proto::handoff::Assembly,
-        started_unix_us: u64,
-        compile_us: u64,
-    ) -> Self {
+    /// Continues the clock `state` records: when its response entered the server, how long it
+    /// took to reach the engine and the timings measured since.
+    pub(super) fn resume(state: &proto::handoff::Assembly) -> Self {
         Self {
-            started: started_instant(started_unix_us),
-            started_unix_us,
-            compile_us,
+            started: started_instant(state.started_unix_us),
+            started_unix_us: state.started_unix_us,
+            compile_us: state.compile_us,
             queue_us: state.queue_us,
             first_visible_output_us: state.first_visible_output_us,
         }
@@ -64,17 +60,8 @@ impl StreamClock {
     pub(super) fn state(&self, assembly: &mut proto::handoff::Assembly) {
         assembly.queue_us = self.queue_us;
         assembly.first_visible_output_us = self.first_visible_output_us;
-    }
-
-    /// How long the request took to reach the engine, in microseconds.
-    pub(super) fn compile_us(&self) -> u64 {
-        self.compile_us
-    }
-
-    /// When the request entered the server, in microseconds since the UNIX
-    /// epoch.
-    pub(super) fn started_unix_us(&self) -> u64 {
-        self.started_unix_us
+        assembly.started_unix_us = self.started_unix_us;
+        assembly.compile_us = self.compile_us;
     }
 
     /// Records the queue wait from the engine's scheduling timestamps, in

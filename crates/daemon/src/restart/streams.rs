@@ -415,9 +415,9 @@ fn take_over(
                 chat.consumed_events,
             )?;
             let started = crate::api::output::started_instant(
-                chat.lowering
+                chat.assembly
                     .as_ref()
-                    .map_or(0, |lowering| lowering.started_unix_us),
+                    .map_or(0, |assembly| assembly.started_unix_us),
             );
             let stats = leader.stat_logger(&request_id, chat.engine_replica, started);
             let run = crate::api::openai::run::GenerationRun::resume_stream(
@@ -437,9 +437,9 @@ fn take_over(
                 chat.consumed_events,
             )?;
             let started = crate::api::output::started_instant(
-                chat.lowering
+                chat.assembly
                     .as_ref()
-                    .map_or(0, |lowering| lowering.started_unix_us),
+                    .map_or(0, |assembly| assembly.started_unix_us),
             );
             let stats = leader.stat_logger(&request_id, chat.engine_replica, started);
             let run = crate::api::openai::run::GenerationRun::resume_collection(

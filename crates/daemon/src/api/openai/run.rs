@@ -604,12 +604,11 @@ mod tests {
             logprobs,
             parser: Some(parser),
             response: Some(response(logprobs)),
-            compile_us: 7,
-            started_unix_us: 0,
         };
         let output = OutputProcessor::new(
             crate::api::test_support::configured_tokenizer(),
             lowering,
+            7,
             Box::new(Unrecorded(std::time::Instant::now())),
         )
         .unwrap();

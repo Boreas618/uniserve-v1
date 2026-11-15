@@ -2,20 +2,15 @@
 //!
 //! The integration cases cover content-shape detection under
 //! `None`, byte-exact rendering of prior
-//! assistant turns through the Qwen3 template, and key-order-preserving
+//! assistant turns through the ChatML template, and key-order-preserving
 //! tool-argument formatting with `serde_json`-normalized numbers.
 
 use std::collections::HashMap;
 
-use crate::api::input::chat::{GenerationPromptMode, HfChatRenderer};
+use crate::api::input::chat::{CHATML_TEMPLATE, GenerationPromptMode, HfChatRenderer};
 use crate::api::protocol::{ChatCompletionRequest, ChatMessage};
 use crate::api::test_support::chat;
 use proto::config::ChatTemplateContentFormat;
-
-const QWEN3_TEMPLATE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/templates/qwen3.jinja"
-));
 
 /// Renders `request` for a new assistant turn.
 fn hf_render(
@@ -75,7 +70,7 @@ fn auto_detection_treats_direct_content_loop_template_as_openai() {
     assert_eq!(rendered, "a|b|");
 }
 
-fn qwen_history() -> ChatCompletionRequest {
+fn chat_history() -> ChatCompletionRequest {
     base_request(vec![
         chat::user("What is the capital of France?"),
         chat::assistant("The capital of France is Paris."),
@@ -84,9 +79,9 @@ fn qwen_history() -> ChatCompletionRequest {
 }
 
 #[test]
-fn qwen3_preserves_prior_assistant_completion_text_byte_identically() {
-    let request = qwen_history();
-    let rendered = hf_render(QWEN3_TEMPLATE, None, &request);
+fn chatml_preserves_prior_assistant_completion_text_byte_identically() {
+    let request = chat_history();
+    let rendered = hf_render(CHATML_TEMPLATE, None, &request);
 
     // The prior assistant turn's visible completion text must survive
     // intact inside the rendered prompt, framed by the assistant turn markers.

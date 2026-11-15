@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 
-use crate::api::input::chat::HfChatRenderer;
+use crate::api::input::chat::{CHATML_TEMPLATE, HfChatRenderer};
 use crate::api::input::media::ImageInput;
 use crate::api::input::{ModelResolutionError, Processor, RequestRenderer};
 use crate::api::model::ModelConfig;
@@ -384,12 +384,6 @@ fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
     }
 }
 
-/// Qwen3 chat template shipped by Qwen3 and Qwen3-MoE checkpoints; it asks for
-/// JSON tool calls inside `<tool_call>` lines.
-const QWEN3_TEMPLATE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/templates/qwen3.jinja"
-));
 /// A template whose tool instruction shows function and parameter tags
 /// instead of JSON objects.
 const XML_CALL_TEMPLATE: &str = "{%- if tools -%}<|im_start|>system\n# Tools\n<tools>{%- for tool in tools -%}{{ tool | tojson }}{%- endfor -%}</tools>\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter>\nvalue\n</parameter>\n</function>\n</tool_call><|im_end|>\n{%- endif -%}{%- for message in messages -%}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}";
@@ -458,7 +452,7 @@ fn the_profile_declares_the_tool_call_format() {
             "parameters": {"type": "object", "properties": {}}
         }}]
     });
-    for template in [QWEN3_TEMPLATE, XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
+    for template in [CHATML_TEMPLATE, XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
         let processor = with_template("ChatForCausalLM", template);
         assert!(processor.supports_tool_calling(), "{template}");
         let (_, lowering) = preprocess_chat(
@@ -484,7 +478,7 @@ fn the_profile_declares_the_tool_call_format() {
     let mut withheld = tool_request.clone();
     withheld["tool_choice"] = serde_json::json!("none");
     let (_, lowering) = preprocess_chat(
-        &with_template("ChatForCausalLM", QWEN3_TEMPLATE),
+        &with_template("ChatForCausalLM", CHATML_TEMPLATE),
         String::from("no-tools"),
         serde_json::from_value(withheld).unwrap(),
         Vec::new(),
@@ -545,7 +539,7 @@ fn tool_calling_follows_the_familys_declared_format() {
 /// same cache partition, which is what lets the prefix cache serve it.
 #[test]
 fn a_harness_conversation_grows_by_its_new_turns() {
-    let processor = with_template("ChatForCausalLM", QWEN3_TEMPLATE);
+    let processor = with_template("ChatForCausalLM", CHATML_TEMPLATE);
     let turn = |messages: serde_json::Value| {
         let request = serde_json::json!({
             "model": SERVED_MODEL,
@@ -620,7 +614,7 @@ fn a_harness_conversation_grows_by_its_new_turns() {
 /// which a deployment here does not have.
 #[test]
 fn a_tool_choice_that_needs_constrained_decoding_is_refused() {
-    let processor = with_template("ChatForCausalLM", QWEN3_TEMPLATE);
+    let processor = with_template("ChatForCausalLM", CHATML_TEMPLATE);
     for choice in [
         serde_json::json!("required"),
         serde_json::json!({"type": "function", "function": {"name": "weather"}}),
@@ -789,11 +783,9 @@ fn an_image_part_becomes_a_vision_block_in_place_of_its_placeholder() {
         Some(ChatTemplateContentFormat::String),
     )
     .unwrap()
-    .with_multimodal(Some(
-        crate::api::input::chat::template::MultimodalRenderInfo {
-            placeholder_token: "<|vision_start|><|image_pad|><|vision_end|>".to_owned(),
-        },
-    ));
+    .with_multimodal(Some(crate::api::input::chat::MultimodalRenderInfo {
+        placeholder_token: "<|vision_start|><|image_pad|><|vision_end|>".to_owned(),
+    }));
     let processor = Processor::new(
         loaded.config().clone(),
         Arc::clone(&tokenizer),

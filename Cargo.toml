@@ -113,8 +113,6 @@ axum = { version = "0.8.4", features = ["multipart"] }
 base64 = "0.22.1"
 # Byte views of plain numeric slices handed to device copies.
 bytemuck = "1.25.0"
-# Stable 64-bit FNV-1a, which keys pages and cache isolation across builds.
-fnv = "1.0.7"
 bitflags = { version = "2.10.0", features = ["serde"] }
 bytes = "1.11.1"
 clap = { version = "4.5.38", features = ["derive", "env"] }

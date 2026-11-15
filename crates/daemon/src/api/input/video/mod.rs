@@ -37,6 +37,7 @@
 mod encodings;
 pub mod probe;
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use processing::{InputError, Length, Reference, ReferenceKind, VideoProcessor, VideoSpec};
@@ -45,8 +46,8 @@ use proto::request::{DiffusionRequest, DiffusionSamplingParams, RequestId, Traje
 use proto::video::{Canvas, Conditions};
 use serde_json::{Value, json};
 
-use crate::api::input::ServeError;
 use crate::api::input::media::{FetchedMedia, MediaConnector};
+use crate::api::input::{ServeError, TokenizeError};
 use crate::api::protocol::{Seconds, VideoGenerationRequest, request_field_names};
 use crate::api::tokenizer::DynTokenizer;
 use proto::config::MediaConfig;
@@ -117,7 +118,7 @@ fn parse_size(size: &str) -> Result<Canvas, InputError> {
         .ok_or_else(|| {
             InputError::invalid(
                 "size",
-                format!("{size:?} is not WxH in pixels, such as 1344x768"),
+                format!("{size:?} is not WxH: a width and a height in pixels, each positive"),
             )
         })
 }
@@ -129,14 +130,14 @@ pub struct ProcessedVideo {
     pub size: Canvas,
     /// The frames generated.
     pub num_frames: u32,
-    /// The output's frame rate.
-    pub fps: u32,
+    /// The output's frame rate, in frames per second.
+    pub fps: NonZeroU32,
 }
 
 impl ProcessedVideo {
     /// The generated duration, in seconds.
     pub fn seconds(&self) -> f64 {
-        f64::from(self.num_frames) / f64::from(self.fps.max(1))
+        f64::from(self.num_frames) / f64::from(self.fps.get())
     }
 }
 
@@ -207,8 +208,8 @@ impl VideoService {
     /// # Errors
     ///
     /// Returns `ServeError::Video` naming the parameter at fault, or failing when processing's
-    /// own resources or the memory file fail, and `ServeError::ContextLengthExceeded` for a
-    /// prompt longer than the prompt capacity.
+    /// own resources or the memory file fail, and `TokenizeError::PromptTooLong` for a prompt
+    /// longer than the prompt capacity.
     pub async fn process(
         &self,
         request_id: &str,
@@ -241,16 +242,22 @@ impl VideoService {
         let processor = Arc::clone(&self.processor);
         let tokenizer = Arc::clone(&self.tokenizer);
         let request_id = request_id.to_owned();
+        let priority = request.priority.unwrap_or(0);
         tokio::task::spawn_blocking(move || {
             let input = processor.process(&spec, &probes, &*tokenizer)?;
-            if input.prompt_token_ids.len() > max_prompt_tokens as usize {
-                return Err(ServeError::ContextLengthExceeded {
+            let prompt_len = u32::try_from(input.prompt_token_ids.len()).map_err(|_| {
+                InputError::Internal("a prompt of more tokens than a u32 counts".into())
+            })?;
+            if prompt_len > max_prompt_tokens {
+                return Err(ServeError::Tokenize {
                     request_id,
-                    prompt_tokens: input.prompt_token_ids.len(),
-                    max_tokens: max_prompt_tokens,
+                    source: TokenizeError::PromptTooLong {
+                        max_model_len: max_prompt_tokens,
+                        prompt_len,
+                    },
                 });
             }
-            submission(input, &media)
+            submission(input, &media, priority)
         })
         .await
         .unwrap_or_else(|error| {
@@ -259,10 +266,12 @@ impl VideoService {
     }
 }
 
-/// The engine request of `input`, holding each reference's media in a sealed memory file.
+/// The engine request of `input` at scheduler `priority`, holding each reference's media in a
+/// sealed memory file.
 fn submission(
     input: processing::VideoInput,
     media: &[FetchedMedia],
+    priority: i32,
 ) -> Result<(DiffusionRequest, ProcessedVideo), ServeError> {
     // Each reference's media reaches the engine's media reader beside the request.
     let mut copies = Vec::with_capacity(media.len());
@@ -311,7 +320,7 @@ fn submission(
             .map(|condition| condition.extent())
             .collect(),
         conditioning: conditions.encode(),
-        priority: 0,
+        priority,
         sampling: DiffusionSamplingParams {
             num_frames: input.num_frames,
             video_units: input.video_units,
@@ -328,7 +337,9 @@ fn submission(
     let video = ProcessedVideo {
         size: input.size,
         num_frames: input.num_frames,
-        fps: input.fps,
+        fps: NonZeroU32::new(input.fps).ok_or_else(|| {
+            InputError::Internal("the processor states an output of no frame rate".into())
+        })?,
     };
     Ok((request, video))
 }
@@ -340,8 +351,6 @@ mod tests {
     use serde_json::Value;
 
     use super::{ServeError, VideoGenerationRequest};
-    use crate::api::input::processor::pipeline_tokenizer;
-    use crate::api::model::assets::PipelineCheckpoint;
     use crate::api::test_support::test_video_service;
 
     fn request(body: Value) -> VideoGenerationRequest {
@@ -460,55 +469,5 @@ mod tests {
             panic!("the request is refused");
         };
         assert_eq!(param, "seconds");
-    }
-
-    /// The request vectors MiniMax-H3's request rules are tested against, generated from the
-    /// diffusers reference.
-    fn vectors() -> Value {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../processing/src/minimax_h3/vectors.json"
-        );
-        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
-    }
-
-    /// A MiniMax-H3 checkpoint's tokenizer, loaded as the server loads a pipeline's
-    /// (`UNISERVE_MINIMAX_H3_MODEL` names the checkpoint root), encodes every text the vectors
-    /// present to the reference's token ids and resolves the vision markers and placeholders to
-    /// the reference's ids.
-    #[tokio::test]
-    #[ignore = "requires UNISERVE_MINIMAX_H3_MODEL: the root of a MiniMax-H3 checkpoint"]
-    async fn a_pipeline_tokenizer_matches_the_reference() {
-        use processing::Vocabulary as _;
-
-        let root = std::env::var("UNISERVE_MINIMAX_H3_MODEL")
-            .expect("UNISERVE_MINIMAX_H3_MODEL must name the root of a MiniMax-H3 checkpoint");
-        let pipeline = PipelineCheckpoint::resolve(&root).await.unwrap().unwrap();
-        let tokenizer = pipeline_tokenizer(&pipeline).await.unwrap();
-        let fixture = vectors();
-        for (token, id) in fixture["tokens"].as_object().unwrap() {
-            assert_eq!(
-                tokenizer.token_id(token).map(u64::from),
-                id.as_u64(),
-                "{token}"
-            );
-        }
-        for case in fixture["requests"].as_array().unwrap() {
-            let Some(expected) = case.get("expected") else {
-                continue;
-            };
-            for segment in expected["segments"].as_array().unwrap() {
-                let Some(text) = segment.get("text") else {
-                    continue;
-                };
-                let ids: Vec<u64> =
-                    processing::Vocabulary::encode(&tokenizer, text.as_str().unwrap())
-                        .unwrap()
-                        .into_iter()
-                        .map(u64::from)
-                        .collect();
-                assert_eq!(Value::from(ids), segment["token_ids"], "{}", case["name"]);
-            }
-        }
     }
 }

@@ -167,11 +167,9 @@ message Lowering {
   Parser parser = 5;
   // The response's OpenAI fields.
   ChatResponseOptions response = 6;
-  // How long the request took to reach the engine, in microseconds.
-  uint64 compile_us = 7;
-  // When the request entered the server, as microseconds since the UNIX
-  // epoch: the origin of every timing the response reports.
-  uint64 started_unix_us = 8;
+  // The response's clock is its assembly's (`Assembly.started_unix_us`).
+  reserved 7, 8;
+  reserved "compile_us", "started_unix_us";
 }
 
 // Incremental detokenization and stop strings of one generation.
@@ -389,10 +387,15 @@ message Assembly {
   reserved 5, 6;
   reserved "images", "image_steps";
   // Timing of the request's first visible output, in microseconds since
-  // `Lowering.started_unix_us`.
+  // `started_unix_us`.
   optional uint64 first_visible_output_us = 7;
   // The engine's queue wait, in microseconds.
   optional uint64 queue_us = 8;
+  // When the request entered the server, as microseconds since the UNIX
+  // epoch: the origin of every timing the response reports.
+  uint64 started_unix_us = 9;
+  // How long the request took to reach the engine, in microseconds.
+  uint64 compile_us = 10;
 }
 
 // A text-like block being assembled.

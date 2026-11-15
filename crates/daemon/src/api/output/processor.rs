@@ -47,8 +47,9 @@ pub struct OutputProcessor {
 impl OutputProcessor {
     /// The output processor of the request `lowering` describes, before any engine event.
     ///
-    /// `stats` records the request's statistics; the instant it started at is the origin of
-    /// the timings the response reports.
+    /// `compile_us` is how long the request took to reach the engine, in microseconds, and `stats`
+    /// records the request's statistics; the instant it started at is the origin of the timings
+    /// the response reports.
     ///
     /// # Errors
     ///
@@ -57,6 +58,7 @@ impl OutputProcessor {
     pub fn new(
         tokenizer: DynTokenizer,
         lowering: handoff::Lowering,
+        compile_us: u64,
         stats: Box<dyn Stats>,
     ) -> Result<Self, OutputError> {
         let handoff::Lowering {
@@ -66,8 +68,6 @@ impl OutputProcessor {
             logprobs,
             parser,
             response,
-            compile_us,
-            started_unix_us: _,
         } = lowering;
         let response = response.unwrap_or_default();
         let parser = parser.unwrap_or_default();
@@ -149,7 +149,7 @@ impl OutputProcessor {
             decode,
             parsers: chat,
             blocks,
-            clock: StreamClock::resume(assembly, lowering.started_unix_us, lowering.compile_us),
+            clock: StreamClock::resume(assembly),
             stats,
             ended: false,
         })
@@ -303,8 +303,6 @@ impl OutputProcessor {
             logprobs: self.logprobs,
             parser: Some(self.parser.clone()),
             response: Some(self.response.clone()),
-            compile_us: self.clock.compile_us(),
-            started_unix_us: self.clock.started_unix_us(),
         }
     }
 

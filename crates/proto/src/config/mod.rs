@@ -894,8 +894,8 @@ pub enum ReasoningParser {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChatConfig {
-    /// Chat template, as a file path or the template itself.
-    pub template: Option<String>,
+    /// The chat template every chat request renders with, in place of the checkpoint's own.
+    pub template: Option<ChatTemplateSource>,
     /// Keyword arguments bound into every chat-template render.
     pub template_kwargs: Option<HashMap<String, Value>>,
     /// How message content renders: `auto`, `string` or `openai`.
@@ -904,6 +904,18 @@ pub struct ChatConfig {
     /// `auto` splits `reasoning_content` from `content`; `none` streams
     /// reasoning delimiters as content.
     pub reasoning_parser: ReasoningParser,
+}
+
+/// Where a configured chat template's Jinja source comes from (`chat_config.template`): a file,
+/// `{ file = "/srv/templates/chat.jinja" }`, or the source itself,
+/// `{ inline = "{{ messages[0].content }}" }`. Either is the template exactly as written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChatTemplateSource {
+    /// A file holding the template's Jinja source.
+    File(PathBuf),
+    /// The template's Jinja source.
+    Inline(String),
 }
 
 /// The time one input image's fetch may take when the deployment states none

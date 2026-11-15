@@ -138,7 +138,7 @@ async fn videos_sync(
             format!("{}x{}", processed.size.width, processed.size.height),
         )
         .header("x-video-num-frames", processed.num_frames)
-        .header("x-video-fps", processed.fps);
+        .header("x-video-fps", processed.fps.get());
     if let Some(timing) = clock.finish() {
         response = response
             .header(
@@ -186,6 +186,10 @@ fn part_value(name: &'static str, kind: FieldKind, text: String) -> Result<Value
             .parse::<u64>()
             .map(Value::from)
             .map_err(|_| invalid("must be an unsigned integer")),
+        FieldKind::Integer => text
+            .parse::<i64>()
+            .map(Value::from)
+            .map_err(|_| invalid("must be an integer")),
         FieldKind::Number => text
             .trim()
             .parse::<f64>()
@@ -295,7 +299,7 @@ async fn videos_create(
         expires_at: None,
         seconds: format!("{}", prepared.seconds()),
         num_frames: prepared.num_frames,
-        fps: prepared.fps,
+        fps: prepared.fps.get(),
         size: format!("{}x{}", prepared.size.width, prepared.size.height),
         status: "queued".to_owned(),
         phase: "queued".to_owned(),

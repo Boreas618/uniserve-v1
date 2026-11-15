@@ -9,7 +9,7 @@
 //! | --- | --- | --- |
 //! | retained weights | the weight's canonical text (`nn::WeightKey`): the identity of each checkpoint file it is read from, the element type, the layout name the reading operator declares and its region of the logical tensor | [`weight`], one copy per GPU [`device_weight`] |
 //! | exclusive storages (KV cache segments, buffers, latent buffers) | the owner's scope, the storage's name, the epoch that created it, its bytes and its GPU | [`exclusive`] |
-//! | KV pages, recurrent-state checkpoints | the chain of the group's pages before it, the group, the modality and the page's tokens, rooted at the group's page seed (what computes the pages and how they are laid out, [`page_seed`]) and the request's isolation key | [`page_root`], [`page_key`] |
+//! | KV pages, recurrent-state checkpoints | the chain of the group's pages before it, the group, the modality and the page's tokens, rooted at the group's page seed (what computes the pages and how they are laid out, [`page_seed`]) and the request's isolation key (its cache salt and adapter, [`isolation`]) | [`page_root`], [`page_key`] |
 //! | encoder outputs | the output's name, what computes it and the digest of what it read; one key per page | [`encoder_output`], [`encoder_page`] |
 //! | latents | what computes the trajectory (the latent seed), the trajectory and its step count | [`latent_seed`], [`latent_content`] |
 //!
@@ -94,6 +94,32 @@ pub fn page_root(seed: &Key, isolation: Option<u64>) -> Key {
         None => digest.number(0),
     }
     digest.key()
+}
+
+/// The isolation key a request's page chain is rooted under ([`page_root`]): what keeps a
+/// tenant's prefix pages apart from every other tenant's. A request isolates its pages by the
+/// cache salt it states, by the identity of the LoRA adapter it computes with (whose pages
+/// differ from the base model's), or by both; one that does neither shares the pages of every
+/// other such request (`None`). The key is the first eight bytes of the digest of both, each
+/// stated as present or absent, so a salt keys apart from an adapter of the same text.
+pub fn isolation(salt: Option<&str>, adapter: Option<&str>) -> Option<u64> {
+    if salt.is_none() && adapter.is_none() {
+        return None;
+    }
+    let mut digest = Digest::new(b"uniserve-isolation");
+    for part in [salt, adapter] {
+        match part {
+            Some(text) => {
+                digest.number(1);
+                digest.text(text);
+            }
+            None => digest.number(0),
+        }
+    }
+    let digest = digest.finish();
+    let mut leading = [0_u8; 8];
+    leading.copy_from_slice(&digest[..8]);
+    Some(u64::from_le_bytes(leading))
 }
 
 /// The key of the page of `tokens` after the page keyed `parent` (or the
@@ -242,6 +268,21 @@ mod tests {
         assert_ne!(keys, chain(&page_seed(&Key([2; 32])), None, pages));
         assert_ne!(keys, chain(&seed, Some(7), pages));
         assert_ne!(chain(&seed, Some(7), pages), chain(&seed, Some(8), pages));
+    }
+
+    /// A request isolates nothing without a salt or an adapter; a salt, an adapter of the same
+    /// text and the two together isolate apart, and equal inputs isolate together.
+    #[test]
+    fn a_salt_and_an_adapter_isolate_apart() {
+        assert_eq!(isolation(None, None), None);
+        let salt = isolation(Some("tenant"), None);
+        let adapter = isolation(None, Some("tenant"));
+        let both = isolation(Some("tenant"), Some("tenant"));
+        assert!(salt.is_some() && adapter.is_some() && both.is_some());
+        assert_ne!(salt, adapter);
+        assert_ne!(salt, both);
+        assert_ne!(adapter, both);
+        assert_eq!(salt, isolation(Some("tenant"), None));
     }
 
     #[test]

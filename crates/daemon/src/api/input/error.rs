@@ -12,9 +12,24 @@ pub enum TokenizeError {
     /// The model tokenizer cannot encode request content.
     #[error(transparent)]
     Tokenizer(#[from] crate::api::tokenizer::TokenizerError),
-    /// Chat rendering fails.
+    /// The chat request contains no message to render.
+    #[error("chat request must contain at least one message")]
+    EmptyMessages,
+    /// The prompt continues the final message of a history whose last message is not the
+    /// assistant's.
+    #[error("cannot continue the final message when the last message is not from the assistant")]
+    ContinueWithoutAssistant,
+    /// The served model has no chat template: neither the deployment nor the checkpoint states
+    /// one.
+    #[error("chat template is required but none was configured")]
+    MissingChatTemplate,
+    /// The chat template fails to render the request.
     #[error(transparent)]
-    Chat(#[from] crate::api::input::chat::Error),
+    Template(#[from] crate::api::input::chat::TemplateError),
+    /// The request carries content the renderer does not take: an image part for a model that
+    /// takes none, or in an assistant message.
+    #[error("unsupported multimodal content: {0}")]
+    UnsupportedMultimodalContent(&'static str),
     /// The tokenized prompt fills or exceeds the model context window, leaving
     /// no room for a generated token.
     #[error(
@@ -58,6 +73,9 @@ pub enum TokenizeError {
     /// The request contains an invalid combination of serving controls.
     #[error("{0}")]
     Invalid(String),
+    /// The request's tools, which its output's tool calls are parsed against, do not serialize.
+    #[error("serializing the request's tools")]
+    Tools(#[source] serde_json::Error),
     /// The blocking tokenization task cannot complete.
     #[error("tokenization task failed")]
     Task(#[source] tokio::task::JoinError),
@@ -73,18 +91,6 @@ pub enum ServeError {
         request_id: String,
         /// Stable feature name.
         feature: &'static str,
-    },
-    /// The prompt exceeds the profile context limit.
-    #[error(
-        "request `{request_id}` has {prompt_tokens} prompt tokens, exceeding the {max_tokens}-token profile limit"
-    )]
-    ContextLengthExceeded {
-        /// Identifier of the rejected request.
-        request_id: String,
-        /// Tokenized prompt length.
-        prompt_tokens: usize,
-        /// Maximum token count declared by the profile.
-        max_tokens: u32,
     },
     /// No live scheduler accepts the request.
     #[error(transparent)]

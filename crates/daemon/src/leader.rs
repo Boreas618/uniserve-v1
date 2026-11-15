@@ -1172,13 +1172,13 @@ impl Leader {
                 source: error.source,
             })?;
         let processor = Arc::clone(&self.processor);
-        let (request, mut lowering) = preprocess(&request_id, {
+        let (request, lowering) = preprocess(&request_id, {
             let request_id = request_id.clone();
             move || processor.process(&request_id, &request, adapter.as_ref(), images)
         })
         .await?;
 
-        lowering.compile_us = elapsed_us(started);
+        let compile_us = elapsed_us(started);
         let (events, core) = self
             .submit(request.into())
             .await
@@ -1193,6 +1193,7 @@ impl Leader {
         let output = crate::api::output::OutputProcessor::new(
             self.processor.tokenizer(),
             lowering,
+            compile_us,
             Box::new(stats),
         )?;
 

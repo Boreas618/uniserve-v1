@@ -1,0 +1,59 @@
+{#- A ChatML chat template of the formats the daemon parses: reasoning between <think> and </think>,
+    kept only after the last user query, and tool calls as JSON objects between <tool_call> and
+    </tool_call>; tool results return in user turns between <tool_response> and </tool_response>. -#}
+{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\n\n' }}
+    {%- endif %}
+    {{- "# Tools\n\nThe functions you may call are listed in <tools></tools>:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" + (tool | tojson) }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nCall a function with a JSON object of its name and arguments in <tool_call></tool_call>:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+{%- elif messages[0].role == 'system' %}
+    {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+{%- endif %}
+{#- The last user query is the last user message that is not a tool result. -#}
+{%- set query = namespace(index=messages|length - 1, open=true) %}
+{%- for message in messages[::-1] %}
+    {%- if query.open and message.role == 'user' and message.content is string
+        and not (message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
+        {%- set query.open = false %}
+        {%- set query.index = (messages|length - 1) - loop.index0 %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- set content = message.content if message.content is string else '' %}
+    {%- if message.role == 'user' or (message.role == 'system' and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>\n' }}
+    {%- elif message.role == 'assistant' %}
+        {%- set reasoning = message.reasoning_content if message.reasoning_content is string else '' %}
+        {%- if loop.index0 > query.index and (loop.last or reasoning) %}
+            {{- '<|im_start|>assistant\n<think>\n' + reasoning.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+        {%- else %}
+            {{- '<|im_start|>assistant\n' + content }}
+        {%- endif %}
+        {%- for call in message.tool_calls or [] %}
+            {%- if content or not loop.first %}
+                {{- '\n' }}
+            {%- endif %}
+            {{- '<tool_call>\n{"name": "' + call.function.name + '", "arguments": ' + (call.function.arguments | tojson) + '}\n</tool_call>' }}
+        {%- endfor %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == 'tool' %}
+        {%- if loop.first or messages[loop.index0 - 1].role != 'tool' %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' + content + '\n</tool_response>' }}
+        {%- if loop.last or messages[loop.index0 + 1].role != 'tool' %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %}

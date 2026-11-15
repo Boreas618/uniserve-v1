@@ -218,8 +218,7 @@ impl From<ServeError> for ApiError {
     /// carry as their error source rather than in their own `Display`.
     fn from(error: ServeError) -> Self {
         match error {
-            error @ (ServeError::UnsupportedFeature { .. }
-            | ServeError::ContextLengthExceeded { .. }) => {
+            error @ ServeError::UnsupportedFeature { .. } => {
                 Self::invalid_request(error.to_string(), None)
             }
             ServeError::ImageInput { ref source, .. } => {

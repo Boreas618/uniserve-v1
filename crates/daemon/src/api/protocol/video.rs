@@ -82,6 +82,9 @@ pub struct VideoGenerationRequest {
     /// Classifier-free guidance scale.
     #[serde(default)]
     pub guidance_scale: Option<f64>,
+    /// Scheduler priority assigned to the request, as a chat request states it.
+    #[serde(default)]
+    pub priority: Option<i32>,
     /// Reference media, in request order.
     #[serde(default)]
     pub input_references: Vec<VideoReference>,
@@ -100,6 +103,8 @@ pub enum FieldKind {
     Json,
     /// An unsigned integer.
     Unsigned,
+    /// A signed integer.
+    Integer,
     /// A number.
     Number,
 }
@@ -107,7 +112,7 @@ pub enum FieldKind {
 /// The fields of the video request body ([`VideoGenerationRequest`]), in schema order, with the
 /// kind of value each takes: the one list of them, which a multipart body is read by, a refusal
 /// names its parameter from and `GET /v1/capabilities` reports.
-pub const REQUEST_FIELDS: [(&str, FieldKind); 12] = [
+pub const REQUEST_FIELDS: [(&str, FieldKind); 13] = [
     ("model", FieldKind::Text),
     ("prompt", FieldKind::Text),
     ("negative_prompt", FieldKind::Text),
@@ -118,6 +123,7 @@ pub const REQUEST_FIELDS: [(&str, FieldKind); 12] = [
     ("seed", FieldKind::Unsigned),
     ("num_inference_steps", FieldKind::Unsigned),
     ("guidance_scale", FieldKind::Number),
+    ("priority", FieldKind::Integer),
     ("input_references", FieldKind::Json),
     ("extra_params", FieldKind::Json),
 ];
