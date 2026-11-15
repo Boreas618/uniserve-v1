@@ -8,8 +8,9 @@
 # The `flashinfer-python` version is the pin's, so it is declared below and a change of it
 # is a new revision. `src/build.py` compiles it with the CuTe DSL
 # for one group and one shape and exports it with its host launcher; `src/entry.cpp` and
-# `src/stage.cu` are the transport around it. The kernel's tuning table is in
-# `src/build.py`, so a revision of this package fixes it (design 5.4).
+# `src/stage.cu` are the transport around it. The kernel's tile, cluster and schedule are
+# the ones FlashInfer's frontend selects for the descriptor's token count (`default_knobs`
+# of the pin), so the pin fixes them.
 #
 # One native module per descriptor, with the entries of the operator's header.
 

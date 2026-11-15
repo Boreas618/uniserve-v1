@@ -5,8 +5,8 @@ compile request. It compiles FlashInfer's MegaMoE kernel (the pinned `megamoe`
 source with `patches/megamoe.patch`, see `load_kernel_sources`) for one group
 and one shape with the CuTe DSL, exports the kernel with its host launcher, and
 links them with `src/entry.cpp` and `src/stage.cu` into `module.so`. No device
-is read: the target names the architecture, and the kernel's tuning is the
-table below.
+is read: the target names the architecture, and the kernel's tuning is the one
+FlashInfer's frontend selects for the descriptor's token count.
 """
 
 import pathlib
@@ -22,37 +22,6 @@ from uniserve_build_server.request import Request
 #: smallest SM100 part's count, and a larger part leaves SMs idle rather than
 #: hanging.
 SM_COUNT = 148
-
-#: The kernel's measured profiles by the largest step's token count: design 5.4
-#: keeps tuning data in the package. These are FlashInfer's built-in
-#: table.
-MID_TOKENS = {
-    "mma_tiler_mnk": (256, 128, 256),
-    "cluster_shape_mnk": (2, 1, 1),
-    "group_hint": 512,
-    "flag_batch": 4,
-    "epi_flag_batch": (2, 4),
-    "token_back_mode": "reuse_dispatch_warps",
-    "load_balance_mode": "atomic_counter",
-}
-SMALL_TOKENS = dict(MID_TOKENS, token_back_mode="epi_warps")
-MID_LARGE_TOKENS = dict(
-    MID_TOKENS,
-    mma_tiler_mnk=(256, 256, 256),
-    token_back_mode="standalone_warps",
-)
-LARGE_TOKENS = dict(MID_TOKENS, mma_tiler_mnk=(256, 256, 256), flag_batch=8)
-
-
-def knobs_for(tokens):
-    """The profile of a step of `tokens` rows, as `default_knobs` chooses it."""
-    if tokens < 512:
-        return SMALL_TOKENS
-    if tokens < 1024:
-        return MID_TOKENS
-    if tokens < 2048:
-        return MID_LARGE_TOKENS
-    return LARGE_TOKENS
 
 
 def shape_of(request):
@@ -170,9 +139,12 @@ def compile_kernel(request, shape, staging):
         _DataDtype,
         _ScaleDtype,
     )
+    from shim.tuner import default_knobs  # noqa: PLC0415
     from src.token_comm import CombineFormat  # noqa: PLC0415
 
-    knobs = knobs_for(tokens)
+    # The tile, cluster and schedule FlashInfer's frontend chooses for a kernel
+    # compiled for `tokens` rows per rank: its profiles measured by token count.
+    knobs = default_knobs(tokens, dtype="nvfp4")
     tiler = knobs["mma_tiler_mnk"]
     cluster = knobs["cluster_shape_mnk"]
     local = experts // ranks

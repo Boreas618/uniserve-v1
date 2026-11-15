@@ -1,15 +1,20 @@
-# FlashInfer's fused MegaMoE CuTe DSL kernel, from the `flashinfer-python`
-# distribution this environment locks. The manifest is `megamoe.sha256`.
-sha256 = "dae28b342e055af61128a79efbce8727bbed54228613b8a547ad37134ecf2d97"
+# FlashInfer's fused MegaMoE CuTe DSL kernel and the tuning its frontend
+# selects, from the `flashinfer-python` distribution this environment locks.
+# The manifest is `megamoe.sha256`.
+sha256 = "4f75c42d13d16dcc34d489b6867c3eb12f6c50a73a86e46bf53801c6c29ad167"
 
 # The kernel's packages, which name one another as top-level modules
 # (`common.megamoe_constants`, `src.token_comm`): FlashInfer's own shim puts
 # their parent directory on the interpreter's path, and `fetch.load` imports
-# them from a build's staged copy instead.
+# them from a build's staged copy instead. Of the shim, the pin holds only
+# `tuner.py`, FlashInfer's default tuning by token count, which imports nothing
+# but the standard library; the rest of the shim drives the kernel through
+# PyTorch and NVSHMEM at run time.
 packages = [
     "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/common",
     "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab",
     "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/src",
+    "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/shim",
 ]
 
 [origin]
