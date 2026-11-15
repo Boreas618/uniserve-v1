@@ -35,7 +35,7 @@ use std::time::Instant;
 
 use crate::batch::{Batch, BatchOutput, Phase, TimingCounters, Variant};
 use nn::capability::{Encoder, PatchFormat};
-use nn::{NO_SLOT, PhaseKind, TokenBatch};
+use nn::{NO_SLOT, TokenBatch};
 use platform::Stream;
 use tensor::{DType, Tensor};
 
@@ -562,7 +562,7 @@ impl Runner for EncoderRunner {
             seq_lens: self.column(SEQ_LENS, seq_lens, DType::U32)?,
             query_offsets: self.column(QUERY_OFFSETS, query_offsets, DType::U32)?,
             logits_rows: self.column(LOGITS_ROWS, logits_rows, DType::U32)?,
-            phase: PhaseKind::Prefill,
+            phase: Phase::Prefill,
             // An encode reads no cache, and a row attends over its own tokens, which a bucket
             // holds no more than.
             page_size: 0,

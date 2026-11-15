@@ -16,8 +16,8 @@ use nn::family::SequenceSplit;
 use nn::functional::{self, WeightOrder};
 use nn::modules::{Attention, AttentionConfig, QkNorm, QkvBias, QkvLinearConfig, QkvNames};
 use nn::{
-    Checkpoint, CpuWeights, DType, Device, KvCache, KvPlanes, NO_SLOT, PhaseKind, Tensor,
-    TokenBatch, WeightLoader,
+    Checkpoint, CpuWeights, DType, Device, KvCache, KvPlanes, NO_SLOT, Phase, Tensor, TokenBatch,
+    WeightLoader,
 };
 use support::{
     assert_close, encode, meta, operators, recorded, recorded_split, sequence, shard, tensor,
@@ -309,7 +309,7 @@ fn cache(dtype: DType, table: &[u32], rows: usize) -> KvCache {
 
 /// A CPU batch of `phase` whose tokens take `slots`, in rows of `seq_lens` keys packed at
 /// `offsets`.
-fn batch(phase: PhaseKind, slots: &[u32], seq_lens: &[u32], offsets: &[u32]) -> TokenBatch {
+fn batch(phase: Phase, slots: &[u32], seq_lens: &[u32], offsets: &[u32]) -> TokenBatch {
     TokenBatch {
         positions: Tensor::zeros(slots.len(), DType::I32, &Device::Cpu).unwrap(),
         slot_mapping: column(slots),
@@ -347,7 +347,7 @@ fn paged_attention_reads_the_rows_kv_write_stored() {
     // the bucket's padding: it has no slot and belongs to no row.
     let cache = cache(DType::F32, &[2, 0, 1, 1], 2);
     let prefill = batch(
-        PhaseKind::Prefill,
+        Phase::Prefill,
         &[8, 9, 10, 11, 0, 1, 4, 5, 6, NO_SLOT],
         &[6, 3],
         &[0, 6, 9],
@@ -401,7 +401,7 @@ fn paged_attention_reads_the_rows_kv_write_stored() {
 
     // A decode appends one token to each row and its query sees the whole row; under a window
     // of two it sees its own key and the two before it.
-    let decode = batch(PhaseKind::Decode, &[2, 7], &[7, 4], &[0, 1, 2]);
+    let decode = batch(Phase::Decode, &[2, 7], &[7, 4], &[0, 1, 2]);
     let (next_query, next_key, next_value) = (
         heads(2, HEADS, 4),
         heads(2, KV_HEADS, 5),
@@ -482,7 +482,7 @@ fn an_fp8_cache_scales_each_page_by_the_rows_it_holds() {
     let mut first = heads(3, KV_HEADS, 1);
     first[2 * row] = 1.0e4;
     let stored = tensor(&first, (3, KV_HEADS, DIM), DType::F32);
-    let prefill = batch(PhaseKind::Prefill, &[4, 5, NO_SLOT], &[2], &[0, 2]);
+    let prefill = batch(Phase::Prefill, &[4, 5, NO_SLOT], &[2], &[0, 2]);
     functional::kv_write_(&cache, 0, &prefill, &stored, &stored).unwrap();
 
     let largest = |x: &[f32]| x.iter().fold(0.0_f32, |largest, x| largest.max(x.abs()));
@@ -502,7 +502,7 @@ fn an_fp8_cache_scales_each_page_by_the_rows_it_holds() {
     // already held keep their decoded values, within a second rounding.
     let second: Vec<f32> = heads(1, KV_HEADS, 2).iter().map(|x| x * 8.0).collect();
     let appended = tensor(&second, (1, KV_HEADS, DIM), DType::F32);
-    let decode = batch(PhaseKind::Decode, &[6], &[3], &[0, 1]);
+    let decode = batch(Phase::Decode, &[6], &[3], &[0, 1]);
     functional::kv_write_(&cache, 0, &decode, &appended, &appended).unwrap();
 
     let grown = largest(&second) / 448.0;
@@ -597,7 +597,7 @@ fn a_dense_cache_of_another_type_holds_each_element_at_its_nearest_value() {
             .take(2 * row)
             .collect();
         let negated = |x: &[f32]| x.iter().map(|x| -x).collect::<Vec<f32>>();
-        let prefill = batch(PhaseKind::Prefill, &[5, 2], &[2], &[0, 2]);
+        let prefill = batch(Phase::Prefill, &[5, 2], &[2], &[0, 2]);
         functional::kv_write_(
             &cache,
             0,
@@ -622,7 +622,7 @@ fn a_dense_cache_of_another_type_holds_each_element_at_its_nearest_value() {
 
 #[test]
 fn the_cache_functions_refuse_what_no_kernel_reads() {
-    let prefill = batch(PhaseKind::Prefill, &[0, 1], &[2], &[0, 2]);
+    let prefill = batch(Phase::Prefill, &[0, 1], &[2], &[0, 2]);
     let query = tensor(&heads(2, HEADS, 1), (2, HEADS, DIM), DType::F32);
     let key = tensor(&heads(2, KV_HEADS, 2), (2, KV_HEADS, DIM), DType::F32);
     let attend = |cache: &KvCache, batch: &TokenBatch| {
@@ -666,7 +666,7 @@ fn the_cache_functions_refuse_what_no_kernel_reads() {
 
     // The batch and the cache state one page size, and the key bound covers a page.
     let plain = cache(DType::F32, &[0], 1);
-    let mut other = batch(PhaseKind::Prefill, &[0, 1], &[2], &[0, 2]);
+    let mut other = batch(Phase::Prefill, &[0, 1], &[2], &[0, 2]);
     other.page_size = 8;
     assert!(attend(&plain, &other).contains("tokens per page"));
 
@@ -717,7 +717,7 @@ fn the_cache_functions_refuse_what_no_kernel_reads() {
 }
 
 /// A meta batch of `tokens` tokens in one row over 64-token pages.
-fn meta_batch(phase: PhaseKind, tokens: usize) -> TokenBatch {
+fn meta_batch(phase: Phase, tokens: usize) -> TokenBatch {
     TokenBatch {
         positions: meta(tokens, DType::I32),
         slot_mapping: meta(tokens, DType::U32),
@@ -760,7 +760,7 @@ fn meta_cache(dtype: DType, kv_heads: usize, head_dim: usize) -> KvCache {
 
 /// The kernels a write and the attention after it state for `tokens` tokens of 32 query heads
 /// over four key heads of 128, over a cache of `dtype`.
-fn paged_launches(phase: PhaseKind, tokens: usize, dtype: DType) -> Vec<(&'static str, String)> {
+fn paged_launches(phase: Phase, tokens: usize, dtype: DType) -> Vec<(&'static str, String)> {
     let (batch, cache) = (meta_batch(phase, tokens), meta_cache(dtype, 4, 128));
     let query = meta((tokens, 32, 128), DType::BF16);
     let key = meta((tokens, 4, 128), DType::BF16);
@@ -776,7 +776,7 @@ fn paged_launches(phase: PhaseKind, tokens: usize, dtype: DType) -> Vec<(&'stati
 #[test]
 fn the_cache_writes_key_the_plane_type_and_the_reads_key_the_phase() {
     // A cache of the projections' own type is one scatter of both planes.
-    let plain = paged_launches(PhaseKind::Prefill, 8, DType::BF16);
+    let plain = paged_launches(Phase::Prefill, 8, DType::BF16);
     assert_eq!(
         plain,
         [
@@ -795,7 +795,7 @@ fn the_cache_writes_key_the_plane_type_and_the_reads_key_the_phase() {
 
     // A dense cache of another type is the same one scatter, compiled for the pair of types:
     // the rounding into the cache is the kernel's store, not a launch of its own.
-    let converted = paged_launches(PhaseKind::Prefill, 8, DType::F16);
+    let converted = paged_launches(Phase::Prefill, 8, DType::F16);
     assert_eq!(
         converted[0],
         (
@@ -808,7 +808,7 @@ fn the_cache_writes_key_the_plane_type_and_the_reads_key_the_phase() {
 
     // An E4M3 cache is the quantizing write, one launch per plane, and another attention
     // kernel.
-    let quantized = paged_launches(PhaseKind::Prefill, 8, DType::F8E4M3);
+    let quantized = paged_launches(Phase::Prefill, 8, DType::F8E4M3);
     let scaled = "dtype_bf16_scale_f32_page_64_heads_4_head_dim_128_block_128_pdl_false";
     assert_eq!(
         quantized,
@@ -825,7 +825,7 @@ fn the_cache_writes_key_the_plane_type_and_the_reads_key_the_phase() {
     );
 
     // A prefill reads a whole sequence and a decode one token: one attention kernel each.
-    let decode = paged_launches(PhaseKind::Decode, 1, DType::BF16);
+    let decode = paged_launches(Phase::Decode, 1, DType::BF16);
     assert_eq!(
         decode[1].1,
         "phase_decode_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32_kv_heads_4\
@@ -1037,7 +1037,7 @@ fn a_paged_forward_attends_what_it_wrote_into_the_cache() {
     let tokens = 6;
     let hidden = tensor(&sequence(tokens * HIDDEN, 10), (tokens, HIDDEN), DType::F32);
     let (cos, sin) = tables(tokens);
-    let prefill = batch(PhaseKind::Prefill, &[4, 5, 6, 7, 0, 1], &[6], &[0, 6]);
+    let prefill = batch(Phase::Prefill, &[4, 5, 6, 7, 0, 1], &[6], &[0, 6]);
 
     let separate = QkNorm::Separate {
         modules: ["q_norm", "k_norm"],
@@ -1255,7 +1255,7 @@ fn a_paged_forward_writes_its_layers_planes_then_reads_them() {
         meta((tokens, DIM / 2), DType::F32),
         meta((tokens, DIM / 2), DType::F32),
     );
-    let batch = meta_batch(PhaseKind::Prefill, tokens);
+    let batch = meta_batch(Phase::Prefill, tokens);
 
     let attention = Attention::load(
         &attention_config(FUSED, true, false),
@@ -1323,7 +1323,7 @@ fn a_sequence_split_member_attends_its_heads_of_every_row_and_returns_its_own_ro
         meta((tokens, DIM / 2), DType::F32),
         meta((tokens, DIM / 2), DType::F32),
     );
-    let batch = meta_batch(PhaseKind::Prefill, tokens);
+    let batch = meta_batch(Phase::Prefill, tokens);
     let cache = meta_cache(DType::BF16, KV_HEADS / 2, DIM);
 
     for (projection, held) in [

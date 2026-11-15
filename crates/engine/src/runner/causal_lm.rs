@@ -164,7 +164,7 @@ use std::time::Instant;
 
 use crate::batch::{Batch, BatchOutput, Phase, Shape as BatchShape, TimingCounters, Variant};
 use nn::family::{StateField, StateShape, TextModel};
-use nn::{KvCache, PhaseKind, RecurrentState, TokenBatch, VerifySlots};
+use nn::{KvCache, RecurrentState, TokenBatch, VerifySlots};
 use platform::{Event, Stream};
 use proto::module::commit::COMMIT_FIELDS;
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
@@ -1580,9 +1580,9 @@ impl Runner for CausalLmRunner {
             query_offsets: self.column(Column::QueryOffsets, rows + 1)?,
             logits_rows: self.column(Column::LogitsRows, rows)?,
             phase: if decode {
-                PhaseKind::Decode
+                Phase::Decode
             } else {
-                PhaseKind::Prefill
+                Phase::Prefill
             },
             page_size: self.config.page_size,
             num_tokens: bucket.tokens,

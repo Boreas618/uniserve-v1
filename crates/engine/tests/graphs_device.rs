@@ -26,7 +26,7 @@ use engine::runner::graphs::Preparation;
 use engine::worker::{Error, Result};
 use nn::functional::{WeightOrder, embedding, rms_norm};
 use nn::modules::Linear;
-use nn::{CausalLm, ExpertExchange, KvCache, PhaseKind, RecurrentState, TokenBatch};
+use nn::{CausalLm, ExpertExchange, KvCache, RecurrentState, TokenBatch};
 use ops::Generation;
 use platform::{Budget, DeviceAllocation, DeviceId, DeviceRange, PoolKind, Stream};
 use storage::runtime::GroupId;
@@ -160,7 +160,7 @@ fn token_batch(columns: [Tensor; 5], rows: usize, bound: u32) -> TokenBatch {
         seq_lens,
         query_offsets,
         logits_rows: ids,
-        phase: PhaseKind::Decode,
+        phase: Phase::Decode,
         page_size: 16,
         num_tokens: rows as u32,
         max_kv_len: bound,

@@ -482,24 +482,17 @@ message Table {
   map<string, Value> entries = 1;
 }
 
-// The phase of an operator's calls that a kernel package fills. An operator
-// is filled once for all its phases unless the configuration fills it per
-// phase, which attention allows (`prefill_attention_backend`,
-// `decode_attention_backend`).
-enum PhaseKind {
-  PHASE_KIND_UNSPECIFIED = 0;
-  PHASE_KIND_PREFILL = 1;
-  PHASE_KIND_DECODE = 2;
-  PHASE_KIND_ENCODE = 3;
-  PHASE_KIND_DENOISE = 4;
-}
-
 // One operator's kernel package, or one phase's of it: the epoch record's
 // key is the operator and the phase, `phase` absent for every phase.
 message KernelPackage {
   // The operator's name, as the `ops` crate names it.
   string op = 1;
-  optional PhaseKind phase = 2;
+  // The phase of the operator's calls the package fills, by its id
+  // (`scheduling::view::Phase::id`); absent when the package fills every
+  // phase. An operator is filled once for all its phases unless the
+  // configuration fills it per phase, which attention allows
+  // (`prefill_attention_backend`, `decode_attention_backend`).
+  optional uint32 phase = 2;
   PackageRevision package = 3;
   // The package itself, for a candidate the epoch's module set fixed for an
   // operator without naming it for a phase: the engine selects among

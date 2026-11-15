@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use models::qwen3::{Config, Qwen3VlModel};
 use nn::config::Fields;
 use nn::family::{Projection, SequenceSplit, TextModel, TextPlacement};
-use nn::{DType, Encoder, ExpertExchange, PhaseKind, Shape, Split, Tensor, WeightLoader};
+use nn::{DType, Encoder, ExpertExchange, Phase, Shape, Split, Tensor, WeightLoader};
 use processing::qwen_vl::ProcessorConfig;
 
 /// Where the released checkpoints are.
@@ -99,7 +99,7 @@ fn keys(context: &ops::Context) -> Keys {
 
 /// The index columns of a meta batch of `rows` rows of `tokens` tokens in all, whose rows may
 /// each read `row_pages` pages.
-fn batch(phase: PhaseKind, rows: usize, tokens: usize, row_pages: usize) -> nn::TokenBatch {
+fn batch(phase: Phase, rows: usize, tokens: usize, row_pages: usize) -> nn::TokenBatch {
     support::batch(
         phase,
         [
@@ -211,10 +211,7 @@ fn buckets(
         keys
     };
 
-    [
-        run(PhaseKind::Decode, (8, 8)),
-        run(PhaseKind::Prefill, (2, 512)),
-    ]
+    [run(Phase::Decode, (8, 8)), run(Phase::Prefill, (2, 512))]
 }
 
 /// The operators of `keys`.
@@ -318,7 +315,7 @@ fn qwen3_moe_profiles_pipeline_stages_and_sequence_members() {
             let group = Some((u64::from(rank), 2));
             let name = format!("Qwen3-30B-A3B {projection:?} sequence member {rank} of 2");
             buckets(&name, &*model, group, &no_exchange);
-            step(&*model, &batch(PhaseKind::Decode, 1, 1, 1), group, None);
+            step(&*model, &batch(Phase::Decode, 1, 1, 1), group, None);
         }
     }
 }
@@ -533,7 +530,7 @@ fn qwen3_6_profiles_its_buckets_its_drafter_and_its_tower() {
 
     // A prefill that holds an image's rows states three coordinates per token and turns by
     // the sectioned spectrum: the same kernels, the factors of three axes.
-    let mut with_image = batch(PhaseKind::Prefill, 1, 512, 8);
+    let mut with_image = batch(Phase::Prefill, 1, 512, 8);
     with_image.rope_positions = Some(meta(Shape::from((3, 512)), DType::I32));
     let (image_keys, _) = step(&*model, &with_image, None, None);
     assert_eq!(operators(&image_keys), operators(&prefill));
@@ -548,7 +545,7 @@ fn qwen3_6_profiles_its_buckets_its_drafter_and_its_tower() {
     let draft = drafter.cache();
     assert_eq!((draft.layers, draft.kv_heads, draft.head_dim), (1, 2, 256));
 
-    for (phase, rows, tokens) in [(PhaseKind::Decode, 8, 8), (PhaseKind::Prefill, 2, 512)] {
+    for (phase, rows, tokens) in [(Phase::Decode, 8, 8), (Phase::Prefill, 2, 512)] {
         let context = context(None);
         {
             let _guard = context.enter();
@@ -713,12 +710,7 @@ fn the_vl_encoder_profiles_a_prompt_with_an_image() {
         let context = context(None);
         let encoded = {
             let _guard = context.enter();
-            let batch = batch(
-                PhaseKind::Prefill,
-                1,
-                tokens,
-                tokens.div_ceil(PAGE as usize),
-            );
+            let batch = batch(Phase::Prefill, 1, tokens, tokens.div_ceil(PAGE as usize));
             let layout = model.layout(&batch, &[grid]);
             assert_eq!((layout.rows, layout.tokens), (tokens as u32, tokens as u32));
 

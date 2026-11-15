@@ -386,9 +386,7 @@ impl BuildServer {
                 let mut preferred = Vec::with_capacity(cover.preferred.len());
                 for entry in cover.preferred {
                     preferred.push(protocol::Preference {
-                        phase: wire::Phase::try_from(entry.phase)
-                            .map_err(|_| Error::Protocol("unknown package phase".into()))?
-                            .try_into()?,
+                        phase: protocol::phase_from_wire(entry.phase)?,
                         backend: entry.backend,
                         revision: (entry.revision != 0).then_some(entry.revision),
                     });
@@ -1032,7 +1030,7 @@ impl BuildServer {
                     .fields(key)?
                     .into_iter()
                     .find(|(dimension, _)| dimension == "phase")
-                    .and_then(|(_, value)| proto::module::PhaseKind::named(&value))
+                    .and_then(|(_, value)| proto::module::Phase::named(&value))
             };
             let preferred = |index: &usize| {
                 request.preferred.iter().any(|preference| {

@@ -43,18 +43,10 @@ message Package {
   uint32 revision = 3;
 }
 
-// Which phase of an operator a package revision fills. `ALL` fills every phase of the
-// operator with one package revision (design section 5.2).
-enum Phase {
-  PHASE_ALL = 0;
-  PHASE_PREFILL = 1;
-  PHASE_DECODE = 2;
-  // The phases of a diffusion computation: the encoding pass that turns
-  // inputs into latents, and the denoising loop that turns latents into
-  // outputs (design section 5.1: a package revision fills one phase of an operator).
-  PHASE_ENCODE = 3;
-  PHASE_DENOISE = 4;
-}
+// A phase of an operator a package revision fills is stated by the phase's
+// id (`scheduling::view::Phase::id`, the one phase vocabulary of the
+// scheduler and the package selection); an absent phase fills every phase of
+// the operator with one package revision (design section 5.2).
 
 // A package revision named by its backend and arguments: the server selects the
 // backend's latest installed revision (design section 5.1).
@@ -74,7 +66,7 @@ message PackageRevision {
 // One operator of an epoch and the package revision that fills it.
 message PackageRequest {
   string op = 1;
-  Phase phase = 2;
+  optional uint32 phase = 2;
   oneof selector {
     Backend backend = 3;
     PackageRevision package = 4;
@@ -91,7 +83,7 @@ message Descriptors {
   string op = 1;
   // Descriptor keys, in the canonical form the operator's `Display` gives.
   repeated string keys = 2;
-  Phase phase = 3;
+  optional uint32 phase = 3;
   string part = 4;
 }
 
@@ -110,7 +102,7 @@ message Prepare {
 // A slot and the package revision the server selected for it.
 message SlotPackage {
   string op = 1;
-  Phase phase = 2;
+  optional uint32 phase = 2;
   PackageRevision package = 3;
   string part = 4;
 }
@@ -156,10 +148,10 @@ message FixedRevision {
   uint32 revision = 2;
 }
 
-// A backend a deployment names for an operator, in every phase (`ALL`) or in
-// one: it is selected for the keys of that phase whenever it covers them.
+// A backend a deployment names for an operator, in every phase (no phase) or
+// in one: it is selected for the keys of that phase whenever it covers them.
 message Preference {
-  Phase phase = 1;
+  optional uint32 phase = 1;
   string backend = 2;
   // The revision to use; zero names the backend's latest installed revision.
   uint32 revision = 3;

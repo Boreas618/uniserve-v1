@@ -32,7 +32,7 @@ use crate::manifest::ModuleForm;
 use crate::store::ModulePath;
 use crate::target::Target;
 use crate::{Error, Result};
-use proto::module::{ModuleSlot, PackageRevision, PhaseKind};
+use proto::module::{ModuleSlot, PackageRevision, Phase, phase_of};
 
 /// The messages of the protocol, as the build script compiled them.
 pub mod wire {
@@ -162,7 +162,7 @@ pub struct CoverRequest {
 /// package for the keys of `phase` (every key when `None`) that it covers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preference {
-    pub phase: Option<PhaseKind>,
+    pub phase: Option<Phase>,
     pub backend: String,
     /// The revision to use; `None` is the backend's latest installed one.
     pub revision: Option<u32>,
@@ -213,46 +213,28 @@ fn arguments(text: &str) -> Result<toml::Table> {
         .map_err(|error| Error::Protocol(format!("a package's arguments are not TOML: {error}")))
 }
 
-/// A slot's phase as the wire states it: `ALL` for a slot of every phase.
-pub(crate) fn phase_to_wire(phase: Option<PhaseKind>) -> i32 {
-    phase.map_or(wire::Phase::All, wire::Phase::from) as i32
+/// A slot's phase as the wire states it: the phase's id, absent for a slot of every phase.
+pub(crate) fn phase_to_wire(phase: Option<Phase>) -> Option<u32> {
+    proto::module::phase_to_wire(phase)
+}
+
+/// The phase a wire id states ([`phase_to_wire`]).
+///
+/// # Errors
+///
+/// `Protocol` for an id no phase has.
+pub(crate) fn phase_from_wire(phase: Option<u32>) -> Result<Option<Phase>> {
+    phase_of(phase).map_err(|error| Error::Protocol(error.to_string()))
 }
 
 /// The slot an operator, a wire phase and a wire part name: an empty part is
 /// a slot that holds the operator's every descriptor.
-pub(crate) fn slot_of(op: String, phase: i32, part: String) -> Result<ModuleSlot> {
+pub(crate) fn slot_of(op: String, phase: Option<u32>, part: String) -> Result<ModuleSlot> {
     Ok(ModuleSlot {
         op,
-        phase: wire::Phase::try_from(phase)
-            .map_err(|_| Error::Protocol("unknown package phase".into()))?
-            .try_into()?,
+        phase: phase_from_wire(phase)?,
         part: (!part.is_empty()).then_some(part),
     })
-}
-
-impl From<PhaseKind> for wire::Phase {
-    fn from(phase: PhaseKind) -> Self {
-        match phase {
-            PhaseKind::Prefill => wire::Phase::Prefill,
-            PhaseKind::Decode => wire::Phase::Decode,
-            PhaseKind::Encode => wire::Phase::Encode,
-            PhaseKind::Denoise => wire::Phase::Denoise,
-        }
-    }
-}
-
-impl TryFrom<wire::Phase> for Option<PhaseKind> {
-    type Error = Error;
-
-    fn try_from(phase: wire::Phase) -> Result<Self> {
-        Ok(match phase {
-            wire::Phase::All => None,
-            wire::Phase::Prefill => Some(PhaseKind::Prefill),
-            wire::Phase::Decode => Some(PhaseKind::Decode),
-            wire::Phase::Encode => Some(PhaseKind::Encode),
-            wire::Phase::Denoise => Some(PhaseKind::Denoise),
-        })
-    }
 }
 
 impl From<ModuleForm> for wire::ModuleForm {

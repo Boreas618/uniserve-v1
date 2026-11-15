@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-pub use proto::module::{ModuleSet, ModuleSlot, PackageRevision, PhaseKind};
+pub use proto::module::{ModuleSet, ModuleSlot, PackageRevision, Phase};
 // The operators the configuration selects a backend for are named by the
 // module vocabulary (`proto::module::operator`), whose names each
 // operator's `Op::NAME` is: the daemon, the Build Server and the engine
@@ -477,7 +477,7 @@ fn record_report(epoch: u64, record: &EpochRecord) -> Value {
         .map(|(slot, package)| {
             serde_json::json!({
                 "op": slot.op,
-                "phase": slot.phase.map(PhaseKind::as_str),
+                "phase": slot.phase.map(Phase::name),
                 "package": package_report(package),
             })
         })
@@ -488,7 +488,7 @@ fn record_report(epoch: u64, record: &EpochRecord) -> Value {
         .map(|(slot, package)| {
             serde_json::json!({
                 "op": slot.op,
-                "phase": slot.phase.map(PhaseKind::as_str),
+                "phase": slot.phase.map(Phase::name),
                 "package": package_report(package),
             })
         })
@@ -642,7 +642,7 @@ fn attention_packages(config: &ServerArgs) -> Vec<(KernelKey, PackageRevision)> 
         }
         return vec![(KernelKey::all(operator::PAGED_ATTENTION), package(prefill))];
     }
-    [(PhaseKind::Prefill, prefill), (PhaseKind::Decode, decode)]
+    [(Phase::Prefill, prefill), (Phase::Decode, decode)]
         .into_iter()
         .filter(|(_, backend)| backend != AUTO_BACKEND)
         .map(|(phase, backend)| {
@@ -1352,9 +1352,8 @@ mod tests {
         };
         let modules = crate::epoch::modules_of(&split);
         let prefill =
-            &modules.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, PhaseKind::Prefill)];
-        let decode =
-            &modules.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, PhaseKind::Decode)];
+            &modules.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, Phase::Prefill)];
+        let decode = &modules.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, Phase::Decode)];
         assert_eq!(
             (prefill.backend.as_str(), decode.backend.as_str()),
             ("fa4", "trtllm")
@@ -1380,10 +1379,9 @@ mod tests {
             "fa4"
         );
         assert!(
-            !modules.kernels.contains_key(&KernelKey::phase(
-                operator::PAGED_ATTENTION,
-                PhaseKind::Prefill
-            )),
+            !modules
+                .kernels
+                .contains_key(&KernelKey::phase(operator::PAGED_ATTENTION, Phase::Prefill)),
             "one backend covers every phase of the operator"
         );
         let agreed = ServerArgs {
@@ -1425,10 +1423,7 @@ mod tests {
         let modules = crate::epoch::modules_of(&config);
         assert_eq!(
             modules.kernels.keys().cloned().collect::<Vec<_>>(),
-            vec![KernelKey::phase(
-                operator::PAGED_ATTENTION,
-                PhaseKind::Decode
-            )]
+            vec![KernelKey::phase(operator::PAGED_ATTENTION, Phase::Decode)]
         );
 
         config.attention_backend = "trtllm".to_owned();
@@ -1557,7 +1552,7 @@ mod tests {
         let mut second = record();
         second.status = Status::Preparing;
         second.kernels.insert(
-            KernelKey::phase(operator::PAGED_ATTENTION, PhaseKind::Decode),
+            KernelKey::phase(operator::PAGED_ATTENTION, Phase::Decode),
             package("trtllm"),
         );
         epochs.record(2, second);

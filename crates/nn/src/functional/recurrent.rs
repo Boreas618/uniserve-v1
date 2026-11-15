@@ -50,7 +50,7 @@ use ops::recurrent::{
     CausalConv1d, CausalConv1dArgs, CausalConv1dDescriptor, Form, GatedDeltaRule,
     GatedDeltaRuleArgs, GatedDeltaRuleDescriptor, RequestSlots, RowColumns, Trail,
 };
-use proto::module::PhaseKind;
+use proto::module::Phase;
 use tensor::{D, DType, Device, Tensor};
 
 use super::{ACCUMULATE, on_cpu, vector};
@@ -401,7 +401,7 @@ pub fn causal_conv1d(
 
     // A decode-phase batch of a state that lends request slots leaves its window for a step
     // that chooses how many of a row's tokens stand.
-    let stepwise = state.verify.is_some() && batch.phase == PhaseKind::Decode;
+    let stepwise = state.verify.is_some() && batch.phase == Phase::Decode;
 
     if on_cpu(x) {
         return conv_formula(
@@ -668,7 +668,7 @@ pub fn gated_delta_rule(
     }
 
     let (form, chunk) = match batch.phase {
-        PhaseKind::Decode => (Form::Recurrent, 1),
+        Phase::Decode => (Form::Recurrent, 1),
         _ => (Form::Chunked, DELTA_RULE_CHUNK),
     };
     if form == Form::Chunked {

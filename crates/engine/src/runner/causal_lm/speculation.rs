@@ -98,7 +98,7 @@ use std::sync::Arc;
 
 use crate::batch::philox::DrawAddress;
 use crate::batch::{Batch, CallOutput, CallStatus, Columns, DraftWork, Phase, Row, Rows};
-use nn::{KvCache, NO_SLOT, PhaseKind, RecurrentState, TokenBatch, functional};
+use nn::{KvCache, NO_SLOT, RecurrentState, TokenBatch, functional};
 use platform::Stream;
 use proto::module::commit::{COMMIT_FIELDS, column, mode};
 use proto::module::sampler::PARAMETER_COLUMNS;
@@ -1173,7 +1173,7 @@ impl CausalLmRunner {
             seq_lens: self.column(Column::SeqLens, tokens)?,
             query_offsets: self.column(Column::QueryOffsets, tokens + 1)?,
             logits_rows: self.column(Column::LogitsRows, tokens)?,
-            phase: PhaseKind::Decode,
+            phase: Phase::Decode,
             page_size: self.config.page_size,
             num_tokens: bucket.tokens,
             max_kv_len: self.config.max_kv_len,
@@ -1414,7 +1414,7 @@ impl CausalLmRunner {
             seq_lens: lens.clone(),
             query_offsets: self.column(Column::StateOffsets, rows + 1)?,
             logits_rows: lens,
-            phase: PhaseKind::Prefill,
+            phase: Phase::Prefill,
             page_size: speculation.pool.page,
             num_tokens: bucket.tokens,
             max_kv_len: self.config.max_kv_len,
@@ -1495,7 +1495,7 @@ impl CausalLmRunner {
                     seq_lens: lens.clone(),
                     query_offsets: self.column(Column::ChainOffsets, rows + 1)?,
                     logits_rows: lens,
-                    phase: PhaseKind::Decode,
+                    phase: Phase::Decode,
                     page_size: speculation.pool.page,
                     num_tokens: bucket.rows,
                     max_kv_len: self.config.max_kv_len,

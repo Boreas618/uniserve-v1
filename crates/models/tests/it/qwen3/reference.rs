@@ -39,7 +39,7 @@ use models::qwen3::config::VisionConfig;
 use models::qwen3::{Config, Qwen3VlModel, positions};
 use nn::family::TextModel;
 use nn::{
-    CpuWeights, DType, Device, Encoder, KvCache, PhaseKind, Shape, Split, Tensor, TokenBatch,
+    CpuWeights, DType, Device, Encoder, KvCache, Phase, Shape, Split, Tensor, TokenBatch,
     WeightLoader,
 };
 
@@ -203,7 +203,7 @@ fn model(name: &str, drafter: bool) -> (Arc<dyn TextModel>, Config) {
 
 /// The batch of a call in which row `r` presents its tokens at positions `ranges[r]`, their
 /// cache slots on the pages [`TABLES`] gives the row.
-fn batch(phase: PhaseKind, ranges: &[Range<u32>]) -> TokenBatch {
+fn batch(phase: Phase, ranges: &[Range<u32>]) -> TokenBatch {
     let positions: Vec<i32> = ranges
         .iter()
         .flat_map(|range| range.clone().map(|position| position as i32))
@@ -260,7 +260,7 @@ fn buffers(model: &dyn TextModel) -> Option<Vec<Vec<Tensor>>> {
 /// model that keeps a state.
 fn forward(
     model: &dyn TextModel,
-    phase: PhaseKind,
+    phase: Phase,
     ids: &[Vec<u32>],
     ranges: &[Range<u32>],
     cache: &KvCache,
@@ -375,7 +375,7 @@ fn check_causal_lm(name: &str) {
     let whole: Vec<Range<u32>> = lengths.iter().map(|length| 0..*length).collect();
     let hidden = forward(
         model,
-        PhaseKind::Prefill,
+        Phase::Prefill,
         &ids,
         &whole,
         &cache(model.cache(), 2),
@@ -415,14 +415,7 @@ fn check_causal_lm(name: &str) {
         rows(&hidden, &placed)
     };
 
-    let prefilled = forward(
-        model,
-        PhaseKind::Prefill,
-        &ids,
-        &opened,
-        &group,
-        state.as_ref(),
-    );
+    let prefilled = forward(model, Phase::Prefill, &ids, &opened, &group, state.as_ref());
     assert_close(
         &format!("{name} opening prefill"),
         &prefilled,
@@ -435,14 +428,7 @@ fn check_causal_lm(name: &str) {
             .iter()
             .map(|range| range.end + step..range.end + step + 1)
             .collect();
-        let decoded = forward(
-            model,
-            PhaseKind::Decode,
-            &ids,
-            &token,
-            &group,
-            state.as_ref(),
-        );
+        let decoded = forward(model, Phase::Decode, &ids, &token, &group, state.as_ref());
 
         assert_close(
             &format!("{name} decode step {step}"),
@@ -506,7 +492,7 @@ fn the_drafter_computes_the_references_hidden_states() {
                 .unwrap_or_else(|error| panic!("the drafter's {phase:?} forward: {error}"))
         };
 
-        let drafted = draft(PhaseKind::Prefill, 0..entries, &cache(shape, 1));
+        let drafted = draft(Phase::Prefill, 0..entries, &cache(shape, 1));
         assert_close(
             &format!("row {row} drafted"),
             &drafted,
@@ -517,7 +503,7 @@ fn the_drafter_computes_the_references_hidden_states() {
         // The first entries in a prefill and the rest one decode step each.
         let group = cache(shape, 1);
         let opened = entries - 3;
-        let prefilled = draft(PhaseKind::Prefill, 0..opened, &group);
+        let prefilled = draft(Phase::Prefill, 0..opened, &group);
         assert_close(
             &format!("row {row} opening entries"),
             &prefilled,
@@ -525,7 +511,7 @@ fn the_drafter_computes_the_references_hidden_states() {
             bound,
         );
         for entry in opened..entries {
-            let decoded = draft(PhaseKind::Decode, entry..entry + 1, &group);
+            let decoded = draft(Phase::Decode, entry..entry + 1, &group);
             assert_close(
                 &format!("row {row} entry {entry}"),
                 &decoded,
@@ -603,7 +589,7 @@ fn a_prompt_with_an_image_computes_the_references_hidden_states() {
         .slice_set(&features, 0, first)
         .expect("the image's rows");
 
-    let mut batch = batch(PhaseKind::Prefill, std::slice::from_ref(&(0..tokens)));
+    let mut batch = batch(Phase::Prefill, std::slice::from_ref(&(0..tokens)));
     batch.rope_positions = Some(coordinates);
     let state = buffers(model).map(|live| {
         support::state(
@@ -682,7 +668,7 @@ fn the_vl_encoder_computes_the_references_states() {
     // order.
     let ids = ids(&reference["prompt.ids"]);
     let tokens = ids.len() as u32;
-    let batch = batch(PhaseKind::Prefill, std::slice::from_ref(&(0..tokens)));
+    let batch = batch(Phase::Prefill, std::slice::from_ref(&(0..tokens)));
     let pixels = [
         reference["image.pixels"].clone(),
         reference["video.pixels"].clone(),

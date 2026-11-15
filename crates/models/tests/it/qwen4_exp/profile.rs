@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nn::family::{TextModel, TextPlacement};
-use nn::{DType, PhaseKind, Shape, Split, Tensor, WeightLoader};
+use nn::{DType, Phase, Shape, Split, Tensor, WeightLoader};
 
 /// Where the released checkpoints are.
 const MODELS: &str = "/workspace/models";
@@ -139,7 +139,7 @@ struct Profile {
 /// `requests` state rows hold them, at this rank's place `group` of its deployment.
 fn step(
     model: &dyn TextModel,
-    phase: PhaseKind,
+    phase: Phase,
     (rows, tokens, requests): (usize, usize, usize),
     group: Option<(u64, u64)>,
 ) -> Profile {
@@ -249,9 +249,9 @@ fn step(
 /// `name`.
 fn buckets(name: &str, model: &dyn TextModel, group: Option<(u64, u64)>) -> Vec<Profile> {
     [
-        (PhaseKind::Decode, (STEP_ROWS, STEP_ROWS, 1)),
-        (PhaseKind::Decode, (8 * STEP_ROWS, 8 * STEP_ROWS, 8)),
-        (PhaseKind::Prefill, (2, 512, 2)),
+        (Phase::Decode, (STEP_ROWS, STEP_ROWS, 1)),
+        (Phase::Decode, (8 * STEP_ROWS, 8 * STEP_ROWS, 8)),
+        (Phase::Prefill, (2, 512, 2)),
     ]
     .into_iter()
     .map(|(phase, bucket)| {
@@ -415,7 +415,7 @@ fn drafter_and_tower(name: &str, model: &dyn TextModel, group: Option<(u64, u64)
             let _guard = context.enter();
             let column = |length: usize, dtype: DType| meta(Shape::from(length), dtype);
             let batch = support::batch(
-                PhaseKind::Decode,
+                Phase::Decode,
                 [
                     column(tokens, DType::I32),
                     column(tokens, DType::U32),

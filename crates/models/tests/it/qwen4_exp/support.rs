@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use nn::family::{CacheShape, ExpertOrder, Model, Registry, StateShape, TextModel, TextPlacement};
 use nn::{
-    Checkpoint, DType, KvCache, KvPlanes, PhaseKind, RecurrentState, Shape, Split, Tensor,
-    TokenBatch, VerifySlots, WeightLoader,
+    Checkpoint, DType, KvCache, KvPlanes, Phase, RecurrentState, Shape, Split, Tensor, TokenBatch,
+    VerifySlots, WeightLoader,
 };
 use proto::config::Quantization;
 
@@ -63,7 +63,7 @@ pub(crate) fn placement(tensor: Split, draft_tokens: u32) -> TextPlacement {
 /// `logits_rows`, in that order, as `columns` holds them, with the tokens' ids and the two ids
 /// before each row as `ngram` holds them.
 pub(crate) fn batch(
-    phase: PhaseKind,
+    phase: Phase,
     columns: [Tensor; 5],
     ngram: Option<(Tensor, Tensor)>,
     page_size: u32,

@@ -49,7 +49,7 @@ use nn::family::TextModel;
 use nn::modules::{Linear, LinearConfig, Parallel, Rotary};
 use nn::quantization::Declaration;
 use nn::{
-    CpuWeights, DType, Device, KvCache, KvPlanes, PhaseKind, RecurrentState, Shape, Split, Tensor,
+    CpuWeights, DType, Device, KvCache, KvPlanes, Phase, RecurrentState, Shape, Split, Tensor,
     TokenBatch, VarBuilder, WeightLoader, functional,
 };
 
@@ -232,7 +232,7 @@ fn request_batch(requests: usize, seen: u32, ngram: Option<(Tensor, Tensor)>) ->
     let offsets: Vec<u32> = (0..=requests).map(|row| (row * STEP) as u32).collect();
 
     support::batch(
-        PhaseKind::Decode,
+        Phase::Decode,
         [
             Tensor::new(positions.as_slice(), &Device::Cpu).expect("positions"),
             column(&vec![0; tokens]),
@@ -564,7 +564,7 @@ fn attention_step(vectors: &HashMap<String, Tensor>, prefix: &str) -> AttentionS
     let signed: Vec<i32> = positions.iter().map(|position| *position as i32).collect();
     let offsets: Vec<u32> = (0..=tokens as u32).collect();
     let batch = support::batch(
-        PhaseKind::Decode,
+        Phase::Decode,
         [
             Tensor::new(signed.as_slice(), &Device::Cpu).unwrap(),
             column(&slots),
@@ -881,7 +881,7 @@ fn the_drafter_over_two_rounds_is_the_references() {
         let offsets: Vec<u32> = (0..=picked.len() as u32).collect();
 
         let batch = support::batch(
-            PhaseKind::Decode,
+            Phase::Decode,
             [
                 pick(&step.batch.positions),
                 pick(&step.batch.slot_mapping),
@@ -1178,11 +1178,11 @@ impl Memory {
 /// request's tokens.
 fn forward(
     model: &dyn TextModel,
-    phase: PhaseKind,
+    phase: Phase,
     parts: &[(&Request, usize, Vec<u32>, u32)],
     memory: &Memory,
 ) -> Tensor {
-    let per_token = phase == PhaseKind::Decode;
+    let per_token = phase == Phase::Decode;
     let (mut positions, mut slots, mut ids) = (Vec::new(), Vec::new(), Vec::new());
     let (mut seq_lens, mut offsets, mut tables, mut context) =
         (Vec::new(), vec![0_u32], Vec::new(), Vec::new());
@@ -1319,7 +1319,7 @@ fn a_prefill_and_verify_steps_compute_what_one_prefill_does() {
         .iter()
         .map(|request| (request, 0, request.ids.clone(), 1))
         .collect();
-    let expected = forward(&*model, PhaseKind::Prefill, &parts, &whole);
+    let expected = forward(&*model, Phase::Prefill, &parts, &whole);
     let row_of = |request: usize, position: usize| -> usize {
         requests[..request]
             .iter()
@@ -1336,7 +1336,7 @@ fn a_prefill_and_verify_steps_compute_what_one_prefill_does() {
         .zip(computed)
         .map(|(request, split)| (request, 0, request.ids[..split].to_vec(), 1))
         .collect();
-    let opened = forward(&*model, PhaseKind::Prefill, &parts, &stepped);
+    let opened = forward(&*model, Phase::Prefill, &parts, &stepped);
     let mut first = 0;
     for (request, split) in computed.iter().enumerate() {
         assert_close(
@@ -1382,7 +1382,7 @@ fn a_prefill_and_verify_steps_compute_what_one_prefill_does() {
             kept.push((index, rows, stand));
         }
 
-        let streams = forward(&*model, PhaseKind::Decode, &parts, &stepped);
+        let streams = forward(&*model, Phase::Decode, &parts, &stepped);
         let mut first = 0;
         for (index, rows, stand) in kept {
             assert_close(

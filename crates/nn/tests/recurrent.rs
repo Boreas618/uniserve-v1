@@ -17,7 +17,7 @@ use nn::family::StateField;
 use nn::functional::{self, WeightOrder};
 use nn::modules::{GatedDeltaNet, GatedDeltaNetConfig};
 use nn::{
-    Checkpoint, CpuWeights, DType, Device, NO_SLOT, PhaseKind, RecurrentState, Tensor, TokenBatch,
+    Checkpoint, CpuWeights, DType, Device, NO_SLOT, Phase, RecurrentState, Tensor, TokenBatch,
     WeightLoader,
 };
 use support::{assert_close, encode, meta, operators, recorded, sequence, shard, tensor, values};
@@ -64,7 +64,7 @@ fn state(
 
 /// A batch of `phase` over pages of `page_size` tokens, on the CPU or of meta tensors; the
 /// recurrent functions read nothing else of it.
-fn batch(phase: PhaseKind, page_size: u32, on_meta: bool) -> TokenBatch {
+fn batch(phase: Phase, page_size: u32, on_meta: bool) -> TokenBatch {
     let column = |dtype| {
         if on_meta {
             meta(1, dtype)
@@ -150,7 +150,7 @@ fn causal_conv1d_continues_each_row_from_its_slots_last_inputs() {
         &tensor(&weight, (channels, width), DType::F32),
         1,
         true,
-        &batch(PhaseKind::Decode, 64, false),
+        &batch(Phase::Decode, 64, false),
         &state,
         0,
         0,
@@ -192,7 +192,7 @@ fn causal_conv1d_continues_each_row_from_its_slots_last_inputs() {
     // A state of another extent, and a field the state does not hold.
     let narrow = tensor(&weight[..channels * 3], (channels, 3), DType::F32);
     let input = tensor(&x, (7, channels), DType::F32);
-    let decode = batch(PhaseKind::Decode, 64, false);
+    let decode = batch(Phase::Decode, 64, false);
     let refused = functional::causal_conv1d(&input, &narrow, 1, true, &decode, &state, 0, 0);
     assert!(refused.unwrap_err().to_string().contains("live buffer"));
 
@@ -360,7 +360,7 @@ fn the_gated_delta_rule_is_its_recurrence_over_each_rows_tokens() {
     fill(&state.live[0][0], 2, &held);
 
     let inputs = Inputs::new(6, 4);
-    let decode = batch(PhaseKind::Decode, 64, false);
+    let decode = batch(Phase::Decode, 64, false);
     let out = inputs.rule(6, (&a_log, &dt_bias), &decode, &state).unwrap();
     assert_eq!(out.dims(), [6, VALUE_HEADS, VALUE_DIM]);
 
@@ -406,7 +406,7 @@ fn a_decode_continues_the_state_its_prompt_left() {
         .rule(
             5,
             (&a_log, &dt_bias),
-            &batch(PhaseKind::Prefill, 64, false),
+            &batch(Phase::Prefill, 64, false),
             &prefill,
         )
         .unwrap();
@@ -418,7 +418,7 @@ fn a_decode_continues_the_state_its_prompt_left() {
         .rule(
             1,
             (&a_log, &dt_bias),
-            &batch(PhaseKind::Decode, 64, false),
+            &batch(Phase::Decode, 64, false),
             &decode,
         )
         .unwrap();
@@ -443,7 +443,7 @@ fn the_rule_refuses_what_its_form_cannot_keep() {
     let refused = inputs.rule(
         2,
         (&a_log, &dt_bias),
-        &batch(PhaseKind::Prefill, 64, false),
+        &batch(Phase::Prefill, 64, false),
         &trailed,
     );
     assert!(refused.unwrap_err().to_string().contains("no trail"));
@@ -452,7 +452,7 @@ fn the_rule_refuses_what_its_form_cannot_keep() {
     let refused = inputs.rule(
         2,
         (&a_log, &dt_bias),
-        &batch(PhaseKind::Prefill, 48, false),
+        &batch(Phase::Prefill, 48, false),
         &plain,
     );
     assert!(refused.unwrap_err().to_string().contains("whole number"));
@@ -467,7 +467,7 @@ fn the_rule_refuses_what_its_form_cannot_keep() {
     let refused = inputs.rule(
         2,
         (&a_log, &dt_bias),
-        &batch(PhaseKind::Decode, 64, false),
+        &batch(Phase::Decode, 64, false),
         &narrow,
     );
     assert!(refused.unwrap_err().to_string().contains("live buffer"));
@@ -533,7 +533,7 @@ fn the_recurrent_functions_state_their_kernels() {
             &meta((channels, 4), DType::BF16),
             1,
             true,
-            &batch(PhaseKind::Decode, 64, true),
+            &batch(Phase::Decode, 64, true),
             &state,
             0,
             0,
@@ -576,14 +576,14 @@ fn the_recurrent_functions_state_their_kernels() {
     };
     let base = "dtype_bf16_key_heads_2_value_heads_4_key_dim_4_value_dim_4_block_4";
 
-    let (out, launches) = rule(PhaseKind::Decode, &meta_state(&config, tokens, true));
+    let (out, launches) = rule(Phase::Decode, &meta_state(&config, tokens, true));
     assert_eq!(out.unwrap().dims(), [tokens, 4, 4]);
     assert_eq!(
         launches,
         [("gated_delta_rule", format!("{base}_form_recurrent_chunk_1"))]
     );
 
-    let (out, launches) = rule(PhaseKind::Prefill, &state);
+    let (out, launches) = rule(Phase::Prefill, &state);
     out.unwrap();
     assert_eq!(
         launches,
@@ -648,15 +648,15 @@ fn request_slots_name_their_window_and_their_slots() {
     };
     let base = "dtype_bf16_channels_32_width_4_block_32";
     assert_eq!(
-        convolution(PhaseKind::Decode, 1, true),
+        convolution(Phase::Decode, 1, true),
         format!("{base}_dilation_1_activation_silu_window_6_stepwise_true")
     );
     assert_eq!(
-        convolution(PhaseKind::Prefill, 1, true),
+        convolution(Phase::Prefill, 1, true),
         format!("{base}_dilation_1_activation_silu_window_6_stepwise_false")
     );
     assert_eq!(
-        convolution(PhaseKind::Decode, 3, false),
+        convolution(Phase::Decode, 3, false),
         format!("{base}_dilation_3_activation_none_window_12_stepwise_true")
     );
 
@@ -674,7 +674,7 @@ fn request_slots_name_their_window_and_their_slots() {
             &meta(4, DType::BF16),
             &meta(4, DType::BF16),
             functional::StateAxes::ValueKey,
-            &batch(PhaseKind::Decode, 64, true),
+            &batch(Phase::Decode, 64, true),
             &state,
             0,
             1,
@@ -702,7 +702,7 @@ fn request_slots_name_their_window_and_their_slots() {
             &meta((channels, 4), DType::BF16),
             1,
             true,
-            &batch(PhaseKind::Decode, 64, true),
+            &batch(Phase::Decode, 64, true),
             &both,
             0,
             0,
@@ -801,7 +801,7 @@ fn a_gated_delta_net_mixes_its_rows_through_the_slots_state() {
             .map(|field| (field.dtype, field.dims))
             .collect();
         let fresh = || state([&[0, 5], &[5], &[1], &[4]], &fields, 2, Some(5));
-        let decode = batch(PhaseKind::Decode, 64, false);
+        let decode = batch(Phase::Decode, 64, false);
         let tokens = 5;
         let hidden = tensor(&sequence(tokens * 16, 10), (tokens, 16), DType::F32);
 
@@ -920,7 +920,7 @@ fn a_gated_delta_net_states_its_fields_and_its_kernels() {
     // its stages and nothing between them.
     let tokens = 8;
     let hidden = meta((tokens, 16), DType::BF16);
-    let prefill = batch(PhaseKind::Prefill, 64, true);
+    let prefill = batch(Phase::Prefill, 64, true);
     let state = meta_state(&config, tokens, false);
     let (out, launches) = recorded(|| network.forward(&hidden, &prefill, &state, 0));
     assert_eq!(out.unwrap().dims(), [tokens, 16]);

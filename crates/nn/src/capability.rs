@@ -32,7 +32,7 @@
 //! cache slot, a padding row's request slot), that row holds [`NO_SLOT`]. Rotary positions are
 //! coordinates, not indices, and are `I32`.
 
-use proto::module::PhaseKind;
+use proto::module::Phase;
 use proto::video::{ConditionRole, LatentShape, Layout};
 use tensor::{DType, Shape, Tensor};
 
@@ -61,7 +61,7 @@ pub struct TokenBatch {
     /// `[rows]` U32 hidden rows whose logits are produced.
     pub logits_rows: Tensor,
     /// Which phase this batch is.
-    pub phase: PhaseKind,
+    pub phase: Phase,
     /// Tokens per cache page.
     pub page_size: u32,
     /// Query tokens packed into this batch, including the padding a bucket appends.
@@ -1422,7 +1422,7 @@ mod tests {
             seq_lens: column(DType::U32, rows),
             query_offsets: column(DType::U32, rows + 1),
             logits_rows: column(DType::U32, rows),
-            phase: PhaseKind::Decode,
+            phase: Phase::Decode,
             page_size: 64,
             num_tokens: u32::try_from(rows).unwrap(),
             max_kv_len: 4_096,

@@ -178,7 +178,9 @@ pub struct PhaseView {
 /// never changes; the three encodings' tags are `text_encoding`,
 /// `vision_encoding` and `latent_encoding`. Appended, never renumbered
 /// ([`Phase::id`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Phase {
     // Context ingestion: reads the request's inputs and writes the prefix cache.
@@ -212,6 +214,13 @@ pub enum Phase {
     #[default]
     #[serde(other)]
     Other,
+}
+
+impl core::fmt::Display for Phase {
+    /// The phase's name ([`Phase::name`]).
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.name())
+    }
 }
 
 /// The four classes work is assembled in (design §4.4, `fcfs`).
@@ -329,6 +338,40 @@ impl Phase {
             Self::Refill => 20,
             Self::Other => u32::MAX,
         })
+    }
+
+    /// The phase numbered `id` ([`Phase::id`]); `None` for an id no phase carries.
+    pub fn of_id(id: PhaseId) -> Option<Self> {
+        Self::ALL.into_iter().find(|phase| phase.id() == id)
+    }
+
+    /// The phase's name: its tag on the policy's wire, which a package's selection key and the
+    /// `phase` dimension of an operator's descriptor key name it by too. [`Phase::Other`], no
+    /// phase, is `other`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::TextEncode => "text_encoding",
+            Self::VisionEncode => "vision_encoding",
+            Self::LatentEncode => "latent_encoding",
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+            Self::Verify => "verify",
+            Self::MediaRead => "media_read",
+            Self::Denoise => "denoise",
+            Self::VideoDecode => "video_decode",
+            Self::AudioDecode => "audio_decode",
+            Self::VideoEncode => "video_encode",
+            Self::AudioEncode => "audio_encode",
+            Self::Mux => "mux",
+            Self::LatentPrepare => "latent_prepare",
+            Self::Refill => "refill",
+            Self::Other => "other",
+        }
+    }
+
+    /// The phase named `name` ([`Phase::name`]); `None` for a name no phase has.
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|phase| phase.name() == name)
     }
 
     /// Whether a chunk of this phase writes the prefix cache. Only such a
@@ -458,6 +501,9 @@ mod tests {
     fn a_phase_keeps_its_id_and_its_wire_tag() {
         for (phase, id, tag) in WIRE {
             assert_eq!(phase.id(), PhaseId(id), "{phase:?}");
+            assert_eq!(Phase::of_id(PhaseId(id)), Some(phase));
+            assert_eq!(phase.name(), tag);
+            assert_eq!(Phase::named(tag), Some(phase));
 
             let encoded = serde_json::to_string(&phase).unwrap();
             assert_eq!(encoded, format!(r#"{{"kind":"{tag}"}}"#), "{phase:?}");

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::process as wire;
 
-use super::{ModuleSet, ModuleSlot, PackageRevision, PhaseKind};
+use super::{ModuleSet, ModuleSlot, PackageRevision, Phase};
 
 /// Why a wire form is no module vocabulary value.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -21,9 +21,9 @@ pub enum WireError {
     /// A kernel slot names no package.
     #[error("the kernel slot of {0} names no package")]
     KernelWithoutPackage(String),
-    /// A phase number no [`PhaseKind`] has.
-    #[error("phase {0} is no phase kind")]
-    Phase(i32),
+    /// A phase id no [`Phase`] has.
+    #[error("phase {0} is no phase")]
+    Phase(u32),
     /// A parameter value of no kind.
     #[error("the parameter {0} states no value")]
     EmptyValue(String),
@@ -32,32 +32,21 @@ pub enum WireError {
     Datetime(String, String),
 }
 
-impl From<PhaseKind> for wire::PhaseKind {
-    fn from(phase: PhaseKind) -> Self {
-        match phase {
-            PhaseKind::Prefill => Self::Prefill,
-            PhaseKind::Decode => Self::Decode,
-            PhaseKind::Encode => Self::Encode,
-            PhaseKind::Denoise => Self::Denoise,
-        }
-    }
+/// A slot's phase as a wire states it: the phase's id ([`Phase::id`]), absent for a package that
+/// fills every phase of its operator.
+pub fn phase_to_wire(phase: Option<Phase>) -> Option<u32> {
+    phase.map(|phase| phase.id().0)
 }
 
-/// The phase a slot's wire number states; `None` for the unspecified value, a package that fills
-/// every phase of its operator.
+/// The phase a slot's wire id states ([`phase_to_wire`]).
 ///
 /// # Errors
 ///
-/// A number of no phase kind.
-pub fn phase_of(phase: i32) -> Result<Option<PhaseKind>, WireError> {
-    Ok(match wire::PhaseKind::try_from(phase) {
-        Ok(wire::PhaseKind::Prefill) => Some(PhaseKind::Prefill),
-        Ok(wire::PhaseKind::Decode) => Some(PhaseKind::Decode),
-        Ok(wire::PhaseKind::Encode) => Some(PhaseKind::Encode),
-        Ok(wire::PhaseKind::Denoise) => Some(PhaseKind::Denoise),
-        Ok(wire::PhaseKind::Unspecified) => None,
-        Err(_) => return Err(WireError::Phase(phase)),
-    })
+/// An id no phase has.
+pub fn phase_of(phase: Option<u32>) -> Result<Option<Phase>, WireError> {
+    phase
+        .map(|id| Phase::of_id(scheduling::PhaseId(id)).ok_or(WireError::Phase(id)))
+        .transpose()
 }
 
 impl From<&PackageRevision> for wire::PackageRevision {
@@ -95,7 +84,7 @@ impl TryFrom<wire::PackageRevision> for PackageRevision {
 pub fn kernel_to_wire(slot: &ModuleSlot, package: &PackageRevision) -> wire::KernelPackage {
     wire::KernelPackage {
         op: slot.op.clone(),
-        phase: slot.phase.map(|phase| wire::PhaseKind::from(phase) as i32),
+        phase: phase_to_wire(slot.phase),
         package: Some(package.into()),
         part: slot.part.clone(),
     }
@@ -112,7 +101,7 @@ pub fn kernel_of(kernel: wire::KernelPackage) -> Result<(ModuleSlot, PackageRevi
         .ok_or_else(|| WireError::KernelWithoutPackage(kernel.op.clone()))?;
     let slot = ModuleSlot {
         op: kernel.op,
-        phase: kernel.phase.map(phase_of).transpose()?.flatten(),
+        phase: phase_of(kernel.phase)?,
         part: kernel.part,
     };
     Ok((slot, package.try_into()?))
@@ -236,7 +225,7 @@ mod tests {
             kernels: BTreeMap::from([
                 (ModuleSlot::all("gemm"), package("cublas", 2)),
                 (
-                    ModuleSlot::phase("paged_attention", PhaseKind::Decode),
+                    ModuleSlot::phase("paged_attention", Phase::Decode),
                     package("trtllm", 4),
                 ),
                 (

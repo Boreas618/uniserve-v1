@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use nn::family::{CacheShape, ExpertOrder, Model, Registry, StateShape, TextModel, TextPlacement};
 use nn::{
-    Checkpoint, DType, KvCache, KvPlanes, PhaseKind, RecurrentState, Shape, Tensor, TokenBatch,
+    Checkpoint, DType, KvCache, KvPlanes, Phase, RecurrentState, Shape, Tensor, TokenBatch,
     WeightLoader,
 };
 use proto::config::Quantization;
@@ -69,7 +69,7 @@ pub(crate) fn whole(drafter: bool) -> TextPlacement {
 /// at most `max_kv_len` keys: `positions`, `slot_mapping`, `seq_lens`, `query_offsets` and
 /// `logits_rows`, in that order, as `columns` holds them.
 pub(crate) fn batch(
-    phase: PhaseKind,
+    phase: Phase,
     columns: [Tensor; 5],
     page_size: u32,
     max_kv_len: u32,

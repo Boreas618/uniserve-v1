@@ -8,7 +8,7 @@ use std::path::Path;
 use build_server::protocol::{CoverRequest, Package, Preference};
 use build_server::server::BuildServer;
 use build_server::target::Target;
-use proto::module::PhaseKind;
+use proto::module::Phase;
 
 use crate::support::{self, arch, other_arch};
 
@@ -56,7 +56,7 @@ fn request(keys: &[&str]) -> CoverRequest {
 }
 
 /// `backend` named for `phase`, at its latest revision.
-fn named(phase: Option<PhaseKind>, backend: &str) -> Preference {
+fn named(phase: Option<Phase>, backend: &str) -> Preference {
     Preference {
         phase,
         backend: backend.to_owned(),
@@ -195,7 +195,7 @@ fn a_backend_named_for_a_phase_takes_that_phase() {
     let prefill = "phase_prefill_dtype_bf16_head_dim_128";
     let decode = "phase_decode_dtype_bf16_head_dim_128";
     let mut asked = request(&[prefill, decode]);
-    asked.preferred = vec![named(Some(PhaseKind::Decode), "beta")];
+    asked.preferred = vec![named(Some(Phase::Decode), "beta")];
     let coverage = server.cover(&asked).unwrap();
     assert_eq!(
         coverage.covered,

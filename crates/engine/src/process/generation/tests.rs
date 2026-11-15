@@ -149,7 +149,7 @@ fn a_policy_a_scheduler_refuses_rolls_the_switch_back() {
 /// carries, and the policy beside them; a kernel without a package is refused by its operator.
 #[test]
 fn a_preparation_names_its_packages_with_their_arguments() {
-    use proto::module::{ModuleSlot, PackageRevision, PhaseKind, kernel_to_wire};
+    use proto::module::{ModuleSlot, PackageRevision, Phase, kernel_to_wire};
     use proto::process::Prepare;
 
     let package = |backend: &str, arguments: &str| PackageRevision {
@@ -158,7 +158,7 @@ fn a_preparation_names_its_packages_with_their_arguments() {
         arguments: toml::from_str(arguments).unwrap(),
     };
     let every_phase = ModuleSlot::all("decode_attention");
-    let prefill = ModuleSlot::phase("rms_norm", PhaseKind::Prefill);
+    let prefill = ModuleSlot::phase("rms_norm", Phase::Prefill);
     let attention = package("trtllm", "block = 16");
     let norm = package("triton", "");
     let fcfs = package("fcfs", "chunked_prefill_size = 4096");

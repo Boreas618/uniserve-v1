@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use build_server::Preference;
-use proto::module::{ModuleSlot, PackageRevision, Packages, PhaseKind};
+use proto::module::{ModuleSlot, PackageRevision, Packages, Phase};
 
 /// The descriptor keys of each slot a selection filled, by slot: the keys its package was selected
 /// for, and the only keys that package is asked to build.
@@ -161,7 +161,7 @@ pub(crate) fn interface_agrees(
 fn held<'a>(
     packages: &'a Packages,
     op: &str,
-) -> Vec<(Option<PhaseKind>, Option<&'a str>, &'a str, u32)> {
+) -> Vec<(Option<Phase>, Option<&'a str>, &'a str, u32)> {
     let mut held: Vec<_> = packages
         .iter()
         .filter(|(slot, _)| slot.op == op)
@@ -482,11 +482,11 @@ mod tests {
     fn named_backends_carry_their_phase_and_pinned_revision() {
         let mut named = Packages::new();
         named.insert(
-            ModuleSlot::phase("paged_attention", PhaseKind::Prefill),
+            ModuleSlot::phase("paged_attention", Phase::Prefill),
             package("trtllm", 4),
         );
         named.insert(
-            ModuleSlot::phase("paged_attention", PhaseKind::Decode),
+            ModuleSlot::phase("paged_attention", Phase::Decode),
             package("triton", 0),
         );
         named.insert(ModuleSlot::all("gemm"), package("cublas", 1));
@@ -495,12 +495,12 @@ mod tests {
             named_backends("paged_attention", &named),
             vec![
                 Preference {
-                    phase: Some(PhaseKind::Prefill),
+                    phase: Some(Phase::Prefill),
                     backend: "trtllm".to_owned(),
                     revision: Some(4),
                 },
                 Preference {
-                    phase: Some(PhaseKind::Decode),
+                    phase: Some(Phase::Decode),
                     backend: "triton".to_owned(),
                     revision: None,
                 },

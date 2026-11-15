@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::batch::{Batch, BatchId, BatchOutput, Columns, Phase, Shape as BatchShape, Variant};
 use nn::functional::{WeightOrder, embedding, rms_norm};
 use nn::modules::Linear;
-use nn::{CausalLm, ExpertExchange, KvCache, PhaseKind, RecurrentState, TokenBatch};
+use nn::{CausalLm, ExpertExchange, KvCache, RecurrentState, TokenBatch};
 use ops::fill;
 use ops::norm::{RmsNorm, RmsNormArgs, RmsNormDescriptor};
 use ops::{Generation, Kernel, KernelEntry};
@@ -147,7 +147,7 @@ impl Runner for TinyRunner {
             seq_lens: self.column(LENGTHS, rows, DType::U32)?,
             query_offsets: self.column(OFFSETS, rows + 1, DType::U32)?,
             logits_rows: self.column(IDS, rows, DType::U32)?,
-            phase: PhaseKind::Decode,
+            phase: Phase::Decode,
             page_size: 16,
             num_tokens: bucket.tokens,
             max_kv_len: self.bound.get(),

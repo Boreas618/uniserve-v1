@@ -16,63 +16,21 @@
 mod wire;
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub use wire::{WireError, kernel_of, kernel_to_wire, phase_of};
+pub use wire::{WireError, kernel_of, kernel_to_wire, phase_of, phase_to_wire};
 
 /// Which phase of a request an operator call belongs to, and which phase of an operator a package
-/// fills.
+/// fills: the scheduling interface's one phase vocabulary ([`scheduling::view::Phase`]), which the
+/// scheduler, the policies and the package selection name work by alike.
 ///
 /// A kernel package may be split by phase: prefill and decode attention are different packages
-/// (`prefill_attention_backend` and `decode_attention_backend`, design section 5.2), and diffusion
-/// distinguishes encoding, denoising and decoding. The phase is part of an operator's descriptor and
-/// of a package's selection key, so one generation still indexes its kernels by (operator name,
-/// descriptor key) (design section 4.2).
-///
-/// Variants are appended, never reordered: the record's encoding names them, and a package built
-/// against an older list keeps its meaning.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PhaseKind {
-    /// One forward over the whole prompt.
-    Prefill,
-    /// One forward per generated token.
-    Decode,
-    /// The encoder of a multimodal or diffusion model.
-    Encode,
-    /// A denoising step of a diffusion model.
-    Denoise,
-}
-
-impl PhaseKind {
-    /// Every phase, in declaration order.
-    pub const ALL: [Self; 4] = [Self::Prefill, Self::Decode, Self::Encode, Self::Denoise];
-
-    /// The name the record and a package's selection key use.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Prefill => "prefill",
-            Self::Decode => "decode",
-            Self::Encode => "encode",
-            Self::Denoise => "denoise",
-        }
-    }
-
-    /// The phase named `name` ([`Self::as_str`]), as a descriptor's `phase` field states it once
-    /// the key's grammar owner (the Build Server's package manifest) has read the key into fields;
-    /// `None` for a name of no phase.
-    pub fn named(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|phase| phase.as_str() == name)
-    }
-}
-
-impl fmt::Display for PhaseKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
+/// (`prefill_attention_backend` and `decode_attention_backend`, design section 5.2). The phase is
+/// part of an operator's descriptor (its `phase` dimension names it by [`Phase::name`]) and of a
+/// package's selection key, so one generation still indexes its kernels by (operator name,
+/// descriptor key) (design section 4.2); a wire states it by its id ([`Phase::id`]).
+pub use scheduling::view::Phase;
 
 /// One package: the backend that implements an operator, the backend's revision, and the arguments
 /// given to it.
@@ -95,9 +53,9 @@ pub struct PackageRevision {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ModuleSlot {
     pub op: String,
-    /// `None` when one package fills every phase of the operator.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub phase: Option<PhaseKind>,
+    /// `None` when one package fills every phase of the operator; written by its name.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "phase_name")]
+    pub phase: Option<Phase>,
     /// The backend, when the operator's packages divide its descriptors between them with no phase
     /// to tell them apart: each holds a slot of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,12 +73,40 @@ impl ModuleSlot {
     }
 
     /// The slot of an operator filled in one phase.
-    pub fn phase(op: impl Into<String>, phase: PhaseKind) -> Self {
+    pub fn phase(op: impl Into<String>, phase: Phase) -> Self {
         Self {
             op: op.into(),
             phase: Some(phase),
             part: None,
         }
+    }
+}
+
+/// A slot's phase as its name ([`Phase::name`]), the form a record and a selection key state it in.
+mod phase_name {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::Phase;
+
+    pub(super) fn serialize<S: Serializer>(
+        phase: &Option<Phase>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match phase {
+            Some(phase) => serializer.serialize_some(phase.name()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Phase>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|name| {
+                Phase::named(&name)
+                    .ok_or_else(|| serde::de::Error::custom(format!("{name:?} names no phase")))
+            })
+            .transpose()
     }
 }
 
@@ -475,22 +461,19 @@ pub mod sampler {
 
 #[cfg(test)]
 mod tests {
-    use super::PhaseKind;
+    use super::{ModuleSlot, Phase};
 
+    /// A slot's phase is recorded by its name and read back from it.
     #[test]
-    fn phases_are_named_once_and_in_order() {
-        let names: Vec<&str> = PhaseKind::ALL.iter().map(|phase| phase.as_str()).collect();
-        assert_eq!(names, ["prefill", "decode", "encode", "denoise"]);
-        let mut printed: Vec<String> = PhaseKind::ALL.iter().map(ToString::to_string).collect();
-        printed.dedup();
-        assert_eq!(printed.len(), PhaseKind::ALL.len());
-    }
-
-    #[test]
-    fn a_phase_is_found_by_its_name_alone() {
-        for phase in PhaseKind::ALL {
-            assert_eq!(PhaseKind::named(phase.as_str()), Some(phase));
-        }
-        assert_eq!(PhaseKind::named("sideways"), None);
+    fn a_slots_phase_is_recorded_by_its_name() {
+        let slot = ModuleSlot::phase("paged_attention", Phase::Prefill);
+        let recorded = serde_json::to_value(&slot).unwrap();
+        assert_eq!(recorded["phase"], "prefill");
+        assert_eq!(
+            serde_json::from_value::<ModuleSlot>(recorded).unwrap(),
+            slot
+        );
+        let every = serde_json::to_value(ModuleSlot::all("rms_norm")).unwrap();
+        assert!(every.get("phase").is_none());
     }
 }

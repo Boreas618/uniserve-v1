@@ -11,7 +11,7 @@ use build_server::manifest::ModuleForm;
 use build_server::protocol::{Client, Descriptors, PackageRequest, PrepareRequest, Selector, wire};
 use build_server::store::ModulePath;
 use build_server::target::Target;
-use proto::module::{ModuleSlot, PackageRevision, PhaseKind};
+use proto::module::{ModuleSlot, PackageRevision, Phase};
 use service::Connection;
 
 use crate::support::arch;
@@ -186,7 +186,7 @@ fn prepare_reports_each_build_and_returns_the_selected_packages() {
                         wire::PrepareResponse {
                             packages: vec![wire::SlotPackage {
                                 op: "rms_norm".into(),
-                                phase: wire::Phase::All as i32,
+                                phase: None,
                                 package: Some(wire::PackageRevision {
                                     backend: "triton".into(),
                                     revision: 2,
@@ -355,10 +355,10 @@ fn the_four_phases_of_a_revision_slot_travel_whole() {
     });
 
     let phases = [
-        PhaseKind::Prefill,
-        PhaseKind::Decode,
-        PhaseKind::Encode,
-        PhaseKind::Denoise,
+        Phase::Prefill,
+        Phase::Decode,
+        Phase::TextEncode,
+        Phase::Denoise,
     ];
     let request = PrepareRequest {
         targets: Vec::new(),
@@ -377,7 +377,7 @@ fn the_four_phases_of_a_revision_slot_travel_whole() {
             })
             .collect(),
         descriptors: vec![Descriptors {
-            slot: ModuleSlot::phase("attention", PhaseKind::Prefill),
+            slot: ModuleSlot::phase("attention", Phase::Prefill),
             keys: vec!["phase_prefill".into()],
         }],
     };
@@ -519,11 +519,8 @@ fn the_protocol_speaks_phases_and_arguments_of_its_own_vocabulary() {
         Some(&toml::Value::Integer(4096))
     );
     assert_eq!(
-        Option::<PhaseKind>::try_from(wire::Phase::Decode).unwrap(),
-        Some(PhaseKind::Decode)
+        proto::module::phase_of(proto::module::phase_to_wire(Some(Phase::Decode))).unwrap(),
+        Some(Phase::Decode)
     );
-    assert_eq!(
-        Option::<PhaseKind>::try_from(wire::Phase::All).unwrap(),
-        None
-    );
+    assert_eq!(proto::module::phase_of(None).unwrap(), None);
 }

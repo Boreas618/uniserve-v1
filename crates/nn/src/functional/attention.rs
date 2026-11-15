@@ -36,7 +36,6 @@ use ops::attention::dense::{DenseArgs, DenseAttention, DenseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention, Phase};
 use ops::fp8::E4M3_MAX;
 use ops::kv::{self, KvWrite, KvWriteScaled};
-use proto::module::PhaseKind;
 use tensor::{D, DType, Device, Shape, Tensor};
 
 use super::nvfp4::integer;
@@ -541,8 +540,8 @@ pub fn paged_attention(
         ));
     }
     let phase = match batch.phase {
-        PhaseKind::Prefill => Phase::Prefill,
-        PhaseKind::Decode => Phase::Decode,
+        proto::module::Phase::Prefill => Phase::Prefill,
+        proto::module::Phase::Decode => Phase::Decode,
         other => {
             return Err(Error::Unsupported(format!(
                 "paged_attention: phase {other} is not an attention phase"

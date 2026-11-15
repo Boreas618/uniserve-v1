@@ -3308,6 +3308,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protox",
+ "scheduling",
  "serde",
  "serde_bytes",
  "serde_json",

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::batch::{Batch, BatchId, Columns, Extent, Phase, Shape};
 use proto::request::{Event, FinishReason, MigrationCause, RejectionKind, RequestId};
 use scheduling::decision::{Shortage, Storage, Victim};
-use scheduling::ids::{EncodingId, PageId, PhaseId};
+use scheduling::ids::{EncodingId, PageId};
 use scheduling::{Duration as Span, Event as PolicyEvent};
 use storage::Key;
 use storage::runtime::{self, GroupId, OwnerId, Tier};
@@ -168,7 +168,7 @@ impl Scheduler {
         //    requests"). A work entry of a phase no request has is skipped.
         for work in &output.work {
             let id = RequestId(work.request.0);
-            if let Some(phase) = phase_of(work.phase)
+            if let Some(phase) = Phase::of_id(work.phase)
                 && self.is_running(id)
             {
                 self.schedule_call(id, phase, work.tokens, &mut budget, &mut batches);
@@ -1585,11 +1585,6 @@ fn placed_groups(request: &Request) -> Vec<GroupId> {
         }
     }
     groups
-}
-
-/// The phase a policy's work names by its id; `None` for an id no phase carries.
-fn phase_of(id: PhaseId) -> Option<Phase> {
-    Phase::ALL.into_iter().find(|phase| phase.id() == id)
 }
 
 /// Whether `phase` is a token phase, whose calls write the request's cache.
