@@ -86,8 +86,9 @@ models = { workspace = true, features = ["fixtures"] }
 rustix = { workspace = true, features = ["process"] }
 # The checkpoint shards the weight store's tests write.
 safetensors.workspace = true
-# A toy policy module in a test is written as `wat`.
-wasmtime = { workspace = true, features = ["wat"] }
+# The policy host's tests assemble their fault modules from the `.wat` files beside
+# `scheduler::policy`; the engine's own wasmtime compiles binary modules only.
+wat.workspace = true
 tempfile.workspace = true
 
 [lints]

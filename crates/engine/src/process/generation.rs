@@ -36,6 +36,7 @@ use crate::worker::completion::{Outcome, Submission};
 use anyhow::{Context as _, Result, anyhow};
 use build_server::{Client, Target};
 use crossbeam_channel::{RecvTimeoutError, Sender};
+use proto::config::PolicyBudget;
 use proto::module::{PackageRevision, Packages};
 use scheduling::limits::{Limits, Parameters};
 use scheduling::view::Snapshot;
@@ -187,7 +188,8 @@ fn serving_kernels(workers: &[Arc<Worker>]) -> Result<Vec<Arc<ops::Generation>>>
 
 /// Resolves the policy package `package` at the Build Server and returns its module with the
 /// arguments it was given (`Prepare`'s policy half). The module is instantiated once against
-/// `ceilings`, the limits the workers hold, and dropped: a policy that faults at its start or
+/// `ceilings`, the limits the workers hold, under the deployment's `budget`, and dropped: a policy
+/// that faults at its start or
 /// declares limits outside the ceilings fails the preparation, with serving untouched, rather
 /// than the switch (`specs/scheduler-design.md` §3.9).
 ///
@@ -197,7 +199,7 @@ fn serving_kernels(workers: &[Arc<Worker>]) -> Result<Vec<Arc<ops::Generation>>>
 pub(crate) fn policy(
     build: &Arc<Mutex<Client>>,
     package: &PackageRevision,
-    ceilings: &Limits,
+    (ceilings, budget): (&Limits, &PolicyBudget),
 ) -> Result<(Arc<wasmtime::Module>, Parameters)> {
     let named = format!(
         "the policy package {}@{}",
@@ -211,6 +213,7 @@ pub(crate) fn policy(
         parameters.clone(),
         Snapshot::default(),
         ceilings,
+        budget,
     )
     .map_err(|fault| anyhow!("{named}: {fault}"))?;
     Ok((module, parameters))

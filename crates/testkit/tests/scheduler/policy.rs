@@ -93,7 +93,7 @@ impl Script {
                 chunked_prefill_size: 16,
                 max_batch: 8,
                 max_num_batched_tokens: 64,
-                ..policy::ceilings([])
+                ..policy::ceilings([], &proto::config::PolicyBudget::default())
             },
             init: Init::Serves,
             observe: None,
@@ -569,7 +569,7 @@ fn a_decision_beyond_a_limit_is_cut_to_it() {
             chunked_prefill_size: CHUNK,
             max_batch: CALLS,
             max_num_batched_tokens: TOKENS,
-            ..policy::ceilings([])
+            ..policy::ceilings([], &proto::config::PolicyBudget::default())
         },
         replies: vec![driving(&[1, 2, 3], 1_000)],
         ..Script::serving(&[])

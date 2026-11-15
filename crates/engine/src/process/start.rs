@@ -240,7 +240,8 @@ impl Engine {
         // for. The model's facts state no feature before its workers do: the engine serves the
         // features its schedulers' groups serve, which each scheduler resolves for its own. Every
         // numeric limit is the lower of the launch's and what the groups were sized for.
-        let ceilings = policy::ceilings(capacities.iter().map(|(_, capacity)| capacity));
+        let budget = &config.scheduler.policy_budget;
+        let ceilings = policy::ceilings(capacities.iter().map(|(_, capacity)| capacity), budget);
         let mut limits = lowered(
             GenerationLimits {
                 max_logprobs: config.max_logprobs,
@@ -337,7 +338,9 @@ impl Engine {
                 ranks,
                 ..Snapshot::default()
             };
-            Some(Policy::new(module, parameters, snapshot, &ceilings)?)
+            Some(Policy::new(
+                module, parameters, snapshot, &ceilings, budget,
+            )?)
         } else {
             None
         };
@@ -904,7 +907,10 @@ fn start_peer(
     let hosts = Mutex::new(hosts);
     let session: Box<dyn FnOnce() -> Result<()> + Send> =
         Box::new(move || service::lock(&hosts).close());
-    let ceilings = policy::ceilings(capacities.iter().map(|(_, capacity)| capacity));
+    let ceilings = policy::ceilings(
+        capacities.iter().map(|(_, capacity)| capacity),
+        &launch.engine_config.scheduler.policy_budget,
+    );
     Ok(Engine {
         schedulers: Vec::new(),
         route: None,

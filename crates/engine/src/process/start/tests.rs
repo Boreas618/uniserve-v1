@@ -67,7 +67,7 @@ fn storage_launch(server: &StorageServer, launch: &EngineArgs) -> StorageLaunch 
 fn start_on_meta(server: &StorageServer, launch: &EngineArgs) -> Engine {
     let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
     let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
-    let policy = (crate::scheduler::packaged(), parameters);
+    let policy = (crate::scheduler::packaged("arrival"), parameters);
     // An engine of one main process has no peer link to lose.
     let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
     start(
@@ -297,7 +297,7 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
     // The packaged policy the launch names, with the arguments the launch pins on it.
     let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
-    let policy = (crate::scheduler::packaged(), parameters);
+    let policy = (crate::scheduler::packaged("arrival"), parameters);
 
     // One scheduler over the one group of the one rank, which no routing policy chooses among,
     // assembling batches for the start's generation.
@@ -391,7 +391,7 @@ fn a_standby_of_the_serving_epoch_opens_a_session_of_its_own_and_maps_its_region
         standby_storage: Default::default(),
     };
     let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
-    let policy = || (crate::scheduler::packaged(), parameters.clone());
+    let policy = || (crate::scheduler::packaged("arrival"), parameters.clone());
     let session = |engine: &super::Engine| {
         let head = service::lock(engine.head.as_ref().unwrap());
         let (open, opened) = head.session().unwrap();
@@ -454,7 +454,7 @@ fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session
     };
     let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
     let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
-    let policy = (crate::scheduler::packaged(), parameters);
+    let policy = (crate::scheduler::packaged("arrival"), parameters);
 
     // One scheduler over the one media group of the one rank, whose worker is warm, with no
     // KV region to grow: every video phase on the group, with its steps and product sizes.
@@ -518,7 +518,7 @@ fn a_meta_start_of_a_model_with_a_vision_tower_encodes_images_beside_its_prefill
     };
     let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
     let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
-    let policy = (crate::scheduler::packaged(), parameters);
+    let policy = (crate::scheduler::packaged("arrival"), parameters);
     let engine = start(&launch, &registry, &storage, None, policy, liveness).unwrap();
 
     // The rank's one worker serves the prefills and the image encodings: its causal runner and
@@ -644,7 +644,10 @@ fn the_limits_an_engine_reports_are_the_lower_of_the_launch_s_and_its_groups() {
         GroupId(0),
         capacity(&[Phase::Prefill, Phase::Decode], 2048, 0),
     )];
-    let ceilings = crate::scheduler::policy::ceilings(text.iter().map(|(_, capacity)| capacity));
+    let ceilings = crate::scheduler::policy::ceilings(
+        text.iter().map(|(_, capacity)| capacity),
+        &proto::config::PolicyBudget::default(),
+    );
     let limits = lowered(unbounded(), &text, &ceilings);
     assert_eq!(
         (limits.max_vit_grid_tokens, limits.max_vision_feature_bytes),
@@ -667,7 +670,10 @@ fn the_limits_an_engine_reports_are_the_lower_of_the_launch_s_and_its_groups() {
             4096,
         ),
     )];
-    let ceilings = crate::scheduler::policy::ceilings(vision.iter().map(|(_, capacity)| capacity));
+    let ceilings = crate::scheduler::policy::ceilings(
+        vision.iter().map(|(_, capacity)| capacity),
+        &proto::config::PolicyBudget::default(),
+    );
     let limits = lowered(unbounded(), &vision, &ceilings);
     assert_eq!(limits.max_vit_grid_tokens, 2048);
     assert_eq!(limits.max_vision_feature_bytes, 2048 * 4096);

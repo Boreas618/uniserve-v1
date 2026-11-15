@@ -194,6 +194,8 @@ wasmtime = { version = "50.0.1", default-features = false, features = [
     "runtime",
     "std",
 ] }
+# The WebAssembly text assembler the policy host's tests build their fault modules with.
+wat = "1.263.0"
 winnow = "1.0.2"
 
 [workspace.lints.clippy]

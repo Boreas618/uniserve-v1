@@ -1992,10 +1992,11 @@ mod tests {
     fn copying() -> (Bench, runtime::RequestId) {
         let mut bench = bench(4096);
         bench.scheduler.policy = Policy::new(
-            packaged(),
+            packaged("arrival"),
             packaged_arguments("max_num_batched_tokens = 8192"),
             Snapshot::default(),
-            &ceilings([]),
+            &ceilings([], &proto::config::PolicyBudget::default()),
+            &proto::config::PolicyBudget::default(),
         )
         .unwrap();
         for index in [0, 1] {

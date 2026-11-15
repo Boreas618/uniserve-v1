@@ -83,7 +83,7 @@ pub(crate) use cache::Cached;
 pub(crate) use group::WorkerGroup;
 /// The packaged policies this tree builds, for the tests of the engine that serves them.
 #[cfg(test)]
-pub(crate) use policy::tests::{packaged, packaged_arguments};
+pub(crate) use policy::tests::packaged;
 use policy::{Policy, PolicyError, ceilings};
 pub(crate) use request::{Blocks, Request, RequestStatus};
 pub(crate) use view::view_of;
@@ -481,10 +481,14 @@ impl Scheduler {
         let config = resolved(config, &workers)?;
 
         // A scheduler that holds no request and knows no cached block yet is told its groups.
-        let bounds = ceilings(workers.iter().map(|worker| &worker.capacity));
+        let bounds = ceilings(
+            workers.iter().map(|worker| &worker.capacity),
+            &config.policy_budget,
+        );
         let snapshot = view::snapshot_of(&workers);
         let parameters = policy::budgeted(parameters, &config);
-        let policy = Policy::new(module, parameters, snapshot, &bounds).map_err(Error::Policy)?;
+        let policy = Policy::new(module, parameters, snapshot, &bounds, &config.policy_budget)
+            .map_err(Error::Policy)?;
 
         // The page seeds every group of the scheduler states for its cache groups, one per class
         // in class order: one key chain serves all of them, so groups that state seeds must state
@@ -658,7 +662,10 @@ fn resolved(mut config: SchedulerConfig, groups: &[WorkerGroup]) -> Result<Sched
         config.max_running_requests = config.max_running_requests.min(slots).max(1);
     }
 
-    let ceilings = ceilings(groups.iter().map(|group| &group.capacity));
+    let ceilings = ceilings(
+        groups.iter().map(|group| &group.capacity),
+        &config.policy_budget,
+    );
     let tokens = usize::try_from(ceilings.max_num_batched_tokens).unwrap_or(usize::MAX);
     config.max_num_batched_tokens = config.max_num_batched_tokens.clamp(1, tokens.max(1));
     if let Some(rows) = NonZeroUsize::new(ceilings.max_batch) {
@@ -1171,7 +1178,10 @@ impl Scheduler {
     /// requests beyond their slots, a step's tokens beyond the widest prefill bucket, its calls
     /// beyond the largest bucket's rows (`S/run.rs:287-347`). The limits are then unchanged.
     fn configure(&mut self, config: SchedulerConfig) -> Result<(), Error> {
-        let ceilings = ceilings(self.groups.iter().map(|group| &group.capacity));
+        let ceilings = ceilings(
+            self.groups.iter().map(|group| &group.capacity),
+            &config.policy_budget,
+        );
         let held = |value: Option<u32>| value.map_or(usize::MAX, |value| value as usize);
         let limits = [
             (

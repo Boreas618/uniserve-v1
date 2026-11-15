@@ -24,8 +24,7 @@ use storage::{Key, QueuePair};
 
 use super::cache::DEVICE;
 use super::policy::ceilings;
-pub(crate) use super::policy::tests::toy;
-use super::policy::tests::{packaged, packaged_arguments};
+use super::policy::tests::{Fixture, fixture, packaged, packaged_arguments};
 use super::{
     Blocks, Cached, Capacity, Executor, Message, Output, Policy, Request, RequestStatus, Scheduler,
 };
@@ -827,10 +826,11 @@ fn a_marked_request_is_told_at_the_next_dispatch() {
     bench.attach(&[]);
     let scheduler = &mut bench.scheduler;
     scheduler.policy = Policy::new(
-        packaged(),
+        packaged("arrival"),
         packaged_arguments("max_num_batched_tokens = 8192"),
         Snapshot::default(),
-        &ceilings([]),
+        &ceilings([], &proto::config::PolicyBudget::default()),
+        &proto::config::PolicyBudget::default(),
     )
     .unwrap();
     let id = proto::request::RequestId(1);
@@ -1071,7 +1071,7 @@ fn configure_refuses_a_limit_above_what_the_workers_hold() {
     let parameters = packaged_arguments(
         "chunked_prefill_size = 512\nmax_batch = 8\nmax_num_batched_tokens = 512",
     );
-    let policy = (packaged(), parameters);
+    let policy = (packaged("arrival"), parameters);
     let Ok(mut bench) = built(1024, SchedulerConfig::default(), groups.collect(), policy) else {
         panic!("the startup checks pass both groups");
     };
@@ -1229,5 +1229,5 @@ fn a_failed_executor_job_stops_the_loop_and_reaches_the_engine() {
 /// A policy module that admits nothing, whose limits are the policy defaults: tests that drive
 /// the queue pair, the views or the placement, which no policy decision reaches.
 pub(crate) fn idle_policy() -> Arc<wasmtime::Module> {
-    toy("(i64.const 0)")
+    fixture(Fixture::Idle)
 }

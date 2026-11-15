@@ -542,7 +542,7 @@ impl MainProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::policy::tests::router;
+    use crate::scheduler::policy::tests::{Fixture, ROUTER_LONGEST, fixture};
 
     /// An event of request 9, distinct by its message.
     fn event(message: &str) -> wire::Event {
@@ -657,21 +657,30 @@ mod tests {
             migratable: false,
             cache_rank: None,
         };
-        // A load the instance routes, and one whose longer message it traps on.
+        // A load the instance routes, and one stated over so many ranks that its message is
+        // longer than the instance routes, which it traps on; rank 1 is the least loaded of both.
         let calm = ranks(&[3, 1]);
-        let busy = ranks(&[3_000_000_000, 1]);
-        let longest = scheduling::wire::encode(&(&arrival, &calm)).unwrap().len();
-        let module = router(&format!(
-            "(if (i32.gt_u (local.get $len) (i32.const {longest})) (then (unreachable))) \
-             (i32.const 0)"
-        ));
+        let mut loads = vec![3, 1];
+        loads.resize(256, 9);
+        let busy = ranks(&loads);
+        let length = |load: &[RankView]| scheduling::wire::encode(&(&arrival, load)).unwrap().len();
+        assert!(length(&calm) <= ROUTER_LONGEST && length(&busy) > ROUTER_LONGEST);
+        let module = fixture(Fixture::Router);
         let start = || {
             let snapshot = Snapshot {
                 ranks: calm.clone(),
                 ..Snapshot::default()
             };
-            let ceilings = crate::scheduler::policy::ceilings([]);
-            Policy::new(Arc::clone(&module), Default::default(), snapshot, &ceilings).unwrap()
+            let budget = proto::config::PolicyBudget::default();
+            let ceilings = crate::scheduler::policy::ceilings([], &budget);
+            Policy::new(
+                Arc::clone(&module),
+                Default::default(),
+                snapshot,
+                &ceilings,
+                &budget,
+            )
+            .unwrap()
         };
 
         let mut route = start();

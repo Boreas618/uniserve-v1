@@ -18,14 +18,16 @@
 //!
 //! A policy module is the wasm32 binary the Build Server builds a policy package to, compiled
 //! here under the one wasmtime configuration of this module ([`runtime`]), which meters fuel,
-//! when a scheduler loads it ([`load`]).
+//! when a scheduler loads it ([`load`]). What a module runs within (each call's fuel, the bounds
+//! of the limits it declares) is the deployment's `scheduler_config.policy_budget`
+//! ([`PolicyBudget`]).
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
 use crate::batch::Shape;
-use proto::config::SchedulerConfig;
+use proto::config::{PolicyBudget, SchedulerConfig};
 use proto::request::RequestId;
 use scheduling::decision::{DispatchOutput, Room, Shortage, Victim};
 use scheduling::event::Event;
@@ -42,35 +44,21 @@ use wasmtime::{Config, Memory, Module, OptLevel, Store, Trap, TypedFunc, WasmPar
 use super::view::view;
 use super::{Capacity, Error, Output, Request, RequestStatus, Scheduler, WorkerGroup};
 
-/// The target a policy module is compiled for: the host architecture's baseline Linux triple, so
-/// the code is the same on every host of the architecture whatever its CPU model. `None` on an
-/// architecture with no policy target, where [`runtime`] fails.
-pub(crate) fn target() -> Option<&'static str> {
-    match std::env::consts::ARCH {
-        "x86_64" => Some("x86_64-unknown-linux-gnu"),
-        "aarch64" => Some("aarch64-unknown-linux-gnu"),
-        _ => None,
-    }
-}
-
 /// The wasmtime engine policy modules are compiled for and run in.
 ///
 /// Fuel metering is on for the whole engine (every call into a policy has a budget), backtraces
 /// are off because a failure is reported as its trap code alone, and the compiler runs at
-/// `Speed`. The target is [`target`]. Each call builds a new engine; a module keeps the engine it
-/// was compiled with, and its instances run in that one.
+/// `Speed`. The code is compiled for the Rust target this engine was built for
+/// (`build_server::Target::host`), whose baseline instruction set every host of the target
+/// runs, so the code is the same on every host whatever its CPU model. Each call builds a new
+/// engine; a module keeps the engine it was compiled with, and its instances run in that one.
 ///
 /// # Errors
 ///
-/// [`PolicyError::Load`] when the host's architecture has no policy target or wasmtime refuses
-/// the configuration.
+/// [`PolicyError::Load`] when wasmtime compiles for no such target or refuses the configuration.
 fn runtime() -> Result<wasmtime::Engine, PolicyError> {
-    let target = target().ok_or_else(|| {
-        PolicyError::Load(format!(
-            "the host architecture {} has no policy target",
-            std::env::consts::ARCH
-        ))
-    })?;
+    let target = build_server::Target::host();
+    let target = target.as_str();
 
     let mut config = Config::new();
     config.consume_fuel(true);
@@ -90,9 +78,9 @@ fn runtime() -> Result<wasmtime::Engine, PolicyError> {
 }
 
 /// The module a scheduler instantiates ([`Policy::new`]) from the bytes the Build Server serves
-/// for a policy package: the wasm32 binary its crate compiled to, compiled here. Text is accepted
-/// where wasmtime's `wat` feature is on, which is the tests. The module carries the fuel-metering
-/// configuration of [`runtime`], so every instance of it is metered per call.
+/// for a policy package: the wasm32 binary its crate compiled to, compiled here. The module
+/// carries the fuel-metering configuration of [`runtime`], so every instance of it is metered per
+/// call.
 ///
 /// # Errors
 ///
@@ -102,33 +90,6 @@ pub fn load(bytes: &[u8]) -> Result<Module, PolicyError> {
     Module::new(&runtime()?, bytes)
         .map_err(|error| PolicyError::Load(format!("cannot compile the policy module: {error}")))
 }
-
-/// The fuel one call into a policy module may consume, and each export the host enters for that
-/// call (`H/instance.rs:32`): far above a step's `observe` and `dispatch` of a real policy, and a
-/// bound on one that never returns.
-pub(super) const DEFAULT_CALL_FUEL: u64 = 10_000_000;
-
-/// The fuel a call is given beyond [`DEFAULT_CALL_FUEL`] for every byte of its message.
-///
-/// A message can state every cached block: `init`'s snapshot states every request and every
-/// cached block, and the events of the step after the scheduler's startup `Listing` state each
-/// block it lists as a `Cached` page, which a scheduler that starts beside a warm cache (an
-/// epoch's target of the same layout maps the serving epoch's regions) learns after its policy
-/// was instantiated. Decoding such a message grows with the cache: typed JSON decoding in a
-/// wasm32 module costs 50 to 100 fuel a byte, and the packaged `arrival` spends about 70 a byte of
-/// cached blocks on its whole `init`. Twice the decoding's dearest leaves a policy as much again
-/// for its own state, so a policy instantiates on, and observes, a warm cache of any size, and
-/// the bound still ends a call that never returns. A step's other events cost what the step
-/// changed, and its other messages are small, so their budget stays near [`DEFAULT_CALL_FUEL`].
-const MESSAGE_FUEL_PER_BYTE: u64 = 200;
-
-/// The longest starvation bound a policy may declare (`limits().timeout`), as `sched_ext` caps
-/// `timeout_ms` at 30 seconds.
-const MAX_TIMEOUT: Nanos = Nanos(30_000_000_000);
-
-/// The smallest prefix-hit deepening a policy may declare (`prefetch_min_tokens`): a shorter hit is
-/// computed faster than it is fetched.
-const PREFETCH_FLOOR_TOKENS: u32 = 256;
 
 /// The serving scheduling policy, and the module it replaced, kept for rollback (SD §2.1, §5.2).
 ///
@@ -146,6 +107,8 @@ pub(crate) struct Policy {
     /// The ceilings the serving policy's limits were checked against, which a rollback checks the
     /// previous policy's against again.
     ceilings: Limits,
+    /// The fuel every instance of the policy is given for each call.
+    budget: PolicyBudget,
     /// The module and arguments the last switch replaced, which a rollback instantiates; `None`
     /// once the switch is committed.
     pub previous: Option<(Arc<Module>, Parameters)>,
@@ -221,7 +184,8 @@ impl std::error::Error for PolicyError {}
 impl Policy {
     /// Instantiates `module` as a scheduler's policy (or the engine's routing policy): constructs
     /// it from the package's `parameters`, initializes it with `snapshot`, reads its limits once
-    /// and checks them against `ceilings`.
+    /// and checks them against `ceilings`. Every instance of the policy, this one and those its
+    /// switches, rollbacks and recoveries make, is given the fuel `budget` states for each call.
     ///
     /// # Errors
     ///
@@ -232,6 +196,7 @@ impl Policy {
         parameters: Parameters,
         snapshot: Snapshot,
         ceilings: &Limits,
+        budget: &PolicyBudget,
     ) -> Result<Self, PolicyError> {
         let (mut calls, mut fuel) = (0, 0);
         let told = told_by(&snapshot);
@@ -239,7 +204,7 @@ impl Policy {
             &module,
             &parameters,
             snapshot,
-            ceilings,
+            (ceilings, budget),
             &mut calls,
             &mut fuel,
         )?;
@@ -249,6 +214,7 @@ impl Policy {
             module,
             parameters,
             ceilings: *ceilings,
+            budget: *budget,
             previous: None,
             recovering: false,
             limits,
@@ -279,7 +245,7 @@ impl Policy {
             &module,
             &parameters,
             snapshot,
-            ceilings,
+            (ceilings, &self.budget),
             &mut self.calls,
             &mut self.fuel,
         )
@@ -463,7 +429,7 @@ impl Policy {
             &module,
             &parameters,
             snapshot,
-            &ceilings,
+            (&ceilings, &self.budget),
             &mut self.calls,
             &mut self.fuel,
         )?;
@@ -522,9 +488,11 @@ impl Policy {
     }
 }
 
-/// A policy module's instance: its store, its memory and the exports the interface calls.
+/// A policy module's instance: its store, its memory, the exports the interface calls, and the
+/// fuel each call is given.
 struct Instance {
     store: Store<()>,
+    budget: PolicyBudget,
     memory: Memory,
     alloc: TypedFunc<u32, u32>,
     free: TypedFunc<(u32, u32), ()>,
@@ -539,12 +507,13 @@ struct Instance {
 
 impl Instance {
     /// Instantiates `module` and binds every export the interface calls, naming the first that
-    /// is missing or has another signature.
-    fn new(module: &Module) -> Result<Self, PolicyError> {
+    /// is missing or has another signature. Each call is given the fuel `budget` states, and so
+    /// is the instantiation.
+    fn new(module: &Module, budget: &PolicyBudget) -> Result<Self, PolicyError> {
         let mut store = Store::new(module.engine(), ());
         // An engine that meters no fuel refuses a budget, and a policy that loops would then
         // hold the scheduler's thread.
-        store.set_fuel(DEFAULT_CALL_FUEL).map_err(|error| {
+        store.set_fuel(budget.call_fuel.get()).map_err(|error| {
             PolicyError::Instantiate(format!(
                 "its engine meters no fuel (load it with `policy::load`): {error}"
             ))
@@ -583,6 +552,7 @@ impl Instance {
             place: bind(&mut store, &instance, Call::Place.export())?,
             limits: bind(&mut store, &instance, Call::Limits.export())?,
             store,
+            budget: *budget,
             memory,
         })
     }
@@ -593,14 +563,8 @@ impl Instance {
     fn exchange(&mut self, call: Call, message: &[u8], fuel: &mut u64) -> Result<u64, PolicyError> {
         let len = u32::try_from(message.len())
             .map_err(|_| malformed(call, "the message is larger than wasm32 addresses"))?;
-        let ptr = enter(
-            &mut self.store,
-            call,
-            &self.alloc,
-            len,
-            DEFAULT_CALL_FUEL,
-            fuel,
-        )?;
+        let call_fuel = self.budget.call_fuel.get();
+        let ptr = enter(&mut self.store, call, &self.alloc, len, call_fuel, fuel)?;
         if ptr == 0 && len != 0 {
             return Err(malformed(call, "the module could not hold the message"));
         }
@@ -609,7 +573,7 @@ impl Instance {
             .map_err(|error| malformed(call, format!("cannot write the message: {error}")))?;
 
         let buffer = (ptr, len);
-        let budget = budget(len);
+        let budget = message_fuel(&self.budget, len);
         let store = &mut self.store;
         let result = match call {
             Call::Init => enter(store, call, &self.init, buffer, budget, fuel)?,
@@ -621,7 +585,7 @@ impl Instance {
             Call::Limits => return Err(malformed(call, "this call takes no message")),
         };
 
-        enter(store, call, &self.free, buffer, DEFAULT_CALL_FUEL, fuel)?;
+        enter(store, call, &self.free, buffer, call_fuel, fuel)?;
         Ok(result)
     }
 
@@ -632,7 +596,7 @@ impl Instance {
             Call::Limits,
             &self.limits,
             (),
-            DEFAULT_CALL_FUEL,
+            self.budget.call_fuel.get(),
             fuel,
         )?;
         self.take(Call::Limits, packed, fuel)
@@ -663,7 +627,7 @@ impl Instance {
             call,
             &self.free,
             (ptr, len),
-            DEFAULT_CALL_FUEL,
+            self.budget.call_fuel.get(),
             fuel,
         )?;
         Ok(Some(reply))
@@ -709,17 +673,18 @@ fn follow(told: &mut HashMap<RequestId, RequestView>, event: &Event) {
     }
 }
 
-/// Instantiates `module` from `parameters` and `snapshot` (`init`), reads its limits once
-/// (`limits`) and checks them against `ceilings`. `calls` and `fuel` gather the two calls.
+/// Instantiates `module` from `parameters` and `snapshot` (`init`) with the fuel `budget` states
+/// for each call, reads its limits once (`limits`) and checks them against `ceilings`. `calls`
+/// and `fuel` gather the two calls.
 fn start(
     module: &Module,
     parameters: &Parameters,
     snapshot: Snapshot,
-    ceilings: &Limits,
+    (ceilings, budget): (&Limits, &PolicyBudget),
     calls: &mut u64,
     fuel: &mut u64,
 ) -> Result<(Instance, Limits), PolicyError> {
-    let mut instance = Instance::new(module)?;
+    let mut instance = Instance::new(module, budget)?;
 
     let instantiation = Instantiation {
         parameters: parameters.clone(),
@@ -740,10 +705,13 @@ fn start(
     Ok((instance, limits))
 }
 
-/// The fuel an export is entered with for a message of `len` bytes: [`DEFAULT_CALL_FUEL`], and
-/// [`MESSAGE_FUEL_PER_BYTE`] more for each byte of the message.
-fn budget(len: u32) -> u64 {
-    DEFAULT_CALL_FUEL.saturating_add(MESSAGE_FUEL_PER_BYTE.saturating_mul(u64::from(len)))
+/// The fuel an export is entered with for a message of `len` bytes: the budget's call fuel, and
+/// its message fuel more for each byte of the message.
+fn message_fuel(budget: &PolicyBudget, len: u32) -> u64 {
+    budget
+        .call_fuel
+        .get()
+        .saturating_add(budget.message_fuel_per_byte.saturating_mul(u64::from(len)))
 }
 
 /// Enters one export with a fresh fuel budget of `budget`, adds what it consumed to `fuel`, and
@@ -803,8 +771,8 @@ fn malformed(call: Call, message: impl Into<String>) -> PolicyError {
 
 /// Refuses limits outside `ceilings` (`H/limits.rs:30-93`): a count that is zero or above its
 /// ceiling, an unbounded queue against a bounded ceiling or a bound above it, a prefetch threshold
-/// below the floor, and a starvation bound that is zero or above 30 s or the ceiling's. A limit
-/// is refused rather than clamped, since the policy's own decisions are sized to the limits it
+/// below the floor, and a starvation bound that is zero or above the ceiling's. A limit is
+/// refused rather than clamped, since the policy's own decisions are sized to the limits it
 /// declared.
 fn check(limits: &Limits, ceilings: &Limits) -> Result<(), PolicyError> {
     let counts = [
@@ -858,11 +826,10 @@ fn check(limits: &Limits, ceilings: &Limits) -> Result<(), PolicyError> {
         )));
     }
 
-    let bound = ceilings.timeout.min(MAX_TIMEOUT);
-    if limits.timeout.0 == 0 || limits.timeout > bound {
+    if limits.timeout.0 == 0 || limits.timeout > ceilings.timeout {
         return Err(PolicyError::Limits(format!(
             "timeout is {} ns, outside (0, {}] ns",
-            limits.timeout.0, bound.0
+            limits.timeout.0, ceilings.timeout.0
         )));
     }
     Ok(())
@@ -881,12 +848,15 @@ pub(super) fn budgeted(mut parameters: Parameters, config: &SchedulerConfig) -> 
 }
 
 /// The ceilings a scheduler's policy declares its limits within (SD §5.2), from what the
-/// workers of its groups captured: the step's tokens and a prefill chunk at most the widest
-/// prefill bucket's tokens, its calls at most the largest bucket's rows, a prefetch threshold of
-/// at least 256 tokens and a starvation bound of at most 30 s. A bound no captured bucket states
-/// (no group captured a prefill, or any, bucket: no such batch is formed) does not bind. The queue
-/// bound is the policy's own.
-pub fn ceilings<'a>(capacities: impl IntoIterator<Item = &'a Capacity>) -> Limits {
+/// workers of its groups captured and the deployment's `budget`: the step's tokens and a prefill
+/// chunk at most the widest prefill bucket's tokens, its calls at most the largest bucket's rows,
+/// a prefetch threshold of at least the budget's smallest and a starvation bound of at most the
+/// budget's longest. A bound no captured bucket states (no group captured a prefill, or any,
+/// bucket: no such batch is formed) does not bind. The queue bound is the policy's own.
+pub fn ceilings<'a>(
+    capacities: impl IntoIterator<Item = &'a Capacity>,
+    budget: &PolicyBudget,
+) -> Limits {
     let buckets: Vec<&Shape> = capacities
         .into_iter()
         .flat_map(|capacity| &capacity.buckets)
@@ -909,8 +879,8 @@ pub fn ceilings<'a>(capacities: impl IntoIterator<Item = &'a Capacity>) -> Limit
         max_queued_requests: None,
         max_batch: rows,
         max_num_batched_tokens: tokens,
-        prefetch_min_tokens: PREFETCH_FLOOR_TOKENS,
-        timeout: MAX_TIMEOUT,
+        prefetch_min_tokens: budget.min_prefetch_tokens,
+        timeout: Nanos(u64::try_from(budget.max_timeout.as_nanos()).unwrap_or(u64::MAX)),
     }
 }
 
@@ -925,7 +895,10 @@ impl Scheduler {
         parameters: Parameters,
     ) -> Result<(), Error> {
         let snapshot = self.snapshot();
-        let ceilings = ceilings(self.groups.iter().map(|group| &group.capacity));
+        let ceilings = ceilings(
+            self.groups.iter().map(|group| &group.capacity),
+            &self.config.policy_budget,
+        );
         let parameters = budgeted(parameters, &self.config);
         self.policy.switch(module, parameters, snapshot, &ceilings)
     }
@@ -948,9 +921,10 @@ impl Scheduler {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::path::PathBuf;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::OnceLock;
+    use std::sync::Mutex;
 
     use scheduling::End;
     use scheduling::Nanos;
@@ -960,40 +934,145 @@ pub(crate) mod tests {
         PageView, Phase as GuestPhase, PhaseView, RequestClass, RequestStatus as GuestStatus,
     };
 
+    use proto::config::DEFAULT_POLICY_CALL_FUEL;
+
     use super::super::view::tests::waiting;
     use super::super::view::view_of;
     use super::*;
 
-    /// The packaged policy, `arrival`, built for `wasm32-unknown-unknown` from this tree once per
-    /// test process, into a target directory of its own (`it-policy`, as `testkit` builds it), and
-    /// compiled on first use by [`load`].
-    pub(crate) fn packaged() -> Arc<Module> {
-        static MODULE: OnceLock<Arc<Module>> = OnceLock::new();
+    /// The module of the workspace's scheduling policy package whose backend is `backend`, built
+    /// for wasm32 once per test process and compiled on first use by [`load`].
+    ///
+    /// The package is the workspace member whose `package.toml` states the scheduling operator
+    /// and that backend, as the Build Server finds a package's crate. The cargo that built these
+    /// tests builds the member's library for wasm32 into a target directory of its own beside
+    /// the workspace's (`it-policy`, so the build does not wait for the lock of the build that
+    /// runs these tests), and the module is the artifact cargo's JSON messages report.
+    pub(crate) fn packaged(backend: &str) -> Arc<Module> {
+        static MODULES: Mutex<BTreeMap<String, Arc<Module>>> = Mutex::new(BTreeMap::new());
 
-        let module = MODULE.get_or_init(|| {
-            let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-            let target = std::env::var_os("CARGO_TARGET_DIR")
-                .map_or_else(|| workspace.join("target"), PathBuf::from)
-                .join("it-policy");
-            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        // The lock is held through a build, so one test process builds each package once.
+        let mut modules = MODULES.lock().unwrap();
+        if let Some(module) = modules.get(backend) {
+            return Arc::clone(module);
+        }
+        let module = Arc::new(load(&built(backend)).unwrap());
+        modules.insert(backend.to_owned(), Arc::clone(&module));
+        module
+    }
 
-            let mut build = Command::new(cargo);
-            build
-                .current_dir(&workspace)
-                .args(["build", "-q", "--release"]);
-            build.args(["--target", "wasm32-unknown-unknown", "--target-dir"]);
-            build.arg(&target);
-            build.args(["-p", "scheduling-policy-arrival"]);
-            let output = build.output().unwrap();
-            assert!(
-                output.status.success(),
-                "building the packaged policy: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let wasm = target.join("wasm32-unknown-unknown/release/scheduling_policy_arrival.wasm");
-            Arc::new(load(&std::fs::read(wasm).unwrap()).unwrap())
-        });
-        Arc::clone(module)
+    /// The wasm32 binary cargo builds of the workspace's scheduling policy package `backend`
+    /// ([`packaged`]). A test runs in its package's directory, from which cargo finds the
+    /// workspace.
+    fn built(backend: &str) -> Vec<u8> {
+        let cargo = env!("CARGO");
+        let metadata = Command::new(cargo)
+            .args([
+                "metadata",
+                "--format-version",
+                "1",
+                "--no-deps",
+                "--offline",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            metadata.status.success(),
+            "cargo metadata: {}",
+            String::from_utf8_lossy(&metadata.stderr)
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+
+        let member = metadata["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| {
+                let manifest = Path::new(package["manifest_path"].as_str().unwrap());
+                manifest
+                    .parent()
+                    .and_then(|root| build_server::manifest::Manifest::load(root).ok())
+                    .is_some_and(|manifest| {
+                        manifest.op == proto::module::POLICY && manifest.backend == backend
+                    })
+            })
+            .unwrap_or_else(|| panic!("no workspace member is the policy package {backend}"));
+        let id = member["id"].as_str().unwrap();
+        let target = Path::new(metadata["target_directory"].as_str().unwrap()).join("it-policy");
+
+        let build = Command::new(cargo)
+            .args(["build", "--release", "--locked", "--offline", "--lib"])
+            .args(["--message-format=json-render-diagnostics", "--target"])
+            .arg(build_server::target::WASM)
+            .arg("--package")
+            .arg(id)
+            .arg("--target-dir")
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "building the policy package {backend}: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let artifact = build
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            .filter(|message| {
+                message["reason"] == "compiler-artifact" && message["package_id"] == id
+            })
+            .flat_map(|message| message["filenames"].as_array().cloned().unwrap_or_default())
+            .filter_map(|file| file.as_str().map(PathBuf::from))
+            .find(|file| {
+                file.extension()
+                    .is_some_and(|extension| extension == "wasm")
+            })
+            .unwrap_or_else(|| panic!("cargo reported no wasm artifact of {backend}"));
+        std::fs::read(artifact).unwrap()
+    }
+
+    /// The policy modules of the policy host's own tests, each a module of the interface's
+    /// exports in a `.wat` file beside this module (`policy/`), assembled by `wat`: one that
+    /// decides nothing, and modules that fault in a stated way. Each states the interface version
+    /// it implements, which is this release's (`scheduling::INTERFACE_VERSION`, 5) for all but
+    /// [`Fixture::Stale`]: a module of another release is refused at instantiation, so a fixture
+    /// of a stale version fails every case that instantiates it.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Fixture {
+        /// Initializes, declares the limits of [`idle_limits`], admits nothing, routes and places
+        /// on the first candidate (`policy/idle.wat`).
+        Idle,
+        /// Traps in `init` (`policy/trap.wat`).
+        Trap,
+        /// Never returns from `init` (`policy/spin.wat`).
+        Spin,
+        /// Replies to `init` with a buffer outside its memory (`policy/stray.wat`).
+        Stray,
+        /// Routes a message of at most [`ROUTER_LONGEST`] bytes to the first rank and traps on a
+        /// longer one (`policy/router.wat`).
+        Router,
+        /// [`Fixture::Idle`] compiled against interface version 0, which no release speaks
+        /// (`policy/stale.wat`).
+        Stale,
+    }
+
+    /// The longest route message [`Fixture::Router`] routes.
+    pub(crate) const ROUTER_LONGEST: usize = 4096;
+
+    /// The module of `fixture`, compiled by [`load`] as a policy package's is.
+    pub(crate) fn fixture(fixture: Fixture) -> Arc<Module> {
+        let text = match fixture {
+            Fixture::Idle => include_str!("policy/idle.wat"),
+            Fixture::Trap => include_str!("policy/trap.wat"),
+            Fixture::Spin => include_str!("policy/spin.wat"),
+            Fixture::Stray => include_str!("policy/stray.wat"),
+            Fixture::Router => include_str!("policy/router.wat"),
+            Fixture::Stale => include_str!("policy/stale.wat"),
+        };
+        let binary = wat::parse_str(text).unwrap();
+        Arc::new(load(&binary).unwrap())
     }
 
     /// The arguments a revision of the packaged policy runs with when its deployment states
@@ -1002,10 +1081,10 @@ pub(crate) mod tests {
         crate::modules::load::parameters(&testkit::serving::policy_revision(stated)).unwrap()
     }
 
-    /// The limits a [`toy`] module declares: chunks and steps of 8192 tokens, 128 calls a step,
-    /// a 256-token prefetch threshold, a 30 s starvation bound and an unbounded queue, which the
-    /// ceilings of workers that captured no bucket ([`ceilings`] of none) hold.
-    pub(crate) fn toy_limits() -> Limits {
+    /// The limits [`Fixture::Idle`] and [`Fixture::Router`] declare: chunks and steps of 8192
+    /// tokens, 128 calls a step, a 256-token prefetch threshold, a 30 s starvation bound and an
+    /// unbounded queue, which the ceilings of workers that captured no bucket hold.
+    pub(crate) fn idle_limits() -> Limits {
         Limits {
             chunked_prefill_size: 8192,
             max_queued_requests: None,
@@ -1014,60 +1093,6 @@ pub(crate) mod tests {
             prefetch_min_tokens: 256,
             timeout: Nanos(30_000_000_000),
         }
-    }
-
-    /// A module that speaks the interface's exports, whose `sched_init` runs `body` (a `wat`
-    /// expression of type `i64`), whose `sched_limits` replies [`toy_limits`], whose
-    /// `sched_dispatch` replies a decision that names nothing, and whose other exports reply
-    /// nothing, or for `sched_route` the first rank.
-    pub(crate) fn toy(body: &str) -> Arc<Module> {
-        exports(body, "(i32.const 0)")
-    }
-
-    /// A routing instance of the exports of [`toy`] whose `sched_init` initializes and whose
-    /// `sched_route` runs `route`, a `wat` expression of type `i32` over the message's address
-    /// `$at` and length `$len`.
-    pub(crate) fn router(route: &str) -> Arc<Module> {
-        exports("(i64.const 0)", route)
-    }
-
-    /// The module of [`toy`] and [`router`]: `init` is `sched_init`'s body, `route` is
-    /// `sched_route`'s.
-    fn exports(init: &str, route: &str) -> Arc<Module> {
-        Arc::new(load(toy_text(init, route, scheduling::INTERFACE_VERSION).as_bytes()).unwrap())
-    }
-
-    /// The text of the module of [`exports`], which states `version` as the version of the
-    /// interface it implements.
-    fn toy_text(init: &str, route: &str, version: u32) -> String {
-        // Every message is written at 1024, and the replies lie at the end of the one page, past
-        // any snapshot a test's scheduler sends: the limits at 64768 and the decision at 65024,
-        // each returned as `ptr << 32 | len`.
-        let reply = |at: u64, bytes: &[u8]| {
-            let escaped: String = bytes.iter().map(|byte| format!("\\{byte:02x}")).collect();
-            (
-                (at << 32) | bytes.len() as u64,
-                format!(r#"(data (i32.const {at}) "{escaped}")"#),
-            )
-        };
-        let (limits, limits_data) = reply(64768, &wire::encode(&toy_limits()).unwrap());
-        let (empty, empty_data) = reply(65024, &wire::encode(&DispatchOutput::default()).unwrap());
-        format!(
-            r#"(module
-                (memory (export "memory") 1)
-                {limits_data}
-                {empty_data}
-                (func (export "sched_interface_version") (result i32) (i32.const {version}))
-                (func (export "sched_alloc") (param i32) (result i32) (i32.const 1024))
-                (func (export "sched_free") (param i32 i32))
-                (func (export "sched_init") (param i32 i32) (result i64) {init})
-                (func (export "sched_observe") (param i32 i32) (result i64) (i64.const 0))
-                (func (export "sched_dispatch") (param i32 i32) (result i64) (i64.const {empty}))
-                (func (export "sched_preempt") (param i32 i32) (result i64) (i64.const 0))
-                (func (export "sched_route") (param $at i32) (param $len i32) (result i32) {route})
-                (func (export "sched_place") (param i32 i32) (result i32) (i32.const 0))
-                (func (export "sched_limits") (result i64) (i64.const {limits})))"#
-        )
     }
 
     /// Arguments that state a deployment's limits, and the ceilings of workers that captured
@@ -1080,7 +1105,7 @@ pub(crate) mod tests {
             chunked_prefill_size: tokens,
             max_batch: calls,
             max_num_batched_tokens: tokens,
-            ..ceilings([])
+            ..ceilings([], &PolicyBudget::default())
         };
         (parameters, ceilings)
     }
@@ -1117,8 +1142,14 @@ pub(crate) mod tests {
             ("arrival", parameters.clone(), [1, 2]),
             ("priority", by_priority(parameters), [2, 1]),
         ] {
-            let mut policy =
-                Policy::new(packaged(), parameters, Snapshot::default(), &ceilings).unwrap();
+            let mut policy = Policy::new(
+                packaged("arrival"),
+                parameters,
+                Snapshot::default(),
+                &ceilings,
+                &PolicyBudget::default(),
+            )
+            .unwrap();
             assert_eq!(policy.limits.max_batch, 8, "{name}");
             assert_eq!(policy.limits.max_num_batched_tokens, 512, "{name}");
             assert_eq!(policy.calls, 2, "{name}: init and limits");
@@ -1147,13 +1178,26 @@ pub(crate) mod tests {
     fn limits_above_a_ceiling_refuse_the_policy() {
         let (parameters, ceilings) = limited(512, 8);
         let (wide, _) = limited(1024, 8);
-        let refused = Policy::new(packaged(), wide.clone(), Snapshot::default(), &ceilings);
+        let budget = PolicyBudget::default();
+        let refused = Policy::new(
+            packaged("arrival"),
+            wide.clone(),
+            Snapshot::default(),
+            &ceilings,
+            &budget,
+        );
         assert!(matches!(refused, Err(PolicyError::Limits(_))));
 
-        let mut policy =
-            Policy::new(packaged(), parameters, Snapshot::default(), &ceilings).unwrap();
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            Snapshot::default(),
+            &ceilings,
+            &budget,
+        )
+        .unwrap();
         let refused = policy.switch(
-            packaged(),
+            packaged("arrival"),
             by_priority(wide),
             Snapshot::default(),
             &ceilings,
@@ -1172,11 +1216,18 @@ pub(crate) mod tests {
     fn a_switch_keeps_the_replaced_policy_for_one_rollback() {
         let (serving, ceilings) = limited(512, 8);
         let (next, _) = limited(256, 4);
-        let mut policy = Policy::new(packaged(), serving, Snapshot::default(), &ceilings).unwrap();
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            serving,
+            Snapshot::default(),
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
 
         policy
             .switch(
-                packaged(),
+                packaged("arrival"),
                 by_priority(next),
                 Snapshot::default(),
                 &ceilings,
@@ -1197,31 +1248,33 @@ pub(crate) mod tests {
     /// each named by the call it happened in; a switch to such a module leaves the serving policy dispatching.
     #[test]
     fn a_faulting_module_is_refused_by_name() {
-        let ceilings = toy_limits();
-        let fault = |body: &str| {
+        let ceilings = idle_limits();
+        let budget = PolicyBudget::default();
+        let fault = |module: Fixture| {
             Policy::new(
-                toy(body),
+                fixture(module),
                 Parameters::default(),
                 Snapshot::default(),
                 &ceilings,
+                &budget,
             )
             .err()
         };
 
         assert!(matches!(
-            fault("(unreachable)"),
+            fault(Fixture::Trap),
             Some(PolicyError::Trap {
                 call: Call::Init,
                 ..
             })
         ));
         assert!(matches!(
-            fault("(loop $spin (br $spin)) (i64.const 0)"),
+            fault(Fixture::Spin),
             Some(PolicyError::Fuel { call: Call::Init })
         ));
         // A reply at an address past the module's one page of memory.
         assert!(matches!(
-            fault("(i64.const 0x0010000000000010)"),
+            fault(Fixture::Stray),
             Some(PolicyError::Malformed {
                 call: Call::Init,
                 ..
@@ -1229,14 +1282,15 @@ pub(crate) mod tests {
         ));
 
         let mut policy = Policy::new(
-            packaged(),
+            packaged("arrival"),
             packaged_arguments("max_num_batched_tokens = 8192"),
             Snapshot::default(),
             &ceilings,
+            &budget,
         )
         .unwrap();
         let refused = policy.switch(
-            toy("(unreachable)"),
+            fixture(Fixture::Trap),
             Parameters::default(),
             Snapshot::default(),
             &ceilings,
@@ -1247,8 +1301,9 @@ pub(crate) mod tests {
         policy.dispatch(&room(), &mut requests, &[]).unwrap();
     }
 
-    /// The ceilings are the widest prefill bucket's tokens and the largest bucket's rows; a
-    /// bound no bucket states does not bind.
+    /// The ceilings are the widest prefill bucket's tokens and the largest bucket's rows, and the
+    /// budget's bounds of the prefetch threshold and the starvation timeout; a bound no bucket
+    /// states does not bind.
     #[test]
     fn the_ceilings_are_what_the_workers_captured() {
         use crate::batch::Variant;
@@ -1259,14 +1314,19 @@ pub(crate) mod tests {
             Shape::prefill(1, 4096, Variant::PrefillWrite),
             Shape::decode(64, Variant::DecodeSampled),
         ];
-        let limits = ceilings([&capacity]);
+        let budget = PolicyBudget {
+            max_timeout: std::time::Duration::from_secs(12),
+            min_prefetch_tokens: 512,
+            ..PolicyBudget::default()
+        };
+        let limits = ceilings([&capacity], &budget);
         assert_eq!(limits.max_num_batched_tokens, 4096);
         assert_eq!(limits.chunked_prefill_size, 4096);
         assert_eq!(limits.max_batch, 64);
-        assert_eq!(limits.prefetch_min_tokens, 256);
-        assert_eq!(limits.timeout, Nanos(30_000_000_000));
+        assert_eq!(limits.prefetch_min_tokens, 512);
+        assert_eq!(limits.timeout, Nanos(12_000_000_000));
 
-        let unbound = ceilings([&super::super::tests::capacity()]);
+        let unbound = ceilings([&super::super::tests::capacity()], &budget);
         assert_eq!(unbound.max_num_batched_tokens, u32::MAX);
         assert_eq!(unbound.max_batch, usize::MAX);
     }
@@ -1275,27 +1335,25 @@ pub(crate) mod tests {
     /// another version is refused before any call; the packaged policy states this engine's.
     #[test]
     fn a_module_of_another_interface_version_is_refused() {
-        let ceilings = toy_limits();
+        let ceilings = idle_limits();
+        let budget = PolicyBudget::default();
         assert!(
             Policy::new(
-                packaged(),
+                packaged("arrival"),
                 limited(512, 8).0,
                 Snapshot::default(),
-                &ceilings
+                &ceilings,
+                &budget,
             )
             .is_ok()
         );
 
-        let stale = toy_text(
-            "(i64.const 0)",
-            "(i32.const 0)",
-            scheduling::INTERFACE_VERSION - 1,
-        );
         let refused = Policy::new(
-            Arc::new(load(stale.as_bytes()).unwrap()),
+            fixture(Fixture::Stale),
             Parameters::default(),
             Snapshot::default(),
             &ceilings,
+            &budget,
         );
         assert!(
             matches!(&refused, Err(PolicyError::Instantiate(message)) if message.contains("version")),
@@ -1380,7 +1438,7 @@ pub(crate) mod tests {
     /// (an advance and an emission per request, an end and one release per ending request, the
     /// step's end; the views of the 4 that run on moved by nothing their emissions do not state).
     /// The step's `observe` and `dispatch`, and those of a step in which all 64 decode on, each
-    /// consume at most half of [`DEFAULT_CALL_FUEL`]: half leaves room for a step twice as heavy
+    /// consume at most half of the default call fuel ([`DEFAULT_POLICY_CALL_FUEL`]): half leaves room for a step twice as heavy
     /// (twice the requests ending, or twice the blocks each) before a call runs out, while
     /// telling each block as a restated page, or decoding each event through a buffered copy,
     /// exceeds it. The policy saw the release: it offloads every block given up, once.
@@ -1389,7 +1447,7 @@ pub(crate) mod tests {
         const RUNNING: u64 = 64;
         const ENDING: u64 = 60;
         const BLOCKS: u64 = 16;
-        const LIMIT: u64 = DEFAULT_CALL_FUEL / 2;
+        const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
         let held = |id: u64| (0..BLOCKS).map(move |index| spread(id * BLOCKS + index));
 
         let (parameters, ceilings) = limited(8192, 128);
@@ -1397,7 +1455,14 @@ pub(crate) mod tests {
             phases: text_phases(),
             ..Snapshot::default()
         };
-        let mut policy = Policy::new(packaged(), parameters, snapshot, &ceilings).unwrap();
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
         let observe = |policy: &mut Policy, events: &[Event]| {
             metered(policy, Call::Observe, wire::encode(&events).unwrap()).0
         };
@@ -1490,7 +1555,7 @@ pub(crate) mod tests {
     /// hundreds): each request's decode was scheduled and applied, so the scheduler marked it
     /// and told its advance and its emission, and nothing else of its view moved. The policy is
     /// not told the views again, so the step's `observe` and `dispatch` together consume at most
-    /// half of [`DEFAULT_CALL_FUEL`], where restating each view costs about as much as a call
+    /// half of the default call fuel ([`DEFAULT_POLICY_CALL_FUEL`]), where restating each view costs about as much as a call
     /// has; and its view stays exact: every request decodes, and in the next step a request
     /// with as many decodes in flight as its group's call window allows is told it has no call
     /// ready, and is not named.
@@ -1499,7 +1564,7 @@ pub(crate) mod tests {
         use crate::batch::Phase;
 
         const RUNNING: u64 = 256;
-        const LIMIT: u64 = DEFAULT_CALL_FUEL / 2;
+        const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
         let mut bench = super::super::tests::bench(4096);
         let scheduler = &mut bench.scheduler;
         let group = scheduler.groups[0].id();
@@ -1521,7 +1586,14 @@ pub(crate) mod tests {
         }
         let (parameters, ceilings) = limited(8192, 512);
         let snapshot = scheduler.snapshot();
-        scheduler.policy = Policy::new(packaged(), parameters, snapshot, &ceilings).unwrap();
+        scheduler.policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
 
         // One decode of each request ran and was applied, as `schedule` and `update` do.
         let step = |scheduler: &mut Scheduler, number: u64| {
@@ -1583,13 +1655,13 @@ pub(crate) mod tests {
 
     /// A policy instantiates on the snapshot of a warm cache: 128 running requests and the 4096
     /// blocks of 64 tokens a cache of 262144 tokens holds, none of them held. Its `init` decodes
-    /// far more than [`DEFAULT_CALL_FUEL`] allows a step's call, and is given fuel for every byte
+    /// far more than the default call fuel ([`DEFAULT_POLICY_CALL_FUEL`]) allows a step's call, and is given fuel for every byte
     /// of the snapshot. A step costs `dispatch` what the step changed, not what the cache holds:
     /// the blocks the snapshot states were the instance before's to offload, and a block given
     /// up since is offloaded once.
     #[test]
     fn a_policy_instantiates_on_the_snapshot_of_a_warm_cache() {
-        const LIMIT: u64 = DEFAULT_CALL_FUEL / 2;
+        const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
         let (parameters, ceilings) = limited(8192, 128);
         let snapshot = Snapshot {
             requests: (1..=128)
@@ -1602,9 +1674,16 @@ pub(crate) mod tests {
             ..Snapshot::default()
         };
 
-        let mut policy = Policy::new(packaged(), parameters, snapshot, &ceilings).unwrap();
+        let mut policy = Policy::new(
+            packaged("arrival"),
+            parameters,
+            snapshot,
+            &ceilings,
+            &PolicyBudget::default(),
+        )
+        .unwrap();
         assert!(
-            policy.fuel > DEFAULT_CALL_FUEL,
+            policy.fuel > DEFAULT_POLICY_CALL_FUEL.get(),
             "the snapshot is one a step's budget cannot decode"
         );
         let room = Room {

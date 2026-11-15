@@ -795,6 +795,7 @@ impl MainProcess {
         let workers = engine.workers.clone();
         let binding = Arc::clone(&engine.binding);
         let ceilings = engine.ceilings;
+        let budget = self.launch.engine_config.scheduler.policy_budget;
         let serving = kernels_of(&self.serving);
         // A preparation whose shadow pass no running request reaches within twice the stall
         // bound is abandoned, naming the operators it could not compare.
@@ -802,7 +803,8 @@ impl MainProcess {
         self.work(Box::new(move || {
             let prepared = generation::kernels(&workers, &build, &named, &serving, generation)
                 .and_then(|kernels| {
-                    let (module, parameters) = generation::policy(&build.0, &policy, &ceilings)?;
+                    let (module, parameters) =
+                        generation::policy(&build.0, &policy, (&ceilings, &budget))?;
                     // Only an operator whose package changed has an old kernel to compare with.
                     // Every peer prepares the generation from its own daemon's command.
                     let changed = changed_operators(&kernels, &serving);

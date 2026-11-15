@@ -153,7 +153,7 @@ mod tests {
             chunked_prefill_size: tokens,
             max_batch: calls,
             max_num_batched_tokens: tokens,
-            ..policy::ceilings([])
+            ..policy::ceilings([], &proto::config::PolicyBudget::default())
         }
     }
 

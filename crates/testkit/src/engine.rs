@@ -162,7 +162,10 @@ fn start(launch: &EngineArgs, fixture: Fixture) -> Result<Engine> {
         .iter()
         .map(|group| (group.id, capacity.clone()))
         .collect();
-    let ceilings = scheduler::policy::ceilings(capacities.iter().map(|(_, capacity)| capacity));
+    let ceilings = scheduler::policy::ceilings(
+        capacities.iter().map(|(_, capacity)| capacity),
+        &launch.engine_config.scheduler.policy_budget,
+    );
     let policy = crate::packaged_policy(&ceilings)?;
 
     let mut inboxes = Vec::with_capacity(open.schedulers.len());

@@ -1336,8 +1336,10 @@ mod tests {
     fn an_admission_pinning_a_thousand_cached_blocks_stays_well_within_a_calls_fuel() {
         use scheduling::decision::{Room, Shortage, Storage, Victim};
 
-        use crate::scheduler::policy::{self, DEFAULT_CALL_FUEL, Policy};
-        use crate::scheduler::{packaged, packaged_arguments};
+        use crate::scheduler::policy::tests::{packaged, packaged_arguments};
+        use proto::config::{DEFAULT_POLICY_CALL_FUEL, PolicyBudget};
+
+        use crate::scheduler::policy::{self, Policy};
 
         const BLOCKS: u64 = 1000;
         let numbered = |number: u64| {
@@ -1352,9 +1354,11 @@ mod tests {
         list(&mut bench, &listed);
         bench.attach(&[(A, OWNER_A, 3)]);
         let snapshot = bench.scheduler.snapshot();
-        let ceilings = policy::ceilings([]);
+        let budget = PolicyBudget::default();
+        let ceilings = policy::ceilings([], &budget);
         let arguments = packaged_arguments("max_num_batched_tokens = 8192");
-        bench.scheduler.policy = Policy::new(packaged(), arguments, snapshot, &ceilings).unwrap();
+        bench.scheduler.policy =
+            Policy::new(packaged("arrival"), arguments, snapshot, &ceilings, &budget).unwrap();
 
         let pin = runtime::Request::Pin {
             owner: OWNER_A,
@@ -1382,7 +1386,7 @@ mod tests {
             .unwrap();
         let spent = scheduler.policy.fuel - fuel;
         assert!(
-            spent <= DEFAULT_CALL_FUEL / 2,
+            spent <= DEFAULT_POLICY_CALL_FUEL.get() / 2,
             "observe and dispatch took {spent} fuel"
         );
         assert!(output.offload.is_empty());
@@ -1413,8 +1417,10 @@ mod tests {
 
         use scheduling::decision::{Room, Shortage, Storage};
 
+        use crate::scheduler::policy::tests::{packaged, packaged_arguments};
+        use proto::config::PolicyBudget;
+
         use crate::scheduler::policy::{self, Policy};
-        use crate::scheduler::{packaged, packaged_arguments};
 
         const ON_DEVICE: u64 = 2048;
         const ON_HOST: u64 = 4094;
@@ -1425,10 +1431,12 @@ mod tests {
         };
 
         let mut bench = bench(1 << 22);
-        let ceilings = policy::ceilings([]);
+        let budget = PolicyBudget::default();
+        let ceilings = policy::ceilings([], &budget);
         let empty = bench.scheduler.snapshot();
         let arguments = packaged_arguments("max_num_batched_tokens = 8192");
-        bench.scheduler.policy = Policy::new(packaged(), arguments, empty, &ceilings).unwrap();
+        bench.scheduler.policy =
+            Policy::new(packaged("arrival"), arguments, empty, &ceilings, &budget).unwrap();
 
         let listed: Vec<(Key, u8)> = (0..ON_DEVICE)
             .map(|number| (numbered(number), DEVICE | HOST))

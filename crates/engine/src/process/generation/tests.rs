@@ -12,7 +12,7 @@ use super::{commit, named, rollback, switch};
 use crate::process::operations::ask;
 use crate::process::operations::tests::Node;
 use crate::scheduler::Message;
-use crate::scheduler::tests::toy;
+use crate::scheduler::policy::tests::{Fixture, fixture};
 use testkit::LONG;
 
 /// The generation every rank's graphs serve, in rank order.
@@ -63,7 +63,7 @@ fn keeps_a_policy(node: &Node) -> bool {
 
 /// A policy module the schedulers take: it admits nothing.
 fn policy() -> (Arc<wasmtime::Module>, Parameters) {
-    (toy("(i64.const 0)"), Parameters::default())
+    (fixture(Fixture::Idle), Parameters::default())
 }
 
 /// The node with generation 2 switched to: on trial, generation 1 kept.
@@ -127,7 +127,7 @@ fn a_policy_a_scheduler_refuses_rolls_the_switch_back() {
     let node = Node::start();
     assert!(prepares(&node, 2));
 
-    let refused = (toy("(unreachable)"), Parameters::default());
+    let refused = (fixture(Fixture::Trap), Parameters::default());
     let failed = switch(
         &node.schedulers,
         Some(&node.route),

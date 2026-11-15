@@ -196,7 +196,7 @@ A checkpoint that declares its own quantization (ModelOpt's `quantization_config
 
 ### `scheduler_config`
 
-**Destination, per field:** `policy` is a module selection (the scheduling policy); `max_queued_requests`, `chunked_prefill_size`, `max_batch` and `max_num_batched_tokens` are package parameters of that policy, bounded by the build config's limits, and the same numbers are the limit each scheduler obeys, which `PUT /admin/config` applies in place within the batch the running processes were started for.
+**Destination, per field:** `policy` is a module selection (the scheduling policy); `max_queued_requests`, `chunked_prefill_size`, `max_batch` and `max_num_batched_tokens` are package parameters of that policy, bounded by the build config's limits, and the same numbers are the limit each scheduler obeys, which `PUT /admin/config` applies in place within the batch the running processes were started for; `policy_budget` is what the engine's policy host runs the module within: the fuel of each call and the bounds of the limits a policy may declare.
 
 **Read at:** `policy` selects the policy package's backend at `crates/daemon/src/epoch.rs:1311`; the other options are the policy package's arguments at `:1449-1466`, where the captured decode graphs' rows and the deployment's resident requests bound `max_batch`. `max_num_batched_tokens` is read at `:1439-1446`, and a value above the catalog is refused at load rather than clamped.
 
@@ -208,6 +208,10 @@ A checkpoint that declares its own quantization (ModelOpt's `quantization_config
 | `max_queued_requests` | Unbounded | Waiting requests, and finished ones with undelivered events, before a submission is refused as overloaded |
 | `chunked_prefill_size` | `8192` | Prompt tokens one request prefills in one step; token models only |
 | `max_batch` | `128` | Calls assembled into one forward batch, clamped to what the workers accept |
+| `policy_budget.call_fuel` | `10000000` | The fuel (wasmtime's count of executed instructions) one call into the scheduling policy module may consume, and each export the engine enters for that call; a call that runs past its fuel is the module's fault, which ends its instance. Far above what a real policy's step consumes, and a bound on a call that never returns |
+| `policy_budget.message_fuel_per_byte` | `200` | The fuel a call is given beyond `call_fuel` for every byte of its message, so that a message that grows with the cache (an instantiation's snapshot of every cached block) is decoded whole: typed JSON decoding in a wasm32 module costs 50 to 100 fuel a byte |
+| `policy_budget.max_timeout` | `"30s"` | The longest starvation timeout a policy may declare among its limits (as `sched_ext` caps a BPF scheduler's `timeout_ms`); a policy that declares a longer one is refused |
+| `policy_budget.min_prefetch_tokens` | `256` | The smallest prefix-hit deepening a policy may declare worth a prefetch, in tokens; a shorter hit is computed faster than it is fetched, and a policy that declares less is refused |
 
 ### `speculative_config`
 

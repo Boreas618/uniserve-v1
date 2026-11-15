@@ -212,6 +212,69 @@ pub struct SchedulerConfig {
     /// eagerly, and the tier bound is honest but vacuous.
     #[serde(skip)]
     pub graph_tiers: Vec<u32>,
+    /// What the scheduling policy module runs within: the fuel of each call into it, and the
+    /// bounds of the starvation timeout and the prefetch threshold its limits may declare.
+    pub policy_budget: PolicyBudget,
+}
+
+/// The budget a scheduling policy module runs under (`scheduler_config.policy_budget`): the
+/// engine's policy host meters every call into the module by fuel, wasmtime's count of executed
+/// instructions, and checks the limits the module declares against these bounds. A call that
+/// runs past its fuel is the module's fault, which ends its instance (`specs/scheduler-design.md`
+/// §5.2, "Faults").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyBudget {
+    /// The fuel one call into the module may consume, and each export the host enters for that
+    /// call (the message buffer's allocation and release), before the message's own share.
+    pub call_fuel: NonZeroU64,
+    /// The fuel a call is given beyond `call_fuel` for every byte of its message, so that
+    /// decoding a message that grows with the cache (an instantiation's snapshot of every cached
+    /// block, the events of a scheduler that starts beside a warm cache) is not cut short.
+    pub message_fuel_per_byte: u64,
+    /// The longest starvation timeout a policy may declare (its limits' `timeout`).
+    #[serde(with = "values::duration")]
+    pub max_timeout: Duration,
+    /// The smallest prefix-hit deepening a policy may declare worth a prefetch (its limits'
+    /// `prefetch_min_tokens`), in tokens.
+    pub min_prefetch_tokens: u32,
+}
+
+/// The fuel of one call into a scheduling policy module when the deployment states none
+/// (`scheduler_config.policy_budget.call_fuel`): far above what a real policy's `observe` and
+/// `dispatch` of a step consume (the packaged `fcfs` stays below half of it for a step over a
+/// thousand running requests), and a bound on a call that never returns.
+pub const DEFAULT_POLICY_CALL_FUEL: NonZeroU64 = match NonZeroU64::new(10_000_000) {
+    Some(fuel) => fuel,
+    None => NonZeroU64::MIN,
+};
+
+/// The fuel a call is given for each byte of its message when the deployment states none
+/// (`scheduler_config.policy_budget.message_fuel_per_byte`): typed JSON decoding in a wasm32
+/// module costs 50 to 100 fuel a byte, and the packaged `fcfs` spends about 70 a byte of cached
+/// blocks on its whole `init`. Twice the decoding's dearest leaves a policy as much again for its
+/// own state, so a policy instantiates on, and observes, a warm cache of any size.
+pub const DEFAULT_POLICY_MESSAGE_FUEL_PER_BYTE: u64 = 200;
+
+/// The longest starvation timeout a policy may declare when the deployment states none
+/// (`scheduler_config.policy_budget.max_timeout`): 30 seconds, as `sched_ext` caps a BPF
+/// scheduler's `timeout_ms`, a bound past which a starved request is better refused than kept.
+pub const DEFAULT_POLICY_MAX_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The smallest prefetch threshold a policy may declare when the deployment states none
+/// (`scheduler_config.policy_budget.min_prefetch_tokens`): a prefix hit deepened by fewer tokens
+/// is computed faster than it is fetched from another tier.
+pub const DEFAULT_POLICY_MIN_PREFETCH_TOKENS: u32 = 256;
+
+impl Default for PolicyBudget {
+    fn default() -> Self {
+        Self {
+            call_fuel: DEFAULT_POLICY_CALL_FUEL,
+            message_fuel_per_byte: DEFAULT_POLICY_MESSAGE_FUEL_PER_BYTE,
+            max_timeout: DEFAULT_POLICY_MAX_TIMEOUT,
+            min_prefetch_tokens: DEFAULT_POLICY_MIN_PREFETCH_TOKENS,
+        }
+    }
 }
 
 impl Default for SchedulerConfig {
@@ -226,6 +289,7 @@ impl Default for SchedulerConfig {
             max_running_requests: DEFAULT_MAX_RUNNING_REQUESTS,
             draft_tokens: 0,
             graph_tiers: Vec::new(),
+            policy_budget: PolicyBudget::default(),
         }
     }
 }
@@ -258,6 +322,7 @@ impl SchedulerConfig {
             max_running_requests: engine.max_running_requests.get(),
             draft_tokens: engine.speculative.num_draft_tokens as usize,
             graph_tiers,
+            policy_budget: engine.scheduler.policy_budget,
         }
     }
 
