@@ -69,7 +69,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
 use engine::batch::{Batch, BatchId, BatchOutput, Columns, Phase, Shape, Variant};
@@ -113,7 +113,6 @@ const PEER: usize = 1;
 
 /// The engine number the peer registers under.
 const ENGINE: u64 = 7;
-
 
 /// The request numbers of the `Finish` requests whose answers are mapped: this plus the copy's.
 const ANSWERS: u64 = 1_000;

@@ -2366,7 +2366,6 @@ mod tests {
     use crate::memory::cache::info::CacheSegment;
     use crate::process::generation;
     use std::thread::JoinHandle;
-    use std::time::Duration;
 
     use testkit::LONG;
 

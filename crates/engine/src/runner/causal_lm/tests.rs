@@ -9,7 +9,6 @@
 //! the page tables the runner gathers.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crate::batch::philox::{DrawAddress, sampling_uniform};
 use crate::batch::{
