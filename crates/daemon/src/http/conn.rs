@@ -749,7 +749,13 @@ impl Connection {
         // The heads that could still be replaced are already answered by the
         // failure above; this names the one that could not be, so the run that
         // reads an empty body says which response produced it (design §7.4).
+        // A body of its handler's own whose exact length is zero answers by its
+        // status alone, as `/health`'s readiness does, and promised no document;
+        // a handed body's declared zero is only its placeholder, so it still
+        // counts.
+        let declared_empty = !handed_is_some && content_length == Some(0);
         if self.frames == frames_before
+            && !declared_empty
             && parts.status.is_success()
             && !status_without_body(parts.status)
             && !head_only
