@@ -3,15 +3,15 @@
 The Build Server compiles a descriptor by calling :func:`compile` with the
 compile request. It compiles FlashInfer's MegaMoE kernel (the pinned `megamoe`
 source with `patches/megamoe.patch`, see `load_kernel_sources`) for one group
-and one shape with the CuTe DSL, exports the kernel with its host launcher, and
-links them with `src/entry.cpp` and `src/stage.cu` into `module.so`. No device
-is read: the target names the architecture, and the kernel's tuning is the one
-FlashInfer's frontend selects for the descriptor's token count.
+and one shape with the CuTe DSL, exports it with its host launch
+(`src/launcher.py`), and links them with `src/entry.cpp` and `src/stage.cu`
+into `module.so`. No device is read: the target names the architecture, and
+the kernel's tuning is the one FlashInfer's frontend selects for the
+descriptor's token count.
 """
 
 import pathlib
 import subprocess
-import sys
 import tempfile
 
 from uniserve_build_server import cute_dsl, fetch
@@ -33,64 +33,6 @@ def shape_of(request):
     """
     names = ("hidden", "intermediate", "top", "experts", "max_tokens", "ranks")
     return tuple(int(request.field(name)) for name in names)
-
-
-#: The kernel's entry, spelled per group size: the exported launcher takes
-#: scalars, so a peer's offset is a parameter of its own.
-EXPORT = """
-class Export:
-    def __init__(self, kernel, clusters):
-        self.kernel = kernel
-        self.clusters = clusters
-
-    @cute.jit
-    def __call__(
-        self,
-        activation: cute.Tensor,
-        activation_sf: cute.Tensor,
-        topk_idx: cute.Tensor,
-        topk_weights: cute.Tensor,
-        fc1_weight: cute.Tensor,
-        fc1_weight_sf: cute.Tensor,
-        fc2_weight: cute.Tensor,
-        fc2_weight_sf: cute.Tensor,
-        fc1_alpha: cute.Tensor,
-        fc2_alpha: cute.Tensor,
-        fc1_norm_const: cute.Tensor,
-        output_activation: cute.Tensor,
-        local_workspace: cute.Pointer,
-        shared_workspace: cute.Pointer,
-        base: cutlass.Int64,
-        {parameters}
-        rank: cutlass.Int32,
-        stream: cuda.CUstream,
-    ):
-        host = SymBufferHost(
-            base_addr=base,
-            offsets=({offsets},),
-            rank_idx=rank,
-            num_max_ranks={ranks},
-        )
-        self.kernel(
-            activation,
-            activation_sf,
-            topk_idx,
-            topk_weights,
-            fc1_weight,
-            fc1_weight_sf,
-            fc2_weight,
-            fc2_weight_sf,
-            fc1_alpha,
-            fc2_alpha,
-            fc1_norm_const,
-            output_activation,
-            local_workspace,
-            shared_workspace,
-            host,
-            self.clusters,
-            stream,
-        )
-"""
 
 
 def load_kernel_sources(request, staging):
@@ -129,12 +71,12 @@ def compile_kernel(request, shape, staging):
     cute_dsl.configure(request.target)
     load_kernel_sources(request, staging)
     import cutlass  # noqa: PLC0415
-    import cutlass.cute as cute  # noqa: PLC0415
     import torch  # noqa: PLC0415
     from common.megamoe_constants import SfPaddingBlock  # noqa: PLC0415
     from cutlass import torch as cutlass_torch  # noqa: PLC0415
-    from cutlass.cute.runtime import make_fake_stream, make_ptr  # noqa: PLC0415
+    from cutlass.cute.runtime import make_ptr  # noqa: PLC0415
     from cutlass.cute.typing import AddressSpace  # noqa: PLC0415
+    from launcher import Launcher  # noqa: PLC0415
     from moe_nvfp4_swapab.epilogue_refactor import (  # noqa: PLC0415
         SwapABSwigluFp4Epilogue,
     )
@@ -219,48 +161,36 @@ def compile_kernel(request, shape, staging):
     alpha = torch.zeros((local,), dtype=torch.float32)
     output = torch.zeros((tokens, hidden), dtype=torch.bfloat16)
 
-    names = ", ".join(f"off{rank}" for rank in range(ranks))
-    parameters = "\n        ".join(
-        f"off{rank}: cutlass.Int64," for rank in range(ranks)
-    )
-    source = EXPORT.format(parameters=parameters, offsets=names, ranks=ranks)
-    # `cute.jit` reads the function's source, so the entry is a real file on the
-    # path.
-    module_path = staging / "mega_export.py"
-    module_path.write_text(
-        "import cuda.bindings.driver as cuda\n"
-        "import cutlass\nimport cutlass.cute as cute\n"
-        "from src.sym_buffer import SymBufferHost\n" + source
-    )
-    sys.path.insert(0, str(staging))
-    import mega_export  # noqa: PLC0415
-
     def pointer():
         return make_ptr(cutlass.Uint8, 16, AddressSpace.gmem, assumed_align=16)
 
     cluster_size = cluster[0] * cluster[1]
     clusters = max(1, SM_COUNT // max(cluster_size, 1))
-    compiled = cute.compile(
-        mega_export.Export(kernel, clusters),
-        described(packed),
-        described(scales),
-        described(routes),
-        described(weights),
-        described(first),
-        described(first_scales),
-        described(second),
-        described(second_scales),
-        described(alpha, 4),
-        described(alpha, 4),
-        described(alpha, 4),
-        described(output),
-        pointer(),
-        pointer(),
-        cutlass.Int64(0),
-        *[cutlass.Int64(0) for _ in range(ranks)],
-        cutlass.Int32(0),
-        make_fake_stream(),
-    )
+    # The launcher is traced with one offset per rank: its tuple's length is
+    # the group's size, and the exported function takes the offsets as one
+    # array.
+    compiled = cute_dsl.kernel(
+        Launcher(kernel, clusters),
+        [
+            described(packed),
+            described(scales),
+            described(routes),
+            described(weights),
+            described(first),
+            described(first_scales),
+            described(second),
+            described(second_scales),
+            described(alpha, 4),
+            described(alpha, 4),
+            described(alpha, 4),
+            described(output),
+            pointer(),
+            pointer(),
+            tuple(cutlass.Int64(0) for _ in range(ranks)),
+            cutlass.Int32(0),
+        ],
+        {},
+    )()
     compiled.export_to_c(str(staging), "mega")
     local_bytes, shared_bytes = kernel.get_workspace_sizes()
     return local_bytes, shared_bytes, scale_columns
@@ -292,7 +222,6 @@ def compile(request: Request) -> None:
         local_bytes, shared_bytes, scale_columns = compile_kernel(
             request, shape, staging
         )
-        offsets = ", ".join(f"offsets[{rank}]" for rank in range(ranks))
         defines = [
             f"-DUNISERVE_RANKS={ranks}",
             f"-DUNISERVE_HIDDEN={hidden}",
@@ -303,8 +232,6 @@ def compile(request: Request) -> None:
             f"-DUNISERVE_SCALE_COLUMNS={scale_columns}",
             f"-DUNISERVE_LOCAL_WORKSPACE={local_bytes}ull",
             f"-DUNISERVE_SHARED_WORKSPACE={shared_bytes}ull",
-            f"-DUNISERVE_OFFSETS={ranks}",
-            f"-DUNISERVE_OFFSET_ARGUMENTS={offsets}",
         ]
         stage = staging / "stage.o"
         run(

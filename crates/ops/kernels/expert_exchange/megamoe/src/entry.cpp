@@ -404,8 +404,9 @@ extern "C" int32_t uniserve_expert_exchange_launch(uniserve_exchange_call* call,
   void* output = tokens > 0 ? call->out : transport->idle_output;
   mega_Tensor_output_activation_t out{output, {extent, kHidden}, {kHidden}};
   // Each rank's offset is the distance from this rank's window to that rank's: the
-  // kernels add it to a local address to reach the same buffer on the peer.
-  int64_t offsets[UNISERVE_OFFSETS] = {};
+  // kernels add it to a local address to reach the same buffer on the peer. The launcher
+  // takes them as one array of the group's size.
+  int64_t offsets[kRanks] = {};
   for (int rank = 0; rank < kRanks; ++rank) {
     offsets[rank] = (static_cast<int64_t>(rank) - transport->rank) *
                     static_cast<int64_t>(transport->window);
@@ -413,7 +414,6 @@ extern "C" int32_t uniserve_expert_exchange_launch(uniserve_exchange_call* call,
   const int32_t status = cute_dsl_mega_wrapper(
       &module(), &activation, &activation_sf, &topk_idx, &topk_weights, &fc1, &fc1_sf, &fc2,
       &fc2_sf, &fc1_alpha, &fc2_alpha, &fc1_norm, &out, transport->local_workspace,
-      own + transport->layout.shared, reinterpret_cast<int64_t>(own + transport->layout.shared),
-      UNISERVE_OFFSET_ARGUMENTS, transport->rank, static_cast<CUstream>(stream));
+      own + transport->layout.shared, offsets, transport->rank, static_cast<CUstream>(stream));
   return status == 0 ? 0 : refuse(call->error, "the fused kernel's launch failed");
 }
