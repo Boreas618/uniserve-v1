@@ -3,9 +3,12 @@
 #
 # One native module per descriptor: Video Sparse Attention, attention over the key
 # blocks a caller selected (`ops::attention::sparse::SparseCall`, 704 bytes). The kernel
-# is FastVideo's block-sparse SM100 forward pass, carried verbatim in this package's
-# sources under the license beside it; this package owns the operator's side — the call
-# structure, the geometry checks a TMA tensor map needs, and the normalizer's base.
+# is FastVideo's block-sparse forward pass for data-center Blackwell, compiled from the
+# `fastvideo` pin of the Build Server's pinned sources (its provenance and licence are
+# the pin's) with this package's patch for an odd number of query tiles
+# (`patches/unpaired-tile.patch`, owed upstream); this package owns the operator's side —
+# the call structure, the kernel's tensor maps over the call's strides and key extent,
+# the geometry checks a TMA tensor map needs, and the normalizer's base.
 #
 # The block size is a compile-time choice of the vendor's kernel, so the descriptor's
 # `block` picks it and the two blocks are two revisions of the same program.

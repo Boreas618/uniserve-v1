@@ -1,0 +1,3 @@
+5c7f173199fd7fb3cc83d86d24f3541e8ae0cb8c16e912ca519ed6a1435bd8f3  fastvideo-kernel/LICENSE
+c46c973d0cafc407a9d58c7ca94eab044b80b9c5f7976041dfdc9811ca3dd7ac  fastvideo-kernel/csrc/attention/block_sparse_kernel_blackwell.cuh
+c5b63a7abb43117b9d50d5af0b30a64bc1c0a67f1eb8403a4966cd7995fd69f6  fastvideo-kernel/csrc/attention/primitives.cuh

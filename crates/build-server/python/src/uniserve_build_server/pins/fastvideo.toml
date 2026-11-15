@@ -1,0 +1,13 @@
+# FastVideo's block-sparse attention forward pass for data-center Blackwell (Video
+# Sparse Attention on tcgen05), at hao-ai-lab/FastVideo commit d4ed61cc7c81 (the
+# last change of these files on `main`), each file from the commit's raw tree:
+# the kernel `block_sparse_kernel_blackwell.cuh`, the device primitives it
+# includes, and the project's licence (Apache-2.0), which covers every file of
+# the pin. The manifest is `fastvideo.sha256` beside this file.
+sha256 = "a719b124c83ee45222076978ec986a746a243983292d4e3a783b70423b975ff8"
+
+# The kernel includes its primitives by their file name.
+include = ["fastvideo-kernel/csrc/attention"]
+
+[origin]
+files = "https://raw.githubusercontent.com/hao-ai-lab/FastVideo/d4ed61cc7c81314398190bf382148b6c2c4bcb2d/"

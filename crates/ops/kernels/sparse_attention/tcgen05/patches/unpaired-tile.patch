@@ -1,0 +1,36 @@
+--- a/fastvideo-kernel/csrc/attention/block_sparse_kernel_blackwell.cuh
++++ b/fastvideo-kernel/csrc/attention/block_sparse_kernel_blackwell.cuh
+@@ -175,7 +175,9 @@
+   it.global_mtile0  = (it.sample * num_heads + it.head) * num_blocks + it.mtile0;
+   it.global_mtile1  = it.global_mtile0 + 1;
+   it.num_kv_blocks_mt[0] = q2k_num[it.global_mtile0];
+-  it.num_kv_blocks_mt[1] = q2k_num[it.global_mtile1];
++  // With an odd num_blocks, each head's trailing m-tile is a pair of its own: the
++  // absent partner selects no key block and reads no metadata.
++  it.num_kv_blocks_mt[1] = it.mtile1 < num_blocks ? q2k_num[it.global_mtile1] : 0;
+   // Floor of 1: a pair whose rows are BOTH empty still walks one K-tile so no
+   // mbarrier wait is left without its arrive (the load/MMA/softmax/correction
+   // pipeline has a fixed per-iteration handshake); the per-tile counts mask
+@@ -763,8 +765,9 @@
+               const float m_tot = (d >= 0.f) ? m_own : m_par;
+               const int q_row = (i == 0 ? it.mtile0 : it.mtile1) * BLOCK + (corr_tid & 63);
+               const float l_safe = (l_tot > 0.f) ? l_tot : 1.0f;
+-              lse_out[((long)it.sample * num_heads + it.head) * (long)seqlen + q_row] =
+-                  m_tot * scale_log2 + __log2f(l_safe);
++              if (q_row < seqlen)
++                lse_out[((long)it.sample * num_heads + it.head) * (long)seqlen + q_row] =
++                    m_tot * scale_log2 + __log2f(l_safe);
+             }
+         }
+         const float2 scale2 = f32x2_splat(scale_own);
+@@ -1043,7 +1046,8 @@
+           if (lse_out != nullptr) {
+             const int q_row = (m_tile == 0 ? it.mtile0 : it.mtile1) * BLOCK + sm_tid;
+             const float l_safe = (l_run > 0.f) ? l_run : 1.0f;
+-            lse_out[((long)it.sample * num_heads + it.head) * (long)seqlen + q_row] =
+-                m_run * scale_log2 + __log2f(l_safe);
++            if (q_row < seqlen)
++              lse_out[((long)it.sample * num_heads + it.head) * (long)seqlen + q_row] =
++                  m_run * scale_log2 + __log2f(l_safe);
+           }
+         }

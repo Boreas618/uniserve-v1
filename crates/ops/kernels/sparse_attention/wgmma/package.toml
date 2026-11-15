@@ -3,10 +3,11 @@
 #
 # One native module per descriptor: Video Sparse Attention, attention over the key
 # blocks a caller selected (`ops::attention::sparse::SparseCall`, 704 bytes), on Hopper.
-# The kernel is the warpgroup-pipelined SM90a block-sparse forward pass carried verbatim in
-# this package's sources; this package owns the operator's side — the call structure, the
-# geometry checks its TMA copies need, and the one thing this backend does not do, which
-# is write the softmax normalizer.
+# The kernel is this package's warpgroup-pipelined SM90a block-sparse forward pass, written
+# with CuTe on the CUTLASS headers the locked FlashInfer distribution installs (the
+# package's one third-party source, used where the distribution installs it); the package
+# also owns the operator's side — the call structure, the geometry checks its TMA copies
+# need, and the one thing this backend does not do, which is write the softmax normalizer.
 #
 # The kernel's query tile and key block are both fixed at 128 rows, so this backend serves
 # the descriptor's block 128 and only that.
@@ -14,6 +15,10 @@
 op = "sparse_attention"
 backend = "wgmma"
 interface_version = 1
+
+# CUTLASS and CuTe, which the kernel is written with, are headers of FlashInfer's distribution.
+[toolchain]
+packages = ["flashinfer-python"]
 
 [source]
 kind = "cuda"

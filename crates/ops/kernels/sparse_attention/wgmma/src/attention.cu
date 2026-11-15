@@ -3,10 +3,11 @@
 // The sparse_attention module's sm90 backend: the operator's call turned into the VSA
 // block-sparse SM90a forward pass.
 //
-// The kernel is the warpgroup-pipelined SM90a block-sparse attention carried verbatim in
-// this package's sources: one CTA per (head, 128-row query tile), a TMA producer
-// warpgroup and two consumer warpgroups, GMMA products with register-sourced A operands,
-// an online softmax in FP32 registers, and the sparse block map read on the device.
+// The kernel is this package's warpgroup-pipelined SM90a block-sparse attention
+// (`block_sparse_sm90a.cuh`, written with CuTe): one CTA per (head, 128-row query tile), a
+// TMA producer warpgroup and two consumer warpgroups, GMMA products with register-sourced
+// A operands, an online softmax in FP32 registers, and the sparse block map read on the
+// device.
 //
 // This unit owns the operator's side of the trade: the geometry checks the kernel's TMA
 // copies need (16-byte aligned bases, strides whole in 16-byte units, contiguous

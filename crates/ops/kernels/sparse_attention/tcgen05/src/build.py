@@ -1,80 +1,64 @@
-"""The sparse_attention package's build module: one descriptor -> one module.
+"""The sparse_attention tcgen05 package's build module.
 
-The module is this package's kernel compiled with nvcc into a shared object
-exporting `uniserve_sparse_attention`. The kernel reads the geometry, the
-strides and the selection from the call structure, so the descriptor decides
-only what a compilation cannot vary:
+One descriptor -> one module: FastVideo's block-sparse attention forward pass
+for data-center Blackwell, the `fastvideo` pin of
+:mod:`uniserve_build_server.fetch`, launched by this package's unit
+`src/attention.cu` and linked into a shared object exporting
+`uniserve_sparse_attention`.
 
-* the sparse block size, which is a compile-time constant of the kernel (the
-  vendor keeps the 64-row and 128-row builds in separate namespaces for exactly
-  this reason), taken from the descriptor's `block`;
-* the tensor-map layout, which this package always takes as strided rows and
-  heads (`VSA_BHSD`), because the operator's call addresses rows and heads
-  through strides.
+The pinned kernel walks a pair of adjacent query tiles per work item and reads
+the partner tile's selection count and writes its normalizer unconditionally,
+so FastVideo's own launch refuses an odd number of query tiles. The operator's
+calls have any number, so the build compiles a staged copy of the pin with
+`patches/unpaired-tile.patch` applied: the absent partner of a head's trailing
+tile selects no key block, reads no metadata of the next head and writes no
+normalizer row past the query rows. The change is owed upstream; until FastVideo
+carries it, the patch is the package's.
+
+The kernel reads the geometry, the strides and the selection from the call, so
+the descriptor decides only what a compilation cannot vary: the sparse block, a
+compile-time constant of the kernel (`VSA_BLK128`), from the descriptor's
+`block`.
 
 The Build Server compiles a descriptor by calling :func:`compile` with the
 compile request.
 """
 
-import subprocess
-import sys
-
+from uniserve_build_server import cuda, fetch
 from uniserve_build_server.request import Request
 
-#: The translation unit of the module.
+#: The package's unit: the operator's entry and the kernel's launch.
 SOURCE = "src/attention.cu"
 
-
-#: The block sizes the kernel knows; the descriptor's `block` chooses one.
-BLOCKS = (64, 128)
-
-
-def block_of(request):
-    """The sparse block size the request's descriptor names in `block`."""
-    block = int(request.field("block"))
-    if block not in BLOCKS:
-        raise SystemExit(f"the kernel knows block sizes {BLOCKS}, not {block}")
-    return block
+#: The package's patch of the pinned kernel.
+PATCH = "patches/unpaired-tile.patch"
 
 
 def compile(request: Request) -> None:
     """Compile the kernel for the request's descriptor into ``module.so``.
 
-    The module is written into the request's output directory; a compiler
-    failure refuses the build, with the compiler's output in the build log.
+    The pin is fetched into the Build Server's cache of pins when the cache
+    does not hold it yet and staged as copies the patch changes; a fetch, patch
+    or compiler failure refuses the build, with its output in the build log.
     """
-    package = request.package
-    # The nvcc the Build Server checked against this package's declared
-    # version, and its driver API stub: the kernel's tensor maps are encoded
-    # through the driver.
-    cuda = request.toolchain.require_cuda()
-    block = block_of(request)
+    pinned = fetch.pin("fastvideo")
+    with cuda.scratch(request) as staged:
+        try:
+            names = list(fetch.manifest(pinned, request.cache))
+            fetch.fetch(pinned, request.cache, names, request.jobs)
+            fetch.stage(pinned, request.cache, staged, names, copy=True)
+            fetch.apply_patch(staged, request.package / PATCH)
+            headers = fetch.includes(pinned, staged)
+        except fetch.FetchError as error:
+            raise SystemExit(
+                f"staging the fastvideo pin failed: {error}"
+            ) from error
 
-    # The kernel's own two choices: which block size, and that the maps take
-    # strided rows and heads. Both must precede the header that reads them.
-    defines = [
-        "-DVSA_BHSD=1",
-        f"-DVSA_BLK128={1 if block == 128 else 0}",
-    ]
-    command = [
-        cuda.nvcc,
-        "-O3",
-        "-std=c++17",
-        f"-arch={request.target}",
-        "--shared",
-        "-Xcompiler",
-        "-fPIC",
-        *defines,
-        f"-I{package / 'src'}",
-        f"-I{package / 'include'}",
-        str(package / SOURCE),
-        f"-L{cuda.stubs}",
-        "-lcuda",
-        "-lcudart",
-        "-o",
-        str(request.output / "module.so"),
-    ]
-    print(" ".join(command), file=sys.stderr)
-    built = subprocess.run(command, check=False)
-    if built.returncode != 0:
-        raise SystemExit(f"nvcc failed with {built.returncode}")
+        unit = cuda.Unit(
+            source=request.package / SOURCE,
+            standard="c++17",
+            definitions={"VSA_BLK128": request.field("block") == 128},
+            includes=headers,
+        )
+        # The kernel's tensor maps are encoded through the driver API.
+        cuda.native(request, [unit], libraries=["cuda"])
