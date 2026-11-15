@@ -360,7 +360,7 @@ impl Config {
                 "a short convolution of fewer than two taps keeps no state".to_owned(),
             ));
         }
-        text.linear_layers = linear_layers(&values, text.num_hidden_layers)?;
+        text.linear_layers = values.linear_attention(text.num_hidden_layers)?;
         text.gated_delta_net = Some(linear);
 
         if values
@@ -701,11 +701,12 @@ impl TextConfig {
                 .optional_positive("rms_norm_eps")?
                 .map_or(1e-6, |value| value as f32),
             rms_norm_centred: false,
-            rope: rope(
+            rope: RotaryConfig::from_hf(
                 fields,
                 head_dim,
                 max_position_embeddings,
                 partial_rotary_factor,
+                PRECISION,
             )?,
             max_position_embeddings,
             attention_bias: fields.optional_flag("attention_bias")?.unwrap_or(false),
@@ -830,41 +831,15 @@ pub fn processor(checkpoint: &nn::Checkpoint) -> Result<Option<(ProcessorConfig,
         return Ok(None);
     };
 
-    let norm = pixel_norm(&Fields::of(image_file, &image)?)?;
+    let norm = Fields::of(image_file, &image)?.pixel_norm()?;
     let processor = ProcessorConfig::from_values(&image, &video).map_err(Error::Config)?;
     Ok(Some((processor, norm)))
 }
 
-/// The pixel normalization a processor's `image_mean` and `image_std` state: each RGB channel
-/// maps `x` in `[0, 255]` to `(x / 255 - mean) / std` ([`PixelNorm`]).
-///
-/// # Errors
-///
-/// Fields of the wrong type or length, or a deviation that is not positive.
-pub fn pixel_norm(values: &Fields<'_>) -> Result<PixelNorm> {
-    let owner = values.owner();
-    let mean = values.fixed_numbers("image_mean", 3)?;
-    let std = values.fixed_numbers("image_std", 3)?;
-
-    let mean: [f32; 3] = [mean[0] as f32, mean[1] as f32, mean[2] as f32];
-    let std: [f32; 3] = [std[0] as f32, std[1] as f32, std[2] as f32];
-    if std.iter().any(|value| *value <= 0.0) {
-        return Err(Error::Config(format!(
-            "{owner}.image_std must be positive, got {std:?}"
-        )));
-    }
-    Ok(PixelNorm { mean, std })
-}
-
-/// The routed experts a configuration states: the expert count and the experts per token.
-///
-/// Transformers serializes the expert count as `num_local_experts` in newer releases; a
-/// configuration that states both must agree.
+/// The routed experts a configuration states: the expert count `num_experts`, the name every
+/// Qwen MoE configuration class serializes it under, and the experts per token.
 fn routed_experts(fields: &Fields<'_>) -> Result<(u32, u32)> {
-    let experts = fields
-        .alias(&["num_experts", "num_local_experts"])?
-        .ok_or_else(|| Error::Config("a mixture of experts declares no expert count".to_owned()))?;
-    let experts = fields.index(experts)?;
+    let experts = fields.index("num_experts")?;
     if experts == 0 {
         return Err(Error::Config(
             "a mixture of experts declares no experts".to_owned(),
@@ -875,146 +850,6 @@ fn routed_experts(fields: &Fields<'_>) -> Result<(u32, u32)> {
         experts,
         fields.optional_count("num_experts_per_tok")?.unwrap_or(8),
     ))
-}
-
-/// The rotary embedding of a text configuration over the heads of `head_dim` channels.
-///
-/// A recipe (`rope_parameters`, or `rope_scaling`) that states `mrope_section` is interleaved
-/// M-RoPE over the default spectrum: its sections count frequencies per axis, over the
-/// `partial_rotary_factor` of a head's channels, and a value the recipe does not state is read
-/// from the text configuration itself. `partial_rotary_factor` is the factor of a
-/// configuration that states none, or `None` when it must state one. Every other recipe is
-/// [`RotaryConfig::from_hf`]'s.
-pub fn rope(
-    values: &Fields<'_>,
-    head_dim: u32,
-    max_position_embeddings: u32,
-    partial_rotary_factor: Option<f64>,
-) -> Result<RotaryConfig> {
-    let recipe = match values.optional_object("rope_parameters")? {
-        Some(parameters) => Some(parameters),
-        None => values.optional_object("rope_scaling")?,
-    };
-    let Some(recipe) = recipe.filter(|recipe| recipe.contains("mrope_section")) else {
-        let config = RotaryConfig::from_hf(values, head_dim, max_position_embeddings)?;
-
-        return Ok(match config.spectrum {
-            Spectrum::Default => RotaryConfig {
-                precision: PRECISION,
-                ..config
-            },
-            _ => config,
-        });
-    };
-
-    let read = |key: &str| -> Result<Option<f64>> {
-        match recipe.optional_number(key)? {
-            Some(value) => Ok(Some(value)),
-            None => Ok(values.optional_number(key)?),
-        }
-    };
-    let stated = |key: &str, value: Option<f64>| {
-        value.ok_or_else(|| Error::Config(format!("an M-RoPE recipe states no {key}")))
-    };
-
-    if recipe.optional_text("rope_type")?.unwrap_or("default") != "default"
-        || !recipe.flag("mrope_interleaved")?
-    {
-        return Err(Error::Config(
-            "an M-RoPE recipe must be the default recipe with interleaved sections".to_owned(),
-        ));
-    }
-
-    let factor = stated(
-        "partial_rotary_factor",
-        read("partial_rotary_factor")?.or(partial_rotary_factor),
-    )?;
-    let rotated = f64::from(head_dim) * factor;
-    if !(factor > 0.0 && factor <= 1.0)
-        || rotated.fract() != 0.0
-        || !(rotated as u32).is_multiple_of(2)
-    {
-        return Err(Error::Config(format!(
-            "a partial_rotary_factor of {factor} rotates no whole number of pairs of a \
-             {head_dim}-channel head"
-        )));
-    }
-
-    let theta = stated("rope_theta", read("rope_theta")?)?;
-    if !(theta.is_finite() && theta > 0.0) {
-        return Err(Error::Config(format!("a rope_theta of {theta}")));
-    }
-    sectioned(
-        theta as f32,
-        rotated as u32,
-        &recipe.indices("mrope_section")?,
-    )
-}
-
-/// Interleaved M-RoPE over `dim` rotated channels, `sections` counting frequencies per axis.
-fn sectioned(theta: f32, dim: u32, sections: &[u32]) -> Result<RotaryConfig> {
-    if sections.len() != POSITION_AXES as usize || sections.iter().sum::<u32>() != dim / 2 {
-        return Err(Error::Config(format!(
-            "M-RoPE sections {sections:?} must split the {} frequencies of {dim} rotated \
-             channels over {POSITION_AXES} axes",
-            dim / 2
-        )));
-    }
-
-    Ok(RotaryConfig {
-        theta,
-        dim,
-        spectrum: Spectrum::sectioned(sections)?,
-        precision: PRECISION,
-    })
-}
-
-/// Which layers of a hybrid stack of `layers` layers are linear, from `layer_types` or
-/// `full_attention_interval`, which must agree when both are stated.
-pub fn linear_layers(values: &Fields<'_>, layers: u32) -> Result<Vec<bool>> {
-    let derived = values
-        .optional_count("full_attention_interval")?
-        .map(|interval| {
-            (0..layers)
-                .map(|layer| !(layer + 1).is_multiple_of(interval))
-                .collect::<Vec<_>>()
-        });
-    let stated = values
-        .optional_texts("layer_types")?
-        .map(|kinds| {
-            kinds
-                .iter()
-                .map(|kind| match *kind {
-                    "full_attention" => Ok(false),
-                    "linear_attention" => Ok(true),
-                    other => Err(Error::Config(format!(
-                        "layer type {other} is neither full_attention nor linear_attention"
-                    ))),
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?;
-
-    let linear = match (stated, derived) {
-        (Some(stated), Some(derived)) if stated != derived => {
-            return Err(Error::Config(
-                "layer_types disagrees with full_attention_interval".to_owned(),
-            ));
-        }
-        (Some(linear), _) | (None, Some(linear)) => linear,
-        (None, None) => {
-            return Err(Error::Config(
-                "a hybrid stack states neither layer_types nor full_attention_interval".to_owned(),
-            ));
-        }
-    };
-    if linear.len() != layers as usize {
-        return Err(Error::Config(format!(
-            "{} layer types for {layers} layers",
-            linear.len()
-        )));
-    }
-    Ok(linear)
 }
 
 /// Released configurations, as this module's unit tests read them.
@@ -1100,6 +935,8 @@ pub(crate) mod fixtures {
         root["text_config"] = serde_json::json!({
             "attn_output_gate": true,
             "full_attention_interval": 4,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention",
+                            "full_attention"],
             "head_dim": 256,
             "hidden_act": "silu",
             "hidden_size": 2048,
@@ -1204,15 +1041,17 @@ mod tests {
         assert!(parse(&scale).is_err());
     }
 
+    /// A Qwen MoE configuration states its expert count as `num_experts`; the count under
+    /// another class's name is no statement of it.
     #[test]
-    fn conflicting_expert_aliases_are_refused() {
+    fn the_expert_count_is_read_under_its_one_name() {
         let mut value = moe();
-        value["num_local_experts"] = serde_json::json!(64);
+        let experts = value
+            .as_object_mut()
+            .and_then(|fields| fields.remove("num_experts"))
+            .expect("the fixture states its experts");
+        value["num_local_experts"] = experts;
         assert!(parse(&value).is_err());
-
-        value["num_local_experts"] = serde_json::json!(128);
-        let experts = parse(&value).expect("agreeing aliases").moe;
-        assert_eq!(experts.expect("experts").num_experts, 128);
     }
 
     #[test]
@@ -1429,24 +1268,5 @@ mod tests {
         let mut embedding = hybrid();
         embedding["text_config"]["mtp_use_dedicated_embeddings"] = serde_json::json!(true);
         assert!(parse(&embedding).is_err());
-    }
-
-    #[test]
-    fn a_processor_states_three_positive_deviations() {
-        let fields =
-            serde_json::json!({"image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.0, 0.5]});
-        let error =
-            pixel_norm(&Fields::of("preprocessor_config.json", &fields).expect("an object"))
-                .expect_err("a zero deviation is refused");
-        assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("image_std")),
-            "{error}"
-        );
-
-        let fields =
-            serde_json::json!({"image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5]});
-        let norm = pixel_norm(&Fields::of("preprocessor_config.json", &fields).expect("an object"))
-            .expect("three positive deviations");
-        assert_eq!((norm.mean, norm.std), ([0.5; 3], [0.5; 3]));
     }
 }

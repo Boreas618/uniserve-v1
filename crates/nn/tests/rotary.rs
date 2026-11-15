@@ -129,20 +129,18 @@ fn sections_cover_the_spectrum_exactly() {
     assert!(Spectrum::sectioned(&[8, 8, 8, 8, 32]).is_err());
 }
 
-/// YaRN keeps the fastest pair, divides the slowest by the extension `max / original`, and
-/// squares its attention factor into the softmax scale.
+/// YaRN keeps the fastest pair, divides the slowest by its factor, and squares its attention
+/// factor into the softmax scale.
 #[test]
 fn yarn_interpolates_the_slow_pairs_and_scales_the_scores() {
     let yarn = Yarn {
-        factor: 4.0,
+        factor: 10.0,
         original_max_position_embeddings: 4096,
-        max_position_embeddings: 40_960,
         attention_factor: None,
         beta_fast: 32.0,
         beta_slow: 1.0,
         mscale: None,
         mscale_all_dim: None,
-        truncate: false,
     };
     let scaled = config(1_000_000.0, 128, Spectrum::Yarn(yarn), Precision::F64);
     let (plain_table, table) = (
@@ -180,40 +178,88 @@ fn the_score_scale_is_computed_in_the_configurations_precision() {
     assert!(spectrum(Precision::F64).score_scale(0).is_err());
 }
 
-/// A Hugging Face configuration states its recipe in either spelling, and a recipe that is not
-/// served is refused.
+/// A Hugging Face configuration states its recipe in one of transformers' two layouts, read
+/// as one; a configuration that mixes them, omits its base, or names a recipe that is not served
+/// is refused.
 #[test]
-fn a_hugging_face_recipe_is_read_from_either_spelling() {
+fn a_hugging_face_recipe_is_read_in_its_layout() {
     let read = |value: serde_json::Value| {
-        RotaryConfig::from_hf(&Fields::of("config.json", &value).unwrap(), 128, 40_960)
+        RotaryConfig::from_hf(
+            &Fields::of("config.json", &value).unwrap(),
+            128,
+            40_960,
+            Some(1.0),
+            Precision::F64,
+        )
     };
 
+    // The earlier layout: the base beside the fields, the recipe in `rope_scaling`.
     assert_eq!(
-        read(serde_json::json!({"rope_theta": 1_000_000.0})).unwrap(),
+        read(serde_json::json!({"rope_theta": 1_000_000.0, "rope_scaling": null})).unwrap(),
         plain(128)
     );
+    assert_eq!(
+        read(serde_json::json!({"rope_theta": 1_000_000.0, "partial_rotary_factor": 0.5})).unwrap(),
+        plain(64)
+    );
 
+    // The standardized layout: one object, whose YaRN factor extends the fitted length to the
+    // configuration's.
     let yarn = read(serde_json::json!({
-        "rope_theta": 1_000_000.0,
-        "rope_parameters": {"rope_type": "yarn", "factor": 4.0,
+        "rope_parameters": {"rope_type": "yarn", "rope_theta": 1_000_000.0, "factor": 10.0,
                             "original_max_position_embeddings": 4096},
     }))
     .unwrap();
     assert!(matches!(
         yarn.spectrum,
-        Spectrum::Yarn(yarn) if yarn.max_position_embeddings == 40_960
+        Spectrum::Yarn(yarn) if yarn.factor == 10.0
             && yarn.original_max_position_embeddings == 4096
     ));
+    assert_eq!(yarn.precision, Precision::F64);
 
-    assert!(read(serde_json::json!({"rope_scaling": {"type": "linear", "factor": 2.0}})).is_err());
-    assert!(read(serde_json::json!({"partial_rotary_factor": 0.5})).is_err());
-    assert!(
-        read(serde_json::json!({
-            "rope_scaling": {"type": "yarn", "factor": 2.0},
-            "rope_parameters": {"rope_type": "default"},
-        }))
-        .is_err()
+    let sectioned = RotaryConfig::from_hf(
+        &Fields::of(
+            "config.json",
+            &serde_json::json!({
+                "rope_parameters": {"rope_type": "default", "rope_theta": 10_000_000.0,
+                                    "mrope_section": [11, 11, 10], "mrope_interleaved": true,
+                                    "partial_rotary_factor": 0.25},
+                "partial_rotary_factor": 0.25,
+            }),
+        )
+        .unwrap(),
+        256,
+        262_144,
+        None,
+        Precision::F32,
+    )
+    .unwrap();
+    assert_eq!(sectioned.dim, 64);
+    assert_eq!(
+        sectioned.spectrum,
+        Spectrum::sectioned(&[11, 11, 10]).unwrap()
     );
+
+    for refused in [
+        // A YaRN factor that does not extend the fitted length to the configuration's.
+        serde_json::json!({"rope_parameters": {"rope_type": "yarn", "rope_theta": 1e6,
+                                               "factor": 4.0,
+                                               "original_max_position_embeddings": 4096}}),
+        serde_json::json!({"rope_theta": 1e6, "rope_scaling": {"rope_type": "linear",
+                                                               "factor": 2.0}}),
+        // Both layouts at once.
+        serde_json::json!({"rope_theta": 1e6, "rope_parameters": {"rope_type": "default",
+                                                                  "rope_theta": 1e6}}),
+        serde_json::json!({"rope_scaling": {"rope_type": "default"},
+                           "rope_parameters": {"rope_type": "default", "rope_theta": 1e6}}),
+        // Two rotated fractions, and no base.
+        serde_json::json!({"partial_rotary_factor": 0.5,
+                           "rope_parameters": {"rope_type": "default", "rope_theta": 1e6,
+                                               "partial_rotary_factor": 0.25}}),
+        serde_json::json!({}),
+    ] {
+        assert!(read(refused.clone()).is_err(), "{refused}");
+    }
 }
 
 // ---- Factors ----------------------------------------------------------------------------------

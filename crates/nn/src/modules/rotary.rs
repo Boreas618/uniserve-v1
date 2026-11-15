@@ -26,9 +26,17 @@
 //! tensor expression has no power of that rounding. The f64 power and the f64 reciprocal of
 //! the power give the same table at every shipped base, so f64 is one rule.
 //!
-//! **The YaRN extension is `max_position_embeddings / original_max_position_embeddings`**,
-//! which is transformers' rule; the declared `factor` is read and not applied (vLLM applies
-//! it). The two agree for a checkpoint that states consistent numbers.
+//! **A configuration's recipe is read in one layout.** transformers states a rotary embedding
+//! in one object, `rope_parameters`; a configuration written before that layout states the
+//! same values as `rope_theta`, `partial_rotary_factor` and `rope_scaling` beside the other
+//! fields. [`RopeParameters::of`] converts the earlier layout into the later one, as
+//! transformers' `standardize_rope_params` does, and every reader of a recipe reads the result.
+//!
+//! **The YaRN extension is the declared `factor`.** transformers derives the extension from
+//! `max_position_embeddings / original_max_position_embeddings` when the recipe states the
+//! fitted length, and vLLM applies `factor`; the two compute the same spectrum exactly when
+//! `max_position_embeddings = original_max_position_embeddings · factor`, so a configuration
+//! that states another product is refused rather than served by one reference's rule.
 
 use std::f64::consts::PI;
 
@@ -52,12 +60,11 @@ pub enum Precision {
 /// The YaRN interpolation of a rotary spectrum, as a checkpoint states it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Yarn {
-    /// The extension factor the checkpoint declares; read, not applied (module documentation).
+    /// The extension factor: the slowest pair's period is multiplied by it.
     pub factor: f32,
-    /// The context length the recipe was fitted to.
+    /// The context length the recipe was fitted to: the window its correction range is
+    /// measured over.
     pub original_max_position_embeddings: u32,
-    /// The extended context length: the numerator of the applied extension.
-    pub max_position_embeddings: u32,
     /// The attention scaling, when the checkpoint declares one.
     pub attention_factor: Option<f32>,
     /// The high-frequency correction boundary.
@@ -68,8 +75,6 @@ pub struct Yarn {
     pub mscale: Option<f32>,
     /// The all-dimension magnitude scale, when declared.
     pub mscale_all_dim: Option<f32>,
-    /// Whether the recipe truncates the correction at the boundaries; read, not applied.
-    pub truncate: bool,
 }
 
 /// How a rotary embedding's frequencies follow from its base and are laid over the position
@@ -141,78 +146,212 @@ pub struct RotaryConfig {
     pub precision: Precision,
 }
 
-impl RotaryConfig {
-    /// The configuration of a Hugging Face text configuration over `dim` rotated channels.
+/// A configuration's rotary recipe, in transformers' standardized layout.
+///
+/// transformers states a configuration's rotary embedding as one object, `rope_parameters`:
+/// the recipe's name `rope_type`, the base `rope_theta`, the rotated fraction of a head
+/// `partial_rotary_factor` and the recipe's own fields (YaRN's `factor`, M-RoPE's
+/// `mrope_section`). A configuration written before that layout states the base and the
+/// fraction as fields of the configuration itself and the recipe as `rope_scaling`, `null` for
+/// the default recipe. [`RopeParameters::of`] reads either into this one value, as
+/// transformers' `standardize_rope_params` converts the earlier layout, so no reader of a
+/// recipe chooses between spellings.
+#[derive(Clone, Debug)]
+pub struct RopeParameters<'a> {
+    /// The recipe's name: `default`, `yarn`, …
+    pub rope_type: &'a str,
+    /// The base θ of the power series, finite and positive.
+    pub theta: f64,
+    /// The fraction of a head's channels the embedding rotates, when the configuration states
+    /// one.
+    pub partial_rotary_factor: Option<f64>,
+    /// The recipe's object, which holds the fields of a recipe beyond its base; `None` for a
+    /// configuration of the earlier layout whose `rope_scaling` is `null`.
+    pub recipe: Option<Fields<'a>>,
+}
+
+impl<'a> RopeParameters<'a> {
+    /// The rotary recipe `fields`, a text configuration, states.
     ///
-    /// Reads `rope_theta` (default 10000), `partial_rotary_factor` (only 1 is served), and the
-    /// recipe of `rope_parameters` or `rope_scaling` (`rope_parameters` takes precedence, and a
-    /// value either states is read through both in that order): `default` or `yarn`.
-    /// `max_position_embeddings` is the configuration's own, the numerator of a YaRN extension.
+    /// A configuration of the standardized layout states `rope_parameters` with its
+    /// `rope_type` and `rope_theta`, and neither of the earlier layout's `rope_scaling` and
+    /// `rope_theta` beside it; a `partial_rotary_factor` of the configuration itself, which
+    /// transformers keeps as an attribute of some configurations, must equal the recipe's. A
+    /// configuration of the earlier layout states `rope_theta` and, unless its recipe is the
+    /// default, `rope_scaling` with its `rope_type`.
     ///
     /// # Errors
     ///
-    /// A field of the wrong type, conflicting recipe aliases, a recipe other than `default` or
-    /// `yarn`, a partial rotation, or a value outside its domain.
-    pub fn from_hf(fields: &Fields<'_>, dim: u32, max_position_embeddings: u32) -> Result<Self> {
-        let scaling = fields.optional_object("rope_scaling")?;
-        let parameters = fields.optional_object("rope_parameters")?;
-        let maps = [parameters.as_ref(), scaling.as_ref()];
+    /// A configuration that states both layouts or two different rotated fractions, a missing
+    /// base or recipe name, a field of the wrong type, or a base outside its domain.
+    pub fn of(fields: &Fields<'a>) -> Result<Self> {
+        let stated_partial = fields.optional_number("partial_rotary_factor")?;
 
-        let stated_type = match &scaling {
-            Some(scaling) => scaling.optional_text("type")?,
-            None => None,
+        let parameters = match fields.optional_object("rope_parameters")? {
+            Some(recipe) => {
+                for legacy in ["rope_scaling", "rope_theta"] {
+                    if fields.contains(legacy) {
+                        return Err(fields.refuse(
+                            legacy,
+                            "is stated beside rope_parameters, which states the rotary recipe \
+                             whole; a configuration states one layout",
+                        ));
+                    }
+                }
+
+                let partial = recipe.optional_number("partial_rotary_factor")?;
+                if let (Some(recipe_partial), Some(stated)) = (partial, stated_partial)
+                    && recipe_partial != stated
+                {
+                    return Err(fields.refuse(
+                        "partial_rotary_factor",
+                        format!(
+                            "is {stated}, and rope_parameters states {recipe_partial} for the \
+                             same rotation"
+                        ),
+                    ));
+                }
+
+                Self {
+                    rope_type: recipe.text("rope_type")?,
+                    theta: recipe.number("rope_theta")?,
+                    partial_rotary_factor: partial.or(stated_partial),
+                    recipe: Some(recipe),
+                }
+            }
+
+            None => {
+                let recipe = fields.optional_object("rope_scaling")?;
+                let rope_type = match &recipe {
+                    Some(recipe) => recipe.text("rope_type")?,
+                    None => "default",
+                };
+
+                Self {
+                    rope_type,
+                    theta: fields.number("rope_theta")?,
+                    partial_rotary_factor: stated_partial,
+                    recipe,
+                }
+            }
         };
-        let kind = match &parameters {
-            Some(parameters) => parameters.optional_text("rope_type")?,
-            None => None,
-        }
-        .or(stated_type)
-        .unwrap_or("default");
-        if let Some(other) = stated_type
-            && other != kind
-        {
-            return Err(fields.refuse(
-                "rope_scaling",
-                "states a rotary type that conflicts with rope_parameters",
-            ));
-        }
 
-        let theta = match fields.optional_number("rope_theta")? {
-            Some(theta) => Some(theta),
-            None => first(&maps, |map| map.optional_number("rope_theta"))?,
-        }
-        .unwrap_or(10_000.0);
-        if !(theta.is_finite() && theta > 0.0) {
+        if !(parameters.theta.is_finite() && parameters.theta > 0.0) {
             return Err(fields.refuse("rope_theta", "must be finite and positive"));
         }
+        Ok(parameters)
+    }
 
-        let partial = match fields.optional_number("partial_rotary_factor")? {
-            Some(partial) => Some(partial),
-            None => first(&maps, |map| map.optional_number("partial_rotary_factor"))?,
-        }
-        .unwrap_or(1.0);
-        if partial != 1.0 {
+    /// The object holding the fields of a recipe beyond the default, as `fields`, the
+    /// configuration, states it.
+    ///
+    /// # Errors
+    ///
+    /// When the configuration names its recipe and states no object holding its fields.
+    pub fn object(&self, fields: &Fields<'_>) -> Result<&Fields<'a>> {
+        self.recipe.as_ref().ok_or_else(|| {
+            fields.refuse(
+                "rope_scaling",
+                format!(
+                    "names no object holding the fields of the {} recipe",
+                    self.rope_type
+                ),
+            )
+        })
+    }
+}
+
+impl RotaryConfig {
+    /// The configuration of a Hugging Face text configuration over heads of `head_dim`
+    /// channels.
+    ///
+    /// Reads the configuration's rotary recipe ([`RopeParameters::of`]):
+    ///
+    /// - `default` is the power series over the rotated channels, or, when the recipe states
+    ///   `mrope_section` with `mrope_interleaved`, interleaved M-RoPE: its sections count the
+    ///   frequencies each position axis owns ([`Spectrum::Sectioned`]);
+    /// - `yarn` is the YaRN interpolation of the power series over every channel of a head,
+    ///   computed in f64; `max_position_embeddings` is the configuration's own, which a recipe
+    ///   that states its fitted length must reach from that length by its factor.
+    ///
+    /// The rotated channels are `partial_rotary_factor` of a head: the configuration's, or
+    /// `partial_default` (the default its configuration class defines) when it states none;
+    /// `None` when the class defines no default, so the configuration must state one.
+    /// `precision` is the arithmetic the model's reference evaluates its spectrum in.
+    ///
+    /// # Errors
+    ///
+    /// A recipe [`RopeParameters::of`] refuses, a recipe other than these, a rotated fraction
+    /// that is unstated without a default or rotates no whole number of pairs, sections that
+    /// are not interleaved, or a value outside its domain.
+    pub fn from_hf(
+        fields: &Fields<'_>,
+        head_dim: u32,
+        max_position_embeddings: u32,
+        partial_default: Option<f64>,
+        precision: Precision,
+    ) -> Result<Self> {
+        let parameters = RopeParameters::of(fields)?;
+
+        let partial = parameters
+            .partial_rotary_factor
+            .or(partial_default)
+            .ok_or_else(|| {
+                fields.refuse(
+                    "partial_rotary_factor",
+                    "is not stated, and this configuration's class defines no default",
+                )
+            })?;
+        let rotated = f64::from(head_dim) * partial;
+        if !(partial > 0.0 && partial <= 1.0)
+            || rotated.fract() != 0.0
+            || !(rotated as u32).is_multiple_of(2)
+        {
             return Err(fields.refuse(
                 "partial_rotary_factor",
-                "is not served: every channel of a head rotates",
+                format!(
+                    "of {partial} rotates no whole number of pairs of a {head_dim}-channel head"
+                ),
             ));
         }
+        let dim = rotated as u32;
 
-        let spectrum = match kind {
-            "default" => Spectrum::Default,
-            "yarn" => Spectrum::Yarn(yarn(fields, &maps, max_position_embeddings)?),
-            other => {
+        let sections = match &parameters.recipe {
+            Some(recipe) => recipe.optional_indices("mrope_section")?,
+            None => None,
+        };
+        let (spectrum, precision) = match (parameters.rope_type, sections) {
+            ("default", None) => (Spectrum::Default, precision),
+            ("default", Some(sections)) => {
+                let recipe = parameters.object(fields)?;
+                if !recipe.flag("mrope_interleaved")? {
+                    return Err(recipe.refuse(
+                        "mrope_interleaved",
+                        "is false; M-RoPE sections are served interleaved over the spectrum",
+                    ));
+                }
+                (Spectrum::sectioned(&sections)?, precision)
+            }
+            ("yarn", None) if dim == head_dim => (
+                Spectrum::Yarn(yarn(parameters.object(fields)?, max_position_embeddings)?),
+                Precision::F64,
+            ),
+            (other, _) => {
                 return Err(fields.refuse(
-                    "rope_scaling",
-                    format!("names the recipe {other:?}; default and yarn are served"),
+                    "rope_type",
+                    format!(
+                        "names the recipe {other:?} over {dim} of {head_dim} channels; the \
+                         default recipe, interleaved M-RoPE and YaRN over a whole head are \
+                         served"
+                    ),
                 ));
             }
         };
         let config = Self {
-            theta: theta as f32,
+            theta: parameters.theta as f32,
             dim,
             spectrum,
-            precision: Precision::F64,
+            precision,
         };
 
         config.check()?;
@@ -393,17 +532,14 @@ fn yarn_frequencies(theta: f32, dim: u32, yarn: &Yarn) -> Result<(Vec<f32>, f32)
         .map(|index| 1.0 / base.powf(2.0 * index as f64 / f64::from(dim)))
         .collect();
 
-    // The length the recipe was fitted to is both the window the correction range is measured
-    // over and the denominator of the extension.
+    // The length the recipe was fitted to is the window the correction range is measured over;
+    // the declared factor is the extension.
     let fitted = f64::from(yarn.original_max_position_embeddings);
-    let factor = f64::from(yarn.max_position_embeddings) / fitted;
+    let factor = f64::from(yarn.factor);
     if !(fitted > 0.0 && factor.is_finite() && factor > 0.0) {
         return Err(Error::shape(
             "Rotary",
-            format!(
-                "a YaRN extension of {} positions over a {fitted}-position window",
-                yarn.max_position_embeddings
-            ),
+            format!("a YaRN extension of {factor} over a {fitted}-position window"),
         ));
     }
 
@@ -466,62 +602,66 @@ fn correction_range(
     (low, high)
 }
 
-/// The first of `maps` that states a value through `read`.
-fn first<T>(
-    maps: &[Option<&Fields<'_>>],
-    read: impl Fn(&Fields<'_>) -> Result<Option<T>>,
-) -> Result<Option<T>> {
-    for map in maps.iter().flatten() {
-        if let Some(value) = read(map)? {
-            return Ok(Some(value));
-        }
-    }
-    Ok(None)
-}
+/// The YaRN recipe `recipe` states, for a configuration of `max_position_embeddings`
+/// positions.
+///
+/// `beta_fast` and `beta_slow` take the YaRN paper's values of 32 and 1 when the recipe states
+/// none, as both references do. The fitted length is the recipe's
+/// `original_max_position_embeddings`, or the configuration's own length when the recipe states
+/// none; a recipe that states one must state the factor that extends it to the configuration's
+/// length (module documentation). The correction range is truncated to whole pairs, so a recipe
+/// that states `truncate: false` is refused.
+fn yarn(recipe: &Fields<'_>, max_position_embeddings: u32) -> Result<Yarn> {
+    let number = |key: &str| recipe.optional_number(key);
 
-/// The YaRN recipe's fields from `maps`, the recipe's objects in precedence order.
-fn yarn(fields: &Fields<'_>, maps: &[Option<&Fields<'_>>], extended: u32) -> Result<Yarn> {
-    let number = |key: &str| first(maps, |map| map.optional_number(key));
-
-    let factor = number("factor")?
-        .ok_or_else(|| fields.refuse("rope_scaling", "a yarn recipe requires factor"))?
-        as f32;
-    let original = first(maps, |map| {
-        map.optional_index("original_max_position_embeddings")
-    })?
-    .unwrap_or(extended);
+    let factor = recipe.number("factor")? as f32;
     let beta_fast = number("beta_fast")?.map_or(32.0, |value| value as f32);
     let beta_slow = number("beta_slow")?.map_or(1.0, |value| value as f32);
-
     for (name, value) in [
         ("factor", factor),
         ("beta_fast", beta_fast),
         ("beta_slow", beta_slow),
     ] {
         if !(value.is_finite() && value > 0.0) {
-            return Err(fields.refuse(
-                "rope_scaling",
-                format!("yarn {name} must be finite and positive"),
-            ));
+            return Err(recipe.refuse(name, "must be finite and positive"));
         }
     }
+
+    let original = match recipe.optional_index("original_max_position_embeddings")? {
+        Some(original) => {
+            if f64::from(original) * f64::from(factor) != f64::from(max_position_embeddings) {
+                return Err(recipe.refuse(
+                    "original_max_position_embeddings",
+                    format!(
+                        "is {original} under a factor of {factor}, and the configuration serves \
+                         {max_position_embeddings} positions: transformers would extend by \
+                         {max_position_embeddings}/{original} and vLLM by {factor}, so the \
+                         recipe states two spectra"
+                    ),
+                ));
+            }
+            original
+        }
+        None => max_position_embeddings,
+    };
     if original == 0 {
-        return Err(fields.refuse(
-            "rope_scaling",
-            "yarn original_max_position_embeddings must be positive",
+        return Err(recipe.refuse("original_max_position_embeddings", "must be positive"));
+    }
+    if recipe.optional_flag("truncate")? == Some(false) {
+        return Err(recipe.refuse(
+            "truncate",
+            "is false; the correction range is truncated to whole pairs",
         ));
     }
 
     Ok(Yarn {
         factor,
         original_max_position_embeddings: original,
-        max_position_embeddings: extended,
         attention_factor: number("attention_factor")?.map(|value| value as f32),
         beta_fast,
         beta_slow,
         mscale: number("mscale")?.map(|value| value as f32),
         mscale_all_dim: number("mscale_all_dim")?.map(|value| value as f32),
-        truncate: first(maps, |map| map.optional_flag("truncate"))?.unwrap_or(true),
     })
 }
 

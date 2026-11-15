@@ -25,7 +25,7 @@
 
 use nn::config::Fields;
 use nn::functional::{Activation, StateAxes};
-use nn::modules::{GatedDeltaNetConfig, RotaryConfig};
+use nn::modules::{GatedDeltaNetConfig, Precision, RotaryConfig};
 use nn::quantization::Declaration;
 use nn::{PixelNorm, Split};
 use processing::qwen_vl::ProcessorConfig;
@@ -35,6 +35,9 @@ use crate::qwen4_exp::{Error, Result};
 
 /// The model class this family builds, as request processing claims it.
 pub const CLASS: &str = "Qwen4ExpForConditionalGeneration";
+
+/// The arithmetic the family's reference evaluates its rotary spectrum in.
+const PRECISION: Precision = Precision::F32;
 
 /// A tensor every checkpoint's vision tower holds: the patch embedding.
 const TOWER_WEIGHT: &str = "model.visual.patch_embed.proj.weight";
@@ -501,7 +504,7 @@ impl TextConfig {
         let gate = values.optional_text("output_gate_type")?.unwrap_or("silu");
         let sigmoid_gate = match gate {
             "sigmoid" => true,
-            "silu" | "swish" => false,
+            "silu" => false,
             other => {
                 return Err(Error::Config(format!(
                     "an output gate of {other} is neither sigmoid nor silu"
@@ -550,10 +553,16 @@ impl TextConfig {
                 .unwrap_or(Activation::Silu),
             rms_norm_eps,
             // The recipe states its own partial rotation.
-            rope: crate::qwen3::config::rope(values, head_dim, max_position_embeddings, None)?,
+            rope: RotaryConfig::from_hf(
+                values,
+                head_dim,
+                max_position_embeddings,
+                None,
+                PRECISION,
+            )?,
             max_position_embeddings,
             eos_token_id: values.index("eos_token_id")?,
-            linear_layers: crate::qwen3::config::linear_layers(values, num_hidden_layers)?,
+            linear_layers: values.linear_attention(num_hidden_layers)?,
             gated_delta_net: network,
         })
     }
@@ -699,6 +708,10 @@ pub(crate) mod fixtures {
                 "attention_bias": false,
                 "eos_token_id": 248044,
                 "full_attention_interval": 4,
+                "layer_types": [
+                    "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                    "linear_attention", "linear_attention", "linear_attention", "full_attention"
+                ],
                 "hc_count": 4,
                 "hc_lowrank": 320,
                 "head_dim": 256,

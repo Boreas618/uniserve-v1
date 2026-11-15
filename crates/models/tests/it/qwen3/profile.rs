@@ -688,7 +688,8 @@ fn the_vl_encoder_profiles_a_prompt_with_an_image() {
     let (image, video) = (sidecar(image_file), sidecar(video_file));
     let images = (
         ProcessorConfig::from_values(&image, &video).expect("the processor"),
-        models::qwen3::config::pixel_norm(&Fields::of(image_file, &image).expect("an object"))
+        Fields::of(image_file, &image)
+            .and_then(|fields| fields.pixel_norm())
             .expect("the pixel normalization"),
     );
 

@@ -156,10 +156,8 @@ impl Config {
         let mut text_encoder = text::text_encoder(&require("text_encoder/config.json")?)?;
         text_encoder.quantization = declared(Stage::TextEncoder.name())?;
         let image_processor = require("processor/preprocessor_config.json")?;
-        let pixels = crate::qwen3::config::pixel_norm(&Fields::of(
-            "processor/preprocessor_config.json",
-            &image_processor,
-        )?)?;
+        let pixels =
+            Fields::of("processor/preprocessor_config.json", &image_processor)?.pixel_norm()?;
         let processor = sidecar("processor/video_preprocessor_config.json")?
             .map(|video| ProcessorConfig::from_values(&image_processor, &video))
             .transpose()

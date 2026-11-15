@@ -13,6 +13,7 @@
 use ops::activation::Activation;
 use serde_json::{Map, Value};
 
+use crate::capability::PixelNorm;
 use crate::error::{Error, Result};
 
 /// One JSON object of a checkpoint configuration, and the document it was read from.
@@ -338,41 +339,12 @@ impl<'a> Fields<'a> {
         })
     }
 
-    /// Which of `keys`, the spellings of one field, the object states.
+    /// A required activation, by its name in transformers' activation table (`ACT2CLS`).
     ///
-    /// A field written under several names by different exporters (`num_experts` and
-    /// `num_local_experts`, `rope_scaling` and `rope_parameters`) is read through the first name
-    /// the object states. An object that states two of them with different values says two things
-    /// about one field and is refused naming both; two equal values are one statement.
-    ///
-    /// # Errors
-    ///
-    /// When two stated spellings disagree.
-    pub fn alias<'k>(&self, keys: &[&'k str]) -> Result<Option<&'k str>> {
-        let mut stated: Option<(&'k str, &Value)> = None;
-        for key in keys {
-            let Some(value) = self.get(key) else {
-                continue;
-            };
-            match stated {
-                None => stated = Some((key, value)),
-                Some((first, held)) if held != value => {
-                    return Err(self.refuse(
-                        key,
-                        format!("states {value} and its alias `{first}` states {held}"),
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
-        Ok(stated.map(|(key, _)| key))
-    }
-
-    /// A required activation, in the names Hugging Face configurations state it by.
-    ///
-    /// `silu` and `swish` are SiLU, `gelu` is the exact GELU and `gelu_pytorch_tanh` (or
-    /// `gelu_tanh`) its tanh approximation. Any other name is refused: an activation read as a
-    /// different one is a model that runs and computes something else.
+    /// The names served are the table's entries for the functions the operators implement:
+    /// `silu`, `gelu` (the exact GELU) and `gelu_pytorch_tanh` (its tanh approximation). Any
+    /// other name is refused: an activation read as a different one is a model that runs and
+    /// computes something else.
     ///
     /// # Errors
     ///
@@ -396,6 +368,73 @@ impl<'a> Fields<'a> {
     /// When the field is present and does not name a served activation.
     pub fn optional_activation(&self, key: &str) -> Result<Option<Activation>> {
         self.optional(key, Self::activation)
+    }
+
+    /// The pixel normalization an image processor's configuration states by `image_mean` and
+    /// `image_std`: each RGB channel maps `x` in `[0, 255]` to `(x / 255 - mean) / std`.
+    ///
+    /// # Errors
+    ///
+    /// Fields of the wrong type or length, or a deviation that is not positive.
+    pub fn pixel_norm(&self) -> Result<PixelNorm> {
+        let channels = |key: &str| -> Result<[f32; 3]> {
+            let values = self.fixed_numbers(key, 3)?;
+            Ok([values[0] as f32, values[1] as f32, values[2] as f32])
+        };
+        let (mean, std) = (channels("image_mean")?, channels("image_std")?);
+
+        if std.iter().any(|value| *value <= 0.0) {
+            return Err(self.refuse("image_std", format!("must be positive, got {std:?}")));
+        }
+        Ok(PixelNorm { mean, std })
+    }
+
+    /// Which layers of a hybrid stack of `layers` layers attend linearly, as `layer_types`
+    /// declares each layer: `linear_attention` or `full_attention`.
+    ///
+    /// transformers derives `layer_types` from `full_attention_interval` when it constructs a
+    /// configuration and serializes both; the interval, when stated, is the same statement in
+    /// another form (every `interval`-th layer attends fully) and must agree with the list.
+    ///
+    /// # Errors
+    ///
+    /// A missing list, a list of another length, a kind other than the two, or an interval
+    /// that disagrees with the list.
+    pub fn linear_attention(&self, layers: u32) -> Result<Vec<bool>> {
+        let kinds = self.optional_texts("layer_types")?.ok_or_else(|| {
+            self.refuse(
+                "layer_types",
+                "is required: a hybrid stack declares the kind of every layer",
+            )
+        })?;
+        let linear = kinds
+            .iter()
+            .map(|kind| match *kind {
+                "full_attention" => Ok(false),
+                "linear_attention" => Ok(true),
+                other => Err(self.refuse(
+                    "layer_types",
+                    format!("names {other}, neither full_attention nor linear_attention"),
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if linear.len() != layers as usize {
+            return Err(self.refuse(
+                "layer_types",
+                format!("states {} layers of a {layers}-layer stack", linear.len()),
+            ));
+        }
+        if let Some(interval) = self.optional_count("full_attention_interval")?
+            && (0..layers)
+                .any(|layer| linear[layer as usize] == (layer + 1).is_multiple_of(interval))
+        {
+            return Err(self.refuse(
+                "full_attention_interval",
+                format!("of {interval} disagrees with layer_types"),
+            ));
+        }
+        Ok(linear)
     }
 
     /// `read(key)` for a present field, `None` for an absent or `null` one.
@@ -440,12 +479,13 @@ impl<'a> Fields<'a> {
     }
 }
 
-/// The activation a Hugging Face configuration names, or `None` for one no operator implements.
+/// The activation transformers' activation table (`ACT2CLS`) names, or `None` for one no
+/// operator implements: one entry per function served.
 fn activation_named(name: &str) -> Option<Activation> {
     Some(match name {
-        "silu" | "swish" => Activation::Silu,
+        "silu" => Activation::Silu,
         "gelu" => Activation::Gelu,
-        "gelu_pytorch_tanh" | "gelu_tanh" => Activation::GeluTanh,
+        "gelu_pytorch_tanh" => Activation::GeluTanh,
         _ => return None,
     })
 }
@@ -492,41 +532,67 @@ mod tests {
         assert!(fields.optional_count("steps").is_err());
     }
 
+    /// An activation is read by its entry in transformers' table, one name per function; a name
+    /// the table defines for a function no operator implements, or a second name, is refused.
     #[test]
-    fn two_spellings_of_one_field_must_agree() {
-        let value = document(r#"{"num_experts": 8, "num_local_experts": 8, "other": 1}"#);
-        let fields = Fields::of("config.json", &value).unwrap();
-        assert_eq!(
-            fields.alias(&["num_experts", "num_local_experts"]).unwrap(),
-            Some("num_experts")
-        );
-        assert_eq!(fields.alias(&["absent", "other"]).unwrap(), Some("other"));
-        assert_eq!(fields.alias(&["absent"]).unwrap(), None);
-
-        let value = document(r#"{"num_experts": 8, "num_local_experts": 16}"#);
-        let fields = Fields::of("config.json", &value).unwrap();
-        let error = fields
-            .alias(&["num_experts", "num_local_experts"])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("num_local_experts") && error.contains("num_experts"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn an_activation_is_read_in_the_hugging_face_names() {
+    fn an_activation_is_read_by_its_table_name() {
         let value = document(
-            r#"{"a": "silu", "b": "swish", "c": "gelu", "d": "gelu_pytorch_tanh", "e": "relu"}"#,
+            r#"{"a": "silu", "c": "gelu", "d": "gelu_pytorch_tanh", "e": "relu", "f": "swish"}"#,
         );
         let fields = Fields::of("config.json", &value).unwrap();
         assert_eq!(fields.activation("a").unwrap(), Activation::Silu);
-        assert_eq!(fields.activation("b").unwrap(), Activation::Silu);
         assert_eq!(fields.activation("c").unwrap(), Activation::Gelu);
         assert_eq!(fields.activation("d").unwrap(), Activation::GeluTanh);
-        let error = fields.activation("e").unwrap_err().to_string();
-        assert!(error.contains("relu"), "{error}");
+        for refused in ["e", "f"] {
+            let error = fields.activation(refused).unwrap_err().to_string();
+            assert!(error.contains(fields.text(refused).unwrap()), "{error}");
+        }
+    }
+
+    /// An image processor's normalization is three means and three positive deviations.
+    #[test]
+    fn a_pixel_normalization_is_three_channels_of_positive_deviation() {
+        let value = document(r#"{"image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.25, 1]}"#);
+        let norm = Fields::of("preprocessor_config.json", &value)
+            .unwrap()
+            .pixel_norm()
+            .unwrap();
+        assert_eq!(
+            norm,
+            PixelNorm {
+                mean: [0.5; 3],
+                std: [0.5, 0.25, 1.0]
+            }
+        );
+
+        let value = document(r#"{"image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0, 1]}"#);
+        let fields = Fields::of("preprocessor_config.json", &value).unwrap();
+        assert!(fields.pixel_norm().is_err());
+    }
+
+    /// A hybrid stack declares each layer's kind; the interval, when stated, must say the same.
+    #[test]
+    fn a_hybrid_stack_declares_each_layer_s_kind() {
+        let kinds = r#""layer_types": ["linear_attention", "linear_attention", "full_attention",
+                         "linear_attention", "linear_attention", "full_attention"]"#;
+        let read = |text: String| {
+            let value = document(&text);
+            Fields::of("config.json", &value)
+                .unwrap()
+                .linear_attention(6)
+        };
+
+        let expected = vec![true, true, false, true, true, false];
+        assert_eq!(read(format!("{{{kinds}}}")).unwrap(), expected);
+        assert_eq!(
+            read(format!(r#"{{{kinds}, "full_attention_interval": 3}}"#)).unwrap(),
+            expected
+        );
+        assert!(read(format!(r#"{{{kinds}, "full_attention_interval": 2}}"#)).is_err());
+        assert!(read(r#"{"full_attention_interval": 3}"#.to_owned()).is_err());
+        assert!(
+            read(r#"{"layer_types": ["full_attention", "sliding_attention"]}"#.to_owned()).is_err()
+        );
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub use moe::{MoE, MoEConfig, SharedExpert, SharedExpertConfig};
 pub use norm::{
     GatedRmsNorm, GatedRmsNormConfig, LayerNorm, LayerNormConfig, RmsNorm, RmsNormConfig,
 };
-pub use rotary::{Precision, Rotary, RotaryConfig, Spectrum, Yarn};
+pub use rotary::{Precision, RopeParameters, Rotary, RotaryConfig, Spectrum, Yarn};
 pub use timestep::{
     TimestepEmbedding, TimestepEmbeddingConfig, TimestepTable, TimestepTableConfig,
 };
