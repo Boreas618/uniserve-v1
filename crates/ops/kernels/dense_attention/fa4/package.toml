@@ -1,9 +1,9 @@
 # The dense_attention operator's fa4 backend: design 5.2's package.
 #
-# One native module per descriptor: FlashAttention 4's Blackwell dense forward pass
-# over packed sequences, compiled through the vendor's own selection
-# (`flash_attn.cute.interface`) at build time and exported to C. The entry is the
-# operator's `attention::dense::Call`.
+# One native module per descriptor: FlashAttention-4's Blackwell dense forward pass
+# over packed sequences, the vendor's kernel class constructed with an explicit
+# configuration (`src/fa4.py`) and exported to C. The entry is the operator's
+# `attention::dense::Call`.
 #
 # No cache and no page table: each sequence's rows are a contiguous run of the packed
 # tensors, named by the two offset tables. A geometry FA4 cannot serve at this shape is
@@ -14,12 +14,12 @@
 op = "dense_attention"
 backend = "fa4"
 interface_version = 1
+# The forward pass's tile, query stages and tile scheduler per descriptor (`Request.tuned`).
+tuning = ["tuning/forward.toml"]
 
-# The CuTe DSL this package is written for, as the toolchain reports it (`cutlass.__version__`);
-# the Build Server refuses a package whose version no host here has, so this must name the
-# environment the tree installs.
+# The distribution whose kernel the build module imports.
 [toolchain]
-packages = ["flash-attn-4", "torch"]
+packages = ["flash-attn-4"]
 
 [source]
 kind = "cute_dsl"
@@ -31,21 +31,17 @@ requires = ["tensor_memory"]
 #
 # The offsets path only: `cu_seq_lens = true` is what the descriptor prints for a packed
 # launch and prints nothing for it, so a package that serves packed sequences names no such
-# field. `max_kv_len` is a bound the caller supplies, deliberately absent from the key, so it
-# is a build parameter here and not a dimension.
+# field. The longest key sequence of a call is a launch value the entry checks, not a
+# compile-time one.
+#
+# `head_dim` is the head widths FA4's forward pass compiles on SM100: `_validate_head_dims`
+# admits every multiple of the alignment (16 bytes = 8 elements) in 8..128. A square head of
+# 256 is FA4's dedicated two-CTA kernel, another class with another call, which this package
+# does not carry. The head counts are the call's shapes; the entry refuses `q_heads` that
+# `kv_heads` does not divide, which is the condition of FA4's grouped-query path
+# (`num_head % num_head_kv == 0`).
 [[kernel.descriptors]]
-# `head_dim` is the head widths FlashAttention-4 compiles on SM100: `_validate_head_dims` admits
-# every multiple of the alignment (16 bytes = 8 BF16 elements) in 8..128, and 256 for a square
-# head. The head counts are the call's shapes; the entry refuses `q_heads` that `kv_heads` does
-# not divide, which is the condition of FA4's grouped-query path (`num_head % num_head_kv == 0`).
-dimensions = { dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["8", "16", "24", "32", "40", "48", "56", "64", "72", "80", "88", "96", "104", "112", "120", "128", "256"], q_heads = { min = 1 }, kv_heads = { min = 1 }, mask = ["causal", "dense"], window = ["false"] }
+dimensions = { dtype = ["bf16"], kv = ["bf16"], out = ["bf16"], head_dim = ["8", "16", "24", "32", "40", "48", "56", "64", "72", "80", "88", "96", "104", "112", "120", "128"], q_heads = { min = 1 }, kv_heads = { min = 1 }, mask = ["causal", "dense"], window = ["false"] }
 
-[parameters]
-# The representative problem the vendor's configuration is chosen for: the batch and
-# query length of one launch. A call of a very different shape runs a configuration
-# chosen for this one.
-batch = 8
-query_len = 512
-# The longest key extent the module claims to serve, which the vendor's selection is told
-# about and a launch longer than is refused.
-max_kv_len = 40960
+[[kernel.descriptors]]
+dimensions = { dtype = ["f16"], kv = ["f16"], out = ["f16"], head_dim = ["8", "16", "24", "32", "40", "48", "56", "64", "72", "80", "88", "96", "104", "112", "120", "128"], q_heads = { min = 1 }, kv_heads = { min = 1 }, mask = ["causal", "dense"], window = ["false"] }

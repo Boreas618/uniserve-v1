@@ -47,10 +47,10 @@
 //!
 //! # The package
 //!
-//! A native library per backend. `fa4` is FlashAttention-4's CuTe package: tiles, the split-K and
-//! scheduler heuristics, the compiled specializations and their choice, and the output allocation
-//! are its host work (`flash_attn/cute/interface.py:276-522, 715-730`), so
-//! [`Op::launch`] computes no grid. `f32` is the FP32 path — cuBLASLt SGEMM and a softmax kernel
+//! A native library per backend. `fa4` is FlashAttention-4's forward pass, which its package
+//! compiles with the tile, query stages and scheduler its tuning data states for the descriptor;
+//! the grid is the exported launcher's host work, so [`Op::launch`] computes none. `f32` is the
+//! FP32 path — cuBLASLt SGEMM and a softmax kernel
 //! inside the package — for the audio encoder and the sparse compression branch, which hold their
 //! activations in FP32. Both take the same call structure and the same descriptor fields.
 

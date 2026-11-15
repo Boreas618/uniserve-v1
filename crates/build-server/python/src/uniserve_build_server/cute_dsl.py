@@ -19,9 +19,10 @@ its typed fields, the manifest's parameters, the target and the installed
 package, whose tuning data a package reads), one shape for every package:
 
 - ``name``: the exported launcher's name, which the entry unit calls;
-- ``compile``: a callable that returns the compiled kernel. A kernel the DSL
-  compiles directly states :func:`kernel`; a package whose kernel is selected
-  and compiled by its vendor's own code states that code;
+- ``compile``: a callable that returns the compiled launcher, :func:`kernel`
+  of the package's launcher (its own kernel, or a vendor's kernel class it
+  constructs with an explicit configuration) and the fake arguments
+  :func:`pointer`, :func:`tensor` and :func:`scalar` describe;
 - ``defines`` (optional): preprocessor definitions of the entry unit.
 
 The entry unit is the C++ translation unit the manifest names in ``[source]
@@ -46,8 +47,8 @@ from typing import Any
 
 import cutlass.cute as cute
 from cutlass import Numeric
-from cutlass.cute.runtime import make_fake_stream, make_ptr
-from cutlass.cute.typing import Pointer
+from cutlass.cute.runtime import make_fake_stream, make_fake_tensor, make_ptr
+from cutlass.cute.typing import Pointer, Tensor
 from cutlass.cutlass_dsl import CuTeDSL
 
 from uniserve_build_server.request import Request, Target
@@ -92,6 +93,27 @@ def pointer(dtype: type[Numeric], align: int) -> Pointer:
     rely on, and the address itself is never read.
     """
     return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=align)
+
+
+def tensor(
+    dtype: type[Numeric], rank: int, leading: int, align: int | None
+) -> Tensor:
+    """A fake device tensor of ``rank`` modes whose layout the launch states.
+
+    Every extent is a 32-bit runtime word and every stride a 64-bit one, but
+    the ``leading`` mode's stride, which is 1: the compiled function takes the
+    tensor's base, extents and strides at launch (the export's tensor struct),
+    and only the unit stride is compiled in. ``align`` is the alignment of the
+    base in bytes the kernel's accesses rely on; ``None`` states one element's.
+    """
+    return make_fake_tensor(
+        dtype,
+        tuple(cute.sym_int32() for _ in range(rank)),
+        tuple(
+            1 if mode == leading else cute.sym_int64() for mode in range(rank)
+        ),
+        assumed_align=align,
+    )
 
 
 def scalar(dtype: type[Numeric]) -> Numeric:

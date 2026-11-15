@@ -3,9 +3,9 @@
 #
 # One native module per descriptor: Video Sparse Attention on SM120/SM121, through
 # FlashInfer's CuTe DSL block-sparse kernel (`BlockSparseAttnForwardSm120Blk64`). The vendor
-# ships the kernel and a torch-shaped wrapper; this package drives the kernel once at build
-# time with fake tensors on the CPU, exports it to C, and fills the generated structs from the
-# operator's call.
+# ships the kernel and a torch-shaped wrapper; this package constructs the kernel class and
+# compiles it for fake tensors in the kernel's own layouts (`src/bsa_sm120.py`), exports it to
+# C, and fills the generated structs from the operator's call.
 #
 # The kernel's tile is 64 rows in both the query and the key domain and its head is 128 wide,
 # so this backend serves block 64 and head_dim 128. It always writes the softmax normalizer,
@@ -15,8 +15,9 @@ op = "sparse_attention"
 backend = "flashinfer"
 interface_version = 1
 
+# The distribution whose kernel the build module imports.
 [toolchain]
-packages = ["flashinfer-python", "torch"]
+packages = ["flashinfer-python"]
 
 [source]
 kind = "cute_dsl"
@@ -24,13 +25,10 @@ kind = "cute_dsl"
 [kernel]
 requires = ["sm_120f"]
 
+# The kernel writes its output in the queries' element type, so each element type is a cell of
+# its own.
 [[kernel.descriptors]]
-dimensions = { block = ["64"], dtype = ["bf16", "f16"], output = ["bf16", "f16"], head_dim = ["128"], lse = ["true"] }
+dimensions = { block = ["64"], dtype = ["bf16"], output = ["bf16"], head_dim = ["128"], lse = ["true"] }
 
-[parameters]
-# The representative call the kernel is compiled for: its layouts are the call's, with the
-# extents as runtime words, so these only have to be a shape the kernel's schedule covers.
-heads = 8
-query_tiles = 4
-key_blocks = 8
-selected = 3
+[[kernel.descriptors]]
+dimensions = { block = ["64"], dtype = ["f16"], output = ["f16"], head_dim = ["128"], lse = ["true"] }

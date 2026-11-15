@@ -11,6 +11,7 @@ and the declared compilation are checked without a CUDA toolkit or a device.
 
 from __future__ import annotations
 
+import io
 import json
 import pathlib
 import subprocess
@@ -21,7 +22,7 @@ import pytest
 import triton
 import triton.language as tl
 from uniserve_build_server import triton as driver
-from uniserve_build_server.request import Target
+from uniserve_build_server.request import Request, Target
 from uniserve_build_server.toolchain import available, missing
 
 #: The recording package: its build module writes what it was handed.
@@ -302,6 +303,40 @@ def test_a_failed_compile_refuses_the_build_naming_the_unit(tmp_path):
 def test_a_target_the_description_does_not_state_is_refused():
     with pytest.raises(SystemExit, match="no target 'sm_75'"):
         Target.named("sm_75")
+
+
+def test_tuning_data_configures_the_first_table_the_descriptor_fits(tmp_path):
+    (tmp_path / "tuning").mkdir()
+    (tmp_path / "tuning" / "forward.toml").write_text(
+        "[[configuration]]\n"
+        'descriptors = { dtype = "bf16", columns = 64 }\n'
+        "stages = 1\n"
+        "[[configuration]]\n"
+        'descriptors = { dtype = "bf16" }\n'
+        "stages = 2\n"
+        "tile = [128, 64]\n"
+        "[[configuration]]\n"
+        "stages = 3\n"
+    )
+    (tmp_path / "tuning" / "narrow.toml").write_text(
+        '[[configuration]]\ndescriptors = { dtype = "f16" }\nstages = 1\n'
+    )
+
+    def handed(**fields):
+        stated = request(tmp_path, tmp_path / "output", fields=fields)
+        return Request.read(io.StringIO(json.dumps(stated)))
+
+    # The first table whose fields the descriptor's all equal, with its
+    # `descriptors` left out; a table naming no fields fits every descriptor.
+    forward = "tuning/forward.toml"
+    assert handed(dtype="bf16", columns=128).tuned(forward) == {
+        "stages": 2,
+        "tile": [128, 64],
+    }
+    assert handed(dtype="bf16", columns=64).tuned(forward) == {"stages": 1}
+    assert handed(dtype="f32", columns=64).tuned(forward) == {"stages": 3}
+    with pytest.raises(SystemExit, match="no configuration of"):
+        handed(dtype="bf16", columns=64).tuned("tuning/narrow.toml")
 
 
 @triton.jit

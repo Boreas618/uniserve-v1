@@ -168,3 +168,33 @@ class Request:
             raise SystemExit(
                 f"the descriptor {self.descriptor} names no {name}"
             ) from None
+
+    def tuned(self, data: str) -> dict[str, Any]:
+        """The configuration the package's tuning data holds for the descriptor.
+
+        Tuning data (design section 5.4, the manifest's ``tuning``) is a TOML
+        file of the package, ``data`` relative to its root: an array of
+        ``[[configuration]]`` tables in the order a descriptor tries them. A
+        table may name ``descriptors``, field values as the descriptor's typed
+        fields spell them; the descriptor takes the first table whose
+        ``descriptors`` its fields all equal (a table naming none fits every
+        descriptor), and the table's other keys are its configuration. A
+        descriptor no table fits is refused.
+        """
+        try:
+            tables = tomllib.loads((self.package / data).read_text())
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise SystemExit(f"the tuning data {data}: {error}") from None
+        for table in tables.get("configuration", []):
+            wanted = table.get("descriptors", {})
+            if all(
+                self.fields.get(name) == value for name, value in wanted.items()
+            ):
+                return {
+                    name: value
+                    for name, value in table.items()
+                    if name != "descriptors"
+                }
+        raise SystemExit(
+            f"the tuning data {data} has no configuration of {self.descriptor}"
+        )

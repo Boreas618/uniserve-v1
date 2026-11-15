@@ -1,152 +1,106 @@
-"""FlashAttention 4's dense forward pass: what this package compiles and exports.
+"""FlashAttention-4's dense forward pass over packed sequences.
 
-FA4 is not a kernel source this package owns: it is the FlashAttention distribution's
-Blackwell CuTe DSL kernel plus the glue that decides *how* to compile it. That glue
-(``flash_attn.cute.interface._flash_attn_fwd``) is written for a torch caller and ends
-in a TVM-FFI function, so this module drives it once at build time and keeps what it
-produced: it makes one fake call of the vendor's interface, captures the kernel that
-call selects, compiles it the plain CuTe DSL way — pointers and scalars, no TVM-FFI —
-and hands it back for ``export_to_c``.
+The kernel is FlashAttention-4's Blackwell forward pass,
+``flash_attn.cute.flash_fwd_sm100.FlashAttentionForwardSm100`` of the locked
+``flash-attn-4`` distribution, constructed here with an explicit
+configuration and compiled through this package's launcher
+(:class:`DenseForward`), whose parameters are the C module's. Every part of the
+configuration is stated by one owner:
 
-The capturing and compiling half is ``compile_selection``, the same mechanism
-`paged_attention`'s fa4 package carries; this package holds its own copy because a
-package's sources are its own, and states only the one ``request`` it makes.
+- the descriptor: the head width, the grouped-query ratio and the mask, and
+  with the ratio whether a tile packs the query heads of one key head (FA4
+  packs them whenever a key head serves several);
+- the C module's call: packed sequences named by two offset tables, no window,
+  no split of the keys, no page table, no score or mask modifier, and the
+  schedule FA4 gives a packed launch whose sequences may span several tiles
+  (no static persistent schedule, which FA4 chooses only when every sequence
+  fits one tile, and no two-CTA MMA, which it never chooses for packed
+  queries);
+- the package's tuning data (``tuning/forward.toml``): the tile, the query
+  stages a CTA keeps in flight and the tile scheduler.
 
-The pass is the packed-sequence one: queries, keys and values are runs of rows named by
-the two offset tables, there is no cache and no page table, and the mask is the
-descriptor's (causal or dense).
-
-Two things the vendor's interface assumes must be true of a C module instead, and
-``compile_selection`` sets them on the vendor's own objects:
-
-* ``aux_data`` describes score and mask modifiers. With none, it is a constant of the
-  compilation and not an argument a C caller could pass;
-* ``max_seqlen_q`` is an extent the call carries, so it is one runtime word.
-
-Everything else — tiles, pipes, whether the schedule is persistent, whether the
-cluster is two CTAs — the vendor's selection decides, from the descriptor's geometry
-and the representative problem the package's parameters state.
+The pass is the packed-sequence one: queries, keys and values are runs of rows
+named by the two offset tables, there is no cache and no page table, and the
+mask is the descriptor's (causal or dense).
 """
 
-import os
-
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
-
-#: The element types the operator's query, key, value and output may have.
-TORCH_DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16}
+from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 
 #: The module's name: the exported C wrapper and the module handle carry it.
 NAME = "flash_attn_dense"
 
+#: The element types the operator's query, key, value and output may have.
+DTYPES = {"bf16": cutlass.BFloat16, "f16": cutlass.Float16}
 
-def compile_selection(request, target):
-    """Compile what FlashAttention's interface selects for one call, to C.
 
-    ``request`` is called once, inside ``FakeTensorMode``, with the vendor's
-    interface module and must make exactly one ``_flash_attn_fwd`` call. The
-    kernel that call selects is compiled the plain CuTe DSL way — pointers and
-    scalars, no TVM-FFI — and handed back for ``export_to_c``.
+def forward_kernel(fields, configuration):
+    """FA4's forward pass for one descriptor and its tuned configuration."""
+    grouped = fields["q_heads"] // fields["kv_heads"]
+    tile_m, tile_n = configuration["tile"]
+    return FlashAttentionForwardSm100(
+        fields["head_dim"],
+        fields["head_dim"],
+        qhead_per_kvhead=grouped,
+        is_causal=fields["mask"] == "causal",
+        is_local=False,
+        is_split_kv=False,
+        pack_gqa=grouped > 1,
+        m_block_size=tile_m,
+        n_block_size=tile_n,
+        q_stage=configuration["query_stages"],
+        is_static_persistent=False,
+        is_varlen_q=True,
+        use_2cta_instrs=False,
+        use_clc_scheduler=configuration["cluster_launch_control"],
+    )
 
-    This is the whole of what a caller needs from the vendor's glue: the
-    selection (tiles, pipes, schedule, cluster) is the vendor's, and the two
-    arguments a C module cannot take are set on the vendor's own objects first.
+
+class DenseForward:
+    """The C module's launcher: FA4's forward pass over packed sequences.
+
+    Its parameters are what the C module takes at launch, in the export's
+    order, and carry FA4's names, which name the export's tensor structs
+    (``flash_attn_dense_Tensor_mQ_t``) that ``entry.cpp`` fills. The vendor's
+    forward pass is called inside this trace, where the arguments a C module
+    cannot take (the absent tensors and the score and mask modifiers' data)
+    are its defaults.
     """
-    import flash_attn.cute.flash_fwd_sm100 as kernels
-    import flash_attn.cute.interface as interface
 
-    forward = kernels.FlashAttentionForwardSm100.__call__
-    forward.__annotations__["aux_data"] = cutlass.Constexpr
-    forward.__annotations__["max_seqlen_q"] = cutlass.Int32
+    def __init__(self, kernel):
+        self.kernel = kernel
 
-    captured = []
-    real_compile = cute.compile
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,  # noqa: N803
+        mK: cute.Tensor,  # noqa: N803
+        mV: cute.Tensor,  # noqa: N803
+        mO: cute.Tensor,  # noqa: N803
+        softmax_scale: cutlass.Float32,
+        mCuSeqlensQ: cute.Tensor,  # noqa: N803
+        mCuSeqlensK: cute.Tensor,  # noqa: N803
+        max_seqlen_q: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """Launch FA4's forward pass on ``stream``.
 
-    class Capturing:
-        """The cute module, with only ``compile`` replaced."""
-
-        @staticmethod
-        def compile(function, *args, **options):
-            options.pop("options", None)
-            captured.append((function, args))
-            return None
-
-        def __getattr__(self, name):
-            return getattr(cute, name)
-
-    original = interface.cute
-    interface.cute = Capturing()
-    try:
-        with FakeTensorMode():
-            request(interface)
-    finally:
-        interface.cute = original
-    if len(captured) != 1:
-        raise SystemExit(f"the selection compiled {len(captured)} kernels; expected one")
-    function, arguments = captured[0]
-    # The stream is the caller's at run time; the compile describes a fake one.
-    arguments = [one for one in arguments if "Stream" not in type(one).__name__]
-    # Scalars are runtime words of the module, not Python constants.
-    arguments = [
-        cutlass.Float32(one)
-        if isinstance(one, float)
-        else cutlass.Int32(one)
-        if isinstance(one, int) and not isinstance(one, bool)
-        else one
-        for one in arguments
-    ]
-    return real_compile(function, *arguments, stream=cute.runtime.make_fake_stream())
-
-
-class DenseCompiler:
-    """One compilation of FA4's dense forward pass over packed sequences."""
-
-    def __init__(self, fields, parameters, target):
-        self.dtype = TORCH_DTYPES[fields["dtype"]]
-        self.key_dtype = TORCH_DTYPES[fields["kv"]]
-        self.output_dtype = TORCH_DTYPES[fields["out"]]
-        self.head_dim = fields["head_dim"]
-        self.q_heads = fields["q_heads"]
-        self.kv_heads = fields["kv_heads"]
-        self.causal = fields["mask"] == "causal"
-        # The longest key sequence the module serves, which the package's parameters declare:
-        # the descriptor's bound is deliberately absent from the key, so it cannot be a field.
-        self.max_kv_len = parameters["max_kv_len"]
-        # The representative problem the vendor's selection is asked about.
-        self.batch = parameters["batch"]
-        self.query_len = parameters["query_len"]
-        self.target = target
-
-    def request(self, interface):
-        """Make the one ``_flash_attn_fwd`` call this descriptor compiles.
-
-        The tensors are fake — this runs inside ``FakeTensorMode``, where a tensor is a
-        shape and a stride and no device is opened. Every sequence holds ``query_len``
-        queries and keys, which the offset tables name.
+        ``mQ`` and ``mO`` are the packed ``[q_tokens, q_heads, head_dim]``
+        queries and output, ``mK`` and ``mV`` the packed ``[kv_tokens,
+        kv_heads, head_dim]`` keys and values, each with its head width
+        contiguous; the offset tables hold ``batch + 1`` entries.
         """
-        batch, query_len = self.batch, self.query_len
-        device = "cuda"
-        tokens = batch * query_len
-        offsets = torch.arange(batch + 1, dtype=torch.int32, device=device) * query_len
-        interface._flash_attn_fwd(
-            torch.empty(tokens, self.q_heads, self.head_dim, dtype=self.dtype, device=device),
-            torch.empty(tokens, self.kv_heads, self.head_dim, dtype=self.key_dtype, device=device),
-            torch.empty(tokens, self.kv_heads, self.head_dim, dtype=self.key_dtype, device=device),
-            cu_seqlens_q=offsets,
-            cu_seqlens_k=offsets.clone(),
-            max_seqlen_q=query_len,
-            max_seqlen_k=query_len,
-            softmax_scale=self.head_dim**-0.5,
-            causal=self.causal,
-            # No window: FA4 reads a window size as a distance, so an absent window is
-            # the absence of both bounds.
-            window_size_left=None,
-            window_size_right=None,
-            _arch=self.target.capability,
+        self.kernel(
+            mQ,
+            mK,
+            mV,
+            mO,
+            None,
+            softmax_scale,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            max_seqlen_q=max_seqlen_q,
+            stream=stream,
         )
-
-    def __call__(self):
-        """Compile the configuration the vendor selects, exported to C."""
-        return compile_selection(self.request, self.target)

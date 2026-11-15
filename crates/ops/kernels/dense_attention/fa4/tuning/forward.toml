@@ -1,0 +1,25 @@
+# The configuration of FA4's forward pass per descriptor: the package's tuning data
+# (design section 5.4, read through `uniserve_build_server.request.Request.tuned`).
+#
+# A descriptor compiles the first `[[configuration]]` whose `descriptors` its fields all
+# equal, each spelled as its dimension types it (`head_dim = 128`, `mask = "causal"`); a
+# configuration that names no `descriptors` fits every descriptor. Each states:
+#
+# - `tile`: the rows of queries and of keys one MMA tile covers;
+# - `query_stages`: the query tiles a CTA keeps in flight, 1 or 2;
+# - `cluster_launch_control`: whether tiles are scheduled by cluster launch control instead
+#   of FA4's static packed-sequence scheduler.
+#
+# The data is produced by the package's tuning step: on a device of the target, for each
+# descriptor of a deployment and over that deployment's sequence lengths, time every
+# configuration FA4's forward pass compiles for the descriptor (its SM100 tiles, one and two
+# query stages, both schedulers) and record the fastest, most specific descriptors first; a
+# new revision of the package carries the result. Until that step has run, one configuration
+# fits every descriptor: FA4's own selection for a packed launch whose sequences hold more
+# query rows (times the query heads a key head serves) than one tile, as its interface
+# makes it on SM100 without a cluster launch control request.
+
+[[configuration]]
+tile = [128, 128]
+query_stages = 2
+cluster_launch_control = false
