@@ -434,6 +434,9 @@ pub struct Worker {
     /// The worker group the device is a rank of, and the rank's place among those that report to
     /// the group's [`Sequences`].
     group: GroupId,
+    /// The turn this worker's eager-forward jobs take ([`in_turn`]): its group's, or the first
+    /// group of the node's expert union when the rank is a member of one ([`Worker::in_union`]).
+    turn: GroupId,
     rank: usize,
     queue: Arc<Queue>,
     counters: Arc<Counters>,
@@ -522,6 +525,7 @@ impl Worker {
         Ok(Self {
             device,
             group,
+            turn: group,
             rank,
             queue,
             counters,
@@ -538,6 +542,15 @@ impl Worker {
     /// The worker group the device is a rank of.
     pub(crate) fn group(&self) -> GroupId {
         self.group
+    }
+
+    /// This worker as a member of the node's expert union whose first group is `first`: its
+    /// eager-forward jobs take the union's turn ([`in_turn`]). Every member's warm-up and
+    /// generation preparation runs the union's exchange, whose launches hold a member's device
+    /// until every member reached them, so the members of the union run those jobs at once.
+    pub(crate) fn in_union(mut self, first: GroupId) -> Self {
+        self.turn = first;
+        self
     }
 
     /// The rank's place among those that report to the group's [`Sequences`].
@@ -837,10 +850,12 @@ impl Worker {
 }
 
 /// Submits a job that runs eager forwards (a warm-up, a generation's preparation) to each of
-/// `workers`, through `submit` of each worker's index and worker: the workers of one group at
-/// once and the groups one after another in the order of their ids, each once every earlier
-/// group's workers ended their jobs. Returns each worker's submission, in the workers' order.
-/// Once an earlier group's job failed, no later group is submitted, and the entries of their
+/// `workers`, through `submit` of each worker's index and worker: the workers of one turn at
+/// once and the turns one after another in the order of their ids, each once every earlier
+/// turn's workers ended their jobs. A worker's turn is its group's, and the members of the
+/// node's expert union, whose exchange meets them all, take the turn of the union's first group
+/// together ([`Worker::in_union`]). Returns each worker's submission, in the workers' order.
+/// Once an earlier turn's job failed, no later turn is submitted, and the entries of their
 /// workers are refusals.
 ///
 /// An eager forward uses kernels for the first time, and a kernel's first use takes a lock of
@@ -855,14 +870,14 @@ pub(crate) fn in_turn(
     workers: &[Arc<Worker>],
     mut submit: impl FnMut(usize, &Worker) -> Result<Submission>,
 ) -> Vec<Result<Submission>> {
-    let mut groups: Vec<GroupId> = workers.iter().map(|worker| worker.group).collect();
-    groups.sort_unstable();
-    groups.dedup();
+    let mut turns: Vec<GroupId> = workers.iter().map(|worker| worker.turn).collect();
+    turns.sort_unstable();
+    turns.dedup();
 
     let mut submitted: Vec<Option<Result<Submission>>> = workers.iter().map(|_| None).collect();
     let mut failed = false;
-    for group in groups {
-        // Every worker of the earlier groups: a collective of a group ends on one device only
+    for turn in turns {
+        // Every worker of the earlier turns: a collective of a group ends on one device only
         // once the group's ranks on the others reached it.
         for entry in submitted.iter().flatten() {
             let ended = match entry {
@@ -873,12 +888,12 @@ pub(crate) fn in_turn(
         }
 
         for (index, worker) in workers.iter().enumerate() {
-            if worker.group != group {
+            if worker.turn != turn {
                 continue;
             }
             submitted[index] = Some(if failed {
                 Err(Error::State(
-                    "an earlier group's job failed, so this group's was not submitted",
+                    "an earlier turn's job failed, so this turn's was not submitted",
                 ))
             } else {
                 submit(index, worker)

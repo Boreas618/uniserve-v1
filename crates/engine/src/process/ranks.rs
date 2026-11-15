@@ -3779,6 +3779,16 @@ pub(crate) fn spawn(
         sequences.push(Sequences::new(*id, local + links, registers));
     }
 
+    // The node's expert union holds every text rank of this process: its members take one turn
+    // of eager forwards, the turn of its first group (`worker::in_turn`).
+    let union_turn = ranks
+        .first()
+        .and_then(|rank| match &rank.loaded {
+            Loaded::Text(text) => text.union.as_ref(),
+            Loaded::Video(_) => None,
+        })
+        .and_then(|_| placed.iter().map(|(id, _)| *id).min());
+
     let mut workers = Vec::with_capacity(ranks.len());
     for (rank, (id, place)) in ranks.iter_mut().zip(&placed) {
         let device = rank.pool.as_ref().map(|_| rank.model_runner.devices()[0]);
@@ -3831,6 +3841,10 @@ pub(crate) fn spawn(
             *place,
             COPY_BUDGET,
         )?;
+        let worker = match union_turn {
+            Some(first) => worker.in_union(first),
+            None => worker,
+        };
         workers.push(Arc::new(worker));
     }
 
