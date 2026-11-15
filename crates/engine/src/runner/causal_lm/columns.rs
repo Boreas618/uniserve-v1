@@ -416,20 +416,6 @@ impl Layout {
         block[start..start + source.len()].copy_from_slice(source);
         Ok(())
     }
-
-    /// The first `elements` elements of `column` in `block`, as [`Layout::put`] wrote them.
-    #[cfg(test)]
-    pub(crate) fn read<T: bytemuck::Pod>(
-        &self,
-        block: &[u8],
-        column: Column,
-        elements: usize,
-    ) -> Vec<T> {
-        let start = self.offset(column) as usize;
-        let bytes = elements * std::mem::size_of::<T>();
-
-        bytemuck::pod_collect_to_vec(&block[start..start + bytes])
-    }
 }
 
 /// The unsigned index a kernel reads for the scheduler's `value`: `value` itself, or `none` for

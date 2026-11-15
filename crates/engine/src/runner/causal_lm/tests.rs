@@ -48,6 +48,20 @@ use crate::worker::completion::Outcome;
 use crate::worker::{Sequences, Worker};
 use testkit::serving::unlaunched_kernel;
 
+/// The first `elements` elements of `column` in `block`, as [`Layout::put`] wrote them: what a
+/// prepared step's columns hand the device.
+fn read<T: bytemuck::Pod>(
+    layout: &Layout,
+    block: &[u8],
+    column: Column,
+    elements: usize,
+) -> Vec<T> {
+    let start = layout.offset(column) as usize;
+    let bytes = elements * std::mem::size_of::<T>();
+
+    bytemuck::pod_collect_to_vec(&block[start..start + bytes])
+}
+
 const VOCABULARY: usize = 64;
 const HIDDEN: usize = 16;
 /// The model's heads: two of eight elements, for its queries and for its cache.
@@ -933,8 +947,8 @@ fn a_decode_batch_is_padded_with_rows_that_address_nothing() {
     let tables = held(&[3, 1, SLOTS]);
     let (layout, block) = filled(&batch, &bucket, &mapping(&batch, &tables), None);
 
-    let u32s = |column, elements| layout.read::<u32>(&block, column, elements);
-    let i32s = |column, elements| layout.read::<i32>(&block, column, elements);
+    let u32s = |column, elements| read::<u32>(&layout, &block, column, elements);
+    let i32s = |column, elements| read::<i32>(&layout, &block, column, elements);
 
     // The batch's tokens write the slots their entries name at their cache positions, and
     // the padding token writes none.
@@ -958,7 +972,7 @@ fn a_decode_batch_is_padded_with_rows_that_address_nothing() {
     assert_eq!(u32s(Column::CallSlots, 4), [2, 0, 5, SLOTS]);
 
     // A greedy row in a drawing bucket draws from its one largest candidate.
-    let parameters = layout.read::<f32>(&block, Column::Parameters, 4 * 8);
+    let parameters = read::<f32>(&layout, &block, Column::Parameters, 4 * 8);
     let row = |row: usize| &parameters[row * 8..(row + 1) * 8];
     assert_eq!(row(0)[TOP_K as usize], 1.0);
     assert_eq!(row(1)[TEMPERATURE as usize], 0.7);
@@ -966,7 +980,7 @@ fn a_decode_batch_is_padded_with_rows_that_address_nothing() {
     assert_eq!(row(3), [0.0; 8]);
 
     // Each row's draw is its request's stream at the position it samples.
-    let draws = layout.read::<f32>(&block, Column::Draws, 4);
+    let draws = read::<f32>(&layout, &block, Column::Draws, 4);
     let expected: Vec<f32> = (0..3)
         .map(|row| sampling_uniform(100 + row, 10 + row, 0, 0))
         .collect();
@@ -983,7 +997,7 @@ fn a_decode_batch_is_padded_with_rows_that_address_nothing() {
     assert_eq!(i32s(Column::Valid, 4), [1; 4]);
     assert_eq!(i32s(Column::Active, 4), [1; 4]);
     assert_eq!(i32s(Column::Points, 4), [0; 4]);
-    assert_eq!(layout.read::<u8>(&block, Column::Continuation, 4), [0; 4]);
+    assert_eq!(read::<u8>(&layout, &block, Column::Continuation, 4), [0; 4]);
 }
 
 #[test]
@@ -993,7 +1007,7 @@ fn a_prefill_batch_is_padded_with_tokens_no_row_holds() {
     let bucket = Bucket::prefill(4, 8, Variant::PrefillScored);
     let (layout, block) = filled(&batch, &bucket, &mapping(&batch, &held(&[2, 4])), None);
 
-    let u32s = |column, elements| layout.read::<u32>(&block, column, elements);
+    let u32s = |column, elements| read::<u32>(&layout, &block, column, elements);
 
     assert_eq!(u32s(Column::InputIds, 8), [5, 6, 7, 8, 9, 0, 0, 0]);
     assert_eq!(
@@ -1027,7 +1041,7 @@ fn a_prefill_batch_is_padded_with_tokens_no_row_holds() {
     assert_eq!(u32s(Column::TableRows, 4), [1, 3, SLOTS, SLOTS]);
     assert_eq!(u32s(Column::CallSlots, 4), [1, 3, SLOTS, SLOTS]);
 
-    let table = layout.read::<i32>(&block, Column::Commit, COMMIT_FIELDS * 4);
+    let table = read::<i32>(&layout, &block, Column::Commit, COMMIT_FIELDS * 4);
     assert_eq!(table[column::SLOT * 4..][..4], [1, 3, -1, -1]);
     assert_eq!(table[column::TASK * 4..][..4], [0, -1, -1, -1]);
     assert_eq!(table[column::CACHE_LENGTH * 4..][..4], [3, 2, 0, 0]);
@@ -1042,7 +1056,7 @@ fn a_row_s_adjustments_are_its_bias_flag_and_its_ban_mask() {
 
     // The second row is the first that bans, so its mask is mask zero.
     assert_eq!(
-        layout.read::<u32>(&block, Column::Adjustments, 4),
+        read::<u32>(&layout, &block, Column::Adjustments, 4),
         [1, NO_SLOT, 0, 0]
     );
 }
@@ -1059,33 +1073,33 @@ fn the_idle_inputs_of_every_bucket_write_and_commit_nothing() {
 
         // No token writes a cache slot and no row has a key, a slot or a request's pages.
         assert_eq!(
-            layout.read::<u32>(&block, Column::SlotMapping, tokens),
+            read::<u32>(&layout, &block, Column::SlotMapping, tokens),
             vec![NO_SLOT; tokens]
         );
         assert_eq!(
-            layout.read::<u32>(&block, Column::SeqLens, rows),
+            read::<u32>(&layout, &block, Column::SeqLens, rows),
             vec![0; rows]
         );
         assert_eq!(
-            layout.read::<u32>(&block, Column::Slots, rows),
+            read::<u32>(&layout, &block, Column::Slots, rows),
             vec![NO_SLOT; rows]
         );
         assert_eq!(
-            layout.read::<u32>(&block, Column::TableRows, rows),
+            read::<u32>(&layout, &block, Column::TableRows, rows),
             vec![SLOTS; rows]
         );
 
         // The step is a full batch of the bucket: every token lies in a row's span.
-        let offsets = layout.read::<u32>(&block, Column::QueryOffsets, rows + 1);
+        let offsets = read::<u32>(&layout, &block, Column::QueryOffsets, rows + 1);
         assert_eq!((offsets[0], offsets[rows]), (0, bucket.tokens));
         assert_eq!(
-            layout.read::<u32>(&block, Column::LiveTokens, 1),
+            read::<u32>(&layout, &block, Column::LiveTokens, 1),
             [bucket.tokens]
         );
 
         // Every row of the commit table is inert.
         let capacity = layout.rows();
-        let table = layout.read::<i32>(&block, Column::Commit, COMMIT_FIELDS * capacity);
+        let table = read::<i32>(&layout, &block, Column::Commit, COMMIT_FIELDS * capacity);
         assert_eq!(
             table[column::SLOT * capacity..][..capacity],
             vec![-1; capacity]
@@ -1135,9 +1149,7 @@ fn chunk(cache_positions: &[i32]) -> Batch {
 
 /// The cache slots the runner wrote into its input block for the step it prepared last.
 fn prepared_mapping(runner: &CausalLmRunner, tokens: usize) -> Vec<u32> {
-    runner
-        .layout
-        .read::<u32>(&runner.staged, Column::SlotMapping, tokens)
+    read::<u32>(&runner.layout, &runner.staged, Column::SlotMapping, tokens)
 }
 
 #[test]
@@ -1302,7 +1314,7 @@ fn the_last_request_slot_serves_and_gathers_its_own_rows() {
     // commits into that row; the padding row is the one after it.
     let bucket = Bucket::decode(2, Variant::DecodeGreedy);
     let (layout, block) = filled(&batch, &bucket, &mapping(&batch, &tables), None);
-    let u32s = |column| layout.read::<u32>(&block, column, 2);
+    let u32s = |column| read::<u32>(&layout, &block, column, 2);
 
     assert_eq!(u32s(Column::Slots), [SLOTS - 1, NO_SLOT]);
     assert_eq!(u32s(Column::TableRows), [SLOTS - 1, SLOTS]);
@@ -1310,7 +1322,7 @@ fn the_last_request_slot_serves_and_gathers_its_own_rows() {
     assert_eq!(u32s(Column::CallSlots), [SLOTS - 1, SLOTS]);
     assert_eq!(u32s(Column::SlotMapping), [written(SLOTS, 10), NO_SLOT]);
 
-    let table = layout.read::<i32>(&block, Column::Commit, COMMIT_FIELDS * 4);
+    let table = read::<i32>(&layout, &block, Column::Commit, COMMIT_FIELDS * 4);
     assert_eq!(table[column::SLOT * 4..][..2], [SLOTS as i32 - 1, -1]);
 }
 
@@ -1678,20 +1690,23 @@ fn a_paired_forward_writes_its_rows_scratch_pages_and_commits_nothing() {
     );
 
     let (layout, block) = filled(&batch, &bucket, &scratch, Some(&spans));
-    assert_eq!(layout.read::<u32>(&block, Column::SlotMapping, 8), scratch);
+    assert_eq!(
+        read::<u32>(&layout, &block, Column::SlotMapping, 8),
+        scratch
+    );
 
     // Each row gathers the row of the set's table that begins at its first page, a row past
     // the batch's row zero; each reads its slot's state.
     assert_eq!(
-        layout.read::<u32>(&block, Column::TableRows, 4),
+        read::<u32>(&layout, &block, Column::TableRows, 4),
         [0, 1, 0, 0]
     );
     assert_eq!(
-        layout.read::<u32>(&block, Column::SlotRows, 4),
+        read::<u32>(&layout, &block, Column::SlotRows, 4),
         [1, 3, SLOTS, SLOTS]
     );
 
-    let table = layout.read::<i32>(&block, Column::Commit, COMMIT_FIELDS * 4);
+    let table = read::<i32>(&layout, &block, Column::Commit, COMMIT_FIELDS * 4);
     assert_eq!(table[column::SLOT * 4..][..4], [-1; 4]);
     assert_eq!(table[column::TASK * 4..][..4], [-1; 4]);
 }
@@ -3101,8 +3116,8 @@ fn a_verification_batch_is_one_row_per_token_and_one_sequence_per_call() {
     )
     .unwrap();
 
-    let u32s = |column, elements| layout.read::<u32>(&block, column, elements);
-    let i32s = |column, elements| layout.read::<i32>(&block, column, elements);
+    let u32s = |column, elements| read::<u32>(&layout, &block, column, elements);
+    let i32s = |column, elements| read::<i32>(&layout, &block, column, elements);
     let none = NO_SLOT;
 
     // ---- Each token is the decode step at its position ----
@@ -3135,7 +3150,7 @@ fn a_verification_batch_is_one_row_per_token_and_one_sequence_per_call() {
     assert_eq!(u32s(Column::CallSlots, 3), [1, 3, SLOTS]);
 
     // A token draws at the position after it in its request's stream.
-    let draws = layout.read::<f32>(&block, Column::Draws, 6);
+    let draws = read::<f32>(&layout, &block, Column::Draws, 6);
     let expected = [
         sampling_uniform(100, 11, 0, 0),
         sampling_uniform(100, 12, 0, 0),
@@ -3225,7 +3240,7 @@ fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
     .unwrap();
 
     {
-        let u32s = |column, elements| layout.read::<u32>(&block, column, elements);
+        let u32s = |column, elements| read::<u32>(&layout, &block, column, elements);
         let stride = layout.rows();
 
         // An entry reads the token its own sampling row chose, and is written while its
@@ -3264,7 +3279,7 @@ fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
 
         // The chained step evaluates the position after the row's first, moved on the
         // device by the length it agreed.
-        let positions = layout.read::<i32>(&block, Column::ChainPositions, 2 * stride);
+        let positions = read::<i32>(&layout, &block, Column::ChainPositions, 2 * stride);
         assert_eq!(positions[stride..][..4], [11, 21, 0, 0]);
         let lens = u32s(Column::ChainLens, 2 * stride);
         assert_eq!(lens[stride..][..4], [12, 22, 0, 0]);
@@ -3316,7 +3331,7 @@ fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
     .unwrap();
 
     {
-        let u32s = |column, elements| layout.read::<u32>(&block, column, elements);
+        let u32s = |column, elements| read::<u32>(&layout, &block, column, elements);
         let stride = layout.rows();
 
         // An entry reads the prompt's next token; the last one of a row that samples reads
@@ -3334,7 +3349,7 @@ fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
         assert_eq!(u32s(Column::DraftLens, 4), [3, 2, 0, 0]);
         assert_eq!(u32s(Column::StateSlots, 4), [1, 3, none, none]);
 
-        let positions = layout.read::<i32>(&block, Column::ChainPositions, 2 * stride);
+        let positions = read::<i32>(&layout, &block, Column::ChainPositions, 2 * stride);
         assert_eq!(positions[stride..][..4], [3, 2, 0, 0]);
         let index = u32s(Column::ChainIndex, 2 * stride);
         assert_eq!(index[stride..][..4], [0, 6 + 3, 12 + 3, 18 + 3]);
@@ -3355,10 +3370,10 @@ fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
     .unwrap();
 
     assert_eq!(
-        layout.read::<u32>(&block, Column::EntrySteps, 6),
+        read::<u32>(&layout, &block, Column::EntrySteps, 6),
         [0, 0, 0, 0, 1, 1]
     );
-    assert_eq!(layout.read::<u32>(&block, Column::LastEntries, 2), [2, 3]);
+    assert_eq!(read::<u32>(&layout, &block, Column::LastEntries, 2), [2, 3]);
 
     // A row with no entry, slot 4's one token, advances no drafter state.
     let rows = &mut batch.columns.rows;
@@ -3378,7 +3393,10 @@ fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
         &mut block,
     )
     .unwrap();
-    assert_eq!(layout.read::<u32>(&block, Column::StateSlots, 2), [1, none]);
+    assert_eq!(
+        read::<u32>(&layout, &block, Column::StateSlots, 2),
+        [1, none]
+    );
 }
 
 #[test]
@@ -3958,7 +3976,7 @@ fn scatter(table: &mut [[u32; 2]], slots: &Tensor, next: &Tensor) {
 fn advance(table: &mut [[u32; 2]], batch: &Batch, bucket: &Bucket) -> Vec<[u32; 2]> {
     let (layout, block) = filled(batch, bucket, &[], None);
     let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
-    let column = |column, elements| u32_column(&layout.read::<u32>(&block, column, elements));
+    let column = |column, elements| u32_column(&read::<u32>(&layout, &block, column, elements));
 
     let contexts = gather(table, &column(Column::SlotRows, rows));
     let index = column(Column::NextContext, 2 * rows)
@@ -4073,7 +4091,7 @@ fn a_verification_continues_each_slot_from_the_token_its_acceptance_ends_on() {
     .unwrap();
 
     let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
-    let column = |column, elements| u32_column(&layout.read::<u32>(&block, column, elements));
+    let column = |column, elements| u32_column(&read::<u32>(&layout, &block, column, elements));
     let mut table = context_table(&[(2, [3, 4]), (4, [1, 2])]);
 
     // Each token is a row of its own, which reads the two ids before it in its request.
@@ -4128,7 +4146,7 @@ fn a_request_s_verify_slots_are_its_home_row_and_its_rows_past_the_home_rows() {
 
     // A prompt's rows state the slots of their requests, and a padding row none.
     let (layout, mut block) = speculating_block();
-    let u32s = |block: &[u8], column, elements| layout.read::<u32>(block, column, elements);
+    let u32s = |block: &[u8], column, elements| read::<u32>(&layout, block, column, elements);
     let mut expected = vec![1, 8, 9, 3, 12, 13];
     expected.resize(4 * 3, none);
 
