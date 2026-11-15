@@ -1356,7 +1356,10 @@ impl Leader {
             prompt_tokens,
             Box::new(events),
         );
-        Ok((processed, self.stats(request_id, started, placement, output)))
+        Ok((
+            processed,
+            self.stats(request_id, started, placement, output),
+        ))
     }
 
     /// Records `output`'s request metrics under where it is served.
