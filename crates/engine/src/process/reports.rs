@@ -359,6 +359,7 @@ mod tests {
         let (engine_process, _daemon_process) = UnixStream::pair().unwrap();
         let mut main = MainProcess::new(
             Connection::new(engine_requests).unwrap(),
+            std::num::NonZeroU32::MIN,
             Connection::new(engine_process).unwrap(),
             crate::support::launch(),
         )

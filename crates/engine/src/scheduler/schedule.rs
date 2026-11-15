@@ -73,7 +73,11 @@ impl Scheduler {
     /// `Overloaded`; neither is kept. Any other is queued: a resumed request behind the other
     /// resumed requests and ahead of every new one, a new one last. The policy is told of it as
     /// `Arrived`.
-    pub(crate) fn add_request(&mut self, input: proto::request::Request) {
+    pub(crate) fn add_request(
+        &mut self,
+        input: proto::request::Request,
+        window: std::num::NonZeroU32,
+    ) {
         let id = input.request_id();
 
         // Refusals answer at once and keep nothing.
@@ -89,7 +93,7 @@ impl Scheduler {
 
         // A resumed request's generated tokens continue its prompt; it is named for its
         // continuation by this epoch unless it carries a name.
-        let mut request = Request::new(input, self.epoch, Instant::now());
+        let mut request = Request::new(input, self.epoch, Instant::now(), window);
         request.listing = self.lists_asked;
         let at = if request.resumes() {
             self.waiting
@@ -1624,6 +1628,9 @@ mod tests {
     use super::super::tests::{A, Bench, KV, OWNER_A, bench, key};
     use super::super::{Blocks, Error, Output, Policy, Request, RequestStatus};
 
+    /// The event window a test's consumer states in its welcome.
+    const WINDOW: std::num::NonZeroU32 = std::num::NonZeroU32::new(64).unwrap();
+
     /// A token request numbered `id` of `prompt` that may generate `max` tokens.
     fn tokens(id: u64, prompt: &[u32], max: usize) -> GenerationRequest {
         GenerationRequest {
@@ -1669,7 +1676,7 @@ mod tests {
         let mut bench = bench(1024);
         let scheduler = &mut bench.scheduler;
         scheduler.policy.limits.chunked_prefill_size = 8;
-        let mut request = Request::new(tokens(1, &[1; 20], 4).into(), 1, Instant::now());
+        let mut request = Request::new(tokens(1, &[1; 20], 4).into(), 1, Instant::now(), WINDOW);
 
         let mut budget = (100, 3);
         let charge = |request: &Request, phase, asked, budget: &mut (u32, usize)| {
@@ -1727,7 +1734,7 @@ mod tests {
             if resumed {
                 input.generated_token_ids = vec![7];
             }
-            scheduler.add_request(input.into());
+            scheduler.add_request(input.into(), WINDOW);
         }
         let waiting: Vec<u64> = scheduler.waiting.iter().map(|id| id.0).collect();
         assert_eq!(waiting, [2, 4, 1, 3]);
@@ -1743,7 +1750,7 @@ mod tests {
         assert_eq!(arrived, [1, 2, 3, 4]);
 
         scheduler.policy.limits.max_queued_requests = Some(4);
-        scheduler.add_request(tokens(5, &[1], 8).into());
+        scheduler.add_request(tokens(5, &[1], 8).into(), WINDOW);
         assert_eq!(scheduler.waiting.len(), 4);
         assert!(!scheduler.requests.contains_key(&RequestId(5)));
         let refused = outputs.try_iter().any(|output| {
@@ -1773,7 +1780,7 @@ mod tests {
         );
         let scheduler = &mut bench.scheduler;
         let place = |scheduler: &mut super::Scheduler, id: u64| {
-            let request = Request::new(tokens(id, &[1, 2], 4).into(), 1, Instant::now());
+            let request = Request::new(tokens(id, &[1, 2], 4).into(), 1, Instant::now(), WINDOW);
             scheduler.requests.insert(RequestId(id), request);
             let placed = scheduler.place(RequestId(id));
             (placed, scheduler.requests[&RequestId(id)].placement)

@@ -287,6 +287,7 @@ impl Bench {
             num_acknowledged_tokens: 0,
             terminal: None,
             event_credit: 64,
+            event_window: 64,
             last_progress: now,
             dirty: false,
         };

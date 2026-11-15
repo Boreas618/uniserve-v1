@@ -866,6 +866,7 @@ pub(crate) fn welcome(
     writer.deliver(&wire::Welcome {
         build: proto::BUILD.to_owned(),
         refusal,
+        event_window: crate::engine::client::EVENT_WINDOW,
     })?;
     match refusal {
         Some(refusal) => Err(anyhow::Error::new(refusal).context("refused the engine")),

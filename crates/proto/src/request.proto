@@ -41,6 +41,10 @@ message Welcome {
   string build = 3;
   // Why the engine is refused; absent when it is accepted.
   Refusal refusal = 5;
+  // The events of one request the daemon takes ahead of its `Consumed`
+  // reports: the engine sends a request's events no further beyond the
+  // position the daemon last reported. Positive.
+  uint32 event_window = 6;
 }
 
 // Why the daemon refuses an engine's hello on its request link.

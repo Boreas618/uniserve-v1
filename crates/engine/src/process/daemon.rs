@@ -13,6 +13,7 @@
 //! run before the readers start: [`connect`] on the request interface, [`claim`] on the process
 //! interface, and [`attach`] for a further front.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -56,8 +57,8 @@ const CLAIM: u64 = 1;
 /// # Errors
 ///
 /// When the daemon closes, refuses this engine, or does not welcome it within a minute.
-pub fn connect(connection: &mut Connection, launch: &EngineArgs) -> Result<()> {
-    hello(connection, launch.engine, HANDSHAKE_TIMEOUT)?;
+pub fn connect(connection: &mut Connection, launch: &EngineArgs) -> Result<NonZeroU32> {
+    let window = hello(connection, launch.engine, HANDSHAKE_TIMEOUT)?;
 
     // `Starting` goes out before the rank load, which takes minutes, so the daemon reads a
     // process that is alive rather than one that vanished after its hello.
@@ -70,7 +71,8 @@ pub fn connect(connection: &mut Connection, launch: &EngineArgs) -> Result<()> {
         }),
         None,
     )
-    .context("stating that this engine starts")
+    .context("stating that this engine starts")?;
+    Ok(window)
 }
 
 /// Says hello on the process interface over `process`, then asks this node's daemon for the
@@ -206,18 +208,18 @@ pub(crate) fn claim(
 ///
 /// When the connection cannot be made, or the daemon refuses this engine or does not welcome it
 /// in time.
-pub(crate) fn attach(address: &str, engine: u64) -> Result<Connection> {
+pub(crate) fn attach(address: &str, engine: u64) -> Result<(Connection, NonZeroU32)> {
     let mut connection = address
         .parse()
         .map_err(std::io::Error::from)
         .and_then(|endpoint| Connection::connect(&endpoint))
         .with_context(|| format!("connecting to the attaching daemon at {address}"))?;
-    hello(&mut connection, engine, ATTACH_TIMEOUT)?;
-    Ok(connection)
+    let window = hello(&mut connection, engine, ATTACH_TIMEOUT)?;
+    Ok((connection, window))
 }
 
 /// The hello of the request interface and the daemon's welcome.
-fn hello(connection: &mut Connection, engine: u64, timeout: Duration) -> Result<()> {
+fn hello(connection: &mut Connection, engine: u64, timeout: Duration) -> Result<NonZeroU32> {
     connection.deliver(&wire::Hello {
         major: proto::ENGINE_INTERFACE_VERSION,
         build: proto::BUILD.to_owned(),
@@ -229,10 +231,12 @@ fn hello(connection: &mut Connection, engine: u64, timeout: Duration) -> Result<
     let welcome: wire::Welcome = connection
         .recv(timeout)?
         .context("the daemon closed the request interface before it welcomed this engine")?;
-    match welcome.refusal {
-        Some(refusal) => Err(anyhow::Error::new(refusal).context("the daemon refused this engine")),
-        None => Ok(()),
+    if let Some(refusal) = welcome.refusal {
+        return Err(anyhow::Error::new(refusal).context("the daemon refused this engine"));
     }
+    // The daemon states how far ahead of its reports it takes a request's events.
+    NonZeroU32::new(welcome.event_window)
+        .context("the daemon's welcome states no event window, which is positive")
 }
 
 /// Starts the reader thread of front `front`, which hands every frame of `connection` to the

@@ -149,7 +149,8 @@ impl std::error::Error for Error {}
 )]
 pub enum Message {
     /// A request from the daemon.
-    AddRequest(proto::request::Request),
+    /// A request from the daemon, with the event window its consumer stated.
+    AddRequest(proto::request::Request, std::num::NonZeroU32),
     /// End a request: `Cancelled`, `Aborted`, or `Stop` when the daemon's decoder matched a stop
     /// string.
     Cancel(RequestId, FinishReason),
@@ -780,7 +781,7 @@ impl Scheduler {
         }
 
         match message {
-            Message::AddRequest(input) => self.add_request(input),
+            Message::AddRequest(input, window) => self.add_request(input, window),
             Message::Cancel(id, reason) => self.cancel(id, reason),
             Message::Acknowledge(id, tokens) => self.acknowledge(id, tokens),
             Message::Consumed(id, events) => self.consumed(id, events),

@@ -44,8 +44,8 @@ use crate::batch::media::{SharedMedia, SharedMediaError};
 use crate::batch::{ArtifactHandle, Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase};
 use proto::config::WorkerGroupRole;
 use proto::request::{
-    ArtifactEvent, EVENT_WINDOW, Event, FinishReason, MediaKind, MigrationCause, PositionLogprobs,
-    RejectionKind, RequestId, StopReason, TokenLogprob,
+    ArtifactEvent, Event, FinishReason, MediaKind, MigrationCause, PositionLogprobs, RejectionKind,
+    RequestId, StopReason, TokenLogprob,
 };
 use scheduling::{End, Event as Change, Nanos, RequestId as PolicyRequestId};
 use storage::Key;
@@ -754,11 +754,13 @@ impl Scheduler {
         }
     }
 
-    /// Events of a request its consumer took: their credit returns, up to the window.
+    /// Events of a request its consumer took: their credit returns, up to the consumer's window.
     pub(super) fn consumed(&mut self, id: RequestId, events: u32) {
-        let window = u32::try_from(EVENT_WINDOW).unwrap_or(u32::MAX);
         if let Some(request) = self.requests.get_mut(&id) {
-            request.event_credit = request.event_credit.saturating_add(events).min(window);
+            request.event_credit = request
+                .event_credit
+                .saturating_add(events)
+                .min(request.event_window);
         }
     }
 

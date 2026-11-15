@@ -31,10 +31,6 @@ pub use sampling::{SamplingParams, SamplingParamsError};
 pub use spec::{PrefixCacheDtype, StandbyStorage};
 pub use values::{DiffusionSamplingParams, ImageEncoder, RequestId, TokenLogprob};
 
-/// The most events the engine sends a request beyond those its consumer took
-/// (`Consumed`).
-pub const EVENT_WINDOW: u64 = 64;
-
 /// The messages of the request interface (`request.proto`).
 #[allow(clippy::all, reason = "code generated from the schema")]
 pub mod wire {

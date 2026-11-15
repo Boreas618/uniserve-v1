@@ -48,7 +48,7 @@ mod requests;
 mod start;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -144,7 +144,7 @@ pub fn run(launch_file: &Path, registry: &nn::family::Registry) -> Result<()> {
         .map_err(std::io::Error::from)
         .and_then(|endpoint| Connection::connect(&endpoint))
         .with_context(|| format!("connecting to the daemon's requests at {}", launch.requests))?;
-    connect(&mut requests, &launch)?;
+    let window = connect(&mut requests, &launch)?;
 
     // What fails before the control thread runs is said on the request interface: the daemon
     // waits for the state a start ends in, and a connection that closes says only that it went.
@@ -176,7 +176,7 @@ pub fn run(launch_file: &Path, registry: &nn::family::Registry) -> Result<()> {
         }
     };
 
-    let main = MainProcess::new(requests, process, launch)?;
+    let main = MainProcess::new(requests, window, process, launch)?;
     let lost = main.link_closed();
     let registry = registry.clone();
     let start: Start = Box::new(move |launch| {
@@ -234,11 +234,12 @@ fn check(launch: &EngineArgs) -> Result<()> {
 /// then left as it is, without its orderly close.
 pub fn serve(
     requests: Connection,
+    window: NonZeroU32,
     process: Connection,
     launch: EngineArgs,
     start: Start,
 ) -> Result<()> {
-    MainProcess::new(requests, process, launch)?.serve(start, Vec::new())
+    MainProcess::new(requests, window, process, launch)?.serve(start, Vec::new())
 }
 
 /// The control thread's state, touched on that thread only.
@@ -248,6 +249,9 @@ pub(crate) struct MainProcess {
     /// The write half of each daemon front's request connection, by front: the launching
     /// daemon's first, then each that attached; `None` once it closed.
     fronts: Vec<Option<Connection>>,
+    /// The event window each front stated in its welcome, by front: a request it submits is sent
+    /// no more events ahead of its consumption reports.
+    windows: Vec<NonZeroU32>,
     /// The write half of the process interface; `None` once the daemon closed it.
     process: Option<Connection>,
     launch: EngineArgs,
@@ -291,7 +295,12 @@ pub(crate) struct MainProcess {
 impl MainProcess {
     /// The control thread over `requests` and `process`, its readers and its operations thread
     /// started.
-    fn new(requests: Connection, process: Connection, launch: EngineArgs) -> Result<Self> {
+    fn new(
+        requests: Connection,
+        window: NonZeroU32,
+        process: Connection,
+        launch: EngineArgs,
+    ) -> Result<Self> {
         let inbox = crossbeam_channel::unbounded();
         let front = requests
             .writer()
@@ -325,6 +334,7 @@ impl MainProcess {
         Ok(Self {
             inbox,
             fronts: vec![Some(front)],
+            windows: vec![window],
             process: Some(writer),
             watchdog: Watchdog::new(timeout)?,
             launch,
@@ -1361,9 +1371,9 @@ impl MainProcess {
     }
 
     /// An attach ended: the daemon at `address` is a further front, told what this engine is.
-    fn attached(&mut self, address: &str, attached: Result<Connection>) {
-        let connection = match attached {
-            Ok(connection) => connection,
+    fn attached(&mut self, address: &str, attached: Result<(Connection, NonZeroU32)>) {
+        let (connection, window) = match attached {
+            Ok(attached) => attached,
             Err(error) => {
                 // A failed hot restart, not this engine's end: the fronts it has serve on.
                 tracing::warn!(daemon = address, error = %format!("{error:#}"), "an attach failed");
@@ -1379,7 +1389,10 @@ impl MainProcess {
                 Ok(writer)
             });
         match started {
-            Ok(writer) => self.fronts.push(Some(writer)),
+            Ok(writer) => {
+                self.fronts.push(Some(writer));
+                self.windows.push(window);
+            }
             Err(error) => {
                 tracing::warn!(daemon = address, error = %format!("{error:#}"), "an attach failed");
                 return;

@@ -113,8 +113,9 @@ pub fn spawn(
     let thread = std::thread::Builder::new()
         .name("engine".to_owned())
         .spawn(move || {
-            let served = ::engine::connect(&mut engine_requests, &launch)
-                .and_then(|()| ::engine::serve(engine_requests, engine_process, launch, start));
+            let served = ::engine::connect(&mut engine_requests, &launch).and_then(|window| {
+                ::engine::serve(engine_requests, window, engine_process, launch, start)
+            });
             if let Err(error) = &served {
                 eprintln!("the test's engine ended: {error:#}");
             }

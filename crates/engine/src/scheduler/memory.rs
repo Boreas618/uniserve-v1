@@ -2683,6 +2683,9 @@ mod tests {
 
     use storage::key::{Digest, encoder_output};
 
+    /// The event window a test's consumer states in its welcome.
+    const WINDOW: std::num::NonZeroU32 = std::num::NonZeroU32::new(64).unwrap();
+
     use super::super::cache::{DEVICE, HOST, REMOTE};
     use super::super::tests::{capacity, idle_policy};
     use super::super::{Blocks, Executor, Output, Request, RequestStatus, Scheduler};
@@ -2863,7 +2866,7 @@ mod tests {
                 generated_token_ids: Vec::new(),
                 adapter: 0,
             };
-            let mut request = Request::new(input.into(), 1, Instant::now());
+            let mut request = Request::new(input.into(), 1, Instant::now(), WINDOW);
             request.placement[Phase::Prefill.index()] = Some(A);
             request.placement[Phase::Decode.index()] = Some(A);
             request.placement[Phase::VisionEncode.index()] = Some(A);

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use proto::report::SchedulerStats;
 use proto::request::wire::{self, from_engine, to_engine};
-use proto::request::{EVENT_WINDOW, Event, GenerationLimits, Request, RequestId};
+use proto::request::{Event, GenerationLimits, Request, RequestId};
 use proto::{MappedMedia, MediaReceiver};
 use service::{Connection, lock};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -1165,10 +1165,16 @@ fn file(shared: &Shared, id: RequestId, event: Event) {
     }
 }
 
+/// The events of one request this daemon takes ahead of its `Consumed` reports, which it states
+/// to every engine in its welcome (`wire::Welcome::event_window`): a request's events queue in its
+/// stream unboundedly, so the window bounds what a slow consumer leaves queued, and a report
+/// every half window keeps a consumer that keeps up from ever holding the engine back.
+pub(crate) const EVENT_WINDOW: u32 = 64;
+
 /// One request's events, as the engine sends them.
 ///
 /// The stream reports to the engine how many events its consumer took, which
-/// lets the engine send more (`EVENT_WINDOW`). It also carries the decoder's
+/// lets the engine send more ([`EVENT_WINDOW`]). It also carries the decoder's
 /// stop-string decisions: the engine holds a token request with stop strings
 /// at a bounded number of tokens awaiting a decision, and
 /// [`Self::acknowledge_consumed_prefix`] reports the tokens received so far
@@ -1298,7 +1304,7 @@ impl EventStream {
         // command failed: a consumer's position is the connection's
         // bookkeeping`. Events already queued when a stream ended still reach
         // `observe`, so the gate is here and not in the caller.
-        if self.open && self.consumed - self.reported >= EVENT_WINDOW / 2 {
+        if self.open && self.consumed - self.reported >= u64::from(EVENT_WINDOW / 2) {
             self.report_consumed();
         }
     }

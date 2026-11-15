@@ -59,6 +59,10 @@ use testkit::executor::output_of;
 use testkit::text::scored;
 use testkit::{FakeExecutor, InProcessPool};
 
+/// The event window the harness states as the consumer of every request it submits, as a daemon
+/// states its own in its welcome.
+const EVENT_WINDOW: std::num::NonZeroU32 = std::num::NonZeroU32::new(64).unwrap();
+
 /// The first two worker groups of a deployment, as the session numbers them.
 pub(crate) const A: GroupId = GroupId(0);
 pub(crate) const B: GroupId = GroupId(1);
@@ -1059,7 +1063,8 @@ impl Harness {
         })
     }
 
-    /// Submits a token request, as the daemon does (`Message::AddRequest`).
+    /// Submits a token request, as the daemon does (`Message::AddRequest`), under the event window
+    /// the harness states as its consumer ([`EVENT_WINDOW`]).
     pub(crate) fn submit(&mut self, request: GenerationRequest) -> RequestId {
         self.add(request.into())
     }
@@ -1075,7 +1080,7 @@ impl Harness {
             self.videos.insert(id);
         }
         self.submitted.push(id);
-        self.apply(Message::AddRequest(request));
+        self.apply(Message::AddRequest(request, EVENT_WINDOW));
         id
     }
 

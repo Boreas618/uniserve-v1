@@ -13,13 +13,14 @@
 //! `Message::AddRequest`.
 //!
 //! Each accepted request has a [`RequestStream`]: the front its events go to and the events its
-//! consumer has not reported consumed. The scheduler bounds those by the event window
-//! (`proto::request::EVENT_WINDOW`), which the consumer's `Consumed` reports return as credit, so
-//! the journal holds at most the window and the terminal event. A `Takeover` moves the stream to
+//! consumer has not reported consumed. The scheduler bounds those by the event window the front
+//! stated in its welcome (`wire::Welcome::event_window`), which the consumer's `Consumed` reports
+//! return as credit, so the journal holds at most the window and the terminal event. A `Takeover` moves the stream to
 //! the front it arrives on and replays the events past the position it names; a position older
 //! than the journal is refused by name rather than served as a stream with a hole in it.
 
 use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -231,7 +232,8 @@ impl MainProcess {
             }
         }
 
-        let Some(scheduler) = self.route(&input) else {
+        let window = self.windows[front];
+        let Some(scheduler) = self.route(&input, window) else {
             let message = "this process holds no scheduler: requests go to the epoch's scheduler \
                            node"
                 .to_owned();
@@ -245,7 +247,7 @@ impl MainProcess {
             let message = format!("scheduler {scheduler} is gone");
             return self.reject(front, id, RejectionKind::Overloaded, message);
         };
-        if inbox.send(Message::AddRequest(input)).is_err() {
+        if inbox.send(Message::AddRequest(input, window)).is_err() {
             let message = format!("scheduler {scheduler} is gone");
             return self.reject(front, id, RejectionKind::Overloaded, message);
         }
@@ -260,7 +262,7 @@ impl MainProcess {
     }
 
     /// The scheduler that serves `input`; `None` when this process holds none (a peer).
-    fn route(&mut self, input: &proto::request::Request) -> Option<usize> {
+    fn route(&mut self, input: &proto::request::Request, window: NonZeroU32) -> Option<usize> {
         let ranks = self.ranks();
         let engine = self.engine.as_mut()?;
         if ranks.len() <= 1 {
@@ -272,7 +274,7 @@ impl MainProcess {
 
         // The arrival as the policy reads a request no scheduler took yet: waiting, with no
         // group and no phase ready.
-        let arrival = Request::new(input.clone(), self.launch.epoch, Instant::now());
+        let arrival = Request::new(input.clone(), self.launch.epoch, Instant::now(), window);
         let index = match routed(route, &view_of(&arrival, &[]), &ranks) {
             Ok(index) => index,
             // This request goes to the least loaded scheduler.
@@ -524,7 +526,13 @@ impl MainProcess {
                 return;
             }
             let input = proto::request::Request::Generation(Box::new(request));
-            if scheduler.inbox.send(Message::AddRequest(input)).is_err() {
+            // A warm-up request's events are dropped: it runs under the launching front's
+            // window, which only its scheduling reads.
+            if scheduler
+                .inbox
+                .send(Message::AddRequest(input, self.windows[0]))
+                .is_err()
+            {
                 tracing::warn!(scheduler = index, "a scheduler took no warm-up request");
             }
         }

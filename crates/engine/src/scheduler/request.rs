@@ -34,8 +34,8 @@ use std::time::Instant;
 
 use crate::batch::Phase;
 use proto::request::{
-    CacheResume, EVENT_WINDOW, Event, FinishReason, GenerationFeatures, GenerationRequest,
-    ImageEncoder, ImageEncoderInput, ImageInput, RequestId, StopReason,
+    CacheResume, Event, FinishReason, GenerationFeatures, GenerationRequest, ImageEncoder,
+    ImageEncoderInput, ImageInput, RequestId, StopReason,
 };
 use storage::Key;
 use storage::runtime::{GroupId, OwnerId};
@@ -138,6 +138,9 @@ pub(crate) struct Request {
     pub terminal: Option<Event>,
     /// Events the consumer can still take.
     pub event_credit: u32,
+    /// The events the consumer takes ahead of its reports (its front's event window): the most
+    /// credit it holds.
+    pub event_window: u32,
     /// Its admission or its last applied call.
     pub last_progress: Instant,
     /// Whether its view changed since the policy was told.
@@ -214,7 +217,12 @@ impl Request {
     /// epoch's (`S/admission.rs:116-121`). The request is queued, with nothing placed, held or
     /// scheduled and the consumer's whole window as its credit; its `blocks`, `keys` and
     /// `encodings` are its admission's to fill.
-    pub(crate) fn new(input: proto::request::Request, epoch: u64, arrival: Instant) -> Self {
+    pub(crate) fn new(
+        input: proto::request::Request,
+        epoch: u64,
+        arrival: Instant,
+        window: std::num::NonZeroU32,
+    ) -> Self {
         let mut input = input;
         let token_ids = match &mut input {
             proto::request::Request::Generation(request) => {
@@ -260,7 +268,8 @@ impl Request {
             crossings: Vec::new(),
             num_acknowledged_tokens: 0,
             terminal: None,
-            event_credit: u32::try_from(EVENT_WINDOW).unwrap_or(u32::MAX),
+            event_credit: window.get(),
+            event_window: window.get(),
             last_progress: arrival,
             dirty: false,
         }
@@ -989,6 +998,9 @@ mod tests {
     use super::super::{Capacity, WorkerGroup};
     use super::{Blocks, Request, RequestStatus};
 
+    /// The event window a test's consumer states in its welcome.
+    const WINDOW: std::num::NonZeroU32 = std::num::NonZeroU32::new(64).unwrap();
+
     const EOS: u32 = 2;
 
     /// A token request of `prompt` that may generate `max` tokens.
@@ -1068,7 +1080,7 @@ mod tests {
 
     /// `request`, admitted with every phase on group 0.
     fn running(request: GenerationRequest) -> Request {
-        let mut request = Request::new(request.into(), 3, Instant::now());
+        let mut request = Request::new(request.into(), 3, Instant::now(), WINDOW);
         request.status = RequestStatus::Running;
         request.placement = [Some(GroupId(0)); Phase::COUNT];
         request
@@ -1093,7 +1105,7 @@ mod tests {
     fn a_resumed_request_continues_its_prompt_and_its_generated_count() {
         let mut input = tokens(&[1, 2, 3], 10);
         input.generated_token_ids = vec![7, 8];
-        let request = Request::new(input.into(), 3, Instant::now());
+        let request = Request::new(input.into(), 3, Instant::now(), WINDOW);
 
         assert_eq!(request.token_ids, [1, 2, 3, 7, 8]);
         assert_eq!(request.num_prompt_tokens, 5);
@@ -1117,7 +1129,7 @@ mod tests {
             request_id: 5,
         };
         named.cache.resume = Some(carried);
-        let request = Request::new(named.into(), 3, Instant::now());
+        let request = Request::new(named.into(), 3, Instant::now(), WINDOW);
         assert!(!request.resumes());
         let resume = request
             .generation()
@@ -1133,7 +1145,7 @@ mod tests {
             image(2, ImageEncoder::Vision, 3),
             image(2, ImageEncoder::Latent, 2),
         ];
-        let request = Request::new(input.into(), 0, Instant::now());
+        let request = Request::new(input.into(), 0, Instant::now(), WINDOW);
 
         assert_eq!(request.token_ids, [1, 2, 0, 0, 0, 0, 0, 3, 4]);
         assert_eq!(request.num_prompt_tokens, 9);

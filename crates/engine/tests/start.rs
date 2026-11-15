@@ -218,6 +218,7 @@ fn started(
         .deliver(&wire::Welcome {
             build: proto::BUILD.to_owned(),
             refusal: None,
+            event_window: 64,
         })
         .unwrap();
     let from_engine::Kind::State(starting) = next(&mut requests, READ) else {
