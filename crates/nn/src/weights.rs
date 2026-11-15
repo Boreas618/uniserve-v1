@@ -1641,7 +1641,8 @@ mod tests {
 
     #[test]
     fn a_key_names_the_checkpoint_the_type_the_layout_and_the_region() {
-        let file = FileIdentity::of(std::path::Path::new("/proc/self/exe")).unwrap();
+        let shard = tempfile::NamedTempFile::new().unwrap();
+        let file = FileIdentity::of(shard.path()).unwrap();
         let key = WeightKey {
             files: vec![file.clone()],
             dtype: DType::BF16,

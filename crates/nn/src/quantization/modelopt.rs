@@ -254,12 +254,55 @@ mod tests {
     use super::*;
     use crate::Error;
 
-    /// The released four-step FastH3 export's manifest, trimmed to the first layer of each
-    /// calibrated stage: every field the export writes, the three stages, and one module of
-    /// each kind the export lists.
-    fn released() -> Value {
-        serde_json::from_str(include_str!("../../tests/fixtures/modelopt_manifest.json")).unwrap()
+    /// A manifest of two calibrated stages and one listed stage that is not calibrated: the
+    /// first block's feed-forward of a network (its down projection, and the gate and up
+    /// halves of one stored projection at one magnitude), one projection of a decoder, and an
+    /// encoder. An exporter's statements the reader does not read (its calibration record, a
+    /// stage's patterns) stand beside them.
+    ///
+    /// The magnitudes are multiples of `6 · 448 = 2688`, so each activation scale is exact.
+    fn manifest() -> Value {
+        json!({
+            "schema_version": 1,
+            "numerical_format": {
+                "activation": "a4",
+                "block_scale": "fp8_e4m3",
+                "block_size": 16,
+                "output": "bf16",
+                "tensor_scale": "fp32",
+                "values": "e2m1",
+                "weight": "w4",
+            },
+            "calibration": {"records": 1},
+            "components": {
+                "network": {
+                    "enabled": true,
+                    "quantized_patterns": ["blocks.*.mlp"],
+                    "modules": {
+                        DOWN: {"activation_amax": 1344.0},
+                        GATE: {"activation_amax": 2688.0},
+                        UP: {"activation_amax": 2688.0},
+                    },
+                },
+                "decoder": {
+                    "enabled": true,
+                    "modules": {
+                        DECODER: {"activation_amax": 5376.0},
+                    },
+                },
+                "encoder": {
+                    "enabled": false,
+                    "modules": {},
+                },
+            },
+        })
     }
+
+    // The paths `manifest` lists its calibrated modules under.
+    const DOWN: &str = "network.layers.0.mlp.down";
+    const GATE: &str = "network.layers.0.mlp.gate_up.gate";
+    const UP: &str = "network.layers.0.mlp.gate_up.up";
+    const DECODER: &str = "decoder.layers.0.output";
 
     /// The field and the problem of a configuration refusal.
     fn refusal(error: Error) -> (String, String) {
@@ -270,29 +313,26 @@ mod tests {
     }
 
     #[test]
-    fn the_released_manifest_lists_each_calibrated_module_with_its_activation_scale() {
-        let manifest = ModeloptManifest::parse(&released()).unwrap();
+    fn a_manifest_lists_each_calibrated_module_with_its_activation_scale() {
+        let manifest = ModeloptManifest::parse(&manifest()).unwrap();
 
-        // Three paths of the denoiser's first block and seven of the video decoder's; the text
-        // encoder is listed and not calibrated.
+        // Three paths of the network's first block and one of the decoder; the encoder is
+        // listed and not calibrated.
         let modules: Vec<&str> = manifest.modules().collect();
-        assert_eq!(modules.len(), 10, "{modules:?}");
-        assert!(modules.contains(&"denoiser.transformer.layers.0.mlp.down"));
-        assert!(modules.contains(&"video_decoder.decoder.decoder.decoder.layers.0.output"));
-        assert!(!modules.iter().any(|path| path.starts_with("text_encoder")));
+        assert_eq!(modules, [DECODER, DOWN, GATE, UP]);
 
         // An activation's tensor scale is its calibrated magnitude over 6 · 448.
-        let down = manifest.activations["denoiser.transformer.layers.0.mlp.down"];
-        assert_eq!(down, (602.315_246_582_031_2_f64 / 2688.0) as f32);
+        assert_eq!(manifest.activations[DOWN], (1344.0_f64 / 2688.0) as f32);
+        assert_eq!(manifest.activations[DECODER], (5376.0_f64 / 2688.0) as f32);
     }
 
     #[test]
     fn a_stage_s_declaration_holds_its_stored_modules_in_the_diffusers_spelling() {
-        let manifest = ModeloptManifest::parse(&released()).unwrap();
+        let manifest = ModeloptManifest::parse(&manifest()).unwrap();
 
-        // The denoiser's stored modules: the gate and the up halves are one stored projection.
+        // The network's stored modules: the gate and the up halves are one stored projection.
         let stored = |listed: &str| {
-            let rest = listed.strip_prefix("denoiser.transformer.layers.0.mlp.")?;
+            let rest = listed.strip_prefix("network.layers.0.mlp.")?;
             Some(
                 if rest == "down" {
                     "blocks.0.ff.net.2"
@@ -308,13 +348,13 @@ mod tests {
         assert!(declaration.is_encoded());
         assert_eq!(
             declaration.activation_scale("blocks.0.ff.net.2").unwrap(),
-            Some((602.315_246_582_031_2_f64 / 2688.0) as f32)
+            Some((1344.0_f64 / 2688.0) as f32)
         );
         assert_eq!(
             declaration
                 .activation_scale("blocks.0.ff.net.0.proj")
                 .unwrap(),
-            Some((485.011_444_091_796_9_f64 / 2688.0) as f32)
+            Some((2688.0_f64 / 2688.0) as f32)
         );
 
         // A packed module the manifest does not calibrate has no activation scale to encode by.
@@ -335,9 +375,8 @@ mod tests {
 
     #[test]
     fn two_paths_of_one_stored_projection_must_agree() {
-        let gate = "denoiser.transformer.layers.0.mlp.gate_up.projections.gate";
-        let mut value = released();
-        value["components"]["denoiser"]["modules"][gate]["activation_amax"] = json!(486.0);
+        let mut value = manifest();
+        value["components"]["network"]["modules"][GATE]["activation_amax"] = json!(2689.0);
         let manifest = ModeloptManifest::parse(&value).unwrap();
 
         let error = manifest
@@ -348,56 +387,55 @@ mod tests {
             })
             .unwrap_err();
         let (field, problem) = refusal(error);
-        assert!(field.contains("gate_up.projections"), "{field}");
+        assert!(field == GATE || field == UP, "{field}");
         assert!(problem.contains("blocks.0.ff.net.0.proj"), "{problem}");
     }
 
     #[test]
     fn a_missing_or_inconsistent_entry_is_refused_by_its_field() {
         let refused = |edit: &dyn Fn(&mut Value)| {
-            let mut value = released();
+            let mut value = manifest();
             edit(&mut value);
             refusal(ModeloptManifest::parse(&value).unwrap_err())
         };
-        let down = "denoiser.transformer.layers.0.mlp.down";
 
         // A listed module without its calibrated magnitude, or with one that scales nothing.
         let (field, problem) = refused(&|value| {
-            value["components"]["denoiser"]["modules"][down] = json!({});
+            value["components"]["network"]["modules"][DOWN] = json!({});
         });
         assert_eq!(
             (field.as_str(), problem.as_str()),
             ("activation_amax", "is missing")
         );
 
-        for amax in [json!(0.0), json!(-3.5), json!("602.3"), json!(true)] {
+        for amax in [json!(0.0), json!(-3.5), json!("1344.0"), json!(true)] {
             let (field, _) = refused(&|value| {
-                value["components"]["denoiser"]["modules"][down]["activation_amax"] = amax.clone();
+                value["components"]["network"]["modules"][DOWN]["activation_amax"] = amax.clone();
             });
             assert_eq!(field, "activation_amax", "{amax}");
         }
 
         // A stage whose two statements disagree.
         let (field, problem) = refused(&|value| {
-            value["components"]["denoiser"]["enabled"] = json!(false);
+            value["components"]["network"]["enabled"] = json!(false);
         });
         assert_eq!(field, "modules");
         assert!(problem.contains("not enabled"), "{problem}");
 
         let (field, problem) = refused(&|value| {
-            value["components"]["text_encoder"]["enabled"] = json!(true);
+            value["components"]["encoder"]["enabled"] = json!(true);
         });
         assert_eq!(field, "modules");
         assert!(problem.contains("lists no module"), "{problem}");
 
         // A module listed under two stages.
         let (field, _) = refused(&|value| {
-            value["components"]["text_encoder"] = json!({
+            value["components"]["encoder"] = json!({
                 "enabled": true,
-                "modules": {down: {"activation_amax": 1.0}},
+                "modules": {DOWN: {"activation_amax": 1.0}},
             });
         });
-        assert_eq!(field, down);
+        assert_eq!(field, DOWN);
 
         // Another representation under the same tensor names, another version, no stage.
         let (field, problem) = refused(&|value| {
@@ -427,7 +465,7 @@ mod tests {
         assert_eq!(field, "components");
 
         let (field, problem) = refused(&|value| {
-            for stage in ["denoiser", "video_vae"] {
+            for stage in ["network", "decoder"] {
                 value["components"][stage] = json!({"enabled": false, "modules": {}});
             }
         });

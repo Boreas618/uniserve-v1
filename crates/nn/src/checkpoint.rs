@@ -1199,46 +1199,24 @@ fn extents(path: &Path, tensor: &str, dims: &[usize]) -> Result<Shape> {
 mod tests {
     use super::*;
 
-    /// Write one shard of `tensors` — each `(name, dtype, shape, bytes)` — into `directory` and
-    /// return the root to open.
+    use safetensors::tensor::TensorView;
+
+    /// Writes the checkpoint of one shard of `tensors`, each `(name, format type, extents,
+    /// bytes)`, into `directory`, as its declared file `model.safetensors`.
     ///
-    /// The header is composed here from the format's own grammar (an eight-byte length, the JSON
-    /// body, then the payload laid out in the order the offsets state), so the test states the
-    /// format rather than going through the parser it is testing.
-    fn shard(directory: &Path, tensors: &[(&str, &str, &[usize], &[u8])]) -> PathBuf {
-        let mut body = String::from("{");
-        let mut payload = Vec::new();
-        for (index, (name, dtype, shape, bytes)) in tensors.iter().enumerate() {
-            if index > 0 {
-                body.push(',');
-            }
-            let start = payload.len();
-            payload.extend_from_slice(bytes);
-            let extents = shape
-                .iter()
-                .map(|extent| extent.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            body.push_str(&format!(
-                r#""{name}":{{"dtype":"{dtype}","shape":[{extents}],"data_offsets":[{start},{}]}}"#,
-                payload.len()
-            ));
-        }
-        body.push('}');
+    /// The format's own writer composes the file, so the test states tensors in the format's
+    /// types (one the operator ABI refuses among them) and checks this crate's reading of them.
+    /// The integration tests share a writer of `nn` element types (`nn-testing`); a unit test
+    /// of this crate cannot link a crate that depends on it.
+    fn shard(directory: &Path, tensors: &[(&str, FormatDtype, &[usize], &[u8])]) {
+        let views = tensors.iter().map(|(name, dtype, shape, bytes)| {
+            let view = TensorView::new(*dtype, shape.to_vec(), bytes)
+                .unwrap_or_else(|error| panic!("the fixture's `{name}`: {error}"));
+            (*name, view)
+        });
+        let file = safetensors::serialize(views, None).expect("a shard");
 
-        // The format states the header length as a multiple of 8 so that the payload is
-        // 8-byte aligned, and every real exporter obeys it; JSON permits the trailing spaces a
-        // padded body needs. A fixture that omits a rule the real files obey tests the fixture.
-        let padded = body.len().div_ceil(8) * 8;
-        body.push_str(&" ".repeat(padded - body.len()));
-
-        let mut file = Vec::new();
-        file.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        file.extend_from_slice(body.as_bytes());
-        file.extend_from_slice(&payload);
-        let path = directory.join("model.safetensors");
-        std::fs::write(&path, &file).expect("a shard");
-        path
+        std::fs::write(directory.join("model.safetensors"), file).expect("a shard");
     }
 
     /// A tensor's name is matched exactly as the checkpoint stores it.
@@ -1255,7 +1233,12 @@ mod tests {
         let halfs = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         shard(
             root.path(),
-            &[("layers.0.attention.q_proj.weight", "BF16", &[2, 2], &halfs)],
+            &[(
+                "layers.0.attention.q_proj.weight",
+                FormatDtype::BF16,
+                &[2, 2],
+                &halfs,
+            )],
         );
 
         let checkpoint = Checkpoint::open(root.path()).expect("the shard opens");
@@ -1297,8 +1280,8 @@ mod tests {
         shard(
             root.path(),
             &[
-                ("halfs", "BF16", &[2, 3], &halfs),
-                ("words", "I32", &[4], &words),
+                ("halfs", FormatDtype::BF16, &[2, 3], &halfs),
+                ("words", FormatDtype::I32, &[4], &words),
             ],
         );
 
@@ -1341,29 +1324,30 @@ mod tests {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10,
         ];
-        let stored: [(&str, DType, usize); 11] = [
-            ("U8", DType::U8, 16),
-            ("U32", DType::U32, 4),
-            ("I16", DType::I16, 8),
-            ("I32", DType::I32, 4),
-            ("I64", DType::I64, 2),
-            ("F16", DType::F16, 8),
-            ("BF16", DType::BF16, 8),
-            ("F32", DType::F32, 4),
-            ("F64", DType::F64, 2),
-            ("F8_E4M3", DType::F8E4M3, 16),
-            ("F4", DType::F4, 32),
+        // Each tensor is named by its format type's spelling.
+        let stored: [(&str, FormatDtype, DType, usize); 11] = [
+            ("U8", FormatDtype::U8, DType::U8, 16),
+            ("U32", FormatDtype::U32, DType::U32, 4),
+            ("I16", FormatDtype::I16, DType::I16, 8),
+            ("I32", FormatDtype::I32, DType::I32, 4),
+            ("I64", FormatDtype::I64, DType::I64, 2),
+            ("F16", FormatDtype::F16, DType::F16, 8),
+            ("BF16", FormatDtype::BF16, DType::BF16, 8),
+            ("F32", FormatDtype::F32, DType::F32, 4),
+            ("F64", FormatDtype::F64, DType::F64, 2),
+            ("F8_E4M3", FormatDtype::F8_E4M3, DType::F8E4M3, 16),
+            ("F4", FormatDtype::F4, DType::F4, 32),
         ];
-        let shapes: Vec<[usize; 1]> = stored.iter().map(|(_, _, count)| [*count]).collect();
-        let tensors: Vec<(&str, &str, &[usize], &[u8])> = stored
+        let shapes: Vec<[usize; 1]> = stored.iter().map(|(.., count)| [*count]).collect();
+        let tensors: Vec<(&str, FormatDtype, &[usize], &[u8])> = stored
             .iter()
             .zip(&shapes)
-            .map(|((name, _, _), shape)| (*name, *name, &shape[..], &bytes[..]))
+            .map(|((name, format, ..), shape)| (*name, *format, &shape[..], &bytes[..]))
             .collect();
         shard(root.path(), &tensors);
 
         let checkpoint = Checkpoint::open(root.path()).expect("the shard opens");
-        for (name, dtype, count) in stored {
+        for (name, _, dtype, count) in stored {
             let located = checkpoint.locate(name).expect(name);
             assert_eq!(located.dtype, dtype, "{name}");
             assert_eq!(located.shape.dims(), [count], "{name}");
@@ -1381,7 +1365,10 @@ mod tests {
         let root = tempfile::tempdir().expect("a temp directory");
         // `F8_E5M2` is eight bits an element, so two elements are two bytes and the crate's own
         // header validation is satisfied: what refuses is this loader's type match.
-        shard(root.path(), &[("wide", "F8_E5M2", &[2], &[0x00, 0x01])]);
+        shard(
+            root.path(),
+            &[("wide", FormatDtype::F8_E5M2, &[2], &[0x00, 0x01])],
+        );
 
         let problem = Checkpoint::open(root.path())
             .err()
