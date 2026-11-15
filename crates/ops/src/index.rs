@@ -55,7 +55,7 @@ use platform::Stream;
 use tensor::{DType, Layout};
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::strided;
@@ -108,14 +108,15 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
-    /// The descriptor of the call `args` makes of `function`.
-    pub fn of(function: Function, args: &Args, block: u32, pdl: bool) -> Self {
+    /// The descriptor of the call `args` makes of `function`, over the operators' block
+    /// ([`descriptor::BLOCK`]).
+    pub fn of(function: Function, args: &Args, pdl: bool) -> Self {
         Self {
             function,
             dtype: args.source.dtype,
             indices: args.indices.dtype,
             rank: rank(function, args),
-            block,
+            block: descriptor::BLOCK,
             pdl,
         }
     }
@@ -358,8 +359,6 @@ mod tests {
     use super::*;
     use platform::DevicePtr;
 
-    const BLOCK: u32 = 1024;
-
     fn operand(dtype: DType, shape: &[u64], strides: &[u64]) -> Operand {
         Operand::with_strides(DevicePtr::from_address(0x1000), dtype, shape, strides)
     }
@@ -369,7 +368,7 @@ mod tests {
     }
 
     fn refusal(function: Function, args: &Args) -> String {
-        Index::check(&Descriptor::of(function, args, BLOCK, false), args)
+        Index::check(&Descriptor::of(function, args, false), args)
             .unwrap_err()
             .to_string()
     }
@@ -388,7 +387,7 @@ mod tests {
     #[test]
     fn the_key_names_the_function_both_types_and_the_axes_traversed() {
         let args = lookup();
-        let descriptor = Descriptor::of(Function::Gather, &args, BLOCK, false);
+        let descriptor = Descriptor::of(Function::Gather, &args, false);
         assert_eq!(
             descriptor.to_string(),
             "function_gather_dtype_bf16_indices_u32_rank_2_block_1024_pdl_false"
@@ -406,7 +405,7 @@ mod tests {
             destination: contiguous(DType::F32, &[4, 20]),
             axis: 1,
         };
-        let descriptor = Descriptor::of(Function::Gather, &args, BLOCK, false);
+        let descriptor = Descriptor::of(Function::Gather, &args, false);
         assert_eq!(descriptor.function, Function::Gather);
         assert_eq!(descriptor.rank, 2);
         Index::check(&descriptor, &args).unwrap();
@@ -418,10 +417,7 @@ mod tests {
             destination: contiguous(DType::F32, &[2, 3, 5]),
             axis: 1,
         };
-        assert_eq!(
-            Descriptor::of(Function::Gather, &args, BLOCK, false).rank,
-            3
-        );
+        assert_eq!(Descriptor::of(Function::Gather, &args, false).rank, 3);
     }
 
     #[test]
@@ -433,7 +429,7 @@ mod tests {
             destination: contiguous(DType::BF16, &[1000, 64]),
             axis: 0,
         };
-        let descriptor = Descriptor::of(Function::ScatterAdd, &rows, BLOCK, false);
+        let descriptor = Descriptor::of(Function::ScatterAdd, &rows, false);
         assert_eq!(
             descriptor.to_string(),
             "function_scatter_add_dtype_bf16_indices_u32_rank_1_block_1024_pdl_false"
@@ -447,7 +443,7 @@ mod tests {
             destination: contiguous(DType::F32, &[4, 151_936]),
             axis: 1,
         };
-        let descriptor = Descriptor::of(Function::ScatterSet, &elements, BLOCK, false);
+        let descriptor = Descriptor::of(Function::ScatterSet, &elements, false);
         assert_eq!(descriptor.rank, 1);
         Index::check(&descriptor, &elements).unwrap();
 
@@ -458,10 +454,7 @@ mod tests {
             destination: contiguous(DType::F32, &[2, 9, 5]),
             axis: 1,
         };
-        assert_eq!(
-            Descriptor::of(Function::ScatterAdd, &middle, BLOCK, false).rank,
-            2
-        );
+        assert_eq!(Descriptor::of(Function::ScatterAdd, &middle, false).rank, 2);
 
         // A vector scattered into a vector has one column.
         let vector = Args {
@@ -470,7 +463,7 @@ mod tests {
             destination: contiguous(DType::I64, &[5]),
             axis: 0,
         };
-        let descriptor = Descriptor::of(Function::ScatterAdd, &vector, BLOCK, false);
+        let descriptor = Descriptor::of(Function::ScatterAdd, &vector, false);
         assert_eq!(descriptor.rank, 1);
         Index::check(&descriptor, &vector).unwrap();
     }
@@ -484,7 +477,7 @@ mod tests {
             destination: contiguous(DType::F8E4M3, &[7, 64]),
             axis: 0,
         };
-        let descriptor = Descriptor::of(Function::Gather, &lookup, BLOCK, false);
+        let descriptor = Descriptor::of(Function::Gather, &lookup, false);
         assert_eq!(
             descriptor.to_string(),
             "function_gather_dtype_f8e4m3_indices_u32_rank_2_block_1024_pdl_false"
@@ -498,7 +491,7 @@ mod tests {
             destination: contiguous(DType::F8E4M3, &[1000, 64]),
             axis: 0,
         };
-        let descriptor = Descriptor::of(Function::ScatterSet, &scatter, BLOCK, false);
+        let descriptor = Descriptor::of(Function::ScatterSet, &scatter, false);
         assert_eq!(
             descriptor.to_string(),
             "function_scatter_set_dtype_f8e4m3_indices_u32_rank_1_block_1024_pdl_false"
@@ -527,11 +520,7 @@ mod tests {
                 indices: operand(indices, &[7, 64], &[1, 0]),
                 ..args.clone()
             };
-            Index::check(
-                &Descriptor::of(Function::Gather, &typed, BLOCK, false),
-                &typed,
-            )
-            .unwrap();
+            Index::check(&Descriptor::of(Function::Gather, &typed, false), &typed).unwrap();
         }
 
         let signed = Args {
@@ -609,7 +598,7 @@ mod tests {
             ..args.clone()
         };
         Index::check(
-            &Descriptor::of(Function::Gather, &permuted, BLOCK, false),
+            &Descriptor::of(Function::Gather, &permuted, false),
             &permuted,
         )
         .unwrap();

@@ -30,7 +30,7 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::strided;
@@ -51,12 +51,13 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
-    /// The descriptor of the call `args` makes.
-    pub fn of(args: &Args, block: u32, pdl: bool) -> Self {
+    /// The descriptor of the call `args` makes, over the operators' block
+    /// ([`descriptor::BLOCK`]).
+    pub fn of(args: &Args, pdl: bool) -> Self {
         Self {
             dtype: args.source.dtype,
             rank: strided::rank([&args.source, &args.destination]),
-            block,
+            block: descriptor::BLOCK,
             pdl,
         }
     }
@@ -162,8 +163,6 @@ mod tests {
     use super::*;
     use platform::DevicePtr;
 
-    const BLOCK: u32 = 1024;
-
     fn operand(address: u64, shape: &[u64], strides: &[u64]) -> Operand {
         Operand::with_strides(
             DevicePtr::from_address(address),
@@ -178,7 +177,7 @@ mod tests {
     }
 
     fn refusal(args: &Args) -> String {
-        CopyStrided::check(&Descriptor::of(args, BLOCK, false), args)
+        CopyStrided::check(&Descriptor::of(args, false), args)
             .unwrap_err()
             .to_string()
     }
@@ -189,7 +188,7 @@ mod tests {
             source: contiguous(0x1000, &[4, 8]),
             destination: contiguous(0x2000, &[4, 8]),
         };
-        let descriptor = Descriptor::of(&args, BLOCK, false);
+        let descriptor = Descriptor::of(&args, false);
         assert_eq!(
             descriptor.to_string(),
             "dtype_bf16_rank_1_block_1024_pdl_false"
@@ -205,7 +204,7 @@ mod tests {
             source: operand(0x1000, &[5, 2, 3], &[1, 15, 5]),
             destination: contiguous(0x2000, &[5, 2, 3]),
         };
-        let descriptor = Descriptor::of(&args, BLOCK, false);
+        let descriptor = Descriptor::of(&args, false);
         assert_eq!(descriptor.rank, 2);
         CopyStrided::check(&descriptor, &args).unwrap();
 
@@ -214,7 +213,7 @@ mod tests {
             source: operand(0x1000, &[4, 8], &[0, 1]),
             destination: contiguous(0x2000, &[4, 8]),
         };
-        let descriptor = Descriptor::of(&args, BLOCK, false);
+        let descriptor = Descriptor::of(&args, false);
         assert_eq!(descriptor.rank, 2);
         CopyStrided::check(&descriptor, &args).unwrap();
     }
@@ -227,7 +226,7 @@ mod tests {
             source: operand(0x1000, &[3, 8], &[16, 1]),
             destination: operand(0x2000, &[3, 8], &[20, 1]),
         };
-        let descriptor = Descriptor::of(&args, BLOCK, false);
+        let descriptor = Descriptor::of(&args, false);
         assert_eq!(descriptor.rank, 2);
         CopyStrided::check(&descriptor, &args).unwrap();
 
@@ -236,7 +235,7 @@ mod tests {
             source: operand(0x1000, &[3, 8], &[8, 1]),
             destination: operand(0x2000, &[3, 8], &[8, 1]),
         };
-        assert_eq!(Descriptor::of(&args, BLOCK, false).rank, 1);
+        assert_eq!(Descriptor::of(&args, false).rank, 1);
     }
 
     #[test]
@@ -248,7 +247,7 @@ mod tests {
             source: source.clone(),
             destination: operand(0x2000, &[4, 8], &[32, 1]),
         };
-        CopyStrided::check(&Descriptor::of(&window, BLOCK, false), &window).unwrap();
+        CopyStrided::check(&Descriptor::of(&window, false), &window).unwrap();
 
         // A permuted destination is no window.
         let permuted = Args {
@@ -308,7 +307,7 @@ mod tests {
 
         // A permuted FP8 view made contiguous.
         let narrow = of(DType::F8E4M3, &[1, 15, 5]);
-        let descriptor = Descriptor::of(&narrow, BLOCK, false);
+        let descriptor = Descriptor::of(&narrow, false);
         assert_eq!(
             descriptor.to_string(),
             "dtype_f8e4m3_rank_2_block_1024_pdl_false"

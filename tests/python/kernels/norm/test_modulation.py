@@ -78,7 +78,7 @@ E4M3_MAX = 448.0
 #: The relative bound a recomputed dequantization scale is held to.
 SCALE_RTOL = 2.0**-20
 
-#: The block `gated_residual` walks, the operator's `GATED_BLOCK`.
+#: The block `gated_residual` walks, the `BLOCK` its launch table binds.
 GATED_BLOCK = 1024
 
 #: Whether the floor of the terms decides an element type: an FP32 row whose

@@ -73,7 +73,7 @@ use std::sync::Arc;
 use crate::batch::StateDirection;
 use nn::family::{StateField, StateShape};
 use ops::block_copy::{
-    BlockShape, COPY_BLOCK, CacheBlockScatter, CacheBlockSnapshot, ScatterArgs, SnapshotArgs,
+    BlockShape, CacheBlockScatter, CacheBlockSnapshot, ScatterArgs, SnapshotArgs,
 };
 use platform::{
     Buffer, CopyBatch, DeviceId, DevicePtr, DeviceRange, Event, EventFlags, PoolKind, SourceOrder,
@@ -517,18 +517,17 @@ impl StateMemory {
 
     /// The descriptor of a block copy over `field`, a `[blocks, width]` byte tensor.
     fn block_shape(field: &ops::Operand) -> BlockShape {
-        BlockShape {
-            dtype: DType::U8,
-            shape: field.dims().iter().map(|&dim| dim as u64).collect(),
-            strides: field
+        BlockShape::new(
+            DType::U8,
+            field.dims().iter().map(|&dim| dim as u64).collect(),
+            field
                 .strides()
                 .iter()
                 .map(|&stride| stride as u64)
                 .collect(),
-            index_stride: 1,
-            width: field.last(),
-            block: COPY_BLOCK,
-        }
+            1,
+            field.last(),
+        )
     }
 
     /// Launches one move between `field` and `part` of the snapshot by the context installed

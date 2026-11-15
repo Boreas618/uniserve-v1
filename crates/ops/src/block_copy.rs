@@ -21,14 +21,11 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
-
-/// The elements one program writes or reads at a time.
-pub const COPY_BLOCK: u32 = 1024;
 
 /// What one compilation of a block copy is: the storage's shape, its strides and the tile.
 ///
@@ -48,6 +45,28 @@ pub struct BlockShape {
     pub width: u64,
     /// The columns one program covers.
     pub block: u32,
+}
+
+impl BlockShape {
+    /// The copy of a `dtype` field of block-major `shape` and `strides`, its blocks
+    /// `index_stride` elements apart in the index vector and `width` elements each, over the
+    /// operators' block ([`descriptor::BLOCK`]).
+    pub const fn new(
+        dtype: DType,
+        shape: Vec<u64>,
+        strides: Vec<u64>,
+        index_stride: u64,
+        width: u64,
+    ) -> Self {
+        Self {
+            dtype,
+            shape,
+            strides,
+            index_stride,
+            width,
+            block: descriptor::BLOCK,
+        }
+    }
 }
 
 impl fmt::Display for BlockShape {
@@ -308,14 +327,7 @@ mod tests {
     /// A block's extents and strides are part of the key, spelled as the stored modules name them.
     #[test]
     fn a_block_shape_names_its_extents_and_strides_in_its_key() {
-        let shape = BlockShape {
-            dtype: DType::BF16,
-            shape: vec![4, 2, 8],
-            strides: vec![16, 8, 1],
-            index_stride: 1,
-            width: 16,
-            block: COPY_BLOCK,
-        };
+        let shape = BlockShape::new(DType::BF16, vec![4, 2, 8], vec![16, 8, 1], 1, 16);
         assert_eq!(
             shape.to_string(),
             "dtype_bf16_shape_4x2x8_strides_16x8x1_index_stride_1_width_16_block_1024"

@@ -40,9 +40,6 @@ use crate::{Error, Op, Result, Twins};
 /// One program reduces a complete row, so the row has to fit the program's register budget.
 pub const MAX_WIDTH: u32 = 32768;
 
-/// The tile `gated_residual` walks the activation with, in elements.
-pub const GATED_BLOCK: u64 = 1024;
-
 /// One compilation of `modulated_rms_norm`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ModulatedRmsNormDescriptor {
@@ -457,12 +454,13 @@ impl Op for GatedResidual {
             .view("gate_ptr", &args.gate)
             .view("row_indices_ptr", &args.row_indices)
             .u64("gate_row_stride", descriptor.gate_stride)
-            // Appended rather than inserted, so every parameter before it keeps its offset: the
-            // row count is the one thing a request changes, and the kernel multiplies it by the
-            // width it was compiled for.
+            // The row count is the one thing a request changes; the kernel multiplies it by
+            // the width it was compiled for.
             .u64("rows", rows);
+        // The tile the module walks the activation with, which its package states.
+        let block = kernel.cubin(Self::NAME)?.integer("BLOCK")?;
         kernel.launch(
-            LaunchGrid::covering(rows * width, GATED_BLOCK)?,
+            LaunchGrid::covering(rows * width, block)?,
             &mut arguments,
             stream,
         )

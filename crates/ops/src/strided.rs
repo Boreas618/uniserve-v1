@@ -363,14 +363,10 @@ impl Slots {
     ///
     /// # Errors
     ///
-    /// [`Error::Metadata`] when the kernel is no cubin or its signature takes no such word.
+    /// [`Error::KernelForm`] when the kernel is native, and [`Error::Metadata`] when its signature
+    /// takes no such word.
     pub(crate) fn of(operator: &'static str, kernel: &Kernel, prefix: &str) -> Result<Self> {
-        let metadata = kernel.metadata().ok_or_else(|| Error::KernelForm {
-            operator,
-            kernel: kernel.name().to_owned(),
-            expected: "cubin",
-            actual: "native",
-        })?;
+        let metadata = kernel.cubin(operator)?;
         let count = metadata
             .signature
             .iter()

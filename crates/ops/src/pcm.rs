@@ -27,7 +27,7 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
@@ -35,9 +35,6 @@ use crate::{Error, Op, Result, Twins};
 
 /// Full-scale value of the 16-bit output: the multiplier after the clamp.
 pub const FULL_SCALE: f32 = 32767.0;
-
-/// Elements one thread block converts.
-pub const BLOCK: u32 = 1024;
 
 /// One compilation of `pcm_interleave`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -48,6 +45,18 @@ pub struct Descriptor {
     pub block: u32,
     /// Whether the module was compiled for programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl Descriptor {
+    /// The interleaving of two `dtype` channels, over the operators' block
+    /// ([`descriptor::BLOCK`]).
+    pub const fn new(dtype: DType, pdl: bool) -> Self {
+        Self {
+            dtype,
+            block: descriptor::BLOCK,
+            pdl,
+        }
+    }
 }
 
 impl fmt::Display for Descriptor {
@@ -162,11 +171,7 @@ mod tests {
     use super::*;
 
     fn descriptor() -> Descriptor {
-        Descriptor {
-            dtype: DType::F32,
-            block: BLOCK,
-            pdl: false,
-        }
+        Descriptor::new(DType::F32, false)
     }
 
     #[test]

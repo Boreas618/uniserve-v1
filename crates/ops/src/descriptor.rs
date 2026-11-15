@@ -14,6 +14,15 @@
 
 use std::fmt::{self, Display, Write};
 
+/// The elements one program of a block-walking operator covers: the block each such operator's
+/// descriptor constructor names.
+///
+/// One power of two serves them all: wide enough to spread a program's index arithmetic and its
+/// launch over a thousand elements, and narrow enough that a tensor of a few thousand elements
+/// still spans several programs. The block is a field of each descriptor and so part of each
+/// module's key; a caller that needs another tile states it in the descriptor it builds.
+pub const BLOCK: u32 = 1024;
+
 /// The canonical key of one descriptor.
 ///
 /// ```ignore

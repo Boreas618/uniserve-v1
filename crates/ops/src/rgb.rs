@@ -48,7 +48,7 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
@@ -57,9 +57,6 @@ use crate::{Error, Op, Result, Twins};
 /// Channels of the packed output: the ImageNet constants' length, and the only value the reference's
 /// de-normalization has constants for.
 pub const CHANNELS: u32 = 3;
-
-/// Elements one thread block converts.
-pub const BLOCK: u32 = 1024;
 
 /// The de-normalization's scale onto bytes: the reference multiplies by 255 before rounding.
 pub const BYTE_SCALE: f32 = 255.0;
@@ -140,6 +137,19 @@ pub struct Descriptor {
     pub block: u32,
     /// Whether the module was compiled for programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl Descriptor {
+    /// The packing of a `dtype` raster into [`CHANNELS`] bytes a pixel, over the operators'
+    /// block ([`descriptor::BLOCK`]).
+    pub const fn new(dtype: DType, pdl: bool) -> Self {
+        Self {
+            dtype,
+            channels: CHANNELS,
+            block: descriptor::BLOCK,
+            pdl,
+        }
+    }
 }
 
 impl fmt::Display for Descriptor {
@@ -319,12 +329,7 @@ mod tests {
 
     #[test]
     fn the_key_names_the_element_type_the_channels_and_the_block() {
-        let descriptor = Descriptor {
-            dtype: DType::BF16,
-            channels: 3,
-            block: 1024,
-            pdl: false,
-        };
+        let descriptor = Descriptor::new(DType::BF16, false);
         assert_eq!(
             crate::descriptor::key(&descriptor),
             "dtype_bf16_channels_3_block_1024_pdl_false"
@@ -332,10 +337,7 @@ mod tests {
         // The geometry is not in the key, so a resolution or a clip length cannot make a new module.
         assert_eq!(
             crate::descriptor::key(&descriptor),
-            crate::descriptor::key(&Descriptor {
-                block: 1024,
-                ..descriptor
-            })
+            crate::descriptor::key(&Descriptor::new(DType::BF16, false))
         );
         assert_ne!(
             crate::descriptor::key(&descriptor),
@@ -424,12 +426,7 @@ mod tests {
 
     #[test]
     fn the_bound_admits_a_tie_and_nothing_looser() {
-        let tolerance = <RgbBytes as Op>::tolerance(&Descriptor {
-            dtype: DType::BF16,
-            channels: 3,
-            block: 1024,
-            pdl: false,
-        });
+        let tolerance = <RgbBytes as Op>::tolerance(&Descriptor::new(DType::BF16, false));
         // A tie can land a byte either side of the boundary: 128 against 127 is the case a
         // half-byte bound would have rejected.
         assert!(tolerance.allows(127.0, 128.0));

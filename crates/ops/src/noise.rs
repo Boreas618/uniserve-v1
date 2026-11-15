@@ -48,14 +48,11 @@ use platform::{DevicePtr, Stream};
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
-
-/// The elements one program draws.
-pub const NOISE_BLOCK: u32 = 1024;
 
 /// What a `philox_noise` draw yields.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -105,6 +102,19 @@ pub struct NoiseDescriptor {
     pub kind: NoiseKind,
     /// Where the draw's key comes from: a view of per-row keys, or one launch scalar.
     pub source: KeySource,
+}
+
+impl NoiseDescriptor {
+    /// A `kind` draw into `dtype` elements keyed by `source`, over the operators' block
+    /// ([`descriptor::BLOCK`]).
+    pub const fn new(dtype: DType, kind: NoiseKind, source: KeySource) -> Self {
+        Self {
+            dtype,
+            block: descriptor::BLOCK,
+            kind,
+            source,
+        }
+    }
 }
 
 impl fmt::Display for NoiseDescriptor {
@@ -335,12 +345,7 @@ mod tests {
     }
 
     fn descriptor(source: KeySource) -> NoiseDescriptor {
-        NoiseDescriptor {
-            dtype: DType::BF16,
-            block: NOISE_BLOCK,
-            kind: NoiseKind::Normal,
-            source,
-        }
+        NoiseDescriptor::new(DType::BF16, NoiseKind::Normal, source)
     }
 
     fn args(out: Operand, keys: Option<Operand>, key: u64) -> NoiseArgs {

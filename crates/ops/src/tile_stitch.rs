@@ -29,14 +29,11 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::{Operand, row_writable};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
-
-/// Raster columns one program writes.
-pub const BLOCK: u32 = 1024;
 
 /// The words of one axis table's row: tile, position inside it, seam width.
 pub const TABLE_WIDTH: u64 = 3;
@@ -54,6 +51,20 @@ pub struct Descriptor {
     pub patch_side: u32,
     /// Raster columns one program writes.
     pub block: u32,
+}
+
+impl Descriptor {
+    /// The stitch of `dtype` tokens of `channels`, `patch_frames` frames and `patch_side`
+    /// rows and columns, over the operators' block ([`descriptor::BLOCK`]).
+    pub const fn new(dtype: DType, channels: u32, patch_frames: u32, patch_side: u32) -> Self {
+        Self {
+            dtype,
+            channels,
+            patch_frames,
+            patch_side,
+            block: descriptor::BLOCK,
+        }
+    }
 }
 
 impl fmt::Display for Descriptor {
@@ -212,13 +223,7 @@ mod tests {
 
     #[test]
     fn the_key_names_the_type_and_the_patch() {
-        let descriptor = Descriptor {
-            dtype: DType::F16,
-            channels: 3,
-            patch_frames: 4,
-            patch_side: 16,
-            block: BLOCK,
-        };
+        let descriptor = Descriptor::new(DType::F16, 3, 4, 16);
         assert_eq!(
             descriptor.to_string(),
             "dtype_f16_channels_3_patch_frames_4_patch_side_16_block_1024"

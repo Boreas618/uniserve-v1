@@ -26,7 +26,7 @@
 //! The destination is execution's: latents it owns and lends, written in place. A draw no
 //! buffer of execution holds is returned as a new tensor ([`philox_normal_like`]).
 
-use ops::noise::{KeySource, NOISE_BLOCK, NoiseArgs, NoiseDescriptor, NoiseKind, PhiloxNoise};
+use ops::noise::{KeySource, NoiseArgs, NoiseDescriptor, NoiseKind, PhiloxNoise};
 use tensor::{DType, Device, Tensor};
 
 use super::on_cpu;
@@ -88,12 +88,7 @@ fn normal_stream(key: u64, stage: u32, draw: u32, offset: u64, count: usize) -> 
 
 /// The descriptor of a normal draw into `dtype` elements keyed by `source`.
 fn descriptor(dtype: DType, source: KeySource) -> NoiseDescriptor {
-    NoiseDescriptor {
-        dtype,
-        block: NOISE_BLOCK,
-        kind: NoiseKind::Normal,
-        source,
-    }
+    NoiseDescriptor::new(dtype, NoiseKind::Normal, source)
 }
 
 /// Draws standard normal noise into `out`, in place and in its element type, from one `seed`

@@ -24,7 +24,7 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::strided;
@@ -45,12 +45,13 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
-    /// The descriptor of the call `args` makes.
-    pub fn of(args: &Args, block: u32, pdl: bool) -> Self {
+    /// The descriptor of the call `args` makes, over the operators' block
+    /// ([`descriptor::BLOCK`]).
+    pub fn of(args: &Args, pdl: bool) -> Self {
         Self {
             dtype: args.destination.dtype,
             rank: strided::rank([&args.destination]),
-            block,
+            block: descriptor::BLOCK,
             pdl,
         }
     }
@@ -168,8 +169,6 @@ mod tests {
     use super::*;
     use platform::DevicePtr;
 
-    const BLOCK: u32 = 1024;
-
     fn window(dtype: DType, shape: &[u64], strides: &[u64], bits: u64) -> Args {
         Args {
             destination: Operand::with_strides(
@@ -183,7 +182,7 @@ mod tests {
     }
 
     fn refusal(args: &Args) -> String {
-        Fill::check(&Descriptor::of(args, BLOCK, false), args)
+        Fill::check(&Descriptor::of(args, false), args)
             .unwrap_err()
             .to_string()
     }
@@ -191,7 +190,7 @@ mod tests {
     #[test]
     fn the_key_names_the_type_and_the_axes_traversed() {
         let zeros = window(DType::BF16, &[4, 8], &[8, 1], 0);
-        let descriptor = Descriptor::of(&zeros, BLOCK, false);
+        let descriptor = Descriptor::of(&zeros, false);
         assert_eq!(
             descriptor.to_string(),
             "dtype_bf16_rank_1_block_1024_pdl_false"
@@ -204,13 +203,13 @@ mod tests {
     fn a_block_of_a_larger_tensor_traverses_the_axes_its_strides_keep_apart() {
         // Rows of eight inside rows of thirty-two.
         let block = window(DType::F32, &[4, 8], &[32, 1], 1.0_f32.to_bits().into());
-        let descriptor = Descriptor::of(&block, BLOCK, false);
+        let descriptor = Descriptor::of(&block, false);
         assert_eq!(descriptor.rank, 2);
         Fill::check(&descriptor, &block).unwrap();
 
         // Every other element of a run is one axis with a step of two.
         let stepped = window(DType::F32, &[16], &[2], 0);
-        let descriptor = Descriptor::of(&stepped, BLOCK, false);
+        let descriptor = Descriptor::of(&stepped, false);
         assert_eq!(descriptor.rank, 1);
         Fill::check(&descriptor, &stepped).unwrap();
     }
@@ -238,11 +237,11 @@ mod tests {
         assert!(message.contains("do not fit a bf16 element"), "{message}");
 
         let whole = window(DType::BF16, &[8], &[1], 0xffff);
-        Fill::check(&Descriptor::of(&whole, BLOCK, false), &whole).unwrap();
+        Fill::check(&Descriptor::of(&whole, false), &whole).unwrap();
 
         // A 64-bit element takes every pattern, a negative integer's included.
         let negative = window(DType::I64, &[8], &[1], (-1_i64) as u64);
-        Fill::check(&Descriptor::of(&negative, BLOCK, false), &negative).unwrap();
+        Fill::check(&Descriptor::of(&negative, false), &negative).unwrap();
 
         let byte = window(DType::U8, &[8], &[1], 0x100);
         assert!(refusal(&byte).contains("do not fit a u8 element"));
@@ -252,7 +251,7 @@ mod tests {
     fn an_fp8_element_is_stored_as_its_byte() {
         // One in E4M3: a zero sign, the exponent's bias and no mantissa.
         let ones = window(DType::F8E4M3, &[4, 8], &[8, 1], 0x38);
-        let descriptor = Descriptor::of(&ones, BLOCK, false);
+        let descriptor = Descriptor::of(&ones, false);
         assert_eq!(
             descriptor.to_string(),
             "dtype_f8e4m3_rank_1_block_1024_pdl_false"
@@ -262,7 +261,7 @@ mod tests {
 
         // A block of a larger FP8 tensor is a window like any other.
         let block = window(DType::F8E4M3, &[4, 8], &[32, 1], 0);
-        Fill::check(&Descriptor::of(&block, BLOCK, false), &block).unwrap();
+        Fill::check(&Descriptor::of(&block, false), &block).unwrap();
 
         let wide = window(DType::F8E4M3, &[8], &[1], 0x100);
         assert!(refusal(&wide).contains("do not fit a f8e4m3 element"));

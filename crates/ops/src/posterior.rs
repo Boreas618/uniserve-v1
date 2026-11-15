@@ -28,14 +28,11 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
-
-/// Elements one thread block produces.
-pub const BLOCK: u32 = 1024;
 
 /// The lower clamp of the log-variance, as the reference states it.
 pub const CLAMP_MIN: f32 = -30.0;
@@ -54,6 +51,16 @@ pub struct Descriptor {
     pub block: u32,
     /// Whether the module was compiled for programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl Descriptor {
+    /// The sample over the operators' block ([`descriptor::BLOCK`]).
+    pub const fn new(pdl: bool) -> Self {
+        Self {
+            block: descriptor::BLOCK,
+            pdl,
+        }
+    }
 }
 
 impl fmt::Display for Descriptor {
@@ -303,10 +310,7 @@ mod tests {
     use super::*;
 
     fn descriptor() -> Descriptor {
-        Descriptor {
-            block: BLOCK,
-            pdl: false,
-        }
+        Descriptor::new(false)
     }
 
     #[test]

@@ -786,6 +786,20 @@ impl Kernel {
         }
     }
 
+    /// The launch metadata of this kernel, which `operator` launches as a cubin.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KernelForm`] when the kernel is native.
+    pub fn cubin(&self, operator: &'static str) -> Result<&CubinMetadata> {
+        self.metadata().ok_or_else(|| Error::KernelForm {
+            operator,
+            kernel: self.name().to_owned(),
+            expected: "cubin",
+            actual: "native",
+        })
+    }
+
     /// Whether this kernel is a cubin.
     pub const fn is_cubin(&self) -> bool {
         matches!(self, Self::Cubin { .. })

@@ -1134,15 +1134,7 @@ impl PagedAttention {
             // (`cdiv(tokens, BLOCK_Q) + batch`); a program whose number no row's tile takes
             // returns at once. The count grows with the tokens and the rows, not their product.
             Phase::Prefill => {
-                let tile = kernel
-                    .metadata()
-                    .ok_or_else(|| Error::KernelForm {
-                        operator: Self::NAME,
-                        kernel: kernel.name().to_owned(),
-                        expected: "cubin",
-                        actual: "native",
-                    })?
-                    .integer(PREFILL_QUERY_TILE)?;
+                let tile = kernel.cubin(Self::NAME)?.integer(PREFILL_QUERY_TILE)?;
                 LaunchGrid::new([
                     launch.tokens.div_ceil(tile) + launch.batch,
                     launch.kv_heads,

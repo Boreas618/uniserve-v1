@@ -43,7 +43,7 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::strided;
@@ -128,8 +128,9 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
-    /// The descriptor of the call `args` makes of `function`.
-    pub fn of(function: Function, args: &Args<'_>, block: u32, pdl: bool) -> Self {
+    /// The descriptor of the call `args` makes of `function`, over the operators' block
+    /// ([`descriptor::BLOCK`]).
+    pub fn of(function: Function, args: &Args<'_>, pdl: bool) -> Self {
         let (kept, reduced) = split(&args.x, args.axes);
         Self {
             function,
@@ -137,7 +138,7 @@ impl Descriptor {
             kept: kept.rank() as u8,
             reduced: reduced.rank() as u8,
             reduction: reduction_class(reduced.numel()),
-            block,
+            block: descriptor::BLOCK,
             pdl,
         }
     }
@@ -351,8 +352,6 @@ mod tests {
     use super::*;
     use platform::DevicePtr;
 
-    const BLOCK: u32 = 1024;
-
     fn contiguous(dtype: DType, shape: &[u64]) -> Operand {
         Operand::new(DevicePtr::from_address(0x1000), dtype, shape)
     }
@@ -381,7 +380,7 @@ mod tests {
     #[test]
     fn the_key_names_the_function_the_type_the_axes_traversed_and_the_tile() {
         let args = reduction(Function::Sum, &contiguous(DType::BF16, &[4, 16, 100]), &[2]);
-        let descriptor = Descriptor::of(Function::Sum, &args, BLOCK, false);
+        let descriptor = Descriptor::of(Function::Sum, &args, false);
         assert_eq!(descriptor.reduction, 128);
         assert_eq!(
             descriptor.to_string(),
@@ -395,7 +394,7 @@ mod tests {
         let key = |length: u64| {
             let x = contiguous(DType::F32, &[8, length]);
             let args = reduction(Function::Max, &x, &[1]);
-            Descriptor::of(Function::Max, &args, BLOCK, false).to_string()
+            Descriptor::of(Function::Max, &args, false).to_string()
         };
 
         // 65 to 128 elements are one class.
@@ -411,7 +410,7 @@ mod tests {
         let x = contiguous(DType::F32, &[2, 3, 4, 5]);
         let ranks = |axes: &[usize]| {
             let args = reduction(Function::Sum, &x, axes);
-            let descriptor = Descriptor::of(Function::Sum, &args, BLOCK, false);
+            let descriptor = Descriptor::of(Function::Sum, &args, false);
             Reduce::check(&descriptor, &args).unwrap();
             (descriptor.kept, descriptor.reduced)
         };
@@ -436,7 +435,7 @@ mod tests {
         let x = contiguous(DType::F32, &[4, 151_936]);
         let args = reduction(Function::ArgMax, &x, &[1]);
         assert_eq!(args.out.dtype, DType::U32);
-        let descriptor = Descriptor::of(Function::ArgMax, &args, BLOCK, false);
+        let descriptor = Descriptor::of(Function::ArgMax, &args, false);
         Reduce::check(&descriptor, &args).unwrap();
         assert_eq!(Reduce::tolerance(&descriptor), Tolerance::exact());
 
@@ -449,7 +448,7 @@ mod tests {
         assert!(message.contains("expected f32 out"), "{message}");
 
         let both = reduction(Function::ArgMax, &x, &[0, 1]);
-        let descriptor = Descriptor::of(Function::ArgMax, &both, BLOCK, false);
+        let descriptor = Descriptor::of(Function::ArgMax, &both, false);
         let message = refusal(&descriptor, &both);
         assert!(message.contains("an index along one axis"), "{message}");
     }
@@ -460,7 +459,7 @@ mod tests {
 
         for axes in [&[][..], &[2], &[1, 1]] {
             let args = reduction(Function::Sum, &x, axes);
-            let descriptor = Descriptor::of(Function::Sum, &args, BLOCK, false);
+            let descriptor = Descriptor::of(Function::Sum, &args, false);
             assert!(Reduce::check(&descriptor, &args).is_err(), "{axes:?}");
         }
     }
@@ -469,7 +468,7 @@ mod tests {
     fn the_output_has_the_inputs_shape_with_the_reduced_extents_one() {
         let x = contiguous(DType::F32, &[4, 8]);
         let args = reduction(Function::Sum, &x, &[1]);
-        let descriptor = Descriptor::of(Function::Sum, &args, BLOCK, false);
+        let descriptor = Descriptor::of(Function::Sum, &args, false);
 
         let squeezed = Args {
             out: contiguous(DType::F32, &[4]),
@@ -504,18 +503,18 @@ mod tests {
         let x = contiguous(DType::F32, &[4, 0]);
 
         let sum = reduction(Function::Sum, &x, &[1]);
-        let descriptor = Descriptor::of(Function::Sum, &sum, BLOCK, false);
+        let descriptor = Descriptor::of(Function::Sum, &sum, false);
         assert_eq!(descriptor.reduction, 1);
         Reduce::check(&descriptor, &sum).unwrap();
 
         let minimum = reduction(Function::Min, &x, &[1]);
-        let descriptor = Descriptor::of(Function::Min, &minimum, BLOCK, false);
+        let descriptor = Descriptor::of(Function::Min, &minimum, false);
         let message = refusal(&descriptor, &minimum);
         assert!(message.contains("no element to return"), "{message}");
 
         // No output at all is nothing to launch, whatever the function.
         let none = reduction(Function::Sum, &x, &[0]);
-        let descriptor = Descriptor::of(Function::Sum, &none, BLOCK, false);
+        let descriptor = Descriptor::of(Function::Sum, &none, false);
         let message = refusal(&descriptor, &none);
         assert!(message.contains("nothing to launch"), "{message}");
     }
@@ -524,7 +523,7 @@ mod tests {
     fn a_floating_sum_is_bounded_by_its_class_and_everything_else_is_exact() {
         let tolerance = |function, dtype, length| {
             let args = reduction(function, &contiguous(dtype, &[4, length]), &[1]);
-            Reduce::tolerance(&Descriptor::of(function, &args, BLOCK, false))
+            Reduce::tolerance(&Descriptor::of(function, &args, false))
         };
 
         assert_eq!(

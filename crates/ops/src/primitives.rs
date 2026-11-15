@@ -74,12 +74,6 @@ use tensor::{CpuStorage, DType, Layout, Shape};
 use crate::storage::CudaStorage;
 use crate::{Error, Result, launch};
 
-/// Elements one thread block of a primitive's kernel computes.
-///
-/// A primitive's package compiles any power-of-two block and the block is part of the key, so
-/// the backend states one: every primitive of every forward shares the modules of this block.
-const BLOCK: u32 = 1024;
-
 /// Whether a primitive's kernel is compiled for programmatic dependent launch. Like the block
 /// it is part of the key, and the backend states one value for every primitive.
 const PDL: bool = false;
@@ -101,7 +95,7 @@ fn copy(source: Operand, destination: Operand) -> Result<()> {
         destination,
     };
 
-    launch::<CopyStrided>(&copy_strided::Descriptor::of(&args, BLOCK, PDL), args)
+    launch::<CopyStrided>(&copy_strided::Descriptor::of(&args, PDL), args)
 }
 
 /// Stores the element whose bits are `bits` at every position `layout` views in `storage`.
@@ -112,7 +106,7 @@ pub(crate) fn fill(storage: &CudaStorage, layout: &Layout, bits: u64) -> Result<
     }
 
     let args = crate::fill::Args { destination, bits };
-    launch::<Fill>(&crate::fill::Descriptor::of(&args, BLOCK, PDL), args)
+    launch::<Fill>(&crate::fill::Descriptor::of(&args, PDL), args)
 }
 
 /// The refusal of `operation`, for which this backend's kernels lack `reason`.
@@ -210,7 +204,7 @@ impl CudaStorage {
 
         if out.numel() > 0 {
             let args = UnaryArgs { x, out, scalars };
-            launch::<ElementwiseUnary>(&UnaryDescriptor::of(function, &args, BLOCK, PDL), args)?;
+            launch::<ElementwiseUnary>(&UnaryDescriptor::of(function, &args, PDL), args)?;
         }
         Ok(storage)
     }
@@ -229,7 +223,7 @@ impl CudaStorage {
 
         if out.numel() > 0 {
             let args = BinaryArgs { lhs, rhs, out };
-            launch::<ElementwiseBinary>(&BinaryDescriptor::of(function, &args, BLOCK, PDL), args)?;
+            launch::<ElementwiseBinary>(&BinaryDescriptor::of(function, &args, PDL), args)?;
         }
         Ok(storage)
     }
@@ -257,7 +251,7 @@ impl CudaStorage {
 
         if out.numel() > 0 {
             let args = cast::Args { x, out };
-            launch::<Cast>(&cast::Descriptor::of(&args, BLOCK, PDL), args)?;
+            launch::<Cast>(&cast::Descriptor::of(&args, PDL), args)?;
         }
         Ok(storage)
     }
@@ -275,7 +269,7 @@ impl CudaStorage {
         // A sum over an axis of no element still has outputs to write, which are zero.
         if out.numel() > 0 {
             let args = reduce::Args { x, out, axes };
-            launch::<Reduce>(&reduce::Descriptor::of(function, &args, BLOCK, PDL), args)?;
+            launch::<Reduce>(&reduce::Descriptor::of(function, &args, PDL), args)?;
         }
         Ok(storage)
     }
@@ -300,7 +294,7 @@ impl CudaStorage {
                 axis,
             };
             launch::<Index>(
-                &index::Descriptor::of(index::Function::Gather, &args, BLOCK, PDL),
+                &index::Descriptor::of(index::Function::Gather, &args, PDL),
                 args,
             )?;
         }
@@ -326,7 +320,7 @@ impl CudaStorage {
             destination,
             axis,
         };
-        launch::<Index>(&index::Descriptor::of(function, &args, BLOCK, PDL), args)
+        launch::<Index>(&index::Descriptor::of(function, &args, PDL), args)
     }
 
     /// The kernel argument of the one-dimensional indices `layout` views in `self`, repeated
@@ -715,7 +709,7 @@ impl BackendStorage for CudaStorage {
                 on_false,
                 out,
             };
-            launch::<ElementwiseWhere>(&WhereDescriptor::of(&args, BLOCK, PDL), args)?;
+            launch::<ElementwiseWhere>(&WhereDescriptor::of(&args, PDL), args)?;
         }
         Ok(Box::new(storage))
     }

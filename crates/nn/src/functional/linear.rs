@@ -49,11 +49,6 @@ const FP8_TILE: (u32, u32, u32) = (128, 128, 128);
 /// The elements of a row one `fp8_quantize` program encodes.
 const FP8_ENCODE_BLOCK: u32 = 1024;
 
-/// The block a row fold of [`dynamic_scales`] reads at a time, the tensor primitives' own, so a
-/// row's largest magnitude is folded by the module of the same key for every projection wider
-/// than the block.
-const ROW_FOLD_BLOCK: u32 = 1024;
-
 /// The partials the one program of `dynamic_scale` reads at a time.
 const SCALE_TILE: u32 = 1024;
 
@@ -300,10 +295,7 @@ pub fn dynamic_scales(x: &Tensor, weight_amax: &Tensor, range: f32) -> Result<(T
         out: ops::operand(&partials)?,
         axes: &[1],
     };
-    ops::launch::<Reduce>(
-        &reduce::Descriptor::of(Function::AbsMax, &fold, ROW_FOLD_BLOCK, PDL),
-        fold,
-    )?;
+    ops::launch::<Reduce>(&reduce::Descriptor::of(Function::AbsMax, &fold, PDL), fold)?;
 
     // 2. The rows' largest, and the two factors from it and the weight's.
     let encode = ops::empty(1, DType::F32)?;

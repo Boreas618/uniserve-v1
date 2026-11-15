@@ -980,12 +980,7 @@ impl DecoderRunner {
                 let length = run.dims().get(1).copied().unwrap_or(0);
                 let out = bytes.narrow(0, frame as usize, length)?;
                 ops::launch::<RgbBytes>(
-                    &rgb::Descriptor {
-                        dtype,
-                        channels: rgb::CHANNELS,
-                        block: rgb::BLOCK,
-                        pdl: false,
-                    },
+                    &rgb::Descriptor::new(dtype, false),
                     rgb::Args {
                         input: ops::operand(&run)?,
                         mean: ops::operand(&mean)?,
@@ -1014,11 +1009,7 @@ impl DecoderRunner {
 
         let pcm = ops::empty((samples as usize, channels as usize), DType::I16)?;
         ops::launch::<PcmInterleave>(
-            &pcm::Descriptor {
-                dtype: DType::F32,
-                block: pcm::BLOCK,
-                pdl: false,
-            },
+            &pcm::Descriptor::new(DType::F32, false),
             pcm::Args {
                 left: ops::operand(&waveform.get(0)?)?,
                 right: ops::operand(&waveform.get(1)?)?,

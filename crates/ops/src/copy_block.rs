@@ -38,15 +38,8 @@ use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
-/// Elements one program moves.
-pub const COPY: u32 = 1024;
-
 /// The rank of every block this operator moves.
 pub const RANK: usize = 4;
-
-/// The elements one program of a wide copy moves: a row of one member's heads in one pass, with each
-/// lane on whole vectors.
-pub const WIDE_COPY: u32 = 2048;
 
 /// What a wide copy's module states of its launch words: each is a multiple of this.
 const WIDE_ALIGNMENT: u64 = 16;
@@ -247,17 +240,19 @@ impl Op for CopyBlock {
             arguments.i64(name, stride);
         }
         let elements = extents.iter().product::<u64>();
-        // `total`, then the elements one program moves, a word the program takes and does not read:
-        // its block is the `BLOCK` constexpr.
-        let copy = if descriptor.wide { WIDE_COPY } else { COPY };
-        arguments.u64("total", elements).u32("block", copy);
+        // The elements one program moves: the module's `BLOCK`, which its package states for a
+        // narrow copy and for a wide one (a row of one member's heads in one pass, each lane on
+        // whole vectors). The `block` word after `total` restates it, and the program reads its
+        // constexpr instead.
+        let copy = kernel.cubin(Self::NAME)?.integer("BLOCK")?;
+        arguments.u64("total", elements).u64("block", copy);
         // A last axis one program wide or more is walked a row at a time (the package's fast path),
         // so the grid counts each row's blocks rather than the elements.
-        let grid = if descriptor.wide || extents[3] >= u64::from(copy) {
+        let grid = if descriptor.wide || extents[3] >= copy {
             let rows = extents[0] * extents[1] * extents[2];
-            LaunchGrid::linear(rows * extents[3].div_ceil(u64::from(copy)))?
+            LaunchGrid::linear(rows * extents[3].div_ceil(copy))?
         } else {
-            LaunchGrid::covering(elements, u64::from(copy))?
+            LaunchGrid::covering(elements, copy)?
         };
         kernel.launch(grid, &mut arguments, stream)
     }

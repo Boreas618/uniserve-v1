@@ -33,14 +33,11 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
-
-/// Elements one thread block blends.
-pub const BLOCK: u32 = 1024;
 
 /// One compilation of `cross_fade`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -55,6 +52,20 @@ pub struct Descriptor {
     pub block: u32,
     /// Whether the module was compiled for programmatic dependent launch.
     pub pdl: bool,
+}
+
+impl Descriptor {
+    /// The blend of `extent` voxels of `dtype` tiles along `axis`, over the operators' block
+    /// ([`descriptor::BLOCK`]).
+    pub const fn new(dtype: DType, extent: u32, axis: u32, pdl: bool) -> Self {
+        Self {
+            dtype,
+            extent,
+            axis,
+            block: descriptor::BLOCK,
+            pdl,
+        }
+    }
 }
 
 impl fmt::Display for Descriptor {
@@ -312,13 +323,7 @@ mod tests {
     use super::*;
 
     fn descriptor() -> Descriptor {
-        Descriptor {
-            dtype: DType::F16,
-            extent: 5,
-            axis: 2,
-            block: BLOCK,
-            pdl: false,
-        }
+        Descriptor::new(DType::F16, 5, 2, false)
     }
 
     #[test]

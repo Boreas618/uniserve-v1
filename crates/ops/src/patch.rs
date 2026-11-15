@@ -32,14 +32,11 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
-
-/// Elements one thread block handles along a destination row.
-pub const BLOCK: u32 = 1024;
 
 /// One compilation of `patch`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -57,8 +54,12 @@ impl Descriptor {
     ///
     /// The geometry is not a compilation choice — the program reads it as words — so it is checked
     /// where it is consumed, by [`geometry`], and a canvas never selects a module.
-    pub const fn new(dtype: DType, block: u32, pdl: bool) -> Self {
-        Self { dtype, block, pdl }
+    pub const fn new(dtype: DType, pdl: bool) -> Self {
+        Self {
+            dtype,
+            block: descriptor::BLOCK,
+            pdl,
+        }
     }
 }
 
@@ -226,11 +227,7 @@ mod tests {
     use platform::DevicePtr;
 
     fn descriptor() -> Descriptor {
-        Descriptor {
-            dtype: DType::BF16,
-            block: BLOCK,
-            pdl: false,
-        }
+        Descriptor::new(DType::BF16, false)
     }
 
     #[test]
@@ -240,7 +237,11 @@ mod tests {
         // compiled difference, and a canvas the manifest missed would be a missing kernel.
         assert_eq!(descriptor().to_string(), "dtype_bf16_block_1024_pdl_false");
         assert_eq!(
-            Descriptor::new(DType::F32, 2048, true).to_string(),
+            Descriptor {
+                block: 2048,
+                ..Descriptor::new(DType::F32, true)
+            }
+            .to_string(),
             "dtype_f32_block_2048_pdl_true"
         );
     }

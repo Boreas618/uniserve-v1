@@ -31,7 +31,7 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
@@ -39,9 +39,6 @@ use crate::{Error, Op, Result, Twins};
 
 /// The widest row these kernels reduce, in elements.
 pub const MAX_WIDTH: u32 = 32768;
-
-/// The elements one `scaled_residual` program walks.
-pub const RESIDUAL_BLOCK: u32 = 1024;
 
 /// One compilation of `weighted_rms_norm`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -702,9 +699,6 @@ fn matches(
     }
 }
 
-/// The elements one `scaled_add` program walks.
-pub const SCALED_ADD_BLOCK: u32 = 1024;
-
 /// One compilation of `sigmoid_gated_add`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SigmoidGatedAddDescriptor {
@@ -845,6 +839,18 @@ pub struct ScaledAddDescriptor {
     /// `i64` argument and derives the row width from the operand's own shape - so it belongs with the
     /// launch, and `check` reads it from the target view.
     pub block: u32,
+}
+
+impl ScaledAddDescriptor {
+    /// The blend of a `source` into a `target`, over the operators' block
+    /// ([`descriptor::BLOCK`]).
+    pub const fn new(target: DType, source: DType) -> Self {
+        Self {
+            target,
+            source,
+            block: descriptor::BLOCK,
+        }
+    }
 }
 
 impl fmt::Display for ScaledAddDescriptor {
@@ -1007,11 +1013,7 @@ mod scaled_add_tests {
     }
 
     fn descriptor(target: DType, source: DType) -> ScaledAddDescriptor {
-        ScaledAddDescriptor {
-            target,
-            source,
-            block: SCALED_ADD_BLOCK,
-        }
+        ScaledAddDescriptor::new(target, source)
     }
 
     fn args(target: Operand, source: Operand) -> ScaledAddArgs {
@@ -1044,11 +1046,7 @@ mod scaled_add_tests {
 
         let target = view(DType::BF16, 1, WIDEST_ENCODER_ROW);
         let source = view(DType::F32, 1, WIDEST_ENCODER_ROW);
-        let descriptor = ScaledAddDescriptor {
-            target: DType::BF16,
-            source: DType::F32,
-            block: SCALED_ADD_BLOCK,
-        };
+        let descriptor = ScaledAddDescriptor::new(DType::BF16, DType::F32);
 
         ScaledAdd::check(&descriptor, &args(target, source))
             .expect("a count past i32::MAX is a launch of this operator");

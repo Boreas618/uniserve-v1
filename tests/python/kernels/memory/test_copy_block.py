@@ -33,7 +33,7 @@ import torch
 pytestmark = pytest.mark.unit
 
 #: The elements one program moves: `COPY` for the general module, `WIDE_COPY`
-#: for a wide one (``crates/ops/src/copy_block.rs``).
+#: for a wide one, the `BLOCK` the package's launch table binds by `wide`.
 COPY = 1024
 WIDE_COPY = 2048
 

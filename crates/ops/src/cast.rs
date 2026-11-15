@@ -28,7 +28,7 @@ use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
-use crate::descriptor::Key;
+use crate::descriptor::{self, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::operand::Operand;
 use crate::strided;
@@ -51,13 +51,14 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
-    /// The descriptor of the call `args` makes.
-    pub fn of(args: &Args, block: u32, pdl: bool) -> Self {
+    /// The descriptor of the call `args` makes, over the operators' block
+    /// ([`descriptor::BLOCK`]).
+    pub fn of(args: &Args, pdl: bool) -> Self {
         Self {
             input: args.x.dtype,
             output: args.out.dtype,
             rank: strided::rank([&args.x, &args.out]),
-            block,
+            block: descriptor::BLOCK,
             pdl,
         }
     }
@@ -198,8 +199,6 @@ mod tests {
     use super::*;
     use platform::DevicePtr;
 
-    const BLOCK: u32 = 1024;
-
     fn contiguous(dtype: DType, shape: &[u64]) -> Operand {
         Operand::new(DevicePtr::from_address(0x2000), dtype, shape)
     }
@@ -218,7 +217,7 @@ mod tests {
     #[test]
     fn the_key_names_both_types_and_the_axes_traversed() {
         let args = args(DType::F32, DType::BF16, &[2, 3, 5]);
-        let descriptor = Descriptor::of(&args, BLOCK, false);
+        let descriptor = Descriptor::of(&args, false);
         assert_eq!(
             descriptor.to_string(),
             "input_f32_output_bf16_rank_1_block_1024_pdl_false"
@@ -231,14 +230,14 @@ mod tests {
         for input in strided::ELEMENTS {
             for output in strided::ELEMENTS {
                 let args = args(input, output, &[4, 8]);
-                let checked = Cast::check(&Descriptor::of(&args, BLOCK, false), &args);
+                let checked = Cast::check(&Descriptor::of(&args, false), &args);
                 assert_eq!(checked.is_ok(), input != output, "{input:?} to {output:?}");
             }
         }
 
         // A packed narrow float is no element of a conversion.
         let args = args(DType::F8E4M3, DType::F32, &[4, 8]);
-        let message = refusal(Cast::check(&Descriptor::of(&args, BLOCK, false), &args));
+        let message = refusal(Cast::check(&Descriptor::of(&args, false), &args));
         assert!(message.contains("input is f8e4m3"), "{message}");
     }
 
@@ -253,7 +252,7 @@ mod tests {
             ),
             out: contiguous(DType::F32, &[5, 3, 2]),
         };
-        let descriptor = Descriptor::of(&permuted, BLOCK, false);
+        let descriptor = Descriptor::of(&permuted, false);
         assert_eq!(descriptor.rank, 3);
         Cast::check(&descriptor, &permuted).unwrap();
 
@@ -266,7 +265,7 @@ mod tests {
             ),
             ..permuted.clone()
         };
-        let descriptor = Descriptor::of(&strided_out, BLOCK, false);
+        let descriptor = Descriptor::of(&strided_out, false);
         let message = refusal(Cast::check(&descriptor, &strided_out));
         assert!(message.contains("out must be contiguous"), "{message}");
 
@@ -274,16 +273,15 @@ mod tests {
             out: contiguous(DType::F32, &[5, 6]),
             ..permuted
         };
-        let descriptor = Descriptor::of(&other_shape, BLOCK, false);
+        let descriptor = Descriptor::of(&other_shape, false);
         let message = refusal(Cast::check(&descriptor, &other_shape));
         assert!(message.contains("expected out of shape"), "{message}");
     }
 
     #[test]
     fn a_conversion_is_exact_unless_it_rounds_into_a_float() {
-        let tolerance = |input, output| {
-            Cast::tolerance(&Descriptor::of(&args(input, output, &[8]), BLOCK, false))
-        };
+        let tolerance =
+            |input, output| Cast::tolerance(&Descriptor::of(&args(input, output, &[8]), false));
 
         // Between integers the low bits are kept, and a float truncates into an integer.
         assert_eq!(tolerance(DType::I64, DType::U8), Tolerance::exact());

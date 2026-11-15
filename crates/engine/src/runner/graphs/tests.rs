@@ -381,7 +381,7 @@ impl Runner for Writes {
             destination: ops::operand(&filled)?,
             bits: 0,
         };
-        ops::launch::<fill::Fill>(&fill::Descriptor::of(&args, 256, false), args)?;
+        ops::launch::<fill::Fill>(&fill::Descriptor::of(&args, false), args)?;
         outputs.push(filled);
         Ok(outputs)
     }
