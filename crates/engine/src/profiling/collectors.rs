@@ -30,6 +30,27 @@ use super::pc_sampling;
 /// The fewest samples a PM sampler's counter data image and hardware buffer hold.
 const PM_MIN_SAMPLES: u64 = 256;
 
+/// The metrics `pm_sampling` collects when the session names none: the graphics engine's and the
+/// SMs' active cycles and the device memory's throughput, the device's whole-device utilization
+/// in CUPTI's metric names.
+const PM_DEFAULT_METRICS: [&str; 3] = [
+    "gr__cycles_active.avg",
+    "sm__cycles_active.avg",
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+];
+
+/// The metrics `range_metrics` collects when the session names none: each range's device time.
+const RANGE_DEFAULT_METRICS: [&str; 1] = ["gpu__time_duration.sum"];
+
+/// The metrics a collector collects: the session's, or `defaults` when it names none.
+fn metrics_or(stated: &[String], defaults: &[&str]) -> Vec<String> {
+    if stated.is_empty() {
+        defaults.iter().map(|&metric| metric.to_owned()).collect()
+    } else {
+        stated.to_vec()
+    }
+}
+
 /// A prepared collector.
 enum Prepared {
     Timeline {
@@ -775,6 +796,7 @@ fn prepare(
             cupti()?;
             let (_, device) = device()?;
             let options = &request.pm_sampling;
+            let metrics = metrics_or(&options.metrics, &PM_DEFAULT_METRICS);
             // The image and the hardware buffer hold twice the samples taken between two reads: a
             // read whose image fills loses the samples past it. The buffer takes the image's
             // bytes per sample, which exceed a raw record's (on GB200, 13.6 KB of image against
@@ -782,11 +804,11 @@ fn prepare(
             let per_read =
                 (super::session::DRAIN_PERIOD.as_nanos() as u64).div_ceil(options.interval_ns);
             let samples = (2 * per_read).max(PM_MIN_SAMPLES);
-            PmSampler::sample_bytes(device, &options.metrics, options.interval_ns)
+            PmSampler::sample_bytes(device, &metrics, options.interval_ns)
                 .and_then(|bytes| {
                     PmSampler::enable(
                         device,
-                        &options.metrics,
+                        &metrics,
                         options.interval_ns,
                         (samples as usize * bytes).next_multiple_of(1 << 20),
                         u32::try_from(samples).unwrap_or(u32::MAX),
@@ -813,7 +835,7 @@ fn prepare(
             RangeProfiler::enable(
                 context,
                 device,
-                &options.metrics,
+                &metrics_or(&options.metrics, &RANGE_DEFAULT_METRICS),
                 ranges,
                 options.pass_ranges,
             )

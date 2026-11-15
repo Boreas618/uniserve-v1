@@ -86,8 +86,8 @@ pub struct TimelineOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PmSamplingOptions {
-    /// Metric names of NVIDIA's performance library that PM sampling
-    /// collects in one pass.
+    /// Metric names of the collector's performance library that PM sampling collects in one
+    /// pass; the collector's own default metrics when empty.
     pub metrics: Vec<String>,
     /// The sampling interval, nanoseconds of device time.
     pub interval_ns: u64,
@@ -96,11 +96,7 @@ pub struct PmSamplingOptions {
 impl Default for PmSamplingOptions {
     fn default() -> Self {
         Self {
-            metrics: vec![
-                "gr__cycles_active.avg".to_owned(),
-                "sm__cycles_active.avg".to_owned(),
-                "dram__throughput.avg.pct_of_peak_sustained_elapsed".to_owned(),
-            ],
+            metrics: Vec::new(),
             interval_ns: 100_000,
         }
     }
@@ -146,7 +142,7 @@ const RANGE_STORAGE_GRANULE: u64 = 2 << 20;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RangeMetricsOptions {
-    /// Metric names one pass collects.
+    /// Metric names one pass collects; the collector's own default metrics when empty.
     pub metrics: Vec<String>,
     pub ranges: MetricRanges,
     /// The ranges one pass holds, at least [`RANGE_STEP_LAUNCHES`]: its
@@ -159,7 +155,7 @@ pub struct RangeMetricsOptions {
 impl Default for RangeMetricsOptions {
     fn default() -> Self {
         Self {
-            metrics: vec!["gpu__time_duration.sum".to_owned()],
+            metrics: Vec::new(),
             ranges: MetricRanges::Kernel,
             pass_ranges: 512,
         }
@@ -352,9 +348,6 @@ impl SessionRequest {
                 "options of {} are stated, but the session does not run it",
                 collector.as_str()
             ));
-        }
-        if self.pm_sampling.metrics.is_empty() || self.range_metrics.metrics.is_empty() {
-            return Err("a metric collector names at least one metric".to_owned());
         }
         if !(PcSamplingOptions::MIN_PERIOD..=31).contains(&self.pc_sampling.period) {
             return Err(format!(
