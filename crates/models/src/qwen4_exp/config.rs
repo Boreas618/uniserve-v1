@@ -150,6 +150,11 @@ pub struct NgramEmbeddingConfig {
 }
 
 impl NgramEmbeddingConfig {
+    /// The ids before a token its n-grams read: `ngram_size − 1`.
+    pub const fn history(&self) -> u32 {
+        self.ngram_size - 1
+    }
+
     /// Hash heads of one token: `heads_per_ngram` for each n-gram length.
     pub const fn heads(&self) -> u32 {
         (self.ngram_size - 1) * self.heads_per_ngram
@@ -628,11 +633,12 @@ impl NgramEmbeddingConfig {
             seed: u64::from(values.optional_index("seed")?.unwrap_or(1234)),
         };
 
-        // The hash reads the token and the two before it, which is what a batch states of a
-        // row's history ([`nn::TokenBatch::ngram_context`]).
-        if config.ngram_size != 3 {
+        // An n-gram of order `n` reads the `n − 1` ids before its token, which the model
+        // declares as its token history ([`nn::family::TextModel::token_history`]); an order
+        // below two reads none.
+        if config.ngram_size < 2 {
             return Err(ID.config(format!(
-                "an n-gram size of {} is not served: the hash reads a token and the two before it",
+                "an n-gram size of {} hashes no id before a token's own",
                 config.ngram_size
             )));
         }
@@ -865,6 +871,25 @@ mod tests {
         assert_eq!(sizes.iter().sum::<u64>(), 320_001_446);
         assert_eq!(ngram.table_rows(), 320_001_536);
         assert_eq!(ngram.table_rows() / u64::from(ngram.parts), 2_500_012);
+    }
+
+    /// An n-gram of order `n` reads the `n − 1` ids before its token, with `heads_per_ngram`
+    /// heads for each length `2..=n`; an order below two reads none and is refused.
+    #[test]
+    fn the_history_an_ngram_reads_follows_its_order() {
+        let order = |size: u32| {
+            let mut value = fixtures::flash_next();
+            value["text_config"]["ngram_size"] = serde_json::json!(size);
+            value["text_config"]["ple_embed_dim"] = serde_json::json!(240 * (size - 1));
+            parse(&value)
+        };
+
+        let ngram = order(4).expect("an n-gram of order four").ngram;
+        assert_eq!((ngram.history(), ngram.heads()), (3, 24));
+        assert_eq!(ngram.multipliers(0, 248_320).len(), 4);
+        assert_eq!(order(2).expect("bigrams").ngram.history(), 1);
+
+        assert!(order(1).is_err());
     }
 
     #[test]

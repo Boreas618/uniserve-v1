@@ -1242,6 +1242,7 @@ mod tests {
             denoise_steps: if denoises { STEPS } else { 0 },
             bos_token_id: 0,
             eos_token_ids: Vec::new(),
+            token_history: 0,
             feature_bytes: 0,
             encoder_identity: String::new(),
             latent_seed: 0,

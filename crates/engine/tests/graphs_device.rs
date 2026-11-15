@@ -154,7 +154,7 @@ fn token_batch(columns: [Tensor; 5], rows: usize, bound: u32) -> TokenBatch {
 
     TokenBatch {
         token_ids: None,
-        ngram_context: None,
+        token_history: None,
         positions,
         slot_mapping,
         seq_lens,

@@ -14,7 +14,7 @@
 //! ```text
 //! pooled page tables [slots + 1, width] ─ index_select(slot rows) → KvCache::block_tables
 //! next input tokens  [slots + 1, …]     ─ index_select(slot rows) → a decode's input ids
-//! contexts           [slots + 1, 2]     ─ index_select(slot rows) → TokenBatch::ngram_context
+//! contexts           [slots + 1, w]     ─ index_select(slot rows) → TokenBatch::token_history
 //! accepted counts    [slots + 1]        ─ index_select(slot rows) → VerifySlots::num_accepted
 //! input ids                             → embed_input_ids         → hidden [tokens, hidden]
 //! hidden, batch, cache, state           → forward                 → hidden [tokens, hidden]
@@ -34,9 +34,10 @@
 //! branches on, and the completion keeps what the batch asked for. The outputs and their order
 //! are stated in [`output`].
 //!
-//! A model whose layers read token ids (`TextModel::reads_token_ids`) is lent the ids the
-//! forward embeds and the two ids before each row, which its slot keeps and the forward
-//! advances to the row's last two (`columns`, token ids). A runner that speculates over a
+//! A model whose layers read token ids (`TextModel::token_history`) is lent the ids the
+//! forward embeds and the `w` ids before each row its history declares, which its slot keeps
+//! and the forward advances to the row's last `w` (`columns`, token ids). A runner that
+//! speculates over a
 //! model whose state keeps a slot per verified token (`nn::family::StateField::stepwise`) lends
 //! every forward its state rows' verify slots (`nn::VerifySlots`; `columns`, verify slots):
 //! their slots, which an input column states, and how many tokens of their slots' last steps
@@ -389,14 +390,14 @@ impl Drop for Lander {
 }
 
 impl CausalLmRunner {
-    /// The bytes of the runner's input tensors for `config`: the `inputs` its [`Graphs`] are
-    /// made with.
+    /// The bytes of the input tensors of a runner of `model` under `config`: the `inputs` its
+    /// [`Graphs`] are made with.
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] for a config with no bucket.
-    pub fn input_bytes(config: &CausalLmConfig) -> Result<u64> {
-        Ok(stated(config)?.1.bytes())
+    pub fn input_bytes(config: &CausalLmConfig, model: &dyn TextModel) -> Result<u64> {
+        Ok(stated(config, model)?.1.bytes())
     }
 
     /// The pages of the scratch page set paired forwards of a runner of `buckets` compute over,
@@ -436,7 +437,7 @@ impl CausalLmRunner {
         if config.drafts == 0 {
             return Ok(0);
         }
-        let layout = stated(config)?.1;
+        let layout = stated(config, model)?.1;
 
         Kept::bytes(
             layout.rows(),
@@ -457,7 +458,7 @@ impl CausalLmRunner {
     /// [`Error::Invalid`] for a config with no bucket, or a model whose state keeps a slot per
     /// verified token under a config that states no drafts.
     pub(crate) fn slot_bytes(config: &CausalLmConfig, model: &dyn TextModel) -> Result<u64> {
-        let layout = stated(config)?.1;
+        let layout = stated(config, model)?.1;
         let owned = owned_slots(model, config)?;
 
         Ok(Slots::bytes(
@@ -465,7 +466,7 @@ impl CausalLmRunner {
             model.vocabulary(),
             layout.rows() as u32,
             1,
-            model.reads_token_ids(),
+            model.token_history(),
             owned.is_some(),
         ))
     }
@@ -510,7 +511,7 @@ impl CausalLmRunner {
         for bucket in config.buckets.iter() {
             bucket.causal_lm()?;
         }
-        let (buckets, layout) = stated(&config)?;
+        let (buckets, layout) = stated(&config, &*model)?;
 
         if graphs.enter().is_ok() != stream.is_some() {
             return Err(Error::Invalid(
@@ -530,7 +531,7 @@ impl CausalLmRunner {
             vocabulary,
             layout.rows() as u32,
             1,
-            model.reads_token_ids(),
+            model.token_history(),
             owned.is_some(),
         )?;
         let sampler = Sampler::new(
@@ -742,7 +743,7 @@ impl CausalLmRunner {
     ///
     /// [`Error::Invalid`] for a config with no bucket.
     pub(crate) fn image_bytes(config: &CausalLmConfig, model: &dyn TextModel) -> Result<u64> {
-        Features::bytes(model, stated(config)?.1.tokens())
+        Features::bytes(model, stated(config, model)?.1.tokens())
     }
 
     /// Lends the runner a feature buffer, [`CausalLmRunner::image_bytes`] of device memory it
@@ -1569,7 +1570,7 @@ impl Runner for CausalLmRunner {
 
         let batch = TokenBatch {
             token_ids: contexts.as_ref().map(|_| ids.clone()),
-            ngram_context: contexts.clone(),
+            token_history: contexts.clone(),
             rope_positions: match images {
                 Some(features) => Some(features.rope(&positions, tokens)?),
                 None => None,
@@ -1688,12 +1689,12 @@ impl Runner for CausalLmRunner {
         let logical = self.slots.logical().index_select(&call_slots, 0)?;
         let sampling = self.slots.sampling().index_select(&call_slots, 0)?;
 
-        // ---- What each row's slot continues from: its last two ids, and one standing token ----
+        // ---- What each row's slot continues from: its last ids, and one standing token ----
 
         // A paired forward writes nothing a serving request reads.
         if !self.paired.get() {
             if let (Some(table), Some(contexts)) = (self.slots.context(), &contexts) {
-                let index = self.column(Column::NextContext, (rows, 2))?;
+                let index = self.column(Column::NextContext, (rows, table.dim(1)?))?;
                 write_rows(table, &slots, &history_ids(contexts, &ids, &index)?)?;
             }
             if let Some(accepted) = self.slots.accepted() {
@@ -2070,8 +2071,9 @@ impl Runner for CausalLmRunner {
 
 /// The buckets a runner of `config` states outside an expert union, and the layout of its
 /// input tensors.
-fn stated(config: &CausalLmConfig) -> Result<(Buckets, Layout)> {
+fn stated(config: &CausalLmConfig, model: &dyn TextModel) -> Result<(Buckets, Layout)> {
     let buckets = config.buckets.with_drafts(config.drafts);
+    let history = model.token_history().map_or(0, |history| history.width);
 
     let pages = match (config.drafts, &config.draft_pool) {
         (0, _) => 0,
@@ -2082,7 +2084,7 @@ fn stated(config: &CausalLmConfig) -> Result<(Buckets, Layout)> {
             ));
         }
     };
-    let layout = Layout::of(buckets.iter(), config.drafts, pages)?;
+    let layout = Layout::of(buckets.iter(), config.drafts, pages, history)?;
 
     Ok((buckets, layout))
 }
@@ -2311,7 +2313,7 @@ fn check_buffers(
 }
 
 /// The ids `index` names in the id history of a forward (`columns`, token ids): `contexts`,
-/// `[rows, 2]` U32, the two ids before each of its rows, then `ids`, `[tokens]` U32, its token
+/// `[rows, w]` U32, the `w` ids before each of its rows, then `ids`, `[tokens]` U32, its token
 /// ids. The result has `index`'s shape.
 ///
 /// # Errors

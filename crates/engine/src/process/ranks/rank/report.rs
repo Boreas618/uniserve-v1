@@ -19,10 +19,11 @@ impl ModelRunner {
     /// phases its buckets serve, each held by every request slot at once (a token phase's
     /// stage is the slots), the shapes it captured that a batch states, the cache groups in
     /// class order with their page `seeds` and the deployment's cache configuration, and the
-    /// model's limits and control tokens. A text rank denoises nothing.
+    /// model's limits, control tokens and the token history `text_model` reads. A text rank
+    /// denoises nothing.
     ///
-    /// A rank that encodes images of at most `rows` rows with the vision tower of `model`, given
-    /// as `vision: Some((model, rows))` (`None` on a rank that encodes none,
+    /// A rank that encodes images of at most `rows` rows with the vision tower of `text_model`,
+    /// given as `images: Some(rows)` (`None` on a rank that encodes none,
     /// `ModelRunner::encodes_images`), also serves their encodings, held by every request slot,
     /// in the shapes its vision runner captures, and states the bytes of a row of their encoder
     /// outputs (`Capacity::feature_bytes`).
@@ -36,9 +37,10 @@ impl ModelRunner {
     pub(crate) fn capacity(
         &self,
         config: &CausalLmConfig,
+        text_model: &dyn TextModel,
         layout: &CacheLayout,
         seeds: Vec<storage::Key>,
-        vision: Option<(&dyn TextModel, u32)>,
+        images: Option<u32>,
     ) -> Result<Capacity> {
         let mut phases = 0;
         let mut rows = [0; Phase::COUNT];
@@ -63,13 +65,13 @@ impl ModelRunner {
         // The image encodings, one image a batch: each bucket the vision runner captures holds
         // one.
         let mut feature_bytes = 0;
-        if let Some((model, images)) = vision {
+        if let Some(images) = images {
             let encode = Phase::VisionEncode.index();
             phases |= 1 << encode;
             rows[encode] = config.slots.max(1);
-            let captured = VisionRunner::captured(model, images)?;
+            let captured = VisionRunner::captured(text_model, images)?;
             buckets.extend(captured.iter().map(|bucket| bucket.shape()));
-            feature_bytes = VisionRunner::feature_bytes(model);
+            feature_bytes = VisionRunner::feature_bytes(text_model);
         }
 
         let (calls, _) = config.buckets.bounds();
@@ -93,6 +95,9 @@ impl ModelRunner {
             denoise_steps: 0,
             bos_token_id: model.bos,
             eos_token_ids: model.eos.clone(),
+            token_history: text_model
+                .token_history()
+                .map_or(0, |history| history.width),
             feature_bytes,
             // The group's encoder identity and latent seed are stated from its ranks' weights by
             // the rank start (`crate::process::ranks::capacities`).

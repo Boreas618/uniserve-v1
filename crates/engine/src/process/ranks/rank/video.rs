@@ -1320,6 +1320,7 @@ impl ModelRunner {
             denoise_steps,
             bos_token_id: config.bos,
             eos_token_ids: config.eos.clone(),
+            token_history: 0,
             feature_bytes: 0,
             // The group's encoder identity and latent seed are stated from its ranks' weights by
             // the rank start (`crate::process::ranks::capacities`).

@@ -633,7 +633,7 @@ pub(crate) mod tests {
 
     use crate::batch::{MediaRow, Variant};
     use nn::capability::{CausalLm, PatchFormat, PixelNorm, Vision};
-    use nn::family::{CacheShape, ExpertShape, StateShape, TextModel};
+    use nn::family::{CacheShape, ExpertShape, StateShape, TextModel, TokenHistory};
     use nn::{Drafter, ExpertExchange, KvCache, RecurrentState, TokenBatch};
     use ops::Generation;
     use proto::request::RequestId as CallRequest;
@@ -721,6 +721,10 @@ pub(crate) mod tests {
 
         fn vision(&self) -> Option<&dyn Vision> {
             Some(self)
+        }
+
+        fn token_history(&self) -> Option<TokenHistory> {
+            None
         }
     }
 

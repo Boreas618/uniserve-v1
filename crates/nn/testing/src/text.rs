@@ -72,8 +72,8 @@ pub fn open(families: &[Family], checkpoint: &Checkpoint) -> nn::Result<Box<dyn 
 
 /// The batch of one forward of `phase` over pages of `page_size` tokens whose rows read at most
 /// `max_kv_len` keys: `columns` holds its `positions`, `slot_mapping`, `seq_lens`,
-/// `query_offsets` and `logits_rows`, in that order, and `ngram` the tokens' ids and the two ids
-/// before each row for a model that reads them.
+/// `query_offsets` and `logits_rows`, in that order, and `ngram` the tokens' ids and the ids
+/// before each row (`TokenBatch::token_history`) for a model that reads them.
 pub fn batch(
     phase: Phase,
     columns: [Tensor; 5],
@@ -89,7 +89,7 @@ pub fn batch(
         logits_rows,
     ] = columns;
     let num_tokens = positions.elem_count() as u32;
-    let (token_ids, ngram_context) = ngram.unzip();
+    let (token_ids, token_history) = ngram.unzip();
 
     TokenBatch {
         positions,
@@ -105,7 +105,7 @@ pub fn batch(
         rope_positions: None,
         live_tokens: None,
         token_ids,
-        ngram_context,
+        token_history,
     }
 }
 

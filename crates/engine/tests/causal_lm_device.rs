@@ -30,7 +30,7 @@ use engine::runner::causal_lm::{CausalLmConfig, PageWork};
 use engine::runner::graphs::Graphs;
 use engine::runner::{CausalLmRunner, Runner};
 use nn::capability::Drafter;
-use nn::family::{CacheShape, ExpertShape, StateShape, TextModel};
+use nn::family::{CacheShape, ExpertShape, StateShape, TextModel, TokenHistory};
 use nn::functional::{WeightOrder, embedding, rms_norm};
 use nn::modules::Linear;
 use nn::{CausalLm, ExpertExchange, KvCache, RecurrentState, TokenBatch};
@@ -225,6 +225,10 @@ impl TextModel for Tiny {
     fn drafter(&self) -> Option<&dyn Drafter> {
         self.drafter.as_ref().map(|drafter| drafter as &dyn Drafter)
     }
+
+    fn token_history(&self) -> Option<TokenHistory> {
+        None
+    }
 }
 
 /// The draft pool of the speculating bench: draft pages of one run of a page's tokens over
@@ -271,7 +275,7 @@ impl Bench {
     /// none for zero.
     fn speculating(drafts: u32) -> Outcome<Self> {
         let config = config(drafts);
-        let inputs = CausalLmRunner::input_bytes(&config)?;
+        let inputs = CausalLmRunner::input_bytes(&config, &Tiny::meta(drafts > 0)?)?;
 
         // The draft cache of a drafter that reads none: no layer, and tensors nothing reads.
         let draft = |unread: Tensor| KvCache {
@@ -388,7 +392,7 @@ fn new_slot(slot: u32, history: Vec<u32>) -> NewSlot {
         history,
         bias: Vec::new(),
         allowed: None,
-        context: [0, 0],
+        context: Vec::new(),
     }
 }
 

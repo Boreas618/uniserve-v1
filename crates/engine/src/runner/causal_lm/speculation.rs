@@ -493,24 +493,29 @@ pub(crate) fn accept(
     Ok((agreed, last))
 }
 
-/// The two token ids each verification's slot continues from, `[rows, 2]` U32 (module
-/// documentation): the id before `last`'s token and that token's own, `last`, `[rows]` U32,
-/// being the token each verification's acceptance ends on ([`accept`]).
+/// The `w` token ids each verification's slot continues from, `[rows, w]` U32 (module
+/// documentation): the `w − 1` ids before `last`'s token and that token's own, `last`,
+/// `[rows]` U32, being the token each verification's acceptance ends on ([`accept`]).
 ///
-/// - `before`: `[tokens, 2]` U32, the two ids before each token of the batch, the earlier
-///   first: the verification's `nn::TokenBatch::ngram_context`;
+/// - `before`: `[tokens, w]` U32, the `w` ids before each token of the batch, the oldest
+///   first: the verification's `nn::TokenBatch::token_history`;
 /// - `ids`: `[tokens]` U32, the batch's token ids.
 ///
 /// # Errors
 ///
 /// Columns of another shape or element type.
 pub(crate) fn continued(before: &Tensor, ids: &Tensor, last: &Tensor) -> Result<Tensor> {
-    let earlier = before
-        .narrow(1, 1, 1)?
-        .flatten_all()?
-        .index_select(last, 0)?;
+    let width = before.dim(1)?;
+    let own = ids.index_select(last, 0)?.unsqueeze(1)?;
+    if width == 1 {
+        return Ok(own);
+    }
 
-    Ok(Tensor::stack(&[earlier, ids.index_select(last, 0)?], 1)?)
+    let earlier = before
+        .index_select(last, 0)?
+        .narrow(1, 1, width - 1)?
+        .contiguous()?;
+    Ok(Tensor::cat(&[earlier, own], 1)?)
 }
 
 /// Whether `call` is a verification: a verification, or a decode, which a speculating runner
@@ -766,13 +771,14 @@ pub(crate) fn fill_verification(
     let mut table = sampler::commit_table(&columns.commit, calls, layout.rows())?;
     let stride = layout.rows();
 
-    // ---- The two ids before each token, in the id history of its token rows ----
+    // ---- The ids before each token, in the id history of its token rows ----
 
-    // Each token is a row whose context, gathered by its slot, is its request's: the two ids
-    // before a token are its row's context at its request's first token, the context's later
-    // id and the request's first token at the second, and the request's two tokens before it
-    // after that (`columns`, token ids). A token no request holds keeps its row's context.
-    let history = 2 * bucket_tokens as u32;
+    // Each token is a row whose context, gathered by its slot, is its request's: the `w` ids
+    // before a token are its request's tokens before it, led by its row's context's later ids
+    // where the request holds fewer than `w` before it (`columns`, token ids). A token no
+    // request holds keeps its row's context.
+    let width = layout.history() as u32;
+    let history = width * bucket_tokens as u32;
     let mut contexts: Vec<u32> = (0..history).collect();
 
     for (index, call) in rows.calls.iter().enumerate() {
@@ -802,15 +808,16 @@ pub(crate) fn fill_verification(
             }
             extras[token * drafts..][..ahead].copy_from_slice(&drafted[..ahead]);
 
+            // Entry `j` of a token's context is the id `w − j` before it: the request's own
+            // when it reaches that far back, and its row's context otherwise.
             let (at, ahead) = (token as u32, ahead as u32);
-            contexts[2 * token] = match ahead {
-                0 | 1 => 2 * at + ahead,
-                _ => history + at - 2,
-            };
-            contexts[2 * token + 1] = match ahead {
-                0 => 2 * at + 1,
-                _ => history + at - 1,
-            };
+            for entry in 0..width {
+                let back = width - entry;
+                contexts[(width * at + entry) as usize] = match ahead.checked_sub(back) {
+                    Some(_) => history + at - back,
+                    None => width * at + width - (back - ahead),
+                };
+            }
         }
         for offset in 0..=drafts {
             windows[index * (drafts + 1) + offset] = (first + offset.min(drafted.len())) as u32;
@@ -1175,7 +1182,7 @@ impl CausalLmRunner {
         let contexts = match self.slots.context() {
             Some(table) => {
                 let gathered = table.index_select(&self.column(Column::SlotRows, tokens)?, 0)?;
-                let index = self.column(Column::TokenContext, (tokens, 2))?;
+                let index = self.column(Column::TokenContext, (tokens, table.dim(1)?))?;
 
                 Some(history_ids(&gathered, &ids, &index)?)
             }
@@ -1184,7 +1191,7 @@ impl CausalLmRunner {
 
         let batch = TokenBatch {
             token_ids: contexts.as_ref().map(|_| ids.clone()),
-            ngram_context: contexts.clone(),
+            token_history: contexts.clone(),
             positions: self.column(Column::Positions, tokens)?,
             slot_mapping: self.column(Column::SlotMapping, tokens)?,
             seq_lens: self.column(Column::SeqLens, tokens)?,
@@ -1428,7 +1435,7 @@ impl CausalLmRunner {
         let lens = self.column(Column::DraftLens, rows)?;
         let batch = TokenBatch {
             token_ids: None,
-            ngram_context: None,
+            token_history: None,
             positions: self.column(Column::Positions, tokens)?,
             slot_mapping,
             seq_lens: lens.clone(),
@@ -1508,7 +1515,7 @@ impl CausalLmRunner {
 
                 let batch = TokenBatch {
                     token_ids: None,
-                    ngram_context: None,
+                    token_history: None,
                     positions: step_column(Column::ChainPositions, step)?.add(&ahead_positions)?,
                     slot_mapping: slots.index_select(&index, 0)?,
                     seq_lens: lens.clone(),

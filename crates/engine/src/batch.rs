@@ -895,10 +895,13 @@ pub struct NewSlot {
     /// The tokens the request may sample, strictly increasing, when it restricts them: every other
     /// token's bias row entry is `-inf`, whatever its bias.
     pub allowed: Option<Vec<u32>>,
-    /// The two token ids before the request's first token in this batch, the earlier first, which
-    /// a model with an n-gram embedding reads as the context of that token; the end-of-text id
-    /// where the request has none.
-    pub context: [u32; 2],
+    /// The token ids before the request's first token in this batch, the oldest first, which a
+    /// model whose layers read token ids reads as the history of that token: the last
+    /// [`Capacity::token_history`](crate::batch::Capacity::token_history) of them, fewer when
+    /// the request holds fewer, and none for a model that reads no token ids. The runner stands
+    /// the model's fill id in for each position before the request's first token
+    /// (`nn::family::TokenHistory::fill`).
+    pub context: Vec<u32>,
 }
 
 /// One copy of a request slot's recurrent state between its banks and a block of its state table.

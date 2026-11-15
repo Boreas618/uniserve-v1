@@ -12,11 +12,11 @@
 //! | `predicates` | U8 `[slots]` | whether the slot's request continues |
 //! | `logical`, `sampling`, `verified` | I32 `[slots + 1]` | the slot's logical and sampling positions and its verified cache length |
 //! | `bans` | U32 `[rows, ceil(vocabulary / 32)]` | the ban masks of the step being issued |
-//! | `context` | U32 `[slots + 1, 2]` | the two token ids before the slot's next row, the earlier first |
+//! | `context` | U32 `[slots + 1, width]` | the `width` token ids before the slot's next row, the oldest first (`nn::family::TokenHistory`) |
 //! | `accepted` | U32 `[slots + 1]` | how many tokens of the slot's last step stand (`nn::VerifySlots::num_accepted`) |
 //!
 //! The last two are held only where a forward reads them: `context` for a model whose layers
-//! read token ids (`nn::family::TextModel::reads_token_ids`), `accepted` for a runner that
+//! read token ids (`nn::family::TextModel::token_history`), `accepted` for a runner that
 //! speculates over a model whose state keeps a slot per verified token
 //! (`nn::family::StateField::stepwise`).
 //!
@@ -34,7 +34,8 @@
 //! - at construction every table is zeroed, and every entry of `accepted` set to one;
 //! - a batch that starts a request on a slot ([`Slots::start`]) sets the slot's counts to the
 //!   request's own history, its bias row when the request states a bias or an allowed set,
-//!   its context to the two ids before the request's first token of the batch, its accepted
+//!   its context to the ids before the request's first token of the batch, the model's fill
+//!   id standing for those before the request's first token, its accepted
 //!   count to one, and, when the request's first step here is a decode, the state the engine
 //!   that sampled its last token committed;
 //! - a batch that restores a slot's recurrent state from a cached prefix sets the slot's
@@ -55,6 +56,8 @@
 //! nothing.
 
 use std::sync::Arc;
+
+use nn::family::TokenHistory;
 
 use crate::batch::{Columns, NewSlot, StateCopy, StateDirection};
 use ops::allocator::ALIGNMENT;
@@ -93,12 +96,13 @@ enum Table {
 impl Table {
     /// The shape and the element type of the table, for `slots` request slots over a
     /// `vocabulary`-wide logit row, buckets of at most `rows` rows and `width` next input tokens
-    /// a slot. `context` and `accepted` state whether the runner holds the context table and the
-    /// accepted counts; a table it does not hold has no row.
+    /// a slot. `context` states the token history of a model whose layers read token ids, and
+    /// `accepted` whether the runner holds the accepted counts; a table it does not hold has no
+    /// row.
     fn shape(
         self,
         (slots, vocabulary, rows, width): (usize, usize, usize, usize),
-        context: bool,
+        context: Option<TokenHistory>,
         accepted: bool,
     ) -> (Shape, DType) {
         let held = |held: bool| if held { slots + 1 } else { 0 };
@@ -112,7 +116,10 @@ impl Table {
                 let words = ban_words(vocabulary as u32) as usize;
                 ((rows, words).into(), DType::U32)
             }
-            Self::Context => ((held(context), 2).into(), DType::U32),
+            Self::Context => {
+                let history = context.map_or(0, |history| history.width as usize);
+                ((held(context.is_some()), history).into(), DType::U32)
+            }
             Self::Accepted => (held(accepted).into(), DType::U32),
         }
     }
@@ -142,8 +149,9 @@ pub(crate) struct Slots {
     width: u32,
     /// Each table every runner holds.
     tables: Held,
-    /// The context table, for a model whose layers read token ids.
-    context: Option<Tensor>,
+    /// The context table, for a model whose layers read token ids, with the history the model
+    /// reads.
+    context: Option<(Tensor, TokenHistory)>,
     /// The accepted counts, for a runner whose forwards lend verify slots.
     accepted: Option<Tensor>,
     /// The device side; `None` for a runner whose graphs hold no device.
@@ -174,7 +182,7 @@ fn shapes(
     vocabulary: u32,
     rows: u32,
     width: u32,
-    context: bool,
+    context: Option<TokenHistory>,
     accepted: bool,
 ) -> Vec<(Shape, DType)> {
     let extents = (
@@ -205,22 +213,22 @@ fn offsets(shapes: &[(Shape, DType)]) -> ([u64; Table::COUNT], u64) {
 impl Slots {
     /// The bytes of device memory the state of `slots` request slots takes, over a
     /// `vocabulary`-wide logit row, for buckets of at most `rows` rows and `width` next input
-    /// tokens a slot, with the context table when `context` and the accepted counts when
-    /// `accepted`.
+    /// tokens a slot, with the context table of a model that reads the token history
+    /// `context` and the accepted counts when `accepted`.
     pub(crate) fn bytes(
         slots: u32,
         vocabulary: u32,
         rows: u32,
         width: u32,
-        context: bool,
+        context: Option<TokenHistory>,
         accepted: bool,
     ) -> u64 {
         offsets(&shapes(slots, vocabulary, rows, width, context, accepted)).1
     }
 
     /// The state of `slots` request slots as a runner starts it: every table zeroed and every
-    /// accepted count one. The context table is held when `context`, for a model whose layers
-    /// read token ids, and the accepted counts when `accepted`, for a runner whose forwards
+    /// accepted count one. The context table is held for a model whose layers read the token
+    /// history `context`, and the accepted counts when `accepted`, for a runner whose forwards
     /// lend verify slots.
     ///
     /// `stream` is the stream the runner's graphs replay on, and `None` for graphs that hold
@@ -236,7 +244,7 @@ impl Slots {
         vocabulary: u32,
         rows: u32,
         width: u32,
-        context: bool,
+        context: Option<TokenHistory>,
         accepted: bool,
     ) -> Result<Self> {
         if slots == 0 || vocabulary == 0 || rows == 0 || width == 0 {
@@ -311,7 +319,9 @@ impl Slots {
             verified: table(Table::Verified)?,
             bans: table(Table::Bans)?,
         };
-        let context = context.then(|| table(Table::Context)).transpose()?;
+        let context = context
+            .map(|history| Ok::<_, Error>((table(Table::Context)?, history)))
+            .transpose()?;
         let accepted = accepted.then(|| table(Table::Accepted)).transpose()?;
 
         Ok(Self {
@@ -357,11 +367,11 @@ impl Slots {
         &self.tables.bans
     }
 
-    /// The context table, `[slots + 1, 2]` U32, the padding row included: row `s - 1` holds the
-    /// two token ids before the next row of request slot `s`, the earlier first. `None` for a
-    /// runner whose model reads no token ids.
-    pub(crate) const fn context(&self) -> Option<&Tensor> {
-        self.context.as_ref()
+    /// The context table, `[slots + 1, width]` U32, the padding row included: row `s - 1`
+    /// holds the `width` token ids before the next row of request slot `s`, the oldest first.
+    /// `None` for a runner whose model reads no token ids.
+    pub(crate) fn context(&self) -> Option<&Tensor> {
+        self.context.as_ref().map(|(table, _)| table)
     }
 
     /// The accepted counts, `[slots + 1]` U32, the padding row included: entry `s - 1` holds
@@ -434,9 +444,10 @@ impl Slots {
     /// - A request that states a bias or an allowed set has its bias row written
     ///   (`Sampler::bias_row`). A request that states neither leaves the row as it is: none of
     ///   its rows is flagged to read it (`Columns::biased`).
-    /// - Where the runner holds them, the slot's context becomes the two ids before the
-    ///   request's first token of the batch (`NewSlot::context`), and its accepted count one:
-    ///   the request's state starts in its home row.
+    /// - Where the runner holds them, the slot's context becomes the ids before the request's
+    ///   first token of the batch (`NewSlot::context`), led by the model's fill id
+    ///   (`nn::family::TokenHistory::fill`) for each position before the request's first
+    ///   token, and its accepted count one: the request's state starts in its home row.
     /// - In a decode batch (`decode`), a new slot's request continues from a token another
     ///   engine sampled, so the slot's commit state starts as that engine's commit left it:
     ///   the row's input token as the next input token, the token's position as the logical
@@ -447,8 +458,8 @@ impl Slots {
     /// # Errors
     ///
     /// [`Error::Invalid`] for a slot the runner holds no state for, a new slot of a decode
-    /// batch that no row of the batch runs on, or a row whose values no slot state holds; the
-    /// driver's refusal of a copy.
+    /// batch that no row of the batch runs on, a context longer than the model's history, or a
+    /// row whose values no slot state holds; the driver's refusal of a copy.
     pub(crate) fn start(
         &mut self,
         sampler: &Sampler,
@@ -475,8 +486,22 @@ impl Slots {
                 self.write(Table::Bias, u64::from(own) * row_bytes, &row)?;
             }
 
-            if self.context.is_some() {
-                self.write(Table::Context, u64::from(own) * 8, &new.context)?;
+            if let Some((_, history)) = self.context {
+                let width = history.width as usize;
+                let Some(fill) = width.checked_sub(new.context.len()) else {
+                    return Err(Error::Invalid(format!(
+                        "a context of {} ids for a model that reads {width} before a token",
+                        new.context.len()
+                    )));
+                };
+
+                let mut row = vec![history.fill; fill];
+                row.extend_from_slice(&new.context);
+                self.write(
+                    Table::Context,
+                    u64::from(own) * 4 * u64::from(history.width),
+                    &row,
+                )?;
             }
             if self.accepted.is_some() {
                 self.write(Table::Accepted, u64::from(own) * 4, &[1_u32])?;

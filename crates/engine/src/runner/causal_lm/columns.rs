@@ -33,7 +33,7 @@
 //! | [`Column::Continuation`] | U8 `[R]` | whether a task's request continues | `0` |
 //! | [`Column::Points`] | I32 `[R]` | the span a verification accepted | `0` |
 //! | [`Column::LiveTokens`] | U32 `[1]` | the tokens the batch itself holds | |
-//! | [`Column::NextContext`] | U32 `[R, 2]` | where the two token ids its slot's next row continues from lie in the id history | the row's own context |
+//! | [`Column::NextContext`] | U32 `[R, w]` | where the `w` token ids its slot's next row continues from lie in the id history | the row's own context |
 //! | [`Column::StateIndices`] | U32 `[R, D + 1]` | each row's slots of a stepwise state field (`nn::VerifySlots::state_indices`) | [`NO_SLOT`] |
 //!
 //! A runner that speculates lays out the columns of its verifications and of the drafter's
@@ -71,21 +71,21 @@
 //! | [`Column::ChainIndex`] | U32 `[D, R]` | where each chained step of a row reads its slot in [`Column::ChainSlots`] | a [`NO_SLOT`] cell |
 //! | [`Column::ChainOffsets`] | U32 `[R + 1]` | the packed offsets of a chained step: one token a row | the batch's row count |
 //! | [`Column::LiveRows`] | U32 `[1]` | the rows the batch itself holds | |
-//! | [`Column::TokenContext`] | U32 `[T, 2]` | where the two token ids before each token lie in the id history | the token's own context |
+//! | [`Column::TokenContext`] | U32 `[T, w]` | where the `w` token ids before each token lie in the id history | the token's own context |
 //!
 //! ## Token ids
 //!
-//! A model whose layers read token ids (`nn::family::TextModel::reads_token_ids`) reads the two
-//! ids before each row's first token (`nn::TokenBatch::ngram_context`), which the request slots
-//! keep (`slots`). A forward reads them from its **id history**, `[2 · rows + tokens]` U32: the
-//! context of each of the bucket's rows, gathered by its slot, then the bucket's token ids.
-//! Each row's slot continues from the row's last two ids in it, which
-//! [`Column::NextContext`] names: the row's last two tokens, its context's later id and its one
-//! token, or, for a row of no token, its own context. The forward writes them into the slot
-//! as the commit advances the slot's other state. A verification's rows are its tokens, each
-//! of which reads its request's context through its slot; [`Column::TokenContext`] names each
-//! token's two ids before it in that history, and the ids its slot continues from are those of
-//! the token its acceptance ends on (`speculation`).
+//! A model whose layers read token ids (`nn::family::TextModel::token_history`) reads the `w`
+//! ids before each row's first token its history declares (`nn::TokenBatch::token_history`),
+//! which the request slots keep (`slots`). A forward reads them from its **id history**,
+//! `[w · rows + tokens]` U32: the context of each of the bucket's rows, gathered by its slot,
+//! then the bucket's token ids. Each row's slot continues from the row's last `w` ids in it,
+//! which [`Column::NextContext`] names: the row's last tokens, preceded by its context's later
+//! ids when it holds fewer than `w`, or, for a row of no token, its own context. The forward
+//! writes them into the slot as the commit advances the slot's other state. A verification's
+//! rows are its tokens, each of which reads its request's context through its slot;
+//! [`Column::TokenContext`] names each token's `w` ids before it in that history, and the ids
+//! its slot continues from are those of the token its acceptance ends on (`speculation`).
 //!
 //! ## Verify slots
 //!
@@ -249,9 +249,16 @@ impl Column {
     }
 
     /// The elements of the column in a layout of `rows` rows and `tokens` tokens, for
-    /// verifications of at most `drafts` drafts and a drafter's page table of `pages` pages a
-    /// row.
-    const fn elements(self, rows: usize, tokens: usize, drafts: usize, pages: usize) -> usize {
+    /// verifications of at most `drafts` drafts, a drafter's page table of `pages` pages a
+    /// row and a model that reads `history` ids before each token.
+    const fn elements(
+        self,
+        rows: usize,
+        tokens: usize,
+        drafts: usize,
+        pages: usize,
+        history: usize,
+    ) -> usize {
         match self {
             Self::InputIds
             | Self::Positions
@@ -267,8 +274,9 @@ impl Column {
             | Self::TokenCap => tokens,
             Self::QueryOffsets | Self::StateOffsets | Self::ChainOffsets => rows + 1,
             Self::Parameters => rows * PARAMETER_COLUMNS as usize,
-            Self::Adjustments | Self::NextContext => rows * 2,
-            Self::TokenContext => tokens * 2,
+            Self::Adjustments => rows * 2,
+            Self::NextContext => rows * history,
+            Self::TokenContext => tokens * history,
             Self::Commit => rows * COMMIT_FIELDS,
             Self::LiveTokens | Self::LiveRows => 1,
             Self::Extras => tokens * drafts,
@@ -299,6 +307,9 @@ pub(crate) struct Layout {
     drafts: usize,
     /// The pages of a row of the drafter's page table; zero without speculation.
     pages: usize,
+    /// The ids before a token the model reads (`nn::family::TokenHistory::width`); zero for a
+    /// model that reads no token ids.
+    history: usize,
     /// Each column's offset in the block, by the column's discriminant.
     offsets: [u64; Column::COUNT],
     /// The bytes of the block.
@@ -307,15 +318,22 @@ pub(crate) struct Layout {
 
 impl Layout {
     /// The layout of columns of `rows` rows and `tokens` tokens, for verifications of at most
-    /// `drafts` drafts and a drafter's page table of `pages` pages a row.
-    pub(crate) fn new(rows: usize, tokens: usize, drafts: usize, pages: usize) -> Self {
+    /// `drafts` drafts, a drafter's page table of `pages` pages a row and a model that reads
+    /// `history` ids before each token.
+    pub(crate) fn new(
+        rows: usize,
+        tokens: usize,
+        drafts: usize,
+        pages: usize,
+        history: usize,
+    ) -> Self {
         let mut offsets = [0; Column::COUNT];
         let mut bytes = 0_u64;
 
         for (offset, column) in offsets.iter_mut().zip(Column::iter()) {
             *offset = bytes;
 
-            let elements = column.elements(rows, tokens, drafts, pages) as u64;
+            let elements = column.elements(rows, tokens, drafts, pages, history) as u64;
             bytes += (elements * column.element()).next_multiple_of(ALIGNMENT);
         }
 
@@ -324,13 +342,15 @@ impl Layout {
             tokens,
             drafts,
             pages,
+            history,
             offsets,
             bytes,
         }
     }
 
     /// The layout that holds every bucket of `buckets`, for verifications of at most `drafts`
-    /// drafts and a drafter's page table of `pages` pages a row.
+    /// drafts, a drafter's page table of `pages` pages a row and a model that reads `history`
+    /// ids before each token.
     ///
     /// Each token of a verification is an attention row and a sampling row, so a verification
     /// bucket's row columns hold its tokens.
@@ -342,6 +362,7 @@ impl Layout {
         buckets: impl IntoIterator<Item = &'a Bucket>,
         drafts: u32,
         pages: u32,
+        history: u32,
     ) -> Result<Self> {
         let (mut rows, mut tokens) = (0, 0);
         for bucket in buckets {
@@ -359,7 +380,13 @@ impl Layout {
                 "a causal runner with no bucket has no input tensor to lay out".into(),
             ));
         }
-        Ok(Self::new(rows, tokens, drafts as usize, pages as usize))
+        Ok(Self::new(
+            rows,
+            tokens,
+            drafts as usize,
+            pages as usize,
+            history as usize,
+        ))
     }
 
     /// The tokens a token column holds.
@@ -375,6 +402,11 @@ impl Layout {
     /// The pages of a row of the drafter's page table.
     pub(crate) const fn pages(&self) -> usize {
         self.pages
+    }
+
+    /// The ids before a token the model reads; zero for a model that reads no token ids.
+    pub(crate) const fn history(&self) -> usize {
+        self.history
     }
 
     /// The rows a row column holds: the capacity of the commit table.
@@ -401,7 +433,13 @@ impl Layout {
     ) -> Result<()> {
         let source: &[u8] = bytemuck::cast_slice(values);
         let start = self.offset(column) as usize;
-        let elements = column.elements(self.rows, self.tokens, self.drafts, self.pages);
+        let elements = column.elements(
+            self.rows,
+            self.tokens,
+            self.drafts,
+            self.pages,
+            self.history,
+        );
         let capacity = elements * column.element() as usize;
 
         if source.len() > capacity || start + source.len() > block.len() {
@@ -748,7 +786,11 @@ pub(crate) fn fill(
 
     // ---- What a row's slot continues from: its token ids and its verify slots ----
 
-    layout.put(block, Column::NextContext, &next_contexts(&offsets))?;
+    layout.put(
+        block,
+        Column::NextContext,
+        &next_contexts(&offsets, layout.history() as u32),
+    )?;
     let owned = layout.drafts as u32 + 1;
     layout.put(
         block,
@@ -784,26 +826,29 @@ pub(crate) fn fill(
     Ok(())
 }
 
-/// Where the two token ids each row's slot continues from lie in the id history of a forward
-/// whose rows' packed query offsets are `offsets`, `[rows + 1]` (module documentation, token
-/// ids): `[rows, 2]` row-major, each pair the earlier first.
+/// Where the `width` token ids each row's slot continues from lie in the id history of a
+/// forward whose rows' packed query offsets are `offsets`, `[rows + 1]` (module documentation,
+/// token ids): `[rows, width]` row-major, each row's the oldest first.
 ///
-/// History entries `2r` and `2r + 1` are row `r`'s context and entry `2 · rows + t` is token
-/// `t`, so a row continues from its last two tokens, from its context's later id and its one
-/// token, or, holding none, from its own context.
-fn next_contexts(offsets: &[u32]) -> Vec<u32> {
+/// History entries `width · r ..` are row `r`'s context and entry `width · rows + t` is token
+/// `t`, so a row continues from the last `width` ids of its context followed by its tokens:
+/// its last tokens, preceded by the later ids of its context when it holds fewer.
+fn next_contexts(offsets: &[u32], width: u32) -> Vec<u32> {
     let rows = offsets.len().saturating_sub(1) as u32;
-    let token = |token: u32| 2 * rows + token;
 
-    let mut next = Vec::with_capacity(2 * rows as usize);
+    let mut next = Vec::with_capacity((width * rows) as usize);
     for (row, span) in (0..rows).zip(offsets.windows(2)) {
         let (first, end) = (span[0], span[1]);
+        let held = end.saturating_sub(first);
 
-        next.extend(match end.saturating_sub(first) {
-            0 => [2 * row, 2 * row + 1],
-            1 => [2 * row + 1, token(first)],
-            _ => [token(end - 2), token(end - 1)],
-        });
+        // Entry `j` of the row's continuation is the id `width − j` before its end.
+        next.extend((0..width).map(|entry| {
+            let back = width - entry;
+            match held.checked_sub(back) {
+                Some(token) => width * rows + first + token,
+                None => width * row + width - (back - held),
+            }
+        }));
     }
     next
 }

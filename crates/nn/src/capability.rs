@@ -83,15 +83,16 @@ pub struct TokenBatch {
     pub live_tokens: Option<Tensor>,
     /// `[tokens]` U32: the token id of each packed token, as the request's prompt states it (a
     /// vision row holds its placeholder's id), for a model whose layers read token ids beside
-    /// the embeddings: an n-gram hash embedding hashes each token with the two before it.
-    /// `None` for every other model.
+    /// the embeddings ([`crate::family::TextModel::token_history`]), such as an n-gram hash
+    /// embedding that hashes each token with the ones before it. `None` for every other model.
     pub token_ids: Option<Tensor>,
-    /// `[rows, 2]` U32: the two token ids before each row's first token, oldest first, with
-    /// the vocabulary's end-of-text id where the request has no earlier token. Present exactly
-    /// when `token_ids` is: a row's first tokens hash with ids the batch does not hold, which
+    /// `[rows, width]` U32: the `width` token ids before each row's first token, oldest first,
+    /// the model's [`crate::family::TokenHistory::fill`] where the request has no earlier
+    /// token, `width` being the model's [`crate::family::TokenHistory::width`]. Present exactly
+    /// when `token_ids` is: a row's first tokens read ids the batch does not hold, which
     /// execution reads from the request's token ids as it reads positions. It is an input,
     /// not state: nothing is kept, checkpointed or committed for it.
-    pub ngram_context: Option<Tensor>,
+    pub token_history: Option<Tensor>,
 }
 
 impl TokenBatch {
@@ -228,21 +229,21 @@ impl TokenBatch {
             ));
         }
 
-        match (&self.token_ids, &self.ngram_context) {
+        match (&self.token_ids, &self.token_history) {
             (None, None) => {}
-            (Some(ids), Some(context))
+            (Some(ids), Some(history))
                 if ids.dims() == [tokens]
                     && ids.dtype() == DType::U32
-                    && context.dims() == [rows, 2]
-                    && context.dtype() == DType::U32 => {}
-            (ids, context) => {
+                    && matches!(history.dims(), &[held, width] if held == rows && width > 0)
+                    && history.dtype() == DType::U32 => {}
+            (ids, history) => {
                 return Err(Error::shape(
                     OWNER,
                     format!(
-                        "token_ids is {:?} and ngram_context {:?}: [{tokens}] u32 and \
-                         [{rows}, 2] u32 expected, both or neither",
+                        "token_ids is {:?} and token_history {:?}: [{tokens}] u32 and \
+                         [{rows}, width] u32 expected, both or neither",
                         ids.as_ref().map(Tensor::dims),
-                        context.as_ref().map(Tensor::dims)
+                        history.as_ref().map(Tensor::dims)
                     ),
                 ));
             }
@@ -1553,7 +1554,7 @@ mod tests {
             rope_positions: None,
             live_tokens: None,
             token_ids: None,
-            ngram_context: None,
+            token_history: None,
         }
     }
 

@@ -2,15 +2,15 @@
 //!
 //! [`NgramEmbedding`] (vLLM's `Qwen4ExpNgramEmbedding`,
 //! `refs/vllm/vllm/models/qwen4_exp/nvidia/ngram_embedding.py`, ids
-//! `refs/vllm/vllm/models/qwen4_exp/common/ops/ple.py:24-168`) hashes each token with the one
-//! and the two before it into rows of one large table:
+//! `refs/vllm/vllm/models/qwen4_exp/common/ops/ple.py:24-168`) hashes each token with the
+//! `n − 1` before it (`n` the checkpoint's `ngram_size`) into rows of one large table, `p_k`
+//! being the id `k` before the token `t0`:
 //!
 //! ```text
-//! p1' = p1;   p2' = eos when p1 = eos, else p2          an n-gram stops at an end of text
-//! mix2 = (t0 · m0) xor (p1' · m1)                       64-bit, wrapping
-//! mix3 = mix2 xor (p2' · m2)
-//! id_h = (mix2 mod P_h) + O_h     for the bigram heads h
-//! id_h = (mix3 mod P_h) + O_h     for the trigram heads h          mod is non-negative
+//! p_k' = eos when p_j' = eos for some j < k, else p_k     an n-gram stops at an end of text
+//! mix_1 = t0 · m0;   mix_k = mix_{k-1} xor (p_{k-1}' · m_{k-1})        64-bit, wrapping
+//! id_h = (mix_k mod P_h) + O_h     for the heads h of n-gram length k, 2 ≤ k ≤ n
+//!                                                                      mod is non-negative
 //! e    = [table[id_0] | table[id_1] | …] · weight_scale
 //! ```
 //!
@@ -183,38 +183,53 @@ impl NgramEmbedding {
         })
     }
 
-    /// The table rows each token reads: `[tokens, heads]` I64, for `context`, `[tokens, 3]`
-    /// U32 token ids `(p2, p1, t0)`: the token two before the row's, the one before it, and
-    /// the row's own, in the request's token order (module documentation).
+    /// The table rows each token reads: `[tokens, heads]` I64, for `context`,
+    /// `[tokens, ngram_size]` U32 token ids: the `ngram_size − 1` ids before the token, oldest
+    /// first, then its own, in the request's token order (module documentation).
     ///
     /// # Errors
     ///
     /// A context of another shape.
     pub fn ids(&self, context: &Tensor) -> Result<Tensor> {
-        let &[tokens, 3] = context.dims() else {
+        let order = self.layer_multipliers.elem_count();
+        let &[tokens, width] = context.dims() else {
             return Err(ID.config(format!(
-                "an n-gram context of {:?} is not [tokens, 3]",
+                "an n-gram context of {:?} is not [tokens, {order}]",
                 context.dims()
             )));
         };
+        if width != order {
+            return Err(ID.config(format!(
+                "an n-gram context of {width} ids for n-grams of order {order}"
+            )));
+        }
 
         let wide = context.to_dtype(DType::I64)?;
         let token = |column: usize| wide.narrow(1, column, 1);
         let multiplier = |position: usize| self.layer_multipliers.narrow(0, position, 1);
-        let (older, previous, current) = (token(0)?, token(1)?, token(2)?);
 
-        // An n-gram stops at an end of text: every token before one counts as one.
-        let ended = previous.broadcast_eq(&self.eos)?;
-        let older = ended.where_cond(&self.eos.broadcast_as(older.shape())?, &older)?;
-
-        // Wrapping 64-bit products: a multiplier is small enough that none overflows.
-        let bigram = current
-            .broadcast_mul(&multiplier(0)?)?
-            .bitwise_xor(&previous.broadcast_mul(&multiplier(1)?)?)?;
-        let trigram = bigram.bitwise_xor(&older.broadcast_mul(&multiplier(2)?)?)?;
-
+        // Each n-gram length's hash, the bigram's first: the token's own term, then the ids
+        // before it from the newest, each mixed into every longer n-gram. An n-gram stops at
+        // an end of text: every id before one counts as one. Wrapping 64-bit products: a
+        // multiplier is small enough that none overflows.
         let per = (tokens, self.heads_per_ngram);
-        let hashes = Tensor::cat(&[bigram.broadcast_as(per)?, trigram.broadcast_as(per)?], 1)?;
+        let mut mixed = token(order - 1)?.broadcast_mul(&multiplier(0)?)?;
+        let mut ended: Option<Tensor> = None;
+        let mut hashes = Vec::with_capacity(order - 1);
+        for shift in 1..order {
+            let mut candidate = token(order - 1 - shift)?;
+            if let Some(ended) = &ended {
+                candidate =
+                    ended.where_cond(&self.eos.broadcast_as(candidate.shape())?, &candidate)?;
+            }
+            // An id past an end of text is one itself, so the ids before this one have ended
+            // exactly when it is one.
+            ended = Some(candidate.broadcast_eq(&self.eos)?);
+
+            mixed = mixed.bitwise_xor(&candidate.broadcast_mul(&multiplier(shift)?)?)?;
+            hashes.push(mixed.broadcast_as(per)?);
+        }
+        let hashes = Tensor::cat(&hashes, 1)?;
 
         // The remainder of a table partition is non-negative, as `torch.remainder`'s is
         // (`ple.py:99-101`).

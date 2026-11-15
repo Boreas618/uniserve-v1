@@ -321,7 +321,7 @@ fn batch(phase: Phase, slots: &[u32], seq_lens: &[u32], offsets: &[u32]) -> Toke
         rope_positions: None,
         live_tokens: None,
         token_ids: None,
-        ngram_context: None,
+        token_history: None,
     }
 }
 
@@ -730,7 +730,7 @@ fn meta_batch(phase: Phase, tokens: usize) -> TokenBatch {
         rope_positions: None,
         live_tokens: None,
         token_ids: None,
-        ngram_context: None,
+        token_history: None,
     }
 }
 

@@ -48,6 +48,10 @@ pub struct Capacity {
     pub denoise_steps: u32,
     pub bos_token_id: u32,
     pub eos_token_ids: Vec<u32>,
+    /// The token ids before a row's first token the group's model reads
+    /// (`nn::family::TokenHistory::width`), which a request's first row on a slot states
+    /// (`crate::batch::NewSlot::context`); zero for a model that reads no token ids.
+    pub token_history: u32,
     /// The bytes of one token of an encoder output the group computes; 0 when it encodes nothing.
     pub feature_bytes: u32,
     /// The identity of the weights that compute the group's encoder outputs (a chat image's

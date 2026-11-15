@@ -288,13 +288,13 @@ impl Scheduler {
         cells[commit::column::PENALTIES] = i64::from(samples && uses_penalties(&input.sampling));
 
         // The request's first row on the group starts its sampling state there: the tokens its
-        // penalties count, its bias row, and the two token ids before the row.
+        // penalties count, its bias row, and the token ids before the row its model reads,
+        // fewer where the request holds fewer before it.
         let new_slot = if seen {
             None
         } else {
-            // The end-of-text id where the request has no earlier token: the beginning-of-
-            // sequence token of a family whose checkpoint states no other.
-            let (mut before, range) = (Vec::new(), start.saturating_sub(2)..start);
+            let range = start.saturating_sub(capacity.token_history)..start;
+            let mut before = Vec::new();
             context(
                 request,
                 range,
@@ -303,10 +303,10 @@ impl Scheduler {
                 &mut Vec::new(),
                 &mut Vec::new(),
             )?;
-            let mut previous = [bos; 2];
-            for (entry, token) in previous.iter_mut().rev().zip(before.iter().rev()) {
-                *entry = u32::try_from(*token).unwrap_or(bos);
-            }
+            let previous = before
+                .iter()
+                .map(|token| u32::try_from(*token).ok())
+                .collect::<Option<Vec<u32>>>()?;
 
             // The bias row in the canonical order: a repeated token's last bias, and the allowed
             // tokens sorted once each.
@@ -979,6 +979,7 @@ mod tests {
                 .collect();
             capacity.bos_token_id = BOS;
             capacity.eos_token_ids = vec![EOS];
+            capacity.token_history = 2;
             capacity.denoise_steps = 4;
         }
         scheduler
@@ -1405,14 +1406,14 @@ mod tests {
                     history: Vec::new(),
                     bias: Vec::new(),
                     allowed: None,
-                    context: [17, 18],
+                    context: vec![17, 18],
                 },
                 NewSlot {
                     slot: 4,
                     history: vec![42, 7],
                     bias: Vec::new(),
                     allowed: None,
-                    context: [8, 42],
+                    context: vec![8, 42],
                 },
             ],
             "slots in increasing order, each counting its own request's history"
@@ -1429,7 +1430,7 @@ mod tests {
         assert!(next.new_slots.is_empty());
 
         // A resumed request's generated tokens continue its prompt and count in its penalties;
-        // before its first token it has no context.
+        // before its first token it has no context, which the runner fills.
         let mut resumed = request(5, vec![1, 2, 3], 5, 0);
         input(&mut resumed).generated_token_ids = vec![5, 6];
         resumed.token_ids.extend([5, 6]);
@@ -1438,7 +1439,7 @@ mod tests {
         let batch = one(&mut scheduler, resumed, Phase::Prefill, 5);
         assert_eq!(batch.columns.input_ids, vec![1, 2, 3, 5, 6]);
         assert_eq!(batch.new_slots[0].history, vec![5, 6]);
-        assert_eq!(batch.new_slots[0].context, [BOS, BOS]);
+        assert!(batch.new_slots[0].context.is_empty());
         assert_eq!(batch.columns.rows.logits_rows, vec![0]);
     }
 

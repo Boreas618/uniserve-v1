@@ -374,13 +374,24 @@ pub trait TextModel: CausalLm + Send + Sync {
         None
     }
 
-    /// Whether a layer reads the batch's token ids beside its embeddings, such as an n-gram
-    /// hash embedding: execution then lends [`crate::capability::TokenBatch::token_ids`] and
-    /// [`crate::capability::TokenBatch::ngram_context`] to every forward, and lends neither
-    /// when this is `false`.
-    fn reads_token_ids(&self) -> bool {
-        false
-    }
+    /// The token ids its layers read beside the embeddings, such as an n-gram hash embedding
+    /// that hashes each token with the ones before it: execution then lends
+    /// [`crate::capability::TokenBatch::token_ids`] and the history before each row
+    /// ([`crate::capability::TokenBatch::token_history`]) to every forward, and lends neither
+    /// for a model that states `None`.
+    fn token_history(&self) -> Option<TokenHistory>;
+}
+
+/// The token ids before each token a model's layers read, as the model states them
+/// ([`TextModel::token_history`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenHistory {
+    /// The ids before a token its layers read, at least one: an n-gram embedding of order `n`
+    /// reads `n − 1`.
+    pub width: u32,
+    /// The id that stands for a position before the request's first token, as the checkpoint
+    /// states it for the layers that read the history.
+    pub fill: u32,
 }
 
 /// The recurrent state a causal language model keeps per request slot, as one rank holds it:

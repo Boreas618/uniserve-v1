@@ -44,6 +44,7 @@ use std::ops::Range;
 
 use nn::family::{
     CacheShape, ExpertOrder, ExpertShape, SequenceSplit, StateShape, TextModel, TextPlacement,
+    TokenHistory,
 };
 use nn::modules::{
     Embedding, EmbeddingConfig, LmHead, LmHeadConfig, RmsNorm, Rotary, RotaryConfig, Spectrum,
@@ -496,6 +497,11 @@ impl TextModel for Qwen3ForCausalLm {
 
     fn vision(&self) -> Option<&dyn Vision> {
         self.visual.as_ref().map(|tower| tower as &dyn Vision)
+    }
+
+    /// The layers read their embeddings alone.
+    fn token_history(&self) -> Option<TokenHistory> {
+        None
     }
 }
 

@@ -570,7 +570,7 @@ impl Runner for EncoderRunner {
             rope_positions: None,
             live_tokens: None,
             token_ids: None,
-            ngram_context: None,
+            token_history: None,
         };
 
         let ids = self.column(IDS, tokens, DType::U32)?;

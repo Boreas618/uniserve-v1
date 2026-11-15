@@ -85,7 +85,7 @@ fn batch(phase: Phase, page_size: u32, on_meta: bool) -> TokenBatch {
         rope_positions: None,
         live_tokens: None,
         token_ids: None,
-        ngram_context: None,
+        token_history: None,
     }
 }
 

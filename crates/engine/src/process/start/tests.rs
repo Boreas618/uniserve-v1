@@ -632,6 +632,7 @@ fn capacity(phases: &[Phase], tokens: u32, feature_bytes: u32) -> Capacity {
         denoise_steps: 0,
         bos_token_id: 1,
         eos_token_ids: vec![2],
+        token_history: 0,
         feature_bytes,
         encoder_identity: String::new(),
         latent_seed: 0,

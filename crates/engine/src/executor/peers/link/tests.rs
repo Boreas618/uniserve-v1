@@ -44,6 +44,7 @@ fn group_capacity() -> Capacity {
         denoise_steps: 0,
         bos_token_id: 1,
         eos_token_ids: vec![2, 3],
+        token_history: 0,
         feature_bytes: 0,
         encoder_identity: String::new(),
         latent_seed: 0,

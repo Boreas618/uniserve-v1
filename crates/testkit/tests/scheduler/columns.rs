@@ -23,9 +23,6 @@ use storage::runtime::{Completion, Request};
 use crate::harness::{BLOCK, Deployment, Harness, chat_image, prompt, token};
 use crate::speculation::with_a_gap;
 
-/// The beginning-of-sequence token every deployment of the harness states.
-const BOS: u32 = 1;
-
 /// The draws a request has made after its prompt's token: its sampling position after it.
 const PROMPT_DRAW: i64 = 1;
 
@@ -180,7 +177,7 @@ fn a_prefill_row_states_its_prompt_positions_lengths_sampling_and_commit() {
             history: Vec::new(),
             bias: Vec::new(),
             allowed: None,
-            context: [BOS, BOS],
+            context: Vec::new(),
         })
         .collect();
     new_slots.sort_unstable_by_key(|new| new.slot);
@@ -546,7 +543,7 @@ fn a_new_slot_starts_its_requests_history_bias_and_context() {
             history: vec![1500, 1501],
             bias: vec![(1300, 1.0), (1700, -0.25)],
             allowed: Some(vec![1300, 1500, 1900]),
-            context: [BOS, BOS],
+            context: Vec::new(),
         }]
     );
     for batch in &batches {

@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 
 use nn::family::{
     CacheShape, ExpertOrder, ExpertShape, IndexKeys, StateShape, TextModel, TextPlacement,
+    TokenHistory,
 };
 use nn::modules::{Embedding, EmbeddingConfig, LmHead, LmHeadConfig, Rotary};
 use nn::{
@@ -128,41 +129,43 @@ pub fn token_columns(batch: &TokenBatch, state: &RecurrentState) -> Result<Vec<T
     Ok(vec![row, position, slot, leading, trailing, index])
 }
 
-/// Each token's n-gram context, `[tokens, 3]` U32 `(p2, p1, t0)`: the token two before it, the
-/// one before it and its own, from the batch's token ids and, for a row's first tokens, from
-/// the two ids before the row ([`TokenBatch::ngram_context`]).
+/// Each token's n-gram context, `[tokens, width + 1]` U32: the `width` ids before it, oldest
+/// first, then its own, from the batch's token ids and, for a row's first tokens, from the
+/// ids before the row ([`TokenBatch::token_history`], `[rows, width]`).
 ///
 /// # Errors
 ///
-/// A batch that states no token ids.
+/// A batch that states no token ids or no history.
 pub fn ngram_context(batch: &TokenBatch, columns: &[Tensor]) -> Result<Tensor> {
-    let (Some(ids), Some(before)) = (&batch.token_ids, &batch.ngram_context) else {
+    let (Some(ids), Some(before)) = (&batch.token_ids, &batch.token_history) else {
         return Err(ID.config(
             "the n-gram embedding hashes token ids, and the batch states none \
-             (token_ids, ngram_context)"
+             (token_ids, token_history)"
                 .to_owned(),
         ));
     };
-    let tokens = batch.tokens();
-    let rows = batch.rows();
+    let (tokens, rows) = (batch.tokens(), batch.rows());
+    let width = before.dim(1)?;
     let index = &columns[INDEX];
     let token = Tensor::arange(0_i32, tokens as i32, &Device::Cpu)?.to_device(ids.device())?;
     let constant = |value: usize| int(value as i64, index);
 
-    // A row's history is the two ids before it, then its own tokens: the ids of every row's
-    // context, then the batch's token ids.
+    // The history the context is read from: every row's ids before it, `width` a row, then
+    // the batch's token ids.
     let history = Tensor::cat(&[&before.flatten_all()?, ids], 0)?;
-    let own = token.broadcast_add(&constant(2 * rows)?)?;
+    let own = token.broadcast_add(&constant(width * rows)?)?;
     let before_row = columns[ROW]
         .to_dtype(DType::I32)?
-        .broadcast_mul(&constant(2)?)?;
+        .broadcast_mul(&constant(width)?)?;
 
     let earlier = |back: usize| -> Result<Tensor> {
         // The token `back` before a token is the row's own when the row reaches that far
-        // back, and the row's context otherwise: its last id for the token before the row's
+        // back, and the row's history otherwise: its last id for the token before the row's
         // first, and so on.
         let in_row = own.broadcast_sub(&constant(back)?)?;
-        let in_context = before_row.add(index)?.broadcast_add(&constant(2 - back)?)?;
+        let in_context = before_row
+            .add(index)?
+            .broadcast_add(&constant(width - back)?)?;
         let entry = index
             .broadcast_ge(&constant(back)?)?
             .where_cond(&in_row, &in_context)?;
@@ -170,7 +173,9 @@ pub fn ngram_context(batch: &TokenBatch, columns: &[Tensor]) -> Result<Tensor> {
         Ok(history.index_select(&entry.to_dtype(DType::U32)?, 0)?)
     };
 
-    Ok(Tensor::stack(&[earlier(2)?, earlier(1)?, ids.clone()], 1)?)
+    let mut context = (1..=width).rev().map(earlier).collect::<Result<Vec<_>>>()?;
+    context.push(ids.clone());
+    Ok(Tensor::stack(&context, 1)?)
 }
 
 /// The rotary coordinates of a batch's tokens, `[3, tokens]` I32: the batch's own when it
@@ -522,10 +527,17 @@ impl TextModel for Qwen4ExpForCausalLm {
         self.visual.as_ref().map(|tower| tower as &dyn Vision)
     }
 
-    /// The PLE layers hash each token with the two before it, so the forward reads token ids
-    /// and their n-gram context whenever one layer holds a PLE layer.
-    fn reads_token_ids(&self) -> bool {
-        self.layers.iter().any(DecoderLayer::has_ple)
+    /// The PLE layers hash each token with the `ngram_size − 1` before it, an n-gram that
+    /// starts before the request reading the checkpoint's end-of-text id there, so the
+    /// forward reads token ids and their history whenever one layer holds a PLE layer.
+    fn token_history(&self) -> Option<TokenHistory> {
+        self.layers
+            .iter()
+            .any(DecoderLayer::has_ple)
+            .then_some(TokenHistory {
+                width: self.config.ngram.history(),
+                fill: self.config.text.eos_token_id,
+            })
     }
 }
 

@@ -755,6 +755,7 @@ impl Deployment {
             denoise_steps: if denoises { STEPS } else { 0 },
             bos_token_id: 1,
             eos_token_ids: vec![EOS],
+            token_history: 0,
             feature_bytes: if serves(Phase::VisionEncode) {
                 FEATURE_BYTES
             } else {

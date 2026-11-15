@@ -590,7 +590,7 @@ fn load_rank(
         )?,
         None => None,
     };
-    let inputs = CausalLmRunner::input_bytes(&meta_config)?;
+    let inputs = CausalLmRunner::input_bytes(&meta_config, meta.as_ref())?;
     let unserved = Arc::new(Generation::new(0, []));
     let mut profiled = model_runner.runner(
         Arc::clone(&meta),
@@ -2716,7 +2716,7 @@ fn open_rank(
     rank.states.0 = states;
     let state_config = model_runner.state_config(rank.model.as_ref(), model_runner.buckets());
     let config = model_runner.causal_config(rank.model.as_ref(), &layout, units)?;
-    let inputs = CausalLmRunner::input_bytes(&config)?;
+    let inputs = CausalLmRunner::input_bytes(&config, rank.model.as_ref())?;
     let member = match &rank.union {
         Some((group, targets, place)) => model_runner.union_member(
             device,
@@ -4060,11 +4060,9 @@ pub(crate) fn capacities(
                     .map(storage::key::page_seed)
                     .collect();
                 let model = text.model.as_ref();
-                let vision = text
-                    .vision
-                    .map(|_| (model, rank.model_runner.image_rows(model)));
+                let images = text.vision.map(|_| rank.model_runner.image_rows(model));
                 rank.model_runner
-                    .capacity(&text.config, cache.layout(), seeds, vision)?
+                    .capacity(&text.config, model, cache.layout(), seeds, images)?
             }
             Loaded::Video(video) => video.capacity.clone(),
         };

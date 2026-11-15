@@ -16,7 +16,7 @@ use crate::batch::{
     Rows, Shape as BatchShape, StateCopy, StateDirection, Variant,
 };
 use nn::capability::Drafter;
-use nn::family::{CacheShape, ExpertShape, StateField, StateShape, TextModel};
+use nn::family::{CacheShape, ExpertShape, StateField, StateShape, TextModel, TokenHistory};
 use nn::functional::{
     WeightOrder, embedding, kv_write_, paged_attention, rms_norm, zero_arrival_counters_,
 };
@@ -80,6 +80,10 @@ const PAGES: usize = 32;
 const SCRATCH_PAGES: u32 = 9;
 /// The most likely tokens a scored row reports.
 const CANDIDATES: u32 = 3;
+/// The ids before each token a model that reads token ids reads, and the id that stands for a
+/// position before a request's first token.
+const HISTORY: u32 = 2;
+const FILL: u32 = 0;
 
 /// A meta tensor: a shape and an element type at an address nothing reads.
 fn meta(shape: impl Into<tensor::Shape>, dtype: DType) -> Tensor {
@@ -328,9 +332,9 @@ impl CausalLm for Tiny {
                 "the model's stepwise state reads its rows' verify slots (verify)".to_owned(),
             ));
         }
-        if self.reads != (batch.token_ids.is_some() && batch.ngram_context.is_some()) {
+        if self.reads != (batch.token_ids.is_some() && batch.token_history.is_some()) {
             return Err(nn::Error::Unsupported(
-                "the model reads token ids exactly when it states it (token_ids, ngram_context)"
+                "the model reads token ids exactly when it states it (token_ids, token_history)"
                     .to_owned(),
             ));
         }
@@ -418,8 +422,11 @@ impl TextModel for Tiny {
         runs
     }
 
-    fn reads_token_ids(&self) -> bool {
-        self.reads
+    fn token_history(&self) -> Option<TokenHistory> {
+        self.reads.then_some(TokenHistory {
+            width: HISTORY,
+            fill: FILL,
+        })
     }
 
     fn experts(&self) -> Option<ExpertShape> {
@@ -478,7 +485,7 @@ fn runner(stateful: bool) -> CausalLmRunner {
     let config = config();
     let graphs = Graphs::meta(
         Arc::new(Generation::new(0, [])),
-        CausalLmRunner::input_bytes(&config).unwrap(),
+        CausalLmRunner::input_bytes(&config, &Tiny::new(false)).unwrap(),
     );
 
     let pooled = meta((SLOTS as usize + 1, TABLE_WIDTH), DType::U32);
@@ -680,7 +687,7 @@ fn filled(
     mapping: &[u32],
     scratch: Option<&[std::ops::Range<u32>]>,
 ) -> (Layout, Vec<u8>) {
-    let layout = Layout::of(config().buckets.iter(), 0, 0).unwrap();
+    let layout = Layout::of(config().buckets.iter(), 0, 0, HISTORY).unwrap();
     let mut block = vec![0xA5_u8; layout.bytes() as usize];
 
     columns::fill(
@@ -878,7 +885,7 @@ fn a_profile_run_states_the_launches_of_every_bucket_and_the_runner_s_memory() {
     // The region holds the input tensors and the largest forward's activations, and the
     // model's one host value is an FP32 per token of the largest bucket, at whatever offset its
     // alignment gives it.
-    let inputs = CausalLmRunner::input_bytes(&config()).unwrap();
+    let inputs = CausalLmRunner::input_bytes(&config(), &Tiny::new(false)).unwrap();
     assert!(runner.graphs().peak() > inputs + (80 * HIDDEN * 2) as u64);
     assert_eq!(
         runner.graphs().input_peak(),
@@ -909,7 +916,7 @@ fn the_runner_s_memory_is_a_function_of_its_config() {
 
     // Twenty-one columns, none longer than one 256-byte block but the token columns and the
     // commit table of the largest bucket.
-    let inputs = CausalLmRunner::input_bytes(&config).unwrap();
+    let inputs = CausalLmRunner::input_bytes(&config, &Tiny::new(false)).unwrap();
     assert_eq!(inputs % 256, 0);
     assert!(inputs >= 4 * 320 + 21 * 256 - 4 * 256);
 
@@ -1051,7 +1058,7 @@ fn a_row_s_adjustments_are_its_bias_flag_and_its_ban_mask() {
 #[test]
 fn the_idle_inputs_of_every_bucket_write_and_commit_nothing() {
     let runner = runner(false);
-    let layout = Layout::of(config().buckets.iter(), 0, 0).unwrap();
+    let layout = Layout::of(config().buckets.iter(), 0, 0, HISTORY).unwrap();
 
     for bucket in runner.buckets() {
         let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
@@ -1288,7 +1295,7 @@ fn the_last_request_slot_serves_and_gathers_its_own_rows() {
         history: vec![3, 3],
         bias: vec![(3, 1.5)],
         allowed: None,
-        context: [0, 0],
+        context: vec![0, 0],
     }];
     runner.prepare_inputs(&batch, &tables).unwrap();
 
@@ -1411,7 +1418,7 @@ fn a_runner_is_built_over_its_model_s_cache_and_state() {
         let config = config();
         let graphs = Graphs::meta(
             Arc::new(Generation::new(0, [])),
-            CausalLmRunner::input_bytes(&config).unwrap(),
+            CausalLmRunner::input_bytes(&config, &Tiny::new(false)).unwrap(),
         );
         let state = state.then(|| {
             let buffers = || vec![vec![meta((SLOTS as usize, HIDDEN), DType::BF16)]];
@@ -1567,7 +1574,7 @@ fn a_slot_the_runner_does_not_hold_is_not_started() {
     let tables = held(&[1, 2]);
     let new = |slot: u32| NewSlot {
         slot,
-        context: [0, 0],
+        context: vec![0, 0],
         ..NewSlot::default()
     };
 
@@ -1771,7 +1778,7 @@ fn a_shadow_batch_whose_rows_do_not_fit_the_scratch_set_is_reported_uncompared()
         config(),
         Graphs::meta(
             Arc::clone(&serving),
-            CausalLmRunner::input_bytes(&config()).unwrap(),
+            CausalLmRunner::input_bytes(&config(), &Tiny::new(false)).unwrap(),
         ),
         None,
         &lock(&cache),
@@ -2123,7 +2130,7 @@ fn union_runner(member: Member) -> CausalLmRunner {
     let config = config();
     let graphs = Graphs::meta(
         Arc::new(Generation::new(0, [])),
-        CausalLmRunner::input_bytes(&config).unwrap(),
+        CausalLmRunner::input_bytes(&config, &Tiny::new(false)).unwrap(),
     );
     let model = Tiny {
         routed: true,
@@ -2379,7 +2386,7 @@ fn over(cache: &KvCacheMemory, state: Option<&StateMemory>) -> CausalLmRunner {
     let config = config();
     let graphs = Graphs::meta(
         Arc::new(Generation::new(0, [])),
-        CausalLmRunner::input_bytes(&config).unwrap(),
+        CausalLmRunner::input_bytes(&config, &Tiny::new(false)).unwrap(),
     );
     let model = Arc::new(Tiny::new(state.is_some()));
 
@@ -2419,7 +2426,7 @@ fn a_runner_over_the_rank_s_cache_and_state_profiles_and_captures_every_bucket()
     let fewer = KvCacheMemory::meta(fewer).unwrap();
     let graphs = Graphs::meta(
         Arc::new(Generation::new(0, [])),
-        CausalLmRunner::input_bytes(&self::config()).unwrap(),
+        CausalLmRunner::input_bytes(&self::config(), &Tiny::new(false)).unwrap(),
     );
     let model = Arc::new(Tiny::new(false));
     assert!(CausalLmRunner::over(model, self::config(), graphs, None, &fewer, None).is_err());
@@ -2840,7 +2847,7 @@ fn speculating(stateful: bool) -> CausalLmRunner {
     let config = speculating_config();
     let graphs = Graphs::meta(
         Arc::new(Generation::new(0, [])),
-        CausalLmRunner::input_bytes(&config).unwrap(),
+        CausalLmRunner::input_bytes(&config, &Tiny::new(false)).unwrap(),
     );
 
     let pooled = meta((SLOTS as usize + 1, TABLE_WIDTH), DType::U32);
@@ -2933,7 +2940,7 @@ fn verification(temperature: f32) -> Batch {
 /// holds something else.
 fn speculating_block() -> (Layout, Vec<u8>) {
     let buckets = config().buckets.with_drafts(DRAFTS);
-    let layout = Layout::of(buckets.iter(), DRAFTS, POOL.width(MAX_KV_LEN)).unwrap();
+    let layout = Layout::of(buckets.iter(), DRAFTS, POOL.width(MAX_KV_LEN), HISTORY).unwrap();
     let block = vec![0xA5_u8; layout.bytes() as usize];
 
     (layout, block)
@@ -2980,8 +2987,8 @@ fn a_speculating_runner_states_verification_and_drafter_buckets() {
         0
     );
     assert!(
-        CausalLmRunner::input_bytes(&config).unwrap()
-            > CausalLmRunner::input_bytes(&self::config()).unwrap()
+        CausalLmRunner::input_bytes(&config, &Tiny::new(false)).unwrap()
+            > CausalLmRunner::input_bytes(&self::config(), &Tiny::new(false)).unwrap()
     );
 }
 
@@ -3600,7 +3607,7 @@ fn speculation_is_refused_where_the_runner_does_not_serve_it() {
     let build = |model: Tiny, config: CausalLmConfig| {
         let graphs = Graphs::meta(
             Arc::new(Generation::new(0, [])),
-            CausalLmRunner::input_bytes(&config)?,
+            CausalLmRunner::input_bytes(&config, &model)?,
         );
         let pooled = meta((SLOTS as usize + 1, TABLE_WIDTH), DType::U32);
 
@@ -3673,7 +3680,7 @@ fn speculating_with_drafter_state() -> CausalLmRunner {
     let config = speculating_config();
     let graphs = Graphs::meta(
         Arc::new(Generation::new(0, [])),
-        CausalLmRunner::input_bytes(&config).unwrap(),
+        CausalLmRunner::input_bytes(&config, &Tiny::new(false)).unwrap(),
     );
     let pooled = meta((SLOTS as usize + 1, TABLE_WIDTH), DType::U32);
     let model = Tiny {
@@ -3830,7 +3837,7 @@ fn a_speculating_runner_is_built_over_the_rank_s_draft_group_and_trail() {
     let over = |config: CausalLmConfig, state: &StateMemory, drafter: TinyDrafter| {
         let graphs = Graphs::meta(
             Arc::new(Generation::new(0, [])),
-            CausalLmRunner::input_bytes(&config)?,
+            CausalLmRunner::input_bytes(&config, &Tiny::new(false))?,
         );
         let model = Tiny {
             drafter: Some(drafter),
@@ -3960,7 +3967,7 @@ fn scatter(table: &mut [[u32; 2]], slots: &Tensor, next: &Tensor) {
 
 /// A forward of `batch` in `bucket` over the context table `table`, on the host, through the
 /// columns the runner pads it with (`columns`, token ids): returns the context each row is lent
-/// (`nn::TokenBatch::ngram_context`), and leaves in `table` what each row's slot continues
+/// (`nn::TokenBatch::token_history`), and leaves in `table` what each row's slot continues
 /// from. A decode's token is the one its slot's commit left, which the batch states as well.
 fn advance(table: &mut [[u32; 2]], batch: &Batch, bucket: &Bucket) -> Vec<[u32; 2]> {
     let (layout, block) = filled(batch, bucket, &[], None);
@@ -3999,7 +4006,7 @@ fn a_model_that_reads_token_ids_is_lent_them_by_every_forward() {
         };
         let graphs = Graphs::meta(
             Arc::new(Generation::new(0, [])),
-            CausalLmRunner::input_bytes(&config).unwrap(),
+            CausalLmRunner::input_bytes(&config, &reading(drafting)).unwrap(),
         );
         let pooled = meta((SLOTS as usize + 1, TABLE_WIDTH), DType::U32);
 
@@ -4028,10 +4035,52 @@ fn a_model_that_reads_token_ids_is_lent_them_by_every_forward() {
     assert!(read >= plain + 2 * 4 * (u64::from(SLOTS) + 1));
 }
 
+/// A slot continues from as many ids as its model reads: a row's last ones, led by its
+/// context's later ids when it holds fewer.
+#[test]
+fn a_slot_continues_from_as_many_ids_as_its_model_reads() {
+    const WIDTH: usize = 3;
+    let layout = Layout::of(config().buckets.iter(), 0, 0, WIDTH as u32).unwrap();
+    let bucket = Bucket::prefill(4, 8, Variant::PrefillWrite);
+
+    // Slot 2's context is 1 2 3 before each chunk.
+    for (ids, expected) in [(vec![7], [2, 3, 7]), (vec![7, 8, 9, 10], [8, 9, 10])] {
+        let batch = prompt(&ids, 4);
+        let mut block = vec![0xA5_u8; layout.bytes() as usize];
+        columns::fill(
+            &layout,
+            SLOTS,
+            VOCABULARY as u32,
+            &batch.columns,
+            &bucket,
+            &[],
+            None,
+            &mut block,
+        )
+        .unwrap();
+
+        let rows = bucket.rows as usize;
+        let column = |column, elements| u32_column(&read::<u32>(&layout, &block, column, elements));
+        let contexts =
+            Tensor::from_slice(&[1_u32, 2, 3].repeat(rows), (rows, WIDTH), &Device::Cpu).unwrap();
+        let index = column(Column::NextContext, WIDTH * rows)
+            .reshape((rows, WIDTH))
+            .unwrap();
+        let next = super::history_ids(
+            &contexts,
+            &column(Column::InputIds, bucket.tokens as usize),
+            &index,
+        )
+        .unwrap();
+
+        assert_eq!(next.to_vec2::<u32>().unwrap()[0], expected, "{ids:?}");
+    }
+}
+
 #[test]
 fn a_slot_s_context_follows_its_request_across_its_prompt_chunks_and_decodes() {
-    // Slot 2's request has no token before its prompt, which its start states as the
-    // end-of-text id twice; slot 4's started elsewhere.
+    // Slot 2's request has no token before its prompt, which its start fills with the model's
+    // fill id; slot 4's started elsewhere.
     let mut table = context_table(&[(2, [63, 63]), (4, [21, 22])]);
     let bucket = Bucket::prefill(4, 8, Variant::PrefillWrite);
 
@@ -4222,7 +4271,7 @@ fn a_runner_over_stepwise_state_lends_verify_slots_to_every_forward_and_keeps_no
     let over = |model: Arc<Tiny>, config: CausalLmConfig, state: &StateMemory| {
         let graphs = Graphs::meta(
             Arc::new(Generation::new(0, [])),
-            CausalLmRunner::input_bytes(&config)?,
+            CausalLmRunner::input_bytes(&config, &*model)?,
         );
         CausalLmRunner::over(model, config, graphs, None, &cache, Some(state))
     };

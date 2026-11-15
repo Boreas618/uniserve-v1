@@ -141,7 +141,7 @@ impl Runner for TinyRunner {
         let rows = bucket.rows as usize;
         let batch = TokenBatch {
             token_ids: None,
-            ngram_context: None,
+            token_history: None,
             positions: self.column(POSITIONS, rows, DType::I32)?,
             slot_mapping: self.column(SLOTS, rows, DType::U32)?,
             seq_lens: self.column(LENGTHS, rows, DType::U32)?,
