@@ -353,7 +353,7 @@ pub(crate) fn leader_over(
         false,
     )
     .unwrap();
-    let images = MediaConnector::from_image_options(&ImageFetchConfig::default()).unwrap();
+    let images = MediaConnector::new(&ImageFetchConfig::default()).unwrap();
     let options = ServerArgs {
         logging_config: LoggingConfig {
             log_requests: false,

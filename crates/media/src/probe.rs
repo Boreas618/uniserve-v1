@@ -12,12 +12,48 @@
 //! - [`decoded_track`]: an audio track's rate, channels and samples as
 //!   [`crate::read::read_audio`] decodes them.
 //!
-//! What a request accepts (formats, codecs, rates, channel layouts) is the
-//! caller's rule; this module only reports.
+//! The media the readers read is declared here ([`readable`]): the image
+//! formats and largest image, the audio and video demuxers and the video
+//! codecs they are written and tested for. A caller refuses media outside them
+//! before it reaches a reader, and what else a request accepts (rates,
+//! durations, channel layouts) is the caller's rule. A video stream also
+//! reports the size and aspect it is displayed at ([`VideoStream::displayed`]),
+//! as FFmpeg displays it.
 
 use std::time::Duration;
 
 use crate::{Error, Result, ffi};
+
+/// The media the condition readers ([`crate::read`]) read, by kind.
+pub mod readable {
+    /// The image formats [`crate::read::read_image`] decodes.
+    pub const IMAGE_FORMATS: [image::ImageFormat; 3] = [
+        image::ImageFormat::Jpeg,
+        image::ImageFormat::Png,
+        image::ImageFormat::WebP,
+    ];
+
+    /// The largest image [`crate::read::read_image`] decodes, in pixels: Pillow's
+    /// decompression-bomb limit (twice its 89,478,485-pixel warning threshold), the limit of the
+    /// reference image loader whose decoding the reader reproduces, so an image the reference
+    /// refuses is refused here too.
+    pub const IMAGE_PIXELS: u64 = 2 * 89_478_485;
+
+    /// The demuxers audio conditions are read through, by FFmpeg's names: WAV and MP3.
+    pub const AUDIO_DEMUXERS: [&str; 2] = ["wav", "mp3"];
+
+    /// The demuxer reference videos are read through, by FFmpeg's name: ISO-BMFF/QuickTime, which
+    /// reads MP4 and MOV.
+    pub const VIDEO_DEMUXERS: [&str; 1] = ["mov"];
+
+    /// The codecs of the video streams [`crate::read::read_video`] decodes, by FFmpeg's names:
+    /// H.264 and H.265.
+    pub const VIDEO_CODECS: [&str; 2] = ["h264", "hevc"];
+
+    /// The most channels an audio track the reader decodes may have: it reads mono and stereo
+    /// ([`crate::read::read_audio`] duplicates mono to stereo).
+    pub const AUDIO_CHANNELS: u32 = 2;
+}
 
 /// An image as its decoder reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +154,62 @@ pub struct VideoStream {
     pub frames: u64,
 }
 
+/// How a video stream is displayed: its coded size scaled by its sample aspect ratio and turned
+/// by its display rotation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Displayed {
+    /// The display aspect, width to height, in lowest terms.
+    pub aspect: (u64, u64),
+    /// The displayed width in pixels.
+    pub width: u32,
+    /// The displayed height in pixels.
+    pub height: u32,
+}
+
+impl VideoStream {
+    /// How the stream is displayed, as FFmpeg displays it: the coded size scaled by the sample
+    /// aspect ratio (square when unknown), keeping the coded height and rounding the width half to
+    /// even, then turned by the display rotation, a quarter turn swapping the sides.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a stream without a size or with a rotation that is not a multiple
+    /// of 90 degrees.
+    pub fn displayed(&self) -> Result<Displayed> {
+        if self.width == 0 || self.height == 0 {
+            return Err(Error::invalid("the video stream has no size"));
+        }
+        let (sample_width, sample_height) = self.sample_aspect.unwrap_or((1, 1));
+        let (width, height) = (
+            u64::from(self.width) * u64::from(sample_width),
+            u64::from(self.height) * u64::from(sample_height),
+        );
+        let divisor = num_integer::gcd(width, height);
+        let mut aspect = (width / divisor, height / divisor);
+        // Coded sizes stay far below 2^53, so the arithmetic is exact up to the rounding.
+        let scaled = f64::from(self.width) * f64::from(sample_width) / f64::from(sample_height);
+        let mut size = (scaled.round_ties_even() as u32, self.height);
+
+        if let Some(rotation) = self.rotation {
+            let turns = rotation / 90.0;
+            if (turns - turns.round()).abs() > 1e-6 {
+                return Err(Error::Invalid(format!(
+                    "a video rotation must be a multiple of 90 degrees, got {rotation}"
+                )));
+            }
+            if turns.round().rem_euclid(2.0) == 1.0 {
+                aspect = (aspect.1, aspect.0);
+                size = (size.1, size.0);
+            }
+        }
+        Ok(Displayed {
+            aspect,
+            width: size.0,
+            height: size.1,
+        })
+    }
+}
+
 /// An audio stream, as its container declares it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioStream {
@@ -198,4 +290,92 @@ pub fn decoded_track(encoded: &[u8]) -> Result<DecodedTrack> {
         channels: decoded.channels,
         samples: decoded.samples,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Displayed, VideoStream};
+
+    fn h264() -> VideoStream {
+        VideoStream {
+            codec: "h264".to_owned(),
+            pixel_format: "yuv420p".to_owned(),
+            width: 320,
+            height: 180,
+            sample_aspect: Some((1, 1)),
+            frame_rate: Some((30000, 1001)),
+            rotation: None,
+            frames: 75,
+        }
+    }
+
+    fn displayed(stream: VideoStream) -> Displayed {
+        stream.displayed().unwrap()
+    }
+
+    /// The displayed size and aspect follow the sample aspect ratio, square when unknown, and a
+    /// quarter turn swaps them.
+    #[test]
+    fn a_stream_is_displayed_scaled_and_turned() {
+        let plain = Displayed {
+            aspect: (16, 9),
+            width: 320,
+            height: 180,
+        };
+        assert_eq!(displayed(h264()), plain);
+        assert_eq!(
+            displayed(VideoStream {
+                sample_aspect: None,
+                ..h264()
+            }),
+            plain
+        );
+        assert_eq!(
+            displayed(VideoStream {
+                rotation: Some(180.0),
+                ..h264()
+            }),
+            plain
+        );
+        for rotation in [90.0, -90.0, 270.0] {
+            assert_eq!(
+                displayed(VideoStream {
+                    rotation: Some(rotation),
+                    ..h264()
+                }),
+                Displayed {
+                    aspect: (9, 16),
+                    width: 180,
+                    height: 320,
+                },
+                "{rotation}"
+            );
+        }
+        // 352x288 at a 12:11 sample aspect displays at 4:3, 384 pixels wide.
+        assert_eq!(
+            displayed(VideoStream {
+                width: 352,
+                height: 288,
+                sample_aspect: Some((12, 11)),
+                ..h264()
+            }),
+            Displayed {
+                aspect: (4, 3),
+                width: 384,
+                height: 288,
+            }
+        );
+    }
+
+    /// A stream without a size, or turned by other than quarter turns, has no displayed size.
+    #[test]
+    fn a_stream_without_a_size_or_a_quarter_turn_is_refused() {
+        let sizeless = VideoStream { width: 0, ..h264() };
+        assert!(sizeless.displayed().is_err());
+        let slanted = VideoStream {
+            rotation: Some(45.0),
+            ..h264()
+        };
+        assert!(slanted.displayed().is_err());
+    }
 }

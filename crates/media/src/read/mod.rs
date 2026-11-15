@@ -172,6 +172,13 @@ fn decode_rgb(encoded: &[u8]) -> Result<Rgb24> {
     let mut decoder = reader
         .into_decoder()
         .map_err(|error| Error::Codec(format!("decoding a condition image: {error}")))?;
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > crate::probe::readable::IMAGE_PIXELS {
+        return Err(Error::Invalid(format!(
+            "a condition image of {width}x{height} pixels exceeds the {} the reader decodes",
+            crate::probe::readable::IMAGE_PIXELS
+        )));
+    }
     // A missing or unknown orientation tag leaves the pixels as they are.
     let orientation = decoder
         .orientation()

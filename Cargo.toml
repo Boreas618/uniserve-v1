@@ -126,6 +126,8 @@ http-body = "1.0.1"
 humantime = "2.4.0"
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 indexmap = "2.13.0"
+# The IANA special-purpose address registries, which the media connector refuses fetches into.
+iprfc = "1.0.0"
 itertools = "0.14.0"
 libc = "0.2.177"
 libloading = "0.8.9"
@@ -140,6 +142,8 @@ minijinja-contrib = { version = "2.0", features = ["pycompat"] }
 # Mooncake Store's C API, loaded at run time (`libmooncake_store.so`, built
 # with `WITH_STORE_C_SHARED`), so nothing links Mooncake.
 mooncake_store = { git = "https://github.com/kvcache-ai/Mooncake", tag = "v0.3.13.post1", default-features = false, features = ["dlopen"] }
+# The greatest common divisor a video's display aspect is reduced by.
+num-integer = "0.1.46"
 prometheus-client = "0.24.0"
 png = "0.18.1"
 # The cross-build interfaces' Protobuf messages and their compiler, which needs

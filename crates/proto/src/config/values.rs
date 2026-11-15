@@ -154,6 +154,24 @@ pub mod bytes {
     }
 }
 
+/// The serde form of an optional positive byte size.
+pub mod optional_bytes {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => serialize_bytes(*value, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u64>, D::Error> {
+        bytes::deserialize(deserializer).map(Some)
+    }
+}
+
 /// The serde form of a positive byte size held as a `usize`.
 pub mod byte_count {
     use super::*;

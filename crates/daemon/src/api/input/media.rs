@@ -4,9 +4,10 @@
 //! [`MediaConnector`] resolves a reference into its bytes before model
 //! preprocessing runs, so network and file I/O stay on the async runtime and
 //! never enter the blocking preprocessing pool. Two connectors serve the
-//! server, each under its own option table: input images of chat and image
-//! generation (`image_fetch_config`), and video
-//! condition media (`media_config`). [`MediaConnector::fetch_images`]
+//! server, each under its own option table of one schema
+//! (`proto::config::MediaSources`): input images of chat
+//! (`image_fetch_config`), and video condition media (`media_config`). The
+//! tables differ only in what they default to. [`MediaConnector::fetch_images`]
 //! additionally validates each image into an [`ImageInput`] (the encoded
 //! file bytes, their header dimensions and a content digest).
 //!
@@ -23,9 +24,9 @@
 //!   check is refused as well.
 //! - `http(s)://`, fetched unless the connector disables remote media. These
 //!   rules apply to the initial URL and to every redirect hop:
-//!   - Only `http` and `https` are followed, for at most
-//!     [`MediaConnector::MAX_REDIRECTS`] redirects, and a redirect may not
-//!     downgrade `https` to `http`.
+//!   - Only `http` and `https` are followed, for at most the table's
+//!     `max_redirects` redirects, and a redirect may not downgrade `https` to
+//!     `http`.
 //!   - Unless private destinations are allowed, every destination address
 //!     must be public ([`is_public_address`]). A literal address in the URL
 //!     is checked before the request. A host name is checked inside the
@@ -44,7 +45,7 @@
 //! and the streamed byte count enforces both limits whatever the headers
 //! declare.
 
-use std::io::{Cursor, Read as _};
+use std::io::Read as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
@@ -59,7 +60,7 @@ use reqwest::{StatusCode, Url};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
-use proto::config::{ImageFetchConfig, MediaConfig};
+use proto::config::{MediaDefaults, MediaSources};
 
 /// Failure to resolve one media reference.
 ///
@@ -120,11 +121,11 @@ pub enum MediaError {
     /// A redirect response carries no usable `Location` header.
     #[error("the URL returned a redirect without a valid Location header")]
     InvalidRedirect,
-    /// The URL redirects more times than [`MediaConnector::MAX_REDIRECTS`].
+    /// The URL redirects more times than the connector follows.
     #[error("the URL redirects more than {limit} times")]
     TooManyRedirects {
         /// Redirects allowed per fetch.
-        limit: usize,
+        limit: u32,
     },
     /// The final response status is not a success.
     #[error("the URL returned HTTP status {status}")]
@@ -149,9 +150,10 @@ pub enum MediaError {
         "the media is not an image: its declared type is not image/* and its bytes match no image format"
     )]
     NotImage,
-    /// The bytes do not form a readable image of a supported format.
+    /// The bytes do not form a readable image of a supported format: the probe of the decoder
+    /// that reads the image refuses its header.
     #[error("the image cannot be decoded: {0}")]
-    Undecodable(image::ImageError),
+    Undecodable(media::Error),
     /// The fetch did not complete within the connector's time limit.
     #[error("the URL fetch did not complete within {timeout:?}")]
     Timeout {
@@ -216,21 +218,12 @@ impl ImageInput {
     pub fn from_bytes(bytes: impl Into<Bytes>) -> Result<Self, MediaError> {
         let bytes = bytes.into();
 
-        // The format comes from the magic number, not from any declared media
-        // type, so a mislabeled file is read as what it actually is.
-        image::ImageReader::new(Cursor::new(&bytes[..]))
-            .with_guessed_format()
-            .map_err(|error| MediaError::Undecodable(image::ImageError::IoError(error)))?
-            .into_dimensions()
-            .map_err(MediaError::Undecodable)?;
-        // The size an image is processed at is its displayed size: the header's with its EXIF
+        // One probe of the decoder the worker reads the image with: its format comes from the
+        // magic number, not from any declared media type, so a mislabeled file is read as what
+        // it actually is, and its size is the displayed one, the header's with its EXIF
         // orientation applied, as the worker decodes its pixels (`media::read`).
-        let media::probe::ImageFacts { width, height, .. } = media::probe::probe_image(&bytes)
-            .map_err(|error| {
-                MediaError::Undecodable(image::ImageError::IoError(std::io::Error::other(
-                    error.to_string(),
-                )))
-            })?;
+        let media::probe::ImageFacts { width, height, .. } =
+            media::probe::probe_image(&bytes).map_err(MediaError::Undecodable)?;
 
         let mut key = storage::key::Digest::new(b"media");
         key.bytes(&bytes);
@@ -280,96 +273,52 @@ pub struct MediaConnector {
     allow_private: bool,
     media_root: Option<MediaRoot>,
     timeout: Duration,
+    max_redirects: u32,
     max_bytes: u64,
     max_request_bytes: Option<u64>,
     slots: Arc<Semaphore>,
 }
 
 impl MediaConnector {
-    /// Redirects followed before a fetch fails.
-    pub const MAX_REDIRECTS: usize = 3;
-
-    /// Largest number of http(s) downloads in progress at once on one connector.
-    ///
-    /// Each download buffers at most the per-medium limit, so the limit also
-    /// bounds the storage in-flight downloads hold (1.28 GB at the 20 MB image
-    /// default). Further fetches wait for a slot; `data:` and `file://`
-    /// references never take one.
-    pub const MAX_CONCURRENT_FETCHES: usize = 64;
-
-    /// Longest time to establish one connection.
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-    /// Longest time for one fetch of video condition media, body included.
-    const CONDITION_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
-
-    /// The connector of input images (`image_fetch_config`): `data:` and
-    /// `http(s)` references, each image within `max_bytes`, each fetch within
-    /// `timeout`, and private destinations only when `allow_private` is set.
+    /// The connector of one media table (`image_fetch_config` or `media_config`): `data:`
+    /// references, `file://` below the table's `directory` when it states one, and `http(s)`
+    /// references when `allow_remote` is set, to public destinations unless `allow_private` is
+    /// set. Each medium is within `max_bytes` and the media of one request within
+    /// `max_request_bytes` when stated; each fetch completes within `timeout`, follows at most
+    /// `max_redirects` redirects, and holds one of `max_concurrent_fetches` download slots, which
+    /// `data:` and `file://` references never take.
     ///
     /// # Errors
     ///
-    /// Fails when the HTTP client cannot be initialized, for example when the
-    /// TLS backend cannot load its configuration.
-    pub fn from_image_options(options: &ImageFetchConfig) -> anyhow::Result<Self> {
-        Self::new(
-            None,
-            true,
-            options.allow_private,
-            options.timeout,
-            options.max_bytes,
-            None,
-        )
-    }
-
-    /// The connector of video condition media (`media_config`): `data:`
-    /// references, `file://` below `directory` when one is configured, and
-    /// public `http(s)` destinations when `allow_remote` is set. The media of
-    /// one request share `max_request_bytes`, which a single condition may
-    /// use up.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the media directory cannot be resolved or the HTTP client
-    /// cannot be initialized.
-    pub fn from_media_options(options: &MediaConfig) -> anyhow::Result<Self> {
-        Self::new(
-            options.directory.as_deref(),
-            options.allow_remote,
-            false,
-            Self::CONDITION_FETCH_TIMEOUT,
-            options.max_request_bytes,
-            Some(options.max_request_bytes),
-        )
-    }
-
-    fn new(
-        directory: Option<&Path>,
-        allow_remote: bool,
-        allow_private: bool,
-        timeout: Duration,
-        max_bytes: u64,
-        max_request_bytes: Option<u64>,
-    ) -> anyhow::Result<Self> {
-        let media_root = directory.map(MediaRoot::resolve).transpose()?;
+    /// Fails when the media directory is not a directory named by its canonical path, or the
+    /// HTTP client cannot be initialized, for example when the TLS backend cannot load its
+    /// configuration.
+    pub fn new<D: MediaDefaults>(options: &MediaSources<D>) -> anyhow::Result<Self> {
+        let media_root = options
+            .directory
+            .as_deref()
+            .map(MediaRoot::resolve)
+            .transpose()?;
+        let allow_private = options.allow_private;
         let client = reqwest::Client::builder()
             // Redirects are followed by `download` so each hop is validated
             // before it is requested.
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .dns_resolver(Arc::new(AddressResolver { allow_private }))
-            .connect_timeout(Self::CONNECT_TIMEOUT)
+            .connect_timeout(options.connect_timeout)
             .user_agent(concat!("uniserve/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
             client,
-            allow_remote,
+            allow_remote: options.allow_remote,
             allow_private,
             media_root,
-            timeout,
-            max_bytes,
-            max_request_bytes,
-            slots: Arc::new(Semaphore::new(Self::MAX_CONCURRENT_FETCHES)),
+            timeout: options.timeout,
+            max_redirects: options.max_redirects,
+            max_bytes: options.max_bytes,
+            max_request_bytes: options.max_request_bytes,
+            slots: Arc::new(Semaphore::new(options.max_concurrent_fetches.get())),
         })
     }
 
@@ -557,9 +506,9 @@ impl MediaConnector {
 
             let status = response.status();
             if is_followed_redirect(status) {
-                if redirects == Self::MAX_REDIRECTS {
+                if redirects == self.max_redirects {
                     return Err(MediaError::TooManyRedirects {
-                        limit: Self::MAX_REDIRECTS,
+                        limit: self.max_redirects,
                     });
                 }
                 let location = response
@@ -630,52 +579,61 @@ impl MediaConnector {
     }
 }
 
-/// The bytes one request may still fetch; unbounded without a request total.
-struct Budget {
-    limit: Option<u64>,
+/// The bytes one request may still fetch of its request total; a request without one has no
+/// budget to keep.
+struct Budget(Option<RequestTotal>);
+
+/// A request total and what of it is left.
+struct RequestTotal {
+    limit: u64,
     remaining: AtomicU64,
 }
 
 impl Budget {
     fn new(limit: Option<u64>) -> Self {
-        Self {
+        Self(limit.map(|limit| RequestTotal {
             limit,
-            remaining: AtomicU64::new(limit.unwrap_or(u64::MAX)),
-        }
+            remaining: AtomicU64::new(limit),
+        }))
     }
 
     /// Reserves `bytes` of the request total.
     fn take(&self, bytes: u64) -> Result<(), MediaError> {
-        let Some(limit) = self.limit else {
+        let Some(total) = &self.0 else {
             return Ok(());
         };
-        let reserved =
-            self.remaining
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                    remaining.checked_sub(bytes)
-                });
-        match reserved {
-            Ok(_) => Ok(()),
-            Err(_) => Err(MediaError::RequestTooLarge { limit }),
-        }
+        total
+            .remaining
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(bytes)
+            })
+            .map(|_| ())
+            .map_err(|_| MediaError::RequestTooLarge { limit: total.limit })
     }
 }
 
-/// The media directory as configured and as canonicalized; a `file://`
-/// path may name it either way.
+/// The media directory, by its canonical path: the one spelling `file://` paths name it by.
 #[derive(Debug, Clone)]
-struct MediaRoot {
-    configured: PathBuf,
-    canonical: PathBuf,
-}
+struct MediaRoot(PathBuf);
 
 impl MediaRoot {
+    /// The root of `directory`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `directory` does not resolve, or when it is not its own canonical path (a
+    /// relative path, or one through a symbolic link): `file://` paths are compared with the
+    /// directory before the file system is consulted, so the directory has one spelling.
     fn resolve(directory: &Path) -> anyhow::Result<Self> {
-        let failed = |error| anyhow::anyhow!("media directory {}: {error}", directory.display());
-        Ok(Self {
-            configured: std::path::absolute(directory).map_err(failed)?,
-            canonical: std::fs::canonicalize(directory).map_err(failed)?,
-        })
+        let canonical = std::fs::canonicalize(directory)
+            .map_err(|error| anyhow::anyhow!("media directory {}: {error}", directory.display()))?;
+        anyhow::ensure!(
+            canonical == directory,
+            "media directory {} is not its canonical path; state it as {}",
+            directory.display(),
+            canonical.display()
+        );
+        Ok(Self(canonical))
     }
 }
 
@@ -695,14 +653,14 @@ fn read_media_file(
         reason,
     };
     let outside = || MediaError::OutsideMediaDirectory { path: shown() };
-    if !path.starts_with(&root.configured) && !path.starts_with(&root.canonical) {
+    if !path.starts_with(&root.0) {
         return Err(outside());
     }
     // Canonicalization resolves every symbolic link, so a path that leaves
     // the media directory through a link ends outside its canonical form.
     let canonical =
         std::fs::canonicalize(path).map_err(|_| unreadable("does not exist".to_owned()))?;
-    if !canonical.starts_with(&root.canonical) {
+    if !canonical.starts_with(&root.0) {
         return Err(outside());
     }
     // Refuse a final symbolic link swapped in after canonicalization.
@@ -812,111 +770,43 @@ fn has_prefix_ignore_case(value: &str, prefix: &str) -> bool {
 
 /// Returns whether a fetch may connect to `address` under the public-only policy.
 ///
-/// Rejected: unspecified, loopback, private-use (RFC 1918), shared (CGNAT),
-/// link-local (which holds the 169.254.169.254 cloud metadata service),
-/// unique-local and site-local IPv6 (which hold IPv6 metadata services such
-/// as `fd00:ec2::254`), documentation, benchmarking, IETF protocol
-/// assignment, discard-only, segment-routing, multicast, reserved, and
-/// broadcast ranges, the deprecated IPv4-compatible IPv6 range, and NAT64
-/// prefixes other than the well-known one. IPv6 forms that carry an IPv4
-/// destination (IPv4-mapped, IPv4-translated, well-known NAT64, and 6to4)
-/// are judged by that IPv4 address.
+/// A public destination is a unicast address of the space IANA allocates for global use, in no
+/// block of IANA's IPv4 and IPv6 Special-Purpose Address Space registries (`iprfc::RFC6890`,
+/// a pinned snapshot of both registries): that refuses unspecified, "this network", loopback,
+/// private-use, shared (CGNAT, which holds the 100.100.100.200 cloud metadata service),
+/// link-local (169.254.169.254 and 169.254.170.2), unique-local (`fd00:ec2::254`), protocol
+/// assignment, documentation, benchmarking, discard-only, segment-routing, reserved and
+/// broadcast blocks. Multicast is not unicast. An IPv6 address must lie in `2000::/3`, the
+/// global unicast space of IANA's IPv6 Address Space registry, which leaves out the reserved
+/// blocks (the deprecated IPv4-compatible `::/96`, site-local `fec0::/10`, NAT64 prefixes but
+/// the well-known one). IPv6 forms that carry an IPv4 destination (IPv4-mapped,
+/// IPv4-translated, well-known NAT64 and 6to4) are judged by that IPv4 address, since a
+/// connection to them reaches it.
 pub fn is_public_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => is_public_ipv4(address),
-        IpAddr::V6(address) => is_public_ipv6(address),
+        IpAddr::V6(address) => match embedded_ipv4(address) {
+            Some(ipv4) => is_public_ipv4(ipv4),
+            None => GLOBAL_UNICAST.contains(&address) && !iprfc::RFC6890.contains(&address),
+        },
     }
 }
 
-/// IPv4 ranges outside public unicast space, as `(network, prefix length)`.
-const NON_PUBLIC_IPV4: &[(Ipv4Addr, u8)] = &[
-    // "This network", including the unspecified address 0.0.0.0, which
-    // Linux connects to the local host.
-    (Ipv4Addr::new(0, 0, 0, 0), 8),
-    (Ipv4Addr::new(10, 0, 0, 0), 8),
-    // Shared address space for carrier-grade NAT, which also holds the
-    // 100.100.100.200 cloud metadata service.
-    (Ipv4Addr::new(100, 64, 0, 0), 10),
-    (Ipv4Addr::new(127, 0, 0, 0), 8),
-    // Link-local, which holds the 169.254.169.254 and 169.254.170.2 cloud
-    // metadata services.
-    (Ipv4Addr::new(169, 254, 0, 0), 16),
-    (Ipv4Addr::new(172, 16, 0, 0), 12),
-    // IETF protocol assignments.
-    (Ipv4Addr::new(192, 0, 0, 0), 24),
-    // Documentation (TEST-NET-1).
-    (Ipv4Addr::new(192, 0, 2, 0), 24),
-    // Deprecated 6to4 relay anycast.
-    (Ipv4Addr::new(192, 88, 99, 0), 24),
-    (Ipv4Addr::new(192, 168, 0, 0), 16),
-    // Benchmarking.
-    (Ipv4Addr::new(198, 18, 0, 0), 15),
-    // Documentation (TEST-NET-2 and TEST-NET-3).
-    (Ipv4Addr::new(198, 51, 100, 0), 24),
-    (Ipv4Addr::new(203, 0, 113, 0), 24),
-    // Multicast.
-    (Ipv4Addr::new(224, 0, 0, 0), 4),
-    // Reserved, including the limited broadcast address 255.255.255.255.
-    (Ipv4Addr::new(240, 0, 0, 0), 4),
-];
+/// The global unicast space of IANA's IPv6 Address Space registry, `2000::/3`: the only space it
+/// allocates for global unicast use.
+const GLOBAL_UNICAST: iprfc::Ipv6Net =
+    iprfc::Ipv6Net::new_assert(Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0), 3);
 
-/// IPv6 ranges outside public unicast space, as `(network, prefix length)`.
-///
-/// Ranges that embed an IPv4 destination are handled by `embedded_ipv4`
-/// before this table is consulted.
-const NON_PUBLIC_IPV6: &[(Ipv6Addr, u8)] = &[
-    // Deprecated IPv4-compatible addresses, including the unspecified
-    // address `::` and loopback `::1`.
-    (Ipv6Addr::UNSPECIFIED, 96),
-    // NAT64 prefixes other than the well-known `64:ff9b::/96`, including
-    // local-use `64:ff9b:1::/48`, which translate to destinations the
-    // embedded IPv4 address does not determine.
-    (Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0), 32),
-    // Discard-only.
-    (Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64),
-    // IETF protocol assignments, including Teredo.
-    (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),
-    // Documentation.
-    (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32),
-    (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),
-    // Segment-routing SIDs.
-    (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16),
-    // Unique-local.
-    (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
-    // Link-local and deprecated site-local.
-    (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
-    (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),
-    // Multicast.
-    (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
-];
-
-/// Returns whether an IPv4 address lies outside every [`NON_PUBLIC_IPV4`] range.
+/// Returns whether an IPv4 address is a unicast address in no special-purpose block.
 fn is_public_ipv4(address: Ipv4Addr) -> bool {
-    let bits = u32::from(address);
-    !NON_PUBLIC_IPV4.iter().any(|(network, length)| {
-        let mask = u32::MAX.checked_shl(32 - u32::from(*length)).unwrap_or(0);
-        bits & mask == u32::from(*network) & mask
-    })
-}
-
-/// Returns whether an IPv6 address is public, judging embedded IPv4
-/// destinations by their IPv4 address.
-fn is_public_ipv6(address: Ipv6Addr) -> bool {
-    if let Some(ipv4) = embedded_ipv4(address) {
-        return is_public_ipv4(ipv4);
-    }
-    let bits = u128::from(address);
-    !NON_PUBLIC_IPV6.iter().any(|(network, length)| {
-        let mask = u128::MAX.checked_shl(128 - u32::from(*length)).unwrap_or(0);
-        bits & mask == u128::from(*network) & mask
-    })
+    !address.is_multicast() && !iprfc::RFC6890.contains(&address)
 }
 
 /// Returns the IPv4 destination an IPv6 address carries, if any.
 ///
-/// Covers IPv4-mapped (`::ffff:0:0/96`), IPv4-translated
-/// (`::ffff:0:0:0/96`), well-known NAT64 (`64:ff9b::/96`), and 6to4
-/// (`2002::/16`, IPv4 in bits 16..48).
+/// Covers IPv4-mapped (`::ffff:0:0/96`, RFC 4291), IPv4-translated (`::ffff:0:0:0/96`,
+/// RFC 2765), well-known NAT64 (`64:ff9b::/96`, RFC 6052) and 6to4 (`2002::/16`, RFC 3056, the
+/// IPv4 address in bits 16..48).
 fn embedded_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
     let bits = u128::from(address);
 
@@ -1018,9 +908,11 @@ fn is_followed_redirect(status: StatusCode) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io::Cursor;
     use std::sync::atomic::AtomicUsize;
 
     use image::ImageFormat;
+    use proto::config::{ImageFetchConfig, MediaConfig};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -1058,7 +950,7 @@ mod tests {
     }
 
     fn image_connector(options: &ImageFetchConfig) -> MediaConnector {
-        MediaConnector::from_image_options(options).unwrap()
+        MediaConnector::new(options).unwrap()
     }
 
     /// Resolves one image reference through `fetch_images`.
@@ -1093,9 +985,10 @@ mod tests {
 
     /// A condition-media connector whose request total is `max_request_bytes`.
     fn condition_connector(directory: Option<&Path>, max_request_bytes: u64) -> MediaConnector {
-        MediaConnector::from_media_options(&MediaConfig {
+        MediaConnector::new(&MediaConfig {
             directory: directory.map(Path::to_path_buf),
-            max_request_bytes,
+            max_bytes: max_request_bytes,
+            max_request_bytes: Some(max_request_bytes),
             ..MediaConfig::default()
         })
         .unwrap()
@@ -1486,8 +1379,8 @@ mod tests {
     }
 
     /// A fetch that stalls before the response head or in the middle of the
-    /// body fails at the time limit.
-    #[tokio::test]
+    /// body fails at the time limit, on the runtime's paused clock.
+    #[tokio::test(start_paused = true)]
     async fn stalled_fetches_end_at_the_time_limit() {
         let server = TestServer::start(|path| match path {
             "/silent" => Reply::Hold(Vec::new()),
@@ -1497,7 +1390,7 @@ mod tests {
             ),
         })
         .await;
-        let timeout = Duration::from_millis(200);
+        let timeout = Duration::from_secs(30);
         let connector = image_connector(&ImageFetchConfig {
             timeout,
             ..loopback_policy()
@@ -1682,14 +1575,19 @@ mod tests {
             Err(MediaError::InvalidFileUrl)
         ));
 
-        // The directory may be named through a link to it.
+        // The directory has one spelling, its canonical path: one named through a link is
+        // refused, naming the path to state.
         let linked = root.path().join("linked");
         std::os::unix::fs::symlink(&media, &linked).unwrap();
-        let through_link = condition_connector(Some(&linked), 64);
-        for path in [linked.join("voice.wav"), media.join("voice.wav")] {
-            let read = fetch_one(&through_link, &uri(&path)).await.unwrap();
-            assert_eq!(read.bytes.as_ref(), b"voice");
-        }
+        let refused = MediaConnector::new(&MediaConfig {
+            directory: Some(linked),
+            ..MediaConfig::default()
+        })
+        .unwrap_err();
+        assert!(
+            refused.to_string().contains(&media.display().to_string()),
+            "{refused}"
+        );
 
         let without_directory = condition_connector(None, 64);
         assert!(matches!(
@@ -1795,7 +1693,7 @@ mod tests {
                 );
             }
         }
-        let remote_disabled = MediaConnector::from_media_options(&MediaConfig {
+        let remote_disabled = MediaConnector::new(&MediaConfig {
             allow_remote: false,
             ..MediaConfig::default()
         })

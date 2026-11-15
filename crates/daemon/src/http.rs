@@ -54,9 +54,13 @@ pub(crate) const BODY_LIMIT: usize = 64 << 20;
 ///
 /// A `data:` URI carries its media base64 encoded, four bytes per three, so
 /// a body holding `media.max_request_bytes` of media plus the request's own
-/// fields fits; it never falls below the server-wide body limit.
+/// fields fits; it never falls below the server-wide body limit, which is the
+/// limit of a deployment that states no request total.
 pub(crate) fn video_body_limit(media: &MediaConfig) -> usize {
-    let encoded = media.max_request_bytes.div_ceil(3) * 4 + (1 << 20);
+    let Some(total) = media.max_request_bytes else {
+        return BODY_LIMIT;
+    };
+    let encoded = total.div_ceil(3) * 4 + (1 << 20);
     usize::try_from(encoded)
         .unwrap_or(usize::MAX)
         .max(BODY_LIMIT)

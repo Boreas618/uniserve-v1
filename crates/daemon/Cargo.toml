@@ -28,6 +28,8 @@ hf-hub.workspace = true
 http-body.workspace = true
 image.workspace = true
 indexmap.workspace = true
+# The IANA special-purpose address registries: the destinations a media fetch may not reach.
+iprfc.workspace = true
 itertools.workspace = true
 libc.workspace = true
 # This host's name (`uname(2)`), the default host identity.
@@ -76,6 +78,9 @@ criterion.workspace = true
 # The paused clock of the tests that wait on a deadline (`tokio::time::pause`).
 tokio = { workspace = true, features = ["test-util"] }
 expect-test.workspace = true
+# Test images with chunks placed where a test states them (an `eXIf` before or after the image
+# data, a header of a size no decoder would allocate).
+png.workspace = true
 # The scratch directories of the tests' files and sockets.
 tempfile.workspace = true
 # Builds the deterministic serving tokenizers of the test fixtures (`api::test_support`).

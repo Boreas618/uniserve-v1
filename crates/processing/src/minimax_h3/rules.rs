@@ -16,8 +16,9 @@
 //! - `start_time_seconds` skips the first `floor(s * fps + 0.5)` frames of a reference video's
 //!   timeline at the output frame rate and the first `floor(s * rate + 0.5)` samples of its
 //!   soundtrack;
-//! - a reference video needs at least the fewest frames of the frame rule (one VAE clip and its
-//!   tail, 22 frames) on that timeline after the start offset;
+//! - a reference video runs at 23.976 to 60 frames per second ([`REFERENCE_FRAME_RATES`]) and needs
+//!   at least the fewest frames of the frame rule (one VAE clip and its tail, 22 frames) on that
+//!   timeline after the start offset;
 //! - `ref2va` keyframes are fitted to the target canvas like `fl2va` ones (the first stretched, a
 //!   second cover-cropped) and do not enter the conditioner;
 //! - without a stated length, a `ref2va` request whose references carry exactly one soundtrack
@@ -43,6 +44,10 @@ use crate::video::{ConditionInput, InputError, Length, Reference, ReferenceKind,
 /// The keyframe sets a request may anchor, by the generated frames their `frame_index` values
 /// name: the first, the last, or both. A `ref2va` request may also anchor none.
 pub const KEYFRAME_ANCHORS: [&[i64]; 3] = [&[0], &[-1], &[0, -1]];
+/// The frame rates a reference video may run at, the lowest and the highest, each as
+/// `(numerator, denominator)` frames per second: from 23.976 (film at NTSC rates, 24000/1001, to
+/// three decimals) to 60, both included.
+pub const REFERENCE_FRAME_RATES: [(u64, u64); 2] = [(2997, 125), (60, 1)];
 
 /// The public request parameter a refusal of the output size names.
 pub const SIZE: &str = "size";
@@ -610,6 +615,20 @@ pub fn video_reference(
         };
     }
 
+    let (numerator, denominator) = (
+        u64::from(media.frame_rate.numerator),
+        u64::from(media.frame_rate.denominator),
+    );
+    let [(low, low_per), (high, high_per)] = REFERENCE_FRAME_RATES;
+    // Compared as fractions, exactly: `n / d >= low / low_per` and `n / d <= high / high_per`.
+    if numerator * low_per < low * denominator || numerator * high_per > high * denominator {
+        return Err(format!(
+            "a reference video must run at {:.3} to {} frames per second, got {:.3}",
+            low as f64 / low_per as f64,
+            high as f64 / high_per as f64,
+            numerator as f64 / denominator as f64
+        ));
+    }
     let source_rate =
         f64::from(media.frame_rate.numerator) / f64::from(media.frame_rate.denominator);
     let fps = f64::from(FPS);

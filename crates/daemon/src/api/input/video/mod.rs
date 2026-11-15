@@ -170,8 +170,8 @@ impl VideoService {
         Ok(Self {
             processor: Arc::from(processor),
             media: media.clone(),
-            connector: MediaConnector::from_media_options(media)?,
-            prober: MediaProber::per_cpu(),
+            connector: MediaConnector::new(media)?,
+            prober: MediaProber::new(media)?,
             tokenizer,
         })
     }

@@ -974,7 +974,7 @@ impl Leader {
         )
         .context("failed to bind the configured model description")?
         .with_images(images);
-        let images = MediaConnector::from_image_options(&config.image_fetch_config)
+        let images = MediaConnector::new(&config.image_fetch_config)
             .context("failed to initialize the image URL fetcher")?;
         let engine = Self::observed(
             families,

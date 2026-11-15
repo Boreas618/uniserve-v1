@@ -918,41 +918,6 @@ pub enum ChatTemplateSource {
     Inline(String),
 }
 
-/// The time one input image's fetch may take when the deployment states none
-/// (`image_fetch_config.timeout`): a request-admission policy bound on one remote fetch,
-/// redirects and body included.
-pub const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// The largest input image a request may carry when the deployment states none
-/// (`image_fetch_config.max_bytes`), in bytes: a request-admission policy of 20 MB, the
-/// per-image limit OpenAI's API states for image inputs.
-pub const IMAGE_FETCH_MAX_BYTES: u64 = 20_000_000;
-
-/// Fetching input images of chat requests (`image_fetch_config`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ImageFetchConfig {
-    /// Time to fetch one `http(s)` image URL, redirects and body included.
-    #[serde(with = "values::duration")]
-    pub timeout: Duration,
-    /// Largest input image, fetched or `data:`.
-    #[serde(with = "values::bytes")]
-    pub max_bytes: u64,
-    /// Allow image URLs resolving to loopback, private, link-local,
-    /// unique-local or cloud metadata addresses.
-    pub allow_private: bool,
-}
-
-impl Default for ImageFetchConfig {
-    fn default() -> Self {
-        Self {
-            timeout: IMAGE_FETCH_TIMEOUT,
-            max_bytes: IMAGE_FETCH_MAX_BYTES,
-            allow_private: false,
-        }
-    }
-}
-
 /// The smallest prompt capacity, in tokens, a media deployment captures when
 /// `video_config.text_capacities` is unset: a short prompt encodes in a graph of at most this
 /// many tokens.
@@ -1016,28 +981,164 @@ impl VideoConfig {
     }
 }
 
-/// Condition media of video requests (`media_config`).
+/// Where a request's media may come from, its size and time limits, and how it is probed: the one
+/// schema of the two media tables, input images of chat requests (`image_fetch_config`,
+/// [`ImageFetchConfig`]) and condition media of video requests (`media_config`,
+/// [`MediaConfig`]). A table's options are the same; what each leaves unset defaults to its own
+/// values (`D`, [`MediaDefaults`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct MediaConfig {
-    /// Directory `file://` condition media resolves under; `file://` is
-    /// refused when unset.
+#[serde(deny_unknown_fields, bound = "")]
+pub struct MediaSources<D: MediaDefaults> {
+    /// Directory `file://` media resolves under; `file://` is refused when unset. The directory
+    /// is named by its canonical path, which `file://` URLs name it by.
+    #[serde(default)]
     pub directory: Option<PathBuf>,
-    /// Fetch `http(s)://` condition media.
+    /// Fetch `http(s)://` media.
+    #[serde(default = "media::allow_remote")]
     pub allow_remote: bool,
-    /// Condition media one request may carry in total.
-    #[serde(with = "values::bytes")]
-    pub max_request_bytes: u64,
+    /// Allow `http(s)` URLs resolving to loopback, private, link-local, unique-local or cloud
+    /// metadata addresses.
+    #[serde(default)]
+    pub allow_private: bool,
+    /// Time to fetch one `http(s)` medium, redirects and body included.
+    #[serde(default = "D::timeout", with = "values::duration")]
+    pub timeout: Duration,
+    /// Time to establish one connection.
+    #[serde(default = "media::connect_timeout", with = "values::duration")]
+    pub connect_timeout: Duration,
+    /// Redirects one fetch follows before it fails.
+    #[serde(default = "media::max_redirects")]
+    pub max_redirects: u32,
+    /// `http(s)` downloads in progress at once; further fetches wait for one to end. Each holds
+    /// at most `max_bytes`, so the two bound the storage downloads hold.
+    #[serde(default = "media::max_concurrent_fetches")]
+    pub max_concurrent_fetches: NonZeroUsize,
+    /// Largest medium, fetched, read or `data:`.
+    #[serde(default = "D::max_bytes", with = "values::bytes")]
+    pub max_bytes: u64,
+    /// Media one request may carry in total; unbounded when unset.
+    #[serde(default = "D::max_request_bytes", with = "values::optional_bytes")]
+    pub max_request_bytes: Option<u64>,
+    /// Time one medium's probe may take: its demuxer reading the streams of an audio or video
+    /// file. An image's probe reads its header alone.
+    #[serde(default = "media::probe_timeout", with = "values::duration")]
+    pub probe_timeout: Duration,
+    /// Media probed at once across requests; the daemon's available parallelism (its CPU set
+    /// and quota) when unset.
+    #[serde(default)]
+    pub max_concurrent_probes: Option<NonZeroUsize>,
+    /// The table's defaults.
+    #[serde(skip)]
+    pub defaults: std::marker::PhantomData<D>,
 }
 
-impl Default for MediaConfig {
+impl<D: MediaDefaults> Default for MediaSources<D> {
     fn default() -> Self {
         Self {
             directory: None,
-            allow_remote: true,
-            // 256 MiB.
-            max_request_bytes: 256 << 20,
+            allow_remote: media::allow_remote(),
+            allow_private: false,
+            timeout: D::timeout(),
+            connect_timeout: media::connect_timeout(),
+            max_redirects: media::max_redirects(),
+            max_concurrent_fetches: media::max_concurrent_fetches(),
+            max_bytes: D::max_bytes(),
+            max_request_bytes: D::max_request_bytes(),
+            probe_timeout: media::probe_timeout(),
+            max_concurrent_probes: None,
+            defaults: std::marker::PhantomData,
         }
+    }
+}
+
+/// The values a media table's options take when the deployment states none, where the tables
+/// differ: each is an admission policy of its kind of media.
+pub trait MediaDefaults {
+    /// Time to fetch one `http(s)` medium.
+    fn timeout() -> Duration;
+    /// Largest medium, in bytes.
+    fn max_bytes() -> u64;
+    /// Media one request may carry in total, in bytes; unbounded for `None`.
+    fn max_request_bytes() -> Option<u64>;
+}
+
+/// The defaults of input images of chat requests (`image_fetch_config`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImageMedia;
+
+impl MediaDefaults for ImageMedia {
+    /// 20 seconds: a request-admission bound on one remote fetch, redirects and body included.
+    fn timeout() -> Duration {
+        Duration::from_secs(20)
+    }
+
+    /// 20 MB, the per-image limit OpenAI's API states for image inputs.
+    fn max_bytes() -> u64 {
+        20_000_000
+    }
+
+    /// A chat request's images are bounded each, not in total.
+    fn max_request_bytes() -> Option<u64> {
+        None
+    }
+}
+
+/// The defaults of condition media of video requests (`media_config`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConditionMedia;
+
+impl MediaDefaults for ConditionMedia {
+    /// 60 seconds: a reference video takes longer to fetch than an image.
+    fn timeout() -> Duration {
+        Duration::from_secs(60)
+    }
+
+    /// 256 MiB, the request total: one condition may use the whole of it.
+    fn max_bytes() -> u64 {
+        256 << 20
+    }
+
+    /// 256 MiB, which also bounds the request body that carries `data:` media.
+    fn max_request_bytes() -> Option<u64> {
+        Some(256 << 20)
+    }
+}
+
+/// Fetching input images of chat requests (`image_fetch_config`).
+pub type ImageFetchConfig = MediaSources<ImageMedia>;
+
+/// Condition media of video requests (`media_config`).
+pub type MediaConfig = MediaSources<ConditionMedia>;
+
+/// The defaults the two media tables share, each a policy of the connector or the prober.
+mod media {
+    use std::num::NonZeroUsize;
+    use std::time::Duration;
+
+    /// `http(s)` media is fetched unless a deployment refuses it.
+    pub(super) fn allow_remote() -> bool {
+        true
+    }
+
+    /// 10 seconds to establish a connection, well past a reachable host's handshake.
+    pub(super) fn connect_timeout() -> Duration {
+        Duration::from_secs(10)
+    }
+
+    /// Three redirects, as many as a CDN chain takes, so a redirect loop ends early.
+    pub(super) fn max_redirects() -> u32 {
+        3
+    }
+
+    /// 64 downloads at once.
+    pub(super) fn max_concurrent_fetches() -> NonZeroUsize {
+        super::positive(64)
+    }
+
+    /// 30 seconds for a demuxer to read one medium's streams, which a crafted file could
+    /// otherwise stretch without bound.
+    pub(super) fn probe_timeout() -> Duration {
+        Duration::from_secs(30)
     }
 }
 

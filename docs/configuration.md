@@ -381,11 +381,7 @@ The workers' always-on profiling: the fence probes at the entry and exit of the 
 **Destination: host layer.**
 
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `timeout` | `"20s"` | Time to fetch one `http(s)` image URL, redirects and body included |
-| `max_bytes` | `20000000` | Largest input image, fetched or `data:` |
-| `allow_private` | `false` | Allow image URLs resolving to loopback, private, link-local, unique-local or cloud metadata addresses |
+Input images of chat requests. The table takes the options of [`media_config`](#media_config), the one schema of request media, with these defaults where the two differ: `timeout` `"20s"`, `max_bytes` `20000000` (the per-image limit OpenAI's API states), and no `max_request_bytes`, so a request's images are bounded each and not in total.
 
 A chat family that takes images (Qwen3.6-35B-A3B, BF16 and NVFP4) serves `image_url` parts, URLs and `data:` URIs alike, when its checkpoint holds the vision tower and its processor files (`preprocessor_config.json`, `video_preprocessor_config.json`). Each image is sized by the processor's rule (`smart_resize` to whole 32-pixel merged tokens within the processor's pixel bounds, its EXIF orientation applied) and takes as many cache tokens as merged tokens, which count against `max_model_len` and, with the prompt, against `max_num_batched_tokens`. The rank holds eight images' features at once, each slot sized for the largest image the processor admits, so a request reads at most eight images. Every other family refuses an image part with `unsupported feature image_input`.
 
@@ -409,11 +405,21 @@ The [FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity) explains how t
 **Destination: host layer.**
 
 
+Condition media of video requests. `image_fetch_config` takes the same options with its own defaults.
+
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `directory` | Unset | Directory `file://` condition media resolves under; `file://` is refused when unset |
-| `allow_remote` | `true` | Fetch `http(s)://` condition media |
-| `max_request_bytes` | `"256MiB"` | Condition media one request may carry in total; the video routes' body limit follows it |
+| `directory` | Unset | Directory `file://` media resolves under, stated by its canonical path (an absolute path through no symbolic link), which `file://` URLs name it by; `file://` is refused when unset |
+| `allow_remote` | `true` | Fetch `http(s)://` media |
+| `allow_private` | `false` | Allow `http(s)` URLs resolving to an address outside IANA's global unicast space or in a block of its special-purpose registries: loopback, private, shared, link-local (cloud metadata services), unique-local, documentation and the rest; IPv6 forms that carry an IPv4 address are judged by it |
+| `timeout` | `"60s"` | Time to fetch one `http(s)` medium, redirects and body included |
+| `connect_timeout` | `"10s"` | Time to establish one connection |
+| `max_redirects` | `3` | Redirects one fetch follows; each hop is checked again, and none may go from `https` to `http` |
+| `max_concurrent_fetches` | `64` | `http(s)` downloads in progress at once; further fetches wait |
+| `max_bytes` | `"256MiB"` | Largest medium, fetched, read or `data:` |
+| `max_request_bytes` | `"256MiB"` | Media one request may carry in total; the video routes' body limit follows it |
+| `probe_timeout` | `"30s"` | Time a demuxer may take to read one audio or video medium's streams |
+| `max_concurrent_probes` | The daemon's available parallelism | Media probed at once across requests |
 
 Reference videos are decoded through the FFmpeg libraries the engine executable links, with no external program.
 
