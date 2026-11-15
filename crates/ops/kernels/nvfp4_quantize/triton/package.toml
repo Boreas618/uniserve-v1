@@ -1,8 +1,5 @@
 # The nvfp4_quantize operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program encodes a row's run of whole K16 blocks into packed E2M1 values
 # and their E4M3 block scales; the row count comes from the grid, so one module
 # serves every row count.
@@ -11,25 +8,35 @@ op = "nvfp4_quantize"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/nvfp4_quantize.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_100f", "sm_90a"]
+[launch]
+kernel = "_nvfp4_quantize_kernel"
+warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
+derive = "derive"
+
+# `global_scale` is a device operand: the deployment's activation scale is published by the loader,
+# so the operator passes its address rather than baking a host constant into the program.
+# `token_scale_ptr` is the row's dequantization factor, an output of the encode, one FP32 per row.
+[launch.types]
+input_ptr = { pointer = "input" }
+values_ptr = "*u8"
+scales_ptr = "*u8"
+rows = "i64"
+global_scale = "*fp32"
+token_scale_ptr = "*fp32"
+
+# The scale matrix's widths are the derivation's: a sixteenth of the row, padded to whole groups of
+# four scale columns under the swizzle, and the power-of-two tile one padded row is zeroed in.
+[launch.constants]
+COLUMNS = { field = "columns" }
+BLOCK = { field = "block" }
+SCALE_COLUMNS = { field = "scale_columns" }
+SWIZZLED = { field = "layout", values = { linear = false, swizzled_128x4 = true } }
+PADDED_COLUMNS = { field = "padded_columns" }
+PADDED_TILE = { field = "padded_tile" }
 
 # `input_bf16_columns_2048_layout_linear_block_256_pdl_true`.
 [[kernel.descriptors]]
 dimensions = { input = ["bf16", "f16"], columns = { multiple = 16 }, layout = ["linear", "swizzled_128x4"], block = { min = 16, power_of_two = true }, pdl = ["true", "false"] }
-
-[parameters]

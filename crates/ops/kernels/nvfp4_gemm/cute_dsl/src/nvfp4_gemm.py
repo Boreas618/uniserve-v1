@@ -42,16 +42,17 @@ product is ``[m, n]`` with unit stride on ``n``.
 """
 
 from typing import Tuple
-import cuda.bindings.driver as cuda
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
-from cutlass.cute.nvgpu import cpasync, tcgen05
+import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
+from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
+
 
 class Nvfp4GemmKernel:
     """One compilation of the block-scaled FP4 product.

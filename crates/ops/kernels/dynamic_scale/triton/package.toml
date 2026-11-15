@@ -1,8 +1,5 @@
 # The dynamic_scale operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program folds an activation's partial largest magnitudes into its
 # largest magnitude and writes the two factors a product over the activation,
 # encoded at that measured scale, reads: the encoder's multiplier
@@ -16,24 +13,24 @@ op = "dynamic_scale"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/dynamic_scale.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_dynamic_scale_kernel"
+warps = { field = "tile", steps = [[2048, 8]], otherwise = 4 }
+
+[launch.types]
+partials = { pointer = "dtype" }
+weight_amax = "*fp32"
+encode = "*fp32"
+alpha = "*fp32"
+count = "i64"
+range_ = "fp32"
+floor = "fp32"
+
+[launch.constants]
+TILE = { field = "tile" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], tile = { power_of_two = true }, pdl = ["false", "true"] }
-
-[parameters]

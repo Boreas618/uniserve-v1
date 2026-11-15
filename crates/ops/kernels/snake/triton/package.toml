@@ -1,9 +1,5 @@
 # The snake operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The key is the one `Descriptor`'s `Display` prints, e.g.
 # `dtype_bf16_channels_512_block_1024_pdl_false`. The channel count is the parameter
 # count, so a second channel layout is a second module.
@@ -12,24 +8,27 @@ op = "snake"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/snake.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_snake_kernel"
+warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
+
+# The signal's row count, channel count and width are launch words. `pdl` is a word the kernel
+# does not read: the dependent launch is compiled in.
+[launch.types]
+x_ptr = { pointer = "dtype" }
+alpha_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+rows = "i64"
+channels = "i32"
+width = "i32"
+pdl = "i32"
+
+# `block` is the program's lane width.
+[launch.constants]
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], channels = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"] }
-
-[parameters]

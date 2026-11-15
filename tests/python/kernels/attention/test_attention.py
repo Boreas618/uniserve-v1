@@ -94,9 +94,9 @@ def test_the_trtllm_paged_decode_matches_its_reference():
 @pytest.mark.parametrize(
     ("check", "backend", "block"),
     [
-        ("sparse_sm90_check.py", "sm90", "128"),
-        ("sparse_sm100_check.py", "sm100", "64"),
-        ("sparse_sm120_check.py", "sm120", "64"),
+        ("sparse_sm90_check.py", "wgmma", "128"),
+        ("sparse_sm100_check.py", "tcgen05", "64"),
+        ("sparse_sm120_check.py", "flashinfer", "64"),
     ],
 )
 def test_a_sparse_attention_matches_its_reference(check, backend, block):

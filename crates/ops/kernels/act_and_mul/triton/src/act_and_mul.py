@@ -12,18 +12,11 @@ checks and its torch types stay with the operator's Rust side.
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
+from uniserve_kernels import dependent_launch
 
 #: sqrt(8 / pi) and sqrt(1 / 2): constants of the two GELU forms.
 _SQRT_8_OVER_PI = tl.constexpr(1.5957691216057308)
 _SQRT_HALF = tl.constexpr(0.7071067811865476)
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -70,7 +63,7 @@ def _act_and_mul_kernel(
     require. ``PDL`` launches run the dependent-launch prologue before the
     first load.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     start = tl.program_id(0)
     if WIDE:

@@ -19,25 +19,13 @@ interface_version = 1
 # the Build Server refuses a package whose version no host here has, so this must name the
 # environment the tree installs.
 [toolchain]
-kind = "cute_dsl"
-version = "4.6.2"
-packages = [
-    { name = "flash-attn-4", version = "4.0.0b30" },
-    { name = "torch", version = "2.13.0" },
-]
-
-[module]
-form = "native"
-entries = { launch = "uniserve_dense_attention" }
+packages = ["flash-attn-4", "torch"]
 
 [source]
 kind = "cute_dsl"
-files = ["src/fa4.py", "src/build.py", "src/entry.cpp", "src/entry.h"]
-script = "src/build.py"
-unit = "src/entry.cpp"
 
 [kernel]
-architectures = ["sm_100a", "sm_100f"]
+requires = ["tensor_memory"]
 
 # `dtype_bf16_kv_bf16_out_bf16_head_dim_128_q_heads_32_kv_heads_4_mask_causal_window_false`.
 #

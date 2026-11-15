@@ -1,9 +1,5 @@
 # The reduce operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # A strided input folded along some of its axes into a contiguous output: a sum,
 # a minimum, a maximum or the largest magnitude over one or more axes, or the
 # `u32` index of the first least or greatest element along one. The kept axes and the reduced axes are
@@ -25,24 +21,52 @@ op = "reduce"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/reduce.py", "src/strided.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_reduce_kernel"
+warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
+derive = "derive"
+
+# The kept axes' extents `k` and strides `ks`, the reduced axes' `r` and `rs`.
+[launch.types]
+x = { pointer = "dtype" }
+out = { pointer = "output" }
+outputs = "i64"
+length = "i64"
+k1 = "i64"
+k2 = "i64"
+k3 = "i64"
+k4 = "i64"
+k5 = "i64"
+ks0 = "i64"
+ks1 = "i64"
+ks2 = "i64"
+ks3 = "i64"
+ks4 = "i64"
+ks5 = "i64"
+r1 = "i64"
+r2 = "i64"
+r3 = "i64"
+r4 = "i64"
+r5 = "i64"
+rs0 = "i64"
+rs1 = "i64"
+rs2 = "i64"
+rs3 = "i64"
+rs4 = "i64"
+rs5 = "i64"
+pdl = "i32"
+
+[launch.constants]
+FUNCTION = { field = "function" }
+ACCUMULATE = { field = "accumulate" }
+NEUTRAL = { field = "neutral" }
+KEPT = { field = "kept" }
+REDUCED = { field = "reduced" }
+ROWS = { field = "rows" }
+TILE = { field = "tile" }
 
 [[kernel.descriptors]]
 dimensions = { function = ["sum", "min", "max", "absmax", "argmin", "argmax"], dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], kept = { min = 1, max = 6 }, reduced = { min = 1, max = 6 }, tile = { power_of_two = true }, block = { power_of_two = true }, pdl = ["false", "true"] }
-
-[parameters]

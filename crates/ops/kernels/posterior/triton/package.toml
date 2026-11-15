@@ -1,8 +1,5 @@
 # The posterior operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one architecture of
-# `[kernel.architectures]`, built by `src/build.py`.
-#
 # This is the condition encoder's last numerical step: the VAE encoder's moments to the sample a
 # conditioner reads, through its FP16 round trip. The chain is fixed
 # -- clamp, `0.5 · log_variance`, `exp`, `· noise`, `+ mean`, round to FP16 and back -- in f32
@@ -19,24 +16,35 @@ op = "posterior"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/posterior.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a", "sm_100f"]
+# One element of a block is four loads, five roundings and a store.
+[launch]
+kernel = "_posterior_kernel"
+warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
+
+# Every operand is read through its own row and channel strides, so both physical layouts are one
+# launch. `pdl` is a word the kernel does not read: the dependent launch is compiled in.
+[launch.types]
+mean_ptr = "*fp32"
+log_variance_ptr = "*fp32"
+noise_ptr = "*fp32"
+out_ptr = "*fp32"
+channels = "u32"
+mean_row = "u32"
+mean_channel = "u32"
+log_variance_row = "u32"
+log_variance_channel = "u32"
+noise_row = "u32"
+noise_channel = "u32"
+out_row = "u32"
+out_channel = "u32"
+total = "u64"
+pdl = "i32"
+
+[launch.constants]
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { block = { power_of_two = true }, pdl = ["true", "false"] }
-
-[parameters]

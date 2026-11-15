@@ -1,9 +1,5 @@
 # The swiglu operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The descriptor is SwiGLU's own: the element type, the output row width, the
 # tile one program walks, the value and gate row strides, whether each half adds
 # its own bias, and whether each program records its largest magnitude. The key
@@ -18,24 +14,32 @@ op = "swiglu"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/swiglu.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_swiglu_kernel"
+warps = 8
+
+# Each program's largest magnitude is FP32, whether or not one is written. The element count is
+# a 32-bit launch word, and the kernel checks its mask in 64 bits.
+[launch.types]
+value_ptr = { pointer = "dtype" }
+gate_ptr = { pointer = "dtype" }
+value_bias_ptr = { pointer = "dtype" }
+gate_bias_ptr = { pointer = "dtype" }
+output_ptr = { pointer = "dtype" }
+partials_ptr = "*fp32"
+elements = "i32"
+
+[launch.constants]
+width = { field = "width" }
+value_row_stride = { field = "value_stride" }
+gate_row_stride = { field = "gate_stride" }
+HAS_VALUE_BIAS = { field = "value_bias" }
+HAS_GATE_BIAS = { field = "gate_bias" }
+RETURN_ABSMAX = { field = "absmax" }
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], width = { min = 1 }, block = { power_of_two = true }, value_stride = { min = 1 }, gate_stride = { min = 1 }, value_bias = ["true", "false"], gate_bias = ["true", "false"], absmax = ["true", "false"] }
-
-[parameters]

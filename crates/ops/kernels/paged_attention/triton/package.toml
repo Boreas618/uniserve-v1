@@ -26,26 +26,77 @@ op = "paged_attention"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/paged_attention.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a"]
+# `phase` is compiled by choosing the program. The derivation gives the query group a program
+# divides its query head by, the prefill program's query tile and products (`prefill_tiles`,
+# `prefill_products`), and each phase's warps and pipelining stages: a decode program's `[page,
+# head_dim]` block takes eight warps from 8192 elements and four below, with Triton's default
+# stages, and a prefill program takes `PREFILL_OPTIONS`. The operator's `check` holds the views it
+# checks by name to a sixteen-byte base, stated to the prefill program so that its tile loads move
+# whole vectors.
+[launch]
+kernel = { field = "phase", values = { decode = "_paged_attention_decode_kernel", prefill = "_paged_attention_prefill_kernel" } }
+warps = { field = "warps" }
+aligned = { field = "phase", values = { decode = [], prefill = ["out_ptr", "query_ptr", "key_ptr", "value_ptr", "page_table_ptr", "seq_lens_ptr"] } }
+derive = "derive"
+options = { num_stages = { field = "stages" } }
+
+# The scales are read only when the cache is quantized; a dense call passes the null pointer the
+# operator states, and the program's `QUANTIZED` branch never touches it. The prefill program alone
+# reads a row's first query token, the launch's token count, which bounds the padding it writes,
+# and its row count, which bounds the search for a tile's row.
+[launch.types]
+out_ptr = { pointer = "out" }
+query_ptr = { pointer = "dtype" }
+key_ptr = { pointer = "kv" }
+value_ptr = { pointer = "kv" }
+key_scale_ptr = "*fp32"
+value_scale_ptr = "*fp32"
+page_table_ptr = "*i32"
+seq_lens_ptr = "*i32"
+cum_seq_lens_q_ptr = "*i32"
+q_stride_tokens = "i32"
+q_stride_heads = "i32"
+q_stride_dim = "i32"
+k_stride_pages = "i32"
+k_stride_tokens = "i32"
+k_stride_heads = "i32"
+k_stride_dim = "i32"
+v_stride_pages = "i32"
+v_stride_tokens = "i32"
+v_stride_heads = "i32"
+v_stride_dim = "i32"
+o_stride_tokens = "i32"
+o_stride_heads = "i32"
+o_stride_dim = "i32"
+max_pages = "i32"
+page_size = "i32"
+softmax_scale = "fp32"
+max_q_len = "i32"
+packed = "i32"
+tokens = "i32"
+rows = "i32"
+
+# `kv` decides the cache's element type and `QUANTIZED` whether the program multiplies a page's
+# scale back: both are compiled, because a program that read a scale it was not given, or read an
+# E4M3 page as if it were dense, would be right only by accident.
+[launch.constants]
+HEAD_DIM = { field = "head_dim" }
+PAGE = { field = "page" }
+GROUP = { field = "group" }
+QUANTIZED = { field = "kv", values = { f8e4m3 = true, bf16 = false, f16 = false, f32 = false } }
+OUT_BF16 = { field = "out", values = { bf16 = true, f16 = false } }
+BLOCK_Q = { field = "block_q" }
+GROUP_PAD = { field = "group_pad" }
+TILE = { field = "tile" }
+TENSOR_CORES = { field = "tensor_cores" }
+F16_SCORES = { field = "f16_scores" }
 
 # `phase_decode_dtype_bf16_kv_f8e4m3_out_bf16_head_dim_128_page_64_q_heads_32_kv_heads_4_mask_causal_window_false_len_40960`
 #
 # `head_dim` and `page` are `tl.arange` extents; the head counts compile into the query group, which
-# the compile script refuses unless `kv_heads` divides `q_heads`; `len` changes no program.
+# the derivation refuses unless `kv_heads` divides `q_heads`; `len` changes no program.
 [[kernel.descriptors]]
 dimensions = { phase = ["decode", "prefill"], dtype = ["bf16", "f16"], kv = ["f8e4m3", "bf16", "f16", "f32"], out = ["bf16", "f16"], head_dim = { power_of_two = true }, page = { power_of_two = true }, q_heads = { min = 1 }, kv_heads = { min = 1 }, mask = ["causal"], window = ["false"], len = { min = 1 } }

@@ -3,15 +3,16 @@
 //!
 //! The Build Server drives five kinds of source:
 //!
-//! - [`ModuleSource`]: a **build module**, the Python module a Triton, CuTe DSL
-//!   or CUDA package names in `[source] script`. The Build Server compiles one
-//!   descriptor by running its Python environment's interpreter as
-//!   `python -m uniserve_build_server compile` in the module's directory with a
-//!   typed compile request on standard input ([`Request`]): the package, the
-//!   descriptor's fields as the manifest reads them, the target with its
-//!   hardware facts, the output directory, the job limit, the cache of pinned
-//!   sources and the toolchain description the server checked. The request is
-//!   the whole interface; a compilation reads no environment variable.
+//! - [`ModuleSource`]: a Triton, CuTe DSL or CUDA package, compiled through
+//!   the Python environment. The Build Server compiles one descriptor by
+//!   running its Python environment's interpreter as
+//!   `python -m uniserve_build_server compile` in the package's source
+//!   directory with a typed compile request on standard input ([`Request`]):
+//!   the package, the descriptor's fields typed as its dimensions declare
+//!   them, a Triton package's launch table, the target with its hardware
+//!   facts, the output directory, the job limit, the cache of pinned sources
+//!   and the toolchain description the server checked. The request is the
+//!   whole interface; a compilation reads no environment variable.
 //! - [`CubinSource`]: a vendor cubin the package carries, stored as it is.
 //! - [`WasmSource`]: a scheduling policy, a crate built for wasm32 from the
 //!   revision's whole-workspace snapshot (`crate::snapshot`).
@@ -28,7 +29,8 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use crate::manifest::{Manifest, ModuleForm, SourceKind};
+use crate::launch::Launch;
+use crate::manifest::{BUILD_MODULE, Manifest, ModuleForm, SOURCE_DIRECTORY, SourceKind};
 use crate::target::{Facts, Target};
 use crate::toolchain::{CARGO, Report, Toolchains};
 use crate::{Error, Result};
@@ -413,21 +415,28 @@ struct RequestTarget<'a> {
     facts: &'a Facts,
 }
 
-/// The compile request of a build module, as `uniserve_build_server.request`
-/// reads it.
+/// The compile request of a package the Python environment compiles, as
+/// `uniserve_build_server.request` reads it.
 #[derive(Serialize)]
 pub struct Request<'a> {
     op: &'a str,
     backend: &'a str,
     descriptor: &'a str,
-    /// The key's fields as the manifest's declared dimensions read them
-    /// ([`Manifest::fields`]): a compilation takes its descriptor's values from
-    /// here and never reads the key's text, so the key grammar is read in one
-    /// place.
+    /// The key's fields, each typed as the manifest's declared dimension types
+    /// it ([`Manifest::typed_fields`]): a compilation takes its descriptor's
+    /// values from here and never reads the key's text, so the key grammar is
+    /// read in one place.
     fields: serde_json::Map<String, serde_json::Value>,
     parameters: &'a BTreeMap<String, toml::Value>,
     source: SourceKind,
+    /// The module the compilation imports from the package's source directory:
+    /// a Triton package's kernel module, `<op>`, or the build module.
     module: &'a str,
+    /// A Triton package's launch table.
+    launch: Option<&'a Launch>,
+    /// A native module's C entry symbols by role, as the manifest resolves them
+    /// (`[module.entries]` over the operator's default launch entry).
+    entries: &'a BTreeMap<String, String>,
     unit: Option<&'a str>,
     package: &'a Path,
     output: &'a Path,
@@ -437,8 +446,8 @@ pub struct Request<'a> {
     toolchain: &'a Report,
 }
 
-/// A build module: a Triton, CuTe DSL or CUDA package's compilation, run
-/// through the Python environment with a typed compile request.
+/// A Triton, CuTe DSL or CUDA package's compilation, run through the Python
+/// environment with a typed compile request.
 #[derive(Clone, Debug)]
 pub struct ModuleSource(PackageSource);
 
@@ -457,38 +466,22 @@ impl Source for ModuleSource {
                 "a build module compiles for a GPU target of the description",
             )
         })?;
-        let script = package
-            .manifest
-            .source
-            .script
-            .as_deref()
-            .map(Path::new)
-            .ok_or_else(|| package.failure(key, target, "the package names no build module"))?;
-        let (Some(directory), Some(module)) = (
-            script.parent().map(|parent| package.root.join(parent)),
-            script.file_stem().and_then(|stem| stem.to_str()),
-        ) else {
-            return Err(package.failure(
-                key,
-                target,
-                format!("{} names no Python module", script.display()),
-            ));
+        let directory = package.root.join(SOURCE_DIRECTORY);
+        let module = match package.manifest.source.kind {
+            SourceKind::Triton => package.manifest.op.as_str(),
+            _ => BUILD_MODULE,
         };
         let pins = build.cache.pins();
         let request = Request {
             op: &package.manifest.op,
             backend: &package.manifest.backend,
             descriptor: key,
-            fields: package
-                .manifest
-                .fields(key)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(dimension, value)| (dimension, serde_json::Value::String(value)))
-                .collect(),
+            fields: package.manifest.typed_fields(key).unwrap_or_default(),
             parameters: &package.manifest.parameters,
             source: package.manifest.source.kind,
             module,
+            launch: package.manifest.launch.as_ref(),
+            entries: &package.manifest.module.entries,
             unit: package.manifest.source.unit.as_deref(),
             package: &package.root,
             output: build.workspace.path(),
@@ -506,9 +499,9 @@ impl Source for ModuleSource {
         })?;
         std::fs::write(&written, text)?;
 
-        // The module's directory is the compilation's working directory: `-m`
-        // puts it first on the interpreter's import path, so the build module
-        // and the package's sources beside it import as any program's own.
+        // The source directory is the compilation's working directory: `-m`
+        // puts it first on the interpreter's import path, so the module and
+        // the package's sources beside it import as any program's own.
         let mut command = Command::new(&environment.interpreter);
         command
             .current_dir(directory)
@@ -769,22 +762,13 @@ op = "vendor"
 backend = "cubin"
 interface_version = 1
 
-[toolchain]
-kind = "none"
-version = ""
-
 [module]
-form = "cubin"
 metadata = "launch.json"
 
 [source]
 kind = "cubin"
-files = []
 cubin = "cubin/{descriptor}.cubin"
 metadata = "cubin/{descriptor}.json"
-
-[kernel]
-architectures = ["sm_100a"]
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16"] }

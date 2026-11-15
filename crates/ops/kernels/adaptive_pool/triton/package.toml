@@ -1,9 +1,5 @@
 # The adaptive_pool operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one architecture
-# of `[kernel.architectures]`, built by `src/build.py` (the compile driver the
-# Build Server runs for one descriptor and target).
-#
 # This is the audio encoder's last reduction: the head mean of the attention
 # projection and its adaptive width pooling, fused into one pass because both land
 # on the same output element. `out[r, i]` averages `heads` values of the input
@@ -20,26 +16,35 @@ op = "adaptive_pool"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/adaptive_pool.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a", "sm_100f"]
+# A warp for every 256 output elements, up to eight: each element reads `heads · window` values,
+# so the block keeps the loads in flight without running out of registers for the accumulators.
+[launch]
+kernel = "_adaptive_pool_kernel"
+warps = { field = "block", steps = [[2048, 8], [1024, 4], [512, 2]], otherwise = 1 }
+derive = "derive"
+
+[launch.types]
+x = { pointer = "dtype" }
+out = { pointer = "dtype" }
+rows = "i64"
+heads = "i32"
+width = "i32"
+output = "i32"
+pdl = "i32"
+
+# The head axis and the window are compile-time loops; `window` is the longest window the width
+# and the pooled width give, which the derivation computes.
+[launch.constants]
+HEADS = { field = "heads" }
+WIDTH = { field = "width" }
+OUTPUT = { field = "output" }
+WINDOW = { field = "window" }
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 # The program unrolls any head count and window, so the three extents are any
 # positive integers; `block` is a `tl.arange` extent, so a power of two.
 dimensions = { dtype = ["f16", "bf16", "f32"], heads = { min = 1 }, width = { min = 1 }, output = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"] }
-
-[parameters]

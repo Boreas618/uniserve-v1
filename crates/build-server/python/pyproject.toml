@@ -41,7 +41,14 @@ dependencies = [
     # policy, and applies a package's patch to a staged copy with patch-ng.
     "urllib3==2.8.0",
     "patch-ng==1.19.1",
+    # The kernel packages' shared sources, which they import as they import
+    # Triton; the toolchain description digests them into every module's
+    # build identity.
+    "uniserve-kernels",
 ]
+
+[tool.uv.sources]
+uniserve-kernels = { path = "../../ops/python", editable = true }
 
 [project.scripts]
 uniserve-build-server = "uniserve_build_server.__main__:main"

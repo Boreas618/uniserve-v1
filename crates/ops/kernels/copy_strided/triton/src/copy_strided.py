@@ -16,9 +16,9 @@ operator holds the destination to a layout in which no two elements share an
 address, so the programs of one launch never write the same element.
 """
 
-import strided
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch, strided
 
 
 @triton.jit
@@ -54,7 +54,7 @@ def _copy_strided_kernel(
     extents; ``s0..s5`` and ``t0..t5`` are the strides of the source and of
     the destination, right-aligned.
     """
-    strided.pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     live = index < elements

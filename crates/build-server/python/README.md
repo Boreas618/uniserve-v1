@@ -26,12 +26,13 @@ prints what this environment compiles with, which the Build Server reads once wh
 |---|---|
 | `interpreter` | the environment's own interpreter, which runs every compilation |
 | `driver` | the SHA-256 of this package's files, read through `importlib.resources`: a module is stored under the driver it was built through, so an edited driver, pin or target description is another identity |
-| `distributions` | every installed distribution and its version, through `importlib.metadata` |
+| `kernels` | the SHA-256 of the kernel packages' shared sources (`uniserve_kernels`, `crates/ops/python`, which this environment installs and the packages import), read the same way, so an edit of what a package imports is another identity |
+| `distributions` | every installed distribution and its version, through `importlib.metadata`; a module's identity carries their digest, so a relock is another identity |
 | `triton`, `cute_dsl` | the versions of the locked `triton` and `nvidia-cutlass-dsl` distributions |
 | `cuda` | the CUDA toolkit of the release the lock fixes (the release of the locked `nvidia-cuda-runtime`, such as `13.0`), through the `cudart-<release>` and `cuda-<release>` pkg-config modules NVIDIA's distribution packages register: its root, `nvcc`, include and library directories and the driver stub's directory; nvcc's version is read from the macros it predefines (`__CUDACC_VER_MAJOR__` and its siblings) |
 | `host_compiler` | the host C++ compiler the program `c++` names on the search path, resolved to its file |
 
-A toolchain the host lacks is `{"missing": "<reason>"}` instead of `{"available": ...}`. A package's `[toolchain] version` is compared with the version described, and its `[toolchain] packages` with the distributions; a disagreement refuses the build by name.
+A toolchain the host lacks is `{"missing": "<reason>"}` instead of `{"available": ...}`. A package states no toolchain version: the one this lock fixes builds it, and every revision records it. A package's `[toolchain] packages` are checked against the distributions, and one the environment lacks refuses the build by name.
 
 ## What it locks
 
@@ -44,7 +45,7 @@ A toolchain the host lacks is `{"missing": "<reason>"}` instead of `{"available"
 | `urllib3`, `patch-ng` | 2.8.0, 1.19.1 | the pinned sources' fetcher and its patch of a staged copy |
 | `torch` | 2.13.0 | required by FlashInfer and FlashAttention-4; never imported by the Build Server itself |
 
-A package names the distributions it imports and their versions in its `[toolchain] packages`, by distribution name (`flash-attn-4`, `flashinfer-python`) and at the version this lock fixes; changing any of them is a new installation and a new revision.
+A package names the distributions it imports in its `[toolchain] packages`, by distribution name (`flash-attn-4`, `flashinfer-python`); their versions are this lock's, and a relock is another build identity for every module. The kernel packages' shared sources, `uniserve-kernels` (`crates/ops/python`), are a distribution of this environment too, installed from the repository.
 
 ## How a package is compiled
 
@@ -54,29 +55,30 @@ The Build Server compiles one descriptor by running
 <interpreter> -m uniserve_build_server compile
 ```
 
-in the directory of the package's build module (`[source] script`, such as `src/build.py`), with the compile request as a JSON object on standard input (`uniserve_build_server.request.Request`); `-m` puts that directory first on the import path, so the build module and the sources beside it import as any program's own. The request is the whole interface, and a compilation reads no environment variable:
+in the package's source directory `src/`, with the compile request as a JSON object on standard input (`uniserve_build_server.request.Request`); `-m` puts that directory first on the import path, so the package's modules import as any program's own. The request is the whole interface, and a compilation reads no environment variable:
 
 | field | value |
 |---|---|
 | `op`, `backend`, `package` | the package and its installed root |
-| `descriptor`, `fields` | the descriptor key and its fields as the Build Server read them against the manifest's `[[kernel.descriptors]]` (`Descriptors::fields` in `crates/build-server/src/manifest.rs`, the one reader of the key grammar), in the key's order |
+| `descriptor`, `fields` | the descriptor key and its fields as the Build Server read them against the manifest's `[[kernel.descriptors]]` (`Descriptors::typed_fields` in `crates/build-server/src/manifest.rs`, the one reader of the key grammar), in the key's order, each typed as its dimension declares it: a number, a list of numbers for an extent tuple, the float of a bit pattern, a boolean for a flag, or a name |
 | `parameters` | the manifest's `[parameters]` |
-| `source`, `module`, `unit` | the source kind, the build module's name, and the entry unit (`[source] unit`) a driver compiles |
-| `target` | the target's name and its architecture's hardware facts (`targets.toml`: capability, warp size, families, shared and tensor memory, dependent launch, FP8), so a package states requirements instead of hardware facts; `str(target)` is its name |
+| `source`, `module`, `unit` | the source kind, the module the compilation imports (a Triton package's kernel module `<op>`, or the build module `build`), and the entry unit (`[source] unit`, `src/entry.cpp` for a CuTe DSL package unless it names another) a driver compiles |
+| `launch`, `entries` | a Triton package's launch table (`[launch]`, `crates/build-server/src/launch.rs`), and a native module's C entries as the manifest resolves them (`launch` is the operator's `uniserve_<op>` unless the manifest names another) |
+| `target` | the target's name and its architecture's hardware facts (`targets.toml`: capability, warp size, families, shared and tensor memory, the warpgroup matrix instructions, dependent launch, FP8), so a package states requirements instead of hardware facts; `str(target)` is its name |
 | `output` | the directory the module's files are written into; a dot directory in it is the compilation's own scratch and is not published |
 | `jobs` | the compiler processes the compilation may run, the compile queue's limit |
 | `cache` | the Build Server's cache of pinned sources |
 | `toolchain` | the toolchain description the Build Server checked, as above |
 
-The source kind selects how the build module states its compilation:
+The source kind selects how the package states its compilation:
 
-- **Triton**: the module states `spec(fields, parameters, target)`, which `uniserve_build_server.triton` compiles with `triton.compile` on the target and writes as `module.cubin` and `metadata.json` with the launch signature;
+- **Triton**: no build module. The manifest's launch table names the kernel, a function of `src/<op>.py`, and binds each of its parameters from literals and the descriptor's fields: each launch argument's type (a pointer to the element type a field names, a type a field's value selects, or a Triton type), each compile-time parameter's value, the warp count, the aligned arguments and further `triton.compile` options; a `derive` function of the source module computes fields the table reads where a value follows from several. `uniserve_build_server.triton` takes the signature's order from the kernel's own parameters, spells element types by its one table, binds the kernel's `PDL` parameter from the descriptor's `pdl` field and the target's dependent launch (a kernel without one never launches dependently), compiles with `triton.compile` on the target and writes `module.cubin` and `metadata.json` with the launch signature;
 - **CuTe DSL**: the module states `spec(fields, parameters, target)` returning the exported launcher's `name`, the C `entry`, a `compile` callable (`cute_dsl.kernel(kernel, args, options)` for a kernel the DSL compiles directly, or the vendor's own selection) and optional `defines`; `uniserve_build_server.cute_dsl` states the target to the DSL, exports the launcher and links it with the manifest's entry unit into `module.so`;
 - **CUDA**: the module states `compile(request)`, the whole compilation, with the CUDA toolkit the request describes.
 
 The Build Server then checks the module its manifest's form requires: a cubin whose metadata names its kernel, or a native library that defines every C entry it is launched through.
 
-`python -m uniserve_build_server` and `uniserve-build-server` are one program. Outside a build, `uniserve_build_server.triton.stated_for` computes what a Triton package's `spec` states for a key, with the fields the Build Server's reader gives (`uniserve build-server fields`), for a check that launches a package's kernel on Triton's interpreter.
+`python -m uniserve_build_server` and `uniserve-build-server` are one program. Outside a build, `uniserve_build_server.triton.stated_for` computes what a Triton package's launch table states for a key, with the typed fields the Build Server's reader gives (`uniserve build-server fields`), for a check that launches a package's kernel on Triton's interpreter.
 
 ## Pinned third-party sources
 

@@ -16,22 +16,8 @@ op = "gemm"
 backend = "cublas_lt"
 interface_version = 1
 
-[toolchain]
-kind = "nvcc"
-version = "13.0.48"
-packages = []
-
-[module]
-form = "native"
-entries = { launch = "uniserve_gemm" }
-
 [source]
 kind = "cuda"
-files = ["src/gemm.cpp", "src/uniserve_gemm.h", "src/build.py"]
-script = "src/build.py"
-
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
 
 # `input_bf16_weight_bf16_accumulate_f32_output_bf16_order_nxk_epilogue_none_k_2048`.
 [[kernel.descriptors]]

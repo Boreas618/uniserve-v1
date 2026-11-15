@@ -117,3 +117,12 @@ def _scaled_residual_rms_norm_absmax_kernel(
             axis=0,
         ),
     )
+
+
+def derive(fields, parameters, target):
+    """The update's and the normalized rows' element type, for the launch table.
+
+    A key names ``activation`` only for rows narrower than the residual; one
+    that names none gives them the residual's ``dtype``.
+    """
+    return {"activation": fields.get("activation", fields["dtype"])}

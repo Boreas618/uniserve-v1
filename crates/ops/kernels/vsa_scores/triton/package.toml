@@ -1,37 +1,45 @@
 # The vsa_scores operator's Triton backend: design 5.2's package.
 #
 # The step between VSA's pooling and its selection: one dot product per (head, query tile, key tile)
-# over the pooled per-head means, written as the contiguous FP32
-# [heads, query tiles, key tiles] matrix the selection reads. No scale and no softmax — the caller
-# applies both — so the value is the raw sum of `width` products, accumulated in FP32. The products
-# are Triton's three-pass TF32 ones, each within (20 + 2^-7)·2^-24 of exact, and the operator's
-# tolerance is the contraction's bound with that excess counted.
+# over the pooled per-head means, scaled by `1 / sqrt(width)` as the reference's scores are and
+# written as the contiguous FP32 [heads, query tiles, key tiles] matrix the selection reads. There
+# is no softmax; the sum of `width` products accumulates in FP32. The products are Triton's
+# three-pass TF32 ones, each within (20 + 2^-7)·2^-24 of exact, and the operator's tolerance is the
+# contraction's bound with that excess counted.
 
 op = "vsa_scores"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/vsa_scores.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_vsa_scores_kernel"
+warps = { field = "block", steps = [[1024, 8]], otherwise = 4 }
 
-# `dtype_bf16_heads_56_width_128_block_128_pdl_false`.
+# The pooled rows are FP32, the type `vsa_prepare_tiles` pools in, so no operand type is a
+# dimension. `pdl` is a word the kernel does not read: the dependent launch is compiled in.
+[launch.types]
+query_ptr = "*fp32"
+key_ptr = "*fp32"
+out_ptr = "*fp32"
+query_tiles = "i32"
+key_tiles = "i32"
+pdl = "i32"
+
+# `width` is the contraction and `block` the lanes it uses, so both are compiled; `heads` sizes no
+# tile, since a program is one head and the grid carries the count. `QUERIES` is the query tiles a
+# program holds, the launch's grid divisor as well, which `crates/ops/src/vsa.rs` states as
+# `POOLED_QUERIES`; `KEY_TILES` is the key tiles one step reduces.
+[launch.constants]
+WIDTH = { field = "width" }
+BLOCK = { field = "block" }
+KEY_TILES = 32
+QUERIES = 16
+
+# `heads_56_width_128_block_128_pdl_false`.
 [[kernel.descriptors]]
 # `block` is a `tl.arange` extent; `heads` and `width` compile for any positive value, the lanes past
 # `width` masked.
 dimensions = { heads = { min = 1 }, width = { min = 1 }, block = { power_of_two = true }, pdl = ["false", "true"] }
-
-[parameters]

@@ -24,17 +24,12 @@ The kernel body imports nothing but Triton: the shape and alias checks, the
 output allocation and the torch types stay with the operator's Rust side.
 """
 
+import itertools
+
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit
@@ -60,7 +55,7 @@ def _factors(
     holds the ``columns`` angles per row, ``cosine``/``sine`` the
     ``[tokens, columns]`` tables. Grid: ``ceil(total / BLOCK)``.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     elements = total.to(tl.int64)
     width = columns.to(tl.int64)
@@ -185,3 +180,28 @@ def _rotary_factors_sectioned_kernel(
         BLOCK,
         PDL,
     )
+
+
+def derive(fields, parameters, target):
+    """The axis count, each axis's frequencies and the cut's thresholds.
+
+    A key names ``axes`` and ``sections`` only for a sectioned rotation, so a
+    key without them reads one axis that owns no section. ``sections`` are
+    rotated elements per axis, padded with empty sections or cut to the axis
+    count, and axis ``a`` owns ``sections[a] / 2`` frequencies. A column at or
+    past threshold ``a`` of the contiguous cut reads axis ``a`` or later, so
+    axis ``a``'s threshold is the frequencies the axes before it own.
+
+    The sections need not cover the columns for the key to name a module: the
+    operator refuses a call whose sections cover anything but its row, and
+    the columns past the last section read the last axis.
+    """
+    axes = fields.get("axes", 1)
+    widths = (fields.get("sections", []) + [0] * axes)[:axes]
+    halves = tuple(width // 2 for width in widths)
+    return {
+        "axes": axes,
+        "halves": halves,
+        "cuts": tuple(itertools.accumulate(halves[:-1], initial=0)),
+        "sectioned": axes > 1,
+    }

@@ -1,9 +1,5 @@
 # The gated_residual operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The descriptor bakes the row width,
 # because the kernel recovers each element's row from it; the row count arrives as
 # the launch's last scalar and the gate row stride is an int32 launch argument. The key is
@@ -22,24 +18,33 @@ op = "gated_residual"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/gated_residual.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds. The gated
+# update rounds to the activation dtype before the residual sum, so the two must not fuse into one
+# rounding.
+[launch]
+kernel = "_gated_residual_kernel"
+warps = 4
+aligned = ["hidden_ptr", "update_ptr", "gate_ptr", "row_indices_ptr", "gate_row_stride"]
+options = { enable_fp_fusion = false }
+
+# The row count is the one thing a request changes: the operator appends it as its last scalar,
+# so the program multiplies it by the width it was compiled for instead of holding an element
+# count of its own.
+[launch.types]
+hidden_ptr = { pointer = "dtype" }
+update_ptr = { pointer = "dtype" }
+gate_ptr = { pointer = "dtype" }
+row_indices_ptr = { pointer = "indices" }
+gate_row_stride = "i32"
+rows = "i64"
+
+# The tile one launch walks is the operator's `GATED_BLOCK`.
+[launch.constants]
+WIDTH = { field = "width" }
+BLOCK = 1024
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], indices = ["u32", "i32", "i64"], width = { min = 1 }, gate_stride = { multiple = 16 } }
-
-[parameters]

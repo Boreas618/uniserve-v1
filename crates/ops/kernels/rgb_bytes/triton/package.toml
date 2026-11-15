@@ -1,9 +1,5 @@
 # The rgb_bytes operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one architecture
-# of `[kernel.architectures]`, built by `src/build.py` (the compile driver the
-# Build Server runs for one descriptor and target).
-#
 # This is the video path's last step: an ImageNet-normalized, channel-major float
 # raster to packed 8-bit RGB, `round_half_to_even(clamp((x · std + mean) · 255, 0,
 # 255))` in FP32 whatever the input's element type. The rounding is visible in the
@@ -22,27 +18,39 @@ op = "rgb_bytes"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/rgb_bytes.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a", "sm_100f"]
+# A warp for every 512 output bytes, up to eight: a byte is three loads and a store.
+[launch]
+kernel = "_rgb_bytes_kernel"
+warps = { field = "block", steps = [[4096, 8], [2048, 4], [1024, 2]], otherwise = 1 }
+
+# `mean` and `std` are the checkpoint's FP32 constants, one per channel, and the output is always
+# packed `u8`. The extents and strides are 64-bit, because a long clip outgrows 32 bits.
+[launch.types]
+input = { pointer = "dtype" }
+mean = "*fp32"
+std = "*fp32"
+out = "*u8"
+frames = "i64"
+rows = "i64"
+columns = "i64"
+channels = "i32"
+in0 = "i64"
+in1 = "i64"
+in2 = "i64"
+out0 = "i64"
+out1 = "i64"
+out2 = "i64"
+pdl = "i32"
+
+[launch.constants]
+CHANNELS = { field = "channels" }
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 # `f16` is the video VAE's raster dtype; `bf16` and `f32` are accepted because the
 # arithmetic is the same either way: the values convert to FP32 before the
 # de-normalization.
 dimensions = { dtype = ["f16", "bf16", "f32"], channels = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"] }
-
-[parameters]

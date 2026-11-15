@@ -1,9 +1,5 @@
 # The copy_strided operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # `destination[i] = source[i]`: a source read through its strides, moved into a
 # row-major window — a contiguous tensor, or a block of a larger one. That is a
 # strided tensor made contiguous at an element offset, a two-dimensional copy
@@ -23,24 +19,41 @@ op = "copy_strided"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/copy_strided.py", "src/strided.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_copy_strided_kernel"
+warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
+derive = "strided.addressed"
+
+# The source's strides `s`, the destination's `t`, over the destination's extents `d`.
+[launch.types]
+source = { pointer = "address" }
+destination = { pointer = "address" }
+elements = "i64"
+d1 = "i64"
+d2 = "i64"
+d3 = "i64"
+d4 = "i64"
+d5 = "i64"
+s0 = "i64"
+s1 = "i64"
+s2 = "i64"
+s3 = "i64"
+s4 = "i64"
+s5 = "i64"
+t0 = "i64"
+t1 = "i64"
+t2 = "i64"
+t3 = "i64"
+t4 = "i64"
+t5 = "i64"
+pdl = "i32"
+
+[launch.constants]
+RANK = { field = "rank" }
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64", "f8e4m3"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
-
-[parameters]

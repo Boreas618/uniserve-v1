@@ -1,4 +1,5 @@
-# The sparse_attention operator's SM120 backend: design 5.2's package.
+# The sparse_attention operator's `flashinfer` backend: design 5.2's package, FlashInfer's kernel
+# for the sm_120 family (`requires = ["sm_120f"]`).
 #
 # One native module per descriptor: Video Sparse Attention on SM120/SM121, through
 # FlashInfer's CuTe DSL block-sparse kernel (`BlockSparseAttnForwardSm120Blk64`). The vendor
@@ -11,29 +12,17 @@
 # so a call must carry one: the operator's `lse = false` form is not a launch this kernel has.
 
 op = "sparse_attention"
-backend = "sm120"
+backend = "flashinfer"
 interface_version = 1
 
 [toolchain]
-kind = "cute_dsl"
-version = "4.6.2"
-packages = [
-    { name = "flashinfer-python", version = "0.6.18" },
-    { name = "torch", version = "2.13.0" },
-]
-
-[module]
-form = "native"
-entries = { launch = "uniserve_sparse_attention" }
+packages = ["flashinfer-python", "torch"]
 
 [source]
 kind = "cute_dsl"
-files = ["src/entry.h", "src/bsa_sm120.py", "src/build.py", "src/entry.cpp"]
-script = "src/build.py"
-unit = "src/entry.cpp"
 
 [kernel]
-architectures = ["sm_120a"]
+requires = ["sm_120f"]
 
 [[kernel.descriptors]]
 dimensions = { block = ["64"], dtype = ["bf16", "f16"], output = ["bf16", "f16"], head_dim = ["128"], lse = ["true"] }
@@ -42,7 +31,6 @@ dimensions = { block = ["64"], dtype = ["bf16", "f16"], output = ["bf16", "f16"]
 # The representative call the kernel is compiled for: its layouts are the call's, with the
 # extents as runtime words, so these only have to be a shape the kernel's schedule covers.
 heads = 8
-kv_heads = 8
 query_tiles = 4
 key_blocks = 8
 selected = 3

@@ -1,9 +1,5 @@
 # The gelu operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The approximation is part of the compilation: PyTorch's exact erf form and its
 # tanh form evaluate different formulas, and the module holds one. The key is the
 # one `Descriptor`'s `Display` prints, e.g.
@@ -14,23 +10,24 @@ op = "gelu"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/gelu.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_gelu_kernel"
+warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
+
+# `pdl` is a word the kernel does not read: the dependent launch is compiled in.
+[launch.types]
+x_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+elements = "i64"
+columns = "i32"
+pdl = "i32"
+
+[launch.constants]
+APPROXIMATE = { field = "approximate" }
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], block = { power_of_two = true }, approximate = ["exact", "tanh"], pdl = ["false", "true"] }
-[parameters]

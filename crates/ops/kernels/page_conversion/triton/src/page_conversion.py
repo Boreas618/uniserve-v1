@@ -96,3 +96,25 @@ def _page_conversion_kernel(
             value = value * tl.load(scale_pointer + head // scale_heads)
         # The logical type's rounding, then the FP32 block the next launch reads.
         tl.store(decoded + offset, value.to(COMPUTE).to(tl.float32))
+
+
+#: The stored element type: what the raw areas hold.
+SOURCES = {"f8e4m3": tl.float8e4nv, "bf16": tl.bfloat16}
+
+#: The logical element type a decoded value rounds through.
+COMPUTES = {"bf16": tl.bfloat16, "f16": tl.float16, "f32": tl.float32}
+
+
+def derive(fields, parameters, target):
+    """The element types as the kernel takes them, and whether it reads scales.
+
+    ``stored`` is the source's element type and ``rounding`` the logical type, both as Triton
+    types. ``dequantizes`` is whether the page's values are multiplied by their scales: a scaled
+    E4M3 source alone. The operator refuses a scaled source in any other element type before a
+    call reaches a module, so that key is never launched; it compiles to the dense path.
+    """
+    return {
+        "stored": SOURCES[fields["source"]],
+        "rounding": COMPUTES[fields["compute"]],
+        "dequantizes": fields["scaled"] and fields["source"] == "f8e4m3",
+    }

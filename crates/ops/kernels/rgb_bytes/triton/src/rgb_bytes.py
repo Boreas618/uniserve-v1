@@ -33,20 +33,12 @@ the geometry is compiled in, so one module serves every raster.
 
 import triton
 import triton.language as tl
-
+from uniserve_kernels import dependent_launch
 
 #: 2^23: the magnitude at which an FP32's ulp is one, and therefore the constant that
 #: turns an addition into a round-half-to-even at one byte. It is a `tl.constexpr`
 #: because a kernel may only read globals declared as one.
 MAGNITUDE = tl.constexpr(8388608.0)
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -77,7 +69,7 @@ def _rgb_bytes_kernel(
     built for: a module launched as a dependent waits for the grid before it
     before reading anything, and then lets the grid after it launch.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     program = tl.program_id(0)
     # The extents and strides arrive as 64-bit scalars, so the index is widened to

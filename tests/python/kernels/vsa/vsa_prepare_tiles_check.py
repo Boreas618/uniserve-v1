@@ -10,13 +10,14 @@ halves. `tl.inline_asm_elementwise` does not execute under `TRITON_INTERPRET`, a
 `_add_rn` uses it as well — so no part of this kernel can run on the build host, not even the
 `norm = false` path. On a host without a device the script says exactly that and stops.
 
-The package's kernel is launched as its module is built: `src/build.py`'s `spec` for the case's
-descriptor fields gives the kernel, its compile-time values (the epsilon decoded from the key's bits)
-and its options (two warps, no FP32 fusion), so the check cannot launch something the build does
-not compile. The operands are the operator's: 16-bit Q/K/V rows of the descriptor's type, `[width]`
-weights of that type and FP32 `[rows, rotated / 2]` factor tables. The stepwise routine addresses
-the rows as words of two 16-bit features, so rows of any other element type are outside its domain:
-they are read and written at the wrong addresses, across other programs' heads.
+The package's kernel is launched as its module is built: the manifest's launch table, stated by the
+Build Server's Triton driver for the case's typed descriptor fields, gives the kernel, its
+compile-time values (the epsilon the key's bits encode) and its options (two warps, no FP32
+fusion), so the check cannot launch something the build does not compile. The operands are the
+operator's: 16-bit Q/K/V rows of the descriptor's type, `[width]` weights of that type and FP32
+`[rows, rotated / 2]` factor tables. The stepwise routine addresses the rows as words of two 16-bit
+features, so rows of any other element type are outside its domain: they are read and written at
+the wrong addresses, across other programs' heads.
 
 Two independent references, because this is the operator where a stride mix-up cannot be caught by
 reading the key — one program reads seven caller strides at once:
@@ -43,11 +44,12 @@ The cases:
 """
 
 import argparse
-import importlib.util
+import importlib
 import os
 import pathlib
 import struct
 import sys
+import tomllib
 
 import torch
 
@@ -57,14 +59,14 @@ ROOT = pathlib.Path(__file__).resolve().parents[4]
 KERNELS = ROOT / "crates" / "ops" / "kernels"
 #: The package this check covers.
 PACKAGE = KERNELS / "vsa_prepare_tiles" / "triton"
-#: The Build Server's Python package, which every compile script imports its driver from.
+#: The Build Server's Python package, whose Triton driver states a launch table's compilation.
 BUILD_SERVER = ROOT / "crates" / "build-server" / "python" / "src"
 
 #: `PrepareTilesDescriptor`'s epsilon, `0x3727c5ac` — the fixture's cell. A key prints a float's
 #: bits; the descriptor means the float they encode.
 EPSILON = 0x3727C5AC
-#: The architecture the compile script is asked about. Its `spec` states the same kernel,
-#: compile-time values and options for every target.
+#: The architecture the launch table is stated for. The kernel has no dependent launch, so the table
+#: states the same kernel, compile-time values and options for every target.
 ARCHITECTURE = "sm_100a"
 #: The descriptor's names of the row types.
 DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16}
@@ -110,17 +112,21 @@ def pool(rows, variable_block_sizes, tile):
     return total / variable_block_sizes.clamp_min(1).view(-1, 1, 1)
 
 
-def load_build(package):
-    """The package's compile script, `src/build.py`, imported with the kernel source it imports."""
+def load_package(package):
+    """The package's kernel module and its manifest's launch table and parameters.
+
+    The kernel module is imported by its name from the package's `src/`, as the Build Server
+    imports it, beside the Build Server's own Python package.
+    """
     for path in (BUILD_SERVER, package / "src"):
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))
-    spec = importlib.util.spec_from_file_location(
-        "vsa_prepare_tiles_build", package / "src" / "build.py"
-    )
-    build = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(build)
-    return build
+    manifest = tomllib.loads((package / "package.toml").read_text())
+    return {
+        "kernels": importlib.import_module("vsa_prepare_tiles"),
+        "launch": manifest["launch"],
+        "parameters": manifest.get("parameters", {}),
+    }
 
 
 class Case:
@@ -231,24 +237,38 @@ class Case:
         )
 
     def fields(self):
-        """The descriptor's fields, spelled as `PrepareTilesDescriptor`'s key prints them."""
+        """The descriptor's fields, typed as the Build Server hands them to the Triton driver.
+
+        Each is the value `PrepareTilesDescriptor`'s key prints, read as the package's dimension
+        declares it: an integer as an integer, `epsilon`'s bits as the float they encode and
+        `norm` as a flag.
+        """
         return {
             "dtype": self.dtype,
-            "heads": str(self.heads),
-            "width": str(self.width),
-            "rotated": str(self.rotated),
-            "tile_rows": str(self.tile),
-            "block_rows": str(self.block),
+            "heads": self.heads,
+            "width": self.width,
+            "rotated": self.rotated,
+            "tile_rows": self.tile,
+            "block_rows": self.block,
+            "epsilon": epsilon(),
+            "norm": self.norm,
+            "query_row_stride": self.row_stride,
+            "query_head_stride": self.head_stride,
+            "key_row_stride": self.row_stride,
+            "key_head_stride": self.head_stride,
+            "value_row_stride": self.row_stride,
+            "value_head_stride": self.head_stride,
+            "factor_stride": self.factor_stride,
+        }
+
+    def descriptor(self):
+        """The descriptor key `PrepareTilesDescriptor`'s `Display` prints for the case."""
+        printed = {
+            **self.fields(),
             "epsilon": f"{EPSILON:#x}",
             "norm": "true" if self.norm else "false",
-            "query_row_stride": str(self.row_stride),
-            "query_head_stride": str(self.head_stride),
-            "key_row_stride": str(self.row_stride),
-            "key_head_stride": str(self.head_stride),
-            "value_row_stride": str(self.row_stride),
-            "value_head_stride": str(self.head_stride),
-            "factor_stride": str(self.factor_stride),
         }
+        return "_".join(f"{name}_{value}" for name, value in printed.items())
 
     def outputs(self):
         """The valid-size table and three NaN-filled FP32 `[tiles, heads, width]` means."""
@@ -265,18 +285,26 @@ class Case:
         return sizes, pooled
 
 
-def launch(build, case, buffers):
+def launch(package, case, buffers):
     """One launch of the package's module for the case's descriptor; returns its pooled tensors.
 
-    The kernel, its compile-time values and its options are what `build.spec` states for the
-    case's fields (the manifest declares no `[parameters]`). The operands are packed as
-    `VsaPrepareTiles::launch` packs them: without normalization the rows stand in for the weights
-    and factor tables, which the module then does not read.
+    The kernel, its compile-time values and its options are what the package's launch table
+    states for the case's typed fields. The operands are packed as `VsaPrepareTiles::launch` packs
+    them: without normalization the rows stand in for the weights and factor tables, which the
+    module then does not read.
     """
-    # The Build Server's package is importable once the build module is loaded.
+    # The Build Server's package is importable once the package is loaded.
+    from uniserve_build_server import triton as driver
     from uniserve_build_server.request import Target
 
-    stated = build.spec(case.fields(), {}, Target.named(ARCHITECTURE))
+    stated = driver.stated(
+        package["launch"],
+        package["kernels"],
+        case.descriptor(),
+        case.fields(),
+        package["parameters"],
+        Target.named(ARCHITECTURE),
+    )
     sizes, pooled = case.outputs()
     query, key, value = (
         case.rows_view(buffers[name]) for name in ("query", "key", "value")
@@ -350,7 +378,7 @@ def compare(what, mine, theirs):
     )
 
 
-def check_fixture_geometry(build, reference, device, row_stride=1200):
+def check_fixture_geometry(package, reference, device, row_stride=1200):
     """The fixture's cell against the retired operator, on a strided buffer.
 
     `row_stride` must be wider than `heads · width` for the case to be about strides at all: a tile
@@ -375,7 +403,7 @@ def check_fixture_geometry(build, reference, device, row_stride=1200):
         row_stride=row_stride,
     )
     mine_buffers, their_buffers = clone(case), clone(case)
-    mine = launch(build, case, mine_buffers)
+    mine = launch(package, case, mine_buffers)
     theirs = launch_reference(reference, case, their_buffers)
     for name, a, b in zip(("query", "key", "value"), mine, theirs):
         compare(f"the pooled {name}", a, b)
@@ -398,7 +426,7 @@ def check_fixture_geometry(build, reference, device, row_stride=1200):
     return 3 * mine[0].numel() + 3 * case.rows * case.heads * case.width
 
 
-def check_pass_through(build, reference, device):
+def check_pass_through(package, reference, device):
     """With `rotated < width`, the features past the rotation do not move."""
 
     def run(cosines):
@@ -417,7 +445,7 @@ def check_pass_through(build, reference, device):
             cosines=cosines,
         )
         buffers = clone(case)
-        pooled = launch(build, case, buffers)
+        pooled = launch(package, case, buffers)
         theirs = launch_reference(reference, case, clone(case))
         compare(
             f"the pooled query with cosines={cosines}", pooled[0], theirs[0]
@@ -442,7 +470,7 @@ def check_pass_through(build, reference, device):
         cosines=False,
     )
     buffers = clone(case)
-    launch(build, case, buffers)
+    launch(package, case, buffers)
     exchanged.copy_(case.rows_view(buffers["query"]))
     rotated = case.rotated
     compare(
@@ -457,7 +485,7 @@ def check_pass_through(build, reference, device):
     return int(exchanged.numel())
 
 
-def check_no_norm(build, reference, device):
+def check_no_norm(package, reference, device):
     """Without normalization: the padding and the mean, against `pool` itself."""
     case = Case(
         device=device,
@@ -473,7 +501,7 @@ def check_no_norm(build, reference, device):
         row_stride=256,
     )
     buffers = clone(case)
-    mine = launch(build, case, buffers)
+    mine = launch(package, case, buffers)
     sizes = torch.tensor(case.sizes, dtype=torch.int32, device=device)
     for name, flat, pooled in zip(
         ("query", "key", "value"),
@@ -489,7 +517,7 @@ def check_no_norm(build, reference, device):
     return 3 * mine[0].numel()
 
 
-def check_empty_tile(build, reference, device):
+def check_empty_tile(package, reference, device):
     """An empty tile's means are zeros: no division by the tile's row count, no NaN."""
     case = Case(
         device=device,
@@ -505,7 +533,7 @@ def check_empty_tile(build, reference, device):
         row_stride=256,
     )
     buffers = clone(case)
-    mine = launch(build, case, buffers)
+    mine = launch(package, case, buffers)
     sizes = torch.tensor(case.sizes, dtype=torch.int32, device=device)
     for name, flat, pooled in zip(
         ("query", "key", "value"),
@@ -524,7 +552,7 @@ def check_empty_tile(build, reference, device):
     return 3 * mine[0].numel()
 
 
-def check_small_valid(build, reference, device, row_stride=1200):
+def check_small_valid(package, reference, device, row_stride=1200):
     """A tile whose valid size is smaller than one row block: the masked tail inside a block."""
     case = Case(
         device=device,
@@ -540,7 +568,7 @@ def check_small_valid(build, reference, device, row_stride=1200):
         row_stride=row_stride,
     )
     mine_buffers, their_buffers = clone(case), clone(case)
-    mine = launch(build, case, mine_buffers)
+    mine = launch(package, case, mine_buffers)
     theirs = launch_reference(reference, case, their_buffers)
     for name, a, b in zip(("query", "key", "value"), mine, theirs):
         compare(f"the pooled {name} of a tile with 5 valid rows", a, b)
@@ -557,7 +585,7 @@ def main():
         "--package",
         type=pathlib.Path,
         default=PACKAGE,
-        help="the package directory holding src/build.py and the kernel source it imports",
+        help="the package directory holding package.toml and the kernel source it imports",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -576,17 +604,19 @@ def main():
             "the packed cvt.rn.bf16x2.f32 forms), which the interpreter cannot execute, so a CPU "
             "run would prove nothing about what the module stores"
         )
-    build = load_build(options.package)
+    package = load_package(options.package)
     reference = reference_operator()
 
     checked = 0
     checked += check_fixture_geometry(
-        build, reference, device, options.row_stride
+        package, reference, device, options.row_stride
     )
-    checked += check_small_valid(build, reference, device, options.row_stride)
-    checked += check_pass_through(build, reference, device)
-    checked += check_no_norm(build, reference, device)
-    checked += check_empty_tile(build, reference, device)
+    checked += check_small_valid(
+        package, reference, device, options.row_stride
+    )
+    checked += check_pass_through(package, reference, device)
+    checked += check_no_norm(package, reference, device)
+    checked += check_empty_tile(package, reference, device)
     print(
         f"ok: {checked} values — the fixture's strided cell and the narrowed rotation against the "
         f"retired operator, bit for bit, the padding zeros, the pooled means against pool, "

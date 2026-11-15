@@ -50,6 +50,7 @@ pub mod build;
 pub mod builder;
 pub mod command;
 pub mod inputs;
+pub mod launch;
 pub mod manifest;
 pub mod protocol;
 pub mod server;

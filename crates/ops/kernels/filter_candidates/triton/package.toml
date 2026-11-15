@@ -1,8 +1,5 @@
 # The filter_candidates operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program filters one row of candidates in place; the row count comes from the
 # grid, and the row is walked in `tile`-sized chunks, so the candidate width is a
 # runtime value: one module serves every count, a vocabulary-sized row included.
@@ -11,22 +8,25 @@ op = "filter_candidates"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/filter_candidates.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_filter_candidates_kernel"
+warps = { field = "tile", steps = [[2048, 8]], otherwise = 4 }
+
+# The ids are read by the operators after this one; `valid` receives whether each row's remaining
+# candidates form a usable distribution.
+[launch.types]
+values_ptr = "*fp32"
+ids_ptr = { pointer = "ids" }
+parameters_ptr = "*fp32"
+valid_ptr = "*i32"
+rows = "i64"
+width = "i32"
+
+[launch.constants]
+BLOCK = { field = "tile" }
 
 # `width_151936_tile_4096_ids_i32_pdl_false`.
 #
@@ -34,5 +34,3 @@ architectures = ["sm_100a", "sm_90a"]
 # chunk the program walks the row in.
 [[kernel.descriptors]]
 dimensions = { width = { min = 1 }, tile = { power_of_two = true }, ids = ["i32", "i64"], pdl = ["true", "false"] }
-
-[parameters]

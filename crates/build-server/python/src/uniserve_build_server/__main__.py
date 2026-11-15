@@ -10,13 +10,13 @@ for three things:
 ``python -m uniserve_build_server compile``
     compiles one descriptor from the request on standard input
     (:mod:`uniserve_build_server.request`). The Build Server runs it with this
-    environment's interpreter and the working directory the package's build
-    module lives in, so the module and the sources beside it import as the
-    interpreter imports any program's own modules. A Triton or CuTe DSL
-    package's module states ``spec(fields, parameters, target)``, which the
-    driver of its source kind compiles (:mod:`uniserve_build_server.triton`,
-    :mod:`uniserve_build_server.cute_dsl`); a CUDA package's module states
-    ``compile(request)``, the whole compilation.
+    environment's interpreter in the package's source directory, so the
+    package's modules import as the interpreter imports any program's own. A
+    Triton package's launch table is compiled by
+    :mod:`uniserve_build_server.triton`; a CuTe DSL package's build module
+    states ``spec(fields, parameters, target)``, which
+    :mod:`uniserve_build_server.cute_dsl` compiles; a CUDA package's build
+    module states ``compile(request)``, the whole compilation.
 
 ``uniserve-build-server provision PIN --cache DIR``
     fetches and verifies a pinned third-party source into the Build Server's
@@ -31,16 +31,19 @@ import json
 import pathlib
 import sys
 from collections.abc import Callable
-from types import ModuleType
 
 from uniserve_build_server import cute_dsl, fetch, toolchain, triton
 from uniserve_build_server.request import Request
 
 #: How each source kind's build module is compiled.
-DRIVERS: dict[str, Callable[[Request, ModuleType], None]] = {
-    "triton": lambda request, module: triton.build(request, module.spec),
-    "cute_dsl": lambda request, module: cute_dsl.build(request, module.spec),
-    "cuda": lambda request, module: module.compile(request),
+DRIVERS: dict[str, Callable[[Request], None]] = {
+    "triton": triton.build,
+    "cute_dsl": lambda request: cute_dsl.build(
+        request, importlib.import_module(request.module).spec
+    ),
+    "cuda": lambda request: importlib.import_module(request.module).compile(
+        request
+    ),
 }
 
 
@@ -53,7 +56,7 @@ def compile_request(request: Request) -> None:
             f"the build modules' source kinds are {sorted(DRIVERS)}"
         )
     request.output.mkdir(parents=True, exist_ok=True)
-    driver(request, importlib.import_module(request.module))
+    driver(request)
 
 
 def describe_toolchain(as_json: bool) -> None:
@@ -63,7 +66,7 @@ def describe_toolchain(as_json: bool) -> None:
         return
     print(f"interpreter    {described.interpreter}")
     print(f"driver         {described.driver}")
-    for name in ("triton", "cute_dsl", "cuda", "host_compiler"):
+    for name in ("kernels", "triton", "cute_dsl", "cuda", "host_compiler"):
         entry = getattr(described, name)
         state = entry.get("available", f"missing: {entry.get('missing')}")
         print(f"{name:<14} {state}")

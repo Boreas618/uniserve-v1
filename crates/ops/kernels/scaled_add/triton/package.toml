@@ -9,23 +9,22 @@ op = "scaled_add"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/scaled_add.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_scaled_add_kernel"
+warps = { field = "block", steps = [[1024, 8]], otherwise = 4 }
+
+[launch.types]
+target_ptr = { pointer = "target" }
+source_ptr = { pointer = "source" }
+alpha = "fp32"
+beta = "fp32"
+elements = "i64"
+
+[launch.constants]
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { target = ["bf16", "f16", "f32"], source = ["bf16", "f16", "f32"], block = { power_of_two = true } }
-[parameters]

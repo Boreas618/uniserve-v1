@@ -50,19 +50,14 @@ def compile(request: Request) -> None:
     """
     package = request.package
     out = request.output
-    experts = int(request.field("experts"))
-    top = int(request.field("top"))
-    renormalize = request.field("renormalize")
+    # The manifest's enumerations admit only the storage kinds `KINDS` names;
+    # whether the module renormalizes is a word of the launch.
+    experts = request.field("experts")
+    top = request.field("top")
     scores = request.field("scores")
     scale = request.field("scale")
     iterations = max(1, -(-experts // 32))
     butterfly = 1 << max(0, (top - 1).bit_length())
-    if renormalize not in ("true", "false"):
-        raise SystemExit(f"renormalize {renormalize!r} is not a flag")
-    if scores not in KINDS:
-        raise SystemExit(f"scores {scores!r} has no storage kind")
-    if scale not in KINDS:
-        raise SystemExit(f"scale {scale!r} has no storage kind")
 
     # The nvcc the Build Server checked against this package's declared version.
     compiler = request.toolchain.require_cuda().nvcc

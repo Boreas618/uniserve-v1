@@ -19,11 +19,7 @@ interface_version = 1
 
 [toolchain]
 kind = "cute_dsl"
-version = "4.6.2"
-packages = [{ name = "flashinfer-python", version = "0.6.18" }]
-
-[module]
-form = "native"
+packages = ["flashinfer-python"]
 
 [module.entries]
 launch = "uniserve_expert_exchange_launch"
@@ -39,17 +35,9 @@ info = "uniserve_expert_exchange_info"
 # names the CuTe DSL release the Build Server checks.
 [source]
 kind = "cuda"
-files = [
-    "include/uniserve_expert_exchange.h",
-    "patches/megamoe.patch",
-    "src/build.py",
-    "src/entry.cpp",
-    "src/stage.cu",
-]
-script = "src/build.py"
 
 [kernel]
-architectures = ["sm_100a"]
+requires = ["tensor_memory"]
 
 # `mode_fused_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_512_ranks_2_attention_0_dtype_bf16`.
 # The extents are the kernel's static expert shape `(local, 2 * intermediate, hidden)`,
@@ -58,5 +46,3 @@ architectures = ["sm_100a"]
 # 256-row two-CTA tiles, so `hidden` is a multiple of 256 and `intermediate` of 128.
 [[kernel.descriptors]]
 dimensions = { mode = ["fused"], hidden = { multiple = 256 }, intermediate = { multiple = 128 }, top = { min = 1 }, experts = { min = 1 }, max_tokens = { min = 1 }, ranks = { min = 1 }, attention = ["0"], dtype = ["bf16"] }
-
-[parameters]

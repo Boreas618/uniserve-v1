@@ -1,9 +1,5 @@
 # The vsa_select_tiles operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The descriptor is the selection's own: the lane width that bounds the key tiles
 # one query tile ranks and keeps. The key is the one `SelectTilesDescriptor`'s
 # `Display` prints, e.g. `block_1024`. The tile count, the query-tile count and the
@@ -14,25 +10,29 @@ op = "vsa_select_tiles"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/vsa_select_tiles.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_select_tiles_kernel"
+warps = 4
+
+# The scores are the FP32 matrix `vsa_scores` writes and the tables are `i32`, so no type is a
+# dimension.
+[launch.types]
+scores = "*fp32"
+tile_segments = "*i32"
+variable_block_sizes = "*i32"
+segment_keep = "*i32"
+indices = "*i32"
+counts = "*i32"
+query_tiles = "i32"
+tiles = "i32"
+query_offset = "i32"
+
+[launch.constants]
+block = { field = "block" }
 
 [[kernel.descriptors]]
 # `block` is a `tl.arange` extent.
 dimensions = { block = { power_of_two = true } }
-
-[parameters]

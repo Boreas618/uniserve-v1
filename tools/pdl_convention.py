@@ -11,7 +11,7 @@ dependent-launch word is `ok` whatever its module does -- no launcher's paramete
 the flag is the module's own business. An operator that does pack one is `ok` when the module
 declares it as a runtime parameter, `MISMATCH` when it does not, `uncovered` when no declared table
 of the package parses the key (a manifest's answer, not a flag's), and `unknown` when the package's
-`spec` states no signature -- which is the only shape of answer this checker cannot give.
+launch table states no signature -- which is the only shape of answer this checker cannot give.
 A package's key reader ends an unusable key with `SystemExit`, so the parse is guarded at that
 width: one table or one backend that cannot place the key must not end the run.
 
@@ -30,8 +30,8 @@ REPOSITORY = pathlib.Path(__file__).resolve().parents[1]
 OPS = REPOSITORY / 'crates/ops/src'
 KERNELS = REPOSITORY / 'crates/ops/kernels'
 
-# A package's `build.py` imports its compile driver from the Build Server's Python package, so
-# the package's source is importable from this tree whichever interpreter runs the tool.
+# A package's launch table is evaluated by the Build Server's Triton driver, so that package is
+# importable from this tree whichever interpreter runs the tool.
 sys.path.insert(0, str(REPOSITORY / 'crates/build-server/python/src'))
 from uniserve_build_server import triton as driver  # noqa: E402
 from uniserve_build_server.request import Target  # noqa: E402
@@ -63,9 +63,10 @@ def packs_pdl(operator):
 def declares_pdl(operator, key):
     for manifest_path in KERNELS.glob(f'{operator}/*/package.toml'):
         source = manifest_path.parent / 'src'
-        if not (source / 'build.py').exists():
-            continue
         manifest = tomllib.loads(manifest_path.read_text())
+        # A Triton package states its kernel's launch in its manifest's `[launch]` table.
+        if 'launch' not in manifest:
+            continue
         # A package may declare one descriptor table or several (`[[kernel]]`), one per shape it
         # serves; both forms describe the same fields, so the checker reads either.
         kernel = manifest.get('kernel', {})
@@ -80,14 +81,14 @@ def declares_pdl(operator, key):
                 tables.append(table.get('dimensions', {}))
         sys.path.insert(0, str(source))
         try:
-            spec = importlib.util.spec_from_file_location('b', source / 'build.py')
+            spec = importlib.util.spec_from_file_location('kernels', source / f'{operator}.py')
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             placed = False
             for dimensions in tables:
                 try:
                     described = driver.stated_for(
-                        module.spec,
+                        module,
                         source.parent,
                         key,
                         Target.named('sm_100a'),
@@ -160,7 +161,7 @@ for operator, key in rows:
         print(f'uncovered {operator:22} op packs True  no declared table parses {key}')
         continue
     if declares is None:
-        # A package was found but could not be asked (its `spec` states no signature) and the
+        # A package was found but could not be asked (its launch table states no signature) and the
         # operator does pack the word: this is the one shape of answer the checker cannot give.
         print(f'unknown  {operator:22} op packs True  the package states no signature')
         continue

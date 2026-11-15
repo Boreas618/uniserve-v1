@@ -8,12 +8,8 @@ op = "scheduling"
 backend = "fcfs"
 interface_version = 4
 
-# An empty version means any cargo release this host has, which is what a
-# fixture that must install on an arbitrary test host declares. A serving
-# package pins the workspace's Rust toolchain instead.
 [toolchain]
 kind = "cargo"
-version = ""
 packages = []
 
 [module]

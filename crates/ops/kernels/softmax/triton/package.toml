@@ -1,9 +1,5 @@
 # The softmax operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The key is the one `SoftmaxDescriptor`'s `Display` prints, e.g.
 # `dtype_bf16_columns_2048_tile_2048_pdl_false`.
 
@@ -11,24 +7,24 @@ op = "softmax"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/softmax.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_softmax_kernel"
+warps = { field = "tile", steps = [[2048, 8]], otherwise = 4 }
+
+# The row width is a launch word. `pdl` is a word the kernel does not read: the dependent launch
+# is compiled in.
+[launch.types]
+x_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+columns = "i32"
+pdl = "i32"
+
+# `tile` is the lane block the program walks a row in.
+[launch.constants]
+BLOCK = { field = "tile" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true }, pdl = ["true", "false"] }
-
-[parameters]

@@ -1,9 +1,5 @@
 # The layer_norm operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # Whether the layer has a bias is part of the compilation: a program without one
 # reads two affine parameters and skips an addition. The key is the one
 # `LayerNormDescriptor`'s `Display` prints, e.g.
@@ -14,23 +10,28 @@ op = "layer_norm"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/layer_norm.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_layer_norm_kernel"
+warps = { field = "tile", steps = [[2048, 8]], otherwise = 4 }
+
+# `has_bias` and `pdl` are words the kernel does not read: the bias and the dependent launch are
+# compiled in. A layer without a bias passes the weight's address as `bias_ptr`.
+[launch.types]
+x_ptr = { pointer = "dtype" }
+weight_ptr = { pointer = "dtype" }
+bias_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+columns = "i32"
+eps = "fp32"
+has_bias = "i32"
+pdl = "i32"
+
+[launch.constants]
+BLOCK = { field = "tile" }
+HAS_BIAS = { field = "bias" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], tile = { power_of_two = true }, bias = ["false", "true"], pdl = ["false", "true"] }
-[parameters]

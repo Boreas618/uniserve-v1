@@ -25,18 +25,11 @@ two tiles is one more addition in a different order, not a different decision ru
 
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch
 
 #: How many columns of the parameter row this operator reads: the top-k width, the nucleus
 #: threshold and the min-p threshold, at 1, 2 and 3, inside a row of this many columns.
 PARAMETER_COLUMNS = tl.constexpr(8)
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit(do_not_specialize=["rows", "width"])
@@ -57,7 +50,7 @@ def _filter_candidates_kernel(
     top-k width at 1, the nucleus threshold at 2 and the min-p threshold at 3, and
     ``valid`` ``[rows]`` i32. Grid: (rows,). ``BLOCK`` is the width of one tile of the row.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     row = tl.program_id(0).to(tl.int64)
     width = width.to(tl.int64)

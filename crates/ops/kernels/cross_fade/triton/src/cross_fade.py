@@ -40,14 +40,7 @@ written at, so one buffer serves as both; nothing here reads a neighbouring prog
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit
@@ -86,7 +79,7 @@ def _cross_fade_kernel(
     ``frames``, ``rows``, ``columns``, each view's three outer strides, ``block`` and ``pdl`` are the
     launch's words.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     dtype = out_ptr.dtype.element_ty
     columns = columns.to(tl.int64)

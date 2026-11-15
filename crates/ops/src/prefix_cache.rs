@@ -312,6 +312,8 @@ pub struct CopyRegionDescriptor {
     pub element: DType,
     /// Whether the destination stores FP8 with a per-unit scale.
     pub scaled: bool,
+    /// Whether the module was compiled for programmatic dependent launch.
+    pub pdl: bool,
 }
 
 impl fmt::Display for CopyRegionDescriptor {
@@ -325,6 +327,7 @@ impl fmt::Display for CopyRegionDescriptor {
             .field("head_dim", self.head_dim)
             .field("element", abi::name(self.element))
             .field("scaled", self.scaled)
+            .field("pdl", self.pdl)
             .finish(formatter)
     }
 }
@@ -599,6 +602,7 @@ mod tests {
             head_dim: 64,
             element: DType::BF16,
             scaled: false,
+            pdl: false,
         };
         let args = |layers: u64| CopyRegionArgs {
             values: view(DType::U8, &[2, 8, descriptor.plane_bytes]),

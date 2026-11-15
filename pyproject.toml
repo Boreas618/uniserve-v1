@@ -33,6 +33,9 @@ test = [
     "safetensors",
     "torch>=2.13,<2.14",
     "transformers>=4.57.1",
+    # The kernel checks import a package's kernel module as its build does,
+    # and the kernels import the kernel packages' shared sources.
+    "uniserve-kernels",
 ]
 dev = [
     "build>=1.2",
@@ -55,6 +58,7 @@ gpu = [
 
 [tool.uv.sources]
 uniserve-eval = { path = "uniserve_eval", editable = true }
+uniserve-kernels = { path = "crates/ops/python", editable = true }
 
 [tool.uv]
 # NCCL 2.30.4 is the oldest release `crates/platform` accepts on a host: an

@@ -758,3 +758,53 @@ def _paged_attention_prefill_kernel(
         tl.store(out_offsets, result.to(tl.bfloat16), mask=live[:, None])
     else:
         tl.store(out_offsets, result, mask=live[:, None])
+
+
+#: The decode program's software-pipelining stages: Triton's default on an
+#: NVIDIA target (``CUDAOptions.num_stages``), the decode program stating none
+#: of its own.
+DECODE_STAGES = 3
+
+
+def derive(fields, parameters, target):
+    """The query group, the prefill tiles and products, and the phase's options.
+
+    ``group`` is the query heads that share a key-value head; a ``q_heads``
+    that is no whole multiple of ``kv_heads`` leaves a query head without one
+    and is refused. A decode program takes ``DECODE_STAGES`` and eight warps
+    for a ``[page, head_dim]`` block of 8192 elements or more, four below. A
+    prefill program takes ``PREFILL_OPTIONS``, ``prefill_tiles`` and
+    ``prefill_products``.
+    """
+    q_heads, kv_heads = fields["q_heads"], fields["kv_heads"]
+    if q_heads % kv_heads != 0:
+        raise SystemExit(
+            f"q_heads={q_heads} is not a whole multiple of "
+            f"kv_heads={kv_heads}: a query head has no key-value head"
+        )
+    derived = {"group": q_heads // kv_heads}
+
+    if fields["phase"] == "decode":
+        block = fields["page"] * fields["head_dim"]
+        derived["warps"] = 8 if block >= 8192 else 4
+        derived["stages"] = DECODE_STAGES
+        return derived
+
+    # The products compare the element types by Triton's names, which the
+    # Triton driver's one table spells; the driver is this function's caller.
+    from uniserve_build_server.triton import element
+
+    tiles = prefill_tiles(q_heads, kv_heads, fields["head_dim"])
+    products = prefill_products(
+        element(fields["dtype"]), element(fields["kv"])
+    )
+    derived.update(
+        warps=PREFILL_OPTIONS["num_warps"],
+        stages=PREFILL_OPTIONS["num_stages"],
+        block_q=tiles["BLOCK_Q"],
+        group_pad=tiles["GROUP_PAD"],
+        tile=tiles["TILE"],
+        tensor_cores=products["TENSOR_CORES"],
+        f16_scores=products["F16_SCORES"],
+    )
+    return derived

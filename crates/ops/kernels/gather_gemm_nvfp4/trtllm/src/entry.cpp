@@ -81,6 +81,9 @@ std::string getCubin(const std::string& name, const std::string& sha256) {
 #ifndef UNISERVE_TOP
 #error "UNISERVE_TOP is not defined"
 #endif
+#ifndef UNISERVE_GELU_TANH
+#error "UNISERVE_GELU_TANH is not defined; the build states the descriptor's activation"
+#endif
 #ifndef UNISERVE_TILE_TOKENS
 #error "UNISERVE_TILE_TOKENS is not defined"
 #endif
@@ -97,9 +100,11 @@ constexpr int32_t kExperts = UNISERVE_EXPERTS;
 constexpr int32_t kTop = UNISERVE_TOP;
 constexpr int32_t kTileTokens = UNISERVE_TILE_TOKENS;
 
-// The fused gated epilogue the descriptor's `activation` names. The artifact calls
-// `silu(gate) · up` Swiglu and `gelu_tanh(gate) · up` Geglu.
-constexpr ActivationType kActivation = ActivationType::Swiglu;
+// The fused gated epilogue the descriptor's `activation` names, which the build states as
+// `UNISERVE_GELU_TANH`. The artifact calls `silu(gate) · up` Swiglu and `gelu_tanh(gate) · up`
+// Geglu, and the kernels the build published are the same activation's.
+constexpr ActivationType kActivation =
+    UNISERVE_GELU_TANH ? ActivationType::Geglu : ActivationType::Swiglu;
 
 //: The dense half of the E2M1 kernels' block scales: this module serves the
 //: artifact's variants whose *weight* scales are the plain `[experts, rows, columns/16]`

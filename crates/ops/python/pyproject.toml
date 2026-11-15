@@ -1,0 +1,29 @@
+# The kernel packages' shared sources (design section 5.2).
+#
+# What several kernel packages of `crates/ops/kernels` compile is one library,
+# installed where they are compiled: the programmatic dependent launch prologue
+# of the Triton kernels and the address arithmetic of the tensor primitives'
+# strided operands. A package imports it as it imports Triton (`from
+# uniserve_kernels import dependent_launch`), so no package reaches outside
+# itself and none carries a copy.
+#
+# The Build Server's Python environment (`crates/build-server/python`) installs
+# it from this directory, and its toolchain description digests its files into
+# every module's build identity, so an edit is another identity. The
+# development environment installs it too, so a kernel check imports a
+# package's source as the package's build does.
+[project]
+name = "uniserve-kernels"
+version = "2.0.0"
+description = "The shared sources of UniServe's kernel packages"
+requires-python = ">=3.11"
+# The sources are Triton's; the environment that installs them locks Triton.
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "uniserve_kernels"
+module-root = "src"

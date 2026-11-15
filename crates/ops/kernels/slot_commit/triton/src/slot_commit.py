@@ -152,3 +152,24 @@ def _slot_commit_kernel(
         weight,
         mask=sampled & dedicated & token_valid & (counts_penalty != 0),
     )
+
+
+#: The Triton type of each element type a descriptor may name for the state.
+ELEMENTS = {
+    "i64": tl.int64,
+    "i32": tl.int32,
+    "u8": tl.uint8,
+}
+
+
+def derive(fields, parameters, target):
+    """The state's element types as Triton types, for the launch table.
+
+    ``index_type``, ``verified_type`` and ``penalties_type`` are the Triton
+    types of the descriptor's ``index``, ``verified`` and ``penalties``.
+    """
+    return {
+        "index_type": ELEMENTS[fields["index"]],
+        "verified_type": ELEMENTS[fields["verified"]],
+        "penalties_type": ELEMENTS[fields["penalties"]],
+    }

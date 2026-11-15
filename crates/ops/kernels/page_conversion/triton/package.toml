@@ -1,8 +1,5 @@
 # The page_conversion operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program decodes one (layer, token) row of a staged host page, every head
 # of it: the source is the host page encoding, layer-major
 # `[layers, block_size, heads, head_dim]` per field and FP32 scales
@@ -14,27 +11,35 @@ op = "page_conversion"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/page_conversion.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# The derivation gives the stored and the logical element types as the kernel takes them, and
+# whether the program multiplies the page's scales back.
+[launch]
+kernel = "_page_conversion_kernel"
+warps = 4
+derive = "derive"
+
+[launch.types]
+scratch = "*u8"
+elements = "u64"
+scales = "u64"
+block_size = "u32"
+scale_heads = "u32"
+
+[launch.constants]
+FIELD = { field = "field", values = { key = 0, value = 1 } }
+SOURCE = { field = "stored" }
+COMPUTE = { field = "rounding" }
+HEAD_DIM = { field = "head_dim" }
+HEADS = { field = "heads" }
+LAYERS = { field = "layers" }
+SCALED = { field = "dequantizes" }
+SOURCE_BYTES = { field = "source", values = { f8e4m3 = 1, bf16 = 2 } }
 
 # `field_key_source_f8e4m3_compute_bf16_head_dim_128_heads_1_layers_32_scaled_true`.
 #
 # `head_dim` is a `tl.arange` extent; the head and layer counts compile for any positive value.
 [[kernel.descriptors]]
 dimensions = { field = ["key", "value"], source = ["f8e4m3", "bf16"], compute = ["bf16", "f16", "f32"], head_dim = { power_of_two = true }, heads = { min = 1 }, layers = { min = 1 }, scaled = ["true", "false"] }
-
-[parameters]

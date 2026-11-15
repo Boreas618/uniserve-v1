@@ -1,8 +1,5 @@
 # The qk_norm_rope operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program normalizes and rotates `rows` head rows of the query or the key;
 # the token count is a launch value and the head geometry is the descriptor's.
 # `block` is the head width the program loads in one tile, so a descriptor's
@@ -12,22 +9,53 @@ op = "qk_norm_rope"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/qk_norm_rope.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# The forms' launch words differ, so each is a program of its own: weights and a width word are
+# ports. The derivation selects the form and gives the rotation's width (the whole head when the
+# key names none), the turned pairs' power-of-two lane count, the factor tables' element type
+# (FP32 but in the strided form) and whether the form is the strided one; it refuses a rotation
+# wider than the head. Only the strided form states its operands aligned: its two ranges start at
+# multiples of a head, and a row is a whole number of heads.
+[launch]
+kernel = { field = "form", values = { weighted = "_qk_norm_rope_kernel", narrowed = "_qk_norm_rope_narrowed_kernel", unweighted = "_qk_norm_rope_unweighted_kernel", unweighted_narrowed = "_qk_norm_rope_unweighted_narrowed_kernel", strided = "_qk_norm_rope_strided_kernel" } }
+warps = 4
+aligned = { field = "strided", values = { true = ["query_ptr", "key_ptr", "cosine_ptr", "sine_ptr", "row_stride"], false = [] } }
+derive = "derive"
+
+# A narrowed program's call names how many channels turn, after `pdl`; the module compiled its
+# own width from the key, so the word is the call's. `pdl` is a word the kernel does not read: the
+# dependent launch is compiled in.
+[launch.types]
+query_ptr = { pointer = "dtype" }
+key_ptr = { pointer = "dtype" }
+q_weight_ptr = { pointer = "dtype" }
+k_weight_ptr = { pointer = "dtype" }
+cosine_ptr = { pointer = "factors" }
+sine_ptr = { pointer = "factors" }
+q_out_ptr = { pointer = "output" }
+k_out_ptr = { pointer = "output" }
+tokens = "i64"
+row_stride = "i64"
+table_rows = "i64"
+epsilon = "fp32"
+pdl = "i32"
+rotated = "u32"
+
+# The strided form's one head count is the query's. A key names `centred` only for a zero-centred
+# scale: the gain is then `1 + w`.
+[launch.constants]
+HEADS = { field = "q_heads" }
+Q_HEADS = { field = "q_heads" }
+K_HEADS = { field = "k_heads" }
+DIM = { field = "head_dim" }
+ROTATED = { field = "rotated" }
+PAIRS = { field = "pairs" }
+ROWS = { field = "rows" }
+INTERLEAVED = { field = "rotation", values = { half = false, interleaved = true } }
+AFFINE = true
+CENTRED = { field = "centred", absent = false }
 
 # `dtype_bf16_output_bf16_head_dim_128_q_heads_32_k_heads_4_rotation_half_epsilon_0x358637bd_rows_16_block_128_pdl_false`.
 # The operator prints `rotated` only when the rotation is narrower than the head, and `affine` only
@@ -36,32 +64,31 @@ architectures = ["sm_100a", "sm_90a"]
 # weighted form a multimodal transformer does (an even `rotated` below `head_dim`), and the
 # weightless form of each. `affine` has one value, because a learned scale is the form that prints
 # no field. One backend, because a deployment names a backend and not a key shape.
-# `head_dim`, `rows` and `block` are `tl.arange` extents, so powers of two; the head counts are
-# compiled in for any positive value, and the epsilon is a launch word.
+# `head_dim`, `rows` and `block` are `tl.arange` extents, so powers of two, and a head turns
+# pairs, so it is at least two channels; the head counts are compiled in for any positive value,
+# and the epsilon is a launch word.
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true, min = 2 }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"] }
 
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], affine = ["false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true, min = 2 }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], affine = ["false"] }
 
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], rotated = { multiple = 2 } }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true, min = 2 }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], rotated = { multiple = 2 } }
 
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], affine = ["false"], rotated = { multiple = 2 } }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true, min = 2 }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], affine = ["false"], rotated = { multiple = 2 } }
 
 # The zero-centred scale (Qwen3-Next, Qwen3.5): each head is multiplied by `1 + w`, the one added in
 # FP32. Named by `centred` and weighted, at full width or narrowed.
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], centred = ["true"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true, min = 2 }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], centred = ["true"] }
 
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], rotated = { multiple = 2 }, centred = ["true"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true, min = 2 }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], rotated = { multiple = 2 }, centred = ["true"] }
 
 # The strided form the video VAE's decoder launches: heads read through a row stride, a factor table
 # of the activation's type that repeats per tile. Named by `factors` and `strided`, and weightless:
 # the operator refuses the strided form a learned scale.
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], affine = ["false"], rotated = { multiple = 2 }, factors = ["f16", "f32"], strided = ["true"] }
-
-[parameters]
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { power_of_two = true, min = 2 }, q_heads = { min = 1 }, k_heads = { min = 1 }, rotation = ["half", "interleaved"], epsilon = { bits = 32 }, rows = { power_of_two = true }, block = { power_of_two = true }, pdl = ["true", "false"], affine = ["false"], rotated = { multiple = 2 }, factors = ["f16", "f32"], strided = ["true"] }

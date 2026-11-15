@@ -26,14 +26,7 @@ mistaken for the legitimate token `0`, and the draw ignores it because it holds 
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit(do_not_specialize=["rows", "width", "vocabulary"])
@@ -56,7 +49,7 @@ def _candidate_order_kernel(
     for the duration of the launch: it holds one count per token id, then that id's rank. ``rows`` is
     unused beyond naming the grid's extent and is kept because the operator packs it. Grid: (rows,).
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     row = tl.program_id(0).to(tl.int64)
     base = row * width

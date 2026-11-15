@@ -12,25 +12,41 @@ op = "copy_block"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/copy_block.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a", "sm_100f"]
+# A wide copy's rows are unit-stride and start on sixteen-element bounds on both sides, which its
+# launch refuses otherwise (`Op::launch` checks the same words); a general copy states nothing.
+[launch]
+kernel = "_copy_block_kernel"
+warps = 4
+aligned = { field = "wide", values = { true = ["source_ptr", "out_ptr", "e3", "s0", "s1", "s2", "d0", "d1", "d2"], false = [] } }
+
+# The descriptor names the two element types, and they are equal at launch: a copy converts
+# nothing. `pdl` is a word the kernel does not read.
+[launch.types]
+source_ptr = { pointer = "source" }
+out_ptr = { pointer = "out" }
+e0 = "u64"
+e1 = "u64"
+e2 = "u64"
+e3 = "u64"
+s0 = "i64"
+s1 = "i64"
+s2 = "i64"
+s3 = "i64"
+d0 = "i64"
+d1 = "i64"
+d2 = "i64"
+d3 = "i64"
+total = "u64"
+block = "u32"
+pdl = "i32"
+
+[launch.constants]
+BLOCK = { field = "wide", values = { true = 2048, false = 1024 } }
+WIDE = { field = "wide" }
 
 # `source_bf16_out_bf16_wide_false`.
 [[kernel.descriptors]]
 dimensions = { source = ["bf16", "f16", "f32"], out = ["bf16", "f16", "f32"], wide = ["false", "true"] }
-
-[parameters]

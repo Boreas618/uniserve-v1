@@ -1,8 +1,5 @@
 # The slot_commit operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program applies the whole step's commit rows with `block` lanes, so the
 # row count is a runtime word and one module serves every step of that shape.
 
@@ -10,22 +7,42 @@ op = "slot_commit"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/slot_commit.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# The commit is latency-bound state movement, not a throughput kernel. The element types the
+# kernel's constexprs take are Triton types (`index_type`, `verified_type` and `penalties_type`,
+# which `derive` gives).
+[launch]
+kernel = "_slot_commit_kernel"
+warps = 4
+derive = "derive"
+
+# Both flags are read as bytes: 0 and 1 are 0 and 1 in the low byte of any integer element the
+# caller may hold them in.
+[launch.types]
+columns = { pointer = "index" }
+tokens = { pointer = "index" }
+valid = "*u8"
+active = "*u8"
+continuation = "*u8"
+points = { pointer = "index" }
+future = { pointer = "index" }
+predicates = "*u8"
+logical = { pointer = "index" }
+sampling = { pointer = "index" }
+verified = { pointer = "verified" }
+penalties = { pointer = "penalties" }
+count = "i64"
+
+[launch.constants]
+INDEX = { field = "index_type" }
+VERIFIED = { field = "verified_type" }
+PENALTY_DTYPE = { field = "penalties_type" }
+STRIDE = { field = "stride" }
+FUTURE_STRIDE = { field = "future_stride" }
+VOCAB = { field = "vocab" }
+BLOCK = { field = "block" }
 
 # `index_i32_verified_i32_penalties_i32_stride_8_future_stride_1_vocab_151936_block_8`.
 [[kernel.descriptors]]
@@ -35,5 +52,3 @@ architectures = ["sm_100a", "sm_90a"]
 # is the table capacity, the largest bucket's rows for every bucket; it, the next
 # input's slot stride and the vocabulary are compiled in for any positive value.
 dimensions = { index = ["i32"], verified = ["i32"], penalties = ["i32"], stride = { min = 1 }, future_stride = { min = 1 }, vocab = { min = 1 }, block = { power_of_two = true } }
-
-[parameters]

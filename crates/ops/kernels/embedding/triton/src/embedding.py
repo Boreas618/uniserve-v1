@@ -10,14 +10,7 @@ The kernel body imports nothing but Triton.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit(do_not_specialize=["tokens", "hidden", "first", "rows"])
@@ -40,7 +33,7 @@ def _embedding_kernel(
     walks its rows' ``TILE`` wide column blocks. A token outside
     ``[first, first + rows)`` writes zeros.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     token = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     token_mask = token < tokens
@@ -61,3 +54,4 @@ def _embedding_kernel(
             value,
             mask=token_mask[:, None] & column_mask[None, :],
         )
+

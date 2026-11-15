@@ -23,8 +23,9 @@ half.workspace = true
 
 [dev-dependencies]
 # `tests/packages.rs` loads every kernel package's manifest as the Build Server
-# reads it.
+# reads it, and reads what each manifest states as written.
 build-server.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

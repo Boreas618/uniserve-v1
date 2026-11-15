@@ -79,10 +79,6 @@ def matching_kernels(header, fields, target):
     descriptor's values, not a guess. A target none of whose families the
     artifact was built for matches no kernel, which refuses the descriptor.
     """
-    if fields["window"] != "false":
-        raise SystemExit(
-            "the trtllm package is compiled without an attention window"
-        )
     families = trtllm.families(target)
     query = NAMES[fields["dtype"]]
     key_value = NAMES[fields["kv"]]

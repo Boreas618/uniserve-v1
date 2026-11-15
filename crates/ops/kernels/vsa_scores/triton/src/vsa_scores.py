@@ -25,18 +25,11 @@ selection reads, which the operator requires and nothing else may be.
 
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch
 
 #: Key tiles one program reduces per step. It is a register tile, not a descriptor field: the
 #: contraction is the descriptor's `width`, and how many keys a step holds changes no result.
 KEY_BLOCK = tl.constexpr(16)
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -60,7 +53,7 @@ def _vsa_scores_kernel(
     ``query_tiles`` and ``key_tiles`` are the launch's words - the grid names the block of query tiles
     and the head - and ``pdl`` is a launching decision.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     head = tl.program_id(1).to(tl.int64)
     heads = tl.num_programs(1).to(tl.int64)

@@ -9,14 +9,7 @@ The result equals torch's ``log_softmax`` of the logits row.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit(do_not_specialize=["columns"])
@@ -36,7 +29,7 @@ def _log_softmax_kernel(
     tile larger than a program's registers costs more steps, not a bigger block.
     Grid: (rows,).
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     row = tl.program_id(0).to(tl.int64)
     base = row * columns
@@ -62,3 +55,16 @@ def _log_softmax_kernel(
         mask = offsets < columns
         values = tl.load(x_ptr + base + offsets, mask=mask, other=0.0)
         tl.store(out_ptr + base + offsets, values.to(tl.float32) - logsumexp, mask=mask)
+
+
+#: The most lanes a program holds in registers in one step: a wider tile walks
+#: the row in more steps, not in a wider block.
+LANES = 4096
+
+
+def derive(fields, parameters, target):
+    """The lanes of one step along the row, for the launch table.
+
+    ``step`` is the descriptor's tile up to :data:`LANES`.
+    """
+    return {"step": min(fields["tile"], LANES)}

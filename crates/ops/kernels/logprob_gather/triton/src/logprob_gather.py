@@ -14,14 +14,7 @@ which no scored token reports.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit(do_not_specialize=["rows", "columns"])
@@ -41,7 +34,7 @@ def _logprob_gather_kernel(
     selected token in the descriptor's id dtype, ``out`` ``[rows]`` FP32 and
     ``ranks`` ``[rows]`` i32. Grid: (rows,).
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     row = tl.program_id(0).to(tl.int64)
     base = row * columns
@@ -63,3 +56,16 @@ def _logprob_gather_kernel(
 
     tl.store(out_ptr + row, tl.where(inside, value, 0.0))
     tl.store(ranks_ptr + row, tl.where(inside, above + 1, 0))
+
+
+#: The most lanes a program holds in registers in one step: a wider tile walks
+#: the row in more steps, not in a wider block.
+LANES = 4096
+
+
+def derive(fields, parameters, target):
+    """The lanes of one step of the rank's count, for the launch table.
+
+    ``step`` is the descriptor's tile up to :data:`LANES`.
+    """
+    return {"step": min(fields["tile"], LANES)}

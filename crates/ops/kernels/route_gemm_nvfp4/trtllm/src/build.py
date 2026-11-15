@@ -35,7 +35,6 @@ def compile(request: Request) -> None:
     """
     trtllm.build_routed_gemm(
         request,
-        "uniserve_route_gemm_nvfp4",
         renderings={
             "mEltwiseActType": lambda name: (
                 f"gemm::EltwiseActType({ELTWISE_ACTIVATIONS[name]})"

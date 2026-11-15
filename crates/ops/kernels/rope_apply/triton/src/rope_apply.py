@@ -19,14 +19,7 @@ construction rather than by a branch.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit
@@ -104,7 +97,7 @@ def _rope_apply_full_kernel(
     PDL: tl.constexpr,
 ):
     """Every channel of a head rotates: the launch's last word is ``pdl``."""
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
     base = tl.program_id(0) * ROWS
     for row in tl.static_range(ROWS):
         _turned_token(
@@ -145,7 +138,7 @@ def _rope_apply_narrowed_kernel(
     PDL: tl.constexpr,
 ):
     """``rotated`` channels of a head turn and the rest are copied."""
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
     base = tl.program_id(0) * ROWS
     for row in tl.static_range(ROWS):
         _turned_token(
@@ -164,3 +157,35 @@ def _rope_apply_narrowed_kernel(
             INTERLEAVED,
             True,
         )
+
+
+def derive(fields, parameters, target):
+    """The rotation's width, its pairs and the program its launch names.
+
+    A key names ``rotated`` only for a rotation narrower than the head, so a
+    key without it turns all ``head_dim`` channels. The turned pairs are
+    walked in a power-of-two tile. A rotation as wide as the head takes the
+    full program; a narrower one the program whose call names its width.
+
+    Raises:
+        SystemExit: When the rotation is wider than the head, or the head
+            tile ``block`` is narrower than the head count.
+    """
+    head_dim = fields["head_dim"]
+    rotated = fields.get("rotated", head_dim)
+    if rotated > head_dim:
+        raise SystemExit(
+            f"a rotation of {rotated} channels exceeds a {head_dim} channel "
+            f"head"
+        )
+    heads, block = fields["heads"], fields["block"]
+    if heads > block:
+        raise SystemExit(f"{heads} heads do not fit a {block} lane head tile")
+
+    pairs = rotated // 2
+    return {
+        "rotated": rotated,
+        "pairs": pairs,
+        "pairs_tile": triton.next_power_of_2(pairs),
+        "narrowed": rotated != head_dim,
+    }

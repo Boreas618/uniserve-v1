@@ -47,3 +47,15 @@ def _snapshot_kernel(
     valid = (block >= 0) & (block < shape[0]) & (columns < width)
     value = tl.load(field + address, valid, 0)
     tl.store(snapshot + row * width + columns, value, valid)
+
+
+def derive(fields, parameters, target):
+    """Refuse a bank whose shape and strides differ in rank.
+
+    The address arithmetic pairs the shape's axes with the strides' one by
+    one, so the two lists name the same axes. Derives no field.
+    """
+    shape, strides = fields["shape"], fields["strides"]
+    if len(shape) != len(strides):
+        raise SystemExit(f"shape {shape} and strides {strides} differ in rank")
+    return {}

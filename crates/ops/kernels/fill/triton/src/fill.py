@@ -15,9 +15,9 @@ and is stored as those bits: nothing is converted, so what a launch writes
 does not depend on a rounding mode or on how a compiler converts a scalar.
 """
 
-import strided
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch, strided
 
 
 @triton.jit
@@ -48,7 +48,7 @@ def _fill_kernel(
     destination's extents and ``t0..t5`` its strides, right-aligned. ``bits``
     is the element's bit pattern and ``WIDTH`` the element's width in bits.
     """
-    strided.pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     live = index < elements
@@ -70,3 +70,17 @@ def _fill_kernel(
     pattern = tl.full([BLOCK], word, word.dtype)
     element = pattern.to(destination.dtype.element_ty, bitcast=True)
     tl.store(destination + write_at, element, mask=live)
+
+
+#: The width in bits of each unsigned word an element's bits travel in.
+WIDTHS = {"u8": 8, "u16": 16, "u32": 32, "u64": 64}
+
+
+def derive(fields, parameters, target):
+    """The element addressed, and the word its bits travel in, for the launch table."""
+    word = strided.BITS[fields["dtype"]]
+    return {
+        "address": strided.address(fields["dtype"]),
+        "word": word,
+        "width": WIDTHS[word],
+    }

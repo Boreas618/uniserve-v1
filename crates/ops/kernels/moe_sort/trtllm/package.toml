@@ -17,34 +17,11 @@ op = "moe_sort"
 backend = "trtllm"
 interface_version = 1
 
-[toolchain]
-kind = "nvcc"
-version = "13.0.48"
-packages = []
-
-[module]
-form = "native"
-
-[module.entries]
-launch = "uniserve_moe_sort"
-
 [source]
 kind = "cuda"
-files = [
-    "include/uniserve_moe_sort.h",
-    "src/entry.cpp",
-    "src/routing.cu",
-    "src/build.py",
-]
-script = "src/build.py"
-
-[kernel]
-architectures = ["sm_100a", "sm_100f"]
 
 # `experts_128_top_8_local_128_tile_128_scales_f32`.
 # Every extent is a launch value. One block's shared memory holds 18 counters per local
 # expert within 46 KiB, which bounds `local` at 654 (`src/routing.cu`).
 [[kernel.descriptors]]
 dimensions = { experts = { min = 1 }, top = { min = 1 }, local = { min = 1, max = 654 }, tile = { min = 1 }, scales = ["f32", "bf16", "f16"], counted = ["true"] }
-
-[parameters]

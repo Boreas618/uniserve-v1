@@ -1,9 +1,5 @@
 # The vsa_prepare_tiles operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The descriptor names the layout as well as the arithmetic: the three row and head
 # stride pairs, since the operator accepts strided Q/K/V views, and the factor
 # table's row stride.
@@ -12,7 +8,7 @@
 # only to form addresses, and the operator passes a view as a bare pointer, so the module has no
 # other source for them. `rotated` is zero when Q and K are used as they are, and `norm` says
 # whether the tiles are normalized and rotated before they are pooled.
-# `epsilon` prints as the hexadecimal bits of a float or double. The key is the one
+# `epsilon` prints as the hexadecimal bits of a float. The key is the one
 # `PrepareTilesDescriptor`'s `Display` prints, e.g.
 # `dtype_bf16_heads_32_width_128_rotated_128_tile_rows_64_block_rows_16_epsilon_0x358637bd_norm_true_query_row_stride_4096_query_head_stride_128_key_row_stride_4096_key_head_stride_128_value_row_stride_4096_value_head_stride_128_factor_stride_64`.
 
@@ -20,29 +16,67 @@ op = "vsa_prepare_tiles"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/vsa_prepare_tiles.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds. The
+# stepwise routine's bits are fixed by its two warps and by unfused arithmetic, as the operator
+# launched it.
+[launch]
+kernel = "_prepare_tiles_kernel"
+warps = 2
+aligned = [
+    "query",
+    "key",
+    "value",
+    "query_weight",
+    "key_weight",
+    "cosine",
+    "sine",
+    "variable_block_sizes",
+    "pooled_query",
+    "pooled_key",
+    "pooled_value",
+]
+derive = "derive"
+options = { enable_fp_fusion = false }
+
+# The factor tables and the pooled means are FP32 and the valid sizes `i32`, whatever the rows'
+# type.
+[launch.types]
+query = { pointer = "dtype" }
+key = { pointer = "dtype" }
+value = { pointer = "dtype" }
+query_weight = { pointer = "dtype" }
+key_weight = { pointer = "dtype" }
+cosine = "*fp32"
+sine = "*fp32"
+variable_block_sizes = "*i32"
+pooled_query = "*fp32"
+pooled_key = "*fp32"
+pooled_value = "*fp32"
+
+# Everything the descriptor names is compiled in, the strides as the pairs `derive` forms.
+[launch.constants]
+QUERY_STRIDES = { field = "query_strides" }
+KEY_STRIDES = { field = "key_strides" }
+VALUE_STRIDES = { field = "value_strides" }
+QUERY_ROWS = { field = "query_rows" }
+KEY_ROWS = { field = "key_rows" }
+FACTOR_STRIDE = { field = "factor_stride" }
+HEADS = { field = "heads" }
+DIM = { field = "width" }
+ROTATED = { field = "rotated" }
+EPS = { field = "epsilon" }
+TILE = { field = "tile_rows" }
+BLOCK = { field = "block_rows" }
+NORM = { field = "norm" }
 
 [[kernel.descriptors]]
 # `width` is a `tl.arange` extent that the stepwise rotation also walks in eight-feature word
 # groups, so it is a power of two of at least eight; that rotation reads rows as 16-byte vectors and
 # pairs of 16-bit features, so the Q/K/V strides are whole 16-byte steps, the factor stride is even
 # and `rotated` is a multiple of four. The tile mean sums rows sixteen at a time, so `tile_rows` is a
-# multiple of sixteen; `block_rows` is a `tl.arange` extent. `epsilon` is a float's or a double's
-# bits.
-dimensions = { dtype = ["bf16", "f16", "f32"], heads = { min = 1 }, width = { min = 8, power_of_two = true }, rotated = { min = 0, multiple = 4 }, tile_rows = { multiple = 16 }, block_rows = { power_of_two = true }, epsilon = { bits = 64 }, norm = ["false", "true"], query_row_stride = { multiple = 8 }, query_head_stride = { multiple = 8 }, key_row_stride = { multiple = 8 }, key_head_stride = { multiple = 8 }, value_row_stride = { multiple = 8 }, value_head_stride = { multiple = 8 }, factor_stride = { min = 0, multiple = 2 } }
-[parameters]
+# multiple of sixteen; `block_rows` is a `tl.arange` extent. `epsilon` is the bits of the `f32` the
+# operator's caller normalizes with.
+dimensions = { dtype = ["bf16", "f16", "f32"], heads = { min = 1 }, width = { min = 8, power_of_two = true }, rotated = { min = 0, multiple = 4 }, tile_rows = { multiple = 16 }, block_rows = { power_of_two = true }, epsilon = { bits = 32 }, norm = ["false", "true"], query_row_stride = { multiple = 8 }, query_head_stride = { multiple = 8 }, key_row_stride = { multiple = 8 }, key_head_stride = { multiple = 8 }, value_row_stride = { multiple = 8 }, value_head_stride = { multiple = 8 }, factor_stride = { min = 0, multiple = 2 } }

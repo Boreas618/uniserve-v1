@@ -13,6 +13,10 @@ Every entry is resolved through a declared mechanism, never by guessing a path:
 - the compile driver itself (this package) as the digest of its files, read
   through :mod:`importlib.resources`: a module is stored under the driver it
   was built through, so an edited driver or pin is another identity;
+- the kernel packages' shared sources (the ``uniserve_kernels`` library of
+  ``crates/ops/python``, which the packages import) as the digest of their
+  files, read the same way, so an edit of what a package imports is another
+  identity too;
 - the CUDA toolkit of the release this environment's lock fixes (the release
   of the locked ``nvidia-cuda-runtime`` distribution, such as ``13.0``),
   through the ``cudart-<release>`` and ``cuda-<release>`` pkg-config modules
@@ -53,6 +57,9 @@ CUTE_DSL = "nvidia-cutlass-dsl"
 #: The program that names the host C++ compiler, as POSIX systems install it.
 HOST_COMPILER = "c++"
 
+#: The kernel packages' shared sources, a library this environment installs.
+KERNELS = "uniserve_kernels"
+
 
 @dataclasses.dataclass(frozen=True)
 class Cuda:
@@ -86,6 +93,8 @@ class Toolchain:
     interpreter: str
     #: The SHA-256 of the compile driver's files, in hex.
     driver: str
+    #: The SHA-256 of the kernel packages' shared sources, in hex.
+    kernels: dict[str, Any]
     #: Every installed distribution by its normalized name (PEP 503), with its
     #: version.
     distributions: dict[str, str]
@@ -160,10 +169,10 @@ def _files(
     return found
 
 
-def driver_digest() -> str:
-    """The SHA-256 of this package's files, framed by names and lengths."""
+def digest(package: str) -> str:
+    """The SHA-256 of an installed package's files, framed by names and lengths."""
     digest = hashlib.sha256()
-    for name, entry in _files(importlib.resources.files(__package__)):
+    for name, entry in _files(importlib.resources.files(package)):
         data = entry.read_bytes()
         digest.update(name.encode())
         digest.update(b"\0")
@@ -257,6 +266,16 @@ def cuda() -> dict[str, Any]:
     )
 
 
+def kernels() -> dict[str, Any]:
+    """The digest of the kernel packages' shared sources."""
+    try:
+        return available(digest(KERNELS))
+    except ModuleNotFoundError:
+        return missing(
+            f"this environment has no {KERNELS} library (crates/ops/python)"
+        )
+
+
 def host_compiler() -> dict[str, Any]:
     """The host C++ compiler, resolved to the file it runs."""
     found = shutil.which(HOST_COMPILER)
@@ -269,7 +288,8 @@ def describe() -> Toolchain:
     """This environment's toolchains."""
     return Toolchain(
         interpreter=sys.executable,
-        driver=driver_digest(),
+        driver=digest(__package__),
+        kernels=kernels(),
         distributions=distributions(),
         triton=_version(TRITON),
         cute_dsl=_version(CUTE_DSL),

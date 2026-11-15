@@ -11,8 +11,9 @@
 //! which this crate compiles in: the targets a package may build for, the
 //! target a device of a compute capability is built for, and the facts every
 //! compilation is handed in its request (warp size, architecture families,
-//! shared and tensor memory, dependent launch, FP8), so a package states what
-//! it requires of a target instead of restating hardware facts.
+//! shared and tensor memory, the matrix instructions, dependent launch, FP8),
+//! so a package states what it requires of a target ([`Requirement`]) instead
+//! of restating hardware facts or naming GPUs.
 //!
 //! Which targets this host builds for is a property of its devices: the
 //! `serve` command is given them as `--target`s or by its caller, which reads
@@ -54,12 +55,111 @@ pub struct Facts {
     pub warp_size: u32,
     /// The largest shared memory one block may opt into, in bytes.
     pub shared_memory: u64,
-    /// Whether the architecture has tensor memory.
+    /// Whether the architecture has tensor memory and the matrix
+    /// instructions that read it (`tcgen05`).
     pub tensor_memory: bool,
+    /// Whether the architecture has the asynchronous warpgroup matrix
+    /// instructions (`wgmma`).
+    pub warpgroup_mma: bool,
     /// Whether a kernel may launch dependent grids.
     pub dependent_launch: bool,
     /// Whether the tensor cores take FP8 operands.
     pub fp8: bool,
+}
+
+impl Facts {
+    /// Whether a target of these facts meets `requirement`.
+    pub fn meets(&self, requirement: &Requirement) -> bool {
+        match requirement {
+            Requirement::Feature(Feature::TensorMemory) => self.tensor_memory,
+            Requirement::Feature(Feature::WarpgroupMma) => self.warpgroup_mma,
+            Requirement::Feature(Feature::DependentLaunch) => self.dependent_launch,
+            Requirement::Feature(Feature::Fp8) => self.fp8,
+            Requirement::Family(family) => self.families.contains(family),
+        }
+    }
+}
+
+/// A hardware feature a package may require of a target: one of the boolean
+/// facts of the description, by the name `targets.toml` gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Feature {
+    TensorMemory,
+    WarpgroupMma,
+    DependentLaunch,
+    Fp8,
+}
+
+impl Feature {
+    /// Every feature, in the description's order.
+    pub const ALL: [Feature; 4] = [
+        Self::TensorMemory,
+        Self::WarpgroupMma,
+        Self::DependentLaunch,
+        Self::Fp8,
+    ];
+
+    /// The fact's name in `targets.toml`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::TensorMemory => "tensor_memory",
+            Self::WarpgroupMma => "warpgroup_mma",
+            Self::DependentLaunch => "dependent_launch",
+            Self::Fp8 => "fp8",
+        }
+    }
+}
+
+/// What a kernel package requires of a target it builds for: a hardware
+/// feature (`tensor_memory`), or an architecture family whose code the target
+/// runs (`sm_120f`), for a package whose vendor states the family its kernel
+/// is written for. A package builds for every GPU target of the description
+/// that meets all of its requirements.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Requirement {
+    Feature(Feature),
+    Family(String),
+}
+
+impl TryFrom<String> for Requirement {
+    type Error = String;
+
+    /// A feature's name, or a family some target of the description runs the
+    /// code of; anything else names nothing a target can be asked for.
+    fn try_from(name: String) -> std::result::Result<Self, String> {
+        if let Some(feature) = Feature::ALL
+            .into_iter()
+            .find(|feature| feature.name() == name)
+        {
+            return Ok(Self::Feature(feature));
+        }
+        if described()
+            .values()
+            .any(|facts| facts.families.contains(&name))
+        {
+            return Ok(Self::Family(name));
+        }
+        let features: Vec<&str> = Feature::ALL.into_iter().map(Feature::name).collect();
+        Err(format!(
+            "`{name}` is neither a feature of the target description ({features:?}) nor an \
+             architecture family a target runs"
+        ))
+    }
+}
+
+/// The names of `requirements` as a manifest states them, for a refusal's text.
+pub fn named(requirements: &[Requirement]) -> Vec<String> {
+    requirements.iter().cloned().map(String::from).collect()
+}
+
+impl From<Requirement> for String {
+    fn from(requirement: Requirement) -> String {
+        match requirement {
+            Requirement::Feature(feature) => feature.name().to_owned(),
+            Requirement::Family(family) => family,
+        }
+    }
 }
 
 /// Every GPU target by name, parsed once from [`DESCRIPTION`].

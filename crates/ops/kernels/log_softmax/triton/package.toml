@@ -1,8 +1,5 @@
 # The log_softmax operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program scores one row in three streaming passes; the row count comes from
 # the grid, so one module serves every row count.
 
@@ -10,27 +7,28 @@ op = "log_softmax"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/log_softmax.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# The program walks a row in steps of `min(tile, 4096)` lanes (`step`, which `derive` gives).
+[launch]
+kernel = "_log_softmax_kernel"
+warps = { field = "step", steps = [[2048, 8]], otherwise = 4 }
+derive = "derive"
 
-# `dtype_fp32_columns_151936_tile_4096_pdl_true`.
-# The program walks a row in steps of `min(tile, 4096)` lanes, a `tl.arange`
-# extent, so a tile below 4096 must be a power of two; a wider one is any width.
+# The output is FP32 whatever the input's element type. `pdl` is a word the kernel does not read:
+# the dependent launch is compiled in.
+[launch.types]
+x_ptr = { pointer = "dtype" }
+out_ptr = "*fp32"
+columns = "i32"
+pdl = "i32"
+
+[launch.constants]
+STEP = { field = "step" }
+
+# `dtype_f32_columns_151936_tile_4096_pdl_true`.
+# A step is a `tl.arange` extent, so a tile below 4096 must be a power of two; a wider one is any
+# width.
 [[kernel.descriptors]]
 dimensions = { dtype = ["f32", "bf16", "f16"], columns = { min = 1 }, tile = { min = 1 }, pdl = ["true", "false"] }
-
-[parameters]

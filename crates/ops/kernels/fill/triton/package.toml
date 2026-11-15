@@ -1,9 +1,5 @@
 # The fill operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # `destination[i] = value` over a row-major window: a contiguous tensor, or a
 # block of a larger one. The value travels as the element's bits and is stored
 # as those bits, so the operator's tolerance is `exact()`. An FP8 (`f8e4m3`)
@@ -20,24 +16,36 @@ op = "fill"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/fill.py", "src/strided.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_fill_kernel"
+warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
+derive = "derive"
+
+# The value's bits travel in the unsigned word as wide as the element.
+[launch.types]
+destination = { pointer = "address" }
+elements = "i64"
+d1 = "i64"
+d2 = "i64"
+d3 = "i64"
+d4 = "i64"
+d5 = "i64"
+t0 = "i64"
+t1 = "i64"
+t2 = "i64"
+t3 = "i64"
+t4 = "i64"
+t5 = "i64"
+bits = { field = "word", values = { u8 = "u8", u16 = "u16", u32 = "u32", u64 = "u64" } }
+pdl = "i32"
+
+[launch.constants]
+WIDTH = { field = "width" }
+RANK = { field = "rank" }
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64", "f8e4m3"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
-
-[parameters]

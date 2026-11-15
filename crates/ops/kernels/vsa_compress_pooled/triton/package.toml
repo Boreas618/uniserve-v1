@@ -5,31 +5,40 @@
 # The pooled scores and values are FP32 and only the result narrows, so `dtype` names the compressed
 # rows and no operand is a dimension.
 #
-# `max_tiles` is the bound the operator refuses a tile count past, and this package compiles it as
-# the block the softmax reduces in, rounded up to a power of two; `width` is the feature block and
-# `block` the lanes it uses; `heads` sizes the pooled values' layout and a program is one head, so
-# the grid carries the count.
+# `max_tiles` is the bound the operator refuses a tile count past and the reduction length its
+# tolerance counts; the kernel walks the key tiles `KEYS` at a time, so nothing compiled reads it.
+# `width` is the feature block and `block` the lanes it uses; `heads` sizes the pooled values'
+# layout and a program is one head, so the grid carries the count.
 
 op = "vsa_compress_pooled"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/vsa_compress_pooled.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_vsa_compress_pooled_kernel"
+warps = 4
+
+# `pdl` is a word the kernel does not read: the dependent launch is compiled in.
+[launch.types]
+scores_ptr = "*fp32"
+values_ptr = "*fp32"
+sizes_ptr = "*i32"
+out_ptr = { pointer = "dtype" }
+query_tiles = "i32"
+tiles = "i32"
+pdl = "i32"
+
+# `QUERIES` is the query tiles a program holds, the launch's grid divisor as well, which
+# `crates/ops/src/vsa.rs` states as `POOLED_QUERIES`; `KEYS` is the key tiles one step reads.
+[launch.constants]
+HEADS = { field = "heads" }
+WIDTH = { field = "width" }
+BLOCK = { field = "block" }
+QUERIES = 16
+KEYS = 64
 
 # `dtype_bf16_heads_56_width_128_max_tiles_1024_block_128_pdl_false`.
 [[kernel.descriptors]]
@@ -37,5 +46,3 @@ architectures = ["sm_100a", "sm_90a"]
 # of 640 tiles and one of 1024 are one module. `block` is a `tl.arange` extent; `heads` and `width`
 # compile for any positive value, the lanes past `width` masked.
 dimensions = { dtype = ["bf16", "f16", "f32"], heads = { min = 1 }, width = { min = 1 }, max_tiles = { power_of_two = true }, block = { power_of_two = true }, pdl = ["false", "true"] }
-
-[parameters]

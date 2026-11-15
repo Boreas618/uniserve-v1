@@ -12,27 +12,38 @@ op = "unpatchify_video"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/unpatchify_video.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = { field = "affine", values = { true = "_unpatchify_video_affine_kernel", false = "_unpatchify_video_kernel" } }
+warps = { field = "block", steps = [[1024, 8]], otherwise = 4 }
+
+# `scale_ptr` and `bias_ptr` are the affine kernel's alone. `block` and `pdl` are words neither
+# kernel reads: the block width is compiled in.
+[launch.types]
+tokens_ptr = { pointer = "dtype" }
+scale_ptr = { pointer = "dtype" }
+bias_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+channels = "i32"
+frames = "i32"
+height = "i32"
+width = "i32"
+patch_frames = "i32"
+patch_height = "i32"
+patch_width = "i32"
+out_stride0 = "i64"
+out_stride1 = "i64"
+out_stride2 = "i64"
+block = "i32"
+pdl = "i32"
+
+[launch.constants]
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 # The affine form is its own program because its launch carries two more pointers; everything else
 # the operator reads — the channels, the token grid and the patch — travels as words, so one module
 # of a form serves every raster.
 dimensions = { dtype = ["bf16", "f16", "f32"], affine = ["true", "false"], block = { power_of_two = true }, pdl = ["false"] }
-
-[parameters]

@@ -16,6 +16,7 @@ def compile(request: Request) -> None:
         "descriptor": request.descriptor,
         "fields": request.fields,
         "parameters": request.parameters,
+        "entries": request.entries,
         "target": str(request.target),
         "capability": request.target.capability,
         "families": list(request.target.families),

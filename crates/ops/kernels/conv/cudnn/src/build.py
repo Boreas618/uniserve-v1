@@ -5,7 +5,8 @@ engine and then executed on the caller's stream. A descriptor is the three
 element types and nothing else: the geometry, the bias and the TF32 choice
 arrive in the call structure, which the entry reads, so one module serves every
 window, filter, group count and rank of its types. The build passes the types
-and the operator's entry name to the compiler as defines.
+and the operator's launch entry, as the manifest resolves it, to the compiler as
+defines.
 
 `tuning/engines.json`, when the package carries one, maps a descriptor key to
 the cuDNN engine's global index a tuning pass chose for it (design section 5.4);
@@ -21,7 +22,6 @@ compile request.
 import json
 import subprocess
 import sys
-import tomllib
 
 from uniserve_build_server.request import Request
 
@@ -44,22 +44,6 @@ ELEMENT_TYPES = {
 
 #: The engine index of a module compiled without tuning data.
 UNTUNED = -1
-
-
-def launch_entry(package):
-    """The launch symbol the package's manifest declares.
-
-    The manifest and the module must name the same entry, so the build reads
-    the symbol out of the manifest instead of building it from the operator's
-    name.
-    """
-    manifest = tomllib.loads((package / "package.toml").read_text())
-    entry = manifest.get("module", {}).get("entries", {}).get("launch")
-    if not entry:
-        raise SystemExit(
-            "the package's [module.entries] names no launch symbol"
-        )
-    return entry
 
 
 def element_type(request, field):
@@ -91,7 +75,6 @@ def compile(request: Request) -> None:
     descriptor = request.descriptor
     # The nvcc the Build Server checked against this package's declared version.
     compiler = request.toolchain.require_cuda().nvcc
-    entry = launch_entry(package)
 
     command = [
         compiler,
@@ -102,7 +85,7 @@ def compile(request: Request) -> None:
         "-Xcompiler",
         "-fPIC",
         f"-I{package / 'include'}",
-        f"-DUNISERVE_CONV_ENTRY={entry}",
+        f"-DUNISERVE_CONV_ENTRY={request.entries['launch']}",
         f"-DUNISERVE_CONV_INPUT_DTYPE={element_type(request, 'input')}",
         f"-DUNISERVE_CONV_WEIGHT_DTYPE={element_type(request, 'weight')}",
         f"-DUNISERVE_CONV_OUTPUT_DTYPE={element_type(request, 'output')}",
@@ -117,13 +100,3 @@ def compile(request: Request) -> None:
     built = subprocess.run(command, check=False)
     if built.returncode != 0:
         raise SystemExit(f"nvcc failed with {built.returncode}")
-
-    print(
-        json.dumps(
-            {
-                "descriptor": descriptor,
-                "target": str(request.target),
-                "entry": entry,
-            }
-        )
-    )

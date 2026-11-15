@@ -16,14 +16,7 @@ computes has to agree with the tile a program moves.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit
@@ -45,7 +38,7 @@ def _transpose_kernel(
     written — the destination's shape is the operator's promise, so a tile that fell
     outside it would be a wrong call rather than a partial one.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     source_rows = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     source_columns = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)

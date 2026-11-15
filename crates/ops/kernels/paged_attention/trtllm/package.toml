@@ -21,21 +21,13 @@ interface_version = 1
 priority = 1
 
 [toolchain]
-kind = "nvcc"
-version = "13.0.48"
-packages = [{ name = "flashinfer-python", version = "0.6.18" }]
-
-[module]
-form = "native"
-entries = { launch = "uniserve_paged_attention" }
+packages = ["flashinfer-python"]
 
 [source]
 kind = "cuda"
-files = ["src/build.py", "src/entry.cpp", "src/entry.h"]
-script = "src/build.py"
 
 [kernel]
-architectures = ["sm_100a", "sm_100f"]
+requires = ["tensor_memory"]
 
 # `phase_decode_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32_kv_heads_4_mask_causal_window_false_len_40960`.
 #

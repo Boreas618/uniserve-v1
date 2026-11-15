@@ -31,10 +31,10 @@ Every exponential is libdevice's (``_exponential``), whose error is a few
 units in the last place of its result whatever the argument.
 """
 
-import strided
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
+from uniserve_kernels import dependent_launch, strided
 
 #: ``sqrt(8 / pi)`` and ``sqrt(1 / 2)``: the two GELU forms' constants,
 #: instantiated so a kernel may read them.
@@ -172,7 +172,7 @@ def _elementwise_unary_kernel(
     extents and ``s0..s5`` the input's strides, right-aligned; ``a`` and ``b``
     are the function's scalars, which a function that takes none ignores.
     """
-    strided.pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     live = index < elements

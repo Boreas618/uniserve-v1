@@ -31,14 +31,7 @@ excess the operator's tolerance counts (``ops::tolerance::tf32x3``).
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit
@@ -64,7 +57,7 @@ def _vsa_compress_pooled_kernel(
     one step reads. ``query_tiles`` and ``tiles`` are the launch's words, and ``pdl`` is a launching
     decision.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     head = tl.program_id(1).to(tl.int64)
     query_tiles = query_tiles.to(tl.int64)

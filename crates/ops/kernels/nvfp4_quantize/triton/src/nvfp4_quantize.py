@@ -34,6 +34,7 @@ too — inside the same launch, since the operator's grid is the matrix's elemen
 
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch
 
 #: The row block the swizzled layout interleaves: 128 rows, in four groups of 32.
 SWIZZLE_ROWS = tl.constexpr(128)
@@ -118,14 +119,6 @@ def _swizzled_offset(rows, columns, PADDED_COLUMNS: tl.constexpr):
 
 
 @triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-@triton.jit
 def _nvfp4_quantize_kernel(
     input_ptr,
     values_ptr,
@@ -149,7 +142,7 @@ def _nvfp4_quantize_kernel(
     swizzled. ``global_scale`` is the address of a one-element FP32 tensor holding the reciprocal
     of the matrix's FP32 tensor scale.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     # The tensor scale is a device operand: the loader publishes a calibrated
     # checkpoint's value as one FP32 word, and every program reads it from there,
@@ -222,3 +215,30 @@ def _nvfp4_quantize_kernel(
                 mask=keep_column,
             )
             padding_row += programs
+
+
+def derive(fields, parameters, target):
+    """The scale matrix's widths, for the launch table.
+
+    ``scale_columns`` is a row's block scales, one per sixteen elements;
+    ``padded_columns`` the width the layout stores them in, rounded up to whole
+    groups of ``SWIZZLE_COLUMNS`` under the swizzle; ``padded_tile`` the power
+    of two ``tl.arange`` needs to cover a padded row. A chunk that does not
+    divide the row is refused.
+    """
+    columns, block = fields["columns"], fields["block"]
+    if columns % block != 0:
+        raise SystemExit(f"{block} elements do not divide a row of {columns}")
+
+    scale_columns = columns // 16
+    padded_columns = scale_columns
+    if fields["layout"] == "swizzled_128x4":
+        group = SWIZZLE_COLUMNS.value
+        padded_columns = (scale_columns + group - 1) // group * group
+
+    return {
+        "scale_columns": scale_columns,
+        "padded_columns": padded_columns,
+        # One program writes a whole padded row of zeros in one tile.
+        "padded_tile": triton.next_power_of_2(max(padded_columns, 1)),
+    }

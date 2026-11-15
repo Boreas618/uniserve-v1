@@ -1,8 +1,5 @@
 # The add_rms_norm operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program adds a residual row, keeps the FP32 sum, normalizes it and rounds
 # once into each output. `columns` is a launch value and `tile` the program's
 # row block.
@@ -11,22 +8,31 @@ op = "add_rms_norm"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/add_rms_norm.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds; the
+# columns are aligned where the key's width is a multiple of sixteen.
+[launch]
+kernel = "_add_rms_norm_kernel"
+warps = { field = "tile", steps = [[2048, 8]], otherwise = 4 }
+aligned = ["x_ptr", "r_ptr", "w_ptr", "y_ptr", "c_ptr", "columns"]
+
+# `pdl` is a word the kernel does not read: the dependent launch is compiled in.
+[launch.types]
+x_ptr = { pointer = "dtype" }
+r_ptr = { pointer = "dtype" }
+w_ptr = { pointer = "dtype" }
+y_ptr = { pointer = "dtype" }
+c_ptr = { pointer = "dtype" }
+columns = "i32"
+eps = "fp32"
+pdl = "i32"
+
+# A key names `centred` only for a zero-centred weight.
+[launch.constants]
+BLOCK = { field = "tile" }
+CENTRED = { field = "centred", absent = false }
 
 # `dtype_bf16_columns_2048_tile_2048_pdl_true`.
 [[kernel.descriptors]]

@@ -19,19 +19,12 @@ candidate. Two passes:
 
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch
 
 #: The sentinel a column that no crossing reached keeps: above every candidate width a deployment
 #: can state (a vocabulary is orders of magnitude below it) and inside int32, which is the type the
 #: row's offsets carry.
 MAX_COLUMN = tl.constexpr(1 << 30)
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit(do_not_specialize=["rows", "width"])
@@ -52,7 +45,7 @@ def _inverse_cdf_kernel(
     in ``[0, 1)`` and ``tokens`` ``[rows]`` the drawn ids in the descriptor's
     token dtype. Grid: (rows,). ``BLOCK`` is the width of one tile of the row.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     row = tl.program_id(0).to(tl.int64)
     width = width.to(tl.int64)

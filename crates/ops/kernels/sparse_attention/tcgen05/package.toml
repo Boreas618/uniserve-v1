@@ -1,4 +1,5 @@
-# The sparse_attention operator's SM100 backend: design 5.2's package.
+# The sparse_attention operator's `tcgen05` backend: design 5.2's package, on the tensor-memory
+# matrix instructions of Blackwell (`requires = ["tensor_memory"]`).
 #
 # One native module per descriptor: Video Sparse Attention, attention over the key
 # blocks a caller selected (`ops::attention::sparse::SparseCall`, 704 bytes). The kernel
@@ -10,37 +11,14 @@
 # `block` picks it and the two blocks are two revisions of the same program.
 
 op = "sparse_attention"
-backend = "sm100"
+backend = "tcgen05"
 interface_version = 1
-
-[toolchain]
-kind = "nvcc"
-version = "13.0.48"
-packages = []
-
-[module]
-form = "native"
-
-[module.entries]
-launch = "uniserve_sparse_attention"
 
 [source]
 kind = "cuda"
-files = [
-    "LICENSE",
-    "include/uniserve_sparse_attention.h",
-    "src/primitives.cuh",
-    "src/block_sparse_kernel_sm100a.cuh",
-    "src/block_sparse_launch_sm100a.cuh",
-    "src/attention.cu",
-    "src/build.py",
-]
-script = "src/build.py"
 
 [kernel]
-architectures = ["sm_100a"]
+requires = ["tensor_memory"]
 
 [[kernel.descriptors]]
 dimensions = { block = ["64", "128"], dtype = ["bf16"], output = ["bf16"], head_dim = ["128"], lse = ["true", "false"] }
-
-[parameters]

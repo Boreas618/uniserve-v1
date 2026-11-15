@@ -248,21 +248,14 @@ op = "rms_norm"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = ""
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/rms.py"]
-script = "src/build.py"
+
+[launch]
+kernel = "_rms_norm_kernel"
+warps = 4
 
 [kernel]
-architectures = ["{arch}"]
 descriptors = [{ dimensions = { dtype = ["bf16"] } }]
 "#;
 
@@ -281,8 +274,7 @@ fn an_installation_records_the_hosts_toolchain_or_is_refused_without_it() {
         &source,
         &[
             ("package.toml", support::for_arch(TRITON).as_bytes()),
-            ("src/rms.py", b"# the kernel\n"),
-            ("src/build.py", b"# the build module\n"),
+            ("src/rms_norm.py", b"# the kernel\n"),
         ],
     );
 
@@ -348,9 +340,7 @@ fn policy_workspace(root: &Path) -> PathBuf {
                 // The crate's files are the ones cargo packages, so the
                 // manifest lists none.
                 b"op = \"scheduling\"\nbackend = \"fixture\"\ninterface_version = 1\n\n\
-                  [toolchain]\nkind = \"cargo\"\nversion = \"\"\n\n\
-                  [module]\nform = \"wasm\"\n\n\
-                  [source]\nkind = \"wasm\"\nfiles = []\n",
+                  [source]\nkind = \"wasm\"\n",
             ),
         ],
     );
@@ -644,13 +634,6 @@ const SAMPLER: &str = r#"
 op = "sampler"
 backend = "process"
 interface_version = 1
-
-[toolchain]
-kind = "none"
-version = ""
-
-[module]
-form = "executable"
 
 [source]
 kind = "executable"

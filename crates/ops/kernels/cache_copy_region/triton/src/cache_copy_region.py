@@ -45,6 +45,7 @@ disagree on them:
 
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit
@@ -113,14 +114,6 @@ def _decode_fp8(byte):
 
 
 @triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-@triton.jit
 def _cache_copy_region_kernel(
     values_ptr,
     scale_ptr,
@@ -151,7 +144,7 @@ def _cache_copy_region_kernel(
     address arithmetic: a plane's index is a product of extents and a 32-bit product would wrap into
     another unit's bytes with no shape to complain about.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     column = tl.program_id(0)
     slot = tl.program_id(1)
@@ -215,3 +208,33 @@ def _cache_copy_region_kernel(
 
     # Last, and once per unit: a reader that sees the flag set may read every row of the unit.
     tl.store(initialized_ptr + flag_index, 1)
+
+
+#: The bytes of one stored element, by the pool's element type.
+ELEMENT_BYTES = {"bf16": 2, "f16": 2, "f8e4m3": 1}
+
+
+def derive(fields, parameters, target):
+    """The token row's extents and the plane's elements, for the launch table.
+
+    ``row_size`` is the elements of one token row, ``heads · head_dim``, and ``row_pow2`` its next
+    power of two, the lanes a program walks the row with. ``plane_elements`` is the unit's plane in
+    stored elements; a plane that is not whole elements and whole token rows is refused.
+    """
+    element_bytes = ELEMENT_BYTES[fields["element"]]
+    plane_bytes = fields["plane_bytes"]
+    row_size = fields["heads"] * fields["head_dim"]
+    if plane_bytes % element_bytes:
+        raise SystemExit(
+            f"a plane of {plane_bytes} bytes is not whole {element_bytes}-byte elements"
+        )
+    plane_elements = plane_bytes // element_bytes
+    if plane_elements % row_size:
+        raise SystemExit(
+            f"a plane of {plane_elements} elements is not whole {row_size}-element token rows"
+        )
+    return {
+        "row_size": row_size,
+        "row_pow2": triton.next_power_of_2(row_size),
+        "plane_elements": plane_elements,
+    }

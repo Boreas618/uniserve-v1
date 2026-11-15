@@ -12,24 +12,35 @@ op = "activation1d"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/activation1d.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_activation1d_kernel"
+warps = { field = "block", steps = [[1024, 8]], otherwise = 4 }
+
+# The two filters are of the signal's element type and SnakeBeta's two log-space parameters are
+# FP32. The kernel has no dependent-launch prologue, so `pdl` is a word it does not read and its
+# launch never carries the attribute.
+[launch.types]
+values_ptr = { pointer = "dtype" }
+alpha_ptr = "*fp32"
+beta_ptr = "*fp32"
+filter_up_ptr = { pointer = "dtype" }
+filter_down_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+channels = "i32"
+kernel = "i32"
+ratio = "i32"
+length = "i32"
+out_length = "i32"
+block = "i32"
+pdl = "i32"
+
+[launch.constants]
+KERNEL = { field = "kernel" }
+RATIO = { field = "ratio" }
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["f32", "bf16", "f16"], channels = { min = 1 }, kernel = { min = 1 }, ratio = { min = 1 }, block = { power_of_two = true }, pdl = ["false", "true"] }
-
-[parameters]

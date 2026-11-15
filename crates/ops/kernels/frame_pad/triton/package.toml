@@ -1,9 +1,5 @@
 # The frame_pad operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The descriptor is the padding's own tile: the element type, whether the rows and
 # columns beside the source are mirrored rather than replicated, and the columns
 # and channels one program writes. `FramePadDescriptor::tiles` derives the tile
@@ -19,24 +15,42 @@ op = "frame_pad"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/frame_pad.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_frame_pad_kernel"
+warps = 4
+
+# Every stride, extent and padding is an `i32` word, as the operator packs them: five source
+# strides, five output strides, then the extents and the padding.
+[launch.types]
+values = { pointer = "dtype" }
+out = { pointer = "dtype" }
+stride_batch = "i32"
+stride_channel = "i32"
+stride_frame = "i32"
+stride_height = "i32"
+stride_width = "i32"
+out_batch = "i32"
+out_channel = "i32"
+out_frame_stride = "i32"
+out_height_stride = "i32"
+out_width_stride = "i32"
+height = "i32"
+width = "i32"
+out_frames = "i32"
+out_height = "i32"
+out_width = "i32"
+channels = "i32"
+pad_top = "i32"
+pad_left = "i32"
+pad_front = "i32"
+
+[launch.constants]
+reflect = { field = "reflect" }
+block_pixels = { field = "block_pixels" }
+block_channels = { field = "block_channels" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], reflect = ["true", "false"], block_pixels = { power_of_two = true }, block_channels = { power_of_two = true } }
-
-[parameters]

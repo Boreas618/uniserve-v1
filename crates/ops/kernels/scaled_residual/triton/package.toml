@@ -1,9 +1,5 @@
 # The scaled_residual operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The descriptor is the residual update's own: the element type, the row width, the
 # element tile one program walks, and whether the update carries a bias. The key is
 # the one `ScaledResidualDescriptor`'s `Display` prints, e.g.
@@ -13,24 +9,31 @@ op = "scaled_residual"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/scaled_residual.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds; the
+# operands are stated aligned only for a row width that is a multiple of sixteen, which the
+# derivation gives as `whole_rows`. The operator rounds the gated product before the residual
+# sum, so the two must not fuse into one multiply-add.
+[launch]
+kernel = "_scaled_residual_kernel"
+warps = 4
+aligned = { field = "whole_rows", values = { true = ["hidden_ptr", "update_ptr", "update_bias_ptr", "scale_ptr", "elements"], false = [] } }
+derive = "derive"
+options = { enable_fp_fusion = false }
+
+[launch.types]
+hidden_ptr = { pointer = "dtype" }
+update_ptr = { pointer = "dtype" }
+update_bias_ptr = { pointer = "dtype" }
+scale_ptr = { pointer = "dtype" }
+elements = "i32"
+
+[launch.constants]
+HAS_UPDATE_BIAS = { field = "update_bias" }
+WIDTH = { field = "columns" }
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, block = { power_of_two = true }, update_bias = ["true", "false"] }
-
-[parameters]

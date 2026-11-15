@@ -1,9 +1,5 @@
 # The topk_softmax operator's CUDA backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The module is a cubin. The descriptor bakes the scores a lane walks (the
 # expert count in whole warps) and the renormalizing butterfly's width (the
 # top-k width rounded up to a power of two); one warp routes one token and a
@@ -14,26 +10,13 @@ op = "topk_softmax"
 backend = "nvcc"
 interface_version = 1
 
-[toolchain]
-kind = "nvcc"
-version = "13.0.48"
-packages = []
-
 [module]
 form = "cubin"
-metadata = "metadata.json"
 
 [source]
 kind = "cuda"
-files = ["src/topk_softmax.cu", "src/build.py"]
-script = "src/build.py"
-
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
 
 # `scores_bf16_experts_128_top_8_renormalize_true_scale_none`.
 # The module compiles for any expert count and top-k width it bakes in.
 [[kernel.descriptors]]
 dimensions = { scores = ["bf16", "f16", "f32"], experts = { min = 1 }, top = { min = 1 }, renormalize = ["true", "false"], scale = ["none", "bf16", "f16", "f32"] }
-
-[parameters]

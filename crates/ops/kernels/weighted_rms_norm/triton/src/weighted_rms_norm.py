@@ -77,3 +77,12 @@ def _weighted_rms_norm_absmax_kernel(
             axis=0,
         ),
     )
+
+
+def derive(fields, parameters, target):
+    """The normalized rows' element type, for the launch table.
+
+    A key names ``activation`` only for rows narrower than the input; one that
+    names none gives them the input's ``dtype``.
+    """
+    return {"activation": fields.get("activation", fields["dtype"])}

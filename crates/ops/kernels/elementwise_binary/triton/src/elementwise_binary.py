@@ -25,9 +25,9 @@ shift count outside the element's width and a zero divisor leave their
 element unspecified.
 """
 
-import strided
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch, strided
 
 
 @triton.jit
@@ -69,7 +69,7 @@ def _elementwise_binary_kernel(
     ``COMPARES`` says that ``FUNCTION`` is a comparison, whose output is ``u8``,
     and ``SIGNED`` that the element type is an integer with a sign.
     """
-    strided.pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     live = index < elements
@@ -144,3 +144,41 @@ def _elementwise_binary_kernel(
         tl.store(out + index, result.to(tl.uint8), mask=live)
     else:
         tl.store(out + index, strided.narrowed(result, out, COMPUTE), mask=live)
+
+
+#: The functions whose output is a ``u8`` truth value.
+COMPARISONS = ("eq", "ne", "lt", "le", "gt", "ge")
+
+#: The functions that exist on the integer element types alone.
+INTEGRAL = (
+    "remainder",
+    "bitwise_and",
+    "bitwise_or",
+    "bitwise_xor",
+    "bitwise_left_shift",
+    "bitwise_right_shift",
+)
+
+#: The integer element types that hold a sign.
+SIGNED = ("i16", "i32", "i64")
+
+
+def derive(fields, parameters, target):
+    """The computing type, the output's element type and the sign, for the launch table.
+
+    A function of the integers alone is refused for a floating element type.
+    """
+    function, dtype = fields["function"], fields["dtype"]
+    compute = strided.compute(dtype)
+    if function in INTEGRAL and compute != "int":
+        raise SystemExit(
+            f"{function} exists on the integer element types alone, not on "
+            f"{dtype}"
+        )
+    compares = function in COMPARISONS
+    return {
+        "compute": compute,
+        "compares": compares,
+        "output": "u8" if compares else dtype,
+        "signed": dtype in SIGNED,
+    }

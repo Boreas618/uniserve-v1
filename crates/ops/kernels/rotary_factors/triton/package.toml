@@ -1,8 +1,5 @@
 # The rotary_factors operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program stores a block of scaled cosine and sine factors; the token count
 # is a launch value, so one module serves every sequence length.
 
@@ -10,22 +7,39 @@ op = "rotary_factors"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/rotary_factors.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# A sectioned call's words carry the axes and the width each owns, so the two forms are two
+# programs over one body. The derivation gives the axis count (one when the key names none), the
+# frequencies each axis owns and the contiguous cut's thresholds, which the module compiles in.
+[launch]
+kernel = { field = "sectioned", values = { false = "_rotary_factors_kernel", true = "_rotary_factors_sectioned_kernel" } }
+warps = 4
+derive = "derive"
+
+# A sectioned program's `axes` and section widths are the words the operator always passes; the
+# module compiled its own from the key, so the words are taken for the call's order and not read.
+[launch.types]
+positions = { pointer = "positions" }
+frequencies = "*fp32"
+cosine = { pointer = "dtype" }
+sine = { pointer = "dtype" }
+total = "u64"
+columns = "u32"
+scale = "fp32"
+axes = "u32"
+section_0 = "u32"
+section_1 = "u32"
+section_2 = "u32"
+section_3 = "u32"
+
+[launch.constants]
+AXES = { field = "axes" }
+HALVES = { field = "halves" }
+CUTS = { field = "cuts" }
+INTERLEAVED = { field = "interleaved", absent = false }
+BLOCK = { field = "block" }
 
 # `dtype_fp32_positions_i64_columns_64_block_256_scale_0x3f800000_pdl_true`.
 # The operator prints `axes`, `sections` and `interleaved` only for a sectioned
@@ -34,10 +48,10 @@ architectures = ["sm_100a", "sm_90a"]
 [[kernel.descriptors]]
 dimensions = { dtype = ["f32"], positions = ["f32", "i32", "i64"], columns = { min = 1 }, block = { power_of_two = true }, scale = { bits = 32 }, pdl = ["true", "false"] }
 
+# An interleaved rotation cycles its frequencies over at least two axes.
 [[kernel.descriptors]]
-dimensions = { dtype = ["f32", "f16"], positions = ["f32", "i32", "i64"], columns = { min = 1 }, block = { power_of_two = true }, scale = { bits = 32 }, pdl = ["false"], axes = { min = 1, max = 4 }, sections = { multiple = 2, separator = "-" }, interleaved = ["true"] }
+dimensions = { dtype = ["f32", "f16"], positions = ["f32", "i32", "i64"], columns = { min = 1 }, block = { power_of_two = true }, scale = { bits = 32 }, pdl = ["false"], axes = { min = 2, max = 4 }, sections = { multiple = 2, separator = "-" }, interleaved = ["true"] }
 
 # A sectioned rotation of half-width pairs prints no `interleaved`, so it is a key shape of its own.
 [[kernel.descriptors]]
 dimensions = { dtype = ["f32", "f16"], positions = ["f32", "i32", "i64"], columns = { min = 1 }, block = { power_of_two = true }, scale = { bits = 32 }, pdl = ["false"], axes = { min = 1, max = 4 }, sections = { multiple = 2, separator = "-" } }
-[parameters]

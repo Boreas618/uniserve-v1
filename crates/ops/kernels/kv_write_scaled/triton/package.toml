@@ -1,8 +1,5 @@
 # The kv_write_scaled operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program per token of the launch, and one of them writes each page of an
 # E4M3 cache the launch touches, the program of the page's first token: it
 # derives the page's scale from the values the launch brings, re-encodes the page
@@ -17,27 +14,38 @@ op = "kv_write_scaled"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/kv_write_scaled.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# The derivation gives the slots one step of an ownership or extent scan reads, the kernel module's
+# `SCAN`.
+[launch]
+kernel = "_kv_write_scaled_kernel"
+warps = 4
+derive = "derive"
+
+# The cache is E4M3 in every descriptor, which is what this operator is for; a full-precision cache
+# is `kv_write`.
+[launch.types]
+source_ptr = { pointer = "dtype" }
+slots_ptr = "*i32"
+scales_ptr = "*fp32"
+cache_ptr = "*fp8e4nv"
+initialized_ptr = "*u8"
+tokens = "i64"
+page = "i32"
+heads = "i32"
+head_dim = "i32"
+pdl = "i32"
+
+[launch.constants]
+BLOCK = { field = "block" }
+SCAN = { field = "scan" }
 
 # `dtype_bf16_scale_f32_page_64_heads_4_head_dim_128_block_128_pdl_false`.
 #
-# `page`, `heads` and `head_dim` are launch words; the block is a `tl.arange` extent.
+# `page`, `heads` and `head_dim` are launch words; the block is a `tl.arange` extent. The page's
+# scale is f32 alone: the page's maximum is compared and the rows are divided in f32, and a narrower
+# scale would round the page twice.
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f32"], scale = ["f32"], page = { min = 1 }, heads = { min = 1 }, head_dim = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"] }
-
-[parameters]

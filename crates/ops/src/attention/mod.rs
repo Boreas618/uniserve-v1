@@ -1012,9 +1012,9 @@ fn words(phase: Phase) -> Vec<PagedWord> {
         PagedWord::Scale,
     ]);
     if phase == Phase::Prefill {
-        // The prefill program's own words follow the scale (`triton/src/build.py`'s prefill
-        // signature: the strides, the extents, the scale, then the row bound, the pack flag, the
-        // token count and the row count).
+        // The prefill program's own words follow the scale (the parameter list of
+        // `triton/src/paged_attention.py`'s prefill program: the strides, the extents, the scale,
+        // then the row bound, the pack flag, the token count and the row count).
         words.extend([
             PagedWord::MaxQueryRow,
             PagedWord::Packed,

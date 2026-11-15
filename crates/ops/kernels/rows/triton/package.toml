@@ -13,25 +13,30 @@ op = "rows"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/rows.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_rows_kernel"
+warps = { field = "block", steps = [[1024, 8]], otherwise = 4 }
+
+# `count`, `columns`, `block` and `pdl` also travel at launch, so one module serves every row count.
+[launch.types]
+source_ptr = { pointer = "dtype" }
+destination_ptr = { pointer = "dtype" }
+indices_ptr = "*i32"
+count = "u32"
+columns = "u32"
+block = "u32"
+pdl = "i32"
+
+# `place` is `replace` whose negative index stores nothing.
+[launch.constants]
+COLUMNS = { field = "columns" }
+REPLACE = { field = "mode", values = { replace = true, add = false, place = true } }
+BLOCK = { field = "block" }
+SKIP = { field = "mode", values = { replace = false, add = false, place = true } }
 
 # `dtype_bf16_mode_replace_columns_5120_block_1024_pdl_false`, and the slice's own widths.
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32", "i32"], mode = ["replace", "add", "place"], columns = { min = 1 }, block = { power_of_two = true }, pdl = ["false", "true"] }
-
-[parameters]

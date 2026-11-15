@@ -173,9 +173,9 @@ def main():
 
     checked = 0
     if options.device:
-        # The module's own extents (`build.py`: a key step of 32, sixteen query tiles a program),
-        # which the tensor cores need at least sixteen wide: query and key tile counts that fill
-        # no step, and a contraction narrower than its lanes.
+        # The module's own extents (the launch table's: a key step of 32, sixteen query
+        # tiles a program), which the tensor cores need at least sixteen wide: query and key
+        # tile counts that fill no step, and a contraction narrower than its lanes.
         checked += run(
             module,
             heads=2,

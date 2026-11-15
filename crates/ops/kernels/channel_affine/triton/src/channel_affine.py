@@ -19,6 +19,7 @@ One element of ``out`` per thread; a flat index gives the element's channel.
 
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit
@@ -48,14 +49,6 @@ def _add_rn(a, b):
 
 
 @triton.jit
-def _pdl_prologue(PDL: tl.constexpr):
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-@triton.jit
 def _channel_affine_kernel(
     x,
     scale,
@@ -72,7 +65,7 @@ def _channel_affine_kernel(
 
     Grid: ``ceil(elements / BLOCK)`` programs, ``elements = batch · channels · positions``.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     valid = offsets < elements

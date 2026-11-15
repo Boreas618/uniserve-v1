@@ -7,11 +7,14 @@ in (:mod:`uniserve_build_server.__main__`). The request is the whole interface:
 a compilation reads no environment variable and looks nothing up, so what it
 builds is a function of the request and of the files the request names.
 
-- the package: its operator and backend, its installed root, its source kind
-  and the build module its manifest names;
+- the package: its operator and backend, its installed root, its source kind,
+  the module the compilation imports (a Triton package's kernel module, or the
+  build module ``src/build.py``) and a Triton package's launch table;
 - the descriptor: its key and the fields the Build Server read out of the key
-  against the package's declared dimensions (``Descriptors::fields`` in
-  ``crates/build-server/src/manifest.rs`` is the one reader of the key grammar),
+  against the package's declared dimensions, each typed as its dimension
+  declares it (``Descriptors::typed_fields`` in
+  ``crates/build-server/src/manifest.rs`` is the one reader of the key
+  grammar): a number, a list of numbers, a float, a boolean flag or a name;
   and the manifest's parameters;
 - the target, with the hardware facts of its architecture
   (``crates/build-server/targets.toml``), so a package states requirements
@@ -60,6 +63,9 @@ class Target:
     shared_memory: int
     #: Whether the target has tensor memory (``tcgen05``).
     tensor_memory: bool
+    #: Whether the target has the asynchronous warpgroup matrix instructions
+    #: (``wgmma``).
+    warpgroup_mma: bool
     #: Whether a kernel may launch dependent grids (programmatic dependent
     #: launch).
     dependent_launch: bool
@@ -100,17 +106,24 @@ class Request:
     backend: str
     #: The descriptor key, which names the module in the store.
     descriptor: str
-    #: The key's fields, each a declared dimension and its value, in the key's
-    #: order. A dimension the key leaves out is absent: the package accounts for
-    #: a field it needs and the key lacks.
-    fields: dict[str, str]
+    #: The key's fields, each a declared dimension and its typed value, in the
+    #: key's order. A dimension the key leaves out is absent: the package
+    #: accounts for a field it needs and the key lacks.
+    fields: dict[str, Any]
     #: The manifest's ``[parameters]``.
     parameters: dict[str, Any]
     #: The manifest's source kind: ``triton``, ``cute_dsl`` or ``cuda``.
     source: str
-    #: The package's build module, imported from the compilation's working
-    #: directory.
+    #: The module the compilation imports from the package's source directory,
+    #: its working directory: a Triton package's kernel module ``<op>``, or the
+    #: build module ``build``.
     module: str
+    #: A Triton package's launch table (``crates/build-server/src/launch.rs``).
+    launch: dict[str, Any] | None
+    #: A native module's C entry symbols by role, as the manifest resolves
+    #: them: ``launch`` is the operator's ``uniserve_<op>`` unless the manifest
+    #: names another.
+    entries: dict[str, str]
     #: The C++ translation unit that defines a native module's C entries, for
     #: a source whose driver compiles it (``[source] unit``), relative to the
     #: package root.
@@ -141,7 +154,7 @@ class Request:
             }
         )
 
-    def field(self, name: str) -> str:
+    def field(self, name: str) -> Any:
         """One descriptor field, or a refusal naming the field the key lacks."""
         try:
             return self.fields[name]

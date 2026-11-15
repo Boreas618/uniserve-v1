@@ -1,4 +1,5 @@
-# The sparse_attention operator's SM90 backend: design 5.2's package.
+# The sparse_attention operator's `wgmma` backend: design 5.2's package, on the warpgroup matrix
+# instructions only Hopper's specific instruction set carries (`requires = ["warpgroup_mma"]`).
 #
 # One native module per descriptor: Video Sparse Attention, attention over the key
 # blocks a caller selected (`ops::attention::sparse::SparseCall`, 704 bytes), on Hopper.
@@ -11,34 +12,14 @@
 # the descriptor's block 128 and only that.
 
 op = "sparse_attention"
-backend = "sm90"
+backend = "wgmma"
 interface_version = 1
-
-[toolchain]
-kind = "nvcc"
-version = "13.0.48"
-packages = []
-
-[module]
-form = "native"
-
-[module.entries]
-launch = "uniserve_sparse_attention"
 
 [source]
 kind = "cuda"
-files = [
-    "include/uniserve_sparse_attention.h",
-    "src/block_sparse_sm90a.cuh",
-    "src/attention.cu",
-    "src/build.py",
-]
-script = "src/build.py"
 
 [kernel]
-architectures = ["sm_90a"]
+requires = ["warpgroup_mma"]
 
 [[kernel.descriptors]]
 dimensions = { block = ["128"], dtype = ["bf16"], output = ["bf16"], head_dim = ["128"], lse = ["false"] }
-
-[parameters]

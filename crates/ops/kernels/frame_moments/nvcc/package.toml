@@ -14,32 +14,8 @@ op = "frame_moments"
 backend = "nvcc"
 interface_version = 1
 
-[toolchain]
-kind = "nvcc"
-version = "13.0.48"
-packages = []
-
-[module]
-form = "native"
-
-[module.entries]
-launch = "uniserve_frame_moments"
-
 [source]
 kind = "cuda"
-files = [
-    "include/uniserve_frame_moments.h",
-    "src/aten_welford.cuh",
-    "src/aten_block_reduce.cuh",
-    "src/frame.cu",
-    "src/build.py",
-]
-script = "src/build.py"
-
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["f32"] }
-
-[parameters]

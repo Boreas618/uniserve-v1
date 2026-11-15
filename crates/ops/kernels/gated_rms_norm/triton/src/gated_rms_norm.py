@@ -49,3 +49,12 @@ def _gated_rms_norm_kernel(
     else:
         y = normalized * (gate * opened)
     tl.store(y_ptr + row_base + offsets, y, mask=mask)
+
+
+def derive(fields, parameters, target):
+    """Whether the gate is the sigmoid, for the launch table.
+
+    A key names ``gate`` only for the sigmoid; one that names none is the
+    SiLU gate's.
+    """
+    return {"sigmoid": fields.get("gate") == "sigmoid"}

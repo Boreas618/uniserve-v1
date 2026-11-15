@@ -16,6 +16,7 @@ torch types stay with the operator's Rust side.
 import triton
 import triton.language as tl
 
+
 @triton.jit(do_not_specialize=["m", "n"])
 def _fp8_gemm_kernel(
     x_ptr,
@@ -71,3 +72,8 @@ def _fp8_gemm_kernel(
         result,
         mask=row_mask[:, None] & column_mask[None, :],
     )
+
+
+def derive(fields, parameters, target):
+    """The elements of one output tile, ``tile``, whose size sets the warp count."""
+    return {"tile": fields["block_m"] * fields["block_n"]}

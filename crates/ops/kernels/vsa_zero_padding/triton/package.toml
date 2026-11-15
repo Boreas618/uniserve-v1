@@ -1,9 +1,5 @@
 # The vsa_zero_padding operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The descriptor is the row pass's own: the element type, the heads per row, the
 # rows of one tile, the features per head and the rows one program handles. The
 # key is the one `ZeroPaddingDescriptor`'s `Display` prints, e.g.
@@ -13,26 +9,26 @@ op = "vsa_zero_padding"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/vsa_zero_padding.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_zero_tile_padding_kernel"
+warps = 4
+
+[launch.types]
+values = { pointer = "dtype" }
+variable_block_sizes = "*i32"
+stride_row = "i32"
+stride_head = "i32"
+
+[launch.constants]
+heads = { field = "heads" }
+tile_rows = { field = "tile_rows" }
+width = { field = "width" }
+block_rows = { field = "block_rows" }
 
 [[kernel.descriptors]]
 # The width and the rows one program handles are `tl.arange` extents; the heads are unrolled and the
 # tile rows compile for any positive value the program's rows divide.
 dimensions = { dtype = ["bf16", "f16", "f32"], heads = { min = 1 }, tile_rows = { min = 1 }, width = { power_of_two = true }, block_rows = { power_of_two = true } }
-
-[parameters]

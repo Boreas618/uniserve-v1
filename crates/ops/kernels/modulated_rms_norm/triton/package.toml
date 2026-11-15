@@ -1,9 +1,5 @@
 # The modulated_rms_norm operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The descriptor is the modulation's own: the activation and output types, the
 # row-index type, the row width and its lane block, the epsilon, the three
 # modulation row strides (one parameter table serves many activation rows, and
@@ -28,24 +24,43 @@ op = "modulated_rms_norm"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/modulated_rms_norm.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds, and the
+# three modulation row strides are multiples of sixteen. Every intermediate rounds to the activation
+# dtype as the eager expression does, so a fused multiply-add would round the wrong count of times.
+[launch]
+kernel = "_modulated_rms_kernel"
+warps = { field = "width", steps = [[2048, 8]], otherwise = 4 }
+aligned = ["hidden_ptr", "update_ptr", "gate_ptr", "weight_ptr", "shift_ptr", "scale_ptr", "row_indices_ptr", "output_ptr", "retain_ptr", "gate_row_stride", "shift_row_stride", "scale_row_stride"]
+options = { enable_fp_fusion = false }
+
+# The dequantization scale is FP32 whether or not the descriptor writes one; with a non-E4M3
+# output the launch reuses another view's address, which the kernel never dereferences.
+[launch.types]
+hidden_ptr = { pointer = "dtype" }
+update_ptr = { pointer = "dtype" }
+gate_ptr = { pointer = "dtype" }
+weight_ptr = { pointer = "dtype" }
+shift_ptr = { pointer = "dtype" }
+scale_ptr = { pointer = "dtype" }
+row_indices_ptr = { pointer = "indices" }
+output_ptr = { pointer = "output" }
+output_scale_ptr = "*fp32"
+retain_ptr = { pointer = "output" }
+gate_row_stride = "i32"
+shift_row_stride = "i32"
+scale_row_stride = "i32"
+
+# An E4M3 output carries one dequantization scale per row.
+[launch.constants]
+WIDTH = { field = "width" }
+BLOCK = { field = "block" }
+EPS = { field = "epsilon" }
+HAS_UPDATE = { field = "update" }
+FP8_OUTPUT = { field = "output", values = { bf16 = false, f16 = false, f32 = false, f8e4m3 = true } }
+RETAIN = { field = "retain" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32", "f8e4m3"], indices = ["u32", "i32", "i64"], width = { min = 1 }, block = { power_of_two = true }, epsilon = { bits = 32 }, gate_stride = { min = 0, multiple = 16 }, shift_stride = { multiple = 16 }, scale_stride = { multiple = 16 }, update = ["true", "false"], retain = ["true", "false"] }
-
-[parameters]

@@ -1,9 +1,5 @@
 # The scaled_residual_layer_norm operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The descriptor is the fused residual's own: the element type, the row width, the
 # lane tile that covers it, whether the update carries a bias, and whether each
 # program publishes its row's largest magnitude. The key is the one
@@ -14,22 +10,36 @@ op = "scaled_residual_layer_norm"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/scaled_residual_layer_norm.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# A program with a magnitude buffer takes one more pointer, so the two variants are two kernels.
+# The derivation gives `activation`, the update's and the normalized rows' element type, the
+# residual's when the key names none. The operator rounds the gated product before the residual
+# sum, so the two must not fuse into one multiply-add.
+[launch]
+kernel = { field = "absmax", values = { true = "_scaled_residual_layer_norm_absmax_kernel", false = "_scaled_residual_layer_norm_kernel" } }
+warps = { field = "columns", steps = [[2048, 8]], otherwise = 4 }
+derive = "derive"
+options = { enable_fp_fusion = false }
+
+# The operator's scale is `[columns]` or `[1]`, and `scale_width` says which.
+[launch.types]
+hidden_ptr = { pointer = "dtype" }
+update_ptr = { pointer = "activation" }
+update_bias_ptr = { pointer = "dtype" }
+scale_ptr = { pointer = "dtype" }
+weight_ptr = { pointer = "dtype" }
+bias_ptr = { pointer = "dtype" }
+output_ptr = { pointer = "activation" }
+partials_ptr = "*fp32"
+eps = "fp32"
+scale_width = "u32"
+
+[launch.constants]
+HAS_UPDATE_BIAS = { field = "update_bias" }
+WIDTH = { field = "columns" }
+BLOCK = { field = "tile" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true }, update_bias = ["true", "false"], absmax = ["true", "false"] }
@@ -38,5 +48,3 @@ dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { p
 # `activation`, and the key names it only then. The video VAE's decoder keeps an FP32 stream.
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true }, update_bias = ["true", "false"], absmax = ["true", "false"] , activation = ["bf16", "f16"] }
-
-[parameters]

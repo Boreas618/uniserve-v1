@@ -12,14 +12,7 @@ and torch types stay with the operator's Rust side.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit(do_not_specialize=["columns"])
@@ -41,7 +34,7 @@ def _add_rms_norm_kernel(
     ``x``, ``r``, ``w``, ``y`` and ``c`` are the launch's packed operands;
     ``c`` receives the residual sum and ``y`` its normalized projection.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     # Rows are contiguous; int64 row bases keep offsets past 2**31 valid.
     row = tl.program_id(0).to(tl.int64)

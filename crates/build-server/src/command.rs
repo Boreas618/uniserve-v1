@@ -93,7 +93,7 @@ pub enum Command {
         key: Option<String>,
     },
     /// Read a descriptor key against a package's declared dimensions and
-    /// print its fields as a JSON object, as a build script is handed them.
+    /// print its fields as a JSON object, typed as a compilation is handed them.
     Fields {
         /// The package directory.
         package: PathBuf,
@@ -458,18 +458,15 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
                 package: package.clone(),
                 source: Box::new(source),
             })?;
-            let fields = manifest
-                .fields(&key)
-                .ok_or_else(|| Error::UnsupportedDescriptor {
-                    op: manifest.op.clone(),
-                    backend: manifest.backend.clone(),
-                    revision: 0,
-                    descriptor: key.clone(),
-                })?;
-            let fields: serde_json::Map<String, serde_json::Value> = fields
-                .into_iter()
-                .map(|(dimension, value)| (dimension, serde_json::Value::String(value)))
-                .collect();
+            let fields =
+                manifest
+                    .typed_fields(&key)
+                    .ok_or_else(|| Error::UnsupportedDescriptor {
+                        op: manifest.op.clone(),
+                        backend: manifest.backend.clone(),
+                        revision: 0,
+                        descriptor: key.clone(),
+                    })?;
             println!("{}", serde_json::Value::Object(fields));
             Ok(())
         }

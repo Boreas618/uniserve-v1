@@ -15,10 +15,8 @@ The Build Server compiles a descriptor by calling :func:`compile` with the
 compile request.
 """
 
-import json
 import subprocess
 import sys
-import tomllib
 
 from uniserve_build_server.request import Request
 
@@ -54,17 +52,6 @@ def element_type(request, name):
     return ELEMENT_TYPES[token]
 
 
-def launch_entry(package):
-    """The launch symbol the package's manifest declares."""
-    manifest = tomllib.loads((package / "package.toml").read_text())
-    entry = manifest.get("module", {}).get("entries", {}).get("launch")
-    if not entry:
-        raise SystemExit(
-            "the package's [module.entries] names no launch symbol"
-        )
-    return entry
-
-
 def compile(request: Request) -> None:
     """Compile the fixture for the request's descriptor into ``module.so``.
 
@@ -73,7 +60,6 @@ def compile(request: Request) -> None:
     output in the build log.
     """
     package = request.package
-    entry = launch_entry(package)
     input_type = element_type(request, "input")
     weight_type = element_type(request, "weight")
     output_type = element_type(request, "output")
@@ -111,7 +97,7 @@ def compile(request: Request) -> None:
         "--shared",
         "-Xcompiler",
         "-fPIC",
-        f"-DUNISERVE_GEMM_ENTRY={entry}",
+        f"-DUNISERVE_GEMM_ENTRY={request.entries['launch']}",
         f"-DUNISERVE_GEMM_INPUT={input_type}",
         f"-DUNISERVE_GEMM_WEIGHT={weight_type}",
         f"-DUNISERVE_GEMM_ACCUMULATE={accumulate}",
@@ -127,13 +113,3 @@ def compile(request: Request) -> None:
     built = subprocess.run(command, check=False)
     if built.returncode != 0:
         raise SystemExit(f"nvcc failed with {built.returncode}")
-
-    print(
-        json.dumps(
-            {
-                "descriptor": request.descriptor,
-                "target": str(request.target),
-                "entry": entry,
-            }
-        )
-    )

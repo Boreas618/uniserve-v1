@@ -1,9 +1,5 @@
 # The vsa_compose_gated_rows operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The descriptor is the composition's own: the element type, the heads, the rows of
 # one tile, the width, the row block and the member slots the payload addresses
 # (the key prints one slot per member, comma-joined). The key is the one
@@ -14,27 +10,56 @@ op = "vsa_compose_gated_rows"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/vsa_compose_gated_rows.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds.
+[launch]
+kernel = "_compose_gated_rows_kernel"
+warps = 4
+aligned = [
+    "output",
+    "fine",
+    "compressed",
+    "gate",
+    "fine_stride_row",
+    "fine_stride_head",
+    "gate_stride_row",
+    "gate_stride_head",
+    "compressed_stride_head",
+    "compressed_stride_tile",
+    "owner_rows",
+    "start",
+    "count",
+]
+derive = "derive"
+
+[launch.types]
+output = { pointer = "dtype" }
+fine = { pointer = "dtype" }
+compressed = { pointer = "dtype" }
+gate = { pointer = "dtype" }
+fine_stride_row = "i32"
+fine_stride_head = "i32"
+gate_stride_row = "i32"
+gate_stride_head = "i32"
+compressed_stride_head = "i32"
+compressed_stride_tile = "i32"
+owner_rows = "i64"
+start = "i64"
+count = "i64"
+
+# The kernel selects a member's payload slot from the compiled slot table, so the table is part of
+# the module.
+[launch.constants]
+heads = { field = "heads" }
+tile_rows = { field = "tile_rows" }
+width = { field = "width" }
+block_rows = { field = "block_rows" }
+slots = { field = "member_slots" }
 
 [[kernel.descriptors]]
 # The width and the rows one program handles are `tl.arange` extents; the heads, the tile rows and
 # the members compile for any positive value, and the slots are the members' payload indices, one per
-# member, which the compile script holds to the member count.
+# member, which `derive` holds to the member count.
 dimensions = { dtype = ["bf16", "f16", "f32"], heads = { min = 1 }, tile_rows = { min = 1 }, width = { power_of_two = true }, block_rows = { power_of_two = true }, slots = { min = 0, separator = "," }, members = { min = 1 } }
-
-[parameters]

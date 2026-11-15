@@ -9,25 +9,36 @@ op = "tile_stitch"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/tile_stitch.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_tile_stitch_kernel"
+warps = 8
+
+# The grid's two tables are rows of three `i32` words, `[tile, position, seam]`, one per raster
+# row and one per raster column.
+[launch.types]
+tokens_ptr = { pointer = "dtype" }
+rows_ptr = "*i32"
+columns_ptr = "*i32"
+out_ptr = { pointer = "dtype" }
+frames = "u32"
+width = "u32"
+out_stride0 = "i64"
+out_stride1 = "i64"
+out_stride2 = "i64"
+tile_columns = "u32"
+token_rows = "u32"
+tile_height = "u32"
+tile_width = "u32"
+
+[launch.constants]
+CHANNELS = { field = "channels" }
+PATCH_FRAMES = { field = "patch_frames" }
+PATCH_SIDE = { field = "patch_side" }
+BLOCK = { field = "block" }
 
 # `dtype_f16_channels_3_patch_frames_4_patch_side_16_block_1024`.
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], channels = { min = 1 }, patch_frames = { min = 1 }, patch_side = { min = 1 }, block = { power_of_two = true } }
-
-[parameters]

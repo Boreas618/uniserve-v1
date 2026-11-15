@@ -1,9 +1,5 @@
 # The gated_delta_rule operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # One program advances `block` value columns of one value head of one row of a
 # batch, from the row's request slot's FP32 state, one token at a time
 # (`form_recurrent_chunk_1`) or in chunks aligned to absolute positions solved in
@@ -15,28 +11,58 @@ op = "gated_delta_rule"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/gated_delta_rule.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# A chunk's tiles (its state, its keys, its triangular solve) need the wider warp set; a chunk of
+# one is the recurrent walk. The tensors read and written in whole head rows are aligned; the gate
+# inputs, read one element per head, are not.
+[launch]
+kernel = "_gated_delta_rule_kernel"
+warps = { field = "chunk", steps = [[2, 8]], otherwise = 4 }
+aligned = [
+    "query_ptr", "key_ptr", "value_ptr", "state_ptr", "checkpoint_ptr", "trail_ptr", "out_ptr"
+]
+derive = "derive"
+
+# The states, their checkpoints and the trail are FP32 whatever the activations' type.
+[launch.types]
+query_ptr = { pointer = "dtype" }
+key_ptr = { pointer = "dtype" }
+value_ptr = { pointer = "dtype" }
+a_ptr = { pointer = "dtype" }
+b_ptr = { pointer = "dtype" }
+a_log_ptr = { pointer = "dtype" }
+dt_bias_ptr = { pointer = "dtype" }
+offsets_ptr = "*i32"
+seq_lens_ptr = "*i32"
+slots_ptr = "*i32"
+checkpoints_ptr = "*i32"
+state_ptr = "*fp32"
+checkpoint_ptr = "*fp32"
+trail_ptr = "*fp32"
+out_ptr = { pointer = "dtype" }
+row_stride = "i32"
+gate_stride = "i32"
+scale = "fp32"
+trailing = "i32"
+
+# `levels` is the derivation's: the doubling levels of a chunk's triangular inverse, log2 of the
+# chunk.
+[launch.constants]
+KEY_HEADS = { field = "key_heads" }
+VALUE_HEADS = { field = "value_heads" }
+KEY_DIM = { field = "key_dim" }
+VALUE_DIM = { field = "value_dim" }
+BLOCK = { field = "block" }
+CHUNK = { field = "chunk" }
+LEVELS = { field = "levels" }
 
 # `dtype_bf16_key_heads_16_value_heads_32_key_dim_128_value_dim_128_block_64_form_chunked_chunk_64`.
 [[kernel.descriptors]]
 # The head widths, the value block and the chunk are `tl.arange` and `tl.dot` extents: powers of two
-# of at least sixteen (a chunk of one is the recurrent walk, which `build.py` pairs with its form).
-# The value heads must be a multiple of the key heads, which `build.py` refuses otherwise.
+# of at least sixteen (a chunk of one is the recurrent walk, which the derivation pairs with its
+# form). The value heads must be a multiple of the key heads and the value block must divide the
+# head width, which the derivation refuses otherwise, as it refuses a chunk whose products outgrow
+# a multiprocessor's tensor memory.
 dimensions = { dtype = ["bf16", "f16", "f32"], key_heads = { min = 1 }, value_heads = { min = 1 }, key_dim = { min = 16, power_of_two = true }, value_dim = { min = 16, power_of_two = true }, block = { min = 16, power_of_two = true }, form = ["recurrent", "chunked"], chunk = { power_of_two = true } }
-
-[parameters]

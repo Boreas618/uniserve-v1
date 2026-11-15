@@ -27,6 +27,7 @@ arithmetic does not.
 
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit
@@ -46,14 +47,6 @@ def _quantize(x):
         is_pure=True,
         pack=1,
     )
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -78,7 +71,7 @@ def _pcm_interleave_kernel(
     module's signature keeps the operator's order, and this kernel reads the
     constexpr rather than the word.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     valid = index < samples.to(tl.int64)

@@ -1,8 +1,5 @@
 # The fp8_quantize operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program encodes one block of one row of a 16-bit activation into
 # per-tensor E4M3: each element times the encoder's multiplier, an FP32 device
 # word, clamped to ±448 and rounded to nearest even. The row's width and the
@@ -14,24 +11,28 @@ op = "fp8_quantize"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/fp8_quantize.py", "src/build.py"]
-script = "src/build.py"
+
+# The operator refuses a row width or a row stride that is not a multiple of sixteen, so whole
+# vectors of a row are loaded and stored.
+[launch]
+kernel = "_fp8_quantize_kernel"
+warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
+aligned = ["x_ptr", "out_ptr", "k", "x_row_stride"]
+
+[launch.types]
+x_ptr = { pointer = "dtype" }
+out_ptr = "*fp8e4nv"
+k = "i64"
+x_row_stride = "i64"
+encode_ptr = "*fp32"
+
+[launch.constants]
+BLOCK = { field = "block" }
 
 [kernel]
-architectures = ["sm_100a", "sm_90a"]
+requires = ["fp8"]
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16"], block = { power_of_two = true, min = 16 } }
-
-[parameters]

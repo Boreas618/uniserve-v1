@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = "==3.12.*"
 
 [[package]]
@@ -886,6 +886,7 @@ dependencies = [
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
     { name = "patch-ng" },
     { name = "triton" },
+    { name = "uniserve-kernels" },
     { name = "urllib3" },
 ]
 
@@ -901,11 +902,17 @@ requires-dist = [
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = "==4.6.2" },
     { name = "patch-ng", specifier = "==1.19.1" },
     { name = "triton", specifier = "==3.7.1" },
+    { name = "uniserve-kernels", editable = "../../ops/python" },
     { name = "urllib3", specifier = "==2.8.0" },
 ]
 
 [package.metadata.requires-dev]
 test = [{ name = "pytest", specifier = "==9.1.1" }]
+
+[[package]]
+name = "uniserve-kernels"
+version = "2.0.0"
+source = { editable = "../../ops/python" }
 
 [[package]]
 name = "urllib3"

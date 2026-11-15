@@ -1,8 +1,5 @@
 # The nvfp4_gemm operator's CuTe DSL backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # The kernel is CUTLASS's block-scaled dense FP4 product: a CTA computes a
 # 128x256 tile of `[m, n]`, reducing over whole 256 element steps with the
 # Blackwell block-scaled tensor-core instructions, and the epilogue applies the
@@ -12,23 +9,11 @@ op = "nvfp4_gemm"
 backend = "cute_dsl"
 interface_version = 1
 
-[toolchain]
-kind = "cute_dsl"
-version = "4.6.2"
-packages = []
-
-[module]
-form = "native"
-entries = { launch = "uniserve_nvfp4_gemm" }
-
 [source]
 kind = "cute_dsl"
-files = ["src/nvfp4_gemm.py", "src/build.py", "src/entry.cpp", "src/entry.h"]
-script = "src/build.py"
-unit = "src/entry.cpp"
 
 [kernel]
-architectures = ["sm_100a", "sm_100f"]
+requires = ["tensor_memory"]
 
 # `packed_u8_scale_f8e4m3_accumulate_f32_output_bf16_layout_swizzled_128x4_epilogue_none_m_128_n_256_k_2048_pdl_true`.
 #
@@ -46,5 +31,3 @@ architectures = ["sm_100a", "sm_100f"]
 # 256-element steps (`src/build.py` refuses any other).
 [[kernel.descriptors]]
 dimensions = { packed = ["u8"], scale = ["f8e4m3"], accumulate = ["f32"], output = ["bf16", "f16"], layout = ["swizzled_128x4"], epilogue = ["none"], m = { multiple = 128 }, n = { multiple = 256 }, k = { multiple = 256 } }
-
-[parameters]

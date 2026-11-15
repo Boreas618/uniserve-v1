@@ -15,14 +15,7 @@ computation and the torch types stay with the operator's Rust side.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit(do_not_specialize=["tokens", "page", "heads", "head_dim"])
@@ -50,7 +43,7 @@ def _kv_write_kernel(
     ``[pages, 1, 1, 1]`` u8, one byte per page. Grid:
     ``[tokens, ceil(heads · head_dim / TILE), 1]``.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     token = tl.program_id(0).to(tl.int64)
     slot = tl.load(slots_ptr + token).to(tl.int64)

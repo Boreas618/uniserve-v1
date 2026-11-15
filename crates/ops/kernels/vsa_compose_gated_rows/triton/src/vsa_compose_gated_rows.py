@@ -120,3 +120,19 @@ def _compose_gated_rows_kernel(
         destination,
         total.to(output.dtype.element_ty, fp_downcast_rounding="rtne"),
     )
+
+
+def derive(fields, parameters, target):
+    """The members' payload slots, as the tuple the kernel's slot table is.
+
+    The key prints one slot per member, so a slot list of another length than
+    ``members`` describes no composition and the descriptor is refused.
+    """
+    slots = tuple(fields["slots"])
+    members = fields["members"]
+    if len(slots) != members:
+        raise SystemExit(
+            f"{members} members need {members} slots, the descriptor prints "
+            f"{slots}"
+        )
+    return {"member_slots": slots}

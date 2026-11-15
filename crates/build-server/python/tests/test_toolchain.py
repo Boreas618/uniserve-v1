@@ -19,6 +19,7 @@ from uniserve_build_server.toolchain import Toolchain
 FIELDS = {
     "interpreter",
     "driver",
+    "kernels",
     "distributions",
     "triton",
     "cute_dsl",
@@ -43,6 +44,9 @@ def test_the_description_names_this_environment_and_its_compilers():
     assert set(description) == FIELDS
     assert description["interpreter"] == sys.executable
     assert re.fullmatch(r"[0-9a-f]{64}", description["driver"])
+    # The kernel packages' shared sources are a library this environment
+    # installs, digested like the driver.
+    assert re.fullmatch(r"[0-9a-f]{64}", description["kernels"]["available"])
     # The two Python compilers are distributions this environment locks.
     assert description["triton"] == {
         "available": description["distributions"]["triton"]

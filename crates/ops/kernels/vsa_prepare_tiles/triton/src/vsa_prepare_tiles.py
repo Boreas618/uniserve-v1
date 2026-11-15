@@ -19,6 +19,7 @@ stay with the operator's Rust side.
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def _narrowed(values, dtype: tl.constexpr):
     """Round ``values`` to the nearest-even ``dtype`` value.
@@ -849,3 +850,26 @@ def _prepare_tiles_kernel(
             value_tile, VALUE_STRIDES[0], columns, divisor, DIM, TILE
         ),
     )
+
+
+def derive(fields, parameters, target):
+    """The stride pairs :func:`_prepare_tiles_kernel` takes as tuples.
+
+    ``*_strides`` are the (row, head) strides of Q, K and V. The stepwise
+    routine reads a block's rows as one head's consecutive tokens, so
+    ``query_rows`` and ``key_rows`` are the row stride alone, as a (token,
+    head) pair whose head stride is zero.
+    """
+    return {
+        "query_strides": (
+            fields["query_row_stride"],
+            fields["query_head_stride"],
+        ),
+        "key_strides": (fields["key_row_stride"], fields["key_head_stride"]),
+        "value_strides": (
+            fields["value_row_stride"],
+            fields["value_head_stride"],
+        ),
+        "query_rows": (fields["query_row_stride"], 0),
+        "key_rows": (fields["key_row_stride"], 0),
+    }

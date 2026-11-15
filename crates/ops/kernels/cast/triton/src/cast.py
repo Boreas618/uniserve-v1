@@ -21,9 +21,9 @@ mode. The step into FP32 from FP64 narrows too, to nearest even, which is
 Triton's rule for a narrowing that names none.
 """
 
-import strided
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch, strided
 
 
 @triton.jit
@@ -54,7 +54,7 @@ def _cast_kernel(
     Grid: ``ceil(elements / BLOCK)`` programs. ``d1..d5`` are the output's
     extents and ``s0..s5`` the input's strides, right-aligned.
     """
-    strided.pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     live = index < elements
@@ -71,3 +71,35 @@ def _cast_kernel(
     else:
         converted = value.to(out.dtype.element_ty)
     tl.store(out + index, converted, mask=live)
+
+
+#: The half-precision element types, which convert only to and from FP32.
+HALVES = ("f16", "bf16")
+
+#: The floating element types, by width in bits.
+FLOATS = {"f16": 16, "bf16": 16, "f32": 32, "f64": 64}
+
+
+def derive(fields, parameters, target):
+    """The steps a conversion takes, for the launch table.
+
+    ``through`` is whether it passes FP32: a half-precision type on either
+    side makes FP32 the middle of the conversion unless FP32 is already the
+    other side. ``narrows`` is whether its last step takes a float to a
+    narrower float. A conversion of a type to itself is ``copy_strided``'s.
+    """
+    source, target_type = fields["input"], fields["output"]
+    if source == target_type:
+        raise SystemExit(
+            f"a conversion from {source} to itself is copy_strided's"
+        )
+    through = (source in HALVES and target_type != "f32") or (
+        target_type in HALVES and source != "f32"
+    )
+    last = "f32" if through else source
+    narrows = (
+        last in FLOATS
+        and target_type in FLOATS
+        and FLOATS[target_type] < FLOATS[last]
+    )
+    return {"through": through, "narrows": narrows}

@@ -1,8 +1,5 @@
 # The top_logprobs operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program per chunk of a row keeps the chunk's few largest entries by max
 # reductions over its registers, so a row's chunks are selected in parallel; a
 # second, indirect launch over the chunks' candidates keeps the row's. The row
@@ -13,25 +10,28 @@ op = "top_logprobs"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/top_logprobs.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_top_logprobs_kernel"
+warps = { field = "tile", steps = [[2048, 8]], otherwise = 4 }
+
+[launch.types]
+values_ptr = "*fp32"
+ids_ptr = "*i32"
+out_values_ptr = "*fp32"
+out_ids_ptr = "*i32"
+width = "i32"
+tiles = "i32"
+
+[launch.constants]
+CANDIDATES = { field = "candidates" }
+TILE = { field = "tile" }
+INDIRECT = { field = "indirect" }
 
 # `candidates_20_tile_4096_indirect_false_pdl_true`.
+#
+# 8192 is the widest chunk a program holds in registers with its ids.
 [[kernel.descriptors]]
 dimensions = { candidates = { min = 1 }, tile = { power_of_two = true, max = 8192 }, indirect = ["true", "false"], pdl = ["true", "false"] }
-
-[parameters]

@@ -5,33 +5,51 @@
 # [channels, frames, height, width] tile. The weights are the decoded dtype's own arithmetic, so the
 # operator's tolerance is exact and one implementation produces the reference's bits.
 #
-# The axis and the block are compiled; `extent`, the tile's four extents, **each of the three views'
-# three outer strides** and the PDL flag are the launch's words. The strides travel because a source
-# may be a view inside the raster the tiles were decoded into — the seam the decoder passes is one —
-# and `out` may still alias `current`.
+# Each of the three views' three outer strides is a launch word, because a source may be a view
+# inside the raster the tiles were decoded into — the seam the decoder passes is one — and `out`
+# may still alias `current`.
 
 op = "cross_fade"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/cross_fade.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_cross_fade_kernel"
+warps = { field = "block", steps = [[1024, 8]], otherwise = 4 }
+
+# `axis` and `block` are words the kernel does not read: it reads the compiled values.
+[launch.types]
+previous_ptr = { pointer = "dtype" }
+current_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+extent = "u32"
+axis = "u32"
+channels = "u32"
+frames = "u32"
+rows = "u32"
+columns = "u32"
+previous_stride0 = "u32"
+previous_stride1 = "u32"
+previous_stride2 = "u32"
+current_stride0 = "u32"
+current_stride1 = "u32"
+current_stride2 = "u32"
+out_stride0 = "u32"
+out_stride1 = "u32"
+out_stride2 = "u32"
+block = "u32"
+pdl = "i32"
+
+# The axis is compiled because the blend's position is the row on axis 2 and the column on axis 3,
+# and the previous tile's band sits at the far end of that axis, so the read and the mask both
+# follow from it.
+[launch.constants]
+AXIS = { field = "axis" }
+BLOCK = { field = "block" }
 
 # `dtype_f16_extent_5_axis_2_block_1024_pdl_false`.
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], extent = { min = 1 }, axis = ["2", "3"], block = { power_of_two = true }, pdl = ["false", "true"] }
-[parameters]

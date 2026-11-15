@@ -1,8 +1,5 @@
 # The inverse_cdf operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program draws one row's token from one uniform draw over the row's
 # candidates, ordered by vocabulary id; the row count comes from the grid.
 
@@ -10,22 +7,24 @@ op = "inverse_cdf"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/inverse_cdf.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_inverse_cdf_kernel"
+warps = { field = "tile", steps = [[2048, 8]], otherwise = 4 }
+
+# `ids` are the candidates' token ids and `tokens` the drawn token of each row.
+[launch.types]
+probabilities_ptr = "*fp32"
+ids_ptr = { pointer = "ids" }
+draws_ptr = "*fp32"
+tokens_ptr = { pointer = "tokens" }
+rows = "i64"
+width = "i32"
+
+[launch.constants]
+BLOCK = { field = "tile" }
 
 # `width_151936_tile_8192_ids_i32_tokens_i32_pdl_false`.
 #
@@ -33,5 +32,3 @@ architectures = ["sm_100a", "sm_90a"]
 # chunk the program walks the row in.
 [[kernel.descriptors]]
 dimensions = { width = { min = 1 }, tile = { power_of_two = true }, ids = ["i32", "i64"], tokens = ["i32", "i64"], pdl = ["true", "false"] }
-
-[parameters]

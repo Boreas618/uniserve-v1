@@ -1,8 +1,5 @@
 # The logits_gather operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program copies a block of elements of the rows a decode step keeps; the
 # row count is a launch value.
 
@@ -10,24 +7,25 @@ op = "logits_gather"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/logits_gather.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_logits_gather_kernel"
+warps = 4
+
+# The gathered rows keep the hidden state's element type; `rows` holds one row index per output
+# row.
+[launch.types]
+hidden_ptr = { pointer = "dtype" }
+rows_ptr = "*i32"
+out_ptr = { pointer = "dtype" }
+count = "i64"
+columns = "i32"
+
+[launch.constants]
+BLOCK = { field = "block" }
 
 # `dtype_bf16_columns_2048_block_1024_pdl_true`.
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32", "i32"], columns = { min = 1 }, block = { power_of_two = true }, pdl = ["false", "true"] }
-[parameters]

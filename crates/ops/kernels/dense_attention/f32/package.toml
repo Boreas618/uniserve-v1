@@ -38,28 +38,8 @@ op = "dense_attention"
 backend = "f32"
 interface_version = 1
 
-[toolchain]
-kind = "nvcc"
-version = "13.0.48"
-packages = []
-
-[module]
-form = "native"
-
-[module.entries]
-launch = "uniserve_dense_attention"
-
 [source]
 kind = "cuda"
-files = [
-    "include/uniserve_dense_attention.h",
-    "src/dense.cu",
-    "src/build.py",
-]
-script = "src/build.py"
-
-[kernel]
-architectures = ["sm_100a", "sm_100f"]
 
 # `dtype_f32_kv_f32_out_f32_head_dim_64_q_heads_8_kv_heads_8_mask_dense_window_false`
 # is one key of the first shape, and adding `_cu_seq_lens_false` is the one-sequence form of it.

@@ -743,21 +743,16 @@ impl BuildServer {
                 revision: revision.revision,
                 target: target.to_string(),
                 descriptor: descriptor.to_owned(),
-                message: format!(
-                    "the package builds for {}",
-                    if package.manifest.kernel.is_some() {
-                        format!(
-                            "{:?}",
-                            package
-                                .manifest
-                                .kernel
-                                .as_ref()
-                                .map(|kernel| &kernel.architectures)
-                        )
-                    } else {
-                        package.manifest.single_target().to_string()
-                    }
-                ),
+                message: match &package.manifest.kernel {
+                    Some(kernel) => format!(
+                        "the package requires {:?} of a target, which {target} does not meet",
+                        crate::target::named(&kernel.requires)
+                    ),
+                    None => format!(
+                        "the package builds for {} alone",
+                        package.manifest.single_target()
+                    ),
+                },
             });
         }
         if !package.manifest.covers(descriptor) {
@@ -1186,7 +1181,10 @@ impl BuildServer {
                 // target to skip.
                 return Err(refused(
                     target.to_string(),
-                    format!("the package builds for {:?}", kernel.architectures),
+                    format!(
+                        "the package requires {:?} of a target",
+                        crate::target::named(&kernel.requires)
+                    ),
                 ));
             }
         }
@@ -1194,8 +1192,9 @@ impl BuildServer {
             return Err(refused(
                 String::new(),
                 format!(
-                    "the package builds for {:?} and this host builds for {:?}",
-                    kernel.architectures, self.targets
+                    "the package requires {:?} of a target, and this host builds for {:?}",
+                    crate::target::named(&kernel.requires),
+                    self.targets
                 ),
             ));
         }
@@ -1432,26 +1431,6 @@ impl Queue {
                     package.manifest.backend,
                     path.revision,
                     package.inputs.toolchain,
-                ),
-            });
-        }
-        // A package that compiles nothing has no compiler version to match,
-        // and a package that declares no version is built by whatever this
-        // host has: both leave `[toolchain] version` empty, and neither is
-        // compared.
-        let version = self.toolchains.version(kind, &directory)?;
-        if !package.manifest.toolchain.version.is_empty()
-            && version != package.manifest.toolchain.version
-        {
-            return Err(Error::Toolchain {
-                kind,
-                message: format!(
-                    "the package {} {} revision {} is written for {kind} {} and this host has \
-                     {version}",
-                    package.manifest.op,
-                    package.manifest.backend,
-                    path.revision,
-                    package.manifest.toolchain.version,
                 ),
             });
         }

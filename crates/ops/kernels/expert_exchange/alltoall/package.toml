@@ -21,14 +21,6 @@ op = "expert_exchange"
 backend = "alltoall"
 interface_version = 1
 
-[toolchain]
-kind = "nvcc"
-version = "13.0.48"
-packages = []
-
-[module]
-form = "native"
-
 [module.entries]
 launch = "uniserve_expert_exchange_launch"
 create = "uniserve_expert_exchange_create"
@@ -40,15 +32,6 @@ info = "uniserve_expert_exchange_info"
 
 [source]
 kind = "cuda"
-files = [
-    "include/uniserve_expert_exchange.h",
-    "src/exchange.cu",
-    "src/build.py",
-]
-script = "src/build.py"
-
-[kernel]
-architectures = ["sm_100a", "sm_100f"]
 
 # `mode_dispatch_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_8192_ranks_2_attention_0_dtype_bf16`.
 # Every extent is a launch value the kernels read from the call, so one object serves any of
@@ -57,5 +40,3 @@ architectures = ["sm_100a", "sm_100f"]
 # `intermediate` is the key's, not the exchange's. The backend has no attention ranks.
 [[kernel.descriptors]]
 dimensions = { mode = ["dispatch", "combine"], hidden = { multiple = 8 }, intermediate = { min = 1 }, top = { min = 1, max = 32 }, experts = { min = 1 }, max_tokens = { min = 1 }, ranks = { min = 1, max = 64 }, attention = ["0"], dtype = ["bf16", "f16"] }
-
-[parameters]

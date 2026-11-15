@@ -220,3 +220,11 @@ def _causal_conv1d_kernel(
         tl.debug_barrier()
         tl.store(checkpoint_ptr + stored, kept, mask=(held & keeps)[:, None] & live[None, :])
         tl.store(state_ptr + stored, last, mask=held[:, None] & live[None, :])
+
+
+def derive(fields, parameters, target):
+    """The lanes of one state tile, ``kept``, for the launch table.
+
+    ``kept`` is the ``width − 1`` inputs a slot keeps, rounded up to a power of two.
+    """
+    return {"kept": 1 << (fields["width"] - 2).bit_length()}

@@ -7,16 +7,13 @@ an operand is ``sum(ik * stride_k)`` elements from its address, and a zero
 stride repeats an axis. Extents and strides are words of the launch, so a
 module is compiled for a rank and serves every shape of that rank.
 
-Each package links this file into its own ``src/``: the address arithmetic of
-a strided operand is one implementation, and an installation copies the file
-the link names.
-
 **The words.** A kernel takes ``MAX_RANK`` strides per strided operand and
 ``MAX_RANK - 1`` extents per index space, right-aligned: axis ``k`` of
 ``RANK`` axes is slot ``MAX_RANK - RANK + k``. The slots before it are unit
 extents and zero strides, which a module compiled for ``RANK`` never reads.
 The extent of slot 0 does not travel: only an outermost axis can sit there,
-and a row-major index needs no modulus on its outermost axis.
+and a row-major index needs no modulus on its outermost axis. The words are
+``i64``: ``d1..d5`` and ``s0..s5`` in a package's launch table.
 
 **The computing type.** A half-precision element is widened to FP32 when it
 is loaded and rounded to nearest even once when it is stored; FP32, FP64 and
@@ -27,37 +24,25 @@ conversion Triton lowers.
 **Elements that only move.** An FP8 (``f8e4m3``) element is one byte, and the
 primitives that convert nothing (``fill``, ``copy_strided``,
 ``elementwise_where``, and the ``gather`` and ``scatter_set`` of ``index``)
-address it as ``u8`` and store the bits they loaded. No primitive computes with
-one (``compute`` refuses it). Two NVFP4 elements share a byte, so no strided
-kernel addresses one: its storage is moved as the ``u8`` tensor of its packed
-bytes.
+address it as ``u8`` and store the bits they loaded (:func:`address`). No
+primitive computes with one (:func:`compute` refuses it). Two NVFP4 elements
+share a byte, so no strided kernel addresses one: its storage is moved as the
+``u8`` tensor of its packed bytes.
+
+The spellings are the ones ``ops::abi`` prints; the Triton driver
+(``uniserve_build_server.triton``) spells them as Triton does.
 """
 
 import triton
 import triton.language as tl
 
-#: The most axes an operand has (``ops::MAX_RANK``).
+#: The axes a primitive addresses: ``ops::strided::SLOTS``, the stride words of
+#: an operand and one more than the extent words of an index space.
 MAX_RANK = 6
 
 #: The element types the primitives move and never compute with: an element is
 #: the byte it is stored in.
 MOVED = ("f8e4m3",)
-
-#: Triton's name for each element type an operand holds, by the name
-#: ``ops::abi::name`` prints. An element that only moves is addressed as its
-#: byte.
-ELEMENTS = {
-    "u8": "u8",
-    "u32": "u32",
-    "i16": "i16",
-    "i32": "i32",
-    "i64": "i64",
-    "f16": "fp16",
-    "bf16": "bf16",
-    "f32": "fp32",
-    "f64": "fp64",
-    "f8e4m3": "u8",
-}
 
 #: The unsigned integer as wide as each element type: what holds its bits.
 BITS = {
@@ -74,9 +59,12 @@ BITS = {
 }
 
 
-def pointer(dtype):
-    """The signature type of an operand of ``dtype`` elements."""
-    return "*" + ELEMENTS[dtype]
+def address(dtype):
+    """The element type a strided kernel addresses ``dtype`` elements as.
+
+    An element type that only moves is addressed as its byte.
+    """
+    return "u8" if dtype in MOVED else dtype
 
 
 def compute(dtype):
@@ -97,27 +85,22 @@ def compute(dtype):
     return "int"
 
 
-def extents(prefix):
-    """The signature of one index space's extents, slots 1 and up."""
-    return {f"{prefix}{axis}": "i64" for axis in range(1, MAX_RANK)}
+def addressed(fields, parameters, target):
+    """The derivation of a primitive that moves its ``dtype`` elements.
+
+    The launch table's derived field ``address`` is the element type the
+    kernel addresses them as (:func:`address`).
+    """
+    return {"address": address(fields["dtype"])}
 
 
-def strides(prefix):
-    """The signature of one operand's strides."""
-    return {f"{prefix}{axis}": "i64" for axis in range(MAX_RANK)}
+def computed(fields, parameters, target):
+    """The derivation of a primitive that computes with its ``dtype`` elements.
 
-
-def warps_of(block):
-    """The warp count one block of elements needs."""
-    return 8 if block >= 2048 else 4
-
-
-@triton.jit
-def pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+    The launch table's derived field ``compute`` is the type the kernel
+    computes in (:func:`compute`), which refuses an element that only moves.
+    """
+    return {"compute": compute(fields["dtype"])}
 
 
 @triton.jit

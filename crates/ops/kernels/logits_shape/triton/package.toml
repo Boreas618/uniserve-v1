@@ -1,8 +1,5 @@
 # The logits_shape operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program penalizes one block of one row and divides by its temperature; the
 # row count is a launch value. A block wider than a program's registers is walked
 # in step tiles, so one module serves the vocabulary whatever its size.
@@ -11,25 +8,39 @@ op = "logits_shape"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/logits_shape.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# A block is walked in steps of `min(block, 4096)` lanes (`step`, which `derive` gives).
+[launch]
+kernel = "_logits_shape_kernel"
+warps = 4
+derive = "derive"
+
+# The shaped logits are FP32 whatever the input's element type. `divide` is a word the kernel
+# does not read: the division is compiled in.
+[launch.types]
+logits_ptr = { pointer = "dtype" }
+counts_ptr = "*i32"
+slots_ptr = "*i32"
+parameters_ptr = "*fp32"
+extras_ptr = "*i32"
+bias_ptr = "*fp32"
+adjustments_ptr = "*i32"
+bans_ptr = "*i32"
+out_ptr = "*fp32"
+rows = "i64"
+vocabulary = "i32"
+divide = "i32"
+
+# `extras` is how many extra token columns a row carries; `divide` whether the row is divided by
+# its temperature.
+[launch.constants]
+BLOCK = { field = "block" }
+STEP = { field = "step" }
+EXTRAS = { field = "extras" }
+DIVIDE = { field = "divide" }
 
 # `dtype_bf16_vocabulary_151936_block_4096_extras_0_divide_true_pdl_false`.
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], vocabulary = { min = 1 }, block = { power_of_two = true }, extras = { min = 0 }, divide = ["true", "false"], pdl = ["true", "false"] }
-
-[parameters]

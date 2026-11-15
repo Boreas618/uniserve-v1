@@ -49,11 +49,11 @@
 //!
 //! # The package
 //!
-//! A native library per backend (`sm100`, `sm90`, `sm120`). The backend owns the whole host side —
+//! A native library per backend (`tcgen05`, `wgmma`, `flashinfer`). The backend owns the whole host side —
 //! its cubin or CuTe module builds, the TMA tensor maps over the strided `[rows, heads, head_dim]`
 //! views, the dynamic shared-memory size, the cluster launch, the packed divisors it divides work
 //! items by, and the specialization it picks for a shape — so [`Op::launch`] computes no grid and
-//! hands the library [`SparseCall`]. The SM100 package builds its 64-row and 128-row kernels as two
+//! hands the library [`SparseCall`]. The `tcgen05` package builds its 64-row and 128-row kernels as two
 //! modules and the descriptor's `block` chooses between them; a package that compiles several
 //! specializations picks inside the call, by the descriptor and the launch extents.
 //!

@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterable
+from typing import Any
 
 from uniserve_build_server import fetch
 from uniserve_build_server.request import Request, Target
@@ -320,12 +321,19 @@ def filtered_header(original: str, blocks, kept) -> str:
     )
 
 
-def manifest_selected(parameters: dict) -> dict:
-    """The options the manifest states the package's kernels were built with."""
+def manifest_selected(parameters: dict, fields: dict[str, Any]) -> dict:
+    """The options the manifest states the package's kernels were built with.
+
+    An option the descriptor decides is stated as the field it takes its value
+    from, ``{ field = "activation" }``, and reads that field.
+    """
     selected = parameters.get("selected")
     if not selected:
         raise SystemExit("the manifest states no [parameters.selected] options")
-    return selected
+    return {
+        name: fields[value["field"]] if isinstance(value, dict) else value
+        for name, value in selected.items()
+    }
 
 
 def cubin_name(name: str) -> str:
@@ -363,7 +371,7 @@ def headers(artifact: pathlib.Path, data: pathlib.Path) -> list[pathlib.Path]:
     ]
 
 
-def geometry(fields: dict[str, str]) -> list[str]:
+def geometry(fields: dict[str, Any]) -> list[str]:
     """The descriptor's own values, as the entry's compile-time definitions."""
     rows, columns = (int(one) for one in fields["tile"].split("x"))
     cluster_m, cluster_n = (int(one) for one in fields["cluster"].split("x"))
@@ -409,8 +417,8 @@ def nvcc_command(
 
 def build_routed_gemm(
     request: Request,
-    entry: str,
     renderings: dict[str, Callable[[str], str]] | None = None,
+    entry_defines: Iterable[str] = (),
 ) -> None:
     """Compiles one descriptor of a routed NVFP4 batched-GEMM package.
 
@@ -433,8 +441,9 @@ def build_routed_gemm(
     4. compile the entry unit (the manifest's ``[source] unit``) and the vendor
        units its runner resolves, and link ``module.so``.
 
-    ``entry`` is the C entry the module exports; ``renderings`` adds the enum
-    renderings of options only one package's manifest selects. The module
+    ``renderings`` adds the enum renderings of options only one package's
+    manifest selects, and ``entry_defines`` the preprocessor definitions only
+    one package's entry unit reads. The module
     needs the CUDA driver (`libcuda`) as well as the runtime: trtllm-gen's
     launcher calls `cuModuleLoadData`, `cuModuleGetFunction` and
     `cuLaunchKernelEx` directly, and the entry writes the padded route count
@@ -463,7 +472,7 @@ def build_routed_gemm(
         kept = selection(
             blocks,
             request.fields,
-            manifest_selected(request.parameters),
+            manifest_selected(request.parameters, request.fields),
             request.target,
             renderings,
         )
@@ -499,7 +508,7 @@ def build_routed_gemm(
         run(
             nvcc_command(
                 request,
-                [*defines, *geometry(request.fields)],
+                [*defines, *geometry(request.fields), *entry_defines],
                 includes,
                 request.package / request.unit,
                 objects[0],

@@ -156,3 +156,13 @@ def _philox_noise_kernel(
         value.to(out_ptr.dtype.element_ty, fp_downcast_rounding="rtne"),
         mask=live,
     )
+
+
+def derive(fields, parameters, target):
+    """Where the draw's key comes from, for the launch table.
+
+    ``rows`` is whether each row of the buffer reads its own key: the operator
+    names ``source = scalar`` for the one-key form and nothing for the per-row
+    form, which is the default.
+    """
+    return {"rows": "source" not in fields}

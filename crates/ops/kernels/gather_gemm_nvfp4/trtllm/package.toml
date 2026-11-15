@@ -17,22 +17,14 @@ backend = "trtllm"
 interface_version = 1
 
 [toolchain]
-kind = "nvcc"
-version = "13.0.48"
-packages = [{ name = "flashinfer-python", version = "0.6.18" }]
-
-[module]
-form = "native"
-entries = { launch = "uniserve_gather_gemm_nvfp4" }
+packages = ["flashinfer-python"]
 
 [source]
 kind = "cuda"
-files = ["src/build.py", "src/entry.cpp", "src/entry.h"]
-script = "src/build.py"
 unit = "src/entry.cpp"
 
 [kernel]
-architectures = ["sm_100a", "sm_100f"]
+requires = ["tensor_memory"]
 
 # `hidden_2048_intermediate_768_experts_128_top_8_activation_silu_dtype_bf16_scale_f8e4m3_layout_swizzled_128x4_tile_128x128_cluster_1x1`.
 #
@@ -67,7 +59,7 @@ mDtypeB = "E2m1"
 mDtypeC = "Bfloat16"
 mDtypeAcc = "Fp32"
 mSfLayoutA = "swizzled_128x4"
-mSfLayoutB = "linear"
+mSfLayoutB = { field = "layout" }
 mSfBlockSizeA = "16"
 mSfBlockSizeB = "16"
 mUsePerTokenSfA = "0"
@@ -77,4 +69,4 @@ mUseShuffledMatrix = "1"
 mBiasType = "m"
 mBiasDtype = "Fp32"
 mFusedAct = "1"
-mActType = "silu"
+mActType = { field = "activation" }

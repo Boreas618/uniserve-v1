@@ -18,14 +18,7 @@ The kernel body imports nothing but Triton.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit
@@ -45,7 +38,7 @@ def _dynamic_scale_kernel(
     ``partials`` is ``[count]`` contiguous; ``weight_amax``, ``encode`` and
     ``alpha`` are one FP32 word each.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     # Magnitudes are never below zero, so zero is the fold's neutral value and
     # a lane past the count reads it.

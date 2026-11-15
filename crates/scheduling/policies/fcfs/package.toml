@@ -11,7 +11,6 @@ interface_version = 4
 # The policy is built with the workspace's pinned Rust toolchain.
 [toolchain]
 kind = "cargo"
-version = "1.99.1"
 
 [module]
 form = "wasm"

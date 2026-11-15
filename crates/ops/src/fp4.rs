@@ -90,7 +90,7 @@ pub const SWIZZLE_COLUMNS: u64 = 4;
 /// transforms it into whichever the product asks for (`nn::weights::swizzled_scales`), so the same
 /// checkpoint serves either. Which one a product accepts is the **package's** decision and is not
 /// implied by this enum: `nvfp4_gemm/cute_dsl` serves `Swizzled128X4` only and refuses the other by
-/// name (`src/build.py:48`).
+/// name (its build module, `src/build.py`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ScaleLayout {
     /// `[rows, columns / 16]` row major, unpadded: the checkpoint's layout.

@@ -12,14 +12,7 @@ plus an absolute part covering the sigmoid's own error over the operator's value
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit
@@ -38,7 +31,7 @@ def _silu_kernel(
     the launch: a word the module does not specialize on. ``pdl`` is the
     launch's flag and the module's metadata carries the decision.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     live = offsets < elements

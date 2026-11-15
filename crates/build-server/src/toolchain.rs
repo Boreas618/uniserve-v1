@@ -32,8 +32,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::manifest::{PythonPackage, ToolchainDeps, ToolchainKind};
+use crate::manifest::{ToolchainDeps, ToolchainKind};
 use crate::{Error, Result};
 
 /// The program of the Build Server's Python environment.
@@ -90,6 +91,9 @@ pub struct Report {
     pub interpreter: PathBuf,
     /// The SHA-256 of the compile driver's files, in hex.
     pub driver: String,
+    /// The SHA-256 of the kernel packages' shared sources (`uniserve_kernels`,
+    /// `crates/ops/python`), in hex.
+    pub kernels: Entry<String>,
     /// Every installed distribution by its normalized name, with its version.
     pub distributions: BTreeMap<String, String>,
     pub triton: Entry<String>,
@@ -142,9 +146,12 @@ impl Report {
     }
 
     /// What a module built through this environment is built by, as one line:
-    /// the compile driver's digest and the version of every compiler the
-    /// environment describes. A build module may use any of them (a CuTe DSL
-    /// kernel linked by nvcc), so a change of any is another identity.
+    /// the compile driver's digest, the digest of the kernel packages' shared
+    /// sources, the version of every compiler the environment describes, and
+    /// the digest of the locked distributions
+    /// ([`Self::distributions_digest`]). A build module may use any of them (a
+    /// CuTe DSL kernel linked by nvcc, FlashInfer's sources), so a change of
+    /// any is another identity.
     fn identity(&self) -> String {
         let entry = |entry: &Entry<String>| match entry {
             Entry::Available(version) => version.clone(),
@@ -155,11 +162,24 @@ impl Report {
             Entry::Missing(_) => "none".to_owned(),
         };
         format!(
-            "driver {}; triton {}; cute_dsl {}; cuda {cuda}",
+            "driver {}; kernels {}; triton {}; cute_dsl {}; cuda {cuda}; distributions {}",
             self.driver,
+            entry(&self.kernels),
             entry(&self.triton),
-            entry(&self.cute_dsl)
+            entry(&self.cute_dsl),
+            self.distributions_digest()
         )
+    }
+
+    /// The SHA-256 of the environment's distributions, each `name version` on
+    /// a line in name order, in hex: the lock's state, which fixes the version
+    /// of every distribution a package imports.
+    fn distributions_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        for (name, version) in &self.distributions {
+            hasher.update(format!("{name} {version}\n").as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
     }
 }
 
@@ -252,21 +272,6 @@ impl Toolchains {
             })
     }
 
-    /// The version of toolchain `kind` on this host: cargo's release in
-    /// `workspace`, whose `rust-toolchain.toml` selects it, or the version the
-    /// environment describes.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Toolchain`] when the host has no toolchain of that kind.
-    pub fn version(&self, kind: ToolchainKind, workspace: &Path) -> Result<String> {
-        match kind {
-            ToolchainKind::None => Ok(String::new()),
-            ToolchainKind::Cargo => cargo_release(workspace),
-            _ => self.environment(kind)?.version(kind).map(str::to_owned),
-        }
-    }
-
     /// What builds a package of toolchain `kind` on this host, as one line,
     /// read now: the toolchain's kind and version and, for the Python
     /// environment, its identity ([`Report`]). Two hosts, or one host before
@@ -293,9 +298,9 @@ impl Toolchains {
     }
 
     /// Refuses a build whose package imports a Python distribution this host's
-    /// environment does not have at the version the package declares (design
-    /// section 5.2: a package names the distributions its sources import, and
-    /// the environment's lock fixes their versions).
+    /// environment does not have (design section 5.2: a package names the
+    /// distributions its sources import, and the environment's lock fixes
+    /// their versions, which the environment's identity carries).
     ///
     /// A package that declares none needs no environment for this. Names are
     /// compared as PEP 503 normalizes them, so `flash_attn_4` and
@@ -304,15 +309,14 @@ impl Toolchains {
     /// # Errors
     ///
     /// Fails with [`Error::Toolchain`], naming every distribution that is
-    /// missing or at another version, or why the environment's distributions
-    /// could not be read.
+    /// missing, or why the environment's distributions could not be read.
     pub fn check_packages(&self, op: &str, backend: &str, toolchain: &ToolchainDeps) -> Result<()> {
         if toolchain.packages.is_empty() {
             return Ok(());
         }
         let installed = &self.environment(toolchain.kind)?.distributions;
-        let disagreements = disagreements(&toolchain.packages, installed);
-        if disagreements.is_empty() {
+        let missing = missing(&toolchain.packages, installed);
+        if missing.is_empty() {
             Ok(())
         } else {
             Err(Error::Toolchain {
@@ -320,7 +324,7 @@ impl Toolchains {
                 message: format!(
                     "the package {op} {backend} imports {} that this host's Python environment \
                      does not have",
-                    disagreements.join(", ")
+                    missing.join(", ")
                 ),
             })
         }
@@ -387,22 +391,12 @@ pub fn normalized(name: &str) -> String {
     normal
 }
 
-/// The declared distributions `installed` does not hold at their declared
-/// version, each as `name version (it has ...)`.
-fn disagreements(declared: &[PythonPackage], installed: &BTreeMap<String, String>) -> Vec<String> {
+/// The declared distributions `installed` does not hold.
+fn missing<'a>(declared: &'a [String], installed: &BTreeMap<String, String>) -> Vec<&'a str> {
     declared
         .iter()
-        .filter_map(|package| match installed.get(&normalized(&package.name)) {
-            Some(version) if *version == package.version => None,
-            Some(version) => Some(format!(
-                "{} {} (it has {version})",
-                package.name, package.version
-            )),
-            None => Some(format!(
-                "{} {} (it has none)",
-                package.name, package.version
-            )),
-        })
+        .filter(|name| !installed.contains_key(&normalized(name)))
+        .map(String::as_str)
         .collect()
 }
 
@@ -471,6 +465,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "interpreter": "/env/bin/python",
             "driver": "ab".repeat(32),
+            "kernels": {"available": "cd".repeat(32)},
             "distributions": {"triton": "3.7.1", "flash-attn-4": "4.0.0b30"},
             "triton": {"available": "3.7.1"},
             "cute_dsl": {"available": "4.6.2"},
@@ -483,42 +478,25 @@ mod tests {
         .unwrap()
     }
 
-    /// A declared distribution is compared by its normalized name and its exact version: the
-    /// environment's spelling of a name does not matter, its version does, and a distribution it
-    /// lacks is named as missing.
+    /// A declared distribution is looked up by its normalized name: the environment's spelling
+    /// of a name does not matter, and a distribution it lacks is named as missing.
     #[test]
-    fn a_declared_distribution_must_be_installed_at_its_version() {
+    fn a_declared_distribution_must_be_installed() {
         let installed: BTreeMap<String, String> =
             [("flash_attn_4", "4.0.0b30"), ("Torch", "2.13.0")]
                 .into_iter()
                 .map(|(name, version)| (normalized(name), version.to_owned()))
                 .collect();
-        let declared = |name: &str, version: &str| PythonPackage {
-            name: name.to_owned(),
-            version: version.to_owned(),
+        let declared = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
         };
-        assert!(
-            disagreements(
-                &[
-                    declared("flash-attn-4", "4.0.0b30"),
-                    declared("torch", "2.13.0")
-                ],
-                &installed
-            )
-            .is_empty()
-        );
+        assert!(missing(&declared(&["flash-attn-4", "torch"]), &installed).is_empty());
         assert_eq!(
-            disagreements(
-                &[
-                    declared("flash-attn-4", "4.0.0"),
-                    declared("flashinfer-python", "0.6.18")
-                ],
+            missing(
+                &declared(&["flash-attn-4", "flashinfer-python"]),
                 &installed
             ),
-            [
-                "flash-attn-4 4.0.0 (it has 4.0.0b30)",
-                "flashinfer-python 0.6.18 (it has none)"
-            ]
+            ["flashinfer-python"]
         );
     }
 
@@ -532,10 +510,7 @@ mod tests {
         let here = Path::new(".");
         let first = toolchains.identity(ToolchainKind::Triton, here).unwrap();
         assert!(first.starts_with("triton 3.7.1; driver "), "{first}");
-        assert_eq!(
-            toolchains.version(ToolchainKind::Nvcc, here).unwrap(),
-            "13.0.48"
-        );
+        assert!(first.contains("cuda 13.0.48"), "{first}");
 
         let edited = Toolchains::from_report(Ok(Report {
             driver: "cd".repeat(32),
@@ -548,6 +523,21 @@ mod tests {
         }));
         assert_ne!(
             upgraded.identity(ToolchainKind::Triton, here).unwrap(),
+            first
+        );
+        // What a package imports is the builder too: the kernel packages' shared sources and the
+        // version the lock fixes of every distribution.
+        let shared = Toolchains::from_report(Ok(Report {
+            kernels: Entry::Available("ef".repeat(32)),
+            ..report()
+        }));
+        assert_ne!(shared.identity(ToolchainKind::Triton, here).unwrap(), first);
+        let relocked = Toolchains::from_report(Ok(Report {
+            distributions: [("flash-attn-4".to_owned(), "4.0.0".to_owned())].into(),
+            ..report()
+        }));
+        assert_ne!(
+            relocked.identity(ToolchainKind::Triton, here).unwrap(),
             first
         );
 

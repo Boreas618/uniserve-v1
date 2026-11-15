@@ -1,9 +1,5 @@
 # The elementwise_where operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # `out[i] = condition[i] != 0 ? on_true[i] : on_false[i]` over three inputs
 # read through their strides, into a contiguous output. A selection converts
 # nothing, so the operator's tolerance is `exact()`, and an FP8 (`f8e4m3`) value
@@ -21,24 +17,49 @@ op = "elementwise_where"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/elementwise_where.py", "src/strided.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_elementwise_where_kernel"
+warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
+derive = "strided.addressed"
+
+# The strides of the condition `c`, the true values `t` and the false values `f`.
+[launch.types]
+condition = { pointer = "condition" }
+on_true = { pointer = "address" }
+on_false = { pointer = "address" }
+out = { pointer = "address" }
+elements = "i64"
+d1 = "i64"
+d2 = "i64"
+d3 = "i64"
+d4 = "i64"
+d5 = "i64"
+c0 = "i64"
+c1 = "i64"
+c2 = "i64"
+c3 = "i64"
+c4 = "i64"
+c5 = "i64"
+t0 = "i64"
+t1 = "i64"
+t2 = "i64"
+t3 = "i64"
+t4 = "i64"
+t5 = "i64"
+f0 = "i64"
+f1 = "i64"
+f2 = "i64"
+f3 = "i64"
+f4 = "i64"
+f5 = "i64"
+pdl = "i32"
+
+[launch.constants]
+RANK = { field = "rank" }
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64", "f8e4m3"], condition = ["u8", "u32", "i64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
-
-[parameters]

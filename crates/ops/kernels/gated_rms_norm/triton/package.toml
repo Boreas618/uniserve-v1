@@ -1,9 +1,5 @@
 # The gated_rms_norm operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # One program normalizes one contiguous row in FP32 statistics, scales it by the
 # weight and by the SiLU of the gate row, and rounds once. `columns` is a launch
 # value and `tile` the program's row block, so one module serves any row count
@@ -13,26 +9,31 @@ op = "gated_rms_norm"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/gated_rms_norm.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds; the
+# columns are aligned where the key's width is a multiple of sixteen. A key names its gate only
+# for the sigmoid, so the derivation states which activation the module compiles.
+[launch]
+kernel = "_gated_rms_norm_kernel"
+warps = { field = "tile", steps = [[2048, 8]], otherwise = 4 }
+aligned = ["x_ptr", "gate_ptr", "w_ptr", "y_ptr", "columns"]
+derive = "derive"
+
+[launch.types]
+x_ptr = { pointer = "dtype" }
+gate_ptr = { pointer = "dtype" }
+w_ptr = { pointer = "dtype" }
+y_ptr = { pointer = "dtype" }
+columns = "i32"
+eps = "fp32"
+
+[launch.constants]
+BLOCK = { field = "tile" }
+SIGMOID = { field = "sigmoid" }
 
 # `dtype_bf16_columns_128_tile_128`, and `..._gate_sigmoid` for a sigmoid gate; a key that
 # states no gate is the SiLU gate's.
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true }, gate = ["sigmoid"] }
-
-[parameters]

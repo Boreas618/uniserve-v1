@@ -25,14 +25,7 @@ null pointer.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit
@@ -274,7 +267,7 @@ def _qk_norm_rope_strided_kernel(
     head, the pair read back as its normalized value, one rounding at the store. Every value a
     program reads, partners included, belongs to its own tile and is loaded before it stores.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
     program = tl.program_id(0)
     head = (program % HEADS).to(tl.int64)
     token = (program // HEADS).to(tl.int64) * ROWS + tl.arange(0, ROWS).to(tl.int64)
@@ -347,7 +340,7 @@ def _qk_norm_rope_kernel(
     PDL: tl.constexpr,
 ):
     """Weighted normalization, full-width rotation."""
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
     _norm_rope(
         query_ptr,
         key_ptr,
@@ -397,7 +390,7 @@ def _qk_norm_rope_narrowed_kernel(
     PDL: tl.constexpr,
 ):
     """Weighted normalization, a rotation narrower than the head."""
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
     _norm_rope(
         query_ptr,
         key_ptr,
@@ -442,7 +435,7 @@ def _qk_norm_rope_unweighted_kernel(
     PDL: tl.constexpr,
 ):
     """No learned scale, full-width rotation."""
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
     _norm_rope(
         query_ptr,
         key_ptr,
@@ -488,7 +481,7 @@ def _qk_norm_rope_unweighted_narrowed_kernel(
     PDL: tl.constexpr,
 ):
     """No learned scale, a rotation narrower than the head."""
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
     _norm_rope(
         query_ptr,
         key_ptr,
@@ -512,3 +505,38 @@ def _qk_norm_rope_unweighted_narrowed_kernel(
     )
 
 
+def derive(fields, parameters, target):
+    """The form a key compiles, its rotation and its factor tables' type.
+
+    A key names ``rotated`` only for a rotation narrower than the head,
+    ``affine`` only for the form with no learned scale, and ``strided`` and
+    ``factors`` only for the strided form, whose factor tables are of the
+    activation's type; every other form reads FP32 tables. The turned pairs
+    are walked in a power-of-two lane count: 96 turned channels are 48 pairs
+    in 64 lanes.
+
+    Raises:
+        SystemExit: When the rotation is wider than the head.
+    """
+    head_dim = fields["head_dim"]
+    rotated = fields.get("rotated", head_dim)
+    if rotated > head_dim:
+        raise SystemExit(
+            f"a rotation of {rotated} channels of a {head_dim} channel head"
+        )
+
+    strided = fields.get("strided", False)
+    narrowed = rotated != head_dim
+    if strided:
+        form = "strided"
+    elif fields.get("affine", True):
+        form = "narrowed" if narrowed else "weighted"
+    else:
+        form = "unweighted_narrowed" if narrowed else "unweighted"
+    return {
+        "form": form,
+        "strided": strided,
+        "rotated": rotated,
+        "pairs": triton.next_power_of_2(rotated // 2),
+        "factors": fields.get("factors", "f32"),
+    }

@@ -1,8 +1,5 @@
 # The embedding operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program copies the hidden rows of `block` tokens out of this shard's
 # vocabulary weight; the token count is a launch value.
 
@@ -10,22 +7,29 @@ op = "embedding"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/embedding.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# The inner tile is the package's `tile` parameter.
+[launch]
+kernel = "_embedding_kernel"
+warps = 4
+
+# A model's token ids are `u32` (`nn::functional::embedding`), and a fused embedding table arrives
+# as `i32` or `i64` ids. A `u32` id widens to `i64` by zero extension, so an id past the shard is
+# outside it, never negative.
+[launch.types]
+ids_ptr = { pointer = "ids" }
+weight_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+tokens = "i64"
+hidden = "i32"
+first = "i32"
+rows = "i32"
+
+[launch.constants]
+BLOCK = { field = "block" }
+TILE = { parameter = "tile" }
 
 # `dtype_bf16_ids_i64_hidden_2048_first_0_rows_151936_block_4_pdl_true`.
 [[kernel.descriptors]]

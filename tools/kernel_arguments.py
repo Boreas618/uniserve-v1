@@ -4,8 +4,9 @@
 A Triton operator's arguments are written down three times, by three different hands:
 
 1. the kernel's ``def`` in ``<op>/triton/src/*.py`` - the parameters the compiled entry reads;
-2. the package's ``build.py``, whose ``spec()["signature"]`` states them **in the order the operator
-   launches them**, with their types;
+2. the package manifest's ``[launch]`` table, which states each launch argument's type and each
+   compile-time parameter's value, and from which the Triton driver states the signature in the
+   kernel's parameter order;
 3. the operator's Rust ``fn launch`` in ``crates/ops/src/*.rs``, which packs one ``Arguments`` chain
    in launch order, and whose constexprs come from the descriptor key.
 
@@ -14,11 +15,11 @@ key and whether it builds, and the recorded walk says whether the model launches
 that reads its stage from its draw's slot satisfies all three. This script reports the three orders
 side by side and names where they disagree.
 
-**The package is asked, not parsed.** Each ``build.py`` is imported and its ``spec(fields,
-parameters, target)`` called once per declared descriptor shape, which is what the Build Server
-does: nine packages build their signature incrementally in code, so a source-level parse reads them
-as having none, and a signature assembled in a loop is exactly the case where a hand-check is most
-likely to be wrong.
+**The package is asked, not parsed.** Each package's kernel module ``src/<op>.py`` is imported and
+its launch table evaluated by the Triton driver's ``stated`` once per declared descriptor shape,
+which is what the Build Server does: a table selects its kernel, types and values by descriptor
+field and may derive fields in code, so a source-level parse reads only part of it, and a selection
+by field is exactly the case where a hand-check is most likely to be wrong.
 
 Read-only: it opens sources, imports them and prints. ``--check`` exits 1 on any disagreement.
 
@@ -36,6 +37,7 @@ import json
 import os
 import pathlib
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -46,7 +48,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 KERNELS = ROOT / "crates/ops/kernels"
 OPS = ROOT / "crates/ops/src"
 
-# A package's `build.py` imports its compile driver from the Build Server's Python package
+# A package's launch table is evaluated by the Build Server's Triton driver
 # (`uniserve_build_server.triton`), so that package is importable from this tree whichever
 # interpreter runs the tool.
 sys.path.insert(0, str(ROOT / "crates/build-server/python/src"))
@@ -83,25 +85,34 @@ def _native_package(package: pathlib.Path) -> bool:
     return kind is not None and kind != "triton"
 
 
-def load_spec(build: pathlib.Path):
-    """The package's `spec` function, imported under a name of its own.
+def launch_table(package: pathlib.Path) -> dict | None:
+    """The package manifest's `[launch]` table, or `None` when it states none."""
+    manifest = package / "package.toml"
+    if not manifest.exists():
+        return None
+    return tomllib.loads(manifest.read_text()).get("launch")
 
-    Each package's `src` is put first on the path for the import, because `build.py` imports its
-    kernel module by bare name. The module is loaded fresh per package so two packages never share
-    one `kernels` module.
+
+def load_kernels(package: pathlib.Path):
+    """The package's kernel module `src/<op>.py`, imported under a name of its own.
+
+    Each package's `src` is put first on the path for the import, because a package's source imports
+    its siblings by bare name. The module is loaded fresh per package so two packages never share
+    one module.
     """
-    source = build.parent
+    source = package / "src"
+    kernels = source / f"{package.parent.name}.py"
     sys.path.insert(0, str(source))
     try:
-        # `build.py` imports its kernel module by bare name, so `sys.modules` would hand every
+        # A package's source imports its siblings by bare name, so `sys.modules` would hand every
         # package after the first the first package's module of that name. Everything imported from
         # a package's source is dropped, which is what a fresh process per package would do.
         for cached, module in list(sys.modules.items()):
             origin = getattr(module, "__file__", None)
             if origin and str(KERNELS) in origin:
                 del sys.modules[cached]
-        name = f"h3_package_{build.parent.parent.parent.name}_{build.parent.parent.name}"
-        found = importlib.util.spec_from_file_location(name, build)
+        name = f"h3_package_{package.parent.name}_{package.name}"
+        found = importlib.util.spec_from_file_location(name, kernels)
         module = importlib.util.module_from_spec(found)
         # A package's source may print while it is imported or leave by `SystemExit`; neither is
         # this report's output and neither may end it, so the import's stdout is captured and every
@@ -112,7 +123,7 @@ def load_spec(build: pathlib.Path):
                 found.loader.exec_module(module)
         except BaseException as error:  # noqa: BLE001 - an unimportable package is a gap
             raise RuntimeError(f"{type(error).__name__}: {error}") from None
-        return module.spec
+        return module
     finally:
         sys.path.remove(str(source))
 
@@ -182,9 +193,9 @@ def sampled(dimensions: dict) -> list[dict]:
     return seen
 
 
-def kernel_entry(spec: dict):
-    """The JIT function a spec names, when it names one."""
-    entry = spec.get("kernel")
+def kernel_entry(stated: dict):
+    """The JIT function a stated compilation names, when it names one."""
+    entry = stated.get("kernel")
     while isinstance(entry, (tuple, list)):
         entry = entry[0]
     return entry
@@ -294,31 +305,40 @@ def report(op: str, verbose: bool) -> tuple[list[str], list[str]]:
                     f"  {backend:9} native: its arguments are its entry's C signature"
                 )
             continue
-        build = package / "src/build.py"
-        if not build.exists():
-            gaps.append(f"{op}/{backend}: no build.py, so no signature to read")
+        table = launch_table(package)
+        if table is None:
+            gaps.append(
+                f"{op}/{backend}: no [launch] table, so no signature to read"
+            )
             continue
         declared, target = parameters(package)
         try:
-            spec = load_spec(build)
+            kernels = load_kernels(package)
         except Exception as error:  # noqa: BLE001 - a package that cannot be imported is a gap
             gaps.append(
-                f"{op}/{backend}: `spec` could not be imported ({error})"
+                f"{op}/{backend}: the kernel module could not be imported ({error})"
             )
             continue
         launch = rust_launch(op)
         for shape in shapes(package):
             for fields in sampled(shape["dimensions"]):
                 stated = read_shape(
-                    spec, fields, declared, target, op, backend, gaps
+                    table,
+                    kernels,
+                    typed(shape["dimensions"], fields),
+                    declared,
+                    target,
+                    op,
+                    backend,
+                    gaps,
                 )
                 if stated is None:
                     continue
                 signature = stated.get("signature") or {}
                 order = list(signature)
-                # Two packages state their compile-time values two ways: marked `"constexpr"` inside
-                # the signature, or listed in a separate `constexprs` table. Both are the same
-                # statement and the Triton driver hands Triton both, so they are read together.
+                # A compile-time parameter is marked `"constexpr"` inside the signature and its value
+                # given in `constexprs`; the Triton driver hands Triton both, so a name in either is
+                # read as a compile-time value rather than a launch word.
                 marked = [
                     name
                     for name, kind in signature.items()
@@ -366,15 +386,55 @@ def report(op: str, verbose: bool) -> tuple[list[str], list[str]]:
     return problems, gaps
 
 
-def read_shape(spec, fields, declared, target, op, backend, gaps):
-    """One descriptor shape's `spec` output, or `None` when the package refuses it."""
+def typed(dimensions: dict, fields: dict) -> dict:
+    """A sampled shape's fields, typed as a build is handed them.
+
+    This mirrors `Dimension::typed` in `crates/build-server/src/manifest.rs`, whose typed fields a
+    launch table is evaluated against: an enumeration of `true` and `false` is a flag, an
+    enumeration of integers a number and any other enumeration its text; a constraint's value is a
+    number, a list of numbers with a `separator`, and with `bits` the float whose bit pattern
+    (`0x` and hexadecimal) the value is.
+    """
+    result = {}
+    for name, text in fields.items():
+        dimension = dimensions[name]
+        if isinstance(dimension, list):
+            if all(value in ("true", "false") for value in dimension):
+                result[name] = text == "true"
+            elif all(str(value).isdigit() for value in dimension):
+                result[name] = int(text)
+            else:
+                result[name] = text
+        elif "bits" in dimension:
+            # The pattern of an `f32` is read as one; any wider width as an `f64`.
+            pattern = int(text.removeprefix("0x"), 16)
+            if dimension["bits"] == 32:
+                result[name] = struct.unpack("<f", pattern.to_bytes(4, "little"))[0]
+            else:
+                result[name] = struct.unpack("<d", pattern.to_bytes(8, "little"))[0]
+        elif "separator" in dimension:
+            result[name] = [
+                int(part) for part in text.split(dimension["separator"])
+            ]
+        else:
+            result[name] = int(text)
+    return result
+
+
+def read_shape(table, kernels, fields, declared, target, op, backend, gaps):
+    """What the launch table states for one descriptor shape, or `None` when it refuses it.
+
+    The shape's fields stand in for the descriptor key in the driver's refusals.
+    """
     try:
-        return spec(fields, declared, target)
+        return driver.stated(
+            table, kernels, str(fields), fields, declared, Target.named(target)
+        )
     except BaseException as error:  # noqa: BLE001 - a shape a package refuses is a gap to report
-        # `SystemExit` is how a package's `spec` refuses a shape it does not serve, so it is caught
+        # `SystemExit` is how the driver refuses a shape the table does not serve, so it is caught
         # with the rest: a refusal is a gap against that package, not the end of the report.
         gaps.append(
-            f"{op}/{backend} {fields}: `spec` refused this shape ({error})"
+            f"{op}/{backend} {fields}: the launch table refused this shape ({error})"
         )
         return None
 
@@ -642,7 +702,7 @@ def native(verbose: bool) -> tuple[list[str], list[str], int]:
     compared = 0
     for package in sorted(KERNELS.glob("*/*")):
         op = package.parent.name
-        # A Triton package's arguments are its `spec()` and the recorded signature its cell carries,
+        # A Triton package's arguments are its launch table and the recorded signature its cell carries,
         # which the sweep compares; this mode is the native package, whose arguments are a C struct.
         if not _native_package(package):
             continue
@@ -745,8 +805,8 @@ def sweep(
     """Compare every built cell's recorded signature with the package that wrote it, in order.
 
     This is `ops::Kernel::check`'s comparison made **before a launch exists**: the cell's
-    `metadata.json` is what `check` holds the packed words to, and the package's own `spec()` is what
-    the compile script handed Triton. Both are keyed by one descriptor, so the comparison is made for
+    `metadata.json` is what `check` holds the packed words to, and the package's own launch table is
+    what the Triton driver handed Triton. Both are keyed by one descriptor, so the comparison is made for
     **the phase the key names** rather than for the union of an operator's arms - which is the one
     thing a source-level reader gets wrong (`paged_attention` packs two phases' lists from one table).
     Each position is compared by name, so a disagreement says which word is where.
@@ -787,7 +847,6 @@ def sweep(
         else:
             finding = f"{op}/{backend}"
         package = KERNELS / op / backend if backend else KERNELS / op
-        build = package / "src/build.py"
         cell = store / op / (backend or ".")
         recorded = sorted(cell.glob(f"*/{target}/{descriptor}/metadata.json"))
         if not recorded:
@@ -834,13 +893,13 @@ def sweep(
                 )
             continue
         cells += 1
-        if not build.exists():
+        if launch_table(package) is None:
             gaps.append(
-                f"{op}/{backend}: a built cell with no package under crates/ops/kernels"
+                f"{op}/{backend}: a built cell with no package launch table under crates/ops/kernels"
             )
             continue
         try:
-            spec = load_spec(build)
+            kernels = load_kernels(package)
         except Exception as error:  # noqa: BLE001
             gaps.append(
                 f"{op}/{backend}: the package could not be read ({error})"
@@ -850,7 +909,7 @@ def sweep(
         try:
             # The key is read as the package's build reads it, by the Build Server's reader.
             stated = driver.stated_for(
-                spec,
+                kernels,
                 package,
                 descriptor,
                 Target.named(target),
@@ -863,7 +922,7 @@ def sweep(
             continue
         except BaseException as error:  # noqa: BLE001
             gaps.append(
-                f"{op}/{backend} {descriptor}: `spec` refused it ({error})"
+                f"{op}/{backend} {descriptor}: the launch table refused it ({error})"
             )
             continue
         constexprs = set(stated.get("constexprs") or {})

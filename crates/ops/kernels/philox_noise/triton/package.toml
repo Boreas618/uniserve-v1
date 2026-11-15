@@ -1,9 +1,5 @@
 # The philox_noise operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The draw's kind is part of the compilation, not of the call: a normal draw takes
 # one counter per element pair and a uniform draw one per element, so they read
 # different words from the same counter. The key is the one `NoiseDescriptor`'s
@@ -13,22 +9,31 @@ op = "philox_noise"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/philox_noise.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# The key's source is a second program: a key per row of the buffer, or one launch word for the
+# whole flattened buffer, which addresses the same draw differently (`rows`, which `derive` gives).
+[launch]
+kernel = "_philox_noise_kernel"
+warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
+derive = "derive"
+
+# The draw is computed in FP32 and stored as `dtype`. The row count, the element count, the stage,
+# the draw index and the scalar key are launch words.
+[launch.types]
+out_ptr = { pointer = "dtype" }
+keys_ptr = "*i64"
+elements = "i64"
+stage = "i32"
+draw = "i32"
+key = "i64"
+offset = "i64"
+
+[launch.constants]
+BLOCK = { field = "block" }
+NORMAL = { field = "kind", values = { normal = true, uniform = false } }
+ROWS = { field = "rows" }
 
 # Two shapes, because the operator prints two: a draw addressed by the rows' own keys names
 # `dtype`, `block` and `kind`, and the form that draws the whole buffer from one key adds
@@ -38,5 +43,3 @@ dimensions = { dtype = ["bf16", "f16", "f32"], block = { power_of_two = true }, 
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], block = { power_of_two = true }, kind = ["normal", "uniform"], source = ["scalar"] }
-
-[parameters]

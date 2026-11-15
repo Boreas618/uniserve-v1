@@ -142,6 +142,9 @@ fn convert_page(
                 head_dim: group.head_dim,
                 element: group.dtype,
                 scaled: layout.quantized,
+                // The region copy follows the conversion that fills its source block on one
+                // stream, so it waits for that grid and lets the next launch start early.
+                pdl: true,
             },
             CopyRegionArgs {
                 values: ops::operand(&values)?,

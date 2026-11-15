@@ -74,7 +74,7 @@ TORCH_TYPES = {
 #: The operators this script runs, and the extra roundings each adds to the reduction.
 OPERATORS = {"softmax": 0, "log_softmax": 1}
 
-#: The widest tile `log_softmax`'s build steps a row in, from its `build.py`.
+#: The widest step `log_softmax`'s program walks a row in, its kernel module's `LANES`.
 LANES = 4096
 
 

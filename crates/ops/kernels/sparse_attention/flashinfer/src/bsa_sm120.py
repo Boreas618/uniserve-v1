@@ -26,10 +26,9 @@ Our `SparseCall` gives rows, heads and the key rows as packed `[rows, heads, 128
 explicit strides, so each of those tensors is the kernel's layout with batch 1 and no copy.
 """
 
-import torch
-
 import cutlass
 import cutlass.cute as cute
+import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 TORCH_DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16}
@@ -47,7 +46,9 @@ def cute_tensor(fake, assumed_align, leading_dim):
     The vendor's own conversion, without its tvm-ffi layer: the compiled function then takes a
     pointer, the extents a module may vary and the strides that are not fixed.
     """
-    from flashinfer.cute_dsl.sparse.bsa_utils.cute_tensor_utils import to_cute_tensor
+    from flashinfer.cute_dsl.sparse.bsa_utils.cute_tensor_utils import (
+        to_cute_tensor,
+    )
 
     return to_cute_tensor(
         fake, assumed_align=assumed_align, leading_dim=leading_dim, enable_tvm_ffi=False
@@ -58,29 +59,16 @@ class BsaCompiler:
     """One compilation of FlashInfer's SM120 block-sparse kernel."""
 
     def __init__(self, fields, parameters, target):
-        if fields["block"] != str(BLOCK):
-            raise SystemExit(
-                f"the SM120 kernel's tile is {BLOCK} rows in both domains; "
-                f"this descriptor names {fields['block']}"
-            )
-        if fields["head_dim"] != "128":
-            raise SystemExit("the SM120 kernel is compiled for 128 elements per head")
-        if fields["lse"] != "true":
-            raise SystemExit(
-                "the SM120 kernel always writes the softmax normalizer, so it needs the "
-                "launch's normalizer buffer"
-            )
         self.dtype = TORCH_DTYPES[fields["dtype"]]
-        self.heads = int(parameters.get("heads", 8))
-        self.kv_heads = int(parameters.get("kv_heads", 8))
-        self.query_tiles = int(parameters.get("query_tiles", 4))
-        self.key_blocks = int(parameters.get("key_blocks", 8))
-        self.selected = int(parameters.get("selected", 3))
+        self.heads = parameters["heads"]
+        self.query_tiles = parameters["query_tiles"]
+        self.key_blocks = parameters["key_blocks"]
+        self.selected = parameters["selected"]
         self.target = target
 
     def compile(self):
         """Compile the kernel for one representative call, to C."""
-        heads, kv_heads = self.heads, self.kv_heads
+        heads = self.heads
         query_rows = self.query_tiles * BLOCK
         key_rows = self.key_blocks * BLOCK
         with FakeTensorMode():
@@ -88,8 +76,8 @@ class BsaCompiler:
             # ask torch for a device that no build host has.
             device = "cpu"
             query = torch.empty(query_rows, heads, 128, dtype=self.dtype, device=device)
-            key = torch.empty(key_rows, kv_heads, 128, dtype=self.dtype, device=device)
-            value = torch.empty(key_rows, kv_heads, 128, dtype=self.dtype, device=device)
+            key = torch.empty(key_rows, heads, 128, dtype=self.dtype, device=device)
+            value = torch.empty(key_rows, heads, 128, dtype=self.dtype, device=device)
             out = torch.empty(query_rows, heads, 128, dtype=self.dtype, device=device)
             lse = torch.empty(heads, query_rows, dtype=torch.float32, device=device)
             indices = torch.zeros(
@@ -120,7 +108,9 @@ class BsaCompiler:
                 cute_tensor(to_counts(counts), None, 0),
                 cutlass.Int32(self.selected),
                 cute_tensor(valid, None, 0),
-                cutlass.Float32(0.08838834764831845),
+                # The softmax scale is the call's; the compilation's is the one a head of
+                # 128 elements takes.
+                cutlass.Float32(128**-0.5),
                 cute.runtime.make_fake_stream(),
             )
 
@@ -128,8 +118,10 @@ class BsaCompiler:
             BlockSparseAttnForwardSm120Blk64,
         )
 
+        # The operator's keys and values carry the queries' heads (`ops::attention::sparse`): one
+        # key head per query head.
         kernel = BlockSparseAttnForwardSm120Blk64(
-            gqa_ratio=heads // kv_heads,
+            gqa_ratio=1,
             head_dim=128,
             value_dim=128,
             blocksparse_blocksize_q=BLOCK,

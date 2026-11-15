@@ -28,6 +28,7 @@ the scratch eight times, and never the row.
 
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch
 
 #: The bits of a key one ordering pass fixes.
 RADIX = tl.constexpr(4)
@@ -60,14 +61,6 @@ def _value_of(keys):
     return bits.to(tl.float32, bitcast=True)
 
 
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
-
-
 @triton.jit(do_not_specialize=["rows", "vocabulary", "width"])
 def _top_k_kernel(
     logits_ptr,
@@ -90,7 +83,7 @@ def _top_k_kernel(
     ``TILE`` is the only size compiled in: the row is walked in ``TILE``-lane chunks, and every
     buffer is addressed with the live width, so the module serves any vocabulary and any kept count.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     row = tl.program_id(0).to(tl.int64)
     base = row * vocabulary

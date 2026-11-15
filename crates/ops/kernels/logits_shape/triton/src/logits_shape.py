@@ -23,6 +23,7 @@ types and the allocation stay with the operator's Rust side.
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit(do_not_specialize=["rows", "vocabulary"])
@@ -55,9 +56,7 @@ def _logits_shape_kernel(
     ``[masks, ceil(vocabulary / 32)]`` ban table. Grid:
     ``[rows, ceil(vocabulary / BLOCK), 1]``.
     """
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+    dependent_launch.prologue(PDL)
 
     row = tl.program_id(0).to(tl.int64)
     slot = tl.load(slots_ptr + row).to(tl.int64)
@@ -122,3 +121,16 @@ def _logits_shape_kernel(
             divisor = tl.where(temperature > 0.0, temperature, 1.0)
             penalized = libdevice.div_rn(penalized, divisor)
         tl.store(out_ptr + row * vocabulary + columns, penalized, mask=mask)
+
+
+#: The most lanes a program holds in registers in one step: a wider block is
+#: walked in more steps, not in a wider tile.
+LANES = 4096
+
+
+def derive(fields, parameters, target):
+    """The lanes of one step through the block, for the launch table.
+
+    ``step`` is the descriptor's block up to :data:`LANES`.
+    """
+    return {"step": min(fields["block"], LANES)}

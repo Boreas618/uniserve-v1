@@ -1,8 +1,5 @@
 # The kv_write operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program writes one tile of one token's cache row and raises the page's
 # initialization flag, so one module serves every token count. The cache's dtype
 # is the keys' own or another of BF16, FP16 and FP32, each element rounded to
@@ -13,27 +10,34 @@ op = "kv_write"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/kv_write.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_kv_write_kernel"
+warps = 4
+
+# The keys and the values share `dtype`, the two cache planes share `kv`. The store's cast reads the
+# cache pointer's element type, so the conversion is compiled, not a launch argument.
+[launch.types]
+key_ptr = { pointer = "dtype" }
+value_ptr = { pointer = "dtype" }
+key_cache_ptr = { pointer = "kv" }
+value_cache_ptr = { pointer = "kv" }
+slots_ptr = "*i32"
+key_initialized_ptr = "*u8"
+value_initialized_ptr = "*u8"
+tokens = "i64"
+page = "i32"
+heads = "i32"
+head_dim = "i32"
+pdl = "i32"
+
+[launch.constants]
+TILE = { field = "tile" }
 
 # `dtype_bf16_kv_bf16_page_64_heads_4_head_dim_128_tile_128_pdl_false`.
 #
 # `page`, `heads` and `head_dim` are launch words; the tile is a `tl.arange` extent.
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], kv = ["bf16", "f16", "f32"], page = { min = 1 }, heads = { min = 1 }, head_dim = { min = 1 }, tile = { power_of_two = true }, pdl = ["true", "false"] }
-
-[parameters]

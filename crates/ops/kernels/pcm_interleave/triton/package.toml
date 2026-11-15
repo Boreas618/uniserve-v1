@@ -1,9 +1,5 @@
 # The pcm_interleave operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one architecture
-# of `[kernel.architectures]`, built by `src/build.py` (the compile driver the
-# Build Server runs for one descriptor and target).
-#
 # This is the audio decoder's last step: two float channels to interleaved 16-bit
 # PCM, `round_half_to_even(clamp(x, -1, 1) · 32767)` with ties to the even
 # neighbour, which the operator states as an exact tolerance and this module
@@ -17,24 +13,26 @@ op = "pcm_interleave"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/pcm_interleave.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a", "sm_100f"]
+# A warp for every 512 samples, up to eight: a sample is two loads and two stores.
+[launch]
+kernel = "_pcm_interleave_kernel"
+warps = { field = "block", steps = [[4096, 8], [2048, 4], [1024, 2]], otherwise = 1 }
+
+# `block` is a word the kernel does not read: it reads the compiled block.
+[launch.types]
+left = { pointer = "dtype" }
+right = { pointer = "dtype" }
+out = "*i16"
+samples = "i32"
+block = "i32"
+pdl = "i32"
+
+# The block is compiled so the grid a launch computes and the module agree.
+[launch.constants]
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["f32"], block = { power_of_two = true }, pdl = ["true", "false"] }
-
-[parameters]

@@ -1,14 +1,15 @@
 //! The kernel packages' rules: every package under `kernels/` installs as
 //! design section 5.2 says and names the operator and backend of its
 //! directories and an operator this build has, carries element type names
-//! `ops` prints, and declares the toolchain version it was validated against;
-//! only a package fixture may take the empty version, and one does.
+//! `ops` prints, and states only what its source kind does not fix.
 
 #![cfg(test)]
 
 use std::path::{Path, PathBuf};
 
-use build_server::manifest::{Dimension, Manifest, ToolchainKind};
+use build_server::manifest::{
+    CUBIN_METADATA, Dimension, ENTRY_UNIT, Manifest, SourceKind, launch_entry,
+};
 use tensor::DType;
 
 /// The kernel packages: `kernels/<op>/<backend>/package.toml`.
@@ -169,39 +170,69 @@ fn every_element_type_is_one_ops_prints() {
     assert_none(&failures);
 }
 
-/// Every package that ships declares the toolchain version its modules were
-/// validated against. The empty version, any version the host has, is for a
-/// fixture that must build on whichever host its test runs on, and at least
-/// one fixture takes it.
+/// Every package states only what is its own. The toolchain, the module's form, a cubin's
+/// metadata file, a native module's launch entry and a CuTe DSL module's entry unit are what the
+/// source kind fixes (`build_server::manifest`), and the toolchain's version is the Build
+/// Server's environment's: a manifest that restates one of them is a copy of the Build Server's
+/// rule, which drifts from it when the rule changes.
 #[test]
-fn every_shipping_package_declares_its_toolchain_version() {
-    let failures: Vec<String> = kernel_manifests()
-        .into_iter()
-        .filter(|(_, manifest)| manifest.toolchain.kind != ToolchainKind::None)
-        .filter(|(_, manifest)| manifest.toolchain.version.is_empty())
-        .map(|(package, manifest)| {
-            format!(
-                "{}: {} {} declares no toolchain version",
-                package.display(),
-                manifest.op,
-                manifest.backend
-            )
-        })
-        .collect();
-    assert_none(&failures);
+fn every_package_states_only_what_its_source_kind_does_not_fix() {
+    let mut failures = Vec::new();
+    for package in kernel_packages().into_iter().chain(fixture_packages()) {
+        let path = package.join(Manifest::FILE);
+        let declared: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap())
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let manifest = Manifest::load(&package)
+            .unwrap_or_else(|error| panic!("{}: {error}", package.display()));
+        let kind = manifest.source.kind;
+        let table = |name: &str| declared.get(name).and_then(toml::Value::as_table);
+        let stated = |table: Option<&toml::Table>, key: &str| {
+            table
+                .and_then(|table| table.get(key))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        };
 
-    let unversioned = fixture_packages()
-        .into_iter()
-        .map(|fixture| {
-            Manifest::load(&fixture)
-                .unwrap_or_else(|error| panic!("{}: {error}", fixture.display()))
-        })
-        .filter(|manifest| manifest.toolchain.version.is_empty())
-        .count();
-    assert!(
-        unversioned > 0,
-        "no fixture takes the empty version the rule exists for"
-    );
+        let mut restated = Vec::new();
+        if table("toolchain").is_some_and(|toolchain| toolchain.contains_key("version")) {
+            restated.push("[toolchain] version".to_owned());
+        }
+        if stated(table("toolchain"), "kind").as_deref() == Some(kind.toolchain().as_str()) {
+            restated.push("[toolchain] kind".to_owned());
+        }
+        let form = table("module")
+            .and_then(|module| module.get("form"))
+            .map(|form| {
+                form.clone()
+                    .try_into::<build_server::manifest::ModuleForm>()
+            });
+        if let Some(Ok(form)) = form
+            && form == kind.module_form()
+        {
+            restated.push("[module] form".to_owned());
+        }
+        if stated(table("module"), "metadata").as_deref() == Some(CUBIN_METADATA) {
+            restated.push("[module] metadata".to_owned());
+        }
+        let entries = table("module")
+            .and_then(|module| module.get("entries"))
+            .and_then(toml::Value::as_table);
+        if stated(entries, "launch") == Some(launch_entry(&manifest.op)) {
+            restated.push("[module.entries] launch".to_owned());
+        }
+        if kind == SourceKind::CuteDsl
+            && stated(table("source"), "unit").as_deref() == Some(ENTRY_UNIT)
+        {
+            restated.push("[source] unit".to_owned());
+        }
+        if !restated.is_empty() {
+            failures.push(format!(
+                "{}: restates what its source kind fixes: {restated:?}",
+                package.display()
+            ));
+        }
+    }
+    assert_none(&failures);
 }
 
 /// Every package names an operator this build has: a package under another

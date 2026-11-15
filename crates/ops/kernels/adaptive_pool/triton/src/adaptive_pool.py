@@ -22,14 +22,7 @@ the element type, rounded once on the store.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit
@@ -57,7 +50,7 @@ def _adaptive_pool_kernel(
     roundings can add a position that the quotient alone does not allow (24 pooled to
     7 gives windows of four and of five). A shorter window is masked out term by term.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     program = tl.program_id(0)
     index = (program * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
@@ -86,3 +79,14 @@ def _adaptive_pool_kernel(
     # output's element type.
     pooled = accumulator / (span * HEADS)
     tl.store(out + index, pooled.to(out.dtype.element_ty), mask=live)
+
+
+def derive(fields, parameters, target):
+    """The longest window a descriptor's pool gives, for the launch table.
+
+    ``window`` is ``ceil(width / output) + 1``, not the quotient alone: a
+    window is ``ceil((i+1)·width/output) - floor(i·width/output)``, and for a
+    width the output does not divide those two roundings can add a position
+    (24 pooled to 7 gives windows of four and of five).
+    """
+    return {"window": -(-fields["width"] // fields["output"]) + 1}

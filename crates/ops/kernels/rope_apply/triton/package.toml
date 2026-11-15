@@ -1,8 +1,5 @@
 # The rope_apply operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program rotates `rows` tokens' heads: a head's leading `rotated` channels
 # turn by the token's own cosine and sine factors in the descriptor's pairing,
 # and the channels past the rotation are copied. The tables arrive already
@@ -12,22 +9,39 @@ op = "rope_apply"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/rope_apply.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# The two programs differ in their launch words: a narrowed rotation's call also names how many
+# channels turn. The derivation gives the rotation's width (the whole head when the key names
+# none), its pairs and the pairs' power-of-two tile, and refuses a rotation wider than the head
+# or a head tile narrower than the head count.
+[launch]
+kernel = { field = "narrowed", values = { false = "_rope_apply_full_kernel", true = "_rope_apply_narrowed_kernel" } }
+warps = { field = "block", steps = [[256, 8]], otherwise = 4 }
+derive = "derive"
+
+# The tables are `[tokens, rotated / 2]` FP32 each. `pdl` is a word the kernel does not read: the
+# dependent launch is compiled in.
+[launch.types]
+x = { pointer = "dtype" }
+cosine = "*fp32"
+sine = "*fp32"
+out = { pointer = "output" }
+tokens = "u64"
+pdl = "i32"
+rotated = "u32"
+
+# The head tile is the descriptor's block, which covers the heads.
+[launch.constants]
+ROTATED = { field = "rotated" }
+PAIRS = { field = "pairs" }
+PAIRS_TILE = { field = "pairs_tile" }
+HEAD_DIM = { field = "head_dim" }
+HEADS = { field = "heads" }
+ROWS = { field = "rows" }
+HEADS_TILE = { field = "block" }
+INTERLEAVED = { field = "rotation", values = { half = false, interleaved = true } }
 
 # `dtype_bf16_output_bf16_head_dim_72_heads_16_rotation_half_rows_8_block_128_pdl_false`.
 #
@@ -45,5 +59,3 @@ dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], 
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = { multiple = 2 }, heads = { min = 1 }, rotation = ["half", "interleaved"], rows = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"], rotated = { multiple = 2 } }
-
-[parameters]

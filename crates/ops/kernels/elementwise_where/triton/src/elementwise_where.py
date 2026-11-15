@@ -14,9 +14,9 @@ A selection moves one of its two values as it is: no element is converted,
 so the output holds the bits of the value it chose.
 """
 
-import strided
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch, strided
 
 
 @triton.jit
@@ -60,7 +60,7 @@ def _elementwise_where_kernel(
     extents; ``c0..c5``, ``t0..t5`` and ``f0..f5`` are the strides of the
     condition, of ``on_true`` and of ``on_false``, right-aligned.
     """
-    strided.pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     live = index < elements

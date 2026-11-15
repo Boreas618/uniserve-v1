@@ -34,9 +34,9 @@ it is; one at or past the extent addresses outside the operand, which the
 operator's caller excludes.
 """
 
-import strided
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch, strided
 
 
 @triton.jit
@@ -76,7 +76,7 @@ def _gather_kernel(
     indexed axis's zeroed, ``i0..i5`` the indices' strides, right-aligned;
     ``step`` is the source's stride along the indexed axis.
     """
-    strided.pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     live = index < elements
@@ -145,7 +145,7 @@ def _scatter_kernel(
     and the three steps are the operands' strides along it. ``ADDS`` says
     that the function accumulates instead of replacing.
     """
-    strided.pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     column = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     live = column < columns
@@ -179,3 +179,22 @@ def _scatter_kernel(
             )
             value = strided.narrowed(total, destination, COMPUTE)
         tl.store(target, value, mask=present)
+
+
+#: The index that names no element, by the indices' type: its largest value.
+ABSENT = {"u8": 2**8 - 1, "u32": 2**32 - 1, "i64": 2**63 - 1}
+
+
+def derive(fields, parameters, target):
+    """The element addressed, the absent index and what a scatter computes in.
+
+    Only an addition computes, and so only it names a computing type: a
+    ``scatter_set`` of an element that only moves stores the bits it loaded.
+    """
+    adds = fields["function"] == "scatter_add"
+    return {
+        "address": strided.address(fields["dtype"]),
+        "absent": ABSENT[fields["indices"]],
+        "adds": adds,
+        "compute": strided.compute(fields["dtype"]) if adds else "int",
+    }

@@ -19,7 +19,11 @@
 # - `families`: the targets whose code runs on this one, itself first.
 # - `warp_size`: the threads of a warp.
 # - `shared_memory`: the largest shared memory one block may opt into, in bytes.
-# - `tensor_memory`: whether the architecture has tensor memory (`tcgen05`).
+# - `tensor_memory`: whether the architecture has tensor memory and the
+#   matrix instructions that read it (`tcgen05`).
+# - `warpgroup_mma`: whether the architecture has the asynchronous warpgroup
+#   matrix instructions (`wgmma`), which only Hopper's specific instruction set
+#   carries.
 # - `dependent_launch`: whether a kernel may launch dependent grids
 #   (programmatic dependent launch).
 # - `fp8`: whether the tensor cores take FP8 operands.
@@ -32,6 +36,7 @@ families = ["sm_90a"]
 warp_size = 32
 shared_memory = 232448
 tensor_memory = false
+warpgroup_mma = true
 dependent_launch = true
 fp8 = true
 
@@ -43,6 +48,7 @@ families = ["sm_100a", "sm_100f"]
 warp_size = 32
 shared_memory = 232448
 tensor_memory = true
+warpgroup_mma = false
 dependent_launch = true
 fp8 = true
 
@@ -54,6 +60,7 @@ families = ["sm_100f"]
 warp_size = 32
 shared_memory = 232448
 tensor_memory = true
+warpgroup_mma = false
 dependent_launch = true
 fp8 = true
 
@@ -65,5 +72,6 @@ families = ["sm_120a", "sm_120f"]
 warp_size = 32
 shared_memory = 101376
 tensor_memory = false
+warpgroup_mma = false
 dependent_launch = true
 fp8 = true

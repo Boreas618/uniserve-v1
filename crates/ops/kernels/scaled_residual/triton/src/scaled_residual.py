@@ -39,3 +39,12 @@ def _scaled_residual_kernel(
     scale = tl.load(scale_ptr + columns, mask=mask, other=0.0).to(tl.float32)
 
     tl.store(hidden_ptr + offsets, hidden + update * scale, mask=mask)
+
+
+def derive(fields, parameters, target):
+    """Whether the row width is a multiple of sixteen, for the launch table.
+
+    ``whole_rows`` selects the aligned arguments: the operands are stated
+    aligned only for such a width.
+    """
+    return {"whole_rows": fields["columns"] % 16 == 0}

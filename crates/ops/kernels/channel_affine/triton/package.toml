@@ -10,24 +10,26 @@ op = "channel_affine"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/channel_affine.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_channel_affine_kernel"
+warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
+
+# `pdl` is a word the kernel does not read: the dependent launch is compiled in.
+[launch.types]
+x = { pointer = "dtype" }
+scale = { pointer = "dtype" }
+shift = { pointer = "dtype" }
+out = { pointer = "dtype" }
+channels = "i64"
+positions = "i64"
+elements = "i64"
+pdl = "i32"
+
+[launch.constants]
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], block = { power_of_two = true }, pdl = ["true", "false"] }
-
-[parameters]

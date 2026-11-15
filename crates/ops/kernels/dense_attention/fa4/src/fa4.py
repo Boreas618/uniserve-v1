@@ -30,11 +30,10 @@ and the representative problem the package's parameters state.
 
 import os
 
-import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
-
 import cutlass
 import cutlass.cute as cute
+import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 #: The element types the operator's query, key, value and output may have.
 TORCH_DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16}
@@ -108,18 +107,16 @@ class DenseCompiler:
         self.dtype = TORCH_DTYPES[fields["dtype"]]
         self.key_dtype = TORCH_DTYPES[fields["kv"]]
         self.output_dtype = TORCH_DTYPES[fields["out"]]
-        self.head_dim = int(fields["head_dim"])
-        self.q_heads = int(fields["q_heads"])
-        self.kv_heads = int(fields["kv_heads"])
+        self.head_dim = fields["head_dim"]
+        self.q_heads = fields["q_heads"]
+        self.kv_heads = fields["kv_heads"]
         self.causal = fields["mask"] == "causal"
-        if fields["window"] != "false":
-            raise SystemExit("FA4's dense pass is compiled without a window")
         # The longest key sequence the module serves, which the package's parameters declare:
         # the descriptor's bound is deliberately absent from the key, so it cannot be a field.
-        self.max_kv_len = int(parameters.get("max_kv_len", 40960))
+        self.max_kv_len = parameters["max_kv_len"]
         # The representative problem the vendor's selection is asked about.
-        self.batch = int(parameters.get("batch", 8))
-        self.query_len = int(parameters.get("query_len", 512))
+        self.batch = parameters["batch"]
+        self.query_len = parameters["query_len"]
         self.target = target
 
     def request(self, interface):

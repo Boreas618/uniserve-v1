@@ -25,6 +25,7 @@ so a slot written twice holds the later row.
 
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch
 
 #: The largest finite E4M3 magnitude, the divisor of a page's scale.
 E4M3_MAX = tl.constexpr(448.0)
@@ -35,14 +36,6 @@ SCALE_FLOOR = tl.constexpr(1e-12)
 
 #: The slots one step of an ownership or extent scan reads.
 SCAN = 1024
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -91,7 +84,7 @@ def _kv_write_scaled_kernel(
     walked ``BLOCK`` columns at a time and the slots ``SCAN`` at a time.
     Grid: ``[max(tokens, 1), 1, 1]``, one program per token.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     token = tl.program_id(0).to(tl.int64)
     slot = tl.load(slots_ptr + token, mask=token < tokens, other=-1).to(
@@ -191,3 +184,8 @@ def _kv_write_scaled_kernel(
     # that covers every byte it reads.
     tl.store(scales_ptr + page_of, scale)
     tl.store(initialized_ptr + page_of, 1)
+
+
+def derive(fields, parameters, target):
+    """The slots one step of a scan reads (``scan``), this module's ``SCAN``."""
+    return {"scan": SCAN}

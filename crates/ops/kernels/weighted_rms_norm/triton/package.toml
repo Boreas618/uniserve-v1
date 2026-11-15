@@ -1,9 +1,5 @@
 # The weighted_rms_norm operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The descriptor is the normalization's own: the element type, the row width, the
 # lane tile that covers it, and whether each program publishes its row's largest
 # magnitude. The key is the one `WeightedRmsNormDescriptor`'s `Display` prints,
@@ -13,22 +9,27 @@ op = "weighted_rms_norm"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/weighted_rms_norm.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# A program with a magnitude buffer takes one more pointer, so the two variants are two kernels.
+# The derivation gives `activation`, the normalized rows' element type, the input's when the key
+# names none.
+[launch]
+kernel = { field = "absmax", values = { true = "_weighted_rms_norm_absmax_kernel", false = "_weighted_rms_norm_kernel" } }
+warps = { field = "columns", steps = [[2048, 8]], otherwise = 4 }
+derive = "derive"
+
+[launch.types]
+hidden_ptr = { pointer = "dtype" }
+weight_ptr = { pointer = "dtype" }
+output_ptr = { pointer = "activation" }
+partials_ptr = "*fp32"
+eps = "fp32"
+
+[launch.constants]
+WIDTH = { field = "columns" }
+BLOCK = { field = "tile" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true }, absmax = ["true", "false"] }
@@ -37,5 +38,3 @@ dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { p
 # `activation`, and the key names it only then. The video VAE's decoder keeps an FP32 stream.
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true }, absmax = ["true", "false"] , activation = ["bf16", "f16"] }
-
-[parameters]

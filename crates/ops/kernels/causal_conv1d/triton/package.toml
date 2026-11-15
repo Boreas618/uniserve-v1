@@ -1,9 +1,5 @@
 # The causal_conv1d operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # One program convolves `block` channels of one row of a batch, continuing from
 # the row's request slot's last `width − 1` inputs and leaving its own there
 # (and a checkpoint of them when the row names one). The channel count and the
@@ -14,27 +10,43 @@ op = "causal_conv1d"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/causal_conv1d.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# The tensors read and written in whole channel rows are aligned; the taps, read at a stride of
+# `width`, are not.
+[launch]
+kernel = "_causal_conv1d_kernel"
+warps = 4
+aligned = ["x_ptr", "out_ptr", "state_ptr", "checkpoint_ptr", "trail_ptr"]
+derive = "derive"
+
+[launch.types]
+x_ptr = { pointer = "dtype" }
+weight_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+offsets_ptr = "*i32"
+seq_lens_ptr = "*i32"
+slots_ptr = "*i32"
+checkpoints_ptr = "*i32"
+state_ptr = { pointer = "dtype" }
+checkpoint_ptr = { pointer = "dtype" }
+trail_ptr = { pointer = "dtype" }
+x_row_stride = "i32"
+trailing = "i32"
+
+# `kept` is the derivation's: `width − 1` rounded up to a power of two, the lanes of one state tile.
+# The token tile one program walks at a time is this package's: a tile of rows for every tap's
+# loads.
+[launch.constants]
+CHANNELS = { field = "channels" }
+WIDTH = { field = "width" }
+KEPT = { field = "kept" }
+BLOCK = { field = "block" }
+TOKENS = 16
 
 # `dtype_bf16_channels_8192_width_4_block_256`.
 [[kernel.descriptors]]
 # A channel count of any multiple of sixteen (each row's channels start on a sixteen-byte bound),
 # any tap count of at least two, and a channel block that is a `tl.arange` extent.
 dimensions = { dtype = ["bf16", "f16", "f32"], channels = { multiple = 16 }, width = { min = 2 }, block = { power_of_two = true } }
-
-[parameters]

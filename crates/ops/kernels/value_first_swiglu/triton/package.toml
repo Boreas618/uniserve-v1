@@ -1,9 +1,5 @@
 # The value_first_swiglu operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The descriptor is the packed gating's own: the element type, the output row
 # width (the packed row holds twice as many), the tile one program walks, the
 # packed row stride, and whether the packed bias is added and each program's
@@ -20,24 +16,34 @@ op = "value_first_swiglu"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/value_first_swiglu.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# Every operand is an arena tensor. The element count and the packed row stride are aligned where
+# the key's width and stride both are multiples of sixteen, which the derivation states.
+[launch]
+kernel = "_value_first_swiglu_kernel"
+warps = 8
+aligned = { field = "whole_rows", values = { true = ["value_gate_ptr", "output_ptr", "elements", "input_row_stride"], false = ["value_gate_ptr", "output_ptr"] } }
+derive = "derive"
+
+# Each program's largest magnitude is FP32, whether or not one is written. The element count and
+# the packed row stride are 32-bit launch words, and the kernel indexes in 64 bits.
+[launch.types]
+value_gate_ptr = { pointer = "dtype" }
+bias_ptr = { pointer = "dtype" }
+output_ptr = { pointer = "dtype" }
+partials_ptr = "*fp32"
+elements = "i32"
+input_row_stride = "i32"
+
+# The packed input row is `width` elements past the value half, and the magnitude buffer's length
+# is the program count the launch derives from the same tile.
+[launch.constants]
+width = { field = "width" }
+HAS_BIAS = { field = "bias" }
+RETURN_ABSMAX = { field = "absmax" }
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], width = { min = 1 }, block = { power_of_two = true }, input_stride = { min = 1 }, bias = ["true", "false"], absmax = ["true", "false"] }
-
-[parameters]

@@ -22,5 +22,16 @@ from uniserve_build_server.request import Request
 
 
 def compile(request: Request) -> None:
-    """Compile the request's descriptor into ``module.so`` with its cubins."""
-    trtllm.build_routed_gemm(request, "uniserve_gather_gemm_nvfp4")
+    """Compile the request's descriptor into ``module.so`` with its cubins.
+
+    The descriptor's activation selects the gated epilogue twice: the
+    artifact's kernels by their `mActType` (the manifest states it as the
+    field), and the runner's activation in the entry unit, which reads
+    `UNISERVE_GELU_TANH`.
+    """
+    trtllm.build_routed_gemm(
+        request,
+        entry_defines=[
+            f"UNISERVE_GELU_TANH={int(request.field('activation') == 'gelu_tanh')}"
+        ],
+    )

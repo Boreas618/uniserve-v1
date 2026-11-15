@@ -1,9 +1,5 @@
 # The cast operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # `out[i] = convert(x[i])` over an input read through its strides, into a
 # contiguous output of another element type: low bits between integers, a
 # truncation toward zero from a float into an integer, a rounding to nearest
@@ -23,24 +19,36 @@ op = "cast"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/cast.py", "src/strided.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_cast_kernel"
+warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
+derive = "derive"
+
+[launch.types]
+x = { pointer = "input" }
+out = { pointer = "output" }
+elements = "i64"
+d1 = "i64"
+d2 = "i64"
+d3 = "i64"
+d4 = "i64"
+d5 = "i64"
+s0 = "i64"
+s1 = "i64"
+s2 = "i64"
+s3 = "i64"
+s4 = "i64"
+s5 = "i64"
+pdl = "i32"
+
+[launch.constants]
+THROUGH = { field = "through" }
+NARROWS = { field = "narrows" }
+RANK = { field = "rank" }
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { input = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], output = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
-
-[parameters]

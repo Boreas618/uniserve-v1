@@ -12,27 +12,31 @@ op = "patch"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/patch.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_patch_kernel"
+warps = { field = "block", steps = [[1024, 8]], otherwise = 4 }
+
+# `block` and `pdl` are the operator's words, which the kernel does not read: the grid names the
+# row and the column slice, and the block width is compiled in.
+[launch.types]
+x_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+frames = "i32"
+rows = "i32"
+channels = "i32"
+height = "i32"
+width = "i32"
+block = "i32"
+pdl = "i32"
+
+[launch.constants]
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 # One module per element type: the program reads the channels, the frames and the canvas as words,
 # so a raster is a launch value and never a reason to compile. A key cannot name a mode either,
 # because the operator has no mode to name.
 dimensions = { dtype = ["bf16", "f16", "f32"], block = { power_of_two = true }, pdl = ["false"] }
-
-[parameters]

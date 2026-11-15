@@ -30,9 +30,9 @@ tile the leftmost, across tiles the earlier, because a later tile replaces
 the best only when it is strictly better.
 """
 
-import strided
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch, strided
 
 
 @triton.jit
@@ -93,7 +93,7 @@ def _reduce_kernel(
     elements one output folds. ``NEUTRAL`` is the value every output starts
     at.
     """
-    strided.pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     rows = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
     live_rows = rows < outputs
@@ -172,3 +172,51 @@ def _reduce_kernel(
             best.to(out.dtype.element_ty, fp_downcast_rounding="rtne"),
             mask=live_rows,
         )
+
+
+#: The two functions that return an index along their one axis.
+INDEXES = ("argmin", "argmax")
+
+#: The largest and the smallest value a 64-bit accumulator holds.
+I64_MAX = 2**63 - 1
+I64_MIN = -(2**63)
+
+
+def accumulate(dtype):
+    """The type a reduction over ``dtype`` elements accumulates in."""
+    if dtype == "f64":
+        return "fp64"
+    if dtype in ("f16", "bf16", "f32"):
+        return "fp32"
+    return "i64"
+
+
+def neutral(function, accumulator):
+    """The value an output starts at: what the function leaves unchanged."""
+    if function == "sum":
+        return 0
+    if function == "absmax":
+        # A magnitude is never below zero, so zero leaves every largest
+        # magnitude unchanged.
+        return 0
+    if function in ("min", "argmin"):
+        return I64_MAX if accumulator == "i64" else float("inf")
+    return I64_MIN if accumulator == "i64" else float("-inf")
+
+
+def derive(fields, parameters, target):
+    """The accumulator, the start value, the output's type and the rows of a block.
+
+    A tile wider than its block is refused.
+    """
+    block, tile = fields["block"], fields["tile"]
+    if tile > block:
+        raise SystemExit(f"a tile of {tile} elements exceeds its block {block}")
+    function = fields["function"]
+    accumulator = accumulate(fields["dtype"])
+    return {
+        "accumulate": accumulator,
+        "neutral": neutral(function, accumulator),
+        "output": "u32" if function in INDEXES else fields["dtype"],
+        "rows": block // tile,
+    }

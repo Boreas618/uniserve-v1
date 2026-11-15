@@ -1,9 +1,5 @@
 # The fp8_gemm operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # One program computes one output tile of a per-tensor FP8 product: the E4M3
 # activation `fp8_quantize` encoded times the E4M3 weight, accumulated in FP32,
 # and the accumulator dequantized by `input_scale · weight_scale` before the one
@@ -17,27 +13,44 @@ op = "fp8_gemm"
 backend = "triton"
 interface_version = 2
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/fp8_gemm.py", "src/build.py"]
-script = "src/build.py"
+
+# An output tile of more than 64 x 64 elements (8192 or more, the blocks being powers of two) takes
+# eight warps. Every operand is an arena tensor or a weight, whose rows start on sixteen-byte
+# bounds, and the operator refuses a contraction or an activation row stride that is not a multiple
+# of sixteen: whole vectors of both operands' rows are loaded along the contraction (without the
+# statement the product runs at a fortieth of its rate).
+[launch]
+kernel = "_fp8_gemm_kernel"
+warps = { field = "tile", steps = [[8192, 8]], otherwise = 4 }
+aligned = ["x_ptr", "w_ptr", "out_ptr", "k", "x_row_stride"]
+derive = "derive"
+
+# The output and its bias are the descriptor's 16-bit type; the product's factor is an FP32 device
+# word.
+[launch.types]
+x_ptr = "*fp8e4nv"
+w_ptr = "*fp8e4nv"
+bias_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+m = "i32"
+n = "i32"
+k = "i32"
+x_row_stride = "i32"
+alpha_ptr = "*fp32"
+
+[launch.constants]
+BLOCK_M = { field = "block_m" }
+BLOCK_N = { field = "block_n" }
+BLOCK_K = { field = "block_k" }
+BIAS = { field = "bias" }
 
 [kernel]
-architectures = ["sm_100a", "sm_90a"]
+requires = ["fp8"]
 
 # `dtype_bf16_block_m_128_block_n_128_block_k_128_bias_false`.
 [[kernel.descriptors]]
 # The three tile extents are `tl.arange` extents and `tl.dot` operands, so
 # powers of two of at least sixteen.
 dimensions = { dtype = ["bf16", "f16"], block_m = { power_of_two = true, min = 16 }, block_n = { power_of_two = true, min = 16 }, block_k = { power_of_two = true, min = 32 }, bias = ["false", "true"] }
-
-[parameters]

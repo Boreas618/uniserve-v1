@@ -111,19 +111,12 @@ op = "sampler"
 backend = "process"
 interface_version = 3
 
-[toolchain]
-kind = "none"
-version = ""
-
-[module]
-form = "executable"
-
 [source]
 kind = "executable"
 files = ["bin/sampler"]
 
 [kernel]
-architectures = ["{arch}"]
+requires = ["{arch}"]
 descriptors = [{ dimensions = { dtype = ["bf16"] } }]
 "#;
 

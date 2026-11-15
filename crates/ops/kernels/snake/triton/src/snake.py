@@ -18,17 +18,10 @@ along with one unit of the sine's own last place.
 
 import triton
 import triton.language as tl
+from uniserve_kernels import dependent_launch
 
 #: The reciprocal's offset, as the formula states it, instantiated so a kernel may read it.
 _EPSILON = tl.constexpr(1e-9)
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -49,7 +42,7 @@ def _snake_kernel(
     descriptor was compiled for and ``channels`` the parameter count; a block covers consecutive
     elements of the row-major signal.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     width_of = width.to(tl.int64)

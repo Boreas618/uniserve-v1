@@ -1,10 +1,6 @@
 # The elementwise_binary operator's Triton backend: design 5.2's
 # package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # `out[i] = lhs[i] o rhs[i]` over two inputs read through their strides, into a
 # contiguous output: arithmetic in the inputs' element type, a comparison
 # writing `u8`, or one of the functions of the integer element types alone
@@ -24,24 +20,46 @@ op = "elementwise_binary"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/elementwise_binary.py", "src/strided.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_elementwise_binary_kernel"
+warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
+derive = "derive"
+
+# A comparison's output is a `u8` truth value.
+[launch.types]
+lhs = { pointer = "dtype" }
+rhs = { pointer = "dtype" }
+out = { pointer = "output" }
+elements = "i64"
+d1 = "i64"
+d2 = "i64"
+d3 = "i64"
+d4 = "i64"
+d5 = "i64"
+l0 = "i64"
+l1 = "i64"
+l2 = "i64"
+l3 = "i64"
+l4 = "i64"
+l5 = "i64"
+r0 = "i64"
+r1 = "i64"
+r2 = "i64"
+r3 = "i64"
+r4 = "i64"
+r5 = "i64"
+pdl = "i32"
+
+[launch.constants]
+FUNCTION = { field = "function" }
+COMPARES = { field = "compares" }
+COMPUTE = { field = "compute" }
+SIGNED = { field = "signed" }
+RANK = { field = "rank" }
+BLOCK = { field = "block" }
 
 [[kernel.descriptors]]
 dimensions = { function = ["add", "sub", "mul", "div", "maximum", "minimum", "eq", "ne", "lt", "le", "gt", "ge", "remainder", "bitwise_and", "bitwise_or", "bitwise_xor", "bitwise_left_shift", "bitwise_right_shift"], dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
-
-[parameters]

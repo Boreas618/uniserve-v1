@@ -113,22 +113,16 @@ backend = "{backend}"
 interface_version = 1
 priority = {priority}
 
-[toolchain]
-kind = "none"
-version = ""
-
 [module]
-form = "cubin"
 metadata = "metadata_{descriptor}.json"
 
 [source]
 kind = "cubin"
-files = ["artifact/module_{descriptor}.cubin", "artifact/metadata_{descriptor}.json"]
 cubin = "artifact/module_{descriptor}.cubin"
 metadata = "artifact/metadata_{descriptor}.json"
 
 [kernel]
-architectures = ["{architecture}"]
+requires = ["{architecture}"]
 descriptors = [{ dimensions = {dimensions} }]
 "#
     .replace("{op}", op)

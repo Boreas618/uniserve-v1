@@ -19,14 +19,7 @@ entries than candidates fills the rest with ``-inf`` and id ``-1``.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit(do_not_specialize=["width", "tiles"])
@@ -50,7 +43,7 @@ def _top_logprobs_kernel(
     chunk ``t`` of row ``r`` writes its candidates at ``r * tiles + t``, the
     largest first. Grid: ``(rows, tiles)``.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1).to(tl.int64)

@@ -1,8 +1,5 @@
 # The vocab_unpad operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program copies a block of the unpadded logits; the row count is a launch
 # value.
 
@@ -10,25 +7,26 @@ op = "vocab_unpad"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/vocab_unpad.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_vocab_unpad_kernel"
+warps = 4
+
+# The output's element type is its own field: the head's product is in the model's dtype and the
+# sampler's candidate buffer is FP32, so this program is one of the places the two meet.
+[launch.types]
+gathered_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "output" }
+rows = "i64"
+padded = "i32"
+vocabulary = "i32"
+ranks = "i32"
+
+[launch.constants]
+BLOCK = { field = "block" }
 
 # `dtype_bf16_vocabulary_151936_padded_151936_block_1024_pdl_false`.
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], output = ["f32", "bf16", "f16"], vocabulary = { min = 1 }, padded = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"] }
-
-[parameters]

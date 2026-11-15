@@ -9,8 +9,8 @@ values as the cubin declares. Two facts make that dangerous, and neither is chec
 * **A packed word the module does not declare does not sit idle.** It takes the position of a parameter
   that follows it, so the driver reads a flag or a width where a device address belongs.
 
-The ground truth here is the PTX: the package's `build.py` `spec()` is executed for the fixture key and
-the module compiled (no GPU needed), and the `.param` lines are counted. The operator's packed words are
+The ground truth here is the PTX: the package's `[launch]` table is evaluated against its kernel module
+`src/<op>.py` for the fixture key and the module compiled (no GPU needed), and the `.param` lines are counted. The operator's packed words are
 read from its `launch` in `crates/ops/src`, separating the words it always packs from those it packs
 only under a condition (`rotary_factors` appends its section widths only for a sectioned rotation), so
 the comparison is a range rather than a number.
@@ -28,6 +28,7 @@ import pathlib
 import re
 import sys
 import tempfile
+import tomllib
 
 # The compiler picks `ptxas` off `PATH`, and the system one may not know this host's architecture;
 # the CUDA toolkit `CUDA_HOME` names, which the store is built with, does. The Triton cache goes
@@ -46,8 +47,8 @@ REPOSITORY = pathlib.Path(__file__).resolve().parents[1]
 OPS = REPOSITORY / "crates/ops/src"
 KERNELS = REPOSITORY / "crates/ops/kernels"
 
-# A package's `build.py` imports its compile driver from the Build Server's Python package, so
-# the package's source is importable from this tree whichever interpreter runs the tool.
+# A package's launch table is evaluated by the Build Server's Triton driver, so that package is
+# importable from this tree whichever interpreter runs the tool.
 sys.path.insert(0, str(REPOSITORY / "crates/build-server/python/src"))
 from uniserve_build_server import triton as driver  # noqa: E402
 from uniserve_build_server.request import Target  # noqa: E402
@@ -148,15 +149,18 @@ def module_parameters(operator, key):
     """The parameter count a module's PTX declares, and its declared signature's length."""
     for manifest_path in KERNELS.glob(f"{operator}/*/package.toml"):
         source = manifest_path.parent / "src"
-        if not (source / "build.py").exists():
+        # A Triton package states its kernel's launch in its manifest's `[launch]` table.
+        if "launch" not in tomllib.loads(manifest_path.read_text()):
             continue
         sys.path.insert(0, str(source))
         try:
-            spec_module = importlib.util.spec_from_file_location("build", source / "build.py")
-            module = importlib.util.module_from_spec(spec_module)
-            spec_module.loader.exec_module(module)
+            spec_module = importlib.util.spec_from_file_location(
+                "kernels", source / f"{operator}.py"
+            )
+            kernels = importlib.util.module_from_spec(spec_module)
+            spec_module.loader.exec_module(kernels)
             described = driver.stated_for(
-                module.spec,
+                kernels,
                 source.parent,
                 key,
                 Target.named("sm_100a"),
@@ -187,7 +191,7 @@ def module_parameters(operator, key):
             # there is no module to compare against.
             return f"not covered: {error}", None
         except KeyError:
-            # A package whose build script describes its module another way (a `#[repr(C)]` call
+            # A package that describes its module another way (a `#[repr(C)]` call
             # structure rather than a parameter list) has no signature to compare against.
             return "no parameter signature in this package", None
         except Exception as error:  # noqa: BLE001 - "not checked" is not "passes"

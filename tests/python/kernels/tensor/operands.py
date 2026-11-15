@@ -7,9 +7,9 @@ for a device, where the same cases run on device tensors. This module holds
 what every such check needs:
 
 - the launch of a descriptor key: the key is read against the package's
-  manifest and given to its compile script as the Build Server does for
-  a build, and the kernel runs with the compile-time values that script
-  states, so a check launches the module a key names;
+  manifest as the Build Server reads it for a build, and the kernel runs with
+  the compile-time values the package's launch table states for it, so a
+  check launches the module a key names;
 - the strided inputs a check traverses: contiguous, sliced, stepped, permuted
   and broadcast (zero-stride) views of rank 1 to 6;
 - the launch arithmetic of ``crates/ops/src/strided.rs``: the axes a program
@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import functools
 import importlib
-import importlib.util
 import os
 import pathlib
 import sys
@@ -133,21 +132,14 @@ def load(op: str):
 def described(op: str, key: str) -> dict:
     """What ``op``'s package states for the module of descriptor ``key``.
 
-    The key is read against the package's manifest and given to its
-    ``spec``, which is how the Build Server asks for a build: a key the
-    manifest does not declare, or a field the compile script misreads, fails
-    here rather than passing as a launch of something else.
+    The key is read against the package's manifest and its launch table is
+    stated for the fields it reads, which is how the Build Server asks for a
+    build: a key the manifest does not declare, or a field the table misreads,
+    fails here rather than passing as a launch of something else.
     """
-    load(op)
-    root = KERNELS / op / "triton"
-    found = importlib.util.spec_from_file_location(
-        f"{op}_build", root / "src" / "build.py"
-    )
-    build = importlib.util.module_from_spec(found)
-    found.loader.exec_module(build)
     return driver.stated_for(
-        build.spec,
-        root,
+        load(op),
+        KERNELS / op / "triton",
         key,
         Target.named(ARCHITECTURE),
         os.environ.get("UNISERVE_BINARY", "uniserve"),

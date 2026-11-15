@@ -1,8 +1,5 @@
 # The top_k operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py`.
-#
 # One program per row selects the row's `width` largest logits by four radix
 # passes, compacts them into its scratch and orders them with eight stable radix
 # passes. The vocabulary, the row count and the kept count are launch values; the
@@ -12,25 +9,33 @@ op = "top_k"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/top_k.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+[launch]
+kernel = "_top_k_kernel"
+warps = 8
+
+# The kept values are FP32 whatever the logits' element type; `workspace` is the program's scratch
+# of compacted keys and ids.
+[launch.types]
+logits_ptr = { pointer = "dtype" }
+values_ptr = "*fp32"
+ids_ptr = { pointer = "ids" }
+workspace_ptr = "*i32"
+rows = "i64"
+vocabulary = "i32"
+width = "i32"
+
+# `tile` is the chunk one pass reads. Nothing else is compiled in: the vocabulary, the row count
+# and the kept count are launch scalars, so one module serves any of them - which is why the key
+# names no candidate width at all.
+[launch.constants]
+TILE = { field = "tile" }
 
 # `dtype_f32_tile_2048_ids_i32_pdl_false`.
+#
+# 8192 is the widest chunk one pass reads: an ordering pass holds two `tile`-lane planes and a
+# nibble's ranks, which is the last size that fits a block's registers at eight warps.
 [[kernel.descriptors]]
 dimensions = { dtype = ["f32", "bf16", "f16"], tile = { power_of_two = true, max = 8192 }, ids = ["i32", "i64"], pdl = ["true", "false"] }
-
-[parameters]

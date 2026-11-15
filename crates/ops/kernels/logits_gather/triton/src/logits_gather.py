@@ -8,14 +8,7 @@ rows on the device without a host-side index list.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):  # noqa: N803
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+from uniserve_kernels import dependent_launch
 
 
 @triton.jit(do_not_specialize=["count", "columns"])
@@ -34,7 +27,7 @@ def _logits_gather_kernel(
     ``hidden`` is ``[tokens, columns]`` and ``out`` ``[count, columns]``. Grid:
     ``ceil(count * columns / BLOCK)``.
     """
-    _pdl_prologue(PDL)
+    dependent_launch.prologue(PDL)
 
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < count * columns

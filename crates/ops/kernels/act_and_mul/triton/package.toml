@@ -1,9 +1,5 @@
 # The act_and_mul operator's Triton backend: design 5.2's package.
 #
-# One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Build Server runs for one descriptor and target).
-#
 # The descriptor is the gating's own: the element type, the output row width,
 # the tile one program walks, the activation, the two input row strides, whether
 # the views span 2**31 elements (the module then addresses in 64 bits), and the
@@ -20,23 +16,31 @@ op = "act_and_mul"
 backend = "triton"
 interface_version = 1
 
-[toolchain]
-kind = "triton"
-version = "3.7.1"
-packages = []
-
-[module]
-form = "cubin"
-metadata = "metadata.json"
-
 [source]
 kind = "triton"
-files = ["src/act_and_mul.py", "src/build.py"]
-script = "src/build.py"
 
-[kernel]
-architectures = ["sm_100a", "sm_90a"]
+# Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds; the
+# element count is a whole number of rows of `width`.
+[launch]
+kernel = "_act_and_mul_kernel"
+warps = 8
+aligned = ["gate_ptr", "value_ptr", "out_ptr", "elements", "gate_row_stride", "value_row_stride"]
+
+# A wide descriptor counts elements and rows in 64 bits, a narrow one in 32.
+[launch.types]
+gate_ptr = { pointer = "dtype" }
+value_ptr = { pointer = "dtype" }
+out_ptr = { pointer = "dtype" }
+elements = { field = "wide", values = { true = "i64", false = "i32" } }
+gate_row_stride = { field = "wide", values = { true = "i64", false = "i32" } }
+value_row_stride = { field = "wide", values = { true = "i64", false = "i32" } }
+
+[launch.constants]
+n_cols = { field = "width" }
+ACTIVATION = { field = "activation" }
+BLOCK = { field = "block" }
+WIDE = { field = "wide" }
+stepwise = { field = "stepwise" }
 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], width = { multiple = 16 }, block = { power_of_two = true }, activation = ["gelu", "gelu_tanh", "silu", "sigmoid"], gate_stride = { multiple = 16 }, value_stride = { multiple = 16 }, wide = ["false", "true"], pdl = ["false", "true"], stepwise = ["false", "true"] }
-[parameters]

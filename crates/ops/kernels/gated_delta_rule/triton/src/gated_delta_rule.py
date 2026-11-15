@@ -38,7 +38,7 @@ with another program. Two forms:
   so a checkpoint is taken at a chunk's end: a multiple of ``CHUNK`` or the row's
   end, and no other position. A chunk of ``CHUNK`` tokens over ``BLOCK`` value
   columns holds ``2·CHUNK + 4·BLOCK`` tensor-memory columns on sm_100, which
-  ``build.py`` checks against the 512 a multiprocessor has.
+  ``derive`` checks against the 512 a multiprocessor has.
 
 Every intermediate and every sum is FP32, and the output rounds once. The
 recurrent walk multiplies in FP32; the chunked form multiplies on the tensor
@@ -429,3 +429,40 @@ def _gated_delta_rule_kernel(
         # the slot's state lands before any store of the new one.
         tl.debug_barrier()
         tl.store(state_ptr + bank, state)
+
+
+#: The 32-bit tensor-memory columns of one sm_100 multiprocessor, which a program's products share.
+TENSOR_MEMORY = 512
+
+
+def derive(fields, parameters, target):
+    """The doubling levels of a chunk's triangular inverse, ``levels``, for the launch table.
+
+    ``levels`` is log2 of the chunk. Refused: a chunk that does not match its form (one token for
+    the recurrent walk, more for the chunked one), value heads that are not a multiple of the key
+    heads, a value block that does not divide the head width, and, on a target with tensor memory,
+    a chunk whose products need more of it than a multiprocessor has.
+    """
+    form, chunk = fields["form"], fields["chunk"]
+    if (form == "recurrent") != (chunk == 1):
+        raise SystemExit(f"a {form} rule walks chunks of {chunk} tokens")
+
+    key_heads, value_heads = fields["key_heads"], fields["value_heads"]
+    value_dim, block = fields["value_dim"], fields["block"]
+    if value_heads % key_heads or value_dim % block:
+        raise SystemExit(
+            f"{value_heads} value heads over {key_heads} key heads, {value_dim} columns in "
+            f"blocks of {block}"
+        )
+
+    # A chunk's products hold their accumulators in tensor memory: two chunk-square sites (the key
+    # and query scores, the inverse's doubling) and four `block`-wide ones (the state's reads, the
+    # new values, their scores and the state's update).
+    columns = 2 * chunk + 4 * block
+    if chunk > 1 and target.tensor_memory and columns > TENSOR_MEMORY:
+        raise SystemExit(
+            f"a chunk of {chunk} over {block} value columns needs {columns} tensor-memory "
+            f"columns of {TENSOR_MEMORY}"
+        )
+
+    return {"levels": chunk.bit_length() - 1}

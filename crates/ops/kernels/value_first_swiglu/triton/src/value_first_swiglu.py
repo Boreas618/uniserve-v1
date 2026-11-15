@@ -66,3 +66,17 @@ def _value_first_swiglu_kernel(
             tl.where(mask, tl.abs(output.to(tl.float32)), 0.0), axis=0
         )
         tl.store(partials_ptr + tl.program_id(0), partial)
+
+
+def derive(fields, parameters, target):
+    """Whether the key's rows start on whole sixteen-element vectors.
+
+    The element count is a whole number of ``width``-element rows and the
+    packed row stride is ``input_stride``; the module states both words
+    aligned together, when the width and the stride both are multiples of
+    sixteen.
+    """
+    whole_rows = (
+        fields["width"] % 16 == 0 and fields["input_stride"] % 16 == 0
+    )
+    return {"whole_rows": whole_rows}

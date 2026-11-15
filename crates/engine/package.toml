@@ -19,7 +19,6 @@ interface_version = 9
 
 [toolchain]
 kind = "cargo"
-version = "1.99.1"
 
 [module]
 form = "executable"

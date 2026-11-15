@@ -259,8 +259,8 @@ def launch(module, case, output, interleaved):
     ]
     if rotated != head_dim:
         words += [rotated]
-    # `build.py`'s own lane count: a lane count is a power of two, and 96 turned channels are 48
-    # pairs, so the block is 64 lanes wide and the last 16 are masked off.
+    # The package derivation's own lane count: a lane count is a power of two, and 96 turned
+    # channels are 48 pairs, so the block is 64 lanes wide and the last 16 are masked off.
     entry = getattr(module, ENTRIES[(affine, rotated != head_dim)])
     entry[
         (
