@@ -1,7 +1,7 @@
 """The ``uniserve-build-server`` program: the Build Server's environment.
 
 The Build Server (``uniserve build-server``, ``crates/build-server``) runs it
-for three things:
+for four things:
 
 ``uniserve-build-server toolchain --json``
     prints the toolchain description (:mod:`uniserve_build_server.toolchain`),
@@ -21,6 +21,13 @@ for three things:
 ``uniserve-build-server provision PIN --cache DIR``
     fetches and verifies a pinned third-party source into the Build Server's
     cache (:mod:`uniserve_build_server.fetch`).
+
+``uniserve-build-server launch``
+    answers each descriptor of one Triton package on standard input with a JSON
+    line stating the compilation its launch table gives it
+    (:func:`uniserve_build_server.triton.launches`): what
+    ``uniserve build-server launch <package> --target <target>`` prints for a
+    check that launches the package's kernel outside a build.
 """
 
 from __future__ import annotations
@@ -103,6 +110,11 @@ def arguments(argv: list[str] | None) -> argparse.Namespace:
 
     commands.add_parser("compile", help="compile the request on standard input")
 
+    commands.add_parser(
+        "launch",
+        help="state the launches of the Triton descriptors on standard input",
+    )
+
     provisioned = commands.add_parser(
         "provision", help="fetch a pinned source into the cache"
     )
@@ -141,6 +153,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if options.command == "compile":
         compile_request(Request.read(sys.stdin))
+        return 0
+    if options.command == "launch":
+        triton.launches(sys.stdin, sys.stdout)
         return 0
     return provision(options)
 

@@ -178,6 +178,16 @@ pub enum Error {
         kind: ToolchainKind,
         message: String,
     },
+    /// A package's launches cannot be stated outside a build: it has no
+    /// launch table, the target is no GPU target, or the driver that states
+    /// them failed (`command::state_launches`).
+    #[error("{op} {backend} states no launch for {target}: {message}")]
+    Launch {
+        op: String,
+        backend: String,
+        target: String,
+        message: String,
+    },
 }
 
 /// What an operation of the Build Server returns.

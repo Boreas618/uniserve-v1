@@ -16,6 +16,10 @@
 //! - `fields <package> <key>`: prints the fields a package's declared
 //!   dimensions read a descriptor key into, for a tool that needs them outside
 //!   a build.
+//! - `launch <package> --target <target> [<key>...]`: prints, one JSON line
+//!   per descriptor key, the compilation a Triton package's launch table
+//!   states for the key, for a check that launches the package's kernel from
+//!   its source outside a build ([`state_launches`]).
 //! - `build --keys <file> --packages <dir> --package <dir>`: fills a store
 //!   directory with the modules of descriptor key lists and of single-module
 //!   packages (a policy, the engine), with a Build Server of its own for the
@@ -29,17 +33,21 @@
 //! device attributes without a context. Its toolchains are its own
 //! (`crate::toolchain`): no option names a compiler.
 
+use std::collections::BTreeMap;
+use std::io::{BufRead as _, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 
 use crate::builder::Limits;
-use crate::manifest::ToolchainKind;
+use crate::launch::Launch;
+use crate::manifest::{SOURCE_DIRECTORY, ToolchainKind};
 use crate::protocol::Client;
 use crate::server::{BuildServer, ServerConfig};
 use crate::store::Root;
 use crate::target::Target;
-use crate::toolchain::PeakMemory;
+use crate::toolchain::{ENVIRONMENT_PROGRAM, PeakMemory};
 use crate::{Error, Manifest, Result, default_socket};
 
 /// The `build-server` command's arguments.
@@ -99,6 +107,21 @@ pub enum Command {
         package: PathBuf,
         /// The descriptor key.
         key: String,
+    },
+    /// Read descriptor keys against a Triton package's declared dimensions
+    /// and print, one JSON line per key, the compilation its launch table
+    /// states for the key and a target: the kernel, its signature in parameter
+    /// order, the compile-time values, the aligned arguments' attributes and
+    /// the options, or why the package states none.
+    Launch {
+        /// The package directory.
+        package: PathBuf,
+        /// The target the compilations are stated for, such as `sm_100a`.
+        #[arg(long, value_name = "NAME")]
+        target: String,
+        /// The descriptor keys; read from standard input, one per line, when
+        /// none is given, each answered before the next is read.
+        keys: Vec<String>,
     },
     /// Build the modules of descriptor key lists and of single-module
     /// packages into a store directory.
@@ -468,24 +491,216 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
             Ok(())
         }
         Command::Fields { package, key } => {
-            let manifest = Manifest::load(&package).map_err(|source| Error::Manifest {
-                package: package.clone(),
-                source: Box::new(source),
-            })?;
-            let fields =
-                manifest
-                    .typed_fields(&key)
-                    .ok_or_else(|| Error::UnsupportedDescriptor {
-                        op: manifest.op.clone(),
-                        backend: manifest.backend.clone(),
-                        revision: 0,
-                        descriptor: key.clone(),
-                    })?;
-            println!("{}", serde_json::Value::Object(fields));
+            let manifest = load_manifest(&package)?;
+            println!(
+                "{}",
+                serde_json::Value::Object(typed_fields(&manifest, &key)?)
+            );
             Ok(())
+        }
+        Command::Launch {
+            package,
+            target,
+            keys,
+        } => {
+            let (package, target) = (absolute(package), Target::new(target));
+            let mut out = std::io::stdout().lock();
+            if keys.is_empty() {
+                state_launches(&package, &target, std::io::stdin().lock().lines(), &mut out)
+            } else {
+                state_launches(&package, &target, keys.into_iter().map(Ok), &mut out)
+            }
         }
         Command::Build(build) => run_build(*build, host),
     }
+}
+
+/// A package directory's manifest, or the reason it has none.
+fn load_manifest(package: &Path) -> Result<Manifest> {
+    Manifest::load(package).map_err(|source| Error::Manifest {
+        package: package.to_owned(),
+        source: Box::new(source),
+    })
+}
+
+/// The fields `manifest`'s declared dimensions read `key` into, each typed as
+/// its dimension declares it, or the refusal of a key the package does not
+/// declare.
+fn typed_fields(
+    manifest: &Manifest,
+    key: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    manifest
+        .typed_fields(key)
+        .ok_or_else(|| Error::UnsupportedDescriptor {
+            op: manifest.op.clone(),
+            backend: manifest.backend.clone(),
+            revision: 0,
+            descriptor: key.to_owned(),
+        })
+}
+
+/// The first line `uniserve-build-server launch` reads: what every descriptor
+/// of the package shares.
+///
+/// The program states each compilation with the driver a build compiles
+/// through (`uniserve_build_server.triton.stated`), so the launch a check takes
+/// is the one the package's module is built with.
+#[derive(Serialize)]
+struct LaunchPackage<'a> {
+    parameters: &'a BTreeMap<String, toml::Value>,
+    /// The package's source directory, which holds the kernel module.
+    source: PathBuf,
+    /// The kernel module, `<op>`, as a build imports it.
+    module: &'a str,
+    launch: &'a Launch,
+    /// The target's name: the program reads its hardware facts from the
+    /// description this crate reads them from (`targets.toml`).
+    target: &'a str,
+}
+
+/// Each later line `uniserve-build-server launch` reads: one descriptor, read
+/// by the Build Server's reader of the key grammar.
+#[derive(Serialize)]
+struct LaunchDescriptor<'a> {
+    descriptor: &'a str,
+    /// The key's fields, typed as the manifest's dimensions declare them.
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The line answering a key the package does not declare, in the shape of the
+/// program's refusals.
+#[derive(Serialize)]
+struct Undeclared<'a> {
+    key: &'a str,
+    refused: String,
+}
+
+/// Prints, one JSON line per key of `keys`, the compilation a Triton package's
+/// launch table states for the key on `target`: `{"key": ..., "launch": {...}}`
+/// with the kernel's name, its signature in parameter order, the compile-time
+/// values, the aligned arguments' attributes and `triton.compile`'s options, or
+/// `{"key": ..., "refused": "..."}` for a key the package does not declare or
+/// that the table or its derivation refuses.
+///
+/// Each key is read by the Build Server's own reader of the key grammar, as a
+/// build reads it, and its table is evaluated by the Triton driver of the Build
+/// Server's Python environment (`uniserve-build-server launch`,
+/// [`ENVIRONMENT_PROGRAM`] on the search path), which imports the package's
+/// kernel module from its source directory once. A key is answered and `out`
+/// flushed before the next key is read, so a caller may write keys one at a
+/// time to a running command and read each answer back.
+///
+/// # Errors
+///
+/// [`Error::Launch`] for a package without a launch table, a target that is no
+/// GPU target, or a program that fails; [`Error::Toolchain`] when the program
+/// cannot be run; [`Error::Io`] when a key cannot be read or an answer written.
+pub fn state_launches(
+    package: &Path,
+    target: &Target,
+    keys: impl IntoIterator<Item = std::io::Result<String>>,
+    out: &mut impl Write,
+) -> Result<()> {
+    let manifest = load_manifest(package)?;
+    let unstated = |message: String| Error::Launch {
+        op: manifest.op.clone(),
+        backend: manifest.backend.clone(),
+        target: target.to_string(),
+        message,
+    };
+    let launch = manifest
+        .launch
+        .as_ref()
+        .ok_or_else(|| unstated("the package states no launch table ([launch])".to_owned()))?;
+    if target.facts().is_none() {
+        return Err(unstated(format!(
+            "{target} is no GPU target of the description"
+        )));
+    }
+
+    // The program's standard error stays the command's: a defect of the driver
+    // reaches the caller as its own traceback.
+    let mut program = std::process::Command::new(ENVIRONMENT_PROGRAM)
+        .arg("launch")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| Error::Toolchain {
+            kind: ToolchainKind::Triton,
+            message: format!(
+                "{ENVIRONMENT_PROGRAM}, the program of the Build Server's Python environment, \
+                 cannot be run from the search path: {error}"
+            ),
+        })?;
+    // Both streams were asked for as pipes, so the child holds both.
+    let (Some(mut descriptors), Some(answers)) = (program.stdin.take(), program.stdout.take())
+    else {
+        return Err(unstated(format!(
+            "{ENVIRONMENT_PROGRAM} launch started without its pipes"
+        )));
+    };
+    let mut answers = BufReader::new(answers);
+    write_line(
+        &mut descriptors,
+        &LaunchPackage {
+            parameters: &manifest.parameters,
+            source: package.join(SOURCE_DIRECTORY),
+            module: &manifest.op,
+            launch,
+            target: target.as_str(),
+        },
+    )?;
+
+    for key in keys {
+        let key = key?;
+        let answer = match manifest.typed_fields(&key) {
+            None => serde_json::to_string(&Undeclared {
+                key: &key,
+                refused: format!(
+                    "{} {} declares no descriptor {key}",
+                    manifest.op, manifest.backend
+                ),
+            })
+            .map_err(std::io::Error::from)?,
+            Some(fields) => {
+                write_line(
+                    &mut descriptors,
+                    &LaunchDescriptor {
+                        descriptor: &key,
+                        fields,
+                    },
+                )?;
+                let mut line = String::new();
+                if answers.read_line(&mut line)? == 0 {
+                    let status = program.wait()?;
+                    return Err(unstated(format!(
+                        "{ENVIRONMENT_PROGRAM} launch ended with {status} before it answered {key}"
+                    )));
+                }
+                line.trim_end().to_owned()
+            }
+        };
+        writeln!(out, "{answer}")?;
+        out.flush()?;
+    }
+
+    // The program ends when its input does.
+    drop(descriptors);
+    let status = program.wait()?;
+    if !status.success() {
+        return Err(unstated(format!(
+            "{ENVIRONMENT_PROGRAM} launch failed with {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Writes `value` to `writer` as one JSON line and flushes it.
+fn write_line(writer: &mut impl Write, value: &impl Serialize) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *writer, value)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
 }
 
 /// Builds the key lists' modules and the named packages' into the store and

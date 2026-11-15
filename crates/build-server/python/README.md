@@ -80,6 +80,14 @@ The Build Server then checks the module its manifest's form requires: a cubin wh
 
 `python -m uniserve_build_server` and `uniserve-build-server` are one program. Outside a build, `uniserve_build_server.triton.stated_for` computes what a Triton package's launch table states for a key, with the typed fields the Build Server's reader gives (`uniserve build-server fields`), for a check that launches a package's kernel on Triton's interpreter.
 
+## A package's launches outside a build
+
+```text
+uniserve build-server launch <package> --target <target> [<key>...]
+```
+
+reads each descriptor key against a Triton package's manifest with the Build Server's reader and prints one JSON line per key: `{"key": ..., "launch": {...}}` with the kernel's name, its signature in parameter order, the compile-time values, the aligned arguments' attributes by name and `triton.compile`'s options, as `uniserve_build_server.triton.stated` states them for a build of that key, or `{"key": ..., "refused": "..."}` with the reason the package states none (a key its dimensions do not declare, or one its table or derivation refuses). Given no key, it reads keys from standard input, one per line, and answers each before it reads the next, so a caller keeps one command per package running and asks it key by key. The command runs this environment's `uniserve-build-server launch`, which imports the package's kernel module once, from the package's source directory by its location; a kernel check launches the named kernel from its own import of the same source (`tests/python/kernels/conftest.py`).
+
 ## Pinned third-party sources
 
 A package that builds against code it does not own names that code by a pin of `uniserve_build_server.fetch` instead of carrying a copy. Every pin is one data file, `src/uniserve_build_server/pins/<name>.toml`: its identity, the sha256 of a manifest listing each file with its own sha256, and its origin. The manifest is published beside the files or kept beside the pin's data file as `<name>.sha256`; every file is verified against it before use and cached content-addressed in the Build Server's cache (`<cache>/<identity>/<path>`), so a cached file is reused offline and one that does not verify is fetched again. A build stages a cached file into its own workspace as a hard link, both being directories of the Build Server's one cache root.

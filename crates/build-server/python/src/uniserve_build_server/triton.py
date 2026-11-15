@@ -25,20 +25,23 @@ fields. This driver is the one implementation of the rest:
   name fixes is attributed as a multiple of sixteen only when that value is.
 
 :func:`stated` gives the compilation a launch table states for one descriptor
-without compiling it, and :func:`stated_for` reads a package's table and a
-descriptor's fields for a check that compares a kernel's arguments.
+without compiling it, and :func:`launches` answers it as JSON for descriptors
+outside a build (``uniserve build-server launch``), which a check that launches
+a package's kernel from its source reads.
 """
 
 from __future__ import annotations
 
 import functools
 import importlib
+import importlib.machinery
+import importlib.util
 import json
 import pathlib
 import subprocess
 import tomllib
 from collections.abc import Mapping
-from typing import Any
+from typing import IO, Any
 
 import triton
 from triton.backends.compiler import GPUTarget
@@ -60,8 +63,8 @@ ELEMENTS = {
     "f8e4m3": "fp8e4nv",
 }
 
-#: The kernel parameter that carries the programmatic dependent launch, and
-#: the descriptor field that asks for it (``crates/build-server/src/launch.rs``).
+#: The kernel parameter that carries the programmatic dependent launch, and the
+#: descriptor field that asks for it (``crates/build-server/src/launch.rs``).
 DEPENDENT_LAUNCH_PARAMETER = "PDL"
 DEPENDENT_LAUNCH_FIELD = "pdl"
 
@@ -85,7 +88,9 @@ def field(fields: Mapping[str, Any], name: str, descriptor: str) -> Any:
     try:
         return fields[name]
     except KeyError:
-        raise SystemExit(f"{descriptor}: the descriptor names no {name}") from None
+        raise SystemExit(
+            f"{descriptor}: the descriptor names no {name}"
+        ) from None
 
 
 def argument_type(
@@ -101,7 +106,9 @@ def argument_type(
     return selected(stated, fields, descriptor)
 
 
-def selected(stated: Mapping[str, Any], fields: Mapping[str, Any], descriptor: str) -> Any:
+def selected(
+    stated: Mapping[str, Any], fields: Mapping[str, Any], descriptor: str
+) -> Any:
     """The value a field's value selects from a table entry's ``values``.
 
     A key of a TOML table is text, so the field's value is looked up as the
@@ -174,9 +181,7 @@ def stated(
         # A derivation is named as the source module reaches it: one of its
         # own functions, or a function of a module it imports, such as the
         # kernel library's (`strided.addressed`).
-        derive = functools.reduce(
-            getattr, launch["derive"].split("."), kernels
-        )
+        derive = functools.reduce(getattr, launch["derive"].split("."), kernels)
         fields.update(derive(fields, parameters, target))
 
     # A table that selects among several kernels states the types and
@@ -229,7 +234,9 @@ def stated(
                 f"no type"
             )
     taken = {
-        parameter.name for candidate in candidates for parameter in candidate.params
+        parameter.name
+        for candidate in candidates
+        for parameter in candidate.params
     }
     unbound = (set(types) | set(constants)) - taken
     if unbound:
@@ -308,6 +315,78 @@ def stated_for(
         manifest.get("parameters", {}),
         target,
     )
+
+
+def launches(requests: IO[str], answers: IO[str]) -> None:
+    """Answer the descriptors ``uniserve build-server launch`` writes.
+
+    The first line of ``requests`` is what every descriptor of one package
+    shares: the manifest's parameters and launch table, the package's source
+    directory and its kernel module's name, and the target's name, whose facts
+    are read from this package's description (:meth:`Target.named`). The
+    kernel module is imported once, from the source directory by its location.
+    Each later line is one descriptor, its key and its typed fields as the
+    Build Server's reader gives them, and is answered by one JSON line of
+    ``answers`` before the next is read: ``{"key": ..., "launch": {...}}`` with
+    what :func:`stated` gives (the kernel named rather than held, since a
+    caller launches it from its own import of the source, and each aligned
+    argument's attributes by its name), or ``{"key": ..., "refused": "..."}``
+    with the reason :func:`stated` refuses the descriptor.
+
+    Raises:
+        SystemExit: When the source directory holds no such module.
+    """
+    package = json.loads(requests.readline())
+    source, name = package["source"], package["module"]
+    spec = importlib.machinery.PathFinder.find_spec(name, [source])
+    if spec is None:
+        raise SystemExit(f"{source} holds no kernel module {name}")
+    kernels = importlib.util.module_from_spec(spec)
+    # A launch is stated for the compiled kernel, whose parameters only a
+    # compiled `@triton.jit` function holds: the module is decorated in
+    # Triton's compiled mode, whichever mode the caller's process runs in (a
+    # kernel check on Triton's interpreter starts this program).
+    triton.knobs.runtime.interpret = False
+    spec.loader.exec_module(kernels)
+    target = Target.named(package["target"])
+
+    while line := requests.readline():
+        descriptor = json.loads(line)
+        key = descriptor["descriptor"]
+        try:
+            compilation = stated(
+                package["launch"],
+                kernels,
+                key,
+                descriptor["fields"],
+                package["parameters"],
+                target,
+            )
+        except SystemExit as refusal:
+            answer = {"key": key, "refused": str(refusal)}
+        else:
+            names = list(compilation["signature"])
+            answer = {
+                "key": key,
+                "launch": {
+                    "kernel": compilation["kernel"].__name__,
+                    "signature": compilation["signature"],
+                    "constexprs": compilation["constexprs"],
+                    # `triton.compile` keys an attribute by the argument's
+                    # position; a description outside the compilation names
+                    # the argument instead.
+                    "attributes": {
+                        names[position]: attributes
+                        for (position,), attributes in compilation[
+                            "attributes"
+                        ].items()
+                    },
+                    "options": compilation["options"],
+                },
+            }
+        # Compact, as the command prints its own refusals.
+        answers.write(json.dumps(answer, separators=(",", ":")) + "\n")
+        answers.flush()
 
 
 def build(request: Request) -> None:
