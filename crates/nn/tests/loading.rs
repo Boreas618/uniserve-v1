@@ -19,6 +19,7 @@ use nn::{
 };
 use nn_testing::{Stored, encode, stored, values, write_checkpoint, write_file};
 use ops::fp4::ScaleLayout;
+use processing::RootFile;
 
 /// The local directory `directory`.
 fn local(directory: &Path) -> Source {
@@ -289,7 +290,7 @@ fn a_pipelines_stages_are_the_components_its_index_declares() {
     write_checkpoint(&root.path().join("extra"), &[&tensors(3.0)]);
 
     let source = local(root.path());
-    let index = PipelineIndex::read(&source).unwrap();
+    let index = PipelineIndex::read(&source, RootFile::ModularIndex).unwrap();
     assert_eq!(index.class(), "Pipeline");
     assert!(index.declares("transformer") && index.declares("scheduler"));
     assert!(!index.declares("tokenizer"), "declared absent");
@@ -308,8 +309,11 @@ fn a_pipelines_stages_are_the_components_its_index_declares() {
     // A declared directory its source does not hold is refused, not skipped.
     let empty = tempfile::tempdir().unwrap();
     assert!(index.directory("scheduler", &local(empty.path())).is_err());
-    let error = PipelineIndex::read(&local(empty.path())).unwrap_err();
-    assert!(error.to_string().contains("model_index.json"), "{error}");
+    let error = PipelineIndex::read(&local(empty.path()), RootFile::ModularIndex).unwrap_err();
+    assert!(
+        error.to_string().contains("modular_model_index.json"),
+        "{error}"
+    );
 }
 
 /// A composed pipeline reads each component's files from the one source it was composed from,
@@ -318,7 +322,7 @@ fn a_pipelines_stages_are_the_components_its_index_declares() {
 fn a_composed_pipeline_reads_each_component_from_its_source() {
     let (export, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     std::fs::write(
-        export.path().join("model_index.json"),
+        export.path().join("modular_model_index.json"),
         r#"{"_class_name": "Pipeline", "transformer": ["diffusers", "Network"],
             "text_encoder": ["transformers", "Encoder"], "scheduler": ["diffusers", "Scheduler"]}"#,
     )
@@ -355,7 +359,7 @@ fn a_composed_pipeline_reads_each_component_from_its_source() {
     write_checkpoint(&base.path().join("text_encoder"), &[&tensors]);
 
     let (export_source, base_source) = (local(export.path()), local(base.path()));
-    let index = PipelineIndex::read(&export_source).unwrap();
+    let index = PipelineIndex::read(&export_source, RootFile::ModularIndex).unwrap();
     let stages = BTreeMap::from([
         (
             "transformer".to_owned(),

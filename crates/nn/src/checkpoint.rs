@@ -948,25 +948,22 @@ struct Component {
 }
 
 impl PipelineIndex {
-    /// The index of the pipeline at `source`: the first of [`processing::PIPELINE_INDEX_FILES`]
-    /// its directory publishes, the files a pipeline declares its class in.
+    /// The index of the pipeline at `source`, read from `file`, the root file its family
+    /// declares its checkpoints name their class in ([`processing::RootFile`]); no other file
+    /// is read in its place.
     ///
     /// # Errors
     ///
-    /// When the directory publishes no index, or the index is not one.
-    pub fn read(source: &Source) -> Result<Self> {
-        for file in processing::PIPELINE_INDEX_FILES {
-            if let Some(value) = source.sidecar(file)? {
-                return Self::parse(&source.directory().join(file), &value);
-            }
+    /// When the directory publishes no such index, or the index is not one.
+    pub fn read(source: &Source, file: processing::RootFile) -> Result<Self> {
+        let name = file.name();
+        match source.sidecar(name)? {
+            Some(value) => Self::parse(&source.directory().join(name), &value),
+            None => Err(Error::Checkpoint {
+                path: source.directory().to_path_buf(),
+                problem: format!("declares no pipeline: it publishes no {name}"),
+            }),
         }
-        Err(Error::Checkpoint {
-            path: source.directory().to_path_buf(),
-            problem: format!(
-                "declares no pipeline: it publishes no {}",
-                processing::PIPELINE_INDEX_FILES.join(" or ")
-            ),
-        })
     }
 
     /// The index `value`, read from the file `path`.

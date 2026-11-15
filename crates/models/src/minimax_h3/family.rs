@@ -232,7 +232,7 @@ pub fn compose(sources: &Sources) -> Result<(Checkpoint, Networks)> {
 
 /// The pipeline index of the checkpoint at `source`, which declares this family's pipeline.
 fn pipeline_index(source: &Source) -> Result<PipelineIndex> {
-    let index = PipelineIndex::read(source)?;
+    let index = PipelineIndex::read(source, FAMILY.request.root)?;
     if index.class() != PIPELINE_CLASS {
         return Err(Error::checkpoint(format!(
             "{} declares a {} pipeline, and this family serves {PIPELINE_CLASS}",

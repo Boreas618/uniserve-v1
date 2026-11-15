@@ -32,7 +32,7 @@ use crate::releases::{FASTH3_4_STEP_NVFP4, MINIMAX_H3};
 fn stage(name: &str) -> Checkpoint {
     let source = MINIMAX_H3.source();
 
-    PipelineIndex::read(&source)
+    PipelineIndex::read(&source, processing::RootFile::ModularIndex)
         .and_then(|index| index.stage(name, &source))
         .unwrap_or_else(|error| panic!("{MINIMAX_H3}: the stage {name}: {error}"))
 }

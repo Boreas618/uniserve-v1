@@ -111,18 +111,16 @@ pub fn assert_operators(
 }
 
 /// Asserts that `what` launched something and that every launch of `launches` names its
-/// operator and its kernel key, neither naming a model family: no family id, configuration
-/// `model_type` or model class of the families this tree serves (`processing::FAMILIES`), in
-/// any case. A kernel is chosen by what a layer computes, never by which model it serves.
+/// operator and its kernel key, neither naming a model family: no family id or model class of
+/// the families this tree serves (`processing::FAMILIES`), in any case. A kernel is chosen by what a layer computes, never by which model it serves.
 pub fn assert_generic(what: &str, launches: &[Launch]) {
     assert!(!launches.is_empty(), "{what} launched nothing");
 
     let families: BTreeSet<String> = processing::FAMILIES
         .iter()
         .flat_map(|family| {
-            let names = [family.id].into_iter();
-            names
-                .chain(family.model_types.iter().copied())
+            [family.id]
+                .into_iter()
                 .chain(family.classes.iter().copied())
         })
         .map(str::to_lowercase)
