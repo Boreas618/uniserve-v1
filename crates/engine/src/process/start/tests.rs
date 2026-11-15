@@ -19,7 +19,6 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::batch::Capacity;
-use crate::batch::product::KINDS;
 use crate::batch::{Phase, Shape, Variant};
 use crate::executor::peers::Liveness;
 use crate::memory::buffers::UNIT_BYTES;
@@ -577,7 +576,8 @@ fn a_meta_start_of_a_model_with_a_vision_tower_encodes_images_beside_its_prefill
         let head = service::lock(engine.head.as_ref().unwrap());
         let (open, _) = head.session().unwrap();
         let class = capacity.cache_groups.len();
-        assert_eq!(usize::from(open.trajectory), class + 1 + KINDS.len());
+        // A text deployment holds no product: the class of stored trajectories follows.
+        assert_eq!(usize::from(open.trajectory), class + 1);
         let outputs = &open.classes[class];
         assert_eq!(outputs.units, 0);
         let (host, _) = outputs.host.unwrap();
@@ -636,6 +636,7 @@ fn capacity(phases: &[Phase], tokens: u32, feature_bytes: u32) -> Capacity {
         encoder_identity: String::new(),
         latent_seed: 0,
         media_bytes: Vec::new(),
+        pipeline: None,
         call_window: 2,
     }
 }

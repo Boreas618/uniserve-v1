@@ -75,14 +75,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::batch::product::{
-    AUDIO_SAMPLES, CONDITION_PIXELS, CONDITION_SAMPLES, ENCODED_UNITS, VIDEO_UNITS, VISION_PIXELS,
-};
 use crate::batch::{
     Batch, BatchId, BatchOutput, CallOutput, CallStatus, ErrorCode, MediaOutput, MediaRow, Phase,
     TimingCounters, Variant,
 };
 use nn::capability::MediaFormat;
+use nn::pipeline::Product;
 use ops::Generation;
 use platform::Stream;
 use storage::runtime::Run;
@@ -130,9 +128,8 @@ pub(crate) struct HostConfig {
     /// The host phases the runner serves, as the scheduler names them in a batch: `MediaRead`,
     /// `VideoEncode`, `AudioEncode` and `Mux`, or some of them.
     pub phases: Vec<Phase>,
-    /// The class of each product kind the runner's phases read or write, by its name in
-    /// `crate::batch::product`.
-    pub classes: Vec<(&'static str, u8)>,
+    /// The class of each product the runner's phases read or write.
+    pub classes: Vec<(Product, u8)>,
     /// Each timeline the deployment serves: its output frames, and the frames each of its media
     /// units keeps, in timeline order (the model's `VideoModel::video_units`).
     pub timelines: Vec<(u32, Vec<u32>)>,
@@ -234,7 +231,7 @@ impl MediaHost {
                 ))
             })?;
             for kind in kinds(phase) {
-                class(&config, kind)?;
+                class(&config, *kind)?;
             }
             buckets.push(Bucket::host(variant));
         }
@@ -475,7 +472,11 @@ impl MediaHost {
                 // rank that decoded them, one after another in timeline order; the units of the
                 // round another process decoded are that process's to encode.
                 let frame = u64::from(height) * u64::from(width) * 3;
-                let decoded = tables.runs(row.slot, class(&self.config, VIDEO_UNITS)?, *frames_at);
+                let decoded = tables.runs(
+                    row.slot,
+                    class(&self.config, Product::VideoUnits)?,
+                    *frames_at,
+                );
                 let here = self.decoded_here(round.clone());
                 let read = here
                     .iter()
@@ -502,7 +503,8 @@ impl MediaHost {
                     .iter()
                     .map(|&unit| {
                         let encoded_at = writes[unit - round.start];
-                        let runs = self.written(tables, row.slot, ENCODED_UNITS, encoded_at)?;
+                        let runs =
+                            self.written(tables, row.slot, Product::EncodedUnits, encoded_at)?;
                         self.spans(&runs, 0, encoded(units, unit..unit + 1, height, width))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -516,7 +518,7 @@ impl MediaHost {
 
                 // The video's duration of the track, which the decoder's window covers; a block
                 // that holds less is read whole, and the track padded with silence.
-                let run = self.read(tables, row.slot, AUDIO_SAMPLES, *samples_at)?;
+                let run = self.read(tables, row.slot, Product::AudioSamples, *samples_at)?;
                 let duration = self.track_samples(row)? as u64 * PCM_SAMPLE;
                 let read = self.span(run, 0, duration.min(u64::from(run.2) * UNIT_BYTES))?;
                 Ok((vec![read], Vec::new()))
@@ -541,7 +543,7 @@ impl MediaHost {
                 let rows = handed
                     .zip(reads)
                     .map(|(unit, &encoded_at)| {
-                        let run = self.read(tables, row.slot, ENCODED_UNITS, encoded_at)?;
+                        let run = self.read(tables, row.slot, Product::EncodedUnits, encoded_at)?;
                         self.span(run, 0, encoded(units, unit..unit + 1, height, width))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -557,15 +559,16 @@ impl MediaHost {
     /// The run a host batch reads the block `slot` holds at `position` of the class of product
     /// `kind` from: the rank's own, or where the rank backs none of the block another rank's of
     /// its process.
-    fn read(&self, tables: &BlockTables, slot: u32, kind: &str, position: u32) -> Result<Run> {
+    fn read(&self, tables: &BlockTables, slot: u32, kind: Product, position: u32) -> Result<Run> {
         let class = class(&self.config, kind)?;
         let own = tables.run(slot, class, position);
 
         own.or_else(|| tables.runs(slot, class, position).first().copied())
             .ok_or_else(|| {
                 Error::Invalid(format!(
-                    "slot {slot} holds no {kind} block at position {position} of class {class} \
-                     on this rank's process"
+                    "slot {slot} holds no {} block at position {position} of class {class} on \
+                     this rank's process",
+                    kind.name()
                 ))
             })
     }
@@ -576,14 +579,15 @@ impl MediaHost {
         &self,
         tables: &BlockTables,
         slot: u32,
-        kind: &str,
+        kind: Product,
         position: u32,
     ) -> Result<Vec<Run>> {
         let class = class(&self.config, kind)?;
         if !tables.writable(slot, class, position) {
             return Err(Error::Invalid(format!(
-                "a host batch writes the {kind} block of slot {slot} at position {position} of \
-                 class {class}, which holds no entry or is read-only"
+                "a host batch writes the {} block of slot {slot} at position {position} of \
+                 class {class}, which holds no entry or is read-only",
+                kind.name()
             )));
         }
 
@@ -978,25 +982,30 @@ const fn variant(phase: Phase) -> Option<Variant> {
     }
 }
 
-/// The product kinds a batch of host phase `phase` may read or write.
-const fn kinds(phase: Phase) -> &'static [&'static str] {
+/// The products a batch of host phase `phase` may read or write: what the host's work of the
+/// phase reads and writes.
+const fn kinds(phase: Phase) -> &'static [Product] {
     match phase {
-        Phase::MediaRead => &[CONDITION_PIXELS, CONDITION_SAMPLES, VISION_PIXELS],
-        Phase::VideoEncode => &[VIDEO_UNITS, ENCODED_UNITS],
-        Phase::AudioEncode => &[AUDIO_SAMPLES],
-        Phase::Mux => &[ENCODED_UNITS],
+        Phase::MediaRead => &[
+            Product::ConditionPixels,
+            Product::ConditionSamples,
+            Product::VisionPixels,
+        ],
+        Phase::VideoEncode => &[Product::VideoUnits, Product::EncodedUnits],
+        Phase::AudioEncode => &[Product::AudioSamples],
+        Phase::Mux => &[Product::EncodedUnits],
         _ => &[],
     }
 }
 
 /// The class of product `kind` in `config`.
-fn class(config: &HostConfig, kind: &str) -> Result<u8> {
+fn class(config: &HostConfig, kind: Product) -> Result<u8> {
     config
         .classes
         .iter()
-        .find(|(name, _)| *name == kind)
+        .find(|(product, _)| *product == kind)
         .map(|(_, class)| *class)
-        .ok_or_else(|| Error::Invalid(format!("the media host states no class of {kind}")))
+        .ok_or_else(|| Error::Invalid(format!("the media host states no class of {}", kind.name())))
 }
 
 /// The frames `units` keep together.
@@ -1191,7 +1200,7 @@ fn conditions_of(row: &MediaRow) -> Result<proto::video::Conditions> {
 fn extents(
     conditioning: &proto::video::Conditions,
     format: &MediaFormat,
-) -> Result<Vec<(&'static str, u64)>> {
+) -> Result<Vec<(Product, u64)>> {
     let row = patch_row(format)?;
     let (mut pixels, mut samples, mut patches) = (0, 0, 0);
 
@@ -1206,9 +1215,9 @@ fn extents(
     }
 
     Ok([
-        (CONDITION_PIXELS, pixels),
-        (CONDITION_SAMPLES, samples),
-        (VISION_PIXELS, patches),
+        (Product::ConditionPixels, pixels),
+        (Product::ConditionSamples, samples),
+        (Product::VisionPixels, patches),
     ]
     .into_iter()
     .filter(|(_, bytes)| *bytes > 0)
@@ -1365,7 +1374,7 @@ fn read_conditions(
 
     // The regions the encoders read, each as many bytes as its product's block holds of it.
     let extents = extents(conditioning, format)?;
-    let region = |kind: &str| -> Result<Vec<u8>> {
+    let region = |kind: Product| -> Result<Vec<u8>> {
         let bytes = extents
             .iter()
             .find(|(name, _)| *name == kind)
@@ -1373,9 +1382,9 @@ fn read_conditions(
         Ok(vec![0_u8; host_bytes(bytes)?])
     };
     let (mut pixels, mut samples, mut patches) = (
-        region(CONDITION_PIXELS)?,
-        region(CONDITION_SAMPLES)?,
-        region(VISION_PIXELS)?,
+        region(Product::ConditionPixels)?,
+        region(Product::ConditionSamples)?,
+        region(Product::VisionPixels)?,
     );
     let patch_row = host_bytes(patch_row(format)?)?;
 
@@ -1500,13 +1509,13 @@ mod tests {
     /// The classes of the product kinds, and the positions of the request's video units, encoded
     /// units (one block per unit) and audio samples in its product table: those of a request of
     /// two units without conditions.
-    const CLASSES: [(&str, u8); 6] = [
-        (CONDITION_PIXELS, 5),
-        (CONDITION_SAMPLES, 6),
-        (VISION_PIXELS, 7),
-        (VIDEO_UNITS, 8),
-        (ENCODED_UNITS, 9),
-        (AUDIO_SAMPLES, 10),
+    const CLASSES: [(Product, u8); 6] = [
+        (Product::ConditionPixels, 5),
+        (Product::ConditionSamples, 6),
+        (Product::VisionPixels, 7),
+        (Product::VideoUnits, 8),
+        (Product::EncodedUnits, 9),
+        (Product::AudioSamples, 10),
     ];
     const VIDEO_AT: u32 = 3;
     const ENCODED_AT: [u32; 2] = [6, 7];
@@ -1680,10 +1689,10 @@ mod tests {
         let mut first = 0;
         let [video, encoded, audio] = blocks();
         for ((kind, at), units) in [
-            ((VIDEO_UNITS, VIDEO_AT), video),
-            ((ENCODED_UNITS, ENCODED_AT[0]), encoded),
-            ((ENCODED_UNITS, ENCODED_AT[1]), encoded),
-            ((AUDIO_SAMPLES, AUDIO_AT), audio),
+            ((Product::VideoUnits, VIDEO_AT), video),
+            ((Product::EncodedUnits, ENCODED_AT[0]), encoded),
+            ((Product::EncodedUnits, ENCODED_AT[1]), encoded),
+            ((Product::AudioSamples, AUDIO_AT), audio),
         ] {
             let allocate = Request::Allocate {
                 owner: OWNER,

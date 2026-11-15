@@ -10,21 +10,62 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use strum::{EnumIter, IntoEnumIterator as _};
+
 use super::{BlockConfig, DeviceKind, RankDevice};
 
 /// The block used when a deployment does not partition a model by capability.
 pub const DEFAULT_BLOCK: &str = "model";
 
-/// The block that decodes video latents into frames. Each member rank decodes
-/// the temporal units dealt to it, one per round, so the block is always
-/// distributed by temporal units and a deployment names no distribution for
-/// it.
-pub const VIDEO_DECODER_BLOCK: &str = "video_decoder";
+/// A block of the engine's own host work on a media group's ranks, beside the parts of the
+/// pipeline the model family declares (`nn::pipeline::Pipeline::blocks`): the main process
+/// reads a video request's condition media, encodes its decoded media and assembles its
+/// artifact on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
+pub enum HostBlock {
+    /// Reads a request's condition media into its condition products, on one rank.
+    MediaReader,
+    /// Encodes each decoded media unit on the host that decoded it, one unit per rank of a
+    /// round.
+    VideoCodec,
+    /// Encodes the soundtrack and assembles the encoded units into the artifact, on one rank.
+    Muxer,
+}
 
-/// The host block that encodes decoded frames, one codec slot per member rank.
-/// It is always distributed by temporal units, one unit per rank, and a
-/// deployment names no distribution for it.
-pub const VIDEO_CODEC_BLOCK: &str = "video_codec";
+impl HostBlock {
+    /// The block's name in a deployment file.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MediaReader => "media_reader",
+            Self::VideoCodec => "video_codec",
+            Self::Muxer => "muxer",
+        }
+    }
+
+    /// The host block a deployment names `name`; `None` for any other block.
+    pub fn of(name: &str) -> Option<Self> {
+        Self::iter().find(|block| block.name() == name)
+    }
+
+    /// The phases of a video request the block's ranks serve.
+    pub const fn phases(self) -> &'static [crate::module::Phase] {
+        use crate::module::Phase;
+        match self {
+            Self::MediaReader => &[Phase::MediaRead],
+            Self::VideoCodec => &[Phase::VideoEncode],
+            Self::Muxer => &[Phase::AudioEncode, Phase::Mux],
+        }
+    }
+
+    /// How the block's work divides over its ranks: the reader and the muxer each serve on one
+    /// rank, a group of one; the codec encodes each unit of a round on the rank that decoded it.
+    pub const fn partition(self) -> super::Partition {
+        match self {
+            Self::MediaReader | Self::Muxer => super::Partition::Group,
+            Self::VideoCodec => super::Partition::Units { carries: false },
+        }
+    }
+}
 
 /// Stable identity of one explicitly configured physical worker pool.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -204,19 +245,7 @@ impl WorkerGroupConfig {
         );
         let per_replica = ranks.len() / self.replicas;
         let mut blocks = self.blocks.clone();
-        for (name, block) in &mut blocks {
-            // The video decoder and codec run one local copy per member rank and take one
-            // independent media unit per rank per round, the only layout a rank accepts for them.
-            if [VIDEO_DECODER_BLOCK, VIDEO_CODEC_BLOCK].contains(&name.as_str()) {
-                anyhow::ensure!(
-                    block.units_per_rank == 1,
-                    "block {name}: {name} takes one media unit per rank, not {}",
-                    block.units_per_rank
-                );
-                block
-                    .distribution
-                    .get_or_insert(super::BlockDistribution::TemporalUnits);
-            }
+        for block in blocks.values_mut() {
             if block.ranks.is_empty() {
                 block.ranks = (0..per_replica).collect();
             }
@@ -902,11 +931,11 @@ mod tests {
         );
     }
 
-    /// The video decoder and codec are temporal-unit blocks whether or
-    /// not the file says so, and no other unit count is a layout they
-    /// have.
+    /// A block of several ranks is a model-parallel group of its degrees or states its
+    /// distribution, whatever its name: the expansion supplies no distribution, which the
+    /// block's owner declares and the engine checks.
     #[test]
-    fn the_video_decoder_and_codec_take_one_unit_per_rank() {
+    fn a_block_of_units_states_its_distribution() {
         let decoder = |table: &str| {
             workers(&format!(
                 "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-1\"]\nqueue_depth = 2\n\
@@ -914,14 +943,25 @@ mod tests {
             ))
         };
 
-        let omitted = decoder("").unwrap();
+        assert!(decoder("").is_err());
         let stated = decoder("distribution = \"temporal_units\"").unwrap();
-        assert_eq!(omitted, stated);
         assert_eq!(
-            omitted[0].blocks["video_decoder"].distribution,
+            stated[0].blocks["video_decoder"].distribution,
             Some(BlockDistribution::TemporalUnits)
         );
-        assert!(decoder("units_per_rank = 2").is_err());
+    }
+
+    /// A host block is known by its name, with the phases it serves and its partition.
+    #[test]
+    fn a_host_block_is_known_by_its_name() {
+        use crate::module::Phase;
+        assert_eq!(HostBlock::of("video_codec"), Some(HostBlock::VideoCodec));
+        assert_eq!(HostBlock::of("video_decoder"), None);
+        assert_eq!(HostBlock::Muxer.phases(), [Phase::AudioEncode, Phase::Mux]);
+        assert_eq!(
+            HostBlock::VideoCodec.partition(),
+            super::super::Partition::Units { carries: false }
+        );
     }
 
     #[test]

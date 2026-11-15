@@ -12,8 +12,7 @@ use crate::batch::cache::CacheGroupKind;
 use crate::batch::{Phase, Shape, Variant};
 use crossbeam_channel::{Receiver, Sender};
 use proto::config::{
-    BlockConfig, SchedulerConfig, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK, WorkerGroupConfig,
-    WorkerRank,
+    BlockConfig, BlockDistribution, HostBlock, SchedulerConfig, WorkerGroupConfig, WorkerRank,
 };
 use proto::request::wire::WeightsInFlight;
 use proto::request::{GenerationLimits, GenerationRequest};
@@ -231,6 +230,7 @@ pub(crate) fn capacity() -> Capacity {
         encoder_identity: String::new(),
         latent_seed: 0,
         media_bytes: Vec::new(),
+        pipeline: None,
         call_window: 2,
     }
 }
@@ -1029,23 +1029,30 @@ fn the_startup_checks_refuse_a_deployment_its_workers_cannot_serve() {
     // Group A decodes one unit per round on its one rank, which lies on `localhost`; group B's
     // codec encodes it on its one rank, on `elsewhere` and then on `localhost`.
     let with = |mut config: WorkerGroupConfig, block: &str, host: &str| {
-        config
-            .blocks
-            .insert(block.to_owned(), BlockConfig::parallel(vec![0]));
+        let units = BlockConfig {
+            distribution: Some(BlockDistribution::TemporalUnits),
+            ..BlockConfig::parallel(vec![0])
+        };
+        config.blocks.insert(block.to_owned(), units);
         config.ranks = vec![WorkerRank {
             host: host.to_owned(),
             device: "cpu".parse().unwrap(),
         }];
         config
     };
+    // Both groups serve parts of MiniMax-H3's pipeline, whose video decoder block they place.
+    let media = |phase: Phase| Capacity {
+        pipeline: Some(models::minimax_h3::family::pipeline()),
+        ..serving(phase)
+    };
     let decoder = (
-        with(a, VIDEO_DECODER_BLOCK, "localhost"),
-        serving(Phase::VideoDecode),
+        with(a, "video_decoder", "localhost"),
+        media(Phase::VideoDecode),
     );
     let encoder = |host| {
         (
-            with(b.clone(), VIDEO_CODEC_BLOCK, host),
-            serving(Phase::VideoEncode),
+            with(b.clone(), HostBlock::VideoCodec.name(), host),
+            media(Phase::VideoEncode),
         )
     };
     let crossing = vec![decoder.clone(), encoder("elsewhere")];

@@ -61,7 +61,6 @@ pub(crate) mod rank;
 use std::sync::{Arc, Barrier, Mutex, OnceLock, Weak};
 
 use crate::batch::Capacity;
-use crate::batch::product;
 use crate::batch::{Batch, Phase};
 use crate::executor::Route;
 use crate::executor::peers::Remote;
@@ -106,8 +105,8 @@ use crate::process::ranks::rank::text::{
     Keys, encoder_class, encodes, feature_tensors, keys, profile, vision_runner,
 };
 use crate::process::ranks::rank::video::{
-    DenoiserGroups, MediaRank, VideoRank, boxed, group_phases, held_kinds, latent_pages,
-    product_classes, product_kind, product_ranks, served_phases, slot_pages,
+    Classes, DenoiserGroups, MediaRank, VideoRank, boxed, group_phases, held_kinds, latent_pages,
+    product_ranks, served_phases, slot_pages,
 };
 use crate::process::start::standby;
 
@@ -870,27 +869,51 @@ fn load_video_rank(
     backing: Backing<'_>,
 ) -> Result<LoadedRank> {
     // Step 3: the parallel groups' communicators, opened before any device measurement because
-    // NCCL keeps device buffers. Every rank forms the six kinds, in this order.
-    let [tensor, ulysses, gather, network, layers, decoder] = model_runner.media_collectives()?;
+    // NCCL keeps device buffers. Every rank forms every kind the pipeline's blocks declare, in
+    // their order, and takes its own groups by the phases their blocks serve: the tensor axis of
+    // the block that encodes prompts, every axis of the block that denoises, and the carries of
+    // the block that decodes video.
+    let pipeline = model_runner.pipeline()?;
+    let serves = |block: &str, phase: Phase| {
+        pipeline
+            .block(block)
+            .is_some_and(|declared| declared.phases.contains(&phase))
+    };
     let communicates = client.is_some();
-    let meet = |kind: usize| meets.get(kind).cloned().flatten();
-    let tensor = group_over(&host, device, &tensor, communicates, meet(0))
-        .context("forming the text encoder's tensor group")?;
+    let mut tensor = None;
     let mut denoiser: DenoiserGroups = Default::default();
-    for (axis, (collective, what)) in [
-        (ulysses, "Ulysses"),
-        (gather, "all-gather"),
-        (network, "tensor"),
-        (layers, "layer"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        denoiser[axis] = group_over(&host, device, &collective, communicates, meet(1 + axis))
-            .with_context(|| format!("forming the denoiser's {what} group"))?;
+    let mut decoder = None;
+    for (kind, formed) in model_runner.media_collectives()?.iter().enumerate() {
+        let what = || {
+            format!(
+                "forming block {}'s group along {:?}",
+                formed.block, formed.axis
+            )
+        };
+        match formed.axis {
+            Some(axis) => {
+                let meet = meets.get(kind).cloned().flatten();
+                let group = group_over(&host, device, &formed.collective, communicates, meet)
+                    .with_context(what)?;
+                if serves(&formed.block, Phase::Denoise) && group.is_some() {
+                    denoiser[axis] = group;
+                } else if serves(&formed.block, Phase::TextEncode)
+                    && axis == nn::family::TENSOR_AXIS
+                    && group.is_some()
+                {
+                    tensor = group;
+                }
+            }
+            None => {
+                let communicator =
+                    communicator_over(&host, device, &formed.collective, communicates)
+                        .with_context(what)?;
+                if serves(&formed.block, Phase::VideoDecode) && communicator.is_some() {
+                    decoder = communicator;
+                }
+            }
+        }
     }
-    let decoder = communicator_over(&host, device, &decoder, communicates)
-        .context("forming the video decoder ranks' communicator")?;
 
     // Steps 4-8: the meta load and the runners' profile run.
     let meta = model_runner
@@ -1056,8 +1079,9 @@ fn meetings(model_runners: &[ModelRunner]) -> Result<Vec<Vec<Option<Meet>>>> {
 ///
 /// - for a text rank, its worker group when it is a pipeline's (`ModelRunner::parallel_groups`),
 ///   whose stages are ranks of one process (`ModelRunner::placed`);
-/// - for a media rank, its text encoder's tensor group and its denoiser's group along each axis
-///   of its partition, in the order of `ModelRunner::media_collectives`.
+/// - for a media rank, its group of every kind the pipeline's blocks form along an axis of
+///   their partitions, in the order of `ModelRunner::media_collectives`; a carry communicator
+///   meets no one.
 ///
 /// `None` for a kind the rank is in no group of, or whose group does not meet.
 ///
@@ -1066,10 +1090,16 @@ fn meetings(model_runners: &[ModelRunner]) -> Result<Vec<Vec<Option<Meet>>>> {
 /// A deployment whose groups the rank cannot place itself in.
 fn meeting_groups(model_runner: &ModelRunner) -> Result<Vec<Option<usize>>> {
     if model_runner.is_video() {
-        let [tensor, ulysses, gather, network, layers, _] = model_runner.media_collectives()?;
-        return Ok([tensor, ulysses, gather, network, layers]
-            .map(|collective| collective.member.map(|(group, _)| group))
-            .to_vec());
+        return Ok(model_runner
+            .media_collectives()?
+            .into_iter()
+            .map(|formed| {
+                formed
+                    .axis
+                    .and(formed.collective.member)
+                    .map(|(group, _)| group)
+            })
+            .collect());
     }
 
     let pipeline = match model_runner.pipeline_stages() > 1 {
@@ -1355,10 +1385,10 @@ pub(crate) fn layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> 
 ///   slot of each such group, and as many again for requests that resume.
 /// - **Classes**, in the numbering the worker uses: cache group `g` is class `g` (the state
 ///   group's of one unit of the state region, every other's of its pages' units of the KV
-///   region), then the class of encoder outputs when a group encodes images, sized per request, with its host copies in
-///   the host region of encoder outputs; then one class per product kind in the order of the
-///   product classes (`crate::batch::product::KINDS`), then the class of stored trajectories. A
-///   text deployment holds no product and no trajectory: those classes name no region.
+///   region), then the class of encoder outputs when a group encodes images, sized per
+///   request, with its host copies in the host region of encoder outputs; then the class of
+///   stored trajectories, which every session states. A text deployment holds no product (no
+///   pipeline declares any) and stores no trajectory: that class names no region.
 /// - **Groups**, numbered for the session ([`group_numbers`]), each with its memory, its slot
 ///   region, per class its device regions, and per class with a host region the host parts its
 ///   ranks copy with: part `i` on the host of its rank `i` for a cache group's pages, of which
@@ -1598,7 +1628,7 @@ pub fn text_layout(
                 }
                 parts.push(hosts);
             }
-            parts.extend((0..=product::KINDS.len()).map(|_| Vec::new()));
+            parts.push(Vec::new());
 
             // Every cache group's class takes its blocks from the KV region but the state group's,
             // which takes them from the state region.
@@ -1632,7 +1662,7 @@ pub fn text_layout(
                 };
                 per_class.push(outputs);
             }
-            per_class.extend((0..=product::KINDS.len()).map(|_| Vec::new()));
+            per_class.push(Vec::new());
             stated.push(Group {
                 id: *id,
                 memory: memory(group),
@@ -1645,10 +1675,8 @@ pub fn text_layout(
     }
 
     // Class `g` is cache group `g`; then the encoder outputs of a deployment that encodes
-    // images; then the product kinds and the stored trajectories, which a text deployment sizes
-    // per request and holds none of.
-    let kinds = product::KINDS.len();
-    let mut classes: Vec<Class> = Vec::with_capacity(cache.groups.len() + kinds + 2);
+    // images; then the stored trajectories, which a text deployment holds none of.
+    let mut classes: Vec<Class> = Vec::with_capacity(cache.groups.len() + 2);
     for (index, (group, host)) in cache.groups.iter().zip(&host_regions).enumerate() {
         let (tensors, encoding) = host::class_digests(cache, index, ranks_per_unit)?;
         classes.push(Class {
@@ -1672,16 +1700,16 @@ pub fn text_layout(
             source: None,
         });
     }
-    // A text deployment keeps no product on the host, so no host copy of these classes is
-    // written or compared: they state no tensors and no encoding.
-    classes.extend((0..=kinds).map(|_| Class {
+    // A text deployment stores no trajectory, so no host copy of its class is written or
+    // compared: it states no tensors and no encoding.
+    classes.push(Class {
         units: 0,
         host: None,
         state_in_slot: false,
         tensors: [0; 32],
         encoding: [0; 32],
         source: None,
-    }));
+    });
     let trajectory =
         u8::try_from(classes.len() - 1).context("more classes than a session numbers")?;
 
@@ -1718,7 +1746,7 @@ pub fn text_layout(
 ///   backs or receives ([`held_kinds`]) at the largest size the denoising group states, a slot's
 ///   units whole granules of the devices ([`slot_units`]); then the region of its slot rows, a
 ///   unit the trajectory row of each of its denoising ranks.
-/// - **Classes.** One per product kind in `crate::batch::product::KINDS` order, sized per request:
+/// - **Classes.** One per product of the pipeline, in its order, sized per request:
 ///   the conditioning with its host copies in the host encoder region and the digests its encoding
 ///   states, the others with none; then the class of stored trajectories, with its host copies in
 ///   the host latent region and the digests the denoiser states (`trajectory_digests`).
@@ -1754,11 +1782,14 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
 
     // The sizes the group that denoises states, and the digests of the classes with host copies.
     let (sizer, sizing) = sizing(ranks)?;
+    let pipeline = sizer.pipeline()?;
     let (tensors, encoding, pages) = sizing
         .trajectory
         .context("a denoising rank states its trajectory class")?;
-    let conditioning = product_kind(product::CONDITIONING)?;
-    let request_units = request_units(sizing)?;
+    let conditioning = pipeline
+        .kind(nn::pipeline::Product::Conditioning)
+        .context("the pipeline holds no conditioning")?;
+    let request_units = request_units(pipeline, sizing);
 
     // The serving groups by their index in the deployment, each with the phases its ranks serve.
     let mut listed: Vec<(GroupId, usize)> = Vec::new();
@@ -1769,7 +1800,10 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
             .context("a listed group is numbered")?;
         listed.push((*id, index));
     }
-    let phases: Vec<Vec<Phase>> = groups.iter().map(group_phases).collect();
+    let phases: Vec<Vec<Phase>> = groups
+        .iter()
+        .map(|group| group_phases(pipeline, group))
+        .collect::<Result<_>>()?;
     let serves = |index: usize, phase: Phase| phases[index].contains(&phase);
     // The request slots of the group at `index`, as the ranks of every host agreed them
     // ([`fit_media_slots`]).
@@ -1850,7 +1884,7 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
     };
 
     // Where each group's blocks of each product kind lie and where it receives them, by rank.
-    let places = product_ranks(groups, config.parallel.data_parallel_size.get())?;
+    let places = product_ranks(pipeline, groups, config.parallel.data_parallel_size.get())?;
 
     // Per group, the product buffer of each rank, each in its host's memory, then its slot rows.
     let mut buffers: Vec<Vec<u8>> = vec![Vec::new(); groups.len()];
@@ -1884,9 +1918,12 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
         // rows are memory of the ranks' own processes. Every denoising rank of the deployment
         // holds the whole samples of the largest request it serves in a row
         // (`DenoiserRunner::row_bytes`), so the sizing rank's row is each one's.
-        let holders = (0..group.ranks.len())
-            .filter(|position| served_phases(group, *position).contains(&Phase::Denoise))
-            .count() as u64;
+        let mut holders = 0_u64;
+        for position in 0..group.ranks.len() {
+            if served_phases(pipeline, group, position)?.contains(&Phase::Denoise) {
+                holders += 1;
+            }
+        }
         let row = if holders > 0 { sizing.row } else { 0 };
         let row = row.next_multiple_of(UNIT_BYTES).max(1);
         let name = format!("slots {} {}", session_engine(launch), id.0);
@@ -1906,8 +1943,8 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
     }
 
     // The product classes and the class of stored trajectories.
-    let mut classes: Vec<Class> = Vec::with_capacity(product::KINDS.len() + 1);
-    for kind in 0..product::KINDS.len() {
+    let mut classes: Vec<Class> = Vec::with_capacity(pipeline.products.len() + 1);
+    for kind in 0..pipeline.products.len() {
         let stated = (kind == conditioning)
             .then_some(conditioning_digests)
             .zip(encoders_region);
@@ -1938,8 +1975,13 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
     for (&(id, index), slot_region) in listed.iter().zip(&slot_regions) {
         let group = &groups[index];
         let host = |position: usize| group.ranks[position].host.clone();
-        let encoder = (0..group.ranks.len())
-            .find(|at| served_phases(group, *at).contains(&Phase::TextEncode));
+        let mut encoder = None;
+        for at in 0..group.ranks.len() {
+            if served_phases(pipeline, group, at)?.contains(&Phase::TextEncode) {
+                encoder = Some(at);
+                break;
+            }
+        }
 
         // A group's memory is where its cached blocks lie, which its loads and clones fill: the
         // process of its first text encoder rank, which holds its conditioning, or of its first
@@ -1967,7 +2009,7 @@ fn media_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
         if latents_region.is_some() {
             for position in 0..group.ranks.len() {
                 let part = (host(position), 0);
-                let denoises = served_phases(group, position).contains(&Phase::Denoise);
+                let denoises = served_phases(pipeline, group, position)?.contains(&Phase::Denoise);
                 if denoises && !parts[usize::from(trajectory)].contains(&part) {
                     parts[usize::from(trajectory)].push(part);
                 }
@@ -2018,8 +2060,8 @@ fn sizing(ranks: &[LoadedRank]) -> Result<(&ModelRunner, &VideoRank)> {
         )
 }
 
-/// The bytes of the largest block of product kind `kind` (an index into
-/// `crate::batch::product::KINDS`) that the denoising rank `sizing` states.
+/// The bytes of the largest block of product kind `kind` (an index into the pipeline's
+/// products) that the denoising rank `sizing` states.
 fn largest_block(sizing: &VideoRank, kind: usize) -> u64 {
     sizing
         .capacity
@@ -2030,34 +2072,28 @@ fn largest_block(sizing: &VideoRank, kind: usize) -> u64 {
         .unwrap_or(0)
 }
 
-/// The product buffer units one request's blocks of each kind take, in
-/// `crate::batch::product::KINDS` order, at the sizes the denoising rank `sizing` states: a block
-/// at the largest size, as many blocks as the request declares (one splice tail and one encoded
-/// unit per unit of the longest timeline).
-///
-/// # Errors
-///
-/// A session that numbers no splice tail or encoded units kind.
-fn request_units(sizing: &VideoRank) -> Result<Vec<u64>> {
-    let per_unit = [
-        product_kind(product::VIDEO_TAIL)?,
-        product_kind(product::ENCODED_UNITS)?,
-    ];
-    Ok((0..product::KINDS.len())
-        .map(|kind| {
-            let blocks = if per_unit.contains(&kind) {
-                u64::from(sizing.units)
-            } else {
-                1
+/// The product buffer units one request's blocks of each kind of `pipeline` take, in the order
+/// of its products, at the sizes the denoising rank `sizing` states: a block at the largest size,
+/// as many blocks as the request declares (one per unit of the longest timeline for a product of
+/// units, `nn::pipeline::Extent::Unit`).
+fn request_units(pipeline: &nn::pipeline::Pipeline, sizing: &VideoRank) -> Vec<u64> {
+    pipeline
+        .products
+        .iter()
+        .enumerate()
+        .map(|(kind, spec)| {
+            let blocks = match spec.extent {
+                nn::pipeline::Extent::Unit => u64::from(sizing.units),
+                nn::pipeline::Extent::Request => 1,
             };
             largest_block(sizing, kind).div_ceil(UNIT_BYTES).max(1) * blocks
         })
-        .collect())
+        .collect()
 }
 
 /// The units of a rank's product buffer that one request slot's part takes, for a rank that
-/// holds the blocks of the product kinds `held` ([`held_kinds`], indices into
-/// `crate::batch::product::KINDS`): the units one request's blocks take of each
+/// holds the blocks of the product kinds `held` ([`held_kinds`], indices into the pipeline's
+/// products): the units one request's blocks take of each
 /// ([`request_units`], `request_units` in that order), in whole allocation granules of `granule`
 /// bytes (`BufferMemory::slot_units`); 0 for a rank that holds no kind.
 fn slot_units(request_units: &[u64], held: &[usize], granule: u64) -> u64 {
@@ -2120,8 +2156,10 @@ pub(crate) fn fit_media_slots(
     let stated = u32::try_from(config.max_running_requests.get())
         .context("more request slots than the protocol addresses")?;
     let groups = &config.parallel.worker_groups;
-    let request_units = request_units(sizing(ranks)?.1)?;
-    let places = product_ranks(groups, config.parallel.data_parallel_size.get())?;
+    let (sizer, sized) = sizing(ranks)?;
+    let pipeline = sizer.pipeline()?;
+    let request_units = request_units(pipeline, sized);
+    let places = product_ranks(pipeline, groups, config.parallel.data_parallel_size.get())?;
 
     // Each rank's group, by its index in the deployment.
     let indices = ranks
@@ -2359,9 +2397,10 @@ pub(crate) fn kept_regions(
     let groups = &config.parallel.worker_groups;
     let (numbers, _) = group_numbers(groups, config.parallel.data_parallel_size.get())?;
     let firsts = WorkerGroupConfig::first_ranks(groups);
-    let (_, sizing) = sizing(ranks)?;
-    let request_units = request_units(sizing)?;
-    let places = product_ranks(groups, config.parallel.data_parallel_size.get())?;
+    let (sizer, sizing) = sizing(ranks)?;
+    let pipeline = sizer.pipeline()?;
+    let request_units = request_units(pipeline, sizing);
+    let places = product_ranks(pipeline, groups, config.parallel.data_parallel_size.get())?;
     let region_of = |name: &str| -> Result<usize> {
         layout
             .regions
@@ -3208,8 +3247,8 @@ fn open_media_memory(
     // The host regions the session states, and those the rank copies to: the encoder outputs'
     // when its product buffer holds its group's conditioning, the stored trajectories' when it
     // denoises.
-    let classes = product_classes(0);
-    let conditioning = usize::from(classes[product_kind(product::CONDITIONING)?]);
+    let classes = Classes::new(model_runner.pipeline()?, 0);
+    let conditioning = usize::from(classes.of(nn::pipeline::Product::Conditioning)?);
     let holds_conditioning = group.regions.get(conditioning) == Some(&vec![products]);
     let encoders = layout.classes[conditioning].host.map(|(region, _)| region);
     let latents = layout.classes[usize::from(layout.trajectory)]
@@ -3352,7 +3391,7 @@ fn open_media_runners(
     let Loaded::Video(video) = loaded else {
         bail!("a text rank builds no media runner");
     };
-    let classes = product_classes(0);
+    let classes = Classes::new(model_runner.pipeline()?, 0);
     let model = Arc::clone(&video.model);
     let stream =
         || Stream::new(device).with_context(|| format!("creating device {}'s stream", device.0));
@@ -3363,7 +3402,7 @@ fn open_media_runners(
             &memory,
             |_, inputs| Ok((Graphs::meta(Arc::clone(kernels), inputs), None)),
             (None, Default::default(), None),
-            (&video.laid, &classes),
+            (&video.laid, classes),
         )?),
         Some(pool) => {
             let mut pool = service::lock(pool);
@@ -3398,7 +3437,7 @@ fn open_media_runners(
                         video.denoiser.clone(),
                         video.decoder.take(),
                     ),
-                    (&video.laid, &classes),
+                    (&video.laid, classes),
                 )?
             };
             let runners = boxed(typed);
@@ -3426,7 +3465,7 @@ fn open_media_runners(
         streams.push(("copy", copies.clone()));
     }
     if let Some(media) =
-        model_runner.media_host(model.as_ref(), (&memory, copies), host, kernels, &classes)?
+        model_runner.media_host(model.as_ref(), (&memory, copies), host, kernels, classes)?
     {
         serving.push(Box::new(media));
     }

@@ -3319,6 +3319,7 @@ dependencies = [
  "service",
  "sha2",
  "storage",
+ "strum",
  "thiserror 2.0.18",
  "toml",
 ]
@@ -4419,6 +4420,7 @@ dependencies = [
  "libc",
  "media",
  "models",
+ "nn",
  "ops",
  "platform",
  "proto",

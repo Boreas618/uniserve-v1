@@ -17,9 +17,10 @@
 //! denoising step's latent layout is the video vocabulary's (`proto::video::Layout`).
 //!
 //! [`Capacity`] is what a worker group's workers serve, stated once they are ready, with the cache
-//! groups it names ([`cache`]); [`product`] holds the products' names and order a request's
-//! phases write and read, [`philox`] the counter-based draws a sampled row's random value comes
-//! from, and [`media`] the generated media a batch's output names by a shared-memory handle.
+//! groups it names ([`cache`]) and a media group's pipeline, whose products a request's phases
+//! write and read (`nn::pipeline`); [`philox`] holds the counter-based draws a sampled row's
+//! random value comes from, and [`media`] the generated media a batch's output names by a
+//! shared-memory handle.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -81,7 +82,6 @@ pub mod cache;
 pub mod capacity;
 pub(crate) mod media;
 pub mod philox;
-pub mod product;
 
 pub use capacity::Capacity;
 

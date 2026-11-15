@@ -65,6 +65,11 @@ pub struct Capacity {
     /// Per captured media shape of a group that denoises: the bytes of a slot's trajectory, and
     /// of each product kind's block in the order of the product classes.
     pub media_bytes: Vec<(Shape, u64, Vec<u64>)>,
+    /// The media pipeline the group's ranks serve a part of, as the model family declares it
+    /// (`nn::pipeline`): the phases a video request offers, its products in the order of their
+    /// classes and the blocks a deployment places. `None` for a group of a text deployment.
+    /// Every group of a media deployment states the same.
+    pub pipeline: Option<nn::pipeline::Pipeline>,
     /// The calls of one request the group holds unresolved at once: the bound on a request's
     /// pipelined decodes, `min(queue_depth * calls, max(queue_depth, 2))` for batches of up to
     /// `calls` calls (`crate::memory::division::call_window`).

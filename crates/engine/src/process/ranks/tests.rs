@@ -34,12 +34,32 @@ use storage::{Interest, QueuePair};
 use super::{
     Backing, Loaded, LoadedRank, Meeting, bind, capacities, layout, load_ranks, open_ranks, spawn,
 };
-use crate::batch::product::KINDS;
 use crate::memory::client::StorageClient;
 use crate::process::ranks::rank::ModelRunner;
 use crate::process::ranks::rank::text::Keys;
+use crate::process::ranks::rank::video::MediaCollective;
 use testkit::LONG;
 use testkit::serving::{DEPLOYMENT, SLOTS, StorageServer, launch};
+use nn::pipeline::{Pipeline, Product};
+
+/// The pipeline of the media cases: MiniMax-H3's, as its family declares it.
+fn pipeline() -> Pipeline {
+    models::minimax_h3::family::pipeline()
+}
+
+/// The collective groups of `block` along `axis` (`None`: its carry communicator) among the kinds
+/// a media rank forms.
+fn formed<'a>(
+    collectives: &'a [MediaCollective],
+    block: &str,
+    axis: Option<usize>,
+) -> &'a super::rank::Collective {
+    &collectives
+        .iter()
+        .find(|kind| kind.block == block && kind.axis == axis)
+        .unwrap_or_else(|| panic!("no collective of block {block} along {axis:?}"))
+        .collective
+}
 
 /// Submits `request` under `number` on the scheduler's end `pair` and returns its completion, the
 /// next to arrive, waiting on the end's doorbell for the buffer pool's records.
@@ -395,9 +415,9 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     let media_bytes = video.capacity.media_bytes.clone();
     assert!(!media_bytes.is_empty());
     assert!(
-        media_bytes
-            .iter()
-            .all(|(_, trajectory, bytes)| bytes.len() == KINDS.len() && *trajectory > 0)
+        media_bytes.iter().all(
+            |(_, trajectory, bytes)| bytes.len() == pipeline().products.len() && *trajectory > 0
+        )
     );
 
     // The session: the host regions of encoder outputs and stored trajectories, the rank's
@@ -437,19 +457,19 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     assert_eq!(slot_rows.part_bytes, video.row.next_multiple_of(UNIT_BYTES));
     assert_eq!(open.regions.len(), 4);
 
-    assert_eq!(open.classes.len(), KINDS.len() + 1);
-    assert_eq!(usize::from(open.trajectory), KINDS.len());
-    for (kind, class) in open.classes[..KINDS.len()].iter().enumerate() {
-        let name = KINDS[kind].0;
+    assert_eq!(open.classes.len(), pipeline().products.len() + 1);
+    assert_eq!(usize::from(open.trajectory), pipeline().products.len());
+    for (kind, class) in open.classes[..pipeline().products.len()].iter().enumerate() {
+        let name = pipeline().products[kind].product.name();
         assert_eq!(class.units, 0, "{name}");
-        let conditioning = name == crate::batch::product::CONDITIONING;
+        let conditioning = name == Product::Conditioning.name();
         assert_eq!(
             class.host,
             conditioning.then_some((encoders_index, 0)),
             "{name}"
         );
     }
-    let trajectory = &open.classes[KINDS.len()];
+    let trajectory = &open.classes[pipeline().products.len()];
     assert_eq!(trajectory.host, Some((latents_index, 0)));
     assert_eq!(
         (trajectory.tensors, trajectory.encoding),
@@ -461,11 +481,11 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     let group = &open.groups[0];
     assert_eq!(group.slots, slots_index);
     assert_eq!(group.regions.len(), open.classes.len());
-    for regions in &group.regions[..KINDS.len()] {
+    for regions in &group.regions[..pipeline().products.len()] {
         assert_eq!(*regions, vec![products_index]);
     }
-    assert!(group.regions[KINDS.len()].is_empty());
-    let request_units: u64 = (0..KINDS.len())
+    assert!(group.regions[pipeline().products.len()].is_empty());
+    let request_units: u64 = (0..pipeline().products.len())
         .map(|kind| {
             let largest = media_bytes.iter().map(|(_, _, bytes)| bytes[kind]).max();
             largest.unwrap().div_ceil(UNIT_BYTES).max(1)
@@ -505,9 +525,7 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
         panic!("the owner is attached: {attached:?}");
     };
     succeeded(workers.map(GroupId(0), slot, RequestId(1), attach, attached));
-    let latents =
-        u8::try_from(crate::batch::product::kind(crate::batch::product::VIDEO_LATENTS).unwrap())
-            .unwrap();
+    let latents = u8::try_from(pipeline().kind(Product::VideoLatents).unwrap()).unwrap();
     let allocate = Request::Allocate {
         owner: OwnerId(1),
         class: latents,
@@ -686,7 +704,9 @@ fn a_parallel_group_takes_its_block_s_ranks_in_their_stated_order() {
     let runners = ModelRunner::of(&launch, family).unwrap().ranks().unwrap();
     assert_eq!(runners.len(), 4);
     for runner in &runners {
-        let [_, sequence, _, _, _, decoder] = runner.media_collectives().unwrap();
+        let collectives = runner.media_collectives().unwrap();
+        let sequence = formed(&collectives, "transformer", Some(nn::family::ULYSSES_AXIS));
+        let decoder = formed(&collectives, "video_decoder", None);
         assert_eq!(sequence.groups, [vec![3, 1, 2, 0]]);
         let place = [3, 1, 2, 0]
             .iter()
@@ -743,7 +763,9 @@ fn a_denoiser_block_forms_a_group_along_each_axis_of_its_partition() {
             projection_rows: None,
         },
     );
-    for (rank, [_, ulysses, gather, tensor, layers, _]) in &mixed {
+    for (rank, collectives) in &mixed {
+        let [ulysses, gather, tensor, layers] =
+            [0, 1, 2, 3].map(|axis| formed(collectives, "transformer", Some(axis)));
         assert_eq!(ulysses.groups, [vec![3, 1], vec![2, 0]]);
         assert_eq!(tensor.groups, [vec![3, 2], vec![1, 0]]);
         assert!(gather.groups.is_empty() && layers.groups.is_empty());
@@ -765,7 +787,9 @@ fn a_denoiser_block_forms_a_group_along_each_axis_of_its_partition() {
             allgather_degree: 2,
         },
     );
-    for (_, [_, ulysses, gather, tensor, _, _]) in &hybrid {
+    for (_, collectives) in &hybrid {
+        let [ulysses, gather, tensor] =
+            [0, 1, 2].map(|axis| formed(collectives, "transformer", Some(axis)));
         assert_eq!(ulysses.groups, [vec![3, 1], vec![2, 0]]);
         assert_eq!(gather.groups, [vec![3, 2], vec![1, 0]]);
         assert!(tensor.groups.is_empty());
@@ -810,7 +834,7 @@ fn every_denoising_rank_encodes_the_conditions_of_its_requests() {
     )
     .unwrap();
 
-    let pixels = crate::batch::product::kind(crate::batch::product::CONDITION_PIXELS).unwrap();
+    let pixels = pipeline().kind(Product::ConditionPixels).unwrap();
     for rank in &ranks {
         let video = rank.video().unwrap();
         let largest = video
@@ -957,10 +981,11 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
     };
     let (text_buffer, flow_buffer) = (region("products 1 0"), region("products 1 1"));
     let (text, flow) = (&open.groups[0], &open.groups[1]);
-    for (kind, (name, ..)) in KINDS.iter().enumerate() {
-        let (texts, flows) = match *name {
-            crate::batch::product::CONDITIONING => (vec![text_buffer], vec![text_buffer]),
-            crate::batch::product::VISION_PIXELS => (vec![flow_buffer], vec![flow_buffer]),
+    for (kind, spec) in pipeline().products.iter().enumerate() {
+        let name = spec.product.name();
+        let (texts, flows) = match spec.product {
+            Product::Conditioning => (vec![text_buffer], vec![text_buffer]),
+            Product::VisionPixels => (vec![flow_buffer], vec![flow_buffer]),
             _ => (Vec::new(), vec![flow_buffer]),
         };
         assert_eq!(text.regions[kind], texts, "{name} on the text group");
@@ -1000,7 +1025,7 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
         succeeded(workers.map(group, slot, RequestId(number), attach, attached));
         slots.push(slot);
     }
-    let conditioning = crate::batch::product::kind(crate::batch::product::CONDITIONING).unwrap();
+    let conditioning = pipeline().kind(Product::Conditioning).unwrap();
     let allocate = Request::Allocate {
         owner: OwnerId(1),
         class: u8::try_from(conditioning).unwrap(),
@@ -1096,7 +1121,7 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
     }
 
     // The conditioning lies with text rank 0 alone, where every flow replica reads it.
-    let conditioning = crate::batch::product::kind(crate::batch::product::CONDITIONING).unwrap();
+    let conditioning = pipeline().kind(Product::Conditioning).unwrap();
     let text_buffer = region("products 1 0");
     for group in &open.groups {
         assert_eq!(group.regions[conditioning], vec![text_buffer]);
@@ -1273,8 +1298,8 @@ fn a_two_host_media_session_states_both_hosts_replicas_when_none_passes_a_produc
     }
 
     // Groups text-0, text-1, flow-0 and flow-1, in that order.
-    let conditioning = crate::batch::product::kind(crate::batch::product::CONDITIONING).unwrap();
-    let vision = crate::batch::product::kind(crate::batch::product::VISION_PIXELS).unwrap();
+    let conditioning = pipeline().kind(Product::Conditioning).unwrap();
+    let vision = pipeline().kind(Product::VisionPixels).unwrap();
     let groups = &open.groups;
     assert_eq!(groups[2].regions[conditioning], buffers(0..1));
     assert_eq!(groups[3].regions[conditioning], buffers(4..5));
@@ -1309,11 +1334,6 @@ fn minimax_h3() -> PathBuf {
 /// its own host. Each product buffer lies in its host's memory. The conditioning's host copies
 /// lie in part 0 on rank 0's host, and a saved trajectory's in part 0 on each host.
 fn a_ulysses8_two_host_layout_receives_what_crosses(placed: Layout, wide: bool) {
-    use crate::batch::product::{
-        AUDIO_LATENTS, AUDIO_SAMPLES, CONDITION_PIXELS, CONDITION_SAMPLES, CONDITIONING,
-        ENCODED_UNITS, VIDEO_LATENTS, VIDEO_TAIL, VIDEO_UNITS, VISION_PIXELS, kind,
-    };
-
     let (launch, ranks) = two_host_ranks(placed, &minimax_h3());
     let held: Vec<u32> = ranks.iter().map(|rank| rank.model_runner.rank()).collect();
     assert_eq!(held, [0, 1, 2, 3, 8, 9]);
@@ -1356,34 +1376,41 @@ fn a_ulysses8_two_host_layout_receives_what_crosses(placed: Layout, wide: bool) 
     }
 
     // Where the model group finds each product, and what rank 4 receives.
-    let at = |name: &str| kind(name).unwrap();
+    let at = |product: Product| pipeline().kind(product).unwrap();
     let crossing = vec![region(4)];
     let vision = if wide { crossing.clone() } else { Vec::new() };
     for (name, lies, received) in [
-        (CONDITION_PIXELS, vec![region(9)], crossing.clone()),
-        (CONDITION_SAMPLES, vec![region(9)], crossing.clone()),
-        (VISION_PIXELS, vec![region(9)], vision),
-        (CONDITIONING, vec![region(0)], crossing.clone()),
-        (VIDEO_LATENTS, buffers(0..8), Vec::new()),
-        (AUDIO_LATENTS, buffers(0..8), Vec::new()),
-        (VIDEO_UNITS, buffers(0..8), Vec::new()),
-        (VIDEO_TAIL, buffers(0..8), Vec::new()),
-        (ENCODED_UNITS, buffers(0..8), Vec::new()),
-        (AUDIO_SAMPLES, buffers(0..8), Vec::new()),
+        (Product::ConditionPixels, vec![region(9)], crossing.clone()),
+        (Product::ConditionSamples, vec![region(9)], crossing.clone()),
+        (Product::VisionPixels, vec![region(9)], vision),
+        (Product::Conditioning, vec![region(0)], crossing.clone()),
+        (Product::VideoLatents, buffers(0..8), Vec::new()),
+        (Product::AudioLatents, buffers(0..8), Vec::new()),
+        (Product::VideoUnits, buffers(0..8), Vec::new()),
+        (Product::VideoTail, buffers(0..8), Vec::new()),
+        (Product::EncodedUnits, buffers(0..8), Vec::new()),
+        (Product::AudioSamples, buffers(0..8), Vec::new()),
     ] {
-        assert_eq!(model.regions[at(name)], lies, "{name} on the model group");
+        let label = name.name();
+        assert_eq!(model.regions[at(name)], lies, "{label} on the model group");
         assert_eq!(
             model.receives[at(name)],
             received,
-            "{name} on the model group"
+            "{label} on the model group"
         );
     }
 
     // The muxer reads the encoded units and the track on its own host; the reader writes the
     // condition media in its rank's buffer.
-    for (index, (name, ..)) in KINDS.iter().enumerate() {
-        let muxed = [ENCODED_UNITS, AUDIO_SAMPLES].contains(name);
-        let read = [CONDITION_PIXELS, CONDITION_SAMPLES, VISION_PIXELS].contains(name);
+    for (index, spec) in pipeline().products.iter().enumerate() {
+        let name = spec.product.name();
+        let muxed = [Product::EncodedUnits, Product::AudioSamples].contains(&spec.product);
+        let read = [
+            Product::ConditionPixels,
+            Product::ConditionSamples,
+            Product::VisionPixels,
+        ]
+        .contains(&spec.product);
         let muxes = if muxed { buffers(0..4) } else { Vec::new() };
         let reads = if read { vec![region(9)] } else { Vec::new() };
         assert_eq!(muxer.regions[index], muxes, "{name} on the muxer");
@@ -1398,7 +1425,7 @@ fn a_ulysses8_two_host_layout_receives_what_crosses(placed: Layout, wide: bool) 
     // Host parts: the conditioning's where rank 0 stores it, a trajectory's on both hosts.
     let trajectory = usize::from(open.trajectory);
     let part = |host: &str| (host.to_owned(), 0);
-    assert_eq!(model.parts[at(CONDITIONING)], vec![part("rank-0")]);
+    assert_eq!(model.parts[at(Product::Conditioning)], vec![part("rank-0")]);
     assert_eq!(
         model.parts[trajectory],
         vec![part("rank-0"), part("rank-1")]

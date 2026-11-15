@@ -133,6 +133,58 @@ pub enum BlockDistribution {
     TemporalUnits,
 }
 
+/// How a block's work divides over the ranks a deployment places it on, as the block's owner
+/// declares it: a model family for each part of its pipeline (`nn::pipeline::Block`), the
+/// engine for its host work ([`super::HostBlock`]). It states the forms of [`BlockConfig`] the
+/// block admits ([`Partition::admits`]) and the collective groups its ranks form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Partition {
+    /// One model-parallel group of the block's tensor, sequence and pipeline degrees over its
+    /// ranks; each axis of more than one rank forms a collective group. It takes no
+    /// distribution.
+    Group,
+    /// An independent local copy on every rank, each dealt one unit of every round in rank order:
+    /// a distribution of temporal units, one unit per rank. With `carries`, each unit hands the
+    /// unit after it a carry (a video decoder's splice tail), which crosses between the ranks of
+    /// consecutive units over a communicator of the block's ranks.
+    Units {
+        /// Whether consecutive units pass a carry between the block's ranks.
+        carries: bool,
+    },
+    /// One unit of work per request, computed on the block's first rank.
+    First,
+    /// No work of its own: what the ranks that serve the phase compute with (a condition encoder
+    /// a latent preparation runs), held by those ranks wherever the deployment places the block.
+    With(crate::module::Phase),
+}
+
+impl Partition {
+    /// Checks that `block` states a form this partition admits: a group takes no distribution,
+    /// and a block of units takes the temporal-unit distribution with one unit per rank.
+    ///
+    /// # Errors
+    ///
+    /// [`BlockConfigError`] naming the form the partition requires.
+    pub fn admits(self, block: &BlockConfig) -> Result<(), BlockConfigError> {
+        match self {
+            Self::Group if block.distribution.is_some() => Err(BlockConfigError(
+                "the block runs as one model-parallel group and takes no distribution",
+            )),
+            Self::Units { .. }
+                if block.distribution != Some(BlockDistribution::TemporalUnits)
+                    || block.units_per_rank != 1 =>
+            {
+                Err(BlockConfigError(
+                    "the block deals one temporal unit per rank: distribution = \"temporal_units\" \
+                     and units_per_rank = 1",
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Where a block keeps its weights while it serves.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -297,6 +349,30 @@ mod tests {
         let mut distributed = BlockConfig::parallel(vec![0, 1, 2, 3]);
         distributed.distribution = Some(BlockDistribution::TemporalUnits);
         assert!(distributed.publishes_on_every_rank());
+    }
+
+    /// A block states a form its owner's partition admits: a group no distribution, units
+    /// the temporal-unit distribution at one unit per rank, and the other partitions either.
+    #[test]
+    fn a_partition_admits_the_forms_it_declares() {
+        let mut distributed = BlockConfig::parallel(vec![0, 1]);
+        distributed.distribution = Some(BlockDistribution::TemporalUnits);
+        let mut doubled = distributed.clone();
+        doubled.units_per_rank = 2;
+        let grouped = BlockConfig::parallel(vec![0]);
+
+        assert!(Partition::Group.admits(&grouped).is_ok());
+        assert!(Partition::Group.admits(&distributed).is_err());
+        let units = Partition::Units { carries: true };
+        assert!(units.admits(&distributed).is_ok());
+        assert!(units.admits(&doubled).is_err());
+        assert!(units.admits(&grouped).is_err());
+        for open in [
+            Partition::First,
+            Partition::With(crate::module::Phase::LatentPrepare),
+        ] {
+            assert!(open.admits(&grouped).is_ok() && open.admits(&distributed).is_ok());
+        }
     }
 
     #[test]

@@ -77,6 +77,7 @@ use crate::batch::{
 };
 use ::storage::manifest::{Encoding, Field, Logical, Segment, Span, StorageLayout};
 use ::storage::runtime;
+use nn::pipeline::Product;
 use nn::{ConditionPiece, ConditionRole, ConditionShape, Conditioning, Denoiser};
 use nn::{LatentShape, MediaInput, Step, VideoRequest};
 use platform::{Event, EventFlags, PitchedBatch, SourceOrder, Stream};
@@ -99,21 +100,16 @@ use crate::worker::{Error, Result};
 /// form `nn::MediaFormat` states for the encoders the conditioner runs.
 pub(crate) const CONDITION_MEDIA: DType = DType::F32;
 
-/// The products a call reads and writes, as indices into [`DenoiserConfig::classes`].
-const CONDITIONING: usize = 0;
-const PIXELS: usize = 1;
-const SAMPLES: usize = 2;
-const VIDEO: usize = 3;
-const AUDIO: usize = 4;
-
-/// The products' names, in the order of [`DenoiserConfig::classes`].
-const NAMES: [&str; 5] = [
-    "conditioning",
-    "condition pixels",
-    "condition samples",
-    "video latents",
-    "audio latents",
+/// The products a latent preparation reads, in the order the denoiser takes them
+/// (`nn::Denoiser::prepare_latents`).
+const READS: [Product; 3] = [
+    Product::Conditioning,
+    Product::ConditionPixels,
+    Product::ConditionSamples,
 ];
+
+/// The products the last step writes, the latents the decoders read.
+const WRITES: [Product; 2] = [Product::VideoLatents, Product::AudioLatents];
 
 /// A served bucket: the step's bucket, its layout, the candidate it is captured from, and the
 /// condition sets a request of it may open with.
@@ -152,10 +148,9 @@ pub(crate) struct DenoiserConfig {
     pub sample: DType,
     /// The width of the conditioning rows the text encoder writes (`VideoModel::text_width`).
     pub width: u32,
-    /// The classes of the products: the conditioning, the condition pixels and the condition
-    /// samples a preparation reads, then the video latents and the audio latents the last step
-    /// writes.
-    pub classes: [u8; 5],
+    /// The session's class of each product the runner reads and writes
+    /// ([`DenoiserRunner::PRODUCTS`]).
+    pub classes: Vec<(Product, u8)>,
     /// The ranks of the denoising group, each holding the whole samples of its requests.
     pub ranks: u32,
     /// The bytes of a unit of a part of the host latent region (`BankPages::page_bytes`).
@@ -198,6 +193,10 @@ pub(crate) struct DenoiserRunner {
 }
 
 impl DenoiserRunner {
+    /// The products the runner reads and writes, whose classes its config states: what a latent
+    /// preparation reads, then what the last step writes.
+    pub(crate) const PRODUCTS: [Product; 5] = [READS[0], READS[1], READS[2], WRITES[0], WRITES[1]];
+
     /// A runner of `model` under `config`, over `memory`, whose trajectory rows are
     /// [`DenoiserRunner::row_bytes`] long.
     ///
@@ -429,6 +428,24 @@ impl DenoiserRunner {
         Ok((Bucket { variant, ..bucket }, row))
     }
 
+    /// The session's class of `product`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a product the config states no class of.
+    fn class(&self, product: Product) -> Result<u8> {
+        self.config
+            .classes
+            .iter()
+            .find_map(|&(held, class)| (held == product).then_some(class))
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "the denoiser states no class of {}",
+                    product.name()
+                ))
+            })
+    }
+
     /// The position of each product of `wanted` among `results`, by the class whose entry the
     /// tables hold at each position.
     fn named<const N: usize>(
@@ -436,15 +453,15 @@ impl DenoiserRunner {
         tables: &BlockTables,
         row: &MediaRow,
         results: &[u32],
-        wanted: [usize; N],
+        wanted: [Product; N],
     ) -> Result<[Option<u32>; N]> {
         let mut found = [None; N];
         for &position in results {
-            let held = |kind: usize| {
-                let class = self.config.classes[kind];
-                !tables.runs(row.slot, class, position).is_empty()
+            let held = |product: Product| {
+                self.class(product)
+                    .is_ok_and(|class| !tables.runs(row.slot, class, position).is_empty())
             };
-            let index = wanted.iter().position(|&kind| held(kind)).ok_or_else(|| {
+            let index = wanted.iter().position(|&product| held(product)).ok_or_else(|| {
                 Error::Invalid(format!(
                     "request {} names result {position}, which the call neither reads nor writes",
                     row.request.0
@@ -474,7 +491,7 @@ impl DenoiserRunner {
             )));
         }
 
-        let read = self.named(tables, row, &row.results, [CONDITIONING, PIXELS, SAMPLES])?;
+        let read = self.named(tables, row, &row.results, READS)?;
         let pieces = self.model.condition_pieces(&request)?;
         let total = |extent: fn(&ConditionPiece) -> Option<&nn::Shape>| -> usize {
             pieces
@@ -483,24 +500,33 @@ impl DenoiserRunner {
                 .map(nn::Shape::elem_count)
                 .sum()
         };
-        let lent = |kind: usize, shape: &[usize], dtype: DType| -> Result<Tensor> {
-            let position =
-                read[kind].ok_or_else(|| refused(format!("names no {} block", NAMES[kind])))?;
-            let entry = (row.slot, self.config.classes[kind], position);
+        let lent = |product: Product, shape: &[usize], dtype: DType| -> Result<Tensor> {
+            let position = READS
+                .iter()
+                .position(|read| *read == product)
+                .and_then(|at| read[at])
+                .ok_or_else(|| refused(format!("names no {} block", product.name())))?;
+            let entry = (row.slot, self.class(product)?, position);
 
             self.memory.lend(tables, entry, false, 0, shape, dtype)
         };
         // A condition medium is read only by a request whose pieces hold some of it.
-        let media = |kind: usize, total: usize| match total {
+        let media = |product: Product, total: usize| match total {
             0 => Ok(None),
-            total => lent(kind, &[total], CONDITION_MEDIA).map(Some),
+            total => lent(product, &[total], CONDITION_MEDIA).map(Some),
         };
 
         let prompt = [request.text_tokens as usize, self.config.width as usize];
         let products = [
-            Some(lent(CONDITIONING, &prompt, self.config.stack)?),
-            media(PIXELS, total(|piece| piece.pixels.as_ref()))?,
-            media(SAMPLES, total(|piece| piece.track.as_ref()))?,
+            Some(lent(Product::Conditioning, &prompt, self.config.stack)?),
+            media(
+                Product::ConditionPixels,
+                total(|piece| piece.pixels.as_ref()),
+            )?,
+            media(
+                Product::ConditionSamples,
+                total(|piece| piece.track.as_ref()),
+            )?,
         ];
         Ok((row.clone(), request, pieces, products))
     }
@@ -669,14 +695,16 @@ impl DenoiserRunner {
         }
         let mut written = Vec::new();
         if last {
-            let named = self.named(tables, row, writes, [VIDEO, AUDIO])?;
-            for (kind, (offset, bytes)) in [(VIDEO, video), (AUDIO, audio)] {
+            let named = self.named(tables, row, writes, WRITES)?;
+            for ((product, (offset, bytes)), position) in
+                WRITES.into_iter().zip([video, audio]).zip(named)
+            {
                 // A layout without a track writes nothing into an audio latents block.
                 if bytes == 0 {
                     continue;
                 }
-                let position = named[kind - VIDEO].ok_or_else(|| refused("names no latents"))?;
-                let class = self.config.classes[kind];
+                let position = position.ok_or_else(|| refused("names no latents"))?;
+                let class = self.class(product)?;
                 let entry = (row.slot, class, position);
                 let block =
                     self.memory

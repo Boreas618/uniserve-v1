@@ -26,6 +26,7 @@ use nn::family::{
     ConditionBounds, Description, Family, Model, Stage, Stages, VideoCheckpoint, VideoFamily,
     VideoModel, VideoPlacement, VideoServing,
 };
+use nn::pipeline::{Block, Extent, Phase, Pipeline, Product, ProductSpec};
 use nn::{
     Checkpoint, ConditionRole, ConditionShape, DType, Decoder, Encoder, MediaFormat, Splicer,
     VideoRequest, WeightLoader,
@@ -34,7 +35,7 @@ use processing::minimax_h3::{
     CANVAS_RULE, ConditionPacking, DenoiserInfo, MIN_SECONDS, PreparedCondition, REFERENCE_LIMITS,
     ReferenceLimits, ServedCanvas, named_canvases,
 };
-use proto::config::Quantization;
+use proto::config::{Partition, Quantization};
 
 use crate::minimax_h3::audio_vae::{AudioDecoder, AudioEncoder};
 use crate::minimax_h3::config::{
@@ -126,14 +127,8 @@ impl VideoFamily for MinimaxH3Family {
 }
 
 impl VideoCheckpoint for Config {
-    fn denoisers(&self) -> &'static [&'static str] {
-        // The two networks a release holds, of which a deployment places one.
-        const NAMES: [&str; 2] = [Stage::Transformer.name(), Stage::TransformerRef.name()];
-        &NAMES
-    }
-
-    fn text_encoder(&self) -> &'static str {
-        Stage::TextEncoder.name()
+    fn pipeline(&self) -> Pipeline {
+        pipeline()
     }
 
     fn load(
@@ -145,6 +140,82 @@ impl VideoCheckpoint for Config {
         Ok(Arc::new(MinimaxH3::load(
             self, checkpoint, loader, placement,
         )?))
+    }
+}
+
+/// MiniMax-H3's pipeline: a conditioned request reads its media, its prompt is encoded with
+/// the vision features of its conditions, its latents are prepared (encoding its condition
+/// latents) and denoised one step per call, its video is decoded in rounds of media units
+/// spliced onto each other and its soundtrack once, each decoded round and the track are
+/// encoded, and the encoded rounds are muxed into the artifact. After denoising, completed
+/// decodes are encoded before further decodes are asked for.
+///
+/// The release holds two networks that denoise (the base and the reference-conditioned
+/// one), of which a deployment places one; the condition encoders are what a latent
+/// preparation computes with, held by the denoising ranks; the audio decoder decodes a
+/// request's track whole, on its block's first rank.
+pub fn pipeline() -> Pipeline {
+    use Extent::{Request, Unit};
+    use Phase::{
+        AudioDecode, AudioEncode, Denoise, LatentPrepare, MediaRead, Mux, TextEncode, VideoDecode,
+        VideoEncode,
+    };
+
+    let product = |product, writer, reader, extent| ProductSpec {
+        product,
+        writer,
+        reader,
+        extent,
+    };
+    let block = |stage: Stage, phases: &[Phase], partition| Block {
+        name: stage.name().to_owned(),
+        phases: phases.to_vec(),
+        partition,
+    };
+    Pipeline {
+        phases: vec![
+            MediaRead,
+            TextEncode,
+            LatentPrepare,
+            Denoise,
+            VideoEncode,
+            AudioEncode,
+            VideoDecode,
+            AudioDecode,
+            Mux,
+        ],
+        products: vec![
+            product(Product::ConditionPixels, MediaRead, LatentPrepare, Request),
+            product(Product::ConditionSamples, MediaRead, LatentPrepare, Request),
+            product(Product::VisionPixels, MediaRead, TextEncode, Request),
+            product(Product::Conditioning, TextEncode, LatentPrepare, Request),
+            product(Product::VideoLatents, Denoise, VideoDecode, Request),
+            product(Product::AudioLatents, Denoise, AudioDecode, Request),
+            product(Product::VideoUnits, VideoDecode, VideoEncode, Request),
+            product(Product::VideoTail, VideoDecode, VideoDecode, Unit),
+            product(Product::EncodedUnits, VideoEncode, Mux, Unit),
+            product(Product::AudioSamples, AudioDecode, AudioEncode, Request),
+        ],
+        blocks: vec![
+            block(Stage::TextEncoder, &[TextEncode], Partition::Group),
+            block(
+                Stage::Transformer,
+                &[LatentPrepare, Denoise],
+                Partition::Group,
+            ),
+            block(
+                Stage::TransformerRef,
+                &[LatentPrepare, Denoise],
+                Partition::Group,
+            ),
+            block(
+                Stage::VideoDecoder,
+                &[VideoDecode],
+                Partition::Units { carries: true },
+            ),
+            block(Stage::AudioDecoder, &[AudioDecode], Partition::First),
+            block(Stage::LatentEncoder, &[], Partition::With(LatentPrepare)),
+        ],
     }
 }
 
@@ -1154,6 +1225,16 @@ mod tests {
             text_capacities: vec![2048],
             condition_rows: None,
         }
+    }
+
+    /// The pipeline execution runs is one it can run: its products' phases and its blocks'
+    /// phases are phases of it, and each product and block is declared once.
+    #[test]
+    fn the_pipeline_is_a_declaration_execution_runs() {
+        let pipeline = pipeline();
+        pipeline.check().unwrap();
+        assert_eq!(pipeline.serving(Phase::Denoise).count(), 2);
+        assert_eq!(pipeline.kind(Product::EncodedUnits), Some(8));
     }
 
     /// A deployment that places the whole pipeline serves what the checkpoint states when that

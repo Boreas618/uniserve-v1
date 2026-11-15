@@ -17,10 +17,12 @@
 //! its groups.
 //!
 //! Every product is a block of the buffer pool: one per declared result, allocated at admission
-//! for the owner on the group whose phase writes it, in the class of its product kind
-//! ([`PRODUCTS`]). A request's declared results list each kind's results together, in kind order,
-//! and a result's position in the request's product table is its index in that list; a media row
-//! names the results its call reads and writes by these positions ([`Request::results`]).
+//! for the owner on the group whose phase writes it, in the class of its product kind (the
+//! products the model family's pipeline declares, `nn::pipeline::Pipeline::products`, which the
+//! groups state, [`pipeline`]). A request's declared results list each kind's results together,
+//! in kind order, and a result's position in the request's product table is its index in that
+//! list; a media row names the results its call reads and writes by these positions
+//! ([`Request::results`]).
 //!
 //! The conditioning is the request's encoder output (SD §3.3, §4.3): keyed by what its text
 //! encoder reads (its prompt and the conditions its vision blocks present) and the encoder's
@@ -31,11 +33,9 @@
 use std::iter;
 use std::ops::Range;
 
-use crate::batch::product;
 use crate::batch::{Extent, Phase, Shape};
-use crate::process::ranks::rank::video::served_phases;
 use crate::runner::decoder::RoundConfig;
-use proto::config::VIDEO_DECODER_BLOCK;
+use nn::pipeline::{Extent as Blocks, Pipeline, Product, ProductSpec};
 use proto::request::{ConditionExtent, DiffusionRequest, Event, MigrationCause, RequestId};
 use storage::Key;
 use storage::key::latent_content;
@@ -44,35 +44,21 @@ use storage::runtime::{self, Cause, Completion, GroupId, OwnerId};
 use super::update::migratable;
 use super::{Request, RequestStatus, Scheduler, WorkerGroup};
 
-/// The media phases of a video request, in the order a request offers the ones that are ready:
-/// the first is its next phase, which the policy reads. After denoising, completed decodes are
-/// encoded before further decodes are asked for (`S/execution/media.rs:380-410`).
-pub(super) const VIDEO_PHASES: [Phase; 9] = [
-    Phase::MediaRead,
-    Phase::TextEncode,
-    Phase::LatentPrepare,
-    Phase::Denoise,
-    Phase::VideoEncode,
-    Phase::AudioEncode,
-    Phase::VideoDecode,
-    Phase::AudioDecode,
-    Phase::Mux,
-];
+/// The media pipeline the groups serve parts of, as their ranks state it
+/// (`Capacity::pipeline`; every group of a media deployment states the same, which the scheduler
+/// checks as it starts): the phases a video request offers, its products in the order of their
+/// classes and the blocks the deployment places. `None` for a text deployment.
+pub(super) fn pipeline(groups: &[WorkerGroup]) -> Option<&Pipeline> {
+    groups
+        .iter()
+        .find_map(|group| group.capacity.pipeline.as_ref())
+}
 
-/// The product kinds, in the order of the product classes, each with the phase whose calls write
-/// it: the one list of `crate::batch::product::KINDS`, which the ranks read too. The class of kind
-/// `k` is the `k`-th of the `PRODUCTS.len()` classes just before the class of stored trajectories,
-/// and `Capacity::media_bytes` states the bytes of a block of each kind in this order.
-pub(super) const PRODUCTS: [(&str, Phase); 10] = {
-    let mut kinds = [(product::KINDS[0].0, product::KINDS[0].1); product::KINDS.len()];
-    let mut kind = 0;
-    while kind < kinds.len() {
-        let (name, writer, _) = product::KINDS[kind];
-        kinds[kind] = (name, writer);
-        kind += 1;
-    }
-    kinds
-};
+/// The products of the groups' pipeline, in the order of their classes; none for a text
+/// deployment.
+pub(super) fn products(groups: &[WorkerGroup]) -> &[ProductSpec] {
+    pipeline(groups).map_or(&[], |pipeline| pipeline.products.as_slice())
+}
 
 /// A video request's calls, products and trajectory.
 impl Request {
@@ -255,47 +241,47 @@ impl Request {
         call: u32,
         groups: &[WorkerGroup],
     ) -> (Vec<u32>, u32) {
-        use crate::batch::product::*;
-
         let last = call.saturating_add(1) == self.video_needed(phase, groups);
-        let rounds = self.video_needed(Phase::VideoEncode, groups);
-        let (reads, writes): (&[&str], &[&str]) = match phase {
-            Phase::MediaRead => (&[], &[CONDITION_PIXELS, CONDITION_SAMPLES, VISION_PIXELS]),
-            Phase::TextEncode => (&[VISION_PIXELS], &[CONDITIONING]),
-            Phase::LatentPrepare => (&[CONDITIONING, CONDITION_PIXELS, CONDITION_SAMPLES], &[]),
-            Phase::Denoise if last => (&[], &[VIDEO_LATENTS, AUDIO_LATENTS]),
-            Phase::VideoDecode => (&[VIDEO_LATENTS], &[VIDEO_UNITS]),
-            Phase::AudioDecode => (&[AUDIO_LATENTS], &[AUDIO_SAMPLES]),
-            Phase::VideoEncode => (&[VIDEO_UNITS], &[]),
-            Phase::AudioEncode => (&[AUDIO_SAMPLES], &[]),
-            _ => (&[], &[]),
-        };
-
-        // A product the request does not declare is neither read nor written.
-        let declared = |names: &[&str]| -> Vec<u32> {
-            names
-                .iter()
-                .filter_map(|name| self.result(name, 0))
-                .collect()
-        };
-        let (mut reads, mut writes) = (declared(reads), declared(writes));
-        let encoded = |units: Range<u32>| -> Vec<u32> {
-            units
-                .filter_map(|unit| self.result(ENCODED_UNITS, unit))
-                .collect()
-        };
-        match phase {
-            Phase::VideoDecode => {
-                let units = self.round_units(phase, call, groups);
-                let before = units.start.checked_sub(1);
-                reads.extend(before.and_then(|unit| self.result(VIDEO_TAIL, unit)));
-                writes.extend(units.filter_map(|unit| self.result(VIDEO_TAIL, unit)));
+        let (mut reads, mut writes) = (Vec::new(), Vec::new());
+        for spec in products(groups) {
+            let product = spec.product;
+            match spec.extent {
+                // A product of one block per request: its reading phase reads it, and its
+                // writing phase writes it, every call its slice of it, except that only the last
+                // denoising step writes the latents: the steps before it keep the trajectory in
+                // the slot.
+                Blocks::Request => {
+                    let declared = self.result(product, 0, groups);
+                    if spec.reader == phase && spec.writer != phase {
+                        reads.extend(declared);
+                    }
+                    if spec.writer == phase && (phase != Phase::Denoise || last) {
+                        writes.extend(declared);
+                    }
+                }
+                // A product of one block per media unit: the writing round writes the blocks of
+                // its units, the reading call of the same index reads them, and a product its own
+                // phase reads is the carry the round before left at the unit before the round's.
+                Blocks::Unit => {
+                    let round = self.round_units(spec.writer, call, groups);
+                    let blocks = |units: Range<u32>| -> Vec<u32> {
+                        units
+                            .filter_map(|unit| self.result(product, unit, groups))
+                            .collect()
+                    };
+                    if spec.writer == phase {
+                        if spec.reader == phase {
+                            let before = round.start.checked_sub(1);
+                            reads
+                                .extend(before.and_then(|unit| self.result(product, unit, groups)));
+                        }
+                        writes.extend(blocks(round));
+                    } else if spec.reader == phase && call < self.video_needed(spec.writer, groups)
+                    {
+                        reads.extend(blocks(round));
+                    }
+                }
             }
-            Phase::VideoEncode => writes.extend(encoded(self.round_units(phase, call, groups))),
-            Phase::Mux if call < rounds => {
-                reads.extend(encoded(self.round_units(Phase::VideoEncode, call, groups)));
-            }
-            _ => {}
         }
 
         let count = u32::try_from(reads.len()).unwrap_or(u32::MAX);
@@ -402,22 +388,22 @@ impl Request {
     }
 
     /// The request's declared results, in position order: per result, the phase whose call
-    /// writes it and its product kind, an index into [`PRODUCTS`].
-    fn declared(&self) -> Vec<(Phase, usize)> {
-        PRODUCTS
+    /// writes it and its product kind, an index into the pipeline's products ([`products`]).
+    fn declared(&self, groups: &[WorkerGroup]) -> Vec<(Phase, usize)> {
+        products(groups)
             .iter()
             .enumerate()
-            .flat_map(|(kind, &(name, phase))| {
-                let count = usize::try_from(self.declares(name)).unwrap_or(0);
-                iter::repeat_n((phase, kind), count)
+            .flat_map(|(kind, spec)| {
+                let count = usize::try_from(self.declares(spec)).unwrap_or(0);
+                iter::repeat_n((spec.writer, kind), count)
             })
             .collect()
     }
 
     /// The position of a video request's conditioning in its product table: where its admission
     /// pins or allocates it, its text encoding writes it and its latent preparation reads it.
-    pub(super) fn conditioning_position(&self) -> Option<u32> {
-        self.result(product::CONDITIONING, 0)
+    pub(super) fn conditioning_position(&self, groups: &[WorkerGroup]) -> Option<u32> {
+        self.result(Product::Conditioning, 0, groups)
     }
 
     /// Whether a video request holds its conditioning without encoding it: its admission's `Pin`
@@ -428,13 +414,12 @@ impl Request {
         held && self.completed[Phase::TextEncode.index()] == 0
     }
 
-    /// The position of the `index`-th declared result of product `name`, if the request
-    /// declares it.
-    fn result(&self, name: &str, index: u32) -> Option<u32> {
+    /// The position of the `index`-th declared result of `product`, if the request declares it.
+    fn result(&self, product: Product, index: u32, groups: &[WorkerGroup]) -> Option<u32> {
         let mut position: u32 = 0;
-        for &(kind, _) in &PRODUCTS {
-            let count = self.declares(kind);
-            if kind == name {
+        for spec in products(groups) {
+            let count = self.declares(spec);
+            if spec.product == product {
                 return (index < count).then(|| position.saturating_add(index));
             }
             position = position.saturating_add(count);
@@ -442,19 +427,20 @@ impl Request {
         None
     }
 
-    /// How many results of product `name` a video request declares (`S/graph.rs:140-242`): a
-    /// condition product when its conditions have what it holds, one splice tail (commit
-    /// `e69a91146`) and one encoded unit per media unit, and one of every other product.
-    fn declares(&self, name: &str) -> u32 {
+    /// How many results of the product `spec` declares a video request declares
+    /// (`S/graph.rs:140-242`): one per media unit of a product of units (a splice tail, commit
+    /// `e69a91146`, and an encoded unit), a condition product when its conditions have what it
+    /// holds, and one of every other product.
+    fn declares(&self, spec: &ProductSpec) -> u32 {
         let Some(video) = self.video() else {
             return 0;
         };
         let has = |extent: fn(&ConditionExtent) -> u64| u32::from(total(video, extent) > 0);
-        match name {
-            product::CONDITION_PIXELS => has(|condition| condition.pixel_bytes / 3),
-            product::CONDITION_SAMPLES => has(|condition| condition.audio_samples),
-            product::VISION_PIXELS => has(|condition| condition.vision_patches),
-            product::VIDEO_TAIL | product::ENCODED_UNITS => video.sampling.video_units,
+        match (spec.extent, spec.product) {
+            (Blocks::Unit, _) => video.sampling.video_units,
+            (_, Product::ConditionPixels) => has(|condition| condition.pixel_bytes / 3),
+            (_, Product::ConditionSamples) => has(|condition| condition.audio_samples),
+            (_, Product::VisionPixels) => has(|condition| condition.vision_patches),
             _ => 1,
         }
     }
@@ -469,14 +455,14 @@ impl Request {
     }
 
     /// The media units one video decode round covers on the group that decodes the request's
-    /// video: the ranks of its video decoder block, each taking the units the block deals a rank
-    /// (`BlockConfig::rank_units`, `S/execution/media.rs:564-572`); 1 when the group states no
-    /// such block. Every rank of the group decodes its share of a round in one call, the rounds'
-    /// shares dealt to the ranks in order and in reverse alternately (SD §3.3).
+    /// video: the ranks of its block that serves video decodes, each taking the units the block
+    /// deals a rank (`BlockConfig::rank_units`, `S/execution/media.rs:564-572`); 1 when the group
+    /// places no such block. Every rank of the group decodes its share of a round in one call,
+    /// the rounds' shares dealt to the ranks in order and in reverse alternately (SD §3.3).
     fn width(&self, groups: &[WorkerGroup]) -> u32 {
         let Some(block) = self
             .serving(Phase::VideoDecode, groups)
-            .and_then(|group| group.config.blocks.get(VIDEO_DECODER_BLOCK))
+            .and_then(|group| decoder_block(groups, &group.config))
         else {
             return 1;
         };
@@ -504,45 +490,62 @@ impl Request {
     /// Whether a call reads declared result `at`: the request makes calls of the phase that reads
     /// its kind. A request whose admission found its conditioning reads no vision pixels.
     pub(super) fn reads_result(&self, at: u32, groups: &[WorkerGroup]) -> bool {
-        self.declared().get(at as usize).is_some_and(|&(_, kind)| {
-            let (_, _, reader) = product::KINDS[kind];
-            self.video_needed(reader, groups) > 0
-        })
+        self.declared(groups)
+            .get(at as usize)
+            .and_then(|&(_, kind)| products(groups).get(kind))
+            .is_some_and(|spec| self.video_needed(spec.reader, groups) > 0)
     }
 
     /// Whether the call that writes declared result `at` was applied: the call of the result's
-    /// phase that writes it (the round of an encoded unit's unit, the last call of any other
-    /// phase), counted in order or ahead of an earlier call. A conditioning the admission's `Pin`
+    /// phase that writes it (for a product of one block per media unit, the round of the block's
+    /// unit; the last call of the phase otherwise), counted in order or ahead of an earlier
+    /// call. A conditioning the admission's `Pin`
     /// found was written before the request arrived.
     fn written(&self, at: u32, groups: &[WorkerGroup]) -> bool {
-        let Some(&(phase, kind)) = self.declared().get(at as usize) else {
+        let Some(&(phase, kind)) = self.declared(groups).get(at as usize) else {
             return false;
         };
-        if Some(at) == self.conditioning_position() && self.found_conditioning() {
+        if Some(at) == self.conditioning_position(groups) && self.found_conditioning() {
             return true;
         }
-        let call = match self.result(product::ENCODED_UNITS, 0) {
-            Some(first) if PRODUCTS[kind].0 == product::ENCODED_UNITS => {
-                self.round_of(at.saturating_sub(first), groups)
-            }
-            _ => self.video_needed(phase, groups).saturating_sub(1),
+        // A block of a product of units is written by the round of its unit.
+        let spec = products(groups).get(kind);
+        let unit = spec
+            .filter(|spec| spec.extent == Blocks::Unit)
+            .and_then(|spec| self.result(spec.product, 0, groups))
+            .map(|first| at.saturating_sub(first));
+        let call = match unit {
+            Some(unit) => self.round_of(unit, groups),
+            None => self.video_needed(phase, groups).saturating_sub(1),
         };
         self.completed[phase.index()] > call || self.early.contains(&(phase, call))
     }
 }
 
 /// Whether every rank of `group` that runs calls of `phase` runs calls of `before` too, by the
-/// blocks the deployment places on its ranks (`served_phases`), so that each such rank's worker
+/// blocks the deployment places on its ranks (`WorkerGroup::positions`), so that each such rank's
+/// worker
 /// runs a call of `before` ahead of the call of `phase` submitted after it: a decoder rank that
 /// denoises reads the latents its own last step wrote into its run. A rank that does not run
 /// `before` passes its batch, and nothing orders its call of `phase` after the writes of `before`
 /// on other ranks. A group whose configuration places no block runs every phase it serves on
 /// every rank.
 fn ordered(group: &WorkerGroup, before: Phase, phase: Phase) -> bool {
-    (0..group.config.ranks.len()).all(|position| {
-        let phases = served_phases(&group.config, position);
-        !phases.contains(&phase) || phases.contains(&before)
-    })
+    group
+        .positions
+        .iter()
+        .all(|phases| !phases.contains(&phase) || phases.contains(&before))
+}
+
+/// The block of `config` whose ranks serve video decodes, by the pipeline's declaration
+/// ([`pipeline`]); `None` for a group that places none.
+pub(super) fn decoder_block<'a>(
+    groups: &[WorkerGroup],
+    config: &'a proto::config::WorkerGroupConfig,
+) -> Option<&'a proto::config::BlockConfig> {
+    pipeline(groups)?
+        .serving(Phase::VideoDecode)
+        .find_map(|block| config.blocks.get(&block.name))
 }
 
 /// A video request against the deployment, and the sizes of its blocks.
@@ -641,7 +644,7 @@ impl Scheduler {
     pub(super) fn declared_results(&self, request: &Request) -> Option<Vec<(Phase, u8, u32)>> {
         let (_, _, bytes) = request.media_shape(&self.groups)?;
         request
-            .declared()
+            .declared(&self.groups)
             .into_iter()
             .map(|(phase, kind)| {
                 let class = self.product_class(kind)?;
@@ -668,16 +671,14 @@ impl Scheduler {
 
     /// The class of a video request's conditioning, the product class of its kind.
     pub(super) fn conditioning_class(&self) -> Option<u8> {
-        let kind = PRODUCTS
-            .iter()
-            .position(|&(name, _)| name == product::CONDITIONING)?;
+        let kind = pipeline(&self.groups)?.kind(Product::Conditioning)?;
         self.product_class(kind)
     }
 
     /// The class of product kind `kind`: the `kind`-th of the classes just before the class of
-    /// stored trajectories.
-    fn product_class(&self, kind: usize) -> Option<u8> {
-        let first = usize::from(self.trajectory).checked_sub(PRODUCTS.len())?;
+    /// stored trajectories, one per product of the pipeline.
+    pub(super) fn product_class(&self, kind: usize) -> Option<u8> {
+        let first = usize::from(self.trajectory).checked_sub(products(&self.groups).len())?;
         u8::try_from(first.checked_add(kind)?).ok()
     }
 
@@ -702,11 +703,13 @@ impl Scheduler {
     /// The crossings the calls of `request`, as it is placed, wait for, none of them asked
     /// (`Request::crossings`): per declared result its writer writes in one memory
     /// ([`Scheduler::writer_region`]), the group placed for the phase that reads its kind
-    /// (`crate::batch::product::KINDS`), when that group reads the class in another memory too.
+    /// ([`products`]), when that group reads the class in another memory too.
     pub(super) fn crossings_of(&self, request: &Request) -> Vec<(u32, GroupId, u8, Option<bool>)> {
         let mut crossings = Vec::new();
-        for (at, (_, kind)) in (0u32..).zip(request.declared()) {
-            let reader = product::KINDS[kind].2;
+        for (at, (_, kind)) in (0u32..).zip(request.declared(&self.groups)) {
+            let Some(reader) = products(&self.groups).get(kind).map(|spec| spec.reader) else {
+                continue;
+            };
             let reading = request.placement[reader.index()].and_then(|id| self.group(id));
             let (Some(class), Some(group)) = (self.product_class(kind), reading) else {
                 continue;
@@ -739,19 +742,20 @@ impl Scheduler {
     /// that decoded each unit, inside the decode call), and where the layout does not tell the
     /// run.
     fn writer_region(&self, request: &Request, at: u32, kind: usize) -> Option<u8> {
-        let (name, phase, _) = product::KINDS[kind];
+        let spec = *products(&self.groups).get(kind)?;
+        let phase = spec.writer;
         let class = self.product_class(kind)?;
         let writer = self.group(request.placement[phase.index()]?)?;
         let regions = writer.regions(class);
-        match name {
-            product::VIDEO_LATENTS
-            | product::AUDIO_LATENTS
-            | product::VIDEO_UNITS
-            | product::VIDEO_TAIL => None,
-            product::ENCODED_UNITS => {
-                let unit = at.checked_sub(request.result(product::ENCODED_UNITS, 0)?)?;
+        match spec.product {
+            Product::VideoLatents
+            | Product::AudioLatents
+            | Product::VideoUnits
+            | Product::VideoTail => None,
+            Product::EncodedUnits => {
+                let unit = at.checked_sub(request.result(spec.product, 0, &self.groups)?)?;
                 let decoder = self.group(request.placement[Phase::VideoDecode.index()]?)?;
-                let block = decoder.config.blocks.get(VIDEO_DECODER_BLOCK)?;
+                let block = decoder_block(&self.groups, &decoder.config)?;
                 // The rounds' deal, by the ranks' positions in the decoder group.
                 let ranks = block.ranks.iter().map(|&rank| u32::try_from(rank));
                 let round = RoundConfig {
@@ -770,8 +774,12 @@ impl Scheduler {
                 // A group's regions of a class it writes on every rank are its ranks' product
                 // buffers, in rank order.
                 let ranks = writer.config.ranks.len();
-                let serving = (0..ranks)
-                    .find(|&position| served_phases(&writer.config, position).contains(&phase));
+                let serving = (0..ranks).find(|&position| {
+                    writer
+                        .positions
+                        .get(position)
+                        .is_some_and(|phases| phases.contains(&phase))
+                });
                 let position = serving.filter(|_| regions.len() == ranks).unwrap_or(0);
                 regions.get(position).copied()
             }
@@ -784,8 +792,8 @@ impl Scheduler {
     /// region lies in every memory that maps it.
     fn rank_memory(&self, group: &WorkerGroup, position: usize) -> Option<&str> {
         let ranks = group.config.ranks.len();
-        let regions = (0..PRODUCTS.len())
-            .filter(|&kind| group.serves(PRODUCTS[kind].1))
+        let regions = (0..products(&self.groups).len())
+            .filter(|&kind| group.serves(products(&self.groups)[kind].writer))
             .filter_map(|kind| self.product_class(kind))
             .map(|class| group.regions(class))
             .find(|regions| regions.len() == ranks)?;
@@ -827,7 +835,7 @@ impl Scheduler {
         (at, group, from): (u32, GroupId, u8),
     ) -> Vec<(usize, u32)> {
         let mut taken = Vec::new();
-        let Some(&(phase, kind)) = request.declared().get(at as usize) else {
+        let Some(&(phase, kind)) = request.declared(&self.groups).get(at as usize) else {
             return taken;
         };
         let writer = request.placement[phase.index()].and_then(|id| self.group(id));
@@ -939,7 +947,7 @@ impl Scheduler {
                 if state.is_some() || !due {
                     continue;
                 }
-                let Some(&(phase, kind)) = request.declared().get(at as usize) else {
+                let Some(&(phase, kind)) = request.declared(&self.groups).get(at as usize) else {
                     continue;
                 };
                 let (Some(owner), Some(class)) =
@@ -1034,7 +1042,10 @@ impl Scheduler {
         let Some(request) = self.requests.get(&id) else {
             return;
         };
-        let kind = request.declared().get(at as usize).map(|&(_, kind)| kind);
+        let kind = request
+            .declared(&self.groups)
+            .get(at as usize)
+            .map(|&(_, kind)| kind);
         let from = kind.and_then(|kind| self.writer_region(request, at, kind));
         let from = from.and_then(|from| self.regions.get(usize::from(from)));
         let results = self.declared_results(request).unwrap_or_default();
@@ -1093,7 +1104,14 @@ fn captured<'a>(
         .capacity
         .media_bytes
         .iter()
-        .filter(|(shape, _, products)| products.len() == PRODUCTS.len() && holds(shape, video))
+        .filter(|(shape, _, bytes)| {
+            let declared = group
+                .capacity
+                .pipeline
+                .as_ref()
+                .map(|pipeline| pipeline.products.len());
+            Some(bytes.len()) == declared && holds(shape, video)
+        })
         .min_by_key(|(shape, _, _)| *shape)
 }
 
@@ -1131,10 +1149,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use crate::batch::product;
     use crate::batch::{Batch, BatchId, Columns, Extent, Phase, Shape, Variant};
     use proto::config::{
-        BlockConfig, BlockDistribution, SchedulerConfig, VIDEO_DECODER_BLOCK, WorkerGroupConfig,
+        BlockConfig, BlockDistribution, HostBlock, SchedulerConfig, WorkerGroupConfig,
         WorkerGroupId, WorkerGroupRole, WorkerRank,
     };
     use proto::request::{
@@ -1146,10 +1163,8 @@ mod tests {
     use storage::{Key, QueuePair};
 
     use crossbeam_channel::Receiver;
-    use nn::family::Stage;
+    use nn::pipeline::{Pipeline, Product};
 
-    use super::{PRODUCTS, VIDEO_PHASES};
-    use crate::process::ranks::rank::video::MUXER;
     use crate::scheduler::Output;
     use crate::scheduler::cache::DEVICE;
     use crate::scheduler::{Capacity, Executor, Request, RequestStatus, Scheduler, WorkerGroup};
@@ -1163,9 +1178,21 @@ mod tests {
     const WIDTH: u32 = 64;
     const HEIGHT: u32 = 32;
 
+    /// The pipeline the fixture's groups serve: MiniMax-H3's, as its family declares it.
+    fn pipeline() -> Pipeline {
+        models::minimax_h3::family::pipeline()
+    }
+
+    /// Every phase of a video request, in the order the pipeline offers them.
+    fn phases() -> Vec<Phase> {
+        pipeline().phases
+    }
+
     /// The session's classes: KV blocks, one class per product kind, then stored trajectories,
     /// whose host copies are in region `LATENTS`.
-    const TRAJECTORY: u8 = 1 + PRODUCTS.len() as u8;
+    fn trajectory() -> u8 {
+        1 + u8::try_from(pipeline().products.len()).unwrap()
+    }
     const LATENTS: u8 = 2;
 
     /// A captured denoising shape of the fixture's raster and timeline.
@@ -1189,7 +1216,7 @@ mod tests {
     /// `k` takes one byte more than `k` units of the product region (256 bytes).
     fn capacity(phases: &[Phase]) -> Capacity {
         let denoises = phases.contains(&Phase::Denoise);
-        let products: Vec<u64> = (0..PRODUCTS.len() as u64)
+        let products: Vec<u64> = (0..pipeline().products.len() as u64)
             .map(|kind| 256 * kind + 1)
             .collect();
         let media_bytes = if denoises {
@@ -1217,6 +1244,7 @@ mod tests {
             encoder_identity: String::new(),
             latent_seed: 0,
             media_bytes,
+            pipeline: Some(pipeline()),
             call_window: 2,
             cache_groups: Vec::new(),
             seeds: Vec::new(),
@@ -1228,14 +1256,14 @@ mod tests {
     fn config(id: GroupId) -> WorkerGroupConfig {
         let mut blocks = BTreeMap::new();
         blocks.insert(
-            VIDEO_DECODER_BLOCK.to_owned(),
+            "video_decoder".to_owned(),
             BlockConfig {
                 distribution: Some(BlockDistribution::TemporalUnits),
                 ..BlockConfig::parallel(vec![0, 1])
             },
         );
-        for stage in [Stage::TextEncoder, Stage::Transformer] {
-            blocks.insert(stage.name().to_owned(), BlockConfig::parallel(vec![0, 1]));
+        for block in ["text_encoder", "transformer"] {
+            blocks.insert(block.to_owned(), BlockConfig::parallel(vec![0, 1]));
         }
         let rank = WorkerRank {
             host: "localhost".to_owned(),
@@ -1258,9 +1286,9 @@ mod tests {
             id,
             memory: format!("memory-{}", id.0),
             slots: 1,
-            regions: (0..=TRAJECTORY)
+            regions: (0..=trajectory())
                 .map(|class| {
-                    if (1..TRAJECTORY).contains(&class) {
+                    if (1..trajectory()).contains(&class) {
                         vec![0]
                     } else {
                         Vec::new()
@@ -1275,7 +1303,9 @@ mod tests {
     fn groups(served: &[(GroupId, &[Phase])]) -> Vec<WorkerGroup> {
         served
             .iter()
-            .map(|&(id, phases)| WorkerGroup::new(config(id), capacity(phases), layout(id)))
+            .map(|&(id, phases)| {
+                WorkerGroup::new(config(id), capacity(phases), layout(id)).unwrap()
+            })
             .collect()
     }
 
@@ -1371,12 +1401,12 @@ mod tests {
 
     /// Every video phase on `group`.
     fn on(group: GroupId) -> Vec<(Phase, GroupId)> {
-        VIDEO_PHASES.iter().map(|&phase| (phase, group)).collect()
+        phases().into_iter().map(|phase| (phase, group)).collect()
     }
 
     /// The phases the request may be given a call of now, in the order it offers them.
     fn ready(request: &Request, groups: &[WorkerGroup]) -> Vec<Phase> {
-        VIDEO_PHASES
+        phases()
             .into_iter()
             .filter(|&phase| request.video_ready(phase, groups))
             .collect()
@@ -1452,7 +1482,7 @@ mod tests {
             encoding: [0; 32],
             source: None,
         }];
-        classes.extend(PRODUCTS.iter().map(|_| sized(None)));
+        classes.extend(pipeline().products.iter().map(|_| sized(None)));
         classes.push(sized(Some((LATENTS, 0))));
         let ids: Vec<GroupId> = served.iter().map(|&(id, _)| id).collect();
 
@@ -1466,7 +1496,7 @@ mod tests {
                 region("latents", Tier::Host, 4096),
             ],
             classes,
-            trajectory: TRAJECTORY,
+            trajectory: trajectory(),
             peers: Vec::new(),
             groups: ids.iter().map(|&id| layout(id)).collect(),
             schedulers: vec![ids.clone()],
@@ -1508,9 +1538,12 @@ mod tests {
     /// serve it (SD §3.3).
     #[test]
     fn a_request_makes_the_calls_of_its_conditions_and_rounds() {
-        let groups = groups(&[(A, &VIDEO_PHASES)]);
+        let groups = groups(&[(A, &phases()[..])]);
         let needed = |request: &Request| {
-            VIDEO_PHASES.map(|phase| (phase, request.video_needed(phase, &groups)))
+            phases()
+                .into_iter()
+                .map(|phase| (phase, request.video_needed(phase, &groups)))
+                .collect::<Vec<_>>()
         };
 
         // Three media units over a decoder of two ranks decode in two rounds, each encoded and
@@ -1548,7 +1581,7 @@ mod tests {
     /// before it completed (SD §3.3, gap G11).
     #[test]
     fn a_text_request_offers_each_phase_once_its_predecessor_is_handed_over() {
-        let groups = groups(&[(A, &VIDEO_PHASES)]);
+        let groups = groups(&[(A, &phases()[..])]);
         let mut request = request(video(3, 40, Vec::new()), &on(A));
         assert_eq!(ready(&request, &groups), [Phase::TextEncode]);
 
@@ -1584,7 +1617,7 @@ mod tests {
     /// the text encoding is handed over, and its denoising after that (SD §3.3).
     #[test]
     fn a_conditioned_request_encodes_its_prompt_once_its_media_read_completed() {
-        let groups = groups(&[(A, &VIDEO_PHASES)]);
+        let groups = groups(&[(A, &phases()[..])]);
         let mut request = request(video(1, 40, reference()), &on(A));
         assert_eq!(ready(&request, &groups), [Phase::MediaRead]);
 
@@ -1608,7 +1641,7 @@ mod tests {
     /// and commits it under its key (SD §3.3, §4.3).
     #[test]
     fn a_conditioning_the_admission_finds_is_read_without_a_text_encoding() {
-        let (mut scheduler, stamped) = stamping(&[(A, &VIDEO_PHASES)]);
+        let (mut scheduler, stamped) = stamping(&[(A, &phases()[..])]);
         let class = scheduler.conditioning_class().unwrap();
         let mut input = video(1, 40, reference());
         input.encoder_inputs = Some(Box::new(EncoderInputs {
@@ -1621,9 +1654,9 @@ mod tests {
         // The conditioning is keyed by what the text encoder reads.
         let mut admitted = request(input, &on(A));
         admitted.encodings = scheduler.encodings_of(&admitted);
-        let key = Key(encoder_output(product::CONDITIONING, "", &[3; 32]));
+        let key = Key(encoder_output(Product::Conditioning.name(), "", &[3; 32]));
         assert_eq!(admitted.encodings, [(key, None)]);
-        let at = admitted.conditioning_position().unwrap();
+        let at = admitted.conditioning_position(&scheduler.groups).unwrap();
         let id = admitted.id;
         scheduler.owners.insert(OwnerId(10), id);
         scheduler.requests.insert(id, admitted.clone());
@@ -1669,7 +1702,11 @@ mod tests {
         complete(&mut pinned, Phase::MediaRead, 1);
         assert_eq!(ready(&pinned, groups), [Phase::LatentPrepare]);
         let (results, reads) = pinned.results(Phase::LatentPrepare, 0, groups);
-        assert_eq!((results[0], reads), (at, 3));
+        assert_eq!(reads, 3);
+        assert!(
+            results[..3].contains(&at),
+            "{results:?} reads the pinned block {at}"
+        );
 
         // Encoded instead: the text encoding's output is committed under the key, the prompt's
         // rows as its tokens, and the request still made its one text encoding.
@@ -1710,7 +1747,7 @@ mod tests {
     /// completed, since no worker orders the two.
     #[test]
     fn a_phase_on_another_group_waits_until_its_predecessor_completed() {
-        let groups = groups(&[(A, &VIDEO_PHASES), (B, &[Phase::TextEncode])]);
+        let groups = groups(&[(A, &phases()[..]), (B, &[Phase::TextEncode])]);
         let mut placement = on(A);
         placement[1] = (Phase::TextEncode, B);
         let mut request = request(video(1, 40, Vec::new()), &placement);
@@ -1725,7 +1762,7 @@ mod tests {
     /// call waits for every round and the audio (SD §3.3).
     #[test]
     fn the_muxer_takes_each_completed_round_and_ends_after_the_audio() {
-        let groups = groups(&[(A, &VIDEO_PHASES)]);
+        let groups = groups(&[(A, &phases()[..])]);
         let mut request = request(video(3, 40, Vec::new()), &on(A));
         for (phase, calls) in [
             (Phase::TextEncode, 1),
@@ -1765,7 +1802,7 @@ mod tests {
     /// (commit `e69a91146`; SD §2.3 `MediaRow::results`).
     #[test]
     fn a_decode_round_reads_the_tail_the_round_before_it_wrote() {
-        let groups = groups(&[(A, &VIDEO_PHASES)]);
+        let groups = groups(&[(A, &phases()[..])]);
         let request = request(video(3, 40, Vec::new()), &on(A));
         let results = |phase, call| request.results(phase, call, &groups);
 
@@ -1812,7 +1849,7 @@ mod tests {
     /// its product class, rounded up to units of the product region (SD §4.4 "Products").
     #[test]
     fn declared_results_are_written_by_their_phase_and_sized_in_their_class() {
-        let scheduler = scheduler(&[(A, &VIDEO_PHASES)]);
+        let scheduler = scheduler(&[(A, &phases()[..])]);
         let groups = &scheduler.groups;
         for request in [
             request(video(3, 40, Vec::new()), &on(A)),
@@ -1820,7 +1857,7 @@ mod tests {
         ] {
             let declared = scheduler.declared_results(&request).unwrap();
             let mut written = vec![0; declared.len()];
-            for phase in VIDEO_PHASES {
+            for phase in phases() {
                 for call in 0..request.video_needed(phase, groups) {
                     let (results, reads) = request.results(phase, call, groups);
                     for &position in &results[reads as usize..] {
@@ -1844,7 +1881,7 @@ mod tests {
             // The kind of a block is its class's place before the class of trajectories, and it
             // takes one byte more than that place's units.
             for &(_, class, units) in &declared {
-                assert!((1..TRAJECTORY).contains(&class));
+                assert!((1..trajectory()).contains(&class));
                 assert_eq!(units, u32::from(class));
             }
         }
@@ -1863,7 +1900,7 @@ mod tests {
     /// the host latent region (SD §3.8, §4.4).
     #[test]
     fn a_trajectory_is_sized_in_units_of_the_host_latent_region() {
-        let scheduler = scheduler(&[(A, &VIDEO_PHASES)]);
+        let scheduler = scheduler(&[(A, &phases()[..])]);
         let units = |input| scheduler.trajectory_units(&request(input, &on(A)));
 
         // 10 000 bytes of the shape of 64 prompt rows, 30 000 of the one of 128, and 20 000 of the
@@ -1877,7 +1914,7 @@ mod tests {
     /// A request the deployment cannot serve is refused with the first rule it breaks (SD §7.2).
     #[test]
     fn a_video_request_the_deployment_cannot_serve_is_refused() {
-        let all = scheduler(&[(A, &VIDEO_PHASES)]);
+        let all = scheduler(&[(A, &phases()[..])]);
         assert_eq!(all.validate_video(&video(2, 40, Vec::new())), Ok(()));
         assert_eq!(all.validate_video(&video(2, 40, reference())), Ok(()));
 
@@ -1888,11 +1925,11 @@ mod tests {
         );
 
         let without = |missing: &[Phase]| {
-            let phases: Vec<Phase> = VIDEO_PHASES
+            let served: Vec<Phase> = phases()
                 .into_iter()
                 .filter(|phase| !missing.contains(phase))
                 .collect();
-            scheduler(&[(A, &phases)])
+            scheduler(&[(A, &served)])
         };
         assert_eq!(
             without(&[Phase::Mux]).validate_video(&video(2, 40, Vec::new())),
@@ -1934,7 +1971,7 @@ mod tests {
     /// them (SD §3.8, §4.3, §7.3).
     #[test]
     fn a_drained_request_stores_its_step_and_resumes_from_it() {
-        let groups = groups(&[(A, &VIDEO_PHASES)]);
+        let groups = groups(&[(A, &phases()[..])]);
         let mut input = video(1, 40, Vec::new());
         input.trajectory.id = 77;
         let drained = |completed: u32, cause: MigrationCause, placement: &[(Phase, GroupId)]| {
@@ -1982,16 +2019,14 @@ mod tests {
     #[test]
     fn a_decode_waits_for_the_last_step_s_output_where_a_decoder_rank_does_not_denoise() {
         let decoding = |denoisers: Vec<usize>| {
-            let mut groups = groups(&[(A, &VIDEO_PHASES)]);
-            let blocks = &mut groups[0].config.blocks;
-            blocks.insert(
-                Stage::Transformer.name().to_owned(),
-                BlockConfig::parallel(denoisers),
-            );
-            blocks.insert(
-                Stage::AudioDecoder.name().to_owned(),
-                BlockConfig::parallel(vec![1]),
-            );
+            let mut placed = config(A);
+            placed
+                .blocks
+                .insert("transformer".to_owned(), BlockConfig::parallel(denoisers));
+            placed
+                .blocks
+                .insert("audio_decoder".to_owned(), BlockConfig::parallel(vec![1]));
+            let groups = vec![WorkerGroup::new(placed, capacity(&phases()), layout(A)).unwrap()];
             let mut request = request(video(2, 40, Vec::new()), &on(A));
             for phase in [Phase::TextEncode, Phase::LatentPrepare] {
                 schedule(&mut request, phase, 1);
@@ -2054,27 +2089,27 @@ mod tests {
             source: None,
         };
         let mut classes = vec![class(1, None)];
-        classes.extend(PRODUCTS.iter().map(|_| class(0, None)));
+        classes.extend(pipeline().products.iter().map(|_| class(0, None)));
         classes.push(class(0, Some((4, 0))));
 
         // Per class, the regions of each group and those it receives in.
-        let kind = |name: &str| PRODUCTS.iter().position(|(kind, _)| *kind == name).unwrap() + 1;
+        let kind = |product: Product| pipeline().kind(product).unwrap() + 1;
         let mut model = vec![Vec::new(); classes.len()];
         let mut receives = vec![Vec::new(); classes.len()];
         let mut muxer = vec![Vec::new(); classes.len()];
-        model[kind(product::CONDITIONING)] = vec![PRODUCTS_FIRST];
-        receives[kind(product::CONDITIONING)] = vec![PRODUCTS_SECOND];
+        model[kind(Product::Conditioning)] = vec![PRODUCTS_FIRST];
+        receives[kind(Product::Conditioning)] = vec![PRODUCTS_SECOND];
         for name in [
-            product::VIDEO_LATENTS,
-            product::AUDIO_LATENTS,
-            product::VIDEO_UNITS,
-            product::VIDEO_TAIL,
-            product::ENCODED_UNITS,
-            product::AUDIO_SAMPLES,
+            Product::VideoLatents,
+            Product::AudioLatents,
+            Product::VideoUnits,
+            Product::VideoTail,
+            Product::EncodedUnits,
+            Product::AudioSamples,
         ] {
             model[kind(name)] = vec![PRODUCTS_FIRST, PRODUCTS_SECOND];
         }
-        for name in [product::ENCODED_UNITS, product::AUDIO_SAMPLES] {
+        for name in [Product::EncodedUnits, Product::AudioSamples] {
             muxer[kind(name)] = vec![PRODUCTS_FIRST];
         }
         let group = |id, slots, regions, receives| runtime::Group {
@@ -2098,11 +2133,11 @@ mod tests {
                 region("latents", Tier::Host, 4096, ""),
             ],
             classes,
-            trajectory: TRAJECTORY,
+            trajectory: trajectory(),
             peers: Vec::new(),
             groups: vec![
                 group(A, 2, model, receives),
-                group(B, 3, muxer, vec![Vec::new(); TRAJECTORY as usize + 1]),
+                group(B, 3, muxer, vec![Vec::new(); trajectory() as usize + 1]),
             ],
             schedulers: vec![vec![A, B]],
         };
@@ -2127,19 +2162,23 @@ mod tests {
         let mut model = config(A);
         model.ranks = vec![rank("a"), rank("b")];
         model.blocks.insert(
-            Stage::AudioDecoder.name().to_owned(),
+            "audio_decoder".to_owned(),
             BlockConfig::parallel(vec![0, 1]),
         );
         model.blocks.insert(
-            proto::config::VIDEO_CODEC_BLOCK.to_owned(),
-            BlockConfig::parallel(vec![0, 1]),
+            HostBlock::VideoCodec.name().to_owned(),
+            BlockConfig {
+                distribution: Some(BlockDistribution::TemporalUnits),
+                ..BlockConfig::parallel(vec![0, 1])
+            },
         );
         let mut muxer = config(B);
         muxer.ranks = vec![rank("a")];
         muxer.blocks = BTreeMap::new();
-        muxer
-            .blocks
-            .insert(MUXER.to_owned(), BlockConfig::parallel(vec![0]));
+        muxer.blocks.insert(
+            HostBlock::Muxer.name().to_owned(),
+            BlockConfig::parallel(vec![0]),
+        );
         let modelled = [
             Phase::TextEncode,
             Phase::LatentPrepare,
@@ -2223,9 +2262,12 @@ mod tests {
         let (mut scheduler, stamped, _) = two_processes();
         let id = crossing(&mut scheduler);
         let row = &scheduler.requests[&id];
-        let conditioning = row.conditioning_position().unwrap();
+        let conditioning = row.conditioning_position(&scheduler.groups).unwrap();
         let units: Vec<u32> = (0..2)
-            .map(|unit| row.result(product::ENCODED_UNITS, unit).unwrap())
+            .map(|unit| {
+                row.result(Product::EncodedUnits, unit, &scheduler.groups)
+                    .unwrap()
+            })
             .collect();
         let [first, second] = [NUMBERS[0], NUMBERS[1]];
         assert_eq!(
@@ -2269,7 +2311,7 @@ mod tests {
             owner: OwnerId(10),
             class,
             at: conditioning,
-            key: Key(encoder_output(product::CONDITIONING, "", &[3; 32])),
+            key: Key(encoder_output(Product::Conditioning.name(), "", &[3; 32])),
             tokens: 40,
             after: Vec::new(),
         };
@@ -2302,9 +2344,8 @@ mod tests {
             ran(&mut scheduler, id, phase, calls);
         }
         scheduler.cross();
-        let class = PRODUCTS
-            .iter()
-            .position(|(name, _)| *name == product::ENCODED_UNITS)
+        let class = pipeline()
+            .kind(Product::EncodedUnits)
             .and_then(|kind| scheduler.product_class(kind))
             .unwrap();
         let replicate = runtime::Request::Replicate {
@@ -2382,7 +2423,7 @@ mod tests {
     /// (SD §7.3 "Progress and artifact").
     #[test]
     fn progress_names_the_stage_of_the_request() {
-        let groups = groups(&[(A, &VIDEO_PHASES)]);
+        let groups = groups(&[(A, &phases()[..])]);
         let mut request = request(video(1, 40, Vec::new()), &on(A));
         request.completed[Phase::Denoise.index()] = 1;
         let progress = |request: &Request, phase| match request.progress(phase, &groups) {

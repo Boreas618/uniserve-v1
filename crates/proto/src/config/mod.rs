@@ -22,12 +22,11 @@ use serde_json::Value;
 use crate::request::wire::{ExpertOrder, Predecessor};
 use crate::request::{PrefixCacheDtype, StandbyStorage};
 pub use block::{
-    BlockConfig, BlockConfigError, BlockDistribution, BlockWeights, HeadProjection,
+    BlockConfig, BlockConfigError, BlockDistribution, BlockWeights, HeadProjection, Partition,
     SequenceParallel,
 };
 pub use worker_group::{
-    DEFAULT_BLOCK, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK, WorkerGroupConfig, WorkerGroupId,
-    WorkerGroupRole, WorkerRank,
+    DEFAULT_BLOCK, HostBlock, WorkerGroupConfig, WorkerGroupId, WorkerGroupRole, WorkerRank,
 };
 
 /// A positive count of a `u32` option's default; a zero count fails the constant's evaluation, so

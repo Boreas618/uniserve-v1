@@ -472,7 +472,7 @@ impl Scheduler {
                 .iter()
                 .find(|group| group.id == *id)
                 .ok_or_else(|| Error::Storage(format!("the session states no group {}", id.0)))?;
-            workers.push(WorkerGroup::new(config, capacity, group.clone()));
+            workers.push(WorkerGroup::new(config, capacity, group.clone())?);
         }
         let config = resolved(config, &workers)?;
 
@@ -499,6 +499,10 @@ impl Scheduler {
             .ok_or_else(|| differ(ENCODER_IDENTITIES))?;
         let latent_seed = agreed(stated().map(|capacity| &capacity.latent_seed))
             .ok_or_else(|| differ("latent seeds for their stored trajectories"))?;
+        // The groups of a media deployment serve parts of one pipeline, whose products the
+        // session classes in one order: the groups that state a pipeline state the same.
+        agreed(stated().map(|capacity| &capacity.pipeline))
+            .ok_or_else(|| differ("media pipelines"))?;
 
         let regions: Vec<(u8, runtime::Region)> = opened
             .regions
@@ -640,7 +644,7 @@ fn resolved(mut config: SchedulerConfig, groups: &[WorkerGroup]) -> Result<Sched
             !encoders.is_empty()
                 && !encoders
                     .iter()
-                    .any(|encoder| group::encodes_on_host(&decoder.config, &encoder.config))
+                    .any(|encoder| group::encodes_on_host(groups, &decoder.config, &encoder.config))
         });
     if let Some(decoder) = stranded {
         return Err(Error::InvalidRequest(format!(

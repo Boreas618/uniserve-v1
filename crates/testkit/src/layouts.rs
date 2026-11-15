@@ -30,6 +30,7 @@ mem_fraction_static = 0.81
 [worker_groups.blocks.transformer]
 
 [worker_groups.blocks.video_decoder]
+distribution = "temporal_units"
 
 [worker_groups.blocks.audio_decoder]
 distribution = "temporal_units"
@@ -38,6 +39,7 @@ distribution = "temporal_units"
 distribution = "temporal_units"
 
 [worker_groups.blocks.video_codec]
+distribution = "temporal_units"
 
 [worker_groups.blocks.muxer]
 ranks = [0]
@@ -71,6 +73,7 @@ mem_fraction_static = 0.73
 sequence_parallel = { kind = "ulysses", ulysses_degree = 4, projection = "exchange" }
 
 [worker_groups.blocks.video_decoder]
+distribution = "temporal_units"
 
 [worker_groups.blocks.audio_decoder]
 distribution = "temporal_units"
@@ -79,6 +82,7 @@ distribution = "temporal_units"
 distribution = "temporal_units"
 
 [worker_groups.blocks.video_codec]
+distribution = "temporal_units"
 
 [worker_groups.blocks.muxer]
 ranks = [0]
@@ -106,6 +110,7 @@ sequence_parallel = {{ kind = "ulysses", ulysses_degree = 8, projection = "excha
 {text_encoder}
 
 [worker_groups.blocks.video_decoder]
+distribution = "temporal_units"
 
 [worker_groups.blocks.audio_decoder]
 distribution = "temporal_units"
@@ -114,6 +119,7 @@ distribution = "temporal_units"
 {latent_encoder}distribution = "temporal_units"
 
 [worker_groups.blocks.video_codec]
+distribution = "temporal_units"
 
 [[worker_groups]]
 id = "muxer"

@@ -32,11 +32,11 @@ use std::cmp::Reverse;
 use crate::batch::Capacity;
 use crate::batch::Phase;
 pub(super) use crate::batch::capacity::variants;
-use proto::config::{VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK, WorkerGroupConfig, WorkerGroupRole};
+use proto::config::{HostBlock, WorkerGroupConfig, WorkerGroupRole};
 use storage::runtime::{self, GroupId};
 
-use super::video::PRODUCTS;
-use super::{Request, Scheduler};
+use super::video::{decoder_block, products};
+use super::{Error, Request, Scheduler};
 
 /// One worker group of a scheduler.
 ///
@@ -54,6 +54,10 @@ pub(crate) struct WorkerGroup {
     /// session's regions (one per class, one per backing rank of a product, none for a class the
     /// group lacks).
     pub layout: runtime::Group,
+    /// Per position of the group's ranks, the phases the blocks the deployment places there serve
+    /// (`crate::process::ranks::rank::video::served_phases`), resolved once against the media
+    /// pipeline the group states; empty for a group of a text deployment.
+    pub positions: Vec<Vec<Phase>>,
     /// Per phase, by [`Phase::index`], the requests the stage serving it holds now.
     pub occupied: [u32; Phase::COUNT],
     /// Batches submitted to the group whose output has not been applied.
@@ -64,19 +68,36 @@ pub(crate) struct WorkerGroup {
 
 impl WorkerGroup {
     /// A group with nothing placed on it and nothing in flight.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRequest`] for a media group whose configuration places a block the
+    /// pipeline it states declares no part of, or a block of a form its owner does not admit.
     pub(crate) fn new(
         config: WorkerGroupConfig,
         capacity: Capacity,
         layout: runtime::Group,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Error> {
+        let positions = match &capacity.pipeline {
+            Some(pipeline) => (0..config.ranks.len())
+                .map(|position| {
+                    crate::process::ranks::rank::video::served_phases(pipeline, &config, position)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+                .map_err(|error| {
+                    Error::InvalidRequest(format!("worker group {}: {error:#}", config.id))
+                })?,
+            None => Vec::new(),
+        };
+        Ok(Self {
             config,
             capacity,
             layout,
+            positions,
             occupied: [0; Phase::COUNT],
             in_flight: 0,
             num_requests: 0,
-        }
+        })
     }
 
     /// The number the session gives the group.
@@ -206,16 +227,22 @@ impl WorkerGroup {
 
 /// Whether the video codec of `encoder` encodes every unit the video decoder of `decoder`
 /// decodes on the host that decoded it, where the encoder reads the decoded unit in place
-/// (`S/worker/codecs.rs:25`). A round deals its units to each block's ranks in order, the
-/// consecutive positions each rank takes (`BlockConfig::rank_units`, by which the decoder's
-/// round width is counted too): position `p` is decoded by the decoder's rank `p / per_decoder`
-/// and encoded by the encoder's rank `p / per_encoder`. The pairing holds when the codec covers
-/// a whole round and those two ranks share a host at every position. Groups that state neither
-/// block run the two in one place, and pair.
-pub(super) fn encodes_on_host(decoder: &WorkerGroupConfig, encoder: &WorkerGroupConfig) -> bool {
+/// (`S/worker/codecs.rs:25`). The decoder is the block of `decoder` that serves video decodes by
+/// the pipeline of `groups`, the codec the host block [`HostBlock::VideoCodec`]. A round deals
+/// its units to each block's ranks in order, the consecutive positions each rank takes
+/// (`BlockConfig::rank_units`, by which the decoder's round width is counted too): position `p`
+/// is decoded by the decoder's rank `p / per_decoder` and encoded by the encoder's rank
+/// `p / per_encoder`. The pairing holds when the codec covers a whole round and those two ranks
+/// share a host at every position. Groups that state neither block run the two in one place, and
+/// pair.
+pub(super) fn encodes_on_host(
+    groups: &[WorkerGroup],
+    decoder: &WorkerGroupConfig,
+    encoder: &WorkerGroupConfig,
+) -> bool {
     let (Some(decoding), Some(encoding)) = (
-        decoder.blocks.get(VIDEO_DECODER_BLOCK),
-        encoder.blocks.get(VIDEO_CODEC_BLOCK),
+        decoder_block(groups, decoder),
+        encoder.blocks.get(HostBlock::VideoCodec.name()),
     ) else {
         return true;
     };
@@ -270,7 +297,9 @@ impl Scheduler {
                 request.placement.contains(&Some(group.id())) || self.free_slots(group) > 0
             })
             .filter(|group| {
-                decoder.is_none_or(|decoder| encodes_on_host(&decoder.config, &group.config))
+                decoder.is_none_or(|decoder| {
+                    encodes_on_host(&self.groups, &decoder.config, &group.config)
+                })
             })
             .collect();
         let passing = |crossing: bool| -> Vec<GroupId> {
@@ -295,7 +324,8 @@ impl Scheduler {
     }
 
     /// Whether a request's products pass between groups `one` and `other`: of every product
-    /// class (`super::video::PRODUCTS`, the classes just before the class of stored trajectories)
+    /// class (one per product of the pipeline, the classes just before the class of stored
+    /// trajectories)
     /// both state regions of, they share one, or, with `crossing`, one of them states receiving
     /// regions of it, where a crossing brings the other's blocks
     /// (`storage::runtime::Request::Replicate`). A group that reads a product states the regions
@@ -306,7 +336,7 @@ impl Scheduler {
     fn passes_products(&self, one: &WorkerGroup, other: &WorkerGroup, crossing: bool) -> bool {
         // A session whose classes do not number the product kinds states no product class.
         let last = usize::from(self.trajectory);
-        let Some(first) = last.checked_sub(PRODUCTS.len()) else {
+        let Some(first) = last.checked_sub(products(&self.groups).len()) else {
             return true;
         };
         let receives = |group: &WorkerGroup, class: usize| {
@@ -391,15 +421,15 @@ mod tests {
 
     use crate::batch::{Batch, BatchId, Columns, Extent, Phase, Shape, Variant};
     use proto::config::{
-        BlockConfig, BlockDistribution, SchedulerConfig, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK,
-        WorkerGroupConfig, WorkerGroupId, WorkerGroupRole, WorkerRank,
+        BlockConfig, BlockDistribution, HostBlock, SchedulerConfig, WorkerGroupConfig,
+        WorkerGroupId, WorkerGroupRole, WorkerRank,
     };
     use proto::request::{GenerationRequest, RequestId};
     use storage::QueuePair;
     use storage::runtime::{self, Completion, GroupId, Region, Tier};
 
     use super::super::{Blocks, Executor, Request, RequestStatus, Scheduler};
-    use super::{Capacity, PRODUCTS, WorkerGroup};
+    use super::{Capacity, WorkerGroup};
 
     struct Idle;
 
@@ -438,8 +468,17 @@ mod tests {
         }
     }
 
-    /// Workers that state `phases`, each served by a stage of `rows` requests, over 8 slots.
+    /// The media pipeline of the video groups of the cases: MiniMax-H3's, as its family declares
+    /// it.
+    fn pipeline() -> nn::pipeline::Pipeline {
+        models::minimax_h3::family::pipeline()
+    }
+
+    /// Workers that state `phases`, each served by a stage of `rows` requests, over 8 slots; a
+    /// group that serves a phase of the media pipeline states the pipeline.
     fn capacity(phases: &[Phase], rows: u32) -> Capacity {
+        let pipeline = pipeline();
+        let media = phases.iter().any(|phase| pipeline.phases.contains(phase));
         let mut capacity = Capacity {
             phases: 0,
             slots: 8,
@@ -456,6 +495,7 @@ mod tests {
             encoder_identity: String::new(),
             latent_seed: 0,
             media_bytes: Vec::new(),
+            pipeline: media.then_some(pipeline),
             call_window: 2,
         };
         for phase in phases {
@@ -474,7 +514,7 @@ mod tests {
             receives: Vec::new(),
             parts: Vec::new(),
         };
-        WorkerGroup::new(config, capacity, layout)
+        WorkerGroup::new(config, capacity, layout).unwrap()
     }
 
     /// A scheduler over `groups`, numbered from 0 in order, each with a slot region of its own
@@ -901,23 +941,23 @@ mod tests {
         };
         let decoder = with(
             config("decoder", WorkerGroupRole::Model, &["a", "b"]),
-            VIDEO_DECODER_BLOCK,
+            "video_decoder",
             vec![0, 1],
         );
         // The codec on the decoder's hosts in order; in the other order; on one rank only.
         let beside = with(
             config("beside", WorkerGroupRole::Model, &["a", "b"]),
-            VIDEO_CODEC_BLOCK,
+            HostBlock::VideoCodec.name(),
             vec![0, 1],
         );
         let crossed = with(
             config("crossed", WorkerGroupRole::Model, &["b", "a"]),
-            VIDEO_CODEC_BLOCK,
+            HostBlock::VideoCodec.name(),
             vec![0, 1],
         );
         let narrow = with(
             config("narrow", WorkerGroupRole::Model, &["a"]),
-            VIDEO_CODEC_BLOCK,
+            HostBlock::VideoCodec.name(),
             vec![0],
         );
 
@@ -966,13 +1006,13 @@ mod tests {
             ],
             &[4, 4, 4, 4],
         );
-        scheduler.trajectory = u8::try_from(PRODUCTS.len()).unwrap();
-        let conditioning = PRODUCTS
-            .iter()
-            .position(|(name, _)| *name == crate::batch::product::CONDITIONING)
+        let products = pipeline().products.len();
+        scheduler.trajectory = u8::try_from(products).unwrap();
+        let conditioning = pipeline()
+            .kind(nn::pipeline::Product::Conditioning)
             .unwrap();
         for (index, region) in [(0, 10), (1, 11), (2, 10), (3, 11)] {
-            let mut regions = vec![Vec::new(); PRODUCTS.len() + 1];
+            let mut regions = vec![Vec::new(); products + 1];
             regions[conditioning] = vec![region];
             scheduler.groups[index].layout.regions = regions;
         }
@@ -1015,15 +1055,15 @@ mod tests {
             vec![text, flow("flow-a", "a"), flow("flow-b", "b")],
             &[4, 4, 4],
         );
-        scheduler.trajectory = u8::try_from(PRODUCTS.len()).unwrap();
-        let conditioning = PRODUCTS
-            .iter()
-            .position(|(name, _)| *name == crate::batch::product::CONDITIONING)
+        let products = pipeline().products.len();
+        scheduler.trajectory = u8::try_from(products).unwrap();
+        let conditioning = pipeline()
+            .kind(nn::pipeline::Product::Conditioning)
             .unwrap();
         for (index, region, received) in [(0, 10, None), (1, 10, None), (2, 11, Some(12))] {
-            let mut regions = vec![Vec::new(); PRODUCTS.len() + 1];
+            let mut regions = vec![Vec::new(); products + 1];
             regions[conditioning] = vec![region];
-            let mut receives = vec![Vec::new(); PRODUCTS.len() + 1];
+            let mut receives = vec![Vec::new(); products + 1];
             receives[conditioning].extend(received);
             let layout = &mut scheduler.groups[index].layout;
             layout.regions = regions;

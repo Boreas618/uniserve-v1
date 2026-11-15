@@ -156,6 +156,9 @@ pub(crate) struct ModelRunner {
     /// The members of the expert union of this node's ranks, on a deployment whose experts are
     /// split; `None` outside a union.
     union: Option<u32>,
+    /// The media pipeline the checkpoint serves, as its family declares it (`nn::pipeline`),
+    /// checked once against the deployment's blocks; `None` for a text deployment.
+    pipeline: Option<Arc<nn::pipeline::Pipeline>>,
 }
 
 /// The collective groups one kind of a deployment's parallel groups forms over the host group, and
@@ -234,7 +237,7 @@ impl ModelRunner {
         if buckets.is_empty() {
             bail!("the build config captures no graph bucket");
         }
-        Ok(Self {
+        let mut runner = Self {
             family,
             launch: Arc::new(launch.clone()),
             devices,
@@ -245,7 +248,23 @@ impl ModelRunner {
             world_size: launch.world_size as usize,
             mapping,
             union: None,
-        })
+            pipeline: None,
+        };
+
+        // A media checkpoint's pipeline, read once from its family: what every rank of it serves
+        // a part of, and what every block the deployment places must be a part of, of a form the
+        // block's owner admits.
+        if runner.is_video() {
+            let opened = runner.open_video_checkpoint()?;
+            let pipeline = runner.open_video_family(&opened)?.pipeline();
+            pipeline
+                .check()
+                .context("the model family declares a pipeline execution cannot run")?;
+            video::check_blocks(&pipeline, &build.parallel.worker_groups)
+                .context("the deployment places a block its pipeline does not admit")?;
+            runner.pipeline = Some(Arc::new(pipeline));
+        }
+        Ok(runner)
     }
 
     /// This rank holding `slots` request slots, as the division of its GPU's share decides

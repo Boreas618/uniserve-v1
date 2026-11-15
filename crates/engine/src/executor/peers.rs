@@ -1087,6 +1087,7 @@ mod tests {
             encoder_identity: String::new(),
             latent_seed: 0,
             media_bytes: Vec::new(),
+            pipeline: None,
             call_window: 2,
         }
     }

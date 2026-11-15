@@ -17,9 +17,9 @@
 
 use std::collections::HashSet;
 
-use engine::batch::product;
 use engine::batch::{MediaRow, Phase};
-use proto::config::{BlockConfig, BlockDistribution, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK};
+use nn::pipeline::Product;
+use proto::config::{BlockConfig, BlockDistribution, HostBlock};
 use proto::request::{
     ConditionExtent, DiffusionRequest, EncoderInputs, Event, FinishReason, MediaKind,
     RejectionKind, RequestId,
@@ -29,6 +29,9 @@ use storage::key::encoder_output;
 use storage::runtime::{Completion, Request};
 
 use crate::harness::{A, B, Deployment, Harness, STEPS, VIDEO_PHASES, token, video};
+
+/// The video decoder's block as a deployment names it, a block of MiniMax-H3's pipeline.
+const VIDEO_DECODER_BLOCK: &str = "video_decoder";
 
 /// The calls of request `id`, in the order their batches were submitted: each call's batch's
 /// place in that order, its phase and its row.
@@ -290,7 +293,8 @@ fn a_reference_request_reads_its_conditions_and_encodes_them_inside_its_text_enc
     };
 
     let (_, prepare) = of(&calls, Phase::LatentPrepare)[0];
-    assert_eq!(reads(prepare), [*conditioning, *pixels, *samples]);
+    // The reads are named in the order of the products' classes.
+    assert_eq!(reads(prepare), [*pixels, *samples, *conditioning]);
     assert!(writes(prepare).is_empty());
 }
 
@@ -314,7 +318,7 @@ fn an_audio_reference_request_reads_only_its_samples_and_prepares_its_latents_fr
         panic!("{text:?}");
     };
     let (_, prepare) = of(&calls, Phase::LatentPrepare)[0];
-    assert_eq!(reads(prepare), [*conditioning, *samples]);
+    assert_eq!(reads(prepare), [*samples, *conditioning]);
 }
 
 /// A video request is told it was scheduled before any progress, and then its progress after
@@ -421,7 +425,7 @@ fn a_repeated_request_finds_its_conditioning_and_makes_no_text_encoding() {
         })
         .expect("the conditioning is committed under its key");
     // Its key covers what computed it: the identity of the text encoder's weights (SD §4.3).
-    let expected = encoder_output(product::CONDITIONING, "text-encoder", &[1; 32]);
+    let expected = encoder_output(Product::Conditioning.name(), "text-encoder", &[1; 32]);
     assert_eq!(committed, Key(expected));
 
     let repeated = harness.submit_video(DiffusionRequest {
@@ -556,7 +560,7 @@ fn a_decoder_that_deals_no_units_decodes_one_a_rank_and_a_codec_covering_that_ro
     };
     let mut harness = Deployment::video(&[&VIDEO_PHASES])
         .block(0, VIDEO_DECODER_BLOCK, decoder)
-        .block(0, VIDEO_CODEC_BLOCK, codec)
+        .block(0, HostBlock::VideoCodec.name(), codec)
         .build();
     let id = harness.submit_video(video(1, 2));
     harness.settle(300);

@@ -140,7 +140,7 @@ fn config(candidates: Vec<VideoRequest>, ranks: u32) -> DenoiserConfig {
         stack: DType::F16,
         sample: DType::F32,
         width: 16,
-        classes: CLASSES,
+        classes: DenoiserRunner::PRODUCTS.into_iter().zip(CLASSES).collect(),
         ranks,
         page_bytes: PAGE,
         first: true,

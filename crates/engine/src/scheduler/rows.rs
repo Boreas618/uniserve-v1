@@ -938,7 +938,7 @@ mod tests {
         Batch, BatchId, Columns, DraftWork, Extent, MediaRow, NewSlot, Phase, Row, Shape,
         StateCopy, StateDirection, Variant, VisionRows,
     };
-    use proto::config::{BlockConfig, BlockDistribution, VIDEO_DECODER_BLOCK};
+    use proto::config::{BlockConfig, BlockDistribution};
     use proto::module::commit::{self, COMMIT_FIELDS};
     use proto::request::{
         ConditionExtent, DiffusionRequest, DiffusionSamplingParams, GenerationRequest,
@@ -1877,16 +1877,20 @@ mod tests {
     #[test]
     fn a_video_requests_media_rows_name_what_they_read_then_write() {
         let mut scheduler = scheduler(&[]);
-        let rank = scheduler.groups[0].config.ranks[0].clone();
-        scheduler.groups[0].config.ranks.push(rank);
+        let served = &scheduler.groups[0];
+        let mut config = served.config.clone();
+        let rank = config.ranks[0].clone();
+        config.ranks.push(rank);
         let decoder = BlockConfig {
             distribution: Some(BlockDistribution::TemporalUnits),
             ..BlockConfig::parallel(vec![0, 1])
         };
-        scheduler.groups[0]
-            .config
-            .blocks
-            .insert(VIDEO_DECODER_BLOCK.to_owned(), decoder);
+        config.blocks.insert("video_decoder".to_owned(), decoder);
+        // The group serves MiniMax-H3's pipeline, whose blocks it places.
+        let mut capacity = served.capacity.clone();
+        capacity.pipeline = Some(models::minimax_h3::family::pipeline());
+        scheduler.groups[0] =
+            crate::scheduler::WorkerGroup::new(config, capacity, served.layout.clone()).unwrap();
         scheduler.requests.insert(RequestId(1), video(1));
 
         // The row of the call `scheduled` counts of `phase`, with the calls `completed` counts.
@@ -1904,15 +1908,15 @@ mod tests {
             (vec![0, 1, 2], 0)
         );
         // The text encoding computes the vision features from the patches it reads; the latent
-        // preparation encodes the condition latents from the media it reads, after the
-        // conditioning.
+        // preparation encodes the condition latents from the media it reads beside the
+        // conditioning, each read named in the order of the products' classes.
         assert_eq!(
             named(&media(&mut scheduler, Phase::TextEncode, 0)),
             (vec![2, 3], 1)
         );
         assert_eq!(
             named(&media(&mut scheduler, Phase::LatentPrepare, 0)),
-            (vec![3, 0, 1], 3)
+            (vec![0, 1, 3], 3)
         );
 
         // The last of the four denoising steps writes the final latents.

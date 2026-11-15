@@ -20,6 +20,8 @@ serde = { workspace = true, features = ["rc"] }
 serde_bytes.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
+# The iteration of the host blocks a deployment may name (`config::HostBlock`).
+strum.workspace = true
 # The workspace's one connection, whose codec the interfaces' envelopes implement.
 service.workspace = true
 # The one phase vocabulary of operator calls and package slots (`module::Phase`).

@@ -172,6 +172,7 @@ def _eight_rank_worker_config(parallel_kind: str) -> dict:
         },
         "video_decoder": {
             "ranks": ranks,
+            "parallel_config": {"distribution": "temporal_units"},
         },
         "audio_decoder": {"ranks": [0]},
     }
@@ -230,6 +231,7 @@ def test_block_bindings_release_cancelled_requests(
             },
             "video_decoder": {
                 "ranks": ranks,
+                "parallel_config": {"distribution": "temporal_units"},
             },
             "audio_decoder": {"ranks": [0]},
         }
@@ -245,6 +247,7 @@ def test_block_bindings_release_cancelled_requests(
             "text_encoder": {"ranks": [0]},
             "video_decoder": {
                 "ranks": [2, 0],
+                "parallel_config": {"distribution": "temporal_units"},
             },
             "audio_decoder": {"ranks": [1]},
         }
@@ -289,6 +292,7 @@ def test_block_bindings_release_cancelled_requests(
     )
     worker_config["video_codec"] = {
         "ranks": worker_config["video_decoder"]["ranks"],
+        "parallel_config": {"distribution": "temporal_units"},
     }
     worker_config["muxer"] = {"ranks": [leader_rank]}
     worker_config["media_reader"] = {"ranks": [leader_rank]}

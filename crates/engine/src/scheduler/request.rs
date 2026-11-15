@@ -41,7 +41,6 @@ use storage::Key;
 use storage::runtime::{GroupId, OwnerId};
 
 use super::group::variants;
-use super::video::VIDEO_PHASES;
 use super::{Scheduler, WorkerGroup};
 
 /// The events a request's window keeps free for its terminal events (SD §7.1).
@@ -419,16 +418,17 @@ impl Request {
 
     /// The phases the request may be given a call of now, in the order its next call is named:
     /// the policy's view of it names the first (SD §5.2). A token request's encodings come before
-    /// its prefill; a video request's phases follow `VIDEO_PHASES`. A refill is never named: only
-    /// the policy's `refill` asks for one.
+    /// its prefill; a video request's phases follow the order its pipeline offers them in
+    /// (`nn::pipeline::Pipeline::phases`). A refill is never named: only the policy's `refill`
+    /// asks for one.
     pub(crate) fn ready_phases<'a>(
         &'a self,
         groups: &'a [WorkerGroup],
     ) -> impl Iterator<Item = Phase> + 'a {
-        let order: &'static [Phase] = if self.is_video() {
-            &VIDEO_PHASES
-        } else {
-            &Phase::ALL
+        let order: &[Phase] = match super::video::pipeline(groups) {
+            Some(pipeline) if self.is_video() => &pipeline.phases,
+            _ if self.is_video() => &[],
+            _ => &Phase::ALL,
         };
         order
             .iter()
@@ -1070,6 +1070,7 @@ mod tests {
             encoder_identity: String::new(),
             latent_seed: 0,
             media_bytes: Vec::new(),
+            pipeline: None,
             call_window: window,
             cache_groups: Vec::new(),
             seeds: Vec::new(),
@@ -1082,7 +1083,7 @@ mod tests {
             receives: Vec::new(),
             parts: Vec::new(),
         };
-        WorkerGroup::new(configs[0].clone(), capacity, layout)
+        WorkerGroup::new(configs[0].clone(), capacity, layout).unwrap()
     }
 
     /// `request`, admitted with every phase on group 0.

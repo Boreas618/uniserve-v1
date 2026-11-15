@@ -10,20 +10,11 @@ use nn::family::{
 };
 use proto::config::{BlockConfig, EngineArgs, HeadProjection, WorkerGroupConfig};
 
+use crate::batch::Phase;
+
 use super::ModelRunner;
 
 impl ModelRunner {
-    /// This rank's place in the denoiser's partition and the text encoder's tensor split, as
-    /// its group's blocks state them for its checkpoint ([`video_split`]).
-    ///
-    /// # Errors
-    ///
-    /// A checkpoint that does not open, or a split the deployment's groups do not state.
-    pub(crate) fn partition(&self) -> Result<(DenoiserSplit, Split)> {
-        let opened = self.open_video_checkpoint()?;
-        self.video_split(&*self.open_video_family(&opened)?)
-    }
-
     /// This rank's video checkpoint, opened over its roots: the checkpoint the launch names and the
     /// base release it continues, with the deployment's adapter fused into the block the
     /// family says it edits.
@@ -62,12 +53,19 @@ impl ModelRunner {
     }
 
     /// The denoiser's partition and the text encoder's tensor split of this rank, as the
-    /// deployment page states them for `checkpoint`'s blocks: its own group's, at its position
-    /// there.
-    pub(super) fn video_split(
-        &self,
-        checkpoint: &dyn VideoCheckpoint,
-    ) -> Result<(DenoiserSplit, Split)> {
+    /// deployment page states them for the blocks of the checkpoint's pipeline that denoise and
+    /// that encode prompts: its own group's, at its position there.
+    pub(crate) fn video_split(&self) -> Result<(DenoiserSplit, Split)> {
+        let pipeline = self.pipeline()?;
+        let denoisers: Vec<&str> = pipeline
+            .serving(Phase::Denoise)
+            .map(|block| block.name.as_str())
+            .collect();
+        let text_encoder = pipeline
+            .serving(Phase::TextEncode)
+            .next()
+            .map(|block| block.name.as_str())
+            .context("the pipeline declares no block that encodes prompts")?;
         video_split(
             self.capability_groups(),
             &self.group,
@@ -77,8 +75,8 @@ impl ModelRunner {
                 rank: self.mapping.tensor_rank,
             },
             self.world_size,
-            checkpoint.denoisers(),
-            checkpoint.text_encoder(),
+            &denoisers,
+            text_encoder,
         )
     }
 

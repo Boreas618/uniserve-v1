@@ -18,6 +18,7 @@ mem_fraction_static = 0.73
 sequence_parallel = { kind = "ulysses", ulysses_degree = 4, projection = "exchange" }
 
 [worker_groups.blocks.video_decoder]
+distribution = "temporal_units"
 
 [worker_groups.blocks.audio_decoder]
 distribution = "temporal_units"
@@ -28,9 +29,10 @@ distribution = "temporal_units"
 # The media blocks are placed on this group's CUDA ranks, one set per replica: a request's
 # encode, mux and read are host calls the main process of the rank that serves it runs (the
 # worker's `Media` lane), and a main process serves CUDA devices only - a rank on `cpu` is
-# refused when the node is launched. `video_codec` takes one unit per rank (the resolver inserts
-# its temporal distribution); the muxer and the reader serve on one rank.
+# refused when the node is launched. `video_codec` takes one unit per rank (it states a
+# temporal-unit distribution); the muxer and the reader serve on one rank.
 [worker_groups.blocks.video_codec]
+distribution = "temporal_units"
 
 [worker_groups.blocks.muxer]
 ranks = [0]

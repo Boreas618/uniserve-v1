@@ -96,11 +96,13 @@ pub(crate) const VIDEO_PHASES: [Phase; 11] = [
     Phase::Mux,
 ];
 
-/// The media product kinds a session states a class for, between the encoder outputs and the
-/// stored trajectories: the count of the scheduler's product classes (`PRODUCTS` of
-/// `engine::scheduler`'s `video.rs`), which finds them as the classes just before the stored
-/// trajectories'.
-const PRODUCT_KINDS: usize = 10;
+/// The media pipeline a video deployment's groups serve and state (`Capacity::pipeline`):
+/// MiniMax-H3's, as its family declares it. Its products are the classes a session states between
+/// the encoder outputs and the stored trajectories, which the scheduler finds as the classes just
+/// before the stored trajectories'.
+fn pipeline() -> nn::pipeline::Pipeline {
+    models::minimax_h3::family::pipeline()
+}
 
 /// The raster and timeline of every video request of the harness, which the denoising shapes of a
 /// video deployment capture.
@@ -572,7 +574,10 @@ impl Deployment {
             .iter()
             .map(|(kind, _)| class(1, host.map(|host| (host, 1)), kind.is_state()))
             .collect();
-        classes.extend((0..=PRODUCT_KINDS).map(|_| class(0, None, false)));
+        // The class of encoder outputs, then one per product of a video deployment's pipeline;
+        // a token deployment holds no product.
+        classes.push(class(0, None, false));
+        classes.extend(self.products().map(|_| class(0, None, false)));
         classes.push(class(0, Some((latents, 0)), false));
         let trajectory = index(classes.len() - 1);
 
@@ -703,7 +708,9 @@ impl Deployment {
         }
 
         let denoises = serves(Phase::Denoise);
-        let products: Vec<u64> = (1..=PRODUCT_KINDS as u64).map(|kind| 256 * kind).collect();
+        let products: Vec<u64> = (1..=self.products().count() as u64)
+            .map(|kind| 256 * kind)
+            .collect();
         let media_bytes = if denoises {
             vec![
                 (denoising(TEXT_ROWS, 0), 30_000, products.clone()),
@@ -771,8 +778,29 @@ impl Deployment {
             },
             latent_seed: if denoises { LATENT_SEED } else { 0 },
             media_bytes,
+            pipeline: self.media().then(pipeline),
             call_window: 2,
         }
+    }
+
+    /// Whether the deployment serves video requests: a group serves a phase of the media
+    /// pipeline, and every group then states the pipeline.
+    fn media(&self) -> bool {
+        let pipeline = pipeline();
+        self.groups
+            .iter()
+            .any(|(_, phases)| phases.iter().any(|phase| pipeline.phases.contains(phase)))
+    }
+
+    /// The products the deployment's session states classes of: the pipeline's for a video
+    /// deployment, none for a token one.
+    fn products(&self) -> impl Iterator<Item = nn::pipeline::ProductSpec> {
+        let products = if self.media() {
+            pipeline().products
+        } else {
+            Vec::new()
+        };
+        products.into_iter()
     }
 
     /// The scheduler's configuration: as many running requests as the groups hold slots for

@@ -126,10 +126,10 @@ def _deployment(
         "blocks": {
             "transformer": transformer,
             "text_encoder": {"tensor_parallel_size": 2},
-            "video_decoder": {},
+            "video_decoder": {"distribution": "temporal_units"},
             "audio_decoder": {"distribution": "temporal_units"},
             "latent_encoder": {"distribution": "temporal_units"},
-            "video_codec": {},
+            "video_codec": {"distribution": "temporal_units"},
             "muxer": {"ranks": [0]},
             "media_reader": {"ranks": [0]},
         },

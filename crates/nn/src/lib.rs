@@ -75,6 +75,7 @@ pub mod error;
 pub mod family;
 pub mod functional;
 pub mod modules;
+pub mod pipeline;
 pub mod profiler;
 pub mod quantization;
 pub mod vae;

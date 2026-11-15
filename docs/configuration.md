@@ -454,6 +454,7 @@ mem_fraction_static = 0.73
 sequence_parallel = { kind = "ulysses", ulysses_degree = 4 }
 
 [worker_groups.blocks.video_decoder]
+distribution = "temporal_units"
 
 [worker_groups.blocks.audio_decoder]
 distribution = "temporal_units"
@@ -468,6 +469,7 @@ ranks = ["cpu*8"]
 queue_depth = 6
 
 [worker_groups.blocks.video_codec]
+distribution = "temporal_units"
 
 [[worker_groups]]
 id = "reader"
@@ -524,7 +526,7 @@ A block table takes:
 | `ranks` | Every rank of the replica | Indices into one replica's ranks; their order assigns each rank its position in the parallel degrees or the unit schedule. A denoiser block's positions run over the Ulysses degree fastest, then the tensor degree, then the all-gather degree, and the pipeline degree slowest: in a block of `tensor_parallel_size = 2` and Ulysses degree 2, positions 0 and 1 are one Ulysses group and positions 0 and 2 one tensor group |
 | `tensor_parallel_size`, `pipeline_parallel_size` | `1` | Model-parallel degrees |
 | `sequence_parallel` | `{ kind = "local" }` | `{ kind = "ulysses", ulysses_degree = N }` with optional `projection` and `projection_rows`, `{ kind = "allgather", allgather_degree = N }`, or `{ kind = "hybrid", ulysses_degree = N, allgather_degree = M }` |
-| `distribution` | Unset | `temporal_units` runs its own copy of the block on every rank and deals independent media units among them; the video decoder and codec always take it |
+| `distribution` | Unset | `temporal_units` runs its own copy of the block on every rank and deals independent media units among them. Each block admits the forms its owner declares, which startup checks: the model family's for a part of its pipeline (MiniMax-H3's video decoder deals one unit per rank, its text encoder and denoisers take none), the engine's for the host blocks `media_reader` and `muxer` (one rank, no distribution) and `video_codec` (one unit per rank) |
 | `units_per_rank` | `1` | Consecutive units each rank takes under `distribution` |
 | `weights` | `device` | `host` keeps the dense projection weights of the block's repeated layer stack in page-locked host storage and serves it without CUDA graphs |
 

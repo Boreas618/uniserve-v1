@@ -518,12 +518,11 @@ pub trait VideoFamily: Send + Sync {
 
 /// A video generation checkpoint, read but not loaded.
 pub trait VideoCheckpoint: Send + Sync {
-    /// The deployment stages that hold a denoiser network, in the names a deployment file
-    /// places them under; a checkpoint may hold several networks and a deployment places one.
-    fn denoisers(&self) -> &'static [&'static str];
-
-    /// The deployment stage that holds the text encoder.
-    fn text_encoder(&self) -> &'static str;
+    /// The checkpoint's pipeline as execution runs it: its phases, its products and the blocks
+    /// a deployment may place, each block under the name a deployment file places it by
+    /// ([`crate::pipeline`]). A checkpoint may hold several networks that serve one phase, of
+    /// which a deployment places one.
+    fn pipeline(&self) -> crate::pipeline::Pipeline;
 
     /// Loads the pipeline's share of `checkpoint`, the checkpoint [`VideoFamily::open`] read, for
     /// `placement`, its weights reached through `loader`.

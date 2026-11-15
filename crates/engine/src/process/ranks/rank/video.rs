@@ -6,11 +6,13 @@
 //! deployment places it on; a device may hold ranks of several groups (a text encoder's and a
 //! denoiser's, as `configs/minimax_h3/fasth3-dp8-text-tp8.toml` places them), each a rank of its
 //! own with its own media memory, graph pool and runners. Its group's blocks name the phases it
-//! serves: the text encoder's block its text encodings, the denoiser's its latent preparations
-//! and steps, the video decoder's its decode rounds, the audio decoder's first rank the request's
-//! track, and the host blocks ([`MEDIA_READER`], [`VIDEO_CODEC_BLOCK`], [`MUXER`]) its host work.
-//! A group that places the whole model ([`DEFAULT_BLOCK`]) serves every phase on its one rank.
-//! The rank loads the stages of its group's blocks that hold it, split as those blocks state
+//! serves, as the model family's pipeline declares each of its blocks (`nn::pipeline`) and as
+//! the engine declares its host blocks ([`HostBlock`]): a block's ranks serve its phases, a
+//! block whose work is one unit per request on its first rank, and a block that computes no
+//! phase of its own none ([`served_phases`]). A group that places the whole model
+//! ([`DEFAULT_BLOCK`]) serves every phase of the pipeline. A block the pipeline does not declare
+//! is refused, and so is a block of a form its owner does not admit ([`check_blocks`]). The rank
+//! loads the parts of its group's blocks that hold it, split as those blocks state
 //! ([`ModelRunner::video_split`]).
 //!
 //! **Runners.** One per block the rank serves, each on a stream of its own: [`EncoderRunner`],
@@ -21,7 +23,7 @@
 //!
 //! **Sizes.** A rank of the group that denoises states its group's captured request shapes with the
 //! bytes of a slot's trajectory and of a block of each product kind there (`Capacity::media_bytes`,
-//! in `crate::batch::product::KINDS` order), from its denoiser's shapes and the decoders'
+//! in the order of the pipeline's products), from its denoiser's shapes and the decoders'
 //! declarations, and a decoding rank buckets by the denoiser's layouts of the served requests.
 //! Neither needs its share to hold the stage it reads: the meta load its profile run reads holds
 //! the deployment's denoiser and decoders beside its share ([`ModelRunner::load_profiled`]), and
@@ -33,7 +35,6 @@ use std::sync::Arc;
 
 use crate::batch::Capacity;
 use crate::batch::capacity::variants;
-use crate::batch::product;
 use crate::batch::{Extent, Phase, Shape, Variant};
 use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::client::StorageClient;
@@ -51,47 +52,20 @@ use crate::runner::thread_pool::ThreadPool;
 use crate::runner::{Runner, RunnerId};
 use anyhow::{Context as _, Result, bail};
 use nn::VideoRequest;
-use nn::family::{Stage, VideoModel, VideoPlacement, VideoServing};
+use nn::family::{VideoModel, VideoPlacement, VideoServing};
+use nn::pipeline::{Pipeline, Product};
 use ops::Generation;
 use platform::{Communicator, DeviceId, Stream};
 use proto::config::{
-    DEFAULT_BLOCK, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK, WorkerGroupConfig, WorkerGroupRole,
+    BlockConfig, DEFAULT_BLOCK, HostBlock, Partition, WorkerGroupConfig, WorkerGroupRole,
 };
 use proto::video::Layout;
+use strum::IntoEnumIterator as _;
 use tensor::DType;
 
 use super::memory::{Peaks, granularity, unreserved};
 use super::text::Keys;
 use super::{ModelRunner, Weights};
-
-/// The block a deployment places a video request's media read under: one rank of its group
-/// reads the conditions into the request's products.
-pub(crate) const MEDIA_READER: &str = "media_reader";
-
-/// The block a deployment places a video request's track encode and its muxing under: one rank
-/// of its group assembles the request's artifact.
-pub(crate) const MUXER: &str = "muxer";
-
-/// Every phase of a video request, which a group that places the whole model serves.
-const MEDIA_PHASES: [Phase; 9] = [
-    Phase::MediaRead,
-    Phase::TextEncode,
-    Phase::LatentPrepare,
-    Phase::Denoise,
-    Phase::VideoDecode,
-    Phase::AudioDecode,
-    Phase::VideoEncode,
-    Phase::AudioEncode,
-    Phase::Mux,
-];
-
-/// The host phases of a video request, which the media host serves.
-const HOST_PHASES: [Phase; 4] = [
-    Phase::MediaRead,
-    Phase::VideoEncode,
-    Phase::AudioEncode,
-    Phase::Mux,
-];
 
 /// The runners of a media rank that compute on the device, by the region of the graph pool
 /// each replays in. The media host computes nothing there.
@@ -136,7 +110,7 @@ pub(crate) struct VideoRank {
     /// The stages the rank's group places, split as its blocks state.
     pub(crate) model: Arc<dyn VideoModel>,
     /// The text encoder's tensor group, and the denoiser's group along each axis of its
-    /// partition ([`DENOISER_AXES`]); `None` for a group of one and on the meta device.
+    /// partition ([`BLOCK_AXES`]); `None` for a group of one and on the meta device.
     pub(crate) tensor: Option<Arc<ops::Group>>,
     pub(crate) denoiser: DenoiserGroups,
     /// The communicator of the ranks a video decode round is dealt to, over which they pass the
@@ -294,6 +268,18 @@ impl ModelRunner {
         self.load_stages(Weights::Meta, true)
     }
 
+    /// The media pipeline the rank's checkpoint serves, as its family declares it (`nn::pipeline`),
+    /// which [`ModelRunner::of`](super::ModelRunner::of) read and checked once.
+    ///
+    /// # Errors
+    ///
+    /// A rank of a text deployment, which serves no pipeline.
+    pub(crate) fn pipeline(&self) -> Result<&Pipeline> {
+        self.pipeline
+            .as_deref()
+            .context("a rank of a text deployment serves no media pipeline")
+    }
+
     /// The stages of the video pipeline `sized` names ([`Self::profiled_stages`] when it holds,
     /// the rank's share otherwise), split as the group's blocks state, their weights reached
     /// through `weights`.
@@ -304,9 +290,9 @@ impl ModelRunner {
     fn load_stages(&self, weights: Weights<'_>, sized: bool) -> Result<Arc<dyn VideoModel>> {
         let opened = self.open_video_checkpoint()?;
         let checkpoint = self.open_video_family(&opened)?;
-        let (denoiser, tensor) = self.video_split(&*checkpoint)?;
+        let (denoiser, tensor) = self.video_split()?;
         let stages = match sized {
-            true => self.profiled_stages(checkpoint.denoisers())?,
+            true => self.profiled_stages()?,
             false => self.stages()?,
         };
 
@@ -322,35 +308,39 @@ impl ModelRunner {
     }
 
     /// The stages a rank's profile run loads: those its group places on it ([`Self::stages`]),
-    /// and on a rank that denoises or decodes the stages whose declarations size what it
-    /// computes, wherever the deployment places them: the deployment's denoiser, one of
-    /// `denoisers`, whose layouts of the served requests a decoder's buckets follow, and the two
-    /// decoders, whose rasters, splices and waveforms a denoising rank sizes the decoded products
-    /// by (`Capacity::media_bytes`). `None` when the deployment places the whole pipeline.
+    /// and on a rank that denoises or decodes the blocks whose declarations size what it
+    /// computes, wherever the deployment places them: the block that denoises in the deployment
+    /// (of those the pipeline declares, the one a group places), whose layouts of the served
+    /// requests a decoder's buckets follow, and the blocks that decode, whose rasters, splices
+    /// and waveforms a denoising rank sizes the decoded products by (`Capacity::media_bytes`).
+    /// `None` when the deployment places the whole pipeline.
     ///
     /// # Errors
     ///
     /// A rank its group does not place.
-    fn profiled_stages(&self, denoisers: &[&str]) -> Result<Option<BTreeSet<String>>> {
+    fn profiled_stages(&self) -> Result<Option<BTreeSet<String>>> {
+        const SIZING: [Phase; 3] = [Phase::Denoise, Phase::VideoDecode, Phase::AudioDecode];
         let Some(mut stages) = self.stages()? else {
             return Ok(None);
         };
-        let sizes = self.media_phases()?.iter().any(|phase| {
-            matches!(
-                phase,
-                Phase::Denoise | Phase::VideoDecode | Phase::AudioDecode
-            )
-        });
-        if !sizes {
+        if !self
+            .media_phases()?
+            .iter()
+            .any(|phase| SIZING.contains(phase))
+        {
             return Ok(Some(stages));
         }
 
+        let pipeline = self.pipeline()?;
         let groups = &self.engine_config().parallel.worker_groups;
-        let network = denoisers
-            .iter()
-            .find(|name| groups.iter().any(|group| group.blocks.contains_key(**name)));
-        stages.extend(network.map(|name| (*name).to_owned()));
-        stages.extend([Stage::VideoDecoder.name(), Stage::AudioDecoder.name()].map(str::to_owned));
+        let placed = |name: &str| groups.iter().any(|group| group.blocks.contains_key(name));
+        let network = pipeline
+            .serving(Phase::Denoise)
+            .find(|block| placed(&block.name));
+        stages.extend(network.map(|block| block.name.clone()));
+        for phase in [Phase::VideoDecode, Phase::AudioDecode] {
+            stages.extend(pipeline.serving(phase).map(|block| block.name.clone()));
+        }
         Ok(Some(stages))
     }
 
@@ -359,10 +349,11 @@ impl ModelRunner {
     /// places the whole model. A rank outside a block, such as a denoising rank beside a text
     /// encoder split over fewer ranks, loads none of that block's stage.
     ///
-    /// A denoising rank also holds the condition encoders whenever the deployment places them
-    /// (the latent encoder's block, in any group and on any ranks): its latent preparation
-    /// encodes its requests' conditions (`specs/engine-worker-port.md` §5, D1), whichever ranks
-    /// the block names.
+    /// A rank also holds every block the pipeline declares as what the ranks of a phase compute
+    /// with (`Partition::With`, a condition encoder a latent preparation runs) when it serves that
+    /// phase and the deployment places the block, in any group and on any ranks: its latent
+    /// preparation encodes its requests' conditions (`specs/engine-worker-port.md` §5, D1),
+    /// whichever ranks the block names.
     ///
     /// # Errors
     ///
@@ -378,17 +369,18 @@ impl ModelRunner {
             .filter(|(_, block)| block.ranks.is_empty() || block.ranks.contains(&position));
         let mut stages: BTreeSet<String> = held.map(|(name, _)| name.clone()).collect();
 
-        let denoises = [Stage::Transformer, Stage::TransformerRef]
-            .iter()
-            .any(|stage| stages.contains(stage.name()));
-        let encoder = Stage::LatentEncoder.name();
+        let phases = self.media_phases()?;
         let groups = &self.engine_config().parallel.worker_groups;
-        if denoises
-            && groups
+        for block in &self.pipeline()?.blocks {
+            let Partition::With(phase) = block.partition else {
+                continue;
+            };
+            let placed = groups
                 .iter()
-                .any(|group| group.blocks.contains_key(encoder))
-        {
-            stages.insert(encoder.to_owned());
+                .any(|group| group.blocks.contains_key(&block.name));
+            if placed && phases.contains(&phase) {
+                stages.insert(block.name.clone());
+            }
         }
         Ok(Some(stages))
     }
@@ -430,79 +422,82 @@ impl ModelRunner {
         let group = self
             .worker_group()
             .with_context(|| format!("the deployment states no worker group {}", self.group))?;
-        Ok(served_phases(group, self.position()?))
+        served_phases(self.pipeline()?, group, self.position()?)
     }
 
-    /// The parallel groups of the deployment's media groups over the process's host group, whose
-    /// members are the deployment's ranks: the text encoders' tensor groups; the denoisers'
-    /// groups along each axis of their partition ([`DENOISER_AXES`], `nn::family::ULYSSES_AXIS`
-    /// and after), each a fiber of the denoiser block's places along that degree
-    /// (`nn::family::DenoiserSplit` orders them); and the video decoders' ranks, which pass a
-    /// round's splice tails between them (`crate::runner::decoder`). A block's ranks are any
-    /// positions of its worker group, the block's rank `r` being its `r`-th, and a group lists
-    /// its members in the order of their coordinate. Each kind holds this rank's place among
-    /// its groups. Every rank forms all six kinds, in this order, so every member of the host
-    /// group takes part in every group's id broadcast.
+    /// The collective groups the deployment's media groups form over the process's host group,
+    /// whose members are the deployment's ranks, by the blocks the pipeline declares
+    /// (`nn::pipeline::Pipeline::blocks`), in declaration order: a block that runs as one
+    /// model-parallel group forms one kind per axis of its degrees, in the order
+    /// `nn::family::DenoiserSplit` orders them (`nn::family::ULYSSES_AXIS` and after), each a
+    /// fiber of the block's places along that degree; a block of units that pass carries forms
+    /// one kind over all its ranks (a video decode round's ranks, which pass its splice tails,
+    /// `crate::runner::decoder`). A kind gathers the groups of every worker group that places its
+    /// block; a block's ranks are any positions of its worker group, the block's rank `r` being
+    /// its `r`-th, and a group lists its members in the order of their coordinate. Each kind holds
+    /// this rank's place among its groups. Every rank forms every kind, in this order, so every
+    /// member of the host group takes part in every group's id broadcast.
     ///
     /// # Errors
     ///
-    /// A split block that states another number of ranks than its parallel degrees' product, or
-    /// a rank twice.
-    pub(crate) fn media_collectives(&self) -> Result<[super::Collective; 6]> {
+    /// A block that states another number of ranks than its parallel degrees' product, or a rank
+    /// twice.
+    pub(crate) fn media_collectives(&self) -> Result<Vec<MediaCollective>> {
         let groups = &self.engine_config().parallel.worker_groups;
         let firsts = WorkerGroupConfig::first_ranks(groups);
-        let text = Stage::TextEncoder.name();
-        let denoisers = [Stage::Transformer.name(), Stage::TransformerRef.name()];
         let own = (|| Some((self.worker_group()?, self.position().ok()?)))();
 
-        let mut kinds: [super::Collective; 6] = std::array::from_fn(|_| super::Collective {
-            groups: Vec::new(),
-            member: None,
-        });
-        for (first, group) in firsts.iter().zip(groups) {
-            for (name, block) in &group.blocks {
-                // Each kind's members as places of the block: one list per group of the kind.
-                let (kind, fibers) = if name == text {
-                    let size = block.tensor_parallel_size;
-                    if size > 1 && block.ranks.len() != size {
-                        bail!(
-                            "block {name} of worker group {} splits over its ranks {:?}, which \
-                             are not {size} distinct ranks of the group",
-                            group.id,
-                            block.ranks
-                        );
-                    }
-                    (0, vec![(0..size).collect::<Vec<_>>()])
-                } else if name == VIDEO_DECODER_BLOCK {
-                    // Every rank a decode round is dealt to (`ModelRunner::round`).
-                    (5, vec![(0..block.ranks.len()).collect()])
-                } else if denoisers.contains(&name.as_str()) {
-                    for (axis, fibers) in denoiser_fibers(block)
-                        .map_err(|refusal| {
-                            anyhow::anyhow!("block {name} of worker group {}: {refusal}", group.id)
-                        })?
-                        .into_iter()
-                        .enumerate()
-                    {
-                        let collective = &mut kinds[1 + axis];
-                        add_fibers(collective, (group, *first, block), fibers, own)?;
-                    }
+        let mut kinds = Vec::new();
+        for declared in &self.pipeline()?.blocks {
+            let axes: Vec<Option<usize>> = match declared.partition {
+                Partition::Group => (0..BLOCK_AXES).map(Some).collect(),
+                Partition::Units { carries: true } => vec![None],
+                Partition::Units { carries: false } | Partition::First | Partition::With(_) => {
                     continue;
-                } else {
-                    continue;
+                }
+            };
+            for axis in axes {
+                let mut collective = super::Collective {
+                    groups: Vec::new(),
+                    member: None,
                 };
-                add_fibers(&mut kinds[kind], (group, *first, block), fibers, own)?;
+                for (first, group) in firsts.iter().zip(groups) {
+                    let Some(block) = group.blocks.get(&declared.name) else {
+                        continue;
+                    };
+                    let fibers = match axis {
+                        Some(axis) => block_fibers(block)
+                            .map_err(|refusal| {
+                                anyhow::anyhow!(
+                                    "block {} of worker group {}: {refusal}",
+                                    declared.name,
+                                    group.id
+                                )
+                            })?
+                            .into_iter()
+                            .nth(axis)
+                            .unwrap_or_default(),
+                        None => vec![(0..block.ranks.len()).collect()],
+                    };
+                    add_fibers(&mut collective, (group, *first, block), fibers, own)?;
+                }
+                kinds.push(MediaCollective {
+                    block: declared.name.clone(),
+                    axis,
+                    collective,
+                });
             }
         }
         Ok(kinds)
     }
 
     /// How a video decode round is dealt to the ranks of the group that decodes this rank's
-    /// requests: its video decoder block's ranks in order, by their rank index in the process's
-    /// media memory (the deployment's rank), each decoding the block's units per rank when it
-    /// deals units and one otherwise, the rounds alternately in that order and in reverse
-    /// (`RoundConfig::rank_of`). Its width is the scheduler's (`crate::scheduler::video`). A group
-    /// that places no video decoder block decodes a round of one unit on its own rank.
+    /// requests: the ranks of its block that serves video decodes (by the pipeline's declaration)
+    /// in order, by their rank index in the process's media memory (the deployment's rank), each
+    /// decoding the block's units per rank when it deals units and one otherwise, the rounds
+    /// alternately in that order and in reverse (`RoundConfig::rank_of`). Its width is the
+    /// scheduler's (`crate::scheduler::video`). A group that places no such block decodes a round
+    /// of one unit on its own rank.
     ///
     /// # Errors
     ///
@@ -510,14 +505,21 @@ impl ModelRunner {
     pub(crate) fn round(&self) -> Result<RoundConfig> {
         let groups = &self.engine_config().parallel.worker_groups;
         let firsts = WorkerGroupConfig::first_ranks(groups);
+        let decoders: Vec<&str> = self
+            .pipeline()?
+            .serving(Phase::VideoDecode)
+            .map(|block| block.name.as_str())
+            .collect();
+        let block_of = |group: &'_ WorkerGroupConfig| {
+            decoders
+                .iter()
+                .find_map(|name| group.blocks.get(*name))
+                .is_some()
+        };
         let own = groups.iter().position(|group| group.id.0 == self.group);
         let decoder = own
-            .filter(|at| groups[*at].blocks.contains_key(VIDEO_DECODER_BLOCK))
-            .or_else(|| {
-                groups
-                    .iter()
-                    .position(|group| group.blocks.contains_key(VIDEO_DECODER_BLOCK))
-            });
+            .filter(|at| block_of(&groups[*at]))
+            .or_else(|| groups.iter().position(block_of));
 
         let Some(at) = decoder else {
             return Ok(RoundConfig {
@@ -525,7 +527,10 @@ impl ModelRunner {
                 units: 1,
             });
         };
-        let block = &groups[at].blocks[VIDEO_DECODER_BLOCK];
+        let block = decoders
+            .iter()
+            .find_map(|name| groups[at].blocks.get(*name))
+            .context("the decoding group places its decoder block")?;
         let ranks = block
             .ranks
             .iter()
@@ -540,8 +545,8 @@ impl ModelRunner {
     }
 
     /// The config of the rank's text encoder of `model`, writing the conditioning and reading the
-    /// vision pixels of their classes in `classes` (the session's class of each product kind, in
-    /// `crate::batch::product::KINDS` order): one captured encode bucket per request count up to
+    /// vision pixels of their classes in `classes` (the session's class of each product of the
+    /// pipeline): one captured encode bucket per request count up to
     /// the deployment's running requests and per prompt capacity the deployment captures, and
     /// for an encoder that takes images the prompts with vision blocks the deployment admits,
     /// whose eager encodes it profiles. The request counts are the deployment's whatever slots
@@ -556,7 +561,7 @@ impl ModelRunner {
     pub(crate) fn encoder_config(
         &self,
         model: &dyn VideoModel,
-        classes: &[u8; 10],
+        classes: Classes<'_>,
     ) -> Result<EncoderConfig> {
         let serving = self.video_serving()?;
         let requests = u32::try_from(self.engine_config().max_running_requests.get())
@@ -583,9 +588,14 @@ impl ModelRunner {
             format!("the deployment's worker groups place no rank {}", self.rank)
         })?;
         let position = self.position()?;
-        let first = (0..group.ranks.len())
-            .find(|&at| served_phases(group, at).contains(&Phase::TextEncode))
-            .unwrap_or(position);
+        let pipeline = self.pipeline()?;
+        let mut first = position;
+        for at in 0..group.ranks.len() {
+            if served_phases(pipeline, group, at)?.contains(&Phase::TextEncode) {
+                first = at;
+                break;
+            }
+        }
         let holder = (self.rank as usize)
             .checked_sub(position)
             .and_then(|start| u32::try_from(start + first).ok())
@@ -596,9 +606,9 @@ impl ModelRunner {
             width: model.text_width(),
             dtype: self.dtype(),
             patches,
-            conditioning: classes[product_kind(product::CONDITIONING)?],
+            conditioning: classes.of(Product::Conditioning)?,
             holder,
-            pixels: classes[product_kind(product::VISION_PIXELS)?],
+            pixels: classes.of(Product::VisionPixels)?,
             warm,
         })
     }
@@ -616,7 +626,7 @@ impl ModelRunner {
     pub(crate) fn denoiser_config(
         &self,
         model: &dyn VideoModel,
-        classes: &[u8; 10],
+        classes: Classes<'_>,
     ) -> Result<DenoiserConfig> {
         let candidates = model.candidates(&self.video_serving()?)?;
         if candidates.is_empty() {
@@ -635,33 +645,31 @@ impl ModelRunner {
             }
             _ => (1, true),
         };
-        let pick = |name: &str| -> Result<u8> { Ok(classes[product_kind(name)?]) };
+        let classes = DenoiserRunner::PRODUCTS
+            .into_iter()
+            .map(|product| Ok((product, classes.of(product)?)))
+            .collect::<Result<Vec<(Product, u8)>>>()?;
         Ok(DenoiserConfig {
             phases: vec![Phase::LatentPrepare, Phase::Denoise],
             candidates,
             stack: self.dtype(),
             sample: model.sample_type(),
             width: model.text_width(),
-            classes: [
-                pick(product::CONDITIONING)?,
-                pick(product::CONDITION_PIXELS)?,
-                pick(product::CONDITION_SAMPLES)?,
-                pick(product::VIDEO_LATENTS)?,
-                pick(product::AUDIO_LATENTS)?,
-            ],
+            classes,
             ranks: ranks.max(1),
             page_bytes: latent_pages(&self.engine_config().video, 0, 0)?.page_bytes()?,
             first,
         })
     }
 
-    /// The denoiser block of this rank's group: the block of a denoiser stage; `None` for a
-    /// group that places the whole model.
-    fn denoiser_block(&self) -> Option<&proto::config::BlockConfig> {
+    /// The denoiser block of this rank's group: its block that serves denoising steps, by the
+    /// pipeline's declaration; `None` for a group that places the whole model.
+    fn denoiser_block(&self) -> Option<&BlockConfig> {
         let group = self.worker_group()?;
-        [Stage::Transformer, Stage::TransformerRef]
-            .into_iter()
-            .find_map(|stage| group.blocks.get(stage.name()))
+        self.pipeline()
+            .ok()?
+            .serving(Phase::Denoise)
+            .find_map(|block| group.blocks.get(&block.name))
     }
 
     /// The configs of the rank's video decoder and its track's decoder of `model`, each `None`
@@ -678,7 +686,7 @@ impl ModelRunner {
         &self,
         model: &dyn VideoModel,
         laid: &[(VideoRequest, Layout)],
-        classes: &[u8; 10],
+        classes: Classes<'_>,
     ) -> Result<(Option<DecoderConfig>, Option<DecoderConfig>)> {
         let phases = self.media_phases()?;
         let (video, audio) = (
@@ -716,16 +724,16 @@ impl ModelRunner {
             }
         }
 
-        let pick = |name: &str| -> Result<u8> { Ok(classes[product_kind(name)?]) };
-        let tail = pick(product::VIDEO_TAIL)?;
+        let pick = |product: Product| classes.of(product);
+        let tail = pick(Product::VideoTail)?;
         let video = video
             .then(|| -> Result<DecoderConfig> {
                 Ok(DecoderConfig {
                     phases: vec![Phase::VideoDecode],
                     buckets: Buckets::new(clips),
                     classes: [
-                        pick(product::VIDEO_LATENTS)?,
-                        pick(product::VIDEO_UNITS)?,
+                        pick(Product::VideoLatents)?,
+                        pick(Product::VideoUnits)?,
                         tail,
                     ],
                     timelines,
@@ -740,8 +748,8 @@ impl ModelRunner {
                     phases: vec![Phase::AudioDecode],
                     buckets: Buckets::new(tracks),
                     classes: [
-                        pick(product::AUDIO_LATENTS)?,
-                        pick(product::AUDIO_SAMPLES)?,
+                        pick(Product::AudioLatents)?,
+                        pick(Product::AudioSamples)?,
                         tail,
                     ],
                     timelines: Vec::new(),
@@ -770,7 +778,7 @@ impl ModelRunner {
     pub(crate) fn host_config(
         &self,
         model: &dyn VideoModel,
-        classes: &[u8; 10],
+        classes: Classes<'_>,
         phases: Vec<Phase>,
     ) -> Result<HostConfig> {
         // The shortest timeline is the least that lasts one frame. A frame count between the
@@ -783,11 +791,7 @@ impl ModelRunner {
 
         Ok(HostConfig {
             phases,
-            classes: product::KINDS
-                .iter()
-                .map(|(name, ..)| *name)
-                .zip(classes.iter().copied())
-                .collect(),
+            classes: classes.all()?,
             timelines,
             round: self.round()?,
             frame_rate: model.frame_rate(),
@@ -820,10 +824,10 @@ impl ModelRunner {
             DenoiserGroups,
             Option<Communicator>,
         ),
-        (laid, classes): (&[(VideoRequest, Layout)], &[u8; 10]),
+        (laid, classes): (&[(VideoRequest, Layout)], Classes<'_>),
     ) -> Result<DeviceRunners> {
         let phases = self.media_phases()?;
-        let (partition, text_split) = self.partition()?;
+        let (partition, text_split) = self.video_split()?;
 
         let encoder = if phases.contains(&Phase::TextEncode) {
             let text = model.text_encoder().context(
@@ -927,12 +931,12 @@ impl ModelRunner {
         (memory, stream): (&Arc<BufferMemory>, Option<Stream>),
         (pool, media): (&Arc<ThreadPool>, &Arc<media::MediaRunner>),
         kernels: &Arc<Generation>,
-        classes: &[u8; 10],
+        classes: Classes<'_>,
     ) -> Result<Option<MediaHost>> {
         let phases: Vec<Phase> = self
             .media_phases()?
             .into_iter()
-            .filter(|phase| HOST_PHASES.contains(phase))
+            .filter(|phase| host_phase(*phase))
             .collect();
         if phases.is_empty() {
             return Ok(None);
@@ -970,9 +974,9 @@ impl ModelRunner {
         groups: (Option<Arc<ops::Group>>, DenoiserGroups),
         pool_tasks: u32,
     ) -> Result<(VideoRank, Keys)> {
-        let classes = product_classes(0);
+        let classes = Classes::new(self.pipeline()?, 0);
         let slots = self.slots();
-        let row = self.row_bytes(model.as_ref(), &classes)?;
+        let row = self.row_bytes(model.as_ref(), classes)?;
 
         // The served requests' layouts, which a decoding rank buckets by and a denoising rank
         // sizes its products by.
@@ -994,7 +998,7 @@ impl ModelRunner {
             &memory,
             |_, inputs| Ok((Graphs::meta(Arc::clone(&unserved), inputs), None)),
             (None, Default::default(), None),
-            (&laid, &classes),
+            (&laid, classes),
         )?;
 
         // What the runners hold beside their regions, and on a denoising rank the trajectory
@@ -1076,7 +1080,7 @@ impl ModelRunner {
     /// # Errors
     ///
     /// A denoising rank whose share holds no denoiser, or a layout it refuses.
-    pub(crate) fn row_bytes(&self, model: &dyn VideoModel, classes: &[u8; 10]) -> Result<u64> {
+    pub(crate) fn row_bytes(&self, model: &dyn VideoModel, classes: Classes<'_>) -> Result<u64> {
         if !self.media_phases()?.contains(&Phase::Denoise) {
             return Ok(0);
         }
@@ -1088,8 +1092,8 @@ impl ModelRunner {
     }
 
     /// Per captured request shape of the rank's denoiser (`DenoiserRunner::media_shapes`): the
-    /// shape, the bytes of a slot's trajectory, and the bytes of a block of each product kind in
-    /// `crate::batch::product::KINDS` order (`Capacity::media_bytes`); and the most units a
+    /// shape, the bytes of a slot's trajectory, and the bytes of a block of each product of the
+    /// pipeline, in its order (`Capacity::media_bytes`); and the most units a
     /// timeline of the deployment has, the splice tails a request declares. `model` is the
     /// profile's meta load, which holds the decoders wherever the deployment places them
     /// ([`ModelRunner::load_profiled`]), and `laid` the served requests with their layouts.
@@ -1211,21 +1215,23 @@ impl ModelRunner {
                 (None, _) => 0,
             };
 
+            let bytes = |product: Product| match product {
+                Product::ConditionPixels => condition_pixels,
+                Product::ConditionSamples => condition_samples,
+                Product::VisionPixels => vision_pixels,
+                Product::Conditioning => conditioning,
+                Product::VideoLatents => *video,
+                Product::AudioLatents => *audio,
+                Product::VideoUnits => video_units,
+                Product::VideoTail => tail,
+                Product::EncodedUnits => encoded,
+                Product::AudioSamples => samples,
+            };
+            let products = &self.pipeline()?.products;
             sized.push((
                 *shape,
                 *trajectory,
-                vec![
-                    condition_pixels,
-                    condition_samples,
-                    vision_pixels,
-                    conditioning,
-                    *video,
-                    *audio,
-                    video_units,
-                    tail,
-                    encoded,
-                    samples,
-                ],
+                products.iter().map(|spec| bytes(spec.product)).collect(),
             ));
         }
         Ok((sized, most_units))
@@ -1269,7 +1275,7 @@ impl ModelRunner {
             .chain(
                 phases
                     .iter()
-                    .filter(|phase| HOST_PHASES.contains(phase))
+                    .filter(|phase| host_phase(**phase))
                     .filter_map(|phase| {
                         variants(*phase)
                             .first()
@@ -1313,6 +1319,7 @@ impl ModelRunner {
             encoder_identity: String::new(),
             latent_seed: 0,
             media_bytes,
+            pipeline: Some(self.pipeline()?.clone()),
             call_window: u32::try_from(window).unwrap_or(u32::MAX),
         })
     }
@@ -1390,7 +1397,7 @@ impl ModelRunner {
     /// units, which every parallel configuration lays alike (`crate::memory::encoders`).
     pub(crate) fn conditioning_digests(&self, model: &dyn VideoModel) -> ([u8; 32], [u8; 32]) {
         let mut tensors = storage::key::Digest::new(b"uniserve.conditioning");
-        tensors.text(product::CONDITIONING);
+        tensors.text(Product::Conditioning.name());
         tensors.text(ops::abi::name(self.dtype()));
         tensors.number(u64::from(model.text_width()));
         (tensors.finish(), encoders::layout())
@@ -1423,31 +1430,55 @@ impl ModelRunner {
     }
 }
 
+/// The phases and the partition of the block a deployment names `name` in a media group: the
+/// whole pipeline for the shorthand's block ([`DEFAULT_BLOCK`]), as a group; a host block's,
+/// as the engine declares it ([`HostBlock`]); a block of the pipeline's, as its family declares
+/// it.
+///
+/// # Errors
+///
+/// A name that is none of these: a deployment places no block execution does not know.
+fn block_role<'a>(pipeline: &'a Pipeline, name: &str) -> Result<(&'a [Phase], Partition)> {
+    if name == DEFAULT_BLOCK {
+        return Ok((&pipeline.phases, Partition::Group));
+    }
+    if let Some(host) = HostBlock::of(name) {
+        return Ok((host.phases(), host.partition()));
+    }
+    let block = pipeline.block(name).with_context(|| {
+        let declared: Vec<&str> = pipeline
+            .blocks
+            .iter()
+            .map(|block| block.name.as_str())
+            .chain(HostBlock::iter().map(|host| -> &str { host.name() }))
+            .collect();
+        format!(
+            "block {name} is no part of the pipeline the model family declares (blocks {})",
+            declared.join(", ")
+        )
+    })?;
+    Ok((&block.phases, block.partition))
+}
+
 /// The phases position `position` of `group` serves (module documentation): each block whose
-/// ranks hold the position names its phases; the audio decoder's track is one unit, dealt to
-/// the block's first rank; a block of no phase (the latent encoder, whose work the latent
-/// preparation computes) names none.
-pub(crate) fn served_phases(group: &WorkerGroupConfig, position: usize) -> Vec<Phase> {
+/// ranks hold the position names its phases (its role in `pipeline`, [`block_role`]); a block
+/// whose work is one unit per request deals it to its first rank, and a block of no phase (a
+/// condition encoder, whose work the latent preparation computes) names none.
+///
+/// # Errors
+///
+/// A block the pipeline and the host blocks do not declare.
+pub(crate) fn served_phases(
+    pipeline: &Pipeline,
+    group: &WorkerGroupConfig,
+    position: usize,
+) -> Result<Vec<Phase>> {
     let mut phases: Vec<Phase> = Vec::new();
     for (name, block) in &group.blocks {
-        let holds = block.ranks.contains(&position);
-        let named: &[Phase] = match name.as_str() {
-            DEFAULT_BLOCK => &MEDIA_PHASES,
-            name if name == Stage::TextEncoder.name() => &[Phase::TextEncode],
-            name if name == Stage::Transformer.name() || name == Stage::TransformerRef.name() => {
-                &[Phase::LatentPrepare, Phase::Denoise]
-            }
-            VIDEO_DECODER_BLOCK => &[Phase::VideoDecode],
-            name if name == Stage::AudioDecoder.name() => {
-                if block.ranks.first() != Some(&position) {
-                    continue;
-                }
-                &[Phase::AudioDecode]
-            }
-            MEDIA_READER => &[Phase::MediaRead],
-            VIDEO_CODEC_BLOCK => &[Phase::VideoEncode],
-            MUXER => &[Phase::AudioEncode, Phase::Mux],
-            _ => &[],
+        let (named, partition) = block_role(pipeline, name)?;
+        let holds = match partition {
+            Partition::First => block.ranks.first() == Some(&position),
+            _ => block.ranks.contains(&position),
         };
         if holds {
             for phase in named {
@@ -1458,26 +1489,63 @@ pub(crate) fn served_phases(group: &WorkerGroupConfig, position: usize) -> Vec<P
         }
     }
     phases.sort_by_key(|phase| phase.index());
-    phases
+    Ok(phases)
 }
 
-/// The axes of a denoiser's partition whose groups a denoising rank's runner computes over, in
-/// the order `nn::family::DenoiserSplit` and the runner's graphs state them: the Ulysses group,
-/// the all-gather group, the tensor group and the stages of the layer split.
-pub(crate) const DENOISER_AXES: usize = 4;
+/// Checks the blocks every media group of `groups` places against their owners' declarations,
+/// since the owner of a block states the forms it admits: each block is the whole model, a host
+/// block or a block of `pipeline`, of a form its partition admits (`Partition::admits`).
+///
+/// # Errors
+///
+/// The first block that is none of these, or of a form its owner does not admit, naming its
+/// worker group.
+pub(crate) fn check_blocks(pipeline: &Pipeline, groups: &[WorkerGroupConfig]) -> Result<()> {
+    for group in groups {
+        for (name, block) in &group.blocks {
+            let (_, partition) =
+                block_role(pipeline, name).with_context(|| format!("worker group {}", group.id))?;
+            partition.admits(block).map_err(|refusal| {
+                anyhow::anyhow!("block {name} of worker group {}: {refusal}", group.id)
+            })?;
+        }
+    }
+    Ok(())
+}
 
-/// A denoising rank's group along each axis of its denoiser's partition ([`DENOISER_AXES`]),
+/// Whether `phase` is host work, which a host block serves on the main process's host
+/// ([`HostBlock::phases`]): a stage of host tasks rather than of device calls.
+fn host_phase(phase: Phase) -> bool {
+    HostBlock::iter().any(|block| block.phases().contains(&phase))
+}
+
+/// One kind of collective group a media deployment forms ([`ModelRunner::media_collectives`]):
+/// the block of the pipeline whose ranks form it, the axis of the block's partition it lies
+/// along (`nn::family::ULYSSES_AXIS` and after), or `None` for the communicator over all the
+/// ranks of a block of units that pass carries, and its groups.
+pub(crate) struct MediaCollective {
+    pub(crate) block: String,
+    pub(crate) axis: Option<usize>,
+    pub(crate) collective: super::Collective,
+}
+
+/// The axes of a block's model-parallel partition, in the order `nn::family::DenoiserSplit`
+/// and a runner's graphs state them: the Ulysses group, the all-gather group, the tensor group
+/// and the stages of the layer split (`nn::family::ULYSSES_AXIS` and after).
+pub(crate) const BLOCK_AXES: usize = 4;
+
+/// A denoising rank's group along each axis of its denoiser's partition ([`BLOCK_AXES`]),
 /// `None` on an axis of one rank and on the meta device.
-pub(crate) type DenoiserGroups = [Option<Arc<ops::Group>>; DENOISER_AXES];
+pub(crate) type DenoiserGroups = [Option<Arc<ops::Group>>; BLOCK_AXES];
 
-/// The groups of a denoiser block along each axis of its partition ([`DENOISER_AXES`]), as
+/// The groups of a model-parallel block along each axis of its partition ([`BLOCK_AXES`]), as
 /// places of the block: per axis, one list per fiber along it, its members in the order of their
 /// coordinate in the block's order (`placement::denoiser_axes`).
 ///
 /// # Errors
 ///
 /// A degree of zero, or a block whose ranks do not number its degrees' product.
-fn denoiser_fibers(block: &proto::config::BlockConfig) -> Result<[Vec<Vec<usize>>; DENOISER_AXES]> {
+fn block_fibers(block: &BlockConfig) -> Result<[Vec<Vec<usize>>; BLOCK_AXES]> {
     // Each axis's degree and the distance between two consecutive coordinates of it.
     let (degrees, strides) = super::placement::denoiser_axes(block);
     let [ulysses, gather, tensor, layers] = degrees;
@@ -1513,7 +1581,7 @@ fn denoiser_fibers(block: &proto::config::BlockConfig) -> Result<[Vec<Vec<usize>
 /// A block whose ranks repeat, or a place past them.
 fn add_fibers(
     collective: &mut super::Collective,
-    (group, first, block): (&WorkerGroupConfig, usize, &proto::config::BlockConfig),
+    (group, first, block): (&WorkerGroupConfig, usize, &BlockConfig),
     fibers: Vec<Vec<usize>>,
     own: Option<(&WorkerGroupConfig, usize)>,
 ) -> Result<()> {
@@ -1550,23 +1618,32 @@ fn add_fibers(
     Ok(())
 }
 
-/// The product kinds the rank at `position` of `group` backs, as indices into
-/// `crate::batch::product::KINDS`: those its group's phases write, the conditioning only on the
-/// group's first text encoder rank, an encoder output being one rank's.
+/// The product kinds the rank at `position` of `group` backs, as indices into the products of
+/// `pipeline`: those its group's phases write, the conditioning only on the group's first text
+/// encoder rank, an encoder output being one rank's.
 ///
 /// # Errors
 ///
-/// A session that numbers no conditioning kind.
-pub(crate) fn backed_kinds(group: &WorkerGroupConfig, position: usize) -> Result<Vec<usize>> {
-    let conditioning = product_kind(product::CONDITIONING)?;
-    let phases = group_phases(group);
-    let encoder = (0..group.ranks.len())
-        .find(|position| served_phases(group, *position).contains(&Phase::TextEncode));
+/// A block the pipeline does not declare.
+pub(crate) fn backed_kinds(
+    pipeline: &Pipeline,
+    group: &WorkerGroupConfig,
+    position: usize,
+) -> Result<Vec<usize>> {
+    let conditioning = pipeline.kind(Product::Conditioning);
+    let phases = group_phases(pipeline, group)?;
+    let mut encoder = None;
+    for at in 0..group.ranks.len() {
+        if served_phases(pipeline, group, at)?.contains(&Phase::TextEncode) {
+            encoder = Some(at);
+            break;
+        }
+    }
 
-    Ok((0..product::KINDS.len())
+    Ok((0..pipeline.products.len())
         .filter(|&kind| {
-            phases.contains(&product::KINDS[kind].1)
-                && (kind != conditioning || encoder == Some(position))
+            phases.contains(&pipeline.products[kind].writer)
+                && (Some(kind) != conditioning || encoder == Some(position))
         })
         .collect())
 }
@@ -1581,10 +1658,10 @@ pub(crate) type MediaRank = (usize, usize);
 /// (`storage::runtime::Group::receives`).
 pub(crate) type KindRanks = (Vec<MediaRank>, Vec<MediaRank>);
 
-/// Where the blocks of each product kind lie for each worker group of the media deployment whose
-/// groups are `groups` and whose `data_parallel` schedulers each serve a block of them
-/// (`WorkerGroupConfig::scheduler_blocks`): per group, in `crate::batch::product::KINDS` order,
-/// its [`KindRanks`].
+/// Where the blocks of each product kind of `pipeline` lie for each worker group of the media
+/// deployment whose groups are `groups` and whose `data_parallel` schedulers each serve a block of
+/// them (`WorkerGroupConfig::scheduler_blocks`): per group, in the order of the pipeline's
+/// products, its [`KindRanks`].
 ///
 /// A block's units exist once, in the product buffers of the ranks that back its kind, and each
 /// main process's ranks reach the product buffers of that process alone
@@ -1604,22 +1681,26 @@ pub(crate) type KindRanks = (Vec<MediaRank>, Vec<MediaRank>);
 ///
 /// # Errors
 ///
-/// Serving groups that do not form `data_parallel` equal blocks, or a session that numbers no
-/// conditioning kind.
+/// Serving groups that do not form `data_parallel` equal blocks, or a block the pipeline does
+/// not declare.
 pub(crate) fn product_ranks(
+    pipeline: &Pipeline,
     groups: &[WorkerGroupConfig],
     data_parallel: usize,
 ) -> Result<Vec<Vec<KindRanks>>> {
-    let kinds = product::KINDS.len();
+    let kinds = pipeline.products.len();
     let schedulers = WorkerGroupConfig::scheduler_blocks(groups, data_parallel)?;
 
     // Per group, the phases its ranks serve and the ranks that back each kind.
-    let phases: Vec<Vec<Phase>> = groups.iter().map(group_phases).collect();
+    let phases: Vec<Vec<Phase>> = groups
+        .iter()
+        .map(|group| group_phases(pipeline, group))
+        .collect::<Result<_>>()?;
     let mut backing: Vec<Vec<Vec<MediaRank>>> = Vec::with_capacity(groups.len());
     for (index, group) in groups.iter().enumerate() {
         let mut backs = vec![Vec::new(); kinds];
         for position in 0..group.ranks.len() {
-            for kind in backed_kinds(group, position)? {
+            for kind in backed_kinds(pipeline, group, position)? {
                 backs[kind].push((index, position));
             }
         }
@@ -1631,13 +1712,15 @@ pub(crate) fn product_ranks(
     for scheduler in &schedulers {
         for &index in scheduler {
             let group = &groups[index];
-            for (kind, (_, writer, reader)) in product::KINDS.iter().enumerate() {
+            for (kind, spec) in pipeline.products.iter().enumerate() {
+                let (writer, reader) = (&spec.writer, &spec.reader);
                 // The hosts of the group's ranks that serve the kind's reading phase, in the
                 // order of their first such rank.
                 let mut reading: Vec<&str> = Vec::new();
                 for position in 0..group.ranks.len() {
                     let on = host((index, position));
-                    if served_phases(group, position).contains(reader) && !reading.contains(&on) {
+                    let reads = served_phases(pipeline, group, position)?.contains(reader);
+                    if reads && !reading.contains(&on) {
                         reading.push(on);
                     }
                 }
@@ -1676,12 +1759,12 @@ pub(crate) fn product_ranks(
     Ok(places)
 }
 
-/// The product kinds whose blocks rank `rank` holds in its product buffer, as indices into
-/// `crate::batch::product::KINDS`, by the places of every group's kinds `places`
-/// ([`product_ranks`]): those it backs, and those it receives for a group that reads them on its
-/// host.
+/// The product kinds whose blocks rank `rank` holds in its product buffer, as indices into the
+/// pipeline's products, by the places of every group's kinds `places` ([`product_ranks`]): those
+/// it backs, and those it receives for a group that reads them on its host.
 pub(crate) fn held_kinds(places: &[Vec<KindRanks>], rank: MediaRank) -> Vec<usize> {
-    (0..product::KINDS.len())
+    let kinds = places.iter().map(Vec::len).max().unwrap_or(0);
+    (0..kinds)
         .filter(|kind| {
             places.iter().any(|group| {
                 group.get(*kind).is_some_and(|(regions, receives)| {
@@ -1693,28 +1776,63 @@ pub(crate) fn held_kinds(places: &[Vec<KindRanks>], rank: MediaRank) -> Vec<usiz
 }
 
 /// The phases any rank of `group` serves.
-pub(crate) fn group_phases(group: &WorkerGroupConfig) -> Vec<Phase> {
-    let mut phases: Vec<Phase> = (0..group.ranks.len())
-        .flat_map(|position| served_phases(group, position))
-        .collect();
-    phases.sort_by_key(|phase| phase.index());
-    phases.dedup();
-    phases
-}
-
-/// The session's class of each product kind, in `crate::batch::product::KINDS` order, when the
-/// product classes follow `first` classes of cache groups.
-pub(crate) fn product_classes(first: u8) -> [u8; 10] {
-    std::array::from_fn(|kind| first.saturating_add(kind as u8))
-}
-
-/// The index of product kind `name` in `crate::batch::product::KINDS`.
 ///
 /// # Errors
 ///
-/// A name that is no product kind of the session.
-pub(crate) fn product_kind(name: &str) -> Result<usize> {
-    product::kind(name).with_context(|| format!("{name} is no product kind of the session"))
+/// A block the pipeline does not declare.
+pub(crate) fn group_phases(pipeline: &Pipeline, group: &WorkerGroupConfig) -> Result<Vec<Phase>> {
+    let mut phases = Vec::new();
+    for position in 0..group.ranks.len() {
+        phases.extend(served_phases(pipeline, group, position)?);
+    }
+    phases.sort_by_key(|phase| phase.index());
+    phases.dedup();
+    Ok(phases)
+}
+
+/// The session's class of each product of a media pipeline: the product classes follow `first`
+/// classes (the cache groups' and the encoder outputs'), one per product in the pipeline's order
+/// (`nn::pipeline::Pipeline::products`).
+#[derive(Clone, Copy)]
+pub(crate) struct Classes<'a> {
+    pipeline: &'a Pipeline,
+    first: u8,
+}
+
+impl<'a> Classes<'a> {
+    /// The classes of `pipeline`'s products after `first` classes.
+    pub(crate) const fn new(pipeline: &'a Pipeline, first: u8) -> Self {
+        Self { pipeline, first }
+    }
+
+    /// The class of `product`.
+    ///
+    /// # Errors
+    ///
+    /// A product the pipeline does not hold, or a class past what a session numbers.
+    pub(crate) fn of(self, product: Product) -> Result<u8> {
+        let kind = self
+            .pipeline
+            .kind(product)
+            .with_context(|| format!("the pipeline holds no {}", product.name()))?;
+        u8::try_from(kind)
+            .ok()
+            .and_then(|kind| self.first.checked_add(kind))
+            .context("a product class past what a session numbers")
+    }
+
+    /// Every product with its class, in class order.
+    ///
+    /// # Errors
+    ///
+    /// A class past what a session numbers.
+    pub(crate) fn all(self) -> Result<Vec<(Product, u8)>> {
+        self.pipeline
+            .products
+            .iter()
+            .map(|spec| Ok((spec.product, self.of(spec.product)?)))
+            .collect()
+    }
 }
 
 /// The bytes of one element of `dtype`.
@@ -1829,7 +1947,7 @@ pub(crate) fn slot_pages(pages: BankPages, slots: u32) -> BankPages {
 fn phase_rows(phase: Phase, slots: u32, pool_tasks: u32) -> u32 {
     match phase {
         Phase::TextEncode => slots.max(1),
-        phase if HOST_PHASES.contains(&phase) => pool_tasks.max(1),
+        phase if host_phase(phase) => pool_tasks.max(1),
         _ => 1,
     }
 }
@@ -1885,7 +2003,7 @@ mod tests {
     use crate::batch::Phase;
     use proto::config::{BlockConfig, BlockDistribution, WorkerGroupConfig, WorkerGroupId};
 
-    use super::{group_phases, prompt_capacities, served_phases};
+    use super::{check_blocks, group_phases, prompt_capacities, served_phases};
 
     /// Video options stating `capacities`, or none.
     fn video(capacities: Option<&[u32]>) -> proto::config::VideoConfig {
@@ -1951,7 +2069,13 @@ mod tests {
                     ..every()
                 },
             ),
-            ("video_codec".to_owned(), every()),
+            (
+                "video_codec".to_owned(),
+                BlockConfig {
+                    distribution: Some(BlockDistribution::TemporalUnits),
+                    ..every()
+                },
+            ),
             ("muxer".to_owned(), BlockConfig::parallel(vec![0])),
             ("media_reader".to_owned(), BlockConfig::parallel(vec![0])),
         ]);
@@ -1986,10 +2110,38 @@ mod tests {
             Phase::Mux,
         ]);
         first.sort_by_key(|phase| phase.index());
-        assert_eq!(served_phases(&group, 0), first);
+        let pipeline = models::minimax_h3::family::pipeline();
+        assert_eq!(served_phases(&pipeline, &group, 0).unwrap(), first);
         for position in 1..4 {
-            assert_eq!(served_phases(&group, position), device, "rank {position}");
+            assert_eq!(
+                served_phases(&pipeline, &group, position).unwrap(),
+                device,
+                "rank {position}"
+            );
         }
-        assert_eq!(group_phases(&group), first);
+        assert_eq!(group_phases(&pipeline, &group).unwrap(), first);
+        check_blocks(&pipeline, std::slice::from_ref(&group)).unwrap();
+
+        // A block the pipeline does not declare is refused, not served as no phase.
+        let mut stray = group.clone();
+        stray
+            .blocks
+            .insert("video_postprocessor".to_owned(), every());
+        let refusal = served_phases(&pipeline, &stray, 0).unwrap_err();
+        assert!(
+            format!("{refusal:#}").contains("video_postprocessor"),
+            "{refusal:#}"
+        );
+
+        // A block of units that states no distribution is refused, whatever its name: a decoder
+        // the family declares and the engine's codec.
+        for name in ["video_decoder", "video_codec"] {
+            let mut grouped = group.clone();
+            grouped
+                .blocks
+                .insert(name.to_owned(), BlockConfig::parallel(vec![0]));
+            let refusal = check_blocks(&pipeline, &[grouped]).unwrap_err();
+            assert!(format!("{refusal:#}").contains(name), "{refusal:#}");
+        }
     }
 }

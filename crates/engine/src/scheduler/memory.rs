@@ -43,7 +43,6 @@ use std::ops::Range;
 use std::time::Instant;
 
 use crate::batch::cache::CacheGroupKind;
-use crate::batch::product::CONDITIONING;
 use crate::batch::{Batch, Phase};
 use proto::config::KvCacheConfig;
 use proto::request::{ImageEncoder, RequestId};
@@ -53,7 +52,7 @@ use storage::runtime::{self, Completion, GroupId, OwnerId, Source, Tier};
 
 use super::cache::{DEVICE, HOST, LOW_WATERMARK, REMOTE};
 use super::rows::state_interval;
-use super::video::PRODUCTS;
+use super::video::products;
 use super::{Blocks, Request, RequestStatus, Scheduler, monotonic_nanos, span};
 
 
@@ -275,10 +274,11 @@ impl Scheduler {
     }
 
     /// The class of encoder outputs: the one after the cache groups, when the session states one
-    /// there before the product classes.
+    /// there before the product classes (one per product of the pipeline, none for a text
+    /// deployment).
     fn encoder_class(&self, request: &Request) -> Option<u8> {
         let class = self.shapes(request).len();
-        let products = usize::from(self.trajectory).checked_sub(PRODUCTS.len())?;
+        let products = usize::from(self.trajectory).checked_sub(products(&self.groups).len())?;
         (class < products)
             .then(|| u8::try_from(class).ok())
             .flatten()
@@ -403,7 +403,8 @@ impl Scheduler {
             proto::request::Request::Diffusion(video) => {
                 let text = video.encoder_inputs.as_ref().map(|inputs| inputs.text);
                 let identity = &self.encoder_identity;
-                let key = |text: [u8; 32]| Key(encoder_output(CONDITIONING, identity, &text));
+                let name = nn::pipeline::Product::Conditioning.name();
+                let key = |text: [u8; 32]| Key(encoder_output(name, identity, &text));
                 return text.into_iter().map(|text| (key(text), None)).collect();
             }
         };
@@ -487,7 +488,7 @@ impl Scheduler {
     fn encoding_at(&self, request: &Request, class: u8, at: u32) -> Option<(usize, u32)> {
         if let Some(video) = request.video() {
             let conditioning = Some(class) == self.conditioning_class()
-                && Some(at) == request.conditioning_position();
+                && Some(at) == request.conditioning_position(&self.groups);
             return conditioning.then(|| (0, count(video.prompt_token_ids.len())));
         }
         if Some(class) != self.encoder_class(request) {
@@ -954,7 +955,7 @@ impl Scheduler {
                     continue;
                 };
                 // Its conditioning is its encoder output, pinned where `cache` holds it.
-                if !alone && Some(at) == request.conditioning_position() {
+                if !alone && Some(at) == request.conditioning_position(&self.groups) {
                     self.charge_encoding(&mut units, request, 0, group, class, size);
                 } else {
                     self.charge_units(&mut units, group, class, 1, size);
@@ -1355,7 +1356,7 @@ impl Scheduler {
         if request.is_video() {
             let results = self.declared_results(request).unwrap_or_default();
             // The conditioning is the request's encoder output, held where `cache` holds it.
-            let conditioning = request.conditioning_position();
+            let conditioning = request.conditioning_position(&self.groups);
             let key = request.encodings.first().map(|&(key, _)| key);
             for (at, (phase, class, units)) in (0u32..).zip(results) {
                 let (Some(owner), Some(group)) =

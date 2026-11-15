@@ -17,6 +17,7 @@ queue_depth = 6
 tensor_parallel_size = 1
 
 [worker_groups.blocks.video_decoder]
+distribution = "temporal_units"
 
 [worker_groups.blocks.audio_decoder]
 distribution = "temporal_units"
@@ -25,6 +26,7 @@ distribution = "temporal_units"
 distribution = "temporal_units"
 
 [worker_groups.blocks.video_codec]
+distribution = "temporal_units"
 
 [worker_groups.blocks.muxer]
 

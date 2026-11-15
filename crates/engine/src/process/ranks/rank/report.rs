@@ -99,6 +99,7 @@ impl ModelRunner {
             encoder_identity: String::new(),
             latent_seed: 0,
             media_bytes: Vec::new(),
+            pipeline: None,
             call_window: u32::try_from(window).unwrap_or(u32::MAX),
         })
     }
