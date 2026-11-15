@@ -23,7 +23,6 @@
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-use crate::batch::product::VISION_FEATURES;
 use crate::batch::{Phase, Stage};
 use crate::memory::buffers::BufferMemory;
 use crate::memory::cache::{CacheLayout, KvCacheMemory};
@@ -249,7 +248,7 @@ pub(crate) fn feature_tensors(model: &dyn TextModel) -> [u8; 32] {
     let axes = model.vision().map_or(0, |vision| vision.position_axes());
 
     let mut tensors = storage::key::Digest::new(b"uniserve.vision-features");
-    tensors.text(VISION_FEATURES);
+    tensors.text(proto::request::ImageEncoder::Vision.output());
     tensors.text(ops::abi::name(model.dtype()));
     tensors.number(u64::from(model.hidden()));
     tensors.number(u64::from(axes));

@@ -12,8 +12,6 @@ pub(crate) const CONDITION_SAMPLES: &str = "condition_samples";
 /// The media reader's vision processor patches of every vision block,
 /// `[patches, features]` in presentation order.
 pub(crate) const VISION_PIXELS: &str = "vision_pixels";
-/// The vision encoder's token features, one row per vision placeholder.
-pub const VISION_FEATURES: &str = "vision_features";
 /// The text encoder's prompt features, one row per presentation token.
 pub const CONDITIONING: &str = "conditioning";
 /// The denoiser's final video latents.

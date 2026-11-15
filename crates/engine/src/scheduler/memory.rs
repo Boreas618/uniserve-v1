@@ -43,7 +43,7 @@ use std::ops::Range;
 use std::time::Instant;
 
 use crate::batch::cache::CacheGroupKind;
-use crate::batch::product::{CONDITIONING, VISION_FEATURES};
+use crate::batch::product::CONDITIONING;
 use crate::batch::{Batch, Phase};
 use proto::config::KvCacheConfig;
 use proto::request::{ImageEncoder, RequestId};
@@ -56,8 +56,6 @@ use super::rows::state_interval;
 use super::video::PRODUCTS;
 use super::{Blocks, Request, RequestStatus, Scheduler, monotonic_nanos, span};
 
-/// The name of an image model's latent encoder output (SD §7.4).
-const LATENT_FEATURES: &str = "latent_features";
 
 /// The checkpoints a recurrent-state table holds: its base at `first`, and the one at `end - 1`
 /// when that is another.
@@ -414,10 +412,7 @@ impl Scheduler {
         let mut keys = Vec::new();
         for image in &input.multimodal_inputs.images {
             for encoder in &image.encoders {
-                let name = match encoder.encoder {
-                    ImageEncoder::Vision => VISION_FEATURES,
-                    ImageEncoder::Latent => LATENT_FEATURES,
-                };
+                let name = encoder.encoder.output();
                 let mut digest = Digest::new(b"image-encoding");
                 digest.bytes(&image.digest);
                 if samples && encoder.encoder == ImageEncoder::Latent {

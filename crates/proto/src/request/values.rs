@@ -59,4 +59,14 @@ impl ImageEncoder {
             Self::Latent => "latent_encoding",
         }
     }
+
+    /// The product the encoder writes, by the name its outputs are keyed under
+    /// (`storage::key::encoder_output`) and their class's tensors are digested by: the vision
+    /// encoder's token features, or the latent encoder's image latents.
+    pub const fn output(self) -> &'static str {
+        match self {
+            Self::Vision => "vision_features",
+            Self::Latent => "latent_features",
+        }
+    }
 }

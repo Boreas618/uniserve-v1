@@ -10,7 +10,6 @@
 //! harness's encoder states 64 bytes of features a row, and its buffers 256 bytes a unit.
 
 use engine::batch::Phase;
-use engine::batch::product::VISION_FEATURES;
 use engine::scheduler::Message;
 use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, GenerationRequest, ImageEncoder, ImageEncoderInput, RequestId};
@@ -37,7 +36,11 @@ fn output_key(identity: &str, digest: [u8; 32]) -> Key {
     let mut inputs = Digest::new(b"image-encoding");
     inputs.bytes(&digest);
     inputs.number(0);
-    Key(encoder_output(VISION_FEATURES, identity, &inputs.finish()))
+    Key(encoder_output(
+        ImageEncoder::Vision.output(),
+        identity,
+        &inputs.finish(),
+    ))
 }
 
 /// Chat request `id` of a prompt of 12 tokens whose image is that of request `image`.
