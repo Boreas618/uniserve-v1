@@ -227,7 +227,9 @@ def _files(
 
 
 def digest(package: str) -> str:
-    """The SHA-256 of an installed package's files, framed by names and lengths."""
+    """The SHA-256 of an installed package's files, framed by names and
+    lengths.
+    """  # noqa: D205
     digest = hashlib.sha256()
     for name, entry in _files(importlib.resources.files(package)):
         data = entry.read_bytes()

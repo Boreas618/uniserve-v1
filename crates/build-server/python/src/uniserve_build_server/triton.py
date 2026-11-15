@@ -58,7 +58,8 @@ from uniserve_build_server.binding import (
 from uniserve_build_server.request import Request, Target
 
 #: The kernel parameter that carries the programmatic dependent launch, and
-#: the descriptor field that asks for it (``crates/build-server/src/launch.rs``).
+#: the descriptor field that asks for it
+#: (``crates/build-server/src/launch.rs``).
 DEPENDENT_LAUNCH_PARAMETER = "PDL"
 DEPENDENT_LAUNCH_FIELD = "pdl"
 

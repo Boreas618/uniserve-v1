@@ -1,5 +1,4 @@
-"""Pinned sources: what a pin states, a build's staged copy of one, and
-importing its packages.
+"""Pinned sources: what a pin states, staged copies, and importing packages.
 
 A pin of Python sources states which of its directories are packages, and a
 build imports them from its own staged copy of the files under their own names

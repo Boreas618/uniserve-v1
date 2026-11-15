@@ -348,7 +348,14 @@ def test_tuning_data_configures_the_first_table_the_descriptor_fits(tmp_path):
 
 
 @triton.jit
-def kernel(x, columns, scale, BLOCK: tl.constexpr, CENTRED: tl.constexpr, PDL: tl.constexpr):  # noqa: N803
+def kernel(
+    x,
+    columns,
+    scale,
+    BLOCK: tl.constexpr,  # noqa: N803
+    CENTRED: tl.constexpr,  # noqa: N803
+    PDL: tl.constexpr,  # noqa: N803
+):
     """A kernel whose launch table the tests state; it is never compiled."""
     tl.store(x + tl.arange(0, BLOCK), scale)
 
@@ -360,7 +367,11 @@ KERNELS = types.SimpleNamespace(kernel=kernel)
 #: or a compiler being asked for one.
 LAUNCH = {
     "kernel": "kernel",
-    "warps": {"field": "columns", "steps": [[256, 8], [128, 4]], "otherwise": 2},
+    "warps": {
+        "field": "columns",
+        "steps": [[256, 8], [128, 4]],
+        "otherwise": 2,
+    },
     "aligned": ["x", "columns"],
     "types": {
         "x": {"pointer": "dtype"},
