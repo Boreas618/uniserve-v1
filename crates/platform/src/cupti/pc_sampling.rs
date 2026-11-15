@@ -568,7 +568,7 @@ mod tests {
         assert!(!sampler.stall_reasons().is_empty());
         sampler.start()?;
         for _ in 0..4 {
-            spin.launch(&stream, 132, 2_000_000)?;
+            spin.occupy(&stream, 2_000_000)?;
         }
         stream.synchronize()?;
         sampler.stop()?;

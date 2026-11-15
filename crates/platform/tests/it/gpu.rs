@@ -2,13 +2,11 @@
 //! few megabytes of storage on device 0; run them with
 //! `cargo test -p platform --test it -- --ignored --test-threads=1`.
 
-use std::collections::BTreeSet;
-use std::ffi::c_void;
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
-use std::time::Duration;
 
 use platform::nccl::{Communicator, ReduceOp, UniqueId};
 use platform::{
@@ -220,7 +218,10 @@ fn a_wait_on_a_written_flag_orders_one_stream_behind_another() {
 
     // The bit-test condition holds while no bit of the value is set and
     // releases once one is: an event recorded behind the wait says whether the
-    // stream got past it, so the wait is observed without a host block.
+    // stream got past it, so the wait is observed without a host block. The
+    // flag holds values without the named bit until the host has looked: the
+    // writer's second write, which has another bit, is complete before the
+    // event is queried, and only a later write sets the named bit.
     let passed = Event::new(EventFlags::default());
     // SAFETY: the flag lies inside `flag`, which outlives this block.
     unsafe { memset_d32(flag.address(), 0, 1, &writing) }.unwrap();
@@ -230,7 +231,8 @@ fn a_wait_on_a_written_flag_orders_one_stream_behind_another() {
         .wait_value32(flag_address, 2, WaitValue::AnyBitSet)
         .unwrap();
     passed.record(&reading).unwrap();
-    thread::sleep(Duration::from_millis(20));
+    writing.write_value32(flag_address, 1).unwrap();
+    writing.synchronize().unwrap();
     assert!(
         !passed.query().unwrap(),
         "a flag without the named bit leaves the wait outstanding"
@@ -274,7 +276,8 @@ fn events_order_streams_and_measure_time() {
     // SAFETY: as above.
     unsafe { memcpy_async(host.address(), device.address(), 1024, &consumer).unwrap() };
 
-    thread::sleep(Duration::from_millis(20));
+    // The producer is held behind the host function until the release below,
+    // so the event recorded behind it cannot have completed.
     assert!(!ready.query().unwrap());
 
     release.send(()).unwrap();
@@ -323,20 +326,6 @@ fn interprocess_events_export_and_open() {
     stream.synchronize().unwrap();
 }
 
-/// Names the role of the process `interprocess_event_process` runs in.
-const EVENT_PROCESS: &str = "UNISERVE_CUDA_TEST_EVENT_PROCESS";
-
-/// The `/dev/shm` objects this process maps that still have a name.
-fn mapped_shared_memory() -> BTreeSet<String> {
-    std::fs::read_to_string("/proc/self/maps")
-        .unwrap()
-        .lines()
-        .filter_map(|line| line.find("/dev/shm/").map(|start| &line[start..]))
-        .filter(|path| !path.ends_with(" (deleted)"))
-        .map(str::to_owned)
-        .collect()
-}
-
 /// A process that created interprocess events, destroyed its primary
 /// contexts and exited leaves none of the shared memory the driver mapped
 /// for those events, although another library's reference kept the context
@@ -346,14 +335,9 @@ fn mapped_shared_memory() -> BTreeSet<String> {
 #[ignore = "requires a CUDA device"]
 fn resetting_primary_contexts_releases_interprocess_event_storage() {
     let _driver = exclusive_driver();
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "gpu::interprocess_event_process",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env(EVENT_PROCESS, "1")
+    // The process half is the package's helper executable
+    // (`tests/helpers/interprocess_event.rs`).
+    let output = Command::new(env!("CARGO_BIN_EXE_interprocess-event"))
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -374,40 +358,6 @@ fn resetting_primary_contexts_releases_interprocess_event_storage() {
     for path in mapped {
         assert!(!Path::new(path).exists(), "{path} outlived its process");
     }
-}
-
-/// The process half of
-/// `resetting_primary_contexts_releases_interprocess_event_storage`: exports
-/// an interprocess event as a rank does, reports the shared memory that
-/// mapped, destroys its primary contexts and exits.
-#[test]
-#[ignore = "runs as the process of the interprocess event storage test"]
-fn interprocess_event_process() {
-    if std::env::var_os(EVENT_PROCESS).is_none() {
-        return;
-    }
-    // A reference this process never releases, as the CUDA runtime holds
-    // one in a rank: without it, the last owner's release below would
-    // destroy the context by itself.
-    let _runtime = std::mem::ManuallyDrop::new(PrimaryContext::retain(DEVICE).unwrap());
-    let stream = Stream::new(DEVICE).unwrap();
-    let before = mapped_shared_memory();
-    let event = Event::new(EventFlags {
-        interprocess: true,
-        ..EventFlags::default()
-    });
-    event.record(&stream).unwrap();
-    event.ipc_handle().unwrap();
-    stream.synchronize().unwrap();
-    for path in mapped_shared_memory().difference(&before) {
-        println!("mapped {path}");
-    }
-
-    drop(event);
-    drop(stream);
-    // SAFETY: this process uses no device after the reset.
-    let devices = unsafe { PrimaryContext::reset_all() }.unwrap();
-    assert!(devices.contains(&DEVICE));
 }
 
 /// A retainable allocation's descriptor keeps its physical storage alive
@@ -994,106 +944,15 @@ fn a_captured_graph_reads_remapped_storage_without_changing_shared_bytes() {
     drop(creator);
 }
 
-/// PTX text of the kernels the launch, capture and rebind tests use.
-///
-/// `report` writes, for each block, its three grid coordinates, the first
-/// thread's three coordinates and the dynamic shared-memory size the driver
-/// allocated for the launch, seven 32-bit words per block; only thread 0 of a
-/// block stores, so a block of more than one thread still writes once.
-///
-/// `write` stores one value per thread, so a launch covers a contiguous run of
-/// words and a rebinding test can tell whose work ran.
-const KERNELS: &str = "\
-.version 8.0\n\
-.target sm_90\n\
-.address_size 64\n\
-.visible .entry nothing()\n\
-{\n\
-    ret;\n\
-}\n\
-.visible .entry report(.param .u64 out)\n\
-{\n\
-    .reg .u64 %rd<4>;\n\
-    .reg .u32 %r<13>;\n\
-    .reg .pred %p;\n\
-    ld.param.u64 %rd1, [out];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ctaid.y;\n\
-    mov.u32 %r3, %ctaid.z;\n\
-    mov.u32 %r4, %tid.x;\n\
-    mov.u32 %r5, %tid.y;\n\
-    mov.u32 %r6, %tid.z;\n\
-    mov.u32 %r7, %dynamic_smem_size;\n\
-    mov.u32 %r8, %nctaid.x;\n\
-    mov.u32 %r9, %nctaid.y;\n\
-    mad.lo.u32 %r10, %r9, %r3, %r2;\n\
-    mad.lo.u32 %r10, %r8, %r10, %r1;\n\
-    mul.wide.u32 %rd2, %r10, 28;\n\
-    add.u64 %rd2, %rd1, %rd2;\n\
-    setp.eq.u32 %p, %r4, 0;\n\
-    @%p st.global.u32 [%rd2], %r1;\n\
-    add.u64 %rd3, %rd2, 4;\n\
-    @%p st.global.u32 [%rd3], %r2;\n\
-    add.u64 %rd3, %rd2, 8;\n\
-    @%p st.global.u32 [%rd3], %r3;\n\
-    add.u64 %rd3, %rd2, 12;\n\
-    @%p st.global.u32 [%rd3], %r4;\n\
-    add.u64 %rd3, %rd2, 16;\n\
-    @%p st.global.u32 [%rd3], %r5;\n\
-    add.u64 %rd3, %rd2, 20;\n\
-    @%p st.global.u32 [%rd3], %r6;\n\
-    add.u64 %rd3, %rd2, 24;\n\
-    @%p st.global.u32 [%rd3], %r7;\n\
-    ret;\n\
-}\n\
-.visible .entry report_cluster(.param .u64 out)\n\
-{\n\
-    .reg .u64 %rd<3>;\n\
-    .reg .u32 %r<11>;\n\
-    .reg .pred %p;\n\
-    ld.param.u64 %rd1, [out];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ctaid.y;\n\
-    mov.u32 %r3, %cluster_ctaid.x;\n\
-    mov.u32 %r4, %cluster_ctaid.y;\n\
-    mov.u32 %r5, %cluster_ctarank;\n\
-    mov.u32 %r6, %cluster_nctaid.x;\n\
-    mov.u32 %r7, %cluster_nctaid.y;\n\
-    mov.u32 %r8, %nctaid.x;\n\
-    mov.u32 %r9, %tid.x;\n\
-    mad.lo.u32 %r10, %r8, %r2, %r1;\n\
-    mul.wide.u32 %rd2, %r10, 32;\n\
-    add.u64 %rd2, %rd1, %rd2;\n\
-    setp.eq.u32 %p, %r9, 0;\n\
-    @%p st.global.u32 [%rd2], %r1;\n\
-    add.u64 %rd2, %rd2, 4;\n\
-    @%p st.global.u32 [%rd2], %r2;\n\
-    add.u64 %rd2, %rd2, 4;\n\
-    @%p st.global.u32 [%rd2], %r3;\n\
-    add.u64 %rd2, %rd2, 4;\n\
-    @%p st.global.u32 [%rd2], %r4;\n\
-    add.u64 %rd2, %rd2, 4;\n\
-    @%p st.global.u32 [%rd2], %r5;\n\
-    add.u64 %rd2, %rd2, 4;\n\
-    @%p st.global.u32 [%rd2], %r6;\n\
-    add.u64 %rd2, %rd2, 4;\n\
-    @%p st.global.u32 [%rd2], %r7;\n\
-    add.u64 %rd2, %rd2, 4;\n\
-    @%p st.global.u32 [%rd2], %r9;\n\
-    ret;\n\
-}\n\
-.visible .entry write(.param .u64 out, .param .u32 value)\n\
-{\n\
-    .reg .u64 %rd<3>;\n\
-    .reg .u32 %r<3>;\n\
-    ld.param.u64 %rd1, [out];\n\
-    ld.param.u32 %r1, [value];\n\
-    mov.u32 %r2, %tid.x;\n\
-    mul.wide.u32 %rd2, %r2, 4;\n\
-    add.u64 %rd2, %rd1, %rd2;\n\
-    st.global.u32 [%rd2], %r1;\n\
-    ret;\n\
-}\n";
+/// The kernels of the launch, capture and rebind tests (`fixtures/kernels.ptx`).
+const KERNELS: &[u8] = include_bytes!("fixtures/kernels.ptx");
+
+/// The cluster kernel of the launch test (`fixtures/cluster.ptx`), for a
+/// device that launches clusters.
+const CLUSTER_KERNELS: &[u8] = include_bytes!("fixtures/cluster.ptx");
+
+/// The source of the binary-image tests' kernel (`fixtures/add_constant.cu`).
+const ADD_CONSTANT: &str = include_str!("fixtures/add_constant.cu");
 
 /// The words of `buffer`, read after the writing stream was synchronized.
 fn words(buffer: &PinnedBuffer) -> Vec<u32> {
@@ -1106,36 +965,101 @@ fn words(buffer: &PinnedBuffer) -> Vec<u32> {
         .collect()
 }
 
-/// A library of [`KERNELS`] on device 0.
+/// A library of [`KERNELS`] on `device`.
 fn kernels(device: &Device) -> Library {
-    Library::load(device, KERNELS.as_bytes()).unwrap()
+    Library::load(device, KERNELS).unwrap()
 }
 
-/// `tests/fixtures/add_constant.cu` as a fatbin, compiled by the `nvcc` of the
-/// toolkit `CUDA_HOME` names into a directory of the test's own.
-fn add_constant_fatbin() -> Vec<u8> {
-    let home = std::env::var_os("CUDA_HOME")
-        .expect("CUDA_HOME names the toolkit whose nvcc compiles the test kernel");
-    let directory = tempfile::tempdir().expect("a directory for the fatbin");
-    let output = directory.path().join("add_constant.fatbin");
-    let status = Command::new(Path::new(&home).join("bin/nvcc"))
-        .args([
-            "-gencode",
-            "arch=compute_90,code=[sm_90,compute_90]",
-            "-fatbin",
-        ])
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/add_constant.cu"))
-        .arg("-o")
-        .arg(&output)
-        .status()
-        .expect("running nvcc");
-    assert!(status.success(), "nvcc failed: {status}");
-    std::fs::read(output).expect("the fatbin nvcc wrote")
+/// NVRTC of the CUDA 13 packages, by the soname its package installs on the
+/// loader's default search path.
+const LIBNVRTC: &str = "libnvrtc.so.13";
+
+/// `nvrtcResult`'s `NVRTC_SUCCESS`.
+const NVRTC_SUCCESS: c_int = 0;
+
+/// [`ADD_CONSTANT`] compiled by NVRTC into a cubin for `device`'s compute
+/// capability: a binary image, NUL bytes included.
+fn add_constant_cubin(device: &Device) -> Vec<u8> {
+    type Program = *mut c_void;
+    type Create = unsafe extern "C" fn(
+        *mut Program,
+        *const c_char,
+        *const c_char,
+        c_int,
+        *const *const c_char,
+        *const *const c_char,
+    ) -> c_int;
+    type Compile = unsafe extern "C" fn(Program, c_int, *const *const c_char) -> c_int;
+    type Size = unsafe extern "C" fn(Program, *mut usize) -> c_int;
+    type Read = unsafe extern "C" fn(Program, *mut c_char) -> c_int;
+    type Destroy = unsafe extern "C" fn(*mut Program) -> c_int;
+
+    // SAFETY: loading NVRTC runs only its own initializers.
+    let nvrtc = unsafe { libloading::Library::new(LIBNVRTC) }
+        .expect("NVRTC of the CUDA 13 packages is on the loader's search path");
+    // SAFETY: each signature is the `nvrtc.h` prototype of the symbol.
+    let (create, compile, log_size, log, cubin_size, cubin, destroy) = unsafe {
+        (
+            *nvrtc.get::<Create>(b"nvrtcCreateProgram").unwrap(),
+            *nvrtc.get::<Compile>(b"nvrtcCompileProgram").unwrap(),
+            *nvrtc.get::<Size>(b"nvrtcGetProgramLogSize").unwrap(),
+            *nvrtc.get::<Read>(b"nvrtcGetProgramLog").unwrap(),
+            *nvrtc.get::<Size>(b"nvrtcGetCUBINSize").unwrap(),
+            *nvrtc.get::<Read>(b"nvrtcGetCUBIN").unwrap(),
+            *nvrtc.get::<Destroy>(b"nvrtcDestroyProgram").unwrap(),
+        )
+    };
+
+    let source = CString::new(ADD_CONSTANT).unwrap();
+    let name = c"add_constant.cu";
+    let (major, minor) = device.architecture();
+    let architecture = CString::new(format!("--gpu-architecture=sm_{major}{minor}")).unwrap();
+    let options = [architecture.as_ptr()];
+    let mut program: Program = std::ptr::null_mut();
+    // SAFETY: the source and name are NUL-terminated and outlive the call; no
+    // headers are given; NVRTC writes the program handle.
+    let created = unsafe {
+        create(
+            &mut program,
+            source.as_ptr(),
+            name.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(created, NVRTC_SUCCESS, "nvrtcCreateProgram");
+
+    // SAFETY: the program is live and the option array holds one C string.
+    let compiled = unsafe { compile(program, 1, options.as_ptr()) };
+    let mut size = 0;
+    // SAFETY: NVRTC writes the log's size, NUL included.
+    assert_eq!(unsafe { log_size(program, &mut size) }, NVRTC_SUCCESS);
+    let mut text = vec![0u8; size.max(1)];
+    // SAFETY: the buffer holds the log's size.
+    let logged = unsafe { log(program, text.as_mut_ptr().cast()) };
+    assert_eq!(logged, NVRTC_SUCCESS);
+    assert_eq!(
+        compiled,
+        NVRTC_SUCCESS,
+        "NVRTC refused {architecture:?}: {}",
+        String::from_utf8_lossy(&text)
+    );
+
+    // SAFETY: NVRTC writes the cubin's size, then the cubin into a buffer of it.
+    assert_eq!(unsafe { cubin_size(program, &mut size) }, NVRTC_SUCCESS);
+    let mut image = vec![0u8; size];
+    // SAFETY: the buffer holds the cubin's size.
+    let read = unsafe { cubin(program, image.as_mut_ptr().cast()) };
+    assert_eq!(read, NVRTC_SUCCESS);
+    // SAFETY: the program is NVRTC's and destroyed once.
+    unsafe { destroy(&mut program) };
+    image
 }
 
-/// A binary library image (a fatbin, so it loads on any device the PTX was
-/// compiled for) contains NUL bytes, which the driver reads by the image's own
-/// headers; it loads and its kernel runs.
+/// A binary library image (a cubin, compiled for the device it loads on)
+/// contains NUL bytes, which the driver reads by the image's own headers; it
+/// loads and its kernel runs.
 #[test]
 #[ignore = "requires a CUDA device"]
 fn libraries_load_a_binary_image_and_launch_its_kernel() {
@@ -1146,7 +1070,7 @@ fn libraries_load_a_binary_image_and_launch_its_kernel() {
         Err(Error::InvalidArgument(_))
     ));
 
-    let library = Library::load(&device, &add_constant_fatbin()).unwrap();
+    let library = Library::load(&device, &add_constant_cubin(&device)).unwrap();
     let add_constant = library.kernel("add_constant").unwrap();
     let stream = Stream::new(DEVICE).unwrap();
     let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
@@ -1183,7 +1107,7 @@ fn libraries_load_a_binary_image_and_launch_its_kernel() {
 fn a_function_reports_the_parameters_of_its_signature() {
     let _driver = exclusive_driver();
     let device = Device::new(DEVICE).unwrap();
-    let library = Library::load(&device, KERNELS.as_bytes()).unwrap();
+    let library = kernels(&device);
 
     // `write(.param .u64 out, .param .u32 value)`: eight bytes, then four.
     let write = library.kernel("write").unwrap();
@@ -1213,8 +1137,8 @@ fn a_function_reports_the_parameters_of_its_signature() {
 
     // The declaration comes from the loaded image, not from the PTX text: a
     // kernel of a cubin image reports the same layout.
-    let fatbin = Library::load(&device, &add_constant_fatbin()).unwrap();
-    let add_constant = fatbin.kernel("add_constant").unwrap();
+    let cubin = Library::load(&device, &add_constant_cubin(&device)).unwrap();
+    let add_constant = cubin.kernel("add_constant").unwrap();
     let layout: Vec<(usize, usize)> = add_constant
         .parameters()
         .unwrap()
@@ -1305,13 +1229,13 @@ fn launch_ex_carries_the_grid_shared_memory_and_launch_attributes() {
         assert_eq!(words(&host)[..7], [0, 0, 0, 0, 0, 0, 0], "{config:?}");
     }
 
-    // A cluster is one launch attribute more; it needs a compute capability
-    // that has clusters (sm_90 and later), which is every device this branch
-    // targets. The kernel reads the cluster's own registers, so a launch that
+    // A cluster is one launch attribute more, on a device that launches
+    // clusters. The kernel reads the cluster's own registers, so a launch that
     // dropped the attribute cannot pass: without it every block is a cluster
     // of one.
-    if device.architecture().0 >= 9 {
-        let cluster = library.kernel("report_cluster").unwrap();
+    if DEVICE.attribute(DeviceAttribute::ClusterLaunch).unwrap() != 0 {
+        let clustered = Library::load(&device, CLUSTER_KERNELS).unwrap();
+        let cluster = clustered.kernel("report_cluster").unwrap();
         let config = LaunchConfig {
             grid: [2, 2, 1],
             block: [1, 1, 1],

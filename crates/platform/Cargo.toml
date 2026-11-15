@@ -24,3 +24,12 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+# The process half of the device test that checks interprocess event storage is released with
+# its contexts (`tests/it/gpu.rs`), which starts it as a child (`CARGO_BIN_EXE_interprocess-event`).
+[[bin]]
+name = "interprocess-event"
+path = "tests/helpers/interprocess_event.rs"
+test = false
+bench = false
+doc = false

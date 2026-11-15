@@ -525,32 +525,29 @@ pub(crate) mod tests {
         assert_eq!((timeline.late_ns, timeline.busy_ns), (4_000, 4_000));
     }
 
-    /// The time of the stream registered as `name` that [`take`] reports
-    /// until `delivered` holds for its sum, or for 5 s: the flush thread
-    /// has the records delivered within its period.
-    pub(crate) fn taken_until(name: &str, delivered: impl Fn(&StreamTime) -> bool) -> StreamTime {
+    /// The time of the stream registered as `name` that [`take`] reports once
+    /// every record of the work that completed was delivered: the caller
+    /// synchronized the stream, and a forced flush returns after CUPTI handed
+    /// every buffer to the delivery callback.
+    pub(crate) fn taken(name: &str) -> StreamTime {
+        subscriber::flush(true);
         let mut sum = StreamTime {
             name: name.to_owned(),
             ..StreamTime::default()
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !delivered(&sum) && std::time::Instant::now() < deadline {
-            std::thread::sleep(FLUSH_PERIOD / 4);
-            for stream in take()
-                .streams
-                .into_iter()
-                .filter(|stream| stream.name == name)
-            {
-                sum.busy_us += stream.busy_us;
-                sum.gap_us += stream.gap_us;
-                sum.late_us += stream.late_us;
-            }
+        for stream in take()
+            .streams
+            .into_iter()
+            .filter(|stream| stream.name == name)
+        {
+            sum.busy_us += stream.busy_us;
+            sum.gap_us += stream.gap_us;
+            sum.late_us += stream.late_us;
         }
         sum
     }
 
     mod device {
-        use std::time::Duration;
 
         use super::super::*;
         use crate::{
@@ -607,16 +604,15 @@ pub(crate) mod tests {
             let other = Stream::new(device)?;
             let storage = DeviceAllocation::linear(device, FILL_BYTES)?;
             let graph = captured(&storage, &stream, 16)?;
-            let pause = Duration::from_millis(50);
             let activity = StreamActivity::start([("device", &stream)], false)?;
 
             let first = fills(&storage, &stream, 16)?;
             stream.synchronize()?;
-            // The stream stands idle for the pause while another stream, one
-            // that is not registered, works.
-            fill(&storage, &other, 16)?;
-            std::thread::sleep(pause);
-            other.synchronize()?;
+            // The stream stands idle while another stream, one that is not
+            // registered, works: it waits on the other stream's last event,
+            // so its idle time is the other's fills, timed on the device.
+            let idle = fills(&storage, &other, 16)?;
+            stream.wait_event(&idle[1])?;
             // The graph, instantiated before the recording started, is
             // recorded by its nodes.
             let flags = EventFlags {
@@ -628,22 +624,22 @@ pub(crate) mod tests {
             graph.launch(&stream)?;
             launched[1].record(&stream)?;
             stream.synchronize()?;
+            other.synchronize()?;
 
             let spanned = elapsed_us(&first)? + elapsed_us(&launched)?;
-            let stream_time =
-                super::taken_until("device", |taken| taken.busy_us >= spanned * 9 / 10);
-            let pause_us = pause.as_micros() as u64;
+            let idle_us = elapsed_us(&idle)?;
+            let stream_time = super::taken("device");
             // The events span the operations and the host's launch latency
-            // before the first of each; the gap adds the host's return from
-            // the synchronizations around the pause.
+            // before the first of each; the gap adds the host's issue of the
+            // other stream's work after the first synchronization.
             assert!(
                 (spanned * 9 / 10..=spanned + 50).contains(&stream_time.busy_us),
                 "busy {} us, events {spanned} us",
                 stream_time.busy_us
             );
             assert!(
-                (pause_us..pause_us + 20_000).contains(&stream_time.gap_us),
-                "gap {} us",
+                (idle_us * 9 / 10..idle_us + 20_000).contains(&stream_time.gap_us),
+                "gap {} us, the other stream's fills {idle_us} us",
                 stream_time.gap_us
             );
             assert_eq!((stream_time.late_us, take().dropped_records), (0, 0));

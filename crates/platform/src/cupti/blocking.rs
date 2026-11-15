@@ -244,7 +244,7 @@ mod tests {
         unsafe { memset_d8(storage.address(), 0, bytes, &stream)? };
         stream.synchronize()?;
         assert_eq!(scope.calls(), vec![("cuStreamSynchronize", 1)]);
-        let taken = crate::cupti::activity::tests::taken_until("device", |taken| taken.busy_us > 0);
+        let taken = crate::cupti::activity::tests::taken("device");
         assert!(taken.busy_us > 0, "{taken:?}");
         drop(recording);
         drop(watch);

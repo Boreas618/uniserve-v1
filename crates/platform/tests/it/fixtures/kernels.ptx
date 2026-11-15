@@ -1,0 +1,68 @@
+// The kernels of the launch, capture and rebind tests. The driver compiles
+// them for the device they are loaded on; they target the oldest architecture
+// the PTX ISA version admits, so they load on every device the crate drives.
+//
+// `report` writes, for each block, its three grid coordinates, the first
+// thread's three coordinates and the dynamic shared-memory size the driver
+// allocated for the launch, seven 32-bit words per block; only thread 0 of a
+// block stores, so a block of more than one thread still writes once.
+//
+// `write` stores one value per thread, so a launch covers a contiguous run of
+// words and a rebinding test can tell whose work ran.
+.version 8.0
+.target sm_50
+.address_size 64
+
+.visible .entry nothing()
+{
+    ret;
+}
+
+.visible .entry report(.param .u64 out)
+{
+    .reg .u64 %rd<4>;
+    .reg .u32 %r<13>;
+    .reg .pred %p;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ctaid.y;
+    mov.u32 %r3, %ctaid.z;
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %tid.y;
+    mov.u32 %r6, %tid.z;
+    mov.u32 %r7, %dynamic_smem_size;
+    mov.u32 %r8, %nctaid.x;
+    mov.u32 %r9, %nctaid.y;
+    mad.lo.u32 %r10, %r9, %r3, %r2;
+    mad.lo.u32 %r10, %r8, %r10, %r1;
+    mul.wide.u32 %rd2, %r10, 28;
+    add.u64 %rd2, %rd1, %rd2;
+    setp.eq.u32 %p, %r4, 0;
+    @%p st.global.u32 [%rd2], %r1;
+    add.u64 %rd3, %rd2, 4;
+    @%p st.global.u32 [%rd3], %r2;
+    add.u64 %rd3, %rd2, 8;
+    @%p st.global.u32 [%rd3], %r3;
+    add.u64 %rd3, %rd2, 12;
+    @%p st.global.u32 [%rd3], %r4;
+    add.u64 %rd3, %rd2, 16;
+    @%p st.global.u32 [%rd3], %r5;
+    add.u64 %rd3, %rd2, 20;
+    @%p st.global.u32 [%rd3], %r6;
+    add.u64 %rd3, %rd2, 24;
+    @%p st.global.u32 [%rd3], %r7;
+    ret;
+}
+
+.visible .entry write(.param .u64 out, .param .u32 value)
+{
+    .reg .u64 %rd<3>;
+    .reg .u32 %r<3>;
+    ld.param.u64 %rd1, [out];
+    ld.param.u32 %r1, [value];
+    mov.u32 %r2, %tid.x;
+    mul.wide.u32 %rd2, %r2, 4;
+    add.u64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2], %r1;
+    ret;
+}

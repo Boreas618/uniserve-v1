@@ -367,17 +367,30 @@ pub(crate) mod tests {
         _library: Library,
         function: Function,
         out: DeviceAllocation,
+        /// The device's multiprocessors: one block on each keeps the whole
+        /// device busy.
+        multiprocessors: u32,
     }
 
     impl Spin {
         pub(crate) fn load(stream: &Stream) -> Result<Self> {
             let library = Library::load(&Device::new(stream.device())?, SPIN)?;
             let function = library.kernel("spin")?;
+            let multiprocessors = stream
+                .device()
+                .attribute(crate::DeviceAttribute::MultiprocessorCount)?;
             Ok(Self {
                 _library: library,
                 function,
                 out: DeviceAllocation::linear(stream.device(), 4)?,
+                multiprocessors: multiprocessors.unsigned_abs(),
             })
+        }
+
+        /// Launch it on `stream` with one block on each multiprocessor of the
+        /// device, every thread counting to `count`.
+        pub(crate) fn occupy(&self, stream: &Stream, count: u32) -> Result<()> {
+            self.launch(stream, self.multiprocessors, count)
         }
 
         /// Launch it on `stream` with `blocks` blocks of 128 threads that
