@@ -306,19 +306,33 @@ pub(crate) struct Adoption {
 /// Takes the responses `records` describe over from the predecessor, whose
 /// sockets follow the takeover's other descriptors in `next`.
 ///
-/// Each response's engine stream is taken over first, so a response only moves
-/// once the engine serves it; a response that cannot be taken over is left
-/// with the predecessor, which resumes it.
+/// Every record's state is read before anything moves: both ends speak one
+/// version of the handoff schema, so a state this process cannot read is a
+/// handoff it refuses whole, and the predecessor keeps every response. Each
+/// response's engine stream is then taken over first, so a response only moves
+/// once the engine serves it; a response whose takeover fails (its engine
+/// stream or its job's media is not here) is left with the predecessor, which
+/// resumes it.
+///
+/// # Errors
+///
+/// A record whose state is no `uniserve.handoff.Stream`, or one that states no
+/// HTTP framing or no application.
 pub(crate) fn adopt(
     leader: &Arc<Leader>,
     records: Vec<StreamHandoff>,
     jobs: &Arc<VideoJobs>,
     next: &mut impl FnMut() -> anyhow::Result<OwnedFd>,
-) -> Adoption {
+) -> anyhow::Result<Adoption> {
+    let states = records
+        .iter()
+        .map(read)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
     let mut taken = Vec::new();
     let mut streams = Vec::new();
-    for record in records {
-        match take_over(leader, jobs, &record, next) {
+    for (record, state) in records.into_iter().zip(states) {
+        match take_over(leader, jobs, &record, state, next) {
             Ok(response) => {
                 streams.push(Taken {
                     request_id: response.request_id.clone(),
@@ -336,7 +350,45 @@ pub(crate) fn adopt(
         }
     }
     queue(taken);
-    Adoption { streams }
+    Ok(Adoption { streams })
+}
+
+/// One response's state as the handoff states it: the request's identity, its
+/// HTTP framing and its application.
+struct Read {
+    request_id: String,
+    http: handoff::Http,
+    application: handoff::stream::Application,
+}
+
+/// Reads `record`'s state.
+///
+/// # Errors
+///
+/// A state that is no `uniserve.handoff.Stream`, or one that states no HTTP
+/// framing or no application.
+fn read(record: &StreamHandoff) -> anyhow::Result<Read> {
+    let state = handoff::Stream::decode(record.state.as_slice()).with_context(|| {
+        format!(
+            "reading the state of response {} of the handoff",
+            record.request_id
+        )
+    })?;
+    Ok(Read {
+        http: state.http.with_context(|| {
+            format!(
+                "response {} of the handoff states no HTTP framing",
+                record.request_id
+            )
+        })?,
+        application: state.application.with_context(|| {
+            format!(
+                "response {} of the handoff states no application",
+                record.request_id
+            )
+        })?,
+        request_id: state.request_id,
+    })
 }
 
 /// Takes one response of the handoff over: its engine stream first, then its body
@@ -345,19 +397,15 @@ fn take_over(
     leader: &Arc<Leader>,
     jobs: &Arc<VideoJobs>,
     record: &StreamHandoff,
+    state: Read,
     next: &mut impl FnMut() -> anyhow::Result<OwnedFd>,
 ) -> anyhow::Result<Adopted> {
     let at_ns = crate::http::handoff::now_ns();
-    let state = handoff::Stream::decode(record.state.as_slice())
-        .context("reading the state of a response of the handoff")?;
-    let http = state
-        .http
-        .clone()
-        .context("a response of the handoff states no HTTP framing")?;
-    let application = state
-        .application
-        .clone()
-        .context("a response of the handoff states no application")?;
+    let Read {
+        request_id,
+        http,
+        application,
+    } = state;
     let descriptor = next()?;
     let body = match application {
         handoff::stream::Application::ChatStream(chat) => {
@@ -371,7 +419,7 @@ fn take_over(
                     .as_ref()
                     .map_or(0, |lowering| lowering.started_unix_us),
             );
-            let stats = leader.stat_logger(&state.request_id, chat.engine_replica, started);
+            let stats = leader.stat_logger(&request_id, chat.engine_replica, started);
             let run = crate::api::openai::run::GenerationRun::resume_stream(
                 &chat,
                 leader.tokenizer(),
@@ -393,7 +441,7 @@ fn take_over(
                     .as_ref()
                     .map_or(0, |lowering| lowering.started_unix_us),
             );
-            let stats = leader.stat_logger(&state.request_id, chat.engine_replica, started);
+            let stats = leader.stat_logger(&request_id, chat.engine_replica, started);
             let run = crate::api::openai::run::GenerationRun::resume_collection(
                 &chat,
                 leader.tokenizer(),
@@ -537,12 +585,11 @@ mod tests {
         );
     }
 
-    /// A response the successor cannot read is not taken over: it stays the
-    /// predecessor's, it is reported as taken over by nobody, and the
-    /// successor does not take its socket out of the handover — it does not
-    /// own the connection, so nothing about it moves.
+    /// A handoff holding a response the successor cannot read is refused
+    /// whole: nothing is taken over and no socket is taken out of the
+    /// handover, so every response stays the predecessor's.
     #[tokio::test]
-    async fn a_response_that_cannot_be_read_stays_with_the_predecessor() {
+    async fn a_handoff_with_a_response_that_cannot_be_read_is_refused() {
         // The queue of taken-over responses is this process's, so the test
         // starts from what earlier tests left there.
         let _ = take_adopted();
@@ -573,10 +620,8 @@ mod tests {
             anyhow::bail!("a refused response must not take a descriptor")
         });
 
-        assert!(
-            adoption.streams.is_empty(),
-            "a response that cannot be read is taken over by nobody"
-        );
+        let refused = format!("{:#}", adoption.err().expect("the handoff is refused"));
+        assert!(refused.contains("refused-handoff-request"), "{refused}");
         assert!(take_adopted().is_empty(), "nothing is reported as adopted");
         assert!(
             !socket_taken,
@@ -587,7 +632,7 @@ mod tests {
     /// The same refusal when the state is readable but names no application:
     /// the record is complete enough to decode and still cannot be resumed.
     #[tokio::test]
-    async fn a_response_that_names_no_application_stays_with_the_predecessor() {
+    async fn a_handoff_with_a_response_that_names_no_application_is_refused() {
         let _ = take_adopted();
         let client = std::sync::Arc::new(fake_client(
             testkit::args("refused-handoff-2"),
@@ -623,7 +668,7 @@ mod tests {
             anyhow::bail!("a refused response must not take a descriptor")
         });
 
-        assert!(adoption.streams.is_empty());
+        assert!(adoption.is_err(), "the handoff is refused");
         assert!(take_adopted().is_empty());
         assert!(!socket_taken, "a response without framing does not move");
     }

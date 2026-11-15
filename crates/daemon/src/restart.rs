@@ -990,7 +990,7 @@ async fn prepared_successor(
             sockets
                 .next()
                 .context("the takeover lacks a response's descriptor")
-        });
+        })?;
         send(
             channel,
             &Message::Adopted {
