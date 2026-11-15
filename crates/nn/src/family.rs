@@ -423,15 +423,32 @@ pub struct StateField {
 
 impl StateField {
     /// The bytes one slot of the field occupies.
-    pub fn bytes(&self) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Unsupported`] for an element type the operator ABI gives no whole-byte
+    /// width, whose slot has no byte count to state.
+    pub fn bytes(&self) -> Result<u64> {
         let elements: usize = self.dims.iter().product();
-        elements as u64 * ops::abi::bytes(self.dtype).unwrap_or(0)
+        let element = ops::abi::bytes(self.dtype).ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "the recurrent state's field {} holds {} elements, which have no whole-byte width",
+                self.name,
+                ops::abi::name(self.dtype)
+            ))
+        })?;
+
+        Ok(elements as u64 * element)
     }
 }
 
 impl StateShape {
     /// The bytes one slot of one layer's fields occupies.
-    pub fn layer_bytes(&self) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// As [`StateField::bytes`], for the first field without a whole-byte element width.
+    pub fn layer_bytes(&self) -> Result<u64> {
         self.fields.iter().map(StateField::bytes).sum()
     }
 }

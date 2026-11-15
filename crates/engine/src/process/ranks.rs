@@ -2879,10 +2879,10 @@ fn open_rank(
         Some(_) => encoder_bytes(rank.model.as_ref(), images)?,
         None => 0,
     };
-    let resident = state_config
-        .as_ref()
-        .map_or(0, |state| state.bytes(&layout))
-        + outputs;
+    let resident = match &state_config {
+        Some(state) => state.bytes(&layout)?,
+        None => 0,
+    } + outputs;
     let regions: Vec<(RunnerId, u64)> = (0..)
         .zip(&peaks)
         .map(|(id, peaks)| (RunnerId(id), peaks.graph))

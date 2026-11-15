@@ -395,6 +395,26 @@ struct Run {
     output: usize,
 }
 
+/// The bytes one element of the tensor at `location` occupies.
+///
+/// # Errors
+///
+/// For an element type the operator ABI gives no whole-byte width: its elements have no byte
+/// range to read.
+fn element_bytes(location: &TensorLocation) -> Result<usize> {
+    ops::abi::bytes(location.dtype)
+        .map(|bytes| bytes as usize)
+        .ok_or_else(|| {
+            Error::weight(
+                &location.tensor,
+                format!(
+                    "{} elements have no whole-byte width",
+                    ops::abi::name(location.dtype)
+                ),
+            )
+        })
+}
+
 /// The fused bytes of `base`'s byte ranges `ranges`, concatenated in order.
 ///
 /// `ranges` are byte offsets within the tensor's own bytes, each a whole number of elements. The
@@ -409,7 +429,7 @@ pub(crate) fn fused(
     ranges: &[(usize, usize)],
 ) -> Result<Vec<u8>> {
     let dtype = base.dtype;
-    let element = ops::abi::bytes(dtype).unwrap_or(4) as usize;
+    let element = element_bytes(base)?;
     let columns = if base.shape.rank() == 0 {
         1
     } else {
@@ -417,7 +437,7 @@ pub(crate) fn fused(
     };
     let decode = |location: &TensorLocation, from: usize, to: usize| -> Result<Vec<f32>> {
         let bytes = checkpoint.bytes(location)?;
-        let width = ops::abi::bytes(location.dtype).unwrap_or(4) as usize;
+        let width = element_bytes(location)?;
         let range = bytes.get(from * width..to * width).ok_or_else(|| {
             Error::weight(
                 &location.tensor,

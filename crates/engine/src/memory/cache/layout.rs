@@ -560,7 +560,11 @@ impl CacheLayout {
     /// Where each field of recurrent layer `layer`'s checkpoint lies in a unit of the state
     /// region, in the order of `fields`: the field's first plane among the unit's planes and its
     /// bytes, which fill whole planes from that one ([`Self::hybrid`]).
-    pub fn state_planes(&self, layer: u32, fields: &[StateField]) -> Vec<(u32, u64)> {
+    ///
+    /// # Errors
+    ///
+    /// A field whose element type has no whole-byte width (`StateField::bytes`).
+    pub fn state_planes(&self, layer: u32, fields: &[StateField]) -> Result<Vec<(u32, u64)>> {
         let mut plane = self
             .checkpoints
             .get(layer as usize)
@@ -569,9 +573,10 @@ impl CacheLayout {
         fields
             .iter()
             .map(|field| {
-                let at = (plane, field.bytes());
-                plane += field.bytes().div_ceil(self.plane_bytes.max(1)) as u32;
-                at
+                let bytes = field.bytes()?;
+                let at = (plane, bytes);
+                plane += bytes.div_ceil(self.plane_bytes.max(1)) as u32;
+                Ok(at)
             })
             .collect()
     }
@@ -664,13 +669,14 @@ impl CacheLayout {
         for fields in layer_fields(runs) {
             let mut layer_planes = 0_u64;
             for field in fields {
-                if field.bytes() == 0 {
+                let bytes = field.bytes()?;
+                if bytes == 0 {
                     return Err(Error::Invalid(format!(
                         "the recurrent state's field {} holds no byte",
                         field.name
                     )));
                 }
-                layer_planes += field.bytes().div_ceil(layout.plane_bytes);
+                layer_planes += bytes.div_ceil(layout.plane_bytes);
             }
 
             let (first_plane, planes_held) = u32::try_from(planes)
@@ -866,7 +872,7 @@ mod tests {
         assert_eq!(layout.groups[1].units_per_page, 1);
         assert_eq!(layout.state_bytes(), 990 * (64 << 10));
         assert_eq!(
-            layout.state_planes(2, &state.fields),
+            layout.state_planes(2, &state.fields).unwrap(),
             vec![(66, 48 << 10), (67, 2 << 20)]
         );
 
@@ -981,8 +987,8 @@ mod tests {
         assert_eq!(keyed.unit_bytes, hybrid.unit_bytes + 10 * index_plane);
         assert_eq!(keyed.groups[1].index_keys, None);
         assert_eq!(
-            keyed.state_planes(2, &state.fields),
-            hybrid.state_planes(2, &state.fields)
+            keyed.state_planes(2, &state.fields).unwrap(),
+            hybrid.state_planes(2, &state.fields).unwrap()
         );
         assert_eq!(keyed.token_units(640), hybrid.token_units(640));
         assert_eq!(keyed.state_bytes(), hybrid.state_bytes());

@@ -310,9 +310,10 @@ impl ModelRunner {
                 (fewest_states(layout), None),
             )
             .fixed_bytes();
-        let recurrent = runner
-            .state_config(model, runner.buckets())
-            .map_or(0, |state| state.bytes(layout));
+        let recurrent = match runner.state_config(model, runner.buckets()) {
+            Some(state) => state.bytes(layout)?,
+            None => 0,
+        };
         Ok(state + tables + recurrent)
     }
 

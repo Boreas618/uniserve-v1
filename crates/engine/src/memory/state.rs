@@ -131,18 +131,22 @@ impl StateConfig {
     /// each live buffer's rows ([`Self::live_rows`]), a checkpoint row per slot and the
     /// trail's row per token, the drafter's live row per slot of each of its fields, and the
     /// copies' index vectors. The snapshot is the scratch pool's ([`CacheLayout::state_bytes`]).
-    pub(crate) fn bytes(&self, layout: &CacheLayout) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// A field whose element type has no whole-byte width (`StateField::bytes`).
+    pub(crate) fn bytes(&self, layout: &CacheLayout) -> Result<u64> {
         let (slots, trail) = (u64::from(self.slots), u64::from(self.trail));
-        let buffers: u64 = layer_fields(&self.shapes)
+        let buffers = layer_fields(&self.shapes)
             .flatten()
-            .map(|field| (u64::from(self.live_rows(field)) + slots + trail) * field.bytes())
-            .sum();
-        let drafter: u64 = layer_fields(&self.drafter)
+            .map(|field| Ok((u64::from(self.live_rows(field)) + slots + trail) * field.bytes()?))
+            .sum::<Result<u64>>()?;
+        let drafter = layer_fields(&self.drafter)
             .flatten()
-            .map(|field| slots * field.bytes())
-            .sum();
+            .map(|field| Ok(slots * field.bytes()?))
+            .sum::<Result<u64>>()?;
 
-        buffers + drafter + RING as u64 * self.index_bytes(layout)
+        Ok(buffers + drafter + RING as u64 * self.index_bytes(layout))
     }
 
     /// The rows of `field`'s live buffer: a home row per request slot, and the further slots
@@ -276,7 +280,7 @@ impl StateMemory {
             .iter()
             .enumerate()
             .map(|(layer, fields)| layout.state_planes(layer as u32, fields))
-            .collect();
+            .collect::<Result<_>>()?;
 
         // Every field's planes lie inside its layer's checkpoint, which the layout laid out
         // from the same runs.
@@ -331,7 +335,7 @@ impl StateMemory {
                         fields
                             .iter()
                             .map(|field| {
-                                let bytes = u64::from(rows(field)) * field.bytes();
+                                let bytes = u64::from(rows(field)) * field.bytes()?;
                                 Ok(allocator.allocate(PoolKind::Resident, bytes as usize)?)
                             })
                             .collect()
@@ -430,14 +434,14 @@ impl StateMemory {
         raw: bool,
         buffers: impl Fn(&Buffers) -> &Vec<Vec<Buffer>>,
     ) -> Result<Vec<Vec<Tensor>>> {
-        let shape = |field: &StateField| {
+        let shape = |field: &StateField| -> Result<Vec<usize>> {
             let mut dims = vec![rows(field) as usize];
             if raw {
-                dims.push(field.bytes() as usize);
+                dims.push(field.bytes()? as usize);
             } else {
                 dims.extend(&field.dims);
             }
-            dims
+            Ok(dims)
         };
 
         layer_fields(runs)
@@ -451,7 +455,7 @@ impl StateMemory {
                         self.tensor(
                             |device| &buffers(device)[layer][index],
                             0,
-                            &shape(field),
+                            &shape(field)?,
                             dtype,
                         )
                     })
@@ -623,7 +627,7 @@ impl StateMemory {
                     .iter()
                     .map(|field| {
                         meta(
-                            &[self.config.slots as usize, field.bytes() as usize],
+                            &[self.config.slots as usize, field.bytes()? as usize],
                             DType::U8,
                         )
                     })
@@ -805,7 +809,7 @@ impl StateMemory {
             .zip(layer_fields(&self.config.shapes));
         for ((live, trail), fields) in layers {
             for ((live, trail), field) in live.iter().zip(trail).zip(fields) {
-                let bytes = field.bytes();
+                let bytes = field.bytes()?;
                 batch.push(
                     live.address() + u64::from(row) * bytes,
                     trail.address() + u64::from(token) * bytes,
@@ -913,7 +917,7 @@ mod tests {
         // for each of the four copies a batch of two rows may carry.
         let layout = cache().layout;
         assert_eq!(
-            config(5).bytes(&layout),
+            config(5).bytes(&layout).unwrap(),
             (2 * 3 + 5) * 2 * 52 + 4 * (4 * 5 * 8)
         );
         assert_eq!(layout.state_bytes(), 4 * 64);
@@ -1070,7 +1074,7 @@ mod tests {
         // and three checkpoints of 16 bytes, and four sets of index vectors of a slot row and
         // five planes for each of the four copies a batch of two rows may carry.
         assert_eq!(
-            config.bytes(&cache.layout),
+            config.bytes(&cache.layout).unwrap(),
             2 * 2 * 3 * 52 + (9 + 3) * 16 + 4 * (4 * 6 * 8)
         );
 
@@ -1133,7 +1137,10 @@ mod tests {
 
         // Three slots of 112 bytes beside the model's state.
         let layout = cache().layout;
-        assert_eq!(drafting.bytes(&layout), config(0).bytes(&layout) + 3 * 112);
+        assert_eq!(
+            drafting.bytes(&layout).unwrap(),
+            config(0).bytes(&layout).unwrap() + 3 * 112
+        );
         assert_eq!(state.live()?.len(), plain.live()?.len());
         assert_eq!(state.checkpoint()?.len(), plain.checkpoint()?.len());
         assert_eq!(state.keys()?, plain.keys()?);

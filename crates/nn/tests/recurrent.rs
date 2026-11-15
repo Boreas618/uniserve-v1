@@ -866,6 +866,21 @@ fn a_gated_delta_net_mixes_its_rows_through_the_slots_state() {
     }
 }
 
+/// A field's slot is its elements at their whole-byte width; an element type the operator ABI
+/// gives no such width has no byte count, and the field says so instead of assuming one.
+#[test]
+fn a_state_field_states_its_slot_bytes_or_refuses_a_sub_byte_element() {
+    let field = |dtype| StateField {
+        name: "conv",
+        dtype,
+        dims: vec![3, 32],
+        stepwise: false,
+    };
+
+    assert_eq!(field(DType::BF16).bytes().unwrap(), 3 * 32 * 2);
+    assert!(field(DType::F4).bytes().is_err());
+}
+
 #[test]
 fn a_gated_delta_net_states_its_fields_and_its_kernels() {
     let config = config(4);
