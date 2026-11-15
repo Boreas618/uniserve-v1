@@ -2,8 +2,8 @@
 //! storage the server holds.
 //!
 //! The server runs the Transfer Server ([`crate::transfer`]) as a child
-//! process ([`Process`]) and starts it again when it ends. It connects
-//! as [`Role::Transfer`](::storage::protocol::Role::Transfer), reports the
+//! process ([`Process`]) and starts it again when it ends. It says hello on the channel the
+//! server made for it as [`Role::Transfer`](::storage::protocol::Role::Transfer), reports the
 //! bandwidth of every link and its CUDA contexts' device storage
 //! ([`Request::Measured`](::storage::protocol::Request::Measured)), and runs
 //! the tasks heads and workers submit:

@@ -4,8 +4,9 @@
 //! when it leads no group), waits for its exit on its pidfd, then waits until
 //! NVML no longer lists it on any GPU whose storage it held, which is when
 //! its context, and every mapping and queued kernel of it, is gone. A
-//! process that has not left a GPU by the deadline is a failed shoot-down:
-//! it keeps its access, and the requests that waited for it fail.
+//! process that has not left a GPU by the deadline is a failed shoot-down,
+//! and so is one whose leaving NVML cannot tell: it keeps its access, and the
+//! requests that waited for it fail.
 //!
 //! The same evidence closes the session of an engine that is gone
 //! ([`crate::sessions`]): the server follows its processes without killing
@@ -45,8 +46,11 @@ pub(super) struct ShootDowns {
     /// Processes that left every GPU; dropped once nothing else refers to
     /// their pidfd.
     finished: Vec<Arc<OwnedFd>>,
-    /// Processes that did not leave a GPU in time.
+    /// Processes that did not leave a GPU in time, or whose leaving NVML could not tell.
     failed: Vec<Arc<OwnedFd>>,
+    /// The NVML session the shoot-downs ask whether a GPU lists a process: opened at the first
+    /// question, and opened again after a question failed.
+    nvml: Option<Nvml>,
 }
 
 impl ShootDowns {
@@ -157,14 +161,20 @@ impl ShootDowns {
                     shot.started = Instant::now();
                 }
             }
-            let out = shot.exited
-                && shot.gpus.iter().all(|gpu| match listed(*gpu, shot.pid) {
-                    Ok(listed) => !listed,
-                    Err(error) => {
-                        tracing::warn!(pid = shot.pid, %error, "NVML cannot tell whether a killed writer left its GPU");
-                        false
-                    }
-                });
+            let out = match shot.exited.then(|| self.left_every_gpu(&shot)) {
+                None => false,
+                Some(Ok(left)) => left,
+                Some(Err(error)) => {
+                    tracing::error!(
+                        pid = shot.pid,
+                        %error,
+                        "NVML cannot tell whether a process left its GPU; its shoot-down fails"
+                    );
+                    self.failed.push(shot.pidfd);
+                    ended = true;
+                    continue;
+                }
+            };
             if out {
                 tracing::info!(
                     pid = shot.pid,
@@ -219,19 +229,29 @@ impl ShootDowns {
         self.finished.iter().any(|other| Arc::ptr_eq(other, pidfd))
     }
 
+    /// Whether no GPU of `shot` lists its process, through the shoot-downs' NVML session; a
+    /// failed question closes the session, so the next opens it again.
+    fn left_every_gpu(&mut self, shot: &ShootDown) -> platform::Result<bool> {
+        let nvml = match &mut self.nvml {
+            Some(nvml) => nvml,
+            slot @ None => slot.insert(Nvml::init()?),
+        };
+        let listed = shot
+            .gpus
+            .iter()
+            .map(|gpu| nvml.lists_process(DeviceUuid(*gpu), shot.pid.unsigned_abs()))
+            .collect::<platform::Result<Vec<bool>>>();
+        match listed {
+            Ok(listed) => Ok(listed.iter().all(|listed| !listed)),
+            Err(error) => {
+                self.nvml = None;
+                Err(error)
+            }
+        }
+    }
+
     /// Whether the process behind `pidfd` did not leave its GPU in time.
     pub(super) fn failed(&self, pidfd: &Arc<OwnedFd>) -> bool {
         self.failed.iter().any(|other| Arc::ptr_eq(other, pidfd))
     }
-}
-
-/// Whether the GPU with `uuid` lists process `pid`, through this process's
-/// one NVML session, opened at the first query.
-fn listed(uuid: [u8; 16], pid: i32) -> platform::Result<bool> {
-    static NVML: std::sync::OnceLock<platform::Result<Nvml>> = std::sync::OnceLock::new();
-    let nvml = NVML
-        .get_or_init(Nvml::init)
-        .as_ref()
-        .map_err(Clone::clone)?;
-    nvml.lists_process(DeviceUuid(uuid), pid as u32)
 }

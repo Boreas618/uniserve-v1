@@ -20,7 +20,7 @@
 //! the blocks every request of the deployment's engines holds on the
 //! device and on the host, which an engine epoch reaches through the queue
 //! pairs of its session ([`sessions`]). The pools live on a thread of their
-//! own, which polls the queue pairs; the main loop opens and closes the
+//! own, which sleeps on the queue pairs' doorbells; the main loop opens and closes the
 //! sessions and runs the pools' tasks on the children.
 //!
 //! [`command`] is the `uniserve storage-server` command: [`serve`] runs a

@@ -457,8 +457,7 @@ impl Process {
             return;
         };
         if let Ok(Some(status)) = process.try_wait() {
-            let child = self.launch.as_ref().map(Launch::child);
-            tracing::warn!(%status, "the {} ended", child.map_or_else(String::new, |child| child.to_string()));
+            tracing::warn!(%status, child = ?self.child(), "a child process ended");
             self.running = None;
             self.note_end(status.to_string());
         }
