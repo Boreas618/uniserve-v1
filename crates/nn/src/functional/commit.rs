@@ -26,8 +26,8 @@ use proto::module::commit::{COMMIT_FIELDS, column, mode};
 use tensor::{DType, Device, Tensor};
 
 use super::nvfp4::integer;
-use super::on_cpu;
 use super::sampling::{require, signed};
+use super::{Fused, compute};
 use crate::capability::NO_SLOT;
 use crate::error::{Error, Result};
 
@@ -94,7 +94,7 @@ pub fn slot_commit_(
     verified: &Tensor,
     counts: &Tensor,
 ) -> Result<()> {
-    const OWNER: &str = "slot_commit_";
+    const OWNER: &str = SlotCommitCall::OWNER;
 
     require(
         OWNER,
@@ -154,7 +154,75 @@ pub fn slot_commit_(
     let vocabulary = u32::try_from(counts.dims()[1])
         .map_err(|_| Error::shape(OWNER, "a vocabulary wider than a kernel takes"))?;
 
-    if on_cpu(table) {
+    compute(SlotCommitCall {
+        table,
+        tokens,
+        valid,
+        active,
+        continuation,
+        points,
+        future,
+        predicates,
+        logical,
+        sampling,
+        verified,
+        counts,
+        rows,
+        width,
+        vocabulary,
+    })
+}
+
+/// A checked call of [`slot_commit_`]: a step of `rows` rows, next input tokens `width` wide
+/// and counts over `vocabulary` tokens.
+struct SlotCommitCall<'t> {
+    table: &'t Tensor,
+    tokens: &'t Tensor,
+    valid: &'t Tensor,
+    active: &'t Tensor,
+    continuation: &'t Tensor,
+    points: &'t Tensor,
+    future: &'t Tensor,
+    predicates: &'t Tensor,
+    logical: &'t Tensor,
+    sampling: &'t Tensor,
+    verified: &'t Tensor,
+    counts: &'t Tensor,
+    rows: usize,
+    width: usize,
+    vocabulary: u32,
+}
+
+impl SlotCommitCall<'_> {
+    const OWNER: &'static str = "slot_commit_";
+}
+
+impl Fused for SlotCommitCall<'_> {
+    type Output = ();
+
+    fn device(&self) -> &Device {
+        self.table.device()
+    }
+
+    fn cpu(self) -> Result<()> {
+        let Self {
+            table,
+            tokens,
+            valid,
+            active,
+            continuation,
+            points,
+            future,
+            predicates,
+            logical,
+            sampling,
+            verified,
+            counts,
+            rows,
+            width,
+            vocabulary,
+        } = self;
+
         let field = |index: usize| -> Result<Tensor> {
             Ok(table.narrow(0, index, 1)?.squeeze(0)?.contiguous()?)
         };
@@ -206,14 +274,14 @@ pub fn slot_commit_(
         let installs = moves.mul(&token_valid)?;
         let at = |mask: &Tensor| mask.where_cond(&slot_index, &no_index);
 
-        flat(OWNER, "verified lengths", verified)?.scatter_set(&at(&states)?, &cache, 0)?;
-        flat(OWNER, "logical positions", logical)?.scatter_set(&at(&moves)?, &position, 0)?;
-        flat(OWNER, "sampling positions", sampling)?.scatter_set(
+        flat(Self::OWNER, "verified lengths", verified)?.scatter_set(&at(&states)?, &cache, 0)?;
+        flat(Self::OWNER, "logical positions", logical)?.scatter_set(&at(&moves)?, &position, 0)?;
+        flat(Self::OWNER, "sampling positions", sampling)?.scatter_set(
             &at(&moves)?,
             &sampling_position,
             0,
         )?;
-        flat(OWNER, "predicates", predicates)?.scatter_set(
+        flat(Self::OWNER, "predicates", predicates)?.scatter_set(
             &at(&installs)?,
             &of_task(continuation)?,
             0,
@@ -221,7 +289,7 @@ pub fn slot_commit_(
 
         // Column 0 of the slot's row of next input tokens.
         let first_column = slot_index.broadcast_mul(&integer(width as u32, &slot_index)?)?;
-        flat(OWNER, "next input tokens", future)?.scatter_set(
+        flat(Self::OWNER, "next input tokens", future)?.scatter_set(
             &installs.where_cond(&first_column, &no_index)?,
             &token,
             0,
@@ -237,39 +305,59 @@ pub fn slot_commit_(
             .broadcast_mul(&Tensor::new(i64::from(vocabulary), &Device::Cpu)?)?
             .broadcast_add(&token.to_dtype(DType::I64)?)?;
         let no_cell = Tensor::full(i64::MAX, rows, &Device::Cpu)?;
-        flat(OWNER, "counts", counts)?.scatter_add_set(
+        flat(Self::OWNER, "counts", counts)?.scatter_add_set(
             &counted.where_cond(&cell, &no_cell)?,
             &weight.to_dtype(DType::I32)?,
             0,
         )?;
-        return Ok(());
+        Ok(())
     }
 
-    // The fields of the table lie `stride` elements apart: the stride follows the table the
-    // rows were taken from, so every step of a runner states one key.
-    ops::launch::<SlotCommit>(
-        &CommitDescriptor::new(
-            table.stride()[0] as u64,
-            future.stride()[0] as u64,
+    fn launch(self) -> Result<()> {
+        let Self {
+            table,
+            tokens,
+            valid,
+            active,
+            continuation,
+            points,
+            future,
+            predicates,
+            logical,
+            sampling,
+            verified,
+            counts,
+            rows,
             vocabulary,
-        )?,
-        CommitArgs {
-            columns: ops::operand(table)?,
-            tokens: signed(tokens)?,
-            valid: ops::operand(valid)?,
-            active: ops::operand(active)?,
-            continuation: ops::operand(continuation)?,
-            points: ops::operand(points)?,
-            future: signed(future)?,
-            predicates: ops::operand(predicates)?,
-            logical: ops::operand(logical)?,
-            sampling: ops::operand(sampling)?,
-            verified: ops::operand(verified)?,
-            penalties: ops::operand(counts)?,
-            count: rows as u64,
-        },
-    )?;
-    Ok(())
+            ..
+        } = self;
+
+        // The fields of the table lie `stride` elements apart: the stride follows the table the
+        // rows were taken from, so every step of a runner states one key.
+        ops::launch::<SlotCommit>(
+            &CommitDescriptor::new(
+                table.stride()[0] as u64,
+                future.stride()[0] as u64,
+                vocabulary,
+            )?,
+            CommitArgs {
+                columns: ops::operand(table)?,
+                tokens: signed(tokens)?,
+                valid: ops::operand(valid)?,
+                active: ops::operand(active)?,
+                continuation: ops::operand(continuation)?,
+                points: ops::operand(points)?,
+                future: signed(future)?,
+                predicates: ops::operand(predicates)?,
+                logical: ops::operand(logical)?,
+                sampling: ops::operand(sampling)?,
+                verified: ops::operand(verified)?,
+                penalties: ops::operand(counts)?,
+                count: rows as u64,
+            },
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

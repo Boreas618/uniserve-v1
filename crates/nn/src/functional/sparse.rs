@@ -18,7 +18,7 @@
 use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
 use tensor::{DType, Device, Tensor};
 
-use super::on_cpu;
+use super::{Fused, compute};
 use crate::error::{Error, Result};
 
 /// The rows `query` attends in the key blocks its tile selects: `[query rows, heads, head_dim]`
@@ -43,7 +43,7 @@ pub fn sparse_attention(
     keys: u32,
     output: DType,
 ) -> Result<Tensor> {
-    const OWNER: &str = "sparse_attention";
+    const OWNER: &str = SparseAttentionCall::OWNER;
 
     let (&[query_rows, heads, head_dim], &[key_rows, ..]) = (query.dims(), key.dims()) else {
         return Err(Error::shape(
@@ -99,7 +99,72 @@ pub fn sparse_attention(
     }
     let scale = (1.0 / (head_dim as f64).sqrt()) as f32;
 
-    if on_cpu(query) {
+    compute(SparseAttentionCall {
+        query,
+        key,
+        value,
+        indices,
+        counts,
+        valid,
+        block,
+        keys,
+        output,
+        heads,
+        head_dim,
+        tile,
+        query_tiles,
+        key_blocks,
+        scale,
+    })
+}
+
+/// A checked call of [`sparse_attention`]: the heads, the tiles and the softmax scale are its rows'.
+struct SparseAttentionCall<'t> {
+    query: &'t Tensor,
+    key: &'t Tensor,
+    value: &'t Tensor,
+    indices: &'t Tensor,
+    counts: &'t Tensor,
+    valid: &'t Tensor,
+    block: u32,
+    keys: u32,
+    output: DType,
+    heads: usize,
+    head_dim: usize,
+    tile: usize,
+    query_tiles: usize,
+    key_blocks: usize,
+    scale: f32,
+}
+
+impl SparseAttentionCall<'_> {
+    const OWNER: &'static str = "sparse_attention";
+}
+
+impl Fused for SparseAttentionCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.query.device()
+    }
+
+    fn cpu(self) -> Result<Self::Output> {
+        let Self {
+            query,
+            key,
+            value,
+            indices,
+            counts,
+            valid,
+            output,
+            heads,
+            head_dim,
+            tile,
+            query_tiles,
+            key_blocks,
+            scale,
+            ..
+        } = self;
         let selected: Vec<Vec<Vec<u32>>> = indices.to_vec3()?;
         let read: Vec<Vec<u32>> = counts.to_vec2()?;
         let visible: Vec<u32> = valid.to_vec1()?;
@@ -123,7 +188,7 @@ pub fn sparse_attention(
                 for block in selected[head][query_tile].iter().take(count) {
                     let Some(visible) = visible.get(*block as usize) else {
                         return Err(Error::shape(
-                            OWNER,
+                            Self::OWNER,
                             format!("key block {block} of {key_blocks} is selected"),
                         ));
                     };
@@ -150,31 +215,48 @@ pub fn sparse_attention(
             }
             heads_out.push(Tensor::cat(&tiles_out, 0)?);
         }
-        return Ok(Tensor::stack(&heads_out, 1)?.to_dtype(output)?);
+        Ok(Tensor::stack(&heads_out, 1)?.to_dtype(output)?)
     }
 
-    let out = ops::empty(query.shape(), output)?;
-    ops::launch::<SparseAttention>(
-        &SparseDescriptor {
+    fn launch(self) -> Result<Self::Output> {
+        let Self {
+            query,
+            key,
+            value,
+            indices,
+            counts,
+            valid,
             block,
-            dtype: query.dtype(),
-            output,
-            head_dim: u32::try_from(head_dim)
-                .map_err(|_| Error::shape(OWNER, format!("heads of {head_dim} elements")))?,
-            lse: false,
             keys,
-        },
-        SparseArgs {
-            query: ops::operand(query)?,
-            key: ops::operand(key)?,
-            value: ops::operand(value)?,
-            indices: ops::operand(indices)?,
-            counts: ops::operand(counts)?,
-            valid: ops::operand(valid)?,
-            lse: None,
-            out: ops::operand(&out)?,
+            output,
+            head_dim,
             scale,
-        },
-    )?;
-    Ok(out)
+            ..
+        } = self;
+        let out = ops::empty(query.shape(), output)?;
+        ops::launch::<SparseAttention>(
+            &SparseDescriptor {
+                block,
+                dtype: query.dtype(),
+                output,
+                head_dim: u32::try_from(head_dim).map_err(|_| {
+                    Error::shape(Self::OWNER, format!("heads of {head_dim} elements"))
+                })?,
+                lse: false,
+                keys,
+            },
+            SparseArgs {
+                query: ops::operand(query)?,
+                key: ops::operand(key)?,
+                value: ops::operand(value)?,
+                indices: ops::operand(indices)?,
+                counts: ops::operand(counts)?,
+                valid: ops::operand(valid)?,
+                lse: None,
+                out: ops::operand(&out)?,
+                scale,
+            },
+        )?;
+        Ok(out)
+    }
 }

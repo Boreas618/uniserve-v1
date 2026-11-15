@@ -29,7 +29,7 @@
 use ops::noise::{KeySource, NoiseArgs, NoiseDescriptor, NoiseKind, PhiloxNoise};
 use tensor::{DType, Device, Tensor};
 
-use super::on_cpu;
+use super::{Fused, compute};
 use crate::error::{Error, Result};
 
 /// The multipliers and the Weyl key increments of Philox4x32.
@@ -97,7 +97,7 @@ fn normal_stream(key: u64, stage: u32, draw: u32, offset: u64, count: usize) -> 
 ///
 /// When `out` has no axis or is a strided view, or the operator refuses its arguments.
 pub fn philox_normal(out: &Tensor, seed: u64, stage: u32, draw: u32, offset: u64) -> Result<()> {
-    const OWNER: &str = "philox_normal";
+    const OWNER: &str = PhiloxNormalCall::OWNER;
 
     // The draw addresses the buffer flattened, so where its axes fold changes no value: every
     // axis but the last folds into the rows the operator reads.
@@ -112,26 +112,81 @@ pub fn philox_normal(out: &Tensor, seed: u64, stage: u32, draw: u32, offset: u64
     };
     let elements = out.elem_count();
 
-    if on_cpu(out) {
-        let samples = normal_stream(seed, stage, draw, offset, elements);
-        let drawn = Tensor::from_vec(samples, out.shape(), &Device::Cpu)?.to_dtype(out.dtype())?;
+    compute(PhiloxNormalCall {
+        out,
+        seed,
+        stage,
+        draw,
+        offset,
+        width,
+        elements,
+    })
+}
 
-        return Ok(out.slice_set(&drawn, 0, 0)?);
+/// A checked call of [`philox_normal`]: `out` holds `elements` packed elements, rows of `width`.
+struct PhiloxNormalCall<'t> {
+    out: &'t Tensor,
+    seed: u64,
+    stage: u32,
+    draw: u32,
+    offset: u64,
+    width: usize,
+    elements: usize,
+}
+
+impl PhiloxNormalCall<'_> {
+    const OWNER: &'static str = "philox_normal";
+}
+
+impl Fused for PhiloxNormalCall<'_> {
+    type Output = ();
+
+    fn device(&self) -> &Device {
+        self.out.device()
     }
 
-    let rows = out.reshape((elements / width.max(1), width))?;
-    ops::launch::<PhiloxNoise>(
-        &NoiseDescriptor::new(out.dtype(), NoiseKind::Normal, KeySource::Scalar),
-        NoiseArgs {
-            out: ops::operand(&rows)?,
-            keys: None,
-            key: seed,
+    fn cpu(self) -> Result<()> {
+        let Self {
+            out,
+            seed,
             stage,
             draw,
             offset,
-        },
-    )?;
-    Ok(())
+            elements,
+            ..
+        } = self;
+
+        let samples = normal_stream(seed, stage, draw, offset, elements);
+        let drawn = Tensor::from_vec(samples, out.shape(), &Device::Cpu)?.to_dtype(out.dtype())?;
+
+        Ok(out.slice_set(&drawn, 0, 0)?)
+    }
+
+    fn launch(self) -> Result<()> {
+        let Self {
+            out,
+            seed,
+            stage,
+            draw,
+            offset,
+            width,
+            elements,
+        } = self;
+
+        let rows = out.reshape((elements / width.max(1), width))?;
+        ops::launch::<PhiloxNoise>(
+            &NoiseDescriptor::new(out.dtype(), NoiseKind::Normal, KeySource::Scalar),
+            NoiseArgs {
+                out: ops::operand(&rows)?,
+                keys: None,
+                key: seed,
+                stage,
+                draw,
+                offset,
+            },
+        )?;
+        Ok(())
+    }
 }
 
 /// Standard normal noise of `like`'s shape and element type, on `like`'s device: a new tensor
@@ -153,14 +208,59 @@ pub fn philox_normal_like(
     draw: u32,
     offset: u64,
 ) -> Result<Tensor> {
-    let out = if on_cpu(like) {
-        Tensor::zeros(like.shape(), like.dtype(), &Device::Cpu)?
-    } else {
-        ops::empty(like.shape(), like.dtype())?
-    };
+    compute(PhiloxNormalLikeCall {
+        like,
+        seed,
+        stage,
+        draw,
+        offset,
+    })
+}
 
-    philox_normal(&out, seed, stage, draw, offset)?;
-    Ok(out)
+/// A call of [`philox_normal_like`]: the draw is checked by [`philox_normal`] over the new
+/// tensor each device allocates.
+struct PhiloxNormalLikeCall<'t> {
+    like: &'t Tensor,
+    seed: u64,
+    stage: u32,
+    draw: u32,
+    offset: u64,
+}
+
+impl Fused for PhiloxNormalLikeCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.like.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            like,
+            seed,
+            stage,
+            draw,
+            offset,
+        } = self;
+
+        let out = Tensor::zeros(like.shape(), like.dtype(), &Device::Cpu)?;
+        philox_normal(&out, seed, stage, draw, offset)?;
+        Ok(out)
+    }
+
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            like,
+            seed,
+            stage,
+            draw,
+            offset,
+        } = self;
+
+        let out = ops::empty(like.shape(), like.dtype())?;
+        philox_normal(&out, seed, stage, draw, offset)?;
+        Ok(out)
+    }
 }
 
 /// Draws standard normal noise into `out`, `[rows, elements]`, in place and in its element type,
@@ -180,7 +280,7 @@ pub fn philox_normal_rows(
     draw: u32,
     offset: u64,
 ) -> Result<()> {
-    const OWNER: &str = "philox_normal_rows";
+    const OWNER: &str = PhiloxNormalRowsCall::OWNER;
 
     let &[rows, elements] = out.dims() else {
         return Err(Error::shape(
@@ -199,7 +299,47 @@ pub fn philox_normal_rows(
         ));
     }
 
-    if on_cpu(out) {
+    compute(PhiloxNormalRowsCall {
+        out,
+        keys,
+        stage,
+        draw,
+        offset,
+        elements,
+    })
+}
+
+/// A checked call of [`philox_normal_rows`]: rows of `elements` elements.
+struct PhiloxNormalRowsCall<'t> {
+    out: &'t Tensor,
+    keys: &'t Tensor,
+    stage: u32,
+    draw: u32,
+    offset: u64,
+    elements: usize,
+}
+
+impl PhiloxNormalRowsCall<'_> {
+    const OWNER: &'static str = "philox_normal_rows";
+}
+
+impl Fused for PhiloxNormalRowsCall<'_> {
+    type Output = ();
+
+    fn device(&self) -> &Device {
+        self.out.device()
+    }
+
+    fn cpu(self) -> Result<()> {
+        let Self {
+            out,
+            keys,
+            stage,
+            draw,
+            offset,
+            elements,
+        } = self;
+
         let keys: Vec<i64> = keys.to_vec1()?;
         let samples: Vec<f32> = keys
             .iter()
@@ -207,19 +347,30 @@ pub fn philox_normal_rows(
             .collect();
         let drawn = Tensor::from_vec(samples, out.shape(), &Device::Cpu)?.to_dtype(out.dtype())?;
 
-        return Ok(out.slice_set(&drawn, 0, 0)?);
+        Ok(out.slice_set(&drawn, 0, 0)?)
     }
 
-    ops::launch::<PhiloxNoise>(
-        &NoiseDescriptor::new(out.dtype(), NoiseKind::Normal, KeySource::Rows),
-        NoiseArgs {
-            out: ops::operand(out)?,
-            keys: Some(ops::operand(keys)?),
-            key: 0,
+    fn launch(self) -> Result<()> {
+        let Self {
+            out,
+            keys,
             stage,
             draw,
             offset,
-        },
-    )?;
-    Ok(())
+            ..
+        } = self;
+
+        ops::launch::<PhiloxNoise>(
+            &NoiseDescriptor::new(out.dtype(), NoiseKind::Normal, KeySource::Rows),
+            NoiseArgs {
+                out: ops::operand(out)?,
+                keys: Some(ops::operand(keys)?),
+                key: 0,
+                stage,
+                draw,
+                offset,
+            },
+        )?;
+        Ok(())
+    }
 }

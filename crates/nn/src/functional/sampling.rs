@@ -50,7 +50,7 @@ use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE, TOP_K, TOP_P};
 use tensor::{D, DType, Device, Tensor};
 
 use super::nvfp4::integer;
-use super::{ACCUMULATE, as_rows, like_rows, on_cpu};
+use super::{ACCUMULATE, Fused, as_rows, compute, like_rows};
 use crate::capability::NO_SLOT;
 use crate::error::{Error, Result};
 
@@ -273,7 +273,7 @@ pub fn logits_shape(
     adjustments: &Tensor,
     bans: &Tensor,
 ) -> Result<Tensor> {
-    const OWNER: &str = "logits_shape";
+    const OWNER: &str = LogitsShapeCall::OWNER;
 
     let (rows, width) = matrix(OWNER, "logits", logits)?;
     let vocabulary = extent(OWNER, "tokens", width)?;
@@ -324,7 +324,66 @@ pub fn logits_shape(
     }
     let extra_columns = extras.map_or(0, |extras| extras.dims()[1]);
 
-    if on_cpu(logits) {
+    compute(LogitsShapeCall {
+        logits,
+        counts,
+        slots,
+        parameters,
+        extras,
+        bias,
+        adjustments,
+        bans,
+        rows,
+        width,
+        vocabulary,
+        extra_columns,
+    })
+}
+
+/// A checked call of [`logits_shape`]: `rows` rows of a `vocabulary` (`width` columns) and
+/// `extra_columns` extra tokens a row.
+struct LogitsShapeCall<'t> {
+    logits: &'t Tensor,
+    counts: &'t Tensor,
+    slots: &'t Tensor,
+    parameters: &'t Tensor,
+    extras: Option<&'t Tensor>,
+    bias: &'t Tensor,
+    adjustments: &'t Tensor,
+    bans: &'t Tensor,
+    rows: usize,
+    width: usize,
+    vocabulary: u32,
+    extra_columns: usize,
+}
+
+impl LogitsShapeCall<'_> {
+    const OWNER: &'static str = "logits_shape";
+}
+
+impl Fused for LogitsShapeCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.logits.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            logits,
+            counts,
+            slots,
+            parameters,
+            extras,
+            bias,
+            adjustments,
+            bans,
+            rows,
+            width,
+            vocabulary,
+            extra_columns,
+        } = self;
+
         let x = logits.to_dtype(ACCUMULATE)?;
         let dropped = Tensor::full(f32::NEG_INFINITY, (rows, width), &Device::Cpu)?;
         let token = Tensor::arange(0_u32, vocabulary, &Device::Cpu)?;
@@ -388,30 +447,47 @@ pub fn logits_shape(
             .gt(0.0_f32)?
             .where_cond(&temperature, &temperature.ones_like()?)?;
 
-        return Ok(x.broadcast_div(&divisor)?);
+        Ok(x.broadcast_div(&divisor)?)
     }
 
-    let out = ops::empty((rows, width), DType::F32)?;
-    ops::launch::<LogitsShape>(
-        &ShapeDescriptor::new(
-            logits.dtype(),
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            logits,
+            counts,
+            slots,
+            parameters,
+            extras,
+            bias,
+            adjustments,
+            bans,
+            rows,
+            width,
             vocabulary,
-            extent(OWNER, "extra tokens", extra_columns)?,
-            true,
-        ),
-        ShapeArgs {
-            logits: ops::operand(logits)?,
-            counts: ops::operand(counts)?,
-            slots: signed(slots)?,
-            parameters: ops::operand(parameters)?,
-            extras: extras.map(signed).transpose()?,
-            bias: ops::operand(bias)?,
-            adjustments: signed(adjustments)?,
-            bans: signed(bans)?,
-            out: ops::operand(&out)?,
-        },
-    )?;
-    Ok(out)
+            extra_columns,
+        } = self;
+
+        let out = ops::empty((rows, width), DType::F32)?;
+        ops::launch::<LogitsShape>(
+            &ShapeDescriptor::new(
+                logits.dtype(),
+                vocabulary,
+                extent(Self::OWNER, "extra tokens", extra_columns)?,
+                true,
+            ),
+            ShapeArgs {
+                logits: ops::operand(logits)?,
+                counts: ops::operand(counts)?,
+                slots: signed(slots)?,
+                parameters: ops::operand(parameters)?,
+                extras: extras.map(signed).transpose()?,
+                bias: ops::operand(bias)?,
+                adjustments: signed(adjustments)?,
+                bans: signed(bans)?,
+                out: ops::operand(&out)?,
+            },
+        )?;
+        Ok(out)
+    }
 }
 
 /// The `width` largest entries of each row of `logits`, `[rows, vocabulary]`: `(values, ids)`,
@@ -426,7 +502,7 @@ pub fn logits_shape(
 /// When `logits` is not a matrix, `width` is not between one and the vocabulary, or the
 /// operator refuses its arguments.
 pub fn top_k(logits: &Tensor, width: u32) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = "top_k";
+    const OWNER: &str = TopKCall::OWNER;
 
     let (rows, row_width) = matrix(OWNER, "logits", logits)?;
     let vocabulary = extent(OWNER, "tokens", row_width)?;
@@ -438,32 +514,73 @@ pub fn top_k(logits: &Tensor, width: u32) -> Result<(Tensor, Tensor)> {
     }
     let kept = width as usize;
 
-    if on_cpu(logits) {
+    compute(TopKCall {
+        logits,
+        width,
+        rows,
+        vocabulary,
+        kept,
+    })
+}
+
+/// A checked call of [`top_k`]: `rows` rows of a `vocabulary`, each keeping `kept`.
+struct TopKCall<'t> {
+    logits: &'t Tensor,
+    width: u32,
+    rows: usize,
+    vocabulary: u32,
+    kept: usize,
+}
+
+impl TopKCall<'_> {
+    const OWNER: &'static str = "top_k";
+}
+
+impl Fused for TopKCall<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.logits.device()
+    }
+
+    fn cpu(self) -> Result<(Tensor, Tensor)> {
+        let Self { logits, kept, .. } = self;
+
         let values = logits.to_dtype(ACCUMULATE)?.contiguous()?;
-        let ids = descending(OWNER, &monotone_keys(&values)?)?
+        let ids = descending(Self::OWNER, &monotone_keys(&values)?)?
             .narrow(1, 0, kept)?
             .contiguous()?;
 
-        return Ok((values.gather(&ids, 1)?, ids));
+        Ok((values.gather(&ids, 1)?, ids))
     }
 
-    let values = ops::empty((rows, kept), DType::F32)?;
-    let ids = ops::empty((rows, kept), DType::U32)?;
+    fn launch(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            logits,
+            width,
+            rows,
+            vocabulary,
+            kept,
+        } = self;
 
-    // The ordering's scratch is the kernel's for the launch and nothing reads it afterwards.
-    let scratch = top_k_workspace(rows as u64, u64::from(width));
-    let workspace = ops::empty((rows, scratch[1] as usize), DType::I32)?;
+        let values = ops::empty((rows, kept), DType::F32)?;
+        let ids = ops::empty((rows, kept), DType::U32)?;
 
-    ops::launch::<TopK>(
-        &TopKDescriptor::new(logits.dtype(), vocabulary, width),
-        TopKArgs {
-            logits: ops::operand(logits)?,
-            values: ops::operand(&values)?,
-            ids: signed(&ids)?,
-            workspace: ops::operand(&workspace)?,
-        },
-    )?;
-    Ok((values, ids))
+        // The ordering's scratch is the kernel's for the launch and nothing reads it afterwards.
+        let scratch = top_k_workspace(rows as u64, u64::from(width));
+        let workspace = ops::empty((rows, scratch[1] as usize), DType::I32)?;
+
+        ops::launch::<TopK>(
+            &TopKDescriptor::new(logits.dtype(), vocabulary, width),
+            TopKArgs {
+                logits: ops::operand(logits)?,
+                values: ops::operand(&values)?,
+                ids: signed(&ids)?,
+                workspace: ops::operand(&workspace)?,
+            },
+        )?;
+        Ok((values, ids))
+    }
 }
 
 /// Applies each row's own thresholds to its candidates, in place: `(values, valid)`, the
@@ -496,7 +613,7 @@ pub fn filter_candidates_(
     ids: &Tensor,
     parameters: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = "filter_candidates_";
+    const OWNER: &str = FilterCandidatesCall::OWNER;
 
     let (rows, width) = matrix(OWNER, "candidates", &values)?;
     let parameter_columns = PARAMETER_COLUMNS as usize;
@@ -528,7 +645,44 @@ pub fn filter_candidates_(
         ));
     }
 
-    if on_cpu(&values) {
+    compute(FilterCandidatesCall {
+        values,
+        ids,
+        parameters,
+        rows,
+        width,
+    })
+}
+
+/// A checked call of [`filter_candidates_`]: `rows` rows of `width` candidates.
+struct FilterCandidatesCall<'t> {
+    values: Tensor,
+    ids: &'t Tensor,
+    parameters: &'t Tensor,
+    rows: usize,
+    width: usize,
+}
+
+impl FilterCandidatesCall<'_> {
+    const OWNER: &'static str = "filter_candidates_";
+}
+
+impl Fused for FilterCandidatesCall<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.values.device()
+    }
+
+    fn cpu(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            values,
+            parameters,
+            rows,
+            width,
+            ..
+        } = self;
+
         let dropped = Tensor::full(f32::NEG_INFINITY, (rows, width), &Device::Cpu)?;
         let column = Tensor::arange(0_u32, width as u32, &Device::Cpu)?.to_dtype(ACCUMULATE)?;
         let parameter = |offset: usize| parameters.narrow(1, offset, 1);
@@ -578,20 +732,30 @@ pub fn filter_candidates_(
             .squeeze(1)?;
 
         values.slice_set(&kept, 0, 0)?;
-        return Ok((values, valid));
+        Ok((values, valid))
     }
 
-    let valid = ops::empty(rows, DType::I32)?;
-    ops::launch::<FilterCandidates>(
-        &FilterDescriptor::new(extent(OWNER, "candidates", width)?),
-        FilterArgs {
-            values: ops::operand(&values)?,
-            ids: signed(ids)?,
-            parameters: ops::operand(parameters)?,
-            valid: ops::operand(&valid)?,
-        },
-    )?;
-    Ok((values, valid))
+    fn launch(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            values,
+            ids,
+            parameters,
+            rows,
+            width,
+        } = self;
+
+        let valid = ops::empty(rows, DType::I32)?;
+        ops::launch::<FilterCandidates>(
+            &FilterDescriptor::new(extent(Self::OWNER, "candidates", width)?),
+            FilterArgs {
+                values: ops::operand(&values)?,
+                ids: signed(ids)?,
+                parameters: ops::operand(parameters)?,
+                valid: ops::operand(&valid)?,
+            },
+        )?;
+        Ok((values, valid))
+    }
 }
 
 /// Each row's candidates in ascending token id: `(values, ids)` in the shapes and element types
@@ -611,7 +775,7 @@ pub fn filter_candidates_(
 /// When the two are not candidates of one shape, the vocabulary is narrower than a row, or the
 /// operator refuses its arguments.
 pub fn candidate_order(values: &Tensor, ids: &Tensor, vocabulary: u32) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = "candidate_order";
+    const OWNER: &str = CandidateOrderCall::OWNER;
 
     let (rows, width) = matrix(OWNER, "candidates", values)?;
     require(
@@ -635,7 +799,44 @@ pub fn candidate_order(values: &Tensor, ids: &Tensor, vocabulary: u32) -> Result
         ));
     }
 
-    if on_cpu(values) {
+    compute(CandidateOrderCall {
+        values,
+        ids,
+        vocabulary,
+        rows,
+        width,
+    })
+}
+
+/// A checked call of [`candidate_order`]: `rows` rows of `width` candidates.
+struct CandidateOrderCall<'t> {
+    values: &'t Tensor,
+    ids: &'t Tensor,
+    vocabulary: u32,
+    rows: usize,
+    width: usize,
+}
+
+impl CandidateOrderCall<'_> {
+    const OWNER: &'static str = "candidate_order";
+}
+
+impl Fused for CandidateOrderCall<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.values.device()
+    }
+
+    fn cpu(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            values,
+            ids,
+            vocabulary,
+            rows,
+            width,
+        } = self;
+
         let unnamed = Tensor::full(NO_SLOT, (rows, width), &Device::Cpu)?;
         let dropped = Tensor::full(f32::NEG_INFINITY, (rows, width), &Device::Cpu)?;
 
@@ -644,31 +845,41 @@ pub fn candidate_order(values: &Tensor, ids: &Tensor, vocabulary: u32) -> Result
         let order = token.where_cond(ids, &unnamed)?.arg_sort_last_dim(true)?;
         let placed = token.gather(&order, 1)?;
 
-        return Ok((
+        Ok((
             placed.where_cond(&values.gather(&order, 1)?, &dropped)?,
             placed.where_cond(&ids.gather(&order, 1)?, &unnamed)?,
-        ));
+        ))
     }
 
-    let ordered_values = ops::empty((rows, width), DType::F32)?;
-    let ordered_ids = ops::empty((rows, width), DType::U32)?;
+    fn launch(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            values,
+            ids,
+            vocabulary,
+            rows,
+            width,
+        } = self;
 
-    // The kernel counts the candidates of each id rather than comparing them, in scratch as
-    // wide as the id space, which is its own for the launch.
-    let counts = ops::empty((rows, vocabulary as usize), DType::I32)?;
+        let ordered_values = ops::empty((rows, width), DType::F32)?;
+        let ordered_ids = ops::empty((rows, width), DType::U32)?;
 
-    ops::launch::<CandidateOrder>(
-        &OrderDescriptor::new(),
-        OrderArgs {
-            values: ops::operand(values)?,
-            ids: signed(ids)?,
-            ordered_values: ops::operand(&ordered_values)?,
-            ordered_ids: signed(&ordered_ids)?,
-            counts: ops::operand(&counts)?,
-            vocabulary: u64::from(vocabulary),
-        },
-    )?;
-    Ok((ordered_values, ordered_ids))
+        // The kernel counts the candidates of each id rather than comparing them, in scratch as
+        // wide as the id space, which is its own for the launch.
+        let counts = ops::empty((rows, vocabulary as usize), DType::I32)?;
+
+        ops::launch::<CandidateOrder>(
+            &OrderDescriptor::new(),
+            OrderArgs {
+                values: ops::operand(values)?,
+                ids: signed(ids)?,
+                ordered_values: ops::operand(&ordered_values)?,
+                ordered_ids: signed(&ordered_ids)?,
+                counts: ops::operand(&counts)?,
+                vocabulary: u64::from(vocabulary),
+            },
+        )?;
+        Ok((ordered_values, ordered_ids))
+    }
 }
 
 /// The softmax of the rows of `x`: `exp(x − max x) / Σ exp(x − max x)`, in `x`'s shape and
@@ -682,30 +893,56 @@ pub fn candidate_order(values: &Tensor, ids: &Tensor, vocabulary: u32) -> Result
 ///
 /// When `x` has no rows, or the operator refuses its arguments.
 pub fn softmax(x: &Tensor) -> Result<Tensor> {
-    const OWNER: &str = "softmax";
+    const OWNER: &str = SoftmaxCall::OWNER;
 
     let width = super::columns(OWNER, x)?;
 
-    if on_cpu(x) {
+    compute(SoftmaxCall { x, width })
+}
+
+/// A checked call of [`softmax`]: rows of `width` columns.
+struct SoftmaxCall<'t> {
+    x: &'t Tensor,
+    width: u32,
+}
+
+impl SoftmaxCall<'_> {
+    const OWNER: &'static str = "softmax";
+}
+
+impl Fused for SoftmaxCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self { x, .. } = self;
+
         let rows = x.to_dtype(ACCUMULATE)?;
         let terms = rows.broadcast_sub(&rows.max_keepdim(D::Minus1)?)?.exp()?;
 
-        return Ok(terms
+        Ok(terms
             .broadcast_div(&terms.sum_keepdim(D::Minus1)?)?
-            .to_dtype(x.dtype())?);
+            .to_dtype(x.dtype())?)
     }
 
-    let rows = as_rows(OWNER, x)?;
-    let out = ops::empty(rows.shape(), x.dtype())?;
+    fn launch(self) -> Result<Tensor> {
+        let Self { x, width } = self;
 
-    ops::launch::<Softmax>(
-        &SoftmaxDescriptor::new(x.dtype(), width),
-        SoftmaxArgs {
-            x: ops::operand(&rows)?,
-            out: ops::operand(&out)?,
-        },
-    )?;
-    like_rows(out, x)
+        let rows = as_rows(Self::OWNER, x)?;
+        let out = ops::empty(rows.shape(), x.dtype())?;
+
+        ops::launch::<Softmax>(
+            &SoftmaxDescriptor::new(x.dtype(), width),
+            SoftmaxArgs {
+                x: ops::operand(&rows)?,
+                out: ops::operand(&out)?,
+            },
+        )?;
+        like_rows(out, x)
+    }
 }
 
 /// One token per row, drawn from its candidates by inverting their cumulative distribution:
@@ -728,7 +965,7 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
 /// When a tensor is not the shape or element type stated above, or the operator refuses its
 /// arguments.
 pub fn inverse_cdf(probabilities: &Tensor, ids: &Tensor, draws: &Tensor) -> Result<Tensor> {
-    const OWNER: &str = "inverse_cdf";
+    const OWNER: &str = InverseCdfCall::OWNER;
 
     let (rows, width) = matrix(OWNER, "probabilities", probabilities)?;
     require(
@@ -747,7 +984,44 @@ pub fn inverse_cdf(probabilities: &Tensor, ids: &Tensor, draws: &Tensor) -> Resu
     )?;
     require(OWNER, "draws", draws, DType::F32, &[Some(rows)])?;
 
-    if on_cpu(probabilities) {
+    compute(InverseCdfCall {
+        probabilities,
+        ids,
+        draws,
+        rows,
+        width,
+    })
+}
+
+/// A checked call of [`inverse_cdf`]: `rows` rows of `width` candidates.
+struct InverseCdfCall<'t> {
+    probabilities: &'t Tensor,
+    ids: &'t Tensor,
+    draws: &'t Tensor,
+    rows: usize,
+    width: usize,
+}
+
+impl InverseCdfCall<'_> {
+    const OWNER: &'static str = "inverse_cdf";
+}
+
+impl Fused for InverseCdfCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.probabilities.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            probabilities,
+            ids,
+            draws,
+            rows,
+            width,
+        } = self;
+
         let target = draws
             .unsqueeze(1)?
             .broadcast_mul(&probabilities.sum_keepdim(1)?)?;
@@ -765,20 +1039,30 @@ pub fn inverse_cdf(probabilities: &Tensor, ids: &Tensor, draws: &Tensor) -> Resu
             .where_cond(ids, &ids.zeros_like()?)?
             .max_keepdim(1)?;
 
-        return Ok(found.where_cond(&drawn, &fallback)?.squeeze(1)?);
+        Ok(found.where_cond(&drawn, &fallback)?.squeeze(1)?)
     }
 
-    let tokens = ops::empty(rows, DType::U32)?;
-    ops::launch::<InverseCdf>(
-        &InverseCdfDescriptor::new(extent(OWNER, "candidates", width)?),
-        InverseCdfArgs {
-            probabilities: ops::operand(probabilities)?,
-            ids: signed(ids)?,
-            draws: ops::operand(draws)?,
-            tokens: signed(&tokens)?,
-        },
-    )?;
-    Ok(tokens)
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            probabilities,
+            ids,
+            draws,
+            rows,
+            width,
+        } = self;
+
+        let tokens = ops::empty(rows, DType::U32)?;
+        ops::launch::<InverseCdf>(
+            &InverseCdfDescriptor::new(extent(Self::OWNER, "candidates", width)?),
+            InverseCdfArgs {
+                probabilities: ops::operand(probabilities)?,
+                ids: signed(ids)?,
+                draws: ops::operand(draws)?,
+                tokens: signed(&tokens)?,
+            },
+        )?;
+        Ok(tokens)
+    }
 }
 
 /// The column of each row's largest entry, the lowest column among equal entries: `[rows]`
@@ -793,12 +1077,47 @@ pub fn inverse_cdf(probabilities: &Tensor, ids: &Tensor, draws: &Tensor) -> Resu
 ///
 /// When `values` is not a matrix, or the operator refuses its arguments.
 pub fn argmax(values: &Tensor) -> Result<Tensor> {
-    const OWNER: &str = "argmax";
+    const OWNER: &str = ArgmaxCall::OWNER;
 
     let (rows, row_width) = matrix(OWNER, "values", values)?;
     let width = extent(OWNER, "columns", row_width)?;
 
-    if on_cpu(values) {
+    compute(ArgmaxCall {
+        values,
+        rows,
+        row_width,
+        width,
+    })
+}
+
+/// A checked call of [`argmax`]: `rows` rows of `row_width` columns (`width` as a launch states
+/// it).
+struct ArgmaxCall<'t> {
+    values: &'t Tensor,
+    rows: usize,
+    row_width: usize,
+    width: u32,
+}
+
+impl ArgmaxCall<'_> {
+    const OWNER: &'static str = "argmax";
+}
+
+impl Fused for ArgmaxCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.values.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            values,
+            rows,
+            row_width,
+            width,
+        } = self;
+
         let x = values.to_dtype(ACCUMULATE)?;
         let largest = x.max_keepdim(1)?;
 
@@ -809,18 +1128,27 @@ pub fn argmax(values: &Tensor) -> Result<Tensor> {
 
         let numeric = largest.gt(f32::NEG_INFINITY)?;
         let none = Tensor::full(width, (rows, 1), &Device::Cpu)?;
-        return Ok(numeric.where_cond(&first, &none)?.squeeze(1)?);
+        Ok(numeric.where_cond(&first, &none)?.squeeze(1)?)
     }
 
-    let out = ops::empty(rows, DType::U32)?;
-    ops::launch::<ArgMax>(
-        &ArgMaxDescriptor::new(values.dtype(), width),
-        ArgMaxArgs {
-            values: ops::operand(values)?,
-            out: signed(&out)?,
-        },
-    )?;
-    Ok(out)
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            values,
+            rows,
+            width,
+            ..
+        } = self;
+
+        let out = ops::empty(rows, DType::U32)?;
+        ops::launch::<ArgMax>(
+            &ArgMaxDescriptor::new(values.dtype(), width),
+            ArgMaxArgs {
+                values: ops::operand(values)?,
+                out: signed(&out)?,
+            },
+        )?;
+        Ok(out)
+    }
 }
 
 /// The log-probabilities of each row of `logits`: `x − (max x + ln Σ exp(x − max x))`, FP32
@@ -833,28 +1161,67 @@ pub fn argmax(values: &Tensor) -> Result<Tensor> {
 ///
 /// When `logits` is not a matrix, or the operator refuses its arguments.
 pub fn log_softmax(logits: &Tensor) -> Result<Tensor> {
-    const OWNER: &str = "log_softmax";
+    const OWNER: &str = LogSoftmaxCall::OWNER;
 
     let (rows, width) = matrix(OWNER, "logits", logits)?;
     let columns = extent(OWNER, "columns", width)?;
 
-    if on_cpu(logits) {
+    compute(LogSoftmaxCall {
+        logits,
+        rows,
+        width,
+        columns,
+    })
+}
+
+/// A checked call of [`log_softmax`]: `rows` rows of `width` columns (`columns` as a launch
+/// states it).
+struct LogSoftmaxCall<'t> {
+    logits: &'t Tensor,
+    rows: usize,
+    width: usize,
+    columns: u32,
+}
+
+impl LogSoftmaxCall<'_> {
+    const OWNER: &'static str = "log_softmax";
+}
+
+impl Fused for LogSoftmaxCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.logits.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self { logits, .. } = self;
+
         let x = logits.to_dtype(ACCUMULATE)?;
         let largest = x.max_keepdim(1)?;
         let total = x.broadcast_sub(&largest)?.exp()?.sum_keepdim(1)?;
 
-        return Ok(x.broadcast_sub(&(largest + total.log()?)?)?);
+        Ok(x.broadcast_sub(&(largest + total.log()?)?)?)
     }
 
-    let out = ops::empty((rows, width), DType::F32)?;
-    ops::launch::<LogSoftmax>(
-        &LogSoftmaxDescriptor::new(logits.dtype(), columns),
-        LogSoftmaxArgs {
-            x: ops::operand(logits)?,
-            out: ops::operand(&out)?,
-        },
-    )?;
-    Ok(out)
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            logits,
+            rows,
+            width,
+            columns,
+        } = self;
+
+        let out = ops::empty((rows, width), DType::F32)?;
+        ops::launch::<LogSoftmax>(
+            &LogSoftmaxDescriptor::new(logits.dtype(), columns),
+            LogSoftmaxArgs {
+                x: ops::operand(logits)?,
+                out: ops::operand(&out)?,
+            },
+        )?;
+        Ok(out)
+    }
 }
 
 /// One token's log-probability and rank per row: `(logprobs, ranks)`, `[rows]` FP32 and
@@ -874,7 +1241,7 @@ pub fn log_softmax(logits: &Tensor) -> Result<Tensor> {
 /// When a tensor is not the shape or element type stated above, or the operator refuses its
 /// arguments.
 pub fn logprob_gather(logprobs: &Tensor, tokens: &Tensor) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = "logprob_gather";
+    const OWNER: &str = LogprobGatherCall::OWNER;
 
     let (rows, width) = matrix(OWNER, "log-probabilities", logprobs)?;
     let columns = extent(OWNER, "columns", width)?;
@@ -887,7 +1254,41 @@ pub fn logprob_gather(logprobs: &Tensor, tokens: &Tensor) -> Result<(Tensor, Ten
     )?;
     require(OWNER, "tokens", tokens, DType::U32, &[Some(rows)])?;
 
-    if on_cpu(logprobs) {
+    compute(LogprobGatherCall {
+        logprobs,
+        tokens,
+        rows,
+        columns,
+    })
+}
+
+/// A checked call of [`logprob_gather`]: `rows` rows of `columns` log-probabilities.
+struct LogprobGatherCall<'t> {
+    logprobs: &'t Tensor,
+    tokens: &'t Tensor,
+    rows: usize,
+    columns: u32,
+}
+
+impl LogprobGatherCall<'_> {
+    const OWNER: &'static str = "logprob_gather";
+}
+
+impl Fused for LogprobGatherCall<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.logprobs.device()
+    }
+
+    fn cpu(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            logprobs,
+            tokens,
+            columns,
+            ..
+        } = self;
+
         let inside = tokens.broadcast_lt(&integer(columns, tokens)?)?;
         let read = inside.where_cond(tokens, &tokens.zeros_like()?)?;
         let inside = inside.unsqueeze(1)?;
@@ -901,22 +1302,31 @@ pub fn logprob_gather(logprobs: &Tensor, tokens: &Tensor) -> Result<(Tensor, Ten
         let one = Tensor::new(1_i32, &Device::Cpu)?;
         let rank = inside.where_cond(&above.broadcast_add(&one)?, &above.zeros_like()?)?;
 
-        return Ok((value.squeeze(1)?, rank.squeeze(1)?));
+        Ok((value.squeeze(1)?, rank.squeeze(1)?))
     }
 
-    let out = ops::empty(rows, DType::F32)?;
-    let ranks = ops::empty(rows, DType::I32)?;
+    fn launch(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            logprobs,
+            tokens,
+            rows,
+            columns,
+        } = self;
 
-    ops::launch::<LogprobGather>(
-        &LogprobDescriptor::new(columns),
-        LogprobArgs {
-            logprobabilities: ops::operand(logprobs)?,
-            tokens: signed(tokens)?,
-            out: ops::operand(&out)?,
-            ranks: ops::operand(&ranks)?,
-        },
-    )?;
-    Ok((out, ranks))
+        let out = ops::empty(rows, DType::F32)?;
+        let ranks = ops::empty(rows, DType::I32)?;
+
+        ops::launch::<LogprobGather>(
+            &LogprobDescriptor::new(columns),
+            LogprobArgs {
+                logprobabilities: ops::operand(logprobs)?,
+                tokens: signed(tokens)?,
+                out: ops::operand(&out)?,
+                ranks: ops::operand(&ranks)?,
+            },
+        )?;
+        Ok((out, ranks))
+    }
 }
 
 /// The `candidates` largest entries of each row of `logprobs`, FP32 `[rows, columns]`:
@@ -935,7 +1345,7 @@ pub fn logprob_gather(logprobs: &Tensor, tokens: &Tensor) -> Result<(Tensor, Ten
 /// When `logprobs` is not an FP32 matrix, `candidates` is zero or more than the second
 /// selection holds for rows of this width, or the operator refuses its arguments.
 pub fn top_logprobs(logprobs: &Tensor, candidates: u32) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = "top_logprobs";
+    const OWNER: &str = TopLogprobsCall::OWNER;
 
     let (rows, width) = matrix(OWNER, "log-probabilities", logprobs)?;
     require(
@@ -951,7 +1361,50 @@ pub fn top_logprobs(logprobs: &Tensor, candidates: u32) -> Result<(Tensor, Tenso
     let chunk_candidates = chunks.written(width as u64);
     let kept = candidates as usize;
 
-    if on_cpu(logprobs) {
+    compute(TopLogprobsCall {
+        logprobs,
+        rows,
+        width,
+        chunks,
+        merge,
+        chunk_candidates,
+        kept,
+    })
+}
+
+/// A checked call of [`top_logprobs`]: `rows` rows of `width` log-probabilities, each keeping
+/// `kept`, by the two selections `chunks` and `merge`, the first of which keeps
+/// `chunk_candidates` of a row.
+struct TopLogprobsCall<'t> {
+    logprobs: &'t Tensor,
+    rows: usize,
+    width: usize,
+    chunks: TopLogprobsDescriptor,
+    merge: TopLogprobsDescriptor,
+    chunk_candidates: u64,
+    kept: usize,
+}
+
+impl TopLogprobsCall<'_> {
+    const OWNER: &'static str = "top_logprobs";
+}
+
+impl Fused for TopLogprobsCall<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.logprobs.device()
+    }
+
+    fn cpu(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            logprobs,
+            rows,
+            width,
+            kept,
+            ..
+        } = self;
+
         let values = logprobs.contiguous()?;
 
         // The kernel compares values, so the two zeros are one value and tie by id.
@@ -959,7 +1412,7 @@ pub fn top_logprobs(logprobs: &Tensor, candidates: u32) -> Result<(Tensor, Tenso
             .eq(0.0_f32)?
             .where_cond(&values.zeros_like()?, &values)?;
         let present = kept.min(width);
-        let ids = descending(OWNER, &monotone_keys(&compared)?)?
+        let ids = descending(Self::OWNER, &monotone_keys(&compared)?)?
             .narrow(1, 0, present)?
             .contiguous()?;
         let values = values.gather(&ids, 1)?;
@@ -968,7 +1421,7 @@ pub fn top_logprobs(logprobs: &Tensor, candidates: u32) -> Result<(Tensor, Tenso
         }
 
         let absent = (rows, kept - present);
-        return Ok((
+        Ok((
             Tensor::cat(
                 &[
                     values,
@@ -977,36 +1430,48 @@ pub fn top_logprobs(logprobs: &Tensor, candidates: u32) -> Result<(Tensor, Tenso
                 1,
             )?,
             Tensor::cat(&[ids, Tensor::full(NO_SLOT, absent, &Device::Cpu)?], 1)?,
-        ));
+        ))
     }
 
-    let chunk_values = ops::empty((rows, chunk_candidates as usize), DType::F32)?;
-    let chunk_ids = ops::empty((rows, chunk_candidates as usize), DType::U32)?;
-    ops::launch::<TopLogprobs>(
-        &chunks,
-        TopLogprobsArgs {
-            values: ops::operand(logprobs)?,
-            ids: None,
-            out_values: ops::operand(&chunk_values)?,
-            out_ids: signed(&chunk_ids)?,
-        },
-    )?;
+    fn launch(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            logprobs,
+            rows,
+            chunks,
+            merge,
+            chunk_candidates,
+            kept,
+            ..
+        } = self;
 
-    let values = ops::empty((rows, kept), DType::F32)?;
-    let ids = ops::empty((rows, kept), DType::U32)?;
+        let chunk_values = ops::empty((rows, chunk_candidates as usize), DType::F32)?;
+        let chunk_ids = ops::empty((rows, chunk_candidates as usize), DType::U32)?;
+        ops::launch::<TopLogprobs>(
+            &chunks,
+            TopLogprobsArgs {
+                values: ops::operand(logprobs)?,
+                ids: None,
+                out_values: ops::operand(&chunk_values)?,
+                out_ids: signed(&chunk_ids)?,
+            },
+        )?;
 
-    ops::launch::<TopLogprobs>(
-        // The second selection reads each candidate's id beside it, in one chunk of the chunks'
-        // candidates.
-        &merge,
-        TopLogprobsArgs {
-            values: ops::operand(&chunk_values)?,
-            ids: Some(signed(&chunk_ids)?),
-            out_values: ops::operand(&values)?,
-            out_ids: signed(&ids)?,
-        },
-    )?;
-    Ok((values, ids))
+        let values = ops::empty((rows, kept), DType::F32)?;
+        let ids = ops::empty((rows, kept), DType::U32)?;
+
+        ops::launch::<TopLogprobs>(
+            // The second selection reads each candidate's id beside it, in one chunk of the chunks'
+            // candidates.
+            &merge,
+            TopLogprobsArgs {
+                values: ops::operand(&chunk_values)?,
+                ids: Some(signed(&chunk_ids)?),
+                out_values: ops::operand(&values)?,
+                out_ids: signed(&ids)?,
+            },
+        )?;
+        Ok((values, ids))
+    }
 }
 
 #[cfg(test)]

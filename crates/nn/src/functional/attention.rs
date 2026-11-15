@@ -40,7 +40,7 @@ use tensor::{D, DType, Device, Shape, Tensor};
 
 use super::nvfp4::integer;
 use super::rotary::heads_of;
-use super::{ACCUMULATE, on_cpu};
+use super::{ACCUMULATE, Fused, compute};
 use crate::capability::{KvCache, KvPlanes, NO_SLOT, TokenBatch};
 use crate::error::{Error, Result};
 
@@ -236,7 +236,7 @@ fn dense(
     causal: bool,
     window: Option<u32>,
 ) -> Result<Tensor> {
-    const OWNER: &str = "dense_attention";
+    const OWNER: &str = DenseCall::OWNER;
 
     let (heads, head_dim) = heads_of(OWNER, "the query", query)?;
     let (kv_heads, kv_dim) = heads_of(OWNER, "the key", key)?;
@@ -298,7 +298,51 @@ fn dense(
         }
     }
 
-    if on_cpu(query) {
+    compute(DenseCall {
+        heads: (query, key, value),
+        sequences,
+        max_kv_len,
+        softmax_scale,
+        causal,
+        window,
+        extents: (heads, kv_heads, head_dim),
+    })
+}
+
+/// A checked call of [`dense_attention`] or [`dense_attention_varlen`]: `extents` are the query
+/// heads, the key heads and their width.
+struct DenseCall<'t> {
+    heads: (&'t Tensor, &'t Tensor, &'t Tensor),
+    sequences: Option<(&'t Tensor, &'t Tensor, Option<u32>)>,
+    max_kv_len: u32,
+    softmax_scale: f32,
+    causal: bool,
+    window: Option<u32>,
+    extents: (u32, u32, u32),
+}
+
+impl DenseCall<'_> {
+    const OWNER: &'static str = "dense_attention";
+}
+
+impl Fused for DenseCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.heads.0.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            heads: (query, key, value),
+            sequences,
+            softmax_scale,
+            causal,
+            window,
+            ..
+        } = self;
+        let (q_tokens, kv_tokens) = (query.dims()[0], key.dims()[0]);
+
         let visible = match sequences {
             Some((queries, keys, _)) => {
                 sequence_mask((queries, q_tokens), (keys, kv_tokens), causal, window)?
@@ -318,43 +362,56 @@ fn dense(
             softmax_scale,
         )?;
 
-        return Ok(attended.to_dtype(query.dtype())?);
+        Ok(attended.to_dtype(query.dtype())?)
     }
 
-    let out = ops::empty(query.shape(), query.dtype())?;
-    ops::launch::<DenseAttention>(
-        // The widths are the tensors' and the key bound the call's; whether offset tables are
-        // read selects one of two kernels, so a launch never reads a table at a null address.
-        &DenseDescriptor {
-            query: query.dtype(),
-            key_value: key.dtype(),
-            output: out.dtype(),
-            head_dim,
-            q_heads: heads,
-            kv_heads,
-            mask: if causal { Mask::Causal } else { Mask::Dense },
-            windowed: window.is_some(),
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            heads: (query, key, value),
+            sequences,
             max_kv_len,
-            cu_seq_lens: sequences.is_some(),
-        },
-        DenseArgs {
-            query: ops::operand(query)?,
-            key: ops::operand(key)?,
-            value: ops::operand(value)?,
-            cu_seq_lens_q: sequences
-                .map(|(queries, _, _)| ops::operand(queries))
-                .transpose()?,
-            cu_seq_lens_k: sequences
-                .map(|(_, keys, _)| ops::operand(keys))
-                .transpose()?,
-            out: ops::operand(&out)?,
-            scale: softmax_scale,
-            window_left: window_left(window),
+            softmax_scale,
             causal,
-            longest: sequences.and_then(|(_, _, longest)| longest).map(u64::from),
-        },
-    )?;
-    Ok(out)
+            window,
+            extents: (heads, kv_heads, head_dim),
+        } = self;
+
+        let out = ops::empty(query.shape(), query.dtype())?;
+        ops::launch::<DenseAttention>(
+            // The widths are the tensors' and the key bound the call's; whether offset tables
+            // are read selects one of two kernels, so a launch never reads a table at a null
+            // address.
+            &DenseDescriptor {
+                query: query.dtype(),
+                key_value: key.dtype(),
+                output: out.dtype(),
+                head_dim,
+                q_heads: heads,
+                kv_heads,
+                mask: if causal { Mask::Causal } else { Mask::Dense },
+                windowed: window.is_some(),
+                max_kv_len,
+                cu_seq_lens: sequences.is_some(),
+            },
+            DenseArgs {
+                query: ops::operand(query)?,
+                key: ops::operand(key)?,
+                value: ops::operand(value)?,
+                cu_seq_lens_q: sequences
+                    .map(|(queries, _, _)| ops::operand(queries))
+                    .transpose()?,
+                cu_seq_lens_k: sequences
+                    .map(|(_, keys, _)| ops::operand(keys))
+                    .transpose()?,
+                out: ops::operand(&out)?,
+                scale: softmax_scale,
+                window_left: window_left(window),
+                causal,
+                longest: sequences.and_then(|(_, _, longest)| longest).map(u64::from),
+            },
+        )?;
+        Ok(out)
+    }
 }
 
 /// The sequence and the place within it of each of `rows` packed rows, by the cumulative
@@ -456,7 +513,7 @@ fn plane_heads(owner: &'static str, planes: &KvPlanes, page: u32) -> Result<(u32
 /// belongs would scale every page of a sequence by one number. The write divides each page by
 /// the page's own scale, so the read takes a table of the plane's pages.
 fn page_scale<'t>(plane: &Tensor, scale: Option<&'t Tensor>) -> Result<Option<&'t Tensor>> {
-    const OWNER: &str = "paged_attention";
+    const OWNER: &str = PagedAttentionCall::OWNER;
 
     match (plane.dtype() == DType::F8E4M3, scale) {
         (true, Some(scale)) => {
@@ -518,7 +575,7 @@ pub fn paged_attention(
     window: Option<u32>,
     max_kv_len: u32,
 ) -> Result<Tensor> {
-    const OWNER: &str = "paged_attention";
+    const OWNER: &str = PagedAttentionCall::OWNER;
 
     // The batch's columns are read by address arithmetic inside the kernels, so they are
     // checked against each other once here, before any of them is addressed.
@@ -573,46 +630,113 @@ pub fn paged_attention(
     let key_scale = page_scale(&planes.key, planes.key_scale.as_ref())?;
     let value_scale = page_scale(&planes.value, planes.value_scale.as_ref())?;
 
-    if on_cpu(query) {
-        let attended = paged_formula(query, batch, cache, planes, phase, softmax_scale, window)?;
-        return Ok(attended.to_dtype(query.dtype())?);
+    compute(PagedAttentionCall {
+        query,
+        batch,
+        cache,
+        planes,
+        phase,
+        softmax_scale,
+        window,
+        max_kv_len,
+        scales: (key_scale, value_scale),
+        geometry: (page, heads, kv_heads, head_dim),
+    })
+}
+
+/// A checked call of [`paged_attention`]: `planes` are the layer's, `scales` their page scales
+/// when they are E4M3, and `geometry` the page size, the query heads, the key heads and their
+/// width.
+struct PagedAttentionCall<'t> {
+    query: &'t Tensor,
+    batch: &'t TokenBatch,
+    cache: &'t KvCache,
+    planes: &'t KvPlanes,
+    phase: Phase,
+    softmax_scale: f32,
+    window: Option<u32>,
+    max_kv_len: u32,
+    scales: (Option<&'t Tensor>, Option<&'t Tensor>),
+    geometry: (u32, u32, u32, u32),
+}
+
+impl PagedAttentionCall<'_> {
+    const OWNER: &'static str = "paged_attention";
+}
+
+impl Fused for PagedAttentionCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.query.device()
     }
 
-    let out = ops::empty(query.shape(), query.dtype())?;
-    ops::launch::<PagedAttention>(
-        // The phase is the batch's, because a prefill reads a whole sequence and a decode one
-        // token; the three element types are the query's, the planes' and the output's, because
-        // the kernel is compiled for the combination.
-        &Descriptor {
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            query,
+            batch,
+            cache,
+            planes,
             phase,
-            query: query.dtype(),
-            key_value: planes.key.dtype(),
-            output: out.dtype(),
-            head_dim,
-            page_size: page,
-            q_heads: heads,
-            kv_heads,
-            mask: Mask::Causal,
-            windowed: window.is_some(),
+            softmax_scale,
+            window,
+            ..
+        } = self;
+
+        let attended = paged_formula(query, batch, cache, planes, phase, softmax_scale, window)?;
+        Ok(attended.to_dtype(query.dtype())?)
+    }
+
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            query,
+            batch,
+            cache,
+            planes,
+            phase,
+            softmax_scale,
+            window,
             max_kv_len,
-        },
-        Args {
-            query: ops::operand(query)?,
-            key: ops::operand(&planes.key)?,
-            value: ops::operand(&planes.value)?,
-            key_scale: key_scale.map(ops::operand).transpose()?,
-            value_scale: value_scale.map(ops::operand).transpose()?,
-            page_table: ops::operand(table)?,
-            seq_lens: ops::operand(&batch.seq_lens)?,
-            cum_seq_lens_q: ops::operand(&batch.query_offsets)?,
-            out: ops::operand(&out)?,
-            workspace: ops::operand(&cache.workspace)?,
-            scale: softmax_scale,
-            window_left: window_left(window),
-            causal: true,
-        },
-    )?;
-    Ok(out)
+            scales: (key_scale, value_scale),
+            geometry: (page, heads, kv_heads, head_dim),
+        } = self;
+
+        let out = ops::empty(query.shape(), query.dtype())?;
+        ops::launch::<PagedAttention>(
+            // The phase is the batch's, because a prefill reads a whole sequence and a decode
+            // one token; the three element types are the query's, the planes' and the
+            // output's, because the kernel is compiled for the combination.
+            &Descriptor {
+                phase,
+                query: query.dtype(),
+                key_value: planes.key.dtype(),
+                output: out.dtype(),
+                head_dim,
+                page_size: page,
+                q_heads: heads,
+                kv_heads,
+                mask: Mask::Causal,
+                windowed: window.is_some(),
+                max_kv_len,
+            },
+            Args {
+                query: ops::operand(query)?,
+                key: ops::operand(&planes.key)?,
+                value: ops::operand(&planes.value)?,
+                key_scale: key_scale.map(ops::operand).transpose()?,
+                value_scale: value_scale.map(ops::operand).transpose()?,
+                page_table: ops::operand(&cache.block_tables)?,
+                seq_lens: ops::operand(&batch.seq_lens)?,
+                cum_seq_lens_q: ops::operand(&batch.query_offsets)?,
+                out: ops::operand(&out)?,
+                workspace: ops::operand(&cache.workspace)?,
+                scale: softmax_scale,
+                window_left: window_left(window),
+                causal: true,
+            },
+        )?;
+        Ok(out)
+    }
 }
 
 /// The FP32 result of [`paged_attention`] on CPU tensors, before its one rounding.
@@ -737,7 +861,7 @@ pub fn kv_write_(
     key: &Tensor,
     value: &Tensor,
 ) -> Result<()> {
-    const OWNER: &str = "kv_write_";
+    const OWNER: &str = KvWriteCall::OWNER;
 
     let page = page_size(OWNER, batch, cache)?;
     let planes = cache.layer(layer)?;
@@ -816,7 +940,45 @@ pub fn kv_write_(
         }
     }
 
-    if on_cpu(key) {
+    compute(KvWriteCall {
+        planes,
+        slots,
+        page,
+        heads: (heads, head_dim),
+        projections: (key, value),
+    })
+}
+
+/// A checked call of [`kv_write_`] into dense planes of one type: `heads` are the planes' key
+/// heads and their width, and `projections` the keys and the values written.
+struct KvWriteCall<'t> {
+    planes: &'t KvPlanes,
+    slots: &'t Tensor,
+    page: u32,
+    heads: (u32, u32),
+    projections: (&'t Tensor, &'t Tensor),
+}
+
+impl KvWriteCall<'_> {
+    const OWNER: &'static str = "kv_write_";
+}
+
+impl Fused for KvWriteCall<'_> {
+    type Output = ();
+
+    fn device(&self) -> &Device {
+        self.projections.0.device()
+    }
+
+    fn cpu(self) -> Result<()> {
+        let Self {
+            planes,
+            slots,
+            page,
+            projections: (key, value),
+            ..
+        } = self;
+
         for (plane, flags, rows) in [
             (&planes.key, &planes.key_initialized, key),
             (&planes.value, &planes.value_initialized, value),
@@ -826,23 +988,33 @@ pub fn kv_write_(
             scatter_rows(plane, slots, &rows.to_dtype(plane.dtype())?)?;
             raise_flags(flags, &pages_of(slots, page)?)?;
         }
-        return Ok(());
+        Ok(())
     }
 
-    ops::launch::<KvWrite>(
-        // The projection's type and the plane's are both key fields.
-        &kv::Descriptor::new(key.dtype(), planes.key.dtype(), page, heads, head_dim),
-        kv::Args {
-            key: ops::operand(key)?,
-            value: ops::operand(value)?,
-            key_cache: ops::operand(&planes.key)?,
-            value_cache: ops::operand(&planes.value)?,
-            slots: ops::operand(slots)?,
-            key_initialized: ops::operand(&planes.key_initialized)?,
-            value_initialized: ops::operand(&planes.value_initialized)?,
-        },
-    )?;
-    Ok(())
+    fn launch(self) -> Result<()> {
+        let Self {
+            planes,
+            slots,
+            page,
+            heads: (heads, head_dim),
+            projections: (key, value),
+        } = self;
+
+        ops::launch::<KvWrite>(
+            // The projection's type and the plane's are both key fields.
+            &kv::Descriptor::new(key.dtype(), planes.key.dtype(), page, heads, head_dim),
+            kv::Args {
+                key: ops::operand(key)?,
+                value: ops::operand(value)?,
+                key_cache: ops::operand(&planes.key)?,
+                value_cache: ops::operand(&planes.value)?,
+                slots: ops::operand(slots)?,
+                key_initialized: ops::operand(&planes.key_initialized)?,
+                value_initialized: ops::operand(&planes.value_initialized)?,
+            },
+        )?;
+        Ok(())
+    }
 }
 
 /// The quantizing write into E4M3 planes: one launch per plane, each with the page scales its
@@ -886,7 +1058,7 @@ fn write_scaled(
         // reader's own buffer.
         let scale = scale.as_ref().ok_or_else(|| {
             Error::shape(
-                "kv_write_",
+                ScaledWriteCall::OWNER,
                 format!(
                     "the {name} cache is {} and has no page scale",
                     ops::abi::name(plane.dtype())
@@ -895,23 +1067,62 @@ fn write_scaled(
         })?;
         let rows = source.reshape((tokens, heads * head_dim))?;
 
-        if on_cpu(source) {
-            write_scaled_formula(plane, scale, flags, slots, &rows, page)?;
-            continue;
-        }
-
-        ops::launch::<KvWriteScaled>(
-            &descriptor,
-            kv::ScaledWriteArgs {
-                source: ops::operand(&rows)?,
-                slots: ops::operand(slots)?,
-                scales: ops::operand(scale)?,
-                cache: ops::operand(plane)?,
-                initialized: ops::operand(flags)?,
-            },
-        )?;
+        compute(ScaledWriteCall {
+            plane,
+            scale,
+            flags,
+            slots,
+            rows: &rows,
+            page,
+            descriptor,
+        })?;
     }
     Ok(())
+}
+
+/// A checked quantizing write of [`kv_write_`] into one E4M3 plane: `rows` are its projection's
+/// `[tokens, width]` rows, `scale` and `flags` the plane's page scales and flags, and
+/// `descriptor` the write's, which both planes share.
+struct ScaledWriteCall<'t> {
+    plane: &'t Tensor,
+    scale: &'t Tensor,
+    flags: &'t Tensor,
+    slots: &'t Tensor,
+    rows: &'t Tensor,
+    page: u32,
+    descriptor: kv::ScaledWriteDescriptor,
+}
+
+impl ScaledWriteCall<'_> {
+    const OWNER: &'static str = "kv_write_";
+}
+
+impl Fused for ScaledWriteCall<'_> {
+    type Output = ();
+
+    fn device(&self) -> &Device {
+        self.rows.device()
+    }
+
+    fn cpu(self) -> Result<()> {
+        write_scaled_formula(
+            self.plane, self.scale, self.flags, self.slots, self.rows, self.page,
+        )
+    }
+
+    fn launch(self) -> Result<()> {
+        ops::launch::<KvWriteScaled>(
+            &self.descriptor,
+            kv::ScaledWriteArgs {
+                source: ops::operand(self.rows)?,
+                slots: ops::operand(self.slots)?,
+                scales: ops::operand(self.scale)?,
+                cache: ops::operand(self.plane)?,
+                initialized: ops::operand(self.flags)?,
+            },
+        )?;
+        Ok(())
+    }
 }
 
 /// The page of each slot of `slots`, `[tokens]` U32, with [`NO_SLOT`] kept as it is.
@@ -1061,7 +1272,7 @@ fn write_scaled_formula(
 /// When the workspace is not a vector of bytes or is smaller than the counters, or the fill
 /// cannot be issued.
 pub fn zero_arrival_counters_(workspace: &Tensor, rows: usize, q_heads: u32) -> Result<()> {
-    const OWNER: &str = "zero_arrival_counters_";
+    const OWNER: &str = ZeroArrivalCountersCall::OWNER;
 
     if workspace.rank() != 1 || workspace.dtype() != DType::U8 {
         return Err(Error::shape(
@@ -1073,24 +1284,58 @@ pub fn zero_arrival_counters_(workspace: &Tensor, rows: usize, q_heads: u32) -> 
             ),
         ));
     }
-    if on_cpu(workspace) {
-        return Ok(());
+    compute(ZeroArrivalCountersCall {
+        workspace,
+        rows,
+        q_heads,
+    })
+}
+
+/// A checked call of [`zero_arrival_counters_`].
+struct ZeroArrivalCountersCall<'t> {
+    workspace: &'t Tensor,
+    rows: usize,
+    q_heads: u32,
+}
+
+impl ZeroArrivalCountersCall<'_> {
+    const OWNER: &'static str = "zero_arrival_counters_";
+}
+
+impl Fused for ZeroArrivalCountersCall<'_> {
+    type Output = ();
+
+    fn device(&self) -> &Device {
+        self.workspace.device()
     }
 
-    let counters =
-        ops::attention::arrival_counter_bytes(workspace.device(), rows as u64, q_heads.into())?;
-    let counters = usize::try_from(counters)
-        .ok()
-        .filter(|counters| *counters <= workspace.elem_count())
-        .ok_or_else(|| {
-            Error::shape(
-                OWNER,
-                format!(
-                    "a workspace of {} bytes holds no {counters} bytes of arrival counters for \
-                     {rows} rows of {q_heads} query heads",
-                    workspace.elem_count()
-                ),
-            )
-        })?;
-    Ok(workspace.narrow(0, 0, counters)?.zero_set()?)
+    /// The CPU attention keeps no arrival counters, so there is nothing to clear.
+    fn cpu(self) -> Result<()> {
+        Ok(())
+    }
+
+    fn launch(self) -> Result<()> {
+        let Self {
+            workspace,
+            rows,
+            q_heads,
+        } = self;
+
+        let counters =
+            ops::attention::arrival_counter_bytes(workspace.device(), rows as u64, q_heads.into())?;
+        let counters = usize::try_from(counters)
+            .ok()
+            .filter(|counters| *counters <= workspace.elem_count())
+            .ok_or_else(|| {
+                Error::shape(
+                    Self::OWNER,
+                    format!(
+                        "a workspace of {} bytes holds no {counters} bytes of arrival counters \
+                         for {rows} rows of {q_heads} query heads",
+                        workspace.elem_count()
+                    ),
+                )
+            })?;
+        Ok(workspace.narrow(0, 0, counters)?.zero_set()?)
+    }
 }

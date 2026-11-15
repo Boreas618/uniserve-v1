@@ -23,9 +23,9 @@ use ops::norm::{
     RmsNormDescriptor,
 };
 use ops::residual::{WeightedRmsNorm, WeightedRmsNormArgs, WeightedRmsNormDescriptor};
-use tensor::{D, DType, Tensor};
+use tensor::{D, DType, Device, Tensor};
 
-use super::{as_rows, columns, like_rows, on_cpu, same_rows, vector};
+use super::{Fused, as_rows, columns, compute, like_rows, same_rows, vector};
 use crate::error::{Error, Result};
 
 /// `rows`, FP32 `[..., columns]`, scaled by the reciprocal root of each row's mean square plus
@@ -72,7 +72,7 @@ pub fn rms_norm(
     centred: bool,
     output: DType,
 ) -> Result<Tensor> {
-    const OWNER: &str = "rms_norm";
+    const OWNER: &str = RmsNormCall::OWNER;
 
     let width = columns(OWNER, x)?;
     let row_count = x.elem_count() / width as usize;
@@ -97,46 +97,85 @@ pub fn rms_norm(
         ));
     }
 
-    if on_cpu(x) {
-        let normalized = rms_scaled(&x.to_dtype(DType::F32)?, eps)?;
-        let gain = gain(weight, centred)?;
+    compute(RmsNormCall {
+        x,
+        weight,
+        eps,
+        centred,
+        groups,
+        output,
+    })
+}
+
+/// A checked call of [`rms_norm`]: `weight` holds `groups` gain rows.
+struct RmsNormCall<'t> {
+    x: &'t Tensor,
+    weight: &'t Tensor,
+    eps: f32,
+    centred: bool,
+    groups: usize,
+    output: DType,
+}
+
+impl RmsNormCall<'_> {
+    const OWNER: &'static str = "rms_norm";
+}
+
+impl Fused for RmsNormCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            x, weight, groups, ..
+        } = self;
+        let normalized = rms_scaled(&x.to_dtype(DType::F32)?, self.eps)?;
+        let gain = gain(weight, self.centred)?;
         if groups == 1 {
-            return Ok(normalized.broadcast_mul(&gain)?.to_dtype(output)?);
+            return Ok(normalized.broadcast_mul(&gain)?.to_dtype(self.output)?);
         }
 
         // Row `i` reads gain row `i mod groups`.
+        let width = gain.elem_count() / groups;
         let scaled = normalized
-            .reshape((row_count / groups, groups, width as usize))?
-            .broadcast_mul(&gain.reshape((groups, width as usize))?)?;
-        return Ok(scaled.reshape(x.shape())?.to_dtype(output)?);
+            .reshape((x.elem_count() / width / groups, groups, width))?
+            .broadcast_mul(&gain.reshape((groups, width))?)?;
+        Ok(scaled.reshape(x.shape())?.to_dtype(self.output)?)
     }
 
-    let rows = as_rows(OWNER, x)?;
-    let out = ops::empty(rows.shape(), output)?;
+    fn launch(self) -> Result<Tensor> {
+        let Self { x, weight, .. } = self;
+        let width = columns(Self::OWNER, x)?;
+        let rows = as_rows(Self::OWNER, x)?;
+        let out = ops::empty(rows.shape(), self.output)?;
 
-    if output == x.dtype() {
-        ops::launch::<RmsNorm>(
-            &RmsNormDescriptor::new(x.dtype(), width, centred, groups as u32),
-            RmsNormArgs {
-                x: ops::operand(&rows)?,
-                weight: ops::operand(weight)?,
-                out: ops::operand(&out)?,
-                eps,
-            },
-        )?;
-    } else {
-        ops::launch::<WeightedRmsNorm>(
-            &WeightedRmsNormDescriptor::new(x.dtype(), width, output, false),
-            WeightedRmsNormArgs {
-                x: ops::operand(&rows)?,
-                weight: ops::operand(weight)?,
-                out: ops::operand(&out)?,
-                eps,
-                partials: None,
-            },
-        )?;
+        if self.output == x.dtype() {
+            ops::launch::<RmsNorm>(
+                &RmsNormDescriptor::new(x.dtype(), width, self.centred, self.groups as u32),
+                RmsNormArgs {
+                    x: ops::operand(&rows)?,
+                    weight: ops::operand(weight)?,
+                    out: ops::operand(&out)?,
+                    eps: self.eps,
+                },
+            )?;
+        } else {
+            ops::launch::<WeightedRmsNorm>(
+                &WeightedRmsNormDescriptor::new(x.dtype(), width, self.output, false),
+                WeightedRmsNormArgs {
+                    x: ops::operand(&rows)?,
+                    weight: ops::operand(weight)?,
+                    out: ops::operand(&out)?,
+                    eps: self.eps,
+                    partials: None,
+                },
+            )?;
+        }
+        like_rows(out, x)
     }
-    like_rows(out, x)
 }
 
 /// The residual add and the RMS normalization of its sum, as one operator: returns
@@ -157,36 +196,71 @@ pub fn add_rms_norm(
     eps: f32,
     centred: bool,
 ) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = "add_rms_norm";
+    const OWNER: &str = AddRmsNormCall::OWNER;
 
     let width = columns(OWNER, x)?;
     vector(OWNER, "weight", weight, width)?;
     same_rows(OWNER, "residual stream", residual, x)?;
 
-    if on_cpu(x) {
-        let sum = (x.to_dtype(DType::F32)? + residual.to_dtype(DType::F32)?)?;
-        let normalized = rms_scaled(&sum, eps)?.broadcast_mul(&gain(weight, centred)?)?;
+    compute(AddRmsNormCall {
+        x,
+        residual,
+        weight,
+        eps,
+        centred,
+    })
+}
 
-        return Ok((normalized.to_dtype(x.dtype())?, sum.to_dtype(x.dtype())?));
+/// A checked call of [`add_rms_norm`].
+struct AddRmsNormCall<'t> {
+    x: &'t Tensor,
+    residual: &'t Tensor,
+    weight: &'t Tensor,
+    eps: f32,
+    centred: bool,
+}
+
+impl AddRmsNormCall<'_> {
+    const OWNER: &'static str = "add_rms_norm";
+}
+
+impl Fused for AddRmsNormCall<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.x.device()
     }
 
-    let rows = as_rows(OWNER, x)?;
-    let residual_rows = as_rows(OWNER, residual)?;
-    let out = ops::empty(rows.shape(), x.dtype())?;
-    let sum = ops::empty(rows.shape(), x.dtype())?;
+    fn cpu(self) -> Result<(Tensor, Tensor)> {
+        let Self { x, residual, .. } = self;
+        let sum = (x.to_dtype(DType::F32)? + residual.to_dtype(DType::F32)?)?;
+        let normalized =
+            rms_scaled(&sum, self.eps)?.broadcast_mul(&gain(self.weight, self.centred)?)?;
 
-    ops::launch::<AddRmsNorm>(
-        &AddRmsNormDescriptor::new(x.dtype(), width, centred),
-        AddRmsNormArgs {
-            x: ops::operand(&rows)?,
-            residual: ops::operand(&residual_rows)?,
-            weight: ops::operand(weight)?,
-            out: ops::operand(&out)?,
-            residual_out: ops::operand(&sum)?,
-            eps,
-        },
-    )?;
-    Ok((like_rows(out, x)?, like_rows(sum, x)?))
+        Ok((normalized.to_dtype(x.dtype())?, sum.to_dtype(x.dtype())?))
+    }
+
+    fn launch(self) -> Result<(Tensor, Tensor)> {
+        let Self { x, residual, .. } = self;
+        let width = columns(Self::OWNER, x)?;
+        let rows = as_rows(Self::OWNER, x)?;
+        let residual_rows = as_rows(Self::OWNER, residual)?;
+        let out = ops::empty(rows.shape(), x.dtype())?;
+        let sum = ops::empty(rows.shape(), x.dtype())?;
+
+        ops::launch::<AddRmsNorm>(
+            &AddRmsNormDescriptor::new(x.dtype(), width, self.centred),
+            AddRmsNormArgs {
+                x: ops::operand(&rows)?,
+                residual: ops::operand(&residual_rows)?,
+                weight: ops::operand(self.weight)?,
+                out: ops::operand(&out)?,
+                residual_out: ops::operand(&sum)?,
+                eps: self.eps,
+            },
+        )?;
+        Ok((like_rows(out, x)?, like_rows(sum, x)?))
+    }
 }
 
 /// RMS normalization gated by an activation of a second input:
@@ -206,41 +280,74 @@ pub fn gated_rms_norm(
     eps: f32,
     sigmoid: bool,
 ) -> Result<Tensor> {
-    const OWNER: &str = "gated_rms_norm";
+    const OWNER: &str = GatedRmsNormCall::OWNER;
 
     let width = columns(OWNER, x)?;
     vector(OWNER, "weight", weight, width)?;
     same_rows(OWNER, "gate", gate, x)?;
 
-    if on_cpu(x) {
-        let normalized =
-            rms_scaled(&x.to_dtype(DType::F32)?, eps)?.broadcast_mul(&gain(weight, false)?)?;
-        let gate = gate.to_dtype(DType::F32)?;
+    compute(GatedRmsNormCall {
+        x,
+        gate,
+        weight,
+        eps,
+        sigmoid,
+    })
+}
+
+/// A checked call of [`gated_rms_norm`].
+struct GatedRmsNormCall<'t> {
+    x: &'t Tensor,
+    gate: &'t Tensor,
+    weight: &'t Tensor,
+    eps: f32,
+    sigmoid: bool,
+}
+
+impl GatedRmsNormCall<'_> {
+    const OWNER: &'static str = "gated_rms_norm";
+}
+
+impl Fused for GatedRmsNormCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let normalized = rms_scaled(&self.x.to_dtype(DType::F32)?, self.eps)?
+            .broadcast_mul(&gain(self.weight, false)?)?;
+        let gate = self.gate.to_dtype(DType::F32)?;
         let gated = (normalized
-            * if sigmoid {
+            * if self.sigmoid {
                 gate.sigmoid()?
             } else {
                 gate.silu()?
             })?;
 
-        return Ok(gated.to_dtype(x.dtype())?);
+        Ok(gated.to_dtype(self.x.dtype())?)
     }
 
-    let rows = as_rows(OWNER, x)?;
-    let gate_rows = as_rows(OWNER, gate)?;
-    let out = ops::empty(rows.shape(), x.dtype())?;
+    fn launch(self) -> Result<Tensor> {
+        let Self { x, gate, .. } = self;
+        let width = columns(Self::OWNER, x)?;
+        let rows = as_rows(Self::OWNER, x)?;
+        let gate_rows = as_rows(Self::OWNER, gate)?;
+        let out = ops::empty(rows.shape(), x.dtype())?;
 
-    ops::launch::<GatedRmsNorm>(
-        &GatedRmsNormDescriptor::new(x.dtype(), width, sigmoid),
-        GatedRmsNormArgs {
-            x: ops::operand(&rows)?,
-            gate: ops::operand(&gate_rows)?,
-            weight: ops::operand(weight)?,
-            out: ops::operand(&out)?,
-            eps,
-        },
-    )?;
-    like_rows(out, x)
+        ops::launch::<GatedRmsNorm>(
+            &GatedRmsNormDescriptor::new(x.dtype(), width, self.sigmoid),
+            GatedRmsNormArgs {
+                x: ops::operand(&rows)?,
+                gate: ops::operand(&gate_rows)?,
+                weight: ops::operand(self.weight)?,
+                out: ops::operand(&out)?,
+                eps: self.eps,
+            },
+        )?;
+        like_rows(out, x)
+    }
 }
 
 /// Layer normalization of the rows of `x` with a per-channel scale and an optional bias:
@@ -252,7 +359,7 @@ pub fn gated_rms_norm(
 /// When `weight` or `bias` is not one vector of `x`'s row width, or the operator refuses its
 /// arguments.
 pub fn layer_norm(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>, eps: f32) -> Result<Tensor> {
-    const OWNER: &str = "layer_norm";
+    const OWNER: &str = LayerNormCall::OWNER;
 
     let width = columns(OWNER, x)?;
     vector(OWNER, "weight", weight, width)?;
@@ -260,35 +367,66 @@ pub fn layer_norm(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>, eps: f32) 
         vector(OWNER, "bias", bias, width)?;
     }
 
-    if on_cpu(x) {
-        let rows = x.to_dtype(DType::F32)?;
+    compute(LayerNormCall {
+        x,
+        weight,
+        bias,
+        eps,
+    })
+}
+
+/// A checked call of [`layer_norm`].
+struct LayerNormCall<'t> {
+    x: &'t Tensor,
+    weight: &'t Tensor,
+    bias: Option<&'t Tensor>,
+    eps: f32,
+}
+
+impl LayerNormCall<'_> {
+    const OWNER: &'static str = "layer_norm";
+}
+
+impl Fused for LayerNormCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let rows = self.x.to_dtype(DType::F32)?;
         let centred = rows.broadcast_sub(&rows.mean_keepdim(D::Minus1)?)?;
         let variance = centred.sqr()?.mean_keepdim(D::Minus1)?;
-        let scale = (variance + f64::from(eps))?.sqrt()?.recip()?;
+        let scale = (variance + f64::from(self.eps))?.sqrt()?.recip()?;
 
         let mut normalized = centred
             .broadcast_mul(&scale)?
-            .broadcast_mul(&weight.to_dtype(DType::F32)?)?;
-        if let Some(bias) = bias {
+            .broadcast_mul(&self.weight.to_dtype(DType::F32)?)?;
+        if let Some(bias) = self.bias {
             normalized = normalized.broadcast_add(&bias.to_dtype(DType::F32)?)?;
         }
-        return Ok(normalized.to_dtype(x.dtype())?);
+        Ok(normalized.to_dtype(self.x.dtype())?)
     }
 
-    let rows = as_rows(OWNER, x)?;
-    let out = ops::empty(rows.shape(), x.dtype())?;
+    fn launch(self) -> Result<Tensor> {
+        let Self { x, bias, .. } = self;
+        let width = columns(Self::OWNER, x)?;
+        let rows = as_rows(Self::OWNER, x)?;
+        let out = ops::empty(rows.shape(), x.dtype())?;
 
-    ops::launch::<LayerNorm>(
-        // The bias is in the descriptor, so a normalization with one and one without are two
-        // kernels: the epilogue loads a second vector or it does not.
-        &LayerNormDescriptor::new(x.dtype(), width, bias.is_some()),
-        LayerNormArgs {
-            x: ops::operand(&rows)?,
-            weight: ops::operand(weight)?,
-            bias: bias.map(ops::operand).transpose()?,
-            out: ops::operand(&out)?,
-            eps,
-        },
-    )?;
-    like_rows(out, x)
+        ops::launch::<LayerNorm>(
+            // The bias is in the descriptor, so a normalization with one and one without are
+            // two kernels: the epilogue loads a second vector or it does not.
+            &LayerNormDescriptor::new(x.dtype(), width, bias.is_some()),
+            LayerNormArgs {
+                x: ops::operand(&rows)?,
+                weight: ops::operand(self.weight)?,
+                bias: bias.map(ops::operand).transpose()?,
+                out: ops::operand(&out)?,
+                eps: self.eps,
+            },
+        )?;
+        like_rows(out, x)
+    }
 }

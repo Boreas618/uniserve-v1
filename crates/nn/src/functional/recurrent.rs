@@ -53,7 +53,7 @@ use ops::recurrent::{
 use proto::module::Phase;
 use tensor::{D, DType, Device, Tensor};
 
-use super::{ACCUMULATE, on_cpu, vector};
+use super::{ACCUMULATE, Fused, compute, vector};
 use crate::capability::{NO_SLOT, RecurrentState, TokenBatch, VerifySlots};
 use crate::error::{Error, Result};
 
@@ -320,7 +320,7 @@ pub fn causal_conv1d(
     layer: usize,
     field: usize,
 ) -> Result<Tensor> {
-    const OWNER: &str = "causal_conv1d";
+    const OWNER: &str = CausalConv1dCall::OWNER;
 
     let (&[tokens, channels], &[tap_channels, width]) = (x.dims(), weight.dims()) else {
         return Err(Error::shape(
@@ -392,39 +392,87 @@ pub fn causal_conv1d(
     // that chooses how many of a row's tokens stand.
     let stepwise = state.verify.is_some() && batch.phase == Phase::Decode;
 
-    if on_cpu(x) {
-        return conv_formula(
-            x,
-            weight,
-            (dilation as usize, activation, stepwise),
-            state,
-            (live, checkpoint, trail),
-        );
+    compute(CausalConv1dCall {
+        x,
+        weight,
+        form: (dilation, activation, stepwise),
+        window,
+        state,
+        buffers: (live, checkpoint, trail),
+    })
+}
+
+/// A checked call of [`causal_conv1d`]: `form` is the taps' dilation, whether the sum is
+/// activated and whether the window is left for a step that chooses, `window` the rows of a
+/// slot's window, and `buffers` the field's live, checkpoint and trail buffers.
+struct CausalConv1dCall<'t> {
+    x: &'t Tensor,
+    weight: &'t Tensor,
+    form: (u32, bool, bool),
+    window: usize,
+    state: &'t RecurrentState,
+    buffers: (&'t Tensor, &'t Tensor, Option<&'t Tensor>),
+}
+
+impl CausalConv1dCall<'_> {
+    const OWNER: &'static str = "causal_conv1d";
+}
+
+impl Fused for CausalConv1dCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
     }
 
-    let out = ops::empty((tokens, channels), x.dtype())?;
-    ops::launch::<CausalConv1d>(
-        &CausalConv1dDescriptor::new(
-            x.dtype(),
-            channels as u32,
-            width as u32,
-            dilation,
-            activation,
-            window as u32,
-            stepwise,
-        ),
-        CausalConv1dArgs {
-            x: ops::operand(x)?,
-            weight: ops::operand(weight)?,
-            out: ops::operand(&out)?,
-            rows: row_columns(state)?,
-            state: ops::operand(live)?,
-            checkpoint: ops::operand(checkpoint)?,
-            trail: trail_operand(trail)?,
-            slots: slots_operand(state.verify.as_ref())?,
-        },
-    )?;
-    Ok(out)
+    fn cpu(self) -> Result<Tensor> {
+        let (dilation, activation, stepwise) = self.form;
+
+        conv_formula(
+            self.x,
+            self.weight,
+            (dilation as usize, activation, stepwise),
+            self.state,
+            self.buffers,
+        )
+    }
+
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            x,
+            weight,
+            form: (dilation, activation, stepwise),
+            window,
+            state,
+            buffers: (live, checkpoint, trail),
+        } = self;
+        let (tokens, channels) = x.dims2()?;
+        let width = weight.dims()[1];
+
+        let out = ops::empty((tokens, channels), x.dtype())?;
+        ops::launch::<CausalConv1d>(
+            &CausalConv1dDescriptor::new(
+                x.dtype(),
+                channels as u32,
+                width as u32,
+                dilation,
+                activation,
+                window as u32,
+                stepwise,
+            ),
+            CausalConv1dArgs {
+                x: ops::operand(x)?,
+                weight: ops::operand(weight)?,
+                out: ops::operand(&out)?,
+                rows: row_columns(state)?,
+                state: ops::operand(live)?,
+                checkpoint: ops::operand(checkpoint)?,
+                trail: trail_operand(trail)?,
+                slots: slots_operand(state.verify.as_ref())?,
+            },
+        )?;
+        Ok(out)
+    }
 }
 
 /// [`causal_conv1d`] on CPU tensors: `form` is the taps' dilation, whether the sum is
@@ -437,7 +485,7 @@ fn conv_formula(
     state: &RecurrentState,
     (live, checkpoint, trail): (&Tensor, &Tensor, Option<&Tensor>),
 ) -> Result<Tensor> {
-    const OWNER: &str = "causal_conv1d";
+    const OWNER: &str = CausalConv1dCall::OWNER;
 
     let (tokens, channels) = x.dims2()?;
     let width = weight.dims()[1];
@@ -579,7 +627,7 @@ pub fn gated_delta_rule(
     layer: usize,
     field: usize,
 ) -> Result<Tensor> {
-    const OWNER: &str = "gated_delta_rule";
+    const OWNER: &str = GatedDeltaRuleCall::OWNER;
 
     let (&[tokens, key_heads, key_dim], &[value_tokens, value_heads, value_dim]) =
         (query.dims(), value.dims())
@@ -682,35 +730,84 @@ pub fn gated_delta_rule(
         }
     }
 
-    if on_cpu(query) {
-        return rule_formula(
-            (query, key, value),
-            (a, b),
-            (a_log, dt_bias),
-            (axes, form == Form::Recurrent),
-            state,
-            (live, checkpoint, trail),
-        );
+    compute(GatedDeltaRuleCall {
+        heads: (query, key, value),
+        gates: (a, b),
+        parameters: (a_log, dt_bias),
+        form: (axes, form),
+        state,
+        buffers: (live, checkpoint, trail),
+    })
+}
+
+/// A checked call of [`gated_delta_rule`]: `heads` are the queries, keys and values, `gates` the
+/// inputs `a` and `b`, `parameters` `A_log` and `dt_bias`, `form` the stored state's axis order
+/// and how the batch's tokens are walked, and `buffers` the field's live, checkpoint and trail
+/// buffers.
+struct GatedDeltaRuleCall<'t> {
+    heads: (&'t Tensor, &'t Tensor, &'t Tensor),
+    gates: (&'t Tensor, &'t Tensor),
+    parameters: (&'t Tensor, &'t Tensor),
+    form: (StateAxes, Form),
+    state: &'t RecurrentState,
+    buffers: (&'t Tensor, &'t Tensor, Option<&'t Tensor>),
+}
+
+impl GatedDeltaRuleCall<'_> {
+    const OWNER: &'static str = "gated_delta_rule";
+}
+
+impl Fused for GatedDeltaRuleCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.heads.0.device()
     }
 
-    let out = ops::empty((tokens, value_heads, value_dim), query.dtype())?;
-    let args = GatedDeltaRuleArgs {
-        query: ops::operand(query)?,
-        key: ops::operand(key)?,
-        value: ops::operand(value)?,
-        a: ops::operand(a)?,
-        b: ops::operand(b)?,
-        a_log: ops::operand(a_log)?,
-        dt_bias: ops::operand(dt_bias)?,
-        rows: row_columns(state)?,
-        state: ops::operand(live)?,
-        checkpoint: ops::operand(checkpoint)?,
-        trail: trail_operand(trail)?,
-        out: ops::operand(&out)?,
-        slots: slots_operand(state.verify.as_ref())?,
-    };
-    ops::launch::<GatedDeltaRule>(&GatedDeltaRuleDescriptor::of(&args, form, axes)?, args)?;
-    Ok(out)
+    fn cpu(self) -> Result<Tensor> {
+        let (axes, form) = self.form;
+
+        rule_formula(
+            self.heads,
+            self.gates,
+            self.parameters,
+            (axes, form == Form::Recurrent),
+            self.state,
+            self.buffers,
+        )
+    }
+
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            heads: (query, key, value),
+            gates: (a, b),
+            parameters: (a_log, dt_bias),
+            form: (axes, form),
+            state,
+            buffers: (live, checkpoint, trail),
+        } = self;
+        let (tokens, _, _) = query.dims3()?;
+        let (_, value_heads, value_dim) = value.dims3()?;
+
+        let out = ops::empty((tokens, value_heads, value_dim), query.dtype())?;
+        let args = GatedDeltaRuleArgs {
+            query: ops::operand(query)?,
+            key: ops::operand(key)?,
+            value: ops::operand(value)?,
+            a: ops::operand(a)?,
+            b: ops::operand(b)?,
+            a_log: ops::operand(a_log)?,
+            dt_bias: ops::operand(dt_bias)?,
+            rows: row_columns(state)?,
+            state: ops::operand(live)?,
+            checkpoint: ops::operand(checkpoint)?,
+            trail: trail_operand(trail)?,
+            out: ops::operand(&out)?,
+            slots: slots_operand(state.verify.as_ref())?,
+        };
+        ops::launch::<GatedDeltaRule>(&GatedDeltaRuleDescriptor::of(&args, form, axes)?, args)?;
+        Ok(out)
+    }
 }
 
 /// [`gated_delta_rule`] on CPU tensors, as the recurrence of the module documentation:
@@ -728,7 +825,7 @@ fn rule_formula(
     state: &RecurrentState,
     (live, checkpoint, trail): (&Tensor, &Tensor, Option<&Tensor>),
 ) -> Result<Tensor> {
-    const OWNER: &str = "gated_delta_rule";
+    const OWNER: &str = GatedDeltaRuleCall::OWNER;
     let (tokens, key_heads, key_dim) = query.dims3()?;
     let (_, value_heads, value_dim) = value.dims3()?;
     let group = value_heads / key_heads;

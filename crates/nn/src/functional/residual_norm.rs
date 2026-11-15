@@ -31,10 +31,10 @@ use ops::residual::{
     ScaledResidualLayerNorm, ScaledResidualLayerNormArgs, ScaledResidualLayerNormDescriptor,
     ScaledResidualRmsNorm, ScaledResidualRmsNormArgs, ScaledResidualRmsNormDescriptor,
 };
-use tensor::{D, DType, Tensor};
+use tensor::{D, DType, Device, Tensor};
 
 use super::norm::rms_scaled;
-use super::{as_rows, columns, like_rows, on_cpu, vector};
+use super::{Fused, as_rows, columns, compute, like_rows, vector};
 use crate::error::{Error, Result};
 
 /// Checks the operands a scaled-residual normalization shares: an `update` of the stream's
@@ -117,44 +117,94 @@ pub fn scaled_residual_rms_norm_(
     weight: &Tensor,
     eps: f32,
 ) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = "scaled_residual_rms_norm_";
+    const OWNER: &str = ScaledResidualRmsNormCall::OWNER;
 
     let width = columns(OWNER, &hidden)?;
     vector(OWNER, "weight", weight, width)?;
     check_scaled(OWNER, &hidden, update, update_bias, scale, width)?;
     written(OWNER, "residual stream", &hidden)?;
 
-    if on_cpu(&hidden) {
-        let sum = scaled_sum(&hidden, update, update_bias, scale)?;
-        let normalized = rms_scaled(&sum, eps)?.broadcast_mul(&weight.to_dtype(DType::F32)?)?;
+    compute(ScaledResidualRmsNormCall {
+        hidden,
+        update,
+        update_bias,
+        scale,
+        weight,
+        eps,
+    })
+}
 
-        hidden.slice_set(&sum.to_dtype(hidden.dtype())?, 0, 0)?;
-        return Ok((normalized.to_dtype(update.dtype())?, hidden));
+/// A checked call of [`scaled_residual_rms_norm_`].
+struct ScaledResidualRmsNormCall<'t> {
+    hidden: Tensor,
+    update: &'t Tensor,
+    update_bias: Option<&'t Tensor>,
+    scale: &'t Tensor,
+    weight: &'t Tensor,
+    eps: f32,
+}
+
+impl ScaledResidualRmsNormCall<'_> {
+    const OWNER: &'static str = "scaled_residual_rms_norm_";
+}
+
+impl Fused for ScaledResidualRmsNormCall<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.hidden.device()
     }
 
-    let (rows, update_rows) = (as_rows(OWNER, &hidden)?, as_rows(OWNER, update)?);
-    let out = ops::empty(rows.shape(), update.dtype())?;
+    fn cpu(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            hidden,
+            update,
+            weight,
+            ..
+        } = self;
+        let sum = scaled_sum(&hidden, update, self.update_bias, self.scale)?;
+        let normalized =
+            rms_scaled(&sum, self.eps)?.broadcast_mul(&weight.to_dtype(DType::F32)?)?;
 
-    ops::launch::<ScaledResidualRmsNorm>(
-        &ScaledResidualRmsNormDescriptor::new(
-            hidden.dtype(),
-            width,
-            update_bias.is_some(),
-            update.dtype(),
-            false,
-        ),
-        ScaledResidualRmsNormArgs {
-            hidden: ops::operand(&rows)?,
-            update: ops::operand(&update_rows)?,
-            update_bias: update_bias.map(ops::operand).transpose()?,
-            scale: ops::operand(scale)?,
-            weight: ops::operand(weight)?,
-            out: ops::operand(&out)?,
-            eps,
-            partials: None,
-        },
-    )?;
-    Ok((like_rows(out, &hidden)?, hidden))
+        hidden.slice_set(&sum.to_dtype(hidden.dtype())?, 0, 0)?;
+        Ok((normalized.to_dtype(update.dtype())?, hidden))
+    }
+
+    fn launch(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            hidden,
+            update,
+            update_bias,
+            ..
+        } = self;
+        let width = columns(Self::OWNER, &hidden)?;
+        let (rows, update_rows) = (
+            as_rows(Self::OWNER, &hidden)?,
+            as_rows(Self::OWNER, update)?,
+        );
+        let out = ops::empty(rows.shape(), update.dtype())?;
+
+        ops::launch::<ScaledResidualRmsNorm>(
+            &ScaledResidualRmsNormDescriptor::new(
+                hidden.dtype(),
+                width,
+                update_bias.is_some(),
+                update.dtype(),
+                false,
+            ),
+            ScaledResidualRmsNormArgs {
+                hidden: ops::operand(&rows)?,
+                update: ops::operand(&update_rows)?,
+                update_bias: update_bias.map(ops::operand).transpose()?,
+                scale: ops::operand(self.scale)?,
+                weight: ops::operand(self.weight)?,
+                out: ops::operand(&out)?,
+                eps: self.eps,
+                partials: None,
+            },
+        )?;
+        Ok((like_rows(out, &hidden)?, hidden))
+    }
 }
 
 /// The layer normalization of a residual stream with a channel-scaled update folded in:
@@ -177,50 +227,92 @@ pub fn scaled_residual_layer_norm(
     bias: &Tensor,
     eps: f32,
 ) -> Result<Tensor> {
-    const OWNER: &str = "scaled_residual_layer_norm";
+    const OWNER: &str = ScaledResidualLayerNormCall::OWNER;
 
     let width = columns(OWNER, hidden)?;
     vector(OWNER, "weight", weight, width)?;
     vector(OWNER, "bias", bias, width)?;
     check_scaled(OWNER, hidden, update, update_bias, scale, width)?;
 
-    if on_cpu(hidden) {
-        let sum = scaled_sum(hidden, update, update_bias, scale)?;
+    compute(ScaledResidualLayerNormCall {
+        hidden,
+        update,
+        update_bias,
+        scale,
+        weight,
+        bias,
+        eps,
+    })
+}
+
+/// A checked call of [`scaled_residual_layer_norm`].
+struct ScaledResidualLayerNormCall<'t> {
+    hidden: &'t Tensor,
+    update: &'t Tensor,
+    update_bias: Option<&'t Tensor>,
+    scale: &'t Tensor,
+    weight: &'t Tensor,
+    bias: &'t Tensor,
+    eps: f32,
+}
+
+impl ScaledResidualLayerNormCall<'_> {
+    const OWNER: &'static str = "scaled_residual_layer_norm";
+}
+
+impl Fused for ScaledResidualLayerNormCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.hidden.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let sum = scaled_sum(self.hidden, self.update, self.update_bias, self.scale)?;
         let centred = sum.broadcast_sub(&sum.mean_keepdim(D::Minus1)?)?;
         let variance = centred.sqr()?.mean_keepdim(D::Minus1)?;
-        let deviation = (variance + f64::from(eps))?.sqrt()?.recip()?;
+        let deviation = (variance + f64::from(self.eps))?.sqrt()?.recip()?;
 
         let normalized = centred
             .broadcast_mul(&deviation)?
-            .broadcast_mul(&weight.to_dtype(DType::F32)?)?
-            .broadcast_add(&bias.to_dtype(DType::F32)?)?;
-        return Ok(normalized.to_dtype(update.dtype())?);
+            .broadcast_mul(&self.weight.to_dtype(DType::F32)?)?
+            .broadcast_add(&self.bias.to_dtype(DType::F32)?)?;
+        Ok(normalized.to_dtype(self.update.dtype())?)
     }
 
-    let (rows, update_rows) = (as_rows(OWNER, hidden)?, as_rows(OWNER, update)?);
-    let out = ops::empty(rows.shape(), update.dtype())?;
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            hidden,
+            update,
+            update_bias,
+            ..
+        } = self;
+        let width = columns(Self::OWNER, hidden)?;
+        let (rows, update_rows) = (as_rows(Self::OWNER, hidden)?, as_rows(Self::OWNER, update)?);
+        let out = ops::empty(rows.shape(), update.dtype())?;
 
-    ops::launch::<ScaledResidualLayerNorm>(
-        &ScaledResidualLayerNormDescriptor::new(
-            hidden.dtype(),
-            width,
-            update_bias.is_some(),
-            update.dtype(),
-            false,
-        ),
-        ScaledResidualLayerNormArgs {
-            hidden: ops::operand(&rows)?,
-            update: ops::operand(&update_rows)?,
-            update_bias: update_bias.map(ops::operand).transpose()?,
-            scale: ops::operand(scale)?,
-            weight: ops::operand(weight)?,
-            bias: ops::operand(bias)?,
-            out: ops::operand(&out)?,
-            eps,
-            partials: None,
-        },
-    )?;
-    like_rows(out, hidden)
+        ops::launch::<ScaledResidualLayerNorm>(
+            &ScaledResidualLayerNormDescriptor::new(
+                hidden.dtype(),
+                width,
+                update_bias.is_some(),
+                update.dtype(),
+                false,
+            ),
+            ScaledResidualLayerNormArgs {
+                hidden: ops::operand(&rows)?,
+                update: ops::operand(&update_rows)?,
+                update_bias: update_bias.map(ops::operand).transpose()?,
+                scale: ops::operand(self.scale)?,
+                weight: ops::operand(self.weight)?,
+                bias: ops::operand(self.bias)?,
+                out: ops::operand(&out)?,
+                eps: self.eps,
+                partials: None,
+            },
+        )?;
+        like_rows(out, hidden)
+    }
 }
 
 /// Checks a modulation's operands against the `[rows, width]` activation they modulate: tables
@@ -322,35 +414,80 @@ pub fn modulated_rms_norm(
     eps: f32,
     output: DType,
 ) -> Result<Tensor> {
-    const OWNER: &str = "modulated_rms_norm";
+    const OWNER: &str = ModulatedRmsNormCall::OWNER;
 
     let width = columns(OWNER, x)?;
     vector(OWNER, "weight", weight, width)?;
     check_modulation(OWNER, x, &[("shift", shift), ("scale", scale)], rows, width)?;
 
-    if on_cpu(x) {
-        let value = x.to_dtype(DType::F32)?;
-        let modulated = modulate(&value, weight, shift, scale, rows, eps, x.dtype())?;
+    compute(ModulatedRmsNormCall {
+        x,
+        weight,
+        shift,
+        scale,
+        rows,
+        eps,
+        output,
+    })
+}
 
-        return Ok(modulated.to_dtype(output)?);
+/// A checked call of [`modulated_rms_norm`].
+struct ModulatedRmsNormCall<'t> {
+    x: &'t Tensor,
+    weight: &'t Tensor,
+    shift: &'t Tensor,
+    scale: &'t Tensor,
+    rows: &'t Tensor,
+    eps: f32,
+    output: DType,
+}
+
+impl ModulatedRmsNormCall<'_> {
+    const OWNER: &'static str = "modulated_rms_norm";
+}
+
+impl Fused for ModulatedRmsNormCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
     }
 
-    let value = x.contiguous()?;
-    let out = ops::empty(x.shape(), output)?;
-    let args = modulation::Args {
-        value: ops::operand(&value)?,
-        update: None,
-        gate: None,
-        weight: ops::operand(weight)?,
-        shift: ops::operand(shift)?,
-        scale: ops::operand(scale)?,
-        row_indices: ops::operand(rows)?,
-        out: ops::operand(&out)?,
-        output_scale: None,
-        retain: None,
-    };
-    ops::launch::<ModulatedRmsNorm>(&ModulatedRmsNormDescriptor::of(&args, eps)?, args)?;
-    Ok(out)
+    fn cpu(self) -> Result<Tensor> {
+        let Self { x, .. } = self;
+        let value = x.to_dtype(DType::F32)?;
+        let modulated = modulate(
+            &value,
+            self.weight,
+            self.shift,
+            self.scale,
+            self.rows,
+            self.eps,
+            x.dtype(),
+        )?;
+
+        Ok(modulated.to_dtype(self.output)?)
+    }
+
+    fn launch(self) -> Result<Tensor> {
+        let Self { x, .. } = self;
+        let value = x.contiguous()?;
+        let out = ops::empty(x.shape(), self.output)?;
+        let args = modulation::Args {
+            value: ops::operand(&value)?,
+            update: None,
+            gate: None,
+            weight: ops::operand(self.weight)?,
+            shift: ops::operand(self.shift)?,
+            scale: ops::operand(self.scale)?,
+            row_indices: ops::operand(self.rows)?,
+            out: ops::operand(&out)?,
+            output_scale: None,
+            retain: None,
+        };
+        ops::launch::<ModulatedRmsNorm>(&ModulatedRmsNormDescriptor::of(&args, self.eps)?, args)?;
+        Ok(out)
+    }
 }
 
 /// A gated update folded into the residual stream and the modulated normalization of the sum,
@@ -382,7 +519,7 @@ pub fn modulated_rms_norm_(
     eps: f32,
     output: DType,
 ) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = "modulated_rms_norm_";
+    const OWNER: &str = ModulatedRmsNormUpdateCall::OWNER;
 
     let width = columns(OWNER, &update)?;
     let activation = update.dtype();
@@ -408,31 +545,86 @@ pub fn modulated_rms_norm_(
     }
     written(OWNER, "update", &update)?;
 
-    if on_cpu(&update) {
-        let gate = parameter_rows(gate, rows)?;
-        let gated = rounded(&(gate * update.to_dtype(DType::F32)?)?, activation)?;
-        let sum = rounded(&(hidden.to_dtype(DType::F32)? + gated)?, activation)?;
-        let modulated = modulate(&sum, weight, shift, scale, rows, eps, activation)?;
+    compute(ModulatedRmsNormUpdateCall {
+        update,
+        hidden,
+        gate,
+        weight,
+        shift,
+        scale,
+        rows,
+        eps,
+        output,
+    })
+}
 
-        update.slice_set(&sum.to_dtype(activation)?, 0, 0)?;
-        return Ok((modulated.to_dtype(output)?, sum.to_dtype(output)?));
+/// A checked call of [`modulated_rms_norm_`].
+struct ModulatedRmsNormUpdateCall<'t> {
+    update: Tensor,
+    hidden: &'t Tensor,
+    gate: &'t Tensor,
+    weight: &'t Tensor,
+    shift: &'t Tensor,
+    scale: &'t Tensor,
+    rows: &'t Tensor,
+    eps: f32,
+    output: DType,
+}
+
+impl ModulatedRmsNormUpdateCall<'_> {
+    const OWNER: &'static str = "modulated_rms_norm_";
+}
+
+impl Fused for ModulatedRmsNormUpdateCall<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.update.device()
     }
 
-    let value = hidden.contiguous()?;
-    let out = ops::empty(update.shape(), output)?;
-    let sum = ops::empty(update.shape(), output)?;
-    let args = modulation::Args {
-        value: ops::operand(&value)?,
-        update: Some(ops::operand(&update)?),
-        gate: Some(ops::operand(gate)?),
-        weight: ops::operand(weight)?,
-        shift: ops::operand(shift)?,
-        scale: ops::operand(scale)?,
-        row_indices: ops::operand(rows)?,
-        out: ops::operand(&out)?,
-        output_scale: None,
-        retain: Some(ops::operand(&sum)?),
-    };
-    ops::launch::<ModulatedRmsNorm>(&ModulatedRmsNormDescriptor::of(&args, eps)?, args)?;
-    Ok((out, sum))
+    fn cpu(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            update,
+            hidden,
+            rows,
+            ..
+        } = self;
+        let activation = update.dtype();
+        let gate = parameter_rows(self.gate, rows)?;
+        let gated = rounded(&(gate * update.to_dtype(DType::F32)?)?, activation)?;
+        let sum = rounded(&(hidden.to_dtype(DType::F32)? + gated)?, activation)?;
+        let modulated = modulate(
+            &sum,
+            self.weight,
+            self.shift,
+            self.scale,
+            rows,
+            self.eps,
+            activation,
+        )?;
+
+        update.slice_set(&sum.to_dtype(activation)?, 0, 0)?;
+        Ok((modulated.to_dtype(self.output)?, sum.to_dtype(self.output)?))
+    }
+
+    fn launch(self) -> Result<(Tensor, Tensor)> {
+        let Self { update, hidden, .. } = self;
+        let value = hidden.contiguous()?;
+        let out = ops::empty(update.shape(), self.output)?;
+        let sum = ops::empty(update.shape(), self.output)?;
+        let args = modulation::Args {
+            value: ops::operand(&value)?,
+            update: Some(ops::operand(&update)?),
+            gate: Some(ops::operand(self.gate)?),
+            weight: ops::operand(self.weight)?,
+            shift: ops::operand(self.shift)?,
+            scale: ops::operand(self.scale)?,
+            row_indices: ops::operand(self.rows)?,
+            out: ops::operand(&out)?,
+            output_scale: None,
+            retain: Some(ops::operand(&sum)?),
+        };
+        ops::launch::<ModulatedRmsNorm>(&ModulatedRmsNormDescriptor::of(&args, self.eps)?, args)?;
+        Ok((out, sum))
+    }
 }

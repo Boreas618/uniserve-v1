@@ -18,7 +18,7 @@
 use ops::activation1d::{Activation1d, Args, BETA_FLOOR, Descriptor};
 use tensor::{DType, Device, Tensor};
 
-use super::on_cpu;
+use super::{Fused, compute};
 use crate::error::{Error, Result};
 
 /// The alias-free SnakeBeta of `x`, `[channels, length]` or `[batch, channels, length]`: a
@@ -41,7 +41,7 @@ pub fn activation1d(
     filter_down: &Tensor,
     ratio: u32,
 ) -> Result<Tensor> {
-    const OWNER: &str = "activation1d";
+    const OWNER: &str = Activation1dCall::OWNER;
 
     let (batch, channels, length) = match *x.dims() {
         [channels, length] => (1, channels, length),
@@ -95,7 +95,53 @@ pub fn activation1d(
     );
     let expected = descriptor.output(length as u64)? as usize;
 
-    if on_cpu(x) {
+    compute(Activation1dCall {
+        x,
+        alpha,
+        beta,
+        filters: (filter_up, filter_down),
+        descriptor,
+        extents: (batch, channels, length),
+        expected,
+    })
+}
+
+/// A checked call of [`activation1d`]: the operator's descriptor, the signal's `(batch,
+/// channels, length)` extents and the `expected` length of an output row.
+struct Activation1dCall<'t> {
+    x: &'t Tensor,
+    alpha: &'t Tensor,
+    beta: &'t Tensor,
+    filters: (&'t Tensor, &'t Tensor),
+    descriptor: Descriptor,
+    extents: (usize, usize, usize),
+    expected: usize,
+}
+
+impl Activation1dCall<'_> {
+    const OWNER: &'static str = "activation1d";
+}
+
+impl Fused for Activation1dCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            x,
+            alpha,
+            beta,
+            filters: (filter_up, filter_down),
+            descriptor,
+            extents: (batch, channels, length),
+            ..
+        } = self;
+        let ratio = descriptor.ratio;
+        let step = ratio as usize;
+
         // Every channel reads the same filter, so the depthwise convolutions are one
         // single-channel convolution over the channels as rows.
         let signal = x
@@ -132,28 +178,45 @@ pub fn activation1d(
             .reshape((batch * channels, 1, length * step))?
             .pad_with_same(2, left as usize, right as usize)?
             .conv1d(&down, 0, step, 1, 1)?;
-        return Ok(filtered.reshape(x.shape())?.to_dtype(x.dtype())?);
+        Ok(filtered.reshape(x.shape())?.to_dtype(x.dtype())?)
     }
 
-    // A batch is the same channel set read again: one launch per batch row over one descriptor.
-    let signal = x.contiguous()?.reshape((batch, channels, length))?;
-    let out = ops::empty((batch, channels, expected), x.dtype())?;
-    let length = u32::try_from(length)
-        .map_err(|_| Error::shape(OWNER, format!("{length} samples exceed a launch value")))?;
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            x,
+            alpha,
+            beta,
+            filters: (filter_up, filter_down),
+            descriptor,
+            extents: (batch, channels, length),
+            expected,
+        } = self;
 
-    for row in 0..batch {
-        ops::launch::<Activation1d>(
-            &descriptor,
-            Args {
-                values: ops::operand(&signal.get(row)?)?,
-                alpha: ops::operand(alpha)?,
-                beta: ops::operand(beta)?,
-                filter_up: ops::operand(filter_up)?,
-                filter_down: ops::operand(filter_down)?,
-                out: ops::operand(&out.get(row)?)?,
-                length,
-            },
-        )?;
+        // A batch is the same channel set read again: one launch per batch row over one
+        // descriptor.
+        let signal = x.contiguous()?.reshape((batch, channels, length))?;
+        let out = ops::empty((batch, channels, expected), x.dtype())?;
+        let length = u32::try_from(length).map_err(|_| {
+            Error::shape(
+                Self::OWNER,
+                format!("{length} samples exceed a launch value"),
+            )
+        })?;
+
+        for row in 0..batch {
+            ops::launch::<Activation1d>(
+                &descriptor,
+                Args {
+                    values: ops::operand(&signal.get(row)?)?,
+                    alpha: ops::operand(alpha)?,
+                    beta: ops::operand(beta)?,
+                    filter_up: ops::operand(filter_up)?,
+                    filter_down: ops::operand(filter_down)?,
+                    out: ops::operand(&out.get(row)?)?,
+                    length,
+                },
+            )?;
+        }
+        Ok(out.reshape(x.shape())?)
     }
-    Ok(out.reshape(x.shape())?)
 }

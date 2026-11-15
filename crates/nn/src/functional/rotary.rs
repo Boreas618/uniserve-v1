@@ -37,7 +37,7 @@ use tensor::{D, DType, Device, Tensor};
 
 use super::norm::{gain, rms_scaled};
 use super::nvfp4::integer;
-use super::{ACCUMULATE, on_cpu, vector};
+use super::{ACCUMULATE, Fused, compute, vector};
 use crate::error::{Error, Result};
 
 /// The heads and the head width of `x`, the tensor `name` of `[tokens, heads, head_dim]`.
@@ -173,7 +173,7 @@ pub fn rotary_factors(
     sections: &[u32],
     interleaved: bool,
 ) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = "rotary_factors";
+    const OWNER: &str = RotaryFactorsCall::OWNER;
 
     let &[columns] = inv_freq.dims() else {
         return Err(Error::shape(
@@ -208,9 +208,46 @@ pub fn rotary_factors(
             ),
         ));
     }
-    let tokens = positions.elem_count() / axes;
+    compute(RotaryFactorsCall {
+        positions,
+        inv_freq,
+        sections,
+        interleaved,
+        columns,
+        axes,
+    })
+}
 
-    if on_cpu(positions) {
+/// A checked call of [`rotary_factors`]: `columns` frequencies over `axes` position axes.
+struct RotaryFactorsCall<'t> {
+    positions: &'t Tensor,
+    inv_freq: &'t Tensor,
+    sections: &'t [u32],
+    interleaved: bool,
+    columns: usize,
+    axes: usize,
+}
+
+impl RotaryFactorsCall<'_> {
+    const OWNER: &'static str = "rotary_factors";
+}
+
+impl Fused for RotaryFactorsCall<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.positions.device()
+    }
+
+    fn cpu(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            positions,
+            sections,
+            columns,
+            axes,
+            ..
+        } = self;
+        let tokens = positions.elem_count() / axes;
         let coordinates = positions.to_dtype(ACCUMULATE)?.reshape((axes, tokens))?;
 
         // Each frequency's coordinate of each token, `[tokens, columns]`.
@@ -218,34 +255,41 @@ pub fn rotary_factors(
             coordinates.t()?
         } else {
             coordinates
-                .index_select(&frequency_axes(sections, columns, interleaved)?, 0)?
+                .index_select(&frequency_axes(sections, columns, self.interleaved)?, 0)?
                 .t()?
         };
-        let angle = per_frequency.broadcast_mul(&inv_freq.to_dtype(ACCUMULATE)?.unsqueeze(0)?)?;
+        let angle =
+            per_frequency.broadcast_mul(&self.inv_freq.to_dtype(ACCUMULATE)?.unsqueeze(0)?)?;
 
-        return Ok((angle.cos()?, angle.sin()?));
+        Ok((angle.cos()?, angle.sin()?))
     }
 
-    let cos = ops::empty((tokens, columns), DType::F32)?;
-    let sin = ops::empty((tokens, columns), DType::F32)?;
+    fn launch(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            positions, columns, ..
+        } = self;
+        let tokens = positions.elem_count() / self.axes;
+        let cos = ops::empty((tokens, columns), DType::F32)?;
+        let sin = ops::empty((tokens, columns), DType::F32)?;
 
-    ops::launch::<RotaryFactors>(
-        &FactorsDescriptor::new(
-            DType::F32,
-            positions.dtype(),
-            columns as u32,
-            1.0,
-            sections,
-            interleaved,
-        )?,
-        FactorsArgs {
-            positions: ops::operand(positions)?,
-            frequencies: ops::operand(inv_freq)?,
-            cosine: ops::operand(&cos)?,
-            sine: ops::operand(&sin)?,
-        },
-    )?;
-    Ok((cos, sin))
+        ops::launch::<RotaryFactors>(
+            &FactorsDescriptor::new(
+                DType::F32,
+                positions.dtype(),
+                columns as u32,
+                1.0,
+                self.sections,
+                self.interleaved,
+            )?,
+            FactorsArgs {
+                positions: ops::operand(positions)?,
+                frequencies: ops::operand(self.inv_freq)?,
+                cosine: ops::operand(&cos)?,
+                sine: ops::operand(&sin)?,
+            },
+        )?;
+        Ok((cos, sin))
+    }
 }
 
 /// `x`, `[tokens, heads, head_dim]`, turned by the factors `cos` and `sin`, FP32 `[tokens,
@@ -256,25 +300,50 @@ pub fn rotary_factors(
 /// Tables that are not one FP32 row per token or are wider than half the head, or the
 /// operator's refusal.
 pub fn rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    const OWNER: &str = "rotary";
+    const OWNER: &str = RotaryCall::OWNER;
 
     let (_, head_dim) = heads_of(OWNER, "the input", x)?;
     rotated(OWNER, cos, sin, head_dim)?;
     per_token(OWNER, cos, x.dims()[0])?;
 
-    if on_cpu(x) {
-        return Ok(rotate(&x.to_dtype(ACCUMULATE)?, cos, sin)?.to_dtype(x.dtype())?);
+    compute(RotaryCall { x, cos, sin })
+}
+
+/// A checked call of [`rotary`].
+struct RotaryCall<'t> {
+    x: &'t Tensor,
+    cos: &'t Tensor,
+    sin: &'t Tensor,
+}
+
+impl RotaryCall<'_> {
+    const OWNER: &'static str = "rotary";
+}
+
+impl Fused for RotaryCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
     }
 
-    let out = ops::empty(x.shape(), x.dtype())?;
-    let args = RopeApplyArgs {
-        x: ops::operand(x)?,
-        cosine: ops::operand(cos)?,
-        sine: ops::operand(sin)?,
-        out: ops::operand(&out)?,
-    };
-    ops::launch::<RopeApply>(&RopeApplyDescriptor::of(&args, Rotation::Half)?, args)?;
-    Ok(out)
+    fn cpu(self) -> Result<Tensor> {
+        let Self { x, cos, sin } = self;
+        Ok(rotate(&x.to_dtype(ACCUMULATE)?, cos, sin)?.to_dtype(x.dtype())?)
+    }
+
+    fn launch(self) -> Result<Tensor> {
+        let Self { x, cos, sin } = self;
+        let out = ops::empty(x.shape(), x.dtype())?;
+        let args = RopeApplyArgs {
+            x: ops::operand(x)?,
+            cosine: ops::operand(cos)?,
+            sine: ops::operand(sin)?,
+            out: ops::operand(&out)?,
+        };
+        ops::launch::<RopeApply>(&RopeApplyDescriptor::of(&args, Rotation::Half)?, args)?;
+        Ok(out)
+    }
 }
 
 /// The per-head RMS normalization of an attention's queries and keys fused with their rotation:
@@ -301,7 +370,7 @@ pub fn qk_norm_rope(
     eps: f32,
     centred: bool,
 ) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = "qk_norm_rope";
+    const OWNER: &str = QkNormRopeCall::OWNER;
 
     let (_, head_dim) = heads_of(OWNER, "the query", query)?;
     let (_, key_dim) = heads_of(OWNER, "the key", key)?;
@@ -329,7 +398,49 @@ pub fn qk_norm_rope(
     // Only a learned gain can be stored zero-centred.
     let centred = weights.is_some() && centred;
 
-    if on_cpu(query) {
+    compute(QkNormRopeCall {
+        query,
+        key,
+        weights,
+        cos,
+        sin,
+        eps,
+        centred,
+    })
+}
+
+/// A checked call of [`qk_norm_rope`]: `centred` only with learned gains.
+struct QkNormRopeCall<'t> {
+    query: &'t Tensor,
+    key: &'t Tensor,
+    weights: Option<(&'t Tensor, &'t Tensor)>,
+    cos: &'t Tensor,
+    sin: &'t Tensor,
+    eps: f32,
+    centred: bool,
+}
+
+impl QkNormRopeCall<'_> {
+    const OWNER: &'static str = "qk_norm_rope";
+}
+
+impl Fused for QkNormRopeCall<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.query.device()
+    }
+
+    fn cpu(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            query,
+            key,
+            weights,
+            cos,
+            sin,
+            eps,
+            centred,
+        } = self;
         let turned = |x: &Tensor, weight: Option<&Tensor>| -> Result<Tensor> {
             let mut normalized = rms_scaled(&x.to_dtype(ACCUMULATE)?, eps)?;
             if let Some(weight) = weight {
@@ -338,31 +449,41 @@ pub fn qk_norm_rope(
             Ok(rotate(&normalized, cos, sin)?.to_dtype(x.dtype())?)
         };
 
-        return Ok((
+        Ok((
             turned(query, weights.map(|(query, _)| query))?,
             turned(key, weights.map(|(_, key)| key))?,
-        ));
+        ))
     }
 
-    let query_out = ops::empty(query.shape(), query.dtype())?;
-    let key_out = ops::empty(key.shape(), key.dtype())?;
+    fn launch(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            query,
+            key,
+            weights,
+            cos,
+            sin,
+            ..
+        } = self;
+        let query_out = ops::empty(query.shape(), query.dtype())?;
+        let key_out = ops::empty(key.shape(), key.dtype())?;
 
-    // With learned gains the kernel loads them; without, it has no weight arguments.
-    let args = QkNormRopeArgs {
-        query: ops::operand(query)?,
-        key: ops::operand(key)?,
-        q_weight: weights.map(|(query, _)| ops::operand(query)).transpose()?,
-        k_weight: weights.map(|(_, key)| ops::operand(key)).transpose()?,
-        cosine: ops::operand(cos)?,
-        sine: ops::operand(sin)?,
-        q_out: ops::operand(&query_out)?,
-        k_out: ops::operand(&key_out)?,
-    };
-    ops::launch::<QkNormRope>(
-        &QkNormRopeDescriptor::of(&args, Rotation::Half, eps, centred, false)?,
-        args,
-    )?;
-    Ok((query_out, key_out))
+        // With learned gains the kernel loads them; without, it has no weight arguments.
+        let args = QkNormRopeArgs {
+            query: ops::operand(query)?,
+            key: ops::operand(key)?,
+            q_weight: weights.map(|(query, _)| ops::operand(query)).transpose()?,
+            k_weight: weights.map(|(_, key)| ops::operand(key)).transpose()?,
+            cosine: ops::operand(cos)?,
+            sine: ops::operand(sin)?,
+            q_out: ops::operand(&query_out)?,
+            k_out: ops::operand(&key_out)?,
+        };
+        ops::launch::<QkNormRope>(
+            &QkNormRopeDescriptor::of(&args, Rotation::Half, self.eps, self.centred, false)?,
+            args,
+        )?;
+        Ok((query_out, key_out))
+    }
 }
 
 /// [`qk_norm_rope`] without a gain, in place over the queries and keys of a merged projection:
@@ -387,7 +508,7 @@ pub fn qk_norm_rope_(
     sin: &Tensor,
     eps: f32,
 ) -> Result<Tensor> {
-    const OWNER: &str = "qk_norm_rope_";
+    const OWNER: &str = QkNormRopeUpdateCall::OWNER;
 
     let width = head_dim as usize;
     let (tokens, heads_per_row) = match *projected.dims() {
@@ -427,12 +548,66 @@ pub fn qk_norm_rope_(
         ));
     }
 
-    // The heads of both ranges, as views of the projection's own rows.
-    let by_head = projected.reshape((tokens, heads_per_row, width))?;
-    let query_heads = by_head.narrow(1, query.start, heads)?;
-    let key_heads = by_head.narrow(1, key.start, heads)?;
+    compute(QkNormRopeUpdateCall {
+        projected,
+        query,
+        key,
+        width,
+        cos,
+        sin,
+        eps,
+    })
+}
 
-    if on_cpu(&projected) {
+/// A checked call of [`qk_norm_rope_`]: the ranges are runs of heads of `width` channels of the
+/// projection's rows, which the factor tables' rows divide.
+struct QkNormRopeUpdateCall<'t> {
+    projected: Tensor,
+    query: Range<usize>,
+    key: Range<usize>,
+    width: usize,
+    cos: &'t Tensor,
+    sin: &'t Tensor,
+    eps: f32,
+}
+
+impl QkNormRopeUpdateCall<'_> {
+    const OWNER: &'static str = "qk_norm_rope_";
+
+    /// The heads of both ranges, as views of the projection's own rows.
+    fn heads(&self) -> Result<(Tensor, Tensor)> {
+        let (tokens, row) = self.projected.dims2()?;
+        let by_head = self
+            .projected
+            .reshape((tokens, row / self.width, self.width))?;
+
+        Ok((
+            by_head.narrow(1, self.query.start, self.query.len())?,
+            by_head.narrow(1, self.key.start, self.key.len())?,
+        ))
+    }
+}
+
+impl Fused for QkNormRopeUpdateCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.projected.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let (query_heads, key_heads) = self.heads()?;
+        let Self {
+            projected,
+            query,
+            key,
+            width,
+            cos,
+            sin,
+            eps,
+        } = self;
+        let tokens = projected.dims()[0];
+        let (heads, table) = (query.len(), cos.dims()[0]);
         let tile = |factors: &Tensor| -> Result<Tensor> {
             Ok(factors.to_dtype(ACCUMULATE)?.repeat((tokens / table, 1))?)
         };
@@ -451,27 +626,31 @@ pub fn qk_norm_rope_(
                 .contiguous()?;
             projected.scatter_set(&index, &turned.reshape((tokens, columns))?, 1)?;
         }
-        return Ok(projected);
+        Ok(projected)
     }
 
-    // Each kernel owns some tokens of one head, the queries' heads and the keys' alike, and the
-    // outputs are the inputs.
-    let (query_operand, key_operand) = (ops::operand(&query_heads)?, ops::operand(&key_heads)?);
-    let args = QkNormRopeArgs {
-        query: query_operand.clone(),
-        key: key_operand.clone(),
-        q_weight: None,
-        k_weight: None,
-        cosine: ops::operand(cos)?,
-        sine: ops::operand(sin)?,
-        q_out: query_operand,
-        k_out: key_operand,
-    };
-    ops::launch::<QkNormRope>(
-        &QkNormRopeDescriptor::of(&args, Rotation::Half, eps, false, true)?,
-        args,
-    )?;
-    Ok(projected)
+    fn launch(self) -> Result<Tensor> {
+        let (query_heads, key_heads) = self.heads()?;
+
+        // Each kernel owns some tokens of one head, the queries' heads and the keys' alike, and
+        // the outputs are the inputs.
+        let (query_operand, key_operand) = (ops::operand(&query_heads)?, ops::operand(&key_heads)?);
+        let args = QkNormRopeArgs {
+            query: query_operand.clone(),
+            key: key_operand.clone(),
+            q_weight: None,
+            k_weight: None,
+            cosine: ops::operand(self.cos)?,
+            sine: ops::operand(self.sin)?,
+            q_out: query_operand,
+            k_out: key_operand,
+        };
+        ops::launch::<QkNormRope>(
+            &QkNormRopeDescriptor::of(&args, Rotation::Half, self.eps, false, true)?,
+            args,
+        )?;
+        Ok(self.projected)
+    }
 }
 
 /// The rotary coordinates of every cell of a grid of `extents` cells per axis: an

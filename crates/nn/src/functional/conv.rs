@@ -35,7 +35,7 @@ use ops::conv::{Args, Conv, Descriptor};
 use ops::frame::is_channels_last;
 use tensor::{DType, Device, Tensor};
 
-use super::on_cpu;
+use super::{Fused, compute};
 use crate::error::{Error, Result};
 
 /// How a causal pad fills the rows and columns beyond a frame's edge: torch's `padding_mode`.
@@ -248,7 +248,55 @@ fn convolve(
         })?);
     }
 
-    if on_cpu(x) {
+    compute(ConvolveCall {
+        x,
+        weight,
+        bias,
+        window: [stride, padding, dilation],
+        groups,
+        precision,
+        rank,
+        transposed,
+        out,
+    })
+}
+
+/// A checked call of the convolution [`conv1d`], [`conv_transpose1d`] and [`conv3d`] share:
+/// `rank` spatial axes, the `window` (stride, padding, dilation per axis) and torch's `out`
+/// extents.
+struct ConvolveCall<'t> {
+    x: &'t Tensor,
+    weight: &'t Tensor,
+    bias: Option<&'t Tensor>,
+    window: [[u32; 3]; 3],
+    groups: u32,
+    precision: ProductPrecision,
+    rank: usize,
+    transposed: bool,
+    out: Vec<usize>,
+}
+
+impl Fused for ConvolveCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            x,
+            weight,
+            bias,
+            window: [stride, padding, dilation],
+            groups,
+            rank,
+            transposed,
+            out,
+            ..
+        } = self;
+        let (group_count, out_channels) = (groups as usize, out[1]);
+
         let (x32, weight32) = (x.to_dtype(DType::F32)?, weight.to_dtype(DType::F32)?);
         let window = |axis: usize| {
             (
@@ -281,35 +329,44 @@ fn convolve(
             per_channel[1] = out_channels;
             sum = sum.broadcast_add(&bias.to_dtype(DType::F32)?.reshape(per_channel)?)?;
         }
-        return Ok(sum.to_dtype(x.dtype())?);
+        Ok(sum.to_dtype(x.dtype())?)
     }
 
-    // The operator derives every operand's strides from the storage order it is told: packed
-    // channel-first, or channels-last for a frame stored that way.
-    let channels_last = rank == 3 && is_channels_last(&ops::operand(x)?);
-    let input = if channels_last { x.clone() } else { packed(x)? };
-    let weight = packed(weight)?;
-    let result = if channels_last {
-        ops::empty((out[0], out[2], out[3], out[4], out[1]), x.dtype())?.permute((0, 4, 1, 2, 3))?
-    } else {
-        ops::empty(out, x.dtype())?
-    };
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            x,
+            weight,
+            bias,
+            window,
+            groups,
+            precision,
+            rank,
+            transposed,
+            out,
+        } = self;
 
-    let args = Args {
-        input: ops::operand(&input)?,
-        weight: ops::operand(&weight)?,
-        bias: bias.map(ops::operand).transpose()?,
-        out: ops::operand(&result)?,
-    };
-    let descriptor = Descriptor::of(
-        &args,
-        transposed,
-        [stride, padding, dilation],
-        groups,
-        precision,
-    )?;
-    ops::launch::<Conv>(&descriptor, args)?;
-    Ok(result)
+        // The operator derives every operand's strides from the storage order it is told:
+        // packed channel-first, or channels-last for a frame stored that way.
+        let channels_last = rank == 3 && is_channels_last(&ops::operand(x)?);
+        let input = if channels_last { x.clone() } else { packed(x)? };
+        let weight = packed(weight)?;
+        let result = if channels_last {
+            ops::empty((out[0], out[2], out[3], out[4], out[1]), x.dtype())?
+                .permute((0, 4, 1, 2, 3))?
+        } else {
+            ops::empty(out, x.dtype())?
+        };
+
+        let args = Args {
+            input: ops::operand(&input)?,
+            weight: ops::operand(&weight)?,
+            bias: bias.map(ops::operand).transpose()?,
+            out: ops::operand(&result)?,
+        };
+        let descriptor = Descriptor::of(&args, transposed, window, groups, precision)?;
+        ops::launch::<Conv>(&descriptor, args)?;
+        Ok(result)
+    }
 }
 
 /// `tensor` stored packed row-major: itself when it is, and a copy otherwise.

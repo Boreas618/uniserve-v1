@@ -10,9 +10,9 @@
 //! distinct; two tokens that name one row leave either's.
 
 use ops::rows::{Args, Descriptor, Mode, Rows};
-use tensor::{DType, Tensor};
+use tensor::{DType, Device, Tensor};
 
-use super::on_cpu;
+use super::{Fused, compute};
 use crate::error::{Error, Result};
 
 /// Writes the rows of `source`, `[count, columns]`, into `destination`, `[rows, columns]` of
@@ -24,7 +24,7 @@ use crate::error::{Error, Result};
 /// Rows of another width or element type than the destination's, indices that are not one I32
 /// per source row, a destination that is a strided view, or the operator's refusal.
 pub fn place_rows_(destination: &Tensor, indices: &Tensor, source: &Tensor) -> Result<()> {
-    const OWNER: &str = "place_rows";
+    const OWNER: &str = PlaceRowsCall::OWNER;
 
     let (&[_, columns], &[count, width]) = (destination.dims(), source.dims()) else {
         return Err(Error::shape(
@@ -55,22 +55,63 @@ pub fn place_rows_(destination: &Tensor, indices: &Tensor, source: &Tensor) -> R
         ));
     }
 
-    if on_cpu(destination) {
+    compute(PlaceRowsCall {
+        destination,
+        indices,
+        source,
+        columns,
+    })
+}
+
+/// A checked call of [`place_rows_`]: rows of `columns` elements.
+struct PlaceRowsCall<'t> {
+    destination: &'t Tensor,
+    indices: &'t Tensor,
+    source: &'t Tensor,
+    columns: usize,
+}
+
+impl PlaceRowsCall<'_> {
+    const OWNER: &'static str = "place_rows";
+}
+
+impl Fused for PlaceRowsCall<'_> {
+    type Output = ();
+
+    fn device(&self) -> &Device {
+        self.destination.device()
+    }
+
+    fn cpu(self) -> Result<()> {
+        let Self {
+            destination,
+            indices,
+            source,
+            ..
+        } = self;
         for (row, index) in indices.to_vec1::<i32>()?.into_iter().enumerate() {
             if index >= 0 {
                 destination.slice_set(&source.narrow(0, row, 1)?, 0, index as usize)?;
             }
         }
-        return Ok(());
+        Ok(())
     }
 
-    ops::launch::<Rows>(
-        &Descriptor::new(destination.dtype(), Mode::Place, columns as u32),
-        Args {
-            source: ops::operand(source)?,
-            destination: ops::operand(destination)?,
-            indices: ops::operand(indices)?,
-        },
-    )?;
-    Ok(())
+    fn launch(self) -> Result<()> {
+        let Self {
+            destination,
+            indices,
+            source,
+            columns,
+        } = self;
+        ops::launch::<Rows>(
+            &Descriptor::new(destination.dtype(), Mode::Place, columns as u32),
+            Args {
+                source: ops::operand(source)?,
+                destination: ops::operand(destination)?,
+                indices: ops::operand(indices)?,
+            },
+        )?;
+        Ok(())
+    }
 }

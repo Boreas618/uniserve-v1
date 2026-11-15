@@ -24,7 +24,7 @@ use float8::F8E4M3;
 use ops::fp4::{BLOCK_ELEMENTS, Nvfp4Quantize, QuantizeArgs, QuantizeDescriptor, ScaleLayout};
 use tensor::{D, DType, Device, Tensor};
 
-use super::{ACCUMULATE, as_rows, columns, on_cpu};
+use super::{ACCUMULATE, Fused, as_rows, columns, compute};
 use crate::error::{Error, Result};
 
 /// The eight magnitudes an E2M1 code states, then the same negated: a code's fourth bit is its
@@ -58,7 +58,7 @@ pub fn nvfp4_quantize(
     global_scale: &Tensor,
     layout: ScaleLayout,
 ) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = "nvfp4_quantize";
+    const OWNER: &str = Nvfp4QuantizeCall::OWNER;
     let refuse = |problem: String| Error::shape(OWNER, problem);
 
     let k = columns(OWNER, x)?;
@@ -87,7 +87,55 @@ pub fn nvfp4_quantize(
     let table = layout.shape(count as u64, u64::from(k));
     let table = (table[0] as usize, table[1] as usize);
 
-    if on_cpu(x) {
+    compute(Nvfp4QuantizeCall {
+        x,
+        rows,
+        global_scale,
+        layout,
+        k,
+        count,
+        packed,
+        blocks,
+        table,
+    })
+}
+
+/// A checked call of [`nvfp4_quantize`]: `rows` is `x` as its rows, and the extents are their encoding's.
+struct Nvfp4QuantizeCall<'t> {
+    x: &'t Tensor,
+    rows: Tensor,
+    global_scale: &'t Tensor,
+    layout: ScaleLayout,
+    k: u32,
+    count: usize,
+    packed: usize,
+    blocks: usize,
+    table: (usize, usize),
+}
+
+impl Nvfp4QuantizeCall<'_> {
+    const OWNER: &'static str = "nvfp4_quantize";
+}
+
+impl Fused for Nvfp4QuantizeCall<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Self::Output> {
+        let Self {
+            rows,
+            global_scale,
+            layout,
+            k,
+            count,
+            packed,
+            blocks,
+            table,
+            ..
+        } = self;
         let (codes, scale) = encoded(&rows, global_scale)?;
 
         // Each element's nibble: the index of its magnitude among the eight, and its sign bit.
@@ -129,24 +177,35 @@ pub fn nvfp4_quantize(
                     .reshape(table)?
             }
         };
-        return Ok((values, scales));
+        Ok((values, scales))
     }
 
-    let values = ops::empty((count, packed), DType::U8)?;
-    let scales = ops::empty(table, DType::U8)?;
-    let factor = ops::empty(count, DType::F32)?;
+    fn launch(self) -> Result<Self::Output> {
+        let Self {
+            rows,
+            global_scale,
+            layout,
+            count,
+            packed,
+            table,
+            ..
+        } = self;
+        let values = ops::empty((count, packed), DType::U8)?;
+        let scales = ops::empty(table, DType::U8)?;
+        let factor = ops::empty(count, DType::F32)?;
 
-    launch_quantize(
-        &rows,
-        global_scale,
-        layout,
-        (
-            ops::operand(&values)?,
-            ops::operand(&scales)?,
-            ops::operand(&factor)?,
-        ),
-    )?;
-    Ok((values, scales))
+        launch_quantize(
+            &rows,
+            global_scale,
+            layout,
+            (
+                ops::operand(&values)?,
+                ops::operand(&scales)?,
+                ops::operand(&factor)?,
+            ),
+        )?;
+        Ok((values, scales))
+    }
 }
 
 /// The encoder's one launch: `rows`, `[m, k]`, encoded under `global_scale` into `encoded`, the

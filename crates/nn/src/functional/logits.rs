@@ -6,9 +6,9 @@
 //! logits a batch asks for is a row gather, which a caller writes as `index_select`.
 
 use ops::logits::{UnpadArgs, UnpadDescriptor, VocabUnpad};
-use tensor::{DType, Tensor};
+use tensor::{DType, Device, Tensor};
 
-use super::on_cpu;
+use super::{Fused, compute};
 use crate::error::{Error, Result};
 
 /// The element type of the logits a head returns: the sampler reads FP32.
@@ -25,7 +25,7 @@ pub const LOGITS: DType = DType::F32;
 /// When `gathered` is not a matrix of `ranks` equal shards that hold the vocabulary, or the
 /// operator refuses its arguments.
 pub fn vocab_unpad(gathered: &Tensor, vocabulary: u32, ranks: u32) -> Result<Tensor> {
-    const OWNER: &str = "vocab_unpad";
+    const OWNER: &str = VocabUnpadCall::OWNER;
 
     let &[rows, padded] = gathered.dims() else {
         return Err(Error::shape(
@@ -48,7 +48,48 @@ pub fn vocab_unpad(gathered: &Tensor, vocabulary: u32, ranks: u32) -> Result<Ten
         ));
     }
 
-    if on_cpu(gathered) {
+    compute(VocabUnpadCall {
+        gathered,
+        vocabulary,
+        ranks,
+        rows,
+        padded,
+        held,
+    })
+}
+
+/// A checked call of [`vocab_unpad`]: `gathered` is `[rows, padded]`, and each of its shards holds
+/// `held` vocabulary ids.
+struct VocabUnpadCall<'t> {
+    gathered: &'t Tensor,
+    vocabulary: u32,
+    ranks: u32,
+    rows: usize,
+    padded: usize,
+    held: usize,
+}
+
+impl VocabUnpadCall<'_> {
+    const OWNER: &'static str = "vocab_unpad";
+}
+
+impl Fused for VocabUnpadCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.gathered.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            gathered,
+            vocabulary,
+            rows,
+            padded,
+            held,
+            ..
+        } = self;
+        let shards = self.ranks as usize;
         let width = padded / shards;
         let blocks = gathered.reshape((shards, rows, width))?;
 
@@ -59,26 +100,35 @@ pub fn vocab_unpad(gathered: &Tensor, vocabulary: u32, ranks: u32) -> Result<Ten
             let count = held.min(vocabulary as usize - first);
             columns.push(blocks.get(shard)?.narrow(1, 0, count)?);
         }
-        return Ok(Tensor::cat(&columns, 1)?.to_dtype(LOGITS)?);
+        Ok(Tensor::cat(&columns, 1)?.to_dtype(LOGITS)?)
     }
 
-    let out = ops::empty((rows, vocabulary as usize), LOGITS)?;
-    ops::launch::<VocabUnpad>(
-        // The gathered width is a launch value that follows the deployment's rank count; the
-        // two element types are separate because the head's product is in the model's type and
-        // the sampler reads FP32: the logits are widened here, once.
-        &UnpadDescriptor::new(
-            gathered.dtype(),
-            LOGITS,
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            gathered,
             vocabulary,
-            u32::try_from(padded)
-                .map_err(|_| Error::shape(OWNER, "a gathered width above u32::MAX"))?,
-        ),
-        UnpadArgs {
-            gathered: ops::operand(gathered)?,
-            out: ops::operand(&out)?,
-            ranks,
-        },
-    )?;
-    Ok(out)
+            rows,
+            padded,
+            ..
+        } = self;
+        let out = ops::empty((rows, vocabulary as usize), LOGITS)?;
+        ops::launch::<VocabUnpad>(
+            // The gathered width is a launch value that follows the deployment's rank count; the
+            // two element types are separate because the head's product is in the model's type
+            // and the sampler reads FP32: the logits are widened here, once.
+            &UnpadDescriptor::new(
+                gathered.dtype(),
+                LOGITS,
+                vocabulary,
+                u32::try_from(padded)
+                    .map_err(|_| Error::shape(Self::OWNER, "a gathered width above u32::MAX"))?,
+            ),
+            UnpadArgs {
+                gathered: ops::operand(gathered)?,
+                out: ops::operand(&out)?,
+                ranks: self.ranks,
+            },
+        )?;
+        Ok(out)
+    }
 }

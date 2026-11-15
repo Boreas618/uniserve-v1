@@ -22,9 +22,9 @@ use ops::activation::{
     ActAndMul, ActAndMulArgs, ActAndMulDescriptor, Swiglu, SwigluArgs, SwigluDescriptor,
     ValueFirstSwiglu, ValueFirstSwigluArgs, ValueFirstSwigluDescriptor,
 };
-use tensor::{D, DType, Tensor};
+use tensor::{D, DType, Device, Tensor};
 
-use super::{as_rows, columns, like_rows, on_cpu, same_rows, vector};
+use super::{Fused, as_rows, columns, compute, like_rows, same_rows, vector};
 use crate::error::{Error, Result};
 
 pub use ops::activation::Activation;
@@ -98,31 +98,65 @@ pub fn act_and_mul(
     activation: Activation,
     stepwise: bool,
 ) -> Result<Tensor> {
-    const OWNER: &str = "act_and_mul";
+    const OWNER: &str = ActAndMulCall::OWNER;
 
     columns(OWNER, gate)?;
     same_rows(OWNER, "value half", value, gate)?;
 
-    if on_cpu(gate) {
-        let mut activated = activate(&gate.to_dtype(DType::F32)?, activation)?;
-        if stepwise {
+    compute(ActAndMulCall {
+        gate,
+        value,
+        activation,
+        stepwise,
+    })
+}
+
+/// A checked call of [`act_and_mul`].
+struct ActAndMulCall<'t> {
+    gate: &'t Tensor,
+    value: &'t Tensor,
+    activation: Activation,
+    stepwise: bool,
+}
+
+impl ActAndMulCall<'_> {
+    const OWNER: &'static str = "act_and_mul";
+}
+
+impl Fused for ActAndMulCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.gate.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self { gate, value, .. } = self;
+        let mut activated = activate(&gate.to_dtype(DType::F32)?, self.activation)?;
+        if self.stepwise {
             activated = activated.to_dtype(gate.dtype())?.to_dtype(DType::F32)?;
         }
         let product = (activated * value.to_dtype(DType::F32)?)?;
 
-        return Ok(product.to_dtype(gate.dtype())?);
+        Ok(product.to_dtype(gate.dtype())?)
     }
 
-    let (gate_rows, value_rows) = (as_rows(OWNER, gate)?, as_rows(OWNER, value)?);
-    let out = ops::empty(gate_rows.shape(), gate.dtype())?;
-    let args = ActAndMulArgs {
-        gate: ops::operand(&gate_rows)?,
-        value: ops::operand(&value_rows)?,
-        out: ops::operand(&out)?,
-    };
+    fn launch(self) -> Result<Tensor> {
+        let Self { gate, value, .. } = self;
+        let (gate_rows, value_rows) = (as_rows(Self::OWNER, gate)?, as_rows(Self::OWNER, value)?);
+        let out = ops::empty(gate_rows.shape(), gate.dtype())?;
+        let args = ActAndMulArgs {
+            gate: ops::operand(&gate_rows)?,
+            value: ops::operand(&value_rows)?,
+            out: ops::operand(&out)?,
+        };
 
-    ops::launch::<ActAndMul>(&ActAndMulDescriptor::of(&args, activation, stepwise)?, args)?;
-    like_rows(out, gate)
+        ops::launch::<ActAndMul>(
+            &ActAndMulDescriptor::of(&args, self.activation, self.stepwise)?,
+            args,
+        )?;
+        like_rows(out, gate)
+    }
 }
 
 /// The SwiGLU product in the value-product order over two halves:
@@ -142,7 +176,7 @@ pub fn swiglu(
     value_bias: Option<&Tensor>,
     gate_bias: Option<&Tensor>,
 ) -> Result<Tensor> {
-    const OWNER: &str = "swiglu";
+    const OWNER: &str = SwigluCall::OWNER;
 
     let width = columns(OWNER, value)?;
     same_rows(OWNER, "gate half", gate, value)?;
@@ -152,7 +186,34 @@ pub fn swiglu(
         }
     }
 
-    if on_cpu(value) {
+    compute(SwigluCall {
+        value,
+        gate,
+        value_bias,
+        gate_bias,
+    })
+}
+
+/// A checked call of [`swiglu`].
+struct SwigluCall<'t> {
+    value: &'t Tensor,
+    gate: &'t Tensor,
+    value_bias: Option<&'t Tensor>,
+    gate_bias: Option<&'t Tensor>,
+}
+
+impl SwigluCall<'_> {
+    const OWNER: &'static str = "swiglu";
+}
+
+impl Fused for SwigluCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.value.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
         let biased = |half: &Tensor, bias: Option<&Tensor>| -> Result<Tensor> {
             let half = half.to_dtype(DType::F32)?;
             match bias {
@@ -160,25 +221,31 @@ pub fn swiglu(
                 None => Ok(half),
             }
         };
-        let (value32, gate32) = (biased(value, value_bias)?, biased(gate, gate_bias)?);
+        let (value32, gate32) = (
+            biased(self.value, self.value_bias)?,
+            biased(self.gate, self.gate_bias)?,
+        );
         let denominator = (gate32.neg()?.exp()? + 1.0)?;
 
-        return Ok(((value32 * &gate32)? / denominator)?.to_dtype(value.dtype())?);
+        Ok(((value32 * &gate32)? / denominator)?.to_dtype(self.value.dtype())?)
     }
 
-    let (value_rows, gate_rows) = (as_rows(OWNER, value)?, as_rows(OWNER, gate)?);
-    let out = ops::empty(value_rows.shape(), value.dtype())?;
-    let args = SwigluArgs {
-        value: ops::operand(&value_rows)?,
-        gate: ops::operand(&gate_rows)?,
-        value_bias: value_bias.map(ops::operand).transpose()?,
-        gate_bias: gate_bias.map(ops::operand).transpose()?,
-        out: ops::operand(&out)?,
-        partials: None,
-    };
+    fn launch(self) -> Result<Tensor> {
+        let Self { value, gate, .. } = self;
+        let (value_rows, gate_rows) = (as_rows(Self::OWNER, value)?, as_rows(Self::OWNER, gate)?);
+        let out = ops::empty(value_rows.shape(), value.dtype())?;
+        let args = SwigluArgs {
+            value: ops::operand(&value_rows)?,
+            gate: ops::operand(&gate_rows)?,
+            value_bias: self.value_bias.map(ops::operand).transpose()?,
+            gate_bias: self.gate_bias.map(ops::operand).transpose()?,
+            out: ops::operand(&out)?,
+            partials: None,
+        };
 
-    ops::launch::<Swiglu>(&SwigluDescriptor::of(&args, false)?, args)?;
-    like_rows(out, value)
+        ops::launch::<Swiglu>(&SwigluDescriptor::of(&args, false)?, args)?;
+        like_rows(out, value)
+    }
 }
 
 /// The SwiGLU product in the value-product order over one packed projection: `value_gate` is
@@ -191,7 +258,7 @@ pub fn swiglu(
 /// When the packed rows are not an even width, the bias is not one vector of the packed width,
 /// or the operator refuses its arguments.
 pub fn value_first_swiglu(value_gate: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-    const OWNER: &str = "value_first_swiglu";
+    const OWNER: &str = ValueFirstSwigluCall::OWNER;
 
     let packed = columns(OWNER, value_gate)?;
     if !packed.is_multiple_of(2) {
@@ -200,35 +267,65 @@ pub fn value_first_swiglu(value_gate: &Tensor, bias: Option<&Tensor>) -> Result<
             format!("a packed row of {packed} elements does not hold two halves"),
         ));
     }
-    let width = packed / 2;
     if let Some(bias) = bias {
         vector(OWNER, "packed bias", bias, packed)?;
     }
 
-    let rows = as_rows(OWNER, value_gate)?;
-    if on_cpu(value_gate) {
-        let mut halves = rows.to_dtype(DType::F32)?;
-        if let Some(bias) = bias {
+    compute(ValueFirstSwigluCall {
+        value_gate,
+        bias,
+        width: (packed / 2) as usize,
+    })
+}
+
+/// A checked call of [`value_first_swiglu`]: `width` is the elements of one half of a packed row.
+struct ValueFirstSwigluCall<'t> {
+    value_gate: &'t Tensor,
+    bias: Option<&'t Tensor>,
+    width: usize,
+}
+
+impl ValueFirstSwigluCall<'_> {
+    const OWNER: &'static str = "value_first_swiglu";
+}
+
+impl Fused for ValueFirstSwigluCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.value_gate.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            value_gate, width, ..
+        } = self;
+        let mut halves = as_rows(Self::OWNER, value_gate)?.to_dtype(DType::F32)?;
+        if let Some(bias) = self.bias {
             halves = halves.broadcast_add(&bias.to_dtype(DType::F32)?)?;
         }
-        let value = halves.narrow(D::Minus1, 0, width as usize)?;
-        let gate = halves.narrow(D::Minus1, width as usize, width as usize)?;
+        let value = halves.narrow(D::Minus1, 0, width)?;
+        let gate = halves.narrow(D::Minus1, width, width)?;
         let denominator = (gate.neg()?.exp()? + 1.0)?;
 
         let product = ((value * &gate)? / denominator)?.to_dtype(value_gate.dtype())?;
-        return like_rows(product, value_gate);
+        like_rows(product, value_gate)
     }
 
-    let out = ops::empty((rows.dims()[0], width as usize), value_gate.dtype())?;
-    let args = ValueFirstSwigluArgs {
-        value_gate: ops::operand(&rows)?,
-        bias: bias.map(ops::operand).transpose()?,
-        out: ops::operand(&out)?,
-        partials: None,
-    };
+    fn launch(self) -> Result<Tensor> {
+        let Self { value_gate, .. } = self;
+        let rows = as_rows(Self::OWNER, value_gate)?;
+        let out = ops::empty((rows.dims()[0], self.width), value_gate.dtype())?;
+        let args = ValueFirstSwigluArgs {
+            value_gate: ops::operand(&rows)?,
+            bias: self.bias.map(ops::operand).transpose()?,
+            out: ops::operand(&out)?,
+            partials: None,
+        };
 
-    ops::launch::<ValueFirstSwiglu>(&ValueFirstSwigluDescriptor::of(&args, false)?, args)?;
-    like_rows(out, value_gate)
+        ops::launch::<ValueFirstSwiglu>(&ValueFirstSwigluDescriptor::of(&args, false)?, args)?;
+        like_rows(out, value_gate)
+    }
 }
 
 /// The periodic activation `x + sin²(α·x) / (α + 1e-9)`, one frequency per channel, evaluated in
@@ -243,7 +340,7 @@ pub fn value_first_swiglu(value_gate: &Tensor, bias: Option<&Tensor>) -> Result<
 /// When `x` is not three axes, `alpha` is not one frequency per channel, or the operator
 /// refuses its arguments.
 pub fn snake(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {
-    const OWNER: &str = "snake";
+    const OWNER: &str = SnakeCall::OWNER;
 
     let &[_, channels, _] = x.dims() else {
         return Err(Error::shape(
@@ -257,29 +354,57 @@ pub fn snake(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {
             format!("{} frequencies for {channels} channels", alpha.elem_count()),
         ));
     }
+    let channels = u32::try_from(channels)
+        .map_err(|_| Error::shape(OWNER, format!("{channels} channels exceed a launch value")))?;
 
-    if on_cpu(x) {
-        let x32 = x.to_dtype(DType::F32)?;
-        let alpha32 = alpha.to_dtype(DType::F32)?.reshape((1, channels, 1))?;
+    compute(SnakeCall { x, alpha, channels })
+}
+
+/// A checked call of [`snake`]: `channels` is the frequencies of `alpha`.
+struct SnakeCall<'t> {
+    x: &'t Tensor,
+    alpha: &'t Tensor,
+    channels: u32,
+}
+
+impl SnakeCall<'_> {
+    const OWNER: &'static str = "snake";
+}
+
+impl Fused for SnakeCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let x32 = self.x.to_dtype(DType::F32)?;
+        let alpha32 = self
+            .alpha
+            .to_dtype(DType::F32)?
+            .reshape((1, self.channels as usize, 1))?;
         let periodic = x32
             .broadcast_mul(&alpha32)?
             .sin()?
             .sqr()?
             .broadcast_div(&(alpha32 + 1e-9)?)?;
 
-        return Ok((x32 + periodic)?.to_dtype(x.dtype())?);
+        Ok((x32 + periodic)?.to_dtype(self.x.dtype())?)
     }
 
-    let channels = u32::try_from(channels)
-        .map_err(|_| Error::shape(OWNER, format!("{channels} channels exceed a launch value")))?;
-    let out = ops::empty(x.shape(), x.dtype())?;
-    ops::launch::<ops::snake::Snake>(
-        &ops::snake::Descriptor::new(x.dtype(), channels),
-        ops::snake::Args {
-            x: ops::operand(x)?,
-            alpha: ops::operand(alpha)?,
-            out: ops::operand(&out)?,
-        },
-    )?;
-    Ok(out)
+    fn launch(self) -> Result<Tensor> {
+        let Self { x, alpha, .. } = self;
+        let out = ops::empty(x.shape(), x.dtype())?;
+
+        ops::launch::<ops::snake::Snake>(
+            &ops::snake::Descriptor::new(x.dtype(), self.channels),
+            ops::snake::Args {
+                x: ops::operand(x)?,
+                alpha: ops::operand(alpha)?,
+                out: ops::operand(&out)?,
+            },
+        )?;
+        Ok(out)
+    }
 }

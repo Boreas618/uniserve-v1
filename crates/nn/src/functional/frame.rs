@@ -18,10 +18,10 @@ use ops::frame::{
     FrameMoments, FrameMomentsArgs, FrameMomentsDescriptor, FrameNormPad, FrameNormPadArgs,
     FrameNormPadDescriptor, frame_reduction_class,
 };
-use tensor::{DType, Tensor};
+use tensor::{DType, Device, Tensor};
 
 use super::conv::{Padding, causal_pad, packed};
-use super::on_cpu;
+use super::{Fused, compute};
 use crate::error::{Error, Result};
 
 /// The per-frame group normalization of `x`, its SiLU and its causal pad, as one operator:
@@ -47,9 +47,9 @@ pub fn frame_norm_pad(
     front: usize,
     padding: Padding,
 ) -> Result<Tensor> {
-    const OWNER: &str = "frame_norm_pad";
+    const OWNER: &str = FrameNormPadCall::OWNER;
 
-    let &[batches, channels, frames, height, width] = x.dims() else {
+    let &[_, channels, _, _, _] = x.dims() else {
         return Err(Error::shape(
             OWNER,
             format!("a frame is rank 5, not {:?}", x.dims()),
@@ -80,10 +80,54 @@ pub fn frame_norm_pad(
             }
         }
     }
-    let group_channels = channels / group_count;
-    let pixels = height * width;
+    compute(FrameNormPadCall {
+        x,
+        affine,
+        groups,
+        eps,
+        spatial,
+        front,
+        padding,
+    })
+}
 
-    if on_cpu(x) {
+/// A checked call of [`frame_norm_pad`].
+struct FrameNormPadCall<'t> {
+    x: &'t Tensor,
+    affine: Option<(&'t Tensor, &'t Tensor)>,
+    groups: u32,
+    eps: f32,
+    spatial: [usize; 4],
+    front: usize,
+    padding: Padding,
+}
+
+impl FrameNormPadCall<'_> {
+    const OWNER: &'static str = "frame_norm_pad";
+}
+
+impl Fused for FrameNormPadCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            x,
+            affine,
+            groups,
+            eps,
+            spatial,
+            front,
+            padding,
+        } = self;
+        let (batches, channels, frames, height, width) = x.dims5()?;
+        let group_count = groups as usize;
+        let group_channels = channels / group_count;
+        let pixels = height * width;
+
         // Each frame's groups as rows: `[n, d, groups, channels per group · pixels]`.
         let grouped = x
             .reshape((batches, group_count, group_channels, frames, pixels))?
@@ -124,63 +168,79 @@ pub fn frame_norm_pad(
                 .broadcast_add(&over_channels(bias)?)?,
             None => x.broadcast_sub(&mean)?.broadcast_mul(&rstd)?,
         };
-        return causal_pad(&normalized.silu()?, spatial, front, padding);
+        causal_pad(&normalized.silu()?, spatial, front, padding)
     }
 
-    let [top, bottom, left, right] = spatial;
-    let values = packed(x)?;
-    let statistics = (batches * frames, group_count);
-    let mean = ops::empty(statistics, DType::F32)?;
-    let rstd = ops::empty(statistics, DType::F32)?;
-    let out = ops::empty(
-        (
-            batches,
-            channels,
-            frames + front,
-            height + top + bottom,
-            width + left + right,
-        ),
-        DType::F32,
-    )?;
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            x,
+            affine,
+            groups,
+            eps,
+            spatial,
+            front,
+            padding,
+        } = self;
+        let (batches, channels, frames, height, width) = x.dims5()?;
+        let group_count = groups as usize;
+        let group_channels = channels / group_count;
+        let pixels = height * width;
 
-    // Both launches take the same reduction: a group's channels by a frame's pixels, padded to
-    // the power of two the kernel's tolerance is stated for.
-    let reduction = frame_reduction_class(group_channels as u64, pixels as u64);
+        let [top, bottom, left, right] = spatial;
+        let values = packed(x)?;
+        let statistics = (batches * frames, group_count);
+        let mean = ops::empty(statistics, DType::F32)?;
+        let rstd = ops::empty(statistics, DType::F32)?;
+        let out = ops::empty(
+            (
+                batches,
+                channels,
+                frames + front,
+                height + top + bottom,
+                width + left + right,
+            ),
+            DType::F32,
+        )?;
 
-    ops::launch::<FrameMoments>(
-        &FrameMomentsDescriptor {
-            dtype: x.dtype(),
-            reduction,
-            epsilon: Float::from(eps),
-        },
-        FrameMomentsArgs {
-            values: ops::operand(&values)?,
-            mean: ops::operand(&mean)?,
-            rstd: ops::operand(&rstd)?,
-            groups: u64::from(groups),
-        },
-    )?;
-    ops::launch::<FrameNormPad>(
-        &FrameNormPadDescriptor {
-            dtype: x.dtype(),
-            reduction,
-            channels_last: false,
-            centered: affine.is_none(),
-            single_pixel: pixels == 1,
-        },
-        FrameNormPadArgs {
-            values: ops::operand(&values)?,
-            mean: ops::operand(&mean)?,
-            rstd: ops::operand(&rstd)?,
-            weight: affine.map(|(weight, _)| ops::operand(weight)).transpose()?,
-            bias: affine.map(|(_, bias)| ops::operand(bias)).transpose()?,
-            out: ops::operand(&out)?,
-            groups: u64::from(groups),
-            top: top as u64,
-            left: left as u64,
-            front: front as u64,
-            reflect: padding == Padding::Reflect,
-        },
-    )?;
-    Ok(out)
+        // Both launches take the same reduction: a group's channels by a frame's pixels,
+        // padded to the power of two the kernel's tolerance is stated for.
+        let reduction = frame_reduction_class(group_channels as u64, pixels as u64);
+
+        ops::launch::<FrameMoments>(
+            &FrameMomentsDescriptor {
+                dtype: x.dtype(),
+                reduction,
+                epsilon: Float::from(eps),
+            },
+            FrameMomentsArgs {
+                values: ops::operand(&values)?,
+                mean: ops::operand(&mean)?,
+                rstd: ops::operand(&rstd)?,
+                groups: u64::from(groups),
+            },
+        )?;
+        ops::launch::<FrameNormPad>(
+            &FrameNormPadDescriptor {
+                dtype: x.dtype(),
+                reduction,
+                channels_last: false,
+                centered: affine.is_none(),
+                single_pixel: pixels == 1,
+            },
+            FrameNormPadArgs {
+                values: ops::operand(&values)?,
+                mean: ops::operand(&mean)?,
+                rstd: ops::operand(&rstd)?,
+                weight: affine.map(|(weight, _)| ops::operand(weight)).transpose()?,
+                bias: affine.map(|(_, bias)| ops::operand(bias)).transpose()?,
+                out: ops::operand(&out)?,
+                groups: u64::from(groups),
+                top: top as u64,
+                left: left as u64,
+                front: front as u64,
+                reflect: padding == Padding::Reflect,
+            },
+        )?;
+        Ok(out)
+    }
 }

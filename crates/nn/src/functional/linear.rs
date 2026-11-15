@@ -31,7 +31,7 @@ use ops::reduce::{self, Function, Reduce};
 use tensor::{D, DType, Device, Tensor};
 
 use super::nvfp4::{decoded, encoded, launch_quantize};
-use super::{ACCUMULATE, as_rows, columns, like_rows, on_cpu, vector};
+use super::{ACCUMULATE, Fused, as_rows, columns, compute, like_rows, vector};
 use crate::error::{Error, Result};
 
 pub use ops::gemm::WeightOrder;
@@ -52,7 +52,7 @@ pub fn linear(
     bias: Option<&Tensor>,
     order: WeightOrder,
 ) -> Result<Tensor> {
-    const OWNER: &str = "linear";
+    const OWNER: &str = LinearCall::OWNER;
 
     let k = columns(OWNER, x)?;
     let &[first, second] = weight.dims() else {
@@ -80,7 +80,47 @@ pub fn linear(
     }
 
     let rows = as_rows(OWNER, x)?;
-    if on_cpu(x) {
+
+    compute(LinearCall {
+        x,
+        rows,
+        weight,
+        bias,
+        order,
+        n,
+    })
+}
+
+/// A checked call of [`linear`]: `rows` is `x` as its rows, and `n` the output channels.
+struct LinearCall<'t> {
+    x: &'t Tensor,
+    rows: Tensor,
+    weight: &'t Tensor,
+    bias: Option<&'t Tensor>,
+    order: WeightOrder,
+    n: u32,
+}
+
+impl LinearCall<'_> {
+    const OWNER: &'static str = "linear";
+}
+
+impl Fused for LinearCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Self::Output> {
+        let Self {
+            x,
+            rows,
+            weight,
+            bias,
+            order,
+            ..
+        } = self;
         let weight = weight.to_dtype(ACCUMULATE)?;
         let weight = match order {
             WeightOrder::KxN => weight,
@@ -91,19 +131,29 @@ pub fn linear(
         if let Some(bias) = bias {
             product = product.broadcast_add(&bias.to_dtype(ACCUMULATE)?)?;
         }
-        return like_rows(product.to_dtype(x.dtype())?, x);
+        like_rows(product.to_dtype(x.dtype())?, x)
     }
 
-    let out = ops::empty((rows.dims()[0], n as usize), x.dtype())?;
-    let args = Args {
-        input: ops::operand(&rows)?,
-        weight: ops::operand(weight)?,
-        bias: bias.map(ops::operand).transpose()?,
-        out: ops::operand(&out)?,
-        alpha: 1.0,
-    };
-    ops::launch::<Gemm>(&Descriptor::of(&args, order)?, args)?;
-    like_rows(out, x)
+    fn launch(self) -> Result<Self::Output> {
+        let Self {
+            x,
+            rows,
+            weight,
+            bias,
+            order,
+            n,
+        } = self;
+        let out = ops::empty((rows.dims()[0], n as usize), x.dtype())?;
+        let args = Args {
+            input: ops::operand(&rows)?,
+            weight: ops::operand(weight)?,
+            bias: bias.map(ops::operand).transpose()?,
+            out: ops::operand(&out)?,
+            alpha: 1.0,
+        };
+        ops::launch::<Gemm>(&Descriptor::of(&args, order)?, args)?;
+        like_rows(out, x)
+    }
 }
 
 /// `x · weightᵀ + bias` over a per-tensor FP8 weight:
@@ -130,7 +180,7 @@ pub fn linear_fp8(
     encode: &Tensor,
     alpha: &Tensor,
 ) -> Result<Tensor> {
-    const OWNER: &str = "linear_fp8";
+    const OWNER: &str = LinearFp8Call::OWNER;
 
     let k = columns(OWNER, x)?;
     let &[n, contraction] = weight.dims() else {
@@ -157,7 +207,50 @@ pub fn linear_fp8(
     factor(OWNER, "alpha", alpha)?;
 
     let rows = as_rows(OWNER, x)?;
-    if on_cpu(x) {
+
+    compute(LinearFp8Call {
+        x,
+        rows,
+        weight,
+        bias,
+        encode,
+        alpha,
+        n,
+    })
+}
+
+/// A checked call of [`linear_fp8`]: `rows` is `x` as its rows, and `n` the output channels.
+struct LinearFp8Call<'t> {
+    x: &'t Tensor,
+    rows: Tensor,
+    weight: &'t Tensor,
+    bias: Option<&'t Tensor>,
+    encode: &'t Tensor,
+    alpha: &'t Tensor,
+    n: u32,
+}
+
+impl LinearFp8Call<'_> {
+    const OWNER: &'static str = "linear_fp8";
+}
+
+impl Fused for LinearFp8Call<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Self::Output> {
+        let Self {
+            x,
+            rows,
+            weight,
+            bias,
+            encode,
+            alpha,
+            ..
+        } = self;
         let limit = f64::from(E4M3_MAX);
         let encoded = rows
             .to_dtype(ACCUMULATE)?
@@ -172,34 +265,45 @@ pub fn linear_fp8(
         if let Some(bias) = bias {
             product = product.broadcast_add(&bias.to_dtype(ACCUMULATE)?)?;
         }
-        return like_rows(product.to_dtype(x.dtype())?, x);
+        like_rows(product.to_dtype(x.dtype())?, x)
     }
 
-    // 1. The activation's codes, each row encoded under the one multiplier.
-    let (m, k) = (rows.dims()[0], rows.dims()[1]);
-    let codes = ops::empty((m, k), DType::F8E4M3)?;
-    ops::launch::<Fp8Quantize>(
-        &Fp8QuantizeDescriptor::new(x.dtype()),
-        Fp8QuantizeArgs {
-            input: ops::operand(&rows)?,
-            out: ops::operand(&codes)?,
-            encode: ops::operand(encode)?,
-        },
-    )?;
+    fn launch(self) -> Result<Self::Output> {
+        let Self {
+            x,
+            rows,
+            weight,
+            bias,
+            encode,
+            alpha,
+            n,
+        } = self;
+        // 1. The activation's codes, each row encoded under the one multiplier.
+        let (m, k) = (rows.dims()[0], rows.dims()[1]);
+        let codes = ops::empty((m, k), DType::F8E4M3)?;
+        ops::launch::<Fp8Quantize>(
+            &Fp8QuantizeDescriptor::new(x.dtype()),
+            Fp8QuantizeArgs {
+                input: ops::operand(&rows)?,
+                out: ops::operand(&codes)?,
+                encode: ops::operand(encode)?,
+            },
+        )?;
 
-    // 2. The product over the two encodings.
-    let out = ops::empty((m, n as usize), x.dtype())?;
-    ops::launch::<Fp8Gemm>(
-        &Fp8GemmDescriptor::new(x.dtype(), bias.is_some()),
-        Fp8GemmArgs {
-            input: ops::operand(&codes)?,
-            weight: ops::operand(weight)?,
-            bias: bias.map(ops::operand).transpose()?,
-            out: ops::operand(&out)?,
-            alpha: ops::operand(alpha)?,
-        },
-    )?;
-    like_rows(out, x)
+        // 2. The product over the two encodings.
+        let out = ops::empty((m, n as usize), x.dtype())?;
+        ops::launch::<Fp8Gemm>(
+            &Fp8GemmDescriptor::new(x.dtype(), bias.is_some()),
+            Fp8GemmArgs {
+                input: ops::operand(&codes)?,
+                weight: ops::operand(weight)?,
+                bias: bias.map(ops::operand).transpose()?,
+                out: ops::operand(&out)?,
+                alpha: ops::operand(alpha)?,
+            },
+        )?;
+        like_rows(out, x)
+    }
 }
 
 /// The two factors a product over `x` encoded at its own measured scale reads, against a weight
@@ -224,7 +328,7 @@ pub fn linear_fp8(
 /// When `x` is not floating or has no element, `weight_amax` is not one FP32 number, or an
 /// operator refuses its arguments.
 pub fn dynamic_scales(x: &Tensor, weight_amax: &Tensor, range: f32) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = "dynamic_scales";
+    const OWNER: &str = DynamicScalesCall::OWNER;
 
     if !matches!(x.dtype(), DType::BF16 | DType::F16 | DType::F32) {
         return Err(Error::shape(
@@ -245,7 +349,42 @@ pub fn dynamic_scales(x: &Tensor, weight_amax: &Tensor, range: f32) -> Result<(T
         ));
     }
 
-    if on_cpu(x) {
+    compute(DynamicScalesCall {
+        x,
+        rows,
+        weight_amax,
+        range,
+        count,
+    })
+}
+
+/// A checked call of [`dynamic_scales`]: `rows` is `x` as its `count` rows.
+struct DynamicScalesCall<'t> {
+    x: &'t Tensor,
+    rows: Tensor,
+    weight_amax: &'t Tensor,
+    range: f32,
+    count: usize,
+}
+
+impl DynamicScalesCall<'_> {
+    const OWNER: &'static str = "dynamic_scales";
+}
+
+impl Fused for DynamicScalesCall<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Self::Output> {
+        let Self {
+            rows,
+            weight_amax,
+            range,
+            ..
+        } = self;
         let amax = rows
             .to_dtype(ACCUMULATE)?
             .abs()?
@@ -259,35 +398,44 @@ pub fn dynamic_scales(x: &Tensor, weight_amax: &Tensor, range: f32) -> Result<(T
 
         let encode = Tensor::new(&[range / amax], &Device::Cpu)?;
         let alpha = Tensor::new(&[(amax / range) * (weight / range)], &Device::Cpu)?;
-        return Ok((encode, alpha));
+        Ok((encode, alpha))
     }
 
-    // 1. Each row's largest magnitude, in the activation's own type: a magnitude is exact. The
-    //    fold is the tensor primitives' own reduction, so every projection's rows are folded by
-    //    the module of one key.
-    let partials = ops::empty((count, 1), x.dtype())?;
-    let fold = reduce::Args {
-        x: ops::operand(&rows)?,
-        out: ops::operand(&partials)?,
-        axes: &[1],
-    };
-    ops::launch::<Reduce>(&reduce::Descriptor::of(Function::AbsMax, &fold), fold)?;
-
-    // 2. The rows' largest, and the two factors from it and the weight's.
-    let encode = ops::empty(1, DType::F32)?;
-    let alpha = ops::empty(1, DType::F32)?;
-    ops::launch::<DynamicScale>(
-        &dynamic_scale::Descriptor::new(x.dtype()),
-        dynamic_scale::Args {
-            partials: ops::operand(&partials.flatten_all()?)?,
-            weight_amax: ops::operand(weight_amax)?,
-            encode: ops::operand(&encode)?,
-            alpha: ops::operand(&alpha)?,
+    fn launch(self) -> Result<Self::Output> {
+        let Self {
+            x,
+            rows,
+            weight_amax,
             range,
-            floor: FLOOR,
-        },
-    )?;
-    Ok((encode, alpha))
+            count,
+        } = self;
+        // 1. Each row's largest magnitude, in the activation's own type: a magnitude is exact. The
+        //    fold is the tensor primitives' own reduction, so every projection's rows are folded by
+        //    the module of one key.
+        let partials = ops::empty((count, 1), x.dtype())?;
+        let fold = reduce::Args {
+            x: ops::operand(&rows)?,
+            out: ops::operand(&partials)?,
+            axes: &[1],
+        };
+        ops::launch::<Reduce>(&reduce::Descriptor::of(Function::AbsMax, &fold), fold)?;
+
+        // 2. The rows' largest, and the two factors from it and the weight's.
+        let encode = ops::empty(1, DType::F32)?;
+        let alpha = ops::empty(1, DType::F32)?;
+        ops::launch::<DynamicScale>(
+            &dynamic_scale::Descriptor::new(x.dtype()),
+            dynamic_scale::Args {
+                partials: ops::operand(&partials.flatten_all()?)?,
+                weight_amax: ops::operand(weight_amax)?,
+                encode: ops::operand(&encode)?,
+                alpha: ops::operand(&alpha)?,
+                range,
+                floor: FLOOR,
+            },
+        )?;
+        Ok((encode, alpha))
+    }
 }
 
 /// Refuses `tensor`, the factor `what` of an encoded product, unless it is one FP32 number.
@@ -407,11 +555,14 @@ pub fn linear_nvfp4(
         return Err(refuse("a projection of no rows has no kernel".to_owned()));
     }
 
-    let product = if on_cpu(x) {
-        nvfp4_formula(&rows, values, scales, input_scale, alpha)?.to_dtype(x.dtype())?
-    } else {
-        packed_product(&rows, values, scales, input_scale, alpha)?
-    };
+    let product = compute(LinearNvfp4Call {
+        x,
+        rows,
+        values,
+        scales,
+        input_scale,
+        alpha,
+    })?;
 
     // The bias joins the rounded product in the activation's type.
     let out = match bias {
@@ -419,6 +570,48 @@ pub fn linear_nvfp4(
         None => product,
     };
     like_rows(out, x)
+}
+
+/// A checked call of [`linear_nvfp4`]'s product, before its bias: `rows` is `x` as its rows.
+struct LinearNvfp4Call<'t> {
+    x: &'t Tensor,
+    rows: Tensor,
+    values: &'t Tensor,
+    scales: &'t Tensor,
+    input_scale: &'t Tensor,
+    alpha: &'t Tensor,
+}
+
+impl Fused for LinearNvfp4Call<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Self::Output> {
+        let Self {
+            x,
+            rows,
+            values,
+            scales,
+            input_scale,
+            alpha,
+        } = self;
+        Ok(nvfp4_formula(&rows, values, scales, input_scale, alpha)?.to_dtype(x.dtype())?)
+    }
+
+    fn launch(self) -> Result<Self::Output> {
+        let Self {
+            rows,
+            values,
+            scales,
+            input_scale,
+            alpha,
+            ..
+        } = self;
+        packed_product(&rows, values, scales, input_scale, alpha)
+    }
 }
 
 /// The packed product of [`linear_nvfp4`] on a device: `rows`, the `[m, k]` activation, encoded

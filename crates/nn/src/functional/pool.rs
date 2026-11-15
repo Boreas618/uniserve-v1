@@ -11,7 +11,7 @@
 use ops::adaptive_pool::{AdaptivePool, Args, Descriptor};
 use tensor::{DType, Device, Tensor};
 
-use super::on_cpu;
+use super::{Fused, compute};
 use crate::error::{Error, Result};
 
 /// `x`, `[batch, rows, columns]`, pooled to `[batch, 1, size[1]]` in its element type: element
@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 /// When `x` is not three axes, the output is more than one row or no column, or the operator
 /// refuses its arguments.
 pub fn adaptive_avg_pool2d(x: &Tensor, size: [u32; 2]) -> Result<Tensor> {
-    const OWNER: &str = "adaptive_avg_pool2d";
+    const OWNER: &str = AdaptiveAvgPool2dCall::OWNER;
 
     let [1, output] = size else {
         return Err(Error::shape(
@@ -45,9 +45,41 @@ pub fn adaptive_avg_pool2d(x: &Tensor, size: [u32; 2]) -> Result<Tensor> {
     };
     let (heads, columns, outputs) = (field(rows)?, field(width)?, field(output as usize)?);
 
-    if on_cpu(x) {
+    compute(AdaptiveAvgPool2dCall {
+        x,
+        batch,
+        heads,
+        columns,
+        outputs,
+    })
+}
+
+/// A checked call of [`adaptive_avg_pool2d`]: `x` is `[batch, heads, columns]`, pooled to
+/// `outputs` columns.
+struct AdaptiveAvgPool2dCall<'t> {
+    x: &'t Tensor,
+    batch: usize,
+    heads: u32,
+    columns: u32,
+    outputs: u32,
+}
+
+impl AdaptiveAvgPool2dCall<'_> {
+    const OWNER: &'static str = "adaptive_avg_pool2d";
+}
+
+impl Fused for AdaptiveAvgPool2dCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.x.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let x = self.x;
+        let (rows, width) = (self.heads as usize, self.columns as usize);
         let x32 = x.to_dtype(DType::F32)?;
-        let outputs = outputs as usize;
+        let outputs = self.outputs as usize;
 
         let mut pooled = Vec::with_capacity(outputs);
         for index in 0..outputs {
@@ -58,20 +90,24 @@ pub fn adaptive_avg_pool2d(x: &Tensor, size: [u32; 2]) -> Result<Tensor> {
 
             pooled.push(window.broadcast_div(&count)?);
         }
-        return Ok(Tensor::cat(&pooled, 2)?.to_dtype(x.dtype())?);
+        Ok(Tensor::cat(&pooled, 2)?.to_dtype(x.dtype())?)
     }
 
-    // The operator reads `[rows, heads, width]` contiguous and writes `[rows, output]`: the
-    // input rows are its heads and the columns its width.
-    let values = x.contiguous()?;
-    let out = ops::empty((batch, outputs as usize), x.dtype())?;
+    fn launch(self) -> Result<Tensor> {
+        let x = self.x;
 
-    ops::launch::<AdaptivePool>(
-        &Descriptor::new(x.dtype(), heads, columns, outputs),
-        Args {
-            x: ops::operand(&values)?,
-            out: ops::operand(&out)?,
-        },
-    )?;
-    Ok(out.unsqueeze(1)?)
+        // The operator reads `[rows, heads, width]` contiguous and writes `[rows, output]`: the
+        // input rows are its heads and the columns its width.
+        let values = x.contiguous()?;
+        let out = ops::empty((self.batch, self.outputs as usize), x.dtype())?;
+
+        ops::launch::<AdaptivePool>(
+            &Descriptor::new(x.dtype(), self.heads, self.columns, self.outputs),
+            Args {
+                x: ops::operand(&values)?,
+                out: ops::operand(&out)?,
+            },
+        )?;
+        Ok(out.unsqueeze(1)?)
+    }
 }

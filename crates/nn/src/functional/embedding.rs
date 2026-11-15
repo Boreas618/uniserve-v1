@@ -7,9 +7,9 @@
 //! a mask, and two implementations of it agree bit for bit.
 
 use ops::embedding::{Args, Descriptor, Embedding};
-use tensor::Tensor;
+use tensor::{Device, Tensor};
 
-use super::{columns, on_cpu};
+use super::{Fused, columns, compute};
 use crate::collective::Split;
 use crate::error::{Error, Result};
 
@@ -36,7 +36,7 @@ pub fn vocabulary_shard(vocabulary: u32, split: Split) -> (u32, u32) {
 /// When `ids` is not one column or `weight` is not a matrix, or the operator refuses its
 /// arguments.
 pub fn embedding(ids: &Tensor, weight: &Tensor, first: u32) -> Result<Tensor> {
-    const OWNER: &str = "embedding";
+    const OWNER: &str = EmbeddingCall::OWNER;
 
     let &[tokens] = ids.dims() else {
         return Err(Error::shape(
@@ -54,7 +54,47 @@ pub fn embedding(ids: &Tensor, weight: &Tensor, first: u32) -> Result<Tensor> {
     let rows = u32::try_from(rows)
         .map_err(|_| Error::shape(OWNER, "more vocabulary rows than a descriptor holds"))?;
 
-    if on_cpu(ids) {
+    compute(EmbeddingCall {
+        ids,
+        weight,
+        first,
+        tokens,
+        hidden,
+        rows,
+    })
+}
+
+/// A checked call of [`embedding`]: `tokens` ids into a shard of `rows` rows of `hidden`.
+struct EmbeddingCall<'t> {
+    ids: &'t Tensor,
+    weight: &'t Tensor,
+    first: u32,
+    tokens: usize,
+    hidden: u32,
+    rows: u32,
+}
+
+impl EmbeddingCall<'_> {
+    const OWNER: &'static str = "embedding";
+}
+
+impl Fused for EmbeddingCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.ids.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            ids,
+            weight,
+            first,
+            tokens,
+            hidden,
+            rows,
+        } = self;
+
         // A rank past the vocabulary's end holds no row: every token is outside its shard.
         if rows == 0 {
             return Ok(Tensor::zeros(
@@ -75,20 +115,31 @@ pub fn embedding(ids: &Tensor, weight: &Tensor, first: u32) -> Result<Tensor> {
 
         let outside = (ids.lt(first)? + ids.gt(last)?)?;
         let mask = outside.unsqueeze(1)?.broadcast_as(gathered.shape())?;
-        return Ok(mask.where_cond(&gathered.zeros_like()?, &gathered)?);
+        Ok(mask.where_cond(&gathered.zeros_like()?, &gathered)?)
     }
 
-    let out = ops::empty((tokens, hidden as usize), weight.dtype())?;
-    ops::launch::<Embedding>(
-        // The token count is not in the descriptor: the ids' length is a launch value.
-        &Descriptor::new(weight.dtype(), ids.dtype(), hidden, first, rows),
-        Args {
-            ids: ops::operand(ids)?,
-            weight: ops::operand(weight)?,
-            out: ops::operand(&out)?,
-        },
-    )?;
-    Ok(out)
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            ids,
+            weight,
+            first,
+            tokens,
+            hidden,
+            rows,
+        } = self;
+
+        let out = ops::empty((tokens, hidden as usize), weight.dtype())?;
+        ops::launch::<Embedding>(
+            // The token count is not in the descriptor: the ids' length is a launch value.
+            &Descriptor::new(weight.dtype(), ids.dtype(), hidden, first, rows),
+            Args {
+                ids: ops::operand(ids)?,
+                weight: ops::operand(weight)?,
+                out: ops::operand(&out)?,
+            },
+        )?;
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

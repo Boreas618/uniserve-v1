@@ -3,18 +3,27 @@
 //! A fused operator is a computation the kernel library has one kernel for where a composition of
 //! tensor operations would launch several and round between them: a normalization with its row
 //! statistics, a gated activation, a product over packed weights, the routed products of a
-//! mixture of experts. Each is one function with two bodies that state the same arithmetic:
+//! mixture of experts. Each is one function that checks its call and states it as a value of a
+//! call type implementing [`Fused`], whose two implementations state the same arithmetic on the
+//! two kinds of device a tensor is on:
 //!
-//! - on **CPU tensors** it computes its formula with tensor operations, in FP32, rounding where
-//!   the kernel rounds. This is what a host check runs and the reference a device check compares
-//!   with;
-//! - on **tensors of the device backend** it takes its output from the context's allocator
-//!   (`ops::empty`), states its arguments (`ops::operand`) and makes one launch
-//!   (`ops::launch`) of the operator, with the descriptor computed from the tensors' element
-//!   types and widths. Under a meta context the launch states its key and computes nothing.
+//! - the **CPU device** computes the operator's formula with the tensor library's operations, in
+//!   FP32, rounding where the kernel rounds ([`Fused::cpu`]);
+//! - the **device backend** takes the outputs from the context's allocator (`ops::empty`),
+//!   states the arguments (`ops::operand`) and launches the operator (`ops::launch`), with the
+//!   descriptor the operator derives from the call ([`Fused::launch`]). Under a meta context the
+//!   launch states its key and computes nothing.
 //!
-//! Which body runs follows from the device of the first tensor argument; mixing devices is
-//! refused by the tensor operation or the operand that meets the other device.
+//! [`compute`] is the one place the implementation is chosen, by the device of the call's tensors;
+//! mixing devices is refused by the tensor operation or the operand that meets the other device.
+//!
+//! The device backend's arguments are device operands without the tensors they view, and its
+//! launches are capture-safe calls of compiled kernels recorded in launch tables; the CPU device
+//! computes new tensors through the tensor library's own CPU backend. A call of several launches
+//! (an encoding and the product that reads it, a normalization that narrows into another
+//! operator's output) states its mathematics once on the CPU, as the composition the function
+//! promises. So both implementations are the function's, beside each other, and not a CPU
+//! operator of `ops` per kernel.
 //!
 //! What is not here is every computation that is a composition of generic tensor operations: a
 //! transpose, an affine form, a residual add, a cast, a row gather. A model writes those as
@@ -106,9 +115,33 @@ pub use vsa::{
 /// The accumulation element type of every floating-point operator here.
 pub(crate) const ACCUMULATE: DType = DType::F32;
 
-/// Whether `x` is computed on the CPU device, by a function's formula in tensor operations.
-pub(crate) fn on_cpu(x: &Tensor) -> bool {
-    matches!(x.device(), Device::Cpu)
+/// One checked call of a fused operator, with its implementation on each kind of device.
+///
+/// A function checks its arguments once, then states the call as a value of a type implementing
+/// this trait and hands it to [`compute`]. Both implementations keep the function's contract: the
+/// same output shapes and element types, and the same rounding points.
+pub(crate) trait Fused {
+    /// What the call returns.
+    type Output;
+
+    /// The device the call's tensors are on.
+    fn device(&self) -> &Device;
+
+    /// The call on CPU tensors: the operator's formula in the tensor library's operations.
+    fn cpu(self) -> Result<Self::Output>;
+
+    /// The call on tensors of the device backend: the operator's launches over outputs from the
+    /// context's allocator.
+    fn launch(self) -> Result<Self::Output>;
+}
+
+/// Computes `call` by the implementation of its tensors' device: the one place a fused operator's
+/// implementation is chosen.
+pub(crate) fn compute<F: Fused>(call: F) -> Result<F::Output> {
+    match call.device() {
+        Device::Cpu => call.cpu(),
+        Device::Backend(_) => call.launch(),
+    }
 }
 
 /// The width of `x`'s rows, its last extent, as a descriptor states it.

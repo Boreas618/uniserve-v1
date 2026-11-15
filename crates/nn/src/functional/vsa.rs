@@ -38,7 +38,7 @@ use ops::vsa::{
 };
 use tensor::{D, DType, Device, Tensor};
 
-use super::on_cpu;
+use super::{Fused, compute};
 use crate::error::{Error, Result};
 
 /// The rows one program of a VSA kernel handles: a tile is whole blocks of them, and on the
@@ -209,7 +209,7 @@ pub fn vsa_prepare_tiles_(
     rotated: u32,
     eps: f32,
 ) -> Result<([Tensor; 3], Tensor)> {
-    const OWNER: &str = "vsa_prepare_tiles_";
+    const OWNER: &str = PrepareTilesCall::OWNER;
 
     let [query, key, value] = rows;
     let (tiles, tile, heads, width) = tile_rows_of(OWNER, &query, tile_rows)?;
@@ -246,7 +246,54 @@ pub fn vsa_prepare_tiles_(
         ));
     }
 
-    if on_cpu(&query) {
+    compute(PrepareTilesCall {
+        rows: [query, key, value],
+        gains,
+        factors,
+        sizes,
+        tile_rows,
+        rotated,
+        eps,
+        extents: (tiles, tile, heads, width),
+    })
+}
+
+/// A checked call of [`vsa_prepare_tiles_`]: `extents` are the projections' tiles, rows per
+/// tile, heads and head width.
+struct PrepareTilesCall<'t> {
+    rows: [Tensor; 3],
+    gains: Option<(&'t Tensor, &'t Tensor)>,
+    factors: Option<(&'t Tensor, &'t Tensor)>,
+    sizes: &'t Tensor,
+    tile_rows: u32,
+    rotated: u32,
+    eps: f32,
+    extents: (usize, usize, usize, usize),
+}
+
+impl PrepareTilesCall<'_> {
+    const OWNER: &'static str = "vsa_prepare_tiles_";
+}
+
+impl Fused for PrepareTilesCall<'_> {
+    type Output = ([Tensor; 3], Tensor);
+
+    fn device(&self) -> &Device {
+        self.rows[0].device()
+    }
+
+    fn cpu(self) -> Result<([Tensor; 3], Tensor)> {
+        let Self {
+            rows: [query, key, value],
+            gains,
+            factors,
+            sizes,
+            rotated,
+            eps,
+            extents: (tiles, tile, heads, width),
+            ..
+        } = self;
+        let turned = rotated as usize;
         let dtype = query.dtype();
         let mut prepared = Vec::with_capacity(3);
 
@@ -281,55 +328,69 @@ pub fn vsa_prepare_tiles_(
         for (rows, stored) in [&query, &key, &value].into_iter().zip(&prepared) {
             rows.slice_set(&stored.to_dtype(dtype)?, 0, 0)?;
         }
-        return Ok(([query, key, value], Tensor::stack(&means, 0)?));
+        Ok(([query, key, value], Tensor::stack(&means, 0)?))
     }
 
-    let pooled = ops::empty((3, tiles, heads, width), DType::F32)?;
-    let (query_rows, key_rows, value_rows) = (
-        ops::operand(&query)?,
-        ops::operand(&key)?,
-        ops::operand(&value)?,
-    );
-    let cosine = factors
-        .map(|(cosine, _)| ops::operand(cosine))
-        .transpose()?;
-    let means = |index: usize| -> Result<ops::Operand> { Ok(ops::operand(&pooled.get(index)?)?) };
-
-    ops::launch::<VsaPrepareTiles>(
-        // The strides are compiled into the kernel, so they are stated from the layouts the
-        // projections have.
-        &PrepareTilesDescriptor {
-            dtype: query.dtype(),
-            heads: field(OWNER, heads)?,
-            width: field(OWNER, width)?,
-            rotated,
+    fn launch(self) -> Result<([Tensor; 3], Tensor)> {
+        let Self {
+            rows: [query, key, value],
+            gains,
+            factors,
+            sizes,
             tile_rows,
-            block_rows: BLOCK_ROWS,
-            epsilon: Float::from(eps),
-            norm: gains.is_some(),
-            query_row_stride: query_rows.stride(0),
-            query_head_stride: query_rows.stride(1),
-            key_row_stride: key_rows.stride(0),
-            key_head_stride: key_rows.stride(1),
-            value_row_stride: value_rows.stride(0),
-            value_head_stride: value_rows.stride(1),
-            factor_stride: cosine.as_ref().map_or(0, |table| table.stride(0)),
-        },
-        PrepareTilesArgs {
-            query: query_rows,
-            key: key_rows,
-            value: value_rows,
-            query_weight: gains.map(|(query, _)| ops::operand(query)).transpose()?,
-            key_weight: gains.map(|(_, key)| ops::operand(key)).transpose()?,
-            cosine,
-            sine: factors.map(|(_, sine)| ops::operand(sine)).transpose()?,
-            sizes: ops::operand(sizes)?,
-            pooled_query: means(0)?,
-            pooled_key: means(1)?,
-            pooled_value: means(2)?,
-        },
-    )?;
-    Ok(([query, key, value], pooled))
+            rotated,
+            eps,
+            extents: (tiles, _, heads, width),
+        } = self;
+
+        let pooled = ops::empty((3, tiles, heads, width), DType::F32)?;
+        let (query_rows, key_rows, value_rows) = (
+            ops::operand(&query)?,
+            ops::operand(&key)?,
+            ops::operand(&value)?,
+        );
+        let cosine = factors
+            .map(|(cosine, _)| ops::operand(cosine))
+            .transpose()?;
+        let means =
+            |index: usize| -> Result<ops::Operand> { Ok(ops::operand(&pooled.get(index)?)?) };
+
+        ops::launch::<VsaPrepareTiles>(
+            // The strides are compiled into the kernel, so they are stated from the layouts the
+            // projections have.
+            &PrepareTilesDescriptor {
+                dtype: query.dtype(),
+                heads: field(Self::OWNER, heads)?,
+                width: field(Self::OWNER, width)?,
+                rotated,
+                tile_rows,
+                block_rows: BLOCK_ROWS,
+                epsilon: Float::from(eps),
+                norm: gains.is_some(),
+                query_row_stride: query_rows.stride(0),
+                query_head_stride: query_rows.stride(1),
+                key_row_stride: key_rows.stride(0),
+                key_head_stride: key_rows.stride(1),
+                value_row_stride: value_rows.stride(0),
+                value_head_stride: value_rows.stride(1),
+                factor_stride: cosine.as_ref().map_or(0, |table| table.stride(0)),
+            },
+            PrepareTilesArgs {
+                query: query_rows,
+                key: key_rows,
+                value: value_rows,
+                query_weight: gains.map(|(query, _)| ops::operand(query)).transpose()?,
+                key_weight: gains.map(|(_, key)| ops::operand(key)).transpose()?,
+                cosine,
+                sine: factors.map(|(_, sine)| ops::operand(sine)).transpose()?,
+                sizes: ops::operand(sizes)?,
+                pooled_query: means(0)?,
+                pooled_key: means(1)?,
+                pooled_value: means(2)?,
+            },
+        )?;
+        Ok(([query, key, value], pooled))
+    }
 }
 
 /// The pooled tile similarities a selection ranks and a compression weighs:
@@ -342,7 +403,7 @@ pub fn vsa_prepare_tiles_(
 ///
 /// When the means are not FP32 tiles of one head shape, or the operator refuses its arguments.
 pub fn vsa_scores(pooled_query: &Tensor, pooled_key: &Tensor) -> Result<Tensor> {
-    const OWNER: &str = "vsa_scores";
+    const OWNER: &str = ScoresCall::OWNER;
 
     let (&[query_tiles, heads, width], &[tiles, key_heads, key_width]) =
         (pooled_query.dims(), pooled_key.dims())
@@ -370,26 +431,56 @@ pub fn vsa_scores(pooled_query: &Tensor, pooled_key: &Tensor) -> Result<Tensor> 
         ));
     }
 
-    if on_cpu(pooled_query) {
-        let queries = pooled_query.transpose(0, 1)?.contiguous()?;
-        let keys = pooled_key.permute((1, 2, 0))?.contiguous()?;
-        let root = Tensor::new((width as f32).sqrt(), &Device::Cpu)?;
+    compute(ScoresCall {
+        pooled_query,
+        pooled_key,
+        extents: (query_tiles, tiles, heads, width),
+    })
+}
 
-        return Ok(queries.matmul(&keys)?.broadcast_div(&root)?);
+/// A checked call of [`vsa_scores`]: `extents` are the query tiles, the key tiles, the heads
+/// and the head width.
+struct ScoresCall<'t> {
+    pooled_query: &'t Tensor,
+    pooled_key: &'t Tensor,
+    extents: (usize, usize, usize, usize),
+}
+
+impl ScoresCall<'_> {
+    const OWNER: &'static str = "vsa_scores";
+}
+
+impl Fused for ScoresCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.pooled_query.device()
     }
 
-    let scores = ops::empty((heads, query_tiles, tiles), DType::F32)?;
-    let width = field(OWNER, width)?;
+    fn cpu(self) -> Result<Tensor> {
+        let width = self.extents.3;
+        let queries = self.pooled_query.transpose(0, 1)?.contiguous()?;
+        let keys = self.pooled_key.permute((1, 2, 0))?.contiguous()?;
+        let root = Tensor::new((width as f32).sqrt(), &Device::Cpu)?;
 
-    ops::launch::<VsaScores>(
-        &ScoresDescriptor::new(field(OWNER, heads)?, width),
-        ScoresArgs {
-            pooled_query: ops::operand(pooled_query)?,
-            pooled_key: ops::operand(pooled_key)?,
-            out: ops::operand(&scores)?,
-        },
-    )?;
-    Ok(scores)
+        Ok(queries.matmul(&keys)?.broadcast_div(&root)?)
+    }
+
+    fn launch(self) -> Result<Tensor> {
+        let (query_tiles, tiles, heads, width) = self.extents;
+        let scores = ops::empty((heads, query_tiles, tiles), DType::F32)?;
+        let width = field(Self::OWNER, width)?;
+
+        ops::launch::<VsaScores>(
+            &ScoresDescriptor::new(field(Self::OWNER, heads)?, width),
+            ScoresArgs {
+                pooled_query: ops::operand(self.pooled_query)?,
+                pooled_key: ops::operand(self.pooled_key)?,
+                out: ops::operand(&scores)?,
+            },
+        )?;
+        Ok(scores)
+    }
 }
 
 /// The ascending order key of a score: its sign-flipped bits, with −0 as +0 and every NaN above
@@ -435,9 +526,9 @@ pub fn vsa_select_tiles(
     keep: &Tensor,
     query_offset: usize,
 ) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = "vsa_select_tiles";
+    const OWNER: &str = SelectTilesCall::OWNER;
 
-    let &[heads, query_tiles, tiles] = scores.dims() else {
+    let &[_, query_tiles, tiles] = scores.dims() else {
         return Err(Error::shape(
             OWNER,
             format!(
@@ -460,7 +551,45 @@ pub fn vsa_select_tiles(
     tile_table(OWNER, "tile segments", segments, tiles, DType::I32)?;
     tile_table(OWNER, "segment keep counts", keep, tiles, DType::U32)?;
 
-    if on_cpu(scores) {
+    compute(SelectTilesCall {
+        scores,
+        sizes,
+        segments,
+        keep,
+        query_offset,
+    })
+}
+
+/// A checked call of [`vsa_select_tiles`].
+struct SelectTilesCall<'t> {
+    scores: &'t Tensor,
+    sizes: &'t Tensor,
+    segments: &'t Tensor,
+    keep: &'t Tensor,
+    query_offset: usize,
+}
+
+impl SelectTilesCall<'_> {
+    const OWNER: &'static str = "vsa_select_tiles";
+}
+
+impl Fused for SelectTilesCall<'_> {
+    type Output = (Tensor, Tensor);
+
+    fn device(&self) -> &Device {
+        self.scores.device()
+    }
+
+    fn cpu(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            scores,
+            sizes,
+            segments,
+            keep,
+            query_offset,
+        } = self;
+        let (heads, query_tiles, tiles) = scores.dims3()?;
+
         let values: Vec<f32> = scores.flatten_all()?.to_vec1()?;
         let sizes: Vec<u32> = sizes.to_vec1()?;
         let segments: Vec<i32> = segments.to_vec1()?;
@@ -468,7 +597,7 @@ pub fn vsa_select_tiles(
         let last_segment = segments.iter().copied().max().unwrap_or(-1);
         if last_segment >= tiles as i32 {
             return Err(Error::shape(
-                OWNER,
+                Self::OWNER,
                 format!("segment {last_segment} has no entry in a keep table of {tiles}"),
             ));
         }
@@ -505,29 +634,40 @@ pub fn vsa_select_tiles(
             counts.push(kept.iter().filter(|flag| **flag).count() as u32);
         }
 
-        return Ok((
+        Ok((
             Tensor::from_vec(indices, (heads, query_tiles, tiles), &Device::Cpu)?,
             Tensor::from_vec(counts, (heads, query_tiles), &Device::Cpu)?,
-        ));
+        ))
     }
 
-    let indices = ops::empty(scores.shape(), DType::U32)?;
-    let counts = ops::empty((heads, query_tiles), DType::U32)?;
-    let scores = scores.contiguous()?;
+    fn launch(self) -> Result<(Tensor, Tensor)> {
+        let Self {
+            scores,
+            sizes,
+            segments,
+            keep,
+            query_offset,
+        } = self;
+        let (heads, query_tiles, tiles) = scores.dims3()?;
 
-    ops::launch::<VsaSelectTiles>(
-        &SelectTilesDescriptor::new(field(OWNER, tiles)?),
-        SelectTilesArgs {
-            scores: ops::operand(&scores)?,
-            segments: ops::operand(segments)?,
-            sizes: ops::operand(sizes)?,
-            keep: ops::operand(keep)?,
-            indices: ops::operand(&indices)?,
-            counts: ops::operand(&counts)?,
-            query_offset: query_offset as u64,
-        },
-    )?;
-    Ok((indices, counts))
+        let indices = ops::empty(scores.shape(), DType::U32)?;
+        let counts = ops::empty((heads, query_tiles), DType::U32)?;
+        let scores = scores.contiguous()?;
+
+        ops::launch::<VsaSelectTiles>(
+            &SelectTilesDescriptor::new(field(Self::OWNER, tiles)?),
+            SelectTilesArgs {
+                scores: ops::operand(&scores)?,
+                segments: ops::operand(segments)?,
+                sizes: ops::operand(sizes)?,
+                keep: ops::operand(keep)?,
+                indices: ops::operand(&indices)?,
+                counts: ops::operand(&counts)?,
+                query_offset: query_offset as u64,
+            },
+        )?;
+        Ok((indices, counts))
+    }
 }
 
 /// The compressed branch: each (head, query tile)'s softmax over the live key tiles, weighting
@@ -556,10 +696,9 @@ pub fn vsa_compress_pooled(
     max_tiles: u32,
     output: DType,
 ) -> Result<Tensor> {
-    const OWNER: &str = "vsa_compress_pooled";
+    const OWNER: &str = CompressPooledCall::OWNER;
 
-    let (&[heads, query_tiles, tiles], &[value_tiles, value_heads, width]) =
-        (scores.dims(), values.dims())
+    let (&[heads, _, tiles], &[value_tiles, value_heads, _]) = (scores.dims(), values.dims())
     else {
         return Err(Error::shape(
             OWNER,
@@ -587,7 +726,46 @@ pub fn vsa_compress_pooled(
     }
     tile_table(OWNER, "tile sizes", sizes, tiles, DType::U32)?;
 
-    if on_cpu(scores) {
+    compute(CompressPooledCall {
+        scores,
+        values,
+        sizes,
+        max_tiles,
+        output,
+    })
+}
+
+/// A checked call of [`vsa_compress_pooled`].
+struct CompressPooledCall<'t> {
+    scores: &'t Tensor,
+    values: &'t Tensor,
+    sizes: &'t Tensor,
+    max_tiles: u32,
+    output: DType,
+}
+
+impl CompressPooledCall<'_> {
+    const OWNER: &'static str = "vsa_compress_pooled";
+}
+
+impl Fused for CompressPooledCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.scores.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            scores,
+            values,
+            sizes,
+            output,
+            ..
+        } = self;
+        let (heads, query_tiles, tiles) = scores.dims3()?;
+        let width = values.dims()[2];
+
         let live: Vec<u32> = sizes.to_vec1()?;
         if live.iter().all(|size| *size == 0) {
             return Ok(Tensor::zeros(
@@ -611,23 +789,35 @@ pub fn vsa_compress_pooled(
         let compressed = weights
             .matmul(&by_head)?
             .broadcast_div(&weights.sum_keepdim(2)?)?;
-        return Ok(compressed.to_dtype(output)?);
+        Ok(compressed.to_dtype(output)?)
     }
 
-    let out = ops::empty((heads, query_tiles, width), output)?;
-    let scores = scores.contiguous()?;
-    let width = field(OWNER, width)?;
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            scores,
+            values,
+            sizes,
+            max_tiles,
+            output,
+        } = self;
+        let (heads, query_tiles, _) = scores.dims3()?;
+        let width = values.dims()[2];
 
-    ops::launch::<VsaCompressPooled>(
-        &CompressPooledDescriptor::new(output, field(OWNER, heads)?, width, max_tiles),
-        CompressPooledArgs {
-            scores: ops::operand(&scores)?,
-            values: ops::operand(values)?,
-            sizes: ops::operand(sizes)?,
-            out: ops::operand(&out)?,
-        },
-    )?;
-    Ok(out)
+        let out = ops::empty((heads, query_tiles, width), output)?;
+        let scores = scores.contiguous()?;
+        let width = field(Self::OWNER, width)?;
+
+        ops::launch::<VsaCompressPooled>(
+            &CompressPooledDescriptor::new(output, field(Self::OWNER, heads)?, width, max_tiles),
+            CompressPooledArgs {
+                scores: ops::operand(&scores)?,
+                values: ops::operand(values)?,
+                sizes: ops::operand(sizes)?,
+                out: ops::operand(&out)?,
+            },
+        )?;
+        Ok(out)
+    }
 }
 
 /// Zeroes the rows of every tile past its valid size, in place, and returns `values`.
@@ -640,31 +830,75 @@ pub fn vsa_compress_pooled(
 /// When the rows are not whole tiles or a strided view, the sizes are not one per tile, or the
 /// operator refuses its arguments.
 pub fn vsa_zero_padding_(values: Tensor, sizes: &Tensor, tile_rows: u32) -> Result<Tensor> {
-    const OWNER: &str = "vsa_zero_padding_";
+    const OWNER: &str = ZeroPaddingCall::OWNER;
 
     let (tiles, tile, heads, width) = tile_rows_of(OWNER, &values, tile_rows)?;
     tile_table(OWNER, "tile sizes", sizes, tiles, DType::U32)?;
     written(OWNER, "rows", &values)?;
 
-    if on_cpu(&values) {
-        values.slice_set(&without_padding(&values, sizes, tiles, tile)?, 0, 0)?;
-        return Ok(values);
+    compute(ZeroPaddingCall {
+        values,
+        sizes,
+        tile_rows,
+        extents: (tiles, tile, heads, width),
+    })
+}
+
+/// A checked call of [`vsa_zero_padding_`]: `extents` are the rows' tiles, rows per tile, heads
+/// and head width.
+struct ZeroPaddingCall<'t> {
+    values: Tensor,
+    sizes: &'t Tensor,
+    tile_rows: u32,
+    extents: (usize, usize, usize, usize),
+}
+
+impl ZeroPaddingCall<'_> {
+    const OWNER: &'static str = "vsa_zero_padding_";
+}
+
+impl Fused for ZeroPaddingCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.values.device()
     }
 
-    ops::launch::<VsaZeroPadding>(
-        &ZeroPaddingDescriptor {
-            dtype: values.dtype(),
-            heads: field(OWNER, heads)?,
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            values,
+            sizes,
+            extents: (tiles, tile, _, _),
+            ..
+        } = self;
+
+        values.slice_set(&without_padding(&values, sizes, tiles, tile)?, 0, 0)?;
+        Ok(values)
+    }
+
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            values,
+            sizes,
             tile_rows,
-            width: field(OWNER, width)?,
-            block_rows: BLOCK_ROWS,
-        },
-        ZeroPaddingArgs {
-            values: ops::operand(&values)?,
-            sizes: ops::operand(sizes)?,
-        },
-    )?;
-    Ok(values)
+            extents: (_, _, heads, width),
+        } = self;
+
+        ops::launch::<VsaZeroPadding>(
+            &ZeroPaddingDescriptor {
+                dtype: values.dtype(),
+                heads: field(Self::OWNER, heads)?,
+                tile_rows,
+                width: field(Self::OWNER, width)?,
+                block_rows: BLOCK_ROWS,
+            },
+            ZeroPaddingArgs {
+                values: ops::operand(&values)?,
+                sizes: ops::operand(sizes)?,
+            },
+        )?;
+        Ok(values)
+    }
 }
 
 /// Checks the operands a gated fold shares: `fine` and `gate` rows of one shape and element
@@ -735,30 +969,78 @@ pub fn vsa_add_gated_tiles_(
     gate: &Tensor,
     tile_rows: u32,
 ) -> Result<Tensor> {
-    const OWNER: &str = "vsa_add_gated_tiles_";
+    const OWNER: &str = AddGatedTilesCall::OWNER;
 
     let extents = check_gated(OWNER, &fine, compressed, gate, tile_rows)?;
     written(OWNER, "fine rows", &fine)?;
 
-    if on_cpu(&fine) {
-        fine.slice_set(&gated_sum(&fine, compressed, gate, extents)?, 0, 0)?;
-        return Ok(fine);
+    compute(AddGatedTilesCall {
+        fine,
+        compressed,
+        gate,
+        tile_rows,
+        extents,
+    })
+}
+
+/// A checked call of [`vsa_add_gated_tiles_`]: `extents` are the rows' tiles, rows per tile,
+/// heads and head width.
+struct AddGatedTilesCall<'t> {
+    fine: Tensor,
+    compressed: &'t Tensor,
+    gate: &'t Tensor,
+    tile_rows: u32,
+    extents: (usize, usize, usize, usize),
+}
+
+impl AddGatedTilesCall<'_> {
+    const OWNER: &'static str = "vsa_add_gated_tiles_";
+}
+
+impl Fused for AddGatedTilesCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.fine.device()
     }
 
-    ops::launch::<VsaAddGatedTiles>(
-        &AddGatedTilesDescriptor {
-            dtype: fine.dtype(),
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            fine,
+            compressed,
+            gate,
+            extents,
+            ..
+        } = self;
+
+        fine.slice_set(&gated_sum(&fine, compressed, gate, extents)?, 0, 0)?;
+        Ok(fine)
+    }
+
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            fine,
+            compressed,
+            gate,
             tile_rows,
-            width: field(OWNER, extents.3)?,
-            block_rows: BLOCK_ROWS,
-        },
-        AddGatedTilesArgs {
-            output: ops::operand(&fine)?,
-            compressed: ops::operand(compressed)?,
-            gate: ops::operand(gate)?,
-        },
-    )?;
-    Ok(fine)
+            extents,
+        } = self;
+
+        ops::launch::<VsaAddGatedTiles>(
+            &AddGatedTilesDescriptor {
+                dtype: fine.dtype(),
+                tile_rows,
+                width: field(Self::OWNER, extents.3)?,
+                block_rows: BLOCK_ROWS,
+            },
+            AddGatedTilesArgs {
+                output: ops::operand(&fine)?,
+                compressed: ops::operand(compressed)?,
+                gate: ops::operand(gate)?,
+            },
+        )?;
+        Ok(fine)
+    }
 }
 
 /// One row interval of every member's gated rows, member by member: the send buffer of a
@@ -790,10 +1072,10 @@ pub fn vsa_compose_gated_rows(
     rows: Range<usize>,
     slots: &[u32],
 ) -> Result<Tensor> {
-    const OWNER: &str = "vsa_compose_gated_rows";
+    const OWNER: &str = ComposeGatedRowsCall::OWNER;
 
     let extents = check_gated(OWNER, fine, compressed, gate, tile_rows)?;
-    let (tiles, tile, heads, width) = extents;
+    let (tiles, tile, _, _) = extents;
     let members = slots.len();
 
     let mut ordered = slots.to_vec();
@@ -815,42 +1097,102 @@ pub fn vsa_compose_gated_rows(
         ));
     }
 
-    if on_cpu(fine) {
+    compute(ComposeGatedRowsCall {
+        fine,
+        compressed,
+        gate,
+        tile_rows,
+        rows,
+        slots,
+        extents,
+        owner_rows,
+    })
+}
+
+/// A checked call of [`vsa_compose_gated_rows`]: `extents` are the rows' tiles, rows per tile,
+/// heads and head width, and `owner_rows` the rows each member owns.
+struct ComposeGatedRowsCall<'t> {
+    fine: &'t Tensor,
+    compressed: &'t Tensor,
+    gate: &'t Tensor,
+    tile_rows: u32,
+    rows: Range<usize>,
+    slots: &'t [u32],
+    extents: (usize, usize, usize, usize),
+    owner_rows: usize,
+}
+
+impl ComposeGatedRowsCall<'_> {
+    const OWNER: &'static str = "vsa_compose_gated_rows";
+}
+
+impl Fused for ComposeGatedRowsCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.fine.device()
+    }
+
+    fn cpu(self) -> Result<Tensor> {
+        let Self {
+            fine,
+            compressed,
+            gate,
+            rows,
+            slots,
+            extents,
+            owner_rows,
+            ..
+        } = self;
         let gated = gated_sum(fine, compressed, gate, extents)?;
 
         // Block `slots[m]` of the result is member `m`'s interval.
-        let mut blocks = vec![None; members];
+        let mut blocks = vec![None; slots.len()];
         for (member, slot) in slots.iter().enumerate() {
             let first = member * owner_rows + rows.start;
             blocks[*slot as usize] = Some(gated.narrow(0, first, rows.len())?);
         }
         let blocks: Vec<Tensor> = blocks.into_iter().flatten().collect();
-        return Ok(Tensor::stack(&blocks, 0)?);
+        Ok(Tensor::stack(&blocks, 0)?)
     }
 
-    let payload = ops::empty((members, rows.len(), heads, width), fine.dtype())?;
-    let mut table = [0_u32; MAX_MEMBERS];
-    table[..members].copy_from_slice(slots);
-
-    ops::launch::<VsaComposeGatedRows>(
-        &ComposeGatedRowsDescriptor {
-            dtype: fine.dtype(),
-            heads: field(OWNER, heads)?,
+    fn launch(self) -> Result<Tensor> {
+        let Self {
+            fine,
+            compressed,
+            gate,
             tile_rows,
-            width: field(OWNER, width)?,
-            block_rows: BLOCK_ROWS,
-            slots: table,
-            members: members as u32,
-        },
-        ComposeGatedRowsArgs {
-            output: ops::operand(&payload)?,
-            fine: ops::operand(fine)?,
-            compressed: ops::operand(compressed)?,
-            gate: ops::operand(gate)?,
-            owner_rows: owner_rows as u64,
-            start: rows.start as u64,
-            count: rows.len() as u64,
-        },
-    )?;
-    Ok(payload)
+            rows,
+            slots,
+            extents: (_, _, heads, width),
+            owner_rows,
+        } = self;
+        let members = slots.len();
+
+        let payload = ops::empty((members, rows.len(), heads, width), fine.dtype())?;
+        let mut table = [0_u32; MAX_MEMBERS];
+        table[..members].copy_from_slice(slots);
+
+        ops::launch::<VsaComposeGatedRows>(
+            &ComposeGatedRowsDescriptor {
+                dtype: fine.dtype(),
+                heads: field(Self::OWNER, heads)?,
+                tile_rows,
+                width: field(Self::OWNER, width)?,
+                block_rows: BLOCK_ROWS,
+                slots: table,
+                members: members as u32,
+            },
+            ComposeGatedRowsArgs {
+                output: ops::operand(&payload)?,
+                fine: ops::operand(fine)?,
+                compressed: ops::operand(compressed)?,
+                gate: ops::operand(gate)?,
+                owner_rows: owner_rows as u64,
+                start: rows.start as u64,
+                count: rows.len() as u64,
+            },
+        )?;
+        Ok(payload)
+    }
 }

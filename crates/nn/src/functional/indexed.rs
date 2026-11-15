@@ -25,7 +25,7 @@ use ops::attention::{
 };
 use tensor::{DType, Device, Tensor};
 
-use super::{ACCUMULATE, on_cpu};
+use super::{ACCUMULATE, Fused, compute};
 use crate::capability::KvCache;
 use crate::error::{Error, Result};
 
@@ -69,7 +69,7 @@ pub fn index_scores(
     rows: &Tensor,
     visible: &Tensor,
 ) -> Result<Tensor> {
-    const OWNER: &str = "index_scores";
+    const OWNER: &str = IndexScoresCall::OWNER;
 
     let keys =
         cache.layer(layer)?.index_keys.as_ref().ok_or_else(|| {
@@ -107,7 +107,58 @@ pub fn index_scores(
     }
     let columns = max_pages * groups;
 
-    if on_cpu(query) {
+    compute(IndexScoresCall {
+        query,
+        cache,
+        keys,
+        rows,
+        visible,
+        tokens,
+        heads,
+        width,
+        groups,
+        columns,
+    })
+}
+
+/// A checked call of [`index_scores`]: `keys` are the layer's index keys.
+struct IndexScoresCall<'t> {
+    query: &'t Tensor,
+    cache: &'t KvCache,
+    keys: &'t Tensor,
+    rows: &'t Tensor,
+    visible: &'t Tensor,
+    tokens: usize,
+    heads: usize,
+    width: usize,
+    groups: usize,
+    columns: usize,
+}
+
+impl IndexScoresCall<'_> {
+    const OWNER: &'static str = "index_scores";
+}
+
+impl Fused for IndexScoresCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.query.device()
+    }
+
+    fn cpu(self) -> Result<Self::Output> {
+        let Self {
+            query,
+            cache,
+            keys,
+            rows,
+            visible,
+            tokens,
+            width,
+            groups,
+            columns,
+            ..
+        } = self;
         let table = cache.block_tables.to_vec2::<u32>()?;
         let (rows, visible) = (column(rows)?, column(visible)?);
         let queries = query.to_dtype(ACCUMULATE)?;
@@ -124,7 +175,7 @@ pub fn index_scores(
             }
             if seen > columns {
                 return Err(Error::shape(
-                    OWNER,
+                    Self::OWNER,
                     format!("token {token} sees {seen} groups of a table of {columns}"),
                 ));
             }
@@ -140,28 +191,42 @@ pub fn index_scores(
             let products = queries.get(token)?.matmul(&seen_keys.t()?)?;
             scores.push(Tensor::cat(&[products.relu()?.sum(0)?, hidden], 0)?);
         }
-        return Ok(Tensor::stack(&scores, 0)?);
+        Ok(Tensor::stack(&scores, 0)?)
     }
 
-    let out = ops::empty((tokens, columns), DType::F32)?;
-    ops::launch::<IndexScores>(
-        &IndexScoresDescriptor::new(
-            query.dtype(),
-            keys.dtype(),
-            heads as u32,
-            width as u32,
-            groups as u32,
-        ),
-        IndexScoresArgs {
-            query: ops::operand(query)?,
-            keys: ops::operand(keys)?,
-            page_table: ops::operand(&cache.block_tables)?,
-            rows: ops::operand(rows)?,
-            visible: ops::operand(visible)?,
-            out: ops::operand(&out)?,
-        },
-    )?;
-    Ok(out)
+    fn launch(self) -> Result<Self::Output> {
+        let Self {
+            query,
+            cache,
+            keys,
+            rows,
+            visible,
+            tokens,
+            heads,
+            width,
+            groups,
+            columns,
+        } = self;
+        let out = ops::empty((tokens, columns), DType::F32)?;
+        ops::launch::<IndexScores>(
+            &IndexScoresDescriptor::new(
+                query.dtype(),
+                keys.dtype(),
+                heads as u32,
+                width as u32,
+                groups as u32,
+            ),
+            IndexScoresArgs {
+                query: ops::operand(query)?,
+                keys: ops::operand(keys)?,
+                page_table: ops::operand(&cache.block_tables)?,
+                rows: ops::operand(rows)?,
+                visible: ops::operand(visible)?,
+                out: ops::operand(&out)?,
+            },
+        )?;
+        Ok(out)
+    }
 }
 
 /// Attention of each query row over the tokens its selection names, through the cache's pages:
@@ -190,7 +255,7 @@ pub fn indexed_attention(
     selection: &Tensor,
     scale: f32,
 ) -> Result<Tensor> {
-    const OWNER: &str = "indexed_attention";
+    const OWNER: &str = IndexedAttentionCall::OWNER;
 
     let planes = cache.layer(layer)?;
     let (key, value) = (&planes.key, &planes.value);
@@ -249,7 +314,70 @@ pub fn indexed_attention(
         ));
     }
 
-    if on_cpu(query) {
+    compute(IndexedAttentionCall {
+        query,
+        cache,
+        key,
+        value,
+        rows,
+        selection,
+        scale,
+        tokens,
+        heads,
+        head_dim,
+        pages,
+        page,
+        kv_heads,
+        columns,
+    })
+}
+
+/// A checked call of [`indexed_attention`]: `key` and `value` are the layer's planes.
+struct IndexedAttentionCall<'t> {
+    query: &'t Tensor,
+    cache: &'t KvCache,
+    key: &'t Tensor,
+    value: &'t Tensor,
+    rows: &'t Tensor,
+    selection: &'t Tensor,
+    scale: f32,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    pages: usize,
+    page: usize,
+    kv_heads: usize,
+    columns: usize,
+}
+
+impl IndexedAttentionCall<'_> {
+    const OWNER: &'static str = "indexed_attention";
+}
+
+impl Fused for IndexedAttentionCall<'_> {
+    type Output = Tensor;
+
+    fn device(&self) -> &Device {
+        self.query.device()
+    }
+
+    fn cpu(self) -> Result<Self::Output> {
+        let Self {
+            query,
+            cache,
+            key,
+            value,
+            rows,
+            selection,
+            scale,
+            tokens,
+            heads,
+            head_dim,
+            pages,
+            page,
+            kv_heads,
+            ..
+        } = self;
         let table = cache.block_tables.to_vec2::<u32>()?;
         let rows = column(rows)?;
         let selected = selection.to_vec2::<i32>()?;
@@ -298,30 +426,47 @@ pub fn indexed_attention(
             }
             out.push(Tensor::cat(&attended, 0)?);
         }
-        return Ok(Tensor::stack(&out, 0)?.to_dtype(query.dtype())?);
+        Ok(Tensor::stack(&out, 0)?.to_dtype(query.dtype())?)
     }
 
-    let out = ops::empty((tokens, heads, head_dim), query.dtype())?;
-    ops::launch::<IndexedAttention>(
-        &IndexedAttentionDescriptor {
-            dtype: query.dtype(),
-            cache: key.dtype(),
-            heads: heads as u32,
-            kv_heads: kv_heads as u32,
-            head_dim: head_dim as u32,
-            page: cache.page_size,
-            columns: columns as u32,
-            scale: scale.into(),
-        },
-        IndexedAttentionArgs {
-            query: ops::operand(query)?,
-            key: ops::operand(key)?,
-            value: ops::operand(value)?,
-            page_table: ops::operand(&cache.block_tables)?,
-            rows: ops::operand(rows)?,
-            selection: ops::operand(selection)?,
-            out: ops::operand(&out)?,
-        },
-    )?;
-    Ok(out)
+    fn launch(self) -> Result<Self::Output> {
+        let Self {
+            query,
+            cache,
+            key,
+            value,
+            rows,
+            selection,
+            scale,
+            tokens,
+            heads,
+            head_dim,
+            kv_heads,
+            columns,
+            ..
+        } = self;
+        let out = ops::empty((tokens, heads, head_dim), query.dtype())?;
+        ops::launch::<IndexedAttention>(
+            &IndexedAttentionDescriptor {
+                dtype: query.dtype(),
+                cache: key.dtype(),
+                heads: heads as u32,
+                kv_heads: kv_heads as u32,
+                head_dim: head_dim as u32,
+                page: cache.page_size,
+                columns: columns as u32,
+                scale: scale.into(),
+            },
+            IndexedAttentionArgs {
+                query: ops::operand(query)?,
+                key: ops::operand(key)?,
+                value: ops::operand(value)?,
+                page_table: ops::operand(&cache.block_tables)?,
+                rows: ops::operand(rows)?,
+                selection: ops::operand(selection)?,
+                out: ops::operand(&out)?,
+            },
+        )?;
+        Ok(out)
+    }
 }
