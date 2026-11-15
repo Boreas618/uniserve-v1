@@ -1236,7 +1236,6 @@ dependencies = [
  "half",
  "indexmap 2.14.0",
  "libc",
- "libloading",
  "media",
  "mimalloc",
  "models",

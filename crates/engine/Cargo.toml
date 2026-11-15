@@ -30,7 +30,6 @@ crossbeam-channel.workspace = true
 half.workspace = true
 indexmap.workspace = true
 libc.workspace = true
-libloading.workspace = true
 # The encoders, muxers and readers a media rank's host work runs on (`media::MediaRunner`), one
 # per process.
 media.workspace = true
