@@ -263,6 +263,20 @@ impl Settings {
         socket_or_default(self.socket.clone())
     }
 
+    /// Whether a Build Server whose readiness record states `record` serves with these settings:
+    /// the same settings, with the socket these settings name.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no socket is named and the user has no runtime directory.
+    pub fn serves(&self, record: &Settings) -> std::io::Result<bool> {
+        let stated = Settings {
+            socket: Some(self.socket()?),
+            ..self.clone()
+        };
+        Ok(stated == *record)
+    }
+
     /// The `serve` flags that state these settings, but the socket: a starter
     /// passes them after `--socket` and `--daemon` (`service::host::start`).
     pub fn arguments(&self) -> Vec<String> {
@@ -591,7 +605,7 @@ fn run_serve(
     // A stop signal makes this descriptor readable, which ends the serving.
     let (stop, _flag) = service::stop_signals()?;
 
-    let (listener, starting) = match service::host::bind::<()>(&socket)? {
+    let (listener, starting) = match service::host::bind::<Settings>(&socket)? {
         service::host::Bound::Owner { listener, starting } => (listener, starting),
         service::host::Bound::Serving(record) => {
             tracing::info!(socket = %socket.display(), pid = record.pid, "another build server serves this socket");
@@ -604,7 +618,7 @@ fn run_serve(
 
     let config = serve.settings.config(serve.settings.targets(host)?)?;
     let server = std::sync::Arc::new(BuildServer::open(&config)?);
-    let record = crate::readiness(&socket);
+    let record = crate::readiness(&socket, &serve.settings);
     let lock = starting.finish(&record)?;
     if let Some(mut ready) = ready {
         ready.report(&record)?;

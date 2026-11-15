@@ -218,11 +218,16 @@ pub(crate) struct Serving {
 /// connections as soon as this returns: a client connects without waiting
 /// for the thread.
 pub(crate) fn serve(server: BuildServer, socket: &Path) -> Serving {
-    let (listener, starting) = service::host::bind::<()>(socket)
+    let (listener, starting) = service::host::bind::<build_server::command::Settings>(socket)
         .unwrap()
         .owned(socket)
         .expect("no other server owns the socket");
-    let lock = starting.finish(&build_server::readiness(socket)).unwrap();
+    let lock = starting
+        .finish(&build_server::readiness(
+            socket,
+            &build_server::command::Settings::default(),
+        ))
+        .unwrap();
     let (stop, stopped) = UnixStream::pair().unwrap();
     let server = Arc::new(server);
     let thread = std::thread::spawn(move || {

@@ -332,11 +332,16 @@ impl BuildServerStandIn {
     /// Serves at `socket`, owning it as a Build Server does; with `held`, each `prepare` answers
     /// only once [`Self::release`] lets it, as one building the engine's executable does.
     pub(crate) fn serve(socket: PathBuf, held: bool, raise: u32) -> Self {
-        let (listener, starting) = service::host::bind::<()>(&socket)
+        let (listener, starting) = service::host::bind::<build_server::command::Settings>(&socket)
             .unwrap()
             .owned(&socket)
             .expect("no server owns the stand-in's socket");
-        let lock = starting.finish(&build_server::readiness(&socket)).unwrap();
+        let lock = starting
+            .finish(&build_server::readiness(
+                &socket,
+                &build_server::command::Settings::default(),
+            ))
+            .unwrap();
         let (asked_sender, asked) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let released = Arc::new(Mutex::new(released));

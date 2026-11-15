@@ -82,11 +82,13 @@ pub fn default_socket() -> std::io::Result<std::path::PathBuf> {
     Ok(service::RuntimeDirectory::of_user()?.socket("build-server"))
 }
 
-/// A Build Server's readiness record: its socket (`build`).
-pub type Readiness = service::Readiness;
+/// A Build Server's readiness record: its socket (`build`) and the settings it serves with, which
+/// a starter that states settings compares with its own ([`command::Settings::serves`]).
+pub type Readiness = service::Readiness<command::Settings>;
 
-/// The readiness record of a Build Server of this process serving on `socket`.
-pub fn readiness(socket: &std::path::Path) -> Readiness {
+/// The readiness record of a Build Server of this process serving on `socket` with `settings`,
+/// whose socket the record states as `socket`.
+pub fn readiness(socket: &std::path::Path, settings: &command::Settings) -> Readiness {
     service::Readiness::of_process(
         service::State::Serving,
         None,
@@ -94,7 +96,10 @@ pub fn readiness(socket: &std::path::Path) -> Readiness {
             build: Some(service::Endpoint::unix(socket)),
             ..service::Endpoints::default()
         },
-        (),
+        command::Settings {
+            socket: Some(socket.to_path_buf()),
+            ..settings.clone()
+        },
     )
 }
 

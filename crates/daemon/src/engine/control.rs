@@ -31,20 +31,22 @@ use crate::engine::client::{EngineClient, EngineInfo, EngineState, StatsSink};
 /// The worker group a daemon supervises an engine process under.
 pub(crate) const ENGINE_GROUP: &str = "engine";
 
-/// Makes sure this host's Build Server serves on the socket `settings` names, and returns that
-/// socket: when none serves, the deployment's daemon starts it with `settings` as a host service
-/// of the running build ([`crate::supervision::RUNNING_IMAGE`], `service::host::start`), which
-/// outlives this daemon. The start ends with the server's readiness record, or with the server's
-/// end before it served.
+/// Makes sure this host's Build Server serves on the socket `settings` names with `settings`, and
+/// returns that socket: when none serves, the deployment's daemon starts it with `settings` as a
+/// host service of the running build ([`crate::supervision::RUNNING_IMAGE`],
+/// `service::host::start`), which outlives this daemon. The start ends with the server's readiness
+/// record, or with the server's end before it served.
 ///
 /// # Errors
 ///
-/// Fails when no Build Server serves and none can be started.
+/// Fails when no Build Server serves and none can be started, and when the one that serves states
+/// other settings than `settings` in its record: the deployment states its host's Build Server,
+/// and another starter's settings never stand in for it.
 pub fn ensure_build_server(settings: &build_server::command::Settings) -> anyhow::Result<PathBuf> {
     let socket = settings
         .socket()
         .context("finding this host's Build Server socket")?;
-    ::service::host::start::<()>(
+    let record: build_server::Readiness = ::service::host::start(
         Path::new(crate::supervision::RUNNING_IMAGE),
         "build-server",
         &socket,
@@ -52,6 +54,13 @@ pub fn ensure_build_server(settings: &build_server::command::Settings) -> anyhow
         None,
     )
     .context("starting this host's Build Server")?;
+    anyhow::ensure!(
+        settings.serves(&record.settings)?,
+        "the Build Server at {} serves with other settings than the deployment states: it \
+         serves with {:?}, and the deployment states {settings:?}",
+        socket.display(),
+        record.settings
+    );
     Ok(socket)
 }
 
