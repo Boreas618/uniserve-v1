@@ -449,6 +449,19 @@ pub(crate) async fn read_response(
     (parts.status, parts.headers, json)
 }
 
+/// The JSON documents of a server-sent event stream's `text`: every event's `data` payload but
+/// the stream's closing `[DONE]`, in order.
+pub(crate) fn sse_documents(text: &str) -> Vec<serde_json::Value> {
+    text.split("\n\n")
+        .filter_map(|event| event.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .map(|payload| {
+            serde_json::from_str(payload)
+                .unwrap_or_else(|error| panic!("an event's data is JSON ({error}): {payload}"))
+        })
+        .collect()
+}
+
 /// Sends `request`, whose response is a streamed body, through `router` and
 /// returns the body's frames as the connection reads them; dropping the
 /// handle is the client going away.

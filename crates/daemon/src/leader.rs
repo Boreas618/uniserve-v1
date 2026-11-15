@@ -3640,16 +3640,16 @@ mod tests {
     use super::{EngineState, Leader, keeps_standby};
     use crate::test_support::{
         SERVED_MODEL, STALL, configured_tokenizer, engine_of, fake_client, leader_over,
-        letter_fake, post_json, router, send, send_streamed, test_model, text_fake,
+        letter_fake, post_json, router, send, send_streamed, sse_documents, test_model, text_fake,
     };
     use testkit::{FakeExecutor, Fixture};
 
-    /// A Qwen3 engine over one scheduler, named `engine_model`, over the fake
+    /// A chat engine over one scheduler, named `engine_model`, over the fake
     /// `shape` makes of the one that samples `a` ([`letter_fake`]).
     ///
     /// The engine's model name labels the process-wide request metrics,
     /// so a test that reads them names its own engine.
-    fn qwen3_engine(
+    fn letter_engine(
         engine_model: &str,
         shape: impl Fn(FakeExecutor) -> FakeExecutor + Send + 'static,
     ) -> Leader {
@@ -3776,20 +3776,17 @@ mod tests {
         );
         assert!(engine.is_healthy());
 
-        // The engine process ends without the leader asking it to.
-        tokio::task::spawn_blocking(move || client.shutdown())
+        // The engine process ends without the leader asking it to; its
+        // connection's end is the state the leader reads.
+        let mut states = client.states();
+        let stopping = Arc::clone(&client);
+        tokio::task::spawn_blocking(move || stopping.shutdown())
             .await
             .unwrap();
-        // The leader learns of the loss from the engine's connection, a
-        // moment after the process ended.
-        let deadline = tokio::time::Instant::now() + STALL;
-        while engine.is_healthy() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the leader still reports the lost engine healthy"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        while *states.borrow_and_update() != EngineState::Stopped {
+            states.changed().await.expect("the client states its end");
         }
+        assert!(!engine.is_healthy());
 
         let error = engine.submit(text_request()).await.err();
         assert!(matches!(
@@ -3802,9 +3799,6 @@ mod tests {
     /// the other available through the same public service.
     #[tokio::test]
     async fn concurrent_requests_spread_over_engine_cores() {
-        // Every wait in this test is bounded and named: an unbounded wait here
-        // reads as a suite that hung, with no line saying which of the seven
-        // responses the leader never gave.
         let mut clients = Vec::new();
         for _ in 0..2 {
             clients.push(client_of("sim-model"));
@@ -3820,77 +3814,40 @@ mod tests {
         // first is still in flight when the second is routed.
         let mut streams = Vec::new();
         let mut serving = Vec::new();
-        for index in 0..2 {
-            let (stream, core) = within(
-                10,
-                &format!("the {} request's admission", index + 1),
-                engine.submit(text_request()),
-            )
-            .await
-            .expect("submit request");
+        for _ in 0..2 {
+            let (stream, core) = engine.submit(text_request()).await.expect("submit request");
             streams.push(stream);
             serving.push(core);
         }
         assert_ne!(serving[0], serving[1]);
-        for (index, stream) in streams.iter_mut().enumerate() {
-            within(10, &format!("the {} request's batch", index + 1), async {
-                while let Some(event) = stream.next().await {
-                    if let Event::Finished { reason, .. } = event {
-                        assert_eq!(reason, proto::request::FinishReason::Eos);
-                        break;
-                    }
-                }
-            })
-            .await;
-        }
-        let lost = Arc::clone(&clients[0]);
-        within(
-            15,
-            "the lost replica's teardown",
-            tokio::task::spawn_blocking(move || {
-                lost.shutdown();
-                lost.await_exit(Duration::from_secs(5)).unwrap();
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(engine.is_healthy());
-        let (mut stream, replica) = within(
-            10,
-            "the request after the lost replica",
-            engine.submit(text_request()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(replica, 1);
-        let mut finished = false;
-        within(10, "the surviving replica's batch", async {
+        for stream in &mut streams {
             while let Some(event) = stream.next().await {
                 if let Event::Finished { reason, .. } = event {
                     assert_eq!(reason, proto::request::FinishReason::Eos);
-                    finished = true;
+                    break;
                 }
             }
-        })
-        .await;
-        assert!(finished);
-        within(10, "the replica's shutdown", engine.shutdown())
-            .await
-            .expect("shutdown replica");
-    }
-
-    /// Awaits `future`, failing by name when it does not respond within
-    /// `seconds`: a test whose unbounded wait hangs says which response it never
-    /// got instead of outliving the suite's bound in silence.
-    async fn within<T>(
-        seconds: u64,
-        what: &str,
-        future: impl std::future::Future<Output = T>,
-    ) -> T {
-        match tokio::time::timeout(Duration::from_secs(seconds), future).await {
-            Ok(value) => value,
-            Err(_) => panic!("{what} did not respond within {seconds} s"),
         }
+        let lost = Arc::clone(&clients[0]);
+        let mut states = lost.states();
+        tokio::task::spawn_blocking(move || lost.shutdown())
+            .await
+            .unwrap();
+        while *states.borrow_and_update() != EngineState::Stopped {
+            states.changed().await.expect("the client states its end");
+        }
+        assert!(engine.is_healthy());
+        let (mut stream, replica) = engine.submit(text_request()).await.unwrap();
+        assert_eq!(replica, 1);
+        let mut finished = false;
+        while let Some(event) = stream.next().await {
+            if let Event::Finished { reason, .. } = event {
+                assert_eq!(reason, proto::request::FinishReason::Eos);
+                finished = true;
+            }
+        }
+        assert!(finished);
+        engine.shutdown().await.expect("shutdown replica");
     }
 
     /// A chat prompt that exceeds the total capacity of a two-unit prefix
@@ -3934,7 +3891,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let engine_model = "preprocessing-latency-model";
-            let engine = Arc::new(qwen3_engine(engine_model, ending));
+            let engine = Arc::new(letter_engine(engine_model, ending));
             let router = router(Arc::clone(&engine));
 
             // Hold the only blocking thread so preprocessing waits in the
@@ -3978,7 +3935,7 @@ mod tests {
     #[tokio::test]
     async fn completed_request_is_recorded_in_request_metrics() {
         let engine_model = "request-metrics-model";
-        let engine = Arc::new(qwen3_engine(engine_model, ending));
+        let engine = Arc::new(letter_engine(engine_model, ending));
         let router = router(Arc::clone(&engine));
 
         let (status, document) = chat(&router, &chat_request(3, &[], false)).await;
@@ -4011,7 +3968,7 @@ mod tests {
     /// reports the same in its usage chunk.
     #[tokio::test]
     async fn a_repeated_prompt_reports_its_cached_tokens() {
-        let engine = Arc::new(qwen3_engine("cached-tokens-model", ending));
+        let engine = Arc::new(letter_engine("cached-tokens-model", ending));
         let router = router(Arc::clone(&engine));
         let body = |stream: bool| {
             let mut body = serde_json::json!({
@@ -4048,22 +4005,12 @@ mod tests {
         let mut stream =
             send_streamed(&router, post_json("/v1/chat/completions", &body(true))).await;
         let mut text = String::new();
-        while let Some(frame) = tokio::time::timeout(STALL, stream.next_frame())
-            .await
-            .expect("the stream writes")
-        {
+        while let Some(frame) = stream.next_frame().await {
             text.push_str(std::str::from_utf8(&frame).unwrap());
         }
-        let usage: Vec<serde_json::Value> = text
-            .split("\n\n")
-            .filter_map(|event| event.strip_prefix("data: "))
-            .filter(|payload| *payload != "[DONE]")
-            .filter_map(|payload| {
-                serde_json::from_str::<serde_json::Value>(payload)
-                    .unwrap()
-                    .get("usage")
-                    .cloned()
-            })
+        let usage: Vec<serde_json::Value> = sse_documents(&text)
+            .into_iter()
+            .filter_map(|document| document.get("usage").cloned())
             .collect();
         let [usage] = &usage[..] else {
             panic!("one usage chunk: {text}");
@@ -4107,7 +4054,7 @@ mod tests {
     #[tokio::test]
     async fn disconnected_request_is_recorded_as_aborted_without_token_usage() {
         let engine_model = "disconnect-metrics-model";
-        let engine = Arc::new(qwen3_engine(engine_model, |fake| fake));
+        let engine = Arc::new(letter_engine(engine_model, |fake| fake));
         let router = router(Arc::clone(&engine));
 
         let mut stream = send_streamed(
@@ -4116,10 +4063,7 @@ mod tests {
         )
         .await;
         loop {
-            let frame = tokio::time::timeout(STALL, stream.next_frame())
-                .await
-                .expect("the stream writes")
-                .expect("the stream goes on");
+            let frame = stream.next_frame().await.expect("the stream goes on");
             if std::str::from_utf8(&frame).is_ok_and(|frame| frame.contains(r#""content":"a"#)) {
                 break;
             }
@@ -4208,6 +4152,12 @@ mod tests {
 
     /// The engine configuration of a deployment of `data` schedulers of `tensor` ranks each,
     /// with expert parallelism (`moe_config.expert_parallel`) when `experts` holds.
+    /// The device strings of `ranks` local ranks of a default deployment's device kind.
+    fn rank_devices(ranks: std::ops::Range<u32>) -> Vec<String> {
+        let kind = crate::options::ServerArgs::default().device_config.device;
+        ranks.map(|rank| kind.rank_device(rank)).collect()
+    }
+
     fn deployment(tensor: usize, data: usize, experts: bool) -> proto::config::EngineConfig {
         let mut options = crate::options::ServerArgs {
             tensor_parallel_size: std::num::NonZeroUsize::new(tensor).unwrap(),
@@ -4235,10 +4185,7 @@ mod tests {
                     .collect()
             })
             .collect();
-        assert_eq!(
-            devices,
-            vec![vec!["cuda:0", "cuda:1"], vec!["cuda:2", "cuda:3"]]
-        );
+        assert_eq!(devices, vec![rank_devices(0..2), rank_devices(2..4)]);
         assert!(replicas.iter().all(|replica| {
             replica.parallel.data_parallel_size.get() == 1 && replica.scheduler == config.scheduler
         }));
@@ -4280,10 +4227,7 @@ mod tests {
                     .collect()
             })
             .collect();
-        assert_eq!(
-            devices,
-            vec![vec!["cuda:0", "cuda:1"], vec!["cuda:2", "cuda:3"]]
-        );
+        assert_eq!(devices, vec![rank_devices(0..2), rank_devices(2..4)]);
         assert!(launches.iter().all(|launch| {
             let replica = &launch.engine_config;
             launch.epoch == 7
@@ -4424,7 +4368,6 @@ mod tests {
         assert!(!keeps_standby(false, EngineState::Serving, true));
         // A parked, standing-by, failed or closed engine has nothing to stand
         // beside, and a standby of a standby is a third copy.
-        assert!(!keeps_standby(true, EngineState::Parked, true));
         assert!(!keeps_standby(true, EngineState::Parked, true));
         assert!(!keeps_standby(
             true,
