@@ -20,8 +20,14 @@ interface_version = 1
 [source]
 kind = "cuda"
 
+# The kernels read every extent at launch, so every descriptor compiles the same object.
+[compile]
+units = ["src/entry.cpp", "src/routing.cu"]
+standard = "c++17"
+
 # `experts_128_top_8_local_128_tile_128_scales_f32`.
-# Every extent is a launch value. One block's shared memory holds 18 counters per local
-# expert within 46 KiB, which bounds `local` at 654 (`src/routing.cu`).
+# Every extent is a launch value. One block's shared memory holds 18 counters per local expert,
+# within the shared memory a block of the launching device takes without opting in to more, and
+# the module refuses a window whose counters outgrow it (`src/routing.cu`).
 [[kernel.descriptors]]
-dimensions = { experts = { min = 1 }, top = { min = 1 }, local = { min = 1, max = 654 }, tile = { min = 1 }, scales = ["f32", "bf16", "f16"], counted = ["true"] }
+dimensions = { experts = { min = 1 }, top = { min = 1 }, local = { min = 1 }, tile = { min = 1 }, scales = ["f32", "bf16", "f16"], counted = ["true"] }

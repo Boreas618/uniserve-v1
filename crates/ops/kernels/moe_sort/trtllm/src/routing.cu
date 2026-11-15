@@ -320,13 +320,21 @@ int32_t uniserve_moe_sort_launch(const uniserve_moe_sort_call* call, void* strea
   }
   const int64_t local_experts = call->local_experts;
   const int64_t expanded = call->tokens * call->top;
-  // A chunk's counts sit at the head of its routes, so an expert count past a chunk has no room.
-  constexpr int64_t kMaxSharedBytes = 46 * 1024;
   const int64_t shared_bytes = (kWarps + 2) * local_experts * sizeof(int32_t);
   if (local_experts <= 0 || call->tile_tokens <= 0) {
     return 2;
   }
-  if (shared_bytes > kMaxSharedBytes || local_experts > kChunk) {
+  // A block's counters live in the shared memory a block takes without opting in to more, the
+  // limit of the device this launch runs on; and a chunk's counts sit at the head of its routes,
+  // so an expert count past a chunk has no room.
+  int device = 0;
+  int shared_limit = 0;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&shared_limit, cudaDevAttrMaxSharedMemoryPerBlock, device) !=
+          cudaSuccess) {
+    return 6;
+  }
+  if (shared_bytes > shared_limit || local_experts > kChunk) {
     return 3;
   }
   cudaStream_t cs = reinterpret_cast<cudaStream_t>(stream);

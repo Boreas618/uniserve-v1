@@ -63,6 +63,8 @@ int32_t launch(const uniserve_moe_sort_call* call, void* stream) {
       return refuse(call, "moe_sort could not start its metadata kernel");
     case 5:
       return refuse(call, "moe_sort could not start its permutation kernel");
+    case 6:
+      return refuse(call, "moe_sort cannot read the device's shared memory per block");
     default:
       return refuse(call, "moe_sort refused the call");
   }
