@@ -1,0 +1,46 @@
+# The support package of UniServe's Python tests: a pytest plugin and the
+# helpers the tests share.
+#
+# pytest loads the plugin through its `pytest11` entry point in every session
+# of the environment that installs this package (the repository's, through
+# the root project's `test` extra), so a test module imports nothing by its
+# position in the tree: the shared helpers are modules of this package, the
+# fixtures are the plugin's, and a stand-in program a test starts is a module
+# of this package run with `python -m`.
+[project]
+name = "uniserve-testing"
+version = "2.0.0"
+description = "The pytest plugin and helpers of UniServe's Python tests"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx",
+    "huggingface-hub",
+    "nvidia-ml-py",
+    "pillow>=10.4",
+    "prometheus-client",
+    "pytest>=8.1",
+    "tomli-w",
+    # The evaluator's reader of streamed answers, which the cases share.
+    "uniserve-eval",
+]
+
+[project.optional-dependencies]
+# What the kernel checks' helpers (`uniserve_testing.kernels`) import: the
+# tensors they launch on, the kernel library whose generated ABI headers
+# they read as package resources, and the numerical references.
+kernels = [
+    "numpy",
+    "torch",
+    "uniserve-kernels",
+]
+
+[project.entry-points.pytest11]
+uniserve = "uniserve_testing.plugin"
+
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "uniserve_testing"
+module-root = "src"

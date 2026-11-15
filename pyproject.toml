@@ -6,36 +6,42 @@ requires = [
 ]
 build-backend = "setuptools.build_meta"
 
-# The repository holds no Python package of its own. This project is what
-# `uv sync` builds and installs: the `uniserve` executable, onto the
-# environment's `bin/`, with the development, test and evaluation tools beside
-# it. The Build Server keeps its own environment
-# (`crates/build-server/python`), the one place a compiler runs Python.
+# The repository's Python environment. This project is what `uv sync` builds
+# and installs: the `uniserve` executable, onto the environment's `bin/`, with
+# the development, test and evaluation tools beside it. Its Python packages are
+# the workspace's members (`[tool.uv.workspace]`). The Build Server keeps its
+# own locked environment (`crates/build-server/python`), the one place a
+# compiler runs Python.
+#
+# `requires-python` is the one statement of the Python release: uv selects the
+# interpreter by it, and ruff reads its target from it.
 [project]
 name = "uniserve"
 version = "2.0.0"
 description = "UniServe: the Rust serving runtime."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 dependencies = []
 
 [project.optional-dependencies]
 test = [
     "httpx",
     "pytest>=8.1",
+    # The evaluator's transport tests serve canned responses from aiohttp's
+    # test servers (`aiohttp_raw_server`).
+    "pytest-aiohttp",
     "pytest-timeout>=2.3",
     # The GPU recipe runs the e2e cases on parallel workers, each case on the
     # GPUs it leases (tests/python/e2e/conftest.py).
     "pytest-xdist>=3.6",
-    # The HTTP tests compare served tensors, and
-    # tokenize with the checkpoint's own tokenizer.
-    "numpy",
+    # The tests' pytest plugin and shared helpers (`tests/support`), with
+    # what the kernel checks' helpers import.
+    "uniserve-testing[kernels]",
+    # The HTTP tests compare served tensors, and tokenize with the
+    # tokenizer of the checkpoint they serve.
     "safetensors",
     "torch>=2.13,<2.14",
     "transformers>=4.57.1",
-    # The kernel checks import a package's kernel module as its build does,
-    # and the kernels import the kernel packages' shared sources.
-    "uniserve-kernels",
 ]
 dev = [
     "build>=1.2",
@@ -57,8 +63,16 @@ gpu = [
 ]
 
 [tool.uv.sources]
-uniserve-eval = { path = "uniserve_eval", editable = true }
-uniserve-kernels = { path = "crates/ops/python", editable = true }
+uniserve-eval = { workspace = true }
+uniserve-kernels = { workspace = true }
+uniserve-testing = { workspace = true }
+
+# The Python packages the repository holds, locked with the root project. The
+# Build Server's environment is a project of its own with its own lock, which
+# holds the compilers apart from the development tools.
+[tool.uv.workspace]
+members = ["crates/ops/python", "tests/support", "uniserve_eval"]
+exclude = ["crates/build-server/python"]
 
 [tool.uv]
 # NCCL 2.30.4 is the oldest release `crates/platform` accepts on a host: an
@@ -94,10 +108,24 @@ target = "uniserve"
 path = "Cargo.toml"
 debug = false
 
+# The operator's manager of a deployment's daemons, installed beside the
+# executable as `uniserve-manager`, with the same release build.
+[[tool.setuptools-rust.bins]]
+target = "uniserve-manager"
+path = "crates/manager/Cargo.toml"
+debug = false
+
+# The tests import no module by its position in the tree: the shared helpers
+# and the plugin are the installed `uniserve-testing` package, and each test
+# module is imported on its own (`importlib` mode), so no test directory is a
+# package and none is put on the search path.
+#
+# A plain run deselects the GPU end-to-end cases, which start servers on the
+# host's GPUs and read released checkpoints; a run that names its own marker
+# expression (`-m "e2e and gpu"`, `-m "unit and not gpu"`) replaces it.
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
-addopts = "-ra"
-pythonpath = ["."]
+addopts = '-ra --import-mode=importlib -m "not (e2e and gpu)"'
 markers = [
     "unit: pure local tests without server or external model files",
     "e2e: black-box server or worker tests",
@@ -116,7 +144,6 @@ markers = [
 # convention, and PEP 8 naming. Local reference checkouts under the ignored
 # `refs/` directory keep their own per-repository style enforcement.
 line-length = 80
-target-version = "py311"
 extend-exclude = [
     "refs",
     "target",
@@ -153,7 +180,6 @@ check_untyped_defs = true
 ignore_missing_imports = true
 
 [tool.pyright]
-pythonVersion = "3.11"
 typeCheckingMode = "basic"
 include = ["uniserve_eval"]
 exclude = ["refs", "target", ".venv"]

@@ -27,28 +27,22 @@ lint: fmt clippy
     {{python}} -m mypy
 
 # Fast Python tests (CPU only); the kernel checks run on Triton's interpreter. A kernel check that
-# launches what a package states for a descriptor key asks the base executable (`uniserve
+# launches what a package states for a descriptor key asks the environment's `uniserve` (`uniserve
 # build-server launch`, which runs the Build Server's environment program `uniserve-build-server`
-# from the search path); it is built here unless `UNISERVE_BINARY` names one.
+# from the search path), which `uv sync` installs with the root project.
 test-python-fast:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ -z "${UNISERVE_BINARY:-}" ]; then
-        {{cargo}} build -p uniserve --bin uniserve
-        export UNISERVE_BINARY=${CARGO_TARGET_DIR:-$PWD/target}/debug/uniserve
-    fi
     {{python}} -m pytest -m "unit and not gpu"
 
 # The missing-state tests (GPU) with every main process under compute-sanitizer's
 # memcheck; the logs go to $SANITIZER_LOGS (the run's artifacts by default).
 # docs/testing.md lists the variables the tests read.
 test-python-sanitizer:
-    PYTHON="{{python}}" CARGO="{{cargo}}" tools/gpu_e2e.sh --memcheck -m "e2e and gpu and missing_state"
+    PYTHON="{{python}}" tools/gpu_e2e.sh --memcheck -m "e2e and gpu and missing_state"
 
 # End-to-end Python tests (GPU), one case per free GPU, from one release
 # build. docs/testing.md lists the variables the tests read.
 test-python-gpu:
-    PYTHON="{{python}}" CARGO="{{cargo}}" tools/gpu_e2e.sh -m "e2e and gpu"
+    PYTHON="{{python}}" tools/gpu_e2e.sh -m "e2e and gpu"
 
 # Run all checks
 test-all: fmt clippy test-rust bench-build test-python-fast
