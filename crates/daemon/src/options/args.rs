@@ -325,7 +325,6 @@ mod tests {
 
     use clap::{FromArgMatches, Parser};
     use proto::config::{PrecisionMode, WeightFormat};
-    use proto::request::{ExpertExchange, SchedulingPolicy};
 
     use super::*;
 
@@ -381,7 +380,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.model.as_deref(), Some("/models/flag"));
         assert_eq!(config.max_running_requests.get(), 1);
-        assert_eq!(config.scheduler_config.policy, SchedulingPolicy::Fcfs);
+        assert_eq!(config.scheduler_config.policy, "fcfs");
         assert_eq!(config.admin_config.port, 0);
     }
 
@@ -401,7 +400,7 @@ mod tests {
             "--set",
             "server_config.request_timeout=2m",
             "--set",
-            "flashinfer_config.workspace_size=1GiB",
+            "admin_config.host=0.0.0.0",
         ])
         .unwrap();
         assert_eq!(
@@ -418,12 +417,12 @@ mod tests {
             [("video_vae".to_owned(), WeightFormat::Bf16)].into()
         );
         assert!(config.moe_config.expert_parallel);
-        assert_eq!(config.moe_config.exchange, ExpertExchange::DeepEp);
+        assert_eq!(config.moe_config.exchange, "deepep");
         assert_eq!(
             config.server_config.request_timeout,
             Some(Duration::from_secs(120))
         );
-        assert_eq!(config.flashinfer_config.workspace_size, 1 << 30);
+        assert_eq!(config.admin_config.host, "0.0.0.0");
     }
 
     /// An unknown option, a value its option does not take, a path through
@@ -441,7 +440,7 @@ mod tests {
                 "max_running_requests",
             ),
             (
-                vec!["--set", "scheduler_config.policy=sometimes"],
+                vec!["--set", "scheduler_config.policy=[\"fcfs\"]"],
                 "scheduler_config.policy",
             ),
             (vec!["--set", "max_batch=4"], "max_batch"),
@@ -892,7 +891,7 @@ mod tests {
             "--set",
             "quantization.mode=performance",
             "--set",
-            "moe_config={ expert_parallel = true, exchange = \"dwdp\" }",
+            "moe_config={ expert_parallel = true, exchange = \"deepep\" }",
             "--set",
             "kv_cache_config.prefix_caching=false",
             "--set",
@@ -907,7 +906,7 @@ mod tests {
             }
         );
         assert!(engine.moe.expert_parallel);
-        assert_eq!(engine.moe.exchange, ExpertExchange::Dwdp);
+        assert_eq!(engine.moe.exchange, "deepep");
         assert!(!engine.kv_cache.prefix_caching);
         assert_eq!(
             engine.scheduler.chunked_prefill_size,

@@ -136,7 +136,7 @@ uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
 | `server_config` | HTTP listener, API key, timeouts and HTTP admission |
 | `load_config`, `kv_cache_config`, `scheduler_config` | Checkpoint loading, the KV cache, and admission and batching |
 | `device_config`, `moe_config` | Parallel configuration without a deployment file, and product transport; expert parallelism |
-| `cuda_graph_config`, `flashinfer_config`, `worker_config` | CUDA graph capture, the FlashInfer provider, and the main processes and their workers |
+| `cuda_graph_config`, `worker_config` | CUDA graph capture, and the main processes and their workers |
 | `logging_config` | Request and statistics logs |
 | `chat_config`, `image_fetch_config` | Chat models: chat template, reasoning parser and image URL fetching |
 | `video_config`, `media_config`, `video_job_config` | Video models: output sizes, durations, prompt capacities, condition media and asynchronous jobs |

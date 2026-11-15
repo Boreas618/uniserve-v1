@@ -38,8 +38,8 @@ use processing::Serving;
 pub use args::{Stated, overridden, printed, resolve_text};
 pub use proto::config::{
     ChatConfig, ChatTemplateContentFormat, CudaGraphConfig, DEFAULT_FENCE_MODULES, DeviceConfig,
-    FlashInferConfig, ImageFetchConfig, ImageSize, KvCacheConfig, LoadConfig, LoggingConfig,
-    MediaConfig, MigrationConfig, MoeConfig, ProfilingConfig, ReasoningParser, SchedulerConfig,
+    ImageFetchConfig, ImageSize, KvCacheConfig, LoadConfig, LoggingConfig, MediaConfig,
+    MigrationConfig, MoeConfig, ProfilingConfig, ReasoningParser, SchedulerConfig,
     ServerConfig, SpeculativeConfig, VideoConfig, VideoJobConfig, WorkerConfig,
 };
 use proto::config::{positive, values};
@@ -284,8 +284,6 @@ pub struct ServerArgs {
     #[arg(skip)]
     pub cuda_graph_config: CudaGraphConfig,
     #[arg(skip)]
-    pub flashinfer_config: FlashInferConfig,
-    #[arg(skip)]
     pub worker_config: WorkerConfig,
     #[arg(skip)]
     pub profiling_config: ProfilingConfig,
@@ -380,7 +378,6 @@ impl Default for ServerArgs {
             device_config: DeviceConfig::default(),
             moe_config: MoeConfig::default(),
             cuda_graph_config: CudaGraphConfig::default(),
-            flashinfer_config: FlashInferConfig::default(),
             worker_config: WorkerConfig::default(),
             profiling_config: ProfilingConfig::default(),
             logging_config: LoggingConfig::default(),

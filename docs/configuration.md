@@ -202,7 +202,7 @@ A checkpoint that declares its own quantization (ModelOpt's `quantization_config
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `policy` | `"fcfs"` | Waiting-queue order: `fcfs` or `priority` |
+| `policy` | `"fcfs"` | The scheduling policy package's backend, which orders the waiting queue: `fcfs` (arrival order) or `priority` among the packages this tree holds (`crates/scheduling/policies`), or any policy package installed at the Build Server, which refuses a backend it holds no package of |
 | `max_queued_requests` | Unbounded | Waiting requests, and finished ones with undelivered events, before a submission is refused as overloaded |
 | `chunked_prefill_size` | `8192` | Prompt tokens one request prefills in one step; token models only |
 | `max_batch` | `128` | Calls assembled into one forward batch, clamped to what the workers accept |
@@ -290,7 +290,7 @@ Each entry is the median over the point's reports of the step time over its run'
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `expert_parallel` | `false` | Shard routed experts across the deployment's expert workers, across schedulers of one rank each (`data_parallel_size` above one), or otherwise over the tensor-parallel ranks of each scheduler's worker group, each rank holding whole experts; a group split over pipeline stages or sequence members is refused with it |
-| `exchange` | `"alltoall"` | `alltoall`, `megamoe`, `deepep` or `dwdp`; a deployment that shards its groups' experts over their tensor-parallel ranks moves no token and refuses any but the default |
+| `exchange` | `"alltoall"` | The expert-exchange package's backend: `alltoall`, `megamoe` or `deepep` among the packages this tree holds (`crates/ops/kernels/expert_exchange`), refused at the Build Server when it holds no package of the backend; a deployment that shards its groups' experts over their tensor-parallel ranks moves no token and refuses any but the default |
 | `microbatches` | `1` | Microbatches overlapping attention with dedicated expert workers |
 
 ### `cuda_graph_config`
@@ -303,21 +303,6 @@ Each entry is the median over the point's reports of the step time over its run'
 | `decode_batch_sizes` | Worker catalog | Decode batch sizes captured, strictly increasing; the largest decode batch the worker admits is captured besides them |
 | `prefill_token_sizes` | Worker catalog | Prefill token counts captured, strictly increasing; the batch token bound is captured besides them, for every row bucket up to the largest batch the worker admits |
 | `flow_shapes` | The model's default image size and its transpose | Distinct `HEIGHTxWIDTH` image sizes captured. Under graphs an image model generates only these sizes, encodes only the generated images of these sizes into latents (input images whose latent size is not among them are refused), and decodes only these sizes |
-
-### `flashinfer_config`
-
-**Destination: package parameters** of the FlashInfer attention package.
-
-**Read at:** `crates/daemon/src/epoch.rs:1376`, which turns the section into the attention package's TOML arguments; an argument the package does not declare reaches it as data rather than being dropped here.
-
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `workspace_size` | `"512MiB"` | Workspace per rank |
-| `use_tensor_core` | Backend decides | Decode attention on tensor cores |
-| `decode_backend`, `prefill_backend` | `"fa2"`, `"auto"` | Kernels: `auto`, `fa2` or `fa3` |
-| `decode_split_tile_size`, `prefill_split_tile_size` | FlashInfer default | Split-KV tile sizes |
-| `split_kv` | `true` | Split a KV sequence across thread blocks |
 
 ### `worker_config`
 

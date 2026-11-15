@@ -323,12 +323,12 @@ pub(crate) fn replica_configs(
         !config.moe.expert_parallel
             || union
             || !tensor_groups
-            || config.moe.exchange == proto::config::MoeConfig::default().exchange,
-        "`moe_config.exchange` is {} and `moe_config.expert_parallel` shards each worker \
+            || config.moe.exchange == proto::config::DEFAULT_EXPERT_EXCHANGE,
+        "`moe_config.exchange` is {:?} and `moe_config.expert_parallel` shards each worker \
          group's experts over its tensor-parallel ranks, which exchange no token: the exchanges \
          serve schedulers of one rank each and dedicated expert workers \
          (docs/expert_parallelism.md)",
-        serde_json::to_string(&config.moe.exchange).unwrap_or_default()
+        config.moe.exchange
     );
 
     let count = config.parallel.data_parallel_size.get();
@@ -4101,15 +4101,15 @@ mod tests {
     fn tensor_parallel_groups_sharding_their_experts_take_no_exchange() {
         for (tensor, data) in [(4, 1), (2, 2)] {
             let mut config = deployment(tensor, data, true);
-            config.moe.exchange = proto::request::ExpertExchange::Dwdp;
+            config.moe.exchange = "deepep".to_owned();
             let error = super::replica_configs(&config)
                 .expect_err("an exchange beside tensor-parallel experts")
                 .to_string();
-            assert!(error.contains("dwdp"), "{error}");
+            assert!(error.contains("deepep"), "{error}");
         }
 
         let mut union = deployment(1, 4, true);
-        union.moe.exchange = proto::request::ExpertExchange::Dwdp;
+        union.moe.exchange = "deepep".to_owned();
         assert_eq!(super::replica_configs(&union).unwrap().len(), 1);
     }
 

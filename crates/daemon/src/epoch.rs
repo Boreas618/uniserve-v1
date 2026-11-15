@@ -573,7 +573,7 @@ pub fn modules_of(config: &ServerArgs) -> ModuleSet {
             kernels.insert(
                 KernelKey::all(operator::EXPERT_EXCHANGE),
                 PackageRevision {
-                    backend: word(&config.moe_config.exchange),
+                    backend: config.moe_config.exchange.clone(),
                     revision: 0,
                     arguments: toml::Table::new(),
                 },
@@ -605,7 +605,7 @@ pub fn modules_of(config: &ServerArgs) -> ModuleSet {
             },
             kernels,
             policy: PackageRevision {
-                backend: word(&config.scheduler_config.policy),
+                backend: config.scheduler_config.policy.clone(),
                 revision: 0,
                 arguments: policy_arguments(config),
             },
@@ -630,10 +630,11 @@ fn attention_packages(config: &ServerArgs) -> Vec<(KernelKey, PackageRevision)> 
         .decode_attention_backend
         .clone()
         .unwrap_or_else(|| config.attention_backend.clone());
+    // No attention package declares parameters: its arguments are none.
     let package = |backend: String| PackageRevision {
         backend,
         revision: 0,
-        arguments: toml_arguments(&config.flashinfer_config),
+        arguments: toml::Table::new(),
     };
     if prefill == decode {
         if prefill == AUTO_BACKEND {
@@ -728,17 +729,6 @@ fn toml_arguments<T: Serialize>(value: &T) -> toml::Table {
     match toml::Value::try_from(value) {
         Ok(toml::Value::Table(table)) => table,
         _ => toml::Table::new(),
-    }
-}
-
-/// The word a vocabulary value is named by, as the configuration spells it
-/// (`fcfs`, `deepep`): its serialized form, which is also the package
-/// backend's name.
-fn word<T: Serialize>(value: &T) -> String {
-    match toml::Value::try_from(value) {
-        Ok(toml::Value::String(word)) => word,
-        Ok(other) => other.to_string(),
-        Err(_) => String::new(),
     }
 }
 
@@ -1139,7 +1129,7 @@ mod tests {
         // The package backends and the package parameters: a `Generation` change.
         let package: Vec<Case> = vec![
             ("scheduler_config.policy", |config: &mut ServerArgs| {
-                config.scheduler_config.policy = proto::request::SchedulingPolicy::Priority
+                config.scheduler_config.policy = "priority".to_owned()
             }),
             (
                 "scheduler_config.chunked_prefill_size",
@@ -1203,29 +1193,14 @@ mod tests {
             );
         }
 
-        // The attention package's arguments are a package change of a
-        // deployment that names its attention backend. One left at `auto`
-        // names no attention package, so they move nothing there.
-        fn named(config: &mut ServerArgs) {
-            config.attention_backend = "trtllm".to_owned();
-        }
-        let named_base = Epoch::of(set(named)).expect("the configuration resolves");
-        let workspace = Epoch::of(set(|config: &mut ServerArgs| {
-            named(config);
-            config.flashinfer_config.workspace_size = 1 << 30;
-        }))
-        .expect("the configuration resolves");
-        assert_eq!(change(&named_base, &workspace), Change::Generation);
-
         // The exchange is a package only where experts are spread over ranks:
         // a single-rank deployment's MoE block takes its local arm and launches
         // no exchange at all (`nn::Moe::forward` routes through
         // `forward_expert_parallel` only when an expert lives on another rank),
         // so the setting moves nothing there — and filling the slot anyway
         // would pin a package no call reaches.
-        let exchange_only = set(|config: &mut ServerArgs| {
-            config.moe_config.exchange = proto::request::ExpertExchange::DeepEp
-        });
+        let exchange_only =
+            set(|config: &mut ServerArgs| config.moe_config.exchange = "deepep".to_owned());
         assert_eq!(
             change(
                 &base,
@@ -1237,7 +1212,7 @@ mod tests {
         let mut spread = ServerArgs::default();
         spread.moe_config.expert_parallel = true;
         let mut spread_exchanged = spread.clone();
-        spread_exchanged.moe_config.exchange = proto::request::ExpertExchange::DeepEp;
+        spread_exchanged.moe_config.exchange = "deepep".to_owned();
         assert_eq!(
             change(
                 &Epoch::of(spread).expect("the configuration resolves"),
@@ -1276,6 +1251,10 @@ mod tests {
 
         // A package's revision is a generation change: the same backend
         // and parameters at a newly installed revision move the modules.
+        let named_base = Epoch::of(set(|config: &mut ServerArgs| {
+            config.attention_backend = "trtllm".to_owned();
+        }))
+        .expect("the configuration resolves");
         let mut installed = named_base.clone();
         for package in installed.modules.kernels.values_mut() {
             package.revision = 3;

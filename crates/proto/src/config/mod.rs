@@ -20,9 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::request::wire::{ExpertOrder, Predecessor};
-use crate::request::{
-    ExpertExchange, FlashInferBackend, PrefixCacheDtype, SchedulingPolicy, StandbyStorage,
-};
+use crate::request::{PrefixCacheDtype, StandbyStorage};
 pub use block::{
     BlockConfig, BlockConfigError, BlockDistribution, BlockWeights, HeadProjection,
     SequenceParallel,
@@ -164,6 +162,9 @@ pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 pub const DEFAULT_MAX_RUNNING_REQUESTS: usize = 128;
 /// Default token threshold above which a prefill is chunked.
 pub const DEFAULT_CHUNKED_PREFILL_SIZE: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
+/// The scheduling policy package a deployment runs when its configuration names none: arrival
+/// order (`crates/scheduling/policies/fcfs`).
+pub const DEFAULT_SCHEDULING_POLICY: &str = "fcfs";
 /// Default period at which a scheduler reads its completion queue while it waits on the buffer
 /// pool and forms no batch.
 pub const DEFAULT_POLL_PERIOD: Duration = Duration::from_millis(1);
@@ -178,8 +179,9 @@ pub const DEFAULT_POLL_PERIOD: Duration = Duration::from_millis(1);
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SchedulerConfig {
-    /// Waiting-queue order: `fcfs` or `priority`.
-    pub policy: SchedulingPolicy,
+    /// The scheduling policy package's backend, which orders the waiting queue (`fcfs`,
+    /// `priority`): a package the Build Server holds.
+    pub policy: String,
     /// Waiting requests, and finished ones with undelivered events, before
     /// a submission is refused as overloaded; unbounded when unset.
     pub max_queued_requests: Option<NonZeroUsize>,
@@ -219,7 +221,7 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            policy: SchedulingPolicy::Fcfs,
+            policy: DEFAULT_SCHEDULING_POLICY.to_owned(),
             max_queued_requests: None,
             chunked_prefill_size: None,
             max_batch: positive(DEFAULT_MAX_BATCH),
@@ -246,7 +248,7 @@ impl SchedulerConfig {
         graph_tiers: Vec<u32>,
     ) -> Self {
         Self {
-            policy: engine.scheduler.policy,
+            policy: engine.scheduler.policy.clone(),
             max_queued_requests: engine.scheduler.max_queued_requests,
             chunked_prefill_size: Some(
                 engine
@@ -364,6 +366,10 @@ impl Default for DeviceConfig {
     }
 }
 
+/// The expert-exchange package a deployment that shards its experts runs when its configuration
+/// names none: FlashInfer's NVLink all-to-all (`crates/ops/kernels/expert_exchange/alltoall`).
+pub const DEFAULT_EXPERT_EXCHANGE: &str = "alltoall";
+
 /// Mixture-of-experts parallelism (`moe_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -373,9 +379,9 @@ pub struct MoeConfig {
     /// ranks of each scheduler's worker group, each rank holding whole
     /// experts ([`EngineConfig::expert_union`]).
     pub expert_parallel: bool,
-    /// How sharded experts are reached: `alltoall`, `megamoe`, `deepep` or
-    /// `dwdp`.
-    pub exchange: ExpertExchange,
+    /// The expert-exchange package's backend, which reaches sharded experts (`alltoall`,
+    /// `megamoe`, `deepep`): a package the Build Server holds.
+    pub exchange: String,
     /// Microbatches overlapping attention with dedicated expert workers.
     pub microbatches: NonZeroU32,
 }
@@ -384,7 +390,7 @@ impl Default for MoeConfig {
     fn default() -> Self {
         Self {
             expert_parallel: false,
-            exchange: ExpertExchange::AllToAll,
+            exchange: DEFAULT_EXPERT_EXCHANGE.to_owned(),
             microbatches: NonZeroU32::MIN,
         }
     }
@@ -425,42 +431,6 @@ impl CudaGraphConfig {
             &sizes(&self.decode_batch_sizes),
             &sizes(&self.prefill_token_sizes),
         )
-    }
-}
-
-/// The FlashInfer attention provider (`flashinfer_config`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct FlashInferConfig {
-    /// Workspace per rank.
-    #[serde(with = "values::bytes")]
-    pub workspace_size: u64,
-    /// Decode attention on tensor cores; the backend decides when unset.
-    pub use_tensor_core: Option<bool>,
-    /// Decode kernels: `auto`, `fa2` or `fa3`.
-    pub decode_backend: FlashInferBackend,
-    /// Prefill kernels: `auto`, `fa2` or `fa3`.
-    pub prefill_backend: FlashInferBackend,
-    /// Split-KV tile size of decode attention.
-    pub decode_split_tile_size: Option<NonZeroU32>,
-    /// Split-KV tile size of prefill attention.
-    pub prefill_split_tile_size: Option<NonZeroU32>,
-    /// Split a KV sequence across thread blocks.
-    pub split_kv: bool,
-}
-
-impl Default for FlashInferConfig {
-    fn default() -> Self {
-        Self {
-            // 512 MiB.
-            workspace_size: 512 << 20,
-            use_tensor_core: None,
-            decode_backend: FlashInferBackend::Fa2,
-            prefill_backend: FlashInferBackend::Auto,
-            decode_split_tile_size: None,
-            prefill_split_tile_size: None,
-            split_kv: true,
-        }
     }
 }
 

@@ -28,10 +28,7 @@ pub use generation::{
     MultimodalInputs,
 };
 pub use sampling::{SamplingParams, SamplingParamsError};
-pub use spec::{
-    ExpertExchange, FlashInferBackend, FlashInferBackendParseError, PrefixCacheDtype,
-    SchedulingPolicy, StandbyStorage,
-};
+pub use spec::{PrefixCacheDtype, StandbyStorage};
 pub use values::{DiffusionSamplingParams, ImageEncoder, RequestId, TokenLogprob};
 
 /// The most events the engine sends a request beyond those its consumer took
