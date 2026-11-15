@@ -1654,7 +1654,7 @@ mod tests {
     fn an_engine_config_reads_back_what_it_wrote() {
         let config = ServerArgs::default();
         let build = config.engine_config().expect("the configuration resolves");
-        assert!(build.cuda_graph.flow_shapes.is_none());
+        assert!(build.cuda_graph.decode_batch_sizes.is_none());
         let text = serde_json::to_string(&build).expect("an engine config is JSON");
         let read: proto::config::EngineConfig =
             serde_json::from_str(&text).expect("the engine config reads back through its writer");

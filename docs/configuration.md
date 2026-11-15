@@ -302,7 +302,6 @@ Each entry is the median over the point's reports of the step time over its run'
 | --- | --- | --- |
 | `decode_batch_sizes` | Worker catalog | Decode batch sizes captured, strictly increasing; the largest decode batch the worker admits is captured besides them |
 | `prefill_token_sizes` | Worker catalog | Prefill token counts captured, strictly increasing; the batch token bound is captured besides them, for every row bucket up to the largest batch the worker admits |
-| `flow_shapes` | The model's default image size and its transpose | Distinct `HEIGHTxWIDTH` image sizes captured. Under graphs an image model generates only these sizes, encodes only the generated images of these sizes into latents (input images whose latent size is not among them are refused), and decodes only these sizes |
 
 ### `worker_config`
 

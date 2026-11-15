@@ -163,7 +163,6 @@ pub(crate) fn launch() -> EngineArgs {
         cuda_graph: proto::config::CudaGraphConfig {
             decode_batch_sizes: sizes(&[1, 2]),
             prefill_token_sizes: sizes(&[16, 32]),
-            ..Default::default()
         },
         worker: Default::default(),
         speculative: Default::default(),

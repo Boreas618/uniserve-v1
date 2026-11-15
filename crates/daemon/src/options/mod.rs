@@ -20,7 +20,6 @@
 
 mod args;
 
-use std::collections::BTreeSet;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -38,9 +37,9 @@ use processing::Serving;
 pub use args::{Stated, overridden, printed, resolve_text};
 pub use proto::config::{
     ChatConfig, ChatTemplateContentFormat, CudaGraphConfig, DEFAULT_FENCE_MODULES, DeviceConfig,
-    ImageFetchConfig, ImageSize, KvCacheConfig, LoadConfig, LoggingConfig, MediaConfig,
-    MigrationConfig, MoeConfig, ProfilingConfig, ReasoningParser, SchedulerConfig,
-    ServerConfig, SpeculativeConfig, VideoConfig, VideoJobConfig, WorkerConfig,
+    ImageFetchConfig, KvCacheConfig, LoadConfig, LoggingConfig, MediaConfig, MigrationConfig,
+    MoeConfig, ProfilingConfig, ReasoningParser, SchedulerConfig, ServerConfig,
+    SpeculativeConfig, VideoConfig, VideoJobConfig, WorkerConfig,
 };
 use proto::config::{positive, values};
 
@@ -712,7 +711,6 @@ impl ServerArgs {
             "cuda_graph_config.prefill_token_sizes",
             &graphs.prefill_token_sizes,
         )?;
-        distinct("cuda_graph_config.flow_shapes", &graphs.flow_shapes)?;
         increasing(
             "video_config.text_capacities",
             &self.video_config.text_capacities,
@@ -971,17 +969,6 @@ fn increasing(path: &str, values: &Option<Vec<NonZeroU32>>) -> anyhow::Result<()
         anyhow::ensure!(
             values.windows(2).all(|pair| pair[0] < pair[1]),
             "`{path}` must be strictly increasing, got {values:?}"
-        );
-    }
-    Ok(())
-}
-
-/// Checks that stated image capture sizes are distinct: the workers capture each size once.
-fn distinct(path: &str, shapes: &Option<Vec<ImageSize>>) -> anyhow::Result<()> {
-    if let Some(shapes) = shapes {
-        anyhow::ensure!(
-            shapes.iter().collect::<BTreeSet<_>>().len() == shapes.len(),
-            "`{path}` repeats an image size"
         );
     }
     Ok(())

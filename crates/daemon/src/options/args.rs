@@ -841,15 +841,9 @@ mod tests {
 
     /// Capture lists and capacities are checked before any rank starts.
     #[test]
-    fn capture_lists_are_strictly_increasing_and_shapes_distinct() {
-        let (_, engine) = lowered(&[
-            "m",
-            "--set",
-            "video_config.text_capacities=[1024, 4096]",
-            "--set",
-            "cuda_graph_config.flow_shapes=[\"1152x2048\", \"2048x1152\"]",
-        ])
-        .unwrap();
+    fn capture_lists_are_strictly_increasing() {
+        let (_, engine) =
+            lowered(&["m", "--set", "video_config.text_capacities=[1024, 4096]"]).unwrap();
         let capacities = engine.video.text_capacities.unwrap();
         assert_eq!(
             capacities
@@ -858,17 +852,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1024, 4096]
         );
-        let shapes = engine.cuda_graph.flow_shapes.unwrap();
-        assert_eq!(
-            shapes.iter().map(|shape| shape.0).collect::<Vec<_>>(),
-            vec![[1152, 2048], [2048, 1152]]
-        );
 
         for refused in [
             "video_config.text_capacities=[4096, 1024]",
             "cuda_graph_config.decode_batch_sizes=[1, 0]",
-            "cuda_graph_config.flow_shapes=[\"1152x2048\", \"1152x2048\"]",
-            "cuda_graph_config.flow_shapes=[\"1152\"]",
             // A list has one form, the array: comma-separated text and a bare element are
             // refused.
             "video_config.text_capacities=1024,4096",

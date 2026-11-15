@@ -25,7 +25,6 @@ pub use block::{
     BlockConfig, BlockConfigError, BlockDistribution, BlockWeights, HeadProjection,
     SequenceParallel,
 };
-pub use values::ImageSize;
 pub use worker_group::{
     DEFAULT_BLOCK, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK, WorkerGroupConfig, WorkerGroupId,
     WorkerGroupRole, WorkerRank,
@@ -406,9 +405,6 @@ pub struct CudaGraphConfig {
     /// Prefill token counts captured, strictly increasing; the worker's
     /// catalog when unset.
     pub prefill_token_sizes: Option<Vec<NonZeroU32>>,
-    /// Distinct `HEIGHTxWIDTH` image sizes captured; `1152x2048` and
-    /// `2048x1152` when unset.
-    pub flow_shapes: Option<Vec<ImageSize>>,
 }
 
 impl CudaGraphConfig {

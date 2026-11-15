@@ -12,12 +12,7 @@
 //!
 //! A list is a TOML array (`[1024, 10240]`), in a file and in a `--set` value
 //! alike; it has no other form.
-//!
-//! It also defines [`ImageSize`], the `HEIGHTxWIDTH` value image-size options
-//! are written in.
 
-use std::fmt;
-use std::str::FromStr;
 use std::time::Duration;
 
 use serde::de;
@@ -174,45 +169,6 @@ pub mod byte_count {
                 "{bytes} bytes exceed this platform's address space"
             ))
         })
-    }
-}
-
-/// A `HEIGHTxWIDTH` image size in pixels, both positive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ImageSize(pub [u32; 2]);
-
-impl FromStr for ImageSize {
-    type Err = String;
-
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let invalid =
-            || format!("invalid image size {text:?}; expected HEIGHTxWIDTH, such as 1152x2048");
-        let lowered = text.trim().to_ascii_lowercase();
-        let (height, width) = lowered.split_once('x').ok_or_else(invalid)?;
-        match (height.trim().parse::<u32>(), width.trim().parse::<u32>()) {
-            (Ok(height), Ok(width)) if height > 0 && width > 0 => Ok(Self([height, width])),
-            _ => Err(invalid()),
-        }
-    }
-}
-
-impl fmt::Display for ImageSize {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}x{}", self.0[0], self.0[1])
-    }
-}
-
-impl Serialize for ImageSize {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.to_string().serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for ImageSize {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(de::Error::custom)
     }
 }
 
