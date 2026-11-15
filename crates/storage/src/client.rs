@@ -250,6 +250,21 @@ impl Client {
         })
     }
 
+    /// Blocks until an event is received, `interrupt` (when given) becomes readable or reaches its
+    /// end, or `deadline` (when given) passes; returns the earliest event not yet taken, with the
+    /// descriptors that came with it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the connection fails.
+    pub fn wait_next_event(
+        &mut self,
+        interrupt: Option<BorrowedFd<'_>>,
+        deadline: Option<Instant>,
+    ) -> Result<Waited<(Event, Vec<OwnedFd>)>> {
+        self.wait_event(interrupt, deadline, VecDeque::pop_front)
+    }
+
     /// Blocks until `found` takes an event from those received, `interrupt` becomes readable,
     /// or `deadline` passes.
     fn wait_event<T>(
