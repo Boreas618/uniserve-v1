@@ -189,12 +189,42 @@ pub fn run(launch: EngineArgs, registry: &nn::family::Registry) -> Result<()> {
         let build = Some(Arc::new(Mutex::new(build)));
         start::start(launch, &registry, &storage, build, policy, liveness)
     });
-    if let Err(error) = main.serve(start, filed) {
-        tracing::error!(error = %format!("{error:#}"), "the main process ends: the epoch failed");
+    if let Err(failed) = main.serve(start, filed) {
+        let error = format!("{:#}", failed.error);
+        tracing::error!(%error, "the main process ends: the epoch failed");
+        // The process ends holding the failed epoch: `exit` runs no destructor, so nothing of it
+        // is released while a device or a peer may still address it, and the daemon learns of
+        // the end from the process's exit.
         std::process::exit(1);
     }
     tracing::warn!("the main process ends: a shutdown was commanded");
     Ok(())
+}
+
+/// How the control thread ended when its epoch failed: why, and the started epoch as the failure
+/// left it.
+///
+/// The epoch is handed to the caller, the owner of the process's lifetime, instead of being
+/// dropped: dropping a worker joins its thread, which a device that stopped making progress never
+/// lets end, and its storage, given back, could still be addressed by device work or a peer rank.
+/// The engine's executable ends the process while it holds the epoch ([`run`]).
+pub struct Failed {
+    /// Why the epoch failed: the start, a scheduler, a device, a stall or a lost peer.
+    pub error: anyhow::Error,
+    /// The started epoch, boxed as the error of every return it travels in; `None` when the epoch
+    /// failed before its start ended.
+    pub engine: Option<Box<Engine>>,
+}
+
+/// A failure that holds no epoch: one before the control thread or the start ran, or of the
+/// orderly close, which consumed the epoch.
+impl From<anyhow::Error> for Failed {
+    fn from(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            engine: None,
+        }
+    }
 }
 
 /// Refuses a launch that states no epoch or host, or a world whose inherited sockets disagree
@@ -228,15 +258,16 @@ fn check(launch: &EngineArgs) -> Result<()> {
 ///
 /// # Errors
 ///
-/// When the epoch fails: the start, a scheduler, a device, a stall or a lost peer. The engine is
-/// then left as it is, without its orderly close.
+/// When the control thread cannot start, or the epoch fails: the start, a scheduler, a device, a
+/// stall or a lost peer. The started epoch is then handed back as the failure left it, without
+/// its orderly close ([`Failed`]).
 pub fn serve(
     requests: Connection,
     window: NonZeroU32,
     process: Connection,
     launch: EngineArgs,
     start: Start,
-) -> Result<()> {
+) -> std::result::Result<(), Failed> {
     MainProcess::new(requests, window, process, launch)?.serve(start, Vec::new())
 }
 
@@ -368,7 +399,11 @@ impl MainProcess {
 
     /// Starts `start` on its thread, serves `filed` (commands the claim read first), and then
     /// serves what arrives until the control thread ends.
-    fn serve(mut self, start: Start, filed: Vec<proto::process::Command>) -> Result<()> {
+    fn serve(
+        mut self,
+        start: Start,
+        filed: Vec<proto::process::Command>,
+    ) -> std::result::Result<(), Failed> {
         let inbox = self.inbox.0.clone();
         let launch = self.launch.clone();
         std::thread::Builder::new()
@@ -592,14 +627,14 @@ impl MainProcess {
     }
 
     /// Ends the control thread: in order after a shutdown or once no daemon serves it; without
-    /// its orderly close after a failure, leaving the engine as it is, since a device or a
-    /// collective may hold every rank.
-    fn end(mut self, ending: Result<()>) -> Result<()> {
+    /// its orderly close after a failure, handing the engine to the caller as it is, since a
+    /// device or a collective may hold every rank ([`Failed`]).
+    fn end(mut self, ending: Result<()>) -> std::result::Result<(), Failed> {
         if let Err(error) = ending {
-            // Nothing of the engine is dropped: dropping a worker joins its thread, which a
-            // device that stopped making progress never lets end.
-            let _ = std::mem::ManuallyDrop::new(self.engine.take());
-            return Err(error);
+            return Err(Failed {
+                error,
+                engine: self.engine.take().map(Box::new),
+            });
         }
 
         self.lifecycle = Lifecycle::Stopped;

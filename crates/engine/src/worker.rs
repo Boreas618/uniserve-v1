@@ -1957,19 +1957,5 @@ fn added_kernels(serving: &Generation, next: &Generation) -> Vec<String> {
     added
 }
 
-/// Keeps `value`, and every resource it owns, until the process exits.
-///
-/// An aborted close, or a release whose device completion is unknown, cannot tell when device
-/// work, a DMA engine or a peer rank stops addressing what `value` owns: releasing it could give
-/// storage, a mapping or a stream that is still in use to another owner. The value is leaked
-/// instead, and process exit returns its resources to the driver.
-#[expect(
-    clippy::mem_forget,
-    reason = "resources whose last device access is unknown must outlive it"
-)]
-pub(crate) fn leak<T>(value: T) {
-    std::mem::forget(value);
-}
-
 #[cfg(test)]
 mod tests;

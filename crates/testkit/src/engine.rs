@@ -113,8 +113,11 @@ pub fn spawn(
     let thread = std::thread::Builder::new()
         .name("engine".to_owned())
         .spawn(move || {
+            // A failed epoch's engine is dropped here: its fakes hold no device that could still
+            // address what it owns.
             let served = ::engine::connect(&mut engine_requests, &launch).and_then(|window| {
                 ::engine::serve(engine_requests, window, engine_process, launch, start)
+                    .map_err(|failed| failed.error)
             });
             if let Err(error) = &served {
                 eprintln!("the test's engine ended: {error:#}");

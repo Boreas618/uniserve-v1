@@ -176,7 +176,9 @@ pub(crate) struct MediaHost {
 type Running = (Arc<HostTask<MediaWork>>, Vec<Vec<Span>>);
 
 /// One row's host work, as the media host's thread pool runs it: what it reads is in host
-/// memory already, and the runner writes what it produces once it ended.
+/// memory already (the bytes were copied to the host, and the copy waited for, before the work
+/// was submitted, so no device work addresses them), and the runner writes what it produces once
+/// it ended.
 pub(crate) struct MediaWork {
     work: Box<dyn Fn() -> Result<Produced> + Send + Sync>,
 }
@@ -186,17 +188,6 @@ impl HostAction for MediaWork {
 
     fn run(&self) -> Result<Produced> {
         (self.work)()
-    }
-
-    /// Nothing to release: what the work reads is its own host memory.
-    fn release(&self) -> Result<()> {
-        Ok(())
-    }
-
-    /// The bytes the work reads were copied to the host, and the copy waited for, before the work
-    /// was submitted: no device work addresses them.
-    fn input_status(&self) -> Outcome {
-        Outcome::Success(())
     }
 }
 
@@ -2015,14 +2006,6 @@ mod tests {
         fn run(&self) -> Result<()> {
             let _ = self.0.recv();
             Ok(())
-        }
-
-        fn release(&self) -> Result<()> {
-            Ok(())
-        }
-
-        fn input_status(&self) -> Outcome {
-            Outcome::Success(())
         }
     }
 

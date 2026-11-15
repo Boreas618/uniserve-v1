@@ -11,10 +11,10 @@
 //! back is where the work's result is read or waited for.
 //!
 //! A pool is aborted when its last owner drops it: admission stops and the queued tasks are
-//! cancelled, without joining work that may wait on a failed device or peer. A task's inputs are
-//! released by its pool, by the rule of [`HostAction::input_status`]: an action whose inputs'
-//! physical producer failed or was cancelled is kept until the process exits, because device work
-//! whose completion is unknown may still address them.
+//! cancelled, without joining work that may wait on a failed device or peer. A task's action, and
+//! every input it owns, is dropped by the thread that ran or cancelled it once that ended: work
+//! reads host memory that no device addresses any more (its submitter waited for the copies that
+//! produced it), so nothing is to be kept past it.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -26,8 +26,8 @@ use service::lock;
 
 /// Work a thread pool runs.
 ///
-/// The pool owns admission, queueing, the result and the release of the inputs; an action
-/// supplies its work and says whether its inputs may be released.
+/// The pool owns admission, queueing and the result; an action supplies its work, and owns its
+/// inputs, which go with it once the work ended or was withdrawn.
 pub(crate) trait HostAction: Send + Sync + Sized + 'static {
     /// What the work returns.
     type Output: Send + Sync;
@@ -38,21 +38,6 @@ pub(crate) trait HostAction: Send + Sync + Sized + 'static {
     ///
     /// The work's own failure, which becomes the task's result.
     fn run(&self) -> Result<Self::Output>;
-
-    /// Releases the action's inputs. The pool calls it once, after the work ended or was
-    /// withdrawn, and only when [`Self::input_status`] reported a success.
-    ///
-    /// # Errors
-    ///
-    /// The release's failure, which replaces a successful result of the work.
-    fn release(&self) -> Result<()>;
-
-    /// How the physical producer of the action's inputs ended, asked once the work ended or was
-    /// withdrawn.
-    ///
-    /// A failure or a cancellation leaves the producer's last device access unknown: the pool
-    /// then keeps the action, and every input it holds, until the process exits.
-    fn input_status(&self) -> Outcome;
 }
 
 /// One submitted action and its result.
@@ -86,35 +71,23 @@ impl<A: HostAction> HostTask<A> {
     }
 
     /// Runs the task on the calling thread of its pool, or cancels it when the pool was
-    /// `aborted` before a thread took it.
+    /// `aborted` before a thread took it. The action, with its inputs, is dropped before the
+    /// result is observable.
     fn run(&self, aborted: bool) {
         // The queue hands each task to one thread once, so the action is there to take.
         let Some(action) = lock(&self.action).take() else {
             return;
         };
 
-        // The pool's threads carry their pool's name, which the log lines below name.
-        let pool = thread::current().name().unwrap_or("thread-pool").to_owned();
-
         if aborted {
-            if let Err(error) = release_inputs(action) {
-                tracing::warn!("{pool}: releasing a withdrawn task's inputs failed: {error}");
-            }
+            drop(action);
             self.return_capacity();
             wake(self.completion.cancel().1);
             return;
         }
 
-        let mut result = action.run();
-        if let Err(cleanup) = release_inputs(action) {
-            match &result {
-                Ok(_) => result = Err(cleanup),
-                Err(error) => tracing::warn!(
-                    "{pool}: releasing the inputs of a failed task also failed: {cleanup} \
-                     (task: {error})"
-                ),
-            }
-        }
+        let result = action.run();
+        drop(action);
         // The capacity goes back before the result is observable, so whoever observes the result
         // can submit again at once.
         self.return_capacity();
@@ -130,19 +103,6 @@ impl<A: HostAction> HostTask<A> {
     fn return_capacity(&self) {
         if let Some(pool) = self.pool.upgrade() {
             lock(&pool).admitted -= 1;
-        }
-    }
-}
-
-/// Releases `action`'s inputs when their physical producer stopped successfully. An unknown
-/// completion keeps the action, and its inputs, until the process exits, whatever the task's own
-/// result.
-fn release_inputs<A: HostAction>(action: A) -> Result<()> {
-    match action.input_status() {
-        Outcome::Success(()) => action.release(),
-        Outcome::Failed(_) | Outcome::Cancelled => {
-            crate::worker::leak(action);
-            Ok(())
         }
     }
 }
@@ -307,12 +267,11 @@ mod tests {
     use super::*;
 
     /// An action that tells `started` it runs and waits at `gate` when it has them, counts its
-    /// run and returns the count. `producer` is how the producer of its `input` ended.
+    /// run and returns the count. It owns `input`.
     struct Counted {
         runs: Arc<AtomicUsize>,
         started: Option<crossbeam_channel::Sender<()>>,
         gate: Option<Arc<Barrier>>,
-        producer: Outcome,
         input: Arc<()>,
     }
 
@@ -322,7 +281,6 @@ mod tests {
                 runs: Arc::clone(runs),
                 started: None,
                 gate: None,
-                producer: Outcome::Success(()),
                 input: Arc::new(()),
             }
         }
@@ -348,14 +306,6 @@ mod tests {
             // The pool holds the action, and so its input, for the whole run.
             assert!(Arc::strong_count(&self.input) >= 1);
             Ok(self.runs.fetch_add(1, Ordering::SeqCst) + 1)
-        }
-
-        fn release(&self) -> Result<()> {
-            Ok(())
-        }
-
-        fn input_status(&self) -> Outcome {
-            self.producer.clone()
         }
     }
 
@@ -463,34 +413,21 @@ mod tests {
         assert!(ThreadPool::new("pool-test", 1, 0).is_err());
     }
 
-    /// Runs one task whose input's producer ended with `producer` and returns whether the input
-    /// is still held once the pool, the task and every other owner are gone. The pool releases
-    /// a task's inputs before it records the task's result.
-    fn held_after_close(producer: Outcome) -> Result<bool> {
+    /// A task's inputs go with its action as soon as the work ended: by the time its result is
+    /// observable the pool holds none of them, while the task and the pool live on.
+    #[test]
+    fn an_ended_task_holds_no_input() -> Result<()> {
         let pool = ThreadPool::new("pool-test", 1, 1)?;
         let runs = Arc::new(AtomicUsize::new(0));
         let input = Arc::new(());
         let held = Arc::downgrade(&input);
 
         let task = pool.submit(Counted {
-            producer,
             input,
             ..Counted::new(&runs)
         })?;
         assert!(matches!(task.wait(), Outcome::Success(_)));
-
-        drop(task);
-        drop(pool);
-        Ok(held.upgrade().is_some())
-    }
-
-    #[test]
-    fn inputs_whose_producer_did_not_stop_outlive_the_pool() -> Result<()> {
-        assert!(!held_after_close(Outcome::Success(()))?);
-
-        let unknown = Arc::new(Error::transport("device access could not be drained"));
-        assert!(held_after_close(Outcome::Failed(unknown))?);
-        assert!(held_after_close(Outcome::Cancelled)?);
+        assert!(held.upgrade().is_none());
         Ok(())
     }
 }

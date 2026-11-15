@@ -41,5 +41,5 @@ pub mod worker;
 
 pub use process::ranks::text_layout;
 pub use process::record::{Recorded, record};
-pub use process::{Engine, Start, connect, run, serve};
+pub use process::{Engine, Failed, Start, connect, run, serve};
 pub use scheduler::Error;
