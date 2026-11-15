@@ -284,7 +284,8 @@ fn a_per_tensor_fp8_projection_is_chosen_by_the_checkpoint_s_declaration() {
     );
     declare(
         directory.path(),
-        r#"{"quant_algo": "MIXED_PRECISION", "quantized_layers": {"proj": {"quant_algo": "FP8"}}}"#,
+        r#"{"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {"proj": {"quant_algo": "FP8"}}}"#,
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let config = LinearConfig {

@@ -35,8 +35,10 @@ use crate::weights::{
 /// that reads the tensor of an export without one is refused under this vocabulary and not as a
 /// missing name.
 ///
-/// A checkpoint's spelling is its declaration's ([`Declaration::names`](super::Declaration::names)),
-/// which every module that reads packed fields takes it from.
+/// A checkpoint's spelling is its producer schema's: [`UNIFIED_EXPORT`](super::UNIFIED_EXPORT)
+/// for a ModelOpt unified checkpoint and [`ModeloptManifest::NAMES`](super::ModeloptManifest::NAMES)
+/// for a packed export calibrated by its manifest. Every module that reads packed fields takes it
+/// from the representation its loader resolved ([`Representation::names`](super::Representation::names)).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Nvfp4Names {
     /// What this vocabulary is called, in refusals: the export that writes it.
@@ -49,37 +51,6 @@ pub struct Nvfp4Names {
     pub tensor_scale: &'static str,
     /// The calibration's activation scale, when the export states one.
     pub input_scale: &'static str,
-}
-
-impl Nvfp4Names {
-    /// The vLLM/ModelOpt spelling: `weight`, `weight_scale`, `weight_scale_2`, `input_scale`.
-    ///
-    /// This is what a ModelOpt export for vLLM states.
-    pub const fn vllm() -> Self {
-        Self {
-            export: "vLLM ModelOpt",
-            values: "weight",
-            block_scale: "weight_scale",
-            tensor_scale: "weight_scale_2",
-            input_scale: "input_scale",
-        }
-    }
-
-    /// The diffusers/ModelOpt spelling: `weight_packed`, `weight_scale`, `weight_tensor_scale`,
-    /// `input_scale`.
-    ///
-    /// This is what a packed NVFP4 export of a diffusers pipeline states in every stage it
-    /// calibrates (a `transformer` and a `vae`, say). A packed projection keeps the `bias` its
-    /// module states, in the stage's own floating-point type.
-    pub const fn diffusers() -> Self {
-        Self {
-            export: "diffusers ModelOpt",
-            values: "weight_packed",
-            block_scale: "weight_scale",
-            tensor_scale: "weight_tensor_scale",
-            input_scale: "input_scale",
-        }
-    }
 }
 
 impl fmt::Display for Nvfp4Names {
@@ -768,9 +739,9 @@ impl WeightLoader<'_> {
         Err(Error::weight(
             tensor,
             format!(
-                "this checkpoint was opened as the {names} spelling of a calibrated NVFP4 \
+                "this checkpoint was opened in the spelling of {names} for a calibrated NVFP4 \
                  projection, whose {field} is `{suffix}`, and it holds no tensor of this name; \
-                 the other export's spelling names the same field differently"
+                 another export's spelling names the same field differently"
             ),
         ))
     }

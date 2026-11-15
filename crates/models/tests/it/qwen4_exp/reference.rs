@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use models::qwen4_exp::causal_lm::{coordinates, ngram_context, token_columns};
 use models::qwen4_exp::{Config, DecoderLayer, HyperConnection, NgramEmbedding, PleLayer};
 use nn::family::TextModel;
-use nn::modules::{Linear, LinearConfig, Parallel, Rotary};
+use nn::modules::Rotary;
 use nn::quantization::Declaration;
 use nn::{
     CpuWeights, DType, Device, KvCache, KvPlanes, Phase, RecurrentState, Shape, Split, Tensor,
@@ -436,7 +436,6 @@ fn the_gated_delta_layer_is_the_references() {
             false,
             &support::placement(Split::WHOLE, DRAFTS),
             None,
-            false,
         )
         .expect("the layer");
         let rotary = Rotary::load(&config.text.rope, model.pp("rotary_emb")).expect("the rotary");
@@ -703,7 +702,6 @@ fn the_indexed_attention_layer_is_the_references() {
             false,
             &support::placement(Split::WHOLE, DRAFTS),
             None,
-            false,
         )
         .expect("the layer");
         let rotary = Rotary::load(&config.text.rope, model.pp("rotary_emb")).expect("the rotary");
@@ -947,34 +945,6 @@ fn the_drafter_over_two_rounds_is_the_references() {
         0.05,
     );
     assert_attention_caches(&vectors, "mtp", &step);
-}
-
-/// A block-scaled FP8 weight is read as the dense matrix its values and scales state, each
-/// element `e4m3(weight) · weight_scale_inv` rounded once to BF16: exactly the reference's.
-#[test]
-fn a_block_scaled_fp8_weight_decodes_to_the_references_matrix() {
-    let vectors = vectors();
-
-    with_fixture("reference", |_, vb| {
-        let projection = Linear::load(
-            &LinearConfig {
-                inputs: 256,
-                outputs: 128,
-                bias: false,
-                parallel: Parallel::None,
-            },
-            vb.pp("fp8_blocks"),
-        )
-        .expect("the projection");
-
-        assert_eq!(projection.weight().dtype(), DType::BF16);
-        assert_close(
-            "decoded FP8 blocks",
-            projection.weight(),
-            &vector(&vectors, "fp8_blocks.dense"),
-            0.0,
-        );
-    });
 }
 
 /// The bound two FP32 evaluations of one formula differ by when their reductions sum `terms`

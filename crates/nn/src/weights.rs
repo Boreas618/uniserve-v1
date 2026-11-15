@@ -44,7 +44,6 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use float8::F8E4M3;
 use half::{bf16, f16};
 use ops::allocator::ALIGNMENT;
 use sha2::{Digest, Sha256};
@@ -52,7 +51,7 @@ use tensor::{CpuStorage, DType, Device, Shape, Storage, Tensor};
 
 use crate::checkpoint::{Checkpoint, FileIdentity, TensorLocation};
 use crate::error::{Error, Result};
-use crate::quantization::{Declaration, Scheme};
+use crate::quantization::{Declaration, Representation, Scheme};
 use crate::var_builder::VarBuilder;
 
 /// The arrangement of a weight's bytes that its reading operator declares.
@@ -499,9 +498,9 @@ pub struct WeightLoader<'a> {
     /// The element type every weight is read as unless the model pins another: the launch's
     /// explicit choice, or `None` for the checkpoint's own.
     dtype: Option<DType>,
-    /// What the checkpoint declares about its packed weights, resolved against its shards; dense
-    /// until a model [`declares`](WeightLoader::declare) one.
-    declaration: Declaration,
+    /// How the checkpoint stores its weights: what it declares, resolved against its shards;
+    /// dense until a model [`declares`](WeightLoader::declare) one.
+    representation: Representation,
 }
 
 impl<'a> WeightLoader<'a> {
@@ -519,7 +518,7 @@ impl<'a> WeightLoader<'a> {
             checkpoint,
             retention: Retention::Store(store),
             dtype,
-            declaration: Declaration::dense(),
+            representation: Representation::dense(),
         }
     }
 
@@ -543,7 +542,7 @@ impl<'a> WeightLoader<'a> {
             checkpoint,
             retention: Retention::Meta(Rc::default()),
             dtype,
-            declaration: Declaration::dense(),
+            representation: Representation::dense(),
         }
     }
 
@@ -560,21 +559,23 @@ impl<'a> WeightLoader<'a> {
     ///
     /// # Errors
     ///
-    /// When the declaration and the shards contradict each other ([`Declaration::resolve`]).
+    /// When the shards store a representation no operator serves, or contradict the
+    /// declaration ([`Declaration::resolve`]).
     pub fn declare(&mut self, declaration: &Declaration) -> Result<()> {
-        self.declaration = declaration.resolve(self.checkpoint)?;
+        self.representation = declaration.resolve(self.checkpoint)?;
         Ok(())
     }
 
-    /// The declaration every weight is read by, resolved against this loader's checkpoint: what
-    /// a module that reads packed fields takes their spelling and its activation scale from.
-    pub fn declaration(&self) -> &Declaration {
-        &self.declaration
+    /// The representation every weight is read by, the declaration resolved against this
+    /// loader's checkpoint: what a module that reads packed fields takes their spelling and its
+    /// activation scale from.
+    pub fn representation(&self) -> &Representation {
+        &self.representation
     }
 
-    /// How the checkpoint stores the weight named `weight`, by the resolved declaration.
+    /// How the checkpoint stores the weight named `weight`, by the resolved representation.
     pub fn scheme(&self, weight: &str) -> Scheme {
-        self.declaration.scheme(weight)
+        self.representation.scheme(weight)
     }
 
     /// The builder of the checkpoint's root: its tensors are named as the checkpoint names them,
@@ -666,208 +667,6 @@ impl<'a> WeightLoader<'a> {
                 held(key, shape, tensor)
             }
         }
-    }
-
-    /// Loads the weight `name` whose tensors the checkpoint stores as weight-only NVFP4
-    /// ([`Scheme::Nvfp4Weights`]) or as block-scaled FP8 ([`Scheme::Fp8Blocks`]), `scheme`
-    /// saying which, as the BF16 matrix their fields state.
-    ///
-    /// `source` names the logical matrix, `[rows, columns]` of every tensor it reads, exactly as
-    /// a dense read names it: a tensor-parallel block, a strided column block or a fused stack
-    /// of experts. Each tensor is decoded once for the read, in FP32 rounded once to BF16 (round
-    /// to nearest even): `code · block_scale · tensor_scale` for NVFP4 and
-    /// `e4m3(weight) · weight_scale_inv` for block-scaled FP8. The source's region is gathered
-    /// from the decoded matrices, and the product that reads the weight is a 16-bit product.
-    ///
-    /// # Errors
-    ///
-    /// A tensor whose fields are missing or of another extent, or the source's own refusals.
-    pub(crate) fn load_decoded(
-        &self,
-        name: &str,
-        source: &WeightSource,
-        layout: WeightLayout,
-        shape: &Shape,
-        scheme: Scheme,
-    ) -> Result<Tensor> {
-        let names = source_names(source);
-        let mut logical = Vec::with_capacity(names.len());
-        let blocks = scheme == Scheme::Fp8Blocks;
-
-        for tensor in &names {
-            let packed = self.checkpoint.locate(tensor)?;
-            let stored = if blocks { DType::F8E4M3 } else { DType::U8 };
-            if packed.dtype != stored || packed.shape.rank() != 2 {
-                return Err(Error::weight(
-                    tensor,
-                    format!(
-                        "a weight decoded at load is a {} matrix, not {} {:?}",
-                        ops::abi::name(stored),
-                        ops::abi::name(packed.dtype),
-                        packed.shape.dims()
-                    ),
-                ));
-            }
-
-            // An NVFP4 byte holds two elements of its row.
-            let per_byte = if blocks { 1 } else { 2 };
-            let (rows, columns) = (dim(&packed.shape, 0), dim(&packed.shape, 1) * per_byte);
-            logical.push(TensorLocation {
-                file: packed.file,
-                tensor: tensor.clone(),
-                dtype: DType::BF16,
-                shape: extents(&[rows, columns]),
-                bytes: (0, rows * columns * 2),
-            });
-        }
-
-        let files = self.identities(&names)?;
-        let (start, source_shape, stride) = source_region(source);
-        let key = WeightKey {
-            files,
-            dtype: DType::BF16,
-            layout,
-            tensors: names.clone(),
-            start,
-            shape: source_shape,
-            stride,
-            provenance: None,
-        };
-        if let Some(weight) = self.retained(&key, shape)? {
-            return Ok(weight);
-        }
-
-        let spans = spans_in(source, &key, &|tensor| {
-            logical.iter().find(|location| location.tensor == tensor)
-        })?;
-        let read: u64 = spans.iter().map(|(_, range)| range.len() as u64).sum();
-        if read != numel(shape) * 2 {
-            return Err(Error::weight(
-                name,
-                format!(
-                    "{read} bytes were read, {} expected for {:?} of bf16",
-                    numel(shape) * 2,
-                    shape.dims()
-                ),
-            ));
-        }
-        check_layout(name, source, layout)?;
-
-        self.publish_with(&key, shape, false, |loader| {
-            let mut decoded: Vec<(String, Vec<u8>)> = Vec::new();
-            let mut bytes = Vec::with_capacity(read as usize);
-
-            for (location, range) in &spans {
-                let tensor = &location.tensor;
-                if !decoded.iter().any(|(decoded, _)| decoded == tensor) {
-                    let matrix = if blocks {
-                        loader.decode_fp8_blocks(tensor, &location.shape)?
-                    } else {
-                        loader.decode_nvfp4(tensor, &location.shape)?
-                    };
-                    decoded.push((tensor.clone(), matrix));
-                }
-
-                let (_, matrix) = decoded
-                    .iter()
-                    .find(|(decoded, _)| decoded == tensor)
-                    .ok_or_else(|| Error::weight(tensor, "a decoded matrix went missing"))?;
-                bytes.extend_from_slice(&matrix[range.clone()]);
-            }
-            Ok(Cow::Owned(bytes))
-        })
-    }
-
-    /// The BF16 bytes of the `[rows, columns]` matrix the block-scaled FP8 fields of `name`
-    /// state: each element `e4m3(weight) · weight_scale_inv` of its block, the product formed
-    /// in FP32 and rounded once to BF16.
-    fn decode_fp8_blocks(&self, name: &str, shape: &Shape) -> Result<Vec<u8>> {
-        let (rows, columns) = (dim(shape, 0) as usize, dim(shape, 1) as usize);
-        let scales_name = format!("{name}_scale_inv");
-        let scales = self.checkpoint.locate(&scales_name)?;
-
-        // The scale tensor's own extents state the blocks: whole blocks of rows and columns.
-        let (scale_rows, scale_columns) = match scales.shape.dims() {
-            &[scale_rows, scale_columns]
-                if scale_rows > 0
-                    && scale_columns > 0
-                    && rows.is_multiple_of(scale_rows)
-                    && columns.is_multiple_of(scale_columns)
-                    && scales.dtype.is_float() =>
-            {
-                (scale_rows, scale_columns)
-            }
-            _ => {
-                return Err(Error::weight(
-                    name,
-                    format!(
-                        "block scales of {} {:?} for a {rows} × {columns} matrix; one floating \
-                         scale per whole block of rows and columns expected",
-                        ops::abi::name(scales.dtype),
-                        scales.shape.dims()
-                    ),
-                ));
-            }
-        };
-        let (block_rows, block_columns) = (rows / scale_rows, columns / scale_columns);
-
-        let values = self.checkpoint.read(name)?;
-        let scales = convert(
-            scales.dtype,
-            DType::F32,
-            &self.checkpoint.read(&scales_name)?,
-            &scales_name,
-        )?;
-        let scale = |row: usize, column: usize| -> f32 {
-            let at = (row / block_rows * scale_columns + column / block_columns) * 4;
-            f32::from_le_bytes([scales[at], scales[at + 1], scales[at + 2], scales[at + 3]])
-        };
-
-        let mut out = Vec::with_capacity(rows * columns * 2);
-        for row in 0..rows {
-            for column in 0..columns {
-                let value = F8E4M3::from_bits(values[row * columns + column]).to_f32();
-                out.extend_from_slice(&bf16::from_f32(value * scale(row, column)).to_le_bytes());
-            }
-        }
-        Ok(out)
-    }
-
-    /// The BF16 bytes of the `[rows, columns]` matrix the NVFP4 fields of `name` state, read in
-    /// the declaration's spelling.
-    fn decode_nvfp4(&self, name: &str, shape: &Shape) -> Result<Vec<u8>> {
-        let names = self.declaration.names();
-        let stem = name.strip_suffix(names.values).ok_or_else(|| {
-            Error::weight(
-                name,
-                format!("an NVFP4 weight is a module's `{}`", names.values),
-            )
-        })?;
-        let (rows, columns) = (dim(shape, 0), dim(shape, 1));
-
-        let packed = self.checkpoint.read(name)?;
-        let scales_name = format!("{stem}{}", names.block_scale);
-        let scales = self.checkpoint.locate(&scales_name)?;
-        if scales.dtype != DType::F8E4M3 || numel(&scales.shape) * 16 != rows * columns {
-            return Err(Error::weight(
-                name,
-                format!(
-                    "block scales of {} {:?} for a {rows} × {columns} matrix; one F8_E4M3 per \
-                     sixteen elements expected",
-                    ops::abi::name(scales.dtype),
-                    scales.shape.dims()
-                ),
-            ));
-        }
-
-        let scales = self.checkpoint.read(&scales_name)?;
-        let tensor_scale = self.tensor_scale(&format!("{stem}{}", names.tensor_scale))?;
-        Ok(crate::quantization::decode_nvfp4(
-            &packed,
-            &scales,
-            tensor_scale,
-            columns as usize,
-        ))
     }
 
     /// Loads the weight `name` from `source`, converting and publishing it the first time and
@@ -1121,7 +920,7 @@ impl<'a> WeightLoader<'a> {
             checkpoint,
             retention,
             dtype: self.dtype,
-            declaration: self.declaration.clone(),
+            representation: self.representation.clone(),
         })
     }
 

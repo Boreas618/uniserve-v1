@@ -78,5 +78,9 @@
     "patch_size": 2,
     "spatial_merge_size": 2,
     "temporal_patch_size": 2
+  },
+  "quantization_config": {
+    "quant_method": "modelopt",
+    "quant_algo": "NVFP4"
   }
 }

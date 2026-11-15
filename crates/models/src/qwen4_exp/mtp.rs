@@ -19,7 +19,7 @@
 //! The drafter's indexer runs at every step, as vLLM's does when the checkpoint states no
 //! `index_share_for_mtp_iteration` (`refs/vllm/vllm/config/speculative.py:1079-1088`). Its
 //! experts keep the checkpoint's order, because an expert redistribution names only the
-//! model's layers; an export's block-scaled FP8 experts are decoded to dense matrices at load.
+//! model's layers.
 //!
 //! ## The drafter's state
 //!
@@ -136,8 +136,7 @@ impl Mtp {
             pre_fc_norm_hidden: norm(hidden * streams, "pre_fc_norm_hidden")?,
             fc_hidden: projection("fc_hidden")?,
             rotary_emb: Rotary::load(&text.rope, vb.pp("rotary_emb"))?,
-            // The drafter's layer attends, without a PLE layer; its experts are few enough
-            // to hold decoded when the export stores them as block-scaled FP8.
+            // The drafter's layer attends, without a PLE layer.
             layer: DecoderLayer::load(
                 config,
                 vb.pp("layers").pp(0),
@@ -145,7 +144,6 @@ impl Mtp {
                 false,
                 placement,
                 None,
-                true,
             )?,
             hyper_connection_mixer: HyperConnection::load(
                 config,

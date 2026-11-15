@@ -3,7 +3,7 @@
 //!
 //! A packed NVFP4 export of a diffusers pipeline writes `modelopt_manifest.json` at the
 //! pipeline's root. Its calibrated projections store their fields in the diffusers spelling
-//! ([`Nvfp4Names::diffusers`]: `weight_packed`, `weight_scale`, `weight_tensor_scale`) and no
+//! ([`ModeloptManifest::NAMES`]: `weight_packed`, `weight_scale`, `weight_tensor_scale`) and no
 //! activation scale beside them: the manifest lists every calibrated module with the largest
 //! activation magnitude its calibration measured, and the activation's tensor scale is that
 //! magnitude in ModelOpt's scale domain,
@@ -29,7 +29,7 @@ use ops::fp4::BLOCK_ELEMENTS;
 use ops::fp8::E4M3_MAX;
 use serde_json::Value;
 
-use super::{Declaration, KvCacheScheme, Nvfp4Names, Scheme};
+use super::{Declaration, Nvfp4Names, Scheme};
 use crate::config::Fields;
 use crate::error::Result;
 
@@ -66,6 +66,19 @@ pub struct ModeloptManifest {
 impl ModeloptManifest {
     /// The manifest's file, at the root of the export.
     pub const FILE: &'static str = "modelopt_manifest.json";
+
+    /// The spelling a packed export calibrated by its manifest writes each projection's fields
+    /// in: the packed values `weight_packed`, the block scales `weight_scale` and the tensor
+    /// scale `weight_tensor_scale`, with no activation scale beside them (it is the manifest's).
+    /// A packed projection keeps the `bias` its module states, in the stage's own
+    /// floating-point type.
+    pub const NAMES: Nvfp4Names = Nvfp4Names {
+        export: "a ModelOpt packed export",
+        values: "weight_packed",
+        block_scale: "weight_scale",
+        tensor_scale: "weight_tensor_scale",
+        input_scale: "input_scale",
+    };
 
     /// The manifest `value` states.
     ///
@@ -191,15 +204,10 @@ impl ModeloptManifest {
             return Ok(Declaration::dense());
         }
         Ok(Declaration {
-            blocks: None,
             scheme: Scheme::Nvfp4,
-            excluded: Vec::new(),
-            kv_cache: KvCacheScheme::Unquantized,
-            packed: None,
-            layers: None,
-            names: Nvfp4Names::diffusers(),
+            names: Self::NAMES,
             activations: Some(activations),
-            converted: Vec::new(),
+            ..Declaration::dense()
         })
     }
 }
@@ -296,7 +304,7 @@ mod tests {
         };
         let declaration = manifest.declaration(stored).unwrap();
 
-        assert_eq!(declaration.names(), Nvfp4Names::diffusers());
+        assert_eq!(declaration.names, ModeloptManifest::NAMES);
         assert!(declaration.is_encoded());
         assert_eq!(
             declaration.activation_scale("blocks.0.ff.net.2").unwrap(),

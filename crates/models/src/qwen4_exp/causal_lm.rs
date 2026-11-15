@@ -223,8 +223,7 @@ impl Qwen4ExpForCausalLm {
     ///
     /// # Errors
     ///
-    /// [`Error::Representation`] for a checkpoint whose decoder layers store their routed
-    /// experts as block-scaled FP8; a split the model does not divide; a pipeline or sequence
+    /// A split the model does not divide; a pipeline or sequence
     /// split, which this model's layers do not serve; an order that names no layer; a drafter
     /// the checkpoint does not carry; or a module the loader refuses.
     pub fn load(
@@ -272,7 +271,6 @@ impl Qwen4ExpForCausalLm {
                     config.ple(layer).is_some(),
                     placement,
                     order.get(&expert_module(layer)),
-                    false,
                 )
             })
             .collect::<Result<Vec<_>>>()?;

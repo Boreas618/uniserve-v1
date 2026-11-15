@@ -52,10 +52,6 @@ pub enum Error {
     /// split does not divide what it shards, or a call's inputs do not describe the model.
     #[error("qwen4_exp: {0}")]
     Config(String),
-    /// The checkpoint stores weights in a form no operator of this build computes with and no
-    /// load can decode: the checkpoint is refused before any tensor is read.
-    #[error("qwen4_exp: {0}")]
-    Representation(String),
     /// A module, a function or the weight loader refused the call.
     #[error(transparent)]
     Nn(#[from] nn::Error),

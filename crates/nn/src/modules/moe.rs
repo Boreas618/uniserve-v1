@@ -438,7 +438,7 @@ impl MoE {
         share: Option<(u64, u64, u64)>,
     ) -> Result<Experts> {
         let loader = vb.loader();
-        let names = loader.declaration().names();
+        let names = loader.representation().names();
         let list = vb.pp(config.list);
         let (gated_layout, down_layout) = if exchanged {
             (ValueLayout::GateFirst, ValueLayout::Plain)

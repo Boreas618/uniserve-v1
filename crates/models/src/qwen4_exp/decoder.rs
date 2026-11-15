@@ -21,7 +21,6 @@ use nn::modules::{
     GateUp, GatedDeltaNet, GatedDeltaNetConfig, MlpConfig, MoE, MoEConfig, Rotary, SharedExpert,
     SharedExpertConfig,
 };
-use nn::quantization::Scheme;
 use nn::{DType, ExpertExchange, KvCache, RecurrentState, Tensor, TokenBatch, VarBuilder};
 
 use crate::qwen4_exp::attention::IndexedAttention;
@@ -67,15 +66,11 @@ impl DecoderLayer {
     /// `ple` the PLE layer the layer holds. The routed experts are held at the placement's share
     /// of them (its window of the expert group's slots, or of the tensor group's when that group
     /// holds whole experts) in the slots `order` states, or in the checkpoint's order when it
-    /// states none. `decode` lets routed experts an export stores as block-scaled FP8 be
-    /// decoded to dense matrices at load, which a drafter's one layer is few enough for and a
-    /// stack's layers are not.
+    /// states none.
     ///
     /// # Errors
     ///
-    /// [`Error::Representation`] for routed experts stored as block-scaled FP8 when `decode`
-    /// does not allow them to be decoded dense at load; a module the loader refuses; or a
-    /// split that does not divide what it shards.
+    /// A module the loader refuses, or a split that does not divide what it shards.
     pub fn load(
         config: &Config,
         vb: VarBuilder<'_, '_>,
@@ -83,24 +78,9 @@ impl DecoderLayer {
         ple: bool,
         placement: &TextPlacement,
         order: Option<&Vec<u32>>,
-        decode: bool,
     ) -> Result<Self> {
         let (tensor, draft_tokens) = (placement.tensor, placement.draft_tokens);
         let (text, moe) = (&config.text, &config.moe);
-
-        // No operator of this build multiplies block-scaled FP8 expert weights, and a
-        // stack's experts are too many to hold decoded.
-        let first_expert = vb.pp("mlp").pp("experts").pp(0).pp("gate_proj");
-        if !decode && first_expert.scheme("weight") == Scheme::Fp8Blocks {
-            return Err(Error::Representation(format!(
-                "{} stores its routed experts as FP8 with block scales (weight_scale_inv): \
-                 the grouped products over block-scaled FP8 weights and activations are not \
-                 served, and {} experts of {} layers are not decoded to dense matrices at load",
-                vb.path(),
-                moe.num_experts,
-                text.num_hidden_layers
-            )));
-        }
 
         let (linear_attn, self_attn) = if linear {
             let network = GatedDeltaNetConfig {

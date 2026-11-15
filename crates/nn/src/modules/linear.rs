@@ -190,9 +190,7 @@ impl Linear {
         let name = vb.name("weight");
 
         match vb.scheme("weight") {
-            // A weight-only NVFP4 matrix and a block-scaled FP8 matrix are read as the dense
-            // matrix they state (`VarBuilder::load`).
-            Scheme::Dense | Scheme::Nvfp4Weights | Scheme::Fp8Blocks => {
+            Scheme::Dense => {
                 let weight = vb.load(
                     &name,
                     &weight_source(&name, inputs, local_out, local_in, parallel),
@@ -371,8 +369,8 @@ impl Linear {
         local_out: u64,
         parallel: Parallel,
     ) -> Result<Self> {
-        let declaration = vb.loader().declaration();
-        let spelling = declaration.names();
+        let representation = vb.loader().representation();
+        let spelling = representation.names();
         let values = weight_source(
             &vb.name(spelling.values),
             inputs / 2,
@@ -391,7 +389,7 @@ impl Linear {
 
         let global_scale = vb.tensor_scale(spelling.tensor_scale)?;
 
-        let stated = declaration.activation_scale(vb.path())?;
+        let stated = representation.activation_scale(vb.path())?;
         let activation_scale = match stated {
             // Two statements of one calibration are two numbers a loader would have to choose
             // between.

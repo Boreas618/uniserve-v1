@@ -15,7 +15,7 @@ use std::path::Path;
 use nn::collective::Split;
 use nn::functional::{self, Activation, Rounding};
 use nn::modules::{GateUp, MlpConfig, MoE, MoEConfig, SharedExpert, SharedExpertConfig};
-use nn::quantization::{Declaration, Nvfp4Names, Nvfp4Stack, ValueLayout};
+use nn::quantization::{Declaration, Nvfp4Stack, UNIFIED_EXPORT, ValueLayout};
 use nn::{Checkpoint, CpuWeights, DType, Device, ExpertExchange, Tensor, WeightLoader};
 use ops::fp4::ScaleLayout;
 use support::{
@@ -851,7 +851,7 @@ fn routed_stacks(loader: &WeightLoader<'_>) -> (Nvfp4Stack, Nvfp4Stack) {
                 projections,
                 &[0, 1],
                 2,
-                Nvfp4Names::vllm(),
+                UNIFIED_EXPORT,
                 (values, ScaleLayout::Swizzled128X4),
                 true,
             )

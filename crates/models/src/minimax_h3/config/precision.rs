@@ -261,7 +261,8 @@ mod tests {
         config
     }
 
-    /// The scheme each module's representative weights are read in under `config`: a denoiser
+    /// The scheme each module's representative weights are read in under `config` over a dense
+    /// checkpoint, which reads a weight no conversion names dense: a denoiser
     /// block's query and gate-compress projections, its feed-forward's two, a language layer's
     /// query and down projections, and a decoder block's value and feed-forward projections.
     fn schemes(config: &Config) -> [[Scheme; 2]; 4] {
@@ -270,20 +271,34 @@ mod tests {
         let decoder = &config.video_vae.quantization;
         [
             [
-                network.scheme("transformer_blocks.7.attn.to_q.weight"),
-                network.scheme("transformer_blocks.49.attn.to_gate_compress.weight"),
+                network
+                    .conversion("transformer_blocks.7.attn.to_q.weight")
+                    .unwrap_or(Scheme::Dense),
+                network
+                    .conversion("transformer_blocks.49.attn.to_gate_compress.weight")
+                    .unwrap_or(Scheme::Dense),
             ],
             [
-                network.scheme("transformer_blocks.0.ff.net.0.proj.weight"),
-                network.scheme("transformer_blocks.3.ff.net.2.weight"),
+                network
+                    .conversion("transformer_blocks.0.ff.net.0.proj.weight")
+                    .unwrap_or(Scheme::Dense),
+                network
+                    .conversion("transformer_blocks.3.ff.net.2.weight")
+                    .unwrap_or(Scheme::Dense),
             ],
             [
-                text.scheme("model.language_model.layers.0.self_attn.q_proj.weight"),
-                text.scheme("model.language_model.layers.49.mlp.down_proj.weight"),
+                text.conversion("model.language_model.layers.0.self_attn.q_proj.weight")
+                    .unwrap_or(Scheme::Dense),
+                text.conversion("model.language_model.layers.49.mlp.down_proj.weight")
+                    .unwrap_or(Scheme::Dense),
             ],
             [
-                decoder.scheme("decoder.transformer_blocks.35.attn.to_v.weight"),
-                decoder.scheme("decoder.transformer_blocks.0.ff.net.0.proj.weight"),
+                decoder
+                    .conversion("decoder.transformer_blocks.35.attn.to_v.weight")
+                    .unwrap_or(Scheme::Dense),
+                decoder
+                    .conversion("decoder.transformer_blocks.0.ff.net.0.proj.weight")
+                    .unwrap_or(Scheme::Dense),
             ],
         ]
     }
@@ -337,7 +352,7 @@ mod tests {
             (decoder, "decoder.transformer_blocks.0.attn.to_q.bias"),
             (decoder, "encoder.down_blocks.0.resnets.0.conv1.conv.weight"),
         ] {
-            assert_eq!(declaration.scheme(weight), Scheme::Dense, "{weight}");
+            assert_eq!(declaration.conversion(weight), None, "{weight}");
         }
     }
 

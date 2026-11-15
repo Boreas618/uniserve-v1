@@ -12,7 +12,7 @@ mod support;
 
 use std::path::Path;
 
-use nn::quantization::{Nvfp4Names, ValueLayout};
+use nn::quantization::{ModeloptManifest, Nvfp4Names, UNIFIED_EXPORT, ValueLayout};
 use nn::weights::PartBlock;
 use nn::{
     Checkpoint, CpuWeights, DType, Device, Shape, Tensor, WeightKey, WeightLayout, WeightLoader,
@@ -547,7 +547,7 @@ fn a_calibrated_nvfp4_matrix_is_loaded_as_its_fields() {
             &region("w", (4, 32)),
             &region("w_scale", (4, 4)),
             Some("w_input"),
-            Nvfp4Names::vllm(),
+            UNIFIED_EXPORT,
             layouts,
             0.25,
         )
@@ -626,10 +626,10 @@ fn a_calibrated_projection_is_read_in_the_spelling_its_export_wrote() {
         )
     };
 
-    fields(Nvfp4Names::diffusers()).expect("the diffusers spelling names its packed values");
-    let error = fields(Nvfp4Names::vllm()).unwrap_err().to_string();
+    fields(ModeloptManifest::NAMES).expect("the packed export's spelling names its packed values");
+    let error = fields(UNIFIED_EXPORT).unwrap_err().to_string();
     assert!(
-        error.contains("vLLM ModelOpt") && error.contains("packed E2M1 values"),
+        error.contains(UNIFIED_EXPORT.export) && error.contains("packed E2M1 values"),
         "{error}"
     );
 }
@@ -689,7 +689,7 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
                 &["up_proj", "gate_proj"],
                 &[0, 1],
                 2,
-                Nvfp4Names::vllm(),
+                UNIFIED_EXPORT,
                 (ValueLayout::Plain, ScaleLayout::Linear),
                 false,
             )
@@ -740,7 +740,7 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
             &["up_proj", "gate_proj"],
             &[1, 0],
             2,
-            Nvfp4Names::vllm(),
+            UNIFIED_EXPORT,
             (ValueLayout::Plain, ScaleLayout::Linear),
             false,
         )
@@ -763,7 +763,7 @@ fn a_stack_keeps_its_scale_type_and_arranges_its_rows_at_load() {
             &["up_proj", "gate_proj"],
             &[0],
             1,
-            Nvfp4Names::vllm(),
+            UNIFIED_EXPORT,
             (values, ScaleLayout::Swizzled128X4),
             false,
         )
@@ -844,7 +844,7 @@ fn a_stack_needs_every_expert_to_agree_on_its_extents() {
             &["up_proj"],
             &[0, 1],
             2,
-            Nvfp4Names::vllm(),
+            UNIFIED_EXPORT,
             (ValueLayout::Plain, ScaleLayout::Linear),
             false,
         )
@@ -1116,7 +1116,7 @@ fn a_meta_load_refuses_what_the_header_contradicts() {
                 &["up_proj"],
                 &[0],
                 1,
-                Nvfp4Names::vllm(),
+                UNIFIED_EXPORT,
                 (ValueLayout::Plain, ScaleLayout::Linear),
                 false,
             )
