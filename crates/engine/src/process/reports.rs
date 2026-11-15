@@ -374,7 +374,8 @@ mod tests {
             testkit::serving::launch(),
         )
         .unwrap();
-        main.streams.insert(RequestId(7), RequestStream::new(0, 0));
+        main.streams
+            .insert(RequestId(7), RequestStream::new(0, RequestId(7), 0));
 
         let reason = "a main process of this epoch was lost: rank 1's engine process".to_owned();
         main.fail(

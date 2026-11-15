@@ -296,7 +296,13 @@ pub(crate) struct MainProcess {
     prepared: Option<(Packages, Arc<wasmtime::Module>, Parameters)>,
     /// The started epoch; `None` while starting.
     engine: Option<Engine>,
+    /// The admitted requests' streams, by the engine's identity of each request.
     streams: HashMap<RequestId, RequestStream>,
+    /// The engine's identity of each admitted request, by its stream's front and the identity
+    /// that front gives it: each front numbers its own requests.
+    named: HashMap<(usize, RequestId), RequestId>,
+    /// The engine identity the next admitted request takes.
+    next_request: u64,
     /// The requests the pause gate holds, in arrival order, each with its front and the media of
     /// its conditions.
     held: VecDeque<(usize, wire::Request, Vec<Arc<proto::MappedMedia>>)>,
@@ -376,6 +382,8 @@ impl MainProcess {
             prepared: None,
             engine: None,
             streams: HashMap::new(),
+            named: HashMap::new(),
+            next_request: 1,
             held: VecDeque::new(),
             paused: false,
             recompute: false,

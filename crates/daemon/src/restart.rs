@@ -162,7 +162,6 @@ struct ReplicaHandoff {
     next_engine: u64,
     /// The arguments the replica's engine process serves with.
     served: proto::config::EngineArgs,
-    first_request: u64,
     config: String,
     paused: bool,
     asleep: bool,
@@ -380,7 +379,6 @@ impl Restarter {
                 engine: replica.engine,
                 next_engine: replica.next_engine,
                 served: replica.served.clone(),
-                first_request: replica.client.next_request_id() + (1 << 32),
                 config: crate::options::printed(&replica.config)?,
                 paused: replica.paused,
                 asleep: replica.asleep,
@@ -853,7 +851,6 @@ async fn prepared_successor(
                     connection,
                     sink,
                 )?;
-                client.number_requests_from(replica.first_request);
                 Ok((replica, options, served, observer, client))
             })
             .collect::<anyhow::Result<Vec<_>>>()

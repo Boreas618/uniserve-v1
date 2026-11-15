@@ -422,13 +422,9 @@ fn an_engine_started_on_the_meta_device_serves_and_shuts_down() {
         from_engine::Kind::Accepted(accepted) => Some(accepted),
         _ => None,
     });
-    assert_eq!(
-        accepted,
-        wire::Accepted {
-            request: 11,
-            scheduler: 0
-        }
-    );
+    // The request keeps the identity this connection gave it, and the engine states its own.
+    assert_eq!((accepted.request, accepted.scheduler), (11, 0));
+    assert_ne!(accepted.engine_request, 0);
 
     // The metrics, once a second.
     until(&mut requests, LONG, |kind| match kind {

@@ -169,10 +169,14 @@ pub enum StreamCancelCause {
 /// A request in flight, as the reader files its frames.
 struct Pending {
     events: mpsc::UnboundedSender<Event>,
-    /// Sent the scheduler serving the request once the engine
-    /// accepts it, or `None` when the request ends first.
-    accepted: Option<oneshot::Sender<Option<u32>>>,
+    /// Sent the request's admission once the engine accepts it, or `None`
+    /// when the request ends first.
+    accepted: Option<oneshot::Sender<Option<Admission>>>,
 }
+
+/// How an engine admitted a request: the scheduler that serves it, and the
+/// engine's own identity of it (`wire::Accepted::engine_request`).
+type Admission = (u32, RequestId);
 
 /// The connection's state shared between the client, its streams and its
 /// reader.
@@ -407,10 +411,11 @@ impl EngineClient {
         self.shared.state.subscribe()
     }
 
-    /// Submits `request` under an identity of the client's choosing and
-    /// returns its events and the scheduler serving it; the scheduler is
-    /// `None` when the engine ended the request at submission, whose
-    /// terminal event the stream holds.
+    /// Submits `request` under an identity of the client's choosing, which
+    /// this connection's requests alone are numbered in, and returns its
+    /// events and the scheduler serving it; the scheduler is `None` when the
+    /// engine ended the request at submission, whose terminal event the
+    /// stream holds.
     ///
     /// # Errors
     ///
@@ -447,8 +452,9 @@ impl EngineClient {
         );
         // The stream exists before the acceptance arrives, so that dropping
         // the submission while it waits cancels the request.
-        let stream = EventStream {
+        let mut stream = EventStream {
             id,
+            engine: None,
             events: receiver,
             shared: Arc::clone(&self.shared),
             awaits_decoder,
@@ -461,8 +467,8 @@ impl EngineClient {
         self.shared.submit(&request);
         // A closed connection drops the acceptance with the request, whose
         // stream then holds the connection's error event.
-        let scheduler = match acceptance.await {
-            Ok(scheduler) => scheduler,
+        let admission = match acceptance.await {
+            Ok(admission) => admission,
             Err(_) => {
                 // Nothing took the sender out of `Pending`, so no event of this
                 // request ever arrived and no scheduler was named: the engine
@@ -476,14 +482,16 @@ impl EngineClient {
                 None
             }
         };
-        Ok((stream, scheduler))
+        stream.engine = admission.map(|(_, engine)| engine);
+        Ok((stream, admission.map(|(scheduler, _)| scheduler)))
     }
 
-    /// Takes one request's event stream over from the connection that
-    /// consumed it, going on after the `consumed` events that response took:
-    /// a hot restart's successor
+    /// Takes the event stream of the request the engine knows as `engine`
+    /// over from the connection that consumed it, going on after the
+    /// `consumed` events that response took: a hot restart's successor
     /// attaches to a request the engine kept running, which is neither
-    /// cancelled nor submitted again.
+    /// cancelled nor submitted again. This connection gives the request an
+    /// identity of its own, which the stream's events and commands carry.
     ///
     /// The local receiver is registered before the command is sent, so the
     /// engine's replay of the events after `consumed` reaches the returned
@@ -493,13 +501,14 @@ impl EngineClient {
     /// # Errors
     ///
     /// Fails when the engine serves no requests.
-    pub fn take_over(&self, request: RequestId, consumed: u64) -> Result<EventStream, SubmitError> {
+    pub fn take_over(&self, engine: RequestId, consumed: u64) -> Result<EventStream, SubmitError> {
         if let EngineState::Failed(reason) = self.state() {
             return Err(SubmitError::Unavailable(reason));
         }
         if self.state() == EngineState::Stopped {
             return Err(SubmitError::Unavailable("its process ended".to_owned()));
         }
+        let request = RequestId(self.shared.next_id.fetch_add(1, Ordering::Relaxed));
         let (events, receiver) = mpsc::unbounded_channel();
         lock(&self.shared.requests).insert(
             request,
@@ -510,6 +519,7 @@ impl EngineClient {
         );
         let stream = EventStream {
             id: request,
+            engine: Some(engine),
             events: receiver,
             shared: Arc::clone(&self.shared),
             // The event stream the predecessor consumed already told the
@@ -523,7 +533,10 @@ impl EngineClient {
         };
         self.shared.command(
             request,
-            wire::command::Kind::Takeover(wire::Takeover { events: consumed }),
+            wire::command::Kind::Takeover(wire::Takeover {
+                events: consumed,
+                engine_request: engine.0,
+            }),
         );
         Ok(stream)
     }
@@ -956,23 +969,6 @@ impl EngineClient {
         lock(&self.control).take()
     }
 
-    /// The identity the next request submitted takes.
-    pub fn next_request_id(&self) -> u64 {
-        self.shared.next_id.load(Ordering::Relaxed)
-    }
-
-    /// Reserve the same request-ID interval used by daemon handoff for an
-    /// attached front. Engine request IDs are shared across all its fronts.
-    pub(crate) fn reserve_request_ids(&self) -> u64 {
-        self.shared.next_id.fetch_add(1 << 32, Ordering::Relaxed)
-    }
-
-    /// Numbers this client's requests from `first` on, so that they never
-    /// take the identity of another daemon's request to the same engine.
-    pub fn number_requests_from(&self, first: u64) {
-        self.shared.next_id.fetch_max(first, Ordering::Relaxed);
-    }
-
     /// Closes the connection without shutting the engine down, as the daemon
     /// a hot restart replaced does once its requests ended: the engine goes
     /// on serving its other daemons. Waits until the reader ended.
@@ -1096,7 +1092,8 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                     .get_mut(&RequestId(accepted.request))
                     .and_then(|pending| pending.accepted.take())
                 {
-                    let _ = responder.send(Some(accepted.scheduler));
+                    let engine = RequestId(accepted.engine_request);
+                    let _ = responder.send(Some((accepted.scheduler, engine)));
                 }
             }
             Some(from_engine::Kind::Metrics(metrics)) => {
@@ -1230,7 +1227,13 @@ const REPORT_EVERY: u64 = EVENT_WINDOW as u64 / 2;
 /// as completing none, [`Self::cancel_at_consumed_prefix`] a match. Dropping
 /// the stream before its terminal event cancels the request.
 pub struct EventStream {
+    /// The identity this connection gave the request, which its events and
+    /// commands carry here.
     id: RequestId,
+    /// The engine's own identity of the request, which a takeover names and
+    /// its private cache pages are kept under; `None` for a request the
+    /// engine did not admit.
+    engine: Option<RequestId>,
     events: mpsc::UnboundedReceiver<Event>,
     /// The engine's connection.
     shared: Arc<Shared>,
@@ -1250,12 +1253,14 @@ pub struct EventStream {
 }
 
 impl EventStream {
-    /// Provenance of private cache pages when this request resumes elsewhere.
-    pub fn cache_resume(&self) -> proto::request::CacheResume {
-        proto::request::CacheResume {
+    /// Provenance of private cache pages when this request resumes elsewhere:
+    /// the epoch and the engine's identity of the request; `None` for a
+    /// request the engine did not admit, which computed no page.
+    pub fn cache_resume(&self) -> Option<proto::request::CacheResume> {
+        self.engine.map(|engine| proto::request::CacheResume {
             epoch: self.epoch(),
-            request_id: self.id.0,
-        }
+            request_id: engine.0,
+        })
     }
 
     /// The epoch of the engine that feeds the stream.
@@ -1263,9 +1268,15 @@ impl EventStream {
         self.shared.epoch
     }
 
-    /// The request's identity in the engine that serves it.
+    /// The identity this connection gave the request.
     pub fn id(&self) -> RequestId {
         self.id
+    }
+
+    /// The engine's own identity of the request, which a successor takes its
+    /// stream over by; `None` for a request the engine did not admit.
+    pub fn engine_id(&self) -> Option<RequestId> {
+        self.engine
     }
 
     /// The events its consumer took in all, as the engine counts them.
@@ -1509,6 +1520,39 @@ mod tests {
             )),
             "{commands:?}"
         );
+    }
+
+    /// A successor takes a request's stream over by the engine's identity of the request, and
+    /// gives it an identity among this connection's own requests, which the replayed events
+    /// carry here; a submitted request learns the engine's identity from its acceptance.
+    #[tokio::test]
+    async fn a_takeover_names_the_engine_s_identity_and_numbers_the_request_here() {
+        let (client, engine) = scripted_client(1, |arrival| match arrival {
+            Arrival::TakenOver(RequestId(42)) => vec![Event::Finished {
+                reason: FinishReason::Stop,
+                stop_reason: None,
+                prompt_tokens: 4,
+                completion_tokens: 3,
+            }],
+            Arrival::TakenOver(_) | Arrival::Submitted(_) => Vec::new(),
+        });
+        let mut stream = client.take_over(RequestId(42), 3).unwrap();
+        assert_eq!(stream.engine_id(), Some(RequestId(42)));
+        assert!(matches!(stream.recv().await, Some(Event::Finished { .. })));
+        let takeover = engine.commands.recv().unwrap();
+        assert_eq!(takeover.request, stream.id().0);
+        assert!(matches!(
+            takeover.kind,
+            Some(wire::command::Kind::Takeover(wire::Takeover {
+                events: 3,
+                engine_request: 42,
+            }))
+        ));
+
+        // The scripted engine states the connection's own identity as its own.
+        let (submitted, _) = client.submit(request(0)).await.unwrap();
+        assert_eq!(submitted.engine_id(), Some(submitted.id()));
+        assert_ne!(submitted.id(), stream.id());
     }
 
     /// An engine's report of what it serves leaves out none of what the request interface

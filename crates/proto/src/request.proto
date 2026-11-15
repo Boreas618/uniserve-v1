@@ -266,13 +266,21 @@ message Submit {
 // queued on one of its schedulers. A request it refuses ends with a
 // `Rejected` event instead.
 message Accepted {
+  // The identity the connection gave the request.
   uint64 request = 1;
   // The scheduler that serves it.
   uint32 scheduler = 2;
+  // The engine's own identity of the request, unique among every
+  // connection's requests: the identity a takeover of its stream names on
+  // another connection, and the one its private cache pages are kept under.
+  uint64 engine_request = 3;
 }
 
 message Request {
-  // The daemon's identity of the request.
+  // The identity this connection gives the request, which its events and
+  // commands carry on this connection. Each connection numbers its own
+  // requests: the engine keeps two connections' requests apart however they
+  // number them.
   uint64 id = 1;
   int32 priority = 2;
   oneof kind {
@@ -320,12 +328,15 @@ message Consumed {
   uint64 events = 1;
 }
 // One request's event stream taken over by another connection (a hot
-// restart's successor daemon). The command's `request` names the request.
+// restart's successor daemon). The command's `request` is the identity this
+// connection gives the request from now on.
 message Takeover {
   // The events the response's previous consumer took in all: the engine
   // sends the new consumer the events after this position, then the ones
   // the request goes on producing.
   uint64 events = 1;
+  // The engine's identity of the request (`Accepted.engine_request`).
+  uint64 engine_request = 2;
 }
 
 // A command for the whole engine. Every command that names an `id` is

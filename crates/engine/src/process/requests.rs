@@ -12,12 +12,19 @@
 //! answers `Accepted`, naming the scheduler, and hands the request to it as
 //! `Message::AddRequest`.
 //!
-//! Each accepted request has a [`RequestStream`]: the front its events go to and the events its
-//! consumer has not reported consumed. The scheduler bounds those by the event window the front
-//! stated in its welcome (`wire::Welcome::event_window`), which the consumer's `Consumed` reports
-//! return as credit, so the journal holds at most the window and the terminal event. A `Takeover` moves the stream to
-//! the front it arrives on and replays the events past the position it names; a position older
-//! than the journal is refused by name rather than served as a stream with a hole in it.
+//! Each front numbers its own requests. The engine gives every request it admits an identity of
+//! its own, which its schedulers, its caches and a takeover name, and states it in the request's
+//! `Accepted`; the request's events and commands carry the identity its front gave it on that
+//! front. Two fronts' requests are therefore kept apart however their daemons number them.
+//!
+//! Each accepted request has a [`RequestStream`]: the front its events go to, the identity they
+//! carry there, and the events its consumer has not reported consumed. The scheduler bounds those
+//! by the event window the front stated in its welcome (`wire::Welcome::event_window`), which the
+//! consumer's `Consumed` reports return as credit, so the journal holds at most the window and
+//! the terminal event. A `Takeover` names a request by the engine's identity, moves its stream to
+//! the front it arrives on under the identity that front gives it, and replays the events past
+//! the position it names; a position older than the journal is refused by name rather than served
+//! as a stream with a hole in it.
 
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -45,6 +52,8 @@ type Media = Option<Arc<dyn ArtifactMedia>>;
 pub(crate) struct RequestStream {
     /// The daemon front its events go to: the one that submitted it, until a `Takeover` moves it.
     pub(crate) front: usize,
+    /// The identity that front gives the request, which its events carry there.
+    pub(crate) local: RequestId,
     /// The scheduler that serves it, which its commands go to.
     pub(crate) scheduler: usize,
     /// The events written for it so far: the position a takeover names and a consumer reports.
@@ -55,10 +64,12 @@ pub(crate) struct RequestStream {
 }
 
 impl RequestStream {
-    /// A stream of no event yet, written to `front`, of a request `scheduler` serves.
-    pub(crate) fn new(front: usize, scheduler: usize) -> Self {
+    /// A stream of no event yet, written to `front` under the identity `local` it gives the
+    /// request, of a request `scheduler` serves.
+    pub(crate) fn new(front: usize, local: RequestId, scheduler: usize) -> Self {
         Self {
             front,
+            local,
             scheduler,
             sent: 0,
             kept: VecDeque::new(),
@@ -213,7 +224,7 @@ impl MainProcess {
         if let Some(refusal) = self.lifecycle.refusal() {
             return self.reject(front, id, RejectionKind::Overloaded, refusal.to_owned());
         }
-        if self.streams.contains_key(&RequestId(id)) {
+        if self.named.contains_key(&(front, RequestId(id))) {
             let message = format!("request {id} is in flight here already");
             return self.reject(front, id, RejectionKind::Invalid, message);
         }
@@ -277,16 +288,25 @@ impl MainProcess {
             let message = format!("scheduler {scheduler} is gone");
             return self.reject(front, id, RejectionKind::Overloaded, message);
         };
+        // The engine's identity of the request, which its scheduler and caches know it by.
+        let engine = RequestId(self.next_request);
+        match &mut input {
+            proto::request::Request::Generation(generation) => generation.request_id = engine,
+            proto::request::Request::Diffusion(diffusion) => diffusion.request_id = engine,
+        }
         if inbox.send(Message::AddRequest(input, window)).is_err() {
             let message = format!("scheduler {scheduler} is gone");
             return self.reject(front, id, RejectionKind::Overloaded, message);
         }
+        self.next_request += 1;
 
         self.streams
-            .insert(RequestId(id), RequestStream::new(front, scheduler));
+            .insert(engine, RequestStream::new(front, RequestId(id), scheduler));
+        self.named.insert((front, RequestId(id)), engine);
         let accepted = wire::Accepted {
             request: id,
             scheduler: u32::try_from(scheduler).unwrap_or(u32::MAX),
+            engine_request: engine.0,
         };
         self.send(front, from_engine::Kind::Accepted(accepted), None);
     }
@@ -354,15 +374,30 @@ impl MainProcess {
         Some(thread.inbox.clone())
     }
 
-    /// One command of the request interface for one request: its consumer's position and a
-    /// takeover are this process's bookkeeping, the rest go to its scheduler. A command for a
-    /// request that ended is a no-op: a client that went away a moment too late is no fault.
+    /// One command of the request interface for one request, which names it by the identity
+    /// `front` gives it: its consumer's position and a takeover are this process's bookkeeping,
+    /// the rest go to its scheduler. A command for a request that ended is a no-op: a client that
+    /// went away a moment too late is no fault.
     pub(super) fn request_command(&mut self, front: usize, command: wire::Command) {
         use wire::command::Kind;
 
-        let id = RequestId(command.request);
+        let local = RequestId(command.request);
         let Some(kind) = command.kind else {
             return;
+        };
+        if let Kind::Takeover(takeover) = kind {
+            let engine = RequestId(takeover.engine_request);
+            return self.take_over(front, local, engine, takeover.events);
+        }
+        let Some(&id) = self.named.get(&(front, local)) else {
+            // A request of this front with no stream waits at the gate, or ended.
+            let reason = match kind {
+                Kind::Cancel(_) => FinishReason::Cancelled,
+                Kind::Stop(_) => FinishReason::Stop,
+                Kind::Abort(_) => FinishReason::Aborted,
+                Kind::Consumed(_) | Kind::Acknowledge(_) | Kind::Takeover(_) => return,
+            };
+            return self.finish_held(front, local, reason);
         };
         let (scheduler, message) = match kind {
             Kind::Consumed(consumed) => {
@@ -376,7 +411,7 @@ impl MainProcess {
                 let credit = u32::try_from(taken).unwrap_or(u32::MAX);
                 (stream.scheduler, Message::Consumed(id, credit))
             }
-            Kind::Takeover(takeover) => return self.take_over(front, id, takeover.events),
+            Kind::Takeover(_) => return,
             Kind::Acknowledge(acknowledge) => {
                 let Some(stream) = self.streams.get(&id) else {
                     return;
@@ -393,30 +428,31 @@ impl MainProcess {
         }
     }
 
-    /// Ends request `id` for `reason`: its scheduler ends it, or, while it waits at the gate, it
-    /// ends here, having computed nothing.
+    /// Ends the admitted request `id` for `reason`: its scheduler ends it.
     fn finish(&mut self, id: RequestId, reason: FinishReason) {
-        if let Some(stream) = self.streams.get(&id) {
-            if let Some(inbox) = self.inbox_of(stream.scheduler) {
-                let _ = inbox.send(Message::Cancel(id, reason));
-            }
-            return;
+        if let Some(stream) = self.streams.get(&id)
+            && let Some(inbox) = self.inbox_of(stream.scheduler)
+        {
+            let _ = inbox.send(Message::Cancel(id, reason));
         }
+    }
 
+    /// Ends the request `front` names `id` for `reason` while it waits at the gate: it ends here,
+    /// having computed nothing.
+    fn finish_held(&mut self, front: usize, id: RequestId, reason: FinishReason) {
         let Some(at) = self
             .held
             .iter()
-            .position(|(_, request, _)| request.id == id.0)
+            .position(|(held, request, _)| *held == front && request.id == id.0)
         else {
             tracing::debug!(
                 request = id.0,
+                front,
                 "a command names a request this engine does not hold"
             );
             return;
         };
-        let Some((front, ..)) = self.held.remove(at) else {
-            return;
-        };
+        self.held.remove(at);
         let finished = Event::Finished {
             reason,
             stop_reason: None,
@@ -427,10 +463,11 @@ impl MainProcess {
         self.send(front, from_engine::Kind::Event(event), None);
     }
 
-    /// A takeover of request `id`'s stream by `front` from position `from`: the stream moves to
-    /// `front` and the events past `from` are written there again; a position older than what
-    /// is kept is refused by name.
-    fn take_over(&mut self, front: usize, id: RequestId, from: u64) {
+    /// A takeover of the stream of the request the engine knows as `id` by `front`, which gives
+    /// it the identity `local`, from position `from`: the stream moves to `front` under `local`
+    /// and the events past `from` are written there again; a position older than what is kept is
+    /// refused by name.
+    fn take_over(&mut self, front: usize, local: RequestId, id: RequestId, from: u64) {
         let Some(stream) = self.streams.get_mut(&id) else {
             // A request that ended before its takeover, or a front that named another identity:
             // only the log can say which.
@@ -444,15 +481,20 @@ impl MainProcess {
         };
         match stream.replay(from) {
             Ok(replay) => {
+                self.named.remove(&(stream.front, stream.local));
                 stream.front = front;
-                for (event, media) in replay {
+                stream.local = local;
+                self.named.insert((front, local), id);
+                for (mut event, media) in replay {
+                    // The journal holds the events as the previous front read them.
+                    event.request = local.0;
                     self.send(front, from_engine::Kind::Event(event), media.as_ref());
                 }
                 tracing::info!(request = id.0, front, from, "a request was taken over");
             }
             Err(refusal) => {
                 tracing::error!(request = id.0, front, from, %refusal, "a takeover was refused");
-                self.reject(front, id.0, RejectionKind::Overloaded, refusal);
+                self.reject(front, local.0, RejectionKind::Overloaded, refusal);
             }
         }
     }
@@ -477,11 +519,13 @@ impl MainProcess {
                 c"uniserve.process.event"
             };
             let _range = crate::profiling::ranges::range(name, Some(id.0));
-            let (event, media) = event.to_wire(id);
+            let (event, media) = event.to_wire(stream.local);
             stream.record(event.clone(), media.clone());
             let front = stream.front;
             if terminal {
+                let local = stream.local;
                 self.streams.remove(&id);
+                self.named.remove(&(front, local));
             }
             self.queue(front, from_engine::Kind::Event(event), media.as_ref());
             if !written.contains(&front) {
@@ -504,9 +548,10 @@ impl MainProcess {
         let held = std::mem::take(&mut self.held)
             .into_iter()
             .map(|(front, request, _)| (RequestId(request.id), front));
+        self.named.clear();
         let streams = std::mem::take(&mut self.streams)
-            .into_iter()
-            .map(|(id, stream)| (id, stream.front));
+            .into_values()
+            .map(|stream| (stream.local, stream.front));
         for (id, front) in streams.chain(held).collect::<Vec<_>>() {
             let (event, _) = lost.to_wire(id);
             self.send(front, from_engine::Kind::Event(event), None);
@@ -597,7 +642,7 @@ mod tests {
 
     /// A stream that wrote `count` events, the `n`-th stating `n`.
     fn written(count: u64) -> RequestStream {
-        let mut stream = RequestStream::new(0, 0);
+        let mut stream = RequestStream::new(0, RequestId(9), 0);
         for position in 1..=count {
             assert_eq!(stream.record(event(&position.to_string()), None), position);
         }

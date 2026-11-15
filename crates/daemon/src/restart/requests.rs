@@ -36,8 +36,6 @@ pub(super) type Writer = Arc<Mutex<Connection>>;
 pub(crate) struct Attachment {
     pub engine: u64,
     pub epoch: u64,
-    /// A new front uses this interval; an existing front keeps its counter.
-    pub first_request: Option<u64>,
     pub kept: Option<Kept>,
 }
 
@@ -142,7 +140,7 @@ impl RemoteHold {
         &self,
         previous_epoch: Option<u64>,
     ) -> Result<(Arc<EngineClient>, Option<Kept>), SubmitError> {
-        // Concurrent continuations share one front and its request counter.
+        // Concurrent continuations share one front.
         let mut client = self.client.lock().await;
         let attachment = self
             .attach(
@@ -151,14 +149,14 @@ impl RemoteHold {
                 previous_epoch,
             )
             .await?;
-        if let Some(first) = attachment.first_request {
+        // An engine this process holds no connection to dials it now
+        // (`RequestHold::attach`), and this process adopts that connection.
+        if client.engine() != Some(attachment.engine) {
             let control = Arc::clone(&self.control);
             let epoch = attachment.epoch;
             let engine = attachment.engine;
             let attached = tokio::task::spawn_blocking(move || {
-                let client = control.adopt(engine, engine + 1, epoch, None, Box::new(|_| {}))?;
-                client.number_requests_from(first);
-                Ok::<_, anyhow::Error>(client)
+                control.adopt(engine, engine + 1, epoch, None, Box::new(|_| {}))
             })
             .await
             .map_err(|error| SubmitError::Unavailable(error.to_string()))?

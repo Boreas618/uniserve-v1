@@ -233,8 +233,10 @@ impl RequestHold {
         }
     }
 
-    /// Attach a predecessor daemon to the current engine. A further handoff
-    /// forwards the request to the final owner, which alone allocates IDs.
+    /// Attach a predecessor daemon to the current engine: the engine dials the
+    /// predecessor's request socket `requests` unless the predecessor holds a
+    /// connection to it already. A further handoff forwards the request to the
+    /// final owner.
     pub(crate) async fn attach(
         &self,
         requests: String,
@@ -247,17 +249,14 @@ impl RequestHold {
                 let engine = client.engine().ok_or_else(|| {
                     SubmitError::Unavailable("the serving engine has no process identity".into())
                 })?;
-                let first_request = if known_engine == Some(engine) {
-                    None
-                } else {
-                    let first = client.reserve_request_ids();
+                // The engine numbers each connection's requests apart, so the
+                // predecessor's connection numbers its own.
+                if known_engine != Some(engine) {
                     client.attach(&requests);
-                    Some(first)
-                };
+                }
                 Ok(crate::restart::requests::Attachment {
                     engine,
                     epoch: client.epoch(),
-                    first_request,
                     kept,
                 })
             }

@@ -268,9 +268,11 @@ fn process_link(
 
 /// What a test's engine is given to answer ([`scripted_client`]).
 pub(crate) enum Arrival<'a> {
-    /// A submitted request, which the engine accepts on scheduler 0 before its events.
+    /// A submitted request, which the engine accepts on scheduler 0 before its events, under the
+    /// identity its connection gave it.
     Submitted(&'a proto::request::Request),
-    /// A takeover of the stream of the request it names, which needs no acceptance.
+    /// A takeover of the stream of the request the engine knows by this identity, which needs
+    /// no acceptance.
     TakenOver(RequestId),
 }
 
@@ -349,9 +351,11 @@ pub(crate) fn scripted_client_with(
                             let id = RequestId(request.id);
                             let request = proto::request::Request::from_wire(request)
                                 .expect("the daemon submits a request the interface states");
+                            // The engine has one connection, whose identities are its own.
                             let accepted = wire::Accepted {
                                 request: id.0,
                                 scheduler: 0,
+                                engine_request: id.0,
                             };
                             write(&mut engine, wire::from_engine::Kind::Accepted(accepted))?;
                             events(&mut engine, id, script(Arrival::Submitted(&request)))?;
@@ -361,13 +365,18 @@ pub(crate) fn scripted_client_with(
                     }
                     Some(wire::to_engine::Kind::Command(command)) => {
                         let id = RequestId(command.request);
-                        let taken_over =
-                            matches!(command.kind, Some(wire::command::Kind::Takeover(_)));
+                        let taken_over = match &command.kind {
+                            Some(wire::command::Kind::Takeover(takeover)) => {
+                                Some(RequestId(takeover.engine_request))
+                            }
+                            _ => None,
+                        };
                         let _ = commanded.send(command);
-                        if taken_over {
-                            events(&mut engine, id, script(Arrival::TakenOver(id)))
-                        } else {
-                            Ok(())
+                        match taken_over {
+                            Some(named) => {
+                                events(&mut engine, id, script(Arrival::TakenOver(named)))
+                            }
+                            None => Ok(()),
                         }
                     }
                     // A request's condition media and the engine commands play no part in a

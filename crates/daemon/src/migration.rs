@@ -134,7 +134,8 @@ enum Resumable {
 impl Resumable {
     /// Makes this request the continuation `migration` submits, and returns
     /// it: a token request with the tokens it generated, its private pages
-    /// named by `provenance` unless an earlier migration named them already;
+    /// named by `provenance` (none for a request its engine did not admit)
+    /// unless an earlier migration named them already;
     /// a video request naming the trajectory steps its engine stored and its
     /// record of where they lie. `kept` is the state an epoch change keeps of
     /// the requests in flight (`in_flight = keep`), which the request
@@ -144,7 +145,7 @@ impl Resumable {
         &mut self,
         migration: &Migration,
         kept: Option<Kept>,
-        provenance: CacheResume,
+        provenance: Option<CacheResume>,
     ) -> Request {
         let cause = migration.cause;
         match self {
@@ -152,7 +153,9 @@ impl Resumable {
                 // Its prompt's log-probabilities were reported where it began.
                 request.sampling.return_prompt_logprobs = false;
                 request.sampling.n_prompt_logprobs = 0;
-                request.cache.resume.get_or_insert(provenance);
+                if request.cache.resume.is_none() {
+                    request.cache.resume = provenance;
+                }
                 // It reads the state it reached and publishes later pages
                 // only to its private continuation: they are neither epoch's.
                 if let Some(seeds) = kept.and_then(|kept| kept.prefix_seeds) {
@@ -508,7 +511,7 @@ impl Events for RequestEvents {
     }
 
     fn engine_request_id(&self) -> Option<RequestId> {
-        self.open.then(|| self.stream.id())
+        self.open.then(|| self.stream.engine_id()).flatten()
     }
 
     fn progress(&self) -> (u64, u64) {
