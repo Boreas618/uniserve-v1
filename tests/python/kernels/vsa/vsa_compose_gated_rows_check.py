@@ -25,9 +25,9 @@ The two narrowings are the operator's, and the comparison is **bit for bit**. Th
   operator's stated invariant;
 - **strided `fine` and `gate`** whose row stride is wider than `heads · width`, and a **padded
   compression** whose tile stride is longer than `width`;
-- **a fusion trap**: data whose product is not representable in the storage dtype, so the
-  narrowed product and a fused multiply-add give different answers — the check asserts the case can
-  tell them apart;
+- **a fusion trap**: BF16 data whose narrowed product puts the sum on a rounding tie that the
+  unnarrowed product breaks, so the narrowed product and a fused multiply-add give different
+  answers — the check asserts the case can tell them apart;
 - **bf16, f16 and f32**.
 """
 
@@ -134,18 +134,27 @@ def run(
     torch.manual_seed(seed)
 
     if fusion_trap:
+        # BF16 values (spacing 2**-7 in [1, 2), 2**-6 in [2, 4)) where the narrowing decides the
+        # sum. The FP32 product (1 + 2**-4)**2 = 1 + 2**-3 + 2**-8 lies halfway between two BF16
+        # neighbours and narrows to the even one, 1 + 2**-3. Added to 1 + 2**-7, that narrowed
+        # product gives 2 + 2**-3 + 2**-7, halfway again, which rounds to the even 2 + 2**-3; the
+        # fused sum is 2**-8 above that tie and rounds up to 2 + 2**-3 + 2**-6. A product tail
+        # smaller than half the sum's spacing would leave both arithmetics on the same value.
         fine = torch.full(
-            (fine_rows, heads, width), 0.5, dtype=torch.float32, device=device
+            (fine_rows, heads, width),
+            1.0 + 2.0**-7,
+            dtype=torch.float32,
+            device=device,
         )
         gate = torch.full(
             (fine_rows, heads, width),
-            1.0 + 2.0**-6,
+            1.0 + 2.0**-4,
             dtype=torch.float32,
             device=device,
         )
         compressed = torch.full(
             (heads, tiles, width),
-            1.0 + 2.0**-6,
+            1.0 + 2.0**-4,
             dtype=torch.float32,
             device=device,
         )

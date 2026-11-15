@@ -18,10 +18,12 @@ steps in torch, and the comparison is **bit for bit**: with the product rounded 
 before the sum, there is nothing left for a bound to cover.
 
 The cases, and the one that matters most:
-- **a fusion trap**: values whose product is not representable in the storage dtype, chosen so
-  that fusing the multiply into the sum (what `enable_fp_fusion` would do, and what the inline
-  assembly exists to prevent) gives a different answer. The check asserts the case can tell the two
-  apart, so a passing run is evidence about this kernel rather than about the data;
+- **a fusion trap**: BF16 values whose narrowed product puts the sum on a rounding tie that the
+  unnarrowed product breaks, so fusing the multiply into the sum (what `enable_fp_fusion` would do,
+  and what the inline assembly exists to prevent) gives a different answer. A product that is merely
+  not representable in the storage dtype is not enough: the sum's own rounding can absorb its tail.
+  The check asserts the case can tell the two apart, so a passing run is evidence about this kernel
+  rather than about the data;
 - **a strided output and gate** whose row stride is wider than `heads · width`, and a strided
   compression whose tile stride is longer than `width`;
 - **`block_rows` narrower than `tile_rows`**, with rows in the second and third blocks of a tile, so
@@ -105,20 +107,27 @@ def run(
     torch.manual_seed(seed)
 
     if fusion_trap:
-        # Values one BF16/F16 ulp apart in their product's tail: 1 + 2**-6 times 1 + 2**-6 is
-        # representable in FP32 and not in 16 bits, so the narrowing decides the answer.
+        # BF16 values (spacing 2**-7 in [1, 2), 2**-6 in [2, 4)) where the narrowing decides the
+        # sum. The FP32 product (1 + 2**-4)**2 = 1 + 2**-3 + 2**-8 lies halfway between two BF16
+        # neighbours and narrows to the even one, 1 + 2**-3. Added to 1 + 2**-7, that narrowed
+        # product gives 2 + 2**-3 + 2**-7, halfway again, which rounds to the even 2 + 2**-3; the
+        # fused sum is 2**-8 above that tie and rounds up to 2 + 2**-3 + 2**-6. A product tail
+        # smaller than half the sum's spacing would leave both arithmetics on the same value.
         before = torch.full(
-            (rows, heads, width), 0.5, dtype=torch.float32, device=device
+            (rows, heads, width),
+            1.0 + 2.0**-7,
+            dtype=torch.float32,
+            device=device,
         )
         gate = torch.full(
             (rows, heads, width),
-            1.0 + 2.0**-6,
+            1.0 + 2.0**-4,
             dtype=torch.float32,
             device=device,
         )
         compressed = torch.full(
             (heads, tiles, width),
-            1.0 + 2.0**-6,
+            1.0 + 2.0**-4,
             dtype=torch.float32,
             device=device,
         )

@@ -10,13 +10,21 @@ halves. `tl.inline_asm_elementwise` does not execute under `TRITON_INTERPRET`, a
 `_add_rn` uses it as well — so no part of this kernel can run on the build host, not even the
 `norm = false` path. On a host without a device the script says exactly that and stops.
 
+The package's kernel is launched as its module is built: `src/build.py`'s `spec` for the case's
+descriptor fields gives the kernel, its compile-time values (the epsilon decoded from the key's bits)
+and its options (two warps, no FP32 fusion), so the check cannot launch something the build does
+not compile. The operands are the operator's: 16-bit Q/K/V rows of the descriptor's type, `[width]`
+weights of that type and FP32 `[rows, rotated / 2]` factor tables. The stepwise routine addresses
+the rows as words of two 16-bit features, so rows of any other element type are outside its domain:
+they are read and written at the wrong addresses, across other programs' heads.
+
 Two independent references, because this is the operator where a stride mix-up cannot be caught by
 reading the key — one program reads seven caller strides at once:
 
-- the retired Python tree's Triton kernel, `uniserve_kernels.attention.vsa_segments._prepare_tiles_kernel`,
-  which is the definition of the arithmetic (`prepare_tiles` itself refuses to run without Triton, so
-  the check launches the kernel with the same constexpr wiring that function passes). This repository
-  no longer holds it: `UNISERVE_REFERENCE_TREE` names a checkout of the last tree that did;
+- the retired Python tree's operator, `uniserve_kernels.attention.vsa_segments.prepare_tiles`, which
+  is the definition of the arithmetic; it is called as its callers called it, so it checks the
+  operands and launches its kernel with its own wiring. This repository no longer holds it:
+  `UNISERVE_REFERENCE_TREE` names a checkout of the last tree that did;
 - eager torch transcriptions of the pooling and zero-padding rules (`pool`, `zero_padding`), for the half
   of the operator the kernel need not be trusted about: the padding zeros and the FP32 mean, which
   must equal torch's own reduction bit for bit.
@@ -26,11 +34,11 @@ The cases:
   empty, on a **strided** buffer whose row stride is wider than `heads · width` — so both the row and
   the head stride have to be honoured for the loads, the stores and the means;
 - **`rotated < width`**, the narrowed rotation: with `cosine = 0, sine = 1` the rotated features
-  exchange pairs, and the features **past `rotated`** must come out identical to the run with
-  `cosine = 1, sine = 0`. That is the pass-through mask, and skipping it is what `rope_apply`'s
+  exchange pairs, and the features **past `rotated`** must come out identical to a run with other
+  factors. That is the pass-through mask, and skipping it is what `rope_apply`'s
   narrowed form did wrong;
 - **no normalization**: only zeroing and pooling, compared bit for bit against `pool` of the zeroed
-  rows rather than against the reference kernel;
+  rows rather than against the retired operator;
 - **an empty tile**: its means are zeros — not a division by the tile's row count, and not NaNs.
 """
 
@@ -38,23 +46,37 @@ import argparse
 import importlib.util
 import os
 import pathlib
+import struct
 import sys
 
 import torch
 
-#: The kernel packages' root: this check lives in `tests/python/kernels/<family>/`.
-KERNELS = (
-    pathlib.Path(__file__).resolve().parents[4] / "crates" / "ops" / "kernels"
-)
+#: The repository root: this check lives in `tests/python/kernels/<family>/`.
+ROOT = pathlib.Path(__file__).resolve().parents[4]
+#: The kernel packages' root.
+KERNELS = ROOT / "crates" / "ops" / "kernels"
 #: The package this check covers.
 PACKAGE = KERNELS / "vsa_prepare_tiles" / "triton"
+#: The Build Server's Python package, which every compile script imports its driver from.
+BUILD_SERVER = ROOT / "crates" / "build-server" / "python" / "src"
 
-#: `PrepareTilesDescriptor`'s epsilon, `0x3727c5ac` — the fixture's cell.
+#: `PrepareTilesDescriptor`'s epsilon, `0x3727c5ac` — the fixture's cell. A key prints a float's
+#: bits; the descriptor means the float they encode.
 EPSILON = 0x3727C5AC
+#: The architecture the compile script is asked about. Its `spec` states the same kernel,
+#: compile-time values and options for every target.
+ARCHITECTURE = "sm_100a"
+#: The descriptor's names of the row types.
+DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16}
 
 
-def reference_kernel():
-    """The retired tree's `_prepare_tiles_kernel`, which defines the arithmetic this package computes."""
+def epsilon():
+    """The float `EPSILON`'s bits encode, which the retired operator took as `eps`."""
+    return struct.unpack("<f", struct.pack("<I", EPSILON))[0]
+
+
+def reference_operator():
+    """The retired tree's `prepare_tiles`, which defines the arithmetic this package computes."""
     tree = os.environ.get("UNISERVE_REFERENCE_TREE")
     if not tree:
         sys.exit(
@@ -66,9 +88,9 @@ def reference_kernel():
             f"prepare_check: {source} holds no reference kernels; set UNISERVE_REFERENCE_TREE"
         )
     sys.path.insert(0, str(source))
-    from uniserve_kernels.attention.vsa_segments import _prepare_tiles_kernel
+    from uniserve_kernels.attention.vsa_segments import prepare_tiles
 
-    return _prepare_tiles_kernel
+    return prepare_tiles
 
 
 def zero_padding(rows, variable_block_sizes, tile):
@@ -88,19 +110,21 @@ def pool(rows, variable_block_sizes, tile):
     return total / variable_block_sizes.clamp_min(1).view(-1, 1, 1)
 
 
-def load_kernel(package):
-    """The package's Triton source, imported as a module."""
-    source = package / "src" / "vsa_prepare_tiles.py"
+def load_build(package):
+    """The package's compile script, `src/build.py`, imported with the kernel source it imports."""
+    for path in (BUILD_SERVER, package / "src"):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
     spec = importlib.util.spec_from_file_location(
-        "vsa_prepare_tiles_kernel", source
+        "vsa_prepare_tiles_build", package / "src" / "build.py"
     )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    build = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(build)
+    return build
 
 
 class Case:
-    """One launch's operands and the constexprs its descriptor gives them."""
+    """One launch's operands and the descriptor fields that describe them."""
 
     def __init__(
         self,
@@ -120,7 +144,8 @@ class Case:
         seed=11,
     ):
         self.device = device
-        self.element = {"bf16": torch.bfloat16, "f16": torch.float16}[dtype]
+        self.dtype = dtype
+        self.element = DTYPES[dtype]
         self.rows = rows
         self.heads = heads
         self.width = width
@@ -144,11 +169,11 @@ class Case:
         self.sine = self.factor("sine" if cosines else "one")
 
     def buffer(self, features):
-        """Hold `[rows, heads, width]` features in a buffer whose row stride the case sets."""
+        """Hold `[rows, heads, width]` rows of the case's type in a buffer whose row stride the case sets."""
         flat = torch.zeros(
-            self.rows * self.row_stride, dtype=torch.float32, device=self.device
+            self.rows * self.row_stride, dtype=self.element, device=self.device
         )
-        self.rows_view(flat).copy_(features.to(torch.float32))
+        self.rows_view(flat).copy_(features)
         return flat
 
     def rows_view(self, flat, count=None):
@@ -160,25 +185,16 @@ class Case:
         )
 
     def weight(self):
-        flat = torch.zeros(
-            self.row_stride, dtype=torch.float32, device=self.device
-        )
-        weight = torch.as_strided(
-            flat, (1, 1, self.width), (self.width, self.width, 1)
-        )
-        weight.copy_(torch.randn(1, 1, self.width, dtype=torch.float32) * 0.25)
-        return flat
-
-    def weight_view(self, flat):
-        return torch.as_strided(
-            flat, (1, 1, self.width), (self.width, self.width, 1)
-        )
+        """A contiguous `[width]` normalization weight of the rows' type, as the operator takes it."""
+        drawn = torch.randn(self.width, dtype=torch.float32) * 0.25
+        return drawn.to(self.element).to(self.device)
 
     @property
     def factor_stride(self):
         return self.row_stride if self.rotated else 0
 
     def factor(self, kind):
+        """An FP32 factor table, `[rows, rotated / 2]` at the case's factor stride."""
         stride = max(self.factor_stride, 1)
         flat = torch.zeros(
             self.rows * stride, dtype=torch.float32, device=self.device
@@ -214,59 +230,92 @@ class Case:
             flat, (self.rows, max(self.rotated // 2, 1)), (stride, 1)
         )
 
-    def constexprs(self):
-        """The constexprs `src/build.py` passes for this descriptor."""
+    def fields(self):
+        """The descriptor's fields, spelled as `PrepareTilesDescriptor`'s key prints them."""
         return {
-            "QUERY_STRIDES": (self.row_stride, self.head_stride),
-            "KEY_STRIDES": (self.row_stride, self.head_stride),
-            "VALUE_STRIDES": (self.row_stride, self.head_stride),
-            # The stepwise routine reads a block's rows as one head's consecutive tokens.
-            "QUERY_ROWS": (self.row_stride, 0),
-            "KEY_ROWS": (self.row_stride, 0),
-            "FACTOR_STRIDE": self.factor_stride,
-            "HEADS": self.heads,
-            "DIM": self.width,
-            "ROTATED": self.rotated,
-            "EPS": EPSILON,
-            "TILE": self.tile,
-            "BLOCK": self.block,
-            "NORM": self.norm,
+            "dtype": self.dtype,
+            "heads": str(self.heads),
+            "width": str(self.width),
+            "rotated": str(self.rotated),
+            "tile_rows": str(self.tile),
+            "block_rows": str(self.block),
+            "epsilon": f"{EPSILON:#x}",
+            "norm": "true" if self.norm else "false",
+            "query_row_stride": str(self.row_stride),
+            "query_head_stride": str(self.head_stride),
+            "key_row_stride": str(self.row_stride),
+            "key_head_stride": str(self.head_stride),
+            "value_row_stride": str(self.row_stride),
+            "value_head_stride": str(self.head_stride),
+            "factor_stride": str(self.factor_stride),
         }
 
+    def outputs(self):
+        """The valid-size table and three NaN-filled FP32 `[tiles, heads, width]` means."""
+        sizes = torch.tensor(self.sizes, dtype=torch.int32, device=self.device)
+        pooled = [
+            torch.full(
+                (self.tiles, self.heads, self.width),
+                float("nan"),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            for _ in range(3)
+        ]
+        return sizes, pooled
 
-def launch(kernel, case, buffers):
-    """One launch of a `_prepare_tiles_kernel` over the case's buffers; returns its pooled tensors."""
-    sizes = torch.tensor(case.sizes, dtype=torch.int32, device=case.device)
-    pooled = [
-        torch.full(
-            (case.tiles, case.heads, case.width),
-            float("nan"),
-            dtype=torch.float32,
-            device=case.device,
-        )
-        for _ in range(3)
-    ]
-    kernel[(case.tiles, case.heads)](
+
+def launch(build, case, buffers):
+    """One launch of the package's module for the case's descriptor; returns its pooled tensors.
+
+    The kernel, its compile-time values and its options are what `build.spec` states for the
+    case's fields (the manifest declares no `[parameters]`). The operands are packed as
+    `VsaPrepareTiles::launch` packs them: without normalization the rows stand in for the weights
+    and factor tables, which the module then does not read.
+    """
+    stated = build.spec(case.fields(), {}, ARCHITECTURE)
+    sizes, pooled = case.outputs()
+    query, key, value = (
+        case.rows_view(buffers[name]) for name in ("query", "key", "value")
+    )
+    stated["kernel"][(case.tiles, case.heads)](
+        query,
+        key,
+        value,
+        buffers["query_weight"] if case.norm else query,
+        buffers["key_weight"] if case.norm else key,
+        case.factor_view(buffers["cosine"]) if case.norm else query,
+        case.factor_view(buffers["sine"]) if case.norm else query,
+        sizes,
+        *pooled,
+        **stated["constexprs"],
+        **stated["options"],
+    )
+    return pooled
+
+
+def launch_reference(prepare_tiles, case, buffers):
+    """The retired operator over the case's buffers; returns its pooled tensors."""
+    sizes, pooled = case.outputs()
+    normalization = (
+        {
+            "query_weight": buffers["query_weight"],
+            "key_weight": buffers["key_weight"],
+            "cosine": case.factor_view(buffers["cosine"]),
+            "sine": case.factor_view(buffers["sine"]),
+            "eps": epsilon(),
+        }
+        if case.norm
+        else {}
+    )
+    prepare_tiles(
         case.rows_view(buffers["query"]),
         case.rows_view(buffers["key"]),
         case.rows_view(buffers["value"]),
-        case.weight_view(buffers["query_weight"])
-        if case.norm
-        else case.rows_view(buffers["query"]),
-        case.weight_view(buffers["key_weight"])
-        if case.norm
-        else case.rows_view(buffers["key"]),
-        case.factor_view(buffers["cosine"])
-        if case.norm
-        else case.rows_view(buffers["query"]),
-        case.factor_view(buffers["sine"])
-        if case.norm
-        else case.rows_view(buffers["query"]),
         sizes,
-        pooled[0],
-        pooled[1],
-        pooled[2],
-        **case.constexprs(),
+        case.tile,
+        *pooled,
+        **normalization,
     )
     return pooled
 
@@ -298,8 +347,8 @@ def compare(what, mine, theirs):
     )
 
 
-def check_fixture_geometry(module, reference, device, row_stride=1200):
-    """The fixture's cell against the tree's kernel, on a strided buffer.
+def check_fixture_geometry(build, reference, device, row_stride=1200):
+    """The fixture's cell against the retired operator, on a strided buffer.
 
     `row_stride` must be wider than `heads · width` for the case to be about strides at all: a tile
     walk that assumed contiguity passes every identity case.
@@ -323,8 +372,8 @@ def check_fixture_geometry(module, reference, device, row_stride=1200):
         row_stride=row_stride,
     )
     mine_buffers, their_buffers = clone(case), clone(case)
-    mine = launch(module._prepare_tiles_kernel, case, mine_buffers)
-    theirs = launch(reference, case, their_buffers)
+    mine = launch(build, case, mine_buffers)
+    theirs = launch_reference(reference, case, their_buffers)
     for name, a, b in zip(("query", "key", "value"), mine, theirs):
         compare(f"the pooled {name}", a, b)
     for name in ("query", "key", "value"):
@@ -346,7 +395,7 @@ def check_fixture_geometry(module, reference, device, row_stride=1200):
     return 3 * mine[0].numel() + 3 * case.rows * case.heads * case.width
 
 
-def check_pass_through(module, reference, device):
+def check_pass_through(build, reference, device):
     """With `rotated < width`, the features past the rotation do not move."""
 
     def run(cosines):
@@ -365,8 +414,8 @@ def check_pass_through(module, reference, device):
             cosines=cosines,
         )
         buffers = clone(case)
-        pooled = launch(module._prepare_tiles_kernel, case, buffers)
-        theirs = launch(reference, case, clone(case))
+        pooled = launch(build, case, buffers)
+        theirs = launch_reference(reference, case, clone(case))
         compare(
             f"the pooled query with cosines={cosines}", pooled[0], theirs[0]
         )
@@ -390,7 +439,7 @@ def check_pass_through(module, reference, device):
         cosines=False,
     )
     buffers = clone(case)
-    launch(module._prepare_tiles_kernel, case, buffers)
+    launch(build, case, buffers)
     exchanged.copy_(case.rows_view(buffers["query"]))
     rotated = case.rotated
     compare(
@@ -405,7 +454,7 @@ def check_pass_through(module, reference, device):
     return int(exchanged.numel())
 
 
-def check_no_norm(module, reference, device):
+def check_no_norm(build, reference, device):
     """Without normalization: the padding and the mean, against `pool` itself."""
     case = Case(
         device=device,
@@ -421,7 +470,7 @@ def check_no_norm(module, reference, device):
         row_stride=256,
     )
     buffers = clone(case)
-    mine = launch(module._prepare_tiles_kernel, case, buffers)
+    mine = launch(build, case, buffers)
     sizes = torch.tensor(case.sizes, dtype=torch.int32, device=device)
     for name, flat, pooled in zip(
         ("query", "key", "value"),
@@ -437,7 +486,7 @@ def check_no_norm(module, reference, device):
     return 3 * mine[0].numel()
 
 
-def check_empty_tile(module, reference, device):
+def check_empty_tile(build, reference, device):
     """An empty tile's means are zeros: no division by the tile's row count, no NaN."""
     case = Case(
         device=device,
@@ -453,7 +502,7 @@ def check_empty_tile(module, reference, device):
         row_stride=256,
     )
     buffers = clone(case)
-    mine = launch(module._prepare_tiles_kernel, case, buffers)
+    mine = launch(build, case, buffers)
     sizes = torch.tensor(case.sizes, dtype=torch.int32, device=device)
     for name, flat, pooled in zip(
         ("query", "key", "value"),
@@ -472,7 +521,7 @@ def check_empty_tile(module, reference, device):
     return 3 * mine[0].numel()
 
 
-def check_small_valid(module, reference, device, row_stride=1200):
+def check_small_valid(build, reference, device, row_stride=1200):
     """A tile whose valid size is smaller than one row block: the masked tail inside a block."""
     case = Case(
         device=device,
@@ -488,8 +537,8 @@ def check_small_valid(module, reference, device, row_stride=1200):
         row_stride=row_stride,
     )
     mine_buffers, their_buffers = clone(case), clone(case)
-    mine = launch(module._prepare_tiles_kernel, case, mine_buffers)
-    theirs = launch(reference, case, their_buffers)
+    mine = launch(build, case, mine_buffers)
+    theirs = launch_reference(reference, case, their_buffers)
     for name, a, b in zip(("query", "key", "value"), mine, theirs):
         compare(f"the pooled {name} of a tile with 5 valid rows", a, b)
     # The mean divides by the valid size, not by the tile's row count.
@@ -505,7 +554,7 @@ def main():
         "--package",
         type=pathlib.Path,
         default=PACKAGE,
-        help="the package directory holding src/vsa_prepare_tiles.py",
+        help="the package directory holding src/build.py and the kernel source it imports",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -524,20 +573,20 @@ def main():
             "the packed cvt.rn.bf16x2.f32 forms), which the interpreter cannot execute, so a CPU "
             "run would prove nothing about what the module stores"
         )
-    module = load_kernel(options.package)
-    reference = reference_kernel()
+    build = load_build(options.package)
+    reference = reference_operator()
 
     checked = 0
     checked += check_fixture_geometry(
-        module, reference, device, options.row_stride
+        build, reference, device, options.row_stride
     )
-    checked += check_small_valid(module, reference, device, options.row_stride)
-    checked += check_pass_through(module, reference, device)
-    checked += check_no_norm(module, reference, device)
-    checked += check_empty_tile(module, reference, device)
+    checked += check_small_valid(build, reference, device, options.row_stride)
+    checked += check_pass_through(build, reference, device)
+    checked += check_no_norm(build, reference, device)
+    checked += check_empty_tile(build, reference, device)
     print(
         f"ok: {checked} values — the fixture's strided cell and the narrowed rotation against the "
-        f"tree's reference kernel, bit for bit, the padding zeros, the pooled means against pool, "
+        f"retired operator, bit for bit, the padding zeros, the pooled means against pool, "
         f"and an empty tile's zeros"
     )
     return 0

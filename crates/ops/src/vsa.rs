@@ -741,6 +741,19 @@ impl Op for VsaPrepareTiles {
     type Args<'a> = PrepareTilesArgs;
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
+        // The stepwise normalize-and-rotate routine addresses Q and K as words of two 16-bit
+        // features (halved strides, packed conversions); rows of another width would be read and
+        // written at the wrong offsets, across other programs' heads. Without normalization the
+        // kernel only zeroes and pools, which any of its element types allows.
+        if descriptor.norm && !matches!(descriptor.dtype, DType::BF16 | DType::F16) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "normalized rows are 16-bit, not {}",
+                    abi::name(descriptor.dtype)
+                ),
+            ));
+        }
         let heads = args.query.dim(1);
         let width = args.query.dim(2);
         if u64::from(descriptor.heads) != heads || u64::from(descriptor.width) != width {
@@ -923,6 +936,69 @@ impl Op for VsaPrepareTiles {
         // roundings.
         let terms = u64::from(descriptor.tile_rows) * u64::from(descriptor.width);
         Tolerance::rounding(terms, DType::F32, descriptor.dtype)
+    }
+}
+
+#[cfg(test)]
+mod prepare_tiles_tests {
+    use super::*;
+    use platform::DevicePtr;
+
+    /// One tile of 64 contiguous rows of two 128-feature heads, 96 of which rotate.
+    fn descriptor(dtype: DType, norm: bool) -> PrepareTilesDescriptor {
+        PrepareTilesDescriptor {
+            dtype,
+            heads: 2,
+            width: 128,
+            rotated: if norm { 96 } else { 0 },
+            tile_rows: 64,
+            block_rows: BLOCK_ROWS,
+            epsilon: Float::from(1e-5_f32),
+            norm,
+            query_row_stride: 256,
+            query_head_stride: 128,
+            key_row_stride: 256,
+            key_head_stride: 128,
+            value_row_stride: 256,
+            value_head_stride: 128,
+            factor_stride: if norm { 48 } else { 0 },
+        }
+    }
+
+    fn args(dtype: DType, norm: bool) -> PrepareTilesArgs {
+        let operand = |address: u64, dtype: DType, dims: &[u64]| {
+            Operand::new(DevicePtr::from_address(address), dtype, dims)
+        };
+        let rows = |address| operand(address, dtype, &[64, 2, 128]);
+        // The weights and factor tables are present exactly when the descriptor normalizes.
+        let normalization =
+            |address, dtype, dims: &[u64]| norm.then(|| operand(address, dtype, dims));
+        PrepareTilesArgs {
+            query: rows(0x10000),
+            key: rows(0x20000),
+            value: rows(0x30000),
+            query_weight: normalization(0x40000, dtype, &[128]),
+            key_weight: normalization(0x41000, dtype, &[128]),
+            cosine: normalization(0x50000, DType::F32, &[64, 48]),
+            sine: normalization(0x60000, DType::F32, &[64, 48]),
+            sizes: operand(0x70000, DType::U32, &[1]),
+            pooled_query: operand(0x80000, DType::F32, &[1, 2, 128]),
+            pooled_key: operand(0x81000, DType::F32, &[1, 2, 128]),
+            pooled_value: operand(0x82000, DType::F32, &[1, 2, 128]),
+        }
+    }
+
+    #[test]
+    fn normalized_rows_are_16_bit_and_plain_rows_may_be_any_row_type() {
+        for dtype in [DType::BF16, DType::F16] {
+            VsaPrepareTiles::check(&descriptor(dtype, true), &args(dtype, true)).unwrap();
+        }
+        assert!(
+            VsaPrepareTiles::check(&descriptor(DType::F32, true), &args(DType::F32, true)).is_err()
+        );
+        for dtype in [DType::BF16, DType::F16, DType::F32] {
+            VsaPrepareTiles::check(&descriptor(dtype, false), &args(dtype, false)).unwrap();
+        }
     }
 }
 
