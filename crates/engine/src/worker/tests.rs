@@ -31,9 +31,7 @@ use crate::runner::graphs::Graphs;
 use crate::worker::completion::{Outcome, Submission, Waker};
 use crate::worker::{Error, Result};
 use service::lock;
-
-/// A bound on the tests' waits that only a defect reaches.
-const LONG: Duration = Duration::from_secs(30);
+use testkit::LONG;
 
 const VOCABULARY: usize = 32;
 const HIDDEN: usize = 16;

@@ -1077,8 +1077,7 @@ mod tests {
     use storage::protocol::{Location, Segment, UnitRun};
     use storage::runtime::{Region, RequestId, Tier, VERSION};
 
-    /// A bound on the tests' waits that only a defect reaches.
-    const LONG: Duration = Duration::from_secs(30);
+    use testkit::LONG;
 
     /// The worker group of the tests' batches.
     const GROUP: GroupId = GroupId(0);

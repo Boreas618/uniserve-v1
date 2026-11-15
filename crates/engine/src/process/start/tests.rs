@@ -7,8 +7,8 @@
 //! an engine reports, against what its groups state.
 //!
 //! The text model is the Qwen3-MoE fixture of the `qwen3` crate, the media model a released
-//! FastH3 checkpoint (`crate::process::ranks::tests::FAST_H3`) and the model with a vision tower
-//! a released Qwen3.6 checkpoint ([`QWEN_VISION`]), neither of which the repository holds, each
+//! FastH3 checkpoint (`crate::process::ranks::tests::fast_h3`) and the model with a vision tower
+//! a released Qwen3.6 checkpoint ([`qwen_vision`]), neither of which the repository holds, each
 //! loaded from its shard headers alone, and the policy the packaged `arrival`; no GPU and no Build
 //! Server is touched.
 
@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::batch::Capacity;
 use crate::batch::product::KINDS;
@@ -32,8 +32,9 @@ use super::{Engine, FIRST_GENERATION, lowered, start};
 use crate::memory::client::{StorageClient, StorageLaunch};
 use crate::process::epoch::{drain, kv_regions, promote};
 use crate::process::ranks::layout;
-use crate::process::ranks::tests::{FAST_H3, loaded, video_launch};
-use crate::support::{DEPLOYMENT, StorageServer, launch};
+use crate::process::ranks::tests::{loaded, video_launch};
+use testkit::LONG;
+use testkit::serving::{DEPLOYMENT, StorageServer, launch};
 
 /// The epoch and launch generation of the sessions that read what the buffer pool holds, beside
 /// the engines of a case.
@@ -46,9 +47,6 @@ const READER: u64 = 9;
 /// (`crate::process::epoch::grow_regions`).
 const SERVING_HOST_GIB: u64 = 2;
 const TARGET_HOST_GIB: u64 = 1;
-
-/// A bound on the tests' waits that only a defect reaches.
-const LONG: Duration = Duration::from_secs(30);
 
 /// The Storage Server launch of `launch`'s engine, whose Storage Server is `server`.
 fn storage_launch(server: &StorageServer, launch: &EngineArgs) -> StorageLaunch {
@@ -460,10 +458,6 @@ fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session
 
     // One scheduler over the one media group of the one rank, whose worker is warm, with no
     // KV region to grow: every video phase on the group, with its steps and product sizes.
-    assert!(
-        std::path::Path::new(FAST_H3).is_dir(),
-        "{FAST_H3} is missing"
-    );
     let engine = start(&launch, &registry, &storage, None, policy, liveness).unwrap();
     assert_eq!(engine.schedulers.len(), 1);
     assert_eq!(engine.workers.len(), 1);
@@ -497,21 +491,19 @@ fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session
 /// The released Qwen3.6 checkpoint (`Qwen3_5MoeForConditionalGeneration`) whose headers the
 /// start of a model with a vision tower loads: a tower whole on every rank, which merges
 /// `2 × 2` patches into a row of `2048` BF16 features over three rotary axes.
-const QWEN_VISION: &str = "/workspace/models/Qwen3.6-35B-A3B";
+fn qwen_vision() -> std::path::PathBuf {
+    testkit::assets::QWEN3_6_35B_A3B.snapshot()
+}
 
 #[test]
 #[ignore = "reads the headers of a released Qwen3.6 checkpoint, which the repository does not hold"]
 fn a_meta_start_of_a_model_with_a_vision_tower_encodes_images_beside_its_prefills() {
-    assert!(
-        std::path::Path::new(QWEN_VISION).is_dir(),
-        "{QWEN_VISION} is missing"
-    );
     let server = StorageServer::start();
     // The fixture's launch, one rank of one group with prefill buckets of up to 32 tokens, over
     // the checkpoint, with the limits of a family that takes images.
     let mut launch = launch();
     launch.engine_config.device.device = proto::config::DeviceKind::Meta;
-    launch.engine_config.model.model = QWEN_VISION.to_owned();
+    launch.engine_config.model.model = qwen_vision().to_string_lossy().into_owned();
     launch.engine_config.model.generation_limits = unbounded();
     let registry = nn::family::Registry::new([models::qwen3::family::HYBRID_FAMILY]).unwrap();
     let storage = crate::memory::client::StorageLaunch {

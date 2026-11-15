@@ -18,7 +18,7 @@
 //! No GPU is touched. The server runs on a thread of the test process with a socket of its own.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::batch::cache::CacheGroupKind;
@@ -39,7 +39,7 @@ use crate::batch::product::KINDS;
 use crate::memory::client::StorageClient;
 use crate::process::ranks::rank::ModelRunner;
 use crate::process::ranks::rank::text::Keys;
-use crate::support::{DEPLOYMENT, SLOTS, StorageServer, launch};
+use testkit::serving::{DEPLOYMENT, SLOTS, StorageServer, launch};
 
 /// Submits `request` under `number` on the scheduler's end `pair` and returns its completion, the
 /// next to arrive, within ten seconds.
@@ -317,12 +317,12 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
 }
 
 /// The released FastH3 checkpoint the media rank loads the headers of: four denoising steps.
-pub(crate) const FAST_H3: &str =
-    "/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree";
+pub(crate) fn fast_h3() -> PathBuf {
+    testkit::assets::FAST_H3_4_STEP.snapshot()
+}
 
-/// The launch of epoch 1's one main process serving [`FAST_H3`] on one rank of one group that
-/// places every block, as `configs/minimax_h3/single.toml` does, at its smallest: square videos
-/// of the shortest timeline, prompts of up to 256 tokens and [`SLOTS`] request slots.
+/// The launch of epoch 1's one main process serving [`fast_h3`] on one rank of one group that
+/// places every block at its smallest: square videos of the shortest timeline, prompts of up to 256 tokens and [`SLOTS`] request slots.
 pub(crate) fn video_launch() -> EngineArgs {
     let mut launch = launch();
     let every = || BlockConfig::parallel(vec![0]);
@@ -349,7 +349,7 @@ pub(crate) fn video_launch() -> EngineArgs {
     );
 
     let config = &mut launch.engine_config;
-    config.model.model = FAST_H3.to_owned();
+    config.model.model = fast_h3().to_string_lossy().into_owned();
     config.model.max_model_len = 256;
     config.parallel.worker_groups = vec![group.clone()];
     config.video = proto::config::VideoConfig {
@@ -365,17 +365,13 @@ pub(crate) fn video_launch() -> EngineArgs {
 #[test]
 #[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
 fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
-    assert!(
-        Path::new(FAST_H3).is_dir(),
-        "the media rank loads the headers of {FAST_H3}, which is missing"
-    );
     let server = StorageServer::start();
     let launch = video_launch();
 
     // The rank's load and its runners' profile run: every phase of a video request on its one
     // rank, a slot's row holding the largest trajectory, and its group's product sizes.
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
     let mut ranks = load_ranks(
         model_runner.ranks().unwrap(),
@@ -593,13 +589,9 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
 #[test]
 #[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
 fn a_media_group_holds_as_many_request_slots_as_its_ranks_shares_hold() {
-    assert!(
-        Path::new(FAST_H3).is_dir(),
-        "the media rank loads the headers of {FAST_H3}, which is missing"
-    );
     let launch = video_launch();
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
     let load = || {
         load_ranks(
@@ -670,10 +662,6 @@ fn a_media_group_holds_as_many_request_slots_as_its_ranks_shares_hold() {
 #[test]
 #[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
 fn a_parallel_group_takes_its_block_s_ranks_in_their_stated_order() {
-    assert!(
-        Path::new(FAST_H3).is_dir(),
-        "the media rank loads the headers of {FAST_H3}, which is missing"
-    );
     let mut launch = video_launch();
     let mut group = launch.engine_config.parallel.worker_groups[0].clone();
     group.ranks = (0..4)
@@ -695,7 +683,7 @@ fn a_parallel_group_takes_its_block_s_ranks_in_their_stated_order() {
     launch.world_size = 4;
 
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let runners = ModelRunner::of(&launch, family).unwrap().ranks().unwrap();
     assert_eq!(runners.len(), 4);
     for runner in &runners {
@@ -722,10 +710,6 @@ fn a_parallel_group_takes_its_block_s_ranks_in_their_stated_order() {
 #[test]
 #[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
 fn a_denoiser_block_forms_a_group_along_each_axis_of_its_partition() {
-    assert!(
-        Path::new(FAST_H3).is_dir(),
-        "the media rank loads the headers of {FAST_H3}, which is missing"
-    );
     let groups_of = |tensor: usize, sequence: proto::config::SequenceParallel| {
         let mut launch = video_launch();
         let mut group = launch.engine_config.parallel.worker_groups[0].clone();
@@ -744,7 +728,7 @@ fn a_denoiser_block_forms_a_group_along_each_axis_of_its_partition() {
         launch.world_size = 4;
 
         let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-        let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+        let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
         let runners = ModelRunner::of(&launch, family).unwrap().ranks().unwrap();
         runners
             .iter()
@@ -796,10 +780,6 @@ fn a_denoiser_block_forms_a_group_along_each_axis_of_its_partition() {
 #[test]
 #[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
 fn every_denoising_rank_encodes_the_conditions_of_its_requests() {
-    assert!(
-        Path::new(FAST_H3).is_dir(),
-        "the media rank loads the headers of {FAST_H3}, which is missing"
-    );
     let mut launch = video_launch();
     let mut group = launch.engine_config.parallel.worker_groups[0].clone();
     group.ranks = (0..2)
@@ -821,7 +801,7 @@ fn every_denoising_rank_encodes_the_conditions_of_its_requests() {
     launch.world_size = 2;
 
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
     let ranks = load_ranks(
         model_runner.ranks().unwrap(),
@@ -848,9 +828,9 @@ fn every_denoising_rank_encodes_the_conditions_of_its_requests() {
     }
 }
 
-/// The launch of [`FAST_H3`] over two devices of one process, each the one rank of a group: the
+/// The launch of [`fast_h3`] over two devices of one process, each the one rank of a group: the
 /// `text` group encodes prompts on device 0, and the `flow` group serves every other phase on
-/// device 1, as `configs/minimax_h3/fasth3-ulysses4x2.toml` splits them.
+/// device 1.
 fn split_launch() -> EngineArgs {
     let mut launch = video_launch();
     let one = || BlockConfig::parallel(vec![0]);
@@ -900,7 +880,6 @@ fn split_launch() -> EngineArgs {
 #[test]
 #[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
 fn a_group_of_no_phase_spawns_a_worker_that_serves_nothing() {
-    assert!(Path::new(FAST_H3).is_dir(), "{FAST_H3} is missing");
     let server = StorageServer::start();
     let mut launch = split_launch();
     let mut encoder = launch.engine_config.parallel.worker_groups[0].clone();
@@ -913,7 +892,7 @@ fn a_group_of_no_phase_spawns_a_worker_that_serves_nothing() {
     launch.world_size = 3;
 
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
     let mut ranks = load_ranks(
         model_runner.ranks().unwrap(),
@@ -946,12 +925,11 @@ fn a_group_of_no_phase_spawns_a_worker_that_serves_nothing() {
 #[test]
 #[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
 fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it() {
-    assert!(Path::new(FAST_H3).is_dir(), "{FAST_H3} is missing");
     let server = StorageServer::start();
     let launch = split_launch();
 
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
     let mut ranks = load_ranks(
         model_runner.ranks().unwrap(),
@@ -1055,16 +1033,14 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
     client.close().unwrap();
 }
 
-/// The launch of [`FAST_H3`] as `configs/minimax_h3/fasth3-dp8-text-tp8.toml` places it on one
-/// host of eight devices: the `text` group's eight ranks encode prompts eight-way tensor
+/// The launch of [`fast_h3`] as `testkit::layouts::fasth3_dp8_text_tp8` places it on one host of
+/// eight devices: the `text` group's eight ranks encode prompts eight-way tensor
 /// parallel, and eight one-rank `flow` replicas serve every other phase, replica `i` on the
 /// device of text rank `i`.
 fn dp8_launch() -> EngineArgs {
     let mut launch = video_launch();
-    let file = crate::support::workspace().join("configs/minimax_h3/fasth3-dp8-text-tp8.toml");
-    let text = std::fs::read_to_string(file).unwrap();
     launch.engine_config.parallel.worker_groups =
-        WorkerGroupConfig::parse_file(&text, "localhost").unwrap();
+        testkit::layouts::fasth3_dp8_text_tp8("localhost");
     launch.devices = (0..8).collect();
     launch.world_size = 8;
     launch
@@ -1073,14 +1049,13 @@ fn dp8_launch() -> EngineArgs {
 #[test]
 #[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
 fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
-    assert!(Path::new(FAST_H3).is_dir(), "{FAST_H3} is missing");
     let server = StorageServer::start();
     let launch = dp8_launch();
     assert_eq!(launch.engine_config.parallel.worker_groups.len(), 9);
 
     // Sixteen ranks, two on each device: text rank `i` and the rank of flow replica `i`.
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
     let placed = model_runner.ranks().unwrap();
     assert_eq!(placed.len(), 16);
@@ -1203,22 +1178,21 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
     client.close().unwrap();
 }
 
+/// A two-host layout of `testkit::layouts`, whose leader is the host it is given.
+type Layout = fn(&str) -> Vec<WorkerGroupConfig>;
+
 /// The launch of `checkpoint` for the main process of host `host` of the two-host deployment
-/// `file` of `configs/minimax_h3/`, whose hosts are `rank-0`, the scheduler node's, and `rank-1`,
-/// four devices each: the process serves from the first rank its host holds, in a world of every
-/// rank of the deployment.
-fn two_host_launch(file: &str, host: &str, checkpoint: &str) -> EngineArgs {
+/// `layout`, whose hosts are `rank-0`, the scheduler node's, and `rank-1`, four devices each: the
+/// process serves from the first rank its host holds, in a world of every rank of the
+/// deployment.
+fn two_host_launch(layout: Layout, host: &str, checkpoint: &Path) -> EngineArgs {
     let mut launch = video_launch();
-    let path = crate::support::workspace()
-        .join("configs/minimax_h3")
-        .join(file);
-    let text = std::fs::read_to_string(path).unwrap();
-    let groups = WorkerGroupConfig::parse_file(&text, "rank-0").unwrap();
+    let groups = layout("rank-0");
     let ranks: Vec<&WorkerRank> = groups.iter().flat_map(|group| &group.ranks).collect();
     launch.world_size = u32::try_from(ranks.len()).unwrap();
     launch.rank = u32::try_from(ranks.iter().position(|rank| rank.host == host).unwrap()).unwrap();
 
-    launch.engine_config.model.model = checkpoint.to_owned();
+    launch.engine_config.model.model = checkpoint.to_string_lossy().into_owned();
     launch.engine_config.parallel.engine_host = "rank-0".to_owned();
     launch.engine_config.parallel.worker_groups = groups;
     launch.host = host.to_owned();
@@ -1230,14 +1204,13 @@ fn two_host_launch(file: &str, host: &str, checkpoint: &str) -> EngineArgs {
 /// deployment `file` of `checkpoint`, loaded onto the meta device while the process of host
 /// `rank-1` loads its own: the two meet at one rendezvous as the deployment's host group, and
 /// agree their groups' request slots over it.
-fn two_host_ranks(file: &str, checkpoint: &str) -> (EngineArgs, Vec<LoadedRank>) {
-    assert!(Path::new(checkpoint).is_dir(), "{checkpoint} is missing");
+fn two_host_ranks(layout: Layout, checkpoint: &Path) -> (EngineArgs, Vec<LoadedRank>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let load = |host: &str, listener: Option<std::net::TcpListener>| {
-        let launch = two_host_launch(file, host, checkpoint);
+        let launch = two_host_launch(layout, host, checkpoint);
         let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-        let family = crate::process::catalogue::resolve(&registry, Path::new(checkpoint)).unwrap();
+        let family = crate::process::catalogue::resolve(&registry, checkpoint).unwrap();
         let model_runner = ModelRunner::of(&launch, family).unwrap();
         let meeting = Meeting::World {
             address: address.clone(),
@@ -1260,8 +1233,8 @@ fn two_host_ranks(file: &str, checkpoint: &str) -> (EngineArgs, Vec<LoadedRank>)
     })
 }
 
-/// `configs/minimax_h3/fasth3-ulysses4x2-two-host.toml` places each replica's text encoder and
-/// denoiser on one host. The scheduler node's process holds the ranks of its own host alone, and
+/// `testkit::layouts::fasth3_ulysses4x2_two_host` places each replica's text encoder and denoiser
+/// on one host. The scheduler node's process holds the ranks of its own host alone, and
 /// its session states every group of both hosts: every rank's product buffer and every group's
 /// slot rows, each denoising replica reading the conditioning of the text encoder on its own
 /// host and each text encoder the vision pixels of the media reader on its own, and the groups
@@ -1269,7 +1242,7 @@ fn two_host_ranks(file: &str, checkpoint: &str) -> (EngineArgs, Vec<LoadedRank>)
 #[test]
 #[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
 fn a_two_host_media_session_states_both_hosts_replicas_when_none_passes_a_product_across() {
-    let (launch, ranks) = two_host_ranks("fasth3-ulysses4x2-two-host.toml", FAST_H3);
+    let (launch, ranks) = two_host_ranks(testkit::layouts::fasth3_ulysses4x2_two_host, &fast_h3());
 
     // Text replica 0 is ranks 0-3 and flow replica 0 ranks 8-11, on `rank-0`; replicas 1 are
     // ranks 4-7 and 12-15, on `rank-1`.
@@ -1317,13 +1290,15 @@ fn a_two_host_media_session_states_both_hosts_replicas_when_none_passes_a_produc
 /// The base MiniMax-H3 release, whose dense denoiser any Ulysses degree splits: the sparse
 /// attention of the FastH3 exports composes rows in blocks that an eight-way split of the test's
 /// one timeline does not leave whole, and refuses it in the profile run.
-const MINIMAX_H3: &str = "/workspace/models/MiniMax-H3";
+fn minimax_h3() -> PathBuf {
+    testkit::assets::MINIMAX_H3.snapshot()
+}
 
-/// The layout the scheduler node states for a Ulysses8 two-host file of `configs/minimax_h3/`,
-/// which places the `model` group's ranks 0-3 on `rank-0` and 4-7 on `rank-1`, beside a muxer
-/// (rank 8) and a media reader (rank 9) on `rank-0`, each its own group of one scheduler. `wide`
-/// states whether the text encoder holds all eight ranks (`ulysses8-two-host.toml`) or the first
-/// four (`ulysses8-reference-two-host.toml`).
+/// The layout the scheduler node states for a Ulysses8 two-host layout `placed`, which places the
+/// `model` group's ranks 0-3 on `rank-0` and 4-7 on `rank-1`, beside a muxer (rank 8) and a media
+/// reader (rank 9) on `rank-0`, each its own group of one scheduler. `wide` states whether the
+/// text encoder holds all eight ranks (`testkit::layouts::ulysses8_two_host`) or the first four
+/// (`testkit::layouts::ulysses8_reference_two_host`).
 ///
 /// Nothing is refused, and every product a group reads in the other host's process is received
 /// there (`p4-design.md` §1.1): the conditioning rank 0 wrote, the condition media the reader
@@ -1332,13 +1307,13 @@ const MINIMAX_H3: &str = "/workspace/models/MiniMax-H3";
 /// the products every rank of the group backs need no crossing, nor does what the muxer reads on
 /// its own host. Each product buffer lies in its host's memory. The conditioning's host copies
 /// lie in part 0 on rank 0's host, and a saved trajectory's in part 0 on each host.
-fn a_ulysses8_two_host_layout_receives_what_crosses(file: &str, wide: bool) {
+fn a_ulysses8_two_host_layout_receives_what_crosses(placed: Layout, wide: bool) {
     use crate::batch::product::{
         AUDIO_LATENTS, AUDIO_SAMPLES, CONDITION_PIXELS, CONDITION_SAMPLES, CONDITIONING,
         ENCODED_UNITS, VIDEO_LATENTS, VIDEO_TAIL, VIDEO_UNITS, VISION_PIXELS, kind,
     };
 
-    let (launch, ranks) = two_host_ranks(file, MINIMAX_H3);
+    let (launch, ranks) = two_host_ranks(placed, &minimax_h3());
     let held: Vec<u32> = ranks.iter().map(|rank| rank.model_runner.rank()).collect();
     assert_eq!(held, [0, 1, 2, 3, 8, 9]);
 
@@ -1436,23 +1411,28 @@ fn a_ulysses8_two_host_layout_receives_what_crosses(file: &str, wide: bool) {
     }
 }
 
-/// `configs/minimax_h3/ulysses8-two-host.toml`: the text encoder over all eight ranks.
+/// `testkit::layouts::ulysses8_two_host`: the text encoder over all eight ranks.
 #[test]
 #[ignore = "reads the headers of the released MiniMax-H3 checkpoint, which the repository does not hold"]
 fn the_ulysses8_two_host_layout_receives_what_crosses_the_hosts() {
-    a_ulysses8_two_host_layout_receives_what_crosses("ulysses8-two-host.toml", true);
+    a_ulysses8_two_host_layout_receives_what_crosses(testkit::layouts::ulysses8_two_host, true);
 }
 
-/// `configs/minimax_h3/ulysses8-reference-two-host.toml`: the text encoder over ranks 0-3, on
+/// `testkit::layouts::ulysses8_reference_two_host`: the text encoder over ranks 0-3, on
 /// `rank-0`, whose `rank-1` ranks load no part of it.
 #[test]
 #[ignore = "reads the headers of the released MiniMax-H3 checkpoint, which the repository does not hold"]
 fn the_ulysses8_reference_two_host_layout_receives_what_crosses_the_hosts() {
-    a_ulysses8_two_host_layout_receives_what_crosses("ulysses8-reference-two-host.toml", false);
+    a_ulysses8_two_host_layout_receives_what_crosses(
+        testkit::layouts::ulysses8_reference_two_host,
+        false,
+    );
 }
 
 /// The released checkpoint deliverable E1 serves (`artifacts/buffer-pool/e1/protocol.md`).
-const QWEN3_30B: &str = "/workspace/models/Qwen3-30B-A3B";
+fn qwen3_30b() -> PathBuf {
+    testkit::assets::QWEN3_30B_A3B.snapshot()
+}
 
 /// The bytes of one GB200, whose quota at a fraction of 0.70 is the 138528423936 bytes E1's
 /// deployment is refused or admitted against, and the granule its exportable allocations take.
@@ -1467,7 +1447,7 @@ const GB200_GRANULE: u64 = 2 << 20;
 const RETAINED_WEIGHTS: u64 = 61_066_969_088;
 const WARM_PROCESS: u64 = 8_604_614_656;
 
-/// E1's launch: one rank of one GPU serving [`QWEN3_30B`] as the protocol's command states it
+/// E1's launch: one rank of one GPU serving [`qwen3_30b`] as the protocol's command states it
 /// (`--max-running-requests 128 --mem-fraction-static 0.70 --set
 /// kv_cache_config.max_tokens=131072`), with the checkpoint's 40960-token context and the
 /// daemon's defaults otherwise: 20 log-probability candidates and the default graph tiers.
@@ -1475,7 +1455,7 @@ fn e1_launch() -> EngineArgs {
     let mut launch = launch();
     let config = &mut launch.engine_config;
 
-    config.model.model = QWEN3_30B.to_owned();
+    config.model.model = qwen3_30b().to_string_lossy().into_owned();
     config.model.max_model_len = 40_960;
     config.max_running_requests = std::num::NonZeroUsize::new(128).unwrap();
     config.mem_fraction_static = 0.70;
@@ -1485,24 +1465,16 @@ fn e1_launch() -> EngineArgs {
     launch
 }
 
-/// The bytes of the tensors of a checkpoint's safetensors shards, as their headers state them:
-/// each shard's bytes past its eight-byte header length and its header.
-fn checkpoint_bytes(directory: &str) -> u64 {
-    let mut total = 0;
-    for entry in std::fs::read_dir(directory).unwrap() {
-        let path = entry.unwrap().path();
-        if path
-            .extension()
-            .is_none_or(|extension| extension != "safetensors")
-        {
-            continue;
-        }
-
-        let mut length = [0_u8; 8];
-        std::io::Read::read_exact(&mut std::fs::File::open(&path).unwrap(), &mut length).unwrap();
-        total += std::fs::metadata(&path).unwrap().len() - 8 - u64::from_le_bytes(length);
-    }
-    total
+/// The bytes of the tensors of the checkpoint at `directory`, as its shards' headers state them.
+fn checkpoint_bytes(directory: &Path) -> u64 {
+    let checkpoint = nn::Checkpoint::open(directory).unwrap();
+    checkpoint
+        .names()
+        .map(|name| {
+            let (first, end) = checkpoint.locate(name).unwrap().bytes;
+            end - first
+        })
+        .sum()
 }
 
 /// E1's text rank started on the meta device from the released checkpoint's headers: its profile
@@ -1514,10 +1486,6 @@ fn checkpoint_bytes(directory: &str) -> u64 {
 #[test]
 #[ignore = "reads the headers of the released Qwen3-30B-A3B checkpoint, which the repository does not hold"]
 fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
-    assert!(
-        Path::new(QWEN3_30B).is_dir(),
-        "the text rank loads the headers of {QWEN3_30B}, which is missing"
-    );
     let launch = e1_launch();
     let ranks = loaded(&launch);
     assert_eq!(ranks.len(), 1);
@@ -1526,7 +1494,7 @@ fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
     let layout = std::sync::Arc::clone(service::lock(&text.cache).layout());
 
     // The server retains the checkpoint's tensors, packed into whole granules.
-    let checkpoint = checkpoint_bytes(QWEN3_30B);
+    let checkpoint = checkpoint_bytes(&qwen3_30b());
     assert!(
         checkpoint <= RETAINED_WEIGHTS && RETAINED_WEIGHTS - checkpoint < 64 * GB200_GRANULE,
         "the checkpoint's {checkpoint} bytes against the {RETAINED_WEIGHTS} retained"
@@ -1912,22 +1880,19 @@ fn a_rank_opening_resolves_the_kernels_of_its_cache_over_its_region_s_units() {
     let fixtures = [
         (
             models::qwen3::family::HYBRID_FAMILY,
-            "crates/models/tests/it/qwen3/data/qwen3_5_moe/model",
+            models::fixtures::qwen3_5_moe(),
             true,
         ),
         (
             models::qwen3::family::FAMILY,
-            "crates/models/tests/it/qwen3/data/qwen3_moe/model",
+            models::fixtures::qwen3_moe(),
             false,
         ),
     ];
     for (family, fixture, keeps_state) in fixtures {
         let server = StorageServer::start();
         let mut launch = launch();
-        launch.engine_config.model.model = crate::support::workspace()
-            .join(fixture)
-            .to_string_lossy()
-            .into_owned();
+        launch.engine_config.model.model = fixture.to_string_lossy().into_owned();
         let registry = nn::family::Registry::new([family]).unwrap();
         let family = crate::process::catalogue::resolve(
             &registry,
@@ -2017,13 +1982,9 @@ fn a_rank_opening_resolves_the_kernels_of_its_cache_over_its_region_s_units() {
 #[test]
 #[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
 fn the_regions_of_a_media_group_serve_the_slots_it_kept() {
-    assert!(
-        Path::new(FAST_H3).is_dir(),
-        "the media rank loads the headers of {FAST_H3}, which is missing"
-    );
     let launch = video_launch();
     let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
-    let family = crate::process::catalogue::resolve(&registry, Path::new(FAST_H3)).unwrap();
+    let family = crate::process::catalogue::resolve(&registry, &fast_h3()).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
     let ranks = load_ranks(
         model_runner.ranks().unwrap(),

@@ -26,5 +26,11 @@ ops.workspace = true
 serde.workspace = true
 tempfile.workspace = true
 
+[features]
+# The paths of the tiny checkpoints this crate's tests hold (`models::fixtures`), for the tests
+# of the crates that serve them; a development feature, so no serving build names this source
+# tree.
+fixtures = []
+
 [lints]
 workspace = true

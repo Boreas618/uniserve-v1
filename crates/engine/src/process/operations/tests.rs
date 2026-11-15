@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use anyhow::bail;
 use crossbeam_channel::{Receiver, Sender};
@@ -29,7 +28,8 @@ use crate::memory::client::StorageClient;
 use crate::process::binding::{Target, WeightBinding};
 use crate::scheduler::tests::{capacity, idle_policy};
 use crate::scheduler::{Message, Output, Scheduler};
-use crate::support::{DEPLOYMENT, StorageServer};
+use testkit::LONG;
+use testkit::serving::{DEPLOYMENT, StorageServer};
 
 /// The units of the region of the KV planes, the first of them reserved, in four segments.
 pub(in crate::process) const KV_UNITS: u32 = 64;
@@ -37,9 +37,6 @@ pub(in crate::process) const SEGMENT_UNITS: u32 = 16;
 
 /// The bytes of one unit of the KV planes on one rank.
 pub(in crate::process) const UNIT_BYTES: u64 = 4096;
-
-/// A bound on the tests' waits that only a defect reaches.
-pub(in crate::process) const LONG: Duration = Duration::from_secs(30);
 
 /// Segment `ordinal` of the KV planes, which epoch 1's ranks created, as a segment table states
 /// it.

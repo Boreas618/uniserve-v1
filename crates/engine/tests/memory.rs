@@ -10,11 +10,8 @@
 // The helpers below unwrap, as tests do (`clippy.toml`).
 #![cfg(test)]
 
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use engine::memory::cache::{CacheLayout, KvCacheConfig, KvCacheMemory, segments};
 use engine::memory::client::StorageClient;
@@ -25,8 +22,8 @@ use nn::{Checkpoint, DType, RetainedWeights, Shape, Tensor, WeightKey, WeightLoa
 use platform::DeviceId;
 use proto::request::PrefixCacheDtype;
 use storage::{Claim, Claimant, Client, Role, Scope};
-use storage_server::Server;
 use tensor::DeviceLocation;
+use testkit::StorageServer;
 
 /// The deployment, worker group and epoch the device tests' rank belongs to.
 const DEPLOYMENT: &str = "model";
@@ -57,26 +54,21 @@ fn embed_bytes(rows: usize, first: f32) -> Vec<u8> {
 /// Writes a checkpoint of one shard under `directory` and opens it: `norm.weight`, [`NORM`]
 /// BF16 elements, and `embed.weight`, `rows` rows of [`COLUMNS`] FP32 elements, with values
 /// counting up from `first`.
-///
-/// The shard is composed from the safetensors grammar (an eight-byte length, the JSON header
-/// padded to eight bytes, then the payload), so the fixture states the format without a writer.
 fn checkpoint(directory: &Path, rows: usize, first: f32) -> Checkpoint {
+    use safetensors::tensor::{Dtype, TensorView};
+
     let (norm, embed) = (norm_bytes(first), embed_bytes(rows, first));
-
-    let mut header = format!(
-        r#"{{"norm.weight":{{"dtype":"BF16","shape":[{NORM}],"data_offsets":[0,{}]}},"embed.weight":{{"dtype":"F32","shape":[{rows},{COLUMNS}],"data_offsets":[{},{}]}}}}"#,
-        norm.len(),
-        norm.len(),
-        norm.len() + embed.len()
-    );
-    let padded = header.len().div_ceil(8) * 8;
-    header.push_str(&" ".repeat(padded - header.len()));
-
-    let mut file = (header.len() as u64).to_le_bytes().to_vec();
-    file.extend_from_slice(header.as_bytes());
-    file.extend_from_slice(&norm);
-    file.extend_from_slice(&embed);
-    std::fs::write(directory.join("model.safetensors"), file).unwrap();
+    let tensors = [
+        (
+            "norm.weight",
+            TensorView::new(Dtype::BF16, vec![NORM], &norm).unwrap(),
+        ),
+        (
+            "embed.weight",
+            TensorView::new(Dtype::F32, vec![rows, COLUMNS], &embed).unwrap(),
+        ),
+    ];
+    safetensors::serialize_to_file(tensors, None, &directory.join("model.safetensors")).unwrap();
 
     Checkpoint::open(directory).unwrap()
 }
@@ -148,64 +140,6 @@ fn a_load_over_the_meta_store_states_its_weights_in_order_and_holds_no_data() {
         order.iter().map(|(_, table)| *table).collect::<Vec<_>>(),
         [false, false, true]
     );
-}
-
-/// A Storage Server on a socket of its own, in the test's process, stopped when dropped.
-struct StorageServer {
-    socket: PathBuf,
-    stop: Arc<AtomicBool>,
-    /// The write end of the pipe whose readability wakes the server's loop.
-    wake: OwnedFd,
-    thread: Option<std::thread::JoinHandle<()>>,
-    _directory: tempfile::TempDir,
-}
-
-impl StorageServer {
-    fn start() -> Self {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("storage.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let (reader, wake) = rustix::pipe::pipe_with(
-            rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC,
-        )
-        .unwrap();
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = Arc::clone(&stop);
-        let thread = std::thread::spawn(move || {
-            // A server of no children that leaves the host's storage to no other process.
-            let settings = ::storage::Settings {
-                server: ::storage::ServerSettings {
-                    host_reserve_gib: 0,
-                    ..::storage::ServerSettings::default()
-                },
-                connector: None,
-            };
-            let mut server = Server::new(listener, settings, None).unwrap();
-            server
-                .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
-                .unwrap();
-        });
-
-        Self {
-            socket,
-            stop,
-            wake,
-            thread: Some(thread),
-            _directory: directory,
-        }
-    }
-}
-
-impl Drop for StorageServer {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        rustix::io::write(&self.wake, b"x").unwrap();
-
-        if let Some(thread) = self.thread.take() {
-            thread.join().unwrap();
-        }
-    }
 }
 
 /// The scope of rank 0 of the tests' worker group.

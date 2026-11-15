@@ -87,6 +87,7 @@ use service::lock;
 use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Run, Stamps, Tier};
 use storage::{Key, QueuePair};
 use tensor::Tensor;
+use testkit::LONG;
 
 /// The worker group, and the regions each of its ranks maps, by the numbers `Open` gave them: the
 /// KV units on the device and the host pool of their copies.
@@ -112,9 +113,6 @@ const PEER: usize = 1;
 
 /// The engine number the peer registers under.
 const ENGINE: u64 = 7;
-
-/// A bound on the test's waits that only a defect reaches.
-const LONG: Duration = Duration::from_secs(10);
 
 /// How long a process whose peer link was lost has before it is ended: longer than any run.
 const DAY: Duration = Duration::from_secs(86_400);

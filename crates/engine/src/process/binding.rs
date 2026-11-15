@@ -2367,8 +2367,7 @@ mod tests {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    /// A bound on the tests' waits that only a defect reaches.
-    const LONG: Duration = Duration::from_secs(30);
+    use testkit::LONG;
 
     /// A peer's link, with the groups it holds ranks of, and the thread that plays the peer.
     type Peer = ((Vec<GroupId>, Arc<Remote>), JoinHandle<Vec<DataOperation>>);

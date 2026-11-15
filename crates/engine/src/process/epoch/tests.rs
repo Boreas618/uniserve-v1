@@ -9,8 +9,9 @@ use proto::config::{ParallelConfig, WorkerGroupConfig, WorkerGroupId, WorkerRank
 
 use super::{by_host, drain, promote, release};
 use crate::process::operations::ask;
-use crate::process::operations::tests::{KV_UNITS, LONG, Node, SEGMENT_UNITS, UNIT_BYTES, segment};
+use crate::process::operations::tests::{KV_UNITS, Node, SEGMENT_UNITS, UNIT_BYTES, segment};
 use crate::scheduler::Message;
+use testkit::LONG;
 
 /// The epoch whose sessions read what the buffer pool holds, beside the engines of each case.
 const READER: u64 = 9;

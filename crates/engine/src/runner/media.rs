@@ -1512,8 +1512,7 @@ mod tests {
     const OWNER: OwnerId = OwnerId(1);
     const SLOT: u32 = 2;
 
-    /// A bound on the tests' waits that only a defect reaches.
-    const LONG: std::time::Duration = std::time::Duration::from_secs(60);
+    use testkit::LONG;
 
     fn config(phases: &[Phase]) -> HostConfig {
         let half = PixelNorm {

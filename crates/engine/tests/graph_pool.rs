@@ -7,82 +7,20 @@
 // The helpers below unwrap, as tests do (`clippy.toml`).
 #![cfg(test)]
 
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use engine::memory::client::{StorageClient, quota_limit};
 use engine::memory::graph_pool::GraphPool;
 use engine::runner::RunnerId;
 use platform::{DeviceId, DeviceRange, PinnedBuffer, PoolKind, Stream};
 use storage::{Claimant, Client, Item, Role, Scope};
-use storage_server::Server;
+use testkit::StorageServer;
 
 const DEPLOYMENT: &str = "model";
 const GROUP: &str = "text";
 const EPOCH: u64 = 1;
 
 const MIB: u64 = 1 << 20;
-
-/// A Storage Server on a socket of its own, in the test's process, stopped when dropped.
-struct StorageServer {
-    socket: PathBuf,
-    stop: Arc<AtomicBool>,
-    /// The write end of the pipe whose readability wakes the server's loop.
-    wake: OwnedFd,
-    thread: Option<std::thread::JoinHandle<()>>,
-    _directory: tempfile::TempDir,
-}
-
-impl StorageServer {
-    fn start() -> Self {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("storage.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let (reader, wake) = rustix::pipe::pipe_with(
-            rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC,
-        )
-        .unwrap();
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = Arc::clone(&stop);
-        let thread = std::thread::spawn(move || {
-            // A server of no children that leaves the host's storage to no other process.
-            let settings = ::storage::Settings {
-                server: ::storage::ServerSettings {
-                    host_reserve_gib: 0,
-                    ..::storage::ServerSettings::default()
-                },
-                connector: None,
-            };
-            let mut server = Server::new(listener, settings, None).unwrap();
-            server
-                .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
-                .unwrap();
-        });
-
-        Self {
-            socket,
-            stop,
-            wake,
-            thread: Some(thread),
-            _directory: directory,
-        }
-    }
-}
-
-impl Drop for StorageServer {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        rustix::io::write(&self.wake, b"x").unwrap();
-
-        if let Some(thread) = self.thread.take() {
-            thread.join().unwrap();
-        }
-    }
-}
 
 /// Claims the deployment at `server` as its head and connects rank 0 of its worker group. The
 /// head's connection is returned with the rank's client, because the claim lasts while the

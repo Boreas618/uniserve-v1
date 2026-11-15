@@ -8,8 +8,9 @@ publish = false
 # Test support for the engine's scheduler and control thread and their callers: the fake
 # executor of the scheduler's worker groups and the Storage Server's buffer pool served in the
 # test's process, the fake engine that runs the engine's own control thread over them for the
-# daemon's tests, the policy module a test engine instantiates, and the fake engine at the process
-# interface. Never a dependency of a serving build.
+# daemon's tests, the policy module a test engine instantiates, the fake engine at the process
+# interface, and what the engine's own unit and integration tests serve from (a Storage Server on
+# a thread and the launch of a fixture checkpoint). Never a dependency of a serving build.
 [dependencies]
 anyhow.workspace = true
 # The policy package's manifest, whose declared parameters a test engine's policy runs with.
@@ -18,6 +19,10 @@ crossbeam-channel.workspace = true
 engine.workspace = true
 # The host's monotonic clock, which the buffer pool's task deadlines are stated in.
 libc.workspace = true
+# The released checkpoints an ignored test reads, resolved into the Hugging Face cache.
+hf-hub.workspace = true
+# The tiny checkpoints the engine's tests serve (`models::fixtures`).
+models = { workspace = true, features = ["fixtures"] }
 # The FFmpeg libraries the engine links through the media crate; `build.rs` reads their
 # directories from its `links` metadata for the test executables' run path.
 media.workspace = true
@@ -28,6 +33,8 @@ storage-server.workspace = true
 # The policy's parameters and limits; a test engine's policy module is loaded with the
 # engine's own policy host (`engine::scheduler::policy`).
 scheduling.workspace = true
+# The pipe that wakes a Storage Server's loop to stop.
+rustix = { workspace = true, features = ["pipe"] }
 uuid.workspace = true
 proto.workspace = true
 tempfile.workspace = true

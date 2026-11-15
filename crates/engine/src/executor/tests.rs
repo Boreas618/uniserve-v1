@@ -3,7 +3,6 @@
 //! scheduler's channel.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crate::batch::{
     Batch, BatchId, BatchOutput, CallOutput, CallStatus, Columns, Phase, Shape, Variant,
@@ -26,6 +25,7 @@ use tensor::Tensor;
 use super::{Shadow, WorkerExecutor};
 use crate::executor::Executor as _;
 use crate::scheduler::Message;
+use testkit::LONG;
 
 pub(crate) const GROUP: GroupId = GroupId(3);
 
@@ -35,9 +35,6 @@ const HOST: u8 = 1;
 
 /// The batch the runners fail.
 const FAILING: u64 = 13;
-
-/// A bound on the tests' waits that only a defect reaches.
-const LONG: Duration = Duration::from_secs(30);
 
 /// A decode runner that holds no device and no model: every call of a batch samples the batch's
 /// number, a copy is issued with the batch, and the batches it prepares paired forwards for are

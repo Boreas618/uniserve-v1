@@ -361,7 +361,7 @@ mod tests {
             Connection::new(engine_requests).unwrap(),
             std::num::NonZeroU32::MIN,
             Connection::new(engine_process).unwrap(),
-            crate::support::launch(),
+            testkit::serving::launch(),
         )
         .unwrap();
         main.streams.insert(RequestId(7), RequestStream::new(0, 0));

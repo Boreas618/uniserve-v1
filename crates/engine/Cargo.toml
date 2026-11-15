@@ -75,9 +75,15 @@ tracing.workspace = true
 wasmtime.workspace = true
 
 [dev-dependencies]
-# A rank's start opens its session with a Storage Server the test runs in its own process, as do
-# the device tests of the weight store.
-storage-server.workspace = true
+# What the unit and integration tests serve from: a Storage Server on a thread of the test's
+# process, the launch of a fixture checkpoint and the bound of a wait (`testkit::serving`), and the
+# released checkpoints an ignored test reads (`testkit::assets`). The unit tests link it beside
+# their own build of this crate, whose types that support names none of.
+testkit.workspace = true
+# The tiny checkpoints of the `models` crate a rank's tests load (`models::fixtures`).
+models = { workspace = true, features = ["fixtures"] }
+# The checkpoint shards the weight store's tests write.
+safetensors.workspace = true
 # A toy policy module in a test is written as `wat`.
 wasmtime = { workspace = true, features = ["wat"] }
 tempfile.workspace = true

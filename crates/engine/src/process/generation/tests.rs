@@ -10,9 +10,10 @@ use scheduling::limits::Parameters;
 
 use super::{commit, named, rollback, switch};
 use crate::process::operations::ask;
-use crate::process::operations::tests::{LONG, Node};
+use crate::process::operations::tests::Node;
 use crate::scheduler::Message;
 use crate::scheduler::tests::toy;
+use testkit::LONG;
 
 /// The generation every rank's graphs serve, in rank order.
 fn serving(node: &Node) -> Vec<u64> {

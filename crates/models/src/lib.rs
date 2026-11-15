@@ -9,9 +9,14 @@
 //!   vision tower and the configuration readers of [`qwen3`];
 //! - [`minimax_h3`]: MiniMax-H3 and FastH3, whose text encoder is [`qwen3`]'s Qwen3-VL model.
 //!
+//! The development feature `fixtures` adds the module `fixtures`, the paths of the tiny
+//! checkpoints this crate's tests hold, for the tests of the crates that serve them.
+//!
 //! A family owns no device, stream, buffer, scheduler or request state (`AGENTS.md`, Model
 //! Library Boundary): the crate depends on `nn`, the tensor library and `processing` only.
 
+#[cfg(feature = "fixtures")]
+pub mod fixtures;
 pub mod minimax_h3;
 pub mod qwen3;
 pub mod qwen4_exp;

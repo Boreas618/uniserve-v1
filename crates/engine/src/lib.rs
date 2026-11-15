@@ -37,10 +37,6 @@ mod process;
 mod profiling;
 pub mod runner;
 pub mod scheduler;
-/// The Storage Server and launch the unit tests start from, which the integration tests share.
-#[cfg(test)]
-#[path = "../tests/support/mod.rs"]
-mod support;
 pub mod worker;
 
 pub use process::ranks::text_layout;

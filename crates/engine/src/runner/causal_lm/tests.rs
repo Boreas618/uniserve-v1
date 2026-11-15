@@ -1759,8 +1759,7 @@ fn entries<'a>(
 
 #[test]
 fn a_shadow_batch_whose_rows_do_not_fit_the_scratch_set_is_reported_uncompared() {
-    /// A bound on the waits that only a defect reaches.
-    const LONG: Duration = Duration::from_secs(30);
+    use testkit::LONG;
 
     // The rank's cache with the runner's scratch page set, and the generation the runner
     // serves, which holds a kernel for every key it launches.
@@ -2581,8 +2580,7 @@ fn a_copy_between_two_runs_is_issued_on_the_cache_and_ends_with_the_batch() {
 
 #[test]
 fn a_batch_with_no_rows_writes_the_tables_and_runs_the_copies_without_a_forward() {
-    /// A bound on the waits that only a defect reaches.
-    const LONG: Duration = Duration::from_secs(30);
+    use testkit::LONG;
 
     let cache = Arc::new(Mutex::new(
         KvCacheMemory::meta(cache_config(false)).unwrap(),

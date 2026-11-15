@@ -1,33 +1,55 @@
-//! What the engine's tests start from, shared by the library's unit tests (`crate::support`) and
-//! the integration tests (`mod support`): a Storage Server on a thread of the test process, and
-//! the launch of one main process serving the Qwen3-MoE fixture of the `qwen3` crate.
+//! What the engine's own tests serve from: a Storage Server on a thread of the test's process, the
+//! launch of one main process serving the Qwen3-MoE fixture of the `models` crate, and the bound
+//! of a test's waits.
+//!
+//! The engine's unit tests and its integration tests share these, so they live in this
+//! development crate rather than in the engine's test tree. None of them names an engine type:
+//! the engine's unit tests link this crate beside their own build of the engine.
 
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsFd as _, OwnedFd};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use proto::config::{EngineArgs, WorkerGroupConfig};
 
-/// The deployment the launch serves, and the one a test's sessions are of.
-pub(crate) const DEPLOYMENT: &str = "model";
+/// The bound of a test's wait that only a defect reaches: a passing test's waits end on the event
+/// they wait for, long before it.
+pub const LONG: Duration = Duration::from_secs(60);
 
-/// The request slots the launch's one rank holds.
-pub(crate) const SLOTS: u32 = 4;
+/// The deployment [`launch`] serves, and the one a test's sessions are of.
+pub const DEPLOYMENT: &str = "model";
 
-/// A Storage Server on a thread of the test process, listening on a socket of its own directory;
-/// stopped when dropped.
-pub(crate) struct StorageServer {
-    pub(crate) socket: PathBuf,
+/// The request slots [`launch`]'s one rank holds.
+pub const SLOTS: u32 = 4;
+
+/// A Storage Server on a thread of the test's process, serving on a socket of its own directory
+/// and publishing its readiness record beside it as a host's server does; stopped when dropped.
+pub struct StorageServer {
+    /// The socket the server serves on.
+    pub socket: PathBuf,
     stop: Arc<AtomicBool>,
+    /// The write end of the pipe whose readability wakes the server's loop.
     wake: OwnedFd,
     thread: Option<std::thread::JoinHandle<()>>,
     _directory: tempfile::TempDir,
 }
 
 impl StorageServer {
-    pub(crate) fn start() -> Self {
+    /// Starts the server, which leaves none of the host's available storage to other processes
+    /// and runs neither the Mooncake connector nor the Transfer Server. Its socket is bound and
+    /// its record published before this returns, so a client connects at once.
+    ///
+    /// # Panics
+    ///
+    /// When the directory, the socket, the record or the wake pipe cannot be made.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test support fails the test that starts it"
+    )]
+    pub fn start() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("storage.sock");
         let (listener, starting) = service::host::bind::<storage::Settings>(&socket)
@@ -42,18 +64,15 @@ impl StorageServer {
                 storage::Settings::default(),
             ))
             .unwrap();
-
-        let mut ends = [0; 2];
-        // SAFETY: pipe2 fills the two descriptors it creates.
-        let created = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_NONBLOCK) };
-        assert_eq!(created, 0);
-        // SAFETY: two new descriptors this test owns.
-        let (reader, writer) =
-            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        let (reader, wake) = rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC,
+        )
+        .unwrap();
 
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
+            // The socket's lock is held for as long as the server serves.
             let _lock = lock;
             // A server of no children that leaves the host's storage to no other process.
             let settings = ::storage::Settings {
@@ -72,7 +91,7 @@ impl StorageServer {
         Self {
             socket,
             stop,
-            wake: writer,
+            wake,
             thread: Some(thread),
             _directory: directory,
         }
@@ -80,30 +99,36 @@ impl StorageServer {
 }
 
 impl Drop for StorageServer {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test support fails the test that stops it"
+    )]
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        // SAFETY: a write to a pipe this test owns.
-        unsafe { libc::write(self.wake.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+        rustix::io::write(&self.wake, b"x").unwrap();
+
         if let Some(thread) = self.thread.take() {
             thread.join().unwrap();
         }
     }
 }
 
-/// The workspace the tests were built from.
-pub(crate) fn workspace() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+/// The workspace's scheduling policy package (`crates/scheduling/policies/arrival`).
+const POLICY_PACKAGE: &str = "crates/scheduling/policies/arrival";
 
-/// The scheduling policy package this tree builds, relative to the workspace.
-pub(crate) const POLICY_PACKAGE: &str = "crates/scheduling/policies/arrival";
-
-/// A revision of the [`POLICY_PACKAGE`] whose arguments are `stated` (TOML) over the package's
-/// declared defaults, as the Build Server states a revision's arguments to the daemon that
-/// launches it.
-pub(crate) fn policy_revision(stated: &str) -> proto::module::PackageRevision {
-    let manifest =
-        build_server::manifest::Manifest::load(&workspace().join(POLICY_PACKAGE)).unwrap();
+/// A revision of the workspace's policy package whose arguments are `stated` (TOML) over the
+/// package's declared defaults, as the Build Server states a revision's arguments to the daemon
+/// that launches it.
+///
+/// # Panics
+///
+/// When the package's manifest cannot be read, or `stated` is not a TOML table.
+#[expect(clippy::unwrap_used, reason = "test support fails the test that asks")]
+pub fn policy_revision(stated: &str) -> proto::module::PackageRevision {
+    let manifest = build_server::manifest::Manifest::load(
+        &std::path::Path::new(proto::WORKSPACE).join(POLICY_PACKAGE),
+    )
+    .unwrap();
     let mut arguments: toml::Table = manifest.parameters.into_iter().collect();
     arguments.extend(toml::from_str::<toml::Table>(stated).unwrap());
     proto::module::PackageRevision {
@@ -113,15 +138,21 @@ pub(crate) fn policy_revision(stated: &str) -> proto::module::PackageRevision {
     }
 }
 
-/// The launch of epoch 1's one main process, engine 1, serving the Qwen3-MoE fixture on one rank of one
-/// group of [`SLOTS`] request slots, on the device the configuration defaults to: decode buckets
-/// of one and two rows, prefill buckets of up to 32 tokens, and the `arrival` policy package,
-/// whose limits the deployment pins to what those buckets serve.
-pub(crate) fn launch() -> EngineArgs {
-    let checkpoint = workspace()
-        .join("crates/models/tests/it/qwen3/data/qwen3_moe/model")
-        .to_string_lossy()
-        .into_owned();
+/// The launch of epoch 1's one main process, engine 1, serving the Qwen3-MoE fixture
+/// (`models::fixtures::qwen3_moe`) on one rank of one group of [`SLOTS`] request slots, on the
+/// device the configuration defaults to: decode buckets of one and two rows, prefill buckets of
+/// up to 32 tokens, and the `arrival` policy package, whose limits the deployment pins to what
+/// those buckets serve.
+///
+/// # Panics
+///
+/// Never: the policy's arguments, the slots and the bucket sizes are positive constants.
+#[expect(
+    clippy::unwrap_used,
+    reason = "constant arguments, slots and bucket sizes"
+)]
+pub fn launch() -> EngineArgs {
+    let checkpoint = models::fixtures::qwen3_moe().to_string_lossy().into_owned();
     let group = WorkerGroupConfig::placed(
         &["localhost".to_owned()],
         proto::config::DeviceKind::Cuda,

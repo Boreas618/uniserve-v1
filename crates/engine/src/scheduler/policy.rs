@@ -999,7 +999,7 @@ pub(crate) mod tests {
     /// The arguments a revision of the packaged policy runs with when its deployment states
     /// `stated` (TOML): the package's declared defaults, replaced by `stated`.
     pub(crate) fn packaged_arguments(stated: &str) -> Parameters {
-        crate::modules::load::parameters(&crate::support::policy_revision(stated)).unwrap()
+        crate::modules::load::parameters(&testkit::serving::policy_revision(stated)).unwrap()
     }
 
     /// The limits a [`toy`] module declares: chunks and steps of 8192 tokens, 128 calls a step,
