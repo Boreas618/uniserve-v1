@@ -727,6 +727,67 @@ host_contraction = false"#;
     assert!(error.contains("relative directory"), "{error}");
 }
 
+/// A cubin module whose unit defines several kernels states the one each descriptor's field
+/// selects; the selecting field is a declared dimension, and every selected kernel is checked.
+#[test]
+fn a_declared_cubin_selects_its_kernel_by_a_field() {
+    let selecting = r#"
+op = "range_marker"
+backend = "nvcc"
+interface_version = 1
+
+[module]
+form = "cubin"
+
+[source]
+kind = "cuda"
+
+[compile]
+units = ["src/range_marker.cu"]
+standard = "c++20"
+
+[compile.kernel]
+field = "function"
+
+[compile.kernel.values.stamp]
+name = "uniserve_range_marker"
+warps = 1
+signature = [["cell", "*u32"], ["mark", "u32"]]
+
+[compile.kernel.values.clock]
+name = "uniserve_clock"
+warps = 1
+signature = [["out", "*u64"]]
+
+[[kernel.descriptors]]
+dimensions = { function = ["stamp", "clock"] }
+"#;
+    let files = ["src/range_marker.cu"];
+    let manifest = load(selecting, &files).unwrap();
+    let kernels = manifest.compile.as_ref().unwrap().kernel.as_ref().unwrap();
+    assert_eq!(kernels.field(), Some("function"));
+    let mut names: Vec<&str> = kernels
+        .each()
+        .into_iter()
+        .map(|kernel| kernel.name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["uniserve_clock", "uniserve_range_marker"]);
+
+    let error = load(
+        &selecting.replace(r#"field = "function""#, r#"field = "role""#),
+        &files,
+    )
+    .unwrap_err();
+    assert!(error.contains("role"), "{error}");
+    let error = load(
+        &selecting.replace(r#"name = "uniserve_clock""#, r#"name = "2clock""#),
+        &files,
+    )
+    .unwrap_err();
+    assert!(error.contains("no C identifier"), "{error}");
+}
+
 /// A cubin module's declared compilation states its kernel: its symbol, its warps and its
 /// signature in parameter order, from one unit and linking nothing; a native module's states no
 /// kernel.
@@ -761,7 +822,10 @@ warps = 4
 "#;
     let files = ["src/topk_softmax.cu"];
     let manifest = load(cubin, &files).unwrap();
-    let kernel = manifest.compile.as_ref().unwrap().kernel.as_ref().unwrap();
+    let kernels = manifest.compile.as_ref().unwrap().kernel.as_ref().unwrap();
+    let build_server::compile::Kernels::One(kernel) = kernels else {
+        panic!("one kernel is stated: {kernels:?}");
+    };
     assert_eq!(kernel.name, "uniserve_topk_softmax");
     let names: Vec<&str> = kernel
         .signature

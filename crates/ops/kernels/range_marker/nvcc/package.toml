@@ -2,7 +2,7 @@
 #
 # The device code of the engine's range markers
 # (`crates/engine/src/profiling/markers.rs`), one cubin per descriptor, built
-# by `src/build.py` for every GPU target the Build Server describes:
+# by its declared compilation for every GPU target the Build Server describes:
 #
 # - `function_stamp`: a range marker, launched at the entry and the exit of a
 #   model module and around each step. It reads the device switch and, when
@@ -27,6 +27,39 @@ form = "cubin"
 
 [source]
 kind = "cuda"
+
+# Both kernels of the unit run one thread, launched with one block of one warp, and take no shared
+# memory; the descriptor's `function` names the one a module holds.
+[compile]
+units = ["src/range_marker.cu"]
+standard = "c++20"
+
+[compile.kernel]
+field = "function"
+
+# A range marker.
+[compile.kernel.values.stamp]
+name = "uniserve_range_marker"
+warps = 1
+signature = [
+    ["switches", "*u32"],
+    ["klass", "u32"],
+    ["marker", "u32"],
+    ["cell", "*u32"],
+    ["mark", "u32"],
+    ["step", "u32"],
+    ["counter", "*u64"],
+    ["written", "*u32"],
+    ["stamps", "*u64"],
+    ["filled", "*u64"],
+    ["shift", "u32"],
+]
+
+# A clock read, for a calibration.
+[compile.kernel.values.clock]
+name = "uniserve_clock"
+warps = 1
+signature = [["out", "*u64"]]
 
 [[kernel.descriptors]]
 dimensions = { function = ["stamp", "clock"] }

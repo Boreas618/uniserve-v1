@@ -60,10 +60,11 @@ pub struct Compile {
     /// `false`.
     #[serde(default = "contracted")]
     pub host_contraction: bool,
-    /// The kernel of a cubin module and its launch metadata; a native module
+    /// The kernel of a cubin module and its launch metadata, or the kernel a
+    /// descriptor field selects among the unit's; a native module
     /// is launched through its C entries and states none.
     #[serde(default)]
-    pub kernel: Option<Kernel>,
+    pub kernel: Option<Kernels>,
 }
 
 /// The value of one preprocessor definition.
@@ -144,6 +145,39 @@ pub struct Headers {
     pub path: String,
 }
 
+/// The kernel of a cubin module: one, or the one a descriptor field's value
+/// selects among the kernels its unit defines, as a launch table selects a
+/// Triton package's kernel.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Kernels {
+    One(Kernel),
+    Selected {
+        /// The field whose value names the kernel.
+        field: String,
+        /// Each value of the field and the kernel it selects.
+        values: BTreeMap<String, Kernel>,
+    },
+}
+
+impl Kernels {
+    /// Every kernel the declaration may select.
+    pub fn each(&self) -> Vec<&Kernel> {
+        match self {
+            Self::One(kernel) => vec![kernel],
+            Self::Selected { values, .. } => values.values().collect(),
+        }
+    }
+
+    /// The field that selects the kernel, when one does.
+    pub fn field(&self) -> Option<&str> {
+        match self {
+            Self::One(_) => None,
+            Self::Selected { field, .. } => Some(field),
+        }
+    }
+}
+
 /// The kernel of a cubin module: what the module's launch metadata states.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,9 +205,12 @@ impl Compile {
             .values()
             .filter_map(Definition::field)
             .collect();
-        if let Some(kernel) = &self.kernel {
-            fields.extend(kernel.warps.field());
-            fields.extend(kernel.signature.iter().filter_map(|(_, ty)| ty.field()));
+        if let Some(kernels) = &self.kernel {
+            fields.extend(kernels.field());
+            for kernel in kernels.each() {
+                fields.extend(kernel.warps.field());
+                fields.extend(kernel.signature.iter().filter_map(|(_, ty)| ty.field()));
+            }
         }
         fields
     }
@@ -185,8 +222,10 @@ impl Compile {
             .values()
             .filter_map(Definition::parameter)
             .collect();
-        if let Some(kernel) = &self.kernel {
-            parameters.extend(kernel.warps.parameter());
+        if let Some(kernels) = &self.kernel {
+            for kernel in kernels.each() {
+                parameters.extend(kernel.warps.parameter());
+            }
         }
         parameters
     }
@@ -222,9 +261,9 @@ impl Compile {
                 "the definition `{name}` names `{enumeration}`, which is no C identifier"
             ));
         }
-        if let Some(kernel) = &self.kernel {
-            if !identifier(&kernel.name) {
-                return Some(format!("the kernel `{}` is no C identifier", kernel.name));
+        if let Some(kernels) = &self.kernel {
+            if kernels.each().is_empty() {
+                return Some("a kernel selection selects no kernel".into());
             }
             if self.units.len() != 1 {
                 return Some("a cubin module is compiled from one translation unit".into());
@@ -236,14 +275,22 @@ impl Compile {
                         .into(),
                 );
             }
-            let mut names: Vec<&str> = kernel
-                .signature
-                .iter()
-                .map(|(name, _)| name.as_str())
-                .collect();
-            names.sort_unstable();
-            if names.windows(2).any(|pair| pair[0] == pair[1]) {
-                return Some("the kernel's signature names a parameter twice".into());
+            for kernel in kernels.each() {
+                if !identifier(&kernel.name) {
+                    return Some(format!("the kernel `{}` is no C identifier", kernel.name));
+                }
+                let mut names: Vec<&str> = kernel
+                    .signature
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                names.sort_unstable();
+                if names.windows(2).any(|pair| pair[0] == pair[1]) {
+                    return Some(format!(
+                        "the signature of `{}` names a parameter twice",
+                        kernel.name
+                    ));
+                }
             }
         }
         None

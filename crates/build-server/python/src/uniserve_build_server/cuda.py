@@ -49,7 +49,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 from uniserve_build_server import fetch
-from uniserve_build_server.binding import argument_type, constant
+from uniserve_build_server.binding import argument_type, constant, selected
 from uniserve_build_server.request import Request
 
 #: The optimization level of every unit.
@@ -432,6 +432,9 @@ def build(request: Request) -> None:
     if stated is None:
         native(request, units, declared["libraries"])
         return
+    if "field" in stated:
+        # A descriptor field's value names the kernel among the unit's.
+        stated = selected(stated, request.fields, request.descriptor)
     (unit,) = units
     cubin(
         request,
