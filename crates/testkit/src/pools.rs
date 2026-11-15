@@ -114,7 +114,7 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
         max_running_requests,
         max_num_batched_tokens: None,
         max_logprobs: 20,
-        attention_backend: String::new(),
+        attention_backend: None,
         prefill_attention_backend: None,
         decode_attention_backend: None,
         moe_runner_backend: None,

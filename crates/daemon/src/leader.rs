@@ -2167,11 +2167,10 @@ impl Replica {
             warn!(epoch, "{reason}");
             // Before the switch a rollback abandons the update; nothing that
             // serves changed.
-            updater.rollback(crate::epoch::Failure {
-                kind: "prepare_failed".to_owned(),
+            updater.rollback(crate::epoch::Failure::new(
+                crate::epoch::FailureKind::PrepareFailed,
                 reason,
-                device: None,
-            });
+            ));
             return;
         }
 
@@ -2576,7 +2575,7 @@ fn domain_processes(
                 host: process.host,
                 group: crate::engine::control::ENGINE_GROUP.to_owned(),
                 generation: process.engine,
-                standby_generation: 0,
+                standby_generation: None,
                 epoch: spans.then(|| serving.epoch()),
             })
         })
@@ -2622,7 +2621,7 @@ impl Replica {
         updater
             .epochs()
             .serving()
-            .is_none_or(|(epoch, _)| epoch == served)
+            .is_none_or(|(epoch, _)| epoch.number() == served)
     }
 
     /// The failure-domain rules over `serving`'s engines: the rules this replica keeps, or
@@ -2962,11 +2961,10 @@ impl Replica {
         // A standby being started or prepared is waited for: it is closer to serving than a
         // process this replica has yet to launch.
         let starting = self.standby_starting.lock().await;
-        let failure = crate::epoch::Failure {
-            kind: "process_exit".to_owned(),
-            reason: "the serving engine ended".to_owned(),
-            device: None,
-        };
+        let failure = crate::epoch::Failure::new(
+            crate::epoch::FailureKind::ProcessExit,
+            "the serving engine ended".to_owned(),
+        );
         let promotions: Vec<(String, u64)> = {
             let mut domain = service::lock(&self.domain);
             let standbys = domain.as_mut()?;

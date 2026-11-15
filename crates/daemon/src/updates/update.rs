@@ -39,9 +39,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use proto::process::{self, Report, Spawn, command, report};
-use serde_json::{Value, json};
 
-use crate::epoch::{Epoch, EpochRecord, Epochs, Failure, Status};
+use crate::epoch::{Epoch, EpochRecord, Epochs, Failure, FailureKind, Recorded, Status};
 use crate::options::PreviousEpoch;
 use crate::supervision::processes::{Event, Processes};
 
@@ -60,6 +59,88 @@ pub(crate) enum Phase {
     RolledBack,
     /// The new was never ready: nothing changed.
     Abandoned,
+}
+
+impl serde::Serialize for Phase {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+/// The form of an update, as its report names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ChangeForm {
+    /// New modules inside the serving engines.
+    Generation,
+    /// A new epoch beside the serving one.
+    Epoch,
+}
+
+/// The engines an epoch update moves service between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct EngineCounts {
+    /// The serving epoch's engines.
+    pub(crate) serving: usize,
+    /// The target epoch's engines.
+    pub(crate) target: usize,
+}
+
+/// What an epoch update reports beyond what every update does.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) struct EpochReport {
+    /// The engine build the target epoch runs.
+    pub(crate) build: String,
+    pub(crate) engines: EngineCounts,
+    /// The seconds the switch lets the serving engines' requests run on.
+    pub(crate) drain_s: f64,
+    /// Whether the serving epoch's layout differs, so its device memory moves to the target's.
+    pub(crate) shrink: bool,
+    /// What the previous epoch keeps during the trial.
+    pub(crate) previous_epoch_kept: PreviousEpoch,
+    /// The hosts that refused to move the previous epoch's weights to host storage.
+    pub(crate) host_refused: Vec<String>,
+    /// The bytes of the previous epoch's weights moved to host storage.
+    pub(crate) moved_to_host_bytes: u64,
+}
+
+/// An update as the operator reads it: `GET /admin/config`'s `update`, an apply's, commit's
+/// or rollback's answer, and the data of the event log's phase events.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) struct UpdateReport {
+    pub(crate) change: ChangeForm,
+    /// The update's number.
+    pub(crate) update: u64,
+    pub(crate) phase: Phase,
+    /// The epoch the update's side executes in.
+    pub(crate) epoch: u64,
+    /// Whether the update is rolling back or rolled back.
+    pub(crate) rollback: bool,
+    /// How long the switch took, once it ended.
+    pub(crate) switch_ms: Option<u128>,
+    /// How long the update has been on trial.
+    pub(crate) trial_s: Option<f64>,
+    /// The seconds left before the deadline rolls the update back.
+    pub(crate) deadline_s: Option<f64>,
+    /// Why the update did not stand, when it did not.
+    pub(crate) failure: Option<Failure>,
+    /// The engines' state the switch could not compare with the target's.
+    pub(crate) uncompared: Vec<String>,
+    /// Why the storage claim that ended the update failed: the storage it released stays
+    /// retained until the deployment's next claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) claim_failed: Option<String>,
+    /// The generation the update's engines execute.
+    pub(crate) generation: Option<u64>,
+    /// What an epoch update reports beyond this.
+    #[serde(flatten)]
+    pub(crate) epoch_form: Option<EpochReport>,
+    /// What the trial's thresholds read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trial: Option<crate::updates::trial::TrialReport>,
+    /// The serving epoch's steps against their baseline while the target prepares.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) transfers: Option<crate::interference::StepTime>,
 }
 
 impl Phase {
@@ -217,7 +298,7 @@ pub(crate) struct Update {
     form: Form,
     epochs: Arc<Epochs>,
     /// The epoch that serves when the update begins.
-    serving: u64,
+    serving: Recorded,
     /// The worker group every engine of the deployment is in.
     group: String,
     /// The engines that serve when the update begins.
@@ -243,6 +324,8 @@ pub(crate) struct Update {
     trial_began: Option<Instant>,
     /// The operators the engines could not compare while they prepared.
     uncompared: Vec<String>,
+    /// Why the claim that ended the update failed, when it did.
+    claim_failed: Option<String>,
     /// Whether a serving engine was lost during the update, which hands its
     /// failure domain to the standby promotion or a relaunch.
     promotion_due: bool,
@@ -255,7 +338,7 @@ impl Update {
         number: u64,
         target: Epoch,
         epochs: Arc<Epochs>,
-        serving: u64,
+        serving: Recorded,
         group: String,
         nodes: Vec<Node>,
         deadline: Option<Instant>,
@@ -279,7 +362,7 @@ impl Update {
         number: u64,
         target: Epoch,
         epochs: Arc<Epochs>,
-        serving: u64,
+        serving: Recorded,
         group: String,
         nodes: Vec<Node>,
         switch: EpochSwitch,
@@ -315,7 +398,7 @@ impl Update {
         target: Epoch,
         form: Form,
         epochs: Arc<Epochs>,
-        serving: u64,
+        serving: Recorded,
         group: String,
         nodes: Vec<Node>,
         deadline: Option<Instant>,
@@ -340,6 +423,7 @@ impl Update {
             switched_in: None,
             trial_began: None,
             uncompared: Vec::new(),
+            claim_failed: None,
             promotion_due: false,
         }
     }
@@ -369,11 +453,11 @@ impl Update {
         self.failure.as_ref()
     }
 
-    /// The form's name, as the status and the event log state it.
-    pub(crate) fn change(&self) -> &'static str {
+    /// The update's form.
+    pub(crate) fn change(&self) -> ChangeForm {
         match self.form {
-            Form::Generation => "generation",
-            Form::Epoch(_) => "epoch",
+            Form::Generation => ChangeForm::Generation,
+            Form::Epoch(_) => ChangeForm::Epoch,
         }
     }
 
@@ -381,7 +465,7 @@ impl Update {
     /// form, the serving epoch of the generation form.
     pub(crate) fn target_epoch(&self) -> u64 {
         match &self.form {
-            Form::Generation => self.serving,
+            Form::Generation => self.serving.number(),
             Form::Epoch(trial) => trial.switch.epoch,
         }
     }
@@ -420,46 +504,50 @@ impl Update {
         }
     }
 
-    /// The update as the operator reads it.
-    pub(crate) fn report(&self) -> Value {
-        let mut report = json!({
-            "change": self.change(),
-            "update": self.number,
-            "phase": self.phase.name(),
-            "epoch": self.target_epoch(),
-            "rollback": self.back,
-            "switch_ms": self.switched_in.map(|switched| switched.as_millis()),
-            "trial_s": self.trial_began.map(|began| began.elapsed().as_secs_f64()),
-            "deadline_s": self
-                .deadline
-                .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_secs_f64()),
-            "failure": self.failure.as_ref().map(|failure| json!({
-                "kind": failure.kind,
-                "reason": failure.reason,
-                "device": failure.device,
-            })),
-            "uncompared": self.uncompared,
-        });
-        match &self.form {
-            Form::Generation => {
-                report["generation"] =
-                    json!(self.nodes.iter().filter_map(|node| node.generation).max());
-            }
-            Form::Epoch(trial) => {
-                report["generation"] = json!(trial.switch.record.generation);
-                report["build"] = json!(trial.switch.record.config.executable);
-                report["engines"] = json!({
-                    "serving": self.nodes.len(),
-                    "target": trial.switch.launches.len(),
-                });
-                report["drain_s"] = json!(trial.switch.drain.as_secs_f64());
-                report["shrink"] = json!(trial.switch.shrink);
-                report["previous_epoch_kept"] = json!(trial.kept);
-                report["host_refused"] = json!(trial.host_refused);
-                report["moved_to_host_bytes"] = json!(trial.moved_bytes);
-            }
+    /// The update as the operator reads it, without what its trial and transfers read.
+    pub(crate) fn report(&self) -> UpdateReport {
+        let (generation, epoch_form) = match &self.form {
+            Form::Generation => (
+                self.nodes.iter().filter_map(|node| node.generation).max(),
+                None,
+            ),
+            Form::Epoch(trial) => (
+                trial.switch.record.generation,
+                Some(EpochReport {
+                    build: trial.switch.record.config.executable.clone(),
+                    engines: EngineCounts {
+                        serving: self.nodes.len(),
+                        target: trial.switch.launches.len(),
+                    },
+                    drain_s: trial.switch.drain.as_secs_f64(),
+                    shrink: trial.switch.shrink,
+                    previous_epoch_kept: trial.kept,
+                    host_refused: trial.host_refused.clone(),
+                    moved_to_host_bytes: trial.moved_bytes,
+                }),
+            ),
+        };
+        UpdateReport {
+            change: self.change(),
+            update: self.number,
+            phase: self.phase,
+            epoch: self.target_epoch(),
+            rollback: self.back,
+            switch_ms: self.switched_in.map(|switched| switched.as_millis()),
+            trial_s: self.trial_began.map(|began| began.elapsed().as_secs_f64()),
+            deadline_s: self.deadline.map(|deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs_f64()
+            }),
+            failure: self.failure.clone(),
+            uncompared: self.uncompared.clone(),
+            claim_failed: self.claim_failed.clone(),
+            generation,
+            epoch_form,
+            trial: None,
+            transfers: None,
         }
-        report
     }
 
     /// Whether every serving engine acknowledged the step the phase waits
@@ -574,7 +662,7 @@ impl Update {
                 launch: Vec::new(),
             };
             if let Err(reason) = processes.spawn(spawn, &launch) {
-                return self.abandon(processes, failure("spawn_failed", reason));
+                return self.abandon(processes, Failure::new(FailureKind::SpawnFailed, reason));
             }
             if let Form::Epoch(trial) = &mut self.form {
                 trial.targets.push(Node::new(
@@ -596,7 +684,7 @@ impl Update {
         let (epoch, targets) = (trial.switch.epoch, trial.targets.clone());
         let retire = trial.switch.retire.clone();
         if let Err(reason) = self.claim_everywhere(processes, epoch, &targets, &retire) {
-            return self.abandon(processes, failure("claim_failed", reason));
+            return self.abandon(processes, Failure::new(FailureKind::ClaimFailed, reason));
         }
         // Every node retired them: none is left for a later claim.
         if let Form::Epoch(trial) = &mut self.form {
@@ -647,7 +735,7 @@ impl Update {
             Some(expected) => {
                 let reason =
                     format!("the engine on {host} runs build {build}, the epoch runs {expected}");
-                self.abandon(processes, failure("build_mismatch", reason));
+                self.abandon(processes, Failure::new(FailureKind::BuildMismatch, reason));
             }
             None => {
                 trial.build = Some(build.clone());
@@ -688,7 +776,7 @@ impl Update {
             }
             (Phase::Preparing, _, Some(report::Kind::PrepareFailed(failed))) => {
                 let reason = failed.reason.clone();
-                self.abandon(processes, failure("prepare_failed", reason));
+                self.abandon(processes, Failure::new(FailureKind::PrepareFailed, reason));
             }
             (Phase::Preparing, _, _) => {
                 if let Some(failure) = Failure::of_report(&report) {
@@ -703,7 +791,11 @@ impl Update {
             (Phase::Switching, false, Some(report::Kind::RolledBack(rolled)))
             | (Phase::Trial, _, Some(report::Kind::RolledBack(rolled))) => {
                 let reason = rolled.reason.clone();
-                self.roll_back(processes, failure("rolled_back", reason), Some(node));
+                self.roll_back(
+                    processes,
+                    Failure::new(FailureKind::RolledBack, reason),
+                    Some(node),
+                );
             }
             (Phase::Switching, true, Some(report::Kind::RolledBack(_))) => {
                 self.acknowledged.insert(node);
@@ -747,7 +839,11 @@ impl Update {
                              does not serve",
                             trial.targets[target].host
                         );
-                        self.roll_back(processes, failure("stale_modules", reason), Some(target));
+                        self.roll_back(
+                            processes,
+                            Failure::new(FailureKind::StaleModules, reason),
+                            Some(target),
+                        );
                     }
                     _ => {
                         // New requests go to the target from its first
@@ -791,7 +887,7 @@ impl Update {
         };
         match (self.phase, self.back, report.kind) {
             (Phase::Switching, back, Some(report::Kind::Drained(drained)))
-                if drained.epoch == self.serving =>
+                if drained.epoch == self.serving.number() =>
             {
                 trial.drained.insert(node);
                 // Its drain was under way when the switch turned back: it is
@@ -818,7 +914,7 @@ impl Update {
     /// requests return to the previous epoch from the first such engine.
     fn previous_serves(&mut self, processes: &mut Processes, node: usize) {
         if self.acknowledged.is_empty() && matches!(self.form, Form::Epoch(_)) {
-            processes.serve(self.serving);
+            processes.serve(self.serving.number());
         }
         self.acknowledged.insert(node);
     }
@@ -832,7 +928,7 @@ impl Update {
             "the engine of launch generation {launch} on {host} exited{}",
             code.map(|code| format!(" with {code}")).unwrap_or_default()
         );
-        let exited = failure("process_exit", reason);
+        let exited = Failure::new(FailureKind::ProcessExit, reason);
 
         let Form::Epoch(trial) = &mut self.form else {
             // The engine that held both generations is gone: its failure
@@ -891,7 +987,7 @@ impl Update {
     /// refuses, or fails to keep them, keeps them on its GPUs: nothing else
     /// of the trial depends on it, and the status says why.
     fn keep_weights(&mut self, processes: &mut Processes, node: usize) {
-        let serving = self.serving;
+        let serving = self.serving.number();
         let Form::Epoch(trial) = &mut self.form else {
             return;
         };
@@ -988,7 +1084,9 @@ impl Update {
                 // The previous epoch's storage ends on every node while the
                 // target keeps its own.
                 let (epoch, targets) = (trial.switch.epoch, trial.targets.clone());
-                let _ = self.claim_everywhere(processes, epoch, &targets, &[self.serving]);
+                self.claim_failed = self
+                    .claim_everywhere(processes, epoch, &targets, &[self.serving.number()])
+                    .err();
             }
         }
     }
@@ -1015,8 +1113,8 @@ impl Update {
             self.deadline = None;
             self.rollback(
                 processes,
-                failure(
-                    "deadline",
+                Failure::new(
+                    FailureKind::Deadline,
                     "the trial was not committed by its deadline".to_owned(),
                 ),
             );
@@ -1153,6 +1251,11 @@ impl Update {
 
     /// Starts `Switching`: `Switch` to every serving engine of a generation
     /// update, `Promote` to every target of an epoch update.
+    #[expect(
+        clippy::expect_used,
+        reason = "a generation update switches once every serving engine acknowledged its \
+                  preparation, which records the generation it prepared"
+    )]
     fn switch(&mut self, processes: &mut Processes) {
         self.enter(Phase::Switching);
         self.switch_began = Some(Instant::now());
@@ -1160,7 +1263,9 @@ impl Update {
             Form::Generation => {
                 for node in &self.nodes {
                     let switch = command::Kind::Switch(process::Switch {
-                        generation: node.generation.unwrap_or_default(),
+                        generation: node
+                            .generation
+                            .expect("every serving engine prepared its generation"),
                     });
                     processes.command(&node.host, node.launch, command(switch));
                 }
@@ -1177,7 +1282,7 @@ impl Update {
     /// The forward switch: once every target serves the serving engines are
     /// drained, and once every engine acknowledged the trial begins.
     fn progress_switch(&mut self, processes: &mut Processes) {
-        let serving = self.serving;
+        let serving = self.serving.number();
         if let Form::Epoch(trial) = &mut self.form {
             if !trial.draining && trial.serving.len() == trial.targets.len() {
                 trial.draining = true;
@@ -1265,7 +1370,9 @@ impl Update {
                 trial.switch.retire.push(trial.switch.epoch);
                 let retire = std::mem::take(&mut trial.switch.retire);
                 let nodes = self.nodes.clone();
-                let _ = self.claim_everywhere(processes, self.serving, &nodes, &retire);
+                self.claim_failed = self
+                    .claim_everywhere(processes, self.serving.number(), &nodes, &retire)
+                    .err();
             }
         }
         self.enter(Phase::RolledBack);
@@ -1317,13 +1424,4 @@ fn drain(epoch: u64, switch: &EpochSwitch) -> process::Command {
         deadline_ms: u64::try_from(switch.drain.as_millis()).unwrap_or(u64::MAX),
         shrink: switch.shrink,
     }))
-}
-
-/// A failure of `kind` the daemon states itself.
-fn failure(kind: &str, reason: String) -> Failure {
-    Failure {
-        kind: kind.to_owned(),
-        reason,
-        device: None,
-    }
 }

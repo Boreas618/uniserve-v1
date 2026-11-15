@@ -227,12 +227,7 @@ pub async fn serve(
     // once its processes are down.
     let retire = Arc::new(AtomicBool::new(false));
     let address = daemon.address().map(str::to_owned);
-    // The epoch records the admin reports and an update writes are one.
-    let epoch_records = Arc::new(crate::epoch::Epochs::new());
-    let updates = daemon.updater(
-        Arc::clone(&epoch_records),
-        config.served_model_name().to_owned(),
-    );
+    let updates = daemon.updater(config.served_model_name().to_owned());
     let daemon = Arc::new(std::sync::Mutex::new(Some(daemon)));
     let (Some(address), Some((listener, admins))) = (address, bound) else {
         ready.report(service::State::Serving);
@@ -251,6 +246,8 @@ pub async fn serve(
     let Some((updates, awake)) = updates else {
         anyhow::bail!("the leader's daemon commands no engine");
     };
+    // The epoch records the admin reports and an update writes are one.
+    let epoch_records = Arc::clone(updates.epochs());
     Daemon::advance_updates(Arc::clone(&updates), awake)
         .context("starting the updater's thread")?;
     let engine = tokio::select! {
@@ -295,6 +292,7 @@ pub async fn serve(
             admins,
             instance.path(),
             jobs,
+            Vec::new(),
             Arc::clone(&daemon),
             &shutdown,
         )
@@ -318,7 +316,8 @@ pub async fn serve(
 }
 
 /// Serves the leader `engine` on `listener` and the admin API on `admins` with `admin` and
-/// `jobs` until `shutdown` is cancelled, or until a hot restart's successor serves and this
+/// `jobs`, going on with the responses a hot restart's predecessor handed over (`adopted`), until
+/// `shutdown` is cancelled, or until a hot restart's successor serves and this
 /// daemon finished the requests it took; returns whether the deployment was handed over.
 /// `daemon` is this node's daemon's service and `instance` its instance directory, which a hot
 /// restart hands over.
@@ -336,6 +335,7 @@ pub(crate) async fn serve_leader(
     admins: admin::Listeners,
     instance: &std::path::Path,
     jobs: Arc<VideoJobs>,
+    adopted: Vec<crate::restart::streams::Adopted>,
     daemon: Arc<std::sync::Mutex<Option<Daemon>>>,
     shutdown: &CancellationToken,
 ) -> Result<bool> {
@@ -359,6 +359,7 @@ pub(crate) async fn serve_leader(
         shutdown,
         &accepting,
         jobs,
+        adopted,
         Some(restarter),
     )
     .await?;
@@ -367,18 +368,10 @@ pub(crate) async fn serve_leader(
     // would report that close as its own failure (`bdf651928`).
     // Only a restart that is still running can be waited for: the channel starts
     // at `None`, so its state alone cannot tell "nothing asked" from "in flight".
+    // A restart decides on every path: the successor serves, gives up, or exits and closes the
+    // handoff socket.
     if restarting.load(std::sync::atomic::Ordering::Acquire) && decided.borrow().is_none() {
-        let waited = tokio::time::timeout(
-            crate::restart::RESTART_GRACE,
-            decided.wait_for(Option::is_some),
-        )
-        .await;
-        if waited.is_err() {
-            tracing::warn!(
-                "a restart was still in flight when this daemon stopped serving; its successor \
-                 may have been left holding a handoff nobody responds to"
-            );
-        }
+        let _ = decided.wait_for(Option::is_some).await;
     }
     Ok(handoff_sent.load(Ordering::Acquire))
 }
@@ -472,6 +465,7 @@ async fn serve_on(
     shutdown: &CancellationToken,
     accepting: &CancellationToken,
     jobs: Arc<VideoJobs>,
+    adopted: Vec<crate::restart::streams::Adopted>,
     restarter: Option<Arc<crate::restart::Restarter>>,
 ) -> Result<()> {
     let server = &config.server_config;
@@ -509,7 +503,7 @@ async fn serve_on(
     // The responses the daemon this one replaced handed over go on here: each
     // connection writes the bytes the predecessor did not write and then goes
     // on with the resumed body.
-    for stream in crate::restart::streams::take_adopted() {
+    for stream in adopted {
         let app = app.clone();
         let admitting = admitting.clone();
         tokio::spawn(async move {
@@ -1436,7 +1430,7 @@ mod tests {
             let admin = admin::Admin::with_epochs(
                 shutdown.clone(),
                 Arc::new(AtomicBool::new(false)),
-                Arc::new(crate::epoch::Epochs::new()),
+                Arc::new(crate::epoch::Epochs::default()),
             );
             let jobs = Arc::new(VideoJobs::new(
                 config.video_job_config.clone(),
@@ -1449,7 +1443,16 @@ mod tests {
                 .to_owned();
             let admins = admin::Listeners::bind(&config.admin_config, &instance)?;
             serve_on(
-                &engine, &admin, listener, admins, &config, &shutdown, &shutdown, jobs, None,
+                &engine,
+                &admin,
+                listener,
+                admins,
+                &config,
+                &shutdown,
+                &shutdown,
+                jobs,
+                Vec::new(),
+                None,
             )
             .await
         })

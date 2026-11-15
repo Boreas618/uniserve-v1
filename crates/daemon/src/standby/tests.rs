@@ -4,7 +4,8 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::epoch::{Failure, Status};
+use crate::epoch::{Failure, FailureKind, Status};
+use proto::process::FaultKind;
 use proto::request::StandbyStorage;
 
 /// The serving generation the fake standbys's processes are at.
@@ -18,7 +19,7 @@ fn process(host: &str, epoch: Option<u64>) -> MainProcess {
         group: format!("main-{host}"),
         rank: 0,
         generation: SERVING,
-        standby_generation: SERVING + 1,
+        standby_generation: Some(SERVING + 1),
         epoch,
     }
 }
@@ -46,13 +47,17 @@ fn options(storage: StandbyStorage) -> StandbyOptions {
     }
 }
 
-fn failure(kind: &str) -> Failure {
+/// A failure of `kind` on device 0.
+fn failure(kind: FailureKind) -> Failure {
     Failure {
-        kind: kind.to_owned(),
+        kind,
         reason: String::new(),
         device: Some(0),
     }
 }
+
+/// A device fault: a context that holds a sticky error.
+const DEVICE: FailureKind = FailureKind::Fault(FaultKind::Device);
 
 fn spawn(host: &str, generation: u64, storage: Storage) -> Action {
     Action::Spawn {
@@ -207,15 +212,15 @@ fn a_serving_epoch_starts_one_standby_a_generation_ahead_of_each_member() {
 fn the_standby_generation_is_the_epoch_layers_number_and_is_never_computed() {
     let mut standbys = Standbys::new(vec![
         MainProcess {
-            standby_generation: 1000,
+            standby_generation: Some(1000),
             ..process("a", None)
         },
         MainProcess {
-            standby_generation: 2001,
+            standby_generation: Some(2001),
             ..process("b", Some(3))
         },
         MainProcess {
-            standby_generation: 2002,
+            standby_generation: Some(2002),
             ..process("c", Some(3))
         },
     ]);
@@ -271,14 +276,14 @@ fn a_parked_domain_is_promoted_on_a_sticky_fault_and_a_new_standby_follows() {
 
     // One promotion per parked engine of the failing domain, all in one step;
     // the node in no cross-node group keeps its own standby.
-    let actions = standbys.failed("b", &failure("sticky"));
+    let actions = standbys.failed("b", &failure(DEVICE));
     assert_eq!(
         actions,
         vec![promote("b", SERVING + 1), promote("c", SERVING + 1)]
     );
 
     // A further fault in the same round changes nothing: the first wins.
-    assert!(standbys.failed("c", &failure("sticky")).is_empty());
+    assert!(standbys.failed("c", &failure(DEVICE)).is_empty());
 
     assert!(standbys.promoted("b", SERVING + 1).is_empty());
     // The last acknowledgement stops the old generation of the domain's members.
@@ -311,7 +316,11 @@ fn a_request_level_failure_promotes_nothing() {
     let mut standbys = standbys();
     start(&mut standbys);
     parked(&mut standbys);
-    for kind in ["non_finite_logits", "policy_reverted", "input_error"] {
+    for kind in [
+        FailureKind::NonFiniteLogits,
+        FailureKind::PolicyRolledBack,
+        FailureKind::Fault(FaultKind::Work),
+    ] {
         assert!(
             standbys.failed("b", &failure(kind)).is_empty(),
             "{kind} replaced the domain"
@@ -325,7 +334,7 @@ fn a_request_level_failure_promotes_nothing() {
     assert_eq!(phases, vec!["parked", "parked"]);
     // The domain still promotes on a process-fatal fault.
     assert_eq!(
-        standbys.failed("b", &failure("sticky")),
+        standbys.failed("b", &failure(DEVICE)),
         vec![promote("b", SERVING + 1), promote("c", SERVING + 1)]
     );
 }
@@ -338,7 +347,7 @@ fn a_domain_with_a_member_that_has_no_parked_standby_relaunches_wholly() {
     standbys.parked("b", SERVING + 1);
     // The caller takes the next number for each member's replacement.
     allocated(&mut standbys, &["b", "c"], SERVING + 2);
-    let actions = standbys.failed("b", &failure("illegal_address"));
+    let actions = standbys.failed("b", &failure(DEVICE));
     assert_eq!(
         actions,
         vec![
@@ -377,7 +386,7 @@ fn a_replacement_waits_for_the_epoch_layers_generation_numbers() {
     assert_eq!(standbys.standby_lost("c"), vec![]);
     // The fault cannot start the replacement: the rules do not mint a number.
     assert_eq!(
-        standbys.failed("b", &failure("sticky")),
+        standbys.failed("b", &failure(DEVICE)),
         vec![allocate("b"), allocate("c")]
     );
     assert_eq!(standbys.state()[1].phase.as_str(), "allocating");
@@ -405,7 +414,7 @@ fn a_parked_standby_that_dies_leaves_the_domain_to_a_relaunch() {
         vec![terminate("b", SERVING + 1)]
     );
     allocated(&mut standbys, &["b", "c"], SERVING + 2);
-    let actions = standbys.failed("c", &failure("process_exit"));
+    let actions = standbys.failed("c", &failure(FailureKind::ProcessExit));
     assert!(
         actions
             .iter()
@@ -425,10 +434,10 @@ fn an_epoch_that_stops_serving_retires_its_standby_and_its_domain_goes_on_short(
     // stop it, so the caller never needs its generation.
     assert_eq!(standbys.retired("c"), vec![terminate("c", SERVING + 1)]);
     // A fault of the retired node replaces nothing.
-    assert!(standbys.failed("c", &failure("sticky")).is_empty());
+    assert!(standbys.failed("c", &failure(DEVICE)).is_empty());
     // The domain's remaining member is promoted alone.
     assert_eq!(
-        standbys.failed("b", &failure("sticky")),
+        standbys.failed("b", &failure(DEVICE)),
         vec![promote("b", SERVING + 1)]
     );
     assert_eq!(
@@ -465,7 +474,7 @@ fn a_device_that_needs_a_reset_takes_its_standby_and_migrates_the_node() {
         ]
     );
     // The dead node's fault replaces nothing: it is already gone.
-    assert!(standbys.failed("c", &failure("sticky")).is_empty());
+    assert!(standbys.failed("c", &failure(DEVICE)).is_empty());
 }
 
 #[test]
@@ -476,7 +485,7 @@ fn every_member_is_asked_to_promote_before_any_acknowledgement_is_awaited() {
     // The whole round's promotions are returned in one call, so the caller
     // issues them all before it awaits any acknowledgement (a suspended epoch
     // restores its communication together).
-    let actions = standbys.failed("c", &failure("launch_failed"));
+    let actions = standbys.failed("c", &failure(FailureKind::Fault(FaultKind::ProcessExit)));
     assert_eq!(
         actions,
         vec![promote("b", SERVING + 1), promote("c", SERVING + 1)]
@@ -488,7 +497,7 @@ fn a_promotion_that_fails_relaunches_the_domain() {
     let mut standbys = standbys();
     start(&mut standbys);
     parked(&mut standbys);
-    standbys.failed("b", &failure("sticky"));
+    standbys.failed("b", &failure(DEVICE));
     standbys.promoted("b", SERVING + 1);
     allocated(&mut standbys, &["b", "c"], SERVING + 2);
     let actions = standbys.promote_failed("c");
@@ -544,7 +553,7 @@ fn a_standby_that_cannot_fit_even_suspended_is_not_kept() {
     );
     // Without a standby the domain is replaced by a relaunch, with the
     // numbers the caller already took (nothing consumed them).
-    let actions = standbys.failed("b", &failure("sticky"));
+    let actions = standbys.failed("b", &failure(DEVICE));
     assert!(actions.contains(&relaunch("b", SERVING + 1)));
     assert!(actions.contains(&relaunch("c", SERVING + 1)));
 }
@@ -556,7 +565,7 @@ fn a_standby_that_fails_to_start_is_left_out() {
     assert!(standbys.standby_lost("a").is_empty());
     assert_eq!(standbys.state()[0].phase.as_str(), "absent");
     allocated(&mut standbys, &["a"], SERVING + 2);
-    let actions = standbys.failed("a", &failure("out_of_memory"));
+    let actions = standbys.failed("a", &failure(FailureKind::Stalled));
     assert_eq!(actions, vec![relaunch("a", SERVING + 2)]);
     standbys.relaunched("a", SERVING + 2);
     allocated(&mut standbys, &["a"], SERVING + 3);

@@ -443,22 +443,18 @@ impl Daemon {
         ::service::lock(&self.link).take()
     }
 
-    /// The updater of `deployment` over `epochs` and this node's service,
-    /// with the tokens that wake the thread advancing it. `None` on a member
-    /// daemon, which commands no deployment's engines.
+    /// The updater of `deployment` over this node's service and new epoch records, with the
+    /// tokens that wake the thread advancing it. `None` on a member daemon, which commands no
+    /// deployment's engines. The records (`Updater::epochs`) report the node's processes from
+    /// the table the service writes as they start and end; the updater's `Processes` adds what
+    /// each launch is.
     pub(crate) fn updater(
         &self,
-        epochs: Arc<crate::epoch::Epochs>,
         deployment: String,
     ) -> Option<(Arc<crate::updates::Updater>, std::sync::mpsc::Receiver<()>)> {
         let link = self.process_link()?;
         let awake = ::service::lock(&self.awake).take()?;
-        // The epoch records report the node's processes: the service writes
-        // them into this table as they start and end, and the updater's
-        // `Processes` adds what each launch is.
-        if let Some(table) = &self.table {
-            epochs.attach_processes(Arc::clone(table));
-        }
+        let epochs = Arc::new(crate::epoch::Epochs::new(self.table.clone()?));
         let processes = processes::Processes::new(Arc::clone(&epochs), deployment, link);
         Some((
             Arc::new(crate::updates::Updater::new(epochs, processes)),

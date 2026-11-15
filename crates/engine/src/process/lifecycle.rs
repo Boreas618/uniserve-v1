@@ -171,9 +171,9 @@ pub(crate) fn drain(lifecycle: &mut Lifecycle, epoch: u64) -> Result<bool, Repor
         }
         Lifecycle::Parked => Err(drained_report(epoch)),
         state @ (Lifecycle::Starting | Lifecycle::Stopped | Lifecycle::Failed) => Err(fault(
-            "drain",
+            proto::process::FaultKind::Drain,
             format!("an engine that is {} cannot drain", state.name()),
-            0,
+            None,
         )),
     }
 }
@@ -222,12 +222,12 @@ pub(crate) fn promote(lifecycle: &mut Lifecycle, serving: Report) -> Result<bool
             Ok(false)
         }
         state @ (Lifecycle::Starting | Lifecycle::Stopped | Lifecycle::Failed) => Err(fault(
-            "promote",
+            proto::process::FaultKind::Promote,
             format!(
                 "an engine that is {} cannot be promoted: only a parked engine is",
                 state.name()
             ),
-            0,
+            None,
         )),
     }
 }
@@ -352,9 +352,9 @@ pub(crate) fn rollback(
         Update::Trial(generation) => {
             if let Some(refusal) = lifecycle.boundary_refusal() {
                 return Err(fault(
-                    "rollback",
+                    proto::process::FaultKind::Rollback,
                     format!("generation {generation} stays on trial: {refusal}"),
-                    0,
+                    None,
                 ));
             }
             (generation, true)
@@ -437,10 +437,14 @@ pub(crate) fn rolled_back(reason: String) -> Report {
     }))
 }
 
-/// A `Fault` of `kind` on device `device` (0 when it names none).
-pub(crate) fn fault(kind: &str, reason: String, device: u32) -> Report {
+/// A `Fault` of `kind`, on device `device` when it names one.
+pub(crate) fn fault(
+    kind: proto::process::FaultKind,
+    reason: String,
+    device: Option<u32>,
+) -> Report {
     report(report::Kind::Fault(proto::process::Fault {
-        kind: kind.to_owned(),
+        kind: kind.into(),
         reason,
         device,
     }))

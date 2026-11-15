@@ -68,7 +68,7 @@ fn admin_state(engine: impl Into<Arc<Leader>>) -> crate::http::admin::AdminState
     let admin = crate::http::admin::Admin::with_epochs(
         CancellationToken::new(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        Arc::new(crate::epoch::Epochs::new()),
+        Arc::new(crate::epoch::Epochs::default()),
     );
     admin.watch(&leader);
     crate::http::admin::AdminState {
@@ -709,7 +709,7 @@ impl Engines {
 /// nobody plays: the leaders the crate's tests build start no update, and
 /// `updates::tests` drives one.
 pub(crate) fn test_updater() -> std::sync::Arc<crate::updates::Updater> {
-    let epochs = std::sync::Arc::new(crate::epoch::Epochs::new());
+    let epochs = std::sync::Arc::new(crate::epoch::Epochs::default());
     let (_engines, link) = Engines::link(testkit::process::Refusals::default());
     let processes = crate::supervision::processes::Processes::new(
         Arc::clone(&epochs),

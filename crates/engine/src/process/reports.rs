@@ -193,7 +193,10 @@ impl MainProcess {
             && let Some(reason) = engine.binding.poisoned()
         {
             let reason = format!("a change of the ranks' weights failed part of the way: {reason}");
-            failure = Some((reason.clone(), lifecycle::fault("weights", reason, 0)));
+            failure = Some((
+                reason.clone(),
+                lifecycle::fault(proto::process::FaultKind::Weights, reason, None),
+            ));
         }
         if let Some((reason, report)) = failure {
             self.fail(reason, report);
@@ -217,10 +220,12 @@ impl MainProcess {
 
         let device = worker
             .device()
-            .and_then(|device| u32::try_from(device.0).ok())
-            .unwrap_or_default();
-        let reason = format!("device {device} reports a sticky error: {error}");
-        let fault = lifecycle::fault("sticky", error.to_string(), device);
+            .and_then(|device| u32::try_from(device.0).ok());
+        let reason = match device {
+            Some(device) => format!("device {device} reports a sticky error: {error}"),
+            None => format!("the rank's device reports a sticky error: {error}"),
+        };
+        let fault = lifecycle::fault(proto::process::FaultKind::Device, error.to_string(), device);
         self.fail(reason, fault);
     }
 
@@ -311,7 +316,10 @@ impl MainProcess {
         } else if fatal {
             let reason =
                 format!("the scheduling policy faulted with none to roll back to: {reason}");
-            self.fail(reason.clone(), lifecycle::fault("policy", reason, 0));
+            self.fail(
+                reason.clone(),
+                lifecycle::fault(proto::process::FaultKind::Policy, reason, None),
+            );
         }
     }
 
@@ -367,7 +375,10 @@ mod tests {
         main.streams.insert(RequestId(7), RequestStream::new(0, 0));
 
         let reason = "a main process of this epoch was lost: rank 1's engine process".to_owned();
-        main.fail(reason.clone(), lifecycle::fault("process_exit", reason, 0));
+        main.fail(
+            reason.clone(),
+            lifecycle::fault(proto::process::FaultKind::ProcessExit, reason, None),
+        );
 
         let mut daemon = Connection::new(daemon_requests).unwrap();
         let mut frames = Vec::new();

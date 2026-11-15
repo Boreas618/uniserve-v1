@@ -28,46 +28,102 @@ use proto::config::EngineConfig;
 use tracing::info;
 
 use crate::engine::client::EngineState;
+use crate::engine::control::NodeUsage;
 use crate::engine::hold::HoldState;
-use crate::epoch::{Change, Epoch, Failure};
+use crate::epoch::{Change, Epoch, Failure, FailureKind};
 use crate::leader::{Leader, Replica, UpdateError};
 use crate::options::ServerArgs;
 use crate::updates::change::{Applied, ApplyRequest, InFlight, resolve};
 use crate::updates::update::{EpochSwitch, Node, Update};
 
-/// The GPUs the deployment's epochs hold storage on, from every node's
-/// storage report (`nodes`): each one's host and name (`GPU-…`, as
-/// `nvidia-smi` prints its UUID), its total and quota and the bytes the
-/// deployment's quota reserves there. A manager of several deployments reads
-/// which GPUs they share from it.
-fn deployment_gpus(nodes: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    let mut gpus = Vec::new();
-    for node in nodes {
-        let host = node["host"].as_str().unwrap_or_default();
-        let quotas: Vec<storage::protocol::Quota> =
-            serde_json::from_value(node["quotas"].clone()).unwrap_or_default();
-        for quota in quotas.iter().filter(|quota| quota.deployment.is_some()) {
-            gpus.push(serde_json::json!({
-                "host": host,
-                "gpu": storage::protocol::gpu_name(&quota.gpu),
-                "total": quota.total,
-                "quota": quota.limit,
-                "used": quota.usage(),
-            }));
-        }
-    }
-    gpus
+/// A GPU the deployment's epochs hold storage on (`GET /admin/config`'s `gpus`). A manager of
+/// several deployments reads which GPUs they share from it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct GpuShare {
+    /// The host the GPU is on, as rank layouts name it.
+    pub(crate) host: String,
+    /// The GPU's identity, its UUID in the `GPU-` form the device reports.
+    pub(crate) gpu: String,
+    /// Its storage in bytes.
+    pub(crate) total: u64,
+    /// The deployment's quota there in bytes, when it states one.
+    pub(crate) quota: Option<u64>,
+    /// The bytes the quota reserves now.
+    pub(crate) used: u64,
 }
 
-/// The digest of a configuration, which names it in the status: of its
-/// printed TOML.
-pub(crate) fn digest(config: &ServerArgs) -> anyhow::Result<String> {
-    use sha2::Digest as _;
-    let printed = crate::options::printed(config)?;
-    Ok(sha2::Sha256::digest(printed.as_bytes())
+/// The GPUs the deployment's epochs hold storage on, from every node's storage report.
+fn deployment_gpus(nodes: &[NodeUsage]) -> Vec<GpuShare> {
+    nodes
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+        .flat_map(|node| {
+            node.quotas
+                .iter()
+                .filter(|quota| quota.deployment.is_some())
+                .map(|quota| GpuShare {
+                    host: node.host.clone(),
+                    gpu: storage::protocol::gpu_name(&quota.gpu),
+                    total: quota.total,
+                    quota: quota.limit,
+                    used: quota.usage(),
+                })
+        })
+        .collect()
+}
+
+/// The nodes' storage as `GET /admin/config` states it: each node's usage, or why it was not
+/// read.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum Quotas {
+    Read(Vec<NodeUsage>),
+    Unread { error: String },
+}
+
+/// What one replica executes, as its status states it: the epoch, and the engine's state there
+/// or why the epoch is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Executing {
+    pub(crate) epoch: u64,
+    pub(crate) state: ExecutingState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+}
+
+/// Where a replica's engine is, as its status names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExecutingState {
+    Starting,
+    Parked,
+    Serving,
+    Draining,
+    Unavailable,
+}
+
+/// One replica's configuration and what it executes (`GET /admin/config`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ReplicaStatus {
+    /// Its configuration's non-default options, as reloadable TOML.
+    pub(crate) config: String,
+    /// The digest that names the configuration.
+    pub(crate) digest: String,
+    pub(crate) executing: Executing,
+}
+
+/// The deployment's configuration and resource ownership, as `GET /admin/config` states them:
+/// the first replica's status at the top level, every replica's, the GPUs and quotas of the
+/// deployment's nodes, the update in flight or the last one, and the targets a rollback marked
+/// unavailable.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ConfigStatus {
+    #[serde(flatten)]
+    pub(crate) first: Option<ReplicaStatus>,
+    pub(crate) replicas: Vec<ReplicaStatus>,
+    pub(crate) gpus: Option<Vec<GpuShare>>,
+    pub(crate) quotas: Option<Quotas>,
+    pub(crate) update: Option<crate::updates::update::UpdateReport>,
+    pub(crate) unavailable: Vec<crate::updates::Unavailable>,
 }
 
 /// How long the status waits for the quotas, which each node's
@@ -96,7 +152,7 @@ fn switches_probes_only(served: &EngineConfig, target: &EngineConfig) -> bool {
 /// replica only once the module set has accounted for those.
 fn comparable(config: &EngineConfig) -> EngineConfig {
     let mut comparable = config.clone();
-    comparable.attention_backend = String::new();
+    comparable.attention_backend = None;
     comparable.prefill_attention_backend = None;
     comparable.decode_attention_backend = None;
     comparable.moe_runner_backend = None;
@@ -180,7 +236,11 @@ impl Leader {
     /// `UpdateError::Refused` for a configuration that does not parse or
     /// validate, one a rollback marked unavailable unless `force`, a module
     /// set the Build Servers cannot select, or a change no form moves.
-    pub async fn apply(&self, request: ApplyRequest, number: u64) -> Result<Applied, UpdateError> {
+    pub(crate) async fn apply(
+        &self,
+        request: ApplyRequest,
+        number: u64,
+    ) -> Result<Applied, UpdateError> {
         let _replacing = self
             .replicas
             .replacing
@@ -370,7 +430,7 @@ impl Leader {
         &self,
         number: u64,
         next: Epoch,
-        serving: u64,
+        serving: crate::epoch::Recorded,
         options: &crate::options::UpdateConfig,
         request: &ApplyRequest,
         deadline: Option<Instant>,
@@ -378,7 +438,7 @@ impl Leader {
         if request.dry_run {
             return Ok(Applied::DryRun(serde_json::json!({
                 "change": "generation",
-                "epoch": serving,
+                "epoch": serving.number(),
                 "modules": crate::updates::change::modules_report(&next.modules),
             })));
         }
@@ -408,7 +468,7 @@ impl Leader {
                 },
             );
         }
-        Ok(Applied::Update(report))
+        Ok(Applied::Update(Box::new(report)))
     }
 
     /// The serving engines, one node each: the processes a generation update
@@ -464,7 +524,7 @@ impl Leader {
         current: &ServerArgs,
         target: &ServerArgs,
         next: Epoch,
-        serving: u64,
+        serving: crate::epoch::Recorded,
         options: &crate::options::UpdateConfig,
         request: &ApplyRequest,
         deadline: Option<Instant>,
@@ -477,8 +537,9 @@ impl Leader {
         let nodes = self.serving_nodes();
         if nodes.is_empty() {
             return Err(UpdateError::Refused(format!(
-                "no engine serving epoch {serving} has a launch generation: this daemon neither \
-                 started nor adopted one"
+                "no engine serving epoch {} has a launch generation: this daemon neither \
+                 started nor adopted one",
+                serving.number()
             )));
         }
         let epochs = self.updates.epochs();
@@ -489,8 +550,8 @@ impl Leader {
             .keys()
             .copied()
             .max()
-            .unwrap_or(serving)
-            .max(serving)
+            // The serving epoch is recorded, so the records hold a number.
+            .unwrap_or(serving.number())
             + 1;
 
         // The target's engine configuration is resolved as a deployment's
@@ -578,7 +639,9 @@ impl Leader {
         let mut targets = Vec::with_capacity(worlds.len());
         for (args, _, numbers) in worlds {
             let mut parked = args.clone();
-            parked.predecessor = Some(proto::request::wire::Predecessor { epoch: serving });
+            parked.predecessor = Some(proto::request::wire::Predecessor {
+                epoch: serving.number(),
+            });
             let (placing, numbering) = (Arc::clone(control), numbers.clone());
             let world =
                 tokio::task::spawn_blocking(move || placing.target_world(&parked, &numbering))
@@ -593,19 +656,19 @@ impl Leader {
             targets.push((args, processes));
         }
 
-        let serving_record = epochs.get(serving).ok_or_else(|| {
-            UpdateError::Refused(format!(
-                "epoch {serving} has no record: the serving epoch cannot be drained or promoted \
-                 again"
-            ))
-        })?;
+        #[expect(
+            clippy::expect_used,
+            reason = "a `Recorded` epoch's record exists: no record is ever removed"
+        )]
+        let serving_record = epochs
+            .get(serving.number())
+            .expect("a recorded epoch's record is never removed");
         let mut record = serving_record;
         record.config = next.engine.clone();
         record.engine = next.modules.engine.clone();
         record.kernels = next.modules.kernels.clone();
         record.policy = next.modules.policy.clone();
-        record.previous_kernels.clear();
-        record.previous_policy = None;
+        record.previous = None;
         // The target's generation is set only by its own engines' reports.
         record.generation = None;
 
@@ -644,12 +707,12 @@ impl Leader {
                 epoch: target_epoch,
             }),
         );
-        Ok(Applied::Update(report))
+        Ok(Applied::Update(Box::new(report)))
     }
 
     /// Commits the update in flight: the decision is recorded before the kept
     /// side is released.
-    pub async fn commit(&self) -> Result<serde_json::Value, UpdateError> {
+    pub(crate) async fn commit(&self) -> Result<crate::updates::update::UpdateReport, UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
         self.updates.commit().ok_or_else(|| {
             UpdateError::Refused("no update is in flight: there is nothing to commit".to_owned())
@@ -666,17 +729,16 @@ impl Leader {
 
     /// Rolls the update in flight back, with `reason` as the operator's or
     /// the submitter's own account.
-    pub async fn rollback(&self, reason: String) -> Result<serde_json::Value, UpdateError> {
+    pub(crate) async fn rollback(
+        &self,
+        reason: String,
+    ) -> Result<crate::updates::update::UpdateReport, UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
         if self.updates.in_flight().is_some() {
             self.end_profiles("rollback").await;
         }
         self.updates
-            .rollback(Failure {
-                kind: "rollback".to_owned(),
-                reason,
-                device: None,
-            })
+            .rollback(Failure::new(FailureKind::Decision, reason))
             .ok_or_else(|| {
                 UpdateError::Refused(
                     "no update is in flight: the deployment already serves the configuration \
@@ -687,7 +749,11 @@ impl Leader {
     }
 
     /// Reports the configuration and resource ownership of the replicas.
-    pub async fn config_status(&self) -> serde_json::Value {
+    ///
+    /// # Errors
+    ///
+    /// Fails when a replica's configuration cannot be printed.
+    pub(crate) async fn config_status(&self) -> anyhow::Result<ConfigStatus> {
         let replicas = self.replicas();
         let client = replicas
             .iter()
@@ -705,41 +771,37 @@ impl Leader {
                         .map_err(|error| error.to_string())?
                         .map_err(|error| format!("{error:#}"))
                 };
-                match tokio::time::timeout(QUOTA_READ, read).await {
-                    Ok(Ok(nodes)) => serde_json::to_value(nodes)
-                        .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() })),
-                    Ok(Err(error)) => serde_json::json!({ "error": error }),
-                    Err(_) => serde_json::json!({
-                        "error": format!("the quotas were not read within {QUOTA_READ:?}")
-                    }),
-                }
+                Some(match tokio::time::timeout(QUOTA_READ, read).await {
+                    Ok(Ok(nodes)) => Quotas::Read(nodes),
+                    Ok(Err(error)) => Quotas::Unread { error },
+                    Err(_) => Quotas::Unread {
+                        error: format!("the quotas were not read within {QUOTA_READ:?}"),
+                    },
+                })
             }
-            _ => serde_json::Value::Null,
+            _ => None,
         };
         // The bytes a change in progress moved: what every node's Transfer
         // Server copied for the deployment since it began, read with the
         // quotas. One change runs at a time, so every transfer since is
         // the change's.
-        let statuses: Vec<_> = replicas
+        let replicas = replicas
             .into_iter()
             .map(|replica| replica.config_status())
-            .collect();
-        // An object even when the deployment has no replica, so the fields
-        // below are written into it rather than into a null.
-        let mut status = statuses
-            .first()
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        status["replicas"] = statuses.into();
-        status["gpus"] = quotas.as_array().map_or(serde_json::Value::Null, |nodes| {
-            deployment_gpus(nodes).into()
-        });
-        status["quotas"] = quotas;
-        // The update in flight, or the one that ended last, with its trial.
-        status["update"] = self.updates.status().unwrap_or_default();
-        status["unavailable"] =
-            serde_json::to_value(self.updates.unavailable_marks()).unwrap_or_default();
-        status
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let gpus = match &quotas {
+            Some(Quotas::Read(nodes)) => Some(deployment_gpus(nodes)),
+            Some(Quotas::Unread { .. }) | None => None,
+        };
+        Ok(ConfigStatus {
+            first: replicas.first().cloned(),
+            replicas,
+            gpus,
+            quotas,
+            // The update in flight, or the one that ended last, with its trial.
+            update: self.updates.status(),
+            unavailable: self.updates.unavailable_marks(),
+        })
     }
 }
 
@@ -747,13 +809,25 @@ impl Replica {
     /// Reports what the replica executes and what its configuration is: the
     /// engine that takes requests with its state, and the digest of the
     /// configuration.
-    pub(crate) fn config_status(&self) -> serde_json::Value {
+    ///
+    /// # Errors
+    ///
+    /// Fails when the configuration cannot be printed.
+    pub(crate) fn config_status(&self) -> anyhow::Result<ReplicaStatus> {
         let config = service::lock(&self.config).clone();
-        let printed = crate::options::printed(&config).unwrap_or_default();
-        let digest = digest(&config).unwrap_or_default();
+        let printed = crate::options::printed(&config)?;
+        let digest = crate::updates::digest_of(&printed);
         let hold = self.hold();
-        let slot = |epoch: u64, state: &str| serde_json::json!({ "epoch": epoch, "state": state });
-        let unavailable = |epoch: u64, reason: &str| serde_json::json!({ "epoch": epoch, "state": "unavailable", "reason": reason });
+        let slot = |epoch: u64, state: ExecutingState| Executing {
+            epoch,
+            state,
+            reason: None,
+        };
+        let unavailable = |epoch: u64, reason: &str| Executing {
+            epoch,
+            state: ExecutingState::Unavailable,
+            reason: Some(reason.to_owned()),
+        };
         // The epoch a replica without an engine last executed is the one its
         // served arguments name.
         let served_epoch = service::lock(&self.served)
@@ -763,10 +837,10 @@ impl Replica {
             Some(client) => {
                 let epoch = client.epoch();
                 match client.state() {
-                    EngineState::Starting => slot(epoch, "starting"),
-                    EngineState::Parked => slot(epoch, "parked"),
-                    EngineState::Serving => slot(epoch, "serving"),
-                    EngineState::Draining => slot(epoch, "draining"),
+                    EngineState::Starting => slot(epoch, ExecutingState::Starting),
+                    EngineState::Parked => slot(epoch, ExecutingState::Parked),
+                    EngineState::Serving => slot(epoch, ExecutingState::Serving),
+                    EngineState::Draining => slot(epoch, ExecutingState::Draining),
                     EngineState::Failed(reason) => unavailable(epoch, &reason),
                     EngineState::Stopped => unavailable(epoch, "its engine process ended"),
                 }
@@ -779,10 +853,10 @@ impl Replica {
                 _ => unavailable(served_epoch, "requests wait for its engine"),
             },
         };
-        serde_json::json!({
-            "config": printed,
-            "digest": digest,
-            "executing": executing,
+        Ok(ReplicaStatus {
+            config: printed,
+            digest,
+            executing,
         })
     }
 
@@ -881,7 +955,6 @@ impl Replica {
         // again, which then leaves the daemon's options as they are.
         if daemon_changes {
             return Ok(Applied::Daemon {
-                executable: None,
                 config: Box::new(current.with_daemon_part(target.daemon_part())),
                 then: Some(Box::new(request)),
             });
@@ -994,7 +1067,7 @@ mod tests {
         served.max_running_requests = std::num::NonZeroUsize::new(8).unwrap();
         let mut target = served.clone();
         target.max_running_requests = std::num::NonZeroUsize::new(4).unwrap();
-        target.attention_backend = "trtllm".to_owned();
+        target.attention_backend = Some("trtllm".to_owned());
         let capacity = proto::request::wire::BatchCapacity {
             max_batch: 8,
             max_num_batched_tokens: 8192,
@@ -1071,7 +1144,7 @@ mod tests {
         let client = replica.hold().client().expect("the replica serves");
         let epoch = client.epoch();
 
-        let status = leader.config_status().await;
+        let status = serde_json::to_value(leader.config_status().await.unwrap()).unwrap();
         assert_eq!(
             status["executing"],
             serde_json::json!({ "epoch": epoch, "state": "serving" })
@@ -1081,7 +1154,7 @@ mod tests {
 
         // An epoch whose engine no longer serves is unavailable.
         replica.hold().close("the engine process ended");
-        let status = leader.config_status().await;
+        let status = serde_json::to_value(leader.config_status().await.unwrap()).unwrap();
         assert_eq!(
             status["executing"],
             serde_json::json!({

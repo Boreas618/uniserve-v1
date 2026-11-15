@@ -14,7 +14,7 @@ use crate::options::ServerArgs;
 /// epoch computes other numerics than the one they ran on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum InFlight {
+pub(crate) enum InFlight {
     /// Each continues with the state it reached, which the new epoch reads
     /// as its own; the pages it writes afterwards reach no shared tier.
     #[default]
@@ -25,7 +25,7 @@ pub enum InFlight {
 
 /// A change of the deployment's configuration (`PUT /admin/config`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ApplyRequest {
+pub(crate) struct ApplyRequest {
     /// Update this independent replica. Without an index, a deployment
     /// update advances through replicas as each trial is committed.
     pub replica: Option<usize>,
@@ -48,7 +48,7 @@ pub struct ApplyRequest {
 
 /// What an apply did.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Applied {
+pub(crate) enum Applied {
     /// The target is the current configuration.
     Unchanged,
     /// The workers took the options that changed at their next step, or the
@@ -56,19 +56,18 @@ pub enum Applied {
     InPlace(serde_json::Value),
     /// What a dry run found the change would do; nothing changed.
     DryRun(serde_json::Value),
-    /// The daemon's own options or executable change: a hot restart of the
+    /// The daemon's own options change: a hot restart of the
     /// daemon with the target configuration applies them. When the change
     /// also moves modules or the build configuration, the daemon's successor
     /// applies `then`, the same change: the daemon changes before what it
     /// updates.
     Daemon {
         config: Box<ServerArgs>,
-        executable: Option<String>,
         then: Option<Box<ApplyRequest>>,
     },
     /// An update started, in its generation or its epoch form: the report is
     /// the update as it stood when its `Preparing` began.
-    Update(serde_json::Value),
+    Update(Box<crate::updates::update::UpdateReport>),
 }
 
 /// A module set by operator and revision, as a report names it.
@@ -158,29 +157,5 @@ mod tests {
             InFlight::Recompute
         );
         assert_eq!(InFlight::default(), InFlight::Keep);
-    }
-
-    /// `apply` reads the submitter's request: the target configuration, the
-    /// overrides, how in-flight requests continue, a dry run, `force` and the
-    /// deadline.
-    #[test]
-    fn an_apply_request_reads_the_operators_body() {
-        let request: ApplyRequest = serde_json::from_value(serde_json::json!({
-            "replica": 2,
-            "config": "[scheduler]\n",
-            "set": ["worker_config.executable=/opt/b"],
-            "in_flight": "recompute",
-            "dry_run": true,
-            "force": true,
-            "deadline_s": 600.0
-        }))
-        .expect("the request's shape");
-        assert_eq!(request.replica, Some(2));
-        assert_eq!(request.config.as_deref(), Some("[scheduler]\n"));
-        assert_eq!(request.set, vec!["worker_config.executable=/opt/b"]);
-        assert_eq!(request.in_flight, InFlight::Recompute);
-        assert!(request.dry_run);
-        assert!(request.force);
-        assert_eq!(request.deadline_s, Some(600.0));
     }
 }

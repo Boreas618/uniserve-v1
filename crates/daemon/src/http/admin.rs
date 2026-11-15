@@ -219,8 +219,8 @@ impl Admin {
     /// phase, epoch and failure).
     pub(crate) fn update_event(&self, transition: crate::updates::Transition) {
         let phase = transition.phase.name();
-        let data = match transition.report {
-            serde_json::Value::Object(data) => data,
+        let data = match serde_json::to_value(&transition.report) {
+            Ok(serde_json::Value::Object(data)) => data,
             _ => serde_json::Map::new(),
         };
         let mut events = service::lock(&self.events);
@@ -650,8 +650,12 @@ struct ConfigBody {
 /// epochs, the change in progress, the trial, the configurations a
 /// rollback marked unavailable and every item of the GPUs' quotas
 /// (`Leader::config_status`).
-async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
-    let mut body = state.leader.config_status().await;
+async fn config(State(state): State<AdminState>) -> Response {
+    let status = match state.leader.config_status().await {
+        Ok(status) => status,
+        Err(error) => return ApiError::server_error(format!("{error:#}")).into_response(),
+    };
+    let mut body = json!(status);
     // The epochs and the processes this daemon manages sit beside the
     // configuration and its epochs: `EpochRecord`s are the daemon's record
     // of what it executes, not the engine's (`crate::epoch`).
@@ -660,7 +664,7 @@ async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
         object.insert("epochs".to_owned(), report["epochs"].clone());
         object.insert("processes".to_owned(), report["processes"].clone());
     }
-    Json(body)
+    Json(body).into_response()
 }
 
 /// Who calls an admin route: the operator on its socket, which serves every route and option,
@@ -738,11 +742,7 @@ async fn apply(state: &AdminState, body: ConfigBody, caller: Caller) -> Response
         async move {
             // The change's future holds the model files it resolves.
             let applied = match Box::pin(applying.apply(request, number)).await {
-                Ok(Applied::Daemon {
-                    config,
-                    executable,
-                    then,
-                }) => match restarter {
+                Ok(Applied::Daemon { config, then }) => match restarter {
                     None => Err((
                         StatusCode::BAD_REQUEST,
                         "the change is of the daemon's own options, and this daemon does not \
@@ -752,7 +752,7 @@ async fn apply(state: &AdminState, body: ConfigBody, caller: Caller) -> Response
                     Some(restarter) => {
                         let update = then.is_some();
                         restarter
-                            .restart(executable, Some(*config), then, &applying, &admin, &jobs)
+                            .restart(Some(*config), then, &applying, &admin, &jobs)
                             .await
                             .map(|pid| {
                                 // The successor applies the rest of the change
@@ -803,7 +803,7 @@ async fn apply(state: &AdminState, body: ConfigBody, caller: Caller) -> Response
             break;
         }
     }
-    let update = leader.updates.status().unwrap_or_default();
+    let update = leader.updates.status();
     let status = if matches!(
         leader.updates.phase_of(number),
         Some(Phase::Trial | Phase::Committed)
@@ -815,7 +815,7 @@ async fn apply(state: &AdminState, body: ConfigBody, caller: Caller) -> Response
     // The operation is the one that started the update; its result states
     // the update as it stands now.
     if let Some(result) = operation.result.as_mut() {
-        result["update"] = update;
+        result["update"] = json!(update);
     }
     (status, Json(operation)).into_response()
 }
@@ -829,9 +829,7 @@ fn applied_result(
         Ok(Applied::Unchanged) => Ok(json!({ "change": "none" })),
         Ok(Applied::InPlace(report)) => Ok(json!({ "change": "in_place", "in_place": report })),
         Ok(Applied::DryRun(report)) => Ok(json!({ "change": "dry_run", "dry_run": report })),
-        Ok(Applied::Update(report)) => {
-            Ok(json!({ "change": report["change"].clone(), "update": report }))
-        }
+        Ok(Applied::Update(report)) => Ok(json!({ "change": report.change, "update": report })),
         Ok(Applied::Daemon { .. }) => Err((
             StatusCode::CONFLICT,
             "the daemon's own options changed again after its hot restart".to_owned(),
@@ -878,12 +876,16 @@ pub(crate) fn apply_after_restart(
 async fn commit(State(state): State<AdminState>) -> Response {
     let leader = Arc::clone(&state.leader);
     run(&state.admin, "commit", true, async move {
-        leader.commit().await.map_err(|error| {
-            (
-                update_status(&error),
-                format!("{:#}", anyhow::Error::from(error)),
-            )
-        })
+        leader
+            .commit()
+            .await
+            .map(|report| json!(report))
+            .map_err(|error| {
+                (
+                    update_status(&error),
+                    format!("{:#}", anyhow::Error::from(error)),
+                )
+            })
     })
     .await
 }
@@ -913,12 +915,16 @@ async fn rollback(State(state): State<AdminState>, body: axum::body::Bytes) -> R
         let reason = body
             .reason
             .unwrap_or_else(|| "the trial was rolled back by decision".to_owned());
-        leader.rollback(reason).await.map_err(|error| {
-            (
-                update_status(&error),
-                format!("{:#}", anyhow::Error::from(error)),
-            )
-        })
+        leader
+            .rollback(reason)
+            .await
+            .map(|report| json!(report))
+            .map_err(|error| {
+                (
+                    update_status(&error),
+                    format!("{:#}", anyhow::Error::from(error)),
+                )
+            })
     })
     .await
 }
@@ -1183,10 +1189,6 @@ async fn stop_profile(State(state): State<AdminState>) -> Response {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RestartBody {
-    /// The `uniserve` executable of the build to restart as; this daemon's
-    /// own when unset.
-    #[serde(default)]
-    executable: Option<String>,
     #[serde(default = "yes")]
     wait: bool,
 }
@@ -1201,10 +1203,7 @@ async fn restart(State(state): State<AdminState>, body: axum::body::Bytes) -> Re
             .into_response();
     };
     let body = if body.is_empty() {
-        RestartBody {
-            executable: None,
-            wait: true,
-        }
+        RestartBody { wait: true }
     } else {
         match serde_json::from_slice::<RestartBody>(&body) {
             Ok(body) => body,
@@ -1216,7 +1215,7 @@ async fn restart(State(state): State<AdminState>, body: axum::body::Bytes) -> Re
     let jobs = Arc::clone(&state.jobs);
     run(&state.admin, "restart", body.wait, async move {
         restarter
-            .restart(body.executable, None, None, &leader, &admin, &jobs)
+            .restart(None, None, &leader, &admin, &jobs)
             .await
             .map(|pid| json!({ "pid": pid }))
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))
@@ -1273,7 +1272,7 @@ mod tests {
         let admin = Admin::with_epochs(
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(crate::epoch::Epochs::new()),
+            Arc::new(crate::epoch::Epochs::default()),
         );
         admin.record("deployment", "first");
         admin.record("deployment", "second");
@@ -1304,7 +1303,7 @@ mod tests {
         let admin = Admin::with_epochs(
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(crate::epoch::Epochs::new()),
+            Arc::new(crate::epoch::Epochs::default()),
         );
         for index in 0..EVENT_CAPACITY + 2 {
             admin.record("deployment", format!("event {index}"));
@@ -1318,7 +1317,7 @@ mod tests {
     /// records its leader keeps, not records of its own.
     #[test]
     fn a_resumed_admin_reports_its_leader_s_records() {
-        let epochs = Arc::new(crate::epoch::Epochs::new());
+        let epochs = Arc::new(crate::epoch::Epochs::default());
         epochs.set_processes(vec![crate::epoch::ManagedProcess {
             group: crate::engine::control::ENGINE_GROUP.to_owned(),
             rank: 0,
@@ -1331,7 +1330,7 @@ mod tests {
         let predecessor = Admin::with_epochs(
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(crate::epoch::Epochs::new()),
+            Arc::new(crate::epoch::Epochs::default()),
         );
         let admin = Admin::resume(
             CancellationToken::new(),
@@ -1348,7 +1347,7 @@ mod tests {
         let admin = Admin::with_epochs(
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(crate::epoch::Epochs::new()),
+            Arc::new(crate::epoch::Epochs::default()),
         );
         let first = admin.begin("update").unwrap();
         let refused = admin.begin("flush_cache").unwrap_err();

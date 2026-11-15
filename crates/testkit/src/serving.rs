@@ -216,7 +216,7 @@ pub fn launch() -> EngineArgs {
         max_running_requests: NonZeroUsize::new(SLOTS as usize).unwrap(),
         max_num_batched_tokens: None,
         max_logprobs: 2,
-        attention_backend: String::new(),
+        attention_backend: None,
         prefill_attention_backend: None,
         decode_attention_backend: None,
         moe_runner_backend: None,

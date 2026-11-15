@@ -126,9 +126,9 @@ impl Engine {
     pub fn fault(&mut self, reason: &str) -> Report {
         self.lifecycle = EngineState::Failed;
         report(report::Kind::Fault(process::Fault {
-            kind: "sticky".to_owned(),
+            kind: process::FaultKind::Device.into(),
             reason: reason.to_owned(),
-            device: 0,
+            device: Some(0),
         }))
     }
 
@@ -173,9 +173,9 @@ impl Engine {
                 }
                 if self.prepared.take() != Some(switch.generation) {
                     return vec![report(report::Kind::Fault(process::Fault {
-                        kind: "out_of_order".to_owned(),
+                        kind: process::FaultKind::Work.into(),
                         reason: format!("generation {} was not prepared", switch.generation),
-                        device: 0,
+                        device: None,
                     }))];
                 }
                 self.kept = Some(std::mem::replace(&mut self.generation, switch.generation));

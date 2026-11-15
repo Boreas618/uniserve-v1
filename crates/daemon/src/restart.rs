@@ -1,9 +1,10 @@
-//! Hot restart of a leader daemon: a successor process, of the same build or
-//! another, takes the deployment over while the daemon it replaces finishes
-//! the requests it took, as Envoy's hot restart does.
+//! Hot restart of a leader daemon: a successor process of the running build takes the
+//! deployment over while the daemon it replaces finishes the requests it took, as Envoy's hot
+//! restart does.
 //!
-//! `POST /admin/restart` starts the successor (`uniserve serve --predecessor
-//! FD`) with one end of a socket pair at that descriptor. They talk over it:
+//! `POST /admin/restart` starts the successor by re-executing the daemon's own image
+//! (`/proc/self/exe serve --predecessor FD`), which inherits one end of a socket pair at the
+//! descriptor the argument names. They talk over it:
 //!
 //! 1. The daemon sends its options and the version of the engine interface
 //!    its engines speak (`Prepare`); a successor of another version gives
@@ -40,7 +41,6 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -58,15 +58,6 @@ use crate::supervision::{Daemon, ServiceHandoff};
 
 pub(crate) mod requests;
 pub(crate) mod streams;
-
-/// The descriptor a successor finds the handoff socket at.
-pub const PREDECESSOR_DESCRIPTOR: i32 = 3;
-
-/// How long each side waits for the other's next step.
-const STEP_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// How often a wait rechecks the channel.
-const POLL: Duration = Duration::from_millis(20);
 
 /// The messages of the handoff socket.
 #[derive(Debug, Serialize, Deserialize)]
@@ -151,11 +142,10 @@ struct Takeover {
     admin: AdminHandoff,
     jobs: Vec<(VideoJob, Option<u64>)>,
     then: Option<crate::updates::change::ApplyRequest>,
-    /// Whether new requests waited when the predecessor handed over. The
-    /// successor's gate starts as the predecessor's ended: a hot restart must
-    /// not reopen admissions, and the in-process hold alone would
-    /// reopen them once the frontend serves.
-    frontend_paused: bool,
+    /// Whether the leader's admissions were paused (new requests waited) when the predecessor
+    /// handed over: the successor's admissions start as the predecessor's ended, so a hot
+    /// restart never reopens them.
+    admissions_paused: bool,
     /// The modules the serving epoch runs. A configuration names a part of
     /// them and the store fills the rest, so the successor cannot derive them.
     modules: Option<proto::module::ModuleSet>,
@@ -261,9 +251,8 @@ impl Restarter {
         service::lock(&self.handoff).clone()
     }
 
-    /// Restarts the daemon as `executable` (this daemon's own when `None`),
-    /// as the module describes, up to the successor serving; returns its
-    /// process id. Video job changes go on to the successor until this
+    /// Restarts the daemon as a successor of the running build, as the module describes, up to
+    /// the successor serving; returns its process id. Video job changes go on to the successor until this
     /// daemon exits.
     ///
     /// # Errors
@@ -272,7 +261,6 @@ impl Restarter {
     /// service was handed over, this daemon serves on.
     pub(crate) async fn restart(
         &self,
-        executable: Option<String>,
         config: Option<crate::options::ServerArgs>,
         then: Option<Box<crate::updates::change::ApplyRequest>>,
         leader: &Arc<Leader>,
@@ -280,9 +268,7 @@ impl Restarter {
         jobs: &Arc<VideoJobs>,
     ) -> anyhow::Result<u32> {
         self.in_flight.store(true, Ordering::Release);
-        let result = self
-            .hand_over(executable, config, then, leader, admin, jobs)
-            .await;
+        let result = self.hand_over(config, then, leader, admin, jobs).await;
         // The restart is concluded however it ended: a daemon waiting to exit
         // stops waiting here, and a successor that adopted the deployment is the
         // only case in which this one may let go of it. The decision is stated
@@ -308,17 +294,12 @@ impl Restarter {
     /// The restart itself, up to the successor serving.
     async fn hand_over(
         &self,
-        executable: Option<String>,
         config: Option<crate::options::ServerArgs>,
         then: Option<Box<crate::updates::change::ApplyRequest>>,
         leader: &Arc<Leader>,
         admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
     ) -> anyhow::Result<u32> {
-        let executable = match executable {
-            Some(executable) => std::path::PathBuf::from(executable),
-            None => std::env::current_exe().context("finding this daemon's executable")?,
-        };
         // No epoch change, rollback or relaunch replaces the engine meanwhile.
         let _quiet = leader.quiesce().await;
         // The parked standbys are this daemon's processes: the successor
@@ -331,8 +312,8 @@ impl Restarter {
         // The persistent reply reader must yield to the continuations it
         // wakes, including when the handoff channel has no further traffic.
         ours.set_nonblocking(true)?;
-        let successor = spawn(&executable, theirs)?;
-        info!(pid = successor, executable = %executable.display(), "started the successor daemon");
+        let successor = spawn(theirs)?;
+        info!(pid = successor, "started the successor daemon");
         let mut channel = Connection::new(ours)?;
 
         // The successor serves with the daemon's options the change
@@ -453,7 +434,7 @@ impl Restarter {
                     admin: admin.hand_over(),
                     jobs: job_records,
                     then: then.map(|request| *request),
-                    frontend_paused: leader.status().paused,
+                    admissions_paused: leader.status().paused,
                     modules: leader.epochs().serving().map(|(_, record)| {
                         proto::module::ModuleSet {
                             engine: record.engine,
@@ -534,7 +515,7 @@ impl Restarter {
         self.accepting.cancel();
         tokio::spawn(async move {
             loop {
-                match receive(&mut channel, None).await {
+                match recv(&mut channel).await {
                     Ok((Message::Resumed { id, attachment }, _)) => {
                         continuations.respond(id, attachment)
                     }
@@ -552,23 +533,24 @@ impl Restarter {
     }
 }
 
-/// Starts `executable serve --predecessor` with `socket` at
-/// [`PREDECESSOR_DESCRIPTOR`]; returns its process id. The successor is not
-/// this daemon's to stop: it outlives it.
-fn spawn(executable: &std::path::Path, socket: UnixStream) -> anyhow::Result<u32> {
+/// The running process's own executable image, as the kernel holds it: what the successor of a
+/// hot restart executes, so it is the running build even when the file it was started from was
+/// replaced since.
+const RUNNING_IMAGE: &str = "/proc/self/exe";
+
+/// Starts the successor, `serve --predecessor FD` of the running image, inheriting `socket` at
+/// the descriptor `FD` names; returns its process id. The successor is not this daemon's to
+/// stop: it outlives it.
+fn spawn(socket: UnixStream) -> anyhow::Result<u32> {
     let descriptor = socket.as_raw_fd();
-    let mut command = std::process::Command::new(executable);
-    command.args([
-        "serve",
-        "--predecessor",
-        &PREDECESSOR_DESCRIPTOR.to_string(),
-    ]);
-    // SAFETY: the closure runs in the forked child before exec and calls
-    // only `dup2`, which is async-signal-safe; `socket` stays open in the
-    // parent until the spawn returned.
+    let mut command = std::process::Command::new(RUNNING_IMAGE);
+    command.args(["serve", "--predecessor", &descriptor.to_string()]);
+    // SAFETY: the closure runs in the forked child before exec and calls only `fcntl`, which is
+    // async-signal-safe; `socket` stays open in the parent until the spawn returned. Only the
+    // child's copy of the descriptor loses close-on-exec, so no other child inherits it.
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(descriptor, PREDECESSOR_DESCRIPTOR) == -1 {
+            if libc::fcntl(descriptor, libc::F_SETFD, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -640,16 +622,10 @@ fn send(
     channel.flush().context("writing to the handoff socket")
 }
 
-/// The next message and its descriptors, waiting up to [`STEP_TIMEOUT`].
+/// The other daemon's next message and its descriptors, read as the socket becomes readable.
+/// The wait ends with the message, or with the socket's end when the other daemon gave up or
+/// exited.
 async fn recv(channel: &mut Connection) -> anyhow::Result<(Message, Vec<OwnedFd>)> {
-    receive(channel, Some(STEP_TIMEOUT)).await
-}
-
-async fn receive(
-    channel: &mut Connection,
-    timeout: Option<Duration>,
-) -> anyhow::Result<(Message, Vec<OwnedFd>)> {
-    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     loop {
         match channel.try_recv_with::<Message>() {
             Ok(Some(frame)) => return Ok(frame),
@@ -659,23 +635,28 @@ async fn receive(
             }
             Err(error) => return Err(error).context("reading the handoff socket"),
         }
-        anyhow::ensure!(
-            deadline.is_none_or(|deadline| Instant::now() < deadline),
-            "the other daemon did not respond in time"
-        );
-        tokio::time::sleep(POLL).await;
+        // Readiness of a descriptor this task borrows for the wait alone: the connection keeps
+        // owning it, and the registration ends before the next read.
+        let readable =
+            tokio::io::unix::AsyncFd::with_interest(channel.as_fd(), tokio::io::Interest::READABLE)
+                .context("waiting on the handoff socket")?;
+        readable
+            .readable()
+            .await
+            .context("waiting on the handoff socket")?
+            .retain_ready();
     }
 }
 
-/// The handoff socket's messages are MessagePack with named fields in the workspace's frames, the
-/// Storage Server protocol's codec, so a daemon hands over to a successor of another build.
+/// The handoff socket's messages are MessagePack with named fields in the workspace's frames
+/// (`service::msgpack`).
 impl service::Message for Message {
     fn encode(&self) -> std::io::Result<Vec<u8>> {
-        storage::protocol::encode(self)
+        service::msgpack::encode(self)
     }
 
     fn decode(payload: &[u8]) -> std::io::Result<Self> {
-        storage::protocol::decode(payload)
+        service::msgpack::decode(payload)
     }
 }
 
@@ -789,7 +770,7 @@ async fn prepared_successor(
         admin,
         jobs,
         then,
-        frontend_paused,
+        admissions_paused,
         modules,
     } = *takeover;
     let mut descriptors = descriptors.into_iter();
@@ -838,13 +819,10 @@ async fn prepared_successor(
         service_fds,
     )
     .context("resuming the node's daemon service")?;
-    let epoch_records = Arc::new(crate::epoch::Epochs::new());
     let (updates, awake) = daemon
-        .updater(
-            Arc::clone(&epoch_records),
-            config.served_model_name().to_owned(),
-        )
+        .updater(config.served_model_name().to_owned())
         .context("the leader's daemon commands no engine")?;
+    let epoch_records = Arc::clone(updates.epochs());
     Daemon::advance_updates(Arc::clone(&updates), awake)
         .context("starting the updater's thread")?;
     let control = Arc::new(control);
@@ -898,7 +876,7 @@ async fn prepared_successor(
         epoch_records.record(served_epoch, record);
         epoch_records.adopt_process(process);
     }
-    if frontend_paused {
+    if admissions_paused {
         // The predecessor was gated when it handed over, so the successor's
         // gate starts closed: the in-process hold is re-asserted here (its
         // `adopt_pause` already carried the per-replica state, and this is the
@@ -980,10 +958,11 @@ async fn prepared_successor(
     // The responses in flight go over once their engine streams do: a
     // response only moves when the engine serves it, and the predecessor
     // decides these before it stops writing anything.
+    let mut adopted = Vec::new();
     if !streams.is_empty() {
         let adopting = Arc::clone(&leader);
         let mut sockets = std::iter::from_fn(|| next().ok());
-        let adopted = streams::adopt(&adopting, streams, &video_jobs, &mut || {
+        let adoption = streams::adopt(&adopting, streams, &video_jobs, &mut || {
             sockets
                 .next()
                 .context("the takeover lacks a response's descriptor")
@@ -992,10 +971,11 @@ async fn prepared_successor(
             channel,
             &Message::Adopted {
                 pid: std::process::id(),
-                streams: adopted.streams,
+                streams: adoption.streams,
             },
             &[],
         )?;
+        adopted = adoption.adopted;
     }
     send(
         channel,
@@ -1019,7 +999,7 @@ async fn prepared_successor(
     let mut relay = std::mem::replace(channel, Connection::new(UnixStream::pair()?.0)?);
     let relay = tokio::spawn(async move {
         loop {
-            match receive(&mut relay, None).await {
+            match recv(&mut relay).await {
                 Ok((Message::Job { record, artifact }, descriptors)) => {
                     let media = match (artifact, descriptors.into_iter().next()) {
                         (Some(length), Some(descriptor)) => {
@@ -1079,6 +1059,7 @@ async fn prepared_successor(
         admins,
         instance.path(),
         video_jobs,
+        adopted,
         Arc::clone(&daemon),
         &shutdown,
     )
@@ -1123,8 +1104,7 @@ fn adopted_epoch(
         engine: modules.engine,
         kernels: modules.kernels,
         policy: modules.policy,
-        previous_kernels: std::collections::BTreeMap::new(),
-        previous_policy: None,
+        previous: None,
         status: crate::epoch::Status::Serving,
         generation: None,
     };
@@ -1167,11 +1147,6 @@ fn storage_server_speaks(socket: &std::path::Path) -> anyhow::Result<()> {
         ))),
     }
 }
-
-/// How long a daemon that stopped serving waits for a restart in flight to
-/// conclude before it exits anyway: the successor's own bounds are its connect
-/// timeout and the prepare deadline, both shorter than this.
-pub(crate) const RESTART_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[cfg(test)]
 mod tests {
@@ -1217,7 +1192,7 @@ mod tests {
                 };
                 let mut connection = Connection::new(stream).unwrap();
                 if let Ok(Some(ClientMessage::Hello(hello))) =
-                    connection.recv::<ClientMessage>(Duration::from_secs(30))
+                    connection.recv::<ClientMessage>(std::time::Duration::from_secs(30))
                 {
                     let refused = ServerMessage::Welcome(Welcome::Refused {
                         refusal: Refusal::Version {

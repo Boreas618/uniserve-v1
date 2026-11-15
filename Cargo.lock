@@ -4370,6 +4370,7 @@ name = "service"
 version = "2.0.0"
 dependencies = [
  "libc",
+ "rmp-serde",
  "rustix",
  "serde",
  "serde_json",

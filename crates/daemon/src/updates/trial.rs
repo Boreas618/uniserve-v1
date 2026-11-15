@@ -43,9 +43,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
-
-use crate::epoch::Failure;
+use crate::epoch::{Failure, FailureKind, Threshold};
 use crate::observe::{Observer, Rates};
 use crate::options::RollbackConfig;
 
@@ -90,6 +88,31 @@ struct Reading {
     /// Each replica's rates over the window up to it, in the order of the
     /// trial's baselines; `None` for a replica that ran no batch in it.
     rates: Vec<Option<Rates>>,
+}
+
+/// What a trial's thresholds read, as the update's report states it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) struct TrialReport {
+    /// The thresholds the trial is read against.
+    pub(crate) thresholds: RollbackConfig,
+    /// How long the trial has run.
+    pub(crate) seconds: f64,
+    /// The requests that ended on trial, and those of them that failed.
+    pub(crate) requests_ended: u64,
+    pub(crate) requests_failed: u64,
+    /// Each replica's baseline and its rates at the latest reading.
+    pub(crate) replicas: Vec<ReplicaReading>,
+}
+
+/// One replica's side of a trial's reading.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub(crate) struct ReplicaReading {
+    /// The epoch the update serves the replica from.
+    pub(crate) epoch: u64,
+    /// What serving reported before the switch.
+    pub(crate) baseline: Option<Rates>,
+    /// The replica's rates over the window up to the latest reading.
+    pub(crate) rates: Option<Rates>,
 }
 
 /// An update on trial, as far as its thresholds read it.
@@ -151,17 +174,15 @@ impl Trial {
 
     /// The first threshold `reading` passed.
     fn breach(&self, reading: &Reading) -> Option<Failure> {
-        let failure = |kind: &str, reason: String| Failure {
-            kind: kind.to_owned(),
-            reason,
-            device: None,
+        let failure = |threshold: Threshold, reason: String| {
+            Failure::new(FailureKind::Threshold(threshold), reason)
         };
 
         if let Some(rate) = self.thresholds.failure_rate {
             let (ended, failed) = reading.requests;
             if ended > 0 && failed as f64 / ended as f64 > rate {
                 return Some(failure(
-                    "failure_rate",
+                    Threshold::FailureRate,
                     format!(
                         "{failed} of the {ended} requests that ended on trial failed, past the \
                          failure rate {rate}"
@@ -185,7 +206,7 @@ impl Trial {
                 && rates.step_us > baseline.step_us * (1.0 + regression)
             {
                 return Some(failure(
-                    "step_time_regression",
+                    Threshold::StepTimeRegression,
                     format!(
                         "the epoch on trial's steps take {:.0} us against {:.0} us before the \
                          switch, past the regression {regression}",
@@ -200,7 +221,7 @@ impl Trial {
                 && now < before * (1.0 - regression)
             {
                 return Some(failure(
-                    "throughput_regression",
+                    Threshold::ThroughputRegression,
                     format!(
                         "the epoch on trial computes {now:.0} tokens/s against {before:.0} \
                          before the switch, past the regression {regression}"
@@ -213,34 +234,31 @@ impl Trial {
 
     /// The trial as `GET /admin/config` reports it: its thresholds and its
     /// latest reading, each replica's rates beside its baseline.
-    pub(crate) fn report(&self) -> Value {
-        let (ended, failed) = self
+    pub(crate) fn report(&self) -> TrialReport {
+        let (requests_ended, requests_failed) = self
             .reading
             .as_ref()
             .map_or((0, 0), |reading| reading.requests);
-        let replicas: Vec<_> = self
+        let replicas = self
             .baselines
             .iter()
             .enumerate()
-            .map(|(index, replica)| {
-                let rates = self
+            .map(|(index, replica)| ReplicaReading {
+                epoch: replica.epoch,
+                baseline: replica.baseline,
+                rates: self
                     .reading
                     .as_ref()
-                    .and_then(|reading| reading.rates.get(index).copied().flatten());
-                json!({
-                    "epoch": replica.epoch,
-                    "baseline": replica.baseline,
-                    "rates": rates,
-                })
+                    .and_then(|reading| reading.rates.get(index).copied().flatten()),
             })
             .collect();
-        json!({
-            "thresholds": self.thresholds,
-            "seconds": self.began.elapsed().as_secs_f64(),
-            "requests_ended": ended,
-            "requests_failed": failed,
-            "replicas": replicas,
-        })
+        TrialReport {
+            thresholds: self.thresholds.clone(),
+            seconds: self.began.elapsed().as_secs_f64(),
+            requests_ended,
+            requests_failed,
+            replicas,
+        }
     }
 }
 
@@ -298,7 +316,10 @@ mod tests {
         assert_eq!(trial.read((10, 1)), None, "10% slower is within 20%");
         observer.record(2, 0, &stats(2_000, 100, 10_000));
         let failure = trial.read((10, 1)).expect("the average is past 20%");
-        assert_eq!(failure.kind, "step_time_regression");
+        assert_eq!(
+            failure.kind,
+            FailureKind::Threshold(Threshold::StepTimeRegression)
+        );
         assert!(
             failure.reason.contains("1550 us against 1000 us"),
             "{failure:?}"
@@ -337,20 +358,26 @@ mod tests {
         };
 
         let (failure, report) = serve(9_829);
-        assert_eq!(failure, None, "{report}");
-        let replica = &report["replicas"][0];
-        assert_eq!(replica["rates"]["step_us"], 9_829.0);
-        assert_eq!(replica["baseline"]["step_us"], 10_666.0);
+        assert_eq!(failure, None, "{report:?}");
+        let replica = report.replicas[0];
+        assert_eq!(replica.rates.map(|rates| rates.step_us), Some(9_829.0));
+        assert_eq!(replica.baseline.map(|rates| rates.step_us), Some(10_666.0));
 
         // 11,500 us is 7.8% past the baseline's 10,666 us.
         let (failure, report) = serve(11_500);
         let failure = failure.expect("a regression past 5%");
-        assert_eq!(failure.kind, "step_time_regression");
+        assert_eq!(
+            failure.kind,
+            FailureKind::Threshold(Threshold::StepTimeRegression)
+        );
         assert!(
             failure.reason.contains("11500 us against 10666 us"),
             "{failure:?}"
         );
-        assert_eq!(report["replicas"][0]["rates"]["step_us"], 11_500.0);
+        assert_eq!(
+            report.replicas[0].rates.map(|rates| rates.step_us),
+            Some(11_500.0)
+        );
     }
 
     /// The same slowed target states no breach when no threshold names it: a
@@ -390,7 +417,10 @@ mod tests {
         std::thread::sleep(WINDOW);
         observer.record(2, 0, &stats(1_000, 100, 1_000));
         let failure = trial.read((0, 0)).expect("a tenth is past the half");
-        assert_eq!(failure.kind, "throughput_regression");
+        assert_eq!(
+            failure.kind,
+            FailureKind::Threshold(Threshold::ThroughputRegression)
+        );
     }
 
     /// The requests that ended before the trial do not count, and a rate past
@@ -410,7 +440,7 @@ mod tests {
         assert_eq!(trial.read((100, 50)), None, "nothing ended on trial");
         assert_eq!(trial.read((104, 51)), None, "a quarter is not past it");
         let failure = trial.read((104, 52)).expect("half is past it");
-        assert_eq!(failure.kind, "failure_rate");
+        assert_eq!(failure.kind, FailureKind::Threshold(Threshold::FailureRate));
         assert!(failure.reason.contains("2 of the 4"), "{failure:?}");
     }
 
@@ -454,8 +484,7 @@ mod tests {
         observer.record(2, 0, &stats(9_000, 100, 1));
         assert_eq!(trial.read((3, 1)), None);
         let report = trial.report();
-        assert_eq!(report["replicas"][0]["baseline"], Value::Null);
-        assert_eq!(report["requests_ended"], 3);
-        assert_eq!(report["requests_failed"], 1);
+        assert_eq!(report.replicas[0].baseline, None);
+        assert_eq!((report.requests_ended, report.requests_failed), (3, 1));
     }
 }

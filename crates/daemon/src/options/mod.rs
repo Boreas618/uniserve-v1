@@ -221,10 +221,12 @@ pub struct ServerArgs {
     #[arg(skip)]
     pub mm_processor_kwargs: serde_json::Map<String, Value>,
     /// Attention package (the paged-attention operator's backend) for every
-    /// attention call, by the name the ranks' attention registry gives it;
-    /// `auto` selects a native kernel per call.
+    /// attention call, by its backend name; unset, the Build Server selects
+    /// each attention descriptor key's package among the installed ones that
+    /// cover it, by manifest priority.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(skip)]
-    pub attention_backend: String,
+    pub attention_backend: Option<String>,
     /// The attention package that fills prompt processing; unset takes
     /// `attention_backend` (`prefill_attention_backend`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -406,7 +408,7 @@ impl Default for ServerArgs {
             dtype: ModelDtype::BFloat16,
             quantization: proto::config::Quantization::default(),
             mm_processor_kwargs: serde_json::Map::new(),
-            attention_backend: "auto".to_owned(),
+            attention_backend: None,
             prefill_attention_backend: None,
             decode_attention_backend: None,
             moe_runner_backend: None,

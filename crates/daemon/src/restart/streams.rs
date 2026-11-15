@@ -47,7 +47,7 @@
 //! so a response whose media did not come over stays with the predecessor.
 
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use prost::Message as _;
@@ -269,24 +269,6 @@ impl super::Restarter {
     }
 }
 
-/// The responses this process took over, which its HTTP server adopts once it
-/// serves.
-///
-/// A successor takes the responses over before it serves, and serves from
-/// another task with the router it builds; the queue is where the two meet.
-static ADOPTED: Mutex<Vec<Adopted>> = Mutex::new(Vec::new());
-
-/// Queues the responses this process took over for its HTTP server.
-pub(crate) fn queue(adopted: Vec<Adopted>) {
-    let mut queue = service::lock(&ADOPTED);
-    queue.extend(adopted);
-}
-
-/// Takes the responses this process took over.
-pub(crate) fn take_adopted() -> Vec<Adopted> {
-    std::mem::take(&mut service::lock(&ADOPTED))
-}
-
 /// One response a successor took over, as it reports it to the predecessor.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Taken {
@@ -298,9 +280,11 @@ pub(crate) struct Taken {
 
 /// What a successor took over of a predecessor's responses.
 pub(crate) struct Adoption {
-    /// The responses it took over and owns from now on. A response it could
-    /// not take over is absent: it stays the predecessor's.
+    /// The responses it took over and owns from now on, as it reports them to the predecessor.
+    /// A response it could not take over is absent: it stays the predecessor's.
     pub(crate) streams: Vec<Taken>,
+    /// The same responses, which its HTTP server goes on writing once it serves.
+    pub(crate) adopted: Vec<Adopted>,
 }
 
 /// Takes the responses `records` describe over from the predecessor, whose
@@ -349,8 +333,10 @@ pub(crate) fn adopt(
             }
         }
     }
-    queue(taken);
-    Ok(Adoption { streams })
+    Ok(Adoption {
+        streams,
+        adopted: taken,
+    })
 }
 
 /// One response's state as the handoff states it: the request's identity, its
@@ -590,9 +576,6 @@ mod tests {
     /// handover, so every response stays the predecessor's.
     #[tokio::test]
     async fn a_handoff_with_a_response_that_cannot_be_read_is_refused() {
-        // The queue of taken-over responses is this process's, so the test
-        // starts from what earlier tests left there.
-        let _ = take_adopted();
         let client = std::sync::Arc::new(fake_client(
             testkit::args("refused-handoff"),
             testkit::Fixture::new(text_fake),
@@ -622,7 +605,6 @@ mod tests {
 
         let refused = format!("{:#}", adoption.err().expect("the handoff is refused"));
         assert!(refused.contains("refused-handoff-request"), "{refused}");
-        assert!(take_adopted().is_empty(), "nothing is reported as adopted");
         assert!(
             !socket_taken,
             "the successor takes no socket of a response it did not take over"
@@ -633,7 +615,6 @@ mod tests {
     /// the record is complete enough to decode and still cannot be resumed.
     #[tokio::test]
     async fn a_handoff_with_a_response_that_names_no_application_is_refused() {
-        let _ = take_adopted();
         let client = std::sync::Arc::new(fake_client(
             testkit::args("refused-handoff-2"),
             testkit::Fixture::new(text_fake),
@@ -669,7 +650,6 @@ mod tests {
         });
 
         assert!(adoption.is_err(), "the handoff is refused");
-        assert!(take_adopted().is_empty());
         assert!(!socket_taken, "a response without framing does not move");
     }
 

@@ -10,7 +10,9 @@ use proto::process::{self, command};
 use proto::report::SchedulerStats;
 use testkit::process::Refusals;
 
-use crate::epoch::{Epoch, EpochRecord, Epochs, Failure, PackageRevision, Status};
+use crate::epoch::{
+    Epoch, EpochRecord, Epochs, Failure, FailureKind, PackageRevision, Recorded, Status, Threshold,
+};
 use crate::observe::Observer;
 use crate::options::{PreviousEpoch, RollbackConfig, ServerArgs, UpdateConfig};
 use crate::supervision::processes::Processes;
@@ -46,13 +48,15 @@ struct Deployment {
     /// What the deployment serves, and what the update under test moves it to.
     serving: Epoch,
     target: Epoch,
+    /// The serving epoch's record.
+    recorded: Recorded,
 }
 
 impl Deployment {
     /// A deployment that serves epoch [`SERVING`] on one engine, whose nodes
     /// refuse what `refusals` names.
     fn new(refusals: Refusals) -> Self {
-        let epochs = Arc::new(Epochs::new());
+        let epochs = Arc::new(Epochs::default());
         let (mut engines, link) = Engines::link(refusals);
         engines.serve(PREVIOUS);
         let processes = Processes::new(Arc::clone(&epochs), "deployment".to_owned(), link);
@@ -60,15 +64,14 @@ impl Deployment {
         let transitions = updater.transitions().expect("the log is read once");
 
         let serving = Epoch::of(ServerArgs::default()).expect("the configuration resolves");
-        epochs.record(
+        let recorded = epochs.record(
             SERVING,
             EpochRecord {
                 config: serving.engine.clone(),
                 engine: serving.modules.engine.clone(),
                 kernels: serving.modules.kernels.clone(),
                 policy: serving.modules.policy.clone(),
-                previous_kernels: Default::default(),
-                previous_policy: None,
+                previous: None,
                 status: Status::Serving,
                 generation: Some(1),
             },
@@ -86,6 +89,7 @@ impl Deployment {
             transitions,
             serving,
             target,
+            recorded,
         }
     }
 
@@ -112,7 +116,7 @@ impl Deployment {
             number,
             self.target.clone(),
             Arc::clone(&self.epochs),
-            SERVING,
+            self.recorded,
             "engine".to_owned(),
             nodes,
             deadline,
@@ -173,7 +177,7 @@ impl Deployment {
             number,
             self.target.clone(),
             Arc::clone(&self.epochs),
-            SERVING,
+            self.recorded,
             "engine".to_owned(),
             nodes,
             switch,
@@ -190,11 +194,12 @@ impl Deployment {
         self.run();
     }
 
-    /// Applies `update` and runs it as far as the fakes take it.
+    /// Applies `update` and runs it as far as the fakes take it; returns the update as it
+    /// stood when it started, as the admin API serializes it.
     fn apply(&mut self, update: Update) -> serde_json::Value {
         let report = self.updater.apply(update).expect("no update is in flight");
         self.run();
-        report
+        serde_json::to_value(report).expect("a report serializes")
     }
 
     /// Runs the update as far as the fakes take it.
@@ -211,9 +216,10 @@ impl Deployment {
         entered
     }
 
-    /// The update as the status reports it.
+    /// The update as the status reports it, serialized as the admin API does.
     fn status(&self) -> serde_json::Value {
-        self.updater.status().expect("an update ran")
+        serde_json::to_value(self.updater.status().expect("an update ran"))
+            .expect("a report serializes")
     }
 
     /// The record of epoch `epoch`.
@@ -266,11 +272,7 @@ fn names(commands: &[command::Kind]) -> Vec<&'static str> {
 }
 
 fn decision(reason: &str) -> Failure {
-    Failure {
-        kind: "rollback".to_owned(),
-        reason: reason.to_owned(),
-        device: None,
-    }
+    Failure::new(FailureKind::Decision, reason.to_owned())
 }
 
 // --- the generation form ------------------------------------------------------------------------
@@ -305,7 +307,7 @@ fn a_generation_update_serves_on_trial_and_a_commit_keeps_it() {
     assert_eq!(record.status, Status::Trial);
     assert_eq!(record.policy, deployment.target.modules.policy);
     assert_eq!(
-        record.previous_policy,
+        record.previous.map(|previous| previous.policy),
         Some(deployment.serving.modules.policy.clone())
     );
 
@@ -319,7 +321,7 @@ fn a_generation_update_serves_on_trial_and_a_commit_keeps_it() {
     let record = deployment.record(SERVING);
     assert_eq!(record.status, Status::Serving);
     assert_eq!(record.policy, deployment.target.modules.policy);
-    assert_eq!(record.previous_policy, None);
+    assert_eq!(record.previous, None);
     assert_eq!(deployment.updater.in_flight(), None);
     assert_eq!(deployment.status()["phase"], "committed");
 }
@@ -422,7 +424,7 @@ fn a_fault_on_trial_rolls_a_generation_update_back() {
     let record = deployment.record(SERVING);
     assert_eq!(record.status, Status::Serving);
     assert_eq!(record.policy, deployment.serving.modules.policy);
-    assert_eq!(record.previous_policy, None);
+    assert_eq!(record.previous, None);
     let mark = deployment
         .updater
         .unavailable(&deployment.target)
@@ -472,8 +474,8 @@ fn a_rollback_by_decision_returns_to_the_kept_generation() {
         .updater
         .rollback(decision("the responses got worse"))
         .expect("an update is on trial");
-    assert_eq!(report["phase"], "switching");
-    assert_eq!(report["rollback"], true);
+    assert_eq!(report.phase, Phase::Switching);
+    assert!(report.rollback);
     deployment.run();
 
     assert_eq!(deployment.status()["phase"], "rolled_back");
@@ -657,7 +659,7 @@ fn an_epoch_update_promotes_the_target_and_then_drains_the_serving_engine() {
         .expect("the commit's claim");
     assert_eq!((retiring.epoch, retiring.retire), (TARGET, vec![SERVING]));
     assert_eq!(
-        deployment.epochs.serving().map(|(epoch, _)| epoch),
+        deployment.epochs.serving().map(|(epoch, _)| epoch.number()),
         Some(TARGET)
     );
 }
@@ -1113,7 +1115,10 @@ fn a_threshold_reads_the_trial_from_the_switchs_end_and_the_status_keeps_its_inp
         .updater
         .read_trial(1, (0, 0))
         .expect("a regression past 5%");
-    assert_eq!(failure.kind, "step_time_regression");
+    assert_eq!(
+        failure.kind,
+        FailureKind::Threshold(Threshold::StepTimeRegression)
+    );
     let decided = deployment.status()["trial"]["replicas"][0]["rates"]["step_us"]
         .as_f64()
         .expect("the reading's step time");
@@ -1154,7 +1159,7 @@ fn a_target_that_faults_on_trial_is_stopped_instead_of_drained() {
     deployment.run();
 
     assert_eq!(deployment.status()["phase"], "rolled_back");
-    assert_eq!(deployment.status()["failure"]["kind"], "sticky");
+    assert_eq!(deployment.status()["failure"]["kind"], "device_fault");
     assert_eq!(
         names(&deployment.engines.received(SPAWNED)),
         ["promote"],

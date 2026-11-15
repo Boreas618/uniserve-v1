@@ -25,14 +25,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use serde_json::Value;
-
 use crate::epoch::{Epoch, Epochs, Failure};
 use crate::interference::StepTime;
 use crate::leader::UpdateError;
 use crate::supervision::processes::Processes;
 use trial::Trial;
-use update::{Phase, Update};
+use update::{Phase, Update, UpdateReport};
 
 /// A configuration a rollback marked unavailable, and why: a target that was
 /// rolled back is not tried again until it is applied with `force`.
@@ -55,21 +53,28 @@ pub(crate) struct Transition {
     pub(crate) update: u64,
     pub(crate) phase: Phase,
     /// The update as it stood when it entered the phase.
-    pub(crate) report: Value,
+    pub(crate) report: UpdateReport,
+}
+
+/// The lowercase hexadecimal SHA-256 digest of `value`'s JSON encoding: what names a
+/// configuration in the status, or a target in a rollback's mark.
+#[expect(
+    clippy::expect_used,
+    reason = "the values digested are plain data with string keys, which JSON always encodes"
+)]
+pub(crate) fn digest_of(value: &impl serde::Serialize) -> String {
+    use sha2::Digest as _;
+    let bytes = serde_json::to_vec(value).expect("plain data encodes as JSON");
+    sha2::Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The digest of what `target` moves a deployment to: its build
 /// configuration and the modules it runs.
 pub(crate) fn target_digest(target: &Epoch) -> String {
-    use sha2::Digest as _;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(target.engine.build_part().identity().as_bytes());
-    hasher.update(serde_json::to_vec(&target.modules).unwrap_or_default());
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    digest_of(&(target.engine.build_part().identity(), &target.modules))
 }
 
 /// The daemon's updater: the engine processes it commands and the update in
@@ -96,7 +101,7 @@ struct State {
     /// update's target prepares.
     transfers: Option<Arc<Mutex<StepTime>>>,
     /// What the last update that ended reported, which the status keeps.
-    last: Option<Value>,
+    last: Option<UpdateReport>,
     /// The targets a rollback marked unavailable, by their digest.
     unavailable: BTreeMap<String, Unavailable>,
     /// Epochs an update dropped whose storage the next claim retires.
@@ -112,14 +117,12 @@ const ENDED_KEPT: usize = 16;
 
 impl State {
     /// `report` with what the update's trial and transfers read.
-    fn completed(&self, mut report: Value) -> Value {
-        if let Some(trial) = &self.trial {
-            report["trial"] = trial.report();
+    fn completed(&self, report: UpdateReport) -> UpdateReport {
+        UpdateReport {
+            trial: self.trial.as_ref().map(Trial::report),
+            transfers: self.transfers.as_ref().map(|steps| *service::lock(steps)),
+            ..report
         }
-        if let Some(steps) = &self.transfers {
-            report["transfers"] = serde_json::to_value(*service::lock(steps)).unwrap_or_default();
-        }
-        report
     }
 }
 
@@ -203,7 +206,7 @@ impl Updater {
     ///
     /// `UpdateError::InProgress` while another update is in flight: one
     /// update runs at a time, so an effect has one cause.
-    pub(crate) fn apply(&self, mut update: Update) -> Result<Value, UpdateError> {
+    pub(crate) fn apply(&self, mut update: Update) -> Result<UpdateReport, UpdateError> {
         let mut state = self.lock();
         if state.update.is_some() {
             return Err(UpdateError::InProgress);
@@ -246,12 +249,13 @@ impl Updater {
         let report = update.report();
         let report = state.completed(report);
         for phase in entered {
-            let mut report = report.clone();
-            report["phase"] = Value::from(phase.name());
             let _ = self.transitions.send(Transition {
                 update: number,
                 phase,
-                report,
+                report: UpdateReport {
+                    phase,
+                    ..report.clone()
+                },
             });
         }
         if !phase.ended() {
@@ -291,7 +295,7 @@ impl Updater {
 
     /// Commits the update in flight, and returns it as it stands; `None` when
     /// no update is there to commit.
-    pub(crate) fn commit(&self) -> Option<Value> {
+    pub(crate) fn commit(&self) -> Option<UpdateReport> {
         let mut state = self.lock();
         let State {
             processes, update, ..
@@ -307,7 +311,7 @@ impl Updater {
 
     /// Rolls the update in flight back with `failure` as its reason, and
     /// returns it as it stands; `None` when no update is in flight.
-    pub(crate) fn rollback(&self, failure: Failure) -> Option<Value> {
+    pub(crate) fn rollback(&self, failure: Failure) -> Option<UpdateReport> {
         let mut state = self.lock();
         let State {
             processes, update, ..
@@ -441,7 +445,7 @@ impl Updater {
 
     /// The update as the status reports it: the one in flight, else the one
     /// that ended last.
-    pub(crate) fn status(&self) -> Option<Value> {
+    pub(crate) fn status(&self) -> Option<UpdateReport> {
         let state = self.lock();
         match state.update.as_ref() {
             Some(update) => Some(state.completed(update.report())),

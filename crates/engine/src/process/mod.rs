@@ -452,7 +452,11 @@ impl MainProcess {
                             Ok(output) => self.output(scheduler, output),
                             Err(_) => self.fail(
                                 format!("scheduler {scheduler} stopped"),
-                                lifecycle::fault("scheduler", "its thread ended".to_owned(), 0),
+                                lifecycle::fault(
+                                    proto::process::FaultKind::Scheduler,
+                                    "its thread ended".to_owned(),
+                                    None,
+                                ),
                             ),
                         }
                     }
@@ -510,7 +514,8 @@ impl MainProcess {
                 let reason = liveness
                     .and_then(|liveness| liveness.lost())
                     .unwrap_or(reason);
-                let fault = lifecycle::fault("process_exit", reason.clone(), 0);
+                let fault =
+                    lifecycle::fault(proto::process::FaultKind::ProcessExit, reason.clone(), None);
                 self.fail(
                     format!("a main process of this epoch was lost: {reason}"),
                     fault,
@@ -541,7 +546,14 @@ impl MainProcess {
             Output::Shrunk(region, units) => self.shrunk(region, units),
             Output::Failed(error) => {
                 let reason = format!("scheduler {scheduler} failed: {error}");
-                self.fail(reason, lifecycle::fault("scheduler", error.to_string(), 0));
+                self.fail(
+                    reason,
+                    lifecycle::fault(
+                        proto::process::FaultKind::Scheduler,
+                        error.to_string(),
+                        None,
+                    ),
+                );
             }
         }
     }
@@ -569,7 +581,10 @@ impl MainProcess {
     fn serial(&mut self, job: Job) {
         if self.operations.send(job).is_err() {
             let reason = "the operations thread ended".to_owned();
-            self.fail(reason.clone(), lifecycle::fault("operations", reason, 0));
+            self.fail(
+                reason.clone(),
+                lifecycle::fault(proto::process::FaultKind::Operations, reason, None),
+            );
         }
     }
 
@@ -583,7 +598,10 @@ impl MainProcess {
             });
         if let Err(error) = spawned {
             let reason = format!("a job beside the batches could not start: {error}");
-            self.fail(reason.clone(), lifecycle::fault("work", reason, 0));
+            self.fail(
+                reason.clone(),
+                lifecycle::fault(proto::process::FaultKind::Work, reason, None),
+            );
         }
     }
 
@@ -671,7 +689,8 @@ impl MainProcess {
             Ok(engine) => engine,
             Err(error) => {
                 let reason = format!("{error:#}");
-                let fault = lifecycle::fault("start", reason.clone(), 0);
+                let fault =
+                    lifecycle::fault(proto::process::FaultKind::Start, reason.clone(), None);
                 return self.fail(format!("the start failed: {reason}"), fault);
             }
         };
@@ -706,7 +725,10 @@ impl MainProcess {
                     Ok(()) => main.park(),
                     Err(error) => {
                         let reason = format!("suspending the graph storage: {error}");
-                        main.fail(reason.clone(), lifecycle::fault("start", reason, 0));
+                        main.fail(
+                            reason.clone(),
+                            lifecycle::fault(proto::process::FaultKind::Start, reason, None),
+                        );
                     }
                 })
             }));
@@ -740,7 +762,10 @@ impl MainProcess {
     fn opened(&mut self, opened: Result<()>) {
         if let Err(error) = opened {
             let reason = format!("opening admission: {error:#}");
-            return self.fail(reason.clone(), lifecycle::fault("promote", reason, 0));
+            return self.fail(
+                reason.clone(),
+                lifecycle::fault(proto::process::FaultKind::Promote, reason, None),
+            );
         }
         if !matches!(self.lifecycle, Lifecycle::Starting | Lifecycle::Parked) {
             return;
@@ -1035,7 +1060,10 @@ impl MainProcess {
     fn committed(&mut self, generation: u64, committed: Result<()>) {
         if let Err(error) = committed {
             let reason = format!("the commit of generation {generation} failed: {error:#}");
-            return self.fail(reason.clone(), lifecycle::fault("commit", reason, 0));
+            return self.fail(
+                reason.clone(),
+                lifecycle::fault(proto::process::FaultKind::Commit, reason, None),
+            );
         }
         self.kept = None;
         if let Some(route) = self
@@ -1086,7 +1114,10 @@ impl MainProcess {
     fn rolled_back(&mut self, kept: u64, reason: String, rolled: Result<()>) {
         if let Err(error) = rolled {
             let reason = format!("the rollback to generation {kept} failed: {error:#}");
-            return self.fail(reason.clone(), lifecycle::fault("rollback", reason, 0));
+            return self.fail(
+                reason.clone(),
+                lifecycle::fault(proto::process::FaultKind::Rollback, reason, None),
+            );
         }
         // A switch that never took effect kept nothing, and nothing returns.
         if let Some(packages) = self.kept.take() {
@@ -1146,7 +1177,10 @@ impl MainProcess {
             Ok(replies) => replies,
             Err(error) => {
                 let reason = format!("draining: {error:#}");
-                return self.fail(reason.clone(), lifecycle::fault("drain", reason, 0));
+                return self.fail(
+                    reason.clone(),
+                    lifecycle::fault(proto::process::FaultKind::Drain, reason, None),
+                );
             }
         };
         self.work(Box::new(move || {
@@ -1209,7 +1243,10 @@ impl MainProcess {
                 }
                 Err(error) => {
                     let reason = format!("releasing region {region} past unit {units}: {error:#}");
-                    main.fail(reason.clone(), lifecycle::fault("release", reason, 0));
+                    main.fail(
+                        reason.clone(),
+                        lifecycle::fault(proto::process::FaultKind::Release, reason, None),
+                    );
                 }
             })
         }));

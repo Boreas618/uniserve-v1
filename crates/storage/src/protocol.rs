@@ -1901,16 +1901,15 @@ pub enum ServerMessage {
     Event(Event),
 }
 
-/// The payload of a frame of the Storage Server's protocol: `message` in MessagePack with named
-/// fields. Each such frame (`service::frame`) carries the descriptors of the storage its
-/// message names.
+/// The payload of a frame of the Storage Server's protocol: `message` in the workspace's
+/// MessagePack codec (`service::msgpack`). Each such frame (`service::frame`) carries the
+/// descriptors of the storage its message names.
 ///
 /// # Errors
 ///
 /// Fails with `InvalidInput` when the message does not encode.
 pub fn encode<T: Serialize>(message: &T) -> std::io::Result<Vec<u8>> {
-    rmp_serde::to_vec_named(message)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    service::msgpack::encode(message)
 }
 
 /// The message a frame's payload of the Storage Server's protocol holds ([`encode`]).
@@ -1919,8 +1918,7 @@ pub fn encode<T: Serialize>(message: &T) -> std::io::Result<Vec<u8>> {
 ///
 /// Fails with `InvalidData` when the payload is no encoding of a `T`.
 pub fn decode<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result<T> {
-    rmp_serde::from_slice(payload)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    service::msgpack::decode(payload)
 }
 
 impl service::Message for ClientMessage {

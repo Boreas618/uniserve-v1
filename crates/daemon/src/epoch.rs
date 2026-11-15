@@ -76,10 +76,8 @@ pub struct EpochRecord {
     /// The scheduling policy package.
     pub policy: PackageRevision,
     /// The modules a generation's trial keeps as the previous generation: a
-    /// rollback returns to them, and a commit empties them.
-    pub previous_kernels: BTreeMap<KernelKey, PackageRevision>,
-    /// The previous scheduling policy package, kept until the next commit.
-    pub previous_policy: Option<PackageRevision>,
+    /// rollback returns to them, and a commit drops them.
+    pub previous: Option<Generation>,
     /// Where the epoch is in its life.
     pub status: Status,
     /// The generation: the number the epoch's own engines gave the modules
@@ -88,6 +86,29 @@ pub struct EpochRecord {
     /// [`ManagedProcess::generation`], the launch generation, allocated by
     /// the deployment's engine control (`EngineControl::launch_number`).
     pub generation: Option<u64>,
+}
+
+/// The modules one generation of an epoch executes, which a generation update's trial keeps for
+/// a rollback.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Generation {
+    /// The kernel package that fills each operator, or each phase of one.
+    pub kernels: BTreeMap<KernelKey, PackageRevision>,
+    /// The scheduling policy package.
+    pub policy: PackageRevision,
+}
+
+/// An epoch the daemon keeps a record of. Records are never removed, so an operation on a
+/// `Recorded` epoch's record always finds it: only [`Epochs`] makes one, when it records the
+/// epoch or reads its record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Recorded(u64);
+
+impl Recorded {
+    /// The epoch's number.
+    pub fn number(self) -> u64 {
+        self.0
+    }
 }
 
 /// The state of a process a node's daemon manages.
@@ -131,20 +152,151 @@ pub struct ManagedProcess {
     pub state: ProcessState,
 }
 
-/// Why an update did not stand: a fault an engine observed, a stalled job,
-/// non-finite logits, a scheduling policy the engine had to roll back, a
-/// threshold, the deadline or the operator's decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A threshold of a trial (`update_config.rollback`) that its reading passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Threshold {
+    /// The share of the trial's requests that failed (`failure_rate`).
+    FailureRate,
+    /// The new epoch's average step against the previous one's
+    /// (`step_time_regression`).
+    StepTimeRegression,
+    /// The new epoch's token throughput against the previous one's
+    /// (`throughput_regression`).
+    ThroughputRegression,
+}
+
+impl Threshold {
+    /// The threshold's option name under `update_config.rollback`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::FailureRate => "failure_rate",
+            Self::StepTimeRegression => "step_time_regression",
+            Self::ThroughputRegression => "throughput_regression",
+        }
+    }
+}
+
+/// What made an engine fail or an update not stand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// A fault an engine reported, of the kind it stated.
+    Fault(proto::process::FaultKind),
+    /// A job of a batch ran past the engine's watchdog.
+    Stalled,
+    /// A request's logits were not finite.
+    NonFiniteLogits,
+    /// A scheduling policy failed and its engine went back to the previous policy.
+    PolicyRolledBack,
+    /// A main process exited, as its daemon observed it.
+    ProcessExit,
+    /// An engine could not prepare the update's modules.
+    PrepareFailed,
+    /// An engine rolled the update back by itself.
+    RolledBack,
+    /// A target process could not be spawned.
+    SpawnFailed,
+    /// A target's storage could not be claimed.
+    ClaimFailed,
+    /// An engine runs another build than its epoch's.
+    BuildMismatch,
+    /// A switched engine executes modules other than the update prepared.
+    StaleModules,
+    /// A threshold of the trial passed.
+    Threshold(Threshold),
+    /// The trial was not committed by its deadline.
+    Deadline,
+    /// The submitter's or the operator's decision.
+    Decision,
+}
+
+impl FailureKind {
+    /// The stable short name the admin API and the event log state.
+    pub fn name(self) -> &'static str {
+        use proto::process::FaultKind;
+        match self {
+            Self::Fault(fault) => match fault {
+                FaultKind::Device => "device_fault",
+                FaultKind::Weights => "weights_fault",
+                FaultKind::Policy => "policy_fault",
+                FaultKind::ProcessExit => "process_exit",
+                FaultKind::Scheduler => "scheduler_fault",
+                FaultKind::Operations => "operations_fault",
+                FaultKind::Work => "work_fault",
+                FaultKind::Start => "start_fault",
+                FaultKind::Promote => "promote_fault",
+                FaultKind::Commit => "commit_fault",
+                FaultKind::Rollback => "rollback_fault",
+                FaultKind::Drain => "drain_fault",
+                FaultKind::Release => "release_fault",
+                FaultKind::Unspecified => "fault",
+            },
+            Self::Stalled => "stalled",
+            Self::NonFiniteLogits => "non_finite_logits",
+            Self::PolicyRolledBack => "policy_rolled_back",
+            Self::ProcessExit => "process_exit",
+            Self::PrepareFailed => "prepare_failed",
+            Self::RolledBack => "rolled_back",
+            Self::SpawnFailed => "spawn_failed",
+            Self::ClaimFailed => "claim_failed",
+            Self::BuildMismatch => "build_mismatch",
+            Self::StaleModules => "stale_modules",
+            Self::Threshold(threshold) => threshold.name(),
+            Self::Deadline => "deadline",
+            Self::Decision => "decision",
+        }
+    }
+
+    /// Whether the failure leaves the failed process's failure domain unusable, so a standby of
+    /// it is promoted in its place: a device whose context holds a sticky error, a process of the
+    /// engine that exited, or a job that stalled. The other failures fail the operation or the
+    /// update they were observed in, and the processes go on.
+    pub fn replaces_domain(self) -> bool {
+        use proto::process::FaultKind;
+        matches!(
+            self,
+            Self::Fault(FaultKind::Device | FaultKind::ProcessExit)
+                | Self::ProcessExit
+                | Self::Stalled
+        )
+    }
+}
+
+impl std::fmt::Display for FailureKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl Serialize for FailureKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+/// Why an engine failed or an update did not stand: a fault an engine observed, a stalled job,
+/// non-finite logits, a scheduling policy the engine had to roll back, a failed step of the
+/// update, a threshold, the deadline or the operator's decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Failure {
-    /// A stable short name: `sticky`, `illegal_address`, `launch_failed`,
-    /// `out_of_memory`, `process_exit`, `stalled`, `non_finite_logits`,
-    /// `policy_rolled_back`, `prepare_failed`, `deadline`, `rollback` or a
-    /// threshold's name.
-    pub kind: String,
+    /// What failed.
+    pub kind: FailureKind,
     /// The account given with it, for the daemon's record.
     pub reason: String,
-    /// The CUDA ordinal the failure names, when it names one.
+    /// The ordinal of the device the failure happened on, on the host of the process that
+    /// reported it, when it names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<u32>,
+}
+
+impl Failure {
+    /// A failure of `kind` for `reason`, naming no device.
+    pub fn new(kind: FailureKind, reason: String) -> Self {
+        Self {
+            kind,
+            reason,
+            device: None,
+        }
+    }
 }
 
 impl Failure {
@@ -157,16 +309,12 @@ impl Failure {
         let kind = report.kind.as_ref()?;
         match kind {
             Kind::Fault(fault) => Some(Self {
-                kind: if fault.kind.is_empty() {
-                    "fault".to_owned()
-                } else {
-                    fault.kind.clone()
-                },
+                kind: FailureKind::Fault(fault.kind()),
                 reason: fault.reason.clone(),
-                device: Some(fault.device),
+                device: fault.device,
             }),
             Kind::Stalled(stalled) => Some(Self {
-                kind: "stalled".to_owned(),
+                kind: FailureKind::Stalled,
                 reason: format!(
                     "the {} job of batch {} ran {} ms",
                     stalled.job, stalled.batch, stalled.elapsed_ms
@@ -174,12 +322,12 @@ impl Failure {
                 device: None,
             }),
             Kind::NonFiniteLogits(logits) => Some(Self {
-                kind: "non_finite_logits".to_owned(),
+                kind: FailureKind::NonFiniteLogits,
                 reason: format!("non-finite logits for request {}", logits.request),
                 device: None,
             }),
             Kind::PolicyRolledBack(policy) => Some(Self {
-                kind: "policy_rolled_back".to_owned(),
+                kind: FailureKind::PolicyRolledBack,
                 reason: {
                     // Absent is the route instance the engine's control
                     // thread runs, a value one scheduler thread's policy.
@@ -219,20 +367,24 @@ impl Failure {
 #[derive(Debug, Default)]
 pub struct Epochs {
     records: Mutex<BTreeMap<u64, EpochRecord>>,
-    processes: Mutex<Vec<ManagedProcess>>,
-    /// The daemon's process table, once the daemon that supervises this
-    /// node's processes attached it: the processes are the supervisor's to
-    /// report, and this record keeps what each of them is.
-    supervised: std::sync::OnceLock<std::sync::Arc<Mutex<Vec<ManagedProcess>>>>,
+    /// The node's process table, which the daemon that supervises the node's processes keeps
+    /// current as they start and end; these records add what each launch is.
+    processes: ProcessTable,
     /// The epoch requests were last moved to: the request path of this daemon follows it by
     /// moving its hold onto that epoch's engine.
     served: tokio::sync::watch::Sender<u64>,
 }
 
+/// A node's process table: the daemon's supervision writes it, and the epoch records report it.
+pub type ProcessTable = std::sync::Arc<Mutex<Vec<ManagedProcess>>>;
+
 impl Epochs {
-    /// No epoch was built and no process started yet.
-    pub fn new() -> Self {
-        Self::default()
+    /// No epoch built yet, over the node's process table `processes`.
+    pub fn new(processes: ProcessTable) -> Self {
+        Self {
+            processes,
+            ..Self::default()
+        }
     }
 
     /// States that `epoch` serves requests from now on.
@@ -247,72 +399,66 @@ impl Epochs {
 
     /// Records `record` as epoch `epoch`'s, replacing what was recorded of
     /// that epoch before.
-    pub fn record(&self, epoch: u64, record: EpochRecord) {
+    pub fn record(&self, epoch: u64, record: EpochRecord) -> Recorded {
         service::lock(&self.records).insert(epoch, record);
+        Recorded(epoch)
+    }
+
+    /// Epoch `epoch` as recorded, if the daemon keeps its record.
+    pub fn recorded(&self, epoch: u64) -> Option<Recorded> {
+        service::lock(&self.records)
+            .contains_key(&epoch)
+            .then_some(Recorded(epoch))
+    }
+
+    /// Runs `change` on the record of `epoch`, which is kept since it is recorded.
+    #[expect(
+        clippy::expect_used,
+        reason = "a `Recorded` epoch's record exists: only `Epochs` makes one, and no record is \
+                  ever removed"
+    )]
+    fn change_record(&self, epoch: Recorded, change: impl FnOnce(&mut EpochRecord)) {
+        let mut records = service::lock(&self.records);
+        let record = records
+            .get_mut(&epoch.0)
+            .expect("a recorded epoch's record is never removed");
+        change(record);
     }
 
     /// Records that epoch `epoch` switched to `modules` on trial, keeping
     /// what it executed before as the previous generation.
-    pub fn switched(&self, epoch: u64, modules: ModuleSet) {
-        let mut records = service::lock(&self.records);
-        let Some(record) = records.get_mut(&epoch) else {
-            // The modules already execute, so an epoch with no record serves
-            // them under a record that says nothing about them.
-            tracing::error!(
-                epoch,
-                "a switch finished for an epoch with no record: the modules serve and no record \
-                 names the generation they replaced"
-            );
-            return;
-        };
-        record.previous_kernels = std::mem::replace(&mut record.kernels, modules.kernels);
-        record.previous_policy = Some(std::mem::replace(&mut record.policy, modules.policy));
-        if record.status == Status::Serving {
-            record.status = Status::Trial;
-        }
+    pub fn switched(&self, epoch: Recorded, modules: ModuleSet) {
+        self.change_record(epoch, |record| {
+            record.previous = Some(Generation {
+                kernels: std::mem::replace(&mut record.kernels, modules.kernels),
+                policy: std::mem::replace(&mut record.policy, modules.policy),
+            });
+            if record.status == Status::Serving {
+                record.status = Status::Trial;
+            }
+        });
     }
 
     /// Records that epoch `epoch`'s new modules are what serves and the
     /// previous generation is no longer kept.
-    pub fn committed(&self, epoch: u64) {
-        let mut records = service::lock(&self.records);
-        let Some(record) = records.get_mut(&epoch) else {
-            tracing::error!(
-                epoch,
-                "a commit finished for an epoch with no record: nothing says the generation it \
-                 replaced was dropped"
-            );
-            return;
-        };
-        record.previous_kernels.clear();
-        record.previous_policy = None;
-        record.status = Status::Serving;
+    pub fn committed(&self, epoch: Recorded) {
+        self.change_record(epoch, |record| {
+            record.previous = None;
+            record.status = Status::Serving;
+        });
     }
 
     /// Ends a generation's trial by putting the previous generation back:
     /// what the epoch executed before the update is what it executes again.
-    pub fn rolled_back(&self, epoch: u64) {
-        let mut records = service::lock(&self.records);
-        let Some(record) = records.get_mut(&epoch) else {
-            tracing::error!(
-                epoch,
-                "a rollback finished for an epoch with no record: the generation it went back \
-                 from is named nowhere"
-            );
-            return;
-        };
-        if !record.previous_kernels.is_empty() || record.previous_policy.is_some() {
-            record.kernels = std::mem::take(&mut record.previous_kernels);
-            record.policy = record
-                .previous_policy
-                .take()
-                .unwrap_or_else(|| record.policy.clone());
-        } else {
-            // The daemon's own inconsistency, never a no-op: the epoch serves
-            // what it served, and the record cannot say what was dropped.
-            tracing::error!(epoch, "a rollback found no previous generation kept");
-        }
-        record.status = Status::Serving;
+    /// An epoch that kept none executes what it executed.
+    pub fn rolled_back(&self, epoch: Recorded) {
+        self.change_record(epoch, |record| {
+            if let Some(previous) = record.previous.take() {
+                record.kernels = previous.kernels;
+                record.policy = previous.policy;
+            }
+            record.status = Status::Serving;
+        });
     }
 
     /// Records epoch `epoch` as serving the `deployment` this node started:
@@ -320,9 +466,7 @@ impl Epochs {
     /// the generation its engines numbered for it. The epoch is recorded
     /// under the number its launch gave it, as an update's target and an
     /// adopted epoch are.
-    ///
-    /// Returns the epoch's number.
-    pub fn install(&self, epoch: u64, deployment: &Epoch, generations: &[u64]) -> u64 {
+    pub fn install(&self, epoch: u64, deployment: &Epoch, generations: &[u64]) -> Recorded {
         self.record(
             epoch,
             EpochRecord {
@@ -330,13 +474,11 @@ impl Epochs {
                 engine: deployment.modules.engine.clone(),
                 kernels: deployment.modules.kernels.clone(),
                 policy: deployment.modules.policy.clone(),
-                previous_kernels: BTreeMap::new(),
-                previous_policy: None,
+                previous: None,
                 status: Status::Serving,
                 generation: generations.first().copied(),
             },
-        );
-        epoch
+        )
     }
 
     /// Epoch `epoch`'s record, if the daemon keeps one.
@@ -351,12 +493,12 @@ impl Epochs {
 
     /// The epoch that serves requests: the highest numbered one that is
     /// serving or on trial.
-    pub fn serving(&self) -> Option<(u64, EpochRecord)> {
+    pub fn serving(&self) -> Option<(Recorded, EpochRecord)> {
         service::lock(&self.records)
             .iter()
             .rev()
             .find(|(_, record)| matches!(record.status, Status::Serving | Status::Trial))
-            .map(|(epoch, record)| (*epoch, record.clone()))
+            .map(|(epoch, record)| (Recorded(*epoch), record.clone()))
     }
 
     /// Records `adopted`, a process a hot restart's successor took over: the
@@ -383,26 +525,12 @@ impl Epochs {
 
     /// Replaces the node's process table with `processes`.
     pub fn set_processes(&self, processes: Vec<ManagedProcess>) {
-        match self.supervised.get() {
-            Some(table) => *service::lock(table) = processes,
-            None => *service::lock(&self.processes) = processes,
-        }
+        *service::lock(&self.processes) = processes;
     }
 
     /// The node's process table.
     pub fn processes(&self) -> Vec<ManagedProcess> {
-        match self.supervised.get() {
-            Some(table) => service::lock(table).clone(),
-            None => service::lock(&self.processes).clone(),
-        }
-    }
-
-    /// Reports the node's processes from `table` from now on: the daemon that
-    /// supervises them writes them there as they start and end, so the record
-    /// names every process of the deployment and never a stale one.
-    /// The first table attached is the one kept.
-    pub fn attach_processes(&self, table: std::sync::Arc<Mutex<Vec<ManagedProcess>>>) {
-        let _ = self.supervised.set(table);
+        service::lock(&self.processes).clone()
     }
 
     /// The epochs and the process table as `GET /admin/config` reports
@@ -414,9 +542,6 @@ impl Epochs {
             .iter()
             .map(|(epoch, record)| record_report(*epoch, record))
             .collect::<Vec<_>>();
-        // The rows the daemon supervises now, not the ones this record was
-        // given before it attached its table: a process that started or ended
-        // is reported from the table's state.
         let processes = self
             .processes()
             .iter()
@@ -442,8 +567,9 @@ fn record_report(epoch: u64, record: &EpochRecord) -> Value {
         })
         .collect::<Vec<_>>();
     let previous = record
-        .previous_kernels
+        .previous
         .iter()
+        .flat_map(|previous| &previous.kernels)
         .map(|(slot, package)| {
             serde_json::json!({
                 "op": slot.op,
@@ -459,7 +585,7 @@ fn record_report(epoch: u64, record: &EpochRecord) -> Value {
         "kernels": kernels,
         "policy": package_report(&record.policy),
         "previous_kernels": previous,
-        "previous_policy": record.previous_policy.as_ref().map(package_report),
+        "previous_policy": record.previous.as_ref().map(|previous| package_report(&previous.policy)),
         "generation": record.generation,
         "status": record.status.name(),
     })
@@ -493,18 +619,6 @@ fn process_report(process: &ManagedProcess) -> Value {
     })
 }
 
-/// The operator names the epoch record keys its kernel packages by, of the
-/// operators whose backend a configuration selects. They must
-/// equal `crates/ops`'s `Op::NAME` of the same operator, which the model and
-/// sched swarms write, so a mismatch is a wrong Build Server lookup and
-/// shows up at prepare; they are stated once here for that reason.
-///
-/// The complete slot set is `crates/ops`'s operator names. The rest are
-/// filled by the epoch's modules like any other slot and need no entry
-/// here: their backend is not a configuration field, so this module names
-/// only the operators the configuration selects a backend for. The
-/// scheduling interface is not an operator at all: its package is the epoch
-/// record's `policy` field.
 /// The module set `config` names: the engine package, the scheduling policy's
 /// and the kernel package of each operator, or phase of one, it selects a
 /// backend for.
@@ -513,86 +627,76 @@ fn process_report(process: &ManagedProcess) -> Value {
 /// are fixed when the configuration is applied, at the Build Server.
 /// A package's `revision` is zero until then, unless the
 /// configuration states one. An operator whose backend the configuration
-/// does not state, or leaves at `auto`, is absent: the deployment names
+/// does not state is absent: the deployment names
 /// nothing for it, and the Build Server selects its package for each of its
 /// descriptor keys among the packages that cover them, by manifest priority.
 pub fn modules_of(config: &ServerArgs) -> ModuleSet {
-    {
-        let mut kernels = BTreeMap::new();
-        let attention = attention_packages(config);
-        kernels.extend(attention);
-        // The exchange slot is filled only when the deployment spreads its
-        // experts over ranks. At one rank the model's MoE block takes its local
-        // arm and launches no exchange at all (`nn::Moe::forward` routes
-        // through `forward_expert_parallel` only when an expert lives on
-        // another rank), so a slot filled here would pin a package no call
-        // reaches — and, worse, the Build Server would refuse the epoch for a
-        // package nothing runs.
-        if config.moe_config.expert_parallel {
+    let mut kernels = BTreeMap::new();
+    let attention = attention_packages(config);
+    kernels.extend(attention);
+    // The exchange slot is filled only when the deployment spreads its
+    // experts over ranks. At one rank the model's MoE block takes its local
+    // arm and launches no exchange at all (`nn::Moe::forward` routes
+    // through `forward_expert_parallel` only when an expert lives on
+    // another rank), so a slot filled here would pin a package no call
+    // reaches — and, worse, the Build Server would refuse the epoch for a
+    // package nothing runs.
+    if config.moe_config.expert_parallel {
+        kernels.insert(
+            KernelKey::all(operator::EXPERT_EXCHANGE),
+            PackageRevision {
+                backend: config
+                    .moe_config
+                    .exchange
+                    .clone()
+                    .unwrap_or_else(|| proto::config::DEFAULT_EXPERT_EXCHANGE.to_owned()),
+                revision: 0,
+                arguments: toml::Table::new(),
+            },
+        );
+    }
+    if let Some(backend) = &config.moe_runner_backend {
+        // The grouped expert GEMM is two operators, gather and route,
+        // and one package backend fills both.
+        for operator in [operator::GATHER_GEMM, operator::ROUTE_GEMM] {
             kernels.insert(
-                KernelKey::all(operator::EXPERT_EXCHANGE),
+                KernelKey::all(operator),
                 PackageRevision {
-                    backend: config
-                        .moe_config
-                        .exchange
-                        .clone()
-                        .unwrap_or_else(|| proto::config::DEFAULT_EXPERT_EXCHANGE.to_owned()),
+                    backend: backend.clone(),
                     revision: 0,
                     arguments: toml::Table::new(),
                 },
             );
         }
-        if let Some(backend) = config
-            .moe_runner_backend
-            .as_ref()
-            .filter(|backend| *backend != AUTO_BACKEND)
-        {
-            // The grouped expert GEMM is two operators, gather and route,
-            // and one package backend fills both.
-            for operator in [operator::GATHER_GEMM, operator::ROUTE_GEMM] {
-                kernels.insert(
-                    KernelKey::all(operator),
-                    PackageRevision {
-                        backend: backend.clone(),
-                        revision: 0,
-                        arguments: toml::Table::new(),
-                    },
-                );
-            }
-        }
-        ModuleSet {
-            engine: PackageRevision {
-                backend: config.worker_config.engine.clone(),
-                revision: config.worker_config.engine_revision.unwrap_or(0),
-                arguments: toml::Table::new(),
-            },
-            kernels,
-            policy: PackageRevision {
-                backend: config.scheduler_config.policy.clone(),
-                revision: 0,
-                arguments: policy_arguments(config),
-            },
-        }
+    }
+    ModuleSet {
+        engine: PackageRevision {
+            backend: config.worker_config.engine.clone(),
+            revision: config.worker_config.engine_revision.unwrap_or(0),
+            arguments: toml::Table::new(),
+        },
+        kernels,
+        policy: PackageRevision {
+            backend: config.scheduler_config.policy.clone(),
+            revision: 0,
+            arguments: policy_arguments(config),
+        },
     }
 }
 
-/// The backend name `auto`: a backend option the deployment leaves to the
-/// Build Server's selection, which names no slot of its own.
-const AUTO_BACKEND: &str = "auto";
-
 /// The attention operator's modules: one entry for every phase when the
 /// per-phase backends agree, or one entry per phase when they differ.
-/// A phase left at `auto` names no package: the Build Server selects its
+/// A phase whose backend is unset names no package: the Build Server selects its
 /// keys' packages.
 fn attention_packages(config: &ServerArgs) -> Vec<(KernelKey, PackageRevision)> {
     let prefill = config
         .prefill_attention_backend
         .clone()
-        .unwrap_or_else(|| config.attention_backend.clone());
+        .or_else(|| config.attention_backend.clone());
     let decode = config
         .decode_attention_backend
         .clone()
-        .unwrap_or_else(|| config.attention_backend.clone());
+        .or_else(|| config.attention_backend.clone());
     // No attention package declares parameters: its arguments are none.
     let package = |backend: String| PackageRevision {
         backend,
@@ -600,14 +704,14 @@ fn attention_packages(config: &ServerArgs) -> Vec<(KernelKey, PackageRevision)> 
         arguments: toml::Table::new(),
     };
     if prefill == decode {
-        if prefill == AUTO_BACKEND {
-            return Vec::new();
-        }
-        return vec![(KernelKey::all(operator::PAGED_ATTENTION), package(prefill))];
+        return prefill
+            .map(|backend| (KernelKey::all(operator::PAGED_ATTENTION), package(backend)))
+            .into_iter()
+            .collect();
     }
     [(Phase::Prefill, prefill), (Phase::Decode, decode)]
         .into_iter()
-        .filter(|(_, backend)| backend != AUTO_BACKEND)
+        .filter_map(|(phase, backend)| Some((phase, backend?)))
         .map(|(phase, backend)| {
             (
                 KernelKey::phase(operator::PAGED_ATTENTION, phase),
@@ -809,8 +913,7 @@ mod tests {
             engine: package("uniserve"),
             kernels: BTreeMap::from([(KernelKey::all("rms_norm"), package("triton"))]),
             policy: package("fcfs"),
-            previous_kernels: BTreeMap::new(),
-            previous_policy: None,
+            previous: None,
             status: Status::Serving,
             generation: None,
         }
@@ -835,27 +938,12 @@ mod tests {
         );
     }
 
-    /// The process table reports what the daemon attached: every process it
-    /// supervises, with the fields the daemon's own service wrote, and no
-    /// row of a process that ended.
+    /// The records report the node's process table as the daemon's supervision keeps it: every
+    /// process it supervises, with the fields it wrote, and no row of a process that ended.
     #[test]
     fn the_process_table_reports_the_processes_the_daemon_supervises() {
-        let epochs = Epochs::new();
-        epochs.set_processes(vec![ManagedProcess {
-            group: "engine".to_owned(),
-            rank: 0,
-            pid: Some(41),
-            epoch: Some(0),
-            build: "uniserve".to_owned(),
-            generation: 3,
-            state: ProcessState::Serving,
-        }]);
-        let table = std::sync::Arc::new(Mutex::new(Vec::new()));
-        epochs.attach_processes(std::sync::Arc::clone(&table));
-
-        // The daemon's service owns the rows from now on: an empty table
-        // reports no process, and the record's own rows are not reported
-        // beside it.
+        let table = ProcessTable::default();
+        let epochs = Epochs::new(std::sync::Arc::clone(&table));
         assert!(epochs.processes().is_empty());
         *service::lock(&table) = vec![ManagedProcess {
             group: "engine".to_owned(),
@@ -871,6 +959,12 @@ mod tests {
         assert_eq!(reported["processes"][0]["pid"], serde_json::json!(42));
         assert_eq!(reported["processes"][0]["generation"], serde_json::json!(4));
         assert_eq!(reported["processes"][0]["state"], "serving");
+        service::lock(&table).clear();
+        assert!(
+            epochs.report()["processes"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
     }
 
     /// A process a hot restart's successor adopted is one row: the row the
@@ -878,7 +972,6 @@ mod tests {
     /// pid the service read.
     #[test]
     fn an_adopted_process_is_one_row_of_the_table() {
-        let epochs = Epochs::new();
         let table = std::sync::Arc::new(Mutex::new(vec![ManagedProcess {
             group: "engine".to_owned(),
             rank: 0,
@@ -888,7 +981,7 @@ mod tests {
             generation: 1,
             state: ProcessState::Serving,
         }]));
-        epochs.attach_processes(std::sync::Arc::clone(&table));
+        let epochs = Epochs::new(std::sync::Arc::clone(&table));
 
         epochs.adopt_process(ManagedProcess {
             group: "engine".to_owned(),
@@ -1141,7 +1234,7 @@ mod tests {
                 |config: &mut ServerArgs| config.speculative_config.refill_token_cost = Some(0.5),
             ),
             ("attention_backend", |config: &mut ServerArgs| {
-                config.attention_backend = "flashinfer".to_owned()
+                config.attention_backend = Some("flashinfer".to_owned())
             }),
             ("prefill_attention_backend", |config: &mut ServerArgs| {
                 config.prefill_attention_backend = Some("fa4".to_owned())
@@ -1243,7 +1336,7 @@ mod tests {
         // A package's revision is a generation change: the same backend
         // and parameters at a newly installed revision move the modules.
         let named_base = Epoch::of(set(|config: &mut ServerArgs| {
-            config.attention_backend = "trtllm".to_owned();
+            config.attention_backend = Some("trtllm".to_owned());
         }))
         .expect("the configuration resolves");
         let mut installed = named_base.clone();
@@ -1359,7 +1452,7 @@ mod tests {
         // phase falls back to `attention_backend`, which the split above
         // keeps as a phase of its own.
         let one = ServerArgs {
-            attention_backend: "fa4".to_owned(),
+            attention_backend: Some("fa4".to_owned()),
             ..Default::default()
         };
         let modules = crate::epoch::modules_of(&one);
@@ -1399,14 +1492,13 @@ mod tests {
         }
     }
 
-    /// A backend option left at `auto` names no slot, whichever phase it is
+    /// A backend option left unset names no slot, whichever phase it is
     /// for: the Build Server selects that operator's packages, and a phase
     /// the deployment does name keeps its package.
     #[test]
-    fn a_backend_left_at_auto_names_no_package() {
+    fn an_unset_backend_names_no_package() {
         let mut config = ServerArgs {
             decode_attention_backend: Some("triton".to_owned()),
-            moe_runner_backend: Some("auto".to_owned()),
             ..Default::default()
         };
         let modules = crate::epoch::modules_of(&config);
@@ -1415,7 +1507,7 @@ mod tests {
             vec![KernelKey::phase(operator::PAGED_ATTENTION, Phase::Decode)]
         );
 
-        config.attention_backend = "trtllm".to_owned();
+        config.attention_backend = Some("trtllm".to_owned());
         config.decode_attention_backend = None;
         let modules = crate::epoch::modules_of(&config);
         assert_eq!(
@@ -1432,16 +1524,16 @@ mod tests {
 
         let fault = proto::process::Report {
             kind: Some(Kind::Fault(proto::process::Fault {
-                kind: "launch_failed".to_owned(),
-                reason: "too many resources requested".to_owned(),
-                device: 2,
+                kind: proto::process::FaultKind::Device.into(),
+                reason: "an illegal memory access was encountered".to_owned(),
+                device: Some(2),
             })),
         };
         assert_eq!(
             Failure::of_report(&fault),
             Some(Failure {
-                kind: "launch_failed".to_owned(),
-                reason: "too many resources requested".to_owned(),
+                kind: FailureKind::Fault(proto::process::FaultKind::Device),
+                reason: "an illegal memory access was encountered".to_owned(),
                 device: Some(2),
             })
         );
@@ -1456,7 +1548,7 @@ mod tests {
         };
         assert_eq!(
             Failure::of_report(&stalled).map(|failure| failure.kind),
-            Some("stalled".to_owned())
+            Some(FailureKind::Stalled)
         );
 
         // The policy's failure names the instance, the backend and the
@@ -1471,7 +1563,7 @@ mod tests {
             })),
         };
         let failure = Failure::of_report(&rolled_back).expect("a policy rollback fails the update");
-        assert_eq!(failure.kind, "policy_rolled_back");
+        assert_eq!(failure.kind, FailureKind::PolicyRolledBack);
         assert!(failure.reason.contains("scheduler 2"), "{}", failure.reason);
         assert!(failure.reason.contains("trtllm"), "{}", failure.reason);
         assert!(failure.reason.contains("revision 7"), "{}", failure.reason);
@@ -1534,7 +1626,7 @@ mod tests {
     /// highest number that is serving or on trial.
     #[test]
     fn epochs_are_reported_by_operator_phase_and_status() {
-        let epochs = Epochs::new();
+        let epochs = Epochs::default();
         let mut first = record();
         first.status = Status::Trial;
         epochs.record(1, first);
@@ -1548,7 +1640,7 @@ mod tests {
         assert_eq!(
             epochs
                 .serving()
-                .map(|(epoch, record)| (epoch, record.status)),
+                .map(|(epoch, record)| (epoch.number(), record.status)),
             Some((1, Status::Trial))
         );
 
@@ -1574,7 +1666,7 @@ mod tests {
     /// The process table names each process's epoch and state.
     #[test]
     fn the_process_table_reports_what_the_daemon_manages() {
-        let epochs = Epochs::new();
+        let epochs = Epochs::default();
         epochs.set_processes(vec![ManagedProcess {
             group: "engine".to_owned(),
             rank: 0,

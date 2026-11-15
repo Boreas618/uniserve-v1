@@ -26,6 +26,7 @@ mod endpoint;
 pub mod frame;
 pub mod host;
 pub mod logging;
+pub mod msgpack;
 mod readiness;
 mod runtime;
 

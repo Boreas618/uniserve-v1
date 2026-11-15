@@ -2,7 +2,7 @@
 //!
 //! Beside every node's serving engine the daemon keeps a parked
 //! standby of the same group, rank and epoch at the next launch
-//! generation. The standby has its own CUDA contexts, so a sticky error of the
+//! generation. The standby has device contexts of its own, so a sticky error of the
 //! serving process cannot touch it; it maps the epoch's weights and cache
 //! read-only by the existing rules, captures its graphs on warmup scratch
 //! and parks, keeping its graph pools, scratch and communicators resident or
@@ -51,11 +51,11 @@ pub struct MainProcess {
     /// serving engine a relaunch starts when no standby can be promoted. The
     /// caller takes it from the group and rank's **single generation
     /// counter**, and it is above every live generation of that group and
-    /// rank when taken; these rules never mint a generation number. `0` means
-    /// none was taken: the rules then return [`Action::Allocate`] and change
-    /// nothing, and the caller takes a number, records it with
+    /// rank when taken; these rules never mint a generation number. `None`
+    /// while none is taken: the rules then return [`Action::Allocate`] and
+    /// change nothing, and the caller takes a number, records it with
     /// [`Standbys::allocated`] and asks again.
-    pub standby_generation: u64,
+    pub standby_generation: Option<u64>,
     /// The cross-node epoch the node's process joins; `None` when the node
     /// is in no cross-node group and is therefore a failure domain alone.
     pub epoch: Option<u64>,
@@ -137,23 +137,6 @@ pub enum Action {
     /// The node cannot run again after a device fault: its requests migrate
     /// to another node or replica.
     Migrate { host: String },
-}
-
-/// Whether a failure replaces the whole failure domain: the kinds
-/// [`Failure`] names for a process that cannot go on, and a stalled job.
-/// A request-level failure replaces nothing: a refused request, a
-/// request's non-finite logits, or a scheduling policy rolled back after a
-/// commit.
-pub fn replaces_domain(failure: &Failure) -> bool {
-    matches!(
-        failure.kind.as_str(),
-        "sticky"
-            | "illegal_address"
-            | "launch_failed"
-            | "out_of_memory"
-            | "process_exit"
-            | "stalled"
-    )
 }
 
 /// Where a domain is in the standby's life.
@@ -280,11 +263,28 @@ impl Standbys {
             .collect()
     }
 
+    /// The index of the node `host` names.
+    fn node_of(&self, host: &str) -> Option<usize> {
+        self.nodes.iter().position(|node| node.process.host == host)
+    }
+
+    /// Replaces `domain`, which `host`'s failure lost, by relaunching every member: no promotion,
+    /// not even of the members that have a parked standby. A member without the generation number
+    /// its relaunch takes makes the round wait for the numbers ([`Action::Allocate`]); the caller
+    /// records them with [`Standbys::allocated`] and the round goes on.
+    fn replace_domain(&mut self, host: &str, domain: usize) -> Vec<Action> {
+        match self.relaunch_all(host, domain) {
+            Some(actions) => actions,
+            None => {
+                self.phases[domain] = Phase::Allocating;
+                self.deferred[domain] = Some(host.to_owned());
+                self.allocate_actions(domain)
+            }
+        }
+    }
+
     fn domain_of(&self, host: &str) -> Option<usize> {
-        self.nodes
-            .iter()
-            .position(|node| node.process.host == host)
-            .map(|node| self.domain_of[node])
+        self.node_of(host).map(|node| self.domain_of[node])
     }
 
     fn live(&self, domain: usize) -> Vec<usize> {
@@ -340,14 +340,16 @@ impl Standbys {
             };
             if live
                 .iter()
-                .any(|&node| self.nodes[node].process.standby_generation == 0)
+                .any(|&node| self.nodes[node].process.standby_generation.is_none())
             {
                 actions.extend(self.allocate_actions(domain));
                 continue;
             }
             for node in live {
                 let process = self.nodes[node].process.clone();
-                let generation = process.standby_generation;
+                let Some(generation) = process.standby_generation else {
+                    continue;
+                };
                 actions.push(Action::Spawn {
                     host: process.host.clone(),
                     group: process.group.clone(),
@@ -360,7 +362,7 @@ impl Standbys {
                     parked: false,
                 });
                 // The number is spent; the next engine needs a new one.
-                self.nodes[node].process.standby_generation = 0;
+                self.nodes[node].process.standby_generation = None;
             }
             self.phases[domain] = Phase::Starting;
         }
@@ -378,7 +380,7 @@ impl Standbys {
         let Some(domain) = self.domain_of(host) else {
             return;
         };
-        let Some(node) = self.nodes.iter().position(|node| node.process.host == host) else {
+        let Some(node) = self.node_of(host) else {
             return;
         };
         match self.nodes[node].standby.as_mut() {
@@ -403,7 +405,7 @@ impl Standbys {
         if self.phases[domain] != Phase::Starting && self.phases[domain] != Phase::Parked {
             return Vec::new();
         }
-        let lost = self.nodes.iter().position(|node| node.process.host == host);
+        let lost = self.node_of(host);
         let mut actions = Vec::new();
         for node in self.live(domain) {
             if Some(node) == lost {
@@ -432,7 +434,7 @@ impl Standbys {
     /// promotion, because whether one is possible is the domain's state, not
     /// the failure's.
     pub fn failed(&mut self, host: &str, failure: &Failure) -> Vec<Action> {
-        if !replaces_domain(failure) {
+        if !failure.kind.replaces_domain() {
             return Vec::new();
         }
         let Some(domain) = self.domain_of(host) else {
@@ -479,22 +481,14 @@ impl Standbys {
         }
         // A member has no parked standby: replace the domain by relaunching
         // every member; no promotion, not even of the members that have one.
-        match self.relaunch_all(host, domain) {
-            Some(actions) => actions,
-            None => {
-                // The round waits for its generation numbers.
-                self.phases[domain] = Phase::Allocating;
-                self.deferred[domain] = Some(host.to_owned());
-                self.allocate_actions(domain)
-            }
-        }
+        self.replace_domain(host, domain)
     }
 
     /// The `Allocate` action of every live node of `domain` without a number.
     fn allocate_actions(&self, domain: usize) -> Vec<Action> {
         self.live(domain)
             .into_iter()
-            .filter(|&node| self.nodes[node].process.standby_generation == 0)
+            .filter(|&node| self.nodes[node].process.standby_generation.is_none())
             .map(|node| {
                 let process = &self.nodes[node].process;
                 Action::Allocate {
@@ -510,10 +504,10 @@ impl Standbys {
     /// from the group and rank's single counter. A replacement round that was
     /// waiting for numbers starts with the last one.
     pub fn allocated(&mut self, host: &str, generation: u64) -> Vec<Action> {
-        let Some(node) = self.nodes.iter().position(|node| node.process.host == host) else {
+        let Some(node) = self.node_of(host) else {
             return Vec::new();
         };
-        self.nodes[node].process.standby_generation = generation;
+        self.nodes[node].process.standby_generation = Some(generation);
         let Some(domain) = self.domain_of(host) else {
             return Vec::new();
         };
@@ -523,7 +517,7 @@ impl Standbys {
         if self
             .live(domain)
             .iter()
-            .any(|&node| self.nodes[node].process.standby_generation == 0)
+            .any(|&node| self.nodes[node].process.standby_generation.is_none())
         {
             return Vec::new();
         }
@@ -542,7 +536,7 @@ impl Standbys {
         let live = self.live(domain);
         if live
             .iter()
-            .any(|&node| self.nodes[node].process.standby_generation == 0)
+            .any(|&node| self.nodes[node].process.standby_generation.is_none())
         {
             return None;
         }
@@ -550,7 +544,9 @@ impl Standbys {
         for &node in &live {
             let process = self.nodes[node].process.clone();
             let generation = process.generation;
-            let next = process.standby_generation;
+            let Some(next) = process.standby_generation else {
+                continue;
+            };
             if let Some(standby) = self.nodes[node].standby.take() {
                 actions.push(Action::Terminate {
                     host: process.host.clone(),
@@ -571,7 +567,7 @@ impl Standbys {
                 generation: next,
             });
             // The number is spent; the next engine needs a new one.
-            self.nodes[node].process.standby_generation = 0;
+            self.nodes[node].process.standby_generation = None;
         }
         self.phases[domain] = Phase::Relaunching {
             awaiting: live.len(),
@@ -616,7 +612,7 @@ impl Standbys {
             if let Some(standby) = self.nodes[node].standby.take() {
                 self.nodes[node].process.generation = standby.generation;
                 // The next engine needs a number from the counter.
-                self.nodes[node].process.standby_generation = 0;
+                self.nodes[node].process.standby_generation = None;
             }
         }
         self.phases[domain] = Phase::Absent;
@@ -631,14 +627,7 @@ impl Standbys {
         if !matches!(self.phases[domain], Phase::Promoting { .. }) {
             return Vec::new();
         }
-        match self.relaunch_all(host, domain) {
-            Some(actions) => actions,
-            None => {
-                self.phases[domain] = Phase::Allocating;
-                self.deferred[domain] = Some(host.to_owned());
-                self.allocate_actions(domain)
-            }
-        }
+        self.replace_domain(host, domain)
     }
 
     /// The serving engine of `host` started again at `generation`.
@@ -651,7 +640,7 @@ impl Standbys {
         };
         if let Some(node) = self.nodes.iter_mut().find(|node| node.process.host == host) {
             node.process.generation = generation;
-            node.process.standby_generation = 0;
+            node.process.standby_generation = None;
         }
         self.phases[domain] = if awaiting <= 1 {
             Phase::Absent
@@ -675,7 +664,7 @@ impl Standbys {
         let Some(domain) = self.domain_of(host) else {
             return Vec::new();
         };
-        let Some(node) = self.nodes.iter().position(|node| node.process.host == host) else {
+        let Some(node) = self.node_of(host) else {
             return Vec::new();
         };
         self.nodes[node].gone = true;
@@ -698,14 +687,7 @@ impl Standbys {
         // serving engines are replaced, and the requests migrate off the
         // node that cannot run. The epoch's rank layout loses the node, which
         // the caller decides.
-        match self.relaunch_all(host, domain) {
-            Some(relaunched) => actions.extend(relaunched),
-            None => {
-                self.phases[domain] = Phase::Allocating;
-                self.deferred[domain] = Some(host.to_owned());
-                actions.extend(self.allocate_actions(domain));
-            }
-        }
+        actions.extend(self.replace_domain(host, domain));
         actions.push(Action::Migrate {
             host: host.to_owned(),
         });
@@ -733,7 +715,7 @@ impl Standbys {
         ) {
             return Vec::new();
         }
-        let Some(node) = self.nodes.iter().position(|node| node.process.host == host) else {
+        let Some(node) = self.node_of(host) else {
             return Vec::new();
         };
         self.nodes[node].retired = true;

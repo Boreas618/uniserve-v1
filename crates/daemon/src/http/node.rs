@@ -330,10 +330,10 @@ async fn serve_deployment(
         .context("a deployment of one node leads")?
         .to_owned();
     let retire = Arc::new(AtomicBool::new(false));
-    let epoch_records = Arc::new(crate::epoch::Epochs::new());
     let (updates, awake) = daemon
-        .updater(Arc::clone(&epoch_records), name.clone())
+        .updater(name.clone())
         .context("the leader's daemon commands no engine")?;
+    let epoch_records = Arc::clone(updates.epochs());
     Daemon::advance_updates(Arc::clone(&updates), awake)
         .context("starting the updater's thread")?;
     let served = async {

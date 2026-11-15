@@ -732,14 +732,43 @@ message Stalled {
   uint64 elapsed_ms = 4;
 }
 
-// A fatal condition the engine observed. `kind` is one of `sticky`,
-// `illegal_address`, `launch_failed`, `out_of_memory`, `process_exit`;
-// `device` the CUDA ordinal it happened on, when it names one; `reason` the
-// driver's message.
+// What part of an engine a fatal condition broke, which decides what the
+// daemon does about it: a fault of the device or of a process makes the
+// process's failure domain unusable, the others fail the operation or the
+// engine they were observed in.
+enum FaultKind {
+  FAULT_KIND_UNSPECIFIED = 0;
+  // A device's context holds a sticky error: nothing more runs on it.
+  FAULT_KIND_DEVICE = 1;
+  // A change of the ranks' weights failed part of the way.
+  FAULT_KIND_WEIGHTS = 2;
+  // The scheduling policy failed with no previous module to return to.
+  FAULT_KIND_POLICY = 3;
+  // A process of the engine exited.
+  FAULT_KIND_PROCESS_EXIT = 4;
+  // A scheduler thread failed or ended.
+  FAULT_KIND_SCHEDULER = 5;
+  // The thread of the data plane's operations failed.
+  FAULT_KIND_OPERATIONS = 6;
+  // The work the engine's ranks run failed.
+  FAULT_KIND_WORK = 7;
+  // The engine's start failed.
+  FAULT_KIND_START = 8;
+  // A promotion, commit, rollback, drain or release of an epoch failed.
+  FAULT_KIND_PROMOTE = 9;
+  FAULT_KIND_COMMIT = 10;
+  FAULT_KIND_ROLLBACK = 11;
+  FAULT_KIND_DRAIN = 12;
+  FAULT_KIND_RELEASE = 13;
+}
+
+// A fatal condition the engine observed: its `kind`, the ordinal of the
+// device it happened on when it names one, and the account given with it
+// (the driver's message for a device fault).
 message Fault {
-  string kind = 1;
+  FaultKind kind = 1;
   string reason = 2;
-  uint32 device = 3;
+  optional uint32 device = 3;
 }
 
 message NonFiniteLogits {

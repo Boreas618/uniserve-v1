@@ -405,7 +405,7 @@ mod tests {
 
     /// The processes of a deployment whose engines and nodes are fakes.
     fn processes() -> (Arc<Epochs>, Engines, Processes) {
-        let epochs = Arc::new(Epochs::new());
+        let epochs = Arc::new(Epochs::default());
         let (engines, link) = Engines::link(Refusals::default());
         let processes = Processes::new(Arc::clone(&epochs), "deployment".to_owned(), link);
         (epochs, engines, processes)

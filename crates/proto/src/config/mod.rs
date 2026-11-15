@@ -1520,7 +1520,7 @@ pub struct EngineConfig {
     pub max_logprobs: u32,
     /// The attention package's backend, and the ones that fill prompt processing and one decoding
     /// token when they differ.
-    pub attention_backend: String,
+    pub attention_backend: Option<String>,
     pub prefill_attention_backend: Option<String>,
     pub decode_attention_backend: Option<String>,
     /// The grouped expert GEMM package's backend.
