@@ -28,6 +28,9 @@ futures.workspace = true
 # The checkpoint's own files and the Hub's cache layout.
 hf-hub.workspace = true
 http-body.workspace = true
+# The HTTP/1.1 request heads, chunk sizes and trailer sections the daemon's
+# own connections parse (`http::conn`).
+httparse.workspace = true
 image.workspace = true
 # The IANA special-purpose address registries: the destinations a media fetch may not reach.
 iprfc.workspace = true
@@ -37,8 +40,10 @@ itertools.workspace = true
 # The schemas of a request's tools, which type and check a tag tool call's arguments.
 jsonschema.workspace = true
 libc.workspace = true
-# This host's name (`uname(2)`), the default host identity.
-rustix.workspace = true
+# This host's name (`uname(2)`), the default host identity; a handed
+# connection's socket family; the monotonic clock a handoff's pause is
+# measured on.
+rustix = { workspace = true, features = ["net", "time"] }
 llm-multimodal.workspace = true
 # The media decoders condition media is probed with, the ones that read it.
 media.workspace = true

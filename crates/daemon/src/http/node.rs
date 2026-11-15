@@ -98,7 +98,7 @@ pub async fn node(
     let listener = Listener::bind(&admin)
         .await
         .context("failed to bind the admin API's listener")?;
-    let address = listener.local_addr()?;
+    let address = listener.endpoint()?;
     let admins = super::admin::Listeners::bind(&admin, instance.path())?;
     {
         let endpoints = ready.endpoints();
@@ -149,6 +149,7 @@ pub async fn node(
     let served = super::conn::serve(
         listener,
         app,
+        super::conn::Limits::of(&server),
         shutdown.clone(),
         super::handoff::Admissions::default(),
     )
@@ -358,7 +359,7 @@ async fn serve_deployment(
             Arc::clone(&engine),
             Arc::clone(&jobs),
             &node.server,
-            video_body_limit(&config.media_config),
+            video_body_limit(&config.media_config, &node.server),
             None,
         );
         let state = super::admin::AdminState {

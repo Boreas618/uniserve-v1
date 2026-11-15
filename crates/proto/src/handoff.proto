@@ -74,6 +74,14 @@ message Http {
   // zero holds the head the same way, because the bytes in `unwritten` are a
   // status this process had not committed to.
   bool head_held = 8;
+  // Whether the request's body was read to its end. Only then are the
+  // socket's next bytes the client's next request or its end of stream,
+  // which the successor watches for to learn that the client left.
+  bool request_body_ended = 9;
+  // Body bytes this process produced into the response's byte stream,
+  // written or in `unwritten`, framing excluded. The successor adds its own,
+  // so a declared `content_length` is checked over the whole body.
+  uint64 body_bytes = 10;
 }
 
 // A chat completion streamed as server-sent events, stopped at an event

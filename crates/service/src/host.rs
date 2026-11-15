@@ -208,31 +208,59 @@ pub fn bind<S: DeserializeOwned>(socket: &Path) -> io::Result<Bound<S>> {
 
     let start = open_lock(&beside(socket, "start"))?;
     flock(&start, libc::LOCK_EX)?;
-    let lock = open_lock(&beside(socket, "lock"))?;
-    if !flock(&lock, libc::LOCK_EX | libc::LOCK_NB)? {
+    let Some((listener, lock)) = own(socket)? else {
         // The owner finished its start before this process took the start lock, so its record
         // is published.
         return read_published(socket).map(|record| Bound::Serving(Box::new(record)));
-    }
-
-    // The lock is ours, so a socket file present now belongs to no live server.
-    match std::fs::remove_file(socket) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let listener = UnixListener::bind(socket)?;
+    };
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(PRIVATE_FILE))?;
     Ok(Bound::Owner {
         listener,
         starting: Starting {
-            lock: SocketLock {
-                file: lock,
-                socket: socket.to_owned(),
-            },
+            lock,
             _start: start,
         },
     })
+}
+
+/// Binds the Unix socket `socket` as its owner, or finds that another process owns it.
+///
+/// Ownership is the lock `NAME.lock` beside the socket, held for the owner's life
+/// ([`SocketLock`]): with the lock taken, a socket file at the path was left by an owner that is
+/// gone and is replaced, and the socket is removed when the owner drops the lock. `None` when
+/// another process holds the lock. A path that holds a file other than a socket is not replaced.
+///
+/// # Errors
+///
+/// Fails when the lock cannot be opened or taken, a leftover socket cannot be removed, or the
+/// socket cannot be bound.
+pub fn own(socket: &Path) -> io::Result<Option<(UnixListener, SocketLock)>> {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let lock = open_lock(&beside(socket, "lock"))?;
+    if !flock(&lock, libc::LOCK_EX | libc::LOCK_NB)? {
+        return Ok(None);
+    }
+    // The lock is ours, so a socket file present now belongs to no live owner.
+    match std::fs::symlink_metadata(socket) {
+        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(socket)?,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("{} is not a socket", socket.display()),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let listener = UnixListener::bind(socket)?;
+    Ok(Some((
+        listener,
+        SocketLock {
+            file: lock,
+            socket: socket.to_owned(),
+        },
+    )))
 }
 
 /// The record of the server that owns `socket`, once it serves; `None` when no server owns it.

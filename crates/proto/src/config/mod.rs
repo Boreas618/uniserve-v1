@@ -46,6 +46,34 @@ pub const fn positive(count: usize) -> NonZeroUsize {
     }
 }
 
+/// The largest request head the HTTP server reads when the deployment states none
+/// (`server_config.max_request_head`), in bytes: a head of the API's routes is a few hundred
+/// bytes, and 64 KiB bounds what one connection buffers before its head parses, as the default
+/// head limits of common HTTP servers do.
+pub const REQUEST_HEAD_BYTES: usize = 64 << 10;
+
+/// The largest request body the HTTP server reads when the deployment states none
+/// (`server_config.max_request_body`), in bytes: room for a chat request that carries its
+/// images inline as base64 data URIs.
+pub const REQUEST_BODY_BYTES: usize = 64 << 20;
+
+/// How long a server-sent-events response waits for its next event before a comment keeps its
+/// connection alive, when the deployment states none (`server_config.stream_keep_alive`): below
+/// the idle timeout of common proxies and load balancers (60 s), so a stream that waits through
+/// a long prefill is not cut by one.
+pub const STREAM_KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+/// The longest client `X-Request-Id` the server takes as a request's ID when the deployment
+/// states none (`server_config.max_request_id`), in bytes: a generated ID is 32 characters and
+/// correlation IDs are short, and the bound caps the client data that enters the logs and the
+/// echoed header.
+pub const REQUEST_ID_BYTES: usize = 128;
+
+/// The `Retry-After` a request shed by the concurrency limit is answered with when the
+/// deployment states none (`server_config.retry_after`): a permit frees as soon as one response
+/// ends, so the header's resolution, one second.
+pub const RETRY_AFTER: Duration = Duration::from_secs(1);
+
 /// How the HTTP server answers (`server_config`); where it listens is the daemon's
 /// `admin_config`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -68,6 +96,27 @@ pub struct ServerConfig {
     /// Add an `X-Request-Id` response header with the ID the request ran
     /// under.
     pub request_id_headers: bool,
+    /// Largest request head (request line and headers), and largest trailer
+    /// section of a chunked request body; a larger head is answered with 431.
+    #[serde(with = "values::byte_count")]
+    pub max_request_head: usize,
+    /// Largest request body of every route but the video submissions, which
+    /// take what `media_config.max_request_bytes` of base64 media needs and
+    /// never less; a larger body is answered with 413.
+    #[serde(with = "values::byte_count")]
+    pub max_request_body: usize,
+    /// Time a server-sent-events response waits for its next event before a
+    /// comment keeps the connection alive.
+    #[serde(with = "values::duration")]
+    pub stream_keep_alive: Duration,
+    /// Longest client `X-Request-Id` taken as the request's ID; a longer one
+    /// is replaced by a generated ID.
+    #[serde(with = "values::byte_count")]
+    pub max_request_id: usize,
+    /// `Retry-After` of a request the concurrency limit sheds, in whole
+    /// seconds.
+    #[serde(with = "values::duration")]
+    pub retry_after: Duration,
 }
 
 impl Default for ServerConfig {
@@ -78,6 +127,11 @@ impl Default for ServerConfig {
             max_concurrent_requests: None,
             shutdown_timeout: Duration::from_secs(30),
             request_id_headers: false,
+            max_request_head: REQUEST_HEAD_BYTES,
+            max_request_body: REQUEST_BODY_BYTES,
+            stream_keep_alive: STREAM_KEEP_ALIVE,
+            max_request_id: REQUEST_ID_BYTES,
+            retry_after: RETRY_AFTER,
         }
     }
 }

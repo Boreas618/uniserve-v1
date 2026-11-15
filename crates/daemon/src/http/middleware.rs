@@ -29,30 +29,26 @@ use crate::http::stream::HandedBody;
 
 const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
-/// Maximum accepted length, in bytes, of a client-supplied request ID.
-///
-/// A generated ID (a `uuid4` in simple form) is 32 characters and legitimate
-/// correlation IDs are short. The cap bounds how much client-controlled data
-/// enters the request ID, logs, and the echoed response header.
-const MAX_REQUEST_ID_LEN: usize = 128;
-
-/// `Retry-After` hint, in seconds, of a request the concurrency limit sheds.
-const RETRY_AFTER_SECONDS: HeaderValue = HeaderValue::from_static("1");
-
 /// Resolves the request's ID and, when `echo` is set, returns it in the
 /// `X-Request-Id` response header.
 ///
 /// The client's `X-Request-Id` is used when it is acceptable (see
-/// `is_acceptable_request_id`); otherwise a fresh ID is generated. The ID is
-/// inserted as [`RequestId`] before the inner service runs. This is the
-/// outermost layer, so every response carries the header when enabled,
-/// including an API-key refusal and a shed request.
-pub(crate) async fn resolve_request_id(echo: bool, mut request: Request, next: Next) -> Response {
+/// `is_acceptable_request_id`, with `server_config.max_request_id` as
+/// `max_length`); otherwise a fresh ID is generated. The ID is inserted as
+/// [`RequestId`] before the inner service runs. This is the outermost layer,
+/// so every response carries the header when enabled, including an API-key
+/// refusal and a shed request.
+pub(crate) async fn resolve_request_id(
+    echo: bool,
+    max_length: usize,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let id = request
         .headers()
         .get(&X_REQUEST_ID)
         .and_then(|value| value.to_str().ok())
-        .filter(|id| is_acceptable_request_id(id))
+        .filter(|id| is_acceptable_request_id(id, max_length))
         .map_or_else(generate_request_id, ToOwned::to_owned);
     request.extensions_mut().insert(RequestId(id.clone()));
 
@@ -69,11 +65,12 @@ pub(crate) async fn resolve_request_id(echo: bool, mut request: Request, next: N
 /// Returns whether a client-supplied request ID (already visible ASCII) is
 /// used as the request's ID.
 ///
-/// Rejects empty and over-long values and any value containing whitespace or
-/// a control character, which would otherwise allow log injection.
-fn is_acceptable_request_id(id: &str) -> bool {
+/// Rejects empty values, values longer than `max_length` bytes and any value
+/// containing whitespace or a control character, which would otherwise allow
+/// log injection.
+fn is_acceptable_request_id(id: &str, max_length: usize) -> bool {
     !id.is_empty()
-        && id.len() <= MAX_REQUEST_ID_LEN
+        && id.len() <= max_length
         && id.chars().all(|c| !c.is_control() && !c.is_whitespace())
 }
 
@@ -86,20 +83,18 @@ fn generate_request_id() -> String {
 /// Refuses a request without `Authorization: Bearer <key>` for `key` with
 /// `401 Unauthorized`.
 ///
-/// The scheme may be spelled `Bearer` or `bearer`, and whitespace around the
-/// token is ignored. A missing header, a non-visible-ASCII header value, or
-/// any other scheme is refused.
+/// The authentication scheme is matched without regard to case, as RFC 9110
+/// §11.1 states, and the credentials follow it after whitespace. A missing
+/// header, a non-visible-ASCII header value, or any other scheme is refused.
 pub(crate) async fn require_api_key(key: Arc<str>, request: Request, next: Next) -> Response {
     let token = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
-            value
-                .strip_prefix("Bearer ")
-                .or_else(|| value.strip_prefix("bearer "))
-        });
-    if token.is_some_and(|token| constant_time_eq(token.trim().as_bytes(), key.as_bytes())) {
+        .and_then(|value| value.trim().split_once(char::is_whitespace))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim());
+    if token.is_some_and(|token| constant_time_eq(token.as_bytes(), key.as_bytes())) {
         next.run(request).await
     } else {
         ApiError::Unauthorized.into_response()
@@ -168,18 +163,23 @@ fn timed_out(timeout: Duration) -> ApiError {
 pub(crate) struct ConcurrencyLimit {
     permits: Arc<Semaphore>,
     limit: u64,
+    /// The `Retry-After` a shed request is answered with
+    /// (`server_config.retry_after`), in whole seconds.
+    retry_after: HeaderValue,
 }
 
 impl ConcurrencyLimit {
-    /// A limit of `limit` concurrent generation requests; a limit above the
-    /// semaphore's capacity is that capacity, which no server reaches.
-    pub(crate) fn new(limit: NonZeroU64) -> Self {
+    /// A limit of `limit` concurrent generation requests, shedding with a
+    /// `Retry-After` of `retry_after`; a limit above the semaphore's capacity
+    /// is that capacity, which no server reaches.
+    pub(crate) fn new(limit: NonZeroU64, retry_after: Duration) -> Self {
         let permits = usize::try_from(limit.get())
             .unwrap_or(usize::MAX)
             .min(Semaphore::MAX_PERMITS);
         Self {
             permits: Arc::new(Semaphore::new(permits)),
             limit: limit.get(),
+            retry_after: HeaderValue::from(retry_after.as_secs()),
         }
     }
 
@@ -201,28 +201,33 @@ impl ConcurrencyLimit {
             let mut response = overloaded(message);
             response
                 .headers_mut()
-                .insert(RETRY_AFTER, RETRY_AFTER_SECONDS);
+                .insert(RETRY_AFTER, self.retry_after.clone());
             return response;
         };
         guard_body(next.run(request).await, permit)
     }
 }
 
-/// Records API-server HTTP metrics with Python-compatible
-/// (`PrometheusFastApiInstrumentator` style) family names and labels.
+/// Records the API server's HTTP metrics (`metrics::api_server`).
 ///
-/// The `handler` label is the matched route template and the `method` label
-/// the request method, `other` for a method outside the standard set, which
-/// keeps the label set bounded as vLLM does. The `status` label is the status
-/// class of the response head, so a stream that fails after its head was sent
-/// still counts under that class. The duration is measured until the response
-/// body is dropped: an SSE handler returns its body at once, so observing at
-/// handler return would record a near-zero duration.
+/// It is a route layer, so it runs only for a request a route matched: the
+/// `handler` label is that route's template, and the `method` label the
+/// request method, `other` for a method outside the standard set, which keeps
+/// the label set bounded. The `status` label is the status class of the
+/// response head, so a stream that fails after its head was sent still counts
+/// under that class. The duration is measured until the response body is
+/// dropped: an SSE handler returns its body at once, so observing at handler
+/// return would record a near-zero duration.
 pub(crate) async fn track_http_metrics(request: Request, next: Next) -> Response {
+    #[expect(
+        clippy::expect_used,
+        reason = "a route layer runs for a matched route, which the router names"
+    )]
     let handler = request
         .extensions()
         .get::<MatchedPath>()
-        .map_or("none", MatchedPath::as_str)
+        .expect("a matched route")
+        .as_str()
         .to_owned();
     let method = method_label(request.method());
     let started_at = Instant::now();
@@ -272,8 +277,6 @@ impl Drop for MetricsGuard {
                 handler: self.handler.clone(),
             })
             .observe(elapsed);
-
-        metrics.http_request_duration_highr_seconds.observe(elapsed);
     }
 }
 
@@ -400,12 +403,46 @@ mod tests {
         assert_eq!(id, "chatcmpl-client/42");
     }
 
+    /// The API key's authentication scheme is matched whatever its case, and
+    /// any other scheme, or another key, is refused.
+    #[tokio::test]
+    async fn the_bearer_scheme_is_matched_whatever_its_case() {
+        let router = router_with(
+            served_engine(crate::test_support::CHAT),
+            &ServerConfig {
+                api_key: Some("secret".to_owned()),
+                ..ServerConfig::default()
+            },
+        );
+        for (authorization, status) in [
+            ("Bearer secret", StatusCode::OK),
+            ("bearer secret", StatusCode::OK),
+            ("BEARER   secret", StatusCode::OK),
+            ("Basic secret", StatusCode::UNAUTHORIZED),
+            ("Bearer other", StatusCode::UNAUTHORIZED),
+            ("Bearersecret", StatusCode::UNAUTHORIZED),
+        ] {
+            let request = axum::http::Request::builder()
+                .uri("/v1/models")
+                .header("authorization", authorization)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let (answered, _, body) = send(&router, request).await;
+            assert_eq!(answered, status, "{authorization:?}: {body}");
+        }
+    }
+
     /// A client ID the server refuses (empty, containing whitespace, or longer
-    /// than 128 bytes) is replaced by one generated ID, used for both the
-    /// header and the request.
+    /// than `server_config.max_request_id`) is replaced by one generated ID,
+    /// used for both the header and the request.
     #[tokio::test]
     async fn a_refused_client_id_is_replaced_by_one_generated_id() {
-        for refused in [String::new(), "has space".to_owned(), "a".repeat(129)] {
+        let longest = ServerConfig::default().max_request_id;
+        for refused in [
+            String::new(),
+            "has space".to_owned(),
+            "a".repeat(longest + 1),
+        ] {
             let (header, id) = chat(Some(&refused)).await;
             assert_ne!(header, refused);
             assert_eq!(id, format!("chatcmpl-{header}"));

@@ -987,6 +987,7 @@ dependencies = [
  "futures",
  "hf-hub 0.5.0",
  "http-body",
+ "httparse",
  "image",
  "indexmap 2.14.0",
  "iprfc",

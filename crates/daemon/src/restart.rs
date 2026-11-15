@@ -175,8 +175,9 @@ pub(crate) struct Restarter {
     /// The daemon's service, which `serve` stops once the restart handed it
     /// over.
     pub(crate) daemon: Arc<std::sync::Mutex<Option<Daemon>>>,
-    /// A duplicate of the HTTP listener, and what the successor needs of it.
-    listener: std::sync::Mutex<Option<(ListenerHandoff, OwnedFd)>>,
+    /// A duplicate of the HTTP listener, and what the successor needs of it:
+    /// its descriptors, in the order [`Listener::resume`] takes them.
+    listener: std::sync::Mutex<Option<(ListenerHandoff, Vec<OwnedFd>)>>,
     /// The daemon's instance directory, which the successor goes on with.
     instance: std::path::PathBuf,
     stated: Stated,
@@ -359,10 +360,9 @@ impl Restarter {
                 .context("the daemon's service is not running")?
                 .hand_over()?
         };
-        let (listener, listener_descriptor) = ::service::lock(&self.listener)
+        let (listener, mut descriptors) = ::service::lock(&self.listener)
             .take()
             .context("the HTTP listener was handed over already")?;
-        let mut descriptors = vec![listener_descriptor];
         let mut replicas = Vec::new();
         for replica in &handoff {
             let control = match replica.client.take_control() {
@@ -727,7 +727,7 @@ async fn prepared_successor(
         let listener = Listener::bind(&config.admin_config)
             .await
             .context("binding the configuration's listening address")?;
-        info!(address = %listener.local_addr()?, "listening on the configuration's address");
+        info!(address = %listener.endpoint()?, "listening on the configuration's address");
         Some(listener)
     } else {
         None
@@ -783,7 +783,7 @@ async fn prepared_successor(
     // failure here is reported as `the successor took the service and gave up: <reason>`,
     // and a transport error alone says what happened but not where.
     let resumed =
-        Listener::resume(listener, next()?).context("resuming the handoff's HTTP listener")?;
+        Listener::resume(listener, &mut next).context("resuming the handoff's HTTP listener")?;
     let listener = match rebound {
         Some(rebound) => {
             drop(resumed);
@@ -962,7 +962,8 @@ async fn prepared_successor(
     if !streams.is_empty() {
         let adopting = Arc::clone(&leader);
         let mut sockets = std::iter::from_fn(|| next().ok());
-        let adoption = streams::adopt(&adopting, streams, &video_jobs, &mut || {
+        let keep_alive = config.server_config.stream_keep_alive;
+        let adoption = streams::adopt(&adopting, streams, &video_jobs, keep_alive, &mut || {
             sockets
                 .next()
                 .context("the takeover lacks a response's descriptor")

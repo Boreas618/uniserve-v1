@@ -57,7 +57,7 @@ pub(crate) fn router_with(engine: impl Into<Arc<Leader>>, server: &ServerConfig)
         engine.into(),
         Arc::new(jobs),
         server,
-        crate::http::BODY_LIMIT,
+        server.max_request_body,
         None,
     )
 }

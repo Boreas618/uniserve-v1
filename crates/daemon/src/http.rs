@@ -47,23 +47,17 @@ use crate::http::middleware::ConcurrencyLimit;
 use crate::leader::{Leader, Task};
 use crate::options::{MediaConfig, ServerArgs, ServerConfig, Stated};
 
-/// HTTP body limit of every route but the video submission routes, in bytes.
-pub(crate) const BODY_LIMIT: usize = 64 << 20;
-
 /// The HTTP body limit of the video submission routes, in bytes.
 ///
 /// A `data:` URI carries its media base64 encoded, four bytes per three, so
-/// a body holding `media.max_request_bytes` of media plus the request's own
-/// fields fits; it never falls below the server-wide body limit, which is the
-/// limit of a deployment that states no request total.
-pub(crate) fn video_body_limit(media: &MediaConfig) -> usize {
-    let Some(total) = media.max_request_bytes else {
-        return BODY_LIMIT;
-    };
-    let encoded = total.div_ceil(3) * 4 + (1 << 20);
-    usize::try_from(encoded)
-        .unwrap_or(usize::MAX)
-        .max(BODY_LIMIT)
+/// the limit is the server's body limit (`server_config.max_request_body`,
+/// which holds the request's own fields) plus `media.max_request_bytes` of
+/// encoded media, when the deployment states a request total.
+pub(crate) fn video_body_limit(media: &MediaConfig, server: &ServerConfig) -> usize {
+    let encoded = media.max_request_bytes.map_or(0, |total| {
+        usize::try_from(total.div_ceil(3) * 4).unwrap_or(usize::MAX)
+    });
+    server.max_request_body.saturating_add(encoded)
 }
 
 const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
@@ -469,12 +463,12 @@ async fn serve_on(
     restarter: Option<Arc<crate::restart::Restarter>>,
 ) -> Result<()> {
     let server = &config.server_config;
-    let bind_address = listener.local_addr()?;
+    let bind_address = listener.endpoint()?;
     let app = router(
         Arc::clone(engine),
         Arc::clone(&jobs),
         server,
-        video_body_limit(&config.media_config),
+        video_body_limit(&config.media_config, server),
         restarter.clone(),
     );
     // The admin API has listeners of its own, apart from the client API.
@@ -503,6 +497,7 @@ async fn serve_on(
     // The responses the daemon this one replaced handed over go on here: each
     // connection writes the bytes the predecessor did not write and then goes
     // on with the resumed body.
+    let limits = conn::Limits::of(server);
     for stream in adopted {
         let app = app.clone();
         let admitting = admitting.clone();
@@ -521,6 +516,7 @@ async fn serve_on(
                 stream.http,
                 stream.body,
                 app,
+                limits,
                 admitting.clone(),
                 move || {
                     crate::restart::streams::adopted(&adopted, frozen_at_ns);
@@ -537,7 +533,7 @@ async fn serve_on(
         });
     }
 
-    let serving = conn::serve(listener, app, accepting.clone(), admitting);
+    let serving = conn::serve(listener, app, limits, accepting.clone(), admitting);
     let drain = async {
         serving.await.context("HTTP server failed")?;
         jobs.wait().await;
@@ -595,7 +591,9 @@ pub(crate) fn router(
         })),
         None => router,
     };
-    let limit = server.max_concurrent_requests.map(ConcurrencyLimit::new);
+    let limit = server
+        .max_concurrent_requests
+        .map(|limit| ConcurrencyLimit::new(limit, server.retry_after));
     let limited = |router: Router, overloaded: fn(String) -> Response| match &limit {
         Some(limit) => {
             let limit = limit.clone();
@@ -606,7 +604,11 @@ pub(crate) fn router(
         None => router,
     };
 
-    let served = served::Served::shared(Arc::clone(&engine), Arc::clone(&handoff));
+    let served = served::Served::shared(
+        Arc::clone(&engine),
+        Arc::clone(&handoff),
+        server.stream_keep_alive,
+    );
     let mut generation = Router::new();
     let mut api = openai::models_router(Arc::clone(&served));
     for task in engine.supported_tasks() {
@@ -632,7 +634,7 @@ pub(crate) fn router(
     });
     let api = timeout(api)
         .merge(generation)
-        .layer(from_fn(middleware::track_http_metrics));
+        .route_layer(from_fn(middleware::track_http_metrics));
 
     let mut authenticated = Router::new().route("/version", get(version)).merge(api);
     if let Some(key) = &server.api_key {
@@ -643,6 +645,7 @@ pub(crate) fn router(
     }
 
     let request_id_headers = server.request_id_headers;
+    let max_request_id = server.max_request_id;
     Router::new()
         .route("/health", get(health))
         .with_state(engine)
@@ -651,10 +654,10 @@ pub(crate) fn router(
         .fallback(not_found)
         // Sets the limit that axum's body extractors (`Json`, `Multipart`,
         // `Bytes`) apply; the video submission routes set their own.
-        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(DefaultBodyLimit::max(server.max_request_body))
         .layer(TraceLayer::new_for_http())
         .layer(from_fn(move |request: Request, next: Next| {
-            middleware::resolve_request_id(request_id_headers, request, next)
+            middleware::resolve_request_id(request_id_headers, max_request_id, request, next)
         }))
 }
 
@@ -1400,7 +1403,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let address = listener.local_addr().unwrap();
+        let address = listener.endpoint().unwrap().to_string();
         (listener, address)
     }
 

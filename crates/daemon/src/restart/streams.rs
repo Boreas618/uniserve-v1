@@ -210,7 +210,7 @@ impl Paused {
                 Decision::Resume
             };
             // A response whose connection already ended needs no decision.
-            let _ = frozen.decision.send(decision);
+            frozen.decide(decision);
         }
         info!(
             "handoff streams adopted {}",
@@ -306,6 +306,7 @@ pub(crate) fn adopt(
     leader: &Arc<Leader>,
     records: Vec<StreamHandoff>,
     jobs: &Arc<VideoJobs>,
+    keep_alive: std::time::Duration,
     next: &mut impl FnMut() -> anyhow::Result<OwnedFd>,
 ) -> anyhow::Result<Adoption> {
     let states = records
@@ -316,7 +317,7 @@ pub(crate) fn adopt(
     let mut taken = Vec::new();
     let mut streams = Vec::new();
     for (record, state) in records.into_iter().zip(states) {
-        match take_over(leader, jobs, &record, state, next) {
+        match take_over(leader, jobs, &record, state, keep_alive, next) {
             Ok(response) => {
                 streams.push(Taken {
                     request_id: response.request_id.clone(),
@@ -384,6 +385,7 @@ fn take_over(
     jobs: &Arc<VideoJobs>,
     record: &StreamHandoff,
     state: Read,
+    keep_alive: std::time::Duration,
     next: &mut impl FnMut() -> anyhow::Result<OwnedFd>,
 ) -> anyhow::Result<Adopted> {
     let at_ns = crate::http::handoff::now_ns();
@@ -414,7 +416,7 @@ fn take_over(
             )?;
             // Server-sent events: the body keeps its connection alive while
             // it waits for the engine.
-            ResponseStream::start(Box::new(run), true)
+            ResponseStream::start(Box::new(run), Some(keep_alive))
         }
         handoff::stream::Application::ChatResponse(chat) => {
             let events = leader.take_over_request(
@@ -435,7 +437,7 @@ fn take_over(
                 Box::new(stats),
             )?;
             // One JSON body: no server-sent events, so no keep-alive comment.
-            ResponseStream::start(Box::new(run), false)
+            ResponseStream::start(Box::new(run), None)
         }
         handoff::stream::Application::VideoContent(content) => {
             // The artifact is the successor's own retained media: the job was
@@ -454,7 +456,7 @@ fn take_over(
             )
             .resumed_at(usize::try_from(content.offset).unwrap_or(usize::MAX));
             // Artifact bytes, not events: no server-sent keep-alive.
-            ResponseStream::start(Box::new(run), false)
+            ResponseStream::start(Box::new(run), None)
         }
     };
     info!(
@@ -552,7 +554,10 @@ mod tests {
             handoff.admissions().open(),
             "the daemon admits requests again"
         );
-        assert!(!handoff.pausing(), "no round is left running");
+        assert!(
+            !*handoff.register().watch().borrow(),
+            "no round is left running"
+        );
 
         // The successor's response was given: this process finishes its
         // responses and leaves the deployment's new requests to the successor.
@@ -598,7 +603,8 @@ mod tests {
             state: b"not a stream's handoff".to_vec(),
         };
         let mut socket_taken = false;
-        let adoption = adopt(&leader, vec![record], &jobs, &mut || {
+        let keep_alive = crate::options::ServerConfig::default().stream_keep_alive;
+        let adoption = adopt(&leader, vec![record], &jobs, keep_alive, &mut || {
             socket_taken = true;
             anyhow::bail!("a refused response must not take a descriptor")
         });
@@ -644,7 +650,8 @@ mod tests {
         .encode_to_vec();
 
         let mut socket_taken = false;
-        let adoption = adopt(&leader, vec![record], &jobs, &mut || {
+        let keep_alive = crate::options::ServerConfig::default().stream_keep_alive;
+        let adoption = adopt(&leader, vec![record], &jobs, keep_alive, &mut || {
             socket_taken = true;
             anyhow::bail!("a refused response must not take a descriptor")
         });
@@ -660,28 +667,30 @@ mod tests {
     /// stopped at.
     #[tokio::test]
     async fn the_predecessor_adopts_what_the_successor_took_and_resumes_the_rest() {
-        let socket = |request_id: &str| {
-            let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
-            // The far end outlives the handoff in a real deployment (it is the
-            // client); the test's pauses are microseconds and the socket is
-            // never written, so dropping it here changes nothing.
-            drop(theirs);
-            let (decision, decided) = tokio::sync::oneshot::channel();
-            let frozen = FrozenStream {
-                request_id: request_id.to_owned(),
-                frozen_at_ns: 1_000,
-                state: handoff::Stream::default(),
-                descriptor: std::os::fd::OwnedFd::from(ours),
-                decision,
-            };
-            (frozen, decided)
+        // Two responses in flight, each reporting itself frozen when the
+        // pause asks it, as a connection does.
+        let registry = crate::http::handoff::Handoff::new();
+        let report = |request_id: &'static str| {
+            let registration = registry.register();
+            tokio::spawn(async move {
+                let mut asked = registration.watch();
+                asked.wait_for(|asked| *asked).await.expect("a pause");
+                let (ours, _theirs) =
+                    std::os::unix::net::UnixStream::pair().expect("a socket pair");
+                let frozen = FrozenStream::new(
+                    request_id.to_owned(),
+                    handoff::Stream::default(),
+                    std::os::fd::OwnedFd::from(ours),
+                );
+                registration.report(frozen).await
+            })
         };
-        let (taken, mut taken_decided) = socket("taken");
-        let (resumed, mut resumed_decided) = socket("resumed");
+        let taken_decided = report("taken");
+        let resumed_decided = report("resumed");
         let paused = Paused {
             records: Vec::new(),
             descriptors: Vec::new(),
-            frozen: vec![taken, resumed],
+            frozen: registry.pause().await,
             handoff: None,
             decided: false,
         };
@@ -695,15 +704,13 @@ mod tests {
         );
 
         assert_eq!(
-            taken_decided
-                .try_recv()
-                .expect("the taken response is decided"),
+            taken_decided.await.expect("the taken response's report"),
             Decision::Adopt
         );
         assert_eq!(
             resumed_decided
-                .try_recv()
-                .expect("the untaken response is decided"),
+                .await
+                .expect("the untaken response's report"),
             Decision::Resume
         );
     }

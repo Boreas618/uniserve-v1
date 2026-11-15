@@ -1,27 +1,28 @@
 //! Listener abstraction for TCP and Unix-domain sockets.
 //!
 //! [`Listener`] presents a single accept interface to Axum over either a TCP or
-//! a Unix-domain listener, bound as `server_config` states. `crate::http`
-//! binds it and logs its inherent `local_addr` string.
+//! a Unix-domain listener, bound as `admin_config` states.
 //!
-//! Every accepted TCP connection takes `TCP_NODELAY`, as vLLM's Rust listener
-//! sets it on accept: a streamed response writes each SSE event as its own
-//! small frame, which Nagle's algorithm would hold back until the previous
-//! frame is acknowledged. Python servers get the option from asyncio's TCP
-//! transports.
+//! Every accepted TCP connection takes `TCP_NODELAY`: a streamed response
+//! writes each SSE event as its own small frame, which Nagle's algorithm would
+//! hold back until the previous frame is acknowledged.
 //!
 //! A Unix-domain socket bound at a path leaves its file behind when the socket
-//! closes. The listener therefore owns the file of a socket it binds: binding
-//! first removes a stale socket file nobody listens on, and dropping the
-//! listener (at shutdown) removes the file again.
+//! closes, so the listener owns the file of a socket it binds. The client API's
+//! socket is owned through its lock (`NAME.lock` beside it,
+//! [`service::host::own`]): binding takes the lock, replaces a socket file an
+//! owner that is gone left, and refuses a path another daemon owns; dropping
+//! the listener (at shutdown) removes the file. The admin sockets are taken
+//! over by rename ([`Listener::bind_over`]), which a hot restart's successor
+//! relies on while its predecessor still serves its own admin requests.
 //!
-//! A hot restart hands a duplicate of the listening socket to the successor
-//! daemon ([`Listener::hand_over`]), which accepts on it beside this one and
-//! owns a Unix socket's file from then on ([`Listener::resume`]).
+//! A hot restart hands the listening socket to the successor daemon
+//! ([`Listener::hand_over`]), with the lock of a Unix socket, which the
+//! successor accepts on and owns from then on ([`Listener::resume`]).
 
 use std::io::{ErrorKind, Result};
 use std::os::fd::{AsFd as _, OwnedFd};
-use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -37,41 +38,54 @@ pub(crate) enum Listener {
     Tcp(TcpListener),
     Unix {
         listener: UnixListener,
-        /// The socket's file, removed when the listener is dropped; `None`
+        /// What makes this process the owner of the socket's file; `None`
         /// once a successor owns it.
-        socket_file: Option<SocketFile>,
+        owner: Option<Owner>,
     },
 }
 
-/// What a successor daemon needs of a listener in a handoff besides its
-/// socket: a Unix socket's file, which the successor owns from then on.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ListenerHandoff {
-    unix: bool,
-    /// The socket file's path, device and inode.
-    socket_file: Option<(PathBuf, u64, u64)>,
+/// How a listener owns its Unix socket's file.
+#[derive(Debug)]
+pub(crate) enum Owner {
+    /// The socket's lock, held for the listener's life; dropping it removes
+    /// the file.
+    Lock(LockedSocket),
+    /// The file this process renamed onto the path, held for its drop, which
+    /// removes it while the path still names it.
+    Renamed { _file: SocketFile },
 }
 
-/// The filesystem entry of a Unix-domain socket this process bound, removed
-/// when dropped.
+/// A socket's ownership lock ([`service::host::SocketLock`]), which has no
+/// `Debug` of its own.
+pub(crate) struct LockedSocket(service::host::SocketLock);
+
+impl std::fmt::Debug for LockedSocket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LockedSocket")
+    }
+}
+
+/// What a successor daemon needs of a listener in a handoff besides its
+/// descriptors: whether it is a Unix socket, and that socket's path, which the
+/// successor owns from then on through the lock that travels after the
+/// socket.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ListenerHandoff {
+    /// The Unix socket's path; `None` for a TCP listener.
+    unix: Option<PathBuf>,
+}
+
+/// The filesystem entry of a Unix-domain socket this process renamed onto its
+/// path, removed when dropped.
 ///
 /// The entry is identified by device and inode, so removal is skipped when the
-/// path no longer names the bound socket, for example after the file was
-/// deleted and another server bound the same path.
+/// path no longer names the bound socket: a hot restart's successor renamed its
+/// own socket onto it.
 #[derive(Debug)]
 pub(crate) struct SocketFile {
     path: PathBuf,
     device: u64,
     inode: u64,
-}
-
-impl SocketFile {
-    /// The file's identity, for a successor to own; this process no longer
-    /// removes it.
-    fn disown(self) -> (PathBuf, u64, u64) {
-        let file = std::mem::ManuallyDrop::new(self);
-        (file.path.clone(), file.device, file.inode)
-    }
 }
 
 impl Drop for SocketFile {
@@ -105,34 +119,34 @@ impl<'a> From<&'a AdminConfig> for BindAddress<'a> {
 
 impl Listener {
     /// Binds the listener `address` states: a Unix-domain socket at `uds`,
-    /// else TCP on `host` and `port`.
+    /// owned through its lock, else TCP on `host` and `port`.
     ///
-    /// Binding a Unix-domain socket first removes a stale socket file at its
-    /// path (see `remove_stale_socket`); it fails with `EADDRINUSE` when the
-    /// path holds a live server's socket or a file that is not a socket. The
-    /// bound socket's file is removed when the listener is dropped.
+    /// # Errors
+    ///
+    /// Fails with `AddrInUse` when another process owns the Unix socket's path
+    /// or the path holds a file that is not a socket, and as the bind fails.
     pub(crate) async fn bind<'a, A: Into<BindAddress<'a>>>(address: A) -> Result<Self> {
         let address = address.into();
         match address.uds {
-            Some(path) => Self::bind_unix(Path::new(path)).await,
+            Some(path) => Self::bind_unix(Path::new(path)),
             None => Ok(Self::Tcp(
                 TcpListener::bind((address.host, address.port)).await?,
             )),
         }
     }
 
-    /// Binds a Unix-domain listener at `path` and takes ownership of its file.
-    async fn bind_unix(path: &Path) -> Result<Self> {
-        remove_stale_socket(path).await?;
-        let listener = UnixListener::bind(path)?;
-        let metadata = std::fs::symlink_metadata(path)?;
+    /// Binds a Unix-domain listener at `path` as the owner of its lock.
+    fn bind_unix(path: &Path) -> Result<Self> {
+        let Some((listener, lock)) = service::host::own(path)? else {
+            return Err(std::io::Error::new(
+                ErrorKind::AddrInUse,
+                format!("another process owns the socket {}", path.display()),
+            ));
+        };
+        listener.set_nonblocking(true)?;
         Ok(Self::Unix {
-            listener,
-            socket_file: Some(SocketFile {
-                path: path.to_owned(),
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            }),
+            listener: UnixListener::from_std(listener)?,
+            owner: Some(Owner::Lock(LockedSocket(lock))),
         })
     }
 
@@ -145,15 +159,11 @@ impl Listener {
     /// restart's successor takes them over while its predecessor finishes the
     /// requests it accepted on its own, now unnamed, socket. The predecessor's
     /// drop leaves the file alone, because the path no longer names the
-    /// socket it bound.
+    /// socket it bound. The path's directory exists: the daemon's instance
+    /// directory, or the one the operator stated.
     pub(crate) fn bind_over(path: &Path, mode: u32) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt as _;
 
-        // The runtime directory may not exist yet: a node that serves no
-        // deployment has started no Storage Server, which would have made it.
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let beside = path.with_extension(format!("{}.binding", std::process::id()));
         let _ = std::fs::remove_file(&beside);
         let listener = std::os::unix::net::UnixListener::bind(&beside)?;
@@ -167,56 +177,75 @@ impl Listener {
         let metadata = std::fs::symlink_metadata(path)?;
         Ok(Self::Unix {
             listener: UnixListener::from_std(listener)?,
-            socket_file: Some(SocketFile {
-                path: path.to_owned(),
-                device: metadata.dev(),
-                inode: metadata.ino(),
+            owner: Some(Owner::Renamed {
+                _file: SocketFile {
+                    path: path.to_owned(),
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                },
             }),
         })
     }
 
-    /// A duplicate of the listening socket and what the successor of a hot
-    /// restart needs beside it ([`Listener::resume`]); the successor owns a
-    /// Unix socket's file from then on.
-    pub(crate) fn hand_over(&mut self) -> Result<(ListenerHandoff, OwnedFd)> {
+    /// The listening socket and what the successor of a hot restart needs
+    /// beside it ([`Listener::resume`]): the socket's descriptor, then a Unix
+    /// socket's lock. The successor owns the socket's file from then on.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the socket cannot be duplicated, and for a socket taken over
+    /// by rename ([`Listener::bind_over`]), which a successor binds anew.
+    pub(crate) fn hand_over(&mut self) -> Result<(ListenerHandoff, Vec<OwnedFd>)> {
         match self {
             Self::Tcp(listener) => Ok((
-                ListenerHandoff {
-                    unix: false,
-                    socket_file: None,
-                },
-                listener.as_fd().try_clone_to_owned()?,
+                ListenerHandoff { unix: None },
+                vec![listener.as_fd().try_clone_to_owned()?],
             )),
-            Self::Unix {
-                listener,
-                socket_file,
-            } => Ok((
-                ListenerHandoff {
-                    unix: true,
-                    socket_file: socket_file.take().map(SocketFile::disown),
-                },
-                listener.as_fd().try_clone_to_owned()?,
-            )),
+            Self::Unix { listener, owner } => {
+                let path = listener
+                    .local_addr()?
+                    .as_pathname()
+                    .map(Path::to_path_buf)
+                    .ok_or_else(|| {
+                        std::io::Error::new(ErrorKind::InvalidInput, "an unnamed Unix socket")
+                    })?;
+                if !matches!(owner, Some(Owner::Lock(_))) {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("{} is not owned through its lock", path.display()),
+                    ));
+                }
+                let mut descriptors = vec![listener.as_fd().try_clone_to_owned()?];
+                if let Some(Owner::Lock(LockedSocket(lock))) = owner.take() {
+                    descriptors.push(lock.hand_over());
+                }
+                Ok((ListenerHandoff { unix: Some(path) }, descriptors))
+            }
         }
     }
 
-    /// Accepts on a listening socket a daemon this one replaced handed over.
-    pub(crate) fn resume(handoff: ListenerHandoff, descriptor: OwnedFd) -> Result<Self> {
-        if handoff.unix {
-            let listener = std::os::unix::net::UnixListener::from(descriptor);
-            listener.set_nonblocking(true)?;
-            Ok(Self::Unix {
-                listener: UnixListener::from_std(listener)?,
-                socket_file: handoff.socket_file.map(|(path, device, inode)| SocketFile {
-                    path,
-                    device,
-                    inode,
-                }),
-            })
-        } else {
-            let listener = std::net::TcpListener::from(descriptor);
-            listener.set_nonblocking(true)?;
-            Ok(Self::Tcp(TcpListener::from_std(listener)?))
+    /// Accepts on a listening socket a daemon this one replaced handed over,
+    /// taking its descriptors from `next` in [`Listener::hand_over`]'s order.
+    pub(crate) fn resume(
+        handoff: ListenerHandoff,
+        next: &mut impl FnMut() -> anyhow::Result<OwnedFd>,
+    ) -> anyhow::Result<Self> {
+        let socket = next()?;
+        match handoff.unix {
+            Some(path) => {
+                let listener = std::os::unix::net::UnixListener::from(socket);
+                listener.set_nonblocking(true)?;
+                let lock = service::host::SocketLock::resume(next()?, path);
+                Ok(Self::Unix {
+                    listener: UnixListener::from_std(listener)?,
+                    owner: Some(Owner::Lock(LockedSocket(lock))),
+                })
+            }
+            None => {
+                let listener = std::net::TcpListener::from(socket);
+                listener.set_nonblocking(true)?;
+                Ok(Self::Tcp(TcpListener::from_std(listener)?))
+            }
         }
     }
 
@@ -237,43 +266,6 @@ impl Listener {
                 }),
         }
     }
-
-    /// Returns a log-friendly local address string for either TCP or Unix
-    /// sockets.
-    pub(crate) fn local_addr(&self) -> Result<String> {
-        match self {
-            Self::Tcp(listener) => Ok(listener.local_addr()?.to_string()),
-            Self::Unix { listener, .. } => Ok(match listener.local_addr()?.as_pathname() {
-                Some(path) => format!("unix:{}", path.display()),
-                None => "unix:<unnamed>".to_string(),
-            }),
-        }
-    }
-}
-
-/// Removes the socket file at `path` when no server listens on it.
-///
-/// A socket whose connection attempt is refused was left behind by a server
-/// that exited without removing it, such as a crashed or killed one. Anything
-/// else at `path` (a live server's socket, a file that is not a socket, or a
-/// socket that cannot be probed) is left in place for `bind` to refuse.
-async fn remove_stale_socket(path: &Path) -> Result<()> {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return Ok(());
-    };
-    if !metadata.file_type().is_socket() {
-        return Ok(());
-    }
-    let refused = UnixStream::connect(path)
-        .await
-        .is_err_and(|error| error.kind() == ErrorKind::ConnectionRefused);
-    if refused {
-        match std::fs::remove_file(path) {
-            Err(error) if error.kind() != ErrorKind::NotFound => return Err(error),
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 /// Allows the unified listener to plug directly into `axum::serve(...)`.
@@ -327,10 +319,10 @@ mod tests {
         }
     }
 
-    /// A socket file left by a server that exited without unlinking it (a
-    /// crash, or a kill) does not prevent a restart on the same path.
+    /// A socket file left by an owner that is gone (a crash, or a kill) does
+    /// not prevent a restart on the same path: its lock went with it.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_stale_socket_file_is_replaced() {
+    async fn a_socket_file_its_owner_left_is_replaced() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("uniserve.sock");
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
@@ -357,20 +349,20 @@ mod tests {
         assert!(!path.exists());
     }
 
-    /// Only a socket nobody listens on is replaced: a live server's socket and
-    /// a file that is not a socket are left in place and the bind fails.
+    /// A path another daemon owns, or a file that is not a socket, is not
+    /// taken over: the bind fails and the path keeps what it holds.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_live_socket_or_another_file_is_not_replaced() {
+    async fn an_owned_socket_or_another_file_is_not_replaced() {
         let directory = tempfile::tempdir().unwrap();
 
-        let live = directory.path().join("live.sock");
-        let server = std::os::unix::net::UnixListener::bind(&live).unwrap();
-        let error = Listener::bind(&uds(&live))
+        let owned = directory.path().join("owned.sock");
+        let owner = Listener::bind(&uds(&owned)).await.unwrap();
+        let error = Listener::bind(&uds(&owned))
             .await
-            .expect_err("a live server's socket must not be taken over");
+            .expect_err("an owned socket must not be taken over");
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
-        std::os::unix::net::UnixStream::connect(&live).unwrap();
-        drop(server);
+        std::os::unix::net::UnixStream::connect(&owned).unwrap();
+        drop(owner);
 
         let file = directory.path().join("data.sock");
         std::fs::write(&file, b"not a socket").unwrap();
@@ -379,5 +371,36 @@ mod tests {
             .expect_err("a regular file must not be replaced");
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
         assert_eq!(std::fs::read(&file).unwrap(), b"not a socket");
+    }
+
+    /// A handed-over Unix listener keeps its ownership in the successor: the
+    /// path stays refused to others, and the successor's drop removes it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_handed_over_socket_stays_owned_by_the_successor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("uniserve.sock");
+        let mut predecessor = Listener::bind(&uds(&path)).await.unwrap();
+
+        let (handoff, descriptors) = predecessor.hand_over().unwrap();
+        drop(predecessor);
+        assert!(
+            path.exists(),
+            "the predecessor leaves the file to its successor"
+        );
+        let mut descriptors = descriptors.into_iter();
+        let successor = Listener::resume(handoff, &mut || {
+            descriptors
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("a descriptor"))
+        })
+        .unwrap();
+        assert!(
+            Listener::bind(&uds(&path)).await.is_err(),
+            "the successor owns the path"
+        );
+        std::os::unix::net::UnixStream::connect(&path).unwrap();
+
+        drop(successor);
+        assert!(!path.exists(), "the successor removes the file it owns");
     }
 }

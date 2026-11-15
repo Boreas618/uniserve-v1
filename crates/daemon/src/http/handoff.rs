@@ -10,19 +10,30 @@
 //!
 //! The registry is the daemon's, not the connection's: a response registers
 //! when its body starts and leaves the registry when it ends, so the restart
-//! sees exactly the responses that are in flight. Every response kind item 1
-//! covers has a state a successor continues from; a covered response whose
-//! state cannot be frozen is a defect, and its connection ends it rather than
-//! keeping it here (see [`crate::http::stream`]).
+//! sees exactly the responses that are in flight. A response whose state
+//! cannot be frozen at its boundary reports so, and its connection ends it
+//! rather than keeping it here (see [`crate::http::stream`]).
+//!
+//! A response registers when its handler attaches its body, not when its
+//! request is admitted: a handler that generates before it responds (the
+//! synchronous video route) has no body to hand over while it runs, and the
+//! pause must not wait for its generation. Such a request, admitted before the
+//! pause closed admissions, is written by this daemon, as is any response
+//! whose body registers after the pause's round ended.
 //!
 //! A pause closes the daemon's admissions when it starts: from then on the
 //! deployment's new requests belong to the successor, and a connection ends at
 //! its next request boundary instead of starting a response this process
 //! cannot hand over (design §7.5.1 step 1). A response that registers while the
 //! pause's round runs is asked to pause too, so the restart never hands over a
-//! connection whose next response is already being written; the round clears
-//! `pausing` when it ends, so `pausing` is true exactly while a round runs and
-//! will read what a response reports.
+//! connection whose next response is already being written.
+//!
+//! The round asks a response by arming its report and then raising its pause
+//! request, so a response that sees the request always has a round to report
+//! to; a response is asked at most once, since after its first pause the
+//! restart owns its decision. Every report is answered: a frozen response is
+//! decided by the restart, and one the restart drops undecided resumes here
+//! ([`FrozenStream`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,18 +52,9 @@ pub(crate) use proto::handoff::Http;
 /// successor records when it first writes there; both processes of a node
 /// read the same clock, so the difference is the response's pause.
 pub(crate) fn now_ns() -> u64 {
-    let mut time = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `CLOCK_MONOTONIC` is a valid clock and `time` a valid pointer.
-    let started = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
-    assert_eq!(started, 0, "CLOCK_MONOTONIC is always readable");
-    // `CLOCK_MONOTONIC` starts at the boot and both fields are non-negative;
-    // the default keeps the conversion total without a panic in the handoff
-    // path, which must not abort a stream.
-    u64::try_from(time.tv_sec).unwrap_or_default() * 1_000_000_000
-        + u64::try_from(time.tv_nsec).unwrap_or_default()
+    let time = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    // `CLOCK_MONOTONIC` counts from the boot, so both fields are non-negative.
+    time.tv_sec.unsigned_abs() * 1_000_000_000 + time.tv_nsec.unsigned_abs()
 }
 
 /// What a restart decides about one frozen response.
@@ -100,7 +102,13 @@ impl Admissions {
 }
 
 /// One response in flight, frozen at an event boundary: everything a
-/// successor needs of it besides the state and the socket.
+/// successor needs of it besides the state and the socket, and the channel
+/// the restart's decision reaches it by.
+///
+/// A frozen response is decided once ([`FrozenStream::decide`]); one dropped
+/// undecided — the successor gave up, or the takeover failed before it named
+/// the responses it took — resumes here, so the response that waits for its
+/// decision always receives one.
 #[derive(Debug)]
 pub(crate) struct FrozenStream {
     /// The request's identity as the deployment named it, which the pause
@@ -114,8 +122,53 @@ pub(crate) struct FrozenStream {
     /// A descriptor of the response's socket: the same socket object the
     /// kernel holds the connection's bytes in.
     pub(crate) descriptor: std::os::fd::OwnedFd,
-    /// Where the restart's decision is delivered.
-    pub(crate) decision: oneshot::Sender<Decision>,
+    /// Where the restart's decision is delivered, once the response reported
+    /// itself ([`Registration::report`]).
+    decision: Option<oneshot::Sender<Decision>>,
+}
+
+impl FrozenStream {
+    /// The response `request_id` frozen now with `state`, on the socket
+    /// `descriptor`.
+    pub(crate) fn new(
+        request_id: String,
+        state: handoff::Stream,
+        descriptor: std::os::fd::OwnedFd,
+    ) -> Self {
+        Self {
+            request_id,
+            frozen_at_ns: now_ns(),
+            state,
+            descriptor,
+            decision: None,
+        }
+    }
+
+    /// Delivers the restart's decision to the response. A response whose
+    /// connection already ended takes none, and needs none.
+    pub(crate) fn decide(mut self, decision: Decision) {
+        if let Some(decided) = self.decision.take() {
+            let _ = decided.send(decision);
+        }
+    }
+}
+
+impl Drop for FrozenStream {
+    /// A frozen response nobody decided resumes here: the handoff gave it back.
+    fn drop(&mut self) {
+        if let Some(decided) = self.decision.take() {
+            let _ = decided.send(Decision::Resume);
+        }
+    }
+}
+
+/// What a response reports to the round that asked it.
+#[derive(Debug)]
+enum Report {
+    /// It froze at its boundary: the successor may take it over.
+    Frozen(Box<FrozenStream>),
+    /// Its state cannot be frozen at its boundary; its connection ends it.
+    Unhandable,
 }
 
 /// The responses in flight of one daemon.
@@ -127,10 +180,6 @@ pub(crate) struct Handoff {
 #[derive(Debug, Default)]
 struct Inner {
     next: AtomicU64,
-    /// Whether a hot restart is handing the deployment over: a response that
-    /// registers now pauses at once. True exactly while a pause's round runs,
-    /// which is what makes the round the reader of every report it asks for.
-    pausing: AtomicBool,
     /// Whether new requests are admitted; closed for the whole handover.
     admitting: Admissions,
     /// The responses in flight, weakly: the connection owns its registration,
@@ -149,33 +198,21 @@ impl Handoff {
     /// hand over.
     ///
     /// The registration leaves the registry when it is dropped, which is when
-    /// the response ended on this daemon.
+    /// the response ended on this daemon. A response registered while a round
+    /// runs is asked by that round; one registered after it is not asked.
     pub(crate) fn register(&self) -> Arc<Registration> {
         let id = self.inner.next.fetch_add(1, Ordering::Relaxed) + 1;
         let (request, requested) = watch::channel(false);
-        let (report, frozen) = oneshot::channel();
         let registration = Arc::new(Registration {
             id,
             request,
             requested,
             registrations: Arc::downgrade(&self.inner),
-            report: Mutex::new(Some(report)),
-            frozen: tokio::sync::Mutex::new(Some(frozen)),
+            asked: AtomicBool::new(false),
+            report: Mutex::new(None),
         });
         service::lock(&self.inner.streaming).insert(id, Arc::downgrade(&registration));
-        // A response that starts while a round runs is asked to pause by the
-        // round itself, which claims its report before asking: a response that
-        // asks for itself here would report into a round that has not claimed
-        // it, and `Registration::report` reads an unclaimed report as "no round
-        // is waiting" and resumes — the response would then be written here
-        // while the round believed it handed over everything in flight.
         registration
-    }
-
-    /// Whether a hot restart is pausing the responses.
-    #[cfg(test)]
-    pub(crate) fn pausing(&self) -> bool {
-        self.inner.pausing.load(Ordering::Acquire)
     }
 
     /// Asks every response in flight to stop at its next event boundary and
@@ -193,92 +230,42 @@ impl Handoff {
         // round is also what keeps the round conclusive — a connection cannot
         // start a request that would register after it.
         self.inner.admitting.close();
-        self.inner.pausing.store(true, Ordering::Release);
-        let mut asked = BTreeSet::new();
+        let mut seen = BTreeSet::new();
         let mut frozen = Vec::new();
         loop {
             let fresh: Vec<Arc<Registration>> = {
                 let streaming = service::lock(&self.inner.streaming);
-                streaming
+                let fresh: Vec<_> = streaming
                     .values()
                     .filter_map(std::sync::Weak::upgrade)
-                    .filter(|registration| !asked.contains(&registration.id))
-                    .collect()
-            };
-            if fresh.is_empty() {
-                // Every response registered when this round began has
-                // answered, and a response that ended meanwhile is gone from
-                // the registry: the handoff holds everything in flight.
-                //
-                // A response may still register between that round and this
-                // check, so yield and look again before concluding.
-                tokio::task::yield_now().await;
-                if self.conclude(&asked) {
-                    // The round is over, and `pausing` stops being true: a
-                    // response that starts now is written here, and the
-                    // registrations it asked stop watching for a boundary.
+                    .filter(|registration| !seen.contains(&registration.id))
+                    .collect();
+                if fresh.is_empty() {
+                    // Every response in flight has answered, and the lock is
+                    // held while the round ends, so a response registers either
+                    // before this check, and is asked, or after the round, and
+                    // is written here.
+                    release_all(&streaming);
                     return frozen;
                 }
-                continue;
-            }
+                fresh
+            };
             for registration in fresh {
-                // Claim the report before asking for it: a response waits for
-                // a decision only when a round holds its report, and a
-                // response whose report nobody claimed resumes at once
-                // (`Registration::report`). A registration an earlier claim
-                // already took is never asked twice.
-                let answered = {
-                    let mut slot = registration.frozen.lock().await;
-                    slot.take()
-                };
-                asked.insert(registration.id);
-                let Some(answered) = answered else {
+                seen.insert(registration.id);
+                let Some(answered) = registration.ask() else {
+                    // An earlier round asked it, and the restart owns its
+                    // decision since.
                     continue;
                 };
-                registration.request();
                 // This loop's own reference goes before the wait: a response
                 // that ends now must reach `Drop`, which is what tells the
                 // pause it left (the registry holds the registration weakly).
                 drop(registration);
-                if let Ok(Some(stream)) = answered.await {
-                    frozen.push(stream);
+                // A response that ended before it froze dropped its report.
+                if let Ok(Report::Frozen(stream)) = answered.await {
+                    frozen.push(*stream);
                 }
             }
-        }
-    }
-
-    /// Ends the round if every response in flight has been asked, and says
-    /// whether it did.
-    ///
-    /// The registry's own lock is held for the check and for the end of the
-    /// pause together, so a response cannot register between the two: it is
-    /// either seen here, and the round goes on to ask it, or it arrives after
-    /// the round is over and is written by this daemon (§7.5.1 step 4).
-    fn conclude(&self, asked: &BTreeSet<u64>) -> bool {
-        let streaming = service::lock(&self.inner.streaming);
-        let unsettled = streaming
-            .values()
-            .filter_map(std::sync::Weak::upgrade)
-            .any(|registration| !asked.contains(&registration.id));
-        if unsettled {
-            return false;
-        }
-        self.inner.pausing.store(false, Ordering::Release);
-        for registration in streaming.values().filter_map(std::sync::Weak::upgrade) {
-            registration.release();
-        }
-        true
-    }
-
-    /// Ends the pause's round: no response asks for a boundary any more, and
-    /// a response that starts from here on is written here.
-    fn end_pause(&self) {
-        self.inner.pausing.store(false, Ordering::Release);
-        for registration in service::lock(&self.inner.streaming)
-            .values()
-            .filter_map(std::sync::Weak::upgrade)
-        {
-            registration.release();
         }
     }
 
@@ -286,13 +273,22 @@ impl Handoff {
     /// handover, so the responses in flight go on being written here and new
     /// requests are admitted again.
     pub(crate) fn release(&self) {
-        self.end_pause();
+        release_all(&service::lock(&self.inner.streaming));
         self.inner.admitting.reopen();
     }
 
     /// Whether new requests are admitted, for the connections that serve them.
     pub(crate) fn admissions(&self) -> Admissions {
         self.inner.admitting.clone()
+    }
+}
+
+/// Lowers the pause request of every registration in `streaming`: a response
+/// that starts from here on is written here, and the ones a round asked stop
+/// watching for a boundary.
+fn release_all(streaming: &BTreeMap<u64, std::sync::Weak<Registration>>) {
+    for registration in streaming.values().filter_map(std::sync::Weak::upgrade) {
+        registration.request.send_replace(false);
     }
 }
 
@@ -304,18 +300,15 @@ pub(crate) struct Registration {
     request: watch::Sender<bool>,
     requested: watch::Receiver<bool>,
     registrations: std::sync::Weak<Inner>,
-    /// Armed at registration. The connection takes the sender when it freezes;
-    /// the restart takes the receiver when it pauses.
-    report: Mutex<Option<oneshot::Sender<Option<FrozenStream>>>>,
-    frozen: tokio::sync::Mutex<Option<oneshot::Receiver<Option<FrozenStream>>>>,
+    /// Whether a round asked this response; it is asked at most once.
+    asked: AtomicBool,
+    /// Where the response reports to the round that asked it: armed by the
+    /// round before it raises the pause request, taken by the response's
+    /// report or by its drop.
+    report: Mutex<Option<oneshot::Sender<Report>>>,
 }
 
 impl Registration {
-    /// Whether a pause was asked for.
-    pub(crate) fn paused(&self) -> bool {
-        *self.requested.borrow()
-    }
-
     /// Watches for this response being asked to pause, for a connection that
     /// waits for the next body frame: `changed()` resolves on every request
     /// and on the restart releasing the responses.
@@ -323,58 +316,57 @@ impl Registration {
         self.requested.clone()
     }
 
-    /// Waits until a hot restart asks this response to pause.
-    ///
-    /// Returns `false` when the restart ended without pausing this response.
-    #[cfg(test)]
-    pub(crate) async fn pausing(&self) -> bool {
-        let mut requested = self.requested.clone();
-        requested.wait_for(|requested| *requested).await.is_ok()
+    /// Arms this response's report and asks it to pause; the receiver of its
+    /// report, or `None` when a round asked it before.
+    fn ask(&self) -> Option<oneshot::Receiver<Report>> {
+        if self.asked.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let (report, answered) = oneshot::channel();
+        *service::lock(&self.report) = Some(report);
+        // The report is armed before the request is visible, so a response
+        // that sees the request finds its report.
+        self.request.send_replace(true);
+        Some(answered)
+    }
+
+    /// Takes the report the round armed before asking this response to pause.
+    fn take_report(&self) -> oneshot::Sender<Report> {
+        #[expect(
+            clippy::expect_used,
+            reason = "a response reports once, after it saw its pause request, which the round \
+                      raises only once it armed the report"
+        )]
+        let report = service::lock(&self.report).take().expect("an armed report");
+        report
     }
 
     /// Reports the response frozen and waits for the restart's decision.
     ///
-    /// `frozen` is `None` when this response cannot be handed over; the
-    /// response then keeps running here. The socket is not written and the
-    /// request's engine stream is not read until the decision arrives, so the
-    /// response still belongs to this daemon: [`Decision::Resume`] continues
-    /// it here, [`Decision::Adopt`] ends it.
-    pub(crate) async fn report(&self, frozen: Option<FrozenStream>) -> Decision {
-        let reported = {
-            let mut slot = service::lock(&self.report);
-            slot.take()
-        };
-        let Some(reported) = reported else {
-            // A second pause request: the first one owns the decision.
-            return Decision::Resume;
-        };
-        let Some(mut frozen) = frozen else {
-            let _ = reported.send(None);
-            return Decision::Resume;
-        };
-        // A pause claims a registration's report before it asks it to freeze,
-        // so an unclaimed report means no round is waiting for this one: the
-        // response is written here. That is the belt for the one registration
-        // admissions cannot exclude — a request admitted just before the pause
-        // whose handler registered just after it — and it is what keeps a
-        // response from waiting for a decision nobody will make.
-        if self.frozen.lock().await.is_some() {
-            return Decision::Resume;
-        }
+    /// The connection calls this once, after it saw the pause request. The
+    /// socket is not written and the request's engine stream is not read until
+    /// the decision arrives, so the response still belongs to this daemon:
+    /// [`Decision::Resume`] continues it here, [`Decision::Adopt`] ends it.
+    pub(crate) async fn report(&self, mut frozen: FrozenStream) -> Decision {
+        let report = self.take_report();
         let (decide, decided) = oneshot::channel();
-        frozen.decision = decide;
-        if reported.send(Some(frozen)).is_err() {
-            return Decision::Resume;
-        }
-        decided.await.unwrap_or(Decision::Resume)
+        frozen.decision = Some(decide);
+        // A round that is gone drops the response it was handed, which resumes
+        // it (`FrozenStream`'s drop), so the decision always arrives.
+        let _ = report.send(Report::Frozen(Box::new(frozen)));
+        #[expect(
+            clippy::expect_used,
+            reason = "a frozen response is decided, or resumes when it is dropped undecided"
+        )]
+        let decision = decided.await.expect("a decision");
+        decision
     }
 
-    fn request(&self) {
-        self.request.send_replace(true);
-    }
-
-    fn release(&self) {
-        self.request.send_replace(false);
+    /// Reports that the response cannot be handed over at its boundary; its
+    /// connection ends it. The connection calls this once, after it saw the
+    /// pause request.
+    pub(crate) fn unhandable(&self) {
+        let _ = self.take_report().send(Report::Unhandable);
     }
 }
 
@@ -382,40 +374,36 @@ impl Drop for Registration {
     fn drop(&mut self) {
         if let Some(inner) = self.registrations.upgrade() {
             service::lock(&inner.streaming).remove(&self.id);
-            // Wake a restart waiting for this response's frozen state: it
-            // ended before it could be frozen.
-            let slot = {
-                let mut slot = service::lock(&self.report);
-                slot.take()
-            };
-            if let Some(reported) = slot {
-                let _ = reported.send(None);
-            }
         }
+        // A round waiting for this response's report sees it end before it
+        // froze, when the armed report is dropped with it.
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
 
-    use super::{Decision, FrozenStream, Handoff};
+    use super::{Decision, FrozenStream, Handoff, Registration};
 
     /// A frozen response's minimal state: a socket descriptor is all the
     /// pause needs of it beyond the state the connection filled in.
     fn frozen(request_id: &str) -> FrozenStream {
-        let (decision, _decided) = tokio::sync::oneshot::channel();
-        let socket: std::os::fd::OwnedFd = std::fs::File::open("/dev/null")
-            .expect("a socket stand-in")
-            .into();
-        FrozenStream {
-            request_id: request_id.to_owned(),
-            frozen_at_ns: super::now_ns(),
-            state: proto::handoff::Stream::default(),
-            descriptor: socket,
-            decision,
-        }
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+        FrozenStream::new(
+            request_id.to_owned(),
+            proto::handoff::Stream::default(),
+            socket.into(),
+        )
+    }
+
+    /// Waits until a round asks `registration` to pause.
+    async fn asked(registration: &Registration) {
+        registration
+            .watch()
+            .wait_for(|asked| *asked)
+            .await
+            .expect("the registration's request");
     }
 
     /// A pause ends when every response in flight has answered: one that ends
@@ -428,17 +416,15 @@ mod tests {
         let freezing = tokio::spawn({
             let kept = Arc::clone(&kept);
             async move {
-                assert!(kept.pausing().await, "the kept response is asked to pause");
-                kept.report(Some(frozen("kept"))).await
+                asked(&kept).await;
+                kept.report(frozen("kept")).await
             }
         });
 
         // The other response's connection ends before it can freeze.
         drop(ended);
 
-        let paused = tokio::time::timeout(Duration::from_secs(10), handoff.pause())
-            .await
-            .expect("the pause ends once the responses in flight answered");
+        let paused = handoff.pause().await;
         assert_eq!(
             paused.len(),
             1,
@@ -451,36 +437,43 @@ mod tests {
             .into_iter()
             .next()
             .expect("the frozen response")
-            .decision
-            .send(Decision::Resume)
-            .expect("the response awaits its decision");
+            .decide(Decision::Adopt);
+        assert_eq!(freezing.await.expect("the freeze task"), Decision::Adopt);
+    }
+
+    /// A frozen response the restart drops without a decision resumes here.
+    #[tokio::test]
+    async fn a_frozen_response_dropped_undecided_resumes() {
+        let handoff = Handoff::new();
+        let kept = handoff.register();
+        let freezing = tokio::spawn({
+            let kept = Arc::clone(&kept);
+            async move {
+                asked(&kept).await;
+                kept.report(frozen("kept")).await
+            }
+        });
+        drop(handoff.pause().await);
         assert_eq!(freezing.await.expect("the freeze task"), Decision::Resume);
     }
 
     /// A response that registers after the pause's round ended is written
-    /// here: no round will read what it reports, so it is neither asked to
-    /// pause nor left waiting for a decision.
+    /// here: no round will read what it reports, so it is not asked to pause.
     #[tokio::test]
     async fn a_response_that_registers_after_the_pause_is_written_here() {
         let handoff = Handoff::new();
         let paused = handoff.pause().await;
         assert!(paused.is_empty(), "no response was in flight");
-        assert!(!handoff.pausing(), "the round ended with the pause");
         assert!(
             !handoff.admissions().open(),
             "the daemon takes no new request while it hands the deployment over"
         );
 
         let late = handoff.register();
-        assert!(!late.paused(), "the finished round asks nothing to pause");
-        // A connection that froze it anyway — a request admitted just before
-        // the pause, whose handler registered just after — is answered at
-        // once, because no round holds its report.
-        let decision =
-            tokio::time::timeout(Duration::from_secs(10), late.report(Some(frozen("late"))))
-                .await
-                .expect("the response is not left waiting for a decision");
-        assert_eq!(decision, Decision::Resume, "the response goes on here");
+        assert!(
+            !*late.watch().borrow(),
+            "the finished round asks nothing to pause"
+        );
     }
 
     /// A pause that hands nothing over gives the deployment back: this daemon
@@ -497,13 +490,11 @@ mod tests {
         let freezing = tokio::spawn({
             let kept = Arc::clone(&kept);
             async move {
-                assert!(kept.pausing().await, "the second round asks it to pause");
-                kept.report(Some(frozen("kept"))).await
+                asked(&kept).await;
+                kept.report(frozen("kept")).await
             }
         });
-        let paused = tokio::time::timeout(Duration::from_secs(10), handoff.pause())
-            .await
-            .expect("the second pause ends");
+        let paused = handoff.pause().await;
         assert!(
             !handoff.admissions().open(),
             "the second handover took the new requests"
@@ -514,9 +505,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("the frozen response")
-            .decision
-            .send(Decision::Resume)
-            .expect("the response awaits its decision");
+            .decide(Decision::Resume);
         assert_eq!(freezing.await.expect("the freeze task"), Decision::Resume);
     }
 
@@ -531,34 +520,31 @@ mod tests {
     async fn a_response_that_registers_during_the_pause_is_handed_over_too() {
         let handoff = Handoff::new();
         let held = handoff.register();
+        let (round_runs, running) = tokio::sync::oneshot::channel();
         let (go_on, released) = tokio::sync::oneshot::channel();
         let freezing = tokio::spawn({
             let held = Arc::clone(&held);
             async move {
-                assert!(held.pausing().await, "the held response is asked to pause");
+                asked(&held).await;
+                round_runs.send(()).expect("the test waits for the round");
                 released.await.expect("the pause goes on");
-                held.report(Some(frozen("held"))).await
+                held.report(frozen("held")).await
             }
         });
         let pausing = tokio::spawn({
             let handoff = handoff.clone();
             async move { handoff.pause().await }
         });
-        while !handoff.pausing() {
-            tokio::task::yield_now().await;
-        }
+        running.await.expect("the round asked the held response");
 
         let late = handoff.register();
         let waiting = tokio::spawn(async move {
-            assert!(late.pausing().await, "the late response is asked to pause");
-            late.report(Some(frozen("late"))).await
+            asked(&late).await;
+            late.report(frozen("late")).await
         });
         go_on.send(()).expect("the pause goes on");
 
-        let paused = tokio::time::timeout(Duration::from_secs(10), pausing)
-            .await
-            .expect("the pause ends")
-            .expect("the pause task");
+        let paused = pausing.await.expect("the pause task");
         assert!(
             paused.iter().any(|stream| stream.request_id == "late"),
             "the response registered during the pause is handed over"
@@ -568,10 +554,7 @@ mod tests {
             "the response that held the pause is handed over"
         );
         for stream in paused {
-            stream
-                .decision
-                .send(Decision::Resume)
-                .expect("the response awaits its decision");
+            stream.decide(Decision::Resume);
         }
         assert_eq!(freezing.await.expect("the held response"), Decision::Resume);
         assert_eq!(

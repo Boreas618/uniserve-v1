@@ -137,6 +137,13 @@ A checkpoint that declares its own quantization (ModelOpt's `quantization_config
 | `max_concurrent_requests` | Unset | In-flight chat and synchronous video requests above which requests are shed with 503 |
 | `shutdown_timeout` | `"30s"` | Longest drain of in-flight requests at shutdown; `0` stops at once |
 | `request_id_headers` | `false` | Add an `X-Request-Id` response header with the ID the request ran under |
+| `max_request_head` | `"64KiB"` | Largest request head (request line and headers), and largest trailer section of a chunked request body; a larger head is answered with 431 |
+| `max_request_body` | `"64MiB"` | Largest request body of every route but the video submissions, which take what `media_config.max_request_bytes` of base64 media needs on top of it; a larger body is answered with 413 |
+| `stream_keep_alive` | `"15s"` | Time a server-sent-events response waits for its next event before a comment (`:`) keeps the connection alive |
+| `max_request_id` | `128` | Longest client `X-Request-Id`, in bytes, taken as the request's ID; a longer one is replaced by a generated ID |
+| `retry_after` | `"1s"` | `Retry-After` of a request the concurrency limit sheds, in whole seconds |
+
+Every response states its body's framing in its head: `Content-Length` when its length is known, chunked otherwise; an HTTP/1.0 client, which cannot read chunks, reads a body of unknown length to the end of its connection. A request body may be chunked, with chunk extensions and a trailer section, which the server reads and discards.
 
 ### `admin_config`
 
@@ -146,7 +153,7 @@ A checkpoint that declares its own quantization (ModelOpt's `quantization_config
 | --- | --- | --- |
 | `host` | `"127.0.0.1"` | TCP address the daemon's client API listens on |
 | `port` | `0` | TCP port the daemon's client API listens on; `0` picks a free one, which the readiness record states (`client`) |
-| `uds` | Unset | Unix domain socket the client API listens on instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
+| `uds` | Unset | Unix domain socket the client API listens on instead of TCP, owned through the lock `NAME.lock` beside it: a socket file a daemon that is gone left is replaced, a path another daemon owns is refused, and the file is removed at shutdown |
 | `admin_uds` | `admin.sock` in the daemon's instance directory (`daemon.XXXXXX` in `$XDG_RUNTIME_DIR/uniserve`) | Unix socket of the operator's admin API, created with mode `0600`; it serves every admin route |
 | `harness_uds` | `harness.sock` in the daemon's instance directory | Unix socket of the harness's subset of the admin API (apply, commit, rollback, status, events and the update's report), created with mode `0660`: the operator grants a harness access through the socket's group |
 | `harness_options` | `[]` | The option paths a harness may set through `PUT /admin/config` on the harness listener, beside the package selections it may always set (`worker_config.engine`, `worker_config.engine_revision`, `scheduler_config.policy`, `attention_backend`, `prefill_attention_backend`, `decode_attention_backend`, `moe_runner_backend`, `moe_config.exchange`) |

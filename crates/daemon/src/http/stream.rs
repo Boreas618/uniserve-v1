@@ -29,18 +29,23 @@
 //! so a frame always ends in the socket or in the predecessor's unwritten
 //! bytes, never half-written.
 //!
-//! Every kind item 1 covers has a state a successor continues from: a chat
-//! completion streamed as server-sent events (the decoder, the output
-//! processors, the assembler and the emitted-chunk counters), a chat
+//! Every response the daemon produces has a state a successor continues
+//! from: a chat completion streamed as server-sent events (the decoder, the
+//! output processors, the assembler and the emitted-chunk counters), a chat
 //! completion answered as one body, and a video artifact's byte position. A
-//! response of such a kind whose state cannot be frozen is a defect, and the
-//! driver ends it instead of keeping it: the process that hands the
-//! deployment over does not wait for a response to end (design §7.5.1). Every
-//! route the daemon serves declares such a state, so no kind is exempt.
-
-use std::task::Poll;
+//! response whose session reports no state at a boundary (its output
+//! processing cannot be continued there) is ended by its driver instead of
+//! being kept: the process that hands the deployment over does not wait for a
+//! response to end (design §7.5.1), and the pause hands such a response over
+//! as nothing.
+//!
+//! A frame is a non-empty run of body bytes: the driver drops an empty one a
+//! session yields, since it carries nothing and, chunked, would be the body's
+//! terminator.
 
 use std::sync::Arc;
+use std::task::Poll;
+use std::time::Duration;
 
 use axum::response::Response;
 use bytes::Bytes;
@@ -51,11 +56,6 @@ pub(crate) use proto::handoff::stream::Application;
 
 use crate::api::openai::error::ApiError;
 use crate::http::handoff::Registration;
-
-/// How long a streamed response may wait for its next frame before the
-/// connection writes an SSE comment to keep the connection alive, as the
-/// `Sse` keep-alive the daemon served before did.
-const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The comment a streamed response writes while it waits for its engine.
 const KEEP_ALIVE_COMMENT: &[u8] = b":\n\n";
@@ -68,6 +68,12 @@ const KEEP_ALIVE_COMMENT: &[u8] = b":\n\n";
 const AHEAD: usize = 1;
 
 /// A message from the connection to its response's driver.
+///
+/// The connection has at most one message outstanding: it waits for the
+/// answer of a pause before it sends the decision that follows it, and an
+/// abort or an adoption is its last message. The channel therefore holds one
+/// message ([`CONTROL_DEPTH`]), and every send waits for room rather than
+/// assuming it.
 enum Control {
     /// Stop at the boundary just reached and answer with the frozen state, or
     /// with `None` when this response cannot be handed over.
@@ -83,6 +89,10 @@ enum Control {
     Abort,
 }
 
+/// How many control messages a driver's channel holds: the one the
+/// connection has outstanding ([`Control`]).
+const CONTROL_DEPTH: usize = 1;
+
 /// What a connection's pause of one response found.
 #[expect(
     clippy::large_enum_variant,
@@ -93,14 +103,21 @@ pub(crate) enum Pause {
     /// The response stopped at an event boundary; this is the state a
     /// successor resumes it from.
     Frozen(Application),
-    /// The response cannot be handed over. No response kind item 1 covers has
-    /// this path (design §7.5.1): a covered response whose state cannot be
-    /// frozen ends here rather than being kept by the process that is
-    /// leaving.
+    /// The response's session reported no state at its boundary, so it cannot
+    /// be handed over; its driver ended it, and its connection ends too.
     Ended,
     /// The response ended at its own terminal event; there is nothing to
     /// carry, and the connection is between responses.
     Complete,
+}
+
+/// A pause's outcome with the frames the body produced before the boundary,
+/// which are the response's whatever the outcome.
+pub(crate) struct Paused {
+    /// What the pause found.
+    pub(crate) pause: Pause,
+    /// The frames produced before the boundary, in order.
+    pub(crate) frames: Vec<Bytes>,
 }
 
 /// What a response's driver hands its connection.
@@ -113,6 +130,17 @@ enum Produced {
         error: crate::api::openai::error::ApiError,
         frames: Vec<Bytes>,
     },
+}
+
+impl Produced {
+    /// The body frames this is: a frame, or a failure's document read as
+    /// frames of a response whose head is written.
+    fn into_frames(self) -> Vec<Bytes> {
+        match self {
+            Self::Frame(frame) => vec![frame],
+            Self::Failed { frames, .. } => frames,
+        }
+    }
 }
 
 /// What a response body produces first, for a connection that has not written
@@ -139,8 +167,10 @@ pub(crate) struct ResponseStream {
     /// which bounds the time until the head is sent ([`Self::bound_head`]).
     head_deadline: Option<(tokio::time::Instant, ApiError)>,
     control: mpsc::Sender<Control>,
-    /// Whether to write an SSE comment while the body waits for its engine.
-    keep_alive: bool,
+    /// How long the body may wait for its engine before an SSE comment keeps
+    /// the connection alive (`server_config.stream_keep_alive`); `None` for a
+    /// body that is not server-sent events.
+    keep_alive: Option<Duration>,
 }
 
 impl ResponseStream {
@@ -148,23 +178,23 @@ impl ResponseStream {
     /// from.
     ///
     /// `keep_alive` writes an SSE comment when the body waits for its engine
-    /// longer than the keep-alive interval; it is for server-sent events only,
-    /// where a comment is part of the protocol.
-    pub(crate) fn start(session: Box<dyn Session>, keep_alive: bool) -> Self {
+    /// longer than that interval; it is for server-sent events only, where a
+    /// comment is part of the protocol.
+    pub(crate) fn start(session: Box<dyn Session>, keep_alive: Option<Duration>) -> Self {
         Self::opening(session, keep_alive, false)
     }
 
     /// Starts a body whose head the connection holds until the first output
     /// arrives: a response answered as one document, whose status is its
     /// outcome (§7.5.1 step 4 — such a response has not started writing when a
-    /// handoff pauses it).
-    pub(crate) fn start_held(session: Box<dyn Session>, keep_alive: bool) -> Self {
-        Self::opening(session, keep_alive, true)
+    /// handoff pauses it). One document writes no keep-alive comment.
+    pub(crate) fn start_held(session: Box<dyn Session>) -> Self {
+        Self::opening(session, None, true)
     }
 
-    fn opening(session: Box<dyn Session>, keep_alive: bool, head_held: bool) -> Self {
+    fn opening(session: Box<dyn Session>, keep_alive: Option<Duration>, head_held: bool) -> Self {
         let (frames, produced) = mpsc::channel(AHEAD);
-        let (control, controls) = mpsc::channel(4);
+        let (control, controls) = mpsc::channel(CONTROL_DEPTH);
         tokio::spawn(drive(session, frames, controls));
         Self {
             frames: produced,
@@ -207,7 +237,7 @@ impl ResponseStream {
                     Ok(produced) => produced,
                     Err(_) => {
                         let error = error.clone();
-                        return self.expired(error);
+                        return self.expired(error).await;
                     }
                 }
             }
@@ -223,11 +253,9 @@ impl ResponseStream {
     /// The held head's deadline passed before the body produced anything:
     /// the driver cancels the request, and the response answers `error` with
     /// its document.
-    fn expired(&mut self, error: ApiError) -> Opened {
-        // Nothing else is queued on the control channel while a head is held
-        // (a pause ends the wait before it sends anything), so the message
-        // fits; a driver that already ended has no request left to cancel.
-        let _ = self.control.try_send(Control::Abort);
+    async fn expired(&mut self, error: ApiError) -> Opened {
+        // A driver that already ended has no request left to cancel.
+        let _ = self.control.send(Control::Abort).await;
         let document = failure_document(&error);
         Opened::Failed(error, vec![document])
     }
@@ -237,13 +265,12 @@ impl ResponseStream {
         if let Some(frame) = self.produced.pop_front() {
             return Some(frame);
         }
-        let frame = if !self.keep_alive {
-            self.frames.recv().await
-        } else {
-            match tokio::time::timeout(KEEP_ALIVE, self.frames.recv()).await {
+        let frame = match self.keep_alive {
+            None => self.frames.recv().await,
+            Some(interval) => match tokio::time::timeout(interval, self.frames.recv()).await {
                 Ok(frame) => frame,
                 Err(_) => return Some(Bytes::from_static(KEEP_ALIVE_COMMENT)),
-            }
+            },
         };
         match frame? {
             Produced::Frame(frame) => Some(frame),
@@ -258,15 +285,25 @@ impl ResponseStream {
 
     /// Freezes the response at the boundary just reached.
     ///
-    /// Every frame produced before the boundary is given to `keep`; the state
-    /// a successor continues from is returned, or `None` when this response
-    /// cannot be handed over or its driver ended meanwhile. Nothing is
-    /// produced until [`Self::resume`] or [`Self::adopt`].
-    pub(crate) async fn pause(&mut self, mut keep: impl FnMut(Bytes)) -> Pause {
+    /// Returns what the pause found with every frame produced before the
+    /// boundary. Nothing is produced until [`Self::resume`] or
+    /// [`Self::adopt`].
+    pub(crate) async fn pause(&mut self) -> Paused {
+        let mut frames = Vec::new();
+        let pause = self.pause_into(&mut frames).await;
+        Paused { pause, frames }
+    }
+
+    /// [`Self::pause`], collecting the frames into `frames`.
+    async fn pause_into(&mut self, frames: &mut Vec<Bytes>) -> Pause {
+        let mut keep = |produced: Produced| frames.extend(produced.into_frames());
         let (answer, paused) = oneshot::channel();
         if self.control.send(Control::Pause(answer)).await.is_err() {
             // The driver ended: the body is over, so there is nothing to
-            // hand over.
+            // hand over but the frames it left.
+            while let Ok(produced) = self.frames.try_recv() {
+                keep(produced);
+            }
             return Pause::Complete;
         }
         let mut paused = paused;
@@ -285,15 +322,10 @@ impl ResponseStream {
                     Ok(None) => return Pause::Ended,
                     Err(_) => return Pause::Complete,
                 },
+                // A failure the connection reads as body frames: its head is
+                // written, so those frames are the response's own.
                 frame = self.frames.recv() => match frame {
-                    Some(Produced::Frame(frame)) => keep(frame),
-                    // A failure the connection reads as body frames: its head
-                    // is written, so those frames are the response's own.
-                    Some(Produced::Failed { frames, .. }) => {
-                        for frame in frames {
-                            keep(frame);
-                        }
-                    }
+                    Some(produced) => keep(produced),
                     None => return Pause::Complete,
                 },
             }
@@ -301,14 +333,7 @@ impl ResponseStream {
         // The driver produces nothing until it is told to go on, so what is
         // left in the channel is everything it produced before the boundary.
         while let Ok(produced) = self.frames.try_recv() {
-            match produced {
-                Produced::Frame(frame) => keep(frame),
-                Produced::Failed { frames, .. } => {
-                    for frame in frames {
-                        keep(frame);
-                    }
-                }
-            }
+            keep(produced);
         }
         Pause::Frozen(state)
     }
@@ -330,8 +355,9 @@ impl ResponseStream {
 }
 
 /// A response body a hot restart can move to a successor: the frames the
-/// connection writes, the registry entry that pauses the response, and the
-/// request identity the pause record names.
+/// connection writes, the registry entry that pauses the response, the request
+/// identity the pause record names, and the body's length when the route
+/// knows it.
 pub(crate) struct Handed {
     /// The frames the body is written from.
     pub(crate) stream: ResponseStream,
@@ -339,6 +365,9 @@ pub(crate) struct Handed {
     pub(crate) registration: Arc<Registration>,
     /// The request's identity as the deployment named it.
     pub(crate) request_id: String,
+    /// The body's exact length in bytes, which its head states; `None` for a
+    /// body of unknown length, which is chunked.
+    pub(crate) length: Option<u64>,
 }
 
 /// The connection's handle on a handoffable body, carried in the response's
@@ -347,23 +376,24 @@ pub(crate) struct Handed {
 /// A response that carries one has no body of its own: the session produces
 /// every frame, and the connection takes the handle out before it writes the
 /// response, so the body can be paused between two frames.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct HandedBody(Arc<std::sync::Mutex<Option<Handed>>>);
 
 impl HandedBody {
-    /// The handle of one handoffable response body.
+    /// The handle of one handoffable response body of `length` bytes, or of
+    /// unknown length.
     pub(crate) fn new(
         stream: ResponseStream,
-        registration: Option<Arc<Registration>>,
+        registration: Arc<Registration>,
         request_id: String,
-    ) -> Option<Self> {
-        registration.map(|registration| {
-            Self(Arc::new(std::sync::Mutex::new(Some(Handed {
-                stream,
-                registration,
-                request_id,
-            }))))
-        })
+        length: Option<u64>,
+    ) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(Handed {
+            stream,
+            registration,
+            request_id,
+            length,
+        }))))
     }
 
     /// Takes the body out; the connection owns it from then on.
@@ -383,16 +413,16 @@ impl HandedBody {
 /// The document a failure answers with when the body produced none: the
 /// error's own JSON, which is what a sink's `failed` writes for it.
 pub(crate) fn failure_document(error: &ApiError) -> Bytes {
-    serde_json::to_vec(&error.to_error_response())
-        .map(Bytes::from)
-        .unwrap_or_default()
+    #[expect(
+        clippy::expect_used,
+        reason = "an error response is a structure of strings, which always serializes"
+    )]
+    let document = serde_json::to_vec(&error.to_error_response()).expect("an error document");
+    Bytes::from(document)
 }
 
-/// Attaches a handoffable body to `response`.
-///
-/// `registration` is `None` when no hot restart can pause this daemon (a node
-/// other than the leader), in which case the response is written without the
-/// handoff registry entry.
+/// Attaches a handoffable body to `response`: the connection writes the body
+/// from it, in place of the response's own.
 pub(crate) fn attach(response: &mut Response, body: HandedBody) {
     response.extensions_mut().insert(body);
 }
@@ -422,7 +452,7 @@ async fn drive(
         .await;
         match step {
             Driven::Step(Step::Frames(produced)) => {
-                for frame in produced {
+                for frame in produced.into_iter().filter(|frame| !frame.is_empty()) {
                     if frames.send(Produced::Frame(frame)).await.is_err() {
                         // The connection is gone; cancel the request.
                         session.abort();
@@ -454,10 +484,10 @@ async fn drive(
                 let handable = frozen.is_some();
                 let _ = answer.send(frozen);
                 if !handable {
-                    // A covered response whose state cannot be frozen must not
-                    // keep running here: the process that hands the deployment
-                    // over does not wait for a response to end (design
-                    // §7.5.1). End it, and let the connection see the body end.
+                    // A response whose state cannot be frozen must not keep
+                    // running here: the process that hands the deployment over
+                    // does not wait for a response to end (design §7.5.1). End
+                    // it, and let the connection see the body end.
                     tracing::error!(
                         "a response in flight cannot be handed over; ending it rather than keeping it"
                     );

@@ -125,6 +125,7 @@ fastokens = "0.3.2"
 futures = "0.3.31"
 hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
 http-body = "1.0.1"
+httparse = "1.10.1"
 humantime = "2.4.0"
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 indexmap = "2.13.0"
