@@ -93,13 +93,13 @@ pub use indexed::{
 };
 pub use sparse::{SparseArgs, SparseAttention, SparseCall, SparseDescriptor};
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use platform::{DevicePtr, Stream};
 use tensor::DType;
 
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::operand::Operand;
@@ -117,12 +117,15 @@ const PREFILL_QUERY_TILE: &str = "BLOCK_Q";
 /// Prefill packs several query rows per sequence; decode has one query per row. The two select
 /// different kernels (a context kernel against a generation kernel) and different grids, so a
 /// module is compiled for one of them.
+///
+/// The call carries its number (`uniserve_phase` in `uniserve_paged_attention.h`).
+#[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Phase {
     /// Packed query rows with `cum_seq_lens_q` offsets.
-    Prefill,
+    Prefill = 0,
     /// One query row per sequence, aligned to the end of its keys.
-    Decode,
+    Decode = 1,
 }
 
 impl fmt::Display for Phase {
@@ -135,12 +138,16 @@ impl fmt::Display for Phase {
 }
 
 /// The mask a module is compiled for.
+///
+/// A `dense_attention` module that compiles its mask in names it by its enumerator in
+/// `uniserve_dense_attention.h` (`uniserve_mask`).
+#[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Mask {
     /// A query at position `i` sees keys `0 ..= i` (and, with a window, `i − window_left ..= i`).
-    Causal,
+    Causal = 1,
     /// Every query sees every visible key; a history window is not expressible with it.
-    Dense,
+    Dense = 0,
 }
 
 impl fmt::Display for Mask {
@@ -233,13 +240,14 @@ pub struct Args {
     pub causal: bool,
 }
 
-/// The call structure a package's entry receives.
+/// The call structure a package's entry receives, declared to the packages as
+/// `uniserve_paged_attention_call` (`uniserve_paged_attention.h`, generated with its layout
+/// asserted: [`abi`]).
 ///
-/// Mirrored by hand in `crates/ops/kernels/paged_attention/<backend>/include/uniserve_paged_attention.h`;
-/// the layout is pinned by [`PAGED_ATTENTION_CALL_LAYOUT`], the assertions below and the test beside
-/// this module. A package caches what it derives from these fields per (device, function) — the SM
-/// count, the loaded cubins, the runner — so nothing here is a device property.
+/// A package caches what it derives from these fields per (device, function) — the SM count, the
+/// loaded cubins, the runner — so nothing here is a device property.
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct Call {
     /// `[tokens, q_heads, head_dim]`.
     pub out: *mut c_void,
@@ -307,126 +315,15 @@ pub struct Call {
     pub dtype_key_value: i64,
     /// `DType`'s ABI number of the output.
     pub dtype_output: i64,
-    /// The phase: 0 prefill, 1 decode.
+    /// The [`Phase`], by its number.
     pub phase: i64,
     /// The entry's message on a nonzero return.
-    pub error: [u8; 512],
+    pub error: [c_char; MESSAGE],
 }
-
-/// The size and field offsets the package's header must mirror, in bytes.
-pub const PAGED_ATTENTION_CALL_LAYOUT: CallLayout = CallLayout {
-    size: 784,
-    out: 0,
-    query: 8,
-    key: 16,
-    value: 24,
-    key_scale: 32,
-    value_scale: 40,
-    workspace: 48,
-    page_table: 56,
-    seq_lens: 64,
-    cum_seq_lens_q: 72,
-    batch: 80,
-    tokens: 88,
-    max_q_len: 96,
-    max_kv_len: 104,
-    num_pages: 112,
-    page_size: 120,
-    q_heads: 128,
-    kv_heads: 136,
-    head_dim: 144,
-    q_stride_tokens: 152,
-    q_stride_heads: 160,
-    kv_stride_page: 168,
-    kv_stride_tokens: 176,
-    kv_stride_heads: 184,
-    o_stride_tokens: 192,
-    o_stride_heads: 200,
-    scale: 208,
-    window_left: 216,
-    causal: 224,
-    workspace_bytes: 232,
-    dtype_query: 240,
-    dtype_key_value: 248,
-    dtype_output: 256,
-    phase: 264,
-    error: 272,
-};
-
-/// The layout of [`Call`], for the header's mirror and its test.
-#[derive(Debug, PartialEq, Eq)]
-pub struct CallLayout {
-    pub size: usize,
-    pub out: usize,
-    pub query: usize,
-    pub key: usize,
-    pub value: usize,
-    pub key_scale: usize,
-    pub value_scale: usize,
-    pub workspace: usize,
-    pub page_table: usize,
-    pub seq_lens: usize,
-    pub cum_seq_lens_q: usize,
-    pub batch: usize,
-    pub tokens: usize,
-    pub max_q_len: usize,
-    pub max_kv_len: usize,
-    pub num_pages: usize,
-    pub page_size: usize,
-    pub q_heads: usize,
-    pub kv_heads: usize,
-    pub head_dim: usize,
-    pub q_stride_tokens: usize,
-    pub q_stride_heads: usize,
-    pub kv_stride_page: usize,
-    pub kv_stride_tokens: usize,
-    pub kv_stride_heads: usize,
-    pub o_stride_tokens: usize,
-    pub o_stride_heads: usize,
-    pub scale: usize,
-    pub window_left: usize,
-    pub causal: usize,
-    pub workspace_bytes: usize,
-    pub dtype_query: usize,
-    pub dtype_key_value: usize,
-    pub dtype_output: usize,
-    pub phase: usize,
-    pub error: usize,
-}
-
-const _: () = assert!(
-    std::mem::size_of::<Call>() == PAGED_ATTENTION_CALL_LAYOUT.size,
-    "the paged_attention call structure's size changed without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, page_table) == PAGED_ATTENTION_CALL_LAYOUT.page_table,
-    "the paged_attention call structure's device pointers moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, batch) == PAGED_ATTENTION_CALL_LAYOUT.batch,
-    "the paged_attention call structure's geometry moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, q_stride_tokens) == PAGED_ATTENTION_CALL_LAYOUT.q_stride_tokens,
-    "the paged_attention call structure's query strides moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, scale) == PAGED_ATTENTION_CALL_LAYOUT.scale,
-    "the paged_attention call structure's scalars moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, dtype_query) == PAGED_ATTENTION_CALL_LAYOUT.dtype_query,
-    "the paged_attention call structure's dtypes moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, error) == PAGED_ATTENTION_CALL_LAYOUT.error,
-    "the paged_attention call structure's `error` moved without its header"
-);
 
 impl NativeCall for Call {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
 
@@ -819,14 +716,11 @@ impl Op for PagedAttention {
             dtype_query: abi::code(descriptor.query)?,
             dtype_key_value: abi::code(descriptor.key_value)?,
             dtype_output: abi::code(descriptor.output)?,
-            phase: match descriptor.phase {
-                Phase::Prefill => 0,
-                Phase::Decode => 1,
-            },
-            error: [0; 512],
+            phase: descriptor.phase as i64,
+            error: [0; MESSAGE],
         };
-        // SAFETY: `Call` is the call structure this package's entry declares, and its layout is
-        // pinned by the assertions above and by the test below.
+        // SAFETY: `Call` is the call structure this package's entry declares: the declaration is
+        // generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 
@@ -1298,83 +1192,6 @@ mod tests {
         assert!(prefill.to_string().contains("_page_16_"));
     }
 
-    /// The header the packages mirror must carry these offsets; the constants beside the structure
-    /// are checked against the compiler here.
-    #[test]
-    fn call_layout_is_the_one_the_header_declares() {
-        let layout = PAGED_ATTENTION_CALL_LAYOUT;
-        assert_eq!(std::mem::size_of::<Call>(), layout.size);
-        assert_eq!(std::mem::align_of::<Call>(), 8);
-        assert_eq!(std::mem::offset_of!(Call, out), layout.out);
-        assert_eq!(std::mem::offset_of!(Call, query), layout.query);
-        assert_eq!(std::mem::offset_of!(Call, key), layout.key);
-        assert_eq!(std::mem::offset_of!(Call, value), layout.value);
-        assert_eq!(std::mem::offset_of!(Call, key_scale), layout.key_scale);
-        assert_eq!(std::mem::offset_of!(Call, value_scale), layout.value_scale);
-        assert_eq!(std::mem::offset_of!(Call, workspace), layout.workspace);
-        assert_eq!(std::mem::offset_of!(Call, page_table), layout.page_table);
-        assert_eq!(std::mem::offset_of!(Call, seq_lens), layout.seq_lens);
-        assert_eq!(
-            std::mem::offset_of!(Call, cum_seq_lens_q),
-            layout.cum_seq_lens_q
-        );
-        assert_eq!(std::mem::offset_of!(Call, batch), layout.batch);
-        assert_eq!(std::mem::offset_of!(Call, tokens), layout.tokens);
-        assert_eq!(std::mem::offset_of!(Call, max_q_len), layout.max_q_len);
-        assert_eq!(std::mem::offset_of!(Call, max_kv_len), layout.max_kv_len);
-        assert_eq!(std::mem::offset_of!(Call, num_pages), layout.num_pages);
-        assert_eq!(std::mem::offset_of!(Call, page_size), layout.page_size);
-        assert_eq!(std::mem::offset_of!(Call, q_heads), layout.q_heads);
-        assert_eq!(std::mem::offset_of!(Call, kv_heads), layout.kv_heads);
-        assert_eq!(std::mem::offset_of!(Call, head_dim), layout.head_dim);
-        assert_eq!(
-            std::mem::offset_of!(Call, q_stride_tokens),
-            layout.q_stride_tokens
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, q_stride_heads),
-            layout.q_stride_heads
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, kv_stride_page),
-            layout.kv_stride_page
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, kv_stride_tokens),
-            layout.kv_stride_tokens
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, kv_stride_heads),
-            layout.kv_stride_heads
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, o_stride_tokens),
-            layout.o_stride_tokens
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, o_stride_heads),
-            layout.o_stride_heads
-        );
-        assert_eq!(std::mem::offset_of!(Call, scale), layout.scale);
-        assert_eq!(std::mem::offset_of!(Call, window_left), layout.window_left);
-        assert_eq!(std::mem::offset_of!(Call, causal), layout.causal);
-        assert_eq!(
-            std::mem::offset_of!(Call, workspace_bytes),
-            layout.workspace_bytes
-        );
-        assert_eq!(std::mem::offset_of!(Call, dtype_query), layout.dtype_query);
-        assert_eq!(
-            std::mem::offset_of!(Call, dtype_key_value),
-            layout.dtype_key_value
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, dtype_output),
-            layout.dtype_output
-        );
-        assert_eq!(std::mem::offset_of!(Call, phase), layout.phase);
-        assert_eq!(std::mem::offset_of!(Call, error), layout.error);
-    }
-
     /// The bound grows with the reduction length and leaves room for a corrected implementation but
     /// not for a different mask: at 40960 keys it is under one percent plus the envelope.
     #[test]
@@ -1437,57 +1254,5 @@ mod tests {
         let narrow = Operand::new(DevicePtr::from_address(0x1_0000), DType::BF16, &[4, 100]);
         let refusal = check_vector_alignment("test", "key", &narrow).unwrap_err();
         assert!(format!("{refusal}").contains("stride of 100"), "{refusal}");
-    }
-
-    /// Every package header that serves this operator states the layout this crate passes.
-    ///
-    /// The mirror is written by hand on both sides, so a field that moves on one side fails on the
-    /// other: the module's entry reads these offsets, and a mismatch is a wrong number rather than a
-    /// refusal.
-    #[test]
-    fn the_paged_attention_header_declares_this_call_layout() {
-        let layout = PAGED_ATTENTION_CALL_LAYOUT;
-        crate::call_layout_check::check(
-            "paged_attention",
-            "uniserve_paged_attention_call",
-            &[
-                ("out", layout.out),
-                ("query", layout.query),
-                ("key", layout.key),
-                ("value", layout.value),
-                ("key_scale", layout.key_scale),
-                ("value_scale", layout.value_scale),
-                ("workspace", layout.workspace),
-                ("page_table", layout.page_table),
-                ("seq_lens", layout.seq_lens),
-                ("cum_seq_lens_q", layout.cum_seq_lens_q),
-                ("batch", layout.batch),
-                ("tokens", layout.tokens),
-                ("max_q_len", layout.max_q_len),
-                ("max_kv_len", layout.max_kv_len),
-                ("num_pages", layout.num_pages),
-                ("page_size", layout.page_size),
-                ("q_heads", layout.q_heads),
-                ("kv_heads", layout.kv_heads),
-                ("head_dim", layout.head_dim),
-                ("q_stride_tokens", layout.q_stride_tokens),
-                ("q_stride_heads", layout.q_stride_heads),
-                ("kv_stride_page", layout.kv_stride_page),
-                ("kv_stride_tokens", layout.kv_stride_tokens),
-                ("kv_stride_heads", layout.kv_stride_heads),
-                ("o_stride_tokens", layout.o_stride_tokens),
-                ("o_stride_heads", layout.o_stride_heads),
-                ("scale", layout.scale),
-                ("window_left", layout.window_left),
-                ("causal", layout.causal),
-                ("workspace_bytes", layout.workspace_bytes),
-                ("dtype_query", layout.dtype_query),
-                ("dtype_key_value", layout.dtype_key_value),
-                ("dtype_output", layout.dtype_output),
-                ("phase", layout.phase),
-                ("error", layout.error),
-            ],
-            layout.size,
-        );
     }
 }

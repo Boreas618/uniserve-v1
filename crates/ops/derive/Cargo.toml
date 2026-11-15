@@ -1,0 +1,21 @@
+[package]
+name = "ops-derive"
+description = "The derive of the operator crate's call-structure layout (`ops::abi::Layout`)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# A procedural macro: the operator crate derives `abi::Layout` on each `#[repr(C)]` call structure
+# a native package receives, so the size and every field offset Rust gives it are stated by the
+# structure's own definition, and the generator of the C ABI headers asserts them in C.
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+
+[lints]
+workspace = true

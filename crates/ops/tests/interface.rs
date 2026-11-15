@@ -237,52 +237,6 @@ fn tolerance_compares_against_the_reference_and_an_envelope_extends_it() {
 }
 
 #[test]
-fn native_call_structures_have_the_layouts_their_headers_mirror() {
-    let gemm = &ops::gemm::GEMM_CALL_LAYOUT;
-    assert_eq!(std::mem::size_of::<ops::gemm::Call>(), gemm.size);
-    assert_eq!(std::mem::offset_of!(ops::gemm::Call, out), gemm.out);
-    assert_eq!(std::mem::offset_of!(ops::gemm::Call, input), gemm.input);
-    assert_eq!(std::mem::offset_of!(ops::gemm::Call, weight), gemm.weight);
-    assert_eq!(std::mem::offset_of!(ops::gemm::Call, bias), gemm.bias);
-    assert_eq!(std::mem::offset_of!(ops::gemm::Call, m), gemm.m);
-    assert_eq!(std::mem::offset_of!(ops::gemm::Call, n), gemm.n);
-    assert_eq!(std::mem::offset_of!(ops::gemm::Call, k), gemm.k);
-    assert_eq!(
-        std::mem::offset_of!(ops::gemm::Call, input_row_stride),
-        gemm.input_row_stride
-    );
-    assert_eq!(
-        std::mem::offset_of!(ops::gemm::Call, weight_row_stride),
-        gemm.weight_row_stride
-    );
-    assert_eq!(
-        std::mem::offset_of!(ops::gemm::Call, out_row_stride),
-        gemm.out_row_stride
-    );
-    assert_eq!(std::mem::offset_of!(ops::gemm::Call, alpha), gemm.alpha);
-    assert_eq!(std::mem::offset_of!(ops::gemm::Call, error), gemm.error);
-
-    // The convolution structure places its geometry where the header does.
-    assert_eq!(std::mem::offset_of!(ops::conv::Call, out), 0);
-    assert_eq!(std::mem::offset_of!(ops::conv::Call, input), 8);
-    assert_eq!(std::mem::offset_of!(ops::conv::Call, weight), 16);
-    assert_eq!(std::mem::offset_of!(ops::conv::Call, bias), 24);
-    assert_eq!(std::mem::offset_of!(ops::conv::Call, input_shape), 32);
-    assert_eq!(
-        std::mem::offset_of!(ops::conv::Call, weight_shape),
-        32 + 5 * std::mem::size_of::<i64>()
-    );
-    assert_eq!(
-        std::mem::offset_of!(ops::conv::Call, out_shape),
-        32 + 10 * std::mem::size_of::<i64>()
-    );
-    assert_eq!(
-        std::mem::offset_of!(ops::conv::Call, kernel),
-        32 + 15 * std::mem::size_of::<i64>()
-    );
-}
-
-#[test]
 fn element_types_keep_their_abi_numbering_and_round_off() {
     // A package's header carries these numbers, so they cannot move.
     assert_eq!(abi::code(DType::U8).unwrap(), 0);

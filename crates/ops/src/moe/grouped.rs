@@ -27,13 +27,13 @@
 //! [`Tolerance::dot`] states the bound relative to the result and the activation envelope
 //! ([`tolerance::VALUE_ENVELOPE`]) gives the absolute term for rows that cancel harder.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use platform::Stream;
 use tensor::DType;
 
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::activation::Activation;
 use crate::descriptor::Key;
 use crate::fp4::ScaleLayout;
@@ -158,10 +158,10 @@ pub struct GatherGemmArgs {
     pub out: Operand,
 }
 
-/// The call structure the FC1 package's entry receives.
-///
-/// Mirrored by hand in `crates/ops/kernels/gather_gemm/<backend>/include/uniserve_gather_gemm.h`.
+/// The call structure the FC1 package's entry receives, declared to the packages as
+/// `uniserve_gather_call` (`uniserve_gather_gemm.h`, generated with its layout asserted: [`abi`]).
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct GatherCall {
     pub hidden: *const c_void,
     pub weights: *const c_void,
@@ -177,63 +177,13 @@ pub struct GatherCall {
     pub experts: i64,
     pub top: i64,
     pub dtype: i64,
-    pub error: [u8; 512],
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
 }
-
-/// The layout of [`GatherCall`].
-pub const GATHER_CALL_LAYOUT: CallLayout = CallLayout {
-    size: 624,
-    hidden: 0,
-    weights: 8,
-    out: 16,
-    tile_to_expert: 24,
-    tile_to_limit: 32,
-    permuted_to_expanded: 40,
-    num_non_exiting_tiles: 48,
-    tokens: 56,
-    permuted_rows: 64,
-    width: 72,
-    hidden_size: 80,
-    experts: 88,
-    top: 96,
-    dtype: 104,
-    error: 112,
-};
-
-/// The layout of a grouped-GEMM call, for the headers' mirrors and their tests.
-#[derive(Debug, PartialEq, Eq)]
-pub struct CallLayout {
-    pub size: usize,
-    pub hidden: usize,
-    pub weights: usize,
-    pub out: usize,
-    pub tile_to_expert: usize,
-    pub tile_to_limit: usize,
-    pub permuted_to_expanded: usize,
-    pub num_non_exiting_tiles: usize,
-    pub tokens: usize,
-    pub permuted_rows: usize,
-    pub width: usize,
-    pub hidden_size: usize,
-    pub experts: usize,
-    pub top: usize,
-    pub dtype: usize,
-    pub error: usize,
-}
-
-const _: () = assert!(
-    std::mem::size_of::<GatherCall>() == GATHER_CALL_LAYOUT.size,
-    "the gather_gemm call structure's size changed without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(GatherCall, error) == GATHER_CALL_LAYOUT.error,
-    "the gather_gemm call structure's `error` moved without its header"
-);
 
 impl NativeCall for GatherCall {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
 
@@ -350,10 +300,10 @@ impl Op for GatherGemm {
             experts: to_i64(Self::NAME, experts)?,
             top: to_i64(Self::NAME, top)?,
             dtype: abi::code(descriptor.dtype)?,
-            error: [0; 512],
+            error: [0; MESSAGE],
         };
-        // SAFETY: `GatherCall` is the call structure this package's entry declares, and its layout is
-        // pinned by the assertions above and by the test below.
+        // SAFETY: `GatherCall` is the call structure this package's entry declares: the declaration
+        // is generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 
@@ -488,10 +438,10 @@ impl Op for RouteGemm {
             intermediate: to_i64(Self::NAME, intermediate)?,
             experts: to_i64(Self::NAME, experts)?,
             dtype: abi::code(descriptor.dtype)?,
-            error: [0; 512],
+            error: [0; MESSAGE],
         };
-        // SAFETY: `RouteCall` is the call structure this package's entry declares, and its layout is
-        // pinned by the assertions above and by the test below.
+        // SAFETY: `RouteCall` is the call structure this package's entry declares: the declaration
+        // is generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 
@@ -543,10 +493,10 @@ pub struct RouteGemmArgs {
     pub out: Operand,
 }
 
-/// The call structure the FC2 package's entry receives.
-///
-/// Mirrored by hand in `crates/ops/kernels/route_gemm/<backend>/include/uniserve_route_gemm.h`.
+/// The call structure the FC2 package's entry receives, declared to the packages as
+/// `uniserve_route_call` (`uniserve_route_gemm.h`, generated with its layout asserted: [`abi`]).
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct RouteCall {
     pub rows: *const c_void,
     pub weights: *const c_void,
@@ -560,59 +510,13 @@ pub struct RouteCall {
     pub intermediate: i64,
     pub experts: i64,
     pub dtype: i64,
-    pub error: [u8; 512],
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
 }
-
-/// The layout of [`RouteCall`], for its header's mirror and its test.
-pub const ROUTE_CALL_LAYOUT: RouteCallLayout = RouteCallLayout {
-    size: 608,
-    rows: 0,
-    weights: 8,
-    out: 16,
-    tile_to_expert: 24,
-    tile_to_limit: 32,
-    permuted_to_expanded: 40,
-    num_non_exiting_tiles: 48,
-    permuted_rows: 56,
-    width: 64,
-    intermediate: 72,
-    experts: 80,
-    dtype: 88,
-    error: 96,
-};
-
-/// The layout of [`RouteCall`], for the header's mirror and its test.
-#[derive(Debug, PartialEq, Eq)]
-pub struct RouteCallLayout {
-    pub size: usize,
-    pub rows: usize,
-    pub weights: usize,
-    pub out: usize,
-    pub tile_to_expert: usize,
-    pub tile_to_limit: usize,
-    pub permuted_to_expanded: usize,
-    pub num_non_exiting_tiles: usize,
-    pub permuted_rows: usize,
-    pub width: usize,
-    pub intermediate: usize,
-    pub experts: usize,
-    pub dtype: usize,
-    pub error: usize,
-}
-
-const _: () = assert!(
-    std::mem::size_of::<RouteCall>() == ROUTE_CALL_LAYOUT.size,
-    "the route_gemm call structure's size changed without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(RouteCall, error) == ROUTE_CALL_LAYOUT.error,
-    "the route_gemm call structure's `error` moved without its header"
-);
 
 impl NativeCall for RouteCall {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
 
@@ -752,7 +656,9 @@ fn check_workspace(operator: &'static str, workspace: &Operand) -> Result<()> {
     Ok(())
 }
 
-/// One encoded FC1 launch, as the trtllm-gen batched-GEMM entry reads it.
+/// One encoded FC1 launch, as the trtllm-gen batched-GEMM entry reads it, declared to the packages
+/// as `uniserve_gather_gemm_nvfp4_call` (`uniserve_gather_gemm_nvfp4.h`, generated with its layout
+/// asserted: [`abi`]).
 ///
 /// The call is a plain structure of pointers and extents rather than a packed argument list, because
 /// a native module's entry takes one: `uniserve_gather_gemm_nvfp4(call, stream)`. The descriptors'
@@ -760,6 +666,7 @@ fn check_workspace(operator: &'static str, workspace: &Operand) -> Result<()> {
 /// scale layout — travel as well, since the entry checks the call against the module it was built as
 /// and refuses a mismatch by name rather than launching a kernel with another tactic's assumptions.
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct GatherNvfp4Call {
     /// `[tokens, hidden/2]` U8: the activations, two E2M1 codes a byte, token-major.
     pub hidden: *const c_void,
@@ -810,46 +717,20 @@ pub struct GatherNvfp4Call {
     /// The element type of the activations and the output, as `abi::code` numbers it.
     pub dtype: i64,
     /// A NUL-terminated refusal, when the entry returns nonzero.
-    pub error: [u8; 512],
-}
-
-/// The offsets of [`GatherNvfp4Call`] its header mirrors, stated once for the test below.
-pub struct GatherNvfp4CallLayout {
-    pub size: usize,
-    pub hidden_scale: usize,
-    pub hidden_token_scale: usize,
-    pub global_scale: usize,
-    pub global_scale_gate: usize,
-    pub workspace: usize,
-    pub workspace_bytes: usize,
-    pub dtype: usize,
-    pub error: usize,
-}
-
-impl GatherNvfp4Call {
-    /// The offsets the C header must agree with.
-    pub const LAYOUT: GatherNvfp4CallLayout = GatherNvfp4CallLayout {
-        size: 712,
-        hidden_scale: 8,
-        hidden_token_scale: 16,
-        global_scale: 40,
-        global_scale_gate: 48,
-        workspace: 96,
-        workspace_bytes: 104,
-        dtype: 192,
-        error: 200,
-    };
+    pub error: [c_char; MESSAGE],
 }
 
 impl NativeCall for GatherNvfp4Call {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
 
-/// One encoded FC2 launch, as the trtllm-gen batched-GEMM entry reads it.
+/// One encoded FC2 launch, as the trtllm-gen batched-GEMM entry reads it, declared to the packages
+/// as `uniserve_route_gemm_nvfp4_call` (`uniserve_route_gemm_nvfp4.h`, generated with its layout
+/// asserted: [`abi`]).
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct RouteNvfp4Call {
     /// `[routes, intermediate/2]` U8: the gated rows FC1 produced, encoded.
     pub hidden: *const c_void,
@@ -898,39 +779,12 @@ pub struct RouteNvfp4Call {
     /// The element type of the activations and the output, as `abi::code` numbers it.
     pub dtype: i64,
     /// A NUL-terminated refusal, when the entry returns nonzero.
-    pub error: [u8; 512],
-}
-
-impl RouteNvfp4Call {
-    /// The offsets the C header must agree with.
-    pub const LAYOUT: RouteNvfp4CallLayout = RouteNvfp4CallLayout {
-        size: 696,
-        hidden_scale: 8,
-        hidden_token_scale: 16,
-        global_scale: 40,
-        workspace: 88,
-        workspace_bytes: 96,
-        dtype: 176,
-        error: 184,
-    };
-}
-
-/// The offsets of [`RouteNvfp4Call`] its header mirrors.
-pub struct RouteNvfp4CallLayout {
-    pub size: usize,
-    pub hidden_scale: usize,
-    pub hidden_token_scale: usize,
-    pub global_scale: usize,
-    pub workspace: usize,
-    pub workspace_bytes: usize,
-    pub dtype: usize,
-    pub error: usize,
+    pub error: [c_char; MESSAGE],
 }
 
 impl NativeCall for RouteNvfp4Call {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
 
@@ -1157,10 +1011,10 @@ impl Op for GatherGemmNvfp4 {
             cluster_m: i64::from(descriptor.cluster.0),
             cluster_n: i64::from(descriptor.cluster.1),
             dtype: abi::code(descriptor.dtype)?,
-            error: [0; 512],
+            error: [0; MESSAGE],
         };
-        // SAFETY: `GatherNvfp4Call` is the structure this package's entry declares, and its layout is
-        // pinned by the offsets above and by the test below.
+        // SAFETY: `GatherNvfp4Call` is the structure this package's entry declares: the declaration
+        // is generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 
@@ -1575,10 +1429,10 @@ impl Op for RouteGemmNvfp4 {
             cluster_m: i64::from(descriptor.cluster.0),
             cluster_n: i64::from(descriptor.cluster.1),
             dtype: abi::code(descriptor.dtype)?,
-            error: [0; 512],
+            error: [0; MESSAGE],
         };
-        // SAFETY: `RouteNvfp4Call` is the structure this package's entry declares, and its layout is
-        // pinned by the offsets declared beside it and by the test below.
+        // SAFETY: `RouteNvfp4Call` is the structure this package's entry declares: the declaration
+        // is generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 
@@ -1696,97 +1550,5 @@ mod nvfp4_launch_tests {
         args.scales = table(DType::F8E4M3, &[127, 1536, 128]);
         let error = <GatherGemmNvfp4 as Op>::check(&fc1(), &args).unwrap_err();
         assert!(format!("{error}").contains("do not cover"));
-    }
-}
-
-#[cfg(test)]
-mod nvfp4_call_layout_tests {
-    use super::*;
-
-    /// The two encoded calls' offsets, as the C headers that mirror them must state them.
-    ///
-    /// A call structure is read by a compiled entry, so a field at the wrong offset is a corrupted
-    /// launch rather than a failed one; this test is the Rust side of the pair `header.h`'s
-    /// `static_assert`s are the other half of.
-    #[test]
-    fn the_encoded_calls_are_the_size_and_shape_their_headers_state() {
-        assert_eq!(std::mem::size_of::<GatherNvfp4Call>(), 712);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, hidden), 0);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, hidden_scale), 8);
-        assert_eq!(
-            std::mem::offset_of!(GatherNvfp4Call, hidden_token_scale),
-            16
-        );
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, weights), 24);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, scales), 32);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale), 40);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale_gate), 48);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, tile_to_expert), 56);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, tile_to_limit), 64);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, permuted_to_token), 72);
-        assert_eq!(
-            std::mem::offset_of!(GatherNvfp4Call, num_non_exiting_tiles),
-            80
-        );
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, out), 88);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, workspace), 96);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, workspace_bytes), 104);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, dtype), 192);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, error), 200);
-
-        assert_eq!(std::mem::size_of::<RouteNvfp4Call>(), 696);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, hidden), 0);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, hidden_scale), 8);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, hidden_token_scale), 16);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, weights), 24);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, scales), 32);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, global_scale), 40);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, tile_to_expert), 48);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, tile_to_limit), 56);
-        assert_eq!(
-            std::mem::offset_of!(RouteNvfp4Call, permuted_to_expanded),
-            64
-        );
-        assert_eq!(
-            std::mem::offset_of!(RouteNvfp4Call, num_non_exiting_tiles),
-            72
-        );
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, out), 80);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, workspace), 88);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, workspace_bytes), 96);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, dtype), 176);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, error), 184);
-    }
-
-    /// Every package header that serves this operator states the layout this crate passes.
-    ///
-    /// The mirror is written by hand on both sides, so a field that moves on one side fails on the
-    /// other: the module's entry reads these offsets, and a mismatch is a wrong number rather than a
-    /// refusal.
-    #[test]
-    fn the_gather_header_declares_this_call_layout() {
-        let layout = GATHER_CALL_LAYOUT;
-        crate::call_layout_check::check(
-            "gather_gemm",
-            "uniserve_gather_call",
-            &[
-                ("hidden", layout.hidden),
-                ("weights", layout.weights),
-                ("out", layout.out),
-                ("tile_to_expert", layout.tile_to_expert),
-                ("tile_to_limit", layout.tile_to_limit),
-                ("permuted_to_expanded", layout.permuted_to_expanded),
-                ("num_non_exiting_tiles", layout.num_non_exiting_tiles),
-                ("tokens", layout.tokens),
-                ("permuted_rows", layout.permuted_rows),
-                ("width", layout.width),
-                ("hidden_size", layout.hidden_size),
-                ("experts", layout.experts),
-                ("top", layout.top),
-                ("dtype", layout.dtype),
-                ("error", layout.error),
-            ],
-            layout.size,
-        );
     }
 }

@@ -23,13 +23,13 @@
 //! cuDNN reads. The two products are separate variants because their results differ in the last bit
 //! of a few elements — a difference of the product, not of the encoding.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use platform::Stream;
 use tensor::DType;
 
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::operand::Operand;
@@ -373,42 +373,43 @@ pub struct GemmArgs {
     pub out: Operand,
 }
 
-/// The call structure `nvfp4_gemm/cute_dsl`'s entry takes, as its header declares it.
+/// The call structure `nvfp4_gemm`'s entry takes, declared to the package as
+/// `uniserve_nvfp4_gemm_call` (`uniserve_nvfp4_gemm.h`, generated with its layout asserted:
+/// [`abi`]).
 ///
-/// The header asserts the two offsets this structure must match — `error` at byte 80 and a size
-/// of 592 — because the entry reads seven device addresses, then `m`, `n` and `k`, and writes its
-/// message into the tail. `bias` is never null: an epilogue that adds none passes `alpha`, which
-/// the entry does not read in that case.
+/// The entry reads seven device addresses, then `m`, `n` and `k`, and writes its message into the
+/// tail. `bias` is never null: an epilogue that adds none passes `alpha`, which the entry does not
+/// read in that case.
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct Call {
+    /// `[m, k / 2]` packed E2M1 bytes, unit stride on the contraction.
     pub input: *const c_void,
+    /// `[n, k / 2]` packed E2M1 bytes, unit stride on the contraction.
     pub weight: *const c_void,
+    /// The input's E4M3 block scales, `[m, k / 16]` in the 128x4 interleaved atom: rows padded to
+    /// 128 and scale columns to 4.
     pub input_scales: *const c_void,
+    /// The weight's E4M3 block scales, `[n, k / 16]` in the same atom.
     pub weight_scales: *const c_void,
+    /// `[1]` FP32: the product of the two tensor scales, which the epilogue reads on the device.
     pub alpha: *const c_void,
+    /// `[n]`: the addend a biasing epilogue takes.
     pub bias: *const c_void,
+    /// `[m, n]`: the product.
     pub out: *mut c_void,
     pub m: i64,
     pub n: i64,
     pub k: i64,
-    pub error: [u8; 512],
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
 }
 
 impl NativeCall for Call {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
-
-const _: () = assert!(
-    std::mem::offset_of!(Call, error) == 80,
-    "the call's message moved without the package's header"
-);
-const _: () = assert!(
-    std::mem::size_of::<Call>() == 592,
-    "the call's size moved without the package's header"
-);
 
 /// An encoded activation's block scales: one byte per scale, declared by whoever produced it.
 ///
@@ -554,10 +555,11 @@ impl Op for Nvfp4Gemm {
             m: m as i64,
             n: n as i64,
             k: i64::from(descriptor.k),
-            error: [0; 512],
+            error: [0; MESSAGE],
         };
-        // SAFETY: `Call` is the structure this package's entry declares, with the layout its
-        // header asserts, and the entry the package resolved is `uniserve_nvfp4_gemm`.
+        // SAFETY: `Call` is the structure this package's entry declares, generated from this
+        // definition with its layout asserted, and the entry the package resolved is
+        // `uniserve_nvfp4_gemm`.
         unsafe { kernel.native(&mut call, stream) }
     }
 

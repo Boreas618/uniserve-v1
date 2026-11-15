@@ -54,13 +54,13 @@
 //! inside the package — for the audio encoder and the sparse compression branch, which hold their
 //! activations in FP32. Both take the same call structure and the same descriptor fields.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use platform::Stream;
 
 use super::{Mask, address, head_stride, row_stride, to_i64};
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::operand::Operand;
@@ -159,13 +159,15 @@ pub struct DenseArgs {
     pub longest: Option<u64>,
 }
 
-/// The call structure a package's entry receives.
+/// The call structure a package's entry receives, declared to the packages as
+/// `uniserve_dense_attention_call` (`uniserve_dense_attention.h`, generated with its layout
+/// asserted: [`abi`]).
 ///
-/// Mirrored by hand in `crates/ops/kernels/dense_attention/<backend>/include/uniserve_dense_attention.h`;
-/// the layout is pinned by [`DENSE_ATTENTION_CALL_LAYOUT`], the assertions below and the test beside
-/// them.
+/// Every pointer is a device address. `cu_seq_lens_q` and `cu_seq_lens_k` are the two offset
+/// tables the scheduler writes, read on the device, so an entry never copies them to the host and a
+/// captured call stays capturable.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, abi::Layout)]
 pub struct DenseCall {
     /// `[q_tokens, q_heads, head_dim]` output.
     pub out: *mut c_void,
@@ -220,107 +222,12 @@ pub struct DenseCall {
     /// `DType`'s ABI number of the output.
     pub dtype_output: i64,
     /// The entry's message on a nonzero return.
-    pub error: [u8; 512],
+    pub error: [c_char; MESSAGE],
 }
-
-/// The size and field offsets the package's header must mirror, in bytes.
-pub const DENSE_ATTENTION_CALL_LAYOUT: DenseCallLayout = DenseCallLayout {
-    size: 720,
-    out: 0,
-    query: 8,
-    key: 16,
-    value: 24,
-    cu_seq_lens_q: 32,
-    cu_seq_lens_k: 40,
-    batch: 48,
-    q_tokens: 56,
-    kv_tokens: 64,
-    max_q_len: 72,
-    max_kv_len: 80,
-    q_heads: 88,
-    kv_heads: 96,
-    head_dim: 104,
-    q_stride_tokens: 112,
-    q_stride_heads: 120,
-    kv_stride_tokens: 128,
-    kv_stride_heads: 136,
-    o_stride_tokens: 144,
-    o_stride_heads: 152,
-    scale: 160,
-    window_left: 168,
-    causal: 176,
-    dtype_query: 184,
-    dtype_key_value: 192,
-    dtype_output: 200,
-    error: 208,
-};
-
-/// The layout of [`DenseCall`], for the header's mirror and its test.
-#[derive(Debug, PartialEq, Eq)]
-pub struct DenseCallLayout {
-    pub size: usize,
-    pub out: usize,
-    pub query: usize,
-    pub key: usize,
-    pub value: usize,
-    pub cu_seq_lens_q: usize,
-    pub cu_seq_lens_k: usize,
-    pub batch: usize,
-    pub q_tokens: usize,
-    pub kv_tokens: usize,
-    pub max_q_len: usize,
-    pub max_kv_len: usize,
-    pub q_heads: usize,
-    pub kv_heads: usize,
-    pub head_dim: usize,
-    pub q_stride_tokens: usize,
-    pub q_stride_heads: usize,
-    pub kv_stride_tokens: usize,
-    pub kv_stride_heads: usize,
-    pub o_stride_tokens: usize,
-    pub o_stride_heads: usize,
-    pub scale: usize,
-    pub window_left: usize,
-    pub causal: usize,
-    pub dtype_query: usize,
-    pub dtype_key_value: usize,
-    pub dtype_output: usize,
-    pub error: usize,
-}
-
-const _: () = assert!(
-    std::mem::size_of::<DenseCall>() == DENSE_ATTENTION_CALL_LAYOUT.size,
-    "the dense_attention call structure's size changed without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(DenseCall, cu_seq_lens_q) == DENSE_ATTENTION_CALL_LAYOUT.cu_seq_lens_q,
-    "the dense_attention call structure's pointers moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(DenseCall, batch) == DENSE_ATTENTION_CALL_LAYOUT.batch,
-    "the dense_attention call structure's geometry moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(DenseCall, q_stride_tokens) == DENSE_ATTENTION_CALL_LAYOUT.q_stride_tokens,
-    "the dense_attention call structure's strides moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(DenseCall, scale) == DENSE_ATTENTION_CALL_LAYOUT.scale,
-    "the dense_attention call structure's scalars moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(DenseCall, dtype_query) == DENSE_ATTENTION_CALL_LAYOUT.dtype_query,
-    "the dense_attention call structure's dtypes moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(DenseCall, error) == DENSE_ATTENTION_CALL_LAYOUT.error,
-    "the dense_attention call structure's `error` moved without its header"
-);
 
 impl NativeCall for DenseCall {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
 
@@ -498,10 +405,10 @@ impl Op for DenseAttention {
             dtype_query: abi::code(descriptor.query)?,
             dtype_key_value: abi::code(descriptor.key_value)?,
             dtype_output: abi::code(descriptor.output)?,
-            error: [0; 512],
+            error: [0; MESSAGE],
         };
-        // SAFETY: `DenseCall` is the call structure this package's entry declares, and its layout is
-        // pinned by the assertions above and by the test below.
+        // SAFETY: `DenseCall` is the call structure this package's entry declares: the declaration
+        // is generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 
@@ -696,79 +603,6 @@ mod tests {
         causal.mask = Mask::Causal;
         assert_ne!(cross().to_string(), causal.to_string());
         assert_eq!(DenseAttention::NAME, "dense_attention");
-    }
-
-    #[test]
-    fn call_layout_is_the_one_the_header_declares() {
-        let layout = DENSE_ATTENTION_CALL_LAYOUT;
-        assert_eq!(std::mem::size_of::<DenseCall>(), layout.size);
-        assert_eq!(std::mem::align_of::<DenseCall>(), 8);
-        assert_eq!(std::mem::offset_of!(DenseCall, out), layout.out);
-        assert_eq!(std::mem::offset_of!(DenseCall, query), layout.query);
-        assert_eq!(std::mem::offset_of!(DenseCall, key), layout.key);
-        assert_eq!(std::mem::offset_of!(DenseCall, value), layout.value);
-        assert_eq!(
-            std::mem::offset_of!(DenseCall, cu_seq_lens_q),
-            layout.cu_seq_lens_q
-        );
-        assert_eq!(
-            std::mem::offset_of!(DenseCall, cu_seq_lens_k),
-            layout.cu_seq_lens_k
-        );
-        assert_eq!(std::mem::offset_of!(DenseCall, batch), layout.batch);
-        assert_eq!(std::mem::offset_of!(DenseCall, q_tokens), layout.q_tokens);
-        assert_eq!(std::mem::offset_of!(DenseCall, kv_tokens), layout.kv_tokens);
-        assert_eq!(std::mem::offset_of!(DenseCall, max_q_len), layout.max_q_len);
-        assert_eq!(
-            std::mem::offset_of!(DenseCall, max_kv_len),
-            layout.max_kv_len
-        );
-        assert_eq!(std::mem::offset_of!(DenseCall, q_heads), layout.q_heads);
-        assert_eq!(std::mem::offset_of!(DenseCall, kv_heads), layout.kv_heads);
-        assert_eq!(std::mem::offset_of!(DenseCall, head_dim), layout.head_dim);
-        assert_eq!(
-            std::mem::offset_of!(DenseCall, q_stride_tokens),
-            layout.q_stride_tokens
-        );
-        assert_eq!(
-            std::mem::offset_of!(DenseCall, q_stride_heads),
-            layout.q_stride_heads
-        );
-        assert_eq!(
-            std::mem::offset_of!(DenseCall, kv_stride_tokens),
-            layout.kv_stride_tokens
-        );
-        assert_eq!(
-            std::mem::offset_of!(DenseCall, kv_stride_heads),
-            layout.kv_stride_heads
-        );
-        assert_eq!(
-            std::mem::offset_of!(DenseCall, o_stride_tokens),
-            layout.o_stride_tokens
-        );
-        assert_eq!(
-            std::mem::offset_of!(DenseCall, o_stride_heads),
-            layout.o_stride_heads
-        );
-        assert_eq!(std::mem::offset_of!(DenseCall, scale), layout.scale);
-        assert_eq!(
-            std::mem::offset_of!(DenseCall, window_left),
-            layout.window_left
-        );
-        assert_eq!(std::mem::offset_of!(DenseCall, causal), layout.causal);
-        assert_eq!(
-            std::mem::offset_of!(DenseCall, dtype_query),
-            layout.dtype_query
-        );
-        assert_eq!(
-            std::mem::offset_of!(DenseCall, dtype_key_value),
-            layout.dtype_key_value
-        );
-        assert_eq!(
-            std::mem::offset_of!(DenseCall, dtype_output),
-            layout.dtype_output
-        );
-        assert_eq!(std::mem::offset_of!(DenseCall, error), layout.error);
     }
 
     #[test]

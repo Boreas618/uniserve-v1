@@ -18,13 +18,13 @@
 //! for. Their launch shape is the package's (the entries launch their own blocks), so the call
 //! structures below carry the operands and nothing about the grid.
 
+use std::ffi::c_char;
 use std::fmt;
-use std::mem::{offset_of, size_of};
 
 use platform::Stream;
 use tensor::DType;
 
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::operand::Operand;
@@ -271,9 +271,6 @@ impl Op for FramePad {
     }
 }
 
-/// The largest message an entry writes into a call structure.
-const MESSAGE: usize = 512;
-
 /// The reduction class a frame of `channels_per_group` channels and `pixels` pixels falls in.
 ///
 /// A class is the reduction padded to a power of two, because that is what a compiled program's
@@ -359,8 +356,10 @@ pub fn pixel_stride(values: &Operand) -> Result<i64> {
     ))
 }
 
-/// The call structure of `frame_moments`, mirrored by the package's header.
-#[derive(Clone, Copy)]
+/// The call structure of `frame_moments`, declared to the package as
+/// `uniserve_frame_moments_call` (`uniserve_frame_moments.h`, generated with its layout asserted:
+/// [`abi`]).
+#[derive(Clone, Copy, abi::Layout)]
 #[repr(C)]
 pub struct FrameMomentsCall {
     /// The values' address.
@@ -390,22 +389,14 @@ pub struct FrameMomentsCall {
     /// The reciprocal standard deviation buffer's address, the same shape.
     pub rstd: u64,
     /// The entry's NUL-terminated error message.
-    pub error: [u8; MESSAGE],
+    pub error: [c_char; MESSAGE],
 }
 
 impl NativeCall for FrameMomentsCall {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
-
-const _: () = assert!(offset_of!(FrameMomentsCall, values) == 0);
-const _: () = assert!(offset_of!(FrameMomentsCall, values_pixel) == 32);
-const _: () = assert!(offset_of!(FrameMomentsCall, epsilon) == 72);
-const _: () = assert!(offset_of!(FrameMomentsCall, mean) == 80);
-const _: () = assert!(offset_of!(FrameMomentsCall, error) == 96);
-const _: () = assert!(size_of::<FrameMomentsCall>() == 96 + MESSAGE);
 
 /// One compilation of `frame_moments`: the element type and nothing else.
 ///
@@ -531,8 +522,8 @@ impl Op for FrameMoments {
             rstd: args.rstd.ptr.address(),
             error: [0; MESSAGE],
         };
-        // SAFETY: the entry is this package's `frame_moments`, whose header mirrors
-        // `FrameMomentsCall` field for field.
+        // SAFETY: the entry is this package's `frame_moments`, whose declaration of
+        // `FrameMomentsCall` is generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 
@@ -596,8 +587,25 @@ impl fmt::Display for FrameNormPadDescriptor {
     }
 }
 
-/// The call structure of `frame_norm_pad`, mirrored by the package's header.
-#[derive(Clone, Copy)]
+/// The normalization a frame's values take in `frame_norm_pad`: the branch PyTorch's
+/// `GroupNormKernelImplInternal` takes for the parameters and the frame's size. The call carries
+/// its number (`uniserve_normalization`).
+#[repr(i32)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Normalization {
+    /// `ComputeFusedParamsCUDAKernel`'s `a = rstd · gamma` and `b = −a · mean + beta`, then the
+    /// apply's `a · x + b`.
+    Fused = 0,
+    /// No affine parameters: `(x − mean) · rstd`.
+    Centered = 1,
+    /// One-pixel frames (`GroupNorm1dForward`).
+    SinglePixel = 2,
+}
+
+/// The call structure of `frame_norm_pad`, declared to the package as
+/// `uniserve_frame_norm_pad_call` (`uniserve_frame_norm_pad.h`, generated with its layout
+/// asserted: [`abi`]).
+#[derive(Clone, Copy, abi::Layout)]
 #[repr(C)]
 pub struct FrameNormPadCall {
     /// The values' address.
@@ -654,26 +662,17 @@ pub struct FrameNormPadCall {
     pub front: i64,
     /// Mirror the padded rows and columns instead of replicating them.
     pub reflect: i32,
-    /// The normalization branch the kernel takes.
+    /// The [`Normalization`] the kernel takes, by its number.
     pub normalization: i32,
     /// The entry's NUL-terminated error message.
-    pub error: [u8; MESSAGE],
+    pub error: [c_char; MESSAGE],
 }
 
 impl NativeCall for FrameNormPadCall {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
-
-const _: () = assert!(offset_of!(FrameNormPadCall, values) == 0);
-const _: () = assert!(offset_of!(FrameNormPadCall, weight) == 48);
-const _: () = assert!(offset_of!(FrameNormPadCall, out) == 64);
-const _: () = assert!(offset_of!(FrameNormPadCall, channels) == 112);
-const _: () = assert!(offset_of!(FrameNormPadCall, reflect) == 208);
-const _: () = assert!(offset_of!(FrameNormPadCall, error) == 216);
-const _: () = assert!(size_of::<FrameNormPadCall>() == 216 + MESSAGE);
 
 /// The arguments of `frame_norm_pad`.
 #[derive(Clone)]
@@ -876,11 +875,11 @@ impl Op for FrameNormPad {
 
         // The kernel's branch: one pixel per frame, the centered reduction, or the fused affine one.
         let normalization = if descriptor.single_pixel {
-            2
+            Normalization::SinglePixel
         } else if descriptor.centered {
-            1
+            Normalization::Centered
         } else {
-            0
+            Normalization::Fused
         };
         let mut call = FrameNormPadCall {
             values: args.values.ptr.address(),
@@ -913,11 +912,11 @@ impl Op for FrameNormPad {
             left: args.left as i64,
             front: args.front as i64,
             reflect: i32::from(args.reflect),
-            normalization,
+            normalization: normalization as i32,
             error: [0; MESSAGE],
         };
-        // SAFETY: the entry is this package's `frame_norm_pad`, whose header mirrors
-        // `FrameNormPadCall` field for field.
+        // SAFETY: the entry is this package's `frame_norm_pad`, whose declaration of
+        // `FrameNormPadCall` is generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 

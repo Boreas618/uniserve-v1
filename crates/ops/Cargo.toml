@@ -21,12 +21,19 @@ proto.workspace = true
 thiserror.workspace = true
 # A host value's BF16 and F16 bytes, rounded as the tensor library's element types round.
 half.workspace = true
+# The layout of each call structure a native package receives (`abi::Layout`), derived from the
+# structure's definition.
+ops-derive.workspace = true
 
 [dev-dependencies]
 # `tests/packages.rs` loads every kernel package's manifest as the Build Server
 # reads it, and reads what each manifest states as written.
 build-server.workspace = true
 toml.workspace = true
+# The C ABI headers of the native packages are generated from the call structures by cbindgen
+# (`abi::headers`) and compared with the committed files, which `UPDATE_EXPECT=1` rewrites.
+cbindgen.workspace = true
+expect-test.workspace = true
 
 [lints]
 workspace = true

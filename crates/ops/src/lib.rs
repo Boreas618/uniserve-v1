@@ -145,9 +145,6 @@ pub mod allocator;
 pub mod attention;
 pub mod block_copy;
 pub mod breaks;
-// Test-only: the package headers' mirrors checked against the layouts this crate passes.
-#[cfg(test)]
-pub mod call_layout_check;
 pub mod cast;
 pub mod channel_affine;
 pub mod collective;

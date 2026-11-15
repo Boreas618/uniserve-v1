@@ -32,7 +32,7 @@
 //! rounds once, so two implementations differ by the `ranks`-term reduction and the output's
 //! rounding, stated as [`Tolerance::dot`].
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::fmt;
 use std::sync::Arc;
 
@@ -40,7 +40,7 @@ use platform::DevicePtr;
 use platform::Stream;
 use tensor::DType;
 
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::operand::Operand;
@@ -50,25 +50,17 @@ use crate::{Error, Op, Result, Twins};
 use super::{address, to_i64};
 
 /// Which direction of the exchange one module performs.
+///
+/// The call carries its number (`uniserve_exchange` in `uniserve_expert_exchange.h`).
+#[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Mode {
     /// Send every route to the rank holding its expert.
-    Dispatch,
+    Dispatch = 0,
     /// Return every token's partial expert sums to the rank holding the token.
-    Combine,
+    Combine = 1,
     /// Dispatch, run this layer's experts and combine, in one launch.
-    Fused,
-}
-
-impl Mode {
-    /// The number the package's header gives this direction.
-    const fn number(self) -> i64 {
-        match self {
-            Self::Dispatch => 0,
-            Self::Combine => 1,
-            Self::Fused => 2,
-        }
-    }
+    Fused = 2,
 }
 
 impl fmt::Display for Mode {
@@ -216,47 +208,61 @@ pub struct ExchangeArgs {
     pub ranks: u32,
 }
 
-/// What a fused launch reads of one layer: its experts, as the loader laid them out.
+/// What a fused launch reads of one layer: its experts, as the loader laid them out, declared to
+/// the packages as `uniserve_fused_layer`.
 ///
-/// Mirrored by hand in the package's header as `uniserve_fused_layer`. Every address is a device
-/// address the layer's weights hold for the life of the model.
+/// Each weight is `[local experts, rows, columns / 2]` packed values, read K-major, with its block
+/// scales in a table of `scale_bytes` per expert. Every address is a device address the layer's
+/// weights hold for the life of the model.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, abi::Layout)]
 pub struct FusedLayer {
     /// `[local, 2 * intermediate, hidden / 2]` packed values.
-    pub up_gate: u64,
+    pub up_gate: *const c_void,
     /// The first projection's block scales.
-    pub up_gate_scales: u64,
+    pub up_gate_scales: *const c_void,
     /// `[local, hidden, intermediate / 2]` packed values.
-    pub down: u64,
+    pub down: *const c_void,
     /// The second projection's block scales.
-    pub down_scales: u64,
+    pub down_scales: *const c_void,
     /// `[local]` f32 that dequantizes the first product.
-    pub up_gate_alpha: u64,
+    pub up_gate_alpha: *const f32,
     /// `[local]` f32 that dequantizes the second product.
-    pub down_alpha: u64,
+    pub down_alpha: *const f32,
     /// `[local]` f32 that encodes the gated rows.
-    pub gated_scale: u64,
+    pub gated_scale: *const f32,
     /// Bytes of one expert's block scales, first projection.
     pub up_gate_scale_bytes: i64,
     /// Bytes of one expert's block scales, second projection.
     pub down_scale_bytes: i64,
 }
 
-/// The call structure the package's entry receives.
+/// One launch of the exchange, declared to the packages as `uniserve_exchange_call`.
 ///
-/// Mirrored by hand in `crates/ops/include/uniserve_expert_exchange.h`, the one header every
-/// `expert_exchange` package links into its `include/`.
+/// The structures of `expert_exchange` are generated into `uniserve_expert_exchange.h` with their
+/// layouts asserted ([`abi`]); every backend includes that one header, so the executor drives any
+/// backend through the same eight entries. Dispatch sends this rank's rows and leaves what the rank
+/// received in the transport's views. Combine returns the rows the rank's experts computed, which
+/// it wrote into the transport's `combined` view, and sums each token's partial results into `out`.
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct Call {
     pub transport: *mut c_void,
+    /// Dispatch: `[tokens, hidden]` rows to send.
     pub states: *const c_void,
+    /// Dispatch: `[tokens, top]` expert ids.
     pub ids: *const i32,
+    /// Dispatch: `[tokens, top]` route weights.
     pub weights: *const f32,
+    /// `[1]` device count of live rows, or null for all `tokens`.
     pub live: *const i32,
+    /// Combine: `[tokens, hidden]` summed rows, written.
     pub out: *mut c_void,
+    /// Fused: this layer's expert operands.
     pub layer: *const FusedLayer,
+    /// The [`Mode`], by its number.
     pub mode: i64,
+    /// Rows of this launch's extent, the captured bucket's.
     pub tokens: i64,
     pub top: i64,
     pub hidden: i64,
@@ -264,56 +270,39 @@ pub struct Call {
     pub max_tokens: i64,
     pub ranks: i64,
     pub dtype: i64,
-    pub error: [u8; 512],
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
 }
-
-/// The size and field offsets the header must mirror, in bytes.
-pub const CALL_LAYOUT: CallLayout = CallLayout {
-    size: 632,
-    error: 120,
-};
-
-/// The layout of one exchange structure, for its header's mirror and its test.
-#[derive(Debug, PartialEq, Eq)]
-pub struct CallLayout {
-    pub size: usize,
-    pub error: usize,
-}
-
-const _: () = assert!(
-    std::mem::size_of::<Call>() == CALL_LAYOUT.size,
-    "the expert_exchange call structure's size changed without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, error) == CALL_LAYOUT.error,
-    "the expert_exchange call structure's `error` moved without its header"
-);
 
 impl NativeCall for Call {
     fn message(&self) -> Option<&str> {
-        message(&self.error)
+        abi::message(&self.error)
     }
 }
 
-fn message(error: &[u8; 512]) -> Option<&str> {
-    let end = error.iter().position(|&byte| byte == 0)?;
-    std::str::from_utf8(&error[..end]).ok()
-}
-
-/// The worker's host channel to the group, as a package sees it.
+/// The worker's host channel to the group, as a package sees it, declared to the packages as
+/// `UniserveGroup`.
 ///
 /// One instance per rank and group, built by the worker and alive for the transport's whole life.
-/// Mirrored by hand in the same header as `UniserveGroup`.
+/// A package may cache neither the pointer nor a copy of what it points at, and must never free
+/// it. Every function is collective over the group and is called from a lifecycle entry only,
+/// never from a launch. The ranks of a host are threads of one process, so a function blocks its
+/// caller's thread and no other's.
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct HostGroup {
     /// What the functions below take as their first argument.
     pub handle: *mut c_void,
     /// The group's `ncclComm_t`, for a package that drives NCCL itself, or null.
     pub communicator: *mut c_void,
+    /// Ranks of the group.
     pub ranks: i64,
+    /// This rank's index in it.
     pub rank: i64,
+    /// The CUDA device this rank's transport lives on.
     pub device: i64,
-    /// Gathers each rank's `bytes` bytes of `mine` into `peers`, `[ranks][bytes]` in rank order.
+    /// Gathers each rank's `bytes` bytes of `mine` into `peers`, `[ranks][bytes]` in rank order:
+    /// peer handles and addresses travel through this.
     pub all_gather: unsafe extern "C" fn(
         handle: *mut c_void,
         mine: *const c_void,
@@ -322,17 +311,9 @@ pub struct HostGroup {
     ) -> i32,
     /// Returns once every rank of the group has called it.
     pub barrier: unsafe extern "C" fn(handle: *mut c_void) -> i32,
-    pub error: [u8; 512],
+    /// Why the last call failed; empty after a successful one.
+    pub error: [c_char; MESSAGE],
 }
-
-/// The size and field offsets the group's header must mirror, in bytes.
-pub const HOST_GROUP_LAYOUT: CallLayout = CallLayout {
-    size: 568,
-    error: 56,
-};
-
-const _: () = assert!(std::mem::size_of::<HostGroup>() == HOST_GROUP_LAYOUT.size);
-const _: () = assert!(std::mem::offset_of!(HostGroup, error) == HOST_GROUP_LAYOUT.error);
 
 /// What the worker states about a transport it creates.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -396,49 +377,58 @@ impl TransportShape {
             intermediate: i64::from(self.intermediate),
             capacity: 0,
             attention_ranks: i64::from(self.attention_ranks),
-            error: [0; 512],
+            error: [0; MESSAGE],
         })
     }
 }
 
-/// The transport's lifecycle call, as the header declares it.
+/// The transport's lifecycle call, as the executor drives it, declared to the packages as
+/// `uniserve_exchange_lifecycle`.
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct Lifecycle {
     pub transport: *mut c_void,
+    /// The executor's channel to the group, alive for the whole package life.
     pub group: *const HostGroup,
     pub ranks: i64,
     pub rank: i64,
+    /// Experts in the router's vocabulary.
     pub experts: i64,
     pub hidden: i64,
+    /// Rows one rank sends in one step, at most.
     pub max_tokens: i64,
     pub top: i64,
     pub dtype: i64,
     pub device: i64,
+    /// An expert's gated width, for a backend that runs the experts.
     pub intermediate: i64,
+    /// Step entry: the rows per rank the group agreed for this step.
     pub capacity: i64,
+    /// Leading ranks that hold no experts; zero when every rank holds some.
     pub attention_ranks: i64,
-    pub error: [u8; 512],
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
 }
 
-/// The size and field offsets the lifecycle's header must mirror, in bytes.
-pub const LIFECYCLE_LAYOUT: CallLayout = CallLayout {
-    size: 616,
-    error: 104,
-};
-
-const _: () = assert!(std::mem::size_of::<Lifecycle>() == LIFECYCLE_LAYOUT.size);
-const _: () = assert!(std::mem::offset_of!(Lifecycle, error) == LIFECYCLE_LAYOUT.error);
-
-/// The views a transport holds, as the header declares them.
+/// The views a transport holds, asked for once per transport and again after a restore, whose
+/// addresses it must agree with; declared to the packages as `uniserve_exchange_info`.
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct Info {
     pub transport: *mut c_void,
+    /// `[ranks * capacity, hidden]` rows received, in the activation's type.
     pub states: *mut c_void,
+    /// `[ranks * capacity, top]` i32.
     pub ids: *mut c_void,
+    /// `[ranks * capacity, top]` f32.
     pub weights: *mut c_void,
+    /// `[ranks * capacity, hidden]` rows the experts computed.
     pub combined: *mut c_void,
+    /// `[1]` i32: how many leading rows of those views this step holds.
     pub live: *mut c_void,
+    /// Fused: `[capacity, hidden / 2]` the encoded rows a rank sends.
     pub packed: *mut c_void,
+    /// Fused: `[capacity, scale columns]` their block scales.
     pub packed_scales: *mut c_void,
     pub ranks: i64,
     pub rank: i64,
@@ -447,18 +437,11 @@ pub struct Info {
     pub top: i64,
     pub dtype: i64,
     pub device: i64,
+    /// Nonzero when one launch runs the whole expert layer.
     pub fused: i64,
-    pub error: [u8; 512],
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
 }
-
-/// The size and field offsets the info's header must mirror, in bytes.
-pub const INFO_LAYOUT: CallLayout = CallLayout {
-    size: 640,
-    error: 128,
-};
-
-const _: () = assert!(std::mem::size_of::<Info>() == INFO_LAYOUT.size);
-const _: () = assert!(std::mem::offset_of!(Info, error) == INFO_LAYOUT.error);
 
 type LifecycleEntry = unsafe extern "C" fn(*mut Lifecycle, *mut c_void) -> i32;
 type InfoEntry = unsafe extern "C" fn(*mut Info, *mut c_void) -> i32;
@@ -534,7 +517,8 @@ impl Transport {
         shape: TransportShape,
         stream: &Stream,
     ) -> Result<Self> {
-        // SAFETY: each symbol is the package's entry of the signature the header declares for it.
+        // SAFETY: each symbol is the package's lifecycle or info entry, which takes the structure
+        // its type names and the stream, as every native entry does (`kernel`).
         let (create, step, info) = unsafe {
             (
                 kernel.native_symbol::<LifecycleEntry>("uniserve_expert_exchange_create")?,
@@ -618,7 +602,7 @@ impl Transport {
             dtype: 0,
             device: 0,
             fused: 0,
-            error: [0; 512],
+            error: [0; MESSAGE],
         };
         // SAFETY: `info` has the layout the header declares; this entry issues no device work.
         let status = unsafe { (self.info)(&mut info, std::ptr::null_mut()) };
@@ -658,14 +642,14 @@ impl Transport {
 }
 
 /// A lifecycle entry's status, with the message it left.
-fn check(status: i32, entry: &str, error: &[u8; 512]) -> Result<()> {
+fn check(status: i32, entry: &str, error: &[c_char; MESSAGE]) -> Result<()> {
     if status == 0 {
         return Ok(());
     }
     Err(Error::Native {
         entry: format!("uniserve_expert_exchange_{entry}"),
         status,
-        message: message(error).map(str::to_owned),
+        message: abi::message(error).map(str::to_owned),
     })
 }
 
@@ -779,7 +763,7 @@ impl Op for ExpertExchange {
             }),
             out: address(args.out.ptr) as usize as *mut c_void,
             layer: fused.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
-            mode: descriptor.mode.number(),
+            mode: descriptor.mode as i64,
             tokens: to_i64(Self::NAME, tokens)?,
             top: to_i64(Self::NAME, top)?,
             hidden: to_i64(Self::NAME, hidden)?,
@@ -787,10 +771,10 @@ impl Op for ExpertExchange {
             max_tokens: to_i64(Self::NAME, max_tokens)?,
             ranks: to_i64(Self::NAME, ranks)?,
             dtype: abi::code(descriptor.dtype)?,
-            error: [0; 512],
+            error: [0; MESSAGE],
         };
-        // SAFETY: `Call` is the call structure this package's entry declares, and its layout is
-        // pinned by the assertions above and by the test below.
+        // SAFETY: `Call` is the call structure this package's entry declares: the declaration is
+        // generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 
@@ -864,13 +848,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn call_layouts_are_the_ones_the_header_declares() {
-        assert_eq!(std::mem::size_of::<Call>(), CALL_LAYOUT.size);
-        assert_eq!(std::mem::offset_of!(Call, error), CALL_LAYOUT.error);
-        assert_eq!(std::mem::offset_of!(Call, transport), 0);
-    }
-
-    #[test]
     fn dispatch_is_exact_and_combine_carries_the_rank_sum() {
         let dispatch = Descriptor {
             mode: Mode::Dispatch,
@@ -924,27 +901,5 @@ mod tests {
             ..combine
         };
         assert_ne!(wider.to_string(), combine.to_string());
-    }
-
-    /// Every package header that serves this operator states the layout this crate passes.
-    ///
-    /// The mirror is written by hand on both sides, so a field that moves on one side fails on the
-    /// other: the module's entry reads these offsets, and a mismatch is a wrong number rather than a
-    /// refusal.
-    #[test]
-    fn the_headers_declare_these_layouts() {
-        for (structure, layout) in [
-            ("uniserve_exchange_call", &CALL_LAYOUT),
-            ("UniserveGroup", &HOST_GROUP_LAYOUT),
-            ("uniserve_exchange_lifecycle", &LIFECYCLE_LAYOUT),
-            ("uniserve_exchange_info", &INFO_LAYOUT),
-        ] {
-            crate::call_layout_check::check(
-                "expert_exchange",
-                structure,
-                &[("error", layout.error)],
-                layout.size,
-            );
-        }
     }
 }

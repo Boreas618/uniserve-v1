@@ -15,13 +15,13 @@
 //! transposed 1-d  input [n, c, l]        weight [c, k/groups, t]         out [n, k, ol]
 //! ```
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use platform::Stream;
 use tensor::DType;
 
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::Key;
 use crate::frame::is_channels_last;
 use crate::kernel::{Kernel, NativeCall};
@@ -143,13 +143,13 @@ impl Descriptor {
     }
 }
 
-/// The call structure a convolution package's entry receives.
+/// The call structure a convolution package's entry receives, declared to the packages as
+/// `uniserve_conv_call` (`uniserve_conv.h`, generated with its layout asserted: [`abi`]).
 ///
-/// Mirrored by hand in `crates/ops/include/uniserve_conv.h`, which the convolution package links
-/// into its `include/`; the assertions below and the test beside this module pin its layout. The
-/// spatial extents are passed as three axes, so one
-/// structure serves a 1-d and a 3-d convolution and the unused axes are 1.
+/// The spatial extents are passed as three axes, so one structure serves a 1-d and a 3-d
+/// convolution and the unused axes are 1, and `transposed` says which pass the library runs.
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct Call {
     pub out: *mut c_void,
     pub input: *const c_void,
@@ -169,39 +169,23 @@ pub struct Call {
     pub groups: i32,
     /// 0 for a plain convolution, 1 for a transposed one.
     pub transposed: i32,
-    /// 1 when the library may use TF32.
+    /// 1 when the library may use TF32 for an FP32 convolution. With 0 the module uses only an
+    /// engine that does not narrow its inputs; a convolution whose inputs are not FP32 may not
+    /// set it, and is refused if it does.
     pub tf32: i32,
-    /// 1 when the tensors are channels-last (NDHWC), 0 for channels-first (NCDHW).
+    /// 0 for channels-first activations (NCDHW), 1 for channels-last (NDHWC). The shapes stay
+    /// logical `[n, c, d, h, w]` either way: only the strides the entry derives for the input and
+    /// the output change, and the filter stays packed.
     pub channels_last: i32,
-    pub error: [u8; 512],
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
 }
 
 impl NativeCall for Call {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
-
-const _: () = assert!(
-    std::mem::offset_of!(Call, input_shape) == 32,
-    "the convolution call structure's geometry moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, kernel) == 32 + 3 * 5 * 8,
-    "the convolution call structure's filter moved without its header"
-);
-// The message's offset and the structure's size are pinned on both sides - here and by the
-// header's `static_assert`s - because a field added to one mirror and not the other is a kernel
-// reading its geometry out of its error buffer.
-const _: () = assert!(
-    std::mem::offset_of!(Call, error) == 216,
-    "the convolution call's message moved: the headers pin the same offset"
-);
-const _: () = assert!(
-    std::mem::size_of::<Call>() == 728,
-    "the convolution call's size must equal the headers', which pin it at 728"
-);
 
 /// The arguments of a convolution.
 #[derive(Clone)]
@@ -424,10 +408,10 @@ impl Op for Conv {
             transposed: i32::from(descriptor.transposed),
             tf32: i32::from(descriptor.tf32),
             channels_last: i32::from(descriptor.channels_last),
-            error: [0; 512],
+            error: [0; MESSAGE],
         };
-        // SAFETY: `Call` is the call structure this package's entry declares, and its layout is
-        // pinned by the assertions above and the test beside this module.
+        // SAFETY: `Call` is the call structure this package's entry declares: the declaration is
+        // generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 

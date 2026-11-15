@@ -61,13 +61,13 @@
 //! strides they are given, so a fused K/V projection that writes both into one allocation needs no
 //! copy.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use platform::Stream;
 
 use super::{address, check_vector_alignment, head_stride, row_stride, to_i64};
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::operand::Operand;
@@ -127,13 +127,15 @@ pub struct SparseArgs {
     pub scale: f32,
 }
 
-/// The call structure a package's entry receives.
+/// The call structure a package's entry receives, declared to the packages as
+/// `uniserve_sparse_attention_call` (`uniserve_sparse_attention.h`, generated with its layout
+/// asserted: [`abi`]).
 ///
-/// Mirrored by hand in `crates/ops/include/uniserve_sparse_attention.h`, which every
-/// `sparse_attention` package links into its `include/`;
-/// the layout is pinned by [`SPARSE_CALL_LAYOUT`], the assertions below and the test beside them.
+/// One block-sparse attention launch over selected key blocks: rows are whole tiles of the
+/// descriptor's block, which is the module's compilation, so a call whose rows do not divide it
+/// is refused.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, abi::Layout)]
 pub struct SparseCall {
     /// `[query_rows, heads, head_dim]` queries.
     pub query: *const c_void,
@@ -184,99 +186,12 @@ pub struct SparseCall {
     /// The softmax scale.
     pub scale: f32,
     /// The entry's message on a nonzero return.
-    pub error: [u8; 512],
+    pub error: [c_char; MESSAGE],
 }
-
-/// The size and field offsets the package's header must mirror, in bytes.
-pub const SPARSE_CALL_LAYOUT: SparseCallLayout = SparseCallLayout {
-    size: 704,
-    query: 0,
-    key: 8,
-    value: 16,
-    out: 24,
-    lse: 32,
-    indices: 40,
-    counts: 48,
-    valid: 56,
-    heads: 64,
-    query_rows: 72,
-    key_rows: 80,
-    q_row_stride: 88,
-    q_head_stride: 96,
-    o_row_stride: 104,
-    o_head_stride: 112,
-    k_row_stride: 120,
-    k_head_stride: 128,
-    v_row_stride: 136,
-    v_head_stride: 144,
-    selected: 152,
-    head_dim: 160,
-    dtype: 168,
-    output_dtype: 176,
-    scale: 184,
-    error: 188,
-};
-
-/// The layout of [`SparseCall`], for the header's mirror and its test.
-#[derive(Debug, PartialEq, Eq)]
-pub struct SparseCallLayout {
-    pub size: usize,
-    pub query: usize,
-    pub key: usize,
-    pub value: usize,
-    pub out: usize,
-    pub lse: usize,
-    pub indices: usize,
-    pub counts: usize,
-    pub valid: usize,
-    pub heads: usize,
-    pub query_rows: usize,
-    pub key_rows: usize,
-    pub q_row_stride: usize,
-    pub q_head_stride: usize,
-    pub o_row_stride: usize,
-    pub o_head_stride: usize,
-    pub k_row_stride: usize,
-    pub k_head_stride: usize,
-    pub v_row_stride: usize,
-    pub v_head_stride: usize,
-    pub selected: usize,
-    pub head_dim: usize,
-    pub dtype: usize,
-    pub output_dtype: usize,
-    pub scale: usize,
-    pub error: usize,
-}
-
-const _: () = assert!(
-    std::mem::size_of::<SparseCall>() == SPARSE_CALL_LAYOUT.size,
-    "the sparse_attention call structure's size changed without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(SparseCall, valid) == SPARSE_CALL_LAYOUT.valid,
-    "the sparse_attention call structure's device pointers moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(SparseCall, heads) == SPARSE_CALL_LAYOUT.heads,
-    "the sparse_attention call structure's geometry moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(SparseCall, selected) == SPARSE_CALL_LAYOUT.selected,
-    "the sparse_attention call structure's selection moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(SparseCall, scale) == SPARSE_CALL_LAYOUT.scale,
-    "the sparse_attention call structure's scalars moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(SparseCall, error) == SPARSE_CALL_LAYOUT.error,
-    "the sparse_attention call structure's `error` moved without its header"
-);
 
 impl NativeCall for SparseCall {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
 
@@ -487,10 +402,10 @@ impl Op for SparseAttention {
             dtype: abi::code(descriptor.dtype)?,
             output_dtype: abi::code(descriptor.output)?,
             scale: args.scale,
-            error: [0; 512],
+            error: [0; MESSAGE],
         };
-        // SAFETY: `SparseCall` is the call structure this package's entry declares, and its layout is
-        // pinned by the assertions above and by the test below.
+        // SAFETY: `SparseCall` is the call structure this package's entry declares: the declaration
+        // is generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 
@@ -555,70 +470,6 @@ mod tests {
         assert_ne!(block64().to_string(), block128.to_string());
         assert!(block128.to_string().starts_with("block_128_dtype_bf16"));
         assert!(block128.to_string().ends_with("_lse_false"));
-    }
-
-    /// The header the packages mirror must carry these offsets; the constants beside the structure
-    /// are checked against the compiler here.
-    #[test]
-    fn call_layout_is_the_one_the_header_declares() {
-        let layout = SPARSE_CALL_LAYOUT;
-        assert_eq!(std::mem::size_of::<SparseCall>(), layout.size);
-        assert_eq!(std::mem::align_of::<SparseCall>(), 8);
-        assert_eq!(std::mem::offset_of!(SparseCall, query), layout.query);
-        assert_eq!(std::mem::offset_of!(SparseCall, key), layout.key);
-        assert_eq!(std::mem::offset_of!(SparseCall, value), layout.value);
-        assert_eq!(std::mem::offset_of!(SparseCall, out), layout.out);
-        assert_eq!(std::mem::offset_of!(SparseCall, lse), layout.lse);
-        assert_eq!(std::mem::offset_of!(SparseCall, indices), layout.indices);
-        assert_eq!(std::mem::offset_of!(SparseCall, counts), layout.counts);
-        assert_eq!(std::mem::offset_of!(SparseCall, valid), layout.valid);
-        assert_eq!(std::mem::offset_of!(SparseCall, heads), layout.heads);
-        assert_eq!(
-            std::mem::offset_of!(SparseCall, query_rows),
-            layout.query_rows
-        );
-        assert_eq!(std::mem::offset_of!(SparseCall, key_rows), layout.key_rows);
-        assert_eq!(
-            std::mem::offset_of!(SparseCall, q_row_stride),
-            layout.q_row_stride
-        );
-        assert_eq!(
-            std::mem::offset_of!(SparseCall, q_head_stride),
-            layout.q_head_stride
-        );
-        assert_eq!(
-            std::mem::offset_of!(SparseCall, o_row_stride),
-            layout.o_row_stride
-        );
-        assert_eq!(
-            std::mem::offset_of!(SparseCall, o_head_stride),
-            layout.o_head_stride
-        );
-        assert_eq!(
-            std::mem::offset_of!(SparseCall, k_row_stride),
-            layout.k_row_stride
-        );
-        assert_eq!(
-            std::mem::offset_of!(SparseCall, k_head_stride),
-            layout.k_head_stride
-        );
-        assert_eq!(
-            std::mem::offset_of!(SparseCall, v_row_stride),
-            layout.v_row_stride
-        );
-        assert_eq!(
-            std::mem::offset_of!(SparseCall, v_head_stride),
-            layout.v_head_stride
-        );
-        assert_eq!(std::mem::offset_of!(SparseCall, selected), layout.selected);
-        assert_eq!(std::mem::offset_of!(SparseCall, head_dim), layout.head_dim);
-        assert_eq!(std::mem::offset_of!(SparseCall, dtype), layout.dtype);
-        assert_eq!(
-            std::mem::offset_of!(SparseCall, output_dtype),
-            layout.output_dtype
-        );
-        assert_eq!(std::mem::offset_of!(SparseCall, scale), layout.scale);
-        assert_eq!(std::mem::offset_of!(SparseCall, error), layout.error);
     }
 
     /// The bound is the standard one for a convex combination: relative to the result, plus the

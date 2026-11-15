@@ -1066,7 +1066,10 @@ pub fn expert_exchange_fused(
         )?;
     }
 
-    let address = |tensor: &Tensor| -> Result<u64> { Ok(ops::operand(tensor)?.ptr.address()) };
+    // The layer's device addresses, as the package's `uniserve_fused_layer` declares them.
+    let address = |tensor: &Tensor| -> Result<*const std::ffi::c_void> {
+        Ok(ops::operand(tensor)?.ptr.address() as usize as *const std::ffi::c_void)
+    };
     let expert_bytes = |tensor: &Tensor| -> Result<i64> {
         i64::try_from(tensor.elem_count() / local)
             .map_err(|_| Error::shape(OWNER, "a scale table beyond i64".to_owned()))
@@ -1077,9 +1080,9 @@ pub fn expert_exchange_fused(
         up_gate_scales: address(&up_gate.scales)?,
         down: address(&down.values)?,
         down_scales: address(&down.scales)?,
-        up_gate_alpha: address(up_gate_alpha)?,
-        down_alpha: address(down_alpha)?,
-        gated_scale: address(gated_scale)?,
+        up_gate_alpha: address(up_gate_alpha)?.cast(),
+        down_alpha: address(down_alpha)?.cast(),
+        gated_scale: address(gated_scale)?.cast(),
         up_gate_scale_bytes: expert_bytes(&up_gate.scales)?,
         down_scale_bytes: expert_bytes(&down.scales)?,
     };

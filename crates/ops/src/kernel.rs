@@ -24,20 +24,21 @@
 //!
 //! It returns 0 on success and nonzero on a parameter or driver error, with a NUL-terminated
 //! message in the call structure's `error` field when it carries one. The structure is
-//! `#[repr(C)]` in the operator's module and mirrored by hand in the package's header; each
-//! operator pins its layout with a `const` assertion and a test. An entry uses only the stream it
-//! is given, never allocates, synchronizes or reads device memory on the host, and is safe to call
+//! `#[repr(C)]` in the operator's module, and the package's C declaration of it is generated from
+//! that definition with its layout asserted ([`crate::abi`]). An entry uses only the stream it is
+//! given, never allocates, synchronizes or reads device memory on the host, and is safe to call
 //! while the stream is capturing.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 
 use platform::{
     Cluster, Device, DeviceAttribute, DevicePtr, Function, FunctionAttribute, LaunchConfig,
     Library, NativeLibrary, Stream,
 };
 
+use crate::abi::MESSAGE;
 use crate::operand::Operand;
 use crate::{Error, Result};
 
@@ -52,8 +53,8 @@ pub type Entry = unsafe extern "C" fn(call: *const c_void, stream: *mut c_void) 
 /// A `#[repr(C)]` call structure of a native package that reports its errors as text.
 ///
 /// The default implementation answers `None`, for an entry that reports nothing beyond its status;
-/// a structure with a `char error[N]` field (the convention of the trtllm-gen and cuDNN packages)
-/// returns the message it finds.
+/// a structure with an `error` field ([`crate::abi::MESSAGE`] bytes) returns the message it finds
+/// there ([`crate::abi::message`]).
 pub trait NativeCall {
     /// The NUL-terminated message the entry wrote, or `None` when it wrote none.
     fn message(&self) -> Option<&str> {
@@ -63,22 +64,20 @@ pub trait NativeCall {
 
 /// The call of a native module's load entry ([`crate::LOAD_ENTRY`]): the directory of the module's
 /// files, for a module that reads files published beside its library (the cubins a trtllm-gen
-/// module launches). The package's header mirrors it as `uniserve_trtllm_load_call`.
+/// module launches). Declared to the packages as `uniserve_load_call` (`uniserve_load.h`,
+/// generated with its layout asserted: [`crate::abi`]).
 #[repr(C)]
+#[derive(crate::abi::Layout)]
 pub struct LoadCall {
     /// The NUL-terminated path of the directory the module's files were published in.
-    pub directory: *const std::ffi::c_char,
-    /// The entry's NUL-terminated error message.
-    pub error: [u8; 512],
+    pub directory: *const c_char,
+    /// The NUL-terminated message the entry writes before it returns a nonzero status.
+    pub error: [c_char; MESSAGE],
 }
-
-const _: () = assert!(std::mem::offset_of!(LoadCall, error) == 8);
-const _: () = assert!(std::mem::size_of::<LoadCall>() == 520);
 
 impl NativeCall for LoadCall {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        crate::abi::message(&self.error)
     }
 }
 
@@ -723,12 +722,12 @@ impl Kernel {
 
         let path = std::ffi::CString::new(directory.as_os_str().as_bytes())
             .map_err(|_| Error::Metadata(format!("{} is not a C string", directory.display())))?;
-        // SAFETY: the package's header declares the load entry with exactly `Entry`'s signature,
-        // taking a `LoadCall`.
+        // SAFETY: the package's load entry has `Entry`'s signature and takes a `LoadCall`, which
+        // its generated header declares.
         let load = unsafe { self.native_symbol::<Entry>(entry)? };
         let mut call = LoadCall {
             directory: path.as_ptr(),
-            error: [0; 512],
+            error: [0; MESSAGE],
         };
         // SAFETY: `call` has the layout the header declares, and `path` outlives the call; the
         // entry issues no device work and takes no stream.

@@ -22,16 +22,17 @@
 //!
 //! The program is a native library: cuBLASLt's algorithm choice, its workspace and its epilogue are
 //! the package's tuning data and its host code, so the grid is the library's
-//! and this launch computes none. The library receives [`Call`], whose layout the package's header
-//! mirrors.
+//! and this launch computes none. The library receives [`Call`], whose C declaration, with the
+//! weight orders and epilogues a module is compiled for, is generated into `uniserve_gemm.h`
+//! ([`abi`]).
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use platform::{DevicePtr, Stream};
 use tensor::DType;
 
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::operand::Operand;
@@ -39,12 +40,16 @@ use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
 /// How the weight matrix is stored.
+///
+/// A module compiles its order in, named by its enumerator in `uniserve_gemm.h`
+/// (`uniserve_weight_order`).
+#[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum WeightOrder {
     /// `[k, n]`: the contraction axis first.
-    KxN,
+    KxN = 0,
     /// `[n, k]`: the output axis first, as Hugging Face checkpoints store a projection.
-    NxK,
+    NxK = 1,
 }
 
 impl fmt::Display for WeightOrder {
@@ -57,12 +62,16 @@ impl fmt::Display for WeightOrder {
 }
 
 /// What the product does after the contraction.
+///
+/// A module compiles its epilogue in, named by its enumerator in `uniserve_gemm.h`
+/// (`uniserve_epilogue`).
+#[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Epilogue {
     /// `out = input · weight`.
-    None,
+    None = 0,
     /// `out = input · weight + bias`.
-    Bias,
+    Bias = 1,
 }
 
 impl fmt::Display for Epilogue {
@@ -148,16 +157,18 @@ impl Descriptor {
     }
 }
 
-/// The call structure the package's entry receives.
-///
-/// Mirrored by hand in `crates/ops/kernels/gemm/<backend>/include/uniserve_gemm.h`; the layout is
-/// pinned by [`CallLayout`], the assertions below and the test beside this module.
+/// The call structure the package's entry receives, declared to the package as
+/// `UniserveGemmCall` (`uniserve_gemm.h`, generated with its layout asserted: [`abi`]).
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct Call {
+    /// `[m, n]` row-major, the product.
     pub out: *mut c_void,
+    /// `[m, k]` row-major, the activations.
     pub input: *const c_void,
+    /// The weight in the descriptor's order: `[k, n]` (kxn) or `[n, k]` (nxk).
     pub weight: *const c_void,
-    /// Null when the epilogue adds no bias.
+    /// `[n]` when the epilogue adds a bias, null otherwise.
     pub bias: *const c_void,
     /// Rows of the input and of the product.
     pub m: i64,
@@ -174,65 +185,12 @@ pub struct Call {
     /// A scalar applied to the product before the epilogue; 1.0 for a plain product.
     pub alpha: f32,
     /// The entry's message on a nonzero return.
-    pub error: [u8; 512],
+    pub error: [c_char; MESSAGE],
 }
-
-/// The size and field offsets the package's header must mirror, in bytes.
-pub const GEMM_CALL_LAYOUT: CallLayout = CallLayout {
-    size: 600,
-    out: 0,
-    input: 8,
-    weight: 16,
-    bias: 24,
-    m: 32,
-    n: 40,
-    k: 48,
-    input_row_stride: 56,
-    weight_row_stride: 64,
-    out_row_stride: 72,
-    alpha: 80,
-    error: 84,
-};
-
-/// The layout of [`Call`], for the header's mirror and its test.
-#[derive(Debug, PartialEq, Eq)]
-pub struct CallLayout {
-    pub size: usize,
-    pub out: usize,
-    pub input: usize,
-    pub weight: usize,
-    pub bias: usize,
-    pub m: usize,
-    pub n: usize,
-    pub k: usize,
-    pub input_row_stride: usize,
-    pub weight_row_stride: usize,
-    pub out_row_stride: usize,
-    pub alpha: usize,
-    pub error: usize,
-}
-
-const _: () = assert!(
-    std::mem::size_of::<Call>() == GEMM_CALL_LAYOUT.size,
-    "the gemm call structure's size changed without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, error) == GEMM_CALL_LAYOUT.error,
-    "the gemm call structure's `error` moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, out_row_stride) == GEMM_CALL_LAYOUT.out_row_stride,
-    "the gemm call structure's strides moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, weight_row_stride) == GEMM_CALL_LAYOUT.weight_row_stride,
-    "the gemm call structure's weight stride moved without its header"
-);
 
 impl NativeCall for Call {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
 
@@ -404,10 +362,10 @@ impl Op for Gemm {
             weight_row_stride: weight_row_stride as i64,
             out_row_stride: row_stride(&args.out) as i64,
             alpha: args.alpha,
-            error: [0; 512],
+            error: [0; MESSAGE],
         };
-        // SAFETY: `Call` is the call structure this package's entry declares, and its layout is
-        // pinned by the assertions above and by the test below.
+        // SAFETY: `Call` is the call structure this package's entry declares: the declaration is
+        // generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 

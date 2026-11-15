@@ -15,6 +15,7 @@ members = [
     "crates/models",
     "crates/nn",
     "crates/ops",
+    "crates/ops/derive",
     "crates/processing",
     "crates/build-server",
     "crates/proto",
@@ -81,6 +82,7 @@ engine = { path = "crates/engine" }
 media = { path = "crates/media" }
 nn = { path = "crates/nn" }
 ops = { path = "crates/ops" }
+ops-derive = { path = "crates/ops/derive" }
 models = { path = "crates/models" }
 processing = { path = "crates/processing" }
 build-server = { path = "crates/build-server" }
@@ -96,6 +98,16 @@ crossbeam-channel = "0.5"
 crossbeam-utils = "0.8"
 sha2 = "0.10"
 signal-hook-registry = "1.4.8"
+
+# ---- the operator crate's C ABI ----
+# cbindgen generates the C headers of the native kernel packages from the operator crate's
+# `#[repr(C)]` call structures (`ops::abi`). The committed headers are its output, compared by a
+# test, so the version is exact: another version may print the same declarations differently.
+cbindgen = { version = "=0.29.4", default-features = false }
+# The derive of a call structure's layout (`crates/ops/derive`) reads the structure's definition.
+proc-macro2 = "1.0.106"
+quote = "1.0.46"
+syn = "2.0.118"
 
 # ---- tensor element types ----
 # The FP8 and 16-bit float types of the tensor library's element types. The crates that compute

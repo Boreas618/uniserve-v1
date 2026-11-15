@@ -17,13 +17,13 @@
 //! indexing and rounds once: the bound is the `top`-term reduction with the output's own rounding,
 //! stated as [`Tolerance::dot`] because the products carry the routes' signs.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use platform::Stream;
 use tensor::DType;
 
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::operand::Operand;
@@ -39,22 +39,15 @@ use super::{address, to_i64};
 /// the entry: `route_gemm`'s dense path writes one row per **expanded** route (`token · top + route`),
 /// its encoded path writes one row per **permuted** row, and a module compiled for the wrong one
 /// indexes a buffer with numbers that mean something else.
+///
+/// The call carries its number (`uniserve_unpermute_layout` in `uniserve_moe_unpermute.h`).
+#[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Layout {
     /// One row per permuted row; `expanded_to_permuted` names the row of each `(token, route)`.
-    Permuted,
+    Permuted = 0,
     /// One row per expanded route, in `token · top + route` order; the map is not read.
-    Expanded,
-}
-
-impl Layout {
-    /// The member the call structure carries.
-    pub fn as_i64(self) -> i64 {
-        match self {
-            Self::Permuted => 0,
-            Self::Expanded => 1,
-        }
-    }
+    Expanded = 1,
 }
 
 impl fmt::Display for Layout {
@@ -117,10 +110,11 @@ pub struct UnpermuteArgs {
     pub out: Operand,
 }
 
-/// The call structure the package's entry receives.
-///
-/// Mirrored by hand in `crates/ops/kernels/moe_unpermute/<backend>/include/uniserve_moe_unpermute.h`.
+/// The call structure the package's entry receives, declared to the packages as
+/// `uniserve_unpermute_call` (`uniserve_moe_unpermute.h`, generated with its layout asserted:
+/// [`abi`]).
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct Call {
     pub routes: *const c_void,
     pub out: *mut c_void,
@@ -133,65 +127,15 @@ pub struct Call {
     pub input_dtype: i64,
     pub scales_dtype: i64,
     pub output_dtype: i64,
-    /// [`Layout`] as an `i64`: 0 permuted, 1 expanded.
+    /// The input buffer's row convention, the [`Layout`]'s number.
     pub layout: i64,
-    pub error: [u8; 512],
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
 }
-
-/// The size and field offsets the package's header must mirror, in bytes.
-pub const UNPERMUTE_CALL_LAYOUT: CallLayout = CallLayout {
-    size: 608,
-    routes: 0,
-    out: 8,
-    expanded_to_permuted: 16,
-    scales: 24,
-    tokens: 32,
-    top: 40,
-    hidden: 48,
-    routes_rows: 56,
-    input_dtype: 64,
-    scales_dtype: 72,
-    output_dtype: 80,
-    layout: 88,
-    error: 96,
-};
-
-/// The layout of [`Call`], for the header's mirror and its test.
-#[derive(Debug, PartialEq, Eq)]
-pub struct CallLayout {
-    pub size: usize,
-    pub routes: usize,
-    pub out: usize,
-    pub expanded_to_permuted: usize,
-    pub scales: usize,
-    pub tokens: usize,
-    pub top: usize,
-    pub hidden: usize,
-    pub routes_rows: usize,
-    pub input_dtype: usize,
-    pub scales_dtype: usize,
-    pub output_dtype: usize,
-    pub layout: usize,
-    pub error: usize,
-}
-
-const _: () = assert!(
-    std::mem::size_of::<Call>() == UNPERMUTE_CALL_LAYOUT.size,
-    "the moe_unpermute call structure's size changed without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, tokens) == UNPERMUTE_CALL_LAYOUT.tokens,
-    "the moe_unpermute call structure's extents moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, error) == UNPERMUTE_CALL_LAYOUT.error,
-    "the moe_unpermute call structure's `error` moved without its header"
-);
 
 impl NativeCall for Call {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
 
@@ -270,11 +214,11 @@ impl Op for MoeUnpermute {
             input_dtype: abi::code(descriptor.input)?,
             scales_dtype: abi::code(descriptor.scales)?,
             output_dtype: abi::code(descriptor.output)?,
-            layout: descriptor.layout.as_i64(),
-            error: [0; 512],
+            layout: descriptor.layout as i64,
+            error: [0; MESSAGE],
         };
-        // SAFETY: `Call` is the call structure this package's entry declares, and its layout is
-        // pinned by the assertions above and by the test below.
+        // SAFETY: `Call` is the call structure this package's entry declares: the declaration is
+        // generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 
@@ -300,34 +244,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn call_layout_is_the_one_the_header_declares() {
-        let layout = UNPERMUTE_CALL_LAYOUT;
-        assert_eq!(std::mem::size_of::<Call>(), layout.size);
-        assert_eq!(std::mem::offset_of!(Call, routes), layout.routes);
-        assert_eq!(std::mem::offset_of!(Call, out), layout.out);
-        assert_eq!(
-            std::mem::offset_of!(Call, expanded_to_permuted),
-            layout.expanded_to_permuted
-        );
-        assert_eq!(std::mem::offset_of!(Call, scales), layout.scales);
-        assert_eq!(std::mem::offset_of!(Call, tokens), layout.tokens);
-        assert_eq!(std::mem::offset_of!(Call, top), layout.top);
-        assert_eq!(std::mem::offset_of!(Call, hidden), layout.hidden);
-        assert_eq!(std::mem::offset_of!(Call, routes_rows), layout.routes_rows);
-        assert_eq!(std::mem::offset_of!(Call, input_dtype), layout.input_dtype);
-        assert_eq!(
-            std::mem::offset_of!(Call, scales_dtype),
-            layout.scales_dtype
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, output_dtype),
-            layout.output_dtype
-        );
-        assert_eq!(std::mem::offset_of!(Call, layout), layout.layout);
-        assert_eq!(std::mem::offset_of!(Call, error), layout.error);
-    }
-
-    #[test]
     fn the_bound_is_the_route_reduction() {
         let descriptor = Descriptor {
             layout: Layout::Permuted,
@@ -342,35 +258,5 @@ mod tests {
         assert!(tolerance.rtol > 0.0, "the output rounding must be covered");
         assert!(tolerance.allows(1.0, 1.0));
         assert!(!tolerance.allows(0.0, 1.0));
-    }
-
-    /// Every package header that serves this operator states the layout this crate passes.
-    ///
-    /// The mirror is written by hand on both sides, so a field that moves on one side fails on the
-    /// other: the module's entry reads these offsets, and a mismatch is a wrong number rather than a
-    /// refusal.
-    #[test]
-    fn the_unpermute_header_declares_this_call_layout() {
-        let layout = UNPERMUTE_CALL_LAYOUT;
-        crate::call_layout_check::check(
-            "moe_unpermute",
-            "uniserve_unpermute_call",
-            &[
-                ("routes", layout.routes),
-                ("out", layout.out),
-                ("expanded_to_permuted", layout.expanded_to_permuted),
-                ("scales", layout.scales),
-                ("tokens", layout.tokens),
-                ("top", layout.top),
-                ("hidden", layout.hidden),
-                ("routes_rows", layout.routes_rows),
-                ("input_dtype", layout.input_dtype),
-                ("scales_dtype", layout.scales_dtype),
-                ("output_dtype", layout.output_dtype),
-                ("layout", layout.layout),
-                ("error", layout.error),
-            ],
-            layout.size,
-        );
     }
 }

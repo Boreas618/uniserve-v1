@@ -23,13 +23,13 @@
 //! other's question, and a page that reads one as the other is the shape of defect this crate keeps
 //! removing.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::fmt;
 
 use platform::Stream;
 use tensor::DType;
 
-use crate::abi;
+use crate::abi::{self, MESSAGE};
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::operand::Operand;
@@ -133,18 +133,31 @@ pub struct SortArgs {
     pub local_offset: u32,
 }
 
-/// The call structure the package's entry receives.
+/// The call structure the package's entry receives, declared to the packages as
+/// `uniserve_moe_sort_call` (`uniserve_moe_sort.h`, generated with its layout asserted: [`abi`]).
 ///
-/// Mirrored by hand in `crates/ops/kernels/moe_sort/<backend>/include/uniserve_moe_sort.h`.
+/// The tile and permutation semantics follow TensorRT-LLM's routing pipeline: the outputs are the
+/// tile metadata the grouped GEMMs read and the three permutation maps.
 #[repr(C)]
+#[derive(abi::Layout)]
 pub struct Call {
+    /// `[tokens, top]` i32 route ids: the router's experts, in the whole vocabulary.
     pub ids: *const i32,
+    /// `[tokens, top]` route weights in `scales_dtype`, accepted and not read: the sort writes
+    /// indices alone.
     pub scales: *const c_void,
+    /// `[max_tiles]`: the expert of a tile.
     pub tile_to_expert: *mut i32,
+    /// `[max_tiles]`: the permuted row a tile's live rows end at, counted from the routing's first
+    /// permuted row (TensorRT-LLM's `mPtrCtaIdxXyToMnLimit`).
     pub tile_to_limit: *mut i32,
+    /// `[tokens, top]`: each route's permuted row, -1 for a route this rank does not hold.
     pub expanded_to_permuted: *mut i32,
+    /// `[max_permuted_rows]`: each permuted row's route.
     pub permuted_to_expanded: *mut i32,
+    /// `[1]`: the padded permuted rows.
     pub total_padded_tokens: *mut i32,
+    /// `[1]`: the tiles that hold live rows.
     pub num_non_exiting_tiles: *mut i32,
     pub tokens: i64,
     pub top: i64,
@@ -153,87 +166,18 @@ pub struct Call {
     pub local_offset: i64,
     pub tile_tokens: i64,
     pub scales_dtype: i64,
-    pub error: [u8; 512],
+    /// The entry's message on a nonzero return.
+    pub error: [c_char; MESSAGE],
+    /// `[1]` the device count of live tokens, or null for all `tokens`.
     pub live_tokens: *const i32,
+    /// `[max_permuted_rows]`: the token row a permuted row gathers, -1 on a tile's padding
+    /// (TensorRT-LLM's `mPtrPermutedIdxToTokenIdx`).
     pub permuted_to_token: *mut i32,
 }
 
-/// The size and field offsets the package's header must mirror, in bytes.
-pub const SORT_CALL_LAYOUT: CallLayout = CallLayout {
-    size: 648,
-    ids: 0,
-    scales: 8,
-    tile_to_expert: 16,
-    tile_to_limit: 24,
-    expanded_to_permuted: 32,
-    permuted_to_expanded: 40,
-    total_padded_tokens: 48,
-    num_non_exiting_tiles: 56,
-    tokens: 64,
-    top: 72,
-    experts: 80,
-    local_experts: 88,
-    local_offset: 96,
-    tile_tokens: 104,
-    scales_dtype: 112,
-    error: 120,
-    live_tokens: 632,
-    permuted_to_token: 640,
-};
-
-/// The layout of [`Call`], for the header's mirror and its test.
-#[derive(Debug, PartialEq, Eq)]
-pub struct CallLayout {
-    pub size: usize,
-    pub ids: usize,
-    pub scales: usize,
-    pub tile_to_expert: usize,
-    pub tile_to_limit: usize,
-    pub expanded_to_permuted: usize,
-    pub permuted_to_expanded: usize,
-    pub total_padded_tokens: usize,
-    pub num_non_exiting_tiles: usize,
-    pub tokens: usize,
-    pub top: usize,
-    pub experts: usize,
-    pub local_experts: usize,
-    pub local_offset: usize,
-    pub tile_tokens: usize,
-    pub scales_dtype: usize,
-    pub error: usize,
-    pub live_tokens: usize,
-    pub permuted_to_token: usize,
-}
-
-const _: () = assert!(
-    std::mem::size_of::<Call>() == SORT_CALL_LAYOUT.size,
-    "the moe_sort call structure's size changed without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, tile_to_expert) == SORT_CALL_LAYOUT.tile_to_expert,
-    "the moe_sort call structure's outputs moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, tokens) == SORT_CALL_LAYOUT.tokens,
-    "the moe_sort call structure's extents moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, live_tokens) == SORT_CALL_LAYOUT.live_tokens,
-    "the moe_sort call structure's live count moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, permuted_to_token) == SORT_CALL_LAYOUT.permuted_to_token,
-    "the moe_sort call structure's token map moved without its header"
-);
-const _: () = assert!(
-    std::mem::offset_of!(Call, error) == SORT_CALL_LAYOUT.error,
-    "the moe_sort call structure's `error` moved without its header"
-);
-
 impl NativeCall for Call {
     fn message(&self) -> Option<&str> {
-        let end = self.error.iter().position(|&byte| byte == 0)?;
-        std::str::from_utf8(&self.error[..end]).ok()
+        abi::message(&self.error)
     }
 }
 
@@ -356,14 +300,14 @@ impl Op for MoeSort {
             local_offset: to_i64(Self::NAME, u64::from(args.local_offset))?,
             tile_tokens: to_i64(Self::NAME, tile)?,
             scales_dtype: abi::code(descriptor.scales)?,
-            error: [0; 512],
+            error: [0; MESSAGE],
             live_tokens: args.live_tokens.map_or(std::ptr::null(), |view| {
                 address(view.ptr) as usize as *const i32
             }),
             permuted_to_token: address(args.permuted_to_token.ptr) as usize as *mut i32,
         };
-        // SAFETY: `Call` is the call structure this package's entry declares, and its layout is
-        // pinned by the assertions above and by the test below.
+        // SAFETY: `Call` is the call structure this package's entry declares: the declaration is
+        // generated from this definition, with its layout asserted.
         unsafe { kernel.native(&mut call, stream) }
     }
 
@@ -392,57 +336,6 @@ impl Op for MoeSort {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn call_layout_is_the_one_the_header_declares() {
-        let layout = SORT_CALL_LAYOUT;
-        assert_eq!(std::mem::size_of::<Call>(), layout.size);
-        assert_eq!(std::mem::offset_of!(Call, ids), layout.ids);
-        assert_eq!(std::mem::offset_of!(Call, scales), layout.scales);
-        assert_eq!(
-            std::mem::offset_of!(Call, tile_to_expert),
-            layout.tile_to_expert
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, tile_to_limit),
-            layout.tile_to_limit
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, expanded_to_permuted),
-            layout.expanded_to_permuted
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, permuted_to_expanded),
-            layout.permuted_to_expanded
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, total_padded_tokens),
-            layout.total_padded_tokens
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, num_non_exiting_tiles),
-            layout.num_non_exiting_tiles
-        );
-        assert_eq!(std::mem::offset_of!(Call, tokens), layout.tokens);
-        assert_eq!(std::mem::offset_of!(Call, top), layout.top);
-        assert_eq!(std::mem::offset_of!(Call, experts), layout.experts);
-        assert_eq!(
-            std::mem::offset_of!(Call, local_experts),
-            layout.local_experts
-        );
-        assert_eq!(
-            std::mem::offset_of!(Call, local_offset),
-            layout.local_offset
-        );
-        assert_eq!(std::mem::offset_of!(Call, tile_tokens), layout.tile_tokens);
-        assert_eq!(
-            std::mem::offset_of!(Call, scales_dtype),
-            layout.scales_dtype
-        );
-        assert_eq!(std::mem::offset_of!(Call, error), layout.error);
-    }
-
     /// The buffer bounds follow the worst routing distribution, not one batch: every expert with a
     /// single route plus one expert with the rest.
     #[test]
@@ -455,41 +348,6 @@ mod tests {
         assert_eq!(
             super::super::max_permuted_rows(1024, 8, 128, 128),
             191 * 128
-        );
-    }
-
-    /// Every package header that serves this operator states the layout this crate passes.
-    ///
-    /// The mirror is written by hand on both sides, so a field that moves on one side fails on the
-    /// other: the module's entry reads these offsets, and a mismatch is a wrong number rather than a
-    /// refusal.
-    #[test]
-    fn the_package_header_declares_this_call_layout() {
-        let layout = SORT_CALL_LAYOUT;
-        crate::call_layout_check::check(
-            "moe_sort",
-            "uniserve_moe_sort_call",
-            &[
-                ("ids", layout.ids),
-                ("scales", layout.scales),
-                ("tile_to_expert", layout.tile_to_expert),
-                ("tile_to_limit", layout.tile_to_limit),
-                ("expanded_to_permuted", layout.expanded_to_permuted),
-                ("permuted_to_expanded", layout.permuted_to_expanded),
-                ("total_padded_tokens", layout.total_padded_tokens),
-                ("num_non_exiting_tiles", layout.num_non_exiting_tiles),
-                ("tokens", layout.tokens),
-                ("top", layout.top),
-                ("experts", layout.experts),
-                ("local_experts", layout.local_experts),
-                ("local_offset", layout.local_offset),
-                ("tile_tokens", layout.tile_tokens),
-                ("scales_dtype", layout.scales_dtype),
-                ("error", layout.error),
-                ("live_tokens", layout.live_tokens),
-                ("permuted_to_token", layout.permuted_to_token),
-            ],
-            layout.size,
         );
     }
 }
