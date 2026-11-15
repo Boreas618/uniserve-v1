@@ -17,7 +17,7 @@
 //!
 //! A trajectory is FP32 and the stack computes in the checkpoint's element type. The four end
 //! projections are FP32 parameters at every preset, as the reference builds them
-//! (`refs/vllm-omni/…/minimax_h3/minimax_h3_transformer.py:556-575`), so a sample crosses to
+//! (`vllm-omni:models/minimax_h3/minimax_h3_transformer.py:556-575`), so a sample crosses to
 //! the stack's type once after its input projection and back once before the output heads, and
 //! both products are FP32 on both sides.
 //!
@@ -104,7 +104,7 @@ pub(crate) fn mlp_config(config: &TransformerConfig, tensor: Split) -> MlpConfig
 /// trailing channels of a head passing through.
 ///
 /// The inverse frequencies are FP32, `1 / theta ** (arange(0, 2f, 2) / 2f)`
-/// (`refs/vllm-omni/…/minimax_h3/minimax_h3_transformer.py:331-355`).
+/// (`vllm-omni:models/minimax_h3/minimax_h3_transformer.py:331-355`).
 pub fn rotary_config(config: &TransformerConfig) -> RotaryConfig {
     RotaryConfig {
         theta: config.rope_theta,
@@ -558,7 +558,7 @@ impl Block {
 ///
 /// A parallel-decoding student stacks one head per fine interval of its schedule's grid and
 /// predicts one block's velocity with the block's weighted sum of its heads, weights and sum
-/// in FP32 (`refs/vllm-omni/…/minimax_h3/pdd.py:41-70`). The sums are tables of the schedule,
+/// in FP32 (`vllm-omni:models/minimax_h3/pdd.py:41-70`). The sums are tables of the schedule,
 /// written once after the load ([`Self::initialize`]); a forward gathers its step's row, so one
 /// capture serves every step.
 pub struct OutputHead {
@@ -819,7 +819,7 @@ impl Transformer {
 
     /// A video latent `[channels, frames, height, width]` as the network's `1 x 2 x 2` patch
     /// rows: `[frames · height/2 · width/2, 4 · channels]`, row-major over the patch grid and
-    /// channel-major inside a row (`refs/vllm-omni/…/minimax_h3/packed_tokens.py:23-41`).
+    /// channel-major inside a row (`vllm-omni:models/minimax_h3/packed_tokens.py:23-41`).
     ///
     /// # Errors
     ///
@@ -885,7 +885,7 @@ impl Transformer {
     /// The modulation of this stage's block `index` at `entries`: the stack block's gathered
     /// `[groups, 18 · hidden]` rows read as `[3 · groups, 6 · hidden]`, group `g`'s row holding
     /// its three tags' six vectors each
-    /// (`refs/vllm-omni/…/minimax_h3/minimax_h3_blocks.py:736-745`).
+    /// (`vllm-omni:models/minimax_h3/minimax_h3_blocks.py:736-745`).
     fn modulation(&self, table: &TimestepTable, index: usize, entries: &Tensor) -> Result<Tensor> {
         let groups = entries.elem_count();
 
@@ -1018,7 +1018,7 @@ impl Transformer {
     /// The final norm modulates every row by its timestep group's shift and scale
     /// (`groups`, `[rows]` `U32`), the rows widen to FP32, and both heads read every row, as
     /// the reference's final layer does
-    /// (`refs/vllm-omni/…/minimax_h3/minimax_h3_transformer.py:578-598`); a caller reads each
+    /// (`vllm-omni:models/minimax_h3/minimax_h3_transformer.py:578-598`); a caller reads each
     /// modality's rows out of its head's.
     ///
     /// # Errors

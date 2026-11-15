@@ -4,7 +4,7 @@
 //! ## The document
 //!
 //! The reference builds one request's sequence in one function, from slices, `arange`, `cat`,
-//! `meshgrid` and indexed assignment (`refs/vllm-omni/…/minimax_h3/packed_sequence.py:149-288`
+//! `meshgrid` and indexed assignment (`vllm-omni:models/minimax_h3/packed_sequence.py:149-288`
 //! for `t2va` and `fl2va`, `:341-738` for the multi-block `ref2va` form). Its row order is the
 //! **document**:
 //!
@@ -32,7 +32,7 @@
 //!   `[ text | conditions | audio | video | padding ]` in whole tiles: the text and the
 //!   conditions are capacities filled from their start, every dense segment fills tiles of its
 //!   own, and a video's rows are tile-major over its token grid
-//!   (`refs/vllm-omni/…/attention/ops/video_tiles.py:11-62`), so every tile the attention keeps
+//!   (`vllm-omni:attention/ops/video_tiles.py:11-62`), so every tile the attention keeps
 //!   is a whole tile of rows. [`tile_table`] states each tile's valid rows, its video segment
 //!   and each segment's kept tiles.
 //!
@@ -59,7 +59,7 @@ pub const TAG_TEXT: u32 = 1;
 pub const TAG_AUDIO: u32 = 2;
 
 /// The timestep group of the generated video, which prompt and padding rows share
-/// (`refs/vllm-omni/…/minimax_h3/denoise_loop.py:194-198`).
+/// (`vllm-omni:models/minimax_h3/denoise_loop.py:194-198`).
 pub const GROUP_VIDEO: u32 = 0;
 /// The timestep group of the generated audio.
 pub const GROUP_AUDIO: u32 = 1;
@@ -443,7 +443,7 @@ fn audio_positions(steps: usize, origin: f64, (first, last): (f64, f64)) -> Resu
 
 /// The rotary coordinates `(time, row, column)` of every row of `request`'s document:
 /// `[rows, 3]` FP64, which the rotary embedding reads rounded to FP32
-/// (`refs/vllm-omni/…/minimax_h3/minimax_h3_transformer.py:346-355`).
+/// (`vllm-omni:models/minimax_h3/minimax_h3_transformer.py:346-355`).
 ///
 /// Prompt row `i` sits at `(i, 0, 0)` and the media clock starts at the prompt's length. The
 /// references advance it in packed order: an image by one unit, at its own spatial grid; an
@@ -544,7 +544,7 @@ pub fn positions(request: &VideoRequest, layout: &Layout) -> Result<Tensor> {
 /// and [`TAG_AUDIO`] (`packed_sequence.py:709-714`).
 ///
 /// A prompt row is text, except the rows of its vision spans, which present an image and read
-/// the video modulation (`refs/vllm-omni/…/minimax_h3/pipeline_minimax_h3.py:2160-2161`).
+/// the video modulation (`vllm-omni:models/minimax_h3/pipeline_minimax_h3.py:2160-2161`).
 ///
 /// # Errors
 ///
@@ -574,7 +574,7 @@ pub fn tags(request: &VideoRequest, layout: &Layout) -> Result<Tensor> {
 ///
 /// A generated video row and a generated audio row read their own level; a condition's visual
 /// rows and its audio rows read the two condition levels; a prompt row reads the generated
-/// video's (`refs/vllm-omni/…/minimax_h3/denoise_loop.py:190-229`).
+/// video's (`vllm-omni:models/minimax_h3/denoise_loop.py:190-229`).
 ///
 /// # Errors
 ///
@@ -757,7 +757,7 @@ fn tile_runs(
 /// them. Cell `c` of the grid is document row `first + c`.
 ///
 /// This is the reference's tile partition laid out in whole tiles
-/// (`refs/vllm-omni/…/attention/ops/video_tiles.py:11-62`): the grid padded to whole tiles,
+/// (`vllm-omni:attention/ops/video_tiles.py:11-62`): the grid padded to whole tiles,
 /// cut into tiles, and each tile's cells ordered with the padding last.
 fn video_tile_rows(first: usize, grid: [usize; 3], shape: [u32; 3], pad: usize) -> Result<Tensor> {
     let [frames, height, width] = grid;
@@ -852,7 +852,7 @@ pub fn tiled_rows(request: &VideoRequest, layout: &Layout, vsa: &VsaConfig) -> R
 /// A segment is one video's tiles: each reference video in packed order, then the generated
 /// video. A reference segment keeps its reference rate of its own tiles and the generated
 /// video its own rate ([`VsaConfig::keep_rates`]); a tile outside every segment is read by
-/// every query (`refs/vllm-omni/…/minimax_h3/attention/fastvideo_h3.py:132-148`).
+/// every query (`vllm-omni:models/minimax_h3/attention/fastvideo_h3.py:132-148`).
 ///
 /// # Errors
 ///

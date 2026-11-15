@@ -279,7 +279,7 @@ impl Denoiser {
     /// The encoder returns the condition's normalized latent; the latent and the piece's draw
     /// become rows by the same patch mapping (the draw is drawn at latent resolution), the
     /// anchor `t · clean + (1 − t) · draw` mixes them in FP32 at [`VISUAL_CONDITION_TIME`]
-    /// (`refs/vllm-omni/…/minimax_h3/pipeline_minimax_h3.py:2238-2243`), and the input
+    /// (`vllm-omni:models/minimax_h3/pipeline_minimax_h3.py:2238-2243`), and the input
     /// projection reads the anchored rows.
     fn encode_visual(&self, piece: &MediaInput, encoder: &VideoEncoder) -> Result<Tensor> {
         let (Some(pixels), Some(draw)) = (&piece.pixels, &piece.noise) else {

@@ -3,7 +3,7 @@
 //! The text encoder's hidden states are `text_dim` wide; the refiner projects them to the
 //! transformer's width (`context_embedder`) and refines them with pre-norm blocks of dense
 //! bidirectional attention and a SwiGLU, without modulation or rotation, then a final norm
-//! (`refs/vllm-omni/…/minimax_h3/minimax_h3_transformer.py:442-522`):
+//! (`vllm-omni:models/minimax_h3/minimax_h3_transformer.py:442-522`):
 //!
 //! ```text
 //! x = context_embedder(features)

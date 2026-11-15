@@ -4,7 +4,7 @@
 //! ## The decoder
 //!
 //! The decoder is a non-causal ViT (the reference's `ViT3DDecoder`,
-//! `refs/sglang/python/sglang/multimodal_gen/runtime/models/vaes/minimax_h3_video_vae/vae_vit.py:237-461`).
+//! `sglang:python/sglang/multimodal_gen/runtime/models/vaes/minimax_h3_video_vae/vae_vit.py:237-461`).
 //! `post_quant_conv` projects the restored latent channels, `proj_in` embeds each latent voxel
 //! as one token, the learned register tokens and one zero token trail the voxels, the
 //! transformer blocks attend over the whole sequence, and `proj_out` writes

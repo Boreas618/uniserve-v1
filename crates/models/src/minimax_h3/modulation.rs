@@ -12,7 +12,7 @@
 //! output  = norm_out.linear(silu(t_emb))      [2 · hidden]
 //! ```
 //!
-//! (`refs/vllm-omni/…/minimax_h3/minimax_h3_transformer.py:366-407`,
+//! (`vllm-omni:models/minimax_h3/minimax_h3_transformer.py:366-407`,
 //! `minimax_h3_blocks.py:710-745`). The schedule is fixed, so the products are computed once
 //! for the schedule's distinct levels into an [`nn::modules::TimestepTable`] and gathered per
 //! step, as the reference derives its AdaLN tables at load.
@@ -36,7 +36,7 @@ use crate::minimax_h3::config::{ScheduleConfig, TransformerConfig};
 
 /// The level a visual condition is anchored at, `t · clean + (1 − t) · noise`, and the level
 /// its timestep group sits at until the generated video is cleaner than it
-/// (`refs/vllm-omni/…/minimax_h3/pipeline_minimax_h3.py:233,394`).
+/// (`vllm-omni:models/minimax_h3/pipeline_minimax_h3.py:233,394`).
 pub const VISUAL_CONDITION_TIME: f32 = 0.999;
 
 /// The level an audio reference sits at: its latent unchanged, so nothing is mixed in

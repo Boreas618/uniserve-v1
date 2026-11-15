@@ -2,7 +2,7 @@
 //! the DAC encoder that turns a reference track into its latent.
 //!
 //! The reference is `DacAudioVAE`
-//! (`refs/sglang/python/sglang/multimodal_gen/runtime/models/vaes/minimax_h3_audio_vae/audio_vae.py:230-339`).
+//! (`sglang:python/sglang/multimodal_gen/runtime/models/vaes/minimax_h3_audio_vae/audio_vae.py:230-339`).
 //!
 //! ## The decoder
 //!
@@ -18,7 +18,7 @@
 //! per latent frame, narrows them to the latent channels with the checkpoint's attention
 //! projection (`pre_block`), takes the posterior's mean (`mean_proj`, no sample is drawn) and
 //! normalizes it, `(mean − latents_mean) / latents_std`
-//! (`refs/sglang/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/reference_encoding.py:422-447`).
+//! (`sglang:python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/reference_encoding.py:422-447`).
 //! The projection's attention is causal: a latent frame depends only on the audio before it.
 //!
 //! ## Precision
@@ -40,7 +40,7 @@ use proto::video::Layout;
 use crate::minimax_h3::{AudioVaeConfig, ID};
 
 /// The up- and down-sampling ratio of BigVGAN's alias-free activations, which the config does
-/// not state (`refs/sglang/python/sglang/multimodal_gen/runtime/models/vaes/alias_free.py:154-166`).
+/// not state (`sglang:python/sglang/multimodal_gen/runtime/models/vaes/alias_free.py:154-166`).
 const ACTIVATION_RATIO: u32 = 2;
 
 /// `nn.LayerNorm`'s default epsilon, which the reference's attention projection keeps.

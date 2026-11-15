@@ -19,6 +19,17 @@
 //! conditions) is [`processing::minimax_h3`]'s; a model consumes those values and redefines
 //! none. A model holds no runtime object: the execution context a forward computes under is the
 //! thread's, installed by execution (`AGENTS.md`, Model Library Boundary).
+//!
+//! ## References
+//!
+//! A citation `name:path:lines` names a file of a reference implementation at the commit
+//! this table pins, its path below the directory the table states, and the lines a rule is
+//! read from:
+//!
+//! | Name | Repository | Commit | Paths below |
+//! | --- | --- | --- | --- |
+//! | `vllm-omni` | <https://github.com/vllm-project/vllm-omni> | `9f95053f95b65d072b37a8bbaea9ff8551266e9a` | `vllm_omni/diffusion/` |
+//! | `sglang` | <https://github.com/sgl-project/sglang> | `505120f0c3026b198ee0dd81a486389a9f82ce27` | the repository |
 
 pub mod adapter;
 pub mod audio_vae;

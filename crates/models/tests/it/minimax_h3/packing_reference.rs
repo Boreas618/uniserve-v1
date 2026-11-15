@@ -6,7 +6,7 @@
 //!
 //! - the document's coordinates, tags, timestep groups and conditioning rows, in the
 //!   reference's row order. The coordinates are compared as the rotary embedding reads them,
-//!   rounded to FP32 (`refs/vllm-omni/…/minimax_h3/minimax_h3_transformer.py:351`);
+//!   rounded to FP32 (`vllm-omni:models/minimax_h3/minimax_h3_transformer.py:351`);
 //! - the dense layout, which leads with the generated rows, and the rows a query attends;
 //! - the tiled layout: the rows of every tile, each video's tiles and the tiles its queries
 //!   keep.

@@ -4,7 +4,7 @@
 //! ([`crate::minimax_h3::video_vae::temporal_clips`]): a clip's first tail-length frames fade against its
 //! predecessor's tail with the weights `i / overlap`, so the first faded frame is entirely the
 //! predecessor's (the reference's `blend(dec_overlap, clip_dec_chunk, frame_overlap, dim=-3)`,
-//! `refs/sglang/python/sglang/multimodal_gen/runtime/models/vaes/minimax_h3_video_vae/klvae.py:882-897`).
+//! `sglang:python/sglang/multimodal_gen/runtime/models/vaes/minimax_h3_video_vae/klvae.py:882-897`).
 //! The fade is the one blend the tiles' seams use ([`nn::vae::blend`]), which rounds each step
 //! in the raster's element type.
 

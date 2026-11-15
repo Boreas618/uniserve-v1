@@ -19,7 +19,7 @@
 //! fixed point    f_s(u) = s u M / (u (s − 1) + M),  M = max_t, which maps M to itself
 //! ```
 //!
-//! The block grid is a parallel-decoding student's (`refs/vllm-omni/…/minimax_h3/pdd.py:20-24`):
+//! The block grid is a parallel-decoding student's (`vllm-omni:models/minimax_h3/pdd.py:20-24`):
 //! one network evaluation per block of a fine grid, whose stacked output heads are fused with
 //! the block's normalized integration weights ([`ScheduleConfig::head_weights`],
 //! `pdd.py:32-39`).
@@ -32,11 +32,11 @@ use nn::{Result, Step};
 use crate::minimax_h3::{ID, VideoTask};
 
 /// The rows of one text or condition capacity unit of a dense layout: the reference's packed
-/// row alignment (`refs/vllm-omni/…/minimax_h3/packed_sequence.py:45`).
+/// row alignment (`vllm-omni:models/minimax_h3/packed_sequence.py:45`).
 const DENSE_CAPACITY_UNIT: u32 = 64;
 
 /// The `(time, height, width)` tokens of one sparse attention tile, per tile row count
-/// (`refs/vllm-omni/…/minimax_h3/attention/fastvideo_h3.py:40,93`).
+/// (`vllm-omni:models/minimax_h3/attention/fastvideo_h3.py:40,93`).
 const TILE_SHAPES: [(u32, [u32; 3]); 2] = [(64, [4, 4, 4]), (128, [4, 4, 8])];
 
 /// The widths of one diffusion transformer, as its `config.json` states them.
@@ -152,7 +152,7 @@ impl TransformerConfig {
     }
 
     /// The channels of a head the rotary embedding rotates: `2 · rope_frequency_dim` on each of
-    /// the three axes (`refs/vllm-omni/…/minimax_h3/minimax_h3_blocks.py:225`).
+    /// the three axes (`vllm-omni:models/minimax_h3/minimax_h3_blocks.py:225`).
     pub const fn rotated(&self) -> u32 {
         6 * self.rope_frequency_dim
     }
@@ -173,7 +173,7 @@ pub struct VsaConfig {
     pub sparsity: f64,
     /// The fraction of its own key tiles a reference-video query tile keeps, when the export
     /// states one; a reference keeps the generated video's rate otherwise
-    /// (`refs/vllm-omni/…/minimax_h3/attention/fastvideo_h3.py:220-223`).
+    /// (`vllm-omni:models/minimax_h3/attention/fastvideo_h3.py:220-223`).
     pub reference_keep: Option<f64>,
 }
 
@@ -220,7 +220,7 @@ impl VsaConfig {
 
     /// The tiles of a segment of `tiles` tiles a query keeps at the keep rate `rate`:
     /// `ceil(rate · tiles)`, at least one and at most every tile, in FP64
-    /// (`refs/vllm-omni/…/minimax_h3/attention/fastvideo_h3.py:144`).
+    /// (`vllm-omni:models/minimax_h3/attention/fastvideo_h3.py:144`).
     pub fn kept_tiles(rate: f64, tiles: u32) -> u32 {
         ((rate * f64::from(tiles)).ceil() as u32).clamp(1, tiles.max(1))
     }
@@ -228,7 +228,7 @@ impl VsaConfig {
     /// The keep rates of a reference video's tiles and of the generated video's, in that order.
     ///
     /// The reference rate is formed as `1 − (1 − keep)`, the rounding the released routing
-    /// feeds its `ceil` (`refs/vllm-omni/…/minimax_h3/attention/fastvideo_h3.py:219-222`).
+    /// feeds its `ceil` (`vllm-omni:models/minimax_h3/attention/fastvideo_h3.py:219-222`).
     pub fn keep_rates(&self) -> (f64, f64) {
         let target = 1.0 - self.sparsity;
         let reference = self
@@ -419,7 +419,7 @@ impl ScheduleConfig {
     /// the schedule scales it.
     ///
     /// Only a parallel-decoding schedule scales its draw
-    /// (`refs/vllm-omni/…/minimax_h3/pipeline_minimax_h3.py:2269-2270`); the released and the
+    /// (`vllm-omni:models/minimax_h3/pipeline_minimax_h3.py:2269-2270`); the released and the
     /// distilled grids start from unit noise, though a distilled grid's first sigma is below
     /// one too, so the grid's kind decides and not its first number.
     pub fn start_sigmas(&self) -> Option<(f32, f32)> {
@@ -437,7 +437,7 @@ impl ScheduleConfig {
     /// A block's weights are the fine grid's sigma increments `f_s(u[j + 1]) − f_s(u[j])` over
     /// its intervals, in the cancellation-free form `s M² (b − a) / (D(a) D(b))` with
     /// `D(u) = M + (s − 1) u`, normalized by their sum in FP64 and rounded once
-    /// (`refs/vllm-omni/…/minimax_h3/pdd.py:32-39`). Their sum is the block's node-sigma
+    /// (`vllm-omni:models/minimax_h3/pdd.py:32-39`). Their sum is the block's node-sigma
     /// increment, so an ordinary Euler step between the node sigmas applies the fused head.
     ///
     /// # Errors
