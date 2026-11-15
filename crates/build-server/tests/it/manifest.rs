@@ -673,6 +673,47 @@ fn a_declared_compilation_is_checked_against_its_package() {
     );
 }
 
+/// A declared compilation includes header sets of the locked distributions its package names in
+/// `[toolchain] packages`, each a relative directory of the distribution's installation, and
+/// states relaxed constexpr for units that include CuTe or CUTLASS; a header set of a
+/// distribution the package does not name, or a path leaving the distribution's root, is
+/// refused.
+#[test]
+fn a_declared_compilation_includes_its_distributions_headers() {
+    let headers = r#"headers = [{ distribution = "torch", path = "torch/include" }]
+relaxed_constexpr = true
+host_contraction = false"#;
+    let declaring = DECLARED.replace("host_contraction = false", headers);
+    let named = declaring.replacen(
+        "[source]",
+        "[toolchain]\npackages = [\"torch\"]\n\n[source]",
+        1,
+    );
+
+    let manifest = load(&named, &DECLARED_FILES).unwrap();
+    let compile = manifest.compile.as_ref().unwrap();
+    assert_eq!(compile.headers.len(), 1);
+    assert_eq!(compile.headers[0].distribution, "torch");
+    assert_eq!(compile.headers[0].path, "torch/include");
+    assert!(compile.relaxed_constexpr);
+    assert!(
+        !load(DECLARED, &DECLARED_FILES)
+            .unwrap()
+            .compile
+            .unwrap()
+            .relaxed_constexpr
+    );
+
+    let error = load(&declaring, &DECLARED_FILES).unwrap_err();
+    assert!(error.contains("torch"), "{error}");
+    let error = load(
+        &named.replace("torch/include", "../include"),
+        &DECLARED_FILES,
+    )
+    .unwrap_err();
+    assert!(error.contains("relative directory"), "{error}");
+}
+
 /// A cubin module's declared compilation states its kernel: its symbol, its warps and its
 /// signature in parameter order, from one unit and linking nothing; a native module's states no
 /// kernel.

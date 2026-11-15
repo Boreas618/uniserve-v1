@@ -189,6 +189,8 @@ def test_a_declared_native_compilation_binds_and_links(tmp_path):
             },
         },
         "libraries": ["cublasLt", "cudnn"],
+        "headers": [],
+        "relaxed_constexpr": False,
         "host_contraction": False,
         "kernel": None,
     }
@@ -238,6 +240,8 @@ def test_a_declared_cubin_writes_its_kernel_launch_metadata(tmp_path):
             "UNISERVE_WARPS": {"parameter": "warps"},
         },
         "libraries": [],
+        "headers": [],
+        "relaxed_constexpr": False,
         "host_contraction": True,
         "kernel": {
             "name": "uniserve_topk_softmax",
@@ -291,6 +295,8 @@ def test_a_failed_compile_refuses_the_build_naming_the_unit(tmp_path):
         "standard": "c++17",
         "definitions": {},
         "libraries": [],
+        "headers": [],
+        "relaxed_constexpr": False,
         "host_contraction": True,
         "kernel": None,
     }
