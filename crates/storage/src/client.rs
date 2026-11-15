@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::ToSocketAddrs;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -54,6 +54,13 @@ impl Client {
     /// Connect to the server at `socket` as `role`.
     pub fn connect(socket: &Path, role: Role) -> Result<Self> {
         Self::open(Connection::new(UnixStream::connect(socket)?)?, role, false)
+    }
+
+    /// Say hello as `role` on `connection`, a connection to this host's server that exists
+    /// already: a child's channel, whose other end the server made and keeps as the child's own
+    /// (its Mooncake connector's or its Transfer Server's).
+    pub fn on_connection(connection: Connection, role: Role) -> Result<Self> {
+        Self::open(connection, role, false)
     }
 
     /// Connect to the server of another host at `address` (`host:port`,
@@ -613,6 +620,31 @@ impl Client {
         }
     }
 
+    /// Closes the connection and returns once the server ended its side of it, which it does
+    /// once it acted on the close: what the connection held at the server (its role, its
+    /// requests, its processes' write access while the process is gone) has ended, so the caller
+    /// observes the server without this client. What arrives meanwhile is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the connection fails otherwise than by the server's close.
+    pub fn close(mut self) -> Result<()> {
+        self.connection.flush()?;
+        // Shutting the socket's sending side ends it at the server whatever other handles of the
+        // socket exist, such as a forked child's before it executes.
+        // SAFETY: shuts down the socket the connection owns, which stays open.
+        if unsafe { libc::shutdown(self.connection.as_fd().as_raw_fd(), libc::SHUT_WR) } == -1 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+        loop {
+            match self.connection.recv_with::<ServerMessage>(Duration::MAX) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     /// See [`Request::Stop`]: stops the server and waits until it ended, which it states by
     /// closing this connection last; `timeout` bounds the wait.
     ///
@@ -645,9 +677,11 @@ impl Client {
         }
     }
 
-    /// See [`Request::Restart`]. Returns the successor's process id.
-    pub fn restart(&mut self, executable: Option<String>) -> Result<u32> {
-        match self.request(&Request::Restart { executable }, &[])?.0 {
+    /// See [`Request::Restart`]: the successor runs `image`, the descriptor of an executable
+    /// opened for reading, whose `storage-server` command `arguments` select. Returns the
+    /// successor's process id.
+    pub fn restart(&mut self, image: BorrowedFd<'_>, arguments: Vec<String>) -> Result<u32> {
+        match self.request(&Request::Restart { arguments }, &[image])?.0 {
             Response::Restarting { pid } => Ok(pid),
             other => Err(unexpected("restart", &other)),
         }

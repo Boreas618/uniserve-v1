@@ -19,12 +19,28 @@ use ::storage::{
     Access, Claim, Claimant, Client, Error, Key, Location, Mode, Role, Scope, StorageRecord,
     TensorRecord,
 };
-use storage_server::{Launch, Server};
+use storage_server::{Children, Program, Server};
 
-/// Held by a test while it starts a child process, and by a test whose
-/// server must see its dropped connections close: a child forked from this
-/// process holds every connection open until it executes its program.
-pub(crate) static FORKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// The helper executable a test's server runs its children from, logging warnings and errors
+/// alone beside the test's output.
+pub(crate) fn helper() -> Program {
+    let path = Path::new(env!("CARGO_BIN_EXE_storage-server-helper"));
+    Program::open(path, vec!["--log-level".into(), "warn".into()]).unwrap()
+}
+
+/// The Transfer Server a test's server runs from the helper: chunks of a millisecond, on the
+/// host's GPUs when `gpus` is set and on host storage alone otherwise.
+pub(crate) fn transfer_child(gpus: bool) -> Children {
+    Children {
+        program: helper(),
+        connector: None,
+        transfer: Some(storage_server::transfer::Options {
+            chunk: Duration::from_millis(1),
+            nixl_library: None,
+            gpus,
+        }),
+    }
+}
 
 /// A server on its own socket, stopped when dropped.
 pub(crate) struct Running {
@@ -39,49 +55,32 @@ pub(crate) struct Running {
 
 impl Running {
     fn start() -> Self {
-        Self::with_transfer(|_| None)
+        Self::with_children(None)
     }
 
-    /// A server that runs the Transfer Server `transfer` names for its
-    /// socket.
-    pub(crate) fn with_transfer(transfer: impl FnOnce(&Path) -> Option<Launch>) -> Self {
-        Self::serving(0, |_| {}, transfer)
+    /// A server that runs `children`.
+    pub(crate) fn with_children(children: Option<Children>) -> Self {
+        Self::serving(0, |_| {}, children)
     }
 
-    /// A server that `configure` sets up before it serves, with no Transfer
-    /// Server.
+    /// A server that `configure` sets up before it serves, with no children.
     pub(crate) fn configured(configure: impl FnOnce(&mut Server) + Send + 'static) -> Self {
-        Self::serving(0, configure, |_| None)
+        Self::serving(0, configure, None)
     }
 
-    /// A server whose buffer pools stop a transfer between worker groups
-    /// and a put to the remote store after `deadlines`, running the
-    /// Transfer Server `transfer` names for its socket.
-    pub(crate) fn with_deadlines(
-        deadlines: (Duration, Duration),
-        transfer: impl FnOnce(&Path) -> Option<Launch>,
-    ) -> Self {
-        Self::serving(
-            0,
-            move |server: &mut Server| server.set_deadlines(deadlines.0, deadlines.1),
-            transfer,
-        )
-    }
-
-    /// A server that leaves `host_reserve` bytes of the host's available
+    /// A server that leaves `host_reserve_gib` GiB of the host's available
     /// storage to other processes.
-    pub(crate) fn reserving(host_reserve: u64) -> Self {
-        Self::serving(host_reserve, |_| {}, |_| None)
+    pub(crate) fn reserving(host_reserve_gib: u64) -> Self {
+        Self::serving(host_reserve_gib, |_| {}, None)
     }
 
     fn serving(
-        host_reserve: u64,
+        host_reserve_gib: u64,
         configure: impl FnOnce(&mut Server) + Send + 'static,
-        transfer: impl FnOnce(&Path) -> Option<Launch>,
+        children: Option<Children>,
     ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("storage.sock");
-        let transfer = transfer(&socket);
         let (listener, starting) = service::host::bind::<::storage::Settings>(&socket)
             .unwrap()
             .owned(&socket)
@@ -90,8 +89,15 @@ impl Running {
         let address = tcp.local_addr().unwrap().to_string();
         let record = readiness(&socket, Some(&address));
         let lock = starting.finish(&record).unwrap();
+        let settings = ::storage::Settings {
+            server: ::storage::ServerSettings {
+                host_reserve_gib,
+                ..::storage::ServerSettings::default()
+            },
+            connector: None,
+        };
         Self::on_thread(directory, socket, address, move || {
-            let mut server = Server::new(listener, host_reserve, None, transfer).unwrap();
+            let mut server = Server::new(listener, settings, children).unwrap();
             configure(&mut server);
             server.listen_tcp(tcp).unwrap();
             // A server states what `serve` publishes for it.
@@ -99,7 +105,6 @@ impl Running {
             (server, lock)
         })
     }
-
     /// Runs the server `make` makes, with what holds its socket's lock, on
     /// a thread of its own until dropped.
     fn on_thread<L: Send + 'static>(
@@ -493,10 +498,7 @@ fn write_access_to_an_exclusive_tensor_passes_on_by_release() {
 #[test]
 fn a_new_head_is_refused_while_the_previous_one_is_connected_and_drops_unlisted_scopes() {
     // The new claim shoots down every worker still connected, which the
-    // workers below, of this process, must not be.
-    let _forking = FORKING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // workers below, of this process, must not be: each closes, acknowledged, first.
     let server = Running::start();
     let mut first = head(&server.socket);
     let claim = first
@@ -517,6 +519,7 @@ fn a_new_head_is_refused_while_the_previous_one_is_connected_and_drops_unlisted_
                 &[(host(4), storage.as_fd())],
             )
             .unwrap();
+        client.close().unwrap();
     }
 
     let mut second = head(&server.socket);
@@ -524,9 +527,10 @@ fn a_new_head_is_refused_while_the_previous_one_is_connected_and_drops_unlisted_
         server_error(second.claim(Claimant::Head, 0, Vec::new(), Vec::new())),
         ErrorKind::Claimed
     );
-    drop(first);
-    // The server notices the disconnect on its next turn.
-    let claim = retry(|| second.claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new()));
+    first.close().unwrap();
+    let claim = second
+        .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
+        .unwrap();
     let names: Vec<String> = second
         .list()
         .unwrap()
@@ -548,33 +552,34 @@ fn a_new_head_is_refused_while_the_previous_one_is_connected_and_drops_unlisted_
     assert_eq!(server_error(result), ErrorKind::Invalid);
 }
 
-/// The child process that holds write access, started by
-/// `a_relaunched_worker_takes_write_access_by_shooting_down_its_predecessor`.
-#[test]
-#[ignore = "a stand-in worker this file's tests start as a child process"]
-fn stand_in_writer() {
-    let Ok(socket) = std::env::var("STORAGE_TEST_SOCKET") else {
-        return;
-    };
-    let claim = Claim(
-        std::env::var("STORAGE_TEST_CLAIM")
-            .unwrap()
-            .split(',')
-            .map(|byte| byte.parse().unwrap())
-            .collect::<Vec<u8>>()
-            .try_into()
-            .unwrap(),
-    );
-    let mut client = worker(Path::new(&socket), scope("flow", 0), 1, claim);
-    let storage = memfd(&[3; 4]);
-    client
-        .put(
-            vec![tensor(key(5), "latents", 0, 0, Access::Exclusive)],
-            &[(host(4), storage.as_fd())],
-        )
-        .unwrap();
-    println!("holding");
-    std::thread::sleep(Duration::from_secs(600));
+/// Hexadecimal of `bytes`, as the helper's arguments state them.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Starts the helper's `role` with `arguments`, its standard input a pipe the test holds, and
+/// returns once it said it is ready: one byte on its standard output.
+pub(crate) fn start_client(
+    role: &str,
+    arguments: &[String],
+    configure: impl FnOnce(&mut std::process::Command),
+) -> std::process::Child {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_storage-server-helper"));
+    command
+        .arg(role)
+        .args(arguments)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    configure(&mut command);
+    let mut child = command.spawn().unwrap();
+    let mut ready = [0_u8; 1];
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_exact(&mut ready)
+        .expect("the helper ended before it was ready");
+    child
 }
 
 #[test]
@@ -583,32 +588,27 @@ fn a_relaunched_worker_takes_write_access_by_shooting_down_its_predecessor() {
     let claim = head(&server.socket)
         .claim(Claimant::Head, 0, vec![scope("flow", 0)], Vec::new())
         .unwrap();
-    let encoded: Vec<String> = claim.0.iter().map(u8::to_string).collect();
-    let forking = FORKING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "server::stand_in_writer",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env("STORAGE_TEST_SOCKET", &server.socket)
-        .env("STORAGE_TEST_CLAIM", encoded.join(","))
-        .stdout(std::process::Stdio::piped())
-        // A worker leads its own process group, which a shoot-down kills.
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    drop(forking);
-    let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    while !line.contains("holding") {
-        line.clear();
-        assert!(std::io::BufRead::read_line(&mut output, &mut line).unwrap() > 0);
-    }
-
+    // A worker of the scope holds write access to an exclusive tensor; a worker leads its own
+    // process group, which a shoot-down kills.
+    let arguments = [
+        "--socket".to_owned(),
+        server.socket.display().to_string(),
+        "--group".to_owned(),
+        "flow".to_owned(),
+        "--rank".to_owned(),
+        "0".to_owned(),
+        "--claim".to_owned(),
+        hex(&claim.0),
+        "--key".to_owned(),
+        hex(&key(5).0),
+        "--bytes".to_owned(),
+        "4".to_owned(),
+        "--fill".to_owned(),
+        "3".to_owned(),
+    ];
+    let mut child = start_client("writer", &arguments, |command| {
+        command.process_group(0);
+    });
     // The next launch of the same scope takes the tensor: the server kills
     // the child, waits for it to exit and passes write access on.
     let mut relaunched = worker(&server.socket, scope("flow", 0), 2, claim);
@@ -623,22 +623,6 @@ fn a_relaunched_worker_takes_write_access_by_shooting_down_its_predecessor() {
     );
     let descriptor = descriptors.into_iter().next().unwrap();
     assert_eq!(contents(descriptor), [3; 4]);
-}
-
-/// The value `attempt` returns once it succeeds, retried briefly while the
-/// server catches up with a disconnect.
-fn retry<T>(mut attempt: impl FnMut() -> Result<T, Error>) -> T {
-    for _ in 0..200 {
-        match attempt() {
-            Ok(value) => return value,
-            Err(Error::Server {
-                kind: ErrorKind::Claimed,
-                ..
-            }) => std::thread::sleep(Duration::from_millis(10)),
-            Err(error) => panic!("{error}"),
-        }
-    }
-    panic!("the server did not notice the disconnect");
 }
 
 /// A head of `deployment`.
@@ -679,8 +663,8 @@ fn a_claim_retires_every_deployment_whose_head_is_gone() {
             &[(host(4), storage.as_fd())],
         )
         .unwrap();
-    drop(gone_worker);
-    drop(gone);
+    gone_worker.close().unwrap();
+    gone.close().unwrap();
     // A deployment whose head stays keeps its tensor.
     let mut kept = head_of(&server.socket, "kept");
     let kept_claim = kept
@@ -695,20 +679,8 @@ fn a_claim_retires_every_deployment_whose_head_is_gone() {
         )
         .unwrap();
 
-    // A new deployment's claim retires the one whose head left, once the
-    // server has noticed it leave.
+    // A new deployment's claim retires the one whose head left.
     let mut operator = Client::connect(&server.socket, Role::Operator).unwrap();
-    for _ in 0..200 {
-        let listing = operator.list().unwrap();
-        if listing
-            .deployments
-            .iter()
-            .any(|listed| listed.deployment == "gone" && !listed.head_connected)
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
     head_of(&server.socket, "new")
         .claim(Claimant::Head, 0, vec![scope_of("new")], Vec::new())
         .unwrap();
@@ -1139,7 +1111,7 @@ fn a_epoch_reads_what_it_published_that_only_a_epoch_on_trial_retains() {
     let mut trial = epoch_worker(&server.socket, scope("text", 0), 2, claim);
     trial.get(vec![key(10)], Mode::Standby, Vec::new()).unwrap();
     serving.retain(Vec::new(), Vec::new()).unwrap();
-    drop(serving);
+    serving.close().unwrap();
 
     let mut restarted = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let (got, _) = restarted
@@ -1173,7 +1145,7 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
         file.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"cache bytes");
         assert_eq!(worker.list().unwrap().tensors.len(), 1);
-        drop(worker);
+        worker.close().unwrap();
         assert_eq!(head.keep_weights(vec![1], vec![key(42)]).unwrap(), 0);
         let mut resumed = epoch_worker(&server.socket, scope("text", 0), 1, claim);
         let (_, descriptors) = resumed
@@ -1184,7 +1156,7 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
         restored.seek(std::io::SeekFrom::Start(0)).unwrap();
         restored.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"cache bytes");
-        drop(resumed);
+        resumed.close().unwrap();
         assert_eq!(head.keep_weights(vec![1], Vec::new()).unwrap(), 1);
         assert!(head.list().unwrap().tensors.is_empty());
     }
@@ -1371,20 +1343,6 @@ pub(crate) fn reserved(quota: &::storage::Quota, item: Item, epochs: &[u64]) -> 
     quota.bytes(|reservation| reservation.item == item && reservation.epochs == epochs)
 }
 
-/// Waits until `client` reads a usage of `usage` bytes: a
-/// connection's end reaches the server a moment after the client drops it.
-fn await_usage(client: &mut Client, usage: u64) {
-    let mut reserved = 0;
-    for _ in 0..200 {
-        reserved = quota_of(client).usage();
-        if reserved == usage {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!("the usage is {reserved} bytes, not {usage}");
-}
-
 /// Two epochs of a deployment share a GPU within one quota: each storage is
 /// reserved once, however many epochs map it, an epoch's reserved items end with
 /// its processes, nothing takes a GPU past its quota, and a commit
@@ -1498,8 +1456,8 @@ fn two_epochs_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
             vec![(Item::Process, 0), (Item::GraphPool, 0)],
         )
         .unwrap();
-    drop(first);
-    await_usage(&mut head, 500);
+    first.close().unwrap();
+    assert_eq!(quota_of(&mut head).usage(), 500);
     head.claim(Claimant::Head, 2, vec![scope("text", 0)], vec![1])
         .unwrap();
     let quota = quota_of(&mut head);
@@ -1555,8 +1513,8 @@ fn a_epoch_kept_as_its_weights_leaves_its_successor_the_rest() {
     first
         .reserve(GPU, 1000, Some(700), vec![(Item::Process, 0)])
         .unwrap();
-    drop(first);
-    await_usage(&mut head, 270);
+    first.close().unwrap();
+    assert_eq!(quota_of(&mut head).usage(), 270);
     assert_eq!(head.keep_weights(vec![1], Vec::new()).unwrap(), 1);
     let quota = quota_of(&mut head);
     assert_eq!(quota.usage(), 250);
@@ -1624,18 +1582,12 @@ fn a_epoch_kept_as_its_weights_keeps_nothing_its_stopped_processes_reserved() {
 
     // One process is stopped before the request: its 500 bytes are kept as a
     // lost process's until the epoch keeps its weights alone.
-    drop(stopped);
+    stopped.close().unwrap();
     head.keep_weights(vec![1], Vec::new()).unwrap();
-    await_usage(&mut head, 100);
+    assert_eq!(quota_of(&mut head).usage(), 100);
 
     // The other is stopped after it.
-    drop(later);
-    for _ in 0..200 {
-        if usage_on_gpu(&mut head) == 0 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    later.close().unwrap();
     assert_eq!(usage_on_gpu(&mut head), 0);
 
     // A rollback starts the epoch again: its process reserves, and a loss of
@@ -1645,8 +1597,7 @@ fn a_epoch_kept_as_its_weights_keeps_nothing_its_stopped_processes_reserved() {
     relaunch
         .reserve(GPU, 1000, Some(700), vec![(Item::Process, 250)])
         .unwrap();
-    drop(relaunch);
-    std::thread::sleep(Duration::from_millis(500));
+    relaunch.close().unwrap();
     assert_eq!(usage_on_gpu(&mut head), 250);
 }
 
@@ -1677,13 +1628,7 @@ fn a_retired_epoch_s_process_keeps_nothing_reserved_when_it_ends() {
         .unwrap();
     assert_eq!(usage_on_gpu(&mut head), 500);
 
-    drop(stopped);
-    for _ in 0..200 {
-        if usage_on_gpu(&mut head) == 0 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    stopped.close().unwrap();
     assert_eq!(usage_on_gpu(&mut head), 0);
 }
 
@@ -1756,8 +1701,8 @@ fn the_processes_of_one_scope_count_as_their_largest_reservation() {
         .reserve(GPU, 1000, Some(700), vec![(Item::Process, 350)])
         .unwrap();
     assert_eq!(quota_of(&mut head).usage(), 350);
-    drop(standby);
-    await_usage(&mut head, 300);
+    standby.close().unwrap();
+    assert_eq!(quota_of(&mut head).usage(), 300);
 }
 
 /// A lost rank's reservation stays reserved for the process that replaces it:
@@ -1784,7 +1729,7 @@ fn a_lost_rank_s_reservation_is_kept_for_its_relaunch() {
         vec![(Item::Process, 300), (Item::GraphPool, 200)],
     )
     .unwrap();
-    drop(rank);
+    rank.close().unwrap();
 
     // The lost rank's 500 bytes leave 200 of the quota to another scope.
     let mut other = epoch_worker(&server.socket, scope("text", 1), 1, claim);
@@ -1830,13 +1775,13 @@ fn reservations_end_with_a_withdrawal_or_the_epoch_s_retirement() {
     closed
         .reserve(GPU, 1000, Some(700), vec![(Item::Process, 0)])
         .unwrap();
-    drop(closed);
-    await_usage(&mut head, 0);
+    closed.close().unwrap();
+    assert_eq!(quota_of(&mut head).usage(), 0);
 
     let mut lost = epoch_worker(&server.socket, scope("text", 1), 1, claim);
     lost.reserve(GPU, 1000, Some(700), vec![(Item::Process, 300)])
         .unwrap();
-    drop(lost);
+    lost.close().unwrap();
     assert_eq!(quota_of(&mut head).usage(), 300);
     head.claim(Claimant::Head, 2, vec![scope("text", 0)], Vec::new())
         .unwrap();

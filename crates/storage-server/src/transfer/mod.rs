@@ -1,7 +1,7 @@
 //! The Transfer Server: the Storage Server's child process that copies
 //! bytes between the storage the server holds.
 //!
-//! The server runs it as `uniserve storage-server transfer` and starts it again
+//! The server runs it as its child (`crate::child`) and starts it again
 //! when it ends, so a fault in a copy or a CUDA context ends this process
 //! and never the server, which creates no CUDA context of its own. It knows
 //! the allocations the server gives it (retained storages: CUDA VMM
@@ -70,7 +70,7 @@ mod threads;
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -88,8 +88,8 @@ use network::{Exposed, Inbound, Lease, Network, Sources};
 use storage::{Fabric, Mapping};
 use threads::{CopyThreads, End, Piece, Runner, ThreadKey};
 
-/// How the Transfer Server copies.
-#[derive(Debug, Clone)]
+/// How the Transfer Server copies: what its server tells it when it starts it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Options {
     /// How long one chunk of a copy lasts at its link's bandwidth: far
     /// below one scheduler step of the epoch that executes beside the
@@ -100,19 +100,23 @@ pub struct Options {
     /// crate binds, which the agent of the path between hosts loads; the
     /// loader's search path finds it when `None`.
     pub nixl_library: Option<PathBuf>,
+    /// Whether to copy on the host's GPUs: the CUDA driver must load then, and every GPU it
+    /// shows is used (none when it shows none); otherwise only host storage is copied, and no
+    /// driver is loaded.
+    pub gpus: bool,
 }
 
 use crate::Error;
 
-/// Measure this host's links, connect to the Storage Server on `socket`
-/// and run its tasks until it closes the connection.
+/// Measure this host's links, say hello on `channel`, the connection its Storage Server made
+/// for it, and run the server's tasks until it closes the connection.
 ///
 /// # Errors
 ///
 /// Fails when a GPU cannot be measured (it has no storage for the context
 /// or the measurement) or the server cannot be reached.
-pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
-    let gpus = Gpus::discover()?;
+pub fn run(channel: service::Connection, options: &Options) -> Result<(), Error> {
+    let gpus = Gpus::discover(options.gpus)?;
     let (links, context_bytes) = devices::measure(&gpus)?;
     let bandwidths = links
         .iter()
@@ -120,7 +124,7 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
         .collect();
     let reserved = reserved(&gpus, &context_bytes)?;
 
-    let mut client = Client::connect(socket, Role::Transfer)?;
+    let mut client = Client::on_connection(channel, Role::Transfer)?;
     let (wake_reader, wake_writer) = rustix::pipe::pipe_with(
         rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
     )

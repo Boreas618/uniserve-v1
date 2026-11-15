@@ -299,13 +299,11 @@ pub enum Refusal {
     /// peer's.
     #[error("a connection from another host is a head's or a peer's")]
     Remote,
-    /// A connector says hello while the server has one.
-    #[error("the server has a connector")]
-    Connector,
-    /// A Transfer Server says hello that the server does not take, for the
-    /// reason given.
-    #[error("the server does not take this Transfer Server: {reason}")]
-    Transfer { reason: String },
+    /// A connection states the role of one of the server's children (its connector's or its
+    /// Transfer Server's) on a connection that is not that child's channel, or a child's channel
+    /// states another role: the server makes each child's connection itself.
+    #[error("only the server's {child} speaks as its {child}, on its own channel")]
+    Child { child: Child },
 }
 
 /// Where a storage's physical storage is.
@@ -1075,14 +1073,14 @@ pub enum Request {
     /// claim: the deployment is no longer served. Refused while its head is
     /// connected.
     Retire { deployment: String },
-    /// Pass the server to a successor server of `executable` (this
-    /// server's own when `None`), which goes on with every connection, the
-    /// listening sockets, the tensors' storage and the buffer pools once no
-    /// request, shoot-down, connector task or transfer is in flight (a hot
-    /// restart);
-    /// the server then exits. Responded with the successor's process id
-    /// once it started.
-    Restart { executable: Option<String> },
+    /// Pass the server to a successor server that runs the executable whose descriptor travels
+    /// with the request (the build of the operator's command), which goes on with every
+    /// connection, the listening sockets, the tensors' storage and the buffer pools once no
+    /// request, shoot-down, connector task or transfer is in flight (a hot restart); the server
+    /// then exits. `arguments` select the executable's `storage-server` command: its global
+    /// options and the command's path, which the successor's own arguments follow. Responded
+    /// with the successor's process id once it started.
+    Restart { arguments: Vec<String> },
     /// The server's readiness record: its endpoints (its socket, and the TCP endpoint other
     /// hosts connect to when it accepts them) and the settings it serves with. Responded with
     /// [`Response::Status`].
@@ -1524,12 +1522,49 @@ pub struct Listing {
     pub deployments: Vec<DeploymentListing>,
     /// Whether the Mooncake connector is connected.
     pub connector: bool,
+    /// The child processes the server runs, as their supervisor sees them.
+    pub children: Vec<ChildListing>,
     /// The Transfer Server, while it is connected.
     pub transfer: Option<TransferListing>,
     /// Every deployment's quota of every GPU the server reserves.
     pub quotas: Vec<Quota>,
     /// The buffer pool of every deployment that opened a session.
     pub buffer_pools: Vec<BufferPoolListing>,
+}
+
+/// A child process of the server, its Mooncake connector or its Transfer Server, in a
+/// [`Listing`]: the server starts it again when it ends, waiting the longer the more often it
+/// ended in a row without connecting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildListing {
+    pub child: Child,
+    /// The running process.
+    pub pid: Option<u32>,
+    /// How many processes in a row ended before they connected.
+    pub failures: u32,
+    /// How the last process ended (its exit status), once one did.
+    pub ended: Option<String>,
+    /// While none runs, the time until the next starts, in milliseconds.
+    pub restart_in_ms: Option<u64>,
+}
+
+/// A child process of the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Child {
+    /// The Mooncake connector, which keeps the buffer pools' host pages in Mooncake.
+    Connector,
+    /// The Transfer Server, which copies between the storage the server holds.
+    TransferServer,
+}
+
+impl std::fmt::Display for Child {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Connector => "Mooncake connector",
+            Self::TransferServer => "Transfer Server",
+        })
+    }
 }
 
 /// One deployment's buffer pool in a [`Listing`]: what it holds and what

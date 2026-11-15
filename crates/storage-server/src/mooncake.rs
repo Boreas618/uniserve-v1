@@ -1,10 +1,10 @@
 //! The Mooncake connector: the distributed host KV cache (L3) behind the
 //! buffer pools' host regions.
 //!
-//! The Storage Server runs the connector as a child process
-//! (`uniserve storage-server connector`), so that a fault in Mooncake ends
-//! the connector and never the server; the server starts it again. The
-//! connector connects to the server as [`Role::Connector`], maps every pool
+//! The Storage Server runs the connector as a child process (`crate::child`), so that a fault
+//! in Mooncake ends the connector and never the server; the server starts it again. The
+//! connector says hello on the channel the server made for it as [`Role::Connector`], maps
+//! every pool
 //! of pages the server sends it (a rank's part of a host region), registers
 //! each with Mooncake (`register_buffer`), and runs the server's tasks:
 //!
@@ -27,7 +27,6 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
-use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -102,10 +101,9 @@ struct Shared {
     wake: OwnedFd,
 }
 
-/// Connect to Mooncake with `settings` and to the Storage Server on
-/// `socket`, and run the server's tasks until the server closes the
-/// connection.
-pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
+/// Connect to Mooncake with `settings`, say hello on `channel`, the connection the Storage Server
+/// made for its connector, and run the server's tasks until the server closes the connection.
+pub fn run(channel: service::Connection, settings: &Settings) -> Result<(), Error> {
     let hostname = host_name()?;
     // Mooncake Store's C API is opened by its soname from the loader's default search path,
     // where the Mooncake package installs it, before any store exists; the binding's own lookup
@@ -129,7 +127,7 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
     )?;
     tracing::info!(master = %settings.master, "connected to Mooncake");
 
-    let mut client = Client::connect(socket, Role::Connector)?;
+    let mut client = Client::on_connection(channel, Role::Connector)?;
     let (wake_reader, wake_writer) = rustix::pipe::pipe_with(
         rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
     )

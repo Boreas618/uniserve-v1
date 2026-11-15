@@ -38,10 +38,6 @@ const SAMPLE_BYTES: usize = 64 << 20;
 /// The timed copies of each link, after one untimed copy.
 const SAMPLES: usize = 8;
 
-/// `CUDA_ERROR_NO_DEVICE`: the driver sees no GPU, as when
-/// `CUDA_VISIBLE_DEVICES` names none.
-const CUDA_ERROR_NO_DEVICE: i32 = 100;
-
 /// One GPU, as this process numbers it.
 pub(super) struct Gpu {
     pub(super) device: DeviceId,
@@ -58,26 +54,20 @@ pub(super) struct Gpus {
 }
 
 impl Gpus {
-    /// The GPUs the driver shows this process. A host without a driver, or
-    /// whose driver shows the process no GPU, has none: its Transfer
-    /// Server copies between host storage only. Discovery creates no CUDA
-    /// context.
-    pub(super) fn discover() -> Result<Self, platform::Error> {
-        let count = match DeviceId::count() {
-            Ok(count) => count,
-            Err(platform::Error::Load { .. }) => {
-                tracing::info!("no CUDA driver: the Transfer Server copies host storage only");
-                0
-            }
-            Err(platform::Error::Driver {
-                code: CUDA_ERROR_NO_DEVICE,
-                ..
-            }) => {
-                tracing::info!("no visible GPU: the Transfer Server copies host storage only");
-                0
-            }
-            Err(error) => return Err(error),
-        };
+    /// The GPUs the driver shows this process when the Transfer Server copies on GPUs (`use_gpus`),
+    /// and none otherwise, without loading the driver: its Transfer Server copies between host
+    /// storage only. A driver that shows no GPU is a count of none, not a failure. Discovery
+    /// creates no CUDA context.
+    ///
+    /// # Errors
+    ///
+    /// Fails when GPUs are to be used and the driver cannot be loaded, or a GPU's identity or
+    /// peers cannot be read.
+    pub(super) fn discover(use_gpus: bool) -> Result<Self, platform::Error> {
+        let count = if use_gpus { DeviceId::count()? } else { 0 };
+        if count == 0 {
+            tracing::info!("no GPU to copy on: the Transfer Server copies host storage only");
+        }
         let devices: Vec<DeviceId> = (0..count).map(DeviceId).collect();
         let mut gpus = Vec::with_capacity(devices.len());
         for &device in &devices {

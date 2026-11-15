@@ -12,7 +12,7 @@ use crate::server::{Running, key, scope, worker};
 /// refused while the claim's client lives.
 #[test]
 fn a_claim_lasts_as_long_as_its_client_and_holds_every_epoch() {
-    let server = Running::with_transfer(|_| None);
+    let server = Running::with_children(None);
     let mut claim = ClaimClient::connect(&server.socket, "model").unwrap();
 
     let token = claim
@@ -58,7 +58,7 @@ fn a_claim_lasts_as_long_as_its_client_and_holds_every_epoch() {
 /// the same token, and what the claim knew of its epochs crosses with it.
 #[test]
 fn a_claim_crosses_to_a_successor_with_its_connection() {
-    let server = Running::with_transfer(|_| None);
+    let server = Running::with_children(None);
     let mut claim = ClaimClient::connect(&server.socket, "model").unwrap();
     let token = claim
         .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())

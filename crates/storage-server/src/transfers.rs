@@ -58,7 +58,7 @@ use ::storage::protocol::{
     TaskListing, TaskStatus, TaskTotal, Throttle, TransferListing,
 };
 
-use crate::child::{Launch, Process};
+use crate::child::Process;
 use crate::{Attachment, ClientId, Handling, Server, StorageId, invalid};
 
 /// A task the Transfer Server runs, as the server keeps it.
@@ -124,9 +124,9 @@ struct Total {
 }
 
 impl Transfers {
-    pub(super) fn new(launch: Option<Launch>) -> Self {
+    pub(super) fn new(process: Process) -> Self {
         Self {
-            process: Process::new("Transfer Server", launch),
+            process,
             client: None,
             tasks: BTreeMap::new(),
             next_task: 1,
@@ -235,23 +235,6 @@ impl Server {
             Role::Worker { scope, .. } => Some(&scope.deployment),
             _ => None,
         }
-    }
-
-    /// Whether the client `id` may connect as the Transfer Server: it is the
-    /// server's running Transfer Server process, and none is connected.
-    pub(super) fn transfer_hello(&mut self, id: ClientId, pid: i32) -> Result<(), String> {
-        if self.transfers.client.is_some() {
-            return Err("the server has a Transfer Server".into());
-        }
-        // The Transfer Server receives the descriptor of every allocation
-        // it copies, so only the process the server started may be one.
-        let child = self.transfers.process.pid();
-        if child.is_none_or(|child| i64::from(child) != i64::from(pid)) {
-            return Err("only the server's own Transfer Server connects as one".into());
-        }
-        self.transfers.client = Some(id);
-        tracing::info!(pid, "the Transfer Server connected");
-        Ok(())
     }
 
     /// A head's or a worker's transfer request.

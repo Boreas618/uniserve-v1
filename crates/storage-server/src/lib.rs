@@ -60,16 +60,16 @@ use std::time::Duration;
 use rustix::event::{PollFd, PollFlags, poll};
 
 use ::storage::protocol::{
-    Access, Allocation, Claim, Claimant, ClientMessage, DeploymentListing, ErrorKind, Event, Hello,
-    HostStorage, Item, Key, Listing, Location, Mode, Quota, Refusal, Request, Response, Retainer,
-    Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorListing, TensorRecord, Tensors,
-    Usage, VERSION, Welcome,
+    Access, Allocation, Child, Claim, Claimant, ClientMessage, DeploymentListing, ErrorKind, Event,
+    Hello, HostStorage, Item, Key, Listing, Location, Mode, Quota, Refusal, Request, Response,
+    Retainer, Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorListing, TensorRecord,
+    Tensors, Usage, VERSION, Welcome,
 };
-pub use child::Launch;
+pub use child::{Children, Program};
 pub use error::Error;
 use kv_storage::{KvStorage, Task};
-pub use restart::{PREDECESSOR_DESCRIPTOR, Pending as RestartPending, relaunch_arguments};
-pub use serve::{ServeOptions, list, retire, run_connector, run_transfer_server, serve};
+pub use restart::Resumed;
+pub use serve::{ServeOptions, Start, list, retire, serve};
 use service::Connection;
 use shoot::ShootDowns;
 
@@ -120,6 +120,8 @@ struct Client {
     /// transfer requests or a peer's requests.
     pidfd: Option<Arc<OwnedFd>>,
     role: Option<Role>,
+    /// The server's child whose channel the connection is, which alone speaks as that child.
+    child: Option<::storage::protocol::Child>,
     /// Requests received and not yet responded, in arrival order.
     queue: VecDeque<(u64, Request, Vec<OwnedFd>)>,
     /// Whether a request taken from the queue waits for the Transfer
@@ -242,9 +244,8 @@ pub struct Server {
     copies: HashMap<Key, Vec<Location>>,
     deployments: HashMap<String, Deployment>,
     shootdowns: ShootDowns,
-    /// Host storage new host storage leaves available to the host's other
-    /// processes.
-    host_reserve: u64,
+    /// What the server serves with, which a restart in place's successor serves with too.
+    settings: ::storage::Settings,
     /// The GPUs' quotas: what the processes reserve and the quotas
     /// the epochs state ([`quota`]).
     quotas: quota::Quotas,
@@ -254,8 +255,9 @@ pub struct Server {
     moves: moves::Moves,
     /// Events to send once the request being handled gets its response.
     events: Vec<(ClientId, Event, Vec<Attachment>)>,
-    /// The arguments a restart in place's successor starts with.
-    relaunch: Vec<String>,
+    /// The executable the server runs its children from; `None` for a server that runs
+    /// none.
+    program: Option<Program>,
     /// A restart in place under way, which passes the server over once nothing is
     /// in flight.
     restart: Option<restart::Pending>,
@@ -271,18 +273,21 @@ pub struct Server {
 }
 
 impl Server {
-    /// Serve on `listener`, which the caller bound with mode 0600, leaving
-    /// `host_reserve` bytes of the host's available storage to other
-    /// processes, and run the Mooncake connector `connector` and the
-    /// Transfer Server `transfer` when given.
+    /// Serve on `listener`, which the caller bound with mode 0600, with `settings`, running
+    /// `children` when given.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the listener cannot be made non-blocking or the buffer pools' thread cannot
+    /// start.
     pub fn new(
         listener: UnixListener,
-        host_reserve: u64,
-        connector: Option<Launch>,
-        transfer: Option<Launch>,
+        settings: ::storage::Settings,
+        children: Option<Children>,
     ) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
-        Ok(Self {
+        let (program, connector, transfer) = child::supervisors(children, &settings.server);
+        let mut server = Self {
             listener,
             tcp: None,
             clients: BTreeMap::new(),
@@ -293,18 +298,30 @@ impl Server {
             copies: HashMap::new(),
             deployments: HashMap::new(),
             shootdowns: ShootDowns::default(),
-            host_reserve,
             quotas: quota::Quotas::default(),
             kv_storage: KvStorage::new(connector),
             transfers: transfers::Transfers::new(transfer),
+            program,
             moves: moves::Moves::default(),
             events: Vec::new(),
-            relaunch: Vec::new(),
             restart: None,
             sessions: sessions::Sessions::new()?,
             readiness: None,
             stopping: None,
-        })
+            settings,
+        };
+        let server_settings = &server.settings.server;
+        let deadlines = (
+            server_settings.transfer_deadline(),
+            server_settings.put_deadline(),
+        );
+        let watch = (
+            server_settings.buffer_pool_trace.clone(),
+            server_settings.buffer_pool_check,
+        );
+        server.set_deadlines(deadlines.0, deadlines.1);
+        server.watch_pools(watch.0, watch.1);
+        Ok(server)
     }
 
     /// The readiness record the server published, which a [`Request::Status`] answers from now
@@ -324,7 +341,7 @@ impl Server {
     /// How long a transfer between worker groups and a put to the remote
     /// store may take before the buffer pools stop them, from now on; a
     /// minute each unless set.
-    pub fn set_deadlines(&mut self, transfer: Duration, put: Duration) {
+    fn set_deadlines(&mut self, transfer: Duration, put: Duration) {
         self.sessions.set_deadlines(transfer, put);
     }
 
@@ -364,7 +381,7 @@ impl Server {
     ) -> io::Result<Option<restart::Pending>> {
         while !stop() && self.stopping.is_none() {
             self.turn(wake)?;
-            if self.restart.is_some() && self.quiescent() && self.agree() {
+            if self.ready_to_hand_over() {
                 return Ok(self.restart.take());
             }
         }
@@ -405,8 +422,14 @@ impl Server {
         for pidfd in &pidfds {
             fds.push(PollFd::new(pidfd.as_ref(), PollFlags::IN));
         }
+        // A restart's handoff socket and its successor's pidfd, whose answer or end the loop reads.
+        let restart = self.restart_descriptors().map(|descriptors| {
+            let at = fds.len();
+            fds.extend(descriptors.map(|fd| PollFd::from_borrowed_fd(fd, PollFlags::IN)));
+            at
+        });
         for process in [&self.kv_storage.process, &self.transfers.process] {
-            if let Some((_, pidfd)) = &process.child {
+            if let Some(pidfd) = process.pidfd() {
                 fds.push(PollFd::new(pidfd, PollFlags::IN));
             }
         }
@@ -428,6 +451,8 @@ impl Server {
             drain(wake);
         }
         let accept_tcp = tcp.is_some() && !fds[3].revents().is_empty();
+        let restart_ready =
+            restart.is_some_and(|at| fds[at..at + 2].iter().any(|fd| !fd.revents().is_empty()));
         let ready: Vec<ClientId> = ids
             .iter()
             .zip(&fds[first..first + ids.len()])
@@ -445,14 +470,16 @@ impl Server {
         for id in ready {
             self.read(id);
         }
+        if restart_ready {
+            self.read_restart();
+        }
         if self.shootdowns.advance() {
             self.settle_shootdowns();
             self.settle_sessions();
         }
         self.kv_storage.process.reap();
-        self.kv_storage.process.start_due();
         self.transfers.process.reap();
-        self.transfers.process.start_due();
+        self.start_children();
         self.take_notices();
         self.settle_lost();
         self.send_events();
@@ -513,6 +540,35 @@ impl Server {
                     pid: 0,
                     pidfd: None,
                     role: None,
+                    child: None,
+                    queue: VecDeque::new(),
+                    held: false,
+                },
+            );
+        }
+    }
+
+    /// Starts each child whose start is due, and admits the server's end of its channel as that
+    /// child's client: the connection only it speaks as its child on.
+    fn start_children(&mut self) {
+        let Some(program) = &self.program else {
+            return;
+        };
+        let started = [&mut self.kv_storage.process, &mut self.transfers.process]
+            .into_iter()
+            .filter_map(|process| Some((process.child()?, process.start_due(program)?)))
+            .collect::<Vec<_>>();
+        for (child, started) in started {
+            let id = self.next_client;
+            self.next_client += 1;
+            self.clients.insert(
+                id,
+                Client {
+                    connection: started.connection,
+                    pid: started.pid,
+                    pidfd: Some(started.pidfd),
+                    role: None,
+                    child: Some(child),
                     queue: VecDeque::new(),
                     held: false,
                 },
@@ -531,6 +587,7 @@ impl Server {
             pid: pid.as_raw_nonzero().get(),
             pidfd: Some(Arc::new(pidfd)),
             role: None,
+            child: None,
             queue: VecDeque::new(),
             held: false,
         })
@@ -609,31 +666,41 @@ impl Server {
                 spoken: VERSION,
             });
         }
-        if let Some(client) = self.clients.get_mut(&id) {
-            if client.role.is_some() {
-                return refused(Refusal::Repeated);
-            }
-            if client.pidfd.is_none() && !matches!(hello.role, Role::Head { .. } | Role::Peer) {
-                return refused(Refusal::Remote);
-            }
-            if matches!(hello.role, Role::Connector) {
-                // The connector's client is forgotten when its connection
-                // closes, so one that is known is connected.
-                if self.kv_storage.client.is_some() {
-                    return refused(Refusal::Connector);
-                }
+        let Some(client) = self.clients.get_mut(&id) else {
+            return refused(Refusal::Repeated);
+        };
+        if client.role.is_some() {
+            return refused(Refusal::Repeated);
+        }
+        if client.pidfd.is_none() && !matches!(hello.role, Role::Head { .. } | Role::Peer) {
+            return refused(Refusal::Remote);
+        }
+        // A child's role is spoken on that child's channel alone, which the server made, and a
+        // channel speaks its child's role alone.
+        let stated = match hello.role {
+            Role::Connector => Some(Child::Connector),
+            Role::Transfer => Some(Child::TransferServer),
+            _ => None,
+        };
+        if let (Some(child), _) | (None, Some(child)) = (stated, client.child)
+            && stated != client.child
+        {
+            return refused(Refusal::Child { child });
+        }
+        let pid = client.pid;
+        client.role = Some(hello.role);
+        match stated {
+            Some(Child::Connector) => {
                 self.kv_storage.client = Some(id);
-                tracing::info!(pid = client.pid, "the Mooncake connector connected");
+                self.kv_storage.process.connected();
+                tracing::info!(pid, "the Mooncake connector connected");
             }
-        }
-        if matches!(hello.role, Role::Transfer) {
-            let pid = self.clients.get(&id).map_or(0, |client| client.pid);
-            if let Err(reason) = self.transfer_hello(id, pid) {
-                return refused(Refusal::Transfer { reason });
+            Some(Child::TransferServer) => {
+                self.transfers.client = Some(id);
+                self.transfers.process.connected();
+                tracing::info!(pid, "the Transfer Server connected");
             }
-        }
-        if let Some(client) = self.clients.get_mut(&id) {
-            client.role = Some(hello.role);
+            None => {}
         }
         Welcome::Accepted
     }
@@ -869,8 +936,8 @@ impl Server {
                 Role::Head { deployment, .. },
             ) => self.pages_for(id, &deployment, (region, *part), pages, *upload),
             (Request::Retire { deployment }, Role::Operator) => self.retire(deployment),
-            (Request::Restart { executable }, Role::Operator) => self
-                .begin_restart(executable.as_deref())
+            (Request::Restart { arguments }, Role::Operator) => self
+                .begin_restart(descriptors.into_iter().next(), arguments)
                 .map(|pid| Handling::Response(Response::Restarting { pid }, Vec::new()))
                 .map_err(resource),
             (
@@ -1297,7 +1364,7 @@ impl Server {
     fn host_storage(&self) -> io::Result<HostStorage> {
         Ok(HostStorage {
             available: platform::host::available_memory()?,
-            reserve: self.host_reserve,
+            reserve: self.settings.server.host_reserve_bytes(),
             // A host region's parts are storages of their own, admitted whole as each is
             // created: what they have yet to allocate counts here.
             unallocated: self
@@ -2145,6 +2212,9 @@ impl Server {
         // the cancellations of a gone submitter's tasks to the Transfer
         // Server.
         self.send_events();
+        // The client reads its end now, whatever other handles of the socket exist (a child the
+        // server forks holds them until it executes): the server acted on its close.
+        client.connection.shutdown();
     }
 
     /// Write pending replies and drop closed clients.
@@ -2234,6 +2304,10 @@ impl Server {
                 })
                 .collect(),
             connector: self.kv_storage.client.is_some(),
+            children: [&self.kv_storage.process, &self.transfers.process]
+                .into_iter()
+                .filter_map(child::Process::listed)
+                .collect(),
             transfer: self.listed_transfer(),
             quotas: self.quotas_of(&[], None),
             buffer_pools: self

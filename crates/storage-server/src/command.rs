@@ -9,28 +9,36 @@
 //! and an operator writes the same document to a file. With `--daemon` it
 //! leaves its starter's session first (`service::host::detach`) and the
 //! starter prints the server's readiness record once it serves; `--ready-fd`
-//! names a descriptor the record is written to instead. With a connector in
-//! its settings, the server also runs the Mooncake connector, which keeps the
-//! pages of the buffer pools' host regions in Mooncake (L3): this
-//! executable's `storage-server connector` command, as a child process the
-//! server starts again when it ends. It always runs its Transfer Server,
-//! which copies between the storage it holds, the same way
-//! (`storage-server transfer`).
+//! names a descriptor the record is written to instead. The server runs its
+//! children from this executable's image (`crate::child`): with a connector in
+//! its settings the Mooncake connector, which keeps the pages of the buffer
+//! pools' host regions in Mooncake (L3), and always its Transfer Server, which
+//! copies between the storage it holds. Each is this command's hidden `child`
+//! entry, which reads which child it is from the channel the server made.
 //!
 //! `status` prints the running server's readiness record (its endpoints and
 //! settings), `stop` stops it and returns once it ended, `list` prints what it
 //! holds, `retire` releases the storage of a deployment that is no longer
-//! served, and `restart` passes the running server to a successor.
+//! served, and `restart` passes the running server to a successor of this
+//! command's own build.
 
+use std::ffi::OsString;
 use std::io::Read as _;
+use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
+use clap::CommandFactory as _;
+
+use crate::child::{CHANNEL_OPTION, Program};
 
 /// How long `stop` waits for the server to end: it ends its children and closes its
 /// connections, which takes no longer than a child's exit.
 const STOP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The option a successor names its handoff socket's descriptor by.
+const PREDECESSOR_OPTION: &str = "predecessor";
 
 /// The `storage-server` command's arguments.
 #[derive(Debug, clap::Parser)]
@@ -62,30 +70,17 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         settings: Option<PathBuf>,
         /// The descriptor of the handoff socket to the server this one
-        /// succeeds in a restart in place (`storage-server restart`), which it
-        /// goes on with.
-        #[arg(long, hide = true, value_name = "FD")]
-        predecessor: Option<i32>,
+        /// succeeds in a restart in place (`storage-server restart`), which
+        /// passes it the socket and the settings it serves with.
+        #[arg(long = PREDECESSOR_OPTION, hide = true, value_name = "FD")]
+        predecessor: Option<RawFd>,
     },
-    /// The Mooncake connector a server runs as its child, with its settings
-    /// (`storage::connector::Settings`, TOML) on its standard input.
+    /// One of a server's children, on the channel the server made for it at
+    /// this descriptor, which states which child it is.
     #[command(hide = true)]
-    Connector {
-        #[arg(long)]
-        socket: PathBuf,
-    },
-    /// The Transfer Server a server runs as its child.
-    #[command(hide = true)]
-    Transfer {
-        #[arg(long)]
-        socket: PathBuf,
-        /// How long one chunk of a copy lasts at its link's bandwidth, in
-        /// microseconds.
-        #[arg(long)]
-        chunk_us: u64,
-        /// NIXL's C API library, for copies from other hosts.
-        #[arg(long)]
-        nixl_library: Option<PathBuf>,
+    Child {
+        #[arg(long = CHANNEL_OPTION, value_name = "FD")]
+        channel: RawFd,
     },
     /// Print the running server's readiness record: its endpoints and the
     /// settings it serves with, one JSON line.
@@ -112,17 +107,23 @@ pub enum Command {
         #[arg(long)]
         deployment: String,
     },
-    /// Hand the running server to a successor, of this build or the one
-    /// `--executable` names, which goes on with every connection, tensor and
-    /// buffer pool once nothing is in flight (a restart in place).
+    /// Hand the running server to a successor of this command's build, which
+    /// goes on with every connection, tensor and buffer pool once nothing is
+    /// in flight (a restart in place).
     Restart {
         #[arg(long)]
         socket: Option<PathBuf>,
-        /// The `uniserve` executable the successor runs; the running
-        /// server's own when unset.
-        #[arg(long)]
-        executable: Option<String>,
     },
+}
+
+/// The entry arguments of a restart's successor of the handoff socket at `predecessor`
+/// (`storage-server serve --predecessor FD`), as [`Command::Serve`] reads them.
+pub(crate) fn successor_entry(predecessor: RawFd) -> Vec<OsString> {
+    vec![
+        "serve".into(),
+        format!("--{PREDECESSOR_OPTION}").into(),
+        predecessor.to_string().into(),
+    ]
 }
 
 /// The settings document `path` names (`-`: standard input), as `serve --settings` reads it.
@@ -153,6 +154,14 @@ fn socket_or_default(socket: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     }
 }
 
+/// This executable's image, running its `storage-server` command at `levels`: the program a
+/// server runs its children and a restart's successor from.
+fn this_program(levels: &service::logging::Levels) -> anyhow::Result<Program> {
+    let mut prefix = levels.arguments();
+    prefix.push(Args::command().get_name().to_owned());
+    Program::running(prefix).context("opening this executable's image")
+}
+
 /// Runs the command. `serve --daemon` forks, so the caller has started no
 /// thread.
 ///
@@ -169,51 +178,35 @@ pub fn run(args: Args, levels: &service::logging::Levels) -> anyhow::Result<()> 
             settings,
             predecessor,
         } => {
-            let settings = match &settings {
-                Some(path) => read_settings(path)?,
-                None => ::storage::Settings::default(),
-            };
-            let executable = std::env::current_exe().context("locating this executable")?;
-            // The helpers log at the server's levels; `--log-level` is the executable's own
-            // option, before its command.
-            let helper = |command: &str| {
-                let mut words: Vec<std::ffi::OsString> = vec![executable.clone().into()];
-                words.extend(levels.arguments().into_iter().map(Into::into));
-                words.extend(["storage-server".into(), command.into()]);
-                words
+            let start = match predecessor {
+                Some(descriptor) => {
+                    // SAFETY: the predecessor placed the handoff socket at this descriptor for
+                    // this process, and nothing else in it owns the descriptor.
+                    let handoff = unsafe { OwnedFd::from_raw_fd(descriptor) };
+                    crate::Start::Successor(handoff)
+                }
+                None => crate::Start::Fresh {
+                    socket: socket_or_default(socket)?,
+                    settings: Box::new(match &settings {
+                        Some(path) => read_settings(path)?,
+                        None => ::storage::Settings::default(),
+                    }),
+                },
             };
             crate::serve(crate::ServeOptions {
-                socket: socket_or_default(socket)?,
+                start,
                 daemon,
                 ready_fd,
-                settings,
-                connector_command: helper("connector"),
-                transfer_command: helper("transfer"),
-                predecessor,
+                program: this_program(levels)?,
                 levels: levels.clone(),
             })
         }
-        Command::Connector { socket } => {
-            let mut document = String::new();
-            std::io::stdin()
-                .read_to_string(&mut document)
-                .context("reading the connector's settings from standard input")?;
-            let settings: ::storage::connector::Settings =
-                toml::from_str(&document).context("parsing the connector's settings")?;
-            crate::run_connector(&socket, &settings, levels)
+        Command::Child { channel } => {
+            // SAFETY: the server that started this process made the channel and placed it at
+            // this descriptor for it; nothing else in this process owns the descriptor.
+            let channel = unsafe { OwnedFd::from_raw_fd(channel) };
+            crate::child::run(channel, levels)
         }
-        Command::Transfer {
-            socket,
-            chunk_us,
-            nixl_library,
-        } => crate::run_transfer_server(
-            &socket,
-            &crate::transfer::Options {
-                chunk: Duration::from_micros(chunk_us),
-                nixl_library,
-            },
-            levels,
-        ),
         Command::Status { socket } => {
             let socket = socket_or_default(socket)?;
             let readiness = ::storage::Client::connect(&socket, ::storage::Role::Operator)
@@ -235,14 +228,20 @@ pub fn run(args: Args, levels: &service::logging::Levels) -> anyhow::Result<()> 
         Command::Retire { socket, deployment } => {
             crate::retire(&socket_or_default(socket)?, &deployment).map_err(anyhow::Error::from)
         }
-        Command::Restart { socket, executable } => {
+        Command::Restart { socket } => {
             let socket = socket_or_default(socket)?;
-            storage::Client::connect(&socket, ::storage::Role::Operator)
-                .and_then(|mut operator| operator.restart(executable))
-                .map(|pid| {
-                    println!("the successor server {pid} takes over once nothing is in flight")
+            // The successor runs this command's own build: the operator restarts the server
+            // into the executable it runs.
+            let program = this_program(levels)?;
+            let pid = ::storage::Client::connect(&socket, ::storage::Role::Operator)
+                .and_then(|mut operator| {
+                    operator.restart(program.image(), program.prefix().to_vec())
                 })
-                .map_err(anyhow::Error::from)
+                .with_context(|| {
+                    format!("restarting the Storage Server at {}", socket.display())
+                })?;
+            println!("the successor server {pid} takes over once nothing is in flight");
+            Ok(())
         }
     }
 }
@@ -281,5 +280,26 @@ mod tests {
             panic!("the arguments are not a `serve` command");
         };
         assert!(settings.is_none());
+    }
+
+    /// The entries the server starts its children and its successor with are this command's.
+    #[test]
+    fn the_entries_a_server_starts_are_its_commands() {
+        let parse = |entry: Vec<OsString>| {
+            let words = std::iter::once(OsString::from("storage-server")).chain(entry);
+            Args::try_parse_from(words).unwrap().command
+        };
+        assert!(matches!(
+            parse(crate::child::child_entry(7)),
+            Command::Child { channel: 7 }
+        ));
+        assert!(matches!(
+            parse(successor_entry(9)),
+            Command::Serve {
+                predecessor: Some(9),
+                daemon: false,
+                ..
+            }
+        ));
     }
 }

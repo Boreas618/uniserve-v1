@@ -152,15 +152,27 @@ pub fn profiler_stop(device: DeviceId) -> Result<()> {
 }
 
 impl DeviceId {
-    /// The number of devices visible to this process.
+    /// The number of devices visible to this process: zero when the driver shows it none (it
+    /// initializes with `CUDA_ERROR_NO_DEVICE` then, as when `CUDA_VISIBLE_DEVICES` names no
+    /// device), which is a count, not a failure.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the driver cannot be loaded or fails otherwise.
     pub fn count() -> Result<i32> {
-        let driver = driver()?;
+        let no_device = sys::CUDA_ERROR_NO_DEVICE as i32;
+        let driver = match driver() {
+            Ok(driver) => driver,
+            Err(crate::Error::Driver { code, .. }) if code == no_device => return Ok(0),
+            Err(error) => return Err(error),
+        };
         let mut count = 0;
-        driver.check(
-            // SAFETY: the driver writes one int to the local `count`.
-            unsafe { (driver.device_get_count)(&mut count) },
-            "cuDeviceGetCount",
-        )?;
+        // SAFETY: the driver writes one int to the local `count`.
+        let status = unsafe { (driver.device_get_count)(&mut count) };
+        if status == sys::CUDA_ERROR_NO_DEVICE {
+            return Ok(0);
+        }
+        driver.check(status, "cuDeviceGetCount")?;
         Ok(count)
     }
 

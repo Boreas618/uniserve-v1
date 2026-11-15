@@ -173,7 +173,15 @@ impl StorageServer {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
-            let mut server = Server::new(listener, 0, None, None).unwrap();
+            // A server of no children that leaves the host's storage to no other process.
+            let settings = ::storage::Settings {
+                server: ::storage::ServerSettings {
+                    host_reserve_gib: 0,
+                    ..::storage::ServerSettings::default()
+                },
+                connector: None,
+            };
+            let mut server = Server::new(listener, settings, None).unwrap();
             server
                 .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
                 .unwrap();

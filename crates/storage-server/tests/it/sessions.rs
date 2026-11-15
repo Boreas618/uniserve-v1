@@ -8,17 +8,16 @@
 //! `completed` registers they write as the workers would) and its ranks
 //! (workers). No GPU is needed: the regions' memory is host storage.
 
-use std::io::BufRead as _;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::fs::FileExt as _;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use ::storage::protocol::{BlockState, ErrorKind, Event, HostCopy, RegionPart, UnitRun};
+use ::storage::protocol::{BlockState, ErrorKind, HostCopy, RegionPart, UnitRun};
 use ::storage::runtime::{
     Cause, Class, Completion, Group, GroupId, Open, Opened, OwnerId, Region, Registers, Request,
-    RequestId, Source, Tier, VERSION,
+    RequestId, Tier, VERSION,
 };
 use ::storage::{
     Access, Claim, Claimant, Client, Interest, Key, Location, Mode, QueueDescriptors, QueuePair,
@@ -26,7 +25,7 @@ use ::storage::{
 };
 
 use crate::server::{
-    FORKING, Running, engine_head, head, host, key, memfd, scope, server_error, tensor, worker,
+    Running, engine_head, head, host, key, memfd, scope, server_error, tensor, worker,
 };
 use crate::transfer::{Gpus, pattern, read, serving};
 
@@ -219,7 +218,7 @@ pub(crate) fn listed(socket: &std::path::Path) -> ::storage::protocol::BufferPoo
 
 #[test]
 fn an_engine_opens_a_session_and_its_schedulers_are_served_on_their_queue_pairs() {
-    serve_a_session(&Running::with_transfer(|_| None));
+    serve_a_session(&Running::with_children(None));
 }
 
 /// An engine opens a session on `server`, its two schedulers are served on
@@ -436,7 +435,7 @@ fn the_operator_s_list_prints_the_buffer_pool_s_blocks_groups_copies_and_check_f
 
 #[test]
 fn a_session_is_refused_what_the_server_does_not_serve() {
-    let server = Running::with_transfer(|_| None);
+    let server = Running::with_children(None);
     let mut engine = engine_head(&server.socket, 0);
 
     // Another interface version than the server's, named, and another epoch
@@ -498,7 +497,7 @@ fn a_session_is_refused_what_the_server_does_not_serve() {
 /// closes on its own, and the other stays open.
 #[test]
 fn an_epochs_standby_opens_a_session_of_its_own_beside_its_serving_engines() {
-    let server = Running::with_transfer(|_| None);
+    let server = Running::with_children(None);
     let mut serving = engine_head(&server.socket, 0);
     let (opened, _) = serving.open_pool(layout(0)).unwrap();
 
@@ -629,7 +628,7 @@ fn a_transfer_copies_an_owner_s_units_between_its_groups_ranks_through_the_trans
 
 #[test]
 fn a_region_s_storage_is_mapped_writable_by_another_epoch_without_taking_its_writer() {
-    let server = Running::with_transfer(|_| None);
+    let server = Running::with_children(None);
     let mut daemon = head(&server.socket);
     let claim = daemon
         .claim(Claimant::Head, 0, vec![scope("prefill", 0)], Vec::new())
@@ -667,19 +666,6 @@ fn a_region_s_storage_is_mapped_writable_by_another_epoch_without_taking_its_wri
         Some(std::process::id() as i32)
     );
     assert!(serving.list().is_ok(), "the serving rank is connected");
-}
-
-/// The connector's next event, within ten seconds.
-fn connector_event(connector: &mut Client) -> Event {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        connector.pump().unwrap();
-        if let Some((event, _)) = connector.next_event() {
-            return event;
-        }
-        assert!(Instant::now() < deadline, "the connector got no event");
-        std::thread::sleep(Duration::from_millis(1));
-    }
 }
 
 /// An engine of epoch 0 with its schedulers, whose two prefill ranks took
@@ -814,7 +800,7 @@ pub(crate) fn host_parts(socket: &Path, claim: Claim) -> Vec<OwnedFd> {
 /// groups fills each unit once, whatever the deployment numbers its ranks.
 #[test]
 fn the_ranks_of_one_index_in_two_groups_share_a_part_of_a_host_region() {
-    let server = Running::with_transfer(|_| None);
+    let server = Running::with_children(None);
     let scopes = vec![
         scope("prefill", 0),
         scope("prefill", 1),
@@ -862,7 +848,7 @@ fn the_ranks_of_one_index_in_two_groups_share_a_part_of_a_host_region() {
 /// region is resized.
 #[test]
 fn an_epoch_that_states_a_held_host_region_at_another_size_resizes_it() {
-    let server = Running::with_transfer(|_| None);
+    let server = Running::with_children(None);
     let mut serving = engine_head(&server.socket, 0);
     serving.open_pool(layout(0)).unwrap();
 
@@ -916,340 +902,8 @@ fn a_host_region_is_admitted_part_by_part_as_its_ranks_take_them() {
 }
 
 #[test]
-fn a_put_and_a_prefetch_move_host_copies_through_the_connector_part_by_part() {
-    let server = Running::with_transfer(|_| None);
-    // The test plays the server's connector.
-    let mut connector = Client::connect(&server.socket, Role::Connector).unwrap();
-    let (_engine, mut schedulers, opened, _parts) = host_copy(&server);
-    let host = opened.regions[HOST].0;
-    let mut parts = Vec::new();
-    for _ in 0..2 {
-        match connector_event(&mut connector) {
-            Event::Pool { pool, shape, slots } => {
-                assert_eq!((shape.page_bytes, slots), (16, 4));
-                parts.push(pool);
-            }
-            other => panic!("the connector got {other:?}"),
-        }
-    }
-    let prefill = &mut schedulers[0];
-
-    // A put: one upload of the block's page per part.
-    let put = prefill.submit(Request::Store {
-        group: PREFILL,
-        keys: vec![key(7)],
-        tier: Tier::Remote,
-    });
-    let mut uploaded = Vec::new();
-    for _ in 0..2 {
-        let Event::Upload { task, pool, pages } = connector_event(&mut connector) else {
-            panic!("the connector got no upload");
-        };
-        assert_eq!(pages, [(key(7), 0)]);
-        uploaded.push(pool);
-        let finished = connector.call(
-            &::storage::protocol::Request::Finished {
-                task,
-                results: vec![true],
-            },
-            &[],
-        );
-        assert!(finished.is_ok());
-    }
-    uploaded.sort_unstable();
-    parts.sort_unstable();
-    assert_eq!(uploaded, parts);
-    let stored = Completion::Stored { keys: vec![key(7)] };
-    assert_eq!(prefill.next(), (put, stored));
-
-    // A prefetch of two keys: the second's page fails on one part, so the
-    // first alone is found.
-    let prefetch = prefill.submit(Request::Prefetch {
-        group: PREFILL,
-        class: KV,
-        units: 0,
-        keys: vec![key(8), key(9)],
-        source: Source::Remote,
-        deadline: u64::MAX / 2,
-    });
-    for answer in [vec![true, true], vec![true, false]] {
-        let Event::Download { task, pages, .. } = connector_event(&mut connector) else {
-            panic!("the connector got no download");
-        };
-        assert_eq!(pages, [(key(8), 1), (key(9), 2)]);
-        let finished = ::storage::protocol::Request::Finished {
-            task,
-            results: answer,
-        };
-        assert!(connector.call(&finished, &[]).is_ok());
-    }
-    assert_eq!(
-        prefill.next(),
-        (
-            prefetch,
-            Completion::Prefetched {
-                found: 1,
-                evicted: Vec::new()
-            }
-        )
-    );
-    let pool = listed(&server.socket);
-    let host_blocks: u32 = pool
-        .blocks
-        .iter()
-        .filter(|count| count.region == "host" && count.state == BlockState::Shared)
-        .map(|count| count.blocks)
-        .sum();
-    assert_eq!(host_blocks, 2, "keys 7 and 8 have host copies");
-    prefill.await_capacity(host, (2, 0, 2));
-
-    // The session names no peer: a prefetch from the peers finds nothing.
-    let peers = Request::Prefetch {
-        group: PREFILL,
-        class: KV,
-        units: 0,
-        keys: vec![key(10)],
-        source: Source::Peers,
-        deadline: u64::MAX / 2,
-    };
-    assert_eq!(
-        prefill.ask(peers),
-        Completion::Prefetched {
-            found: 0,
-            evicted: Vec::new()
-        }
-    );
-}
-
-/// Answers the connector's next task, an upload when `upload` and a
-/// download otherwise, which must move `pages`, with `results`.
-fn run_pages(connector: &mut Client, upload: bool, pages: &[(Key, u64)], results: Vec<bool>) {
-    let (task, moved) = match connector_event(connector) {
-        Event::Upload { task, pages, .. } if upload => (task, pages),
-        Event::Download { task, pages, .. } if !upload => (task, pages),
-        other => panic!("the connector got {other:?}"),
-    };
-    assert_eq!(moved, pages);
-    let finished = ::storage::protocol::Request::Finished { task, results };
-    assert!(connector.call(&finished, &[]).is_ok());
-}
-
-/// A host region whose parts lie on two hosts: a put and a prefetch of the
-/// scheduler's host move each part's pages through the connector of the
-/// host it lies on, the other host's asked by this one's server, and a key
-/// counts only once every part of it moved.
-#[test]
-fn a_put_and_a_prefetch_move_each_part_through_the_connector_of_its_host() {
-    let here = Running::with_transfer(|_| None);
-    let there = Running::with_transfer(|_| None);
-    // The test plays each server's connector, which is given its host's
-    // part.
-    let mut connectors =
-        [&here, &there].map(|server| Client::connect(&server.socket, Role::Connector).unwrap());
-    let (_engine, _peer, mut schedulers, _opened, _parts) =
-        split_host_region(&here, &there, Vec::new());
-    store_on_host(&mut schedulers[0]);
-    for connector in &mut connectors {
-        assert!(matches!(
-            connector_event(connector),
-            Event::Pool { slots: 4, .. }
-        ));
-    }
-    let prefill = &mut schedulers[0];
-
-    // A put: the block's page of each part, written by its host's
-    // connector.
-    let put = prefill.submit(Request::Store {
-        group: PREFILL,
-        keys: vec![key(7)],
-        tier: Tier::Remote,
-    });
-    for connector in &mut connectors {
-        run_pages(connector, true, &[(key(7), 0)], vec![true]);
-    }
-    let stored = Completion::Stored { keys: vec![key(7)] };
-    assert_eq!(prefill.next(), (put, stored));
-
-    // A prefetch of two keys: the second's page fails on the other host's
-    // part, so the first alone is found.
-    let prefetch = prefill.submit(Request::Prefetch {
-        group: PREFILL,
-        class: KV,
-        units: 0,
-        keys: vec![key(8), key(9)],
-        source: Source::Remote,
-        deadline: u64::MAX / 2,
-    });
-    let pages = [(key(8), 1), (key(9), 2)];
-    run_pages(&mut connectors[0], false, &pages, vec![true, true]);
-    run_pages(&mut connectors[1], false, &pages, vec![true, false]);
-    assert_eq!(
-        prefill.next(),
-        (
-            prefetch,
-            Completion::Prefetched {
-                found: 1,
-                evicted: Vec::new()
-            }
-        )
-    );
-
-    // A put the other host's connector fails stores nothing.
-    let put = prefill.submit(Request::Store {
-        group: PREFILL,
-        keys: vec![key(8)],
-        tier: Tier::Remote,
-    });
-    run_pages(&mut connectors[0], true, &[(key(8), 1)], vec![true]);
-    run_pages(&mut connectors[1], true, &[(key(8), 1)], vec![false]);
-    let stored = Completion::Stored { keys: Vec::new() };
-    assert_eq!(prefill.next(), (put, stored));
-}
-
-/// Two groups whose ranks of one index lie on two hosts, each copying with
-/// the parts of its own host: a prefetch fills the host parts of the group
-/// it is for and a put reads those that hold the copy, each through the
-/// connector of their host, and a peer reads a copy only from parts that
-/// hold it.
-#[test]
-fn host_parts_of_one_index_on_two_hosts_are_kept_apart() {
-    let here = Running::with_transfer(|_| None);
-    let there = Running::with_transfer(|_| None);
-    // The test plays each server's connector.
-    let mut connectors =
-        [&here, &there].map(|server| Client::connect(&server.socket, Role::Connector).unwrap());
-
-    // The prefill group's ranks copy with the parts of host a, the
-    // session's, and the decode group's with those of host b, where the
-    // engine's peer opened the host regions alone. Each rank takes its part
-    // at its host's server and states its host there; the head states where
-    // the decode ranks' parts lie.
-    let mut open = layout(0);
-    open.groups[0].parts = vec![vec![("a".into(), 0), ("a".into(), 1)]];
-    open.groups[1].parts = vec![vec![("b".into(), 0), ("b".into(), 1)]];
-    let scopes = |group| vec![scope(group, 0), scope(group, 1)];
-    let claim = head(&here.socket)
-        .claim(Claimant::Head, 0, scopes("prefill"), Vec::new())
-        .unwrap();
-    let mut engine = engine_head(&here.socket, 0);
-    let (opened, descriptors) = engine.open_pool(open.clone()).unwrap();
-    let mut hosts = open;
-    hosts.regions.retain(|region| region.tier == Tier::Host);
-    hosts.classes.clear();
-    hosts.groups.clear();
-    hosts.schedulers.clear();
-    let there_claim = head(&there.socket)
-        .claim(Claimant::Head, 0, scopes("decode"), Vec::new())
-        .unwrap();
-    let mut peer = engine_head(&there.socket, 0);
-    peer.open_pool(hosts).unwrap();
-    let mut ranks = Vec::new();
-    for index in 0..2 {
-        for (server, group, claimed, host) in [
-            (&here, "prefill", claim, "a"),
-            (&there, "decode", there_claim, "b"),
-        ] {
-            let mut part = rank(&server.socket, group, index, claimed);
-            part.host_part("host".into(), index, 16, None).unwrap();
-            part.place("host".into(), host.into(), index, Vec::new())
-                .unwrap();
-            ranks.push(part);
-        }
-        engine
-            .place_remote(
-                "host".into(),
-                "b".into(),
-                index,
-                there.tcp.clone(),
-                Vec::new(),
-            )
-            .unwrap();
-    }
-    for connector in &mut connectors {
-        for _ in 0..2 {
-            assert!(matches!(
-                connector_event(connector),
-                Event::Pool { slots: 4, .. }
-            ));
-        }
-    }
-    let mut schedulers = Scheduler::all(&opened, descriptors);
-
-    // Each group's prefetch fills the parts of its own host, through that
-    // host's connector, part by part.
-    for (scheduler, group, byte, unit) in [(1, DECODE, 8, 0), (0, PREFILL, 9, 1)] {
-        let prefetch = schedulers[scheduler].submit(Request::Prefetch {
-            group,
-            class: KV,
-            units: 0,
-            keys: vec![key(byte)],
-            source: Source::Remote,
-            deadline: u64::MAX / 2,
-        });
-        for _ in 0..2 {
-            run_pages(
-                &mut connectors[scheduler],
-                false,
-                &[(key(byte), unit)],
-                vec![true],
-            );
-        }
-        let found = Completion::Prefetched {
-            found: 1,
-            evicted: Vec::new(),
-        };
-        assert_eq!(schedulers[scheduler].next(), (prefetch, found));
-    }
-    let listed = Completion::Listing {
-        keys: vec![
-            (key(8), KV, 64, 0b010, 0, 0b10),
-            (key(9), KV, 64, 0b010, 0, 0b01),
-        ],
-    };
-    assert_eq!(schedulers[0].ask(Request::List), listed);
-
-    // A put reads each copy from the parts that hold it, on their host.
-    for (connector, byte, unit) in [(1, 8, 0), (0, 9, 1)] {
-        let put = schedulers[0].submit(Request::Store {
-            group: PREFILL,
-            keys: vec![key(byte)],
-            tier: Tier::Remote,
-        });
-        for _ in 0..2 {
-            run_pages(
-                &mut connectors[connector],
-                true,
-                &[(key(byte), unit)],
-                vec![true],
-            );
-        }
-        let stored = Completion::Stored {
-            keys: vec![key(byte)],
-        };
-        assert_eq!(schedulers[0].next(), (put, stored));
-    }
-
-    // A peer reads a region's copies from the parts its first copy lies in;
-    // the second, which other parts hold, is left out.
-    let mut reader = Client::connect_peer(&here.tcp).unwrap();
-    let (copies, mut parts) = reader
-        .peer_hold("model".into(), vec![key(8), key(9)])
-        .unwrap();
-    let held: Vec<Key> = copies.iter().map(|copy| copy.key).collect();
-    assert_eq!(held, [key(8)]);
-    parts.sort_by_key(|part| part.rank);
-    let part = |rank| RegionPart {
-        region: "host".into(),
-        rank,
-        bytes: 16,
-        endpoint: Some(there.tcp.clone()),
-    };
-    assert_eq!(parts, [part(0), part(1)]);
-}
-
-#[test]
 fn a_peer_holds_the_host_copies_it_reads_until_it_releases_them() {
-    let server = Running::with_transfer(|_| None);
+    let server = Running::with_children(None);
     let (_engine, schedulers, opened, _parts) = host_copy(&server);
     let host = opened.regions[HOST].0;
     let prefill = &schedulers[0];
@@ -1294,51 +948,21 @@ fn a_peer_holds_the_host_copies_it_reads_until_it_releases_them() {
     prefill.await_capacity(host, (3, 0, 1));
 }
 
-/// The engine `an_engine_s_session_closes_once_its_processes_are_out` starts
-/// as a child process: it opens the session of epoch 0, attaches an owner,
-/// closes its connection and stays until its standard input closes.
-#[test]
-#[ignore = "a stand-in engine this file's tests start as a child process"]
-fn stand_in_engine() {
-    let Ok(socket) = std::env::var("STORAGE_TEST_SOCKET") else {
-        return;
-    };
-    let mut engine = engine_head(Path::new(&socket), 0);
-    let (opened, descriptors) = engine.open_pool(layout(0)).unwrap();
-    let mut schedulers = Scheduler::all(&opened, descriptors);
-    let attach = Request::Attach {
-        owner: OwnerId(1),
-        group: PREFILL,
-    };
-    assert_eq!(schedulers[0].ask(attach), Completion::Attached { slot: 1 });
-    drop(engine);
-    println!("left");
-    let mut line = String::new();
-    let _ = std::io::stdin().read_line(&mut line);
-}
-
 #[test]
 fn an_engine_s_session_closes_once_its_processes_are_out() {
-    let server = Running::with_transfer(|_| None);
-    let forking = FORKING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "sessions::stand_in_engine",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env("STORAGE_TEST_SOCKET", &server.socket)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    drop(forking);
-    let stdout = child.stdout.take().unwrap();
-    let mut lines = std::io::BufReader::new(stdout).lines();
-    while lines.next().unwrap().unwrap() != "left" {}
+    let server = Running::with_children(None);
+    // An engine process opens the session of epoch 0, attaches an owner, closes its connection
+    // once the server acted on its requests, and stays until its standard input ends.
+    let open = ::storage::protocol::encode(&layout(0)).unwrap();
+    let arguments = [
+        "--socket".to_owned(),
+        server.socket.display().to_string(),
+        "--epoch".to_owned(),
+        "0".to_owned(),
+        "--open".to_owned(),
+        crate::server::hex(&open),
+    ];
+    let mut child = crate::server::start_client("engine", &arguments, |_| {});
 
     // The connection closed while the engine's process lives: its owner
     // stays attached.
@@ -1350,11 +974,7 @@ fn an_engine_s_session_closes_once_its_processes_are_out() {
             .find(|count| count.region == "prefill rows 0");
         (pool.groups.len(), rows.map(|count| count.blocks))
     };
-    for _ in 0..20 {
-        assert_eq!(attached(&server.socket), (2, Some(1)));
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
+    assert_eq!(attached(&server.socket), (2, Some(1)));
     // Once it has exited, the session closes and the owner is detached.
     drop(child.stdin.take());
     assert!(child.wait().unwrap().success());
@@ -1367,7 +987,7 @@ fn an_engine_s_session_closes_once_its_processes_are_out() {
 
 #[test]
 fn what_an_epoch_on_trial_commits_is_its_own_until_its_head_publishes_it() {
-    let server = Running::with_transfer(|_| None);
+    let server = Running::with_children(None);
     let mut daemon = head(&server.socket);
     daemon
         .claim(Claimant::Head, 0, Vec::new(), Vec::new())
@@ -1446,7 +1066,7 @@ fn segmented(epoch: u64) -> Open {
 
 #[test]
 fn a_region_grows_into_the_segments_its_ranks_created_and_releases_them_after_a_shrink() {
-    let server = Running::with_transfer(|_| None);
+    let server = Running::with_children(None);
     let mut engine = engine_head(&server.socket, 0);
     let (opened, descriptors) = engine.open_pool(segmented(0)).unwrap();
     assert_eq!(opened.regions[UNITS].1, 3);

@@ -9,50 +9,52 @@
 //! The server binds its socket and its TCP endpoint before anything else, and
 //! publishes the record beside its socket for every later client.
 //!
-//! With connector settings, the server also runs the Mooncake connector
-//! ([`run_connector`]) as a child process it starts again when it ends. It
-//! always runs its Transfer Server ([`run_transfer_server`]) the same way.
+//! The server runs its children from its own executable image ([`crate::child`]): with
+//! connector settings the Mooncake connector, and always its Transfer Server, each started
+//! again when it ends. A restart's successor goes on with the socket and the settings its
+//! predecessor passes it ([`crate::restart`]).
 
-use std::ffi::OsString;
 use std::io::Write;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ::storage::connector::Settings;
 use ::storage::protocol::{BlockState, BufferPoolListing, Waiting};
 use ::storage::{Client, Role};
 use anyhow::Context;
 use service::host::Bound;
 use service::{Endpoint, Endpoints, ReadyFd, State};
 
+use crate::Server;
+use crate::child::{Children, Program};
 use crate::transfer::storage_name;
-use crate::{Launch, Server};
+
+/// How a server starts.
+#[derive(Debug)]
+pub enum Start {
+    /// It binds `socket` and serves with `settings`.
+    Fresh {
+        socket: PathBuf,
+        settings: Box<::storage::Settings>,
+    },
+    /// It goes on with the server the predecessor of a restart in place passes it on this
+    /// handoff socket, with that server's socket and settings.
+    Successor(OwnedFd),
+}
 
 /// How to serve: the arguments of `uniserve storage-server serve`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ServeOptions {
-    /// The socket to listen on.
-    pub socket: PathBuf,
+    pub start: Start,
     /// Leave the starter's session, log beside the socket, and return to the
     /// starter once serving, which prints the readiness record.
     pub daemon: bool,
     /// The inherited descriptor the readiness record is written to once the
     /// server serves.
     pub ready_fd: Option<i32>,
-    /// What the server serves with.
-    pub settings: ::storage::Settings,
-    /// The command that runs the connector, before its own arguments: this
-    /// executable and its `storage-server connector` command.
-    pub connector_command: Vec<OsString>,
-    /// The command that runs the Transfer Server, before its own arguments:
-    /// this executable and its `storage-server transfer` command.
-    pub transfer_command: Vec<OsString>,
-    /// Go on with the server the predecessor of a restart in place passes on on
-    /// the handoff socket at this descriptor, rather than binding the
-    /// socket (`crate::restart`).
-    pub predecessor: Option<i32>,
-    /// The levels the server and the helpers it starts log at.
+    /// The executable the server runs its children from: its own.
+    pub program: Program,
+    /// The levels the server logs at.
     pub levels: service::logging::Levels,
 }
 
@@ -72,69 +74,25 @@ pub fn serve(options: ServeOptions) -> anyhow::Result<()> {
         .transpose()
         .context("taking the readiness descriptor")?;
     // Forked before any thread exists. A successor runs detached already.
-    let ready = if options.daemon && options.predecessor.is_none() {
-        Some(
-            service::host::detach(&options.socket, inherited)
-                .context("leaving the starter's session")?,
-        )
-    } else {
-        inherited
+    let ready = match (&options.start, options.daemon) {
+        (Start::Fresh { socket, .. }, true) => Some(
+            service::host::detach(socket, inherited).context("leaving the starter's session")?,
+        ),
+        _ => inherited,
     };
     service::logging::init(
         "StorageServer",
         &options.levels,
         service::logging::Output::Stderr,
     );
-    let served = match options.predecessor {
-        Some(descriptor) => serve_resumed(&options, descriptor, ready),
-        None => serve_on(&options, ready),
+    let served = match options.start {
+        Start::Fresh { socket, settings } => serve_on(&socket, *settings, options.program, ready),
+        Start::Successor(handoff) => serve_resumed(handoff, options.program, ready),
     };
     if let Err(error) = &served {
         tracing::error!("storage server failed: {error:#}");
     }
     served
-}
-
-/// Run the Mooncake connector for the server on `socket` until the server
-/// closes its connection.
-///
-/// # Errors
-///
-/// Fails when the connector cannot reach Mooncake or the server.
-pub fn run_connector(
-    socket: &Path,
-    settings: &Settings,
-    levels: &service::logging::Levels,
-) -> anyhow::Result<()> {
-    service::logging::init(
-        "MooncakeConnector",
-        levels,
-        service::logging::Output::Stderr,
-    );
-    let ran = crate::mooncake::run(socket, settings).map_err(anyhow::Error::from);
-    if let Err(error) = &ran {
-        tracing::error!("the Mooncake connector failed: {error:#}");
-    }
-    ran
-}
-
-/// Run the Transfer Server for the server on `socket` until the server
-/// closes its connection.
-///
-/// # Errors
-///
-/// Fails when a GPU cannot be measured or the server cannot be reached.
-pub fn run_transfer_server(
-    socket: &Path,
-    options: &crate::transfer::Options,
-    levels: &service::logging::Levels,
-) -> anyhow::Result<()> {
-    service::logging::init("TransferServer", levels, service::logging::Output::Stderr);
-    let ran = crate::transfer::run(socket, options).map_err(anyhow::Error::from);
-    if let Err(error) = &ran {
-        tracing::error!("the Transfer Server failed: {error:#}");
-    }
-    ran
 }
 
 /// Write to `out` what the server on `socket` holds, a line each: its
@@ -354,10 +312,15 @@ fn report(ready: Option<ReadyFd>, record: &::storage::Readiness) {
     }
 }
 
-/// Bind the socket and serve until stopped. `ready` is the starter's descriptor, which receives
-/// the readiness record once the server serves, or the record of the server found serving.
-fn serve_on(options: &ServeOptions, ready: Option<ReadyFd>) -> anyhow::Result<()> {
-    let socket = &options.socket;
+/// Bind `socket` and serve with `settings` until stopped. `ready` is the starter's descriptor,
+/// which receives the readiness record once the server serves, or the record of the server found
+/// serving.
+fn serve_on(
+    socket: &Path,
+    settings: ::storage::Settings,
+    program: Program,
+    ready: Option<ReadyFd>,
+) -> anyhow::Result<()> {
     let (listener, starting) = match service::host::bind::<::storage::Settings>(socket)
         .with_context(|| format!("binding {}", socket.display()))?
     {
@@ -365,7 +328,7 @@ fn serve_on(options: &ServeOptions, ready: Option<ReadyFd>) -> anyhow::Result<()
         Bound::Serving(record) => {
             // The server that owns the socket keeps its settings: a starter that states others
             // is refused rather than served with settings it did not state.
-            ::storage::settings::Mismatch::check(&record, &options.settings)
+            ::storage::settings::Mismatch::check(&record, &settings)
                 .with_context(|| format!("serving on {}", socket.display()))?;
             tracing::info!(socket = %socket.display(), pid = record.pid, "another storage server serves this socket");
             report(ready, &record);
@@ -374,14 +337,9 @@ fn serve_on(options: &ServeOptions, ready: Option<ReadyFd>) -> anyhow::Result<()
     };
     service::raise_descriptor_limit().context("raising the descriptor limit")?;
     let (wake, stop) = service::stop_signals().context("installing the stop signals")?;
-    let server_settings = &options.settings.server;
-    let mut server = Server::new(
-        listener,
-        server_settings.host_reserve_bytes(),
-        connector_launch(options),
-        Some(transfer_launch(options)),
-    )?;
-    let peer = match &server_settings.tcp {
+    let children = Children::of(program, &settings);
+    let mut server = Server::new(listener, settings.clone(), Some(children))?;
+    let peer = match &settings.server.tcp {
         Some(endpoint) => {
             let bound = bind_tcp(endpoint)
                 .and_then(|listener| server.listen_tcp(listener))
@@ -391,16 +349,7 @@ fn serve_on(options: &ServeOptions, ready: Option<ReadyFd>) -> anyhow::Result<()
         }
         None => None,
     };
-    server.set_relaunch(crate::relaunch_arguments(std::env::args_os().collect()));
-    server.set_deadlines(
-        server_settings.transfer_deadline(),
-        server_settings.put_deadline(),
-    );
-    server.watch_pools(
-        server_settings.buffer_pool_trace.clone(),
-        server_settings.buffer_pool_check,
-    );
-    let record = readiness(socket, peer, &options.settings);
+    let record = readiness(socket, peer, &settings);
     let lock = starting
         .finish(&record)
         .context("publishing the readiness record")?;
@@ -410,38 +359,21 @@ fn serve_on(options: &ServeOptions, ready: Option<ReadyFd>) -> anyhow::Result<()
     run_until_stopped(server, &wake, &stop, lock)
 }
 
-/// Go on with the server a restart in place's predecessor passes on over the
-/// handoff socket at `descriptor`, and serve until stopped. The predecessor states its settings
-/// on this process's standard input, so the successor serves with them.
-fn serve_resumed(
-    options: &ServeOptions,
-    descriptor: i32,
-    ready: Option<ReadyFd>,
-) -> anyhow::Result<()> {
+/// Go on with the server a restart in place's predecessor passes on over the handoff socket
+/// `handoff`, with its socket and settings, and serve until stopped.
+fn serve_resumed(handoff: OwnedFd, program: Program, ready: Option<ReadyFd>) -> anyhow::Result<()> {
     service::raise_descriptor_limit().context("raising the descriptor limit")?;
     let (wake, stop) = service::stop_signals().context("installing the stop signals")?;
-    let (mut server, lock) = Server::resume(
-        descriptor,
-        connector_launch(options),
-        Some(transfer_launch(options)),
-    )
-    .context("taking the server over from its predecessor")?;
-    let server_settings = &options.settings.server;
-    server.set_deadlines(
-        server_settings.transfer_deadline(),
-        server_settings.put_deadline(),
-    );
-    server.watch_pools(
-        server_settings.buffer_pool_trace.clone(),
-        server_settings.buffer_pool_check,
-    );
-    let lock = service::host::SocketLock::resume(lock, options.socket.clone());
+    let resumed = Server::resume(handoff, Some(program))
+        .context("taking the server over from its predecessor")?;
+    let mut server = resumed.server;
+    let lock = service::host::SocketLock::resume(resumed.lock, resumed.socket.clone());
     // The record names this process now.
-    let record = readiness(&options.socket, server.tcp_endpoint(), &options.settings);
+    let record = readiness(&resumed.socket, server.tcp_endpoint(), &resumed.settings);
     lock.publish(&record)
         .context("publishing the readiness record")?;
     server.set_readiness(record.clone());
-    tracing::info!(socket = %options.socket.display(), "storage server serving after a restart in place");
+    tracing::info!(socket = %resumed.socket.display(), "storage server serving after a restart in place");
     report(ready, &record);
     run_until_stopped(server, &wake, &stop, lock)
 }
@@ -469,44 +401,4 @@ fn run_until_stopped(
         }
     }
     Ok(())
-}
-
-/// The connector the server runs, from `options`.
-fn connector_launch(options: &ServeOptions) -> Option<Launch> {
-    options.settings.connector.as_ref().map(|settings| {
-        let mut command = options.connector_command.clone();
-        let program = command.remove(0);
-        command.extend(["--socket".into(), options.socket.as_os_str().to_owned()]);
-        Launch {
-            program: program.into(),
-            arguments: command,
-            input: Some(connector_document(settings)),
-        }
-    })
-}
-
-/// The connector's settings as the document its command reads on its standard input.
-fn connector_document(settings: &Settings) -> String {
-    // Every field has a TOML form: strings, an endpoint as text and integers.
-    toml::to_string(settings).unwrap_or_default()
-}
-
-/// The Transfer Server the server runs, from `options`.
-fn transfer_launch(options: &ServeOptions) -> Launch {
-    let mut command = options.transfer_command.clone();
-    let program = command.remove(0);
-    command.extend([
-        "--socket".into(),
-        options.socket.as_os_str().to_owned(),
-        "--chunk-us".into(),
-        options.settings.server.transfer_chunk_us.to_string().into(),
-    ]);
-    if let Some(library) = &options.settings.server.nixl_library {
-        command.extend(["--nixl-library".into(), library.as_os_str().to_owned()]);
-    }
-    Launch {
-        program: program.into(),
-        arguments: command,
-        input: None,
-    }
 }

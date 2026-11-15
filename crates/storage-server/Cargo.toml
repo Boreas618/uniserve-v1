@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+# The integration tests are the one target `[[test]]` names; `tests/helper` is their helper
+# executable, not a test.
+autotests = false
 
 # The Storage Server of one host, its Mooncake connector and its Transfer
 # Server. It links no CUDA runtime: the server holds device storage only
@@ -32,6 +35,20 @@ tracing.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+
+# The integration tests' helper executable: the `storage-server` command, which a test's server
+# runs its children and a restart's successor from, and the client processes a test's server
+# follows (`CARGO_BIN_EXE_storage-server-helper`).
+[[bin]]
+name = "storage-server-helper"
+path = "tests/helper/main.rs"
+test = false
+doc = false
+bench = false
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
 
 [lints]
 workspace = true

@@ -2,7 +2,7 @@
 //! serves.
 //!
 //! The server runs the connector ([`crate::mooncake`]) as a child process
-//! and starts it again when it ends. The connector connects as
+//! and starts it again when it ends. The connector says hello on its channel as
 //! [`Role::Connector`](::storage::protocol::Role::Connector); the server
 //! sends it every part of a buffer pool's host region as a pool of pages
 //! and its tasks as events, and the connector reports each task's results
@@ -21,7 +21,7 @@ use std::collections::{BTreeSet, HashMap};
 use ::storage::protocol::Key;
 
 use crate::ClientId;
-use crate::child::{Launch, Process};
+use crate::child::Process;
 
 /// A task the connector runs for the server: pages of one part of a host
 /// region, the connector's pool `pool`, written to the KV storage when
@@ -60,9 +60,9 @@ pub(super) struct KvStorage {
 }
 
 impl KvStorage {
-    pub(super) fn new(launch: Option<Launch>) -> Self {
+    pub(super) fn new(process: Process) -> Self {
         Self {
-            process: Process::new("Mooncake connector", launch),
+            process,
             client: None,
             tasks: HashMap::new(),
             next: 1,

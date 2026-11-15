@@ -351,6 +351,9 @@ message StorageSettings {
   bool buffer_pool_check = 8;
   // The Mooncake connector the server runs; none when unset.
   MooncakeConnector connector = 9;
+  uint64 child_restart_s = 10;
+  uint64 child_restart_max_s = 11;
+  bool transfer_gpus = 12;
 }
 
 // A Mooncake connector's settings (`storage::connector::Settings`).

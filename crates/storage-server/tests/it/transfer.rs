@@ -3,12 +3,12 @@
 //! Transfer Server that crashes.
 //!
 //! The server runs on a thread of the test process; its Transfer Server is
-//! the real one (`storageserver::run_transfer_server`), run as the
-//! server's child process by this test binary (`stand_in_transfer_server`).
-//! The host tests hide every GPU from it (`CUDA_VISIBLE_DEVICES` empty), so
-//! it copies host storage with the CPU and no GPU is touched. The device
-//! tests need a CUDA device and see the GPUs this process sees; run them
-//! with `cargo test -p storage-server --test it transfer -- --ignored`.
+//! the real one, which the server runs as its child from the tests' helper
+//! executable (`crate::server::transfer_child`). The host tests have it copy
+//! on no GPU, so it copies host storage with the CPU and no GPU is touched.
+//! The device tests need a CUDA device and have it copy on the GPUs the
+//! driver shows; run them with `cargo test -p storage-server --test it
+//! transfer -- --ignored`.
 
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
@@ -19,75 +19,23 @@ use ::storage::protocol::{
     ErrorKind, Event, Link, LinkEnd, Priority, Region, Span, TaskStatus, TaskTotal, Throttle,
 };
 use ::storage::{Access, Claimant, Client, Role};
-use storage_server::Launch;
 
 use crate::server::{
-    FORKING, Running, head, host, key, memfd, scope, server_error, tensor, worker,
+    Running, head, host, key, memfd, scope, server_error, tensor, transfer_child, worker,
 };
 
-/// The Transfer Server the server starts, as this test binary runs it.
-#[test]
-#[ignore = "the Transfer Server this file's tests start as the server's child"]
-fn stand_in_transfer_server() {
-    let Ok(socket) = std::env::var("STORAGE_TEST_SOCKET") else {
-        return;
-    };
-    storage_server::run_transfer_server(
-        Path::new(&socket),
-        &storage_server::transfer::Options {
-            chunk: Duration::from_millis(1),
-            // The NIXL build the tests between hosts name; the loader's
-            // search path otherwise.
-            nixl_library: std::env::var_os("NIXL_CAPI_LIBRARY").map(Into::into),
-        },
-        // Its warnings and errors alone, beside the test's output.
-        &service::logging::Levels::new(Some(tracing::level_filters::LevelFilter::WARN)),
-    )
-    .unwrap();
-}
-
-/// Which GPUs the Transfer Server sees.
+/// Which GPUs the Transfer Server copies on.
 #[derive(Clone, Copy)]
 pub(crate) enum Gpus {
     /// None: it copies host storage only.
     Hidden,
-    /// Those this process sees.
+    /// Those the driver shows.
     Visible,
-}
-
-/// The launch of this binary's stand-in Transfer Server for `socket`.
-pub(crate) fn transfer_server(socket: &Path, gpus: Gpus) -> Launch {
-    let mut arguments: Vec<std::ffi::OsString> = Vec::new();
-    if let Gpus::Hidden = gpus {
-        arguments.push("CUDA_VISIBLE_DEVICES=".into());
-    }
-    arguments.push(format!("STORAGE_TEST_SOCKET={}", socket.display()).into());
-    arguments.push(std::env::current_exe().unwrap().into());
-    arguments.extend(
-        [
-            "--exact",
-            "transfer::stand_in_transfer_server",
-            "--ignored",
-            "--nocapture",
-            "--quiet",
-        ]
-        .map(Into::into),
-    );
-    Launch {
-        program: "env".into(),
-        arguments,
-        input: None,
-    }
 }
 
 /// A server whose Transfer Server is connected and measured.
 pub(crate) fn serving(gpus: Gpus) -> Running {
-    // The server forks the Transfer Server; no test's dropped connection
-    // must stay open in the child meanwhile.
-    let _forking = FORKING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let server = Running::with_transfer(|socket| Some(transfer_server(socket, gpus)));
+    let server = Running::with_children(Some(transfer_child(matches!(gpus, Gpus::Visible))));
     transfer_pid(&server.socket, None);
     server
 }
@@ -544,7 +492,7 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_storage_of_its_deployment(
 
     // A server that runs no Transfer Server refuses transfers as
     // unavailable.
-    let bare = Running::with_transfer(|_| None);
+    let bare = Running::with_children(None);
     let claim = crate::server::head(&bare.socket)
         .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
         .unwrap();
@@ -791,11 +739,6 @@ fn a_crashed_transfer_server_fails_its_tasks_and_the_server_starts_another() {
         Event::TaskProgress { .. }
     ));
 
-    // The forks of the Transfer Server's restart hold no test's
-    // connections.
-    let _forking = FORKING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let crashed = transfer_pid(&server.socket, None);
     // SAFETY: SIGKILL to the Transfer Server this test's server started.
     assert_eq!(unsafe { libc::kill(crashed, libc::SIGKILL) }, 0);

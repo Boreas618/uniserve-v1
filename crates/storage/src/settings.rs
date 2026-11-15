@@ -52,6 +52,10 @@ pub struct ServerSettings {
     /// a higher priority, between chunks, so a chunk is kept far below one scheduler step.
     /// Default 1000.
     pub transfer_chunk_us: u64,
+    /// Whether the Transfer Server copies on this host's GPUs: it then requires the CUDA driver
+    /// and copies on every GPU the driver shows; otherwise it copies host storage alone and loads
+    /// no driver. Default true.
+    pub transfer_gpus: bool,
     /// How long a buffer pool's transfer of a request between worker groups may take, in
     /// seconds, before it is stopped and answered as failed. Default 60.
     pub transfer_deadline_s: u64,
@@ -71,6 +75,14 @@ pub struct ServerSettings {
     /// takes at most a tenth of the thread that answers the steps: an inconsistency is logged when
     /// the pool turns inconsistent and counted in its listing (`check_failures`). Default off.
     pub buffer_pool_check: bool,
+    /// How long the server waits before it starts a child process again (its Mooncake connector
+    /// or its Transfer Server) after one ended, in seconds; the wait doubles with each process in
+    /// a row that ended before it connected, up to `child_restart_max_s`, so a child that cannot
+    /// start (its Mooncake master unreachable, a GPU without room for its context) is not started
+    /// in a loop. Default 5.
+    pub child_restart_s: u64,
+    /// The longest wait before a child process starts again, in seconds. Default 300.
+    pub child_restart_max_s: u64,
 }
 
 impl Default for ServerSettings {
@@ -79,11 +91,14 @@ impl Default for ServerSettings {
             tcp: None,
             host_reserve_gib: 10,
             transfer_chunk_us: 1000,
+            transfer_gpus: true,
             transfer_deadline_s: 60,
             put_deadline_s: 60,
             nixl_library: None,
             buffer_pool_trace: None,
             buffer_pool_check: false,
+            child_restart_s: 5,
+            child_restart_max_s: 300,
         }
     }
 }

@@ -24,24 +24,15 @@ use std::path::Path;
 use ::storage::protocol::{Priority, TaskStatus};
 use ::storage::{Access, Claimant, Client, Role};
 
-use crate::server::{FORKING, Running, head, host, key, memfd, scope, tensor, worker};
+use crate::server::{Running, head, host, key, memfd, scope, tensor, transfer_child, worker};
 use crate::transfer::{
-    Gpus, end_of, read, remote_region, serving, span, tensor_region, transfer_pid, transfer_server,
+    Gpus, end_of, read, remote_region, serving, span, tensor_region, transfer_pid,
 };
 
 /// A server whose Transfer Server sees this process's GPUs and READs from
 /// another server through the network adapters only.
 fn rdma_host() -> Running {
-    // The server forks the Transfer Server; no test's dropped connection
-    // must stay open in the child meanwhile.
-    let _forking = FORKING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let server = Running::with_transfer(|socket| {
-        let mut launch = transfer_server(socket, Gpus::Visible);
-        launch.arguments.insert(0, "UCX_TLS=rc,cuda_copy".into());
-        Some(launch)
-    });
+    let server = Running::with_children(Some(transfer_child(true)));
     transfer_pid(&server.socket, None);
     server
 }
@@ -95,7 +86,7 @@ fn a_read_from_another_host_fails_when_that_host_cannot_expose_its_source() {
         .unwrap()
         .to_string();
     // A host that holds the source, whose server runs no Transfer Server.
-    let bare = Running::with_transfer(|_| None);
+    let bare = Running::with_children(None);
     let mut bare_head = crate::server::head(&bare.socket);
     let bare_claim = bare_head
         .claim(Claimant::Head, 0, vec![scope("text", 0)], Vec::new())
@@ -153,7 +144,7 @@ mod device {
     use platform::{DeviceAllocation, DeviceId, HandleType, ShareableHandle};
 
     use super::{endpoint, first_difference, rdma_host, sequence};
-    use crate::server::{FORKING, head, host, key, memfd, scope, tensor, worker};
+    use crate::server::{head, host, key, memfd, scope, tensor, worker};
     use crate::transfer::device::{device_bytes, device_storage, record};
     use crate::transfer::{end_of, remote_region, span, tensor_region, transfer_pid};
 
@@ -379,10 +370,6 @@ mod device {
         // The source host's Transfer Server ends; its server starts another,
         // whose agent registers the region again when asked.
         {
-            // The forks of the restart hold no test's connections.
-            let _forking = FORKING
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let ended = transfer_pid(&source_host.socket, None);
             // SAFETY: SIGKILL to the Transfer Server this test's server
             // started.

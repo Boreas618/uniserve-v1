@@ -24,6 +24,9 @@ impl From<&storage::Settings> for StorageSettings {
             nixl_library: path(&server.nixl_library),
             buffer_pool_trace: path(&server.buffer_pool_trace),
             buffer_pool_check: server.buffer_pool_check,
+            child_restart_s: server.child_restart_s,
+            child_restart_max_s: server.child_restart_max_s,
+            transfer_gpus: server.transfer_gpus,
             connector: settings
                 .connector
                 .as_ref()
@@ -89,6 +92,9 @@ impl TryFrom<&StorageSettings> for storage::Settings {
                 nixl_library: path(&message.nixl_library),
                 buffer_pool_trace: path(&message.buffer_pool_trace),
                 buffer_pool_check: message.buffer_pool_check,
+                child_restart_s: message.child_restart_s,
+                child_restart_max_s: message.child_restart_max_s,
+                transfer_gpus: message.transfer_gpus,
             },
             connector,
         })
