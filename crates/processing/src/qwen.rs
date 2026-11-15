@@ -82,7 +82,15 @@ impl ImageFamily for Images {
         &ProcessorConfig::FILES
     }
 
-    fn bind(&self, files: &[String]) -> Result<Box<dyn ImageProcessor>, String> {
+    fn bind(
+        &self,
+        files: &[String],
+        options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Box<dyn ImageProcessor>, String> {
+        // The Qwen-VL processor rules read every value from the checkpoint's processor files.
+        if let Some(name) = options.keys().next() {
+            return Err(format!("the Qwen-VL image processor takes no option {name:?}"));
+        }
         let [image, video] = files else {
             return Err(format!("{} processor files, two expected", files.len()));
         };
@@ -132,5 +140,23 @@ mod tests {
         assert!(profile(QWEN3).images.is_none());
         assert!(profile(QWEN3_5_MOE).images.is_some());
         assert!(profile(QWEN4_EXP).images.is_some());
+    }
+
+    /// The Qwen-VL image processor reads every value from the checkpoint's processor files, so it
+    /// binds without options and refuses any, naming it.
+    #[test]
+    fn the_qwen_vl_image_processor_takes_no_option() {
+        let images = profile(QWEN3_5_MOE).images.expect("a family that takes images");
+        let file = r#"{"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
+            "size": {"shortest_edge": 4096, "longest_edge": 16777216}}"#;
+        let files = [file.to_owned(), file.to_owned()];
+
+        assert!(images.bind(&files, &serde_json::Map::new()).is_ok());
+        let options = serde_json::Map::from_iter([("max_pixels".to_owned(), 1.into())]);
+        let error = images
+            .bind(&files, &options)
+            .err()
+            .expect("an option is refused");
+        assert!(error.contains("max_pixels"), "{error}");
     }
 }

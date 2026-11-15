@@ -545,6 +545,11 @@ impl VideoFamily for H3Family {
         MAX_SECONDS
     }
 
+    fn processing_parts(&self) -> &'static [&'static str] {
+        // The conditioner's tokenizer and processor, and the video and audio schedules.
+        &["tokenizer", "processor", "scheduler", "audio_scheduler"]
+    }
+
     fn bind(&self, binding: VideoBinding<'_>) -> Result<Box<dyn VideoProcessor>, String> {
         Ok(Box::new(H3Processor::bind(binding)?))
     }

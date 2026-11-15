@@ -340,7 +340,7 @@ impl Leader {
         &self,
         target: &ServerArgs,
     ) -> Result<crate::epoch::ModuleSet, UpdateError> {
-        let named = self.named_modules(target);
+        let named = crate::epoch::modules_of(target);
         // A daemon that starts no engine of its own has no Build Server to
         // select at, no daemons of other hosts to reach, and no engine to move.
         let control = Arc::clone(
@@ -507,7 +507,7 @@ impl Leader {
         // Other model files serve the deployment's requests only when they
         // are processed as the serving ones are.
         if current.model() != target.model() {
-            crate::leader::same_processing(current.model(), target.model())
+            crate::leader::same_processing(&self.families, current.model(), target.model())
                 .await
                 .map_err(UpdateError::Refused)?;
             let served = service::lock(&replicas[0].served).clone();
@@ -845,7 +845,11 @@ impl Replica {
         // defaults and model facts.
         let served_model = &served.engine_config.model;
         if served_model.model != target_engine.model.model {
-            crate::leader::same_processing(&served_model.model, &target_engine.model.model)
+            crate::leader::same_processing(
+                &self.families,
+                &served_model.model,
+                &target_engine.model.model,
+            )
                 .await
                 .map_err(UpdateError::Refused)?;
             if !served_model.processes_as(&target_engine.model) {

@@ -17,7 +17,7 @@ use anyhow::Context as _;
 use proto::config::EngineArgs;
 
 use crate::engine::control::{BuildServer, Interfaces, ensure_build_server, place};
-use crate::leader::{Leader, fix_modules, named_modules, replica_configs};
+use crate::leader::{Leader, fix_modules, replica_configs};
 use crate::options::{ServerArgs, Stated};
 
 /// The launch of every engine the deployment `config` starts on this node, in replica
@@ -37,7 +37,7 @@ pub async fn launches(
     let prepared = Leader::prepare(families, config, stated).await?;
     // The module set is fixed when the keys are recorded (`record`): a launch built here names
     // the packages the configuration names.
-    let named = named_modules(config, prepared.model_config.video().is_some());
+    let named = crate::epoch::modules_of(config);
     replica_configs(&prepared.engine)?
         .into_iter()
         .zip(1..)

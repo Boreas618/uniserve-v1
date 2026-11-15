@@ -245,6 +245,12 @@ pub trait VideoFamily: Send + Sync {
     /// (`video_config.max_seconds`), in seconds.
     fn default_max_seconds(&self) -> f64;
 
+    /// The pipeline's parts (its stage directories) whose files decide how a request is
+    /// processed and generated beside the weights: the prompt's tokenizer, the processor, the
+    /// schedules. A checkpoint whose files in any of them differ from the served one's is
+    /// another deployment, not new weights of the served model.
+    fn processing_parts(&self) -> &'static [&'static str];
+
     /// Binds the deployment's processor.
     ///
     /// # Errors

@@ -110,6 +110,10 @@ impl processing::VideoFamily for TestVideo {
         4.0
     }
 
+    fn processing_parts(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     fn bind(
         &self,
         _: processing::VideoBinding<'_>,

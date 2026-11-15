@@ -183,16 +183,21 @@ impl ModelConfig {
     /// configured `max_model_len`, else, for a root configuration, its
     /// `max_position_embeddings` or `ModelConfig::DEFAULT_MAX_MODEL_LEN`; a
     /// pipeline's deployment must state it. `chat` configures a chat
-    /// checkpoint's template.
+    /// checkpoint's template, and `processor_options` (`mm_processor_kwargs`)
+    /// are a chat family's image processor's, which binds with them; a video
+    /// family's processor binds with them once its workers described the
+    /// placed denoiser.
     ///
     /// # Errors
     ///
-    /// Fails when the checkpoint's files cannot be resolved or read, or no
-    /// family of `registry` serves it.
+    /// Fails when the checkpoint's files cannot be resolved or read, no
+    /// family of `registry` serves it, or a chat family that binds no image
+    /// processor is given processor options.
     pub async fn load(
         model: &str,
         max_model_len: Option<std::num::NonZeroU32>,
         chat: &proto::config::ChatConfig,
+        processor_options: &serde_json::Map<String, serde_json::Value>,
         registry: &Registry,
     ) -> std::result::Result<LoadedModel, ModelResolutionError> {
         let max_model_len = max_model_len.map(std::num::NonZeroU32::get);
@@ -238,8 +243,15 @@ impl ModelConfig {
         // template that reads content parts writes its own image markup, and one that reads
         // flattened content is given the family's.
         let images = match config.chat().and_then(|profile| profile.images) {
-            Some(family) => Some(bind_images(model, family).await?),
-            None => None,
+            Some(family) => Some(bind_images(model, family, processor_options).await?),
+            None if processor_options.is_empty() => None,
+            None => {
+                return Err(ModelResolutionError::ImageProcessor(format!(
+                    "the {} family binds no image processor, which `mm_processor_kwargs` \
+                     configures",
+                    family.id
+                )));
+            }
         };
         let multimodal = images.as_ref().map(|images| MultimodalRenderInfo {
             placeholder_token: images.markup().to_owned(),
@@ -258,7 +270,7 @@ impl ModelConfig {
 
 /// The family of `registry` the checkpoint `model` names declares in the root files the
 /// registry's families declare in.
-async fn declared_family(
+pub(crate) async fn declared_family(
     model: &str,
     registry: &Registry,
 ) -> std::result::Result<Family, ModelResolutionError> {
@@ -293,6 +305,7 @@ async fn root_file(
 async fn bind_images(
     model: &str,
     family: &'static dyn ImageFamily,
+    options: &serde_json::Map<String, serde_json::Value>,
 ) -> std::result::Result<Arc<dyn ImageProcessor>, ModelResolutionError> {
     let source = crate::api::model::assets::model_files::ModelSource::from_model_id(model)?;
     let mut files = Vec::with_capacity(family.processor_files().len());
@@ -303,7 +316,7 @@ async fn bind_images(
         files.push(text);
     }
     family
-        .bind(&files)
+        .bind(&files, options)
         .map(Arc::from)
         .map_err(ModelResolutionError::ImageProcessor)
 }
@@ -941,6 +954,7 @@ mod tests {
             directory.path().to_str().unwrap(),
             None,
             &proto::config::ChatConfig::default(),
+            &serde_json::Map::new(),
             &registry,
         )
         .await

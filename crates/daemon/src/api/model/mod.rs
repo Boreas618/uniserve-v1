@@ -299,6 +299,7 @@ mod tests {
             directory.path().to_str().unwrap(),
             None,
             &proto::config::ChatConfig::default(),
+            &serde_json::Map::new(),
             &registry,
         )
         .await;
@@ -334,6 +335,10 @@ mod tests {
 
         fn default_max_seconds(&self) -> f64 {
             4.0
+        }
+
+        fn processing_parts(&self) -> &'static [&'static str] {
+            &[]
         }
 
         fn bind(&self, _: VideoBinding<'_>) -> Result<Box<dyn VideoProcessor>, String> {

@@ -62,6 +62,14 @@ const KIND_OPTIONS: [(Kind, &[&str]); 2] = [
     (
         Kind::Chat,
         &[
+            // The kernel backends of a causal language model's operators: attention, the grouped
+            // expert GEMM and the expert exchange. A slot these name is a module of the epoch,
+            // which a model that calls no such operator would fix and never run.
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+            "moe_runner_backend",
+            "moe_config",
             "max_num_batched_tokens",
             "scheduler_config.chunked_prefill_size",
             "speculative_config",

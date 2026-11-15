@@ -41,10 +41,17 @@ pub trait ImageFamily: Send + Sync {
     /// The checkpoint files the processor reads, relative to the checkpoint's root.
     fn processor_files(&self) -> &'static [&'static str];
 
-    /// Binds the processor to the contents of [`ImageFamily::processor_files`], in that order.
+    /// Binds the processor to the contents of [`ImageFamily::processor_files`], in that order,
+    /// with the deployment's processor options (`mm_processor_kwargs`), which the family alone
+    /// reads and validates.
     ///
     /// # Errors
     ///
-    /// Fails when the files are not the family's processor files.
-    fn bind(&self, files: &[String]) -> Result<Box<dyn ImageProcessor>, String>;
+    /// Fails when the files are not the family's processor files, or the options are not the
+    /// family's.
+    fn bind(
+        &self,
+        files: &[String],
+        options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Box<dyn ImageProcessor>, String>;
 }

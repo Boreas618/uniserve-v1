@@ -227,20 +227,6 @@ pub(crate) async fn fix_modules(
     fixed.map_err(|error| UpdateError::Refused(format!("fixing the module set: {error:#}")))
 }
 
-/// The modules `config` names for a deployment that serves video or not.
-///
-/// The configuration selects a backend for attention and for the grouped
-/// experts, which are a causal language model's operators. A video deployment
-/// launches neither, so a slot filled for them would fix a package no call
-/// reaches: every operator it runs is selected from the store.
-pub(crate) fn named_modules(config: &ServerArgs, video: bool) -> crate::epoch::ModuleSet {
-    let mut named = crate::epoch::modules_of(config);
-    if video {
-        named.kernels.clear();
-    }
-    named
-}
-
 /// The hosts the processes of an epoch of `config` run on, each once, in the order its replicas
 /// and their worlds name them: every replica's scheduler node and its peers'
 /// ([`crate::engine::control::world_hosts`]). Each prepares the epoch's module set before any of
@@ -727,7 +713,7 @@ impl Leader {
             targets: Vec::new(),
         };
         let hosts = epoch_hosts(&prepared.engine)?;
-        let named = named_modules(config, prepared.model_config.video().is_some());
+        let named = crate::epoch::modules_of(config);
         let modules = fix_modules(local, Some(Arc::clone(&control)), hosts, named)
             .await
             .map_err(anyhow::Error::from)
@@ -834,11 +820,6 @@ impl Leader {
         Ok(leader)
     }
 
-    /// The modules `config` names for what this deployment launches.
-    pub(crate) fn named_modules(&self, config: &ServerArgs) -> crate::epoch::ModuleSet {
-        named_modules(config, self.video_service().is_some())
-    }
-
     /// What a leader prepares before it has an engine: the model's files
     /// and the engine configuration of the engine that serves it, as
     /// [`Leader::start`] describes.
@@ -859,6 +840,7 @@ impl Leader {
             config.model(),
             config.max_model_len,
             &config.chat_config,
+            &config.mm_processor_kwargs,
             families,
         )
         .await
@@ -882,23 +864,20 @@ impl Leader {
         // Video workers prepare exactly the configured sizes, refusing one
         // their model does not generate, and report them back as the only
         // sizes requests may target; the family states the sizes and the
-        // longest output a configuration leaves unset. Other models prepare
-        // none.
-        match model_config.video() {
-            Some(family) => {
-                let video = &mut engine.video;
-                video.sizes.get_or_insert_with(|| {
-                    family
-                        .default_sizes()
-                        .iter()
-                        .map(|&size| size.to_owned())
-                        .collect()
-                });
-                video
-                    .max_seconds
-                    .get_or_insert_with(|| family.default_max_seconds());
-            }
-            None => engine.video.sizes = None,
+        // longest output a configuration leaves unset. Another family's
+        // configuration states no `video_config` (`refuse_foreign_options`).
+        if let Some(family) = model_config.video() {
+            let video = &mut engine.video;
+            video.sizes.get_or_insert_with(|| {
+                family
+                    .default_sizes()
+                    .iter()
+                    .map(|&size| size.to_owned())
+                    .collect()
+            });
+            video
+                .max_seconds
+                .get_or_insert_with(|| family.default_max_seconds());
         }
 
         Ok(Prepared {
@@ -947,12 +926,6 @@ impl Leader {
                 images: processor,
             } => {
                 images = processor;
-                // No other served model's processor takes options.
-                anyhow::ensure!(
-                    config.mm_processor_kwargs.is_empty(),
-                    "invalid mm_processor_kwargs: the processor of `{}` takes no options",
-                    config.model()
-                );
                 RequestRenderer::Chat(*renderer)
             }
             LoadedRenderer::Video { family, files } => {
@@ -1122,19 +1095,13 @@ impl Leader {
         self.processor.video_service()
     }
 
-    /// The tasks this engine serves.
-    ///
-    /// A video model serves video generation alone; every other model serves
-    /// chat completions, and a model that generates images serves image
-    /// generation as well.
+    /// The tasks this engine serves: what the served family declares it serves
+    /// ([`processing::Family::serving`]).
     pub fn supported_tasks(&self) -> Vec<Task> {
-        let mut tasks = Vec::new();
-        if self.processor.video_service().is_some() {
-            tasks.push(Task::VideoGeneration);
-        } else {
-            tasks.push(Task::Generate);
+        match self.processor.config().family.serving {
+            processing::Serving::Chat(_) => vec![Task::Generate],
+            processing::Serving::Video(_) => vec![Task::VideoGeneration],
         }
-        tasks
     }
 
     /// Whether the engine can accept requests: whether a ready engine
@@ -1511,19 +1478,76 @@ pub(crate) fn configurable(
         && within(updated.max_running_requests, capacity.max_running_requests)
 }
 
-/// Whether the daemon processes requests for the checkpoint at `path` as
-/// it does for the served model at `served`: the same tokenizer, tokenizer
-/// settings, generation defaults and chat template, byte for byte.
-pub(crate) async fn same_processing(served: &str, path: &str) -> Result<(), String> {
-    use crate::api::model::assets::model_files::ResolvedModelFiles;
-    // A diffusers checkpoint keeps what processes a request in directories of its own, and states
-    // no tokenizer at its root for the model's files to resolve.
-    let pipeline = std::path::Path::new(served)
-        .join(processing::RootFile::ModularIndex.name())
-        .is_file();
-    if pipeline {
-        return same_pipeline(std::path::Path::new(served), std::path::Path::new(path));
+/// Whether the daemon processes requests for the checkpoint `path` names as it does for the
+/// served checkpoint `served`, whose family of `families` both must declare: the files its family
+/// reads to process a request, each the same in both, byte for byte, and published by both or by
+/// neither.
+///
+/// What a family reads is declared, not probed: a chat family's request processing reads the
+/// checkpoint's tokenizer, tokenizer settings, generation defaults and chat template (the
+/// resolved model files, [`ResolvedModelFiles`]); a video family's reads its pipeline index and
+/// every file of the pipeline parts it declares ([`processing::VideoFamily::processing_parts`]).
+/// The model facts (`config.json`) are compared by the engine configuration's own comparison
+/// (`proto::config::ModelConfig::processes_as`).
+///
+/// # Errors
+///
+/// The reason the checkpoints differ, or the reason a checkpoint's files cannot be resolved or
+/// read.
+///
+/// [`ResolvedModelFiles`]: crate::api::model::assets::model_files::ResolvedModelFiles
+pub(crate) async fn same_processing(
+    families: &processing::Registry,
+    served: &str,
+    path: &str,
+) -> Result<(), String> {
+    let family = crate::api::input::declared_family(served, families)
+        .await
+        .map_err(|error| format!("resolving the family of {served}: {error}"))?;
+    let other = crate::api::input::declared_family(path, families)
+        .await
+        .map_err(|error| format!("resolving the family of {path}: {error}"))?;
+    if other != family {
+        return Err(format!(
+            "the checkpoint at {path} is a {} model, not a {} model as the served one: deploy it \
+             instead",
+            other.id, family.id
+        ));
     }
+    match family.serving {
+        processing::Serving::Video(video) => same_pipeline(
+            family.root,
+            video.processing_parts(),
+            std::path::Path::new(served),
+            std::path::Path::new(path),
+        ),
+        processing::Serving::Chat(_) => same_model_files(served, path).await,
+    }
+}
+
+/// [`same_processing`] for a chat checkpoint: the resolved model files request processing reads.
+async fn same_model_files(served: &str, path: &str) -> Result<(), String> {
+    use crate::api::model::assets::model_files::ResolvedModelFiles;
+
+    /// The files request processing reads, named for the refusal. Every field of the resolved
+    /// set is classified here, so a file the set gains is compared or named as a model fact.
+    fn processing_files(files: ResolvedModelFiles) -> [(&'static str, Option<std::path::PathBuf>); 4] {
+        let ResolvedModelFiles {
+            tokenizer_path,
+            tokenizer_config_path,
+            generation_config_path,
+            chat_template_path,
+            // The model facts, which the engine configuration compares.
+            config_path: _,
+        } = files;
+        [
+            ("tokenizer.json", Some(tokenizer_path)),
+            ("tokenizer_config.json", tokenizer_config_path),
+            ("generation_config.json", generation_config_path),
+            ("chat template", chat_template_path),
+        ]
+    }
+
     let resolve = |model: &str| {
         let model = model.to_owned();
         async move {
@@ -1533,33 +1557,8 @@ pub(crate) async fn same_processing(served: &str, path: &str) -> Result<(), Stri
         }
     };
     let (old, new) = (resolve(served).await?, resolve(path).await?);
-    let read = |file: Option<&std::path::Path>| -> Result<Option<Vec<u8>>, String> {
-        file.map(|file| std::fs::read(file).map_err(|error| format!("{}: {error}", file.display())))
-            .transpose()
-    };
-    for (name, old, new) in [
-        (
-            "tokenizer.json",
-            Some(old.tokenizer_path.as_path()),
-            Some(new.tokenizer_path.as_path()),
-        ),
-        (
-            "tokenizer_config.json",
-            old.tokenizer_config_path.as_deref(),
-            new.tokenizer_config_path.as_deref(),
-        ),
-        (
-            "generation_config.json",
-            old.generation_config_path.as_deref(),
-            new.generation_config_path.as_deref(),
-        ),
-        (
-            "the chat template",
-            old.chat_template_path.as_deref(),
-            new.chat_template_path.as_deref(),
-        ),
-    ] {
-        if read(old)? != read(new)? {
+    for ((name, old), (_, new)) in processing_files(old).into_iter().zip(processing_files(new)) {
+        if read_published(old.as_deref())? != read_published(new.as_deref())? {
             return Err(format!(
                 "the checkpoint at {path} has another {name} than the served model, which \
                  changes how requests are processed: deploy it instead"
@@ -1569,48 +1568,83 @@ pub(crate) async fn same_processing(served: &str, path: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// The parts of a diffusers checkpoint that decide how a request is processed.
-const PROCESSING_PARTS: [&str; 4] = ["tokenizer", "processor", "scheduler", "audio_scheduler"];
+/// The contents of `file`, `None` when the checkpoint publishes none.
+fn read_published(file: Option<&std::path::Path>) -> Result<Option<Vec<u8>>, String> {
+    file.map(|file| std::fs::read(file).map_err(|error| format!("{}: {error}", file.display())))
+        .transpose()
+}
 
-/// [`same_processing`] for a diffusers checkpoint: the same index, and every file of the parts
-/// that process a request the same.
-fn same_pipeline(served: &std::path::Path, path: &std::path::Path) -> Result<(), String> {
-    let read = |file: &std::path::Path| {
-        std::fs::read(file).map_err(|error| format!("{}: {error}", file.display()))
+/// The files of the directory `directory` by name, `None` when the checkpoint has no such
+/// directory.
+fn part_files(
+    directory: &std::path::Path,
+) -> Result<Option<BTreeMap<std::ffi::OsString, std::path::PathBuf>>, String> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", directory.display())),
     };
-    // The index either checkpoint publishes, the same in both.
-    let published = |root: &std::path::Path, index: &str| root.join(index).is_file();
-    for index in [processing::RootFile::ModularIndex.name()] {
-        let same = match (published(served, index), published(path, index)) {
-            (false, false) => true,
-            (true, true) => read(&served.join(index))? == read(&path.join(index))?,
-            _ => false,
-        };
-        if !same {
+    let mut files = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("{}: {error}", directory.display()))?;
+        files.insert(entry.file_name(), entry.path());
+    }
+    Ok(Some(files))
+}
+
+/// [`same_processing`] for a diffusers checkpoint: the same pipeline index, and in every part of
+/// `parts` the same files, compared both ways.
+fn same_pipeline(
+    index: processing::RootFile,
+    parts: &[&str],
+    served: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    // A part is compared by the files its directory holds, which a checkpoint states only where
+    // it lies: one named by its repository is resolved file by file, never listed.
+    for root in [served, path] {
+        if !root.is_dir() {
             return Err(format!(
-                "the checkpoint at {} states other parts than the served model: deploy it instead",
-                path.display()
+                "{} is no checkpoint directory: a pipeline's parts are compared where they lie",
+                root.display()
             ));
         }
     }
-    for part in PROCESSING_PARTS {
-        let directory = served.join(part);
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(format!("{}: {error}", directory.display())),
-        };
-        for entry in entries {
-            let entry = entry.map_err(|error| format!("{}: {error}", directory.display()))?;
-            let name = entry.file_name();
-            if read(&entry.path())? != read(&path.join(part).join(&name))? {
-                return Err(format!(
-                    "the checkpoint at {} has another {part}/{} than the served model, \
-                     which changes how requests are processed: deploy it instead",
-                    path.display(),
-                    name.to_string_lossy()
-                ));
+    let published = |root: &std::path::Path| {
+        let file = root.join(index.name());
+        read_published(file.is_file().then_some(file.as_path()))
+    };
+    if published(served)? != published(path)? {
+        return Err(format!(
+            "the checkpoint at {} states other parts than the served model: deploy it instead",
+            path.display()
+        ));
+    }
+    for part in parts {
+        let (old, new) = (part_files(&served.join(part))?, part_files(&path.join(part))?);
+        let differs = match (old, new) {
+            (None, None) => None,
+            (Some(old), Some(new)) => {
+                let names: std::collections::BTreeSet<_> = old.keys().chain(new.keys()).collect();
+                let mut differs = None;
+                for name in names {
+                    let old = read_published(old.get(name).map(std::path::PathBuf::as_path))?;
+                    let new = read_published(new.get(name).map(std::path::PathBuf::as_path))?;
+                    if old != new {
+                        differs = Some(format!("{part}/{}", name.to_string_lossy()));
+                        break;
+                    }
+                }
+                differs
             }
+            _ => Some((*part).to_owned()),
+        };
+        if let Some(file) = differs {
+            return Err(format!(
+                "the checkpoint at {} has another {file} than the served model, which changes \
+                 how requests are processed: deploy it instead",
+                path.display()
+            ));
         }
     }
     Ok(())
@@ -3145,7 +3179,7 @@ impl Replica {
         if streamed {
             config.load_config.weights = Some(model_path.to_owned());
         } else {
-            same_processing(config.model(), model_path)
+            same_processing(&self.families, config.model(), model_path)
                 .await
                 .map_err(UpdateError::Refused)?;
             config.model = Some(model_path.to_owned());
@@ -4101,6 +4135,80 @@ mod tests {
         let mut union = deployment(1, 4, true);
         union.moe.exchange = "deepep".to_owned();
         assert_eq!(super::replica_configs(&union).unwrap().len(), 1);
+    }
+
+    /// A pipeline checkpoint processes requests as the served one only with the same index and,
+    /// in every part its family declares, the same files, whichever side holds a file alone; a
+    /// part the family does not declare decides nothing.
+    #[tokio::test]
+    async fn a_pipeline_differs_by_a_part_file_either_side_holds_alone() {
+        struct Parts;
+
+        impl processing::VideoFamily for Parts {
+            fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
+                &[]
+            }
+
+            fn default_sizes(&self) -> &'static [&'static str] {
+                &["64x64"]
+            }
+
+            fn default_max_seconds(&self) -> f64 {
+                1.0
+            }
+
+            fn processing_parts(&self) -> &'static [&'static str] {
+                &["processor"]
+            }
+
+            fn bind(
+                &self,
+                _: processing::VideoBinding<'_>,
+            ) -> Result<Box<dyn processing::VideoProcessor>, String> {
+                Err("this family binds no processor".to_owned())
+            }
+        }
+
+        const PARTS: processing::Family = processing::Family {
+            id: "parts",
+            root: processing::RootFile::ModularIndex,
+            classes: &["PartsPipeline"],
+            serving: processing::Serving::Video(&Parts),
+        };
+        let families = processing::Registry::new([PARTS]).unwrap();
+        let checkpoint = |files: &[(&str, &str)]| {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(
+                directory.path().join(processing::RootFile::ModularIndex.name()),
+                r#"{"_class_name": "PartsPipeline"}"#,
+            )
+            .unwrap();
+            for (name, text) in files {
+                let path = directory.path().join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text).unwrap();
+            }
+            directory
+        };
+        let compare = |served: &tempfile::TempDir, other: &tempfile::TempDir| {
+            let families = families.clone();
+            let served = served.path().to_str().unwrap().to_owned();
+            let other = other.path().to_str().unwrap().to_owned();
+            async move { super::same_processing(&families, &served, &other).await }
+        };
+
+        let processor = ("processor/preprocessor_config.json", "{}");
+        let served = checkpoint(&[processor, ("scheduler/config.json", "{}")]);
+        let same = checkpoint(&[processor, ("scheduler/config.json", "{\"steps\": 8}")]);
+        compare(&served, &same)
+            .await
+            .expect("an undeclared part decides nothing");
+
+        let more = checkpoint(&[processor, ("processor/extra.json", "{}")]);
+        for (from, to) in [(&served, &more), (&more, &served)] {
+            let error = compare(from, to).await.expect_err("a file one side holds alone");
+            assert!(error.contains("processor/extra.json"), "{error}");
+        }
     }
 
     /// A standby exists only where the deployment reserved room for one and the
