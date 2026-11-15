@@ -29,6 +29,10 @@ pub struct EventFlags {
     /// Outside capture the same handle uses ordinary flags, as CUDA rejects the
     /// external flags there.
     pub external: bool,
+    /// A thread waiting for the event in [`Event::synchronize`] blocks until it completes
+    /// (`CU_EVENT_BLOCKING_SYNC`) instead of spinning or yielding as the context's scheduling
+    /// flags choose, so a thread that waits for each of its copies holds no core meanwhile.
+    pub blocking: bool,
 }
 
 /// The 64-byte interprocess handle of an event (`CUipcEventHandle`).
@@ -129,6 +133,9 @@ impl Event {
         }
         if self.flags.interprocess {
             flags |= sys::CU_EVENT_INTERPROCESS;
+        }
+        if self.flags.blocking {
+            flags |= sys::CU_EVENT_BLOCKING_SYNC;
         }
         flags
     }
@@ -275,6 +282,7 @@ impl Event {
                 timing: false,
                 interprocess: true,
                 external: false,
+                blocking: false,
             },
             current: Mutex::new(Some(Arc::new(EventHandle {
                 raw,
