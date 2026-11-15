@@ -25,6 +25,7 @@ impl From<&storage::Settings> for StorageSettings {
             child_restart_s: server.child_restart_s,
             child_restart_max_s: server.child_restart_max_s,
             transfer_gpus: server.transfer_gpus,
+            shoot_down_s: server.shoot_down_s,
             connector: settings
                 .connector
                 .as_ref()
@@ -91,6 +92,7 @@ impl TryFrom<&StorageSettings> for storage::Settings {
                 child_restart_s: message.child_restart_s,
                 child_restart_max_s: message.child_restart_max_s,
                 transfer_gpus: message.transfer_gpus,
+                shoot_down_s: message.shoot_down_s,
             },
             connector,
         })

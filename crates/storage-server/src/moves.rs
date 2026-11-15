@@ -441,33 +441,4 @@ impl Server {
             self.allocation_released(Allocation::Storage { storage });
         }
     }
-
-    /// Refuses `bytes` of new device storage on `gpu` that would take
-    /// `deployment`'s quota of it past its quota, naming `what`.
-    pub(crate) fn admit_device(
-        &self,
-        deployment: &str,
-        gpu: [u8; 16],
-        bytes: u64,
-        what: &str,
-    ) -> Result<(), (ErrorKind, String)> {
-        for quota in self.quotas_of(&[gpu], Some(deployment)) {
-            let (Some(limit), usage) = (quota.limit, quota.usage()) else {
-                continue;
-            };
-            if usage + bytes > limit {
-                return Err((
-                    ErrorKind::Quota,
-                    format!(
-                        "{bytes} bytes of {what} would take the usage of GPU {} to {} \
-                         bytes, past its quota of {limit} bytes:\n{}",
-                        ::storage::protocol::gpu_name(&gpu),
-                        usage + bytes,
-                        quota.describe()
-                    ),
-                ));
-            }
-        }
-        Ok(())
-    }
 }

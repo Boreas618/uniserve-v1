@@ -1556,7 +1556,7 @@ impl Server {
         if let Some(spans) = local {
             let spans: Vec<Span> = spans.into_iter().map(|(span, _)| span).collect();
             let owner = crate::transfers::Owner::Pool { number };
-            self.submit_for(owner, deployment, &spans, Priority::Request, 0)
+            self.submit_for(owner, deployment, &spans, Priority::Request, None)
                 .map_err(|(_, message)| message)?;
         }
         if let Some(running) = self.sessions.running.get_mut(&number) {

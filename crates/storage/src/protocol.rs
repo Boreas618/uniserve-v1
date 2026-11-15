@@ -1665,7 +1665,8 @@ pub struct TransferListing {
 pub struct TaskListing {
     pub task: u64,
     pub deployment: String,
-    pub update: u64,
+    /// The update a head's task serves; `None` for a task the Storage Server runs for itself.
+    pub update: Option<u64>,
     pub priority: Priority,
     /// The bytes of all its spans.
     pub bytes: u64,

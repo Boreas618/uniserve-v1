@@ -293,7 +293,7 @@ impl Server {
             tensors: HashMap::new(),
             copies: HashMap::new(),
             deployments: HashMap::new(),
-            shootdowns: ShootDowns::default(),
+            shootdowns: ShootDowns::new(settings.server.shoot_down()),
             quotas: quota::Quotas::default(),
             kv_storage: KvStorage::new(connector),
             transfers: transfers::Transfers::new(transfer),
@@ -1336,6 +1336,35 @@ impl Server {
         Ok(())
     }
 
+    /// Refuses `bytes` of new device storage on `gpu` that would take
+    /// `deployment`'s quota of it past its quota, naming `what`.
+    fn admit_device(
+        &self,
+        deployment: &str,
+        gpu: [u8; 16],
+        bytes: u64,
+        what: &str,
+    ) -> Result<(), (ErrorKind, String)> {
+        for quota in self.quotas_of(&[gpu], Some(deployment)) {
+            let (Some(limit), usage) = (quota.limit, quota.usage()) else {
+                continue;
+            };
+            if usage + bytes > limit {
+                return Err((
+                    ErrorKind::Quota,
+                    format!(
+                        "{bytes} bytes of {what} would take the usage of GPU {} to {} \
+                         bytes, past its quota of {limit} bytes:\n{}",
+                        ::storage::protocol::gpu_name(&gpu),
+                        usage + bytes,
+                        quota.describe()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// What the host admits of new host storage now ([`Self::admit_host`]).
     fn host_storage(&self) -> io::Result<HostStorage> {
         Ok(HostStorage {
@@ -1906,25 +1935,8 @@ impl Server {
             }
         }
         for (gpu, bytes) in added {
-            let deployment = holder.scope.deployment.as_str();
-            for quota in self.quotas_of(&[gpu], Some(deployment)) {
-                let (Some(limit), usage) = (quota.limit, quota.usage()) else {
-                    continue;
-                };
-                if usage + bytes > limit {
-                    return Err((
-                        ErrorKind::Quota,
-                        format!(
-                            "{bytes} bytes of new device storage of {} would take the usage \
-                             of GPU {} to {} bytes, past its quota of {limit} bytes:\n{}",
-                            holder.scope,
-                            ::storage::protocol::gpu_name(&gpu),
-                            usage + bytes,
-                            quota.describe()
-                        ),
-                    ));
-                }
-            }
+            let what = format!("new device storage of {}", holder.scope);
+            self.admit_device(&holder.scope.deployment, gpu, bytes, &what)?;
         }
         Ok(())
     }

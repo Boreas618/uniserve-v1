@@ -24,9 +24,6 @@ use rustix::event::{PollFd, PollFlags, poll};
 
 use platform::{DeviceUuid, Nvml};
 
-/// How long a victim may take to leave every GPU it held.
-const DEADLINE: Duration = Duration::from_secs(60);
-
 struct ShootDown {
     pid: i32,
     pidfd: Arc<OwnedFd>,
@@ -40,8 +37,10 @@ struct ShootDown {
 }
 
 /// The shoot-downs in progress and their results.
-#[derive(Default)]
 pub(super) struct ShootDowns {
+    /// How long a process may take to leave every GPU it held once it exited
+    /// (`storage_config.shoot_down_s`).
+    deadline: Duration,
     running: Vec<ShootDown>,
     /// Processes that left every GPU; dropped once nothing else refers to
     /// their pidfd.
@@ -54,6 +53,17 @@ pub(super) struct ShootDowns {
 }
 
 impl ShootDowns {
+    /// No shoot-down, each to come allowed `deadline` to leave its GPUs.
+    pub(super) fn new(deadline: Duration) -> Self {
+        Self {
+            deadline,
+            running: Vec::new(),
+            finished: Vec::new(),
+            failed: Vec::new(),
+            nvml: None,
+        }
+    }
+
     /// Kill the process behind `pidfd` and follow it until it left `gpus`.
     /// A process already being shot down, or already out, is not killed
     /// again.
@@ -184,7 +194,7 @@ impl ShootDowns {
                 );
                 self.finished.push(shot.pidfd);
                 ended = true;
-            } else if (shot.killed || shot.exited) && shot.started.elapsed() > DEADLINE {
+            } else if (shot.killed || shot.exited) && shot.started.elapsed() > self.deadline {
                 tracing::error!(
                     pid = shot.pid,
                     exited = shot.exited,

@@ -160,10 +160,11 @@ pub fn list(socket: &Path, out: &mut impl Write) -> anyhow::Result<()> {
         for task in &transfer.tasks {
             writeln!(
                 out,
-                "transfer {} of {} update {} {:?}: {} of {} bytes{}",
+                "transfer {} of {}{} {:?}: {} of {} bytes{}",
                 task.task,
                 task.deployment,
-                task.update,
+                task.update
+                    .map_or_else(String::new, |update| format!(" update {update}")),
                 task.priority,
                 task.copied,
                 task.bytes,

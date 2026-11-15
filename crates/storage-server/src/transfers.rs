@@ -66,7 +66,9 @@ pub(super) struct Task {
     /// Who learns of the task's progress and end.
     owner: Owner,
     deployment: String,
-    update: u64,
+    /// The update a head's task serves; `None` for a task the server runs for itself (a pool's
+    /// task, a move of an epoch's weights), which no head's cancellation by update names.
+    update: Option<u64>,
     priority: Priority,
     /// The bytes of all its spans, and those copied so far.
     bytes: u64,
@@ -256,7 +258,7 @@ impl Server {
                 update,
             } => {
                 let owner = Owner::Client(id);
-                let task = self.submit_for(owner, &deployment, spans, *priority, *update)?;
+                let task = self.submit_for(owner, &deployment, spans, *priority, Some(*update))?;
                 Ok(Handling::Response(Response::Submitted { task }, Vec::new()))
             }
             Request::OpenSession { gpus } => {
@@ -297,7 +299,8 @@ impl Server {
                 let selected: BTreeSet<u64> = tasks.iter().copied().collect();
                 let cancelled = self.cancel_where(|task_id, task| {
                     task.deployment == deployment
-                        && (selected.contains(&task_id) || Some(task.update) == *update)
+                        && (selected.contains(&task_id)
+                            || task.update.is_some() && task.update == *update)
                 });
                 Ok(Handling::Response(
                     Response::Cancelled { tasks: cancelled },
@@ -578,7 +581,7 @@ impl Server {
         deployment: &str,
         spans: &[Span],
         priority: Priority,
-        update: u64,
+        update: Option<u64>,
     ) -> Result<u64, (ErrorKind, String)> {
         let Some(transfer_server) = self.transfers.client else {
             return Err(unavailable());
@@ -756,7 +759,7 @@ impl Server {
             Task {
                 owner: Owner::Move { number, index },
                 deployment: deployment.to_owned(),
-                update: 0,
+                update: None,
                 priority: Priority::Background,
                 bytes,
                 copied: 0,

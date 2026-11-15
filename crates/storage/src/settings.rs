@@ -74,6 +74,11 @@ pub struct ServerSettings {
     pub child_restart_s: u64,
     /// The longest wait before a child process starts again, in seconds. Default 300.
     pub child_restart_max_s: u64,
+    /// How long a process the server shot down, or an engine's process it follows, may take
+    /// after its exit to leave every GPU whose storage it held, in seconds: past it the
+    /// shoot-down fails (the GPU needs a reset) and the requests that waited for it fail.
+    /// Default 60.
+    pub shoot_down_s: u64,
 }
 
 impl Default for ServerSettings {
@@ -88,6 +93,7 @@ impl Default for ServerSettings {
             buffer_pool_trace: None,
             child_restart_s: 5,
             child_restart_max_s: 300,
+            shoot_down_s: 60,
         }
     }
 }
@@ -111,6 +117,11 @@ impl ServerSettings {
     /// How long a buffer pool's put to the remote store may take.
     pub fn put_deadline(&self) -> Duration {
         Duration::from_secs(self.put_deadline_s)
+    }
+
+    /// How long a process may take to leave every GPU it held once it exited.
+    pub fn shoot_down(&self) -> Duration {
+        Duration::from_secs(self.shoot_down_s)
     }
 }
 

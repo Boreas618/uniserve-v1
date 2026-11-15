@@ -164,6 +164,7 @@ A checkpoint that declares its own quantization (ModelOpt's `quantization_config
 | `child_restart_max_s` | `300` | The longest wait, in seconds, before a child process starts again |
 | `transfer_deadline_s` | `60` | How long a buffer pool's transfer of a request between worker groups may take, in seconds, before it is cancelled and answered as failed |
 | `put_deadline_s` | `60` | How long a buffer pool's put of host copies to the remote store may take, in seconds, before it is stopped and answered with the keys put so far |
+| `shoot_down_s` | `60` | How long a process the server killed (a previous writer) or followed (an engine that is gone) may take, in seconds, to leave every GPU whose storage it held once it exited; past it the shoot-down fails, the GPU needs a reset, and the requests that waited for it fail |
 | `buffer_pool_trace` | Unset | A directory the server records every buffer pool's inputs and completions in (`specs/buffer-pool.md` §18); a failure to write stops the trace, not the pool |
 
 ### `load_config`

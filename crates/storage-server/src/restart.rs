@@ -723,7 +723,7 @@ impl Server {
             .map(|_| next())
             .collect::<io::Result<Vec<_>>>()?;
         let sessions = Sessions::resume(handoff.sessions, queues, pidfd, &handoff.settings.server)?;
-        let mut shootdowns = crate::shoot::ShootDowns::default();
+        let mut shootdowns = crate::shoot::ShootDowns::new(handoff.settings.server.shoot_down());
         for index in handoff.shot_finished {
             shootdowns.note_finished(pidfd(index)?);
         }

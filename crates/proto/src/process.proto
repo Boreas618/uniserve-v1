@@ -353,6 +353,7 @@ message StorageSettings {
   uint64 child_restart_s = 10;
   uint64 child_restart_max_s = 11;
   bool transfer_gpus = 12;
+  uint64 shoot_down_s = 13;
 }
 
 // A Mooncake connector's settings (`storage::connector::Settings`).
