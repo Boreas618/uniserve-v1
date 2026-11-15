@@ -17,7 +17,7 @@ The numerical checks of the kernel packages under `crates/ops/kernels` live in `
 The HTTP tests under `tests/python/e2e` start real servers on the host's GPUs. `just test-python-gpu` runs every test marked `e2e and gpu`; `just test-python-sanitizer` runs those marked `missing_state` with every main process under compute-sanitizer's memcheck. Both call `tools/gpu_e2e.sh`, which the nightly workflows call as well:
 
 - it builds the release `uniserve` executable and `uniserve-manager` once, and every process of every test deployment runs that one build; each test module's Build Server compiles kernels with its toolchain environment, whose program `uniserve-build-server` must be on the search path (`uv sync --locked --project crates/build-server/python` creates the environment);
-- it puts the NCCL the project pins on the loader's path (`tools/check_nccl.sh`) and states the Python environment (`VIRTUAL_ENV`) a main process takes CUPTI from;
+- its serving processes take the NVIDIA driver, NCCL and CUPTI from the host's default loader path: the host provides the releases the [README](../README.md#requirements) names, and a process refuses an older one by name;
 - it runs pytest with one worker per GPU (pytest-xdist), and each case leases the GPUs it serves on, so independent cases run beside one another on different GPUs while a case that observes host-wide state runs alone; the cases of a module that serves one deployment for all of them stay on one worker;
 - it writes pytest's temporary directory, which holds every server's log, and a JUnit report to `artifacts/e2e/<UTC time>/`.
 
@@ -59,7 +59,7 @@ These name the checkpoints and inputs of the host. Set the ones the host has; th
 | `UNISERVE_REBIND_PACKAGE`, `UNISERVE_RECAPTURE_PACKAGE`, `UNISERVE_POLICY_PACKAGE`, `UNISERVE_WRONG_PACKAGE` | the kernel packages under `crates/ops/package-fixtures` and the policy package `crates/scheduling/policies/fixture` | The packages `test_generation_update_http.py` installs |
 | `SANITIZER_LOGS`, `COMPUTE_SANITIZER` | the run's `memcheck/`, `compute-sanitizer` | Where memcheck writes and which sanitizer runs (`just test-python-sanitizer`) |
 
-`tools/gpu_e2e.sh` sets `UNISERVE_RUN_GPU_E2E`, `UNISERVE_BINARY`, `UNISERVE_MEMCHECK_TARGET` and `VIRTUAL_ENV` itself. A case's lease sets `UNISERVE_WORLD_DEVICES` to the GPUs it holds, comma-separated, and every test takes its devices from it (`http_helpers.granted_devices`); `cuda:N` ranks in a test's deployment index those GPUs.
+`tools/gpu_e2e.sh` sets `UNISERVE_RUN_GPU_E2E`, `UNISERVE_BINARY` and `UNISERVE_MEMCHECK_TARGET` itself. A case's lease sets `UNISERVE_WORLD_DEVICES` to the GPUs it holds, comma-separated, and every test takes its devices from it (`http_helpers.granted_devices`); `cuda:N` ranks in a test's deployment index those GPUs.
 
 ### Two hosts
 

@@ -12,7 +12,9 @@ The executable serves two model families, Qwen3-MoE (chat) and MiniMax-H3 (video
 | --- | --- |
 | OS / architecture | Linux on x86-64 or aarch64 |
 | GPU | NVIDIA Hopper or Blackwell GPUs; H200, GB200 and RTX PRO 6000 Blackwell Server Edition have end-to-end validation |
-| CUDA | CUDA 13 toolkit and a matching driver |
+| CUDA | CUDA 13 toolkit and a driver of CUDA 13.0 or later (`libcuda.so.1`, `libnvidia-ml.so.1`) |
+| NCCL | `libnccl.so.2` of release 2.30.4 or later on the default loader path |
+| CUPTI | `libcupti.so.13` of release 13.4.92 or later on the default loader path |
 | Python | Python 3.12 |
 | Rust | Stable Rust toolchain with edition 2024 support |
 
@@ -32,7 +34,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The executable links a shared FFmpeg 8.1.2 with libx264, which `crates/media/native/build.sh` builds from the FFmpeg source into the prefix it is given (it needs gcc, make, nasm, pkg-config, zlib and patchelf; [the media crate](crates/media/README.md) describes the runtime), and every build finds it through `UNISERVE_FFMPEG_DIR`. The sync builds the `uniserve` executable, and the `gpu` extra installs the NCCL and CUPTI libraries serving loads. The Build Server keeps an environment of its own, which `uv sync --locked --python /usr/bin/python3.12 --project crates/build-server/python` creates; it compiles the kernel packages with that environment and the host's CUDA toolkit. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
+The executable links a shared FFmpeg 8.1.2 with libx264, which `crates/media/native/build.sh` builds from the FFmpeg source into the prefix it is given (it needs gcc, make, nasm, pkg-config, zlib and patchelf; [the media crate](crates/media/README.md) describes the runtime), and every build finds it through `UNISERVE_FFMPEG_DIR`. The sync builds the `uniserve` executable. The NVIDIA driver, NCCL and CUPTI come from the host: the serving processes open them at run time by their sonames from the default loader path, as NVIDIA's distribution packages install them (`/etc/ld.so.conf.d` registers any other directory that holds them), and refuse a library older than the release the table above names with an error that names it, before they use it. The Build Server keeps an environment of its own, which `uv sync --locked --python /usr/bin/python3.12 --project crates/build-server/python` creates; it compiles the kernel packages with that environment and the host's CUDA toolkit. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
 
 For RDMA transfers between hosts, install the pinned UCX and NIXL builds described in [NIXL transfers](docs/nixl.md).
 

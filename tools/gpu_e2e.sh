@@ -13,8 +13,9 @@
 # installs and builds with cargo from the installed snapshot of the workspace: that build reads
 # `UNISERVE_FFMPEG_DIR` and `LIBCLANG_PATH` from this environment, and cargo keeps what it
 # compiled between runs. Each Build Server compiles kernels with its toolchain environment, whose
-# program `uniserve-build-server` must be on the search path. It puts the NCCL this project pins on the loader's path
-# (`tools/check_nccl.sh`), sets the gate `UNISERVE_RUN_GPU_E2E=1`, and runs pytest with one
+# program `uniserve-build-server` must be on the search path. The serving processes open the
+# driver, NCCL and CUPTI from the host's default loader path and refuse a release older than the
+# one they require. The script sets the gate `UNISERVE_RUN_GPU_E2E=1` and runs pytest with one
 # worker per GPU (pytest-xdist); each case leases the GPUs it serves on
 # (`tests/python/e2e/conftest.py`). pytest's temporary directory, which holds every server's log,
 # and the JUnit report go to `artifacts/e2e/<UTC time>/` unless `UNISERVE_E2E_ARTIFACTS` names
@@ -77,14 +78,6 @@ if [ "$memcheck" = 1 ]; then
     export UNISERVE_E2E_SET=${UNISERVE_E2E_SET:-"mem_fraction_static=0.6 worker_config.watchdog_timeout=2h"}
     export UNISERVE_E2E_TIME_SCALE=${UNISERVE_E2E_TIME_SCALE:-20}
 fi
-
-# The environment the tests run in: its NCCL, checked against the pin, is the one a serving
-# process opens by name, and a main process takes CUPTI from the environment `VIRTUAL_ENV`
-# states (docs/profiling.md).
-prefix=$("${python[@]}" -c 'import sys; print(sys.prefix)')
-export VIRTUAL_ENV=${VIRTUAL_ENV:-$prefix}
-nccl=$(PATH=$prefix/bin:$PATH tools/check_nccl.sh)
-export LD_LIBRARY_PATH=$nccl${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 if [ -n "${UNISERVE_E2E_DEVICES:-}" ]; then
     gpus=$(tr ',' '\n' <<< "$UNISERVE_E2E_DEVICES" | grep -c .)

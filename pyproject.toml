@@ -44,9 +44,10 @@ dev = [
 bench = [
     "uniserve-eval[datasets]",
 ]
-# The native libraries a GPU host takes from this environment: the NCCL
-# `crates/platform` opens by name (`tools/check_nccl.sh` states the directory)
-# and the CUPTI that sits beside the CUDA runtime.
+# The NCCL and CUPTI of this environment's GPU tools (PyTorch), at the releases
+# the serving processes require. The serving processes themselves open NCCL
+# and CUPTI from the host's default loader path (`crates/platform`), never
+# from this environment.
 gpu = [
     "nvidia-cuda-cupti; sys_platform == 'linux'",
     "nvidia-nccl-cu13; sys_platform == 'linux'",
@@ -56,9 +57,8 @@ gpu = [
 uniserve-eval = { path = "uniserve_eval", editable = true }
 
 [tool.uv]
-# `crates/platform` opens `libnccl.so.2` by name, and `tools/check_nccl.sh`
-# holds the library a host hands it to this pin: an older NCCL crashes on the
-# first replay of a graph that holds a collective.
+# NCCL 2.30.4 is the oldest release `crates/platform` accepts on a host: an
+# older NCCL crashes on the first replay of a graph that holds a collective.
 #
 # PyTorch's `cuda-toolkit` 13.0.3 pins CUPTI 13.0.85, whose software kernel
 # timestamps are written by the device into per-kernel host records that
