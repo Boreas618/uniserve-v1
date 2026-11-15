@@ -66,9 +66,10 @@ pub(crate) fn router_with(engine: impl Into<Arc<Leader>>, server: &ServerConfig)
 /// The state of the admin routes over `engine`, with a new event log.
 fn admin_state(engine: impl Into<Arc<Leader>>) -> crate::http::admin::AdminState {
     let leader = engine.into();
-    let admin = crate::http::admin::Admin::new(
+    let admin = crate::http::admin::Admin::with_epochs(
         CancellationToken::new(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::new(crate::epoch::Epochs::new()),
     );
     admin.watch(&leader);
     crate::http::admin::AdminState {

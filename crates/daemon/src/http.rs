@@ -573,7 +573,7 @@ async fn serve_on(
 /// each served task (`Leader::supported_tasks`) take the key and are counted.
 /// The generation routes (chat completions, image generation and synchronous
 /// video) share the in-flight limit. A path no
-/// route serves gets FastAPI's `404 {"detail": "Not Found"}`.
+/// route serves gets the API's error document, a 404 whose code is `route_not_found`.
 ///
 /// Layers apply from the outside in: request ID (which also sets the
 /// `X-Request-Id` response header when enabled), tracing, body limit, API
@@ -688,13 +688,14 @@ async fn version() -> Json<serde_json::Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
 
-/// Responds to a path no route serves as FastAPI does.
-async fn not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({ "detail": "Not Found" })),
+/// Responds to a request no route serves with the API's own error document: a 404 whose code is
+/// `route_not_found`, naming the method and path.
+async fn not_found(method: axum::http::Method, uri: axum::http::Uri) -> Response {
+    ApiError::not_found(
+        "route_not_found",
+        format!("no route serves {method} {}", uri.path()),
     )
-        .into_response()
+    .into_response()
 }
 
 #[cfg(test)]
@@ -1211,10 +1212,10 @@ mod tests {
 
     /// A token model serves chat completions and no video route; a video
     /// model serves the video routes and no chat completions. A route the
-    /// model does not serve gets FastAPI's 404.
+    /// model does not serve gets the API's 404, `route_not_found`.
     #[tokio::test]
     async fn routes_follow_the_served_tasks() {
-        let not_found = json!({"detail": "Not Found"});
+        let not_found = |body: &serde_json::Value| body["error"]["code"] == "route_not_found";
 
         let chat = router(served_engine(crate::test_support::CHAT));
         let (status, _, _) = send(
@@ -1229,7 +1230,8 @@ mod tests {
             post_json("/v1/images/generations", &json!({"prompt": "draw"})),
         ] {
             let (status, _, body) = send(&chat, request).await;
-            assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found.clone()));
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(not_found(&body), "{body}");
         }
 
         let video = router(served_engine(crate::test_support::VIDEO));
@@ -1240,7 +1242,8 @@ mod tests {
             post_json("/v1/chat/completions", &chat_body(2, false)),
         )
         .await;
-        assert_eq!((status, body), (StatusCode::NOT_FOUND, not_found));
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(not_found(&body), "{body}");
     }
 
     /// With an API key, every route but `/health` and `/metrics` requires it,
@@ -1426,7 +1429,11 @@ mod tests {
         let engine = Arc::clone(engine);
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let admin = admin::Admin::new(shutdown.clone(), Arc::new(AtomicBool::new(false)));
+            let admin = admin::Admin::with_epochs(
+                shutdown.clone(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(crate::epoch::Epochs::new()),
+            );
             let jobs = Arc::new(VideoJobs::new(
                 config.video_job_config.clone(),
                 shutdown.child_token(),

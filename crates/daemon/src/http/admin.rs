@@ -127,14 +127,6 @@ fn now() -> f64 {
 }
 
 impl Admin {
-    /// An admin whose shutdown cancels `shutdown` and, when asked to, sets
-    /// `retire`, over epoch records of its own: a test's, which no leader
-    /// keeps.
-    #[cfg(test)]
-    pub(crate) fn new(shutdown: CancellationToken, retire: Arc<AtomicBool>) -> Arc<Self> {
-        Self::with_epochs(shutdown, retire, Arc::new(crate::epoch::Epochs::new()))
-    }
-
     /// An admin over `epochs`, the records the node's leader keeps: there is
     /// one `Epochs` per node and the admin holds the same instance, so
     /// `GET /admin/config` and the update operations read what the updater
@@ -1272,7 +1264,11 @@ mod tests {
 
     #[tokio::test]
     async fn events_are_read_after_a_sequence_number_and_waited_for() {
-        let admin = Admin::new(CancellationToken::new(), Arc::new(AtomicBool::new(false)));
+        let admin = Admin::with_epochs(
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::epoch::Epochs::new()),
+        );
         admin.record("deployment", "first");
         admin.record("deployment", "second");
         let (events, next, gap) = admin.events_after(1, Duration::ZERO).await;
@@ -1299,7 +1295,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_reader_behind_the_log_is_told_of_the_gap() {
-        let admin = Admin::new(CancellationToken::new(), Arc::new(AtomicBool::new(false)));
+        let admin = Admin::with_epochs(
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::epoch::Epochs::new()),
+        );
         for index in 0..EVENT_CAPACITY + 2 {
             admin.record("deployment", format!("event {index}"));
         }
@@ -1322,7 +1322,11 @@ mod tests {
             generation: 1,
             state: crate::epoch::ProcessState::Serving,
         }]);
-        let predecessor = Admin::new(CancellationToken::new(), Arc::new(AtomicBool::new(false)));
+        let predecessor = Admin::with_epochs(
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::epoch::Epochs::new()),
+        );
         let admin = Admin::resume(
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
@@ -1335,7 +1339,11 @@ mod tests {
 
     #[tokio::test]
     async fn one_operation_runs_at_a_time() {
-        let admin = Admin::new(CancellationToken::new(), Arc::new(AtomicBool::new(false)));
+        let admin = Admin::with_epochs(
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::epoch::Epochs::new()),
+        );
         let first = admin.begin("update").unwrap();
         let refused = admin.begin("flush_cache").unwrap_err();
         assert_eq!(refused.id, first.id);
