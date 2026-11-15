@@ -32,7 +32,7 @@ pub fn args(name: &str) -> EngineArgs {
 /// The launch arguments of a deployment of model `name` on the CPU with `schedulers`
 /// data-parallel schedulers, each over a worker group of one rank on a device of its own on this
 /// host: a text model's generation limits without a model-imposed bound, sequences of up to 4096
-/// tokens, the fake's end of text ([`crate::EOS`]), two batches in flight, the module set's `fcfs` policy, and
+/// tokens, the fake's end of text ([`crate::EOS`]), two batches in flight, the module set's `arrival` policy, and
 /// every other section's default. The epoch is the first, and the process its daemon's first
 /// engine.
 ///
@@ -73,7 +73,7 @@ pub fn launch(name: &str, schedulers: usize) -> EngineArgs {
     };
     let modules = proto::module::ModuleSet {
         engine: package("uniserve"),
-        policy: package("fcfs"),
+        policy: package("arrival"),
         kernels: Default::default(),
     };
     let config = proto::config::EngineConfig {

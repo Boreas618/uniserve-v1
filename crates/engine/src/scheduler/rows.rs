@@ -477,7 +477,7 @@ impl Scheduler {
         // A video request's token-phase calls have no media row.
         if matches!(
             phase,
-            Phase::Prefill | Phase::Decode | Phase::Verify | Phase::Refill | Phase::Other
+            Phase::Prefill | Phase::Decode | Phase::Verify | Phase::Refill
         ) {
             return None;
         }

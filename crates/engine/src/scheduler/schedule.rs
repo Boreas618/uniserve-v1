@@ -1620,11 +1620,11 @@ mod tests {
     use proto::request::{GenerationFeatures, GenerationLimits, GenerationRequest, RequestId};
     use scheduling::Event as PolicyEvent;
     use scheduling::ids::PageId;
-    use scheduling::limits::{Limits, Parameters};
     use scheduling::view::Snapshot;
     use storage::runtime::{self, Completion, OwnerId, Tier};
 
-    use super::super::policy::tests::packaged;
+    use super::super::policy::ceilings;
+    use super::super::policy::tests::{packaged, packaged_arguments};
     use super::super::tests::{A, Bench, KV, OWNER_A, bench, key};
     use super::super::{Blocks, Error, Output, Policy, Request, RequestStatus};
 
@@ -1987,15 +1987,15 @@ mod tests {
     }
 
     /// Request 1's `Load` of one block on group A, answered `Copy`, which the scheduler handed to
-    /// group A's workers; groups A and B serve prefills and decodes under `fcfs`. Returns the
-    /// number of the `Load`.
+    /// group A's workers; groups A and B serve prefills and decodes under the packaged policy.
+    /// Returns the number of the `Load`.
     fn copying() -> (Bench, runtime::RequestId) {
         let mut bench = bench(4096);
         bench.scheduler.policy = Policy::new(
-            packaged("fcfs"),
-            Parameters::default(),
+            packaged(),
+            packaged_arguments("max_num_batched_tokens = 8192"),
             Snapshot::default(),
-            &Limits::default(),
+            &ceilings([]),
         )
         .unwrap();
         for index in [0, 1] {

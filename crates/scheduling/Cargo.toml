@@ -4,12 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "The scheduling policy's interface: its phases, views, events, decisions and ABI, compiled into the engine and into every policy."
+description = "The scheduling policy's interface: its phases, views, events, decisions, parameters and ABI, compiled into the engine and into every policy."
 
 [dependencies]
-# The wire format between the mechanism and a policy module. JSON is
-# self-describing, so a policy skips event kinds and struct fields it does not
-# know; that is what makes the views and events append-only lists (design §4.4).
+# The wire between the mechanism and a policy module: JSON of this crate's types.
 serde.workspace = true
 serde_json.workspace = true
 

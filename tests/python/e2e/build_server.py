@@ -53,7 +53,7 @@ BUILD_SERVER_START_S = 120.0
 # A package's backend is a package's name: the Build Server selects a package
 # by the backend its manifest declares, and no package is named ``auto``.
 KERNEL_PACKAGES = "crates/ops/kernels"
-POLICY_PACKAGE = "crates/scheduling/policies/fixture"
+POLICY_PACKAGE = "crates/scheduling/policies/arrival"
 
 # The engine package: the executable every deployment's main processes run
 # as. The daemon fixes its revision when a deployment starts, and the server

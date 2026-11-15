@@ -103,7 +103,7 @@ fn each_phase_is_placed_on_a_group_whose_role_allows_it() {
 /// `place` names, the group with the fewest requests placed (the first on a tie), and its later
 /// phases stay on the group that holds it: the first request, a chat request, prefills, encodes
 /// its image and decodes on the first group; the second request runs on the other (SD §3.5
-/// `place`; the `fcfs` policy's `place`).
+/// `place`; the `arrival` policy's `place`).
 #[test]
 fn a_request_goes_where_the_policy_places_it_and_its_later_phases_follow_it() {
     let mut harness = Deployment::tokens().images().replicas(2).build();

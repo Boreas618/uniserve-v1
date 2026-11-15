@@ -1335,10 +1335,9 @@ mod tests {
     #[test]
     fn an_admission_pinning_a_thousand_cached_blocks_stays_well_within_a_calls_fuel() {
         use scheduling::decision::{Room, Shortage, Storage, Victim};
-        use scheduling::limits::Parameters;
 
-        use crate::scheduler::packaged;
         use crate::scheduler::policy::{self, DEFAULT_CALL_FUEL, Policy};
+        use crate::scheduler::{packaged, packaged_arguments};
 
         const BLOCKS: u64 = 1000;
         let numbered = |number: u64| {
@@ -1354,8 +1353,8 @@ mod tests {
         bench.attach(&[(A, OWNER_A, 3)]);
         let snapshot = bench.scheduler.snapshot();
         let ceilings = policy::ceilings([]);
-        bench.scheduler.policy =
-            Policy::new(packaged("fcfs"), Parameters::default(), snapshot, &ceilings).unwrap();
+        let arguments = packaged_arguments("max_num_batched_tokens = 8192");
+        bench.scheduler.policy = Policy::new(packaged(), arguments, snapshot, &ceilings).unwrap();
 
         let pin = runtime::Request::Pin {
             owner: OWNER_A,
@@ -1406,17 +1405,16 @@ mod tests {
     /// its policy was instantiated on an empty cache, and tells the policy each of them as a
     /// `Cached` page in the next step's `observe`. With the cache of E1's deployment after a few
     /// minutes of load (2,048 blocks of 64 tokens with a device copy, 4,094 more on the host
-    /// alone), `fcfs` takes that step without a fault, and has seen the pages: a shortage of
-    /// device units names listed pages, none of them on the host alone.
+    /// alone), the packaged policy takes that step without a fault, and has seen the pages: a
+    /// shortage of device units names listed pages, none of them on the host alone.
     #[test]
     fn a_policy_observes_a_warm_cache_listed_at_the_start_without_a_fault() {
         use std::collections::HashSet;
 
         use scheduling::decision::{Room, Shortage, Storage};
-        use scheduling::limits::Parameters;
 
-        use crate::scheduler::packaged;
         use crate::scheduler::policy::{self, Policy};
+        use crate::scheduler::{packaged, packaged_arguments};
 
         const ON_DEVICE: u64 = 2048;
         const ON_HOST: u64 = 4094;
@@ -1429,8 +1427,8 @@ mod tests {
         let mut bench = bench(1 << 22);
         let ceilings = policy::ceilings([]);
         let empty = bench.scheduler.snapshot();
-        bench.scheduler.policy =
-            Policy::new(packaged("fcfs"), Parameters::default(), empty, &ceilings).unwrap();
+        let arguments = packaged_arguments("max_num_batched_tokens = 8192");
+        bench.scheduler.policy = Policy::new(packaged(), arguments, empty, &ceilings).unwrap();
 
         let listed: Vec<(Key, u8)> = (0..ON_DEVICE)
             .map(|number| (numbered(number), DEVICE | HOST))

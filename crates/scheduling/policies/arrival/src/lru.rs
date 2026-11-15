@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 /// the head; [`Lru::least`] is the first victim of a shortage and
 /// [`Lru::pop_least`] takes it.
 #[derive(Clone, Debug)]
-pub struct Lru<I: Copy + Ord, V = ()> {
+pub(crate) struct Lru<I: Copy + Ord, V = ()> {
     /// The slot of every object in the order.
     index: BTreeMap<I, usize>,
     /// The objects in no particular order, each linked to its neighbours in the
@@ -60,7 +60,7 @@ impl<I: Copy + Ord, V> Default for Lru<I, V> {
 
 impl<I: Copy + Ord, V> Lru<I, V> {
     /// An empty order.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             index: BTreeMap::new(),
             slots: Vec::new(),
@@ -71,7 +71,7 @@ impl<I: Copy + Ord, V> Lru<I, V> {
 
     /// An order from the least recently used object to the most recently
     /// used, as a snapshot of the mechanism states it.
-    pub fn from_least_recent(objects: impl IntoIterator<Item = (I, V)>) -> Self {
+    pub(crate) fn from_least_recent(objects: impl IntoIterator<Item = (I, V)>) -> Self {
         let mut lru = Self::new();
         for (object, value) in objects {
             lru.insert(object, value);
@@ -80,9 +80,9 @@ impl<I: Copy + Ord, V> Lru<I, V> {
     }
 
     /// Records an object as the most recently used with `value`, whether it is
-    /// new to the order or already in it: the `Cached` case, which states the
-    /// object anew.
-    pub fn insert(&mut self, object: I, value: V) {
+    /// new to the order or already in it: the `Cached`, `Released` and `Held`
+    /// case, which states the object anew.
+    pub(crate) fn insert(&mut self, object: I, value: V) {
         if let Some(slot) = self.touch(object) {
             *slot = value;
             return;
@@ -100,9 +100,9 @@ impl<I: Copy + Ord, V> Lru<I, V> {
     }
 
     /// Records an object already in the order as the most recently used and
-    /// returns its state, for the caller to update: the `Hit`, `Released` and
-    /// `Held` case. `None`, and no change, for an object not in the order.
-    pub fn touch(&mut self, object: I) -> Option<&mut V> {
+    /// returns its state, for the caller to update: the `Hit` case. `None`, and
+    /// no change, for an object not in the order.
+    pub(crate) fn touch(&mut self, object: I) -> Option<&mut V> {
         let at = *self.index.get(&object)?;
         if self.tail != Some(at) {
             self.detach(at);
@@ -114,14 +114,14 @@ impl<I: Copy + Ord, V> Lru<I, V> {
     }
 
     /// The state kept of an object, if it is in the order.
-    pub fn get(&self, object: I) -> Option<&V> {
+    pub(crate) fn get(&self, object: I) -> Option<&V> {
         let at = *self.index.get(&object)?;
         Some(&self.slots[at].value)
     }
 
     /// Takes an object out of the order and returns its state: the `Freed`
     /// case, and the object a shortage took. `None` for an object not in it.
-    pub fn remove(&mut self, object: I) -> Option<V> {
+    pub(crate) fn remove(&mut self, object: I) -> Option<V> {
         let at = self.index.remove(&object)?;
         self.detach(at);
 
@@ -149,35 +149,25 @@ impl<I: Copy + Ord, V> Lru<I, V> {
     }
 
     /// The object a shortage takes first: the least recently used.
-    pub fn least(&self) -> Option<I> {
+    pub(crate) fn least(&self) -> Option<I> {
         self.head.map(|at| self.slots[at].object)
     }
 
     /// Takes the least recently used object out of the order.
-    pub fn pop_least(&mut self) -> Option<I> {
+    pub(crate) fn pop_least(&mut self) -> Option<I> {
         let object = self.least()?;
         self.remove(object);
         Some(object)
     }
 
     /// The objects with their state, from the least to the most recently used.
-    pub fn iter(&self) -> impl Iterator<Item = (I, &V)> + '_ {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (I, &V)> + '_ {
         let mut next = self.head;
         std::iter::from_fn(move || {
             let slot = &self.slots[next?];
             next = slot.after;
             Some((slot.object, &slot.value))
         })
-    }
-
-    /// How many objects are in the order.
-    pub fn len(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// Whether no object is in the order.
-    pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
     }
 
     /// Links the slot `at`, whose `before` names the current tail, as the most
@@ -222,7 +212,7 @@ mod tests {
         let lru = of(&[1, 2, 3]);
         assert_eq!(order(&lru), vec![1, 2, 3]);
         assert_eq!(lru.least(), Some(1));
-        assert_eq!(lru.len(), 3);
+        assert_eq!(order(&lru).len(), 3);
     }
 
     #[test]
@@ -249,7 +239,7 @@ mod tests {
         lru.insert(1, 'z');
         assert_eq!(order(&lru), vec![2, 3, 1]);
         assert_eq!(lru.get(1), Some(&'z'));
-        assert_eq!(lru.len(), 3);
+        assert_eq!(order(&lru).len(), 3);
 
         *lru.touch(2).unwrap() = 'y';
         assert_eq!(order(&lru), vec![3, 1, 2]);
@@ -284,7 +274,7 @@ mod tests {
         assert_eq!(lru.pop_least(), Some(8));
         assert_eq!(lru.pop_least(), Some(9));
         assert_eq!(lru.pop_least(), None);
-        assert!(lru.is_empty());
+        assert!(order(&lru).is_empty());
     }
 
     #[test]

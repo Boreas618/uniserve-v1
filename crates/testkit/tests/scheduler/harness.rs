@@ -4,7 +4,7 @@
 //!
 //! - [`Deployment`] states the worker groups (their roles and phases), the cache groups of the
 //!   model, speculation, chat images or video, and the sizes of the session; [`Deployment::build`]
-//!   opens the session at the buffer pool, builds the scheduler with the `fcfs` policy this tree
+//!   opens the session at the buffer pool, builds the scheduler with the `arrival` policy this tree
 //!   builds (which the scheduler instantiates on its own snapshot, which states the phases its
 //!   groups serve), and answers its startup `List`.
 //! - [`Harness::step`] is one pass: the buffer pool's turn (it takes the requests the last pass
@@ -402,7 +402,7 @@ impl Deployment {
     }
 
     /// Opens the session at a new in-process buffer pool, builds the scheduler over the fake
-    /// executors of its groups with the `fcfs` policy, and answers the scheduler's startup `List`
+    /// executors of its groups with the `arrival` policy, and answers the scheduler's startup `List`
     /// (an empty buffer pool lists nothing).
     ///
     /// # Panics
@@ -794,15 +794,16 @@ impl Deployment {
         }
     }
 
-    /// The arguments of the `fcfs` policy: the deployment's chunk, step tokens (unless the
-    /// package leaves them to the scheduler) and calls, and its queue bound.
+    /// The arguments of the packaged policy: the deployment's chunk, step tokens (unless the
+    /// deployment leaves them to the scheduler) and calls, its queue bound, and the package's
+    /// defaults for the rest.
     fn parameters(&self) -> Parameters {
         Parameters {
             chunked_prefill_size: Some(self.chunk),
             max_queued_requests: self.queued,
             max_batch: Some(self.rows as usize),
             max_num_batched_tokens: self.states_budget.then_some(self.tokens),
-            ..Parameters::default()
+            ..testkit::packaged_parameters()
         }
     }
 }

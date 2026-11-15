@@ -161,9 +161,12 @@ pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 pub const DEFAULT_MAX_RUNNING_REQUESTS: usize = 128;
 /// Default token threshold above which a prefill is chunked.
 pub const DEFAULT_CHUNKED_PREFILL_SIZE: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
-/// The scheduling policy package a deployment runs when its configuration names none: arrival
-/// order (`crates/scheduling/policies/fcfs`).
-pub const DEFAULT_SCHEDULING_POLICY: &str = "fcfs";
+/// The order a scheduling policy's waiting queue admits by, which `scheduler_config.order` states.
+pub use scheduling::QueueOrder;
+
+/// The scheduling policy package a deployment runs when its configuration names none
+/// (`crates/scheduling/policies/arrival`).
+pub const DEFAULT_SCHEDULING_POLICY: &str = "arrival";
 
 /// Admission and batching (`scheduler_config`), and the limits a scheduler runs with once the
 /// engine resolved them.
@@ -175,9 +178,11 @@ pub const DEFAULT_SCHEDULING_POLICY: &str = "fcfs";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SchedulerConfig {
-    /// The scheduling policy package's backend, which orders the waiting queue (`fcfs`,
-    /// `priority`): a package the Build Server holds.
+    /// The scheduling policy package's backend (`arrival`): a package the Build Server holds.
     pub policy: String,
+    /// The order the policy's waiting queue admits by (its `order` argument): by arrival, or by
+    /// the request's own priority and then arrival; the package's default when unset.
+    pub order: Option<QueueOrder>,
     /// Waiting requests, and finished ones with undelivered events, before
     /// a submission is refused as overloaded; unbounded when unset.
     pub max_queued_requests: Option<NonZeroUsize>,
@@ -213,6 +218,7 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             policy: DEFAULT_SCHEDULING_POLICY.to_owned(),
+            order: None,
             max_queued_requests: None,
             chunked_prefill_size: None,
             max_batch: positive(DEFAULT_MAX_BATCH),
@@ -239,6 +245,7 @@ impl SchedulerConfig {
     ) -> Self {
         Self {
             policy: engine.scheduler.policy.clone(),
+            order: engine.scheduler.order,
             max_queued_requests: engine.scheduler.max_queued_requests,
             chunked_prefill_size: Some(
                 engine

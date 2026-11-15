@@ -154,10 +154,11 @@ fn build_policy() {
     });
     if module.recv_timeout(POLICY_BUILD).is_err() {
         panic!(
-            "the fcfs policy module was not built within {} s: a cargo build inside this \
+            "the arrival policy module was not built within {} s: a cargo build inside this \
              process is waiting on a package cache or a wasm32 toolchain another process holds. \
-             Set SCHED_POLICY_WASM to a module built with `cargo build -p scheduling-policy-fcfs \
-             --target wasm32-unknown-unknown --release` to run without the build.",
+             Set SCHED_POLICY_WASM to a module built with `cargo build -p \
+             scheduling-policy-arrival --target wasm32-unknown-unknown --release` to run \
+             without the build.",
             POLICY_BUILD.as_secs()
         )
     }

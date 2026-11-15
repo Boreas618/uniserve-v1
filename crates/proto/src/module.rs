@@ -36,7 +36,7 @@ pub use scheduling::view::Phase;
 /// given to it.
 ///
 /// `backend` is the name the configuration field selects, such as `"trtllm"` for attention or
-/// `"fcfs"` for the scheduling policy (design section 5.1). `arguments` are the package's
+/// `"arrival"` for the scheduling policy (design section 5.1). `arguments` are the package's
 /// parameters, which come from the configuration fields that are not part of the build config.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PackageRevision {

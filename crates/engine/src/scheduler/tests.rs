@@ -17,14 +17,15 @@ use proto::config::{
 };
 use proto::request::wire::WeightsInFlight;
 use proto::request::{GenerationLimits, GenerationRequest};
-use scheduling::limits::{Limits, Parameters};
+use scheduling::limits::Parameters;
 use scheduling::view::Snapshot;
 use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
 use storage::{Key, QueuePair};
 
 use super::cache::DEVICE;
-use super::policy::tests::packaged;
+use super::policy::ceilings;
 pub(crate) use super::policy::tests::toy;
+use super::policy::tests::{packaged, packaged_arguments};
 use super::{
     Blocks, Cached, Capacity, Executor, Message, Output, Policy, Request, RequestStatus, Scheduler,
 };
@@ -818,18 +819,18 @@ fn available_is_the_buffer_pools_word_less_the_units_of_allocates_not_yet_answer
 }
 
 /// A request marked since the last step is told to the policy at the next `dispatch`, however
-/// often it was marked, and can be marked again once told: `fcfs`, which learns of request 1 from
-/// nothing else, admits it.
+/// often it was marked, and can be marked again once told: the packaged policy, which learns of
+/// request 1 from nothing else, admits it.
 #[test]
 fn a_marked_request_is_told_at_the_next_dispatch() {
     let mut bench = bench(1024);
     bench.attach(&[]);
     let scheduler = &mut bench.scheduler;
     scheduler.policy = Policy::new(
-        packaged("fcfs"),
-        Parameters::default(),
+        packaged(),
+        packaged_arguments("max_num_batched_tokens = 8192"),
         Snapshot::default(),
-        &Limits::default(),
+        &ceilings([]),
     )
     .unwrap();
     let id = proto::request::RequestId(1);
@@ -1067,13 +1068,10 @@ fn configure_refuses_a_limit_above_what_the_workers_hold() {
         .into_iter()
         .map(|config| (config, prefills.clone()));
     // A policy whose limits the buckets hold.
-    let parameters = Parameters {
-        chunked_prefill_size: Some(512),
-        max_batch: Some(8),
-        max_num_batched_tokens: Some(512),
-        ..Parameters::default()
-    };
-    let policy = (packaged("fcfs"), parameters);
+    let parameters = packaged_arguments(
+        "chunked_prefill_size = 512\nmax_batch = 8\nmax_num_batched_tokens = 512",
+    );
+    let policy = (packaged(), parameters);
     let Ok(mut bench) = built(1024, SchedulerConfig::default(), groups.collect(), policy) else {
         panic!("the startup checks pass both groups");
     };

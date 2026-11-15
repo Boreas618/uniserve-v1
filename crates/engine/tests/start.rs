@@ -2,7 +2,7 @@
 //!
 //! The test plays the daemon on two Unix sockets (the request interface and the process
 //! interface) and runs a Storage Server and a Build Server on threads of its own process, the
-//! Build Server holding the tree's `fcfs` policy package. It starts the built `uniserve-engine`
+//! Build Server holding the tree's `arrival` policy package. It starts the built `uniserve-engine`
 //! with a launch of the Qwen3-MoE fixture on one rank of one group, `device = "meta"`: the
 //! engine says hello and `Starting`, claims the node's Storage Server, starts its rank, opens
 //! its session, resolves its policy and serves; it takes a request, states its metrics, and
@@ -13,7 +13,7 @@
 //! place them, a replica on each host, and one replica across both whose products cross between
 //! the two processes.
 //!
-//! No GPU is touched. The Build Server builds the `fcfs` module for wasm32 from its installed
+//! No GPU is touched. The Build Server builds the `arrival` module for wasm32 from its installed
 //! snapshot of the workspace, and the engine compiles the module when it loads it.
 #![cfg(test)]
 
@@ -41,7 +41,7 @@ const READ: Duration = Duration::from_secs(60);
 const START: Duration = Duration::from_secs(900);
 
 /// A Build Server on a thread of the test process at `directory`'s socket, holding the tree's
-/// `fcfs` policy package as revision 1, which serves until the returned stop end is dropped.
+/// `arrival` policy package as revision 1, which serves until the returned stop end is dropped.
 /// Returns its socket and that end.
 fn build_server(directory: &Path) -> (PathBuf, std::os::unix::net::UnixStream) {
     let config = build_server::server::ServerConfig {
@@ -73,7 +73,7 @@ fn build_server(directory: &Path) -> (PathBuf, std::os::unix::net::UnixStream) {
 
     let mut client = build_server::protocol::Client::connect(&socket).unwrap();
     let installed = client
-        .install(&workspace().join("crates/scheduling/policies/fcfs"))
+        .install(&workspace().join(support::POLICY_PACKAGE))
         .unwrap();
     assert_eq!(installed.revision, 1);
     (socket, stop)

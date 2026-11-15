@@ -348,7 +348,7 @@ fn a_refill_that_does_not_pay_is_never_run() {
         max_num_batched_tokens: Some(8),
         expected_speedup: Some(1.0),
         refill_token_cost: Some(1.0),
-        ..Parameters::default()
+        ..testkit::packaged_parameters()
     };
     let (reply, replied) = crossbeam_channel::bounded(1);
     harness.apply(Message::SetPolicy(module, parameters, reply));

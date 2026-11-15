@@ -69,7 +69,7 @@ pub(super) const VIDEO_PHASES: [Phase; 9] = [
 /// `k` is the `k`-th of the `PRODUCTS.len()` classes just before the class of stored trajectories,
 /// and `Capacity::media_bytes` states the bytes of a block of each kind in this order.
 pub(super) const PRODUCTS: [(&str, Phase); 10] = {
-    let mut kinds = [("", Phase::Other); product::KINDS.len()];
+    let mut kinds = [(product::KINDS[0].0, product::KINDS[0].1); product::KINDS.len()];
     let mut kind = 0;
     while kind < kinds.len() {
         let (name, writer, _) = product::KINDS[kind];

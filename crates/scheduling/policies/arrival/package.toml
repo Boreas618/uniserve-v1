@@ -1,0 +1,50 @@
+# The `arrival` scheduling policy's package (design §5.2): the deployment's
+# default policy. Its waiting queue admits in the order its `order` argument
+# names, and each step assembles the running requests by phase class and
+# admission. A deployment selects it by naming its backend
+# (`scheduler_config.policy`).
+
+op = "scheduling"
+backend = "arrival"
+# The policy interface the module implements (`scheduling::INTERFACE_VERSION`),
+# which the Build Server records with the module: the engine refuses a module
+# whose record, or whose own `sched_interface_version`, states another.
+interface_version = 5
+
+# The policy is built with the workspace's pinned Rust toolchain.
+[toolchain]
+kind = "cargo"
+
+[module]
+form = "wasm"
+
+# Every parameter the policy requires, with its default: the arguments a
+# revision runs with are these, replaced by the ones the deployment states
+# (`scheduling::limits::Parameters`). `max_num_batched_tokens` has no default:
+# the scheduler states its own step budget where the deployment states none.
+# `max_queued_requests` has none either: unstated, the queue is unbounded.
+[parameters]
+# The order the waiting queue admits by: "arrival", or "priority" (the
+# request's own priority, lower first, then arrival).
+order = "arrival"
+# Tokens of one prefill chunk.
+chunked_prefill_size = 8192
+# Calls per step.
+max_batch = 128
+# The smallest prefix-hit deepening worth fetching from the host KV cache, in
+# tokens: a shorter hit is computed faster than it is fetched.
+prefetch_min_tokens = 256
+# How long a running request that waits for no transfer may go without
+# progressing before the scheduler ends it as starved, in nanoseconds (30 s).
+timeout = 30_000_000_000
+# Batches carrying prefill work that may be in flight before ready token
+# progress takes the step instead.
+prefill_window = 2
+
+# The package is this crate: the Build Server snapshots its whole workspace when
+# it is installed and builds the crate for wasm32 from that snapshot; the engine
+# compiles the module when it loads it. The crate's files are the ones cargo
+# packages, so none is listed here.
+[source]
+kind = "wasm"
+files = []

@@ -434,19 +434,19 @@ fn workspace_package(op: &str, backend: &str) -> PathBuf {
 /// vendored and nothing fetched; a second server over the same roots resolves
 /// the committed module without building it.
 #[test]
-#[ignore = "builds the workspace's fcfs policy for wasm32 with cargo: run with --ignored"]
+#[ignore = "builds the workspace's arrival policy for wasm32 with cargo: run with --ignored"]
 fn the_workspace_policy_is_built_from_its_installed_snapshot() {
     let _exclusive = support::exclusive();
     let temporary = tempfile::tempdir().unwrap();
     let config = support::config(temporary.path());
     let server = BuildServer::open(&config).unwrap();
     let installed = server
-        .install(&workspace_package("scheduling", "fcfs"))
+        .install(&workspace_package("scheduling", "arrival"))
         .unwrap();
     let revision = support::revision(&installed.backend, installed.revision);
     server
         .prepare(
-            &support::latest("scheduling", "fcfs", &[SINGLE_KEY], Vec::new()),
+            &support::latest("scheduling", "arrival", &[SINGLE_KEY], Vec::new()),
             &mut |_| {},
         )
         .expect("the server builds the policy from its snapshot");

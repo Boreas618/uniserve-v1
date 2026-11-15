@@ -12,7 +12,7 @@
 //!   with between two turns, until the engine's close ends the session;
 //! - one [`FakeExecutor`] per scheduler, shaped by the fixture's knobs, and what each worker
 //!   group serves ([`crate::capacity`]);
-//! - the tree's `fcfs` policy ([`crate::packaged_policy`]) within the groups' ceilings.
+//! - the tree's `arrival` policy ([`crate::packaged_policy`]) within the groups' ceilings.
 //!
 //! As the binary's start grants the segments its ranks created and grows the KV regions into
 //! them, the pool's thread grants each device region the session opened short of its numbering

@@ -1,13 +1,15 @@
 //! The wire between the mechanism and a policy module.
 //!
 //! Both sides are built from this crate, so they agree on the encoding: every
-//! message is JSON of the corresponding type (see the crate documentation for
-//! why JSON and not a compact binary format), and the buffers of the module's
-//! linear memory carry it: the mechanism writes a message with `sched_alloc`
-//! and reads a reply through the packed pointer and length a call returns.
+//! message is JSON of the corresponding type, as serde's derive writes it, and
+//! the buffers of the module's linear memory carry it: the mechanism writes a
+//! message with `sched_alloc` and reads a reply through the packed pointer and
+//! length a call returns.
 //!
 //! # Call convention
 //!
+//! - `sched_interface_version() -> u32`: the [`crate::INTERFACE_VERSION`] the
+//!   module was compiled against, which the mechanism reads first.
 //! - `sched_alloc(len: u32) -> u32`: a buffer of `len` bytes the mechanism
 //!   writes a message into.
 //! - `sched_free(ptr: u32, len: u32)`: releases a buffer this module allocated,
@@ -27,6 +29,8 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+/// The export that states the version of the interface the module implements, with no message.
+pub const EXPORT_INTERFACE_VERSION: &str = "sched_interface_version";
 /// The export that instantiates: its message is [`crate::policy::Instantiation`].
 pub const EXPORT_INIT: &str = "sched_init";
 /// The export that observes events: its message is `Vec<Event>`.

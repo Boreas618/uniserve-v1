@@ -1,20 +1,20 @@
 [package]
-name = "scheduling-policy-fcfs"
+name = "scheduling-policy-arrival"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "The default scheduling policy: first come, first served, reproducing the rules the current scheduler applies."
+description = "The scheduling policy that admits in the order its package argument names (arrival, or the request's priority then arrival) and assembles each step by phase class and admission."
 
 [lib]
 # A policy package is compiled to `wasm32-unknown-unknown` and loaded as a
 # WASM module by the mechanism (design §4.4, §5.2). The library form is what
-# `cargo check` and the guest's own checks read.
+# `cargo check` and the policy's own tests read.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# The types, the events, the decisions and the helpers every policy shares.
+# The policy interface: its views, events, decisions, parameters and exports.
 scheduling.workspace = true
 
 [lints]

@@ -632,10 +632,31 @@ mod tests {
     /// one that routed a request recovers again.
     #[test]
     fn a_fault_of_the_routing_instance_restarts_it_and_a_second_before_it_routes_is_fatal() {
-        let arrival: RequestView = scheduling::wire::decode(
-            br#"{"id":7,"state":{"state":"waiting"},"class":{"class":"token"}}"#,
-        )
-        .unwrap();
+        // A token request that just arrived, with nothing of it computed yet.
+        let arrival = RequestView {
+            id: scheduling::RequestId(7),
+            state: scheduling::RequestStatus::Waiting,
+            phase: None,
+            priority: 0,
+            arrived_at: scheduling::Nanos(0),
+            admitted_at: None,
+            prompt_tokens: 0,
+            prefill_tokens: 0,
+            generated_tokens: 0,
+            cached_prefix_tokens: 0,
+            prefilled_tokens: 0,
+            cached_pages: 0,
+            last_emitted_at: None,
+            class: scheduling::RequestClass::Token,
+            waiting_transfer: false,
+            next_tokens: 0,
+            reservation_units: 0,
+            prefetch_tokens: 0,
+            refill_tokens: None,
+            remaining_tokens: 0,
+            migratable: false,
+            cache_rank: None,
+        };
         // A load the instance routes, and one whose longer message it traps on.
         let calm = ranks(&[3, 1]);
         let busy = ranks(&[3_000_000_000, 1]);
@@ -649,7 +670,7 @@ mod tests {
                 ranks: calm.clone(),
                 ..Snapshot::default()
             };
-            let ceilings = scheduling::Limits::default();
+            let ceilings = crate::scheduler::policy::ceilings([]);
             Policy::new(Arc::clone(&module), Default::default(), snapshot, &ceilings).unwrap()
         };
 

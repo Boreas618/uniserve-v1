@@ -660,6 +660,8 @@ fn policy_arguments(config: &ServerArgs) -> toml::Table {
     #[derive(Serialize)]
     struct Arguments {
         #[serde(skip_serializing_if = "Option::is_none")]
+        order: Option<proto::config::QueueOrder>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         chunked_prefill_size: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         max_queued_requests: Option<u32>,
@@ -707,6 +709,7 @@ fn policy_arguments(config: &ServerArgs) -> toml::Table {
     let max_batch =
         max_batch.min(u32::try_from(config.max_running_requests.get()).unwrap_or(u32::MAX));
     let arguments = Arguments {
+        order: scheduler.order,
         chunked_prefill_size: scheduler
             .chunked_prefill_size
             .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX))
@@ -1055,6 +1058,25 @@ mod tests {
         );
     }
 
+    /// The order a deployment states for its waiting queue is the policy's `order` argument;
+    /// one that states none leaves the package's declared default.
+    #[test]
+    fn the_queue_order_is_the_policys_order_argument() {
+        let mut config = ServerArgs::default();
+        assert!(
+            !crate::epoch::modules_of(&config)
+                .policy
+                .arguments
+                .contains_key("order")
+        );
+
+        config.scheduler_config.order = Some(proto::config::QueueOrder::Priority);
+        assert_eq!(
+            crate::epoch::modules_of(&config).policy.arguments["order"],
+            toml::Value::String("priority".into())
+        );
+    }
+
     /// Which [`Change`] a change takes is decided by what it moves, never by
     /// the change itself: `Host` for the options the
     /// daemon or the frontend read alone, `Epoch` for the values
@@ -1129,7 +1151,10 @@ mod tests {
         // The package backends and the package parameters: a `Generation` change.
         let package: Vec<Case> = vec![
             ("scheduler_config.policy", |config: &mut ServerArgs| {
-                config.scheduler_config.policy = "priority".to_owned()
+                config.scheduler_config.policy = "another".to_owned()
+            }),
+            ("scheduler_config.order", |config: &mut ServerArgs| {
+                config.scheduler_config.order = Some(proto::config::QueueOrder::Priority)
             }),
             (
                 "scheduler_config.chunked_prefill_size",
@@ -1309,7 +1334,7 @@ mod tests {
 
         // The scheduling policy package's backend is the policy's name, and its
         // parameters are the configuration's values it reads, as TOML strings.
-        assert_eq!(modules.policy.backend, "fcfs");
+        assert_eq!(modules.policy.backend, "arrival");
         assert_eq!(
             modules.policy.arguments["max_batch"],
             toml::Value::Integer(128)

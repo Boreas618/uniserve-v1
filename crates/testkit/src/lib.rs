@@ -10,7 +10,7 @@
 //! - [`buffer_pool`]: the in-process buffer pool and the knobs a case paces it with.
 //! - [`engine`]: the fake engine's start over both, and the thread that runs its control thread.
 //! - [`pools`]: the launch a fake engine is started with and what its worker groups serve.
-//! - [`policy`]: the `fcfs` module this tree builds, and the arguments a test engine's
+//! - [`policy`]: the `arrival` module this tree builds, and the arguments a test engine's
 //!   schedulers instantiate it with.
 //! - [`text`]: what a fake's text model samples, and where its text ends.
 //! - [`process`]: a fake engine at the process interface, and a fake node daemon behind it.
@@ -26,6 +26,6 @@ pub mod text;
 pub use self::engine::{Fixture, Pace, UNITS, fake_start, spawn};
 pub use buffer_pool::InProcessPool;
 pub use executor::FakeExecutor;
-pub use policy::{packaged_arguments, packaged_module, packaged_policy};
+pub use policy::{packaged_arguments, packaged_module, packaged_parameters, packaged_policy};
 pub use pools::{BLOCK_TOKENS, args, cache, capacity, launch};
 pub use text::{EOS, EndOfText, SAMPLED, draw_token};

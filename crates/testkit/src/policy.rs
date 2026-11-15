@@ -2,38 +2,63 @@
 //!
 //! A deployed engine takes its policy from the Build Server; a test engine has none, and a
 //! scheduler with no policy decides nothing (no output, no admission, no batch), so an engine that
-//! serves a request must be given a module. [`packaged_policy`] is that module: the real `fcfs`
-//! package this tree builds, with the arguments that make its declared limits fit the ceilings of
-//! the groups the engine's schedulers serve (`engine::scheduler::policy::ceilings`). Every scheduler
-//! instantiates it as it instantiates a deployment's, so a caller's fixtures exercise the
-//! mechanism rather than a stand-in for it, and there is no second policy in the tree to keep
-//! honest.
+//! serves a request must be given a module. [`packaged_policy`] is that module: the real `arrival`
+//! package this tree builds, with the arguments its revision runs with — the package's declared
+//! defaults ([`packaged_parameters`]), replaced by limits that fit the ceilings of the groups the
+//! engine's schedulers serve (`engine::scheduler::policy::ceilings`). Every scheduler instantiates
+//! it as it instantiates a deployment's, so a caller's fixtures exercise the mechanism rather than
+//! a stand-in for it, and there is no second policy in the tree to keep honest.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use ::engine::scheduler::policy;
 use anyhow::Result;
 use scheduling::{Limits, Parameters};
 
-/// The arguments that state `limits` as the policy's parameters: every limit a deployment can
-/// state.
-fn parameters_of(limits: &Limits) -> Parameters {
-    Parameters {
-        chunked_prefill_size: Some(limits.chunked_prefill_size),
-        max_queued_requests: limits.max_queued_requests,
-        max_batch: Some(limits.max_batch),
-        max_num_batched_tokens: Some(limits.max_num_batched_tokens),
-        prefetch_min_tokens: Some(limits.prefetch_min_tokens),
-        timeout: Some(limits.timeout),
-        ..Parameters::default()
-    }
+/// The scheduling policy package this tree builds, relative to the workspace.
+const PACKAGE: &str = "crates/scheduling/policies/arrival";
+
+/// The arguments a revision of the tree's policy package runs with when its deployment states
+/// none: the defaults its manifest declares, as the Build Server fills them in.
+///
+/// # Panics
+///
+/// When the package's manifest cannot be read or declares parameters the policy interface does
+/// not name.
+pub fn packaged_parameters() -> Parameters {
+    let root = Path::new(proto::WORKSPACE).join(PACKAGE);
+    let manifest = build_server::manifest::Manifest::load(&root)
+        .unwrap_or_else(|error| panic!("reading the policy package {}: {error}", root.display()));
+    toml::Value::Table(manifest.parameters.into_iter().collect())
+        .try_into()
+        .unwrap_or_else(|error| {
+            panic!(
+                "the policy package {} declares parameters the policy interface does not name: \
+                 {error}",
+                root.display()
+            )
+        })
 }
 
-/// The arguments `fcfs` runs under in an engine whose groups' captured buckets bound it by
-/// `ceilings` (`engine::scheduler::policy::ceilings`): they state the ceilings themselves, so the limits
-/// the module declares are the ones a scheduler checks a policy against and cannot be refused.
+/// The arguments the packaged policy runs under in an engine whose groups' captured buckets bound
+/// it by `ceilings` (`engine::scheduler::policy::ceilings`): every limit states its ceiling, so the
+/// limits the module declares are the ones a scheduler checks a policy against and cannot be
+/// refused, and every other parameter is the package's default.
+///
+/// # Panics
+///
+/// As [`packaged_parameters`].
 pub fn packaged_arguments(ceilings: &Limits) -> Parameters {
-    parameters_of(ceilings)
+    Parameters {
+        chunked_prefill_size: Some(ceilings.chunked_prefill_size),
+        max_queued_requests: ceilings.max_queued_requests,
+        max_batch: Some(ceilings.max_batch),
+        max_num_batched_tokens: Some(ceilings.max_num_batched_tokens),
+        prefetch_min_tokens: Some(ceilings.prefetch_min_tokens),
+        timeout: Some(ceilings.timeout),
+        ..packaged_parameters()
+    }
 }
 
 /// [`packaged_module`] loaded for a scheduler's policy engine, with [`packaged_arguments`] of
@@ -46,18 +71,18 @@ pub fn packaged_arguments(ceilings: &Limits) -> Parameters {
 ///
 /// # Panics
 ///
-/// As [`packaged_module`].
+/// As [`packaged_module`] and [`packaged_parameters`].
 pub fn packaged_policy(ceilings: &Limits) -> Result<(Arc<wasmtime::Module>, Parameters)> {
     let module = policy::load(&packaged_module())
-        .map_err(|error| anyhow::anyhow!("loading the fcfs policy module: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("loading the arrival policy module: {error}"))?;
     Ok((Arc::new(module), packaged_arguments(ceilings)))
 }
 
-/// The `fcfs` module this tree builds for `wasm32-unknown-unknown`, as a deployment's store serves
-/// a policy, made once per process and shared by every fixture that installs a policy.
+/// The `arrival` module this tree builds for `wasm32-unknown-unknown`, as a deployment's store
+/// serves a policy, made once per process and shared by every fixture that installs a policy.
 ///
 /// `SCHED_POLICY_WASM` names a module to serve with instead, which a caller testing a build of its
-/// own sets. Unset, the module is built from this tree's `scheduling-policy-fcfs` on first use,
+/// own sets. Unset, the module is built from this tree's `scheduling-policy-arrival` on first use,
 /// into a target directory of its own (`target/it-policy`), so a test run needs no setup step and
 /// the build does not contend for the lock of the tree the running tests were built in.
 ///
@@ -77,7 +102,7 @@ pub fn packaged_module() -> Vec<u8> {
         .clone()
 }
 
-/// Builds this tree's `fcfs` policy package and returns the module bytes.
+/// Builds this tree's `arrival` policy package and returns the module bytes.
 ///
 /// The build runs the same `cargo` that started the tests (`CARGO`), so the toolchain and the
 /// target the caller selected are the ones the module is built with. A failure states the status
@@ -92,13 +117,13 @@ fn build_packaged_module() -> Vec<u8> {
     let output = std::process::Command::new(&cargo)
         .current_dir(&workspace)
         .arg("build")
-        .args(["-q", "-p", "scheduling-policy-fcfs"])
+        .args(["-q", "-p", "scheduling-policy-arrival"])
         .args(["--target", "wasm32-unknown-unknown", "--release"])
         .arg("--target-dir")
         .arg(&target_dir)
         .output()
         .unwrap_or_else(|error| {
-            panic!("running {cargo:?} to build the fcfs policy module: {error}")
+            panic!("running {cargo:?} to build the arrival policy module: {error}")
         });
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -106,14 +131,15 @@ fn build_packaged_module() -> Vec<u8> {
     let tail: Vec<&str> = tail.into_iter().rev().collect();
     assert!(
         output.status.success(),
-        "building this tree's fcfs policy module failed ({}). Set SCHED_POLICY_WASM to a module \
-         built with `cargo build -p scheduling-policy-fcfs --target wasm32-unknown-unknown \
-         --release` to run without the build. The build's stderr ended:\n{}",
+        "building this tree's arrival policy module failed ({}). Set SCHED_POLICY_WASM to a \
+         module built with `cargo build -p scheduling-policy-arrival --target \
+         wasm32-unknown-unknown --release` to run without the build. The build's stderr \
+         ended:\n{}",
         output.status,
         tail.join("\n"),
     );
 
-    let path = target_dir.join("wasm32-unknown-unknown/release/scheduling_policy_fcfs.wasm");
+    let path = target_dir.join("wasm32-unknown-unknown/release/scheduling_policy_arrival.wasm");
     std::fs::read(&path).unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
 }
 
@@ -127,39 +153,45 @@ mod tests {
             chunked_prefill_size: tokens,
             max_batch: calls,
             max_num_batched_tokens: tokens,
-            ..Limits::default()
+            ..policy::ceilings([])
         }
     }
 
+    /// The arguments state every limit at its ceiling, so the limits the module declares are the
+    /// ones the mechanism checks a policy against, and every other parameter at the package's
+    /// default.
     #[test]
-    fn the_packaged_arguments_state_limits_the_ceilings_allow() {
+    fn the_packaged_arguments_state_the_ceilings_and_the_package_defaults() {
         let ceilings = ceilings(8, 1024);
-
-        // The arguments state the ceilings themselves, so the limits the module declares are the
-        // ones the mechanism checks a policy against and cannot be refused for an engine of these
-        // ceilings.
-        let limits = Limits::from_parameters(&packaged_arguments(&ceilings));
-        assert_eq!(limits.max_batch, ceilings.max_batch);
+        let arguments = packaged_arguments(&ceilings);
+        assert_eq!(arguments.max_batch, Some(ceilings.max_batch));
         assert_eq!(
-            limits.max_num_batched_tokens,
-            ceilings.max_num_batched_tokens
+            arguments.max_num_batched_tokens,
+            Some(ceilings.max_num_batched_tokens)
         );
-        assert_eq!(limits.chunked_prefill_size, ceilings.chunked_prefill_size);
-        assert_eq!(limits.prefetch_min_tokens, ceilings.prefetch_min_tokens);
-        assert_eq!(limits.timeout, ceilings.timeout);
+        assert_eq!(
+            arguments.chunked_prefill_size,
+            Some(ceilings.chunked_prefill_size)
+        );
+        assert_eq!(
+            arguments.prefetch_min_tokens,
+            Some(ceilings.prefetch_min_tokens)
+        );
+        assert_eq!(arguments.timeout, Some(ceilings.timeout));
+
+        let defaults = packaged_parameters();
+        assert_eq!(arguments.order, defaults.order);
+        assert_eq!(arguments.prefill_window, defaults.prefill_window);
+        assert!(defaults.order.is_some() && defaults.prefill_window.is_some());
     }
 
+    /// An engine whose buckets hold two calls is given arguments of two calls, not the package's
+    /// default of more, which its ceilings would refuse.
     #[test]
     fn an_engine_of_fewer_calls_states_fewer() {
-        // `fcfs`'s own default declares 128 calls, which an engine whose buckets hold two would
-        // be refused for: the arguments are what make the declaration fit.
         let small = packaged_arguments(&ceilings(2, 64));
         assert_eq!(small.max_batch, Some(2));
         assert_eq!(small.max_num_batched_tokens, Some(64));
-        assert_eq!(
-            Limits::from_parameters(&small).max_batch,
-            2,
-            "the module declares what the arguments state, not the package default"
-        );
+        assert!(packaged_parameters().max_batch > Some(2));
     }
 }

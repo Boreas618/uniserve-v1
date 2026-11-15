@@ -3862,21 +3862,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "scheduling-policy-fcfs"
-version = "2.0.0"
-dependencies = [
- "scheduling",
-]
-
-[[package]]
-name = "scheduling-policy-fixture"
-version = "2.0.0"
-dependencies = [
- "scheduling",
-]
-
-[[package]]
-name = "scheduling-policy-priority"
+name = "scheduling-policy-arrival"
 version = "2.0.0"
 dependencies = [
  "scheduling",
@@ -4423,6 +4409,7 @@ name = "testkit"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "build-server",
  "crossbeam-channel",
  "engine",
  "libc",
@@ -4433,6 +4420,7 @@ dependencies = [
  "storage",
  "storage-server",
  "tempfile",
+ "toml",
  "uuid",
  "wasmtime",
 ]

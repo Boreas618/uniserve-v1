@@ -11,15 +11,13 @@ use crate::view::{CallView, RankView, ReplicaView, RequestView, Snapshot};
 /// package's arguments (design §5.1) and the state of everything already
 /// running.
 ///
-/// The arguments construct the policy ([`From<Parameters>`]); the state is what
+/// The arguments construct the policy (`TryFrom<Parameters>`); the state is what
 /// [`Policy::init`] receives, exactly as design §4.4 writes that method.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Instantiation {
-    /// The package's arguments, from the deployment configuration.
-    #[serde(default)]
+    /// The package's arguments, from the package's declared defaults and the deployment.
     pub parameters: Parameters,
     /// Every object that exists at instantiation.
-    #[serde(default)]
     pub state: Snapshot,
 }
 
@@ -38,7 +36,7 @@ pub trait Policy {
     /// `fn init(&mut self, state: &Snapshot)`).
     ///
     /// The package's arguments reach the policy before this call: a module is
-    /// constructed from its [`Parameters`] (`From<Parameters>`), then
+    /// constructed from its [`Parameters`] (`TryFrom<Parameters>`), then
     /// initialized with the state. The arguments are part of the package
     /// (§5.1), so they are not a second state argument here.
     fn init(&mut self, state: &Snapshot);

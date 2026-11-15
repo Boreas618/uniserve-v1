@@ -7,5 +7,5 @@ channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 # Scheduling policies are WebAssembly modules: the Build Server builds a policy
 # package for this target from its workspace snapshot, and the scheduler's tests
-# build the fcfs policy for it.
+# build the arrival policy for it.
 targets = ["wasm32-unknown-unknown"]

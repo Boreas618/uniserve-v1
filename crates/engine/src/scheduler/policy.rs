@@ -115,7 +115,7 @@ pub(super) const DEFAULT_CALL_FUEL: u64 = 10_000_000;
 /// block it lists as a `Cached` page, which a scheduler that starts beside a warm cache (an
 /// epoch's target of the same layout maps the serving epoch's regions) learns after its policy
 /// was instantiated. Decoding such a message grows with the cache: typed JSON decoding in a
-/// wasm32 module costs 50 to 100 fuel a byte, and the packaged `fcfs` spends about 70 a byte of
+/// wasm32 module costs 50 to 100 fuel a byte, and the packaged `arrival` spends about 70 a byte of
 /// cached blocks on its whole `init`. Twice the decoding's dearest leaves a policy as much again
 /// for its own state, so a policy instantiates on, and observes, a warm cache of any size, and
 /// the bound still ends a call that never returns. A step's other events cost what the step
@@ -179,7 +179,8 @@ pub enum PolicyError {
     /// to compile them with.
     Load(String),
     /// The module does not instantiate as a policy: it does not link, lacks the memory or an
-    /// export the interface calls, or its engine meters no fuel.
+    /// export the interface calls, implements another version of the interface, or its engine
+    /// meters no fuel.
     Instantiate(String),
     /// The policy trapped in a call: `unreachable`, an access outside its memory, a panic.
     Trap { call: Call, trap: Trap },
@@ -554,6 +555,22 @@ impl Instance {
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or_else(|| PolicyError::Instantiate("it exports no `memory`".into()))?;
+
+        // A module of another version of the interface would be asked decisions through calls
+        // whose messages mean something else to it: it states the version it was compiled
+        // against before any call is made.
+        let version: TypedFunc<(), u32> =
+            bind(&mut store, &instance, wire::EXPORT_INTERFACE_VERSION)?;
+        let implemented = version.call(&mut store, ()).map_err(|error| {
+            PolicyError::Instantiate(format!("it states no interface version: {error}"))
+        })?;
+        if implemented != scheduling::INTERFACE_VERSION {
+            return Err(PolicyError::Instantiate(format!(
+                "it implements version {implemented} of the scheduling policy interface and this \
+                 engine instantiates version {}",
+                scheduling::INTERFACE_VERSION
+            )));
+        }
 
         Ok(Self {
             alloc: bind(&mut store, &instance, "sched_alloc")?,
@@ -936,6 +953,7 @@ pub(crate) mod tests {
     use std::sync::OnceLock;
 
     use scheduling::End;
+    use scheduling::Nanos;
     use scheduling::ids::{PageId, RequestId as GuestId, StageId};
     use scheduling::time::Duration;
     use scheduling::view::{
@@ -946,16 +964,13 @@ pub(crate) mod tests {
     use super::super::view::view_of;
     use super::*;
 
-    /// The packaged policies, by name: `fcfs`, `priority` and `fixture`, built for
-    /// `wasm32-unknown-unknown` from this tree once per test process, into a target directory of
-    /// their own (`it-policy`, as `testkit` builds `fcfs`), and each compiled on first use by
-    /// [`load`].
-    pub(crate) fn packaged(name: &str) -> Arc<Module> {
-        const NAMES: [&str; 3] = ["fcfs", "priority", "fixture"];
-        static BUILT: OnceLock<PathBuf> = OnceLock::new();
-        static MODULES: [OnceLock<Arc<Module>>; 3] = [const { OnceLock::new() }; 3];
+    /// The packaged policy, `arrival`, built for `wasm32-unknown-unknown` from this tree once per
+    /// test process, into a target directory of its own (`it-policy`, as `testkit` builds it), and
+    /// compiled on first use by [`load`].
+    pub(crate) fn packaged() -> Arc<Module> {
+        static MODULE: OnceLock<Arc<Module>> = OnceLock::new();
 
-        let built = BUILT.get_or_init(|| {
+        let module = MODULE.get_or_init(|| {
             let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
             let target = std::env::var_os("CARGO_TARGET_DIR")
                 .map_or_else(|| workspace.join("target"), PathBuf::from)
@@ -968,30 +983,43 @@ pub(crate) mod tests {
                 .args(["build", "-q", "--release"]);
             build.args(["--target", "wasm32-unknown-unknown", "--target-dir"]);
             build.arg(&target);
-            for name in NAMES {
-                build.arg("-p").arg(format!("scheduling-policy-{name}"));
-            }
+            build.args(["-p", "scheduling-policy-arrival"]);
             let output = build.output().unwrap();
             assert!(
                 output.status.success(),
-                "building the packaged policies: {}",
+                "building the packaged policy: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            target.join("wasm32-unknown-unknown/release")
-        });
-
-        let index = NAMES.iter().position(|packaged| *packaged == name).unwrap();
-        let module = MODULES[index].get_or_init(|| {
-            let wasm = std::fs::read(built.join(format!("scheduling_policy_{name}.wasm"))).unwrap();
-            Arc::new(load(&wasm).unwrap())
+            let wasm = target.join("wasm32-unknown-unknown/release/scheduling_policy_arrival.wasm");
+            Arc::new(load(&std::fs::read(wasm).unwrap()).unwrap())
         });
         Arc::clone(module)
     }
 
+    /// The arguments a revision of the packaged policy runs with when its deployment states
+    /// `stated` (TOML): the package's declared defaults, replaced by `stated`.
+    pub(crate) fn packaged_arguments(stated: &str) -> Parameters {
+        crate::modules::load::parameters(&crate::support::policy_revision(stated)).unwrap()
+    }
+
+    /// The limits a [`toy`] module declares: chunks and steps of 8192 tokens, 128 calls a step,
+    /// a 256-token prefetch threshold, a 30 s starvation bound and an unbounded queue, which the
+    /// ceilings of workers that captured no bucket ([`ceilings`] of none) hold.
+    pub(crate) fn toy_limits() -> Limits {
+        Limits {
+            chunked_prefill_size: 8192,
+            max_queued_requests: None,
+            max_batch: 128,
+            max_num_batched_tokens: 8192,
+            prefetch_min_tokens: 256,
+            timeout: Nanos(30_000_000_000),
+        }
+    }
+
     /// A module that speaks the interface's exports, whose `sched_init` runs `body` (a `wat`
-    /// expression of type `i64`), whose `sched_limits` and `sched_dispatch` reply `{}` (every limit
-    /// at its default; a decision that names nothing) and whose other exports reply nothing, or
-    /// for `sched_route` the first rank.
+    /// expression of type `i64`), whose `sched_limits` replies [`toy_limits`], whose
+    /// `sched_dispatch` replies a decision that names nothing, and whose other exports reply
+    /// nothing, or for `sched_route` the first rank.
     pub(crate) fn toy(body: &str) -> Arc<Module> {
         exports(body, "(i32.const 0)")
     }
@@ -1006,13 +1034,30 @@ pub(crate) mod tests {
     /// The module of [`toy`] and [`router`]: `init` is `sched_init`'s body, `route` is
     /// `sched_route`'s.
     fn exports(init: &str, route: &str) -> Arc<Module> {
-        // Every message is written at 1024, and the `{}` reply lies at 65024, at the end of the
-        // one page, past any snapshot a test's scheduler sends: `ptr << 32 | len`.
-        let empty = (65024_u64 << 32) | 2;
-        let text = format!(
+        Arc::new(load(toy_text(init, route, scheduling::INTERFACE_VERSION).as_bytes()).unwrap())
+    }
+
+    /// The text of the module of [`exports`], which states `version` as the version of the
+    /// interface it implements.
+    fn toy_text(init: &str, route: &str, version: u32) -> String {
+        // Every message is written at 1024, and the replies lie at the end of the one page, past
+        // any snapshot a test's scheduler sends: the limits at 64768 and the decision at 65024,
+        // each returned as `ptr << 32 | len`.
+        let reply = |at: u64, bytes: &[u8]| {
+            let escaped: String = bytes.iter().map(|byte| format!("\\{byte:02x}")).collect();
+            (
+                (at << 32) | bytes.len() as u64,
+                format!(r#"(data (i32.const {at}) "{escaped}")"#),
+            )
+        };
+        let (limits, limits_data) = reply(64768, &wire::encode(&toy_limits()).unwrap());
+        let (empty, empty_data) = reply(65024, &wire::encode(&DispatchOutput::default()).unwrap());
+        format!(
             r#"(module
                 (memory (export "memory") 1)
-                (data (i32.const 65024) "{{}}")
+                {limits_data}
+                {empty_data}
+                (func (export "sched_interface_version") (result i32) (i32.const {version}))
                 (func (export "sched_alloc") (param i32) (result i32) (i32.const 1024))
                 (func (export "sched_free") (param i32 i32))
                 (func (export "sched_init") (param i32 i32) (result i64) {init})
@@ -1021,27 +1066,31 @@ pub(crate) mod tests {
                 (func (export "sched_preempt") (param i32 i32) (result i64) (i64.const 0))
                 (func (export "sched_route") (param $at i32) (param $len i32) (result i32) {route})
                 (func (export "sched_place") (param i32 i32) (result i32) (i32.const 0))
-                (func (export "sched_limits") (result i64) (i64.const {empty})))"#
-        );
-        Arc::new(load(text.as_bytes()).unwrap())
+                (func (export "sched_limits") (result i64) (i64.const {limits})))"#
+        )
     }
 
     /// Arguments that state a deployment's limits, and the ceilings of workers that captured
     /// exactly that much.
     fn limited(tokens: u32, calls: usize) -> (Parameters, Limits) {
-        let parameters = Parameters {
-            chunked_prefill_size: Some(tokens),
-            max_batch: Some(calls),
-            max_num_batched_tokens: Some(tokens),
-            ..Parameters::default()
-        };
+        let parameters = packaged_arguments(&format!(
+            "chunked_prefill_size = {tokens}\nmax_batch = {calls}\nmax_num_batched_tokens = {tokens}"
+        ));
         let ceilings = Limits {
             chunked_prefill_size: tokens,
             max_batch: calls,
             max_num_batched_tokens: tokens,
-            ..Limits::default()
+            ..ceilings([])
         };
         (parameters, ceilings)
+    }
+
+    /// `parameters` with the waiting queue admitting by the request's priority, then arrival.
+    fn by_priority(parameters: Parameters) -> Parameters {
+        Parameters {
+            order: Some(scheduling::QueueOrder::Priority),
+            ..parameters
+        }
     }
 
     fn room() -> Room {
@@ -1053,9 +1102,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Each packaged policy declares the limits its arguments state, admits what arrived in its
-    /// own order, and costs `init` and `limits` once and one `observe` and one `dispatch` per
-    /// step.
+    /// The packaged policy declares the limits its arguments state, admits what arrived in the
+    /// order its arguments name, and costs `init` and `limits` once and one `observe` and one
+    /// `dispatch` per step.
     #[test]
     fn a_packaged_policy_admits_what_arrived_in_its_order() {
         let (parameters, ceilings) = limited(512, 8);
@@ -1064,14 +1113,12 @@ pub(crate) mod tests {
         let second = waiting(2, 1, &[4, 5]);
         let mut requests = HashMap::from([(first.id, first), (second.id, second)]);
 
-        for (name, admitted) in [("fcfs", [1, 2]), ("fixture", [1, 2]), ("priority", [2, 1])] {
-            let mut policy = Policy::new(
-                packaged(name),
-                parameters.clone(),
-                Snapshot::default(),
-                &ceilings,
-            )
-            .unwrap();
+        for (name, parameters, admitted) in [
+            ("arrival", parameters.clone(), [1, 2]),
+            ("priority", by_priority(parameters), [2, 1]),
+        ] {
+            let mut policy =
+                Policy::new(packaged(), parameters, Snapshot::default(), &ceilings).unwrap();
             assert_eq!(policy.limits.max_batch, 8, "{name}");
             assert_eq!(policy.limits.max_num_batched_tokens, 512, "{name}");
             assert_eq!(policy.calls, 2, "{name}: init and limits");
@@ -1100,17 +1147,17 @@ pub(crate) mod tests {
     fn limits_above_a_ceiling_refuse_the_policy() {
         let (parameters, ceilings) = limited(512, 8);
         let (wide, _) = limited(1024, 8);
-        let refused = Policy::new(
-            packaged("fcfs"),
-            wide.clone(),
-            Snapshot::default(),
-            &ceilings,
-        );
+        let refused = Policy::new(packaged(), wide.clone(), Snapshot::default(), &ceilings);
         assert!(matches!(refused, Err(PolicyError::Limits(_))));
 
         let mut policy =
-            Policy::new(packaged("fcfs"), parameters, Snapshot::default(), &ceilings).unwrap();
-        let refused = policy.switch(packaged("priority"), wide, Snapshot::default(), &ceilings);
+            Policy::new(packaged(), parameters, Snapshot::default(), &ceilings).unwrap();
+        let refused = policy.switch(
+            packaged(),
+            by_priority(wide),
+            Snapshot::default(),
+            &ceilings,
+        );
         assert!(matches!(
             refused,
             Err(Error::Policy(PolicyError::Limits(_)))
@@ -1125,11 +1172,15 @@ pub(crate) mod tests {
     fn a_switch_keeps_the_replaced_policy_for_one_rollback() {
         let (serving, ceilings) = limited(512, 8);
         let (next, _) = limited(256, 4);
-        let mut policy =
-            Policy::new(packaged("fcfs"), serving, Snapshot::default(), &ceilings).unwrap();
+        let mut policy = Policy::new(packaged(), serving, Snapshot::default(), &ceilings).unwrap();
 
         policy
-            .switch(packaged("priority"), next, Snapshot::default(), &ceilings)
+            .switch(
+                packaged(),
+                by_priority(next),
+                Snapshot::default(),
+                &ceilings,
+            )
             .unwrap();
         assert_eq!(policy.limits.max_batch, 4);
         assert!(policy.previous.is_some());
@@ -1146,7 +1197,7 @@ pub(crate) mod tests {
     /// each named by the call it happened in; a switch to such a module leaves the serving policy dispatching.
     #[test]
     fn a_faulting_module_is_refused_by_name() {
-        let ceilings = Limits::default();
+        let ceilings = toy_limits();
         let fault = |body: &str| {
             Policy::new(
                 toy(body),
@@ -1178,8 +1229,8 @@ pub(crate) mod tests {
         ));
 
         let mut policy = Policy::new(
-            packaged("fcfs"),
-            Parameters::default(),
+            packaged(),
+            packaged_arguments("max_num_batched_tokens = 8192"),
             Snapshot::default(),
             &ceilings,
         )
@@ -1220,30 +1271,37 @@ pub(crate) mod tests {
         assert_eq!(unbound.max_batch, usize::MAX);
     }
 
-    /// The packaged policies declare the version of the policy interface this engine runs: the
-    /// engine refuses a module built for another version of the interface.
+    /// A module states the version of the policy interface it was compiled against, and one of
+    /// another version is refused before any call; the packaged policy states this engine's.
     #[test]
-    fn the_packaged_policies_declare_this_engines_interface() {
-        let interface = format!("interface_version = {}", scheduling::INTERFACE_VERSION);
-        for (backend, manifest) in [
-            (
-                "fcfs",
-                include_str!("../../../scheduling/policies/fcfs/package.toml"),
-            ),
-            (
-                "priority",
-                include_str!("../../../scheduling/policies/priority/package.toml"),
-            ),
-            (
-                "fixture",
-                include_str!("../../../scheduling/policies/fixture/package.toml"),
-            ),
-        ] {
-            assert!(
-                manifest.lines().any(|stated| stated == interface),
-                "the {backend} package does not declare {interface}"
-            );
-        }
+    fn a_module_of_another_interface_version_is_refused() {
+        let ceilings = toy_limits();
+        assert!(
+            Policy::new(
+                packaged(),
+                limited(512, 8).0,
+                Snapshot::default(),
+                &ceilings
+            )
+            .is_ok()
+        );
+
+        let stale = toy_text(
+            "(i64.const 0)",
+            "(i32.const 0)",
+            scheduling::INTERFACE_VERSION - 1,
+        );
+        let refused = Policy::new(
+            Arc::new(load(stale.as_bytes()).unwrap()),
+            Parameters::default(),
+            Snapshot::default(),
+            &ceilings,
+        );
+        assert!(
+            matches!(&refused, Err(PolicyError::Instantiate(message)) if message.contains("version")),
+            "{:?}",
+            refused.err()
+        );
     }
 
     /// A page id as the leading eight bytes of a block's key give them: spread over every bit.
@@ -1339,7 +1397,7 @@ pub(crate) mod tests {
             phases: text_phases(),
             ..Snapshot::default()
         };
-        let mut policy = Policy::new(packaged("fcfs"), parameters, snapshot, &ceilings).unwrap();
+        let mut policy = Policy::new(packaged(), parameters, snapshot, &ceilings).unwrap();
         let observe = |policy: &mut Policy, events: &[Event]| {
             metered(policy, Call::Observe, wire::encode(&events).unwrap()).0
         };
@@ -1463,7 +1521,7 @@ pub(crate) mod tests {
         }
         let (parameters, ceilings) = limited(8192, 512);
         let snapshot = scheduler.snapshot();
-        scheduler.policy = Policy::new(packaged("fcfs"), parameters, snapshot, &ceilings).unwrap();
+        scheduler.policy = Policy::new(packaged(), parameters, snapshot, &ceilings).unwrap();
 
         // One decode of each request ran and was applied, as `schedule` and `update` do.
         let step = |scheduler: &mut Scheduler, number: u64| {
@@ -1544,7 +1602,7 @@ pub(crate) mod tests {
             ..Snapshot::default()
         };
 
-        let mut policy = Policy::new(packaged("fcfs"), parameters, snapshot, &ceilings).unwrap();
+        let mut policy = Policy::new(packaged(), parameters, snapshot, &ceilings).unwrap();
         assert!(
             policy.fuel > DEFAULT_CALL_FUEL,
             "the snapshot is one a step's budget cannot decode"
@@ -1556,6 +1614,12 @@ pub(crate) mod tests {
             ..Room::default()
         };
         for released in [Vec::new(), vec![spread(5000)], Vec::new()] {
+            // A block cached since the snapshot, which a request held and gave up.
+            for (number, &page) in (5000..).zip(&released) {
+                policy.events.push(Event::Cached {
+                    page: block(page, number, false),
+                });
+            }
             policy.events.push(Event::Released {
                 pages: released.clone(),
             });

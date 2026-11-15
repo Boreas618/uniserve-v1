@@ -19,9 +19,7 @@ members = [
     "crates/build-server",
     "crates/proto",
     "crates/scheduling",
-    "crates/scheduling/policies/fcfs",
-    "crates/scheduling/policies/fixture",
-    "crates/scheduling/policies/priority",
+    "crates/scheduling/policies/arrival",
     "crates/service",
     "crates/storage",
     "crates/storage-server",
@@ -86,8 +84,6 @@ build-server = { path = "crates/build-server" }
 proto = { path = "crates/proto" }
 scheduling = { path = "crates/scheduling" }
 testkit = { path = "crates/testkit" }
-scheduling-policy-fcfs = { path = "crates/scheduling/policies/fcfs" }
-scheduling-policy-priority = { path = "crates/scheduling/policies/priority" }
 service = { path = "crates/service" }
 storage = { path = "crates/storage" }
 storage-server = { path = "crates/storage-server" }

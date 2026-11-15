@@ -10,7 +10,7 @@
 //!
 //! The cases state their own policy modules as WebAssembly text ([`Script`]): modules that serve
 //! a fixed decision, fault where a case puts the fault, or probe the messages the scheduler sends
-//! them by trapping on what a case looks for, which the scheduler reports. The `fcfs` policy the
+//! them by trapping on what a case looks for, which the scheduler reports. The `arrival` policy the
 //! harness serves is the policy a switch replaces. Every step of every case checks the
 //! scheduler's side of A1 to A4.
 
@@ -44,7 +44,7 @@ const MESSAGES_AT: u32 = 65536;
 const PAGES: u32 = 8;
 
 /// How an `Updated` event of the policy's wire begins (`scheduling::event::Event`).
-const UPDATED: &str = r#""kind":"updated""#;
+const UPDATED: &str = r#"{"updated":"#;
 
 /// What a script's `init` does.
 enum Init {
@@ -93,7 +93,7 @@ impl Script {
                 chunked_prefill_size: 16,
                 max_batch: 8,
                 max_num_batched_tokens: 64,
-                ..Limits::default()
+                ..policy::ceilings([])
             },
             init: Init::Serves,
             observe: None,
@@ -170,6 +170,7 @@ impl Script {
 
         let segments = segments.join("\n");
         let count = count(needle.len());
+        let version = scheduling::INTERFACE_VERSION;
         let text = format!(
             r#"(module
                 (memory (export "memory") {PAGES})
@@ -177,6 +178,7 @@ impl Script {
                 (global $dispatched (mut i32) (i32.const 0))
                 (global $placed (mut i32) (i32.const 0))
                 {count}
+                (func (export "sched_interface_version") (result i32) (i32.const {version}))
                 (func (export "sched_alloc") (param i32) (result i32) (i32.const {MESSAGES_AT}))
                 (func (export "sched_free") (param i32 i32))
                 (func (export "sched_init") (param $at i32) (param $len i32) (result i64) {init})
@@ -251,19 +253,19 @@ fn load(bytes: &[u8]) -> Arc<Module> {
     Arc::new(policy::load(bytes).unwrap())
 }
 
-/// The `fcfs` policy the harness serves.
-fn fcfs() -> Arc<Module> {
+/// The packaged policy the harness serves.
+fn packaged() -> Arc<Module> {
     load(&testkit::packaged_module())
 }
 
-/// The arguments of the `fcfs` policy on [`Deployment::tokens`]: chunks of `chunk` tokens, and
-/// the deployment's 8 calls and 64 tokens a step.
+/// The arguments of the packaged policy on [`Deployment::tokens`]: chunks of `chunk` tokens, the
+/// deployment's 8 calls and 64 tokens a step, and the package's defaults for the rest.
 fn chunked(chunk: u32) -> Parameters {
     Parameters {
         chunked_prefill_size: Some(chunk),
         max_batch: Some(8),
         max_num_batched_tokens: Some(64),
-        ..Parameters::default()
+        ..testkit::packaged_parameters()
     }
 }
 
@@ -357,7 +359,7 @@ fn observe_and_dispatch_are_called_once_per_step_and_limits_once_per_instance() 
     let mut harness = Deployment::tokens().build();
     let id = harness.submit(token(1, 10, 20));
     harness.run(10);
-    set_policy(&mut harness, fcfs(), chunked(8)).unwrap();
+    set_policy(&mut harness, packaged(), chunked(8)).unwrap();
     harness.run(5);
     rollback(&mut harness).unwrap();
     harness.settle(100);
@@ -400,7 +402,7 @@ fn a_trap_exhausted_fuel_or_limits_above_a_ceiling_refuse_a_switch_and_leave_the
             "it ran past its fuel in `init`",
         ),
         (
-            fcfs(),
+            packaged(),
             wide,
             "its limits are outside the ceilings: max_num_batched_tokens is 1024, above the \
              ceiling of 64",
@@ -489,7 +491,7 @@ fn a_fault_of_the_serving_policy_with_none_kept_restarts_it_on_a_fresh_snapshot(
     harness.run_until(30, |harness| harness.tokens(first).len() >= 2);
 
     let arrival_traps = Script {
-        observe: Some((r#""kind":"arrived""#.to_owned(), 1)),
+        observe: Some((r#"{"arrived":"#.to_owned(), 1)),
         ..Script::serving(&[1, 2])
     };
     set_policy(&mut harness, arrival_traps.module(), Parameters::default()).unwrap();
@@ -567,7 +569,7 @@ fn a_decision_beyond_a_limit_is_cut_to_it() {
             chunked_prefill_size: CHUNK,
             max_batch: CALLS,
             max_num_batched_tokens: TOKENS,
-            ..Limits::default()
+            ..policy::ceilings([])
         },
         replies: vec![driving(&[1, 2, 3], 1_000)],
         ..Script::serving(&[])
@@ -665,7 +667,7 @@ fn ids_in_the_wrong_state_are_skipped() {
 #[test]
 fn rollback_serves_the_replaced_policy_again_and_commit_drops_it() {
     let mut harness = Deployment::tokens().build();
-    set_policy(&mut harness, fcfs(), chunked(8)).unwrap();
+    set_policy(&mut harness, packaged(), chunked(8)).unwrap();
     let first = harness.submit(token(1, 20, 2));
     harness.settle(100);
     assert_eq!(
@@ -684,7 +686,7 @@ fn rollback_serves_the_replaced_policy_again_and_commit_drops_it() {
     );
     assert!(rollback(&mut harness).is_err(), "one rollback per switch");
 
-    set_policy(&mut harness, fcfs(), chunked(8)).unwrap();
+    set_policy(&mut harness, packaged(), chunked(8)).unwrap();
     harness.apply(Message::CommitPolicy);
     assert!(
         rollback(&mut harness).is_err(),

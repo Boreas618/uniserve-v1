@@ -12,6 +12,8 @@ publish = false
 # interface. Never a dependency of a serving build.
 [dependencies]
 anyhow.workspace = true
+# The policy package's manifest, whose declared parameters a test engine's policy runs with.
+build-server.workspace = true
 crossbeam-channel.workspace = true
 engine.workspace = true
 # The host's monotonic clock, which the buffer pool's task deadlines are stated in.
@@ -29,6 +31,8 @@ scheduling.workspace = true
 uuid.workspace = true
 proto.workspace = true
 tempfile.workspace = true
+# The policy package's declared parameters, read as the policy's arguments.
+toml.workspace = true
 # The runtime of the policy module a test engine's schedulers instantiate.
 wasmtime.workspace = true
 

@@ -74,7 +74,7 @@ pub struct Capacity {
 impl Capacity {
     /// Whether the workers stated `phase`.
     pub fn serves(&self, phase: Phase) -> bool {
-        phase != Phase::Other && self.phases & (1 << phase.index()) != 0
+        self.phases & (1 << phase.index()) != 0
     }
 
     /// Whether `batch`, a batch of `phase` being formed, still fits a bucket the workers
@@ -122,6 +122,5 @@ pub fn variants(phase: Phase) -> &'static [Variant] {
         Phase::AudioEncode => &[Variant::AudioEncode],
         Phase::Mux => &[Variant::Mux],
         Phase::LatentPrepare => &[Variant::LatentPrepare],
-        Phase::Other => &[],
     }
 }

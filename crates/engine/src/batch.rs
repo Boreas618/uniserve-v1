@@ -100,7 +100,7 @@ pub struct Batch {
     pub id: BatchId,
     /// The worker group whose ranks run the batch.
     pub group: GroupId,
-    /// What every call of the batch computes. Never [`Phase::Other`].
+    /// What every call of the batch computes.
     pub phase: Phase,
     /// The kernel and policy generation the batch was assembled for.
     pub generation: u64,
@@ -936,7 +936,7 @@ impl Batch {
     /// Checks the rules that span the batch's parts, so a batch that crosses a process boundary is
     /// refused before any of it is staged:
     ///
-    /// - the batch names a phase of the vocabulary and each request once;
+    /// - the batch names each request once;
     /// - a token batch carries no media row, one call row per request on distinct slots, and its
     ///   columns follow the three counts of [`Columns`] and fit its shape;
     /// - its state copies run on slots of its calls, restores before checkpoints and one restore
@@ -950,10 +950,6 @@ impl Batch {
     ///
     /// [`ValidationError`] naming the first rule the batch breaks.
     pub fn check(&self) -> ValidationResult<()> {
-        ensure_valid!(
-            self.phase != Phase::Other,
-            "a batch names no phase of the vocabulary"
-        );
         let mut requests = HashSet::with_capacity(self.requests.len());
         ensure_valid!(
             self.requests

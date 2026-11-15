@@ -20,9 +20,9 @@
 //!
 //! A policy never reports a bad decision here: the mechanism validates every
 //! decision and owns the hard limits (design §4.4). A trap is the policy's
-//! only failure — an exhausted fuel budget, or bytes that do not decode to the
-//! message the export expects, which the mechanism reports as a malformed
-//! reply of that call.
+//! only failure — an exhausted fuel budget, bytes that do not decode to the
+//! message the export expects, or arguments that leave out a parameter the
+//! policy requires ([`crate::limits::Unstated`]).
 
 use crate::decision::{DispatchOutput, Room, Shortage, Victim};
 use crate::event::Event;
@@ -127,14 +127,24 @@ macro_rules! export_policy {
             }
         }
 
+        /// The version of the policy interface this module was compiled against, which the
+        /// mechanism reads before any other export and refuses a module of another version by.
+        #[unsafe(no_mangle)]
+        extern "C" fn sched_interface_version() -> u32 {
+            $crate::INTERFACE_VERSION
+        }
+
         #[unsafe(no_mangle)]
         extern "C" fn sched_init(ptr: u32, len: u32) -> u64 {
             // SAFETY: the mechanism's message buffer lives for this call.
             let bytes = unsafe { $crate::abi::message(ptr, len) };
             let instantiation: $crate::Instantiation = $crate::abi::init_message(bytes);
-            let mut policy = <$policy as ::core::convert::From<$crate::Parameters>>::from(
+            // A revision that leaves out a parameter the policy requires is a fault of the
+            // instantiation: the policy has no decision to make without it.
+            let mut policy = <$policy as ::core::convert::TryFrom<$crate::Parameters>>::try_from(
                 instantiation.parameters,
-            );
+            )
+            .unwrap_or_else(|unstated| panic!("{unstated}"));
             <$policy as $crate::Policy>::init(&mut policy, &instantiation.state);
             // SAFETY: as in `policy`; `init` is called once.
             unsafe {

@@ -95,10 +95,28 @@ pub(crate) fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// The scheduling policy package this tree builds, relative to the workspace.
+pub(crate) const POLICY_PACKAGE: &str = "crates/scheduling/policies/arrival";
+
+/// A revision of the [`POLICY_PACKAGE`] whose arguments are `stated` (TOML) over the package's
+/// declared defaults, as the Build Server states a revision's arguments to the daemon that
+/// launches it.
+pub(crate) fn policy_revision(stated: &str) -> proto::module::PackageRevision {
+    let manifest =
+        build_server::manifest::Manifest::load(&workspace().join(POLICY_PACKAGE)).unwrap();
+    let mut arguments: toml::Table = manifest.parameters.into_iter().collect();
+    arguments.extend(toml::from_str::<toml::Table>(stated).unwrap());
+    proto::module::PackageRevision {
+        backend: manifest.backend,
+        revision: 1,
+        arguments,
+    }
+}
+
 /// The launch of epoch 1's one main process, engine 1, serving the Qwen3-MoE fixture on one rank of one
 /// group of [`SLOTS`] request slots, on the device the configuration defaults to: decode buckets
-/// of one and two rows, prefill buckets of up to 32 tokens, and the `fcfs` policy package, whose
-/// limits the deployment pins to what those buckets serve.
+/// of one and two rows, prefill buckets of up to 32 tokens, and the `arrival` policy package,
+/// whose limits the deployment pins to what those buckets serve.
 pub(crate) fn launch() -> EngineArgs {
     let checkpoint = workspace()
         .join("crates/models/tests/it/qwen3/data/qwen3_moe/model")
@@ -119,8 +137,7 @@ pub(crate) fn launch() -> EngineArgs {
     let modules = proto::module::ModuleSet {
         engine: package("uniserve", ""),
         // A prefill of up to 32 tokens and a batch of up to two rows: what the buckets capture.
-        policy: package(
-            "fcfs",
+        policy: policy_revision(
             "chunked_prefill_size = 32\nmax_batch = 2\nmax_num_batched_tokens = 32",
         ),
         kernels: Default::default(),

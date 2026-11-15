@@ -26,8 +26,8 @@ when it is unset. The packages are the tree's fixtures under
   structure (a rebind swap).
 - ``UNISERVE_RECAPTURE_PACKAGE``: a package of one operator whose single
   entry launches two kernels (a native module; the recapture case of 4.5).
-- ``UNISERVE_POLICY_PACKAGE``: a scheduling-policy package (wasm) whose
-  parameters differ from the serving one.
+- ``UNISERVE_POLICY_PACKAGE``: a scheduling-policy package (wasm) of the
+  serving policy's backend, which installing makes its next revision.
 - ``UNISERVE_WRONG_PACKAGE``: a package of the rebind operator whose
   result is outside ``Op::tolerance``.
 - ``UNISERVE_MODULE_TARGET``: the Build Server's target, derived from the
@@ -59,10 +59,10 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.python.e2e.build_server import POLICY_PACKAGE, repository
 from tests.python.e2e.build_server import (
     build_server as running_build_server,
 )
-from tests.python.e2e.build_server import repository
 from tests.python.e2e.http_helpers import (
     QWEN3_CHECKPOINT,
     admin,
@@ -130,11 +130,13 @@ COMMITTED = ["committed"]
 ROLLED_BACK = ["rolled_back"]
 
 
-#: The tree's fixture package each variable stands for when it is unset.
+#: The tree's package each variable stands for when it is unset: a kernel
+#: fixture, or the deployment's own policy package, whose second installation is
+#: the next revision of its backend.
 FIXTURE_PACKAGES = {
     "UNISERVE_REBIND_PACKAGE": "crates/ops/package-fixtures/rms_norm_rebind",
     "UNISERVE_RECAPTURE_PACKAGE": "crates/ops/package-fixtures/recapture",
-    "UNISERVE_POLICY_PACKAGE": "crates/scheduling/policies/fixture",
+    "UNISERVE_POLICY_PACKAGE": POLICY_PACKAGE,
     "UNISERVE_WRONG_PACKAGE": "crates/ops/package-fixtures/rms_norm_wrong",
 }
 

@@ -272,10 +272,10 @@ fn an_admission_under_way_returns_to_the_queue_before_any_victim() {
     );
 }
 
-/// When nothing else relieves a shortage, the policy's victims are taken: the `fcfs` policy
+/// When nothing else relieves a shortage, the policy's victims are taken: the `arrival` policy
 /// names the least recently used cached blocks no request holds, which the scheduler evicts by
 /// their keys, the deepest block of the request that freed them first; no request ends (SD
-/// §3.6; the `fcfs` policy's `preempt`; §4.4 "The eviction order").
+/// §3.6; the `arrival` policy's `preempt`; §4.4 "The eviction order").
 #[test]
 fn the_policys_victim_blocks_are_evicted_by_key() {
     let mut harness = Deployment::tokens().build();
@@ -321,7 +321,7 @@ fn the_policys_victim_blocks_are_evicted_by_key() {
     );
 }
 
-/// When no cached block is free, the policy's victim is a running request: the `fcfs` policy
+/// When no cached block is free, the policy's victim is a running request: the `arrival` policy
 /// names the one admitted last, which ends as `Migratable { Drain }` with its blocks committed,
 /// its partial last block under its tail key; resubmitted by the daemon with what it generated,
 /// it is admitted ahead of new requests, reads its full blocks and its tail, computes from where
@@ -438,7 +438,7 @@ fn a_mutual_shortage_preempts_the_last_admitted_of_the_lowest_priority() {
     );
 }
 
-/// Serves the `fcfs` policy again with a starvation bound of `timeout`, the deployment's other
+/// Serves the packaged policy again with a starvation bound of `timeout`, the deployment's other
 /// limits as `Deployment::tokens` states them (chunks and steps of 64 tokens, 8 calls a step).
 fn starve_after(harness: &mut Harness, timeout: Duration) {
     let module = Arc::new(policy::load(&testkit::packaged_module()).unwrap());
@@ -447,7 +447,7 @@ fn starve_after(harness: &mut Harness, timeout: Duration) {
         max_batch: Some(8),
         max_num_batched_tokens: Some(64),
         timeout: Some(Nanos(u64::try_from(timeout.as_nanos()).unwrap())),
-        ..Parameters::default()
+        ..testkit::packaged_parameters()
     };
     let (reply, replied) = crossbeam_channel::bounded(1);
     harness.apply(Message::SetPolicy(module, parameters, reply));

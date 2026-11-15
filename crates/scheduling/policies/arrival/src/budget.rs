@@ -2,32 +2,28 @@
 //!
 //! Design §4.4: the mechanism states each step's room and rejects a `DispatchOutput`
 //! that exceeds its token, call, graph-tier or slot limits as a policy
-//! failure, so a policy charges itself as it fills the step. This is the
-//! structure that does the charging, shared by every policy.
+//! failure, so the policy charges itself as it fills the step.
 //!
-//! Two budgets apply, as today:
+//! Two budgets apply:
 //!
 //! - the step's tokens and calls (`max_num_batched_tokens`, `max_batch`);
 //! - the tokens the step may spend on work that writes the prefix cache,
 //!   which is the whole step except while an epoch warms and bounds new
 //!   prefix writes (`Room::prefill_tokens`).
 //!
-//! The budgets are the step's own: the mechanism starts every step with them
-//! (today `assemble_batch` starts `budget = max_num_batched_tokens` on every
-//! pass), and the work of earlier steps was charged to those steps. So nothing
-//! is subtracted for work already in flight; [`Room::inflight`] says what those
+//! The budgets are the step's own: the mechanism starts every step with them,
+//! and the work of earlier steps was charged to those steps. So nothing is
+//! subtracted for work already in flight; [`Room::inflight`] says what those
 //! steps sent, which the prefill window reads and the budget does not.
 //!
 //! A call is charged what it costs: a prefill chunk its tokens, a decode or
 //! verification step its query tokens, a denoising step its latent units.
 
-use crate::decision::{Room, Work};
-use crate::ids::{PhaseId, RequestId};
-use crate::view::Phase;
+use scheduling::{Phase, PhaseId, RequestId, Room, Work};
 
 /// The tokens and calls one step may still spend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Shares {
+pub(crate) struct Shares {
     /// Tokens the step may still spend.
     tokens: u32,
     /// Calls the step may still add.
@@ -38,18 +34,9 @@ pub struct Shares {
 }
 
 impl Shares {
-    /// The shares of one step.
-    pub fn new(tokens: u32, calls: usize, prefill: Option<u32>) -> Self {
-        Self {
-            tokens,
-            calls,
-            prefill,
-        }
-    }
-
     /// The shares a room states: the step's tokens and calls, and the
     /// warm-up's bound on prefix writes.
-    pub fn of(room: &Room) -> Self {
+    pub(crate) fn of(room: &Room) -> Self {
         Self {
             tokens: room.token_budget,
             calls: room.call_budget,
@@ -58,22 +45,17 @@ impl Shares {
     }
 
     /// Tokens the step may still spend.
-    pub fn tokens(&self) -> u32 {
+    pub(crate) fn tokens(&self) -> u32 {
         self.tokens
     }
 
-    /// Calls the step may still add.
-    pub fn calls(&self) -> usize {
-        self.calls
-    }
-
     /// Tokens the step may still spend on work that writes the prefix cache.
-    pub fn prefill(&self) -> u32 {
+    pub(crate) fn prefill(&self) -> u32 {
         self.prefill.unwrap_or(self.tokens)
     }
 
     /// Whether no further call fits.
-    pub fn full(&self) -> bool {
+    pub(crate) fn full(&self) -> bool {
         self.calls == 0 || self.tokens == 0
     }
 
@@ -83,7 +65,7 @@ impl Shares {
     /// A call that does not fit changes nothing, so a policy can leave the
     /// room to a later request, as the current scheduler does when a call
     /// cannot reserve its storage.
-    pub fn charge(&mut self, tokens: u32) -> bool {
+    pub(crate) fn charge(&mut self, tokens: u32) -> bool {
         if self.calls == 0 || tokens > self.tokens {
             return false;
         }
@@ -94,7 +76,7 @@ impl Shares {
 
     /// Takes one call costing `tokens` that also writes the prefix cache out
     /// of both budgets, returning whether it fitted in both.
-    pub fn charge_prefill(&mut self, tokens: u32) -> bool {
+    pub(crate) fn charge_prefill(&mut self, tokens: u32) -> bool {
         if self.calls == 0 || tokens > self.tokens || tokens > self.prefill() {
             return false;
         }
@@ -118,10 +100,10 @@ impl Shares {
 ///
 /// The start is the view's `prefilled_tokens`, which already states the further
 /// of the two cursors — the prompt tokens the runtime computed and the prefix
-/// the cache held at admission ([`crate::RequestView`]); `page_tokens` is the KV
-/// page size ([`crate::Room::page_tokens`]). A zero here means the prompt is
+/// the cache held at admission ([`scheduling::RequestView`]); `page_tokens` is the KV
+/// page size ([`Room::page_tokens`]). A zero here means the prompt is
 /// done.
-pub fn prefill_chunk(
+pub(crate) fn prefill_chunk(
     start: u32,
     prompt_tokens: u32,
     chunked_prefill_size: u32,
@@ -150,15 +132,14 @@ pub fn prefill_chunk(
     aligned.saturating_sub(start).max(1)
 }
 
-/// The token work one call of `kind` states, as the current scheduler charges
-/// it (`call_token_cost` in `batching.rs`).
+/// The token work one call of `kind` is charged.
 ///
 /// A prefill or refill chunk is the chunk the policy sizes; every other phase
 /// states the charge the mechanism's view already states for the request's
-/// next call ([`crate::RequestView::next_tokens`]: a verification's `1 +
+/// next call ([`scheduling::RequestView::next_tokens`]: a verification's `1 +
 /// drafts`, a denoising step's `latent units x guidance branches`, one for
 /// decode).
-pub fn work_tokens(kind: Phase, chunk: u32, next_tokens: u32) -> u32 {
+pub(crate) fn work_tokens(kind: Phase, chunk: u32, next_tokens: u32) -> u32 {
     match kind {
         Phase::Prefill | Phase::Refill => chunk,
         _ => next_tokens.max(1),
@@ -170,14 +151,14 @@ pub fn work_tokens(kind: Phase, chunk: u32, next_tokens: u32) -> u32 {
 /// A policy adds work in its own order and stops when nothing more fits; the
 /// order is the decision, the charging is not.
 #[derive(Clone, Debug)]
-pub struct Step {
+pub(crate) struct Step {
     shares: Shares,
     work: Vec<Work>,
 }
 
 impl Step {
     /// A step with the given shares and no work.
-    pub fn new(shares: Shares) -> Self {
+    pub(crate) fn new(shares: Shares) -> Self {
         Self {
             shares,
             work: Vec::new(),
@@ -185,7 +166,7 @@ impl Step {
     }
 
     /// The shares the step has left.
-    pub fn shares(&self) -> Shares {
+    pub(crate) fn shares(&self) -> Shares {
         self.shares
     }
 
@@ -195,7 +176,7 @@ impl Step {
     /// `writes_prefix` says the call's phase writes the prefix cache, which
     /// draws on the warm-up bound as well as on the step's tokens
     /// ([`Phase::writes_prefix_cache`]).
-    pub fn add(
+    pub(crate) fn add(
         &mut self,
         request: RequestId,
         phase: PhaseId,
@@ -219,7 +200,7 @@ impl Step {
     }
 
     /// The work of the step, in the order it was added.
-    pub fn into_work(self) -> Vec<Work> {
+    pub(crate) fn into_work(self) -> Vec<Work> {
         self.work
     }
 }
@@ -228,11 +209,22 @@ impl Step {
 mod tests {
     use super::*;
 
+    /// The shares of a step of `tokens` tokens and `calls` calls, of which `prefill` tokens may
+    /// write the prefix cache.
+    fn step(tokens: u32, calls: usize, prefill: Option<u32>) -> Shares {
+        Shares::of(&Room {
+            token_budget: tokens,
+            call_budget: calls,
+            prefill_tokens: prefill,
+            ..Room::default()
+        })
+    }
+
     #[test]
     fn a_call_is_charged_its_tokens_and_one_call() {
-        let mut shares = Shares::new(10, 2, None);
+        let mut shares = step(10, 2, None);
         assert!(shares.charge(4));
-        assert_eq!((shares.tokens(), shares.calls()), (6, 1));
+        assert_eq!(shares, step(6, 1, None));
         assert!(shares.charge(6));
         assert!(shares.full());
         assert!(!shares.charge(1));
@@ -240,14 +232,14 @@ mod tests {
 
     #[test]
     fn a_call_that_does_not_fit_charges_nothing() {
-        let mut shares = Shares::new(5, 4, None);
+        let mut shares = step(5, 4, None);
         assert!(!shares.charge(6));
-        assert_eq!((shares.tokens(), shares.calls()), (5, 4));
+        assert_eq!(shares, step(5, 4, None));
     }
 
     #[test]
     fn prefix_writing_work_draws_on_both_budgets() {
-        let mut shares = Shares::new(10, 4, Some(3));
+        let mut shares = step(10, 4, Some(3));
         assert!(!shares.charge_prefill(4));
         assert_eq!((shares.tokens(), shares.prefill()), (10, 3));
         assert!(shares.charge_prefill(3));
@@ -259,7 +251,7 @@ mod tests {
 
     #[test]
     fn without_a_warm_up_bound_the_whole_step_is_the_bound() {
-        let mut shares = Shares::new(8, 2, None);
+        let mut shares = step(8, 2, None);
         assert_eq!(shares.prefill(), 8);
         assert!(shares.charge_prefill(5));
         assert_eq!((shares.tokens(), shares.prefill()), (3, 3));
@@ -275,7 +267,7 @@ mod tests {
         };
         let shares = Shares::of(&room);
         assert_eq!(shares.tokens(), 100);
-        assert_eq!(shares.calls(), 8);
+        assert_eq!(shares.calls, 8);
         assert_eq!(shares.prefill(), 40);
     }
 
@@ -315,7 +307,7 @@ mod tests {
 
     #[test]
     fn the_step_keeps_the_order_work_was_added_in() {
-        let mut step = Step::new(Shares::new(8, 3, None));
+        let mut step = Step::new(step(8, 3, None));
         assert!(step.add(RequestId(1), PhaseId(0), 2, false));
         assert!(step.add(RequestId(2), PhaseId(1), 2, false));
         assert!(!step.add(RequestId(3), PhaseId(0), 9, true));

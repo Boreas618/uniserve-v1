@@ -83,7 +83,7 @@ pub(crate) use cache::Cached;
 pub(crate) use group::WorkerGroup;
 /// The packaged policies this tree builds, for the tests of the engine that serves them.
 #[cfg(test)]
-pub(crate) use policy::tests::packaged;
+pub(crate) use policy::tests::{packaged, packaged_arguments};
 use policy::{Policy, PolicyError, ceilings};
 pub(crate) use request::{Blocks, Request, RequestStatus};
 pub(crate) use view::view_of;
