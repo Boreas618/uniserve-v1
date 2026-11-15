@@ -1,52 +1,67 @@
-# Shortcuts for local checks and tests. Build is `uv sync` / `cargo`;
-# serving is `uniserve serve <model> --served-model-name <name>`.
+# The repository's checks and test suites. cargo is rustup's, at the release
+# `rust-toolchain.toml` pins; every Python command runs in the repository's
+# environment, which installs the `uniserve` executable the tests run. Serving
+# is `uniserve serve <model> --served-model-name <name>`.
 
-python := env("PYTHON", "uv run python")
-cargo := env("CARGO", "cargo")
+# A recipe's arguments reach its command as the shell's positional arguments,
+# so `"$@"` passes each one as it was given, a marker expression's spaces
+# included.
+set positional-arguments
 
-# Format check (Rust)
+# A Python command, in the repository's environment with the extras of the
+# development tools, the tests and the evaluator (docs/testing.md), which uv
+# first brings up to date with the lockfile.
+uv_run := "uv run --locked --extra dev --extra test --extra bench"
+
+# Where a GPU suite writes what a run leaves: pytest's temporary directory,
+# which holds every server's log, and the JUnit report. `just e2e=DIR <recipe>`
+# names another directory.
+e2e := "artifacts/e2e/" + datetime_utc("%Y%m%dT%H%M%SZ")
+
+[doc("Format check (Rust)")]
 fmt:
-    {{cargo}} fmt --all -- --check
+    cargo fmt --all -- --check
 
-# Clippy lint (Rust)
-clippy:
-    {{cargo}} clippy --workspace --all-targets -- -D warnings
+[doc("Clippy lint (Rust); arguments go to cargo, such as `--features media/vendored`")]
+clippy *cargo:
+    cargo clippy --workspace --all-targets "$@" -- -D warnings
 
-# Run Rust tests
-test-rust:
-    {{cargo}} test --workspace
+[doc("Run Rust tests; arguments go to cargo")]
+test-rust *cargo:
+    cargo test --workspace "$@"
 
-# Build benchmarks without running
-bench-build:
-    {{cargo}} bench --workspace --no-run
+[doc("Build benchmarks without running; arguments go to cargo")]
+bench-build *cargo:
+    cargo bench --workspace --no-run "$@"
 
-# Lint: fmt + clippy + ruff + mypy
+[doc("Lint: fmt + clippy + ruff + mypy")]
 lint: fmt clippy
-    {{python}} -m ruff check uniserve_eval tests
-    {{python}} -m ruff format --check uniserve_eval tests
-    {{python}} -m mypy
+    {{ uv_run }} ruff check uniserve_eval tests
+    {{ uv_run }} ruff format --check uniserve_eval tests
+    {{ uv_run }} mypy
 
-# Fast Python tests (CPU only); the kernel checks run on Triton's interpreter. A kernel check that
-# launches what a package states for a descriptor key asks the environment's `uniserve` (`uniserve
-# build-server launch`, which runs the Build Server's environment program `uniserve-build-server`
-# from the search path), which `uv sync` installs with the root project.
-test-python-fast:
-    {{python}} -m pytest -m "unit and not gpu"
+# The kernel checks run on Triton's interpreter.
+[doc("Fast Python tests (CPU only); arguments go to pytest")]
+test-python-fast *pytest:
+    {{ uv_run }} pytest -m "unit and not gpu" "$@"
 
-# The missing-state tests (GPU) with every main process under compute-sanitizer's
-# memcheck; the logs go to $SANITIZER_LOGS (the run's artifacts by default).
-# docs/testing.md lists the variables the tests read.
-test-python-sanitizer:
-    PYTHON="{{python}}" tools/gpu_e2e.sh --memcheck -m "e2e and gpu and missing_state"
+# One pytest-xdist worker per GPU the run may lease, each case on the GPUs it
+# leases (docs/testing.md). pytest makes its temporary directory, but not the
+# directories above it.
+[doc("End-to-end Python tests (GPU); arguments go to pytest, such as a module")]
+test-python-gpu *pytest:
+    mkdir -p "{{ e2e }}"
+    {{ uv_run }} pytest -n auto --dist loadgroup --basetemp "{{ e2e }}/pytest" \
+        --junitxml "{{ e2e }}/junit.xml" -m "e2e and gpu" "$@"
 
-# End-to-end Python tests (GPU), one case per free GPU, from one release
-# build. docs/testing.md lists the variables the tests read.
-test-python-gpu:
-    PYTHON="{{python}}" tools/gpu_e2e.sh -m "e2e and gpu"
+# Every deployment runs the engine package `memcheck` (tests/python/sanitizer),
+# with more of each device left free and every wait stretched; the package
+# awaits a declared engine launcher (docs/testing.md).
+[doc("The missing-state tests (GPU) under compute-sanitizer's memcheck; arguments go to pytest")]
+test-python-sanitizer *pytest:
+    {{ just_executable() }} e2e="{{ e2e }}" test-python-gpu --engine memcheck --time-scale 20 \
+        --serve-set mem_fraction_static=0.6 --serve-set worker_config.watchdog_timeout=2h \
+        -m "e2e and gpu and missing_state" "$@"
 
-# Run all checks
+[doc("Run all checks")]
 test-all: fmt clippy test-rust bench-build test-python-fast
-
-# Resolve the decode-runtime suite without starting a server
-eval-plan:
-    {{python}} -m uniserve_eval plan decode-runtime

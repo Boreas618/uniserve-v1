@@ -37,12 +37,12 @@ A check that launches what a Triton package's launch table states for a descript
 
 ## GPU end-to-end tests
 
-The HTTP tests under `tests/python/e2e` start real servers on the host's GPUs. `just test-python-gpu` runs every test marked `e2e and gpu`; `just test-python-sanitizer` runs those marked `missing_state` under compute-sanitizer's memcheck. Both call `tools/gpu_e2e.sh`, which the nightly workflows call as well:
+The HTTP tests under `tests/python/e2e` start real servers on the host's GPUs. `just test-python-gpu` runs every test marked `e2e and gpu`; `just test-python-sanitizer` runs those marked `missing_state` under compute-sanitizer's memcheck. The nightly workflow (`.github/workflows/gpu-nightly.yml`) runs both recipes:
 
 - every process of every test deployment runs the `uniserve` executable the environment installed; the run's Build Server compiles kernels with its toolchain environment, whose program `uniserve-build-server` must be on the search path;
 - its serving processes take the NVIDIA driver, NCCL and CUPTI from the host's default loader path, and FFmpeg as the build found it through pkg-config: the host provides the releases the [README](../README.md#requirements) names, and a process refuses an older driver, NCCL or CUPTI by name;
-- it runs pytest with one worker per GPU (pytest-xdist), and each case leases the GPUs it serves on (`tests/python/e2e/conftest.py`), so independent cases run beside one another on different GPUs while a case that observes host-wide state runs alone; the cases of a module that serves one deployment for all of them stay on one worker. Leases are advisory locks a case takes under one allocator lock, blocking on a GPU until its holder releases it;
-- it writes pytest's temporary directory, which holds every server's log, and a JUnit report to `artifacts/e2e/<UTC time>/` unless `UNISERVE_E2E_ARTIFACTS` names another directory; `UNISERVE_E2E_WORKERS` states another worker count.
+- the recipe runs pytest on one pytest-xdist worker per GPU the run may lease (`-n auto`, which the plugin answers with the count of `--e2e-devices`, else of the GPUs NVML reports), and each case leases the GPUs it serves on (`tests/python/e2e/conftest.py`), so independent cases run beside one another on different GPUs while a case that observes host-wide state runs alone; the cases of a module that serves one deployment for all of them stay on one worker (`--dist loadgroup`). Leases are advisory locks a case takes under one allocator lock, blocking on a GPU until its holder releases it;
+- the recipe writes pytest's temporary directory, which holds every server's log, and a JUnit report to `artifacts/e2e/<UTC time>/`, or to the directory `just e2e=DIR test-python-gpu` names.
 
 Each test session (each pytest-xdist worker) starts one Build Server with every package of the tree installed (the kernel packages, the scheduling policy and the engine), and every deployment resolves its modules there: a deployment states its host's Build Server, and its daemon refuses one that serves with other settings, so each deployment states that server's settings, as its readiness record reports them, as its `build_config` (a `--config` file); the Build Server compiles a kernel the first time a deployment asks for it, so the first deployment of a session takes longer. A module whose cases install package revisions of their own (`test_generation_update_http.py`, `test_live_updates_http.py`) starts a Build Server of its own, since an installed revision is what every later deployment would select.
 
@@ -68,14 +68,16 @@ A two-host case runs on this host and a second one when `--peer-host` names the 
 
 ### Under compute-sanitizer
 
-`tools/gpu_e2e.sh --memcheck` runs the deployments with the engine package `memcheck` (`tests/python/sanitizer`), more device storage left free and every wait stretched. The package runs the tree's engine under compute-sanitizer's memcheck through a wrapper that reads its target and log directory from its environment, which the declared launch environment no longer carries: the suite runs again once a declared engine launcher replaces the package.
+`just test-python-sanitizer` runs the deployments with the engine package `memcheck` (`tests/python/sanitizer`, `--engine memcheck`), more device storage left free (`--serve-set mem_fraction_static=0.6`, and a longer `worker_config.watchdog_timeout`) and every wait stretched (`--time-scale 20`). The package runs the tree's engine under compute-sanitizer's memcheck through a wrapper that reads its target and log directory from its environment, which the declared launch environment no longer carries: the suite runs again once a declared engine launcher replaces the package.
 
 ### Example
+
+With the Build Server environment's `bin` directory (`crates/build-server/python/.venv/bin`) on the search path:
 
 ```bash
 uv sync --locked --extra dev --extra test --extra bench
 uv sync --locked --project crates/build-server/python
-PATH=$PWD/crates/build-server/python/.venv/bin:$PATH just test-python-gpu
+just test-python-gpu
 ```
 
-Arguments after the recipe's own go to pytest through `tools/gpu_e2e.sh`, so one module runs with `tools/gpu_e2e.sh -m "e2e and gpu" tests/python/e2e/test_live_updates_http.py`.
+The recipes run pytest in the repository's environment through `uv run --locked`, which first brings the environment up to date with the lockfile. Arguments after a recipe's name go to pytest, so one module runs with `just test-python-gpu tests/python/e2e/test_live_updates_http.py`, and a run that may lease four GPUs only with `just test-python-gpu --e2e-devices 0,1,2,3`.

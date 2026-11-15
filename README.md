@@ -180,10 +180,10 @@ just test-python-fast
 just test-python-gpu
 ```
 
-`test-python-fast` runs without a CUDA device. The HTTP tests under `tests/python/e2e` start real servers on the host's GPUs with the `uniserve` the environment installed; `test-python-gpu` runs them one case per free GPU, and a plain `pytest` deselects them (`-m "e2e and gpu"` selects them). The cases serve released checkpoints by Hugging Face repository and pinned revision from the standard cache; [Testing](docs/testing.md) lists them and the tests' options. The FastH3 tests, for example, load a complete checkpoint on four GPUs:
+`test-python-fast` runs without a CUDA device. The HTTP tests under `tests/python/e2e` start real servers on the host's GPUs with the `uniserve` the environment installed; `test-python-gpu` runs them on one worker per GPU, each case on the GPUs it leases, and a plain `pytest` deselects them (`-m "e2e and gpu"` selects them). The cases serve released checkpoints by Hugging Face repository and pinned revision from the standard cache; [Testing](docs/testing.md) lists them and the tests' options. A recipe's further arguments go to pytest; the FastH3 tests, for example, load a complete checkpoint on four GPUs:
 
 ```bash
-tools/gpu_e2e.sh -m "e2e and gpu" tests/python/e2e/test_h3_parallel_http.py
+just test-python-gpu tests/python/e2e/test_h3_parallel_http.py
 ```
 
 The serving evaluator runs HTTP workloads against serving models, measures performance, validates response correctness, and writes reproducible result bundles. Benchmark points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).

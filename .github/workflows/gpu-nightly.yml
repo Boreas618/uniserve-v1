@@ -1,0 +1,49 @@
+name: Nightly GPU suites
+
+# The justfile's GPU suites on the self-hosted GPU runner: the end-to-end tests
+# (`just test-python-gpu`) and the cases marked `missing_state` with every main
+# process under compute-sanitizer's memcheck (`just test-python-sanitizer`),
+# so that code assuming an optional derived state is present fails there first.
+# The runner host provides what the README's requirements name: the driver,
+# NCCL and CUPTI on the default loader path, FFmpeg 8.1 through pkg-config, the
+# CUDA toolkit and cuDNN NVIDIA's packages register, and rustup. The cases
+# serve released checkpoints by Hugging Face repository and pinned revision
+# from the runner's Hugging Face cache (docs/testing.md).
+
+on:
+  schedule:
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+
+jobs:
+  gpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: test-python-gpu
+            timeout: 360
+          - suite: test-python-sanitizer
+            timeout: 1440
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: ${{ matrix.timeout }}
+    env:
+      E2E: artifacts/e2e/${{ matrix.suite }}-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain, its components and the wasm32 target scheduling policies
+      # are built for, as rust-toolchain.toml states them.
+      - run: rustup toolchain install
+      - uses: astral-sh/setup-uv@v6
+      - uses: extractions/setup-just@v2
+      - run: uv sync --locked --extra dev --extra test --extra bench --extra gpu
+      - run: uv sync --locked --project crates/build-server/python
+      # The Build Server runs its toolchain environment's program from the
+      # search path (crates/build-server/python/README.md).
+      - run: echo "$PWD/crates/build-server/python/.venv/bin" >> "$GITHUB_PATH"
+      - run: just e2e="$E2E" ${{ matrix.suite }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.suite }}
+          path: ${{ env.E2E }}
