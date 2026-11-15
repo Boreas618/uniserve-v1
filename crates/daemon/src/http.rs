@@ -183,8 +183,9 @@ pub async fn serve(
         .await
         .context("failed to bind the daemon's listener")?;
     let admins = admin::Listeners::bind(instance.path())?;
-    let join = match (&config.model, &config.dist_init_addr) {
-        (Some(_), Some(endpoint)) => Some(Daemon::bind_join(endpoint)?),
+    // A model stated as a repository or as a local directory configures the node's deployment.
+    let join = match &config.dist_init_addr {
+        Some(endpoint) if config.states_model() => Some(Daemon::bind_join(endpoint)?),
         _ => None,
     };
     {
@@ -195,16 +196,17 @@ pub async fn serve(
     }
     ready.report(service::State::Listening);
 
-    let (lifetime, first) = match config.model {
-        Some(_) => (
+    let (lifetime, first) = if config.states_model() {
+        (
             node::Lifetime::Deployment,
             node::First::Configured {
                 config: Box::new(config.clone()),
                 stated,
                 join,
             },
-        ),
-        None => (node::Lifetime::Deployments, node::First::Idle),
+        )
+    } else {
+        (node::Lifetime::Deployments, node::First::Idle)
     };
     let start = node::Start {
         families,
