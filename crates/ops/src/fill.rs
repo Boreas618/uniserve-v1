@@ -134,12 +134,13 @@ impl Op for Fill {
         let [destination] = strided::merge_axes([&args.destination]);
         let elements = destination.numel();
 
+        let slots = strided::Slots::of(Self::NAME, kernel, "t")?;
         let mut arguments = Arguments::new(Self::NAME);
         arguments
             .view("destination", &destination)
             .u64("elements", elements);
-        strided::pack_extents(&mut arguments, "d", &destination);
-        strided::pack_strides(&mut arguments, "t", &destination);
+        slots.extents(&mut arguments, "d", &destination)?;
+        slots.strides(&mut arguments, "t", &destination)?;
         arguments.u64("bits", args.bits);
 
         kernel.launch(

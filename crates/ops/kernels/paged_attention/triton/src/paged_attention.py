@@ -52,9 +52,9 @@ import triton.language as tl
 #: `BLOCK_Q · GROUP_PAD`, and the most elements its query tile holds, which
 #: lowers the pairs for a wide head (sixty-four at a head of 256, thirty-two at
 #: 512) so that the tile, its accumulator and the key tile fit one
-#: multiprocessor without spilling: the operator's `PREFILL_TILE_ROWS` and
-#: `PREFILL_TILE_ELEMENTS` (`crates/ops/src/attention/mod.rs`), from which its
-#: launch derives the grid. The numbers are one statement and change together.
+#: multiprocessor without spilling. A module records the `BLOCK_Q` they make
+#: among its compile-time definitions, from which the operator's launch counts
+#: the grid.
 TILE_ROWS = 128
 TILE_ELEMENTS = 16384
 
@@ -69,12 +69,13 @@ KEY_TILE_ELEMENTS = 8192
 #: next key tile's loads in flight during this one's products.
 PREFILL_OPTIONS = {"num_warps": 8, "num_stages": 2}
 
-#: The (query, cache) element types, by Triton's names, whose values one 16-bit
-#: type holds exactly, so that the tensor cores multiply them exactly: an E4M3
-#: value has four significant bits and an exponent in `[-9, 8]`, so BF16 and F16
-#: both hold it, and a BF16 cache is the BF16 query's own type. Any other pair
-#: is multiplied on the CUDA cores in f32, one key at a time.
-TENSOR_CORE_PAIRS = {("bf16", "fp8e4nv"), ("bf16", "bf16"), ("fp16", "fp8e4nv")}
+#: The (query, cache) element types, by the names a descriptor's fields give
+#: them (`ops::abi`'s), whose values one 16-bit type holds exactly, so that the
+#: tensor cores multiply them exactly: an E4M3 value has four significant bits
+#: and an exponent in `[-9, 8]`, so BF16 and F16 both hold it, and a BF16 cache
+#: is the BF16 query's own type. Any other pair is multiplied on the CUDA cores
+#: in f32, one key at a time.
+TENSOR_CORE_PAIRS = {("bf16", "f8e4m3"), ("bf16", "bf16"), ("f16", "f8e4m3")}
 
 
 def prefill_tiles(q_heads, kv_heads, head_dim):
@@ -98,14 +99,14 @@ def prefill_tiles(q_heads, kv_heads, head_dim):
 def prefill_products(query, plane):
     """The prefill program's product constexprs for a query and cache type.
 
-    The types are Triton's names of them.
+    The types are named as the descriptor's fields name them.
 
     ``TENSOR_CORES`` multiplies on the tensor cores (`TENSOR_CORE_PAIRS`), with
     the scores in F16 for F16 queries (``F16_SCORES``) and in BF16 otherwise.
     """
     return {
         "TENSOR_CORES": (query, plane) in TENSOR_CORE_PAIRS,
-        "F16_SCORES": query == "fp16",
+        "F16_SCORES": query == "f16",
     }
 
 
@@ -790,15 +791,8 @@ def derive(fields, parameters, target):
         derived["stages"] = DECODE_STAGES
         return derived
 
-    # The products compare the element types by Triton's names, which the
-    # Build Server's drivers spell by one table; the Triton driver is this
-    # function's caller.
-    from uniserve_build_server.binding import element
-
     tiles = prefill_tiles(q_heads, kv_heads, fields["head_dim"])
-    products = prefill_products(
-        element(fields["dtype"]), element(fields["kv"])
-    )
+    products = prefill_products(fields["dtype"], fields["kv"])
     derived.update(
         warps=PREFILL_OPTIONS["num_warps"],
         stages=PREFILL_OPTIONS["num_stages"],

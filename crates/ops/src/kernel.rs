@@ -30,6 +30,7 @@
 //! while the stream is capturing.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 
 use platform::{
@@ -83,7 +84,8 @@ impl NativeCall for LoadCall {
 
 /// A module's launch metadata, in Triton's field names.
 ///
-/// Triton writes this JSON beside every cubin it compiles, and the Build Server writes the same
+/// Triton writes this JSON beside every cubin it compiles, the Build Server's Triton driver adds
+/// the launch signature and the compile-time definitions, and its CUDA driver writes the same
 /// record for a cubin it compiles with nvcc; `ops` reads those fields directly rather than
 /// defining a manifest of its own, so a module's launch shape travels with the module. Every field
 /// below is required: a record that lacks one is refused at load instead of launched with a
@@ -122,6 +124,13 @@ pub struct CubinMetadata {
     pub profile_scratch_size: u64,
     /// The alignment profile scratch must have.
     pub profile_scratch_align: u64,
+    /// The values the module was compiled with, by name: a Triton kernel's constexprs as its
+    /// launch table bound them, a CUDA unit's preprocessor definitions.
+    ///
+    /// A launch that depends on one of them (the tile a grid is counted in) reads it here, from
+    /// the module it launches, instead of restating it beside the package. A module compiled with
+    /// none states an empty object.
+    pub definitions: BTreeMap<String, serde_json::Value>,
 }
 
 /// One parameter of a kernel's runtime signature.
@@ -198,6 +207,27 @@ impl CubinMetadata {
     /// Whether the kernel needs global scratch.
     pub const fn needs_scratch(&self) -> bool {
         self.global_scratch_size > 0
+    }
+
+    /// The compile-time definition `name`, which the module states as a non-negative integer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Metadata`] naming the kernel and the definition when the module states none of
+    /// that name, or states it as another value than a non-negative integer.
+    pub fn integer(&self, name: &str) -> Result<u64> {
+        let value = self.definitions.get(name).ok_or_else(|| {
+            Error::Metadata(format!(
+                "`{}` was compiled with no definition `{name}`",
+                self.name
+            ))
+        })?;
+        value.as_u64().ok_or_else(|| {
+            Error::Metadata(format!(
+                "`{}` defines `{name}` as {value}, which is no non-negative integer",
+                self.name
+            ))
+        })
     }
 }
 
@@ -877,6 +907,7 @@ mod tests {
             "global_scratch_align": 1,
             "profile_scratch_size": 0,
             "profile_scratch_align": 1,
+            "definitions": {"BLOCK": 1024, "PDL": false},
         });
         CubinMetadata::parse(record.to_string().as_bytes()).expect("the metadata parses")
     }

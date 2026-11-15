@@ -21,28 +21,24 @@
 //!
 //! ## The words
 //!
-//! A program takes [`SLOTS`] strides per strided operand and `SLOTS − 1` extents per index
-//! space, right-aligned: axis `k` of `rank` axes is slot `SLOTS − rank + k`, and the slots
-//! before it are unit extents and zero strides that a program compiled for `rank` never reads.
-//! The extent of slot 0 does not travel: only an outermost axis can sit there, and a row-major
-//! index needs no modulus on its outermost axis.
+//! A program takes `slots` strides per strided operand (`s0`, `s1`, ...) and `slots − 1` extents
+//! per index space (`d1`, ...), right-aligned: axis `k` of `rank` axes is slot
+//! `slots − rank + k`, and the slots before it are unit extents and zero strides that a program
+//! compiled for `rank` never reads. The extent of slot 0 does not travel: only an outermost axis
+//! can sit there, and a row-major index needs no modulus on its outermost axis.
 //!
-//! An operand takes as many axes as a tensor does, and the folding brings a call down to the axes
-//! its address arithmetic needs, which is what the slots carry: a call that still traverses more
-//! axes than [`SLOTS`] after folding is refused by its operator's check.
+//! The slots are the kernel's own parameters, so a launch counts them in the signature of the
+//! module it launches ([`Slots::of`]). An operand takes as many axes as a tensor does, and the
+//! folding brings a call down to the axes its address arithmetic needs; which ranks a package
+//! compiles is its manifest's statement (the descriptor's `rank` dimension), so a call that still
+//! traverses more axes than a package covers names a key no package builds.
 
 use tensor::nditer::merge_axes as fold;
 use tensor::{DType, Layout, Shape};
 
-use crate::kernel::Arguments;
+use crate::kernel::{Arguments, Kernel};
 use crate::operand::Operand;
 use crate::{Error, Result, Twins, abi};
-
-/// The axes a primitive's program addresses: the extent and stride words of the packages' ABI.
-///
-/// Every primitive package is compiled against six stride words per operand and five extent
-/// words per index space; a descriptor's `rank` is at most this.
-pub(crate) const SLOTS: usize = 6;
 
 /// The element types the primitives compute with.
 pub(crate) const ELEMENTS: [DType; 9] = [
@@ -259,23 +255,13 @@ pub(crate) fn require_window(operator: &'static str, name: &str, operand: &Opera
     Ok(())
 }
 
-/// Check that a descriptor states the axes its call traverses, and that the program's slots
-/// hold them.
+/// Check that a descriptor states the axes its call traverses.
 pub(crate) fn require_rank(
     operator: &'static str,
     field: &str,
     stated: u8,
     traversed: u8,
 ) -> Result<()> {
-    if usize::from(traversed) > SLOTS {
-        return Err(Error::argument(
-            operator,
-            format!(
-                "the operands traverse {traversed} axes once folded, and a primitive's program \
-                 addresses at most {SLOTS}"
-            ),
-        ));
-    }
     if stated == traversed {
         return Ok(());
     }
@@ -360,36 +346,114 @@ pub(crate) fn select_axes(operand: &Operand, keep: impl Fn(usize) -> bool) -> Op
     Operand::with_layout(operand.ptr, operand.dtype, &layout)
 }
 
-/// Pack the extents of an index space: the words of slots 1 to `SLOTS − 1`, right-aligned,
-/// unit before the first axis, each named `<prefix><slot>` as the packages' kernels name them
-/// (`d1` to `d5`). The caller's check refused more than [`SLOTS`] axes.
-pub(crate) fn pack_extents(arguments: &mut Arguments, prefix: &str, operand: &Operand) {
-    let pad = SLOTS - operand.rank();
-    for slot in 1..SLOTS {
-        arguments.u64(
-            format!("{prefix}{slot}"),
-            if slot < pad {
-                1
-            } else {
-                operand.dim(slot - pad)
-            },
-        );
-    }
+/// The axes a primitive's module addresses: the stride words it takes per strided operand.
+///
+/// A primitive's kernel states its slots as parameters (`s0` to `s5` of an operand, `d1` to `d5`
+/// of an index space), so a launch counts them in the signature of the module it launches and packs
+/// that many words; the names it packs are then checked by the same signature.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Slots {
+    operator: &'static str,
+    count: usize,
 }
 
-/// Pack an operand's strides: `SLOTS` words, right-aligned, zero before the first axis, each
-/// named `<prefix><slot>` as the packages' kernels name them (`s0` to `s5`). The caller's check
-/// refused more than [`SLOTS`] axes.
-pub(crate) fn pack_strides(arguments: &mut Arguments, prefix: &str, operand: &Operand) {
-    let pad = SLOTS - operand.rank();
-    for slot in 0..SLOTS {
-        arguments.u64(
-            format!("{prefix}{slot}"),
-            if slot < pad {
-                0
-            } else {
-                operand.stride(slot - pad)
-            },
-        );
+impl Slots {
+    /// The slots of `kernel`'s module: the stride words `<prefix>0`, `<prefix>1`, ... its
+    /// signature takes for one strided operand.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Metadata`] when the kernel is no cubin or its signature takes no such word.
+    pub(crate) fn of(operator: &'static str, kernel: &Kernel, prefix: &str) -> Result<Self> {
+        let metadata = kernel.metadata().ok_or_else(|| Error::KernelForm {
+            operator,
+            kernel: kernel.name().to_owned(),
+            expected: "cubin",
+            actual: "native",
+        })?;
+        let count = metadata
+            .signature
+            .iter()
+            .filter(|parameter| {
+                parameter
+                    .name
+                    .strip_prefix(prefix)
+                    .is_some_and(|slot| slot.parse::<usize>().is_ok())
+            })
+            .count();
+        if count == 0 {
+            return Err(Error::Metadata(format!(
+                "`{}` takes no stride word `{prefix}0`",
+                metadata.name
+            )));
+        }
+        Ok(Self { operator, count })
+    }
+
+    /// The unit or zero words before an operand's first axis, right-aligning its `rank` axes in
+    /// the slots.
+    fn pad(self, operand: &Operand) -> Result<usize> {
+        self.count.checked_sub(operand.rank()).ok_or_else(|| {
+            Error::argument(
+                self.operator,
+                format!(
+                    "the operands traverse {} axes and the module addresses {}",
+                    operand.rank(),
+                    self.count
+                ),
+            )
+        })
+    }
+
+    /// Pack the extents of an index space: the words of slots 1 to `slots − 1`, right-aligned,
+    /// unit before the first axis, each named `<prefix><slot>` (`d1` to `d5`).
+    ///
+    /// # Errors
+    ///
+    /// An argument error when the operand has more axes than the module's slots.
+    pub(crate) fn extents(
+        self,
+        arguments: &mut Arguments,
+        prefix: &str,
+        operand: &Operand,
+    ) -> Result<()> {
+        let pad = self.pad(operand)?;
+        for slot in 1..self.count {
+            arguments.u64(
+                format!("{prefix}{slot}"),
+                if slot < pad {
+                    1
+                } else {
+                    operand.dim(slot - pad)
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Pack an operand's strides: one word per slot, right-aligned, zero before the first axis,
+    /// each named `<prefix><slot>` (`s0` to `s5`).
+    ///
+    /// # Errors
+    ///
+    /// An argument error when the operand has more axes than the module's slots.
+    pub(crate) fn strides(
+        self,
+        arguments: &mut Arguments,
+        prefix: &str,
+        operand: &Operand,
+    ) -> Result<()> {
+        let pad = self.pad(operand)?;
+        for slot in 0..self.count {
+            arguments.u64(
+                format!("{prefix}{slot}"),
+                if slot < pad {
+                    0
+                } else {
+                    operand.stride(slot - pad)
+                },
+            );
+        }
+        Ok(())
     }
 }

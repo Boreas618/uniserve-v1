@@ -3,8 +3,9 @@
 The Build Server compiles a Triton package's descriptor by handing its request
 to :func:`build`, and keeps what it writes into the request's output directory:
 ``module.cubin`` and ``metadata.json``, the metadata ``triton.compile`` itself
-recorded for the module, with the launch signature added. Triton's own AOT
-tool expresses neither clusters nor PDL nor global scratch
+recorded for the module, with the launch signature and the compile-time
+definitions (the values bound to the kernel's constexprs) added. Triton's own
+AOT tool expresses neither clusters nor PDL nor global scratch
 (``triton/tools/compile.py``), so the module is compiled through
 ``triton.compile`` on the request's target, which needs no GPU.
 
@@ -44,6 +45,7 @@ from collections.abc import Mapping
 from typing import IO, Any
 
 import triton
+import triton.language as tl
 from triton.backends.compiler import GPUTarget
 from triton.compiler.compiler import ASTSource
 
@@ -62,6 +64,23 @@ DEPENDENT_LAUNCH_FIELD = "pdl"
 
 #: The divisor an aligned argument is attributed with.
 ALIGNMENT = 16
+
+
+def recorded(value: Any) -> Any:
+    """A compile-time value as JSON states it, in a module's metadata and in
+    a stated launch.
+
+    A Triton type becomes ``{"type": <Triton's name>}`` (``fp32``,
+    ``int64``), which ``triton.language.dtype`` reads back: JSON has no type
+    of its own, and the bare name would read as a string constexpr, which a
+    table may bind to the same text. A tuple becomes an array; any other value
+    is JSON's own.
+    """  # noqa: D205
+    if isinstance(value, tl.dtype):
+        return {"type": str(value)}
+    if isinstance(value, (list, tuple)):
+        return [recorded(item) for item in value]
+    return value
 
 
 def warps(stated: Any, fields: Mapping[str, Any], descriptor: str) -> int:
@@ -255,7 +274,10 @@ def launches(requests: IO[str], answers: IO[str]) -> None:
                 "launch": {
                     "kernel": compilation["kernel"].__name__,
                     "signature": compilation["signature"],
-                    "constexprs": compilation["constexprs"],
+                    "constexprs": {
+                        name: recorded(value)
+                        for name, value in compilation["constexprs"].items()
+                    },
                     # `triton.compile` keys an attribute by the argument's
                     # position; a description outside the compilation names
                     # the argument instead.
@@ -318,6 +340,15 @@ def build(request: Request) -> None:
     written = json.loads(pathlib.Path(metadata).read_text())
     written["signature"] = {
         name: kind for name, kind in signature.items() if kind != "constexpr"
+    }
+    # The values the launch table bound to the kernel's constexprs, by name:
+    # the module's compile-time definitions, which a launch reads from the
+    # loaded module (the tile a grid is counted in) instead of restating
+    # them. The CUDA driver records a cubin's preprocessor definitions under
+    # the same name. Each value is as :func:`recorded` states it.
+    written["definitions"] = {
+        name: recorded(value)
+        for name, value in compilation["constexprs"].items()
     }
     (out / "metadata.json").write_text(json.dumps(written))
     print(

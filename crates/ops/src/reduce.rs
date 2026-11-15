@@ -304,16 +304,17 @@ impl Op for Reduce {
         let (kept, reduced) = split(&args.x, args.axes);
         let outputs = kept.numel();
 
+        let slots = strided::Slots::of(Self::NAME, kernel, "ks")?;
         let mut arguments = Arguments::new(Self::NAME);
         arguments
             .view("x", &args.x)
             .view("out", &args.out)
             .u64("outputs", outputs)
             .u64("length", reduced.numel());
-        strided::pack_extents(&mut arguments, "k", &kept);
-        strided::pack_strides(&mut arguments, "ks", &kept);
-        strided::pack_extents(&mut arguments, "r", &reduced);
-        strided::pack_strides(&mut arguments, "rs", &reduced);
+        slots.extents(&mut arguments, "k", &kept)?;
+        slots.strides(&mut arguments, "ks", &kept)?;
+        slots.extents(&mut arguments, "r", &reduced)?;
+        slots.strides(&mut arguments, "rs", &reduced)?;
 
         // One program folds `block / tile` outputs.
         let rows = u64::from(descriptor.block / descriptor.tile());

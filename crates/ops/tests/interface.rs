@@ -96,6 +96,7 @@ const TRITON_RECORD: &str = r#"{
     "global_scratch_align": 128,
     "profile_scratch_size": 0,
     "profile_scratch_align": 1,
+    "definitions": {"BLOCK": 2048, "PDL": true, "COMPUTE": "fp32"},
     "num_stages": 3,
     "cluster_dims": [2, 1, 1],
     "target": {"arch": 100, "backend": "cuda"}
@@ -125,6 +126,23 @@ fn cubin_metadata_reads_triton_fields_and_skips_what_it_does_not_need() {
 }
 
 #[test]
+fn cubin_metadata_answers_an_integer_definition_and_refuses_any_other_by_name() {
+    let metadata = CubinMetadata::parse(TRITON_RECORD.as_bytes()).unwrap();
+    assert_eq!(metadata.integer("BLOCK").unwrap(), 2048);
+
+    // A definition the module was not compiled with, and one that is no integer.
+    for (name, refusal) in [
+        ("BLOCK_Q", "no definition `BLOCK_Q`"),
+        ("COMPUTE", "\"fp32\""),
+    ] {
+        let error = metadata.integer(name).unwrap_err();
+        assert!(matches!(error, Error::Metadata(_)), "{name}: {error}");
+        assert!(error.to_string().contains("rms_norm_kernel"), "{error}");
+        assert!(error.to_string().contains(refusal), "{error}");
+    }
+}
+
+#[test]
 fn cubin_metadata_refuses_a_record_without_a_field_a_launch_reads() {
     let record: serde_json::Value = serde_json::from_str(TRITON_RECORD).unwrap();
     for field in [
@@ -139,6 +157,7 @@ fn cubin_metadata_refuses_a_record_without_a_field_a_launch_reads() {
         "global_scratch_align",
         "profile_scratch_size",
         "profile_scratch_align",
+        "definitions",
     ] {
         let mut partial = record.clone();
         partial.as_object_mut().unwrap().remove(field);

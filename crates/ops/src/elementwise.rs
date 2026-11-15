@@ -315,13 +315,14 @@ impl Op for ElementwiseUnary {
         let [x, out] = strided::merge_axes([&args.x, &args.out]);
         let elements = out.numel();
 
+        let slots = strided::Slots::of(Self::NAME, kernel, "s")?;
         let mut arguments = Arguments::new(Self::NAME);
         arguments
             .view("x", &x)
             .view("out", &out)
             .u64("elements", elements);
-        strided::pack_extents(&mut arguments, "d", &out);
-        strided::pack_strides(&mut arguments, "s", &x);
+        slots.extents(&mut arguments, "d", &out)?;
+        slots.strides(&mut arguments, "s", &x)?;
         for (name, scalar) in ["a", "b"].into_iter().zip(args.scalars) {
             pack_scalar(&mut arguments, name, descriptor.dtype, scalar);
         }
@@ -569,15 +570,16 @@ impl Op for ElementwiseBinary {
         let [lhs, rhs, out] = strided::merge_axes([&args.lhs, &args.rhs, &args.out]);
         let elements = out.numel();
 
+        let slots = strided::Slots::of(Self::NAME, kernel, "l")?;
         let mut arguments = Arguments::new(Self::NAME);
         arguments
             .view("lhs", &lhs)
             .view("rhs", &rhs)
             .view("out", &out)
             .u64("elements", elements);
-        strided::pack_extents(&mut arguments, "d", &out);
-        strided::pack_strides(&mut arguments, "l", &lhs);
-        strided::pack_strides(&mut arguments, "r", &rhs);
+        slots.extents(&mut arguments, "d", &out)?;
+        slots.strides(&mut arguments, "l", &lhs)?;
+        slots.strides(&mut arguments, "r", &rhs)?;
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
@@ -719,6 +721,7 @@ impl Op for ElementwiseWhere {
             strided::merge_axes([&args.condition, &args.on_true, &args.on_false, &args.out]);
         let elements = out.numel();
 
+        let slots = strided::Slots::of(Self::NAME, kernel, "c")?;
         let mut arguments = Arguments::new(Self::NAME);
         arguments
             .view("condition", &condition)
@@ -726,10 +729,10 @@ impl Op for ElementwiseWhere {
             .view("on_false", &on_false)
             .view("out", &out)
             .u64("elements", elements);
-        strided::pack_extents(&mut arguments, "d", &out);
-        strided::pack_strides(&mut arguments, "c", &condition);
-        strided::pack_strides(&mut arguments, "t", &on_true);
-        strided::pack_strides(&mut arguments, "f", &on_false);
+        slots.extents(&mut arguments, "d", &out)?;
+        slots.strides(&mut arguments, "c", &condition)?;
+        slots.strides(&mut arguments, "t", &on_true)?;
+        slots.strides(&mut arguments, "f", &on_false)?;
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,

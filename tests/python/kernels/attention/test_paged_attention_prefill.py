@@ -92,13 +92,13 @@ HALF_ROUNDOFF = 2.0**-11
 #: The relative error of a weight held as two BF16 parts, each rounded to
 #: nearest: `2⁻⁸ · 2⁻⁸`.
 WEIGHT_PARTS_ERROR = 2.0**-16
-#: Triton's names of the element types, by which the package states its
-#: products.
-TRITON_NAMES = {
-    torch.float8_e4m3fn: "fp8e4nv",
+#: The element types by the names a descriptor's fields give them
+#: (`ops::abi`'s), by which the package states its products.
+ELEMENT_NAMES = {
+    torch.float8_e4m3fn: "f8e4m3",
     torch.bfloat16: "bf16",
-    torch.float16: "fp16",
-    torch.float32: "fp32",
+    torch.float16: "f16",
+    torch.float32: "f32",
 }
 
 
@@ -320,7 +320,7 @@ def launch(kernels, operands_of, device, interpreted):
     rows = on["page_table"].shape[0]
     tiles = kernels.prefill_tiles(q_heads, kv_heads, head_dim)
     products = kernels.prefill_products(
-        TRITON_NAMES[query.dtype], TRITON_NAMES[key.dtype]
+        ELEMENT_NAMES[query.dtype], ELEMENT_NAMES[key.dtype]
     )
     grid = (
         (tokens + tiles["BLOCK_Q"] - 1) // tiles["BLOCK_Q"] + rows,
@@ -534,8 +534,8 @@ def test_a_prefill_matches_the_float64_composition_within_its_bound(
     generator = torch.Generator().manual_seed(23)
     operands_of = operands(rows, generator, **case)
     tensor_cores = kernels.prefill_products(
-        TRITON_NAMES[operands_of["query"].dtype],
-        TRITON_NAMES[operands_of["key"].dtype],
+        ELEMENT_NAMES[operands_of["query"].dtype],
+        ELEMENT_NAMES[operands_of["key"].dtype],
     )["TENSOR_CORES"]
     assert not (interpreted and tensor_cores), (
         "the package multiplies this pair on the tensor cores, which the "

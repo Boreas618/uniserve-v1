@@ -7,13 +7,15 @@ an operand is ``sum(ik * stride_k)`` elements from its address, and a zero
 stride repeats an axis. Extents and strides are words of the launch, so a
 module is compiled for a rank and serves every shape of that rank.
 
-**The words.** A kernel takes ``MAX_RANK`` strides per strided operand and
-``MAX_RANK - 1`` extents per index space, right-aligned: axis ``k`` of
-``RANK`` axes is slot ``MAX_RANK - RANK + k``. The slots before it are unit
-extents and zero strides, which a module compiled for ``RANK`` never reads.
-The extent of slot 0 does not travel: only an outermost axis can sit there,
-and a row-major index needs no modulus on its outermost axis. The words are
-``i64``: ``d1..d5`` and ``s0..s5`` in a package's launch table.
+**The words.** A kernel takes six strides per strided operand (``s0..s5``)
+and five extents per index space (``d1..d5``), right-aligned: axis ``k`` of
+``RANK`` axes is slot ``6 - RANK + k``. The slots before it are unit extents
+and zero strides, which a module compiled for ``RANK`` never reads. The
+extent of slot 0 does not travel: only an outermost axis can sit there, and
+a row-major index needs no modulus on its outermost axis. The words are
+``i64``. The kernels' parameter lists are the one statement of the slots:
+``ops`` counts them in the signature of the module it launches, and a
+package's ``rank`` dimension states the ranks it compiles.
 
 **The computing type.** A half-precision element is widened to FP32 when it
 is loaded and rounded to nearest even once when it is stored; FP32, FP64 and
@@ -35,10 +37,6 @@ The spellings are the ones ``ops::abi`` prints; the Triton driver
 
 import triton
 import triton.language as tl
-
-#: The axes a primitive addresses: ``ops::strided::SLOTS``, the stride words of
-#: an operand and one more than the extent words of an index space.
-MAX_RANK = 6
 
 #: The element types the primitives move and never compute with: an element is
 #: the byte it is stored in.

@@ -74,8 +74,9 @@
 //! `decode_attention_backend` / `prefill_attention_backend`. This crate's Triton package serves
 //! the caches the vendor programs do not read, an E4M3 page and a dense page of another type than
 //! the queries, with the arguments its programs declare instead of [`Call`], and a grid this
-//! launch computes ([`PREFILL_TILE_ROWS`]); a key no package a deployment names covers goes to a
-//! package that covers it (`cover` at the Build Server).
+//! launch computes in the query tiles the loaded module was compiled for (its `BLOCK_Q`); a key
+//! no package a deployment names covers goes to a package that covers it (`cover` at the Build
+//! Server).
 //!
 //! The workspace is the program's `workspace_size` argument (512 MiB for trtllm-gen), a transient
 //! region the worker allocates from its scratch pool and zeroes before its first use: trtllm-gen
@@ -105,20 +106,11 @@ use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
-/// The most (query token, query head) pairs one prefill program of the Triton package holds.
-///
-/// A program holds `BLOCK_Q` consecutive query tokens of one batch row and the query heads that
-/// share one key-value head, the head group rounded up to a power of two: `BLOCK_Q` is the tile's
-/// pairs divided by that, at least one ([`prefill_query_tile`]). The launch's grid is counted in
-/// such tiles, so this number and [`PREFILL_TILE_ELEMENTS`] are the package's `TILE_ROWS` and
-/// `TILE_ELEMENTS` (`kernels/paged_attention/triton/src/paged_attention.py`), and they change
-/// together.
-pub const PREFILL_TILE_ROWS: u64 = 128;
-
-/// The most elements a prefill program's query tile holds: a head wider than 128 holds fewer
-/// pairs, `PREFILL_TILE_ELEMENTS / head_dim` (sixty-four at 256, thirty-two at 512), and never
-/// fewer than sixteen, so that the tile and its accumulator fit one multiprocessor.
-pub const PREFILL_TILE_ELEMENTS: u64 = 16384;
+/// The compile-time definition of the Triton prefill program that states the query tokens one
+/// program holds: `BLOCK_Q` consecutive tokens of one batch row, with the query heads that share
+/// one key-value head. The package derives it from its tile and the head group; the launch
+/// counts its grid in such tiles, read from the module it launches.
+const PREFILL_QUERY_TILE: &str = "BLOCK_Q";
 
 /// Which half of a batch's attention work a module serves.
 ///
@@ -1026,7 +1018,7 @@ impl PagedAttention {
     /// **It serves both phases from two kernels of one module**: decode walks one program per
     /// (query row, query head) along the row's page table with a running maximum, normaliser and
     /// accumulator; prefill runs one program per tile of a batch row's query tokens and one
-    /// key-value head ([`PREFILL_TILE_ROWS`]), places each row's queries at the end of its keys,
+    /// key-value head ([`PREFILL_QUERY_TILE`]), places each row's queries at the end of its keys,
     /// masks each at its own key, and writes zero to the tokens past the last row's end.
     ///
     /// The refusals here are the operator's own conditions stated where the program's compilation
@@ -1142,11 +1134,15 @@ impl PagedAttention {
             // (`cdiv(tokens, BLOCK_Q) + batch`); a program whose number no row's tile takes
             // returns at once. The count grows with the tokens and the rows, not their product.
             Phase::Prefill => {
-                let tile = prefill_query_tile(
-                    launch.q_heads,
-                    launch.kv_heads,
-                    u64::from(descriptor.head_dim),
-                );
+                let tile = kernel
+                    .metadata()
+                    .ok_or_else(|| Error::KernelForm {
+                        operator: Self::NAME,
+                        kernel: kernel.name().to_owned(),
+                        expected: "cubin",
+                        actual: "native",
+                    })?
+                    .integer(PREFILL_QUERY_TILE)?;
                 LaunchGrid::new([
                     launch.tokens.div_ceil(tile) + launch.batch,
                     launch.kv_heads,
@@ -1161,16 +1157,6 @@ impl PagedAttention {
 /// Whether the cache's pages hold quantized elements that are read through a per-page scale.
 fn quantized(dtype: DType) -> bool {
     matches!(dtype, DType::F8E4M3 | DType::F4)
-}
-
-/// The query tokens one prefill program of the Triton package holds, its `BLOCK_Q`: the tile's
-/// pairs ([`PREFILL_TILE_ROWS`], or [`PREFILL_TILE_ELEMENTS`] divided by a wider head, at least
-/// sixteen) divided among the head group rounded up to a power of two, and one token when the
-/// group is wider. The package's `prefill_tiles` states the same rule.
-fn prefill_query_tile(q_heads: u64, kv_heads: u64, head_dim: u64) -> u64 {
-    let group = (q_heads / kv_heads.max(1)).max(1).next_power_of_two();
-    let rows = (PREFILL_TILE_ELEMENTS / head_dim.max(1)).clamp(16, PREFILL_TILE_ROWS);
-    (rows / group).max(1)
 }
 
 /// The elements between consecutive rows of a `[rows, heads, dim]` view.
@@ -1268,35 +1254,6 @@ pub(super) fn to_i64(operator: &'static str, value: u64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The prefill launch counts its grid in the program's query tiles, so the tile the launch
-    /// divides by is the one the program holds: `PREFILL_TILE_ROWS` and `PREFILL_TILE_ELEMENTS`
-    /// are the package's `TILE_ROWS` and `TILE_ELEMENTS`. A launch that divided by more than the
-    /// program holds would leave a long row's last tokens to no program, which is unwritten
-    /// output rather than a refusal.
-    #[test]
-    fn the_prefill_grid_counts_the_tiles_its_program_holds() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("kernels/paged_attention/triton/src/paged_attention.py");
-        let source = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("{} is unreadable: {error}", path.display()));
-        let stated = |name: &str| {
-            source
-                .lines()
-                .find_map(|line| line.strip_prefix(&format!("{name} = ")))
-                .and_then(|value| value.trim().parse::<u64>().ok())
-        };
-        assert_eq!(stated("TILE_ROWS"), Some(PREFILL_TILE_ROWS));
-        assert_eq!(stated("TILE_ELEMENTS"), Some(PREFILL_TILE_ELEMENTS));
-
-        // A group of eight query heads of 128 holds sixteen tokens a tile, eight at a head
-        // of 256 and four at 512; a group wider than the tile holds one.
-        assert_eq!(prefill_query_tile(32, 4, 128), 16);
-        assert_eq!(prefill_query_tile(32, 4, 256), 8);
-        assert_eq!(prefill_query_tile(32, 4, 512), 4);
-        assert_eq!(prefill_query_tile(6, 2, 128), 32);
-        assert_eq!(prefill_query_tile(256, 1, 128), 1);
-    }
 
     /// A BF16 causal decode module of 32 query and 4 KV heads of 128 at TP=8, page size 64.
     fn decode() -> Descriptor {

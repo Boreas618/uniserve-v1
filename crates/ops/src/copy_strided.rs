@@ -125,14 +125,15 @@ impl Op for CopyStrided {
         let [source, destination] = strided::merge_axes([&args.source, &args.destination]);
         let elements = destination.numel();
 
+        let slots = strided::Slots::of(Self::NAME, kernel, "s")?;
         let mut arguments = Arguments::new(Self::NAME);
         arguments
             .view("source", &source)
             .view("destination", &destination)
             .u64("elements", elements);
-        strided::pack_extents(&mut arguments, "d", &destination);
-        strided::pack_strides(&mut arguments, "s", &source);
-        strided::pack_strides(&mut arguments, "t", &destination);
+        slots.extents(&mut arguments, "d", &destination)?;
+        slots.strides(&mut arguments, "s", &source)?;
+        slots.strides(&mut arguments, "t", &destination)?;
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,

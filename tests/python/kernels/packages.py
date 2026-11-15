@@ -49,10 +49,17 @@ def compile_time(value: Any) -> Any:
 
     A tuple a launch table states (a derived stride pair, a slot table)
     crosses the command's JSON as an array, and Triton takes a compile-time
-    sequence as a tuple only, so every array becomes a tuple again.
+    sequence as a tuple only, so every array becomes a tuple again. A Triton
+    type crosses it as ``{"type": <Triton's name>}`` and becomes the type.
     """
     if isinstance(value, list):
         return tuple(compile_time(item) for item in value)
+    if isinstance(value, dict):
+        # Imported here, after the session has fixed Triton's mode
+        # (`conftest.py`), which an import at this module's load could precede.
+        import triton.language as tl
+
+        return tl.dtype(value["type"])
     return value
 
 

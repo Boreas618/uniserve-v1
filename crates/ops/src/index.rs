@@ -289,6 +289,7 @@ impl Op for Index {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
+        let slots = strided::Slots::of(Self::NAME, kernel, "s")?;
         let mut arguments = Arguments::new(Self::NAME);
         arguments
             .view("source", &args.source)
@@ -301,9 +302,9 @@ impl Op for Index {
                 let elements = destination.numel();
 
                 arguments.u64("elements", elements);
-                strided::pack_extents(&mut arguments, "d", &destination);
-                strided::pack_strides(&mut arguments, "s", &repeated);
-                strided::pack_strides(&mut arguments, "i", &indices);
+                slots.extents(&mut arguments, "d", &destination)?;
+                slots.strides(&mut arguments, "s", &repeated)?;
+                slots.strides(&mut arguments, "i", &indices)?;
                 arguments.u64("step", args.source.stride(args.axis));
                 elements
             }
@@ -314,10 +315,10 @@ impl Op for Index {
                 arguments
                     .u64("columns", count)
                     .u64("length", args.source.dim(args.axis));
-                strided::pack_extents(&mut arguments, "c", &source);
-                strided::pack_strides(&mut arguments, "s", &source);
-                strided::pack_strides(&mut arguments, "i", &indices);
-                strided::pack_strides(&mut arguments, "t", &destination);
+                slots.extents(&mut arguments, "c", &source)?;
+                slots.strides(&mut arguments, "s", &source)?;
+                slots.strides(&mut arguments, "i", &indices)?;
+                slots.strides(&mut arguments, "t", &destination)?;
                 arguments
                     .u64("source_step", args.source.stride(args.axis))
                     .u64("indices_step", args.indices.stride(args.axis))

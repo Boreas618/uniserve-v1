@@ -156,13 +156,14 @@ impl Op for Cast {
         let [x, out] = strided::merge_axes([&args.x, &args.out]);
         let elements = out.numel();
 
+        let slots = strided::Slots::of(Self::NAME, kernel, "s")?;
         let mut arguments = Arguments::new(Self::NAME);
         arguments
             .view("x", &x)
             .view("out", &out)
             .u64("elements", elements);
-        strided::pack_extents(&mut arguments, "d", &out);
-        strided::pack_strides(&mut arguments, "s", &x);
+        slots.extents(&mut arguments, "d", &out)?;
+        slots.strides(&mut arguments, "s", &x)?;
 
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
