@@ -45,14 +45,12 @@ use crate::api::openai::error::{bail_server_error, server_error};
 use crate::api::openai::run::{ChatBodySink, GenerationRun};
 use crate::api::openai::{ApiError, RequestId, ValidatedJson, check_model_served};
 use crate::api::output::chat::AssistantBlockKind;
-use crate::api::output::{
-    FinishReason, RequestOutput, RequestUsage, StopReason, finish_reason_name,
-};
+use crate::api::output::{FinishReason, RequestOutput, RequestUsage, StopReason};
 use crate::api::protocol::{
     AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
-    ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse, ChatLogProbs,
-    ChatLogProbsContent, ChatMessageDelta, FunctionCallDelta, FunctionCallResponse, ToolCall,
-    ToolCallDelta, TopLogProb, Usage,
+    ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse,
+    ChatFinishReason, ChatLogProbs, ChatLogProbsContent, ChatMessageDelta, FunctionCallDelta,
+    FunctionCallResponse, ToolCall, ToolCallDelta, TopLogProb, Usage,
 };
 use crate::http::served::Served;
 
@@ -210,7 +208,7 @@ pub fn chat_response(
     // When reasoning is hidden, omit them rather than leaking hidden reasoning
     // tokens through per-token metadata.
     let include_output_metadata = include_reasoning || reasoning.is_none();
-    let finish_reason = openai_finish_reason(&reason, saw_tool_calls).to_string();
+    let finish_reason = ChatFinishReason::of(&reason, saw_tool_calls);
     let logprobs = if requested_logprobs && include_output_metadata {
         Some(decoded_logprobs_to_openai_chat(
             collector.logprobs.as_ref().ok_or_else(|| {
@@ -356,11 +354,6 @@ impl ChatCollector {
     /// The collector's state, for the process that goes on collecting after a
     /// hot restart (design §7.5.1 step 3).
     pub fn state(&self) -> handoff::ChatCollection {
-        let finish_reason = self
-            .finished
-            .as_ref()
-            .map(|(reason, _, _)| finish_reason_name(reason).to_owned())
-            .unwrap_or_default();
         handoff::ChatCollection {
             blocks: self.blocks.clone(),
             prompt_token_ids: self.prompt_token_ids.clone(),
@@ -370,13 +363,6 @@ impl ChatCollector {
             prompt_logprobs: self.prompt_logprobs.clone(),
             logprobs: self.logprobs.clone(),
             token_ids: self.token_ids.clone(),
-            finish_reason,
-            usage: self.finished.as_ref().map(|(_, _, usage)| handoff::Usage {
-                prompt_tokens: usage.prompt_tokens,
-                output_tokens: usage.output_tokens,
-                cached_tokens: usage.cached_tokens,
-            }),
-            stop_reason: None,
         }
     }
 
@@ -970,33 +956,21 @@ fn final_chunk(
     saw_tool_calls: bool,
 ) -> ChatCompletionStreamResponse {
     let stop_reason = stop_reason_value(stop_reason);
-    let finish_reason = openai_finish_reason(reason, saw_tool_calls);
+    let finish_reason = ChatFinishReason::of(reason, saw_tool_calls);
 
     debug!(
-        finish_reason = %finish_reason,
+        finish_reason = ?finish_reason,
         stop_reason = ?stop_reason,
         "chat stream finished"
     );
 
     let mut chunk = ChatCompletionStreamResponse::new(request_id, response_model, created);
     chunk.choices.push(ChatCompletionStreamChoice {
-        finish_reason: Some(finish_reason.to_string()),
+        finish_reason: Some(finish_reason),
         stop_reason,
         ..Default::default()
     });
     chunk
-}
-
-/// Maps a finish reason to the OpenAI `finish_reason` string.
-///
-/// A stop after any tool call reports `tool_calls`, and a repetition stop
-/// reports `stop`.
-fn openai_finish_reason(reason: &FinishReason, saw_tool_calls: bool) -> &'static str {
-    match finish_reason_name(reason) {
-        "stop" if saw_tool_calls => "tool_calls",
-        "repetition" => "stop",
-        name => name,
-    }
 }
 
 /// Returns the `stop_reason` response value: the matched stop token ID or
@@ -1120,10 +1094,15 @@ fn position_to_chat_logprobs_content(
     })
 }
 
-/// Floors a log probability at `-9999.0`, so `-inf` (and NaN, which
-/// `f32::max` discards) reaches the response as a finite number.
+/// The log probability OpenAI's responses state for a token too unlikely to state: JSON has no
+/// `-inf`, and OpenAI's chat completions document `-9999.0` as the value of a very unlikely
+/// token.
+const UNLIKELY_LOGPROB: f32 = -9999.0;
+
+/// A log probability as the response states it: the value itself, or [`UNLIKELY_LOGPROB`] for one
+/// below it, `-inf` included.
 fn clamp_logprob(logprob: f32) -> f32 {
-    logprob.max(-9999.0)
+    logprob.max(UNLIKELY_LOGPROB)
 }
 
 #[cfg(test)]

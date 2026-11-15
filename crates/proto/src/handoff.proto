@@ -420,14 +420,10 @@ message ChatCollection {
   optional DecodedLogprobs logprobs = 4;
   // Generated token identifiers.
   repeated uint32 token_ids = 5;
-  reserved 6, 7;
-  reserved "images", "image_steps_per_image";
-  // The finish reason, as the response lists it.
-  string finish_reason = 8;
-  // The usage the terminal event reported.
-  Usage usage = 9;
-  // The stop reason the terminal event reported, when it reported one.
-  optional string stop_reason = 10;
+  // A collector is handed over only before the terminal event, so its state
+  // states no finish reason, usage or stop reason.
+  reserved 6, 7, 8, 9, 10;
+  reserved "images", "image_steps_per_image", "finish_reason", "usage", "stop_reason";
 }
 
 // One closed assistant content block.
@@ -444,16 +440,6 @@ message ToolCall {
   string id = 1;
   string name = 2;
   string arguments = 3;
-}
-
-// A request's token counts, as a response reports them.
-message Usage {
-  uint32 prompt_tokens = 1;
-  uint32 output_tokens = 2;
-  reserved 3, 4, 5;
-  reserved "image_count", "image_steps", "image_steps_per_image";
-  // Of `prompt_tokens`, those the request's first admission found cached.
-  uint32 cached_tokens = 6;
 }
 
 // Candidate tokens of one scored position, as the engine reported them.

@@ -533,7 +533,7 @@ fn tool_calling_follows_the_familys_declared_format() {
 
 /// What an agent harness sends turn after turn is lowered as it sends it: tool
 /// definitions with OpenAI's `strict`, `tool_choice: auto`, `max_tokens`, an
-/// assistant turn sent back as it was received (`reasoning_content`, null
+/// assistant turn sent back as it was received (`reasoning`, null
 /// content, tool calls) and the tools' results. Each turn's prompt begins with
 /// the prompt of the turn before it, under the same cache salt and so in the
 /// same cache partition, which is what lets the prefix cache serve it.
@@ -578,7 +578,7 @@ fn a_harness_conversation_grows_by_its_new_turns() {
         serde_json::json!({
             "role": "assistant",
             "content": null,
-            "reasoning_content": "I need the file first.",
+            "reasoning": "I need the file first.",
             "tool_calls": [{
                 "id": "call_1",
                 "type": "function",

@@ -591,10 +591,7 @@ fn response_options(
         return_token_ids: request.return_token_ids.unwrap_or(false),
         return_tokens_as_token_ids: request.return_tokens_as_token_ids.unwrap_or(false),
         // One timestamp for the whole response, shared by every streamed chunk.
-        created: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
+        created: crate::api::since_epoch().as_secs(),
         // How many of a generated position's candidates `top_logprobs` lists, the sampled
         // token first: the request's count, zero when unset, as vLLM's
         // `chat_top_logprobs_limit`.

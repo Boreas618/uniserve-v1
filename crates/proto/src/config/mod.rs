@@ -882,7 +882,7 @@ impl Default for LoggingConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningParser {
-    /// The model description's parser splits `reasoning_content` from
+    /// The model description's parser splits `reasoning` from
     /// `content`.
     #[default]
     Auto,
@@ -901,7 +901,7 @@ pub struct ChatConfig {
     /// How message content renders: `auto`, `string` or `openai`.
     #[serde(with = "content_format")]
     pub template_content_format: Option<ChatTemplateContentFormat>,
-    /// `auto` splits `reasoning_content` from `content`; `none` streams
+    /// `auto` splits `reasoning` from `content`; `none` streams
     /// reasoning delimiters as content.
     pub reasoning_parser: ReasoningParser,
 }

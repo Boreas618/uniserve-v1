@@ -50,16 +50,6 @@ pub(crate) fn models_router(served: Arc<Served>) -> Router {
         .with_state(served)
 }
 
-/// The current wall-clock time in whole seconds since the Unix epoch, as the
-/// `created` field of OpenAI objects states it; times before the epoch clamp
-/// to zero.
-pub fn unix_time() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 /// Returns the served model, and every LoRA adapter its workers hold, in
 /// OpenAI `list models` format.
 ///
@@ -69,7 +59,7 @@ pub fn unix_time() -> u64 {
 async fn list_models(State(served): State<Arc<Served>>) -> Json<ListModelsResponse> {
     // OpenAI clients expect `created` to be a real Unix timestamp; the listing
     // reports the time it was produced.
-    let created = unix_time() as i64;
+    let created = crate::api::since_epoch().as_secs() as i64;
     let model = |id: String| ModelObject {
         id,
         object: "model".to_string(),

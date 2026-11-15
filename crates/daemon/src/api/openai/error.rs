@@ -11,8 +11,7 @@
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
-use axum::http::header::RETRY_AFTER;
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use thiserror_ext::{Construct, Macro};
 
@@ -23,9 +22,6 @@ use crate::api::input::{ServeError, TokenizeError};
 use crate::api::output::OutputError;
 use crate::api::output::video::VideoStreamError;
 
-/// `Retry-After` hint, in seconds, of a `503 Service Unavailable`.
-const RETRY_AFTER_SECONDS: HeaderValue = HeaderValue::from_static("1");
-
 /// Error categories of the OpenAI-compatible API.
 #[derive(Debug, Clone, PartialEq, Eq, Construct, Macro)]
 #[thiserror_ext(macro(vis = pub, path = "crate::api::openai::error"))]
@@ -35,8 +31,9 @@ pub enum ApiError {
     InvalidRequest {
         /// Human-readable validation failure.
         message: String,
-        /// Request parameter associated with the failure, when known.
-        param: Option<&'static str>,
+        /// The request parameter at fault, when one is, as its path in the request
+        /// (`input_references[2]`).
+        param: Option<String>,
     },
     /// The request body could not be parsed as the endpoint's JSON schema.
     JsonParseError {
@@ -146,7 +143,7 @@ impl ApiError {
     pub fn to_error_response(&self) -> ErrorResponse {
         let (message, error_type, param) = match self {
             Self::InvalidRequest { message, param } => {
-                (message.clone(), "invalid_request_error", *param)
+                (message.clone(), "invalid_request_error", param.clone())
             }
             Self::Unauthorized => (
                 "Missing or invalid API key. Provide `Authorization: Bearer <key>`.".to_owned(),
@@ -156,7 +153,7 @@ impl ApiError {
             Self::ModelNotFound { model } => (
                 format!("The model `{model}` does not exist."),
                 "invalid_request_error",
-                Some("model"),
+                Some("model".to_owned()),
             ),
             Self::JsonParseError { message }
             | Self::NotFound { message, .. }
@@ -175,7 +172,7 @@ impl ApiError {
             error: ErrorDetail {
                 message,
                 error_type: error_type.to_string(),
-                param: param.map(str::to_string),
+                param,
                 code: Some(self.code().to_string()),
             },
         }
@@ -183,16 +180,11 @@ impl ApiError {
 }
 
 impl IntoResponse for ApiError {
-    /// Converts the error into an HTTP response; a `503` carries a
-    /// `Retry-After` hint.
+    /// Converts the error into an HTTP response. A `503` states no `Retry-After`: an
+    /// overloaded engine knows no time at which its waiting queue has room, so a client retries
+    /// on its own backoff.
     fn into_response(self) -> Response {
-        let mut response = (self.status_code(), Json(self.to_error_response())).into_response();
-        if let Self::ServiceUnavailable { .. } = self {
-            response
-                .headers_mut()
-                .insert(RETRY_AFTER, RETRY_AFTER_SECONDS);
-        }
-        response
+        (self.status_code(), Json(self.to_error_response())).into_response()
     }
 }
 
@@ -228,18 +220,18 @@ impl From<ServeError> for ApiError {
             ServeError::Tokenize {
                 source: TokenizeError::InvalidParameter { param, message },
                 ..
-            } => Self::invalid_request(message, param),
+            } => Self::invalid_request(message, param.map(str::to_owned)),
             ServeError::Tokenize { ref source, .. } => {
                 Self::invalid_request(format!("{error}: {source}"), None)
             }
             ServeError::Video(error) => match &error {
                 InputError::Invalid { param, .. } => {
-                    Self::invalid_request(error.to_string(), video_param(param))
+                    Self::invalid_request(error.to_string(), Some(param.clone()))
                 }
                 // A capacity refusal names the option that sizes the deployment's capacity.
                 InputError::Capacity { param, .. } => Self::invalid_request(
                     format!("{error}; serve with a larger video_config.max_condition_rows"),
-                    video_param(param),
+                    Some(param.clone()),
                 ),
                 InputError::Internal(message) => {
                     Self::server_error(format!("video request processing failed: {message}"))
@@ -270,13 +262,6 @@ impl From<VideoStreamError> for ApiError {
     }
 }
 
-/// The video request field a refusal's parameter names: `input_references[2]` is the
-/// `input_references` field, whose index the message states.
-fn video_param(param: &str) -> Option<&'static str> {
-    let field = param.split(['[', '.']).next().unwrap_or(param);
-    crate::api::protocol::request_field(field).map(|(name, _)| name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,7 +272,6 @@ mod tests {
         let overloaded =
             ApiError::rejected(RejectionKind::Overloaded, "queue full").into_response();
         assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(overloaded.headers()[RETRY_AFTER], "1");
 
         let invalid = ApiError::rejected(RejectionKind::Invalid, "unsupported");
         assert_eq!(invalid.status_code(), StatusCode::BAD_REQUEST);
@@ -310,9 +294,8 @@ mod tests {
     }
 
     /// A refused video request is an invalid request that names the field at
-    /// fault in its message, with the condition list as the parameter of a
-    /// condition; a failure of the server's own video processing is a server
-    /// error.
+    /// fault in its message and as its parameter path; a failure of the
+    /// server's own video processing is a server error.
     #[test]
     fn video_rejections_map_to_openai_categories() {
         let rejected = ApiError::from(ServeError::from(InputError::invalid(
@@ -323,7 +306,7 @@ mod tests {
             rejected,
             ApiError::invalid_request(
                 "input_references[2]: is not an image",
-                Some("input_references")
+                Some("input_references[2]".to_owned())
             )
         );
 
@@ -333,7 +316,7 @@ mod tests {
         )));
         assert_eq!(
             rejected,
-            ApiError::invalid_request("size: is not served", Some("size"))
+            ApiError::invalid_request("size: is not served", Some("size".to_owned()))
         );
 
         let failed = ApiError::from(ServeError::from(InputError::Internal(

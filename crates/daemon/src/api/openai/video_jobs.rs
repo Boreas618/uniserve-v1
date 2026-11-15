@@ -4,8 +4,8 @@
 //! `openai::videos`. It holds each job's public record, its generated
 //! artifact once complete, and the cancellation token of its detached
 //! generation task, and it tracks those tasks so server shutdown can wait for
-//! them. Nothing persists across a restart, so server shutdown cancels every
-//! job. Synchronous video requests do not use it.
+//! them. Server shutdown cancels every job; a hot restart hands them over (below).
+//! Synchronous video requests do not use it.
 //!
 //! The operator's `video_job_config` states the two policies of the store,
 //! and the video `capabilities` route advertises both:
@@ -37,10 +37,7 @@ use proto::config::VideoJobConfig;
 
 /// Public job record, serialized in the responses of the video job routes.
 ///
-/// Timestamps are Unix seconds from `timestamp`. `status` is `queued` when
-/// the video routes create the record, `in_progress` after
-/// `VideoJobs::progress`, and `completed` or `failed` after
-/// `VideoJobs::finish`.
+/// Timestamps are Unix seconds since the epoch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VideoJob {
     pub id: String,
@@ -59,10 +56,11 @@ pub struct VideoJob {
     pub fps: u32,
     /// The generated raster, `WxH` in pixels.
     pub size: String,
-    pub status: String,
-    /// `queued`, then the phases the generation task reports from runtime
-    /// events, then `completed` or `failed`.
-    pub phase: String,
+    pub status: JobStatus,
+    /// The generation phase the engine last reported, while the job is in progress: a phase of
+    /// the model's own pipeline, which the engine names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     /// Completed inference steps; set to `total_steps` on success.
     pub completed_steps: u32,
     pub total_steps: u32,
@@ -74,16 +72,30 @@ pub struct VideoJob {
     pub error: Option<VideoFailure>,
 }
 
+/// Where a job is: `queued` when the video routes create its record, `in_progress` from the
+/// engine's first report on, and `completed` or `failed` once it finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStatus {
+    /// Created; the engine has reported nothing yet.
+    Queued,
+    /// The engine reports progress.
+    InProgress,
+    /// Generated; the artifact is retained.
+    Completed,
+    /// Ended without an artifact; the record states the failure.
+    Failed,
+}
+
+/// The phase a generation is in from its scheduling until the engine reports the first phase
+/// of the model's pipeline.
+pub const SCHEDULED_PHASE: &str = "scheduled";
+
 /// Server-observed wall time of one generation and of each of its phases.
 ///
-/// A phase starts at its first report and ends where the next phase starts;
-/// the last one ends at completion. `encoding` starts when the engine
-/// schedules the request. Every later phase is the one the engine reports
-/// after a media call completes: `preparing` after the first encoding call,
-/// `denoising` once latent preparation completes, `decoding` once the last
-/// denoising step completes (covering video and audio decoding, their
-/// H.264/AAC encoding and muxing), and `finalizing` (artifact delivery)
-/// once the muxer completes.
+/// A phase starts at its first report and ends where the next phase starts; the last one ends
+/// at completion. [`SCHEDULED_PHASE`] starts when the engine schedules the request; every later
+/// phase is one the engine reports, named by the model's pipeline.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationTiming {
     /// Seconds from scheduling to completion.
@@ -94,10 +106,9 @@ pub struct GenerationTiming {
 
 /// Times one generation's phases from its runtime events.
 ///
-/// Scheduling starts the `encoding` phase; each `MediaProgress` report whose
-/// phase differs from the current one starts that phase. `finish` closes the
-/// current phase and yields [`GenerationTiming`], or `None` when the request
-/// was never scheduled.
+/// Scheduling starts [`SCHEDULED_PHASE`]; each `MediaProgress` report whose phase differs from
+/// the current one starts that phase. `finish` closes the current phase and yields
+/// [`GenerationTiming`], or `None` when the request was never scheduled.
 #[derive(Default)]
 pub struct StageClock {
     scheduled: Option<Instant>,
@@ -105,18 +116,17 @@ pub struct StageClock {
 }
 
 impl StageClock {
-    /// Records `event` and returns the progress it reports: the phase and
-    /// completed steps of a scheduling (`encoding`, no step) or media-progress
-    /// event.
+    /// Records `event` and returns the progress it reports: the phase and completed steps of a
+    /// scheduling ([`SCHEDULED_PHASE`], no step) or media-progress event.
     pub fn observe<'a>(&mut self, event: &'a RequestOutput) -> Option<(&'a str, u32)> {
         let now = Instant::now();
         match event {
             RequestOutput::Scheduled { .. } => {
                 if self.scheduled.is_none() {
                     self.scheduled = Some(now);
-                    self.phases.push(("encoding".to_owned(), now));
+                    self.phases.push((SCHEDULED_PHASE.to_owned(), now));
                 }
-                Some(("encoding", 0))
+                Some((SCHEDULED_PHASE, 0))
             }
             RequestOutput::MediaProgress {
                 phase,
@@ -302,21 +312,64 @@ impl VideoJobs {
     /// An unknown or deleted ID is ignored.
     pub fn progress(&self, id: &str, phase: &str, steps: u32) {
         if let Some(job) = self.entries().get_mut(id) {
-            job.record.status = "in_progress".to_owned();
-            job.record.phase = phase.to_owned();
+            job.record.status = JobStatus::InProgress;
+            job.record.phase = Some(phase.to_owned());
             job.record.completed_steps = steps;
             self.relay(&job.record, None);
         }
     }
 
+    /// Retains `media` under the store's byte budget.
+    ///
+    /// `try_acquire_many_owned` takes a `u32` count and does not wait, so an artifact larger
+    /// than `u32::MAX` bytes and an exhausted budget both fail with
+    /// `artifact_capacity_exceeded`.
+    fn retain(&self, media: Arc<dyn ArtifactMedia>) -> Result<Arc<RetainedMedia>, VideoFailure> {
+        u32::try_from(media.bytes().len())
+            .ok()
+            .and_then(|bytes| Arc::clone(&self.bytes).try_acquire_many_owned(bytes).ok())
+            .map(|permit| {
+                Arc::new(RetainedMedia {
+                    media,
+                    _bytes: permit,
+                })
+            })
+            .ok_or_else(|| VideoFailure {
+                code: "artifact_capacity_exceeded".to_owned(),
+                message: format!(
+                    "retained videos and active downloads exceed the {}-byte limit",
+                    self.settings.max_bytes
+                ),
+            })
+    }
+
+    /// Deletes the job `id` once the retention passed, unless `cancellation` (the job's token,
+    /// which a deletion and server shutdown cancel) ends the timer first.
+    ///
+    /// The timer holds only a clone of the token and a `Weak` handle, so a pending timer does
+    /// not keep the store alive. Must run inside a Tokio runtime.
+    fn expire(self: &Arc<Self>, id: String, cancellation: CancellationToken) {
+        let weak = Arc::downgrade(self);
+        let retention = self.settings.retention;
+        self.tasks.spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(retention) => {}
+                _ = cancellation.cancelled() => return,
+            }
+            if let Some(jobs) = weak.upgrade() {
+                jobs.delete(&id);
+            }
+        });
+    }
+
     /// Publish completion atomically with ownership of the one generated artifact.
     ///
     /// A successful result is retained only if its bytes fit the remaining
-    /// retained-byte budget; otherwise the job fails with
+    /// retained-byte budget ([`Self::retain`]); otherwise the job fails with
     /// `artifact_capacity_exceeded`. Either way the record gets `completed_at`
-    /// and `expires_at`, and a timer task deletes it after the retention
-    /// unless its token is cancelled first. If the job was already deleted,
-    /// the result and any budget it took are dropped and no timer starts.
+    /// and `expires_at`, and the job expires after the retention unless its
+    /// token is cancelled first. If the job was already deleted, the result and
+    /// any budget it took are dropped and no timer starts.
     ///
     /// Must run inside a Tokio runtime, because it spawns the timer task.
     pub fn finish(
@@ -326,40 +379,19 @@ impl VideoJobs {
         timing: Option<GenerationTiming>,
     ) {
         let mut entries = self.entries();
-
-        // `try_acquire_many_owned` takes a `u32` count and does not wait, so an
-        // artifact larger than `u32::MAX` bytes and an exhausted budget both
-        // fail the job.
-        let result = result.and_then(|media| {
-            let bytes = u32::try_from(media.bytes().len())
-                .ok()
-                .and_then(|bytes| Arc::clone(&self.bytes).try_acquire_many_owned(bytes).ok());
-            match bytes {
-                Some(permit) => Ok(Arc::new(RetainedMedia {
-                    media,
-                    _bytes: permit,
-                })),
-                None => Err(VideoFailure {
-                    code: "artifact_capacity_exceeded".to_owned(),
-                    message: format!(
-                        "retained videos and active downloads exceed the {}-byte limit",
-                        self.settings.max_bytes
-                    ),
-                }),
-            }
-        });
+        let result = result.and_then(|media| self.retain(media));
         let Some(job) = entries.get_mut(id) else {
             return;
         };
 
-        let now = crate::api::openai::unix_time();
+        let now = crate::api::since_epoch().as_secs();
         job.record.completed_at = Some(now);
         job.record.expires_at = Some(now + self.settings.retention.as_secs());
+        job.record.phase = None;
         match result {
             Ok(media) => {
-                job.record.status = "completed".to_owned();
+                job.record.status = JobStatus::Completed;
                 job.record.completed_steps = job.record.total_steps;
-                job.record.phase = "completed".to_owned();
                 if let Some(timing) = timing {
                     job.record.inference_time_s = Some(timing.inference_time_s);
                     job.record.stage_durations = Some(timing.stage_durations);
@@ -367,30 +399,13 @@ impl VideoJobs {
                 job.media = Some(media);
             }
             Err(error) => {
-                job.record.status = "failed".to_owned();
-                job.record.phase = "failed".to_owned();
+                job.record.status = JobStatus::Failed;
                 job.record.error = Some(error);
             }
         }
 
         self.relay(&job.record, job.media.as_ref());
-
-        // The expiry timer holds only a clone of the token and a `Weak` handle,
-        // so a pending timer does not keep `VideoJobs` alive. `delete` and
-        // server shutdown cancel the token, which ends it.
-        let expiry_cancellation = job.cancellation.clone();
-        let weak = Arc::downgrade(self);
-        let id = id.to_owned();
-        let retention = self.settings.retention;
-        self.tasks.spawn(async move {
-            tokio::select! {
-                _ = tokio::time::sleep(retention) => {}
-                _ = expiry_cancellation.cancelled() => return,
-            }
-            if let Some(jobs) = weak.upgrade() {
-                jobs.delete(&id);
-            }
-        });
+        self.expire(id.to_owned(), job.cancellation.clone());
     }
 
     /// Every record and artifact, for the successor of a hot restart to go
@@ -413,25 +428,27 @@ impl VideoJobs {
         }
     }
 
-    /// Takes a job a daemon a hot restart replaced holds, or a change of
-    /// it: its record, and its artifact once it completed, which then counts
-    /// against this store's byte budget. A completed or failed job expires
-    /// after the retention, as one this store finished. The generation
-    /// stays the replaced daemon's: deleting the job here forgets it.
+    /// Takes a job a daemon a hot restart replaced holds, or a change of it: its record, and
+    /// its artifact once it completed, which then counts against this store's byte budget. An
+    /// artifact the budget cannot hold fails the job here with `artifact_capacity_exceeded`, as a
+    /// generation of this store's would. A completed or failed job expires after the retention, as
+    /// one this store finished. The generation stays the replaced daemon's: deleting the job here
+    /// forgets it.
     ///
     /// Must run inside a Tokio runtime, because it spawns the timer task.
-    pub fn adopt(self: &Arc<Self>, record: VideoJob, media: Option<Arc<dyn ArtifactMedia>>) {
-        let media = media.and_then(|media| {
-            let bytes = u32::try_from(media.bytes().len()).ok()?;
-            let permit = Arc::clone(&self.bytes).try_acquire_many_owned(bytes).ok()?;
-            Some(Arc::new(RetainedMedia {
-                media,
-                _bytes: permit,
-            }))
-        });
+    pub fn adopt(self: &Arc<Self>, mut record: VideoJob, media: Option<Arc<dyn ArtifactMedia>>) {
+        let media = match media.map(|media| self.retain(media)).transpose() {
+            Ok(media) => media,
+            Err(failure) => {
+                record.status = JobStatus::Failed;
+                record.phase = None;
+                record.error = Some(failure);
+                None
+            }
+        };
         let ended = record.completed_at.is_some();
         let id = record.id.clone();
-        let cancellation = {
+        let expiry = {
             let mut entries = self.entries();
             let job = entries.entry(id.clone()).or_insert_with(|| RetainedJob {
                 record: record.clone(),
@@ -445,18 +462,8 @@ impl VideoJobs {
             }
             (ended && !started_expiry).then(|| job.cancellation.clone())
         };
-        if let Some(expiry_cancellation) = cancellation {
-            let weak = Arc::downgrade(self);
-            let retention = self.settings.retention;
-            self.tasks.spawn(async move {
-                tokio::select! {
-                    _ = tokio::time::sleep(retention) => {}
-                    _ = expiry_cancellation.cancelled() => return,
-                }
-                if let Some(jobs) = weak.upgrade() {
-                    jobs.delete(&id);
-                }
-            });
+        if let Some(cancellation) = expiry {
+            self.expire(id, cancellation);
         }
     }
 
@@ -490,15 +497,15 @@ mod tests {
             id: id.to_owned(),
             object: "video".to_owned(),
             model: "FastH3".to_owned(),
-            created_at: crate::api::openai::unix_time(),
+            created_at: crate::api::since_epoch().as_secs(),
             completed_at: None,
             expires_at: None,
             seconds: format!("{}", 124.0 / 24.0),
             num_frames: 124,
             fps: 24,
             size: "1344x768".to_owned(),
-            status: "queued".to_owned(),
-            phase: "queued".to_owned(),
+            status: JobStatus::Queued,
+            phase: None,
             completed_steps: 0,
             total_steps: 4,
             inference_time_s: None,
@@ -531,8 +538,12 @@ mod tests {
         jobs.progress("video-a", "denoising", 2);
         let running = jobs.get("video-a").unwrap();
         assert_eq!(
-            (running.status.as_str(), running.completed_steps),
-            ("in_progress", 2)
+            (
+                running.status,
+                running.phase.as_deref(),
+                running.completed_steps
+            ),
+            (JobStatus::InProgress, Some("denoising"), 2)
         );
 
         assert!(jobs.delete("video-a"));
@@ -571,7 +582,7 @@ mod tests {
             None,
         );
         let failed = jobs.get("video-0").unwrap();
-        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.status, JobStatus::Failed);
         assert_eq!(failed.error.unwrap().code, "generation_failed");
         assert_eq!(
             failed.expires_at.unwrap() - failed.completed_at.unwrap(),
@@ -592,9 +603,7 @@ mod tests {
         let second = start(&jobs, "video-b");
 
         shutdown.cancel();
-        tokio::time::timeout(Duration::from_secs(10), jobs.wait())
-            .await
-            .unwrap();
+        jobs.wait().await;
 
         first.await.unwrap();
         second.await.unwrap();

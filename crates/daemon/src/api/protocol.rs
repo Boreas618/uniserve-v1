@@ -13,16 +13,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::slice;
 
-use llm_multimodal::ImageDetail;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::SerializeDisplay;
 use validator::Validate;
 
-pub use video::{
-    FieldKind, REQUEST_FIELDS, Seconds, VideoGenerationRequest, VideoReference, request_field,
-    request_field_names,
-};
+pub use video::{VideoGenerationRequest, VideoReference, from_form, request_field_names};
 
 /// Returns `true` for fields whose wire default is enabled.
 fn default_true() -> bool {
@@ -92,9 +88,6 @@ pub enum ContentPart {
     ImageUrl {
         /// Image source and requested detail level.
         image_url: ImageUrl,
-        /// Optional caller-provided image identity.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        uuid: Option<String>,
     },
 }
 
@@ -105,8 +98,18 @@ pub enum ContentPart {
 pub struct ImageUrl {
     /// Remote URL or data URL containing the image.
     pub url: String,
-    /// Requested image preprocessing detail.
+    /// Requested image detail. The model family's image processor sizes every image by its own
+    /// rule, which is OpenAI's `auto`; `low` and `high` are refused.
     pub detail: Option<ImageDetail>,
+}
+
+/// The image detail a request may ask for: OpenAI's `auto`, the server's choice, which the model
+/// family's image processor makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageDetail {
+    /// The image processor sizes the image.
+    Auto,
 }
 
 /// Options that alter streamed chat-completion responses.
@@ -310,11 +313,8 @@ pub enum ChatMessage {
         name: Option<String>,
         /// Tool calls requested by the assistant.
         tool_calls: Option<Vec<ToolCall>>,
-        /// Reasoning content for reasoning-capable models. The request field
-        /// is named `reasoning`; `reasoning_content`, the name responses emit
-        /// it under, is accepted for it, so a client may send an assistant
-        /// message back as it received it.
-        #[serde(alias = "reasoning_content")]
+        /// The assistant's reasoning, under the name responses state it by, so a
+        /// client sends an assistant message back as it received it.
         reasoning: Option<String>,
     },
     /// Tool result message.
@@ -498,8 +498,7 @@ pub struct ChatCompletionRequest {
     /// Maximum number of completion tokens.
     #[validate(range(min = 1))]
     pub max_completion_tokens: Option<u32>,
-    /// The older name of `max_completion_tokens`, which wins when both are
-    /// stated, as in vLLM.
+    /// OpenAI's deprecated name of `max_completion_tokens`; a request states one of the two.
     #[validate(range(min = 1))]
     pub max_tokens: Option<u32>,
     /// Presence-based token penalty in the inclusive range `[-2, 2]`.
@@ -633,7 +632,8 @@ impl ChatCompletionRequest {
     }
 
     /// The most tokens the request generates, when it states a limit:
-    /// `max_completion_tokens`, or `max_tokens`, its older name.
+    /// `max_completion_tokens`, or `max_tokens`, OpenAI's deprecated name of it.
+    /// [`validate_chat_request`] refuses a request that states both.
     pub fn max_output_tokens(&self) -> Option<u32> {
         self.max_completion_tokens.or(self.max_tokens)
     }
@@ -649,6 +649,50 @@ impl ChatCompletionRequest {
         self.tools
             .as_deref()
             .filter(|tools| allowed && !tools.is_empty())
+    }
+}
+
+/// Why a chat completion's choice ended, as its `finish_reason` states it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatFinishReason {
+    /// The model stopped: at its end of sequence, a stop string or token, the end of its own
+    /// output, or a repetition stop, after calling no tool.
+    Stop,
+    /// The request's generation-length limit ended it.
+    Length,
+    /// The model stopped after calling tools.
+    ToolCalls,
+    /// The request was cancelled or aborted.
+    Abort,
+    /// The sequence reached the length the engine's whole KV cache holds.
+    CacheCapacity,
+    /// The engine failed the request.
+    Error,
+}
+
+impl ChatFinishReason {
+    /// The finish reason of a choice the engine ended for `reason`, after calling tools when
+    /// `called_tools` is set.
+    pub fn of(reason: &proto::request::FinishReason, called_tools: bool) -> Self {
+        use proto::request::FinishReason;
+
+        match reason {
+            FinishReason::Completed
+            | FinishReason::Eos
+            | FinishReason::Stop
+            | FinishReason::Repetition => {
+                if called_tools {
+                    Self::ToolCalls
+                } else {
+                    Self::Stop
+                }
+            }
+            FinishReason::MaxTokens => Self::Length,
+            FinishReason::Cancelled | FinishReason::Aborted => Self::Abort,
+            FinishReason::CacheCapacity => Self::CacheCapacity,
+            FinishReason::Error => Self::Error,
+        }
     }
 }
 
@@ -701,7 +745,7 @@ pub struct ChatCompletionChoice {
     /// Generated-token logprob details, when requested.
     pub logprobs: Option<ChatLogProbs>,
     /// Stable terminal reason, when generation is complete.
-    pub finish_reason: Option<String>,
+    pub finish_reason: Option<ChatFinishReason>,
     /// Token identifier or string that triggered stopping, when applicable.
     pub stop_reason: Option<Value>,
     /// Generated token identifiers, when requested.
@@ -729,8 +773,8 @@ pub struct ChatCompletionMessage {
     pub content: Option<String>,
     /// Completed tool calls requested by the assistant.
     pub tool_calls: Option<Vec<ToolCall>>,
-    /// Parsed reasoning content, when requested.
-    #[serde(rename = "reasoning_content")]
+    /// Parsed reasoning, when requested; an assistant message sent back states it under the
+    /// same name.
     pub reasoning: Option<String>,
 }
 
@@ -783,7 +827,7 @@ pub struct ChatCompletionStreamChoice {
     /// Generated-token logprob details for this chunk.
     pub logprobs: Option<ChatLogProbs>,
     /// Stable terminal reason on the final choice chunk.
-    pub finish_reason: Option<String>,
+    pub finish_reason: Option<ChatFinishReason>,
     /// Token identifier or string that triggered stopping, when applicable.
     pub stop_reason: Option<Value>,
     /// Generated token identifiers carried by this chunk.
@@ -801,7 +845,6 @@ pub struct ChatMessageDelta {
     /// Incremental tool-call fields.
     pub tool_calls: Option<Vec<ToolCallDelta>>,
     /// Incremental parsed reasoning text.
-    #[serde(rename = "reasoning_content")]
     pub reasoning: Option<String>,
 }
 
@@ -847,6 +890,12 @@ fn validate_chat_cross_parameters(
     if request.stream_options.is_some() && !request.stream {
         return Err(validator::ValidationError::new(
             "stream_options_requires_stream",
+        ));
+    }
+
+    if request.max_completion_tokens.is_some() && request.max_tokens.is_some() {
+        return Err(validator::ValidationError::new(
+            "max_tokens_and_max_completion_tokens_both_stated",
         ));
     }
 
@@ -925,10 +974,10 @@ mod tests {
         }
     }
 
-    /// `max_tokens` is the older name of `max_completion_tokens`, which wins when a
-    /// request states both.
+    /// `max_tokens`, OpenAI's deprecated name of `max_completion_tokens`, states the limit when
+    /// the request states it alone, and a request stating both is refused.
     #[test]
-    fn max_tokens_is_the_older_name_of_max_completion_tokens() {
+    fn max_tokens_is_the_deprecated_name_of_max_completion_tokens() {
         let request = |fields: serde_json::Value| {
             let mut value = serde_json::json!({
                 "model": "test-model",
@@ -942,14 +991,41 @@ mod tests {
         };
 
         assert_eq!(request(serde_json::json!({})).max_output_tokens(), None);
-        assert_eq!(
-            request(serde_json::json!({"max_tokens": 7})).max_output_tokens(),
-            Some(7)
+        let deprecated = request(serde_json::json!({"max_tokens": 7}));
+        assert_eq!(deprecated.max_output_tokens(), Some(7));
+        assert!(deprecated.validate().is_ok());
+
+        let both = request(serde_json::json!({"max_tokens": 7, "max_completion_tokens": 9}));
+        let refused = both.validate().unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("max_tokens_and_max_completion_tokens_both_stated"),
+            "{refused}"
         );
-        assert_eq!(
-            request(serde_json::json!({"max_tokens": 7, "max_completion_tokens": 9}))
-                .max_output_tokens(),
-            Some(9)
+    }
+
+    /// An image part asks for the processor's own sizing (`auto`) or none, and states no other
+    /// field.
+    #[test]
+    fn an_image_part_takes_only_the_processors_detail() {
+        let part = |image: serde_json::Value| {
+            serde_json::from_value::<ContentPart>(serde_json::json!({
+                "type": "image_url",
+                "image_url": image,
+            }))
+        };
+
+        assert!(part(serde_json::json!({"url": "data:,", "detail": "auto"})).is_ok());
+        assert!(part(serde_json::json!({"url": "data:,"})).is_ok());
+        assert!(part(serde_json::json!({"url": "data:,", "detail": "high"})).is_err());
+        assert!(
+            serde_json::from_value::<ContentPart>(serde_json::json!({
+                "type": "image_url",
+                "image_url": {"url": "data:,"},
+                "uuid": "a",
+            }))
+            .is_err()
         );
     }
 

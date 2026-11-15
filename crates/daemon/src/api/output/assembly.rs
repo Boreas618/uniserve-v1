@@ -11,7 +11,7 @@
 //! `Finished` with the request's usage, `Rejected`, `Failed`, or an
 //! `OutputError` when engine output violates the event protocol.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::api::events::Events;
 use asynk_strim_attr::{TryYielder, try_stream};
@@ -92,10 +92,7 @@ impl StreamClock {
 
 /// The current UNIX time in microseconds.
 fn unix_us() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_micros() as u64)
-        .unwrap_or_default()
+    crate::api::since_epoch().as_micros() as u64
 }
 
 /// The instant a response started, from the wall-clock origin a handed state

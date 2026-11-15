@@ -33,10 +33,10 @@ use futures::StreamExt as _;
 use serde_json::{Value, json};
 
 use crate::api::openai::RequestId;
-use crate::api::openai::video_jobs::{StageClock, VideoFailure, VideoJob, VideoJobs};
+use crate::api::openai::video_jobs::{JobStatus, StageClock, VideoFailure, VideoJob, VideoJobs};
 use crate::api::openai::{ApiError, check_model_served};
 use crate::api::output::video::ArtifactCollector;
-use crate::api::protocol::{FieldKind, VideoGenerationRequest, request_field};
+use crate::api::protocol::{VideoGenerationRequest, from_form};
 use crate::http::served::Served;
 use String;
 
@@ -127,28 +127,9 @@ async fn videos_sync(
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, &artifact.content_type)
-        .header(header::CONTENT_LENGTH, artifact.media.bytes().len())
-        .header(
-            "server-timing",
-            format!("generation;dur={generation_ms:.1}"),
-        )
-        // The shape the model generated, which a client holds the media to.
-        .header(
-            "x-video-size",
-            format!("{}x{}", processed.size.width, processed.size.height),
-        )
-        .header("x-video-num-frames", processed.num_frames)
-        .header("x-video-fps", processed.fps.get());
-    if let Some(timing) = clock.finish() {
-        response = response
-            .header(
-                "x-inference-time-s",
-                format!("{:.3}", timing.inference_time_s),
-            )
-            .header(
-                "x-stage-durations",
-                serde_json::to_string(&timing.stage_durations).unwrap_or_default(),
-            );
+        .header(header::CONTENT_LENGTH, artifact.media.bytes().len());
+    for (name, value) in generation_headers(&processed, generation_ms, clock.finish()) {
+        response = response.header(name, value);
     }
     response
         .body(media_body(Arc::new(ArtifactBytes(artifact.media))))
@@ -158,81 +139,76 @@ async fn videos_sync(
         })
 }
 
-/// Video request extractor accepting `application/json` or
-/// `multipart/form-data`.
+/// The headers a synchronous video response states its generation with, beside the video's
+/// bytes: the one declaration of them.
 ///
-/// Both content types deserialize into the same `VideoGenerationRequest`,
-/// whose `deny_unknown_fields` rejects unknown fields at every level. A
-/// multipart body carries every field as a text part of the same name:
-/// `input_references` and `extra_params` as JSON text, counts as unsigned
-/// integers and `seconds` and `guidance_scale` as numbers. File parts, repeated fields and fields outside the schema are
-/// rejected. A JSON body that is not the schema is a `json_parse_error`, a
-/// refused multipart body an `invalid_request_error` (both `400`), and an
-/// unsupported content type `415 Unsupported Media Type`. Semantic checks
-/// (served model, the model's own rules) happen in the handlers and in
-/// `VideoService::process`.
-pub struct VideoBody(pub VideoGenerationRequest);
-
-/// Converts one multipart text part into the JSON value its field takes.
-fn part_value(name: &'static str, kind: FieldKind, text: String) -> Result<Value, ApiError> {
-    let invalid =
-        |message: &str| ApiError::invalid_request(format!("{name} {message}"), Some(name));
-    match kind {
-        FieldKind::Text => Ok(Value::String(text)),
-        FieldKind::Json => {
-            serde_json::from_str(&text).map_err(|error| invalid(&format!("must be JSON: {error}")))
-        }
-        FieldKind::Unsigned => text
-            .parse::<u64>()
-            .map(Value::from)
-            .map_err(|_| invalid("must be an unsigned integer")),
-        FieldKind::Integer => text
-            .parse::<i64>()
-            .map(Value::from)
-            .map_err(|_| invalid("must be an integer")),
-        FieldKind::Number => text
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map(Value::Number)
-            .ok_or_else(|| invalid("must be a number")),
+/// - `server-timing`: `generation;dur=MS`, the request's time in the server, in milliseconds.
+/// - `x-video-size` (`WxH`), `x-video-num-frames` and `x-video-fps`: the shape the model
+///   generated, which a client holds the media to.
+/// - `x-inference-time-s`: seconds from scheduling to completion, and `x-stage-durations`: the
+///   seconds of each phase as one JSON object ([`GenerationTiming`]); both absent when the
+///   request was never scheduled.
+fn generation_headers(
+    processed: &crate::api::input::video::ProcessedVideo,
+    generation_ms: f64,
+    timing: Option<crate::api::openai::video_jobs::GenerationTiming>,
+) -> Vec<(&'static str, String)> {
+    let mut headers = vec![
+        (
+            "server-timing",
+            format!("generation;dur={generation_ms:.1}"),
+        ),
+        (
+            "x-video-size",
+            format!("{}x{}", processed.size.width, processed.size.height),
+        ),
+        ("x-video-num-frames", processed.num_frames.to_string()),
+        ("x-video-fps", processed.fps.to_string()),
+    ];
+    if let Some(timing) = timing {
+        headers.push((
+            "x-inference-time-s",
+            format!("{:.3}", timing.inference_time_s),
+        ));
+        headers.push((
+            "x-stage-durations",
+            json!(timing.stage_durations).to_string(),
+        ));
     }
+    headers
 }
 
-/// Reads a multipart body into the JSON object its fields form.
-async fn multipart_fields(mut multipart: Multipart) -> Result<Value, ApiError> {
+/// Video request extractor accepting `application/json` or `multipart/form-data`.
+///
+/// Both content types deserialize into the same `VideoGenerationRequest`, whose
+/// `deny_unknown_fields` rejects unknown fields at every level. A multipart body carries every
+/// field as a text part of the same name, which the field's own type reads
+/// ([`from_form`]): text for a string, a number for a number, JSON for the reference list and
+/// the model's options. File parts, repeated fields and fields outside the schema are rejected. A
+/// JSON body that is not the schema is a `json_parse_error`, a refused multipart body an
+/// `invalid_request_error` naming its field (both `400`), and an unsupported content type `415
+/// Unsupported Media Type`. Semantic checks (served model, the model's own rules) happen in the
+/// handlers and in `VideoService::process`.
+pub struct VideoBody(pub VideoGenerationRequest);
+
+/// Reads a multipart body's text parts, as `(field, text)` in body order.
+async fn multipart_parts(mut multipart: Multipart) -> Result<Vec<(String, String)>, ApiError> {
     let invalid = |error: axum::extract::multipart::MultipartError| {
         ApiError::invalid_request(error.to_string(), None)
     };
-    // Multipart values are all text, so each field is converted to the JSON
-    // value its schema takes and the object is deserialized exactly like a
-    // JSON body.
-    let mut fields = serde_json::Map::new();
+    let mut parts = Vec::new();
     while let Some(field) = multipart.next_field().await.map_err(invalid)? {
         let name = field.name().unwrap_or("").to_owned();
-        let Some((name, kind)) = request_field(&name) else {
-            return Err(ApiError::invalid_request(
-                format!("unknown video field {name:?}"),
-                None,
-            ));
-        };
         if field.file_name().is_some() {
             return Err(ApiError::invalid_request(
                 format!("video field {name:?} must be text, not a file"),
                 Some(name),
             ));
         }
-        if fields.contains_key(name) {
-            return Err(ApiError::invalid_request(
-                format!("duplicate video field {name:?}"),
-                Some(name),
-            ));
-        }
         let text = field.text().await.map_err(invalid)?;
-        fields.insert(name.to_owned(), part_value(name, kind, text)?);
+        parts.push((name, text));
     }
-    Ok(Value::Object(fields))
+    Ok(parts)
 }
 
 impl<S: Send + Sync> FromRequest<S> for VideoBody {
@@ -248,9 +224,12 @@ impl<S: Send + Sync> FromRequest<S> for VideoBody {
             let multipart = Multipart::from_request(request, state)
                 .await
                 .map_err(|error| ApiError::invalid_request(error.body_text(), None))?;
-            serde_json::from_value(multipart_fields(multipart).await?)
+            from_form(multipart_parts(multipart).await?)
                 .map(Self)
-                .map_err(|error| ApiError::invalid_request(error.to_string(), None))
+                .map_err(|error| {
+                    let field = error.path().to_string();
+                    ApiError::invalid_request(error.into_inner().to_string(), Some(field))
+                })
         } else if content_type
             .split(';')
             .next()
@@ -294,15 +273,15 @@ async fn videos_create(
         id: id.clone(),
         object: "video".to_owned(),
         model: served.leader.served_model_name().to_owned(),
-        created_at: crate::api::openai::unix_time(),
+        created_at: crate::api::since_epoch().as_secs(),
         completed_at: None,
         expires_at: None,
         seconds: format!("{}", prepared.seconds()),
         num_frames: prepared.num_frames,
         fps: prepared.fps.get(),
         size: format!("{}x{}", prepared.size.width, prepared.size.height),
-        status: "queued".to_owned(),
-        phase: "queued".to_owned(),
+        status: JobStatus::Queued,
+        phase: None,
         completed_steps: 0,
         // The deployment's denoiser fixes every request's step count.
         total_steps: served
@@ -458,7 +437,6 @@ async fn capabilities(State(state): State<JobState>) -> Json<Value> {
         "video_jobs": {
             "max_retained_bytes": settings.max_bytes,
             "retention_seconds": settings.retention.as_secs(),
-            "restart_behavior": "jobs and retained content are removed",
         },
     }))
 }

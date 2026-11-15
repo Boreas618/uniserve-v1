@@ -565,8 +565,11 @@ struct EventsQuery {
 /// the log, and the caller should read the status again.
 async fn events(State(state): State<AdminState>, Query(query): Query<EventsQuery>) -> Response {
     if !(query.wait.is_finite() && query.wait >= 0.0) {
-        return ApiError::invalid_request("wait must be a number of seconds", Some("wait"))
-            .into_response();
+        return ApiError::invalid_request(
+            "wait must be a number of seconds",
+            Some("wait".to_owned()),
+        )
+        .into_response();
     }
     let wait = Duration::from_secs_f64(query.wait).min(MAX_WAIT);
     let (events, next, gap) = state.admin.events_after(query.after, wait).await;

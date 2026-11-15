@@ -167,6 +167,9 @@ safetensors = "0.8.0"
 procfs = { version = "0.18", default-features = false }
 rustix = { version = "1.1.4", features = ["event", "net", "system"] }
 serde = { version = "1.0.228", features = ["derive"] }
+# The field names a derived `Deserialize` takes, which the video request's multipart form and
+# its capability report read from the schema.
+serde-aux = { version = "4.7.0", default-features = false }
 serde_bytes = "0.11"
 serde-json-fmt = "0.1.0"
 serde_json = { version = "1.0.145", features = ["preserve_order"] }

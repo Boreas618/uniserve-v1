@@ -48,7 +48,7 @@ use serde_json::{Value, json};
 
 use crate::api::input::media::{FetchedMedia, MediaConnector};
 use crate::api::input::{ServeError, TokenizeError};
-use crate::api::protocol::{Seconds, VideoGenerationRequest, request_field_names};
+use crate::api::protocol::{VideoGenerationRequest, request_field_names};
 use crate::api::tokenizer::DynTokenizer;
 use proto::config::MediaConfig;
 
@@ -70,9 +70,7 @@ impl VideoGenerationRequest {
                     "a request states its length once: seconds or num_frames",
                 ));
             }
-            (Some(Seconds::Number(seconds) | Seconds::Text(seconds)), None) => {
-                Some(Length::Seconds(seconds))
-            }
+            (Some(seconds), None) => Some(Length::Seconds(seconds)),
             (None, Some(frames)) => Some(Length::Frames(frames)),
             (None, None) => None,
         };
@@ -382,7 +380,7 @@ mod tests {
     #[test]
     fn a_request_reads_as_its_spec() {
         let spec = request(serde_json::json!({
-            "model": "m", "prompt": "a fox", "size": "1344x768", "seconds": "5",
+            "model": "m", "prompt": "a fox", "size": "1344x768", "seconds": 5,
             "input_references": [{"type": "image", "url": "data:,", "frame_index": -1}],
         }))
         .spec()

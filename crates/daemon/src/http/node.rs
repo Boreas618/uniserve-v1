@@ -234,14 +234,15 @@ async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
     let (mut config, stated) = match resolve_text(&body.config, &body.set) {
         Ok(resolved) => resolved,
         Err(error) => {
-            return ApiError::invalid_request(format!("{error:#}"), Some("config")).into_response();
+            return ApiError::invalid_request(format!("{error:#}"), Some("config".to_owned()))
+                .into_response();
         }
     };
     if config.nnodes.get() != 1 {
         return ApiError::invalid_request(
             "a node serves a deployment of one node; a deployment of several starts with \
              `uniserve serve` on each node",
-            Some("config"),
+            Some("config".to_owned()),
         )
         .into_response();
     }
@@ -251,11 +252,15 @@ async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
         config.build_config = node.build_config.clone();
     }
     if let Err(error) = config.validate(&stated) {
-        return ApiError::invalid_request(format!("{error:#}"), Some("config")).into_response();
+        return ApiError::invalid_request(format!("{error:#}"), Some("config".to_owned()))
+            .into_response();
     }
     if !config.states_model() {
-        return ApiError::invalid_request("the configuration names no model", Some("config"))
-            .into_response();
+        return ApiError::invalid_request(
+            "the configuration names no model",
+            Some("config".to_owned()),
+        )
+        .into_response();
     }
     let name = config.served_model_name().to_owned();
     if body.dry_run {

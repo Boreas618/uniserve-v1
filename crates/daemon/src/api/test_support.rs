@@ -376,7 +376,6 @@ pub mod chat {
                 url: url.into(),
                 detail: None,
             },
-            uuid: None,
         }
     }
 

@@ -220,7 +220,7 @@ def test_ranks_out_of_order_generate_the_one_device_outputs(
             choice = result["choices"][0]
             assert choice["finish_reason"] in ("stop", "length"), name
             message = choice["message"]
-            assert message.get("content") or message.get("reasoning_content")
+            assert message.get("content") or message.get("reasoning")
 
         ranked = _ranked(base_url, description)
 

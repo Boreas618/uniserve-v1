@@ -56,6 +56,8 @@ reqwest = { workspace = true, features = ["http2", "rustls-tls"] }
 # The header of a checkpoint's safetensors file, read without its tensors.
 safetensors.workspace = true
 serde.workspace = true
+# The video request schema's field names (`protocol::video`).
+serde-aux.workspace = true
 serde_json.workspace = true
 serde-json-fmt.workspace = true
 serde_path_to_error.workspace = true

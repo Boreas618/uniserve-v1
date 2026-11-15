@@ -31,6 +31,15 @@ pub mod output;
 pub mod protocol;
 pub mod tokenizer;
 
+/// The wall-clock time since the Unix epoch, which the API's timestamps state: an OpenAI
+/// object's `created` in seconds, a response's start in microseconds. A system clock set before
+/// the epoch reads as the epoch.
+pub fn since_epoch() -> std::time::Duration {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 pub mod test_support;
 /// Input processing and output assembly over real tokenizers and templates.

@@ -151,7 +151,7 @@ def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
             # scheduling to completion; the phases tile the inference time.
             stages = json.loads(response.headers["x-stage-durations"])
             assert set(stages) == {
-                "encoding",
+                "scheduled",
                 "preparing",
                 "denoising",
                 "decoding",
