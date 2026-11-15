@@ -26,9 +26,6 @@
 //! `L · K · 2⁻²⁴` of a value's magnitude: here `K = 384` (the widest tiled layout's rows) and
 //! `L = 2 · 8 + 6` (eight reductions a block, the refiner's and the heads'), about `5.0e-4`.
 
-// The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
-use super::support;
-
 use std::path::Path;
 
 use models::minimax_h3::config::{DenoiserConfig, ScheduleConfig, TransformerConfig, VsaConfig};
@@ -39,7 +36,7 @@ use nn::{
     Checkpoint, ConditionRole, ConditionShape, Conditioning, CpuWeights, DType, Denoiser as _,
     Device, MetaWeights, Split, Tensor, VideoRequest, WeightLoader,
 };
-use support::{assert_close, f32_shard, meta, recorded_at, sequence, values};
+use nn_testing::{assert_close, meta, record, sequence, stored, values};
 
 /// Stages times the longest reduction times the FP32 unit roundoff (module documentation).
 const TOLERANCE: f32 = 22.0 * 384.0 / 16_777_216.0;
@@ -199,7 +196,7 @@ fn write_checkpoint(directory: &Path, config: &TransformerConfig) {
         );
     }
 
-    f32_shard(directory, "model.safetensors", &tensors);
+    nn_testing::write_checkpoint(directory, &[&stored(DType::F32, &tensors)]);
 }
 
 /// A request of 22 frames at 64x64 pixels with a prompt of five rows, and `conditions`.
@@ -451,7 +448,7 @@ fn an_eight_way_ulysses_rank_steps_the_largest_profiled_layout() {
         assert_eq!(packing::tiled_len(&layout, &vsa), 2089 * 64);
 
         let schedule = denoiser.schedule(&request).unwrap();
-        let (stepped, _) = recorded_at(split, || {
+        let (stepped, _) = record(&split.axes(), || {
             let shape = layout.video;
             let video = meta(
                 (

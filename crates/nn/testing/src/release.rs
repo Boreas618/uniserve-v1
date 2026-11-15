@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Cache, Repo, RepoType};
-use nn::Checkpoint;
+use nn::{Checkpoint, Library, Source, Sources};
 
 /// A released checkpoint: a Hugging Face model repository at a pinned commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,11 +91,27 @@ impl Release {
         snapshot
     }
 
-    /// The checkpoint of the release's snapshot ([`Release::snapshot`]), opened by its
-    /// declaration.
+    /// The release's snapshot ([`Release::snapshot`]) as the source a loader keys its files by:
+    /// the repository's files at the pinned commit.
+    pub fn source(&self) -> Source {
+        Source::snapshot(self.repository, self.revision, self.snapshot())
+    }
+
+    /// The transformers checkpoint of the release's snapshot, opened by the shard set it
+    /// declares.
     pub fn checkpoint(&self) -> Checkpoint {
-        let snapshot = self.snapshot();
-        Checkpoint::open(&snapshot).unwrap_or_else(|error| panic!("{self}: {error}"))
+        Checkpoint::shards(&self.source(), Library::Transformers)
+            .unwrap_or_else(|error| panic!("{self}: {error}"))
+    }
+
+    /// The release as a deployment names it alone: its snapshot, with no base release and no
+    /// adapter.
+    pub fn sources(&self) -> Sources {
+        Sources {
+            checkpoint: self.source(),
+            base: None,
+            adapter: None,
+        }
     }
 }
 

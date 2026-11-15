@@ -7,29 +7,34 @@
 //! the committed token and three drafts) and a prefill bucket (the embedding, the decoder
 //! stack and the logits), at tensor parallelism one and as a rank of four, and asserts the
 //! shapes of the outputs, that every launch names an operator, that no kernel key names a
-//! model, and that a second run of the same bucket states the same keys and reaches the same
-//! allocator peak. It prints the keys, the peaks, the bytes of host values a forward moves to
-//! the device, and the launches of one layer of each kind.
+//! model family, and that a second run of the same bucket states the same keys and reaches the
+//! same allocator peak. It prints the keys, the peaks, the bytes of host values a forward moves
+//! to the device, and the launches of one layer of each kind.
 //!
-//! The tests need the checkpoints' files under [`MODELS`] and no device; they are ignored by
-//! default and fail when asked for without the files.
-
-use super::support;
+//! The tests read the releases of [`crate::releases`] through the Hugging Face cache and need
+//! no device; they are ignored by default and fail, naming the release, when asked for without
+//! it:
+//!
+//! ```text
+//! cargo test -p models --test it qwen4_exp::profile -- --ignored --nocapture
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use nn::family::{TextModel, TextPlacement};
-use nn::{DType, MetaWeights, Phase, Shape, Split, Tensor, WeightLoader};
+use nn::family::{CacheShape, Family, TextModel, TextPlacement};
+use nn::{DType, KvCache, MetaWeights, Phase, RecurrentState, Split, WeightLoader};
+use nn_testing::text::{self, WORKSPACE_BYTES};
+use nn_testing::{
+    Launch, PAGE_TOKENS, Recording, Release, assert_generic, assert_operators, meta, record, report,
+};
 
-/// Where the released checkpoints are.
-const MODELS: &str = "/workspace/models";
+use crate::releases::{
+    QWEN3_8_FLASH_NEXT_FP8, QWEN3_8_FLASH_NEXT_NVFP4, QWEN3_8_FLASH_NEXT_NVFP4_RADIXARK,
+};
 
-/// Tokens of one cache page: whole chunks of the gated delta rule and whole groups of the
-/// indexer.
-const PAGE: u32 = 64;
+/// The family the profiled checkpoints declare.
+const FAMILIES: [Family; 1] = [models::qwen4_exp::family::FAMILY];
 
 /// Request slots of the recurrent state's buffers.
 const SLOTS: usize = 64;
@@ -41,88 +46,56 @@ const STEP_ROWS: usize = DRAFTS as usize + 1;
 /// The kernels a forward stated: `(operator, key)` pairs.
 type Keys = BTreeSet<(&'static str, String)>;
 
-/// A meta tensor of `shape` elements of `dtype`: an input of a profile run, which takes no
-/// block of the context's allocator. Each call gives a range of addresses no other has.
-fn meta(shape: Shape, dtype: DType) -> Tensor {
-    static NEXT: AtomicU64 = AtomicU64::new(1 << 40);
-
-    let bytes = dtype
-        .storage_bytes(shape.elem_count())
-        .expect("a profile input fits the address space") as u64;
-    let address = NEXT.fetch_add(
-        bytes.next_multiple_of(1 << 16).max(1 << 16),
-        Ordering::Relaxed,
-    );
-
-    ops::retained(address, shape, dtype, &ops::meta()).expect("a meta tensor")
+/// The profiled deployment at `tensor`'s rank: it drafts [`DRAFTS`] tokens a step with the
+/// checkpoint's drafter.
+fn placement(tensor: Split) -> TextPlacement {
+    TextPlacement {
+        tensor,
+        drafter: true,
+        draft_tokens: DRAFTS,
+        ..TextPlacement::WHOLE
+    }
 }
 
-/// The released checkpoint `name`, its headers read.
-fn checkpoint(name: &str) -> nn::Checkpoint {
-    let root = Path::new(MODELS).join(name);
-    assert!(
-        root.is_dir(),
-        "{} is not there: this test reads the released checkpoint's headers",
-        root.display()
-    );
-
-    support::checkpoint(&root)
-}
-
-/// The model of the released checkpoint `name`, meta-loaded for `placement`, with the
-/// checkpoint tensors the load named none of its weights by.
-///
-/// A block scale beside a weight decoded at load (`weight_scale_inv`) is read with the weight
-/// and is the weight's.
-fn load(name: &str, placement: &TextPlacement) -> (Arc<dyn TextModel>, Vec<String>) {
-    let checkpoint = checkpoint(name);
+/// The model of `release`, meta-loaded for `placement`, with the checkpoint tensors the load
+/// consumed none of: neither a weight's tensor the meta store holds a key of, nor a value the
+/// loader read (a tensor scale).
+fn load(release: Release, placement: &TextPlacement) -> (Arc<dyn TextModel>, Vec<String>) {
+    let checkpoint = release.checkpoint();
     let store = MetaWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None);
-    let model = support::load(&checkpoint, &mut loader, placement)
-        .unwrap_or_else(|error| panic!("{name}: {error}"));
+    let model = text::load(&FAMILIES, &checkpoint, &mut loader, placement)
+        .unwrap_or_else(|error| panic!("{release}: {error}"));
 
-    let named = store.tensors();
+    let (read, _) = checkpoint.reading();
+    let mut consumed = store.tensors();
+    consumed.extend(read);
     let unnamed = checkpoint
         .names()
-        .filter(|tensor| {
-            let weight = tensor.strip_suffix("_scale_inv").unwrap_or(tensor);
-            !named.contains(weight)
-        })
+        .filter(|tensor| !consumed.contains(*tensor))
         .map(str::to_owned)
         .collect();
     (model, unnamed)
 }
 
-/// A meta context, stating this rank's place `(rank, ranks)` in a group when it has one, that
-/// records the launches of what runs under it.
-fn context(group: Option<(u64, u64)>) -> ops::Context {
-    let context = ops::Context::meta(None);
-    if let Some((rank, ranks)) = group {
-        context
-            .set_group(None, rank, ranks)
-            .expect("a group of a meta context");
-    }
-    context.record_launches();
-    context
+/// The meta cache group of `shape` in `dtype` over `rows` rows of `row_pages` pages each.
+fn cache(shape: CacheShape, dtype: DType, rows: usize, row_pages: usize) -> KvCache {
+    KvCache::allocate(
+        shape,
+        dtype,
+        rows * row_pages,
+        PAGE_TOKENS,
+        meta((rows, row_pages), DType::U32),
+        meta(WORKSPACE_BYTES, DType::U8),
+        |shape, dtype| Ok(meta(shape, dtype)),
+    )
+    .expect("a meta cache group")
 }
 
-/// The launches `context` recorded, in order, each checked: every launch names its operator
-/// and its key, and no key names a model.
-fn launches(context: &ops::Context) -> Vec<(&'static str, String)> {
-    context
-        .take_launches()
-        .into_iter()
-        .map(|(operator, key, ..)| {
-            assert!(!operator.is_empty(), "a launch of no operator: {key}");
-            assert!(!key.is_empty(), "{operator} states no key");
-            assert!(
-                !key.to_lowercase().contains("qwen") && !operator.to_lowercase().contains("qwen"),
-                "{operator} {key} names a model"
-            );
-
-            (operator, key)
-        })
-        .collect()
+/// Meta buffers of every layer of `shapes`, [`SLOTS`] rows each.
+fn buffers(shapes: &[nn::family::StateShape]) -> Vec<Vec<nn::Tensor>> {
+    RecurrentState::buffers(shapes, |_| SLOTS, |shape, dtype| Ok(meta(shape, dtype)))
+        .expect("the state buffers")
 }
 
 /// What one step of a bucket stated: its kernel keys, the launches of one gated delta network
@@ -139,61 +112,49 @@ struct Profile {
 }
 
 /// One step of `model` over a bucket of `rows` attention rows of `tokens` tokens in all, whose
-/// `requests` state rows hold them, at this rank's place `group` of its deployment.
+/// `requests` state rows hold them, at this rank's place `group` of its deployment: what it
+/// recorded, each launch checked ([`assert_generic`]).
 fn step(
     model: &dyn TextModel,
     phase: Phase,
     (rows, tokens, requests): (usize, usize, usize),
-    group: Option<(u64, u64)>,
-) -> Profile {
-    let row_pages = (tokens / rows).div_ceil(PAGE as usize).max(2);
-    let column = |length: usize, dtype: DType| meta(Shape::from(length), dtype);
+    group: &[Split],
+) -> Recording {
+    let row_pages = (tokens / rows).div_ceil(PAGE_TOKENS as usize).max(2);
 
-    let context = context(group);
-    {
-        let _guard = context.enter();
-
-        let batch = support::batch(
+    let (stepped, recording) = record(group, || {
+        let batch = text::batch(
             phase,
             [
-                column(tokens, DType::I32),
-                column(tokens, DType::U32),
-                column(rows, DType::U32),
-                column(rows + 1, DType::U32),
-                column(rows, DType::U32),
+                meta(tokens, DType::I32),
+                meta(tokens, DType::U32),
+                meta(rows, DType::U32),
+                meta(rows + 1, DType::U32),
+                meta(rows, DType::U32),
             ],
-            Some((
-                column(tokens, DType::U32),
-                meta(Shape::from((rows, 2)), DType::U32),
-            )),
-            PAGE,
-            PAGE * row_pages as u32,
+            Some((meta(tokens, DType::U32), meta((rows, 2), DType::U32))),
+            PAGE_TOKENS,
+            PAGE_TOKENS * row_pages as u32,
         );
-        let cache = support::cache(
-            model.cache(),
-            model.dtype(),
-            (rows * row_pages, PAGE),
-            meta(Shape::from((rows, row_pages)), DType::U32),
-            &meta,
-        );
+        let cache = cache(model.cache(), model.dtype(), rows, row_pages);
         let shapes = model.state_layers();
-        let state = support::state(
+        let state = text::state(
             [
-                column(requests + 1, DType::U32),
-                column(requests, DType::U32),
-                column(requests, DType::U32),
-                column(requests, DType::U32),
+                meta(requests + 1, DType::U32),
+                meta(requests, DType::U32),
+                meta(requests, DType::U32),
+                meta(requests, DType::U32),
             ],
-            &support::state_buffers(&shapes, SLOTS, &meta),
-            &support::state_buffers(&shapes, SLOTS, &meta),
+            &buffers(&shapes),
+            &buffers(&shapes),
             Some((
-                meta(Shape::from((requests, STEP_ROWS)), DType::U32),
-                column(requests, DType::U32),
+                meta((requests, STEP_ROWS), DType::U32),
+                meta(requests, DType::U32),
             )),
         );
 
         let embedded = model
-            .embed_input_ids(&column(tokens, DType::U32))
+            .embed_input_ids(&meta(tokens, DType::U32))
             .expect("the embeddings");
         assert_eq!(embedded.dims(), [tokens, model.hidden() as usize]);
         assert_eq!(embedded.dtype(), model.dtype());
@@ -214,9 +175,17 @@ fn step(
             .expect("the logits");
         assert_eq!(logits.dims(), [rows, model.vocabulary() as usize]);
         assert_eq!(logits.dtype(), DType::F32);
-    }
+        Ok(())
+    });
+    stepped.unwrap_or_else(|error| panic!("the {phase:?} step: {error}"));
 
-    let launches = launches(&context);
+    assert_generic(&format!("a {phase:?} step"), &recording.launches);
+    recording
+}
+
+/// The profile of `recording`, one step of a bucket.
+fn profile(recording: &Recording) -> Profile {
+    let launches: &[Launch] = &recording.launches;
 
     // The grouped norm opens each read of the streams: two a layer, and three more in the
     // layer that holds the PLE layer (the stack's second). The launches from one layer's
@@ -241,16 +210,16 @@ fn step(
         // The stack's third layer is a gated delta network and its fourth attends.
         linear_layer: layer(2),
         attention_layer: layer(3),
-        keys: launches.into_iter().collect(),
-        peak: context.peak(),
-        host_bytes: context.input_peak(),
+        keys: launches.iter().cloned().collect(),
+        peak: recording.peak,
+        host_bytes: recording.host_bytes,
     }
 }
 
 /// Runs the two verify buckets and the prefill bucket of `model` twice each, asserts that both
-/// runs of a bucket state the same kernels and reach the same peak, and prints them under
+/// runs of a bucket state the same kernels and reach the same peak, and reports them under
 /// `name`.
-fn buckets(name: &str, model: &dyn TextModel, group: Option<(u64, u64)>) -> Vec<Profile> {
+fn buckets(name: &str, model: &dyn TextModel, group: &[Split]) -> Vec<Profile> {
     [
         (Phase::Decode, (STEP_ROWS, STEP_ROWS, 1)),
         (Phase::Decode, (8 * STEP_ROWS, 8 * STEP_ROWS, 8)),
@@ -258,37 +227,20 @@ fn buckets(name: &str, model: &dyn TextModel, group: Option<(u64, u64)>) -> Vec<
     ]
     .into_iter()
     .map(|(phase, bucket)| {
-        let first = step(model, phase, bucket, group);
-        let second = step(model, phase, bucket, group);
+        let recording = step(model, phase, bucket, group);
+        let first = profile(&recording);
+        let second = profile(&step(model, phase, bucket, group));
         assert_eq!(first, second, "two runs of one {phase:?} bucket differ");
 
-        let operators: BTreeSet<&str> = first.keys.iter().map(|(operator, _)| *operator).collect();
+        let run = format!("{name} {phase:?} {} rows, {} tokens", bucket.0, bucket.1);
+        report(&run, &recording);
         println!(
-            "{name} {phase:?} {} rows, {} tokens: {} launches, {} kernel keys of {} operators, \
-             {} launches a gated delta layer, {} an attention layer, allocator peak {} bytes, \
-             {} bytes of host values",
-            bucket.0,
-            bucket.1,
-            first.launches,
-            first.keys.len(),
-            operators.len(),
+            "{run}: {} launches a gated delta layer, {} an attention layer",
             first.linear_layer.values().sum::<usize>(),
             first.attention_layer.values().sum::<usize>(),
-            first.peak,
-            first.host_bytes
         );
-        println!(
-            "{name} {phase:?} a gated delta layer: {:?}",
-            first.linear_layer
-        );
-        println!(
-            "{name} {phase:?} an attention layer: {:?}",
-            first.attention_layer
-        );
-        println!("{name} {phase:?} operators: {operators:?}");
-        for (operator, key) in &first.keys {
-            println!("{name} {phase:?} key: {operator} {key}");
-        }
+        println!("{run} a gated delta layer: {:?}", first.linear_layer);
+        println!("{run} an attention layer: {:?}", first.attention_layer);
         assert!(first.peak > 0, "a forward allocates its activations");
 
         first
@@ -296,22 +248,9 @@ fn buckets(name: &str, model: &dyn TextModel, group: Option<(u64, u64)>) -> Vec<
     .collect()
 }
 
-/// Asserts that `profile` states every operator of `expected` and none of `absent`.
-fn assert_operators(what: &str, profile: &Profile, expected: &[&str], absent: &[&str]) {
-    let named: BTreeSet<&str> = profile.keys.iter().map(|(operator, _)| *operator).collect();
-
-    for operator in expected {
-        assert!(
-            named.contains(operator),
-            "{what} launches no {operator}: {named:?}"
-        );
-    }
-    for operator in absent {
-        assert!(
-            !named.contains(operator),
-            "{what} launches {operator}: {named:?}"
-        );
-    }
+/// The operators of `profile`.
+fn operators(profile: &Profile) -> BTreeSet<&'static str> {
+    profile.keys.iter().map(|(operator, _)| *operator).collect()
 }
 
 /// The operators every step of the model launches.
@@ -368,9 +307,9 @@ fn assert_shapes(model: &dyn TextModel, tensor: Split) {
 }
 
 /// The profile of a checkpoint whose experts are NVFP4: whole, and as rank one of four.
-fn profile_packed(name: &str) {
+fn profile_packed(release: Release) {
     for tensor in [Split::WHOLE, Split { size: 4, rank: 1 }] {
-        let (model, unread) = load(name, &support::placement(tensor, DRAFTS));
+        let (model, unread) = load(release, &placement(tensor));
         assert_shapes(&*model, tensor);
         assert!(model.experts().expect("routed experts").encoded);
 
@@ -382,18 +321,26 @@ fn profile_packed(name: &str) {
             .collect();
         assert!(
             stray.is_empty(),
-            "{name}: {} tensors no module names, the first {:?}",
+            "{release}: {} tensors no module names, the first {:?}",
             stray.len(),
             &stray[..stray.len().min(12)]
         );
 
-        let label = format!("{name} tensor rank {} of {}", tensor.rank, tensor.size);
-        let group = (tensor.size > 1).then_some((u64::from(tensor.rank), u64::from(tensor.size)));
+        let label = format!(
+            "{} tensor rank {} of {}",
+            release.repository, tensor.rank, tensor.size
+        );
+        let group: &[Split] = if tensor.size > 1 { &[tensor] } else { &[] };
         for profile in buckets(&label, &*model, group) {
-            assert_operators("a step", &profile, &STEP, &["gather_gemm", "route_gemm"]);
             assert_operators(
                 "a step",
-                &profile,
+                &operators(&profile),
+                &STEP,
+                &["gather_gemm", "route_gemm"],
+            );
+            assert_operators(
+                "a step",
+                &operators(&profile),
                 &["nvfp4_quantize", "gather_gemm_nvfp4", "route_gemm_nvfp4"],
                 &[],
             );
@@ -405,7 +352,7 @@ fn profile_packed(name: &str) {
 
 /// The drafter's forward over a draft cache and a ring of its own, and one image through the
 /// tower.
-fn drafter_and_tower(name: &str, model: &dyn TextModel, group: Option<(u64, u64)>) {
+fn drafter_and_tower(name: &str, model: &dyn TextModel, group: &[Split]) {
     let drafter = model.drafter().expect("the drafter");
     let draft = drafter.cache();
     assert_eq!((draft.layers, draft.head_dim), (1, 256));
@@ -413,39 +360,30 @@ fn drafter_and_tower(name: &str, model: &dyn TextModel, group: Option<(u64, u64)
     assert_eq!(shapes.len(), 1);
 
     for (rows, tokens, requests) in [(STEP_ROWS, STEP_ROWS, 1), (1, 1, 1)] {
-        let context = context(group);
-        {
-            let _guard = context.enter();
-            let column = |length: usize, dtype: DType| meta(Shape::from(length), dtype);
-            let batch = support::batch(
+        let (drafted, recording) = record(group, || {
+            let batch = text::batch(
                 Phase::Decode,
                 [
-                    column(tokens, DType::I32),
-                    column(tokens, DType::U32),
-                    column(rows, DType::U32),
-                    column(rows + 1, DType::U32),
-                    column(rows, DType::U32),
+                    meta(tokens, DType::I32),
+                    meta(tokens, DType::U32),
+                    meta(rows, DType::U32),
+                    meta(rows + 1, DType::U32),
+                    meta(rows, DType::U32),
                 ],
                 None,
-                PAGE,
-                PAGE * 2,
+                PAGE_TOKENS,
+                PAGE_TOKENS * 2,
             );
-            let cache = support::cache(
-                draft,
-                model.dtype(),
-                (rows * 2, PAGE),
-                meta(Shape::from((rows, 2)), DType::U32),
-                &meta,
-            );
-            let state = support::state(
+            let cache = cache(draft, model.dtype(), rows, 2);
+            let state = text::state(
                 [
-                    column(requests + 1, DType::U32),
-                    column(requests, DType::U32),
-                    column(requests, DType::U32),
-                    column(requests, DType::U32),
+                    meta(requests + 1, DType::U32),
+                    meta(requests, DType::U32),
+                    meta(requests, DType::U32),
+                    meta(requests, DType::U32),
                 ],
-                &support::state_buffers(&shapes, SLOTS, &meta),
-                &support::state_buffers(&shapes, SLOTS, &meta),
+                &buffers(&shapes),
+                &buffers(&shapes),
                 None,
             );
 
@@ -454,14 +392,8 @@ fn drafter_and_tower(name: &str, model: &dyn TextModel, group: Option<(u64, u64)
                     &batch,
                     &cache,
                     Some(&state),
-                    &meta(
-                        Shape::from((tokens, model.hidden() as usize)),
-                        model.dtype(),
-                    ),
-                    &meta(
-                        Shape::from((tokens, model.stream_width() as usize)),
-                        model.dtype(),
-                    ),
+                    &meta((tokens, model.hidden() as usize), model.dtype()),
+                    &meta((tokens, model.stream_width() as usize), model.dtype()),
                 )
                 .unwrap_or_else(|error| panic!("the drafter's forward: {error}"));
             assert_eq!(drafted.dims(), [tokens, model.stream_width() as usize]);
@@ -472,28 +404,27 @@ fn drafter_and_tower(name: &str, model: &dyn TextModel, group: Option<(u64, u64)
             assert_eq!(rows_read.dims(), [tokens, model.hidden() as usize]);
             let logits = model.compute_logits(&rows_read).expect("the draft logits");
             assert_eq!(logits.dims(), [tokens, model.vocabulary() as usize]);
-        }
+            Ok(())
+        });
+        drafted.unwrap_or_else(|error| panic!("the drafter's step: {error}"));
 
-        let launched = launches(&context);
-        let operators: BTreeSet<&str> = launched.iter().map(|(operator, _)| *operator).collect();
-        println!(
-            "{name} drafter {tokens} rows: {} launches, allocator peak {} bytes, operators \
-             {operators:?}",
-            launched.len(),
-            context.peak()
+        report(&format!("{name} drafter {tokens} rows"), &recording);
+        let operators: BTreeSet<&str> = recording
+            .launches
+            .iter()
+            .map(|(operator, _)| *operator)
+            .collect();
+        assert_operators(
+            "the drafter",
+            &operators,
+            &[
+                "index_scores",
+                "indexed_attention",
+                "kv_write",
+                "topk_softmax",
+            ],
+            &["gated_delta_rule"],
         );
-        for operator in [
-            "index_scores",
-            "indexed_attention",
-            "kv_write",
-            "topk_softmax",
-        ] {
-            assert!(
-                operators.contains(operator),
-                "the drafter launches no {operator}"
-            );
-        }
-        assert!(!operators.contains("gated_delta_rule"));
     }
 
     // The tower: an image of 448 x 672 pixels is sized to a 28 x 42 patch grid, which merges
@@ -504,78 +435,57 @@ fn drafter_and_tower(name: &str, model: &dyn TextModel, group: Option<(u64, u64)
     let rows = tower.image_rows(grid).expect("whole merge blocks") as usize;
     assert_eq!((rows, tower.position_axes()), (294, 3));
 
-    let context = context(None);
-    {
-        let _guard = context.enter();
+    let (encoded, recording) = record(&[], || {
         let format = tower.patch_format();
-        let pixels = meta(
-            Shape::from((28 * 42, format.width() as usize)),
-            format.dtype,
-        );
-        let features = meta(Shape::from((rows, model.hidden() as usize)), model.dtype());
+        let pixels = meta((28 * 42, format.width() as usize), format.dtype);
+        let features = meta((rows, model.hidden() as usize), model.dtype());
 
-        tower
-            .encode_image(grid, &pixels, &features)
-            .expect("the image's features");
-    }
-    let launched = launches(&context);
-    println!(
-        "{name} tower 28x42: {} launches, allocator peak {} bytes",
-        launched.len(),
-        context.peak()
-    );
+        tower.encode_image(grid, &pixels, &features)
+    });
+    encoded.expect("the image's features");
+    report(&format!("{name} tower 28x42"), &recording);
     assert!(
-        launched
+        recording
+            .launches
             .iter()
             .any(|(operator, _)| *operator == "dense_attention")
     );
 }
 
-/// The NVIDIA export: NVFP4 experts in every decoder layer, the drafter's experts
-/// block-scaled FP8 (decoded dense at load), the n-gram table FP8.
+/// The NVIDIA export stores its drafter's experts as weight-only block-scaled FP8
+/// (`FP8_PB_WO`), which no operator of this build multiplies: the family refuses the checkpoint
+/// when it opens it, naming the representation, and the checkpoint is refused until an
+/// operator serves that representation (decision D12).
 #[test]
-#[ignore = "requires /workspace/models/Qwen3.8-Flash-Next-NVFP4-nvidia"]
-fn the_nvidia_nvfp4_export_profiles_its_buckets() {
-    profile_packed("Qwen3.8-Flash-Next-NVFP4-nvidia");
+#[ignore = "reads the Hugging Face release nvidia/Qwen3.8-Flash-Next-NVFP4"]
+fn the_nvidia_nvfp4_export_is_refused_by_its_drafters_experts() {
+    let release = QWEN3_8_FLASH_NEXT_NVFP4;
+    let refused = text::open(&FAMILIES, &release.checkpoint())
+        .err()
+        .unwrap_or_else(|| panic!("{release} opened"));
+
+    assert!(refused.to_string().contains("FP8_PB_WO"), "{refused}");
 }
 
 /// The RadixArk export: NVFP4 experts in every decoder layer, the drafter's experts stacked
 /// BF16.
 #[test]
-#[ignore = "requires /workspace/models/Qwen3.8-Flash-Next-NVFP4-RadixArk"]
+#[ignore = "reads the Hugging Face release RadixArk/Qwen3.8-Flash-Next-NVFP4"]
 fn the_radixark_nvfp4_export_profiles_its_buckets() {
-    profile_packed("Qwen3.8-Flash-Next-NVFP4-RadixArk");
+    profile_packed(QWEN3_8_FLASH_NEXT_NVFP4_RADIXARK);
 }
 
-/// The FP8 export stores the experts of every decoder layer as block-scaled FP8, which no
-/// operator of this build multiplies and no load decodes: its configuration opens and its load
-/// is refused by the representation, before any tensor is read.
+/// The FP8 export declares the producer `fp8`, whose block-scaled FP8 experts no operator of
+/// this build multiplies: the family refuses the checkpoint when it opens it, naming the
+/// producer, and the checkpoint is refused until an operator serves its representation
+/// (decision D12).
 #[test]
-#[ignore = "requires /workspace/models/Qwen3.8-Flash-Next-FP8"]
-fn the_fp8_export_is_refused_by_its_experts_representation() {
-    let name = "Qwen3.8-Flash-Next-FP8";
-    let checkpoint = checkpoint(name);
-
-    let config = models::qwen4_exp::Config::open(&checkpoint).expect("the configuration");
-    assert_eq!(config.text.num_hidden_layers, 48);
-    assert_eq!(config.ngram.table_rows(), 320_001_536);
-
-    for tensor in [Split::WHOLE, Split { size: 4, rank: 0 }] {
-        let store = MetaWeights::new();
-        let mut loader = WeightLoader::new(&checkpoint, &store, None);
-        let refused = support::load(
-            &checkpoint,
-            &mut loader,
-            &support::placement(tensor, DRAFTS),
-        )
+#[ignore = "reads the Hugging Face release Qwen/Qwen3.8-Flash-Next-FP8"]
+fn the_fp8_export_is_refused_by_its_producer() {
+    let release = QWEN3_8_FLASH_NEXT_FP8;
+    let refused = text::open(&FAMILIES, &release.checkpoint())
         .err()
-        .unwrap_or_else(|| panic!("{name} loaded"));
+        .unwrap_or_else(|| panic!("{release} opened"));
 
-        let message = refused.to_string();
-        println!("{name}: {message}");
-        assert!(
-            matches!(refused, nn::Error::Model { .. }) && message.contains("weight_scale_inv"),
-            "{message}"
-        );
-    }
+    assert!(refused.to_string().contains("`fp8`"), "{refused}");
 }

@@ -18,11 +18,7 @@
 //!   hidden width 32 and the head width 16 are shorter);
 //! - `L` the stages of the module under test, counted in each test.
 
-// The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
-use super::support;
-
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use models::minimax_h3::VideoTask;
 use models::minimax_h3::config::{DenoiserConfig, ScheduleConfig, TransformerConfig};
@@ -31,8 +27,8 @@ use models::minimax_h3::refiner::TokenRefiner;
 use models::minimax_h3::transformer::{Block, Transformer, rotary_config};
 use nn::family::DenoiserSplit;
 use nn::modules::{Rotary, TimestepTable, TimestepTableConfig};
-use nn::{Checkpoint, CpuWeights, DType, Device, Tensor, WeightLoader};
-use support::{assert_close, values};
+use nn::{CpuWeights, DType, Device, Tensor, WeightLoader};
+use nn_testing::{Fixture, assert_close, values};
 
 /// The FP32 unit roundoff.
 const ROUNDOFF: f32 = 1.0 / 16_777_216.0;
@@ -43,15 +39,13 @@ const LONGEST_REDUCTION: f32 = 48.0;
 /// The rows of the packed sequence the fixture's block runs over.
 const ROWS: u32 = 40;
 
-/// The directory of the committed fixtures.
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/it/minimax_h3/fixtures")
-}
-
-/// The inputs and the reference's outputs, by name.
-fn expected() -> HashMap<String, Tensor> {
-    let path = fixtures().join("transformer.expected.safetensors");
-    crate::fixture::tensors(&path)
+/// The committed fixture: the tiny checkpoint under `transformer`, and the inputs and the
+/// reference's outputs in `transformer.expected.safetensors`.
+fn fixture() -> Fixture {
+    nn_testing::fixture!("fixtures": [
+        "transformer/model.safetensors",
+        "transformer.expected.safetensors",
+    ])
 }
 
 /// The tiny network the generator states: two blocks of two heads of sixteen channels, twelve
@@ -125,8 +119,9 @@ fn offsets() -> Vec<Tensor> {
 
 #[test]
 fn the_modulation_is_the_references_adaln_projection_of_each_level() {
-    let expected = expected();
-    let checkpoint = Checkpoint::open(&fixtures().join("transformer")).unwrap();
+    let fixture = fixture();
+    let expected = fixture.tensors("transformer.expected.safetensors");
+    let checkpoint = fixture.checkpoint("transformer");
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let table = modulation_table(&loader, &expected["timesteps"]);
@@ -149,8 +144,9 @@ fn the_modulation_is_the_references_adaln_projection_of_each_level() {
 
 #[test]
 fn the_rotary_factors_are_the_references_table() {
-    let expected = expected();
-    let checkpoint = Checkpoint::open(&fixtures().join("transformer")).unwrap();
+    let fixture = fixture();
+    let expected = fixture.tensors("transformer.expected.safetensors");
+    let checkpoint = fixture.checkpoint("transformer");
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
 
@@ -175,8 +171,9 @@ fn the_rotary_factors_are_the_references_table() {
 
 #[test]
 fn a_block_is_the_references_block() {
-    let expected = expected();
-    let checkpoint = Checkpoint::open(&fixtures().join("transformer")).unwrap();
+    let fixture = fixture();
+    let expected = fixture.tensors("transformer.expected.safetensors");
+    let checkpoint = fixture.checkpoint("transformer");
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let config = config();
@@ -218,8 +215,9 @@ fn a_block_is_the_references_block() {
 
 #[test]
 fn the_stack_and_its_heads_are_the_references() {
-    let expected = expected();
-    let checkpoint = Checkpoint::open(&fixtures().join("transformer")).unwrap();
+    let fixture = fixture();
+    let expected = fixture.tensors("transformer.expected.safetensors");
+    let checkpoint = fixture.checkpoint("transformer");
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let config = config();
@@ -259,8 +257,9 @@ fn the_stack_and_its_heads_are_the_references() {
 
 #[test]
 fn the_refined_prompt_is_the_references() {
-    let expected = expected();
-    let checkpoint = Checkpoint::open(&fixtures().join("transformer")).unwrap();
+    let fixture = fixture();
+    let expected = fixture.tensors("transformer.expected.safetensors");
+    let checkpoint = fixture.checkpoint("transformer");
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
 

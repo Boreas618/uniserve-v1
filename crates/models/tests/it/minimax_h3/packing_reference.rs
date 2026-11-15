@@ -13,28 +13,29 @@
 
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 
 use models::minimax_h3::config::{TransformerConfig, VsaConfig};
 use models::minimax_h3::packing;
 use nn::{ConditionRole, ConditionShape, DType, Tensor, VideoRequest};
+use nn_testing::Fixture;
 use proto::video::Layout;
 use serde_json::Value;
 
-/// The directory of the committed fixtures.
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/it/minimax_h3/fixtures/packing")
+/// The committed fixture: the requests in `cases.json` and the reference's tensors of each in
+/// `expected.safetensors`.
+fn fixture() -> Fixture {
+    nn_testing::fixture!("fixtures/packing": ["cases.json", "expected.safetensors"])
 }
 
 /// The requests the generator stated.
 fn cases() -> Vec<Value> {
-    let text = std::fs::read_to_string(fixtures().join("cases.json")).unwrap();
+    let text = std::fs::read_to_string(fixture().path("cases.json")).unwrap();
     serde_json::from_str(&text).unwrap()
 }
 
 /// The reference's tensors, by `<request>.<tensor>`.
 fn expected() -> HashMap<String, Tensor> {
-    crate::fixture::tensors(&fixtures().join("expected.safetensors"))
+    fixture().tensors("expected.safetensors")
 }
 
 /// The released network's widths: the packing reads its latent channels alone.

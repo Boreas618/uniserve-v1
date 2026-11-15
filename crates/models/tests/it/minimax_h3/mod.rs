@@ -6,7 +6,6 @@ mod composition;
 mod denoiser;
 mod denoiser_profile;
 mod packing_reference;
-mod support;
 mod transformer_reference;
 mod vae_profile;
 mod vae_reference;

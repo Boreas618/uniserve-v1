@@ -2857,10 +2857,10 @@ name = "models"
 version = "2.0.0"
 dependencies = [
  "nn",
+ "nn-testing",
  "ops",
  "processing",
  "proto",
- "serde",
  "serde_json",
  "tempfile",
  "tensor",

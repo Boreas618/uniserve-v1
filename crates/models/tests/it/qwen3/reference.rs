@@ -28,26 +28,27 @@
 //!
 //! Nothing here touches a GPU.
 
-use super::support;
-
-use std::collections::HashMap;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use models::qwen3::config::VisionConfig;
 use models::qwen3::{Config, Qwen3VlModel, positions};
-use nn::family::TextModel;
+use nn::family::{CacheShape, Family, TextModel, TextPlacement};
 use nn::{
-    CpuWeights, DType, Device, Encoder, KvCache, Phase, Shape, Split, Tensor, TokenBatch,
-    WeightLoader,
+    CpuWeights, DType, Device, Encoder, KvCache, Phase, RecurrentState, Shape, Split, Tensor,
+    TokenBatch, WeightLoader,
 };
+use nn_testing::text::{self, WORKSPACE_BYTES};
+use nn_testing::{Fixture, PAGE_TOKENS};
 
-/// Tokens of one cache page, a whole chunk of the gated delta rule: a row of seventy tokens
-/// spans two.
-const PAGE: u32 = 64;
+/// The families the fixtures' checkpoints declare.
+const FAMILIES: [Family; 2] = [
+    models::qwen3::family::FAMILY,
+    models::qwen3::family::HYBRID_FAMILY,
+];
 
-/// The pages of each of two rows, in the order the row fills them, out of [`PAGES`].
+/// The pages of each of two rows, in the order the row fills them, out of [`PAGES`]: a row of
+/// seventy tokens spans two pages of [`PAGE_TOKENS`].
 const TABLES: [[u32; 2]; 2] = [[3, 0], [1, 2]];
 
 /// Pages of a cache group.
@@ -155,18 +156,36 @@ fn tower_terms(vision: &VisionConfig, frame: u32) -> u32 {
     vision.tubelet() + 4 + vision.depth * block + merger
 }
 
-/// The directory of the fixture `name`.
-fn data(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/it/qwen3/data")
-        .join(name)
+/// The `Qwen3MoeForCausalLM` fixture: its tiny checkpoint under `model` and the reference's
+/// vectors in `reference.safetensors`.
+fn qwen3_moe() -> Fixture {
+    nn_testing::fixture!("data/qwen3_moe": [
+        "model/config.json",
+        "model/model.safetensors",
+        "reference.safetensors",
+    ])
 }
 
-/// The reference vectors of the fixture `name`, by name.
-fn reference(name: &str) -> HashMap<String, Tensor> {
-    let path = data(name).join("reference.safetensors");
+/// The `Qwen3_5MoeForConditionalGeneration` fixture, with the processor files of its tower.
+fn qwen3_5_moe() -> Fixture {
+    nn_testing::fixture!("data/qwen3_5_moe": [
+        "model/config.json",
+        "model/model.safetensors",
+        "model/preprocessor_config.json",
+        "model/video_preprocessor_config.json",
+        "reference.safetensors",
+    ])
+}
 
-    crate::fixture::tensors(&path)
+/// The `Qwen3VLModel` fixture, with the processor files of its tower.
+fn qwen3_vl() -> Fixture {
+    nn_testing::fixture!("data/qwen3_vl": [
+        "model/config.json",
+        "model/model.safetensors",
+        "model/preprocessor_config.json",
+        "model/video_preprocessor_config.json",
+        "reference.safetensors",
+    ])
 }
 
 /// The token ids the reference stored as `ids`.
@@ -185,14 +204,19 @@ fn zeros(shape: Shape, dtype: DType) -> Tensor {
     Tensor::zeros(shape, dtype, &Device::Cpu).expect("zeros")
 }
 
-/// The causal language model of the fixture `name`, loaded on the CPU device.
-fn model(name: &str, drafter: bool) -> (Arc<dyn TextModel>, Config) {
-    let checkpoint = support::checkpoint(&data(name).join("model"));
+/// The causal language model of `fixture`, loaded on the CPU device whole, with its drafter
+/// when `drafter` asks for it.
+fn model(fixture: &Fixture, drafter: bool) -> (Arc<dyn TextModel>, Config) {
+    let checkpoint = fixture.checkpoint("model");
     let store = CpuWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None);
+    let placement = TextPlacement {
+        drafter,
+        ..TextPlacement::WHOLE
+    };
 
     (
-        support::load(&checkpoint, &mut loader, &support::whole(drafter)),
+        text::load(&FAMILIES, &checkpoint, &mut loader, &placement).expect("the load"),
         Config::open(&checkpoint).expect("the configuration"),
     )
 }
@@ -208,9 +232,9 @@ fn batch(phase: Phase, ranges: &[Range<u32>]) -> TokenBatch {
         .iter()
         .zip(TABLES)
         .flat_map(|(range, pages)| {
-            range
-                .clone()
-                .map(move |position| pages[(position / PAGE) as usize] * PAGE + position % PAGE)
+            range.clone().map(move |position| {
+                pages[(position / PAGE_TOKENS) as usize] * PAGE_TOKENS + position % PAGE_TOKENS
+            })
         })
         .collect();
     let seq_lens: Vec<u32> = ranges.iter().map(|range| range.end).collect();
@@ -221,7 +245,7 @@ fn batch(phase: Phase, ranges: &[Range<u32>]) -> TokenBatch {
     }
     let last: Vec<u32> = offsets[1..].iter().map(|end| end - 1).collect();
 
-    support::batch(
+    text::batch(
         phase,
         [
             Tensor::new(positions.as_slice(), &Device::Cpu).expect("positions"),
@@ -230,25 +254,36 @@ fn batch(phase: Phase, ranges: &[Range<u32>]) -> TokenBatch {
             column(&offsets),
             column(&last),
         ],
-        PAGE,
-        PAGE * TABLES[0].len() as u32,
+        None,
+        PAGE_TOKENS,
+        PAGE_TOKENS * TABLES[0].len() as u32,
     )
 }
 
 /// An empty cache group of `shape` for `rows` rows on the pages of [`TABLES`].
-fn cache(shape: nn::family::CacheShape, rows: usize) -> KvCache {
+fn cache(shape: CacheShape, rows: usize) -> KvCache {
     let tables = column(&TABLES[..rows].concat())
         .reshape((rows, TABLES[0].len()))
         .expect("a block table");
 
-    support::cache(shape, DType::F32, (PAGES, PAGE), tables, &zeros)
+    KvCache::allocate(
+        shape,
+        DType::F32,
+        PAGES,
+        PAGE_TOKENS,
+        tables,
+        zeros(Shape::from(WORKSPACE_BYTES), DType::U8),
+        |shape, dtype| Ok(zeros(shape, dtype)),
+    )
+    .expect("a cache group")
 }
 
 /// The state buffers of `model`, zeroed, when it keeps a state.
 fn buffers(model: &dyn TextModel) -> Option<Vec<Vec<Tensor>>> {
-    model
-        .state()
-        .map(|shape| support::state_buffers(&shape, SLOTS, &zeros))
+    model.state().map(|shape| {
+        RecurrentState::buffers(&[shape], |_| SLOTS, |shape, dtype| Ok(zeros(shape, dtype)))
+            .expect("the state buffers")
+    })
 }
 
 /// One forward of `model` over the tokens `ranges` of the rows' `ids`: the final hidden
@@ -274,7 +309,7 @@ fn forward(
 
     // Each row advances its own slot from where its earlier tokens left it.
     let state = state.map(|[live, checkpoint]| {
-        support::state(
+        text::state(
             [
                 batch.query_offsets.clone(),
                 batch.seq_lens.clone(),
@@ -283,6 +318,7 @@ fn forward(
             ],
             live,
             checkpoint,
+            None,
         )
     });
 
@@ -343,12 +379,13 @@ fn rows(tensor: &Tensor, rows: &[Range<u32>]) -> Tensor {
     Tensor::cat(&parts, 0).expect("the rows")
 }
 
-/// The fixture `name`'s two rows through its causal language model: one prefill of both rows
-/// against the reference's hidden states and logits, then a prefill of each row's opening
-/// tokens and decode steps through the cache and the state against the one prefill.
-fn check_causal_lm(name: &str) {
-    let (model, config) = model(name, false);
-    let reference = reference(name);
+/// The two rows of the fixture `name`, `fixture`, through its causal language model: one
+/// prefill of both rows against the reference's hidden states and logits, then a prefill of
+/// each row's opening tokens and decode steps through the cache and the state against the one
+/// prefill.
+fn check_causal_lm(name: &str, fixture: &Fixture) {
+    let (model, config) = model(fixture, false);
+    let reference = fixture.tensors("reference.safetensors");
     let model = &*model;
 
     let ids: Vec<Vec<u32>> = (0..2)
@@ -437,20 +474,21 @@ fn check_causal_lm(name: &str) {
 
 #[test]
 fn qwen3_moe_computes_the_references_hidden_states_and_logits() {
-    check_causal_lm("qwen3_moe");
+    check_causal_lm("qwen3_moe", &qwen3_moe());
 }
 
 #[test]
 fn qwen3_5_moe_computes_the_references_hidden_states_and_logits() {
-    check_causal_lm("qwen3_5_moe");
+    check_causal_lm("qwen3_5_moe", &qwen3_5_moe());
 }
 
 /// The drafter's entries of a row are the reference's, in one prefill and as a prefill
 /// followed by decode steps over the draft cache.
 #[test]
 fn the_drafter_computes_the_references_hidden_states() {
-    let (model, config) = model("qwen3_5_moe", true);
-    let reference = reference("qwen3_5_moe");
+    let fixture = qwen3_5_moe();
+    let (model, config) = model(&fixture, true);
+    let reference = fixture.tensors("reference.safetensors");
     let drafter = model.drafter().expect("the drafter");
 
     let shape = drafter.cache();
@@ -523,8 +561,9 @@ fn the_drafter_computes_the_references_hidden_states() {
 /// reference's hidden states.
 #[test]
 fn a_prompt_with_an_image_computes_the_references_hidden_states() {
-    let (model, config) = model("qwen3_5_moe", false);
-    let reference = reference("qwen3_5_moe");
+    let fixture = qwen3_5_moe();
+    let (model, config) = model(&fixture, false);
+    let reference = fixture.tensors("reference.safetensors");
     let model = &*model;
     let tower = model.vision().expect("the tower");
     let vision = config.vision.as_ref().expect("a tower's configuration");
@@ -588,7 +627,7 @@ fn a_prompt_with_an_image_computes_the_references_hidden_states() {
     let mut batch = batch(Phase::Prefill, std::slice::from_ref(&(0..tokens)));
     batch.rope_positions = Some(coordinates);
     let state = buffers(model).map(|live| {
-        support::state(
+        text::state(
             [
                 batch.query_offsets.clone(),
                 batch.seq_lens.clone(),
@@ -597,6 +636,7 @@ fn a_prompt_with_an_image_computes_the_references_hidden_states() {
             ],
             &live,
             &buffers(model).expect("a state"),
+            None,
         )
     });
     let hidden = model
@@ -623,9 +663,10 @@ fn a_prompt_with_an_image_computes_the_references_hidden_states() {
 /// with the final norm, and over a prefix of its layers without it.
 #[test]
 fn the_vl_encoder_computes_the_references_states() {
-    let checkpoint = support::checkpoint(&data("qwen3_vl").join("model"));
+    let fixture = qwen3_vl();
+    let checkpoint = fixture.checkpoint("model");
     let config = Config::open(&checkpoint).expect("the configuration");
-    let reference = reference("qwen3_vl");
+    let reference = fixture.tensors("reference.safetensors");
     let vision = config.vision.as_ref().expect("a tower's configuration");
     let images = config.images.expect("the processor files");
 

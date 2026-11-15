@@ -7,51 +7,34 @@
 //! the stage by: the launches, the distinct kernel keys, which operators are generic tensor
 //! primitives and which are fused operators of `nn`, and the allocator's peak.
 //!
-//! The runs need the checkpoint at [`CHECKPOINT`], and the packed decoder's the export at
-//! [`NVFP4_EXPORT`], and are ignored without them:
+//! The runs read the base release, and the packed decoder's the NVFP4 export, of
+//! [`crate::releases`] through the Hugging Face cache; they are ignored by default and fail,
+//! naming the release, when asked for without it:
 //!
 //! ```text
 //! cargo test -p models --test it minimax_h3::vae_profile -- --ignored --nocapture
 //! ```
 
-// The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
-use super::support;
-
-use std::path::{Path, PathBuf};
-
 use models::minimax_h3::audio_vae::{AudioDecoder, AudioEncoder, padded_samples};
 use models::minimax_h3::video_vae::{self, VideoDecoder, VideoEncoder};
 use models::minimax_h3::{AudioVaeConfig, VideoVaeConfig};
-use nn::{
-    Checkpoint, Clip, DType, Decoder, LatentShape, MetaWeights, PipelineIndex, Source, Sources,
-    WeightLoader,
-};
+use nn::{Checkpoint, Clip, DType, Decoder, LatentShape, MetaWeights, PipelineIndex, WeightLoader};
+use nn_testing::{meta, record, report};
 use processing::minimax_h3::{
     AUDIO_LATENTS_PER_SECOND, FRAMES, MAX_SECONDS, MIN_SECONDS, named_canvases,
 };
 use proto::video::Layout;
-use support::{meta, recorded, report};
 
-/// The released checkpoint the runs read the headers of.
-const CHECKPOINT: &str = "/workspace/models/MiniMax-H3";
+use crate::releases::{FASTH3_4_STEP_NVFP4, MINIMAX_H3};
 
-/// The four-step FastH3 student's ModelOpt NVFP4 export, whose manifest calibrates the
-/// attention and feed-forward projections of the video decoder's blocks.
-const NVFP4_EXPORT: &str =
-    "/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4";
-
-/// The stage `name` of the released checkpoint, opened by its headers where its pipeline index
+/// The stage `name` of the base release, opened by its headers where its pipeline index
 /// declares it.
 fn stage(name: &str) -> Checkpoint {
-    assert!(
-        Path::new(CHECKPOINT).is_dir(),
-        "the profile runs read the headers of {CHECKPOINT}, which is missing"
-    );
-    let source = Source::Local(PathBuf::from(CHECKPOINT));
+    let source = MINIMAX_H3.source();
 
     PipelineIndex::read(&source)
         .and_then(|index| index.stage(name, &source))
-        .unwrap()
+        .unwrap_or_else(|error| panic!("{MINIMAX_H3}: the stage {name}: {error}"))
 }
 
 /// The video VAE's stage and its config.
@@ -105,8 +88,9 @@ fn profile_decoder(name: &str, decoder: &VideoDecoder, config: &VideoVaeConfig) 
 
         let trajectory = meta((24, voxels), DType::F32);
         let block = meta((rows, 24), DType::F32);
-        let (gathered, recording) =
-            recorded(|| decoder.gather_latents(&layout, &trajectory, clips.start(2), &block));
+        let (gathered, recording) = record(&[], || {
+            decoder.gather_latents(&layout, &trajectory, clips.start(2), &block)
+        });
         gathered.unwrap();
         report(
             &format!("{name}: video gather {width}x{height}"),
@@ -115,7 +99,8 @@ fn profile_decoder(name: &str, decoder: &VideoDecoder, config: &VideoVaeConfig) 
 
         let raster = (3, clip.frames as usize, height as usize, width as usize);
         let video = meta(raster, decoder.element_type());
-        let (decoded, recording) = recorded(|| decoder.decode(&layout, &block, Some(&video), None));
+        let (decoded, recording) =
+            record(&[], || decoder.decode(&layout, &block, Some(&video), None));
         decoded.unwrap();
         report(
             &format!("{name}: video decode {width}x{height}, {rows} latent rows"),
@@ -125,7 +110,7 @@ fn profile_decoder(name: &str, decoder: &VideoDecoder, config: &VideoVaeConfig) 
 }
 
 #[test]
-#[ignore = "requires /workspace/models/MiniMax-H3"]
+#[ignore = "reads the Hugging Face release MiniMaxAI/MiniMax-H3"]
 fn the_video_decoder_profiles_one_clip_at_a_small_and_a_large_resolution() {
     let (checkpoint, config) = video_stage();
     let store = MetaWeights::new();
@@ -139,25 +124,16 @@ fn the_video_decoder_profiles_one_clip_at_a_small_and_a_large_resolution() {
 /// quantization the export's manifest declares of the stage, and the blocks' projections load
 /// packed.
 #[test]
-#[ignore = "requires /workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4"]
+#[ignore = "reads the Hugging Face release \
+            FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4"]
 fn the_nvfp4_export_s_video_decoder_profiles_one_clip_at_a_small_and_a_large_resolution() {
-    let root = Path::new(NVFP4_EXPORT);
-    assert!(
-        root.is_dir(),
-        "the profile run reads the headers of {NVFP4_EXPORT}, which is missing"
-    );
-    let sources = Sources {
-        checkpoint: Source::Local(root.to_path_buf()),
-        base: None,
-        adapter: None,
-    };
-    let (checkpoint, networks) = models::minimax_h3::family::compose(&sources).unwrap();
+    let (checkpoint, networks) =
+        models::minimax_h3::family::compose(&FASTH3_4_STEP_NVFP4.sources()).unwrap();
     let config = models::minimax_h3::Config::open(&checkpoint, &networks)
         .unwrap()
         .video_vae;
 
     let store = MetaWeights::new();
-
     let mut loader = WeightLoader::new(checkpoint.stage("vae").unwrap(), &store, None);
     loader.declare(&config.quantization).unwrap();
     let decoder = VideoDecoder::load(&config, loader.root()).unwrap();
@@ -166,7 +142,7 @@ fn the_nvfp4_export_s_video_decoder_profiles_one_clip_at_a_small_and_a_large_res
 }
 
 #[test]
-#[ignore = "requires /workspace/models/MiniMax-H3"]
+#[ignore = "reads the Hugging Face release MiniMaxAI/MiniMax-H3"]
 fn the_video_encoder_profiles_a_still_and_a_clip() {
     let (checkpoint, config) = video_stage();
     let store = MetaWeights::new();
@@ -184,7 +160,7 @@ fn the_video_encoder_profiles_a_still_and_a_clip() {
             (3, frames as usize, height as usize, width as usize),
             DType::F32,
         );
-        let (latent, recording) = recorded(|| encoder.encode(&pixels));
+        let (latent, recording) = record(&[], || Ok(encoder.encode(&pixels)?));
         let latent = latent.unwrap();
 
         assert_eq!(
@@ -205,7 +181,7 @@ fn the_video_encoder_profiles_a_still_and_a_clip() {
 }
 
 #[test]
-#[ignore = "requires /workspace/models/MiniMax-H3"]
+#[ignore = "reads the Hugging Face release MiniMaxAI/MiniMax-H3"]
 fn the_audio_decoder_profiles_the_shortest_and_the_longest_track() {
     let (checkpoint, config) = audio_stage();
     let store = MetaWeights::new();
@@ -240,8 +216,9 @@ fn the_audio_decoder_profiles_the_shortest_and_the_longest_track() {
 
         let latents = meta((track.channels as usize, frames as usize), DType::F32);
         let audio = meta((2, samples as usize), DType::F32);
-        let (decoded, recording) =
-            recorded(|| decoder.decode(&layout, &latents, None, Some(&audio)));
+        let (decoded, recording) = record(&[], || {
+            decoder.decode(&layout, &latents, None, Some(&audio))
+        });
         decoded.unwrap();
         report(
             &format!("audio decode {seconds} s, {frames} latent frames"),
@@ -251,7 +228,7 @@ fn the_audio_decoder_profiles_the_shortest_and_the_longest_track() {
 }
 
 #[test]
-#[ignore = "requires /workspace/models/MiniMax-H3"]
+#[ignore = "reads the Hugging Face release MiniMaxAI/MiniMax-H3"]
 fn the_audio_encoder_profiles_a_reference_track() {
     let (checkpoint, config) = audio_stage();
     let store = MetaWeights::new();
@@ -265,7 +242,7 @@ fn the_audio_encoder_profiles_a_reference_track() {
     assert_eq!(frames, 161);
 
     let samples = meta((2, 1, length as usize), DType::F32);
-    let (rows, recording) = recorded(|| encoder.encode(&samples));
+    let (rows, recording) = record(&[], || Ok(encoder.encode(&samples)?));
     let rows = rows.unwrap();
 
     assert_eq!(rows.dims(), [2 * frames, 32]);

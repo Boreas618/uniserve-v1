@@ -58,7 +58,7 @@ A ModelOpt NVFP4 export of the family (a FastH3 export with a `modelopt_manifest
 
 ## Tests
 
-`cargo test -p models` runs the unit tests and the integration tests of [`tests/it`](tests/it), one module per family, on CPU tensors without a GPU. Each reference test loads a family through its own loading path and compares it with outputs the reference implementation computed from the same weights; the reference tensors are read with `nn::Checkpoint` ([`tests/it/fixture.rs`](tests/it/fixture.rs)). Each generator states the reference classes it runs.
+`cargo test -p models` runs the unit tests and the integration tests of [`tests/it`](tests/it), one module per family, on CPU tensors without a GPU. Each reference test loads a family through its own loading path and compares it with outputs the reference implementation computed from the same weights. A test embeds its committed fixtures in its binary (`nn_testing::fixture!`, from paths relative to the test's source file) and reads them from a temporary directory with the readers the families load with, a reference's tensors through `nn::Checkpoint::open_file`; what the tests share (checkpoint writing, released checkpoints, meta forwards and their checks) is the development crate [`nn-testing`](../nn/testing). Each generator states the reference classes it runs.
 
 The generators of [`python`](python) are console programs of one project, which imports each reference as a package pinned to one revision by its own lock (`python/uv.lock`): its `reference` group holds vLLM-Omni, the vLLM release it is written against and their Transformers. Each generator writes under `--out`, runs on `--device` and draws from `--seed` under `torch.use_deterministic_algorithms(True)` (`model_fixtures.run`); the committed fixtures are those of the default arguments on the CPU. The environment is installed apart from the root project's, whose `test` extra pins another PyTorch:
 
@@ -72,4 +72,20 @@ UV_PROJECT_ENVIRONMENT=<directory> uv sync --locked --project crates/models/pyth
 - `qwen4_exp::reference`: the family's modules and the whole model against the references of [`generate_reference.py`](tests/it/qwen4_exp/generate_reference.py), and prefill against steps.
 - `minimax_h3::packing_reference` compares every packed tensor exactly with fixtures of vLLM-Omni's packing (`minimax-h3-packing-fixtures`); `minimax_h3::transformer_reference` and `minimax_h3::vae_reference` compare the modules over tiny checkpoints with the reference modules run on CPU (`fixtures/generate_transformer.py`, `fixtures/generate_vae.py`); `minimax_h3::denoiser` steps a tiny denoiser through `nn::Denoiser` in several layouts of one request.
 
-The profile runs (`qwen3::profile`, `qwen4_exp::profile`, `minimax_h3::denoiser_profile`, `minimax_h3::vae_profile`) run on the meta device over the headers of the released checkpoints under `/workspace/models` and print their kernel keys and allocator peaks; they are ignored by default and run with `cargo test -p models --test it -- --ignored --nocapture`, or one family's with its module path as the filter.
+The profile runs (`qwen3::profile`, `qwen4_exp::profile`, `minimax_h3::denoiser_profile`, `minimax_h3::vae_profile`) run on the meta device over the headers of released checkpoints and print their kernel keys and allocator peaks. Each release is a Hugging Face repository pinned at a commit ([`tests/it/releases.rs`](tests/it/releases.rs)):
+
+| Repository | Commit | Read by |
+| --- | --- | --- |
+| `Qwen/Qwen3-30B-A3B` | `ad44e777bcd18fa416d9da3bd8f70d33ebb85d39` | `qwen3::profile` |
+| `nvidia/Qwen3-30B-A3B-NVFP4` | `2538ded2a4edb247b4d2b4a8ba24e44bd4c017c3` | `qwen3::profile` |
+| `Qwen/Qwen3.6-35B-A3B` | `345d467b117d1fd5eda9b879a5988de9ae5f47a7` | `qwen3::profile` |
+| `nvidia/Qwen3.6-35B-A3B-NVFP4` | `1355db6a052410cfd62085d94b58866fd0f2c3c5` | `qwen3::profile` |
+| `nvidia/Qwen3.8-Flash-Next-NVFP4` | `fc694b54fb0174e0913e6adf86691ef85a4ead47` | `qwen4_exp::profile` |
+| `RadixArk/Qwen3.8-Flash-Next-NVFP4` | `7b719225242aacd3dbd3f9407468c2ee9a9d2594` | `qwen4_exp::profile` |
+| `Qwen/Qwen3.8-Flash-Next-FP8` | `236dfdf285828023ca3bcd3f37366c58a3469b13` | `qwen4_exp::profile` |
+| `MiniMaxAI/MiniMax-H3` | `42ed227ee7df40d41602854ae760620d6eb651fe` | `qwen3::profile`, `minimax_h3::denoiser_profile`, `minimax_h3::vae_profile` |
+| `FastVideo/FastVideo-FastH3-8-Step-V2` | `3da2ddfe1954d9cda4c05b643dc0f26007a655c5` | `minimax_h3::denoiser_profile` |
+| `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree` | `5ea076f35b84da4c3c82217112fa733d8eea2ae1` | `minimax_h3::denoiser_profile` |
+| `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4` | `3e7ccea5cb400e802cdb8aa1848707a6b0c82b06` | `minimax_h3::denoiser_profile`, `minimax_h3::vae_profile` |
+
+A run resolves its releases through the standard Hugging Face cache (`nn_testing::Release`): `HF_HUB_CACHE`, or `HF_HOME/hub`, or `~/.cache/huggingface/hub`, with `HF_ENDPOINT` for a mirror and `HF_TOKEN` (or the token file under `HF_HOME`) for a gated repository. Online, the files of the pinned commit the cache lacks are downloaded into it first; a host that sets `HF_HUB_OFFLINE=1` reads the cache alone, populated beforehand with `hf download <repository> --revision <commit>`. A release that cannot be resolved fails the run, naming the repository and the commit. The runs are ignored by default and run with `cargo test -p models --test it -- --ignored --nocapture`, or one family's with its module path as the filter.

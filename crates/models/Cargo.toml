@@ -19,11 +19,13 @@ proto.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
-# The profile runs install a meta context and make their meta inputs, which the library target
-# names neither of; the tests write tiny checkpoints.
+# The integration tests' checkpoints, fixtures, released checkpoints and meta forwards
+# (`crates/nn/testing`), and the temporary directories they write tiny checkpoints into. The
+# denoiser's unit test installs a meta context of its own, which the library target names
+# nothing of.
 [dev-dependencies]
+nn-testing.workspace = true
 ops.workspace = true
-serde.workspace = true
 tempfile.workspace = true
 
 [features]

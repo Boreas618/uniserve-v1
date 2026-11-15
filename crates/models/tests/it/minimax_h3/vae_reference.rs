@@ -18,18 +18,14 @@
 //! Nothing here touches a GPU.
 
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
-use super::support;
-
-use std::path::Path;
-
 use models::minimax_h3::audio_vae::{AudioDecoder, AudioEncoder};
 use models::minimax_h3::video_vae::{self, TransformerBlock, VideoDecoder, VideoEncoder};
 use models::minimax_h3::{AudioVaeConfig, VideoVaeConfig};
 use nn::functional::{self, Padding};
 use nn::modules::{ResnetBlock3d, ResnetBlock3dConfig, Rotary};
 use nn::{Checkpoint, Clip, CpuWeights, DType, Decoder, Device, LatentShape, Tensor, WeightLoader};
+use nn_testing::{Fixture, assert_close, checkpoint, decode, sequence, tensor, values};
 use proto::video::Layout;
-use support::{assert_close, f32_shard, f32_values, sequence, tensor, values};
 
 /// The unit roundoff of FP32.
 const UNIT_ROUNDOFF: f32 = f32::EPSILON / 2.0;
@@ -43,13 +39,21 @@ fn bound(stages: usize, terms: usize) -> f32 {
     (stages * terms) as f32 * UNIT_ROUNDOFF
 }
 
-/// The fixture `case`: a tiny checkpoint with its inputs and the reference's output.
-fn fixture(case: &str) -> Checkpoint {
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/it/minimax_h3/fixtures/vae")
-        .join(case);
+/// The committed fixtures: one tiny checkpoint per case, each with its inputs and the
+/// reference's output.
+fn fixtures() -> Fixture {
+    nn_testing::fixture!("fixtures/vae": [
+        "audio_decoder/model.safetensors",
+        "audio_encoder/model.safetensors",
+        "resnet_block/model.safetensors",
+        "transformer_block/model.safetensors",
+        "video_encoder/model.safetensors",
+    ])
+}
 
-    Checkpoint::open(&directory).unwrap()
+/// The checkpoint of the fixture `case`.
+fn fixture(case: &str) -> Checkpoint {
+    fixtures().checkpoint(case)
 }
 
 /// The FP32 CPU tensor the fixture stores as `fixture.<name>`.
@@ -58,7 +62,7 @@ fn stored(checkpoint: &Checkpoint, name: &str) -> Tensor {
     let shape = checkpoint.locate(&name).unwrap().shape.clone();
 
     tensor(
-        &f32_values(&checkpoint.read(&name).unwrap()),
+        &decode(DType::F32, &checkpoint.read(&name).unwrap()),
         shape,
         DType::F32,
     )
@@ -262,7 +266,7 @@ fn a_decoder_block_computes_the_references() {
     // The block's output is the stream with the feed-forward's update joined at `scale2`,
     // which the next normalization folds in.
     let scale2 = tensor(
-        &f32_values(&checkpoint.read("block.scale2").unwrap()),
+        &decode(DType::F32, &checkpoint.read("block.scale2").unwrap()),
         16,
         DType::F32,
     );
@@ -400,12 +404,7 @@ fn decoded(decoder: &VideoDecoder, trajectory: &Tensor, clip: Clip) -> Tensor {
 fn a_tiled_decode_is_each_tiles_own_decode_outside_the_seam() {
     let directory = tempfile::tempdir().unwrap();
     let config = video_config();
-    f32_shard(
-        directory.path(),
-        "model.safetensors",
-        &decoder_tensors(&config),
-    );
-    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let checkpoint = checkpoint(directory.path(), DType::F32, &decoder_tensors(&config));
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let decoder = VideoDecoder::load(&config, loader.root()).unwrap();

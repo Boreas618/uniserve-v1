@@ -38,27 +38,34 @@
 //!
 //! Nothing here touches a GPU.
 
-use super::support;
-
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
 use models::qwen4_exp::causal_lm::{coordinates, ngram_context, token_columns};
 use models::qwen4_exp::{Config, DecoderLayer, HyperConnection, NgramEmbedding, PleLayer};
-use nn::family::TextModel;
+use nn::family::{Family, TextModel, TextPlacement};
 use nn::modules::Rotary;
 use nn::quantization::Declaration;
 use nn::{
     CpuWeights, DType, Device, KvCache, KvPlanes, Phase, RecurrentState, Shape, Split, Tensor,
     TokenBatch, VarBuilder, WeightLoader, functional,
 };
+use nn_testing::text::{self, WORKSPACE_BYTES};
+use nn_testing::{Fixture, PAGE_TOKENS};
 
-/// Tokens of one cache page.
-const PAGE: u32 = 64;
+/// The family the fixtures' checkpoints declare.
+const FAMILIES: [Family; 1] = [models::qwen4_exp::family::FAMILY];
 
 /// The tokens a step of the checked deployment drafts, and the rows a request has in a step.
 const DRAFTS: u32 = 3;
 const STEP: usize = DRAFTS as usize + 1;
+
+/// The checked deployment: one rank that drafts [`DRAFTS`] tokens a step with the checkpoint's
+/// drafter.
+const DEPLOYMENT: TextPlacement = TextPlacement {
+    drafter: true,
+    draft_tokens: DRAFTS,
+    ..TextPlacement::WHOLE
+};
 
 /// The module path of the language model.
 const LANGUAGE: &str = "model.language_model";
@@ -66,18 +73,19 @@ const LANGUAGE: &str = "model.language_model";
 /// The unit roundoff of FP32.
 const UNIT_ROUNDOFF: f32 = f32::EPSILON / 2.0;
 
-/// The directory of the fixture `name`.
-fn data(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/it/qwen4_exp/data")
-        .join(name)
+/// The reference fixture: a tiny NVFP4 export of the family under `model` and the
+/// references' vectors in `reference.safetensors`.
+fn reference() -> Fixture {
+    nn_testing::fixture!("data/reference": [
+        "model/config.json",
+        "model/model.safetensors",
+        "reference.safetensors",
+    ])
 }
 
-/// The reference vectors, by name.
-fn vectors() -> HashMap<String, Tensor> {
-    let path = data("reference").join("reference.safetensors");
-
-    crate::fixture::tensors(&path)
+/// The consistency fixture: a tiny FP32 checkpoint of the family under `model`.
+fn consistency() -> Fixture {
+    nn_testing::fixture!("data/consistency": ["model/config.json", "model/model.safetensors"])
 }
 
 /// The vector `name`, which the generator wrote.
@@ -107,10 +115,10 @@ fn zeros(shape: Shape, dtype: DType) -> Tensor {
     Tensor::zeros(shape, dtype, &Device::Cpu).expect("zeros")
 }
 
-/// Runs `check` with the configuration of the fixture `name` and a builder of its root, its
+/// Runs `check` with the configuration of `fixture`'s checkpoint and a builder of its root, its
 /// weights loaded onto the CPU device as its export declares them.
-fn with_fixture<T>(name: &str, check: impl FnOnce(&Config, VarBuilder<'_, '_>) -> T) -> T {
-    let checkpoint = support::checkpoint(&data(name).join("model"));
+fn with_fixture<T>(fixture: &Fixture, check: impl FnOnce(&Config, VarBuilder<'_, '_>) -> T) -> T {
+    let checkpoint = fixture.checkpoint("model");
     let store = CpuWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None);
     let config = Config::open(&checkpoint).expect("the configuration");
@@ -231,7 +239,7 @@ fn request_batch(requests: usize, seen: u32, ngram: Option<(Tensor, Tensor)>) ->
         .collect();
     let offsets: Vec<u32> = (0..=requests).map(|row| (row * STEP) as u32).collect();
 
-    support::batch(
+    text::batch(
         Phase::Decode,
         [
             Tensor::new(positions.as_slice(), &Device::Cpu).expect("positions"),
@@ -241,8 +249,8 @@ fn request_batch(requests: usize, seen: u32, ngram: Option<(Tensor, Tensor)>) ->
             column(&offsets[1..].iter().map(|end| end - 1).collect::<Vec<_>>()),
         ],
         ngram,
-        PAGE,
-        PAGE * 2,
+        PAGE_TOKENS,
+        PAGE_TOKENS * 2,
     )
 }
 
@@ -272,7 +280,7 @@ fn request_state(
         })
         .collect::<Vec<Vec<Tensor>>>();
 
-    support::state(
+    text::state(
         [
             column(&offsets),
             column(seen),
@@ -289,9 +297,10 @@ fn request_state(
 /// the wrapping products, the end-of-text rule, the non-negative remainder and the offsets.
 #[test]
 fn the_ngram_ids_are_the_references() {
-    let vectors = vectors();
+    let fixture = reference();
+    let vectors = fixture.tensors("reference.safetensors");
 
-    with_fixture("reference", |config, vb| {
+    with_fixture(&fixture, |config, vb| {
         let embedding = NgramEmbedding::load(
             config,
             vb.pp(LANGUAGE).pp("layers.1.ple.ple_embedding"),
@@ -334,9 +343,10 @@ fn the_ngram_ids_are_the_references() {
 /// every count of standing tokens the reference's cases state.
 #[test]
 fn the_ple_layer_is_the_references() {
-    let vectors = vectors();
+    let fixture = reference();
+    let vectors = fixture.tensors("reference.safetensors");
 
-    with_fixture("reference", |config, vb| {
+    with_fixture(&fixture, |config, vb| {
         let model = vb.pp(LANGUAGE);
         let layer =
             PleLayer::load(config, model.pp("layers.1.ple"), Split::WHOLE).expect("the layer");
@@ -425,19 +435,14 @@ fn the_ple_layer_is_the_references() {
 /// logits, the convolution window and the state slots.
 #[test]
 fn the_gated_delta_layer_is_the_references() {
-    let vectors = vectors();
+    let fixture = reference();
+    let vectors = fixture.tensors("reference.safetensors");
 
-    with_fixture("reference", |config, vb| {
+    with_fixture(&fixture, |config, vb| {
         let model = vb.pp(LANGUAGE);
-        let layer = DecoderLayer::load(
-            config,
-            model.pp("layers.0"),
-            true,
-            false,
-            &support::placement(Split::WHOLE, DRAFTS),
-            None,
-        )
-        .expect("the layer");
+        let layer =
+            DecoderLayer::load(config, model.pp("layers.0"), true, false, &DEPLOYMENT, None)
+                .expect("the layer");
         let rotary = Rotary::load(&config.text.rope, model.pp("rotary_emb")).expect("the rotary");
 
         for case in 0..3 {
@@ -531,7 +536,7 @@ fn attention_step(vectors: &HashMap<String, Tensor>, prefix: &str) -> AttentionS
     let key = vector(vectors, &name("key")).copy().unwrap();
     let ring_keys = vector(vectors, &name("ring_keys")).copy().unwrap();
     let (pages, capacity) = (key.dims()[0], ring_keys.dims()[1] as u32);
-    let groups = PAGE / 4;
+    let groups = PAGE_TOKENS / 4;
 
     let positions: Vec<u32> = start
         .iter()
@@ -542,7 +547,8 @@ fn attention_step(vectors: &HashMap<String, Tensor>, prefix: &str) -> AttentionS
         .iter()
         .enumerate()
         .map(|(token, position)| {
-            table[request_of(token)][(position / PAGE) as usize] * PAGE + position % PAGE
+            table[request_of(token)][(position / PAGE_TOKENS) as usize] * PAGE_TOKENS
+                + position % PAGE_TOKENS
         })
         .collect();
     let completed = positions
@@ -562,7 +568,7 @@ fn attention_step(vectors: &HashMap<String, Tensor>, prefix: &str) -> AttentionS
 
     let signed: Vec<i32> = positions.iter().map(|position| *position as i32).collect();
     let offsets: Vec<u32> = (0..=tokens as u32).collect();
-    let batch = support::batch(
+    let batch = text::batch(
         Phase::Decode,
         [
             Tensor::new(signed.as_slice(), &Device::Cpu).unwrap(),
@@ -577,8 +583,8 @@ fn attention_step(vectors: &HashMap<String, Tensor>, prefix: &str) -> AttentionS
             column(&offsets[..tokens]),
         ],
         None,
-        PAGE,
-        PAGE * table[0].len() as u32,
+        PAGE_TOKENS,
+        PAGE_TOKENS * table[0].len() as u32,
     );
 
     let row_tables: Vec<u32> = (0..tokens)
@@ -589,7 +595,7 @@ fn attention_step(vectors: &HashMap<String, Tensor>, prefix: &str) -> AttentionS
         block_tables: column(&row_tables)
             .reshape((tokens, table[0].len()))
             .unwrap(),
-        page_size: PAGE,
+        page_size: PAGE_TOKENS,
         layers: vec![KvPlanes {
             key,
             value: vector(vectors, &name("value")).copy().unwrap(),
@@ -618,7 +624,7 @@ fn attention_step(vectors: &HashMap<String, Tensor>, prefix: &str) -> AttentionS
                 .collect()
         })
         .collect();
-    let state = support::state(
+    let state = text::state(
         [
             column(&state_offsets),
             column(&seen),
@@ -691,16 +697,17 @@ fn assert_attention_caches(vectors: &HashMap<String, Tensor>, prefix: &str, step
 /// than a row may keep (the third).
 #[test]
 fn the_indexed_attention_layer_is_the_references() {
-    let vectors = vectors();
+    let fixture = reference();
+    let vectors = fixture.tensors("reference.safetensors");
 
-    with_fixture("reference", |config, vb| {
+    with_fixture(&fixture, |config, vb| {
         let model = vb.pp(LANGUAGE);
         let layer = DecoderLayer::load(
             config,
             model.pp("layers.1"),
             false,
             false,
-            &support::placement(Split::WHOLE, DRAFTS),
+            &DEPLOYMENT,
             None,
         )
         .expect("the layer");
@@ -745,26 +752,23 @@ fn the_indexed_attention_layer_is_the_references() {
     });
 }
 
-/// The whole model of the reference fixture, loaded through its family with its drafter.
-fn reference_model() -> std::sync::Arc<dyn TextModel> {
-    let checkpoint = support::checkpoint(&data("reference").join("model"));
+/// The whole model of the reference fixture `fixture`, loaded through its family with its
+/// drafter.
+fn reference_model(fixture: &Fixture) -> std::sync::Arc<dyn TextModel> {
+    let checkpoint = fixture.checkpoint("model");
     let store = CpuWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None);
 
-    support::load(
-        &checkpoint,
-        &mut loader,
-        &support::placement(Split::WHOLE, DRAFTS),
-    )
-    .expect("the load")
+    text::load(&FAMILIES, &checkpoint, &mut loader, &DEPLOYMENT).expect("the load")
 }
 
 /// The read-out and the head: the last layer's output folded into the streams, and the logits
 /// of shuffled rows through the model's `compute_logits`.
 #[test]
 fn the_read_out_and_the_head_are_the_references() {
-    let vectors = vectors();
-    let model = reference_model();
+    let fixture = reference();
+    let vectors = fixture.tensors("reference.safetensors");
+    let model = reference_model(&fixture);
     assert_eq!((model.hidden(), model.stream_width()), (128, 512));
 
     let folded = HyperConnection::combine(
@@ -797,8 +801,9 @@ fn the_read_out_and_the_head_are_the_references() {
 /// its logits through its own read-out and the model's head.
 #[test]
 fn the_drafter_is_the_references() {
-    let vectors = vectors();
-    let model = reference_model();
+    let fixture = reference();
+    let vectors = fixture.tensors("reference.safetensors");
+    let model = reference_model(&fixture);
     let drafter = model.drafter().expect("the drafter");
     assert_eq!(drafter.state().len(), 1);
 
@@ -853,8 +858,9 @@ fn the_drafter_is_the_references() {
 /// ring alone, which no checkpoint keeps.
 #[test]
 fn the_drafter_over_two_rounds_is_the_references() {
-    let vectors = vectors();
-    let model = reference_model();
+    let fixture = reference();
+    let vectors = fixture.tensors("reference.safetensors");
+    let model = reference_model(&fixture);
     let drafter = model.drafter().expect("the drafter");
 
     let step = attention_step(&vectors, "mtp");
@@ -878,7 +884,7 @@ fn the_drafter_over_two_rounds_is_the_references() {
         let pick = |tensor: &Tensor| rows_of(tensor, &picked);
         let offsets: Vec<u32> = (0..=picked.len() as u32).collect();
 
-        let batch = support::batch(
+        let batch = text::batch(
             Phase::Decode,
             [
                 pick(&step.batch.positions),
@@ -888,7 +894,7 @@ fn the_drafter_over_two_rounds_is_the_references() {
                 column(&offsets[..picked.len()]),
             ],
             None,
-            PAGE,
+            PAGE_TOKENS,
             step.batch.max_kv_len,
         );
         let cache = KvCache {
@@ -901,7 +907,7 @@ fn the_drafter_over_two_rounds_is_the_references() {
             .collect();
         let seen: Vec<u32> = start.iter().map(|first| first + round.end as u32).collect();
         let slots: Vec<u32> = (1..=requests as u32).collect();
-        let state = support::state(
+        let state = text::state(
             [
                 column(&state_offsets),
                 column(&seen),
@@ -957,7 +963,8 @@ fn tolerance(terms: u32) -> f32 {
 /// reference functions, in FP32.
 #[test]
 fn the_indexed_functions_are_vllms_references() {
-    let vectors = vectors();
+    let fixture = reference();
+    let vectors = fixture.tensors("reference.safetensors");
     let named = |tensor: &str| vector(&vectors, &format!("vllm.{tensor}"));
     let table = named("page_table").to_dtype(DType::U32).unwrap();
     let rows = named("rows").to_dtype(DType::U32).unwrap();
@@ -1125,16 +1132,26 @@ const EOS: u32 = 60;
 impl Memory {
     /// Zeroed memory for `model`.
     fn new(model: &dyn TextModel) -> Self {
-        let buffers = || support::state_buffers(&model.state_layers(), SLOTS, &zeros);
+        let buffers = || {
+            RecurrentState::buffers(
+                &model.state_layers(),
+                |_| SLOTS,
+                |shape, dtype| Ok(zeros(shape, dtype)),
+            )
+            .expect("the state buffers")
+        };
 
         Self {
-            cache: support::cache(
+            cache: KvCache::allocate(
                 model.cache(),
                 model.dtype(),
-                (PAGES, PAGE),
+                PAGES,
+                PAGE_TOKENS,
                 zeros(Shape::from((1, 1)), DType::U32),
-                &zeros,
-            ),
+                zeros(Shape::from(WORKSPACE_BYTES), DType::U8),
+                |shape, dtype| Ok(zeros(shape, dtype)),
+            )
+            .expect("a cache group"),
             live: buffers(),
             checkpoint: buffers(),
         }
@@ -1175,7 +1192,10 @@ fn forward(
         for (row, id) in fed.iter().enumerate() {
             let position = (start + row) as u32;
             positions.push(position as i32);
-            slots.push(request.pages[(position / PAGE) as usize] * PAGE + position % PAGE);
+            slots.push(
+                request.pages[(position / PAGE_TOKENS) as usize] * PAGE_TOKENS
+                    + position % PAGE_TOKENS,
+            );
             ids.push(*id);
 
             if per_token {
@@ -1202,7 +1222,7 @@ fn forward(
     let rows = seq_lens.len();
     let row_pages = parts[0].0.pages.len();
     let last: Vec<u32> = offsets[1..].iter().map(|end| end - 1).collect();
-    let batch = support::batch(
+    let batch = text::batch(
         phase,
         [
             Tensor::new(positions.as_slice(), &Device::Cpu).unwrap(),
@@ -1212,14 +1232,14 @@ fn forward(
             column(&last),
         ],
         Some((column(&ids), column(&context).reshape((rows, 2)).unwrap())),
-        PAGE,
-        PAGE * row_pages as u32,
+        PAGE_TOKENS,
+        PAGE_TOKENS * row_pages as u32,
     );
     let cache = KvCache {
         block_tables: column(&tables).reshape((rows, row_pages)).unwrap(),
         ..memory.cache.clone()
     };
-    let state = support::state(
+    let state = text::state(
         [
             column(&state_offsets),
             column(&state_seen),
@@ -1249,15 +1269,16 @@ fn forward(
 /// slots, cache rows and compressed keys the next step overwrites or never reads.
 #[test]
 fn a_prefill_and_verify_steps_compute_what_one_prefill_does() {
-    let checkpoint = support::checkpoint(&data("consistency").join("model"));
+    let fixture = consistency();
+    let checkpoint = fixture.checkpoint("model");
     let store = CpuWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None);
     let config = Config::open(&checkpoint).expect("the configuration");
-    let placement = nn::family::TextPlacement {
+    let placement = TextPlacement {
         drafter: false,
-        ..support::placement(Split::WHOLE, DRAFTS)
+        ..DEPLOYMENT
     };
-    let model = support::load(&checkpoint, &mut loader, &placement).expect("the load");
+    let model = text::load(&FAMILIES, &checkpoint, &mut loader, &placement).expect("the load");
     assert_eq!(model.dtype(), DType::F32);
 
     // Two requests of tokens below the vocabulary's specials, with an end of text in each.
@@ -1387,10 +1408,11 @@ fn a_prefill_and_verify_steps_compute_what_one_prefill_does() {
 
     for (index, request) in requests.iter().enumerate() {
         let length = request.ids.len() as u32;
-        let slot =
-            |position: u32| request.pages[(position / PAGE) as usize] * PAGE + position % PAGE;
+        let slot = |position: u32| {
+            request.pages[(position / PAGE_TOKENS) as usize] * PAGE_TOKENS + position % PAGE_TOKENS
+        };
         let token_rows: Vec<u32> = (0..length).map(slot).collect();
-        let groups = PAGE / ratio;
+        let groups = PAGE_TOKENS / ratio;
         let group_rows: Vec<u32> = (0..length / ratio)
             .map(|group| request.pages[(group / groups) as usize] * groups + group % groups)
             .collect();

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use nn::family::{ExpertOrder, Family, Model, Registry, TextModel, TextPlacement};
+use nn::family::{ExpertOrder, Family, Model, Registry, TextCheckpoint, TextModel, TextPlacement};
 use nn::{Checkpoint, Phase, RecurrentState, Tensor, TokenBatch, VerifySlots, WeightLoader};
 use proto::config::Quantization;
 
@@ -24,10 +24,8 @@ pub const PAGE_TOKENS: u32 = 64;
 /// that clear what a deployment's is, so a profile run states the same launches.
 pub const WORKSPACE_BYTES: usize = 1 << 20;
 
-/// The causal language model of `checkpoint`, opened and loaded as execution does: the
-/// registry of `families` resolves the class the checkpoint's `config.json` declares, the
-/// family opens the checkpoint under no precision policy, and the opened checkpoint loads
-/// `placement`'s share through `loader`.
+/// The causal language model of `checkpoint`, opened ([`open`]) and loaded as execution does:
+/// the opened checkpoint loads `placement`'s share through `loader`.
 ///
 /// # Errors
 ///
@@ -38,6 +36,17 @@ pub fn load(
     loader: &mut WeightLoader<'_>,
     placement: &TextPlacement,
 ) -> nn::Result<Arc<dyn TextModel>> {
+    open(families, checkpoint)?.load(checkpoint, loader, placement, &ExpertOrder::new())
+}
+
+/// The checkpoint opened by the family of `families` it declares, as execution opens it: the
+/// registry of `families` resolves the class the checkpoint's `config.json` declares, and the
+/// family reads the checkpoint's configuration under no precision policy.
+///
+/// # Errors
+///
+/// The family's refusal to open the checkpoint, such as a representation no operator serves.
+pub fn open(families: &[Family], checkpoint: &Checkpoint) -> nn::Result<Box<dyn TextCheckpoint>> {
     let config = checkpoint
         .sidecar("config.json")?
         .unwrap_or_else(|| panic!("{} holds no config.json", checkpoint.root().display()));
@@ -53,8 +62,7 @@ pub fn load(
         panic!("{class} is not a text family");
     };
 
-    let opened = family.open(checkpoint, &Quantization::default())?;
-    opened.load(checkpoint, loader, placement, &ExpertOrder::new())
+    family.open(checkpoint, &Quantization::default())
 }
 
 /// The batch of one forward of `phase` over pages of `page_size` tokens whose rows read at most

@@ -14,7 +14,7 @@ use models::minimax_h3::family::compose;
 use nn::family::Stage;
 use nn::{Checkpoint, DType, Source, Sources};
 
-use super::support::{f32_bytes, f32_values, shard, shard_with_header};
+use nn_testing::{decode, encode, write_file};
 
 /// Every component of a MiniMax-H3 pipeline index, with its library and whether it holds a
 /// shard set.
@@ -77,14 +77,14 @@ fn components(root: &Path, names: &[&str], label: &str) {
                 "transformers" => "model.safetensors",
                 _ => "diffusion_pytorch_model.safetensors",
             };
-            shard(
-                &directory,
-                file,
+            write_file(
+                &directory.join(file),
+                &[],
                 &[(
                     "proj.weight",
                     DType::F32,
                     vec![2, 3],
-                    f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                    encode(DType::F32, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
                 )],
             );
         }
@@ -268,15 +268,29 @@ fn a_whole_student_export_continues_no_base() {
 
 /// Writes a FastVideo adapter into `directory`: a rank-one edit of `proj.weight`.
 fn adapter(directory: &Path) {
-    let header = r#"{"__metadata__": {"format": "fastvideo-lora-v2", "rank": "1",
-        "low_rank_tensors": "2", "diff_tensors": "0", "set_weight_tensors": "0"},
-        "proj.lora_A.weight": {"dtype": "F32", "shape": [1, 3], "data_offsets": [0, 12]},
-        "proj.lora_B.weight": {"dtype": "F32", "shape": [2, 1], "data_offsets": [12, 20]}}"#;
-    shard_with_header(
-        directory,
-        "adapter_model.safetensors",
-        header,
-        &f32_bytes(&[1.0, 2.0, 3.0, 0.5, -1.0]),
+    write_file(
+        &directory.join("adapter_model.safetensors"),
+        &[
+            ("format", "fastvideo-lora-v2"),
+            ("rank", "1"),
+            ("low_rank_tensors", "2"),
+            ("diff_tensors", "0"),
+            ("set_weight_tensors", "0"),
+        ],
+        &[
+            (
+                "proj.lora_A.weight",
+                DType::F32,
+                vec![1, 3],
+                encode(DType::F32, &[1.0, 2.0, 3.0]),
+            ),
+            (
+                "proj.lora_B.weight",
+                DType::F32,
+                vec![2, 1],
+                encode(DType::F32, &[0.5, -1.0]),
+            ),
+        ],
     );
 }
 
@@ -300,7 +314,7 @@ fn an_adapter_is_fused_into_the_network_its_contract_names() {
 
     // `W + lora_B @ lora_A`: rows of [1, 2, 3] scaled by 0.5 and -1, added to the base.
     let transformer = checkpoint.stage("transformer").unwrap();
-    let values = f32_values(&transformer.read("proj.weight").unwrap());
+    let values = decode(DType::F32, &transformer.read("proj.weight").unwrap());
     assert_eq!(values, [1.5, 3.0, 4.5, 3.0, 3.0, 3.0]);
 
     // An adapter is fused into the base release, not into a student.
