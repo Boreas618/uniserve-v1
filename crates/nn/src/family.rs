@@ -89,8 +89,7 @@ impl PartialEq for Family {
 
 impl Eq for Family {}
 
-/// The families an executable loads, each claiming the `model_type`s and classes its
-/// checkpoints declare.
+/// The families an executable loads, each claiming the classes its checkpoints declare.
 ///
 /// The claims are request processing's registry ([`processing::Registry`]) of the same families,
 /// so both sides resolve a checkpoint by one rule.
@@ -105,8 +104,8 @@ impl Registry {
     ///
     /// # Errors
     ///
-    /// Fails, naming the class, when two families claim one `model_type` or class: a checkpoint
-    /// of it would resolve to either.
+    /// Fails, naming the class, when two families claim one class: a checkpoint of it would
+    /// resolve to either.
     pub fn new(families: impl IntoIterator<Item = Family>) -> Result<Self> {
         let families: Vec<Family> = families.into_iter().collect();
         let claims = processing::Registry::new(families.iter().map(|family| family.request))
@@ -849,7 +848,7 @@ mod tests {
     const CHAT: Family = Family {
         request: processing::Family {
             id: "chat",
-            model_types: &["chat_model"],
+            root: processing::RootFile::Config,
             classes: &["ChatForCausalLM"],
             serving: Serving::Chat(ChatProfile {
                 reasoning: None,
@@ -880,6 +879,6 @@ mod tests {
             ..CHAT
         };
         let error = Registry::new([CHAT, second]).unwrap_err();
-        assert!(error.to_string().contains("chat_model"), "{error}");
+        assert!(error.to_string().contains("ChatForCausalLM"), "{error}");
     }
 }

@@ -74,8 +74,8 @@ pub fn configured_tokenizer() -> DynTokenizer {
 /// A chat family whose outputs are parsed as `<think>` reasoning and JSON tool calls.
 pub const CHAT: processing::Family = processing::Family {
     id: "chat",
-    model_types: &["chat"],
-    classes: &[],
+    root: processing::RootFile::Config,
+    classes: &["ChatForCausalLM"],
     serving: processing::Serving::Chat(processing::ChatProfile {
         reasoning: Some(processing::ReasoningFormat::Think),
         tool_calls: Some(processing::ToolCallFormat::Json),
@@ -86,7 +86,7 @@ pub const CHAT: processing::Family = processing::Family {
 /// A video family whose processor is [`TestProcessor`].
 pub const VIDEO: processing::Family = processing::Family {
     id: "video",
-    model_types: &[],
+    root: processing::RootFile::ModularIndex,
     classes: &["TestVideoPipeline"],
     serving: processing::Serving::Video(&TestVideo),
 };

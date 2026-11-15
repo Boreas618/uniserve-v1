@@ -3,33 +3,60 @@
 //! A model crate states one [`Family`] beside the numerical model execution loads
 //! (`nn::family::Family` holds it), and the executable registers each once: request processing
 //! reads the [`Registry`] of these values, execution the registry of numerical families built
-//! from the same list. A checkpoint resolves by what its own root files declare
-//! ([`Registry::resolve`]): the daemon and the engine read those files where the checkpoint is and
-//! resolve them by this one rule.
+//! from the same list. A family declares the one root file its checkpoints name their class in
+//! ([`RootFile`]) and the classes it claims there; a checkpoint resolves by what those files
+//! declare ([`Registry::resolve`]). The daemon and the engine read the root files the registry
+//! names ([`Registry::root_files`]) where the checkpoint is and resolve them by this one rule.
 
 use serde_json::Value;
 
 use crate::serving::Serving;
 
-/// The file a transformers checkpoint declares its family in, at its root: `architectures[0]`
-/// names its model class and `model_type` its configuration's kind.
-pub const CONFIG_FILE: &str = "config.json";
+/// A file at a checkpoint's root that names the checkpoint's class.
+///
+/// Each checkpoint format declares its class in one file under one key, and a family names the
+/// format its checkpoints are published in: no file is read in place of another, and no second
+/// key stands in for the class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RootFile {
+    /// A transformers checkpoint's `config.json`, whose `architectures[0]` names the model
+    /// class.
+    Config,
+    /// A diffusers modular pipeline's `modular_model_index.json`, whose `_class_name` names the
+    /// pipeline class.
+    ModularIndex,
+}
 
-/// The files a diffusers pipeline checkpoint declares its family in, at its root, in the order
-/// they are read: the classic pipeline index, then the modular one. Each names the pipeline's
-/// class in `_class_name`; a checkpoint's index is the first of them it publishes.
-pub const PIPELINE_INDEX_FILES: [&str; 2] = ["model_index.json", "modular_model_index.json"];
+impl RootFile {
+    /// The file's name at the checkpoint's root.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Config => "config.json",
+            Self::ModularIndex => "modular_model_index.json",
+        }
+    }
+
+    /// The class the file's JSON object names, if it names one.
+    fn class(self, object: &serde_json::Map<String, Value>) -> Option<&str> {
+        match self {
+            Self::Config => object
+                .get("architectures")
+                .and_then(Value::as_array)
+                .and_then(|architectures| architectures.first())
+                .and_then(Value::as_str),
+            Self::ModularIndex => object.get("_class_name").and_then(Value::as_str),
+        }
+    }
+}
 
 /// One model family, as its checkpoints declare it and request processing serves it.
 #[derive(Clone, Copy)]
 pub struct Family {
     /// The family's stable identifier, as the daemon reports it.
     pub id: &'static str,
-    /// The `model_type` values of a root `config.json` that declare this family; empty for a
-    /// family that ships only as a diffusers pipeline.
-    pub model_types: &'static [&'static str],
-    /// The model classes a checkpoint of this family declares: a transformers checkpoint's
-    /// `config.json` `architectures[0]`, or a diffusers pipeline's `_class_name`.
+    /// The root file the family's checkpoints name their class in.
+    pub root: RootFile,
+    /// The classes a checkpoint of this family names in [`Self::root`].
     pub classes: &'static [&'static str],
     /// What request processing serves.
     pub serving: Serving,
@@ -40,7 +67,7 @@ impl std::fmt::Debug for Family {
         formatter
             .debug_struct("Family")
             .field("id", &self.id)
-            .field("model_types", &self.model_types)
+            .field("root", &self.root)
             .field("classes", &self.classes)
             .finish_non_exhaustive()
     }
@@ -65,7 +92,7 @@ pub const FAMILIES: [Family; 4] = [
     crate::minimax_h3::FAMILY,
 ];
 
-/// Two families claim one `model_type` or class: a checkpoint of it would resolve to either.
+/// Two families claim one class: a checkpoint of it would resolve to either.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("two model families claim the class {0}")]
 pub struct RegistryError(pub &'static str);
@@ -74,34 +101,44 @@ pub struct RegistryError(pub &'static str);
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ResolveError {
     /// A root file the checkpoint publishes is not a JSON object.
-    #[error("the checkpoint's {file} is not a JSON object: {message}")]
+    #[error("the checkpoint's {} is not a JSON object: {message}", file.name())]
     Malformed {
-        /// The file, [`CONFIG_FILE`] or the pipeline index.
-        file: &'static str,
+        /// The file.
+        file: RootFile,
         /// What is wrong with it.
         message: String,
     },
-    /// The checkpoint declares neither a class nor a `model_type`.
+    /// No root file the registry's families declare in names a class.
     #[error(
-        "the checkpoint declares no model class: it has neither a {CONFIG_FILE} naming \
-         `architectures` or `model_type` nor a pipeline index ({}) naming `_class_name`",
-        PIPELINE_INDEX_FILES.join(" or ")
+        "the checkpoint declares no model class: none of {files} it publishes names one",
+        files = files.join(", ")
     )]
-    Undeclared,
+    Undeclared {
+        /// The root files the registry's families declare their classes in.
+        files: Vec<&'static str>,
+    },
     /// No family claims what the checkpoint declares.
     #[error(
         "the checkpoint declares {declared}, which this build cannot serve: it serves {served}"
     )]
     Unserved {
-        /// The class, `model_type` or both the checkpoint declares.
+        /// Each class the checkpoint declares, with the file that declares it.
         declared: String,
-        /// Every class and `model_type` the registry's families claim.
+        /// Every class the registry's families claim.
         served: String,
+    },
+    /// Two root files declare classes of two families.
+    #[error("the checkpoint declares {first} and {second}, two families' classes")]
+    Ambiguous {
+        /// The first family's class, with the file that declares it.
+        first: String,
+        /// The second family's class, with the file that declares it.
+        second: String,
     },
 }
 
-/// The families an executable serves, each claiming the `model_type`s and classes its checkpoints
-/// declare.
+/// The families an executable serves, each claiming the classes its checkpoints declare in its
+/// root file.
 #[derive(Clone, Debug, Default)]
 pub struct Registry {
     families: Vec<Family>,
@@ -112,14 +149,15 @@ impl Registry {
     ///
     /// # Errors
     ///
-    /// Fails, naming the class, when two families claim one `model_type` or class.
+    /// Fails, naming the class, when two families claim one class.
     pub fn new(families: impl IntoIterator<Item = Family>) -> Result<Self, RegistryError> {
         let families: Vec<Family> = families.into_iter().collect();
         for (index, family) in families.iter().enumerate() {
-            for class in family.model_types.iter().chain(family.classes) {
-                if families[..index].iter().any(|earlier| {
-                    earlier.model_types.contains(class) || earlier.classes.contains(class)
-                }) {
+            for class in family.classes {
+                if families[..index]
+                    .iter()
+                    .any(|earlier| earlier.classes.contains(class))
+                {
                     return Err(RegistryError(class));
                 }
             }
@@ -127,16 +165,8 @@ impl Registry {
         Ok(Self { families })
     }
 
-    /// The family a root `config.json` declares by its `model_type`.
-    pub fn by_model_type(&self, model_type: &str) -> Option<Family> {
-        self.families
-            .iter()
-            .copied()
-            .find(|family| family.model_types.contains(&model_type))
-    }
-
-    /// The family a checkpoint declares by its class: a transformers checkpoint's
-    /// `architectures[0]`, or a diffusers pipeline's `_class_name`.
+    /// The family that claims `class`: a transformers checkpoint's `architectures[0]`, or a
+    /// diffusers pipeline's `_class_name`.
     pub fn by_class(&self, class: &str) -> Option<Family> {
         self.families
             .iter()
@@ -149,80 +179,82 @@ impl Registry {
         &self.families
     }
 
-    /// The family a checkpoint declares in its root files: `config` is the text of its
-    /// [`CONFIG_FILE`] and `index` that of its pipeline index (the first of
-    /// [`PIPELINE_INDEX_FILES`] it publishes), each `None` when the checkpoint publishes none.
+    /// The root files the families declare their classes in, each once, in registration order:
+    /// the files a checkpoint is resolved from.
+    pub fn root_files(&self) -> Vec<RootFile> {
+        let mut files = Vec::new();
+        for family in &self.families {
+            if !files.contains(&family.root) {
+                files.push(family.root);
+            }
+        }
+        files
+    }
+
+    /// The family a checkpoint declares in its root files: `files` holds the text of each of
+    /// [`Self::root_files`] the checkpoint publishes.
     ///
-    /// A `config.json` decides when it declares anything: the family claiming its class
-    /// (`architectures[0]`), else the family claiming its `model_type`. A checkpoint whose root has
-    /// no `config.json`, or one that declares neither, is a diffusers pipeline, decided by the
-    /// class its index names (`_class_name`).
+    /// Every published file is read under its own key, and a family claims the checkpoint when
+    /// the file it declares in names one of its classes. Exactly one family must claim it.
     ///
     /// # Errors
     ///
-    /// [`ResolveError::Malformed`] for a file that is not a JSON object, [`ResolveError::Undeclared`]
-    /// when neither file declares anything, and [`ResolveError::Unserved`] when no family claims
-    /// what the deciding file declares.
-    pub fn resolve(
+    /// [`ResolveError::Malformed`] for a file that is not a JSON object,
+    /// [`ResolveError::Undeclared`] when no file names a class, [`ResolveError::Unserved`] when no
+    /// family claims a class the files name, and [`ResolveError::Ambiguous`] when two files name
+    /// classes of two families.
+    pub fn resolve<'a>(
         &self,
-        config: Option<&str>,
-        index: Option<&str>,
+        files: impl IntoIterator<Item = (RootFile, &'a str)>,
     ) -> Result<Family, ResolveError> {
-        if let Some(config) = config {
-            let config = object(CONFIG_FILE, config)?;
-            let class = config
-                .get("architectures")
-                .and_then(Value::as_array)
-                .and_then(|architectures| architectures.first())
-                .and_then(Value::as_str);
-            let model_type = config.get("model_type").and_then(Value::as_str);
-
-            let claimed = class
-                .and_then(|class| self.by_class(class))
-                .or_else(|| model_type.and_then(|model_type| self.by_model_type(model_type)));
-            match (claimed, class, model_type) {
-                (Some(family), _, _) => return Ok(family),
-                (None, None, None) => {}
-                (None, class, model_type) => {
-                    let declared = [
-                        class.map(|class| format!("class {class}")),
-                        model_type.map(|model_type| format!("model_type {model_type}")),
-                    ];
-                    return Err(self.unserved(declared.into_iter().flatten().collect()));
+        let mut declared = Vec::new();
+        let mut claimed: Option<(Family, String)> = None;
+        for (file, text) in files {
+            let object = object(file, text)?;
+            let Some(class) = file.class(&object) else {
+                continue;
+            };
+            let stated = format!("class {class} ({})", file.name());
+            let family = self
+                .families
+                .iter()
+                .copied()
+                .find(|family| family.root == file && family.classes.contains(&class));
+            match (family, &claimed) {
+                (None, _) => declared.push(stated),
+                (Some(family), None) => claimed = Some((family, stated)),
+                (Some(family), Some((first, _))) if family == *first => {}
+                (Some(_), Some((_, first))) => {
+                    return Err(ResolveError::Ambiguous {
+                        first: first.clone(),
+                        second: stated,
+                    });
                 }
             }
         }
 
-        let Some(index) = index else {
-            return Err(ResolveError::Undeclared);
-        };
-        let index = object("pipeline index", index)?;
-        let class = index
-            .get("_class_name")
-            .and_then(Value::as_str)
-            .ok_or(ResolveError::Undeclared)?;
-        self.by_class(class)
-            .ok_or_else(|| self.unserved(vec![format!("class {class}")]))
-    }
-
-    /// The refusal of a checkpoint that declares `declared`, which names everything this registry
-    /// serves.
-    fn unserved(&self, declared: Vec<String>) -> ResolveError {
-        let claimed: Vec<&str> = self
-            .families
-            .iter()
-            .flat_map(|family| family.classes.iter().chain(family.model_types))
-            .copied()
-            .collect();
-        ResolveError::Unserved {
-            declared: declared.join(" and "),
-            served: claimed.join(", "),
+        if let Some((family, _)) = claimed {
+            return Ok(family);
         }
+        if declared.is_empty() {
+            return Err(ResolveError::Undeclared {
+                files: self.root_files().into_iter().map(RootFile::name).collect(),
+            });
+        }
+        Err(ResolveError::Unserved {
+            declared: declared.join(" and "),
+            served: self
+                .families
+                .iter()
+                .flat_map(|family| family.classes.iter().copied())
+                .collect::<Vec<_>>()
+                .join(", "),
+        })
     }
 }
 
 /// `text`, the content of the checkpoint's `file`, as a JSON object.
-fn object(file: &'static str, text: &str) -> Result<serde_json::Map<String, Value>, ResolveError> {
+fn object(file: RootFile, text: &str) -> Result<serde_json::Map<String, Value>, ResolveError> {
     let malformed = |message: String| ResolveError::Malformed { file, message };
     match serde_json::from_str(text) {
         Ok(Value::Object(object)) => Ok(object),
@@ -238,7 +270,7 @@ mod tests {
 
     const CHAT: Family = Family {
         id: "chat",
-        model_types: &["chat_model"],
+        root: RootFile::Config,
         classes: &["ChatForCausalLM"],
         serving: Serving::Chat(ChatProfile {
             reasoning: None,
@@ -247,118 +279,99 @@ mod tests {
         }),
     };
 
-    /// A checkpoint resolves by the `model_type` or the class its own file declares, and one no
-    /// family claims resolves to none.
-    #[test]
-    fn a_family_is_found_by_what_its_checkpoints_declare() {
-        let registry = Registry::new([CHAT]).unwrap();
-        assert_eq!(registry.by_model_type("chat_model"), Some(CHAT));
-        assert_eq!(registry.by_class("ChatForCausalLM"), Some(CHAT));
-        assert_eq!(registry.by_model_type("other"), None);
-        assert_eq!(registry.by_class("chat_model"), None);
-    }
-
-    /// Two families that claim one `model_type` or class are refused: a checkpoint of it would
-    /// resolve to either.
-    #[test]
-    fn two_families_may_not_claim_one_class() {
-        let twin = Family { id: "twin", ..CHAT };
-        assert_eq!(
-            Registry::new([CHAT, twin]).unwrap_err(),
-            RegistryError("chat_model")
-        );
-
-        let class = Family {
-            id: "class",
-            model_types: &[],
-            ..CHAT
-        };
-        assert_eq!(
-            Registry::new([CHAT, class]).unwrap_err(),
-            RegistryError("ChatForCausalLM")
-        );
-    }
-
-    /// A video family declared by a pipeline's class alone.
+    /// A video family declared by a modular pipeline's class.
     const VIDEO: Family = Family {
         id: "video",
-        model_types: &[],
+        root: RootFile::ModularIndex,
         classes: &["VideoModularPipeline"],
         ..CHAT
     };
 
-    /// A checkpoint resolves by what its root files declare: a `config.json` by its class, else
-    /// by its `model_type`, and a checkpoint with no `config.json` by its pipeline index's class.
-    #[test]
-    fn a_checkpoint_resolves_by_what_its_root_files_declare() {
-        let registry = Registry::new([CHAT, VIDEO]).unwrap();
-        let index = r#"{"_class_name": "VideoModularPipeline", "transformer": ["diffusers", "X"]}"#;
+    const CONFIG: &str = r#"{"architectures": ["ChatForCausalLM"], "model_type": "chat_model"}"#;
+    const INDEX: &str =
+        r#"{"_class_name": "VideoModularPipeline", "transformer": ["diffusers", "X"]}"#;
 
-        assert_eq!(registry.resolve(None, Some(index)), Ok(VIDEO));
+    /// A family is found by the classes it claims, and two families may not claim one class.
+    #[test]
+    fn a_family_is_found_by_its_one_claimed_class() {
+        let registry = Registry::new([CHAT, VIDEO]).unwrap();
+        assert_eq!(registry.by_class("ChatForCausalLM"), Some(CHAT));
+        assert_eq!(registry.by_class("chat_model"), None);
         assert_eq!(
-            registry.resolve(
-                Some(r#"{"architectures": ["ChatForCausalLM"]}"#),
-                Some(index)
-            ),
-            Ok(CHAT)
+            registry.root_files(),
+            [RootFile::Config, RootFile::ModularIndex]
         );
+
+        let twin = Family {
+            id: "twin",
+            ..VIDEO
+        };
         assert_eq!(
-            registry.resolve(Some(r#"{"model_type": "chat_model"}"#), None),
-            Ok(CHAT)
+            Registry::new([CHAT, VIDEO, twin]).unwrap_err(),
+            RegistryError("VideoModularPipeline")
         );
-        // A class no family claims falls back to the `model_type` beside it.
-        assert_eq!(
-            registry.resolve(
-                Some(r#"{"architectures": ["OtherForCausalLM"], "model_type": "chat_model"}"#),
-                None
-            ),
-            Ok(CHAT)
-        );
-        // A `config.json` that declares nothing leaves the decision to the pipeline index.
-        assert_eq!(registry.resolve(Some("{}"), Some(index)), Ok(VIDEO));
     }
 
-    /// What no family claims is refused naming what the checkpoint declares and everything the
-    /// build serves; a checkpoint that declares nothing, and a file that is no JSON object, are
+    /// A checkpoint resolves by the class the file its family declares in names, whichever other
+    /// files it publishes.
+    #[test]
+    fn a_checkpoint_resolves_by_its_familys_root_file() {
+        let registry = Registry::new([CHAT, VIDEO]).unwrap();
+        assert_eq!(registry.resolve([(RootFile::Config, CONFIG)]), Ok(CHAT));
+        assert_eq!(
+            registry.resolve([(RootFile::ModularIndex, INDEX)]),
+            Ok(VIDEO)
+        );
+        // A `config.json` that names no class leaves the decision to the index, as a file the
+        // video family does not declare in.
+        assert_eq!(
+            registry.resolve([(RootFile::Config, "{}"), (RootFile::ModularIndex, INDEX)]),
+            Ok(VIDEO)
+        );
+    }
+
+    /// A class no family claims is refused, whatever its `model_type` says, naming what the
+    /// checkpoint declares and everything the build serves; a checkpoint whose files name no
+    /// class, two files naming two families' classes, and a file that is no JSON object are each
     /// refused as such.
     #[test]
-    fn an_unserved_or_undeclared_checkpoint_is_refused_by_name() {
+    fn an_unserved_undeclared_or_ambiguous_checkpoint_is_refused() {
         let registry = Registry::new([CHAT, VIDEO]).unwrap();
 
-        let refused = registry
-            .resolve(Some(r#"{"architectures": ["OtherForCausalLM"]}"#), None)
-            .unwrap_err();
-        let message = refused.to_string();
-        assert!(message.contains("OtherForCausalLM"), "{message}");
+        let unserved = r#"{"architectures": ["OtherForCausalLM"], "model_type": "chat_model"}"#;
+        let message = registry
+            .resolve([(RootFile::Config, unserved)])
+            .unwrap_err()
+            .to_string();
         assert!(
-            message.contains("ChatForCausalLM, chat_model, VideoModularPipeline"),
+            message.contains("OtherForCausalLM (config.json)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("ChatForCausalLM, VideoModularPipeline"),
             "{message}"
         );
 
-        let refused = registry
-            .resolve(None, Some(r#"{"_class_name": "OtherPipeline"}"#))
+        assert!(matches!(
+            registry.resolve([]),
+            Err(ResolveError::Undeclared { .. })
+        ));
+        let undeclared = registry
+            .resolve([(RootFile::ModularIndex, "{}")])
             .unwrap_err();
         assert!(
-            matches!(refused, ResolveError::Unserved { .. }),
-            "{refused}"
+            undeclared.to_string().contains("modular_model_index.json"),
+            "{undeclared}"
         );
 
-        assert_eq!(registry.resolve(None, None), Err(ResolveError::Undeclared));
-        assert_eq!(
-            registry.resolve(Some("{}"), None),
-            Err(ResolveError::Undeclared)
-        );
-        assert!(
-            registry
-                .resolve(None, Some("{}"))
-                .unwrap_err()
-                .to_string()
-                .contains("modular_model_index.json")
-        );
         assert!(matches!(
-            registry.resolve(Some("[1]"), None),
+            registry.resolve([(RootFile::Config, CONFIG), (RootFile::ModularIndex, INDEX)]),
+            Err(ResolveError::Ambiguous { .. })
+        ));
+        assert!(matches!(
+            registry.resolve([(RootFile::Config, "[1]")]),
             Err(ResolveError::Malformed {
-                file: "config.json",
+                file: RootFile::Config,
                 ..
             })
         ));

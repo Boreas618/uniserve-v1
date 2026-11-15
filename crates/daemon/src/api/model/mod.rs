@@ -215,8 +215,8 @@ mod tests {
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
     use processing::{
-        ChatProfile, Family, ReasoningFormat, Registry, Serving, ToolCallFormat, VideoBinding,
-        VideoFamily, VideoProcessor,
+        ChatProfile, Family, ReasoningFormat, Registry, RootFile, Serving, ToolCallFormat,
+        VideoBinding, VideoFamily, VideoProcessor,
     };
 
     use super::ModelConfig;
@@ -236,10 +236,10 @@ mod tests {
         "</answer>",
     ];
 
-    /// Writes a minimal checkpoint for `model_type`: a character-level BPE
+    /// Writes a minimal checkpoint of the model class `class`: a character-level BPE
     /// tokenizer over ASCII plus [`SPECIAL_TOKENS`], and root, tokenizer, and
     /// generation configs. Dropping the returned directory deletes the files.
-    fn configured_files(model_type: &str) -> (tempfile::TempDir, ResolvedModelFiles) {
+    fn configured_files(class: &str) -> (tempfile::TempDir, ResolvedModelFiles) {
         let directory = tempdir().expect("create model directory");
         let mut vocab = Vocab::from_iter([("<unk>".to_string(), 0_u32)]);
         for codepoint in 1_u32..=127 {
@@ -266,7 +266,7 @@ mod tests {
         fs::write(
             &config_path,
             format!(
-                r#"{{"model_type":"{model_type}","max_position_embeddings":4096,"num_attention_heads":8}}"#
+                r#"{{"architectures":["{class}"],"max_position_embeddings":4096,"num_attention_heads":8}}"#
             ),
         )
         .expect("write model config");
@@ -290,12 +290,10 @@ mod tests {
         (directory, files)
     }
 
-    /// The family the checkpoint [`configured_files`] writes for `model_type` declares, as
-    /// startup loads it with a registry of [`CHAT`] and [`VIDEO`].
-    async fn loaded(
-        model_type: &str,
-    ) -> Result<ModelConfig, crate::api::input::ModelResolutionError> {
-        let (directory, _files) = configured_files(model_type);
+    /// The family the checkpoint [`configured_files`] writes for `class` declares, as startup
+    /// loads it with a registry of [`CHAT`] and [`VIDEO`].
+    async fn loaded(class: &str) -> Result<ModelConfig, crate::api::input::ModelResolutionError> {
+        let (directory, _files) = configured_files(class);
         let registry = Registry::new([CHAT, VIDEO]).unwrap();
         let loaded = ModelConfig::load(
             directory.path().to_str().unwrap(),
@@ -307,11 +305,11 @@ mod tests {
         loaded.map(|loaded| loaded.config)
     }
 
-    /// A chat family of the two `model_type`s these checkpoints declare.
+    /// A chat family of the class these checkpoints declare.
     const CHAT: Family = Family {
         id: "chat",
-        model_types: &["qwen3", "qwen3_moe"],
-        classes: &[],
+        root: RootFile::Config,
+        classes: &["ChatForCausalLM"],
         serving: Serving::Chat(ChatProfile {
             reasoning: Some(ReasoningFormat::Think),
             tool_calls: Some(ToolCallFormat::Json),
@@ -342,7 +340,7 @@ mod tests {
 
     const VIDEO: Family = Family {
         id: "video",
-        model_types: &["video"],
+        root: RootFile::ModularIndex,
         classes: &["VideoModularPipeline"],
         serving: Serving::Video(&Video),
     };
@@ -351,7 +349,7 @@ mod tests {
     /// generation defaults.
     #[test]
     fn a_chat_checkpoint_states_its_bound_and_defaults() {
-        let (_directory, files) = configured_files("qwen3");
+        let (_directory, files) = configured_files("ChatForCausalLM");
         let tokenizer = HuggingFaceTokenizer::load(
             &files.tokenizer_path,
             files.tokenizer_config_path.as_deref(),
@@ -366,17 +364,17 @@ mod tests {
         assert_eq!(bounded.max_model_len, 1024);
     }
 
-    /// Startup serves the family the checkpoint declares; a video family declared by a root
-    /// configuration with no pipeline index beside it, and a `model_type` no family claims, are
+    /// Startup serves the family the checkpoint declares; a root configuration naming the class a
+    /// video family declares in its pipeline index alone, and a class no family claims, are
     /// refused.
     #[tokio::test]
     async fn startup_serves_the_family_the_checkpoint_declares() {
-        for model_type in ["qwen3", "qwen3_moe"] {
-            assert_eq!(loaded(model_type).await.unwrap().family, CHAT);
-        }
+        assert_eq!(loaded("ChatForCausalLM").await.unwrap().family, CHAT);
         assert!(matches!(
-            loaded("video").await,
-            Err(crate::api::input::ModelResolutionError::NoPipeline { family: "video" })
+            loaded("VideoModularPipeline").await,
+            Err(crate::api::input::ModelResolutionError::Family(
+                processing::ResolveError::Unserved { .. }
+            ))
         ));
         assert!(matches!(
             loaded("unsupported_architecture").await,

@@ -12,7 +12,7 @@ use crate::api::model::assets::ResolvedModelFiles;
 use crate::api::openai::ApiError;
 use crate::api::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use processing::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
-use processing::{Family, Registry};
+use processing::{Family, Registry, RootFile};
 use proto::config::ChatTemplateContentFormat;
 use proto::handoff::Lowering;
 use proto::request::{GenerationLimits, GenerationRequest};
@@ -45,8 +45,8 @@ const SPECIAL_TOKENS: &[&str] = &[
 /// A chat family that declares neither a reasoning nor a tool-call format.
 const PLAIN: Family = Family {
     id: "plain",
-    model_types: &["plain"],
-    classes: &[],
+    root: RootFile::Config,
+    classes: &["PlainForCausalLM"],
     serving: Serving::Chat(ChatProfile {
         reasoning: None,
         tool_calls: None,
@@ -54,11 +54,11 @@ const PLAIN: Family = Family {
     }),
 };
 
-/// A chat family of Qwen3's `model_type`s whose outputs are parsed in its formats.
+/// A chat family whose outputs are parsed in its formats.
 const CHAT: Family = Family {
     id: "chat",
-    model_types: &["qwen3", "qwen3_moe"],
-    classes: &[],
+    root: RootFile::Config,
+    classes: &["ChatForCausalLM"],
     serving: Serving::Chat(ChatProfile {
         reasoning: Some(ReasoningFormat::Think),
         tool_calls: Some(ToolCallFormat::Json),
@@ -66,11 +66,11 @@ const CHAT: Family = Family {
     }),
 };
 
-/// Resolves a chat checkpoint of `model_type` over a synthetic checkpoint with
+/// Resolves a chat checkpoint of the model class `class` over a synthetic checkpoint with
 /// worker limits that cover every generation feature; see
 /// `try_resolved_model`.
-fn resolved_model(model_type: &str) -> (tempfile::TempDir, DynTokenizer, Processor) {
-    try_resolved_model(model_type, runtime_limits()).unwrap()
+fn resolved_model(class: &str) -> (tempfile::TempDir, DynTokenizer, Processor) {
+    try_resolved_model(class, runtime_limits()).unwrap()
 }
 
 /// Writes a synthetic checkpoint to a temporary directory and binds an
@@ -87,7 +87,7 @@ fn resolved_model(model_type: &str) -> (tempfile::TempDir, DynTokenizer, Process
 /// Returns the `Processor::new` error, for example when `limits` do not
 /// cover a feature the profile needs. Other setup failures panic.
 fn try_resolved_model(
-    model_type: &str,
+    class: &str,
     limits: GenerationLimits,
 ) -> Result<(tempfile::TempDir, DynTokenizer, Processor), ModelResolutionError> {
     let directory = tempdir().unwrap();
@@ -115,7 +115,7 @@ fn try_resolved_model(
     fs::write(
         &config_path,
         format!(
-            r#"{{"model_type":"{model_type}","max_position_embeddings":4096,"num_attention_heads":8}}"#
+            r#"{{"architectures":["{class}"],"max_position_embeddings":4096,"num_attention_heads":8}}"#
         ),
     )
     .unwrap();
@@ -157,10 +157,12 @@ fn try_resolved_model(
     // The family the checkpoint's `config.json` declares, as startup resolves it.
     let family = Registry::new([CHAT, PLAIN, processing::qwen::QWEN4_EXP])
         .unwrap()
-        .resolve(
-            Some(&fs::read_to_string(directory.path().join("config.json")).unwrap()),
-            None,
-        )
+        .resolve([(
+            RootFile::Config,
+            fs::read_to_string(directory.path().join("config.json"))
+                .unwrap()
+                .as_str(),
+        )])
         .unwrap();
     let config = ModelConfig::from_files(family, &files, Some(4096), tokenizer.as_ref()).unwrap();
     let renderer = RequestRenderer::Chat(renderer);
@@ -219,7 +221,7 @@ fn model_resolution_refuses_a_missing_runtime_branch() {
     limits
         .features
         .remove(proto::request::GenerationFeatures::UNDERSTANDING);
-    let error = match try_resolved_model("qwen3", limits) {
+    let error = match try_resolved_model("ChatForCausalLM", limits) {
         Ok(_) => panic!("incomplete worker limits must fail model resolution"),
         Err(error) => error,
     };
@@ -231,7 +233,7 @@ fn model_resolution_refuses_a_missing_runtime_branch() {
 
 #[test]
 fn context_length_limits_preprocessed_requests() {
-    let (_directory, tokenizer, loaded) = resolved_model("qwen3");
+    let (_directory, tokenizer, loaded) = resolved_model("ChatForCausalLM");
     let renderer = HfChatRenderer::new(
         Some(CHAT_TEMPLATE.to_string()),
         HashMap::new(),
@@ -270,7 +272,7 @@ fn context_length_limits_preprocessed_requests() {
 /// length is rejected rather than replaced by the 128-token checkpoint default.
 #[test]
 fn sampling_defaults_preserve_explicit_zero_controls() {
-    let (_directory, _tokenizer, model) = resolved_model("qwen3");
+    let (_directory, _tokenizer, model) = resolved_model("ChatForCausalLM");
     let mut request: crate::api::protocol::ChatCompletionRequest =
         serde_json::from_value(serde_json::json!({
             "model": SERVED_MODEL, "messages": [{"role": "user", "content": "hello"}]
@@ -314,7 +316,7 @@ fn sampling_defaults_preserve_explicit_zero_controls() {
 /// prompt positions whose logprobs are requested.
 #[test]
 fn cache_salt_isolates_and_prompt_logprobs_disable_cache_reads() {
-    let (_directory, _tokenizer, processor) = resolved_model("qwen3");
+    let (_directory, _tokenizer, processor) = resolved_model("ChatForCausalLM");
     let preprocess = |fields: serde_json::Value| {
         preprocess_chat(
             &processor,
@@ -349,7 +351,7 @@ fn cache_salt_isolates_and_prompt_logprobs_disable_cache_reads() {
 /// the same buffered request still requests them.
 #[test]
 fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
-    let (_directory, _tokenizer, processor) = resolved_model("qwen3");
+    let (_directory, _tokenizer, processor) = resolved_model("ChatForCausalLM");
     for stream in [true, false] {
         let request: crate::api::protocol::ChatCompletionRequest =
             serde_json::from_value(serde_json::json!({
@@ -390,8 +392,8 @@ const QWEN3_TEMPLATE: &str = include_str!(concat!(
 const XML_CALL_TEMPLATE: &str = "{%- if tools -%}<|im_start|>system\n# Tools\n<tools>{%- for tool in tools -%}{{ tool | tojson }}{%- endfor -%}</tools>\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter>\nvalue\n</parameter>\n</function>\n</tool_call><|im_end|>\n{%- endif -%}{%- for message in messages -%}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}";
 
 /// Rebinds a resolved Qwen3-family model to `template`.
-fn with_template(model_type: &str, template: &str) -> Processor {
-    let (_directory, tokenizer, loaded) = resolved_model(model_type);
+fn with_template(class: &str, template: &str) -> Processor {
+    let (_directory, tokenizer, loaded) = resolved_model(class);
     let renderer = HfChatRenderer::new(
         Some(template.to_string()),
         HashMap::new(),
@@ -413,7 +415,7 @@ fn with_template(model_type: &str, template: &str) -> Processor {
 /// refusal, not a text answer.
 #[test]
 fn a_chat_request_for_image_output_is_refused_by_name() {
-    let (_directory, _tokenizer, processor) = resolved_model("qwen3");
+    let (_directory, _tokenizer, processor) = resolved_model("ChatForCausalLM");
     for modalities in [vec!["image"], vec!["text", "image"]] {
         let request: crate::api::protocol::ChatCompletionRequest =
             serde_json::from_value(serde_json::json!({
@@ -453,33 +455,31 @@ fn the_profile_declares_the_tool_call_format() {
             "parameters": {"type": "object", "properties": {}}
         }}]
     });
-    for model_type in ["qwen3", "qwen3_moe"] {
-        for template in [QWEN3_TEMPLATE, XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
-            let processor = with_template(model_type, template);
-            assert!(processor.supports_tool_calling(), "{model_type}");
-            let (_, lowering) = preprocess_chat(
-                &processor,
-                String::from("tools"),
-                serde_json::from_value(tool_request.clone()).unwrap(),
-                Vec::new(),
-            )
-            .unwrap();
+    for template in [QWEN3_TEMPLATE, XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
+        let processor = with_template("ChatForCausalLM", template);
+        assert!(processor.supports_tool_calling(), "{template}");
+        let (_, lowering) = preprocess_chat(
+            &processor,
+            String::from("tools"),
+            serde_json::from_value(tool_request.clone()).unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
 
-            let parser = lowering.parser.unwrap();
-            assert_eq!(
-                (parser.reasoning.as_str(), parser.tool_calls.as_str()),
-                ("think", "json")
-            );
-            let tools: serde_json::Value = serde_json::from_str(&parser.tools).unwrap();
-            assert_eq!(tools[0]["function"]["name"], "weather");
-        }
+        let parser = lowering.parser.unwrap();
+        assert_eq!(
+            (parser.reasoning.as_str(), parser.tool_calls.as_str()),
+            ("think", "json")
+        );
+        let tools: serde_json::Value = serde_json::from_str(&parser.tools).unwrap();
+        assert_eq!(tools[0]["function"]["name"], "weather");
     }
 
     // `tool_choice: none` withholds the tools from the model, so no call is parsed.
     let mut withheld = tool_request.clone();
     withheld["tool_choice"] = serde_json::json!("none");
     let (_, lowering) = preprocess_chat(
-        &with_template("qwen3", QWEN3_TEMPLATE),
+        &with_template("ChatForCausalLM", QWEN3_TEMPLATE),
         String::from("no-tools"),
         serde_json::from_value(withheld).unwrap(),
         Vec::new(),
@@ -505,7 +505,7 @@ fn tool_calling_follows_the_familys_declared_format() {
         }}]
     });
 
-    let (_directory, _, plain) = resolved_model("plain");
+    let (_directory, _, plain) = resolved_model("PlainForCausalLM");
     assert!(!plain.supports_tool_calling());
     let error = preprocess_chat(
         &plain,
@@ -519,7 +519,7 @@ fn tool_calling_follows_the_familys_declared_format() {
     let message = error.to_error_response().error.message;
     assert!(message.contains("tool_calling"), "{message}");
 
-    let (_directory, _, tagged) = resolved_model("qwen4_exp");
+    let (_directory, _, tagged) = resolved_model("Qwen4ExpForConditionalGeneration");
     assert!(tagged.supports_tool_calling());
     let (_, lowering) = preprocess_chat(
         &tagged,
@@ -540,7 +540,7 @@ fn tool_calling_follows_the_familys_declared_format() {
 /// same cache partition, which is what lets the prefix cache serve it.
 #[test]
 fn a_harness_conversation_grows_by_its_new_turns() {
-    let processor = with_template("qwen3", QWEN3_TEMPLATE);
+    let processor = with_template("ChatForCausalLM", QWEN3_TEMPLATE);
     let turn = |messages: serde_json::Value| {
         let request = serde_json::json!({
             "model": SERVED_MODEL,
@@ -615,7 +615,7 @@ fn a_harness_conversation_grows_by_its_new_turns() {
 /// which a deployment here does not have.
 #[test]
 fn a_tool_choice_that_needs_constrained_decoding_is_refused() {
-    let processor = with_template("qwen3", QWEN3_TEMPLATE);
+    let processor = with_template("ChatForCausalLM", QWEN3_TEMPLATE);
     for choice in [
         serde_json::json!("required"),
         serde_json::json!({"type": "function", "function": {"name": "weather"}}),
@@ -653,7 +653,7 @@ fn a_tool_choice_that_needs_constrained_decoding_is_refused() {
 /// `u64` value.
 #[test]
 fn negative_seeds_are_reinterpreted() {
-    let (_directory, _, model) = resolved_model("qwen3");
+    let (_directory, _, model) = resolved_model("ChatForCausalLM");
     for seed in [-1, -2] {
         let (request, _) = preprocess_chat(
             &model,
@@ -674,7 +674,7 @@ fn negative_seeds_are_reinterpreted() {
 /// here serves the whole vocabulary.
 #[test]
 fn a_logprob_count_above_max_logprobs_is_refused() {
-    let (_directory, _, model) = resolved_model("qwen3");
+    let (_directory, _, model) = resolved_model("ChatForCausalLM");
     let lowered = |fields: serde_json::Value| {
         preprocess_chat(
             &model,
@@ -759,7 +759,7 @@ fn image_chat(before: &str, after: &str) -> crate::api::protocol::ChatCompletion
 /// feature.
 #[test]
 fn a_text_only_deployment_refuses_an_image_part() {
-    let (_directory, _tokenizer, processor) = resolved_model("qwen3");
+    let (_directory, _tokenizer, processor) = resolved_model("ChatForCausalLM");
     assert!(!processor.supports_image_input());
     let error = preprocess_chat(
         &processor,
@@ -777,7 +777,7 @@ fn a_text_only_deployment_refuses_an_image_part() {
 /// digest that keys its encodings within the request's cache partition.
 #[test]
 fn an_image_part_becomes_a_vision_block_in_place_of_its_placeholder() {
-    let (_directory, tokenizer, loaded) = resolved_model("qwen3");
+    let (_directory, tokenizer, loaded) = resolved_model("ChatForCausalLM");
     let renderer = HfChatRenderer::new(
         Some(CHAT_TEMPLATE.to_string()),
         HashMap::new(),

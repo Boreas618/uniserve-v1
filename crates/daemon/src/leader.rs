@@ -1558,9 +1558,9 @@ pub(crate) async fn same_processing(served: &str, path: &str) -> Result<(), Stri
     use crate::api::model::assets::model_files::ResolvedModelFiles;
     // A diffusers checkpoint keeps what processes a request in directories of its own, and states
     // no tokenizer at its root for the model's files to resolve.
-    let pipeline = processing::PIPELINE_INDEX_FILES
-        .iter()
-        .any(|index| std::path::Path::new(served).join(index).is_file());
+    let pipeline = std::path::Path::new(served)
+        .join(processing::RootFile::ModularIndex.name())
+        .is_file();
     if pipeline {
         return same_pipeline(std::path::Path::new(served), std::path::Path::new(path));
     }
@@ -1618,9 +1618,9 @@ fn same_pipeline(served: &std::path::Path, path: &std::path::Path) -> Result<(),
     let read = |file: &std::path::Path| {
         std::fs::read(file).map_err(|error| format!("{}: {error}", file.display()))
     };
-    // The index files either checkpoint publishes, each the same in both.
+    // The index either checkpoint publishes, the same in both.
     let published = |root: &std::path::Path, index: &str| root.join(index).is_file();
-    for index in processing::PIPELINE_INDEX_FILES {
+    for index in [processing::RootFile::ModularIndex.name()] {
         let same = match (published(served, index), published(path, index)) {
             (false, false) => true,
             (true, true) => read(&served.join(index))? == read(&path.join(index))?,

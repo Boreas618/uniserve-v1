@@ -1,10 +1,9 @@
 //! Root stage index of a diffusers pipeline checkpoint.
 //!
 //! A pipeline checkpoint names its pipeline class and stage folders in a
-//! root index instead of a root `config.json`. The classic layout publishes
-//! `model_index.json`, where each stage lives in the folder named by its
-//! key; the modular layout publishes `modular_model_index.json`, where a
-//! stage's specification may name its folder explicitly.
+//! root index instead of a root `config.json`: a modular pipeline's
+//! `modular_model_index.json`, where each stage lives in the folder named by
+//! its key unless its specification names its folder explicitly.
 //!
 //! The class selects the family (`processing::Registry::resolve`); server
 //! startup (`ModelConfig::load` in `input::processor`) then reads this index,
@@ -73,22 +72,19 @@ impl PipelineIndex {
 }
 
 /// Resolves the root index of the diffusers pipeline checkpoint `source`
-/// holds.
+/// holds: its `modular_model_index.json` ([`processing::RootFile::ModularIndex`]).
 ///
-/// A checkpoint that publishes neither index file is not a pipeline
-/// checkpoint: [`Error::MissingFile`] for both files yields `None`. Any other
-/// resolution failure, such as a refused, rate-limited or unreachable Hub
-/// request, is returned, since it says nothing about whether the index
-/// exists. An index that resolves but cannot be read or parsed is an error.
+/// A checkpoint that publishes no index is not a pipeline checkpoint:
+/// [`Error::MissingFile`] yields `None`. Any other resolution failure, such as
+/// a refused, rate-limited or unreachable Hub request, is returned, since it
+/// says nothing about whether the index exists. An index that resolves but
+/// cannot be read or parsed is an error.
 pub(super) async fn pipeline_index(source: &ModelSource) -> Result<Option<PipelineIndex>> {
-    for filename in processing::PIPELINE_INDEX_FILES {
-        match source.file(filename).await {
-            Ok(path) => return read_pipeline_index(&path).map(Some),
-            Err(Error::MissingFile { .. }) => continue,
-            Err(error) => return Err(error),
-        }
+    match source.file(processing::RootFile::ModularIndex.name()).await {
+        Ok(path) => read_pipeline_index(&path).map(Some),
+        Err(Error::MissingFile { .. }) => Ok(None),
+        Err(error) => Err(error),
     }
-    Ok(None)
 }
 
 /// Reads and parses one resolved index file.

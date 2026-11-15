@@ -10,27 +10,25 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use nn::family::{Family, Registry};
 
-/// The family of the checkpoint at `checkpoint`, by what its root `config.json` or pipeline index
-/// declares ([`processing::Registry::resolve`]).
+/// The family of the checkpoint at `checkpoint`, by what the root files the families declare in
+/// name ([`processing::Registry::resolve`]).
 ///
 /// # Errors
 ///
 /// Fails when a root file cannot be read, or the checkpoint declares nothing a family of
 /// `registry` claims; the refusal names what the build serves.
 pub(crate) fn resolve(registry: &Registry, checkpoint: &Path) -> Result<Family> {
-    let config = root_file(checkpoint, processing::CONFIG_FILE)?;
-    let mut index = None;
-    for file in processing::PIPELINE_INDEX_FILES {
-        index = root_file(checkpoint, file)?;
-        if index.is_some() {
-            break;
+    let claims =
+        processing::Registry::new(registry.families().iter().map(|family| family.request))?;
+    let mut files = Vec::new();
+    for file in claims.root_files() {
+        if let Some(text) = root_file(checkpoint, file.name())? {
+            files.push((file, text));
         }
     }
 
-    let claims =
-        processing::Registry::new(registry.families().iter().map(|family| family.request))?;
     let declared = claims
-        .resolve(config.as_deref(), index.as_deref())
+        .resolve(files.iter().map(|(file, text)| (*file, text.as_str())))
         .with_context(|| format!("resolving the model family of {}", checkpoint.display()))?;
     registry
         .families()
@@ -92,7 +90,7 @@ mod tests {
             Family {
                 request: processing::Family {
                     id: "text",
-                    model_types: &[],
+                    root: processing::RootFile::Config,
                     classes: &["TextForCausalLM"],
                     serving: chat,
                 },
@@ -102,7 +100,7 @@ mod tests {
             Family {
                 request: processing::Family {
                     id: "video",
-                    model_types: &[],
+                    root: processing::RootFile::ModularIndex,
                     classes: &["VideoModularPipeline"],
                     serving: chat,
                 },
@@ -113,26 +111,23 @@ mod tests {
         .unwrap()
     }
 
-    /// A checkpoint resolves by the root file its format declares it in: a diffusers modular
-    /// pipeline's `modular_model_index.json`, and a transformers checkpoint's `config.json`, which
-    /// decides when both are present.
+    /// A checkpoint resolves by the root file its family declares in: a diffusers modular
+    /// pipeline's `modular_model_index.json`, a transformers checkpoint's `config.json`; one whose
+    /// two files name two families' classes is refused.
     #[test]
     fn a_checkpoint_resolves_by_the_class_it_declares() {
         let registry = registry();
-        let root = tempfile::tempdir().unwrap();
+        let (pipeline, text) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let index = r#"{"_class_name": "VideoModularPipeline"}"#;
+        let config = r#"{"architectures": ["TextForCausalLM"]}"#;
 
-        std::fs::write(
-            root.path().join("modular_model_index.json"),
-            r#"{"_class_name": "VideoModularPipeline"}"#,
-        )
-        .unwrap();
-        assert_eq!(resolve(&registry, root.path()).unwrap().id(), "video");
+        std::fs::write(pipeline.path().join("modular_model_index.json"), index).unwrap();
+        assert_eq!(resolve(&registry, pipeline.path()).unwrap().id(), "video");
 
-        std::fs::write(
-            root.path().join("config.json"),
-            r#"{"architectures": ["TextForCausalLM"]}"#,
-        )
-        .unwrap();
-        assert_eq!(resolve(&registry, root.path()).unwrap().id(), "text");
+        std::fs::write(text.path().join("config.json"), config).unwrap();
+        assert_eq!(resolve(&registry, text.path()).unwrap().id(), "text");
+
+        std::fs::write(pipeline.path().join("config.json"), config).unwrap();
+        assert!(resolve(&registry, pipeline.path()).is_err());
     }
 }

@@ -256,22 +256,20 @@ impl ModelConfig {
     }
 }
 
-/// The family of `registry` the checkpoint `model` names declares in its root files: its
-/// `config.json`, and the first pipeline index it publishes.
+/// The family of `registry` the checkpoint `model` names declares in the root files the
+/// registry's families declare in.
 async fn declared_family(
     model: &str,
     registry: &Registry,
 ) -> std::result::Result<Family, ModelResolutionError> {
     let source = ModelSource::from_model_id(model)?;
-    let config = root_file(&source, processing::CONFIG_FILE).await?;
-    let mut index = None;
-    for file in processing::PIPELINE_INDEX_FILES {
-        index = root_file(&source, file).await?;
-        if index.is_some() {
-            break;
+    let mut files = Vec::new();
+    for file in registry.root_files() {
+        if let Some(text) = root_file(&source, file.name()).await? {
+            files.push((file, text));
         }
     }
-    Ok(registry.resolve(config.as_deref(), index.as_deref())?)
+    Ok(registry.resolve(files.iter().map(|(file, text)| (*file, text.as_str())))?)
 }
 
 /// The text of the checkpoint's root file `name`; `None` when the checkpoint
@@ -922,7 +920,7 @@ mod tests {
             .unwrap();
         std::fs::write(
             directory.path().join("config.json"),
-            r#"{"model_type": "chat", "max_position_embeddings": 64}"#,
+            r#"{"architectures": ["ChatForCausalLM"], "max_position_embeddings": 64}"#,
         )
         .unwrap();
         std::fs::write(

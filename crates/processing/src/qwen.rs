@@ -6,18 +6,19 @@
 //! the numerical side of the families it loads and refers to these values.
 //!
 //! Every Qwen chat model since Qwen3 delimits its reasoning with `<think>` and `</think>`.
-//! Their tool calls differ by generation, as each generation's chat template instructs them:
+//! Their tool calls differ by generation, as each generation's chat template instructs them. Each
+//! family claims the model class its checkpoints' `config.json` names:
 //!
-//! | Family | `model_type` | Tool calls |
+//! | Family | Model class | Tool calls |
 //! | --- | --- | --- |
-//! | Qwen 2.5, Qwen3 | `qwen3`, `qwen3_moe` | [`ToolCallFormat::Json`] |
-//! | Qwen3.6 | `qwen3_5_moe` | [`ToolCallFormat::Xml`] |
-//! | Qwen3.8 Flash Next | `qwen4_exp` | [`ToolCallFormat::Xml`] |
+//! | Qwen3-MoE | `Qwen3MoeForCausalLM` | [`ToolCallFormat::Json`] |
+//! | Qwen3.6 | `Qwen3_5MoeForConditionalGeneration` | [`ToolCallFormat::Xml`] |
+//! | Qwen3.8 Flash Next | `Qwen4ExpForConditionalGeneration` | [`ToolCallFormat::Xml`] |
 //!
 //! Qwen3.6 and Qwen3.8 Flash Next hold the Qwen3-VL vision tower and take images, sized by the
 //! Qwen-VL processor rules their checkpoints state.
 
-use crate::family::Family;
+use crate::family::{Family, RootFile};
 use crate::image::{ImageFamily, ImageProcessor};
 use crate::qwen_vl::ProcessorConfig;
 use crate::serving::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
@@ -28,10 +29,10 @@ pub const QWEN3_MOE_CLASS: &str = "Qwen3MoeForCausalLM";
 /// The model class of a Qwen3.6 checkpoint.
 pub const QWEN3_5_MOE_CLASS: &str = "Qwen3_5MoeForConditionalGeneration";
 
-/// Qwen 2.5 and Qwen3 (`Qwen3MoeForCausalLM`): a text chat family with JSON tool calls.
+/// Qwen3-MoE (`Qwen3MoeForCausalLM`): a text chat family with JSON tool calls.
 pub const QWEN3: Family = Family {
     id: "qwen3",
-    model_types: &["qwen3", "qwen3_moe"],
+    root: RootFile::Config,
     classes: &[QWEN3_MOE_CLASS],
     serving: Serving::Chat(ChatProfile {
         reasoning: Some(ReasoningFormat::Think),
@@ -44,7 +45,7 @@ pub const QWEN3: Family = Family {
 /// tool calls as function and parameter tags.
 pub const QWEN3_5_MOE: Family = Family {
     id: "qwen3_5_moe",
-    model_types: &["qwen3_5_moe"],
+    root: RootFile::Config,
     classes: &[QWEN3_5_MOE_CLASS],
     serving: Serving::Chat(ChatProfile {
         reasoning: Some(ReasoningFormat::Think),
@@ -57,7 +58,7 @@ pub const QWEN3_5_MOE: Family = Family {
 /// with `<think>` reasoning and function and parameter tags for tool calls.
 pub const QWEN4_EXP: Family = Family {
     id: "qwen4_exp",
-    model_types: &["qwen4_exp"],
+    root: RootFile::Config,
     classes: &["Qwen4ExpForConditionalGeneration"],
     serving: Serving::Chat(ChatProfile {
         reasoning: Some(ReasoningFormat::Think),
@@ -98,17 +99,16 @@ mod tests {
         profile
     }
 
-    /// A Qwen3.8 Flash Next checkpoint resolves to its family by the `model_type` or the class
-    /// its `config.json` declares, and the family's profile names the formats its output is
-    /// parsed in.
+    /// A Qwen3.8 Flash Next checkpoint resolves to its family by the class its `config.json`
+    /// declares, and the family's profile names the formats its output is parsed in.
     #[test]
     fn a_qwen4_exp_checkpoint_resolves_to_its_profile() {
         let registry = Registry::new([QWEN4_EXP]).unwrap();
 
-        assert_eq!(registry.by_model_type("qwen4_exp"), Some(QWEN4_EXP));
+        let config = r#"{"architectures": ["Qwen4ExpForConditionalGeneration"]}"#;
         assert_eq!(
-            registry.by_class("Qwen4ExpForConditionalGeneration"),
-            Some(QWEN4_EXP)
+            registry.resolve([(crate::RootFile::Config, config)]),
+            Ok(QWEN4_EXP)
         );
         assert_eq!(profile(QWEN4_EXP).reasoning, Some(ReasoningFormat::Think));
         assert_eq!(profile(QWEN4_EXP).tool_calls, Some(ToolCallFormat::Xml));
