@@ -42,6 +42,66 @@ fn cgroup_room() -> Option<u64> {
     Some(limit.saturating_sub(usage))
 }
 
+/// The NUMA nodes of the host, by number, as a set of nodes 0 to 1023.
+pub type NumaNodes = [u64; 16];
+
+/// `get_mempolicy(2)`'s flags (`linux/mempolicy.h`): ask for the node of a page, of the policy
+/// of an address, or of the nodes the process may allocate on.
+const MPOL_F_NODE: libc::c_ulong = 1;
+const MPOL_F_ADDR: libc::c_ulong = 1 << 1;
+const MPOL_F_MEMS_ALLOWED: libc::c_ulong = 1 << 2;
+
+/// `get_mempolicy(2)` with `flags` at `address`: the mode word and the set of nodes.
+fn mempolicy(address: usize, flags: libc::c_ulong) -> io::Result<(libc::c_int, NumaNodes)> {
+    let mut mode: libc::c_int = 0;
+    let mut nodes: NumaNodes = [0; 16];
+    let bits = libc::c_ulong::try_from(nodes.len() * 64).map_err(io::Error::other)?;
+    // SAFETY: the kernel writes the mode word and at most `bits` bits of the node set, the sizes
+    // passed; it reads nothing at `address`.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_get_mempolicy,
+            &raw mut mode,
+            nodes.as_mut_ptr(),
+            bits,
+            address,
+            flags,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((mode, nodes))
+}
+
+/// The NUMA nodes the process may allocate memory on.
+///
+/// # Errors
+///
+/// Fails when the kernel refuses the question (a kernel without NUMA support).
+pub fn allowed_numa_nodes() -> io::Result<NumaNodes> {
+    Ok(mempolicy(0, MPOL_F_MEMS_ALLOWED)?.1)
+}
+
+/// The memory policy of the mapped page at `address`: its mode (`libc::MPOL_*`) and its nodes.
+///
+/// # Errors
+///
+/// Fails when `address` is not mapped.
+pub fn page_policy(address: usize) -> io::Result<(libc::c_int, NumaNodes)> {
+    mempolicy(address, MPOL_F_ADDR)
+}
+
+/// The NUMA node the page at `address` lies on; the page is allocated when it is not yet.
+///
+/// # Errors
+///
+/// Fails when `address` is not mapped.
+pub fn page_node(address: usize) -> io::Result<u32> {
+    let (node, _) = mempolicy(address, MPOL_F_ADDR | MPOL_F_NODE)?;
+    u32::try_from(node).map_err(io::Error::other)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

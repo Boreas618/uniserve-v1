@@ -125,16 +125,13 @@ mod tests {
 
         use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 
-        // The last node with CPUs, as a host's sockets are: on a host of one
+        // The last node the process may allocate on, as the kernel states them: on a host of one
         // node, node 0.
-        let online = std::fs::read_to_string("/sys/devices/system/node/has_cpu")
-            .unwrap_or_else(|_| "0".into());
-        let node: u32 = online
-            .trim()
-            .rsplit([',', '-'])
-            .next()
-            .and_then(|node| node.parse().ok())
-            .unwrap_or(0);
+        let allowed = platform::host::allowed_numa_nodes().unwrap();
+        let node = (0..1024_u32)
+            .rev()
+            .find(|node| allowed[*node as usize / 64] & 1 << (node % 64) != 0)
+            .unwrap();
         let bytes = 4 << 20;
         let descriptor = shared_memory("uniserve-host-memory", bytes, Some(node)).unwrap();
 
@@ -153,15 +150,13 @@ mod tests {
         .unwrap();
         // SAFETY: writes inside the mapping made above.
         unsafe { std::ptr::write_bytes(address.cast::<u8>(), 1, bytes as usize) };
-        let maps = std::fs::read_to_string("/proc/self/numa_maps").unwrap();
-        let line = maps
-            .lines()
-            .find(|line| line.starts_with(&format!("{:x} ", address as usize)))
-            .unwrap()
-            .to_owned();
+        let (policy, preferred) = platform::host::page_policy(address as usize).unwrap();
+        let placed = platform::host::page_node(address as usize).unwrap();
         // SAFETY: the mapping made above.
         unsafe { munmap(address, bytes as usize) }.unwrap();
-        assert!(line.contains(&format!("prefer:{node}")), "{line}");
-        assert!(line.contains(&format!("N{node}=")), "{line}");
+
+        assert_eq!(policy, libc::MPOL_PREFERRED);
+        assert_eq!(preferred[node as usize / 64], 1 << (node % 64));
+        assert_eq!(placed, node);
     }
 }
