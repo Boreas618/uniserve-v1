@@ -35,7 +35,7 @@ FRAME_COUNTS = tuple(107 + 17 * index for index in range(16))
 # Prompt lengths around and between the text capacities: the listed 1024 and
 # the prompt capacity `--max-model-len`, 16384.
 PROMPT_TOKENS = (1, 777, 1024, 1025, 3000, 16384, 9000, 64)
-TEXT_CAPACITIES = "1024"
+TEXT_CAPACITIES = "[1024]"
 
 
 def _request(prompt: str, seconds: float, seed: int) -> dict[str, object]:

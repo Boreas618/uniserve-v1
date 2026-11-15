@@ -158,7 +158,7 @@ What computes with an adapter of a slot is a kernel package, and this repository
 uniserve-manager --node "$ADMIN" --node http://127.0.0.1:9000 status
 uniserve-manager --node "$ADMIN" watch            # Ctrl-C detaches
 uniserve-manager --node "$ADMIN" apply --config qwen3.toml   # an idle node deploys
-uniserve-manager --node "$ADMIN_A" --node "$ADMIN_B" apply --set cuda_graph_config.decode_batch_sizes=1,2,4,8 --commit-after 300
+uniserve-manager --node "$ADMIN_A" --node "$ADMIN_B" apply --set 'cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]' --commit-after 300
 uniserve-manager --node "$ADMIN" config
 uniserve-manager --node "$ADMIN" commit                      # or rollback
 uniserve-manager --node "$ADMIN" shutdown

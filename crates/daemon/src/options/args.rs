@@ -385,13 +385,13 @@ mod tests {
         assert_eq!(config.admin_config.port, 0);
     }
 
-    /// A `--set` value is a TOML value, JSON, or text; lists also take
-    /// comma-separated text, and durations and sizes take units.
+    /// A `--set` value is a TOML value, JSON, or text; a list is an array, and durations and
+    /// sizes take units.
     #[test]
     fn set_values_read_as_toml_json_or_text() {
         let (config, _) = resolved(&[
             "--set",
-            "video_config.text_capacities=1024,10240",
+            "video_config.text_capacities=[1024, 10240]",
             "--set",
             "video_config.sizes=[\"1344x768\"]",
             "--set",
@@ -846,9 +846,9 @@ mod tests {
         let (_, engine) = lowered(&[
             "m",
             "--set",
-            "video_config.text_capacities=1024,4096",
+            "video_config.text_capacities=[1024, 4096]",
             "--set",
-            "cuda_graph_config.flow_shapes=1152x2048,2048x1152",
+            "cuda_graph_config.flow_shapes=[\"1152x2048\", \"2048x1152\"]",
         ])
         .unwrap();
         let capacities = engine.video.text_capacities.unwrap();
@@ -866,10 +866,14 @@ mod tests {
         );
 
         for refused in [
-            "video_config.text_capacities=4096,1024",
-            "cuda_graph_config.decode_batch_sizes=1,0",
-            "cuda_graph_config.flow_shapes=1152x2048,1152x2048",
-            "cuda_graph_config.flow_shapes=1152",
+            "video_config.text_capacities=[4096, 1024]",
+            "cuda_graph_config.decode_batch_sizes=[1, 0]",
+            "cuda_graph_config.flow_shapes=[\"1152x2048\", \"1152x2048\"]",
+            "cuda_graph_config.flow_shapes=[\"1152\"]",
+            // A list has one form, the array: comma-separated text and a bare element are
+            // refused.
+            "video_config.text_capacities=1024,4096",
+            "video_config.text_capacities=1024",
         ] {
             assert!(
                 lowered(&["m", "--set", refused]).is_err(),

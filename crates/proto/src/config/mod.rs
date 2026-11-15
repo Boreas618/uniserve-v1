@@ -135,7 +135,6 @@ pub struct KvCacheConfig {
     /// Server and loaded like host pages. The endpoints are unauthenticated;
     /// the hosts rely on the isolation of their network. Applies with
     /// `host_tier`; none when empty.
-    #[serde(deserialize_with = "values::list::deserialize")]
     pub peers: Vec<String>,
 }
 
@@ -347,10 +346,8 @@ pub struct DeviceConfig {
     /// numbers each host's ranks from zero. A change of the parallel
     /// configuration that does not state it takes the order that leaves
     /// the most weights on the GPUs already holding them.
-    #[serde(deserialize_with = "values::list::deserialize")]
     pub devices: Vec<u32>,
     /// Hosts after this one the ranks spread across, in equal blocks.
-    #[serde(deserialize_with = "values::list::deserialize")]
     pub worker_hosts: Vec<String>,
     /// Batches in flight per rank; a deployment group states its own.
     pub queue_depth: NonZeroUsize,
@@ -399,15 +396,12 @@ impl Default for MoeConfig {
 pub struct CudaGraphConfig {
     /// Decode batch sizes captured, strictly increasing; the worker's
     /// catalog when unset.
-    #[serde(deserialize_with = "values::optional_list::deserialize")]
     pub decode_batch_sizes: Option<Vec<NonZeroU32>>,
     /// Prefill token counts captured, strictly increasing; the worker's
     /// catalog when unset.
-    #[serde(deserialize_with = "values::optional_list::deserialize")]
     pub prefill_token_sizes: Option<Vec<NonZeroU32>>,
     /// Distinct `HEIGHTxWIDTH` image sizes captured; `1152x2048` and
     /// `2048x1152` when unset.
-    #[serde(deserialize_with = "values::optional_list::deserialize")]
     pub flow_shapes: Option<Vec<ImageSize>>,
 }
 
@@ -611,12 +605,10 @@ pub struct VideoConfig {
     pub max_seconds: f64,
     /// Output sizes startup prepares, each `WxH` in pixels (`1344x768`); the
     /// model refuses a size it does not generate.
-    #[serde(deserialize_with = "values::list::deserialize")]
     pub sizes: Vec<String>,
     /// Prompt capacities startup captures, strictly increasing and none above
     /// `max_model_len`, which completes them as the largest; 1024, then steps
     /// of 2048 below `max_model_len`, when unset.
-    #[serde(deserialize_with = "values::optional_list::deserialize")]
     pub text_capacities: Option<Vec<NonZeroU32>>,
     /// Denoiser rows one request's conditions may take; the largest
     /// condition set the denoiser admits when unset.

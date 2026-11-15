@@ -312,9 +312,8 @@ pub struct ServerArgs {
     /// Set the option at PATH, such as `video_config.max_seconds=10` or
     /// `moe_config.exchange=deepep`; repeatable, and it overrides the flags
     /// and the file. VALUE is a TOML value (`2`, `true`, `[1024, 4096]`,
-    /// `{ mode = "balanced" }`) or JSON, and otherwise text; a list may be
-    /// comma-separated text. One invocation may not set both a table and an
-    /// option inside it.
+    /// `{ mode = "balanced" }`) or JSON, and otherwise text; a list is an
+    /// array. One invocation may not set both a table and an option inside it.
     #[serde(skip)]
     #[arg(long = "set", value_name = "PATH=VALUE")]
     pub set: Vec<String>,

@@ -344,7 +344,7 @@ def test_block_bindings_release_cancelled_requests(
         # Two text capacities bound the startup capture of every admitted
         # duration; the requests below exercise both.
         "--set",
-        "video_config.text_capacities=1024",
+        "video_config.text_capacities=[1024]",
         # One and two device layouts hold the whole denoiser on each of their
         # ranks and split the 15-second sequence over fewer of them, so their
         # warmup reaches a larger share of the device than the four-device
@@ -516,7 +516,7 @@ def test_replicas_on_two_hosts_serve_complete_media(tmp_path: Path) -> None:
         "--set",
         "video_config.max_seconds=5",
         "--set",
-        "video_config.text_capacities=1024",
+        "video_config.text_capacities=[1024]",
         "--host-identity",
         "rank-0",
         "--nnodes",
@@ -606,7 +606,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         "--max-model-len",
         "1024",
         "--set",
-        "video_config.text_capacities=1024",
+        "video_config.text_capacities=[1024]",
         # Full-duration decoder graphs need a larger static grant on H200
         # alongside BF16 weights and two resident request slots.
         "--mem-fraction-static",

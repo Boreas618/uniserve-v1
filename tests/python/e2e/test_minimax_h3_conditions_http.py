@@ -147,7 +147,7 @@ def test_base_first_frame_request(tmp_path: Path) -> None:
         "--max-model-len",
         "2048",
         "--set",
-        "video_config.text_capacities=2048",
+        "video_config.text_capacities=[2048]",
     ]
     with (
         server_process(
@@ -179,13 +179,13 @@ def test_fasth3_first_frame_request(tmp_path: Path) -> None:
     # keyframes a request may bring in tiles of their own.
     options = [
         "--set",
-        "video_config.sizes=1344x768",
+        'video_config.sizes=["1344x768"]',
         "--set",
         "video_config.max_seconds=8",
         "--max-model-len",
         "2048",
         "--set",
-        "video_config.text_capacities=2048",
+        "video_config.text_capacities=[2048]",
     ]
     with (
         server_process(
@@ -269,7 +269,7 @@ REFERENCE_OPTIONS = [
     "--max-model-len",
     "8192",
     "--set",
-    "video_config.text_capacities=8192",
+    "video_config.text_capacities=[8192]",
     "--set",
     "video_config.max_condition_rows=40960",
 ]
@@ -299,7 +299,7 @@ OMNIREF_OPTIONS = [
     "--max-model-len",
     "8192",
     "--set",
-    "video_config.text_capacities=8192",
+    "video_config.text_capacities=[8192]",
     "--set",
     "video_config.max_condition_rows=49152",
 ]
@@ -349,7 +349,7 @@ SMALL_CAPACITY_OPTIONS = [
     "--max-model-len",
     "8192",
     "--set",
-    "video_config.text_capacities=8192",
+    "video_config.text_capacities=[8192]",
     "--set",
     "video_config.max_condition_rows=7680",
 ]

@@ -155,7 +155,7 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
         "--tensor-parallel-size",
         "2",
         "--set",
-        "device_config.worker_hosts=rank-1",
+        'device_config.worker_hosts=["rank-1"]',
         "--set",
         "dtype=bfloat16",
         "--set",

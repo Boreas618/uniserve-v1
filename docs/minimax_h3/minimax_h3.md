@@ -89,7 +89,7 @@ Base text-to-video and keyframe requests:
 uniserve serve "$H3_ROOT" \
   --worker-groups configs/minimax_h3/ulysses4.toml --served-model-name MiniMax-H3 \
   --host 0.0.0.0 --set video_config.max_seconds=8 --max-model-len 2048 \
-  --set video_config.text_capacities=2048
+  --set 'video_config.text_capacities=[2048]'
 ```
 
 Reference requests, with the base reference denoiser or an OmniRef export:
@@ -99,7 +99,7 @@ uniserve serve "$H3_ROOT" \
   --worker-groups configs/minimax_h3/ulysses4-reference.toml \
   --served-model-name MiniMax-H3 --host 0.0.0.0 \
   --set video_config.max_seconds=5 --max-model-len 8192 \
-  --set video_config.text_capacities=8192 \
+  --set 'video_config.text_capacities=[8192]' \
   --set video_config.max_condition_rows=40960 \
   --set media_config.directory=/srv/media
 
@@ -107,7 +107,7 @@ uniserve serve "$OMNIREF_EXPORT" \
   --worker-groups configs/minimax_h3/ulysses4-reference.toml \
   --served-model-name MiniMax-H3-OmniRef --host 0.0.0.0 \
   --set video_config.max_seconds=5 --max-model-len 8192 \
-  --set video_config.text_capacities=8192 \
+  --set 'video_config.text_capacities=[8192]' \
   --set video_config.max_condition_rows=49152 \
   --set media_config.directory=/srv/media
 ```
@@ -140,7 +140,7 @@ The deployment files are in `configs/minimax_h3/`, in the TOML format [Configura
 | `ulysses8-reference.toml` | Eight on one host | Ulysses8 `transformer_ref` | TP8 |
 | `ulysses8-reference-two-host.toml` | Four on each of two hosts | Ulysses8 `transformer_ref` | TP4 on `rank-0` |
 
-A block placed with `weights = "host"` keeps the dense projection weights of its repeated layer stack in page-locked host storage. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device storage becomes capacity. `fasth3-dp8-text-tp8-host-weights.toml` places every replica's denoiser this way, and each replica holds its own host copy. On eight RTX PRO 6000 it serves the BF16 checkpoint for throughput with `--max-running-requests 8 --max-model-len 10240 --set video_config.text_capacities=1024 --set video_config.sizes=1344x768 --mem-fraction-static 0.92`, the options of the `rtx-pro-6000-8-dp8-bf16` evaluation server.
+A block placed with `weights = "host"` keeps the dense projection weights of its repeated layer stack in page-locked host storage. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device storage becomes capacity. `fasth3-dp8-text-tp8-host-weights.toml` places every replica's denoiser this way, and each replica holds its own host copy. On eight RTX PRO 6000 it serves the BF16 checkpoint for throughput with `--max-running-requests 8 --max-model-len 10240 --set 'video_config.text_capacities=[1024]' --set 'video_config.sizes=["1344x768"]' --mem-fraction-static 0.92`, the options of the `rtx-pro-6000-8-dp8-bf16` evaluation server.
 
 A Ulysses denoiser's `sequence_parallel` table also selects how each layer's Q/K/V/gate projection reaches every rank's heads. With `projection = "gather"`, the default, every rank all-gathers the other ranks' input rows and projects its own heads, holding the projection weights partitioned by head. With `projection = "exchange"`, every rank projects its own rows for all heads, holding the whole weights, and sends each rank that rank's heads. For FastH3 the exchange transfers two thirds of the gather's bytes with eight ranks and more than the gather with four, and every rank holds the whole Q/K/V/gate weights of the 50 layers, 14.4 GiB in BF16, instead of its share of them. `projection_rows = <rows>` makes the exchange project and send each rank's rows in steps of that many rows, each step's transfer overlapping the next step's projection; without it the exchange sends the whole shard at once. A step holds whole attention tiles: a multiple of the checkpoint's 64- or 128-row tile, so a multiple of 128 suits every FastH3 checkpoint. Every mode produces the same values and serves every precision preset. None applies to the `allgather` kind, which exchanges no heads, and the Ulysses members of a `hybrid` split gather. A denoiser that exchanges in steps:
 
@@ -155,10 +155,10 @@ One replica across every GPU gives the lowest latency; replicas serve more reque
 | --- | --- | --- | --- |
 | 4 x GB200 | Latency and throughput | `ulysses4.toml` | `--max-running-requests 2` |
 | 8 x GB200, two hosts | Throughput | `fasth3-ulysses4x2-two-host.toml` | `--max-running-requests 4` |
-| 8 x RTX PRO 6000 | Latency | `ulysses8.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --set video_config.text_capacities=1024` |
-| 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2.toml` | `--max-running-requests 4 --mem-fraction-static 0.92 --max-model-len 10240 --set video_config.text_capacities=1024` |
+| 8 x RTX PRO 6000 | Latency | `ulysses8.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --set 'video_config.text_capacities=[1024]'` |
+| 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2.toml` | `--max-running-requests 4 --mem-fraction-static 0.92 --max-model-len 10240 --set 'video_config.text_capacities=[1024]'` |
 | 4 x H200 | Latency and throughput | `ulysses4.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 1024` |
-| 8 x H200 | Latency, up to 10240 prompt tokens | `ulysses8.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --set video_config.text_capacities=1024` |
+| 8 x H200 | Latency, up to 10240 prompt tokens | `ulysses8.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --set 'video_config.text_capacities=[1024]'` |
 | 8 x H200 | Throughput, up to 5 s and 1024 prompt tokens | `fasth3-dp8-text-tp8.toml` | `--max-running-requests 8 --set video_config.max_seconds=5 --max-model-len 1024` |
 
 The GB200 measurements ran with `NCCL_NVLS_ENABLE=0`. On H200, OmniRef serves reference requests as one Ulysses8 replica on one eight-GPU host (`ulysses8-reference.toml`) with `--mem-fraction-static 0.92`, with the capacities of [OmniRef on H200](evaluation.md#omniref-on-h200).
@@ -180,7 +180,7 @@ Each host's main process holds the products of a request its ranks write: the co
 | Option | Meaning |
 | --- | --- |
 | `video_config.max_seconds` | Longest admitted duration, 4 to 15 seconds; 15 by default. A value outside that range is refused at startup. |
-| `video_config.sizes` | The output sizes startup prepares, each `WxH` in pixels, `1344x768,768x1344` by default; the sizes are listed under [Generate a video](#generate-a-video). The workers refuse at startup a size the checkpoint does not generate, naming the sizes it does, and a request for any other size is refused. |
+| `video_config.sizes` | The output sizes startup prepares, each `WxH` in pixels, `["1344x768", "768x1344"]` by default; the sizes are listed under [Generate a video](#generate-a-video). The workers refuse at startup a size the checkpoint does not generate, naming the sizes it does, and a request for any other size is refused. |
 | `--max-model-len` | Longest prompt presentation in tokens, vision tokens included; required, since a pipeline keeps no key/value cache from which a length would follow. The text encoder itself accepts up to 262144 positions; the stated length bounds the prompt capacities startup prepares layouts and storage for (`video_config.text_capacities`). The official keyframe request presents 1935 tokens and the official video-plus-audio request 6913. |
 | `video_config.text_capacities` | Prompt capacities that startup prepares, strictly increasing and none above `--max-model-len`; `--max-model-len` itself is always the largest, and each prompt runs in the smallest capacity that holds it. By default 1024, then steps of 2048, below `--max-model-len`. |
 | `--max-running-requests` | Concurrently resident requests, up to the workers' request slots. |
@@ -191,7 +191,7 @@ Each host's main process holds the products of a request its ranks write: the co
 | `media_config.max_request_bytes` | Largest request body and fetched media in total, such as `512MiB`; 256 MiB by default. |
 | `--mem-fraction-static` | Device storage each worker may hold for weights and KV cache; 0.70 by default. |
 
-Startup prepares, and with graphs captures, every layout a request reaches: each frame count up to `video_config.max_seconds` at each canvas, and for a task with conditions each rung of the condition ladder. A layout's condition rows are real rows of every denoising step, so a request runs in the smallest rung that holds its conditions and its steps cost its own rows, not the deployment's capacity. The server derives the ladder from the condition capacity, and it takes no option: 1,024 rows, doubling, with a rung halfway between two doublings from 4,096 rows up, and the capacity last. A rung is one more captured graph per frame count and canvas, about a second of startup each at five seconds, and the rungs share one arena. Fewer canvases, capacities and seconds start faster and hold less storage. The first startup also compiles kernels. Serving every FastH3 size needs fewer text capacities, such as `--set video_config.text_capacities=1024,10240`. 1536x672 needs more request storage than the other sizes. A deployment that does not fit fails before it reports ready and logs what each block holds.
+Startup prepares, and with graphs captures, every layout a request reaches: each frame count up to `video_config.max_seconds` at each canvas, and for a task with conditions each rung of the condition ladder. A layout's condition rows are real rows of every denoising step, so a request runs in the smallest rung that holds its conditions and its steps cost its own rows, not the deployment's capacity. The server derives the ladder from the condition capacity, and it takes no option: 1,024 rows, doubling, with a rung halfway between two doublings from 4,096 rows up, and the capacity last. A rung is one more captured graph per frame count and canvas, about a second of startup each at five seconds, and the rungs share one arena. Fewer canvases, capacities and seconds start faster and hold less storage. The first startup also compiles kernels. Serving every FastH3 size needs fewer text capacities, such as `--set 'video_config.text_capacities=[1024, 10240]'`. 1536x672 needs more request storage than the other sizes. A deployment that does not fit fails before it reports ready and logs what each block holds.
 
 A base denoiser counts one condition row per token: a five-second reference video with its soundtrack occupies about 38,000 rows, a 16:9 reference image at a 2048-pixel short edge about 7,300 and one at its own 2560×1440 size 3,600. OmniRef packs each condition into whole 128-row tiles: an image or audio track takes `ceil(rows / 128)` tiles, and a video's token grid of latent frames × height/32 × width/32 takes `ceil(frames / 4) × ceil(height / 32 / 4) × ceil(width / 32 / 8)`. The official video-plus-audio request therefore occupies 38,124 rows on the base reference denoiser and 47,104 on OmniRef. The deployment's text capacity, condition capacity and seconds, and the storage they need, bound a request's packed sequence (prompt, conditions and generated rows).
 

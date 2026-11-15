@@ -176,9 +176,9 @@ def _serve(tmp_path: Path, deployment=_deployment) -> Iterator[str]:
         # The default prompt-capacity ladder holds capacities below the
         # admitted length only, so the deployment states its one capacity.
         "--set",
-        "video_config.text_capacities=1024",
+        "video_config.text_capacities=[1024]",
         "--set",
-        "video_config.sizes=1344x768",
+        'video_config.sizes=["1344x768"]',
         "--set",
         f"video_config.max_seconds={SECONDS:g}",
     ]

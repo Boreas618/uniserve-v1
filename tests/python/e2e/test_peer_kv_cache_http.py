@@ -419,7 +419,7 @@ def test_a_host_loads_a_prompts_blocks_from_a_peer_hosts_host_tier(
                 tmp_path / "b.log",
                 find_free_port(),
                 FOLLOWER_DEVICE,
-                ["--set", f"kv_cache_config.peers={peer}"],
+                ["--set", f'kv_cache_config.peers=["{peer}"]'],
             ) as (b_url, b_runtime):
                 # B reads the shared prompt's blocks from A.
                 b_shared, shared_found = _found(b_url, shared)
@@ -484,7 +484,7 @@ def test_an_fp8_host_loads_a_bf16_hosts_blocks_by_converting_them(
                     "--set",
                     "kv_cache_config.dtype=float8_e4m3fn",
                     "--set",
-                    f"kv_cache_config.peers={peer}",
+                    f'kv_cache_config.peers=["{peer}"]',
                 ],
             ) as (b_url, _):
                 # The same prompt on B under a salt no cache holds: computed

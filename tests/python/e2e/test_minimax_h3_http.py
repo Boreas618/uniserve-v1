@@ -72,7 +72,7 @@ def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
         # Five seconds bound the layouts startup prepares: two frame counts
         # at each of the six sizes and one text capacity.
         "--set",
-        f"video_config.sizes={','.join(sizes)}",
+        f"video_config.sizes={json.dumps(list(sizes))}",
         "--set",
         "video_config.max_seconds=5",
         "--max-model-len",
@@ -80,7 +80,7 @@ def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
         # The default prompt-capacity ladder holds capacities below the
         # admitted length only, so the deployment states its one capacity.
         "--set",
-        "video_config.text_capacities=1024",
+        "video_config.text_capacities=[1024]",
     ]
     prompt = (
         "A red fox trots across a snowy meadow at sunrise, its breath "
@@ -191,13 +191,13 @@ def test_a_fasth3_adapter_over_the_base_release_serves_its_student(
         "--port",
         str(port),
         "--set",
-        "video_config.sizes=1344x768",
+        'video_config.sizes=["1344x768"]',
         "--set",
         "video_config.max_seconds=5",
         "--max-model-len",
         "1024",
         "--set",
-        "video_config.text_capacities=1024",
+        "video_config.text_capacities=[1024]",
     ]
     prompt = (
         "A red fox trots across a snowy meadow at sunrise, its breath "

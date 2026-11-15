@@ -8,19 +8,19 @@
 //!   `30s`, `5m`, `1h`), printed with units;
 //! - a byte size is whole bytes or an integer with a decimal (`20MB`) or
 //!   binary (`512MiB`) unit, printed in the largest binary unit that divides
-//!   it, or as whole bytes;
-//! - a list is an array, a comma-separated string (`"1024,10240"`) or one
-//!   element, printed as an array.
+//!   it, or as whole bytes.
+//!
+//! A list is a TOML array (`[1024, 10240]`), in a file and in a `--set` value
+//! alike; it has no other form.
 //!
 //! It also defines [`ImageSize`], the `HEIGHTxWIDTH` value image-size options
 //! are written in.
 
 use std::fmt;
-use std::marker::PhantomData;
 use std::str::FromStr;
 use std::time::Duration;
 
-use serde::de::{self, DeserializeOwned, IntoDeserializer, SeqAccess, Visitor};
+use serde::de;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Parses a duration: whole seconds or a value with units.
@@ -177,127 +177,6 @@ pub mod byte_count {
     }
 }
 
-/// Reads a list from an array, a comma-separated string or one element.
-struct ListVisitor<T>(PhantomData<T>);
-
-impl<'de, T> Visitor<'de> for ListVisitor<T>
-where
-    T: DeserializeOwned + FromStr,
-    T::Err: fmt::Display,
-{
-    type Value = Vec<T>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an array, a comma-separated string or one element")
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
-        let mut values = Vec::new();
-        while let Some(value) = sequence.next_element()? {
-            values.push(value);
-        }
-        Ok(values)
-    }
-
-    fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
-        text.split(',')
-            .map(|element| {
-                element
-                    .trim()
-                    .parse::<T>()
-                    .map_err(|error| E::custom(format!("{:?}: {error}", element.trim())))
-            })
-            .collect()
-    }
-
-    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-        T::deserialize(value.into_deserializer()).map(|value| vec![value])
-    }
-
-    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-        T::deserialize(value.into_deserializer()).map(|value| vec![value])
-    }
-}
-
-/// The serde form of a list.
-pub mod list {
-    use super::*;
-
-    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
-    where
-        D: Deserializer<'de>,
-        T: DeserializeOwned + FromStr,
-        T::Err: fmt::Display,
-    {
-        deserializer.deserialize_any(ListVisitor(PhantomData))
-    }
-}
-
-/// The serde form of an optional list.
-pub mod optional_list {
-    use super::*;
-
-    /// Reads an optional list from every form [`ListVisitor`] takes, and from
-    /// `null`: a serialized `None` is written as `null`, so a value the daemon
-    /// wrote (a build config, an epoch record) must read back through the same
-    /// type that wrote it.
-    struct OptionalListVisitor<T>(PhantomData<T>);
-
-    impl<'de, T> Visitor<'de> for OptionalListVisitor<T>
-    where
-        T: DeserializeOwned + FromStr,
-        T::Err: fmt::Display,
-    {
-        type Value = Option<Vec<T>>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("an array, a comma-separated string, one element or null")
-        }
-
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_some<D: Deserializer<'de>>(
-            self,
-            deserializer: D,
-        ) -> Result<Self::Value, D::Error> {
-            deserializer
-                .deserialize_any(ListVisitor(PhantomData))
-                .map(Some)
-        }
-
-        fn visit_seq<A: SeqAccess<'de>>(self, sequence: A) -> Result<Self::Value, A::Error> {
-            ListVisitor::<T>(PhantomData).visit_seq(sequence).map(Some)
-        }
-
-        fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
-            ListVisitor::<T>(PhantomData).visit_str(text).map(Some)
-        }
-
-        fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-            ListVisitor::<T>(PhantomData).visit_u64(value).map(Some)
-        }
-
-        fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-            ListVisitor::<T>(PhantomData).visit_i64(value).map(Some)
-        }
-    }
-
-    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
-    where
-        D: Deserializer<'de>,
-        T: DeserializeOwned + FromStr,
-        T::Err: fmt::Display,
-    {
-        deserializer.deserialize_any(OptionalListVisitor(PhantomData))
-    }
-}
-
 /// A `HEIGHTxWIDTH` image size in pixels, both positive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ImageSize(pub [u32; 2]);
@@ -339,8 +218,6 @@ impl<'de> Deserialize<'de> for ImageSize {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
-
     use super::*;
 
     #[test]
@@ -374,40 +251,5 @@ mod tests {
         let printed = |size| toml::Value::try_from(Size(size)).unwrap();
         assert_eq!(printed(512 << 20), toml::Value::String("512MiB".into()));
         assert_eq!(printed(20_000_000), toml::Value::Integer(20_000_000));
-    }
-
-    #[derive(Debug, PartialEq, Deserialize)]
-    struct Lists {
-        #[serde(deserialize_with = "list::deserialize")]
-        sizes: Vec<NonZeroU32>,
-        #[serde(deserialize_with = "list::deserialize")]
-        shapes: Vec<ImageSize>,
-    }
-
-    /// A list reads the same from an array, a comma-separated string or one
-    /// element, and each element keeps its own checks.
-    #[test]
-    fn lists_take_arrays_comma_separated_strings_or_one_element() {
-        let lists = |text: &str| toml::from_str::<Lists>(text);
-        let expected = Lists {
-            sizes: [1024, 10240]
-                .map(|size| NonZeroU32::new(size).unwrap())
-                .to_vec(),
-            shapes: vec![ImageSize([1152, 2048])],
-        };
-        assert_eq!(
-            lists("sizes = [1024, 10240]\nshapes = [\"1152x2048\"]").unwrap(),
-            expected
-        );
-        assert_eq!(
-            lists("sizes = \"1024, 10240\"\nshapes = \"1152x2048\"").unwrap(),
-            expected
-        );
-        assert_eq!(
-            lists("sizes = 1024\nshapes = []").unwrap().sizes,
-            vec![NonZeroU32::new(1024).unwrap()]
-        );
-        assert!(lists("sizes = \"1024,0\"\nshapes = []").is_err());
-        assert!(lists("sizes = []\nshapes = \"1152\"").is_err());
     }
 }
