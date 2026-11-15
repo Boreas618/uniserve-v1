@@ -1742,6 +1742,38 @@ pub(super) mod tests {
         assert_eq!(video(1280, 720, &released), sized(1344, 768));
     }
 
+    /// A reference video runs at 23.976 to 60 frames per second, both included.
+    #[test]
+    fn a_reference_video_runs_at_the_frame_rates_the_rules_take() {
+        let vision = vision(&vectors());
+        let sizing = ReferenceSizing::released(&REFERENCE_LIMITS);
+        let at = |numerator: u32, denominator: u32| {
+            let facts = VideoMetadata {
+                display_width: 16,
+                display_height: 9,
+                width: 1344,
+                height: 768,
+                frame_rate: FrameRate {
+                    numerator,
+                    denominator,
+                },
+                frames: 240,
+                soundtrack: None,
+            };
+            video_reference(&facts, 0.0, 124, &sizing, &vision)
+        };
+        for (numerator, denominator) in [(2997, 125), (24000, 1001), (30, 1), (60, 1)] {
+            assert!(
+                at(numerator, denominator).is_ok(),
+                "{numerator}/{denominator}"
+            );
+        }
+        for (numerator, denominator) in [(2997, 126), (15, 1), (60001, 1000), (120, 1)] {
+            let error = at(numerator, denominator).unwrap_err();
+            assert!(error.contains("frames per second"), "{error}");
+        }
+    }
+
     /// The sizing reads the processor options a deployment states, absent ones keeping their
     /// defaults (the image edge the denoiser declares), and refuses an option the processor does
     /// not take; its short edge lies on the canvas grid up to the declared edge.
