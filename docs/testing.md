@@ -18,7 +18,7 @@ The interpreter is the default. A test marked `gpu` needs a device (a libdevice 
 | Variable | What it names | Tests |
 | --- | --- | --- |
 | `UNISERVE_BINARY` | The base executable; `uniserve` on the search path when unset. Its `build-server launch` states what a Triton package's launch table compiles for a descriptor key, through the Build Server's Python environment, whose program `uniserve-build-server` must be on the search path (`uv sync --locked --project crates/build-server/python` creates it); its `build-server serve`, `install` and `resolve` build the modules the `gpu` checks of native and cubin packages load. `just test-python-fast` builds it and sets the variable | the checks that launch the module a key names (the `stated_launch` fixture), and the `gpu` checks of native and cubin modules (the `kernel_module` fixture) |
-| `UNISERVE_KERNEL_MODULES` | A directory of built modules, `<op>/<backend>/` holding the module of the descriptor the check's defaults describe (a check comparing two builds reads named subdirectories of it) | the module scripts of the families whose checks are scripts, among them the `topk_softmax` router's launch |
+| `UNISERVE_KERNEL_MODULES` | A directory of built modules, `<op>/<backend>/` holding the module of the descriptor the check's defaults describe (a check comparing two builds reads named subdirectories of it) | the module scripts of the families whose checks are scripts |
 | `UNISERVE_KERNEL_KEYS`, `UNISERVE_KERNEL_STORE` | A key fixture and the store built from it | `test_kernel_arguments.py`, which compares every built cell's arguments with its operator's |
 
 ## GPU end-to-end tests
