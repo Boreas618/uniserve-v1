@@ -143,7 +143,7 @@ def engine_selection() -> list[str]:
     """
     configured = os.environ.get("UNISERVE_ENGINE")
     if configured:
-        return ["--set", f"worker_config.engine={configured}"]
+        return ["--set", f'worker_config.engine="{configured}"']
     return []
 
 
@@ -497,7 +497,7 @@ def start_server(
             args = [
                 *args,
                 "--set",
-                f"build_config.socket={_BUILD_SERVER}",
+                f'build_config.socket="{_BUILD_SERVER}"',
             ]
         sized = any("kv_cache_config.host_" in arg for arg in args)
         if not sized:
@@ -1141,11 +1141,11 @@ def tiny_input_png_b64() -> str:
 
 
 def written_deployment(directory: Path, groups: list[dict[str, Any]]) -> Path:
-    """Write the deployment file a serve invocation is given.
+    """Write the deployment file a serve invocation is given with `--config`.
 
-    `--worker-groups` names a TOML file because a deployment states every
-    worker group's ranks and the blocks placed on them; a test states
-    one the same way a deployment does. Each entry of `groups` is one
+    A deployment states every worker group's ranks and the blocks placed
+    on them in its configuration's `worker_groups`; a test states one the
+    same way a deployment does. Each entry of `groups` is one
     `[[worker_groups]]` table, such as `{"id": "model", "ranks":
     ["cuda:0-1"], "queue_depth": 2, "blocks": {"model":
     {"tensor_parallel_size": 2}}}`.

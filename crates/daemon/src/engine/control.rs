@@ -1798,10 +1798,13 @@ mod tests {
     /// launch's host, first rank, devices, world size, whether it is the scheduler node, and epoch.
     fn two_host_launches(file: &str) -> Vec<(String, u32, Vec<u32>, u32, bool, u64)> {
         let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        let layout = std::fs::read_to_string(configs.join(file)).expect("reading the layout");
+        let (stated, _) =
+            crate::options::resolve_text(&layout, &[]).expect("the layout is a configuration");
         let options = ServerArgs {
             model: Some("/models/checkpoint".to_owned()),
             host_identity: "rank-0".to_owned(),
-            worker_groups: Some(configs.join(file)),
+            worker_groups: stated.worker_groups,
             ..Default::default()
         };
         let args = EngineArgs::new(

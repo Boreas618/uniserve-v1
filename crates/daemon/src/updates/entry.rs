@@ -1008,40 +1008,6 @@ mod tests {
         ));
     }
 
-    /// The resolved deployment carries the ranks it read even when the
-    /// file is changed in place before the engine starts.
-    #[test]
-    fn a_resolved_deployment_keeps_its_ranks_when_the_file_changes() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("deployment.toml");
-        let resolve = |ranks: &str| {
-            std::fs::write(
-                &path,
-                format!(
-                    "[[worker_groups]]\nid = \"model\"\nranks = {ranks}\nqueue_depth = 2\n\n\
-                     [worker_groups.blocks.model]\ntensor_parallel_size = 2\n"
-                ),
-            )
-            .unwrap();
-            crate::options::ServerArgs {
-                worker_groups: Some(path.clone()),
-                ..Default::default()
-            }
-            .engine_config()
-            .unwrap()
-        };
-        let served = resolve(r#"["rank-0/cuda:0", "rank-0/cuda:1"]"#);
-        let moved = resolve(r#"["rank-1/cuda:0", "rank-1/cuda:1"]"#);
-        std::fs::remove_file(path).unwrap();
-        for (resolved, host) in [(served, "rank-0"), (moved, "rank-1")] {
-            let ranks = &resolved.parallel.worker_groups[0].ranks;
-            assert_eq!(ranks.len(), 2);
-            assert!(ranks.iter().all(|rank| rank.host == host));
-            assert_eq!(ranks[0].device, proto::config::RankDevice::cuda(0));
-            assert_eq!(ranks[1].device, proto::config::RankDevice::cuda(1));
-        }
-    }
-
     /// The target's layout differs from the serving one's in its parallel
     /// configuration, its devices, its slot count, its KV layout, its graph
     /// buckets and its number of replicas, and not in the cache's size or its

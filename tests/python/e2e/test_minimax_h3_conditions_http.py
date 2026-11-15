@@ -99,13 +99,13 @@ def _command(model, deployment, inputs, options) -> list[str]:
         str(require_uniserve_binary()),
         "serve",
         model,
-        "--worker-groups",
+        "--config",
         str(ROOT / "configs" / "minimax_h3" / deployment),
         *engine_selection(),
         "--served-model-name",
         "MiniMax-H3",
         "--set",
-        f"media_config.directory={inputs}",
+        f'media_config.directory="{inputs}"',
         *options,
     ]
 

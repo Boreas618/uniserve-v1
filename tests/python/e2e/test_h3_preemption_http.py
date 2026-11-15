@@ -162,7 +162,7 @@ def _serve(tmp_path: Path, deployment=_deployment) -> Iterator[str]:
         "--host",
         "127.0.0.1",
         *engine_selection(),
-        "--worker-groups",
+        "--config",
         str(deployment(tmp_path)),
         "--max-running-requests",
         "1",

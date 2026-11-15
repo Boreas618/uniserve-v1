@@ -51,7 +51,7 @@ export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
 
 uniserve serve "$H3_MODEL" \
-  --worker-groups configs/minimax_h3/ulysses4.toml \
+  --config configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
   --max-running-requests 2 \
@@ -72,7 +72,7 @@ curl --fail-with-body --max-time 600 \
 
 ## Deployments
 
-A deployment file passed to `--worker-groups` places FastH3's blocks on devices and hosts: TOML `[[worker_groups]]` groups, each with its ranks (`cuda:0-3`), replicas and blocks. `configs/minimax_h3/` holds them; the FastH3 deployments with published measurements are:
+A deployment file, a configuration file passed to `--config`, places FastH3's blocks on devices and hosts: TOML `[[worker_groups]]` groups, each with its ranks (`cuda:0-3`), replicas and blocks. `configs/minimax_h3/` holds them; the FastH3 deployments with published measurements are:
 
 | File | GPUs | Layout |
 | --- | --- | --- |
@@ -118,18 +118,18 @@ The metrics endpoint publishes scheduler, worker, request and HTTP metrics in on
 UniServe's options form one tree, following TensorRT-LLM's serving configuration: the options most deployments state sit at its top level, and the rest in `*_config` tables, one per part of the system. `uniserve serve` reads the tree from a `--config` TOML file, from flags for the most common options, and from repeatable `--set PATH=VALUE` assignments that reach any option by its path, each overriding the last:
 
 ```bash
-uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
+uniserve serve "$H3_MODEL" --config configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 --max-running-requests 2 \
-  --set quantization.mode=balanced
+  --set 'quantization.mode="balanced"'
 ```
 
 | Flags | Options |
 | --- | --- |
 | `MODEL`, `--served-model-name`, `--max-model-len` | The checkpoint, its served name and context length |
 | `--host`, `--port` | The HTTP listener (`server_config`) |
-| `--worker-groups`, `--tensor-parallel-size`, `--data-parallel-size`, `--host-identity` | Parallel configuration: a deployment file, or the tensor- and data-parallel shorthand |
+| `--tensor-parallel-size`, `--data-parallel-size`, `--host-identity` | Parallel configuration without a deployment file: the tensor- and data-parallel shorthand |
 | `--max-running-requests`, `--mem-fraction-static` | Resident requests and each GPU worker's device-storage share |
-| `--config`, `--set` | The configuration file and assignments by path |
+| `--config`, `--set` | The configuration files (a deployment file among them) and assignments by path |
 
 | Table | Options for |
 | --- | --- |

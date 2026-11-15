@@ -7,7 +7,7 @@ Mixture-of-experts models can shard their routed experts across GPUs. UniServe s
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/uniserve serve /models/Qwen3-30B-A3B \
   --served-model-name qwen3-moe --data-parallel-size 2 \
-  --set moe_config.expert_parallel=true --set moe_config.exchange=alltoall
+  --set moe_config.expert_parallel=true --set 'moe_config.exchange="alltoall"'
 ```
 
 Every scheduler keeps its own KV cache and attention, and its worker holds `1 / N` of each layer's routed experts. The schedulers run every expert layer together: before each forward, their workers agree over a host connection on which scheduler's batch runs and on the step's per-scheduler token capacity, and every other worker joins the step without tokens of its own, so its experts serve the tokens routed to them. A worker that is idle keeps joining. Schedulers sharing their experts each run one one-rank worker group.
@@ -61,8 +61,8 @@ queue_depth = 2
 
 ```bash
 .venv/bin/uniserve serve /models/Qwen3-30B-A3B \
-  --worker-groups attention_experts.toml --set moe_config.expert_parallel=true \
-  --set moe_config.exchange=deepep --set moe_config.microbatches=2
+  --config attention_experts.toml --set moe_config.expert_parallel=true \
+  --set 'moe_config.exchange="deepep"' --set moe_config.microbatches=2
 ```
 
 Attention ranks hold no routed-expert weights; expert ranks hold every routed expert, partitioned among themselves, and own no request state. Dedicated expert workers require `deepep` or `megamoe`. `configs/afd/qwen3_moe.toml` places a tensor-parallel attention group and two expert workers on two hosts.

@@ -149,7 +149,7 @@ def build_server_option() -> list[str]:
     """
     if BUILD_SERVER is None:
         pytest.fail("the module's Build Server is not running")
-    return ["--set", f"build_config.socket={BUILD_SERVER}"]
+    return ["--set", f'build_config.socket="{BUILD_SERVER}"']
 
 
 def _host_region_gib(runtime: Path) -> float:

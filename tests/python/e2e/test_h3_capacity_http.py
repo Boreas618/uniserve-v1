@@ -122,7 +122,7 @@ def test_every_admitted_duration_and_prompt_length_replays(
         str(require_uniserve_binary()),
         "serve",
         model,
-        "--worker-groups",
+        "--config",
         str(deployment),
         *engine_selection(),
         "--served-model-name",

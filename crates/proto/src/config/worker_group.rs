@@ -205,14 +205,25 @@ impl WorkerGroupConfig {
     /// zero or does not divide its ranks, the decoder or codec states another unit count, or
     /// [`WorkerGroupConfig::validate_all`] refuses the expanded groups.
     pub fn parse_file(text: &str, engine_host: &str) -> anyhow::Result<Vec<Self>> {
-        use anyhow::Context as _;
         let file: File = toml::from_str(text)?;
+        Self::place(file.worker_groups, engine_host)
+    }
+
+    /// The groups a deployment states, as its `[[worker_groups]]` tables read them (in a
+    /// deployment file or in the serving configuration's `worker_groups`), with its ranks placed
+    /// and its replicas expanded, as [`WorkerGroupConfig::parse_file`] describes.
+    ///
+    /// # Errors
+    ///
+    /// As [`WorkerGroupConfig::parse_file`], but for the text.
+    pub fn place(stated: Vec<Self>, engine_host: &str) -> anyhow::Result<Vec<Self>> {
+        use anyhow::Context as _;
         anyhow::ensure!(
-            !file.worker_groups.is_empty(),
+            !stated.is_empty(),
             "a deployment lists at least one [[worker_groups]] group"
         );
         let mut groups = Vec::new();
-        for group in file.worker_groups {
+        for group in stated {
             let id = group.id.clone();
             group
                 .expand(engine_host, &mut groups)

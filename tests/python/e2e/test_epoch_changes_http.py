@@ -133,12 +133,12 @@ def _topology(topology: str, tmp_path: Path) -> tuple[str, tuple[str, ...]]:
             "moe_config.expert_parallel=true",
         )
     return granted_devices(2), (
-        "--worker-groups",
+        "--config",
         str(dedicated_experts(tmp_path)),
         "--set",
         "moe_config.expert_parallel=true",
         "--set",
-        "moe_config.exchange=deepep",
+        'moe_config.exchange="deepep"',
     )
 
 

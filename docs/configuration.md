@@ -6,14 +6,14 @@ A UniServe server is configured by one tree of serving options and, for a parall
 
 `uniserve serve` reads options from three places, each overriding the last:
 
-1. **`--config FILE`**: a TOML file of the tree.
+1. **`--config FILE`**, repeatable: TOML files of the tree, each overriding the ones before it, so a deployment layout file and a file of other options combine.
 2. **Flags** for the most common options, each a shortcut for one path of the tree.
 3. **`--set PATH=VALUE`**, repeatable, reaching any option by its path.
 
 Options none of them states keep their defaults. `GET /admin/config` returns the resolved non-default options as reloadable TOML. Reading it restores defaults without treating options belonging to other model families or rank-assignment modes as explicitly configured.
 
 ```bash
-uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
+uniserve serve "$H3_MODEL" --config configs/minimax_h3/ulysses4.toml \
   --max-running-requests 2 --max-model-len 10240 \
   --set 'video_config.text_capacities=[1024]'
 
@@ -25,7 +25,6 @@ uniserve serve --config fasth3.toml --set video_config.max_seconds=10
 | `MODEL` (positional) | `model` |
 | `--host`, `--port` | `admin_config.host`, `admin_config.port` |
 | `--served-model-name` | `served_model_name` |
-| `--worker-groups` | `worker_groups` |
 | `--tensor-parallel-size`, `--data-parallel-size` | `tensor_parallel_size`, `data_parallel_size` |
 | `--max-running-requests` | `max_running_requests` |
 | `--max-model-len` | `max_model_len` |
@@ -38,7 +37,7 @@ uniserve serve --config fasth3.toml --set video_config.max_seconds=10
 
 `--log-level` sets the log level of every target of the `uniserve` process, and `--log-level-http` the level of the daemon's HTTP stack (the server and the media-fetching client); every subcommand takes them, before or after its name. A level is one of tracing's names (`off`, `error`, `warn`, `info`, `debug`, `trace`), `info` when unset, and any other value is refused. The environment sets no level (`RUST_LOG` is not read). The daemon starts its engine processes at its own `--log-level`, and a Storage Server its helpers at its own; lines name the level as tracing does (`WARN`, not `WARNING`).
 
-A `--set` value is a TOML value (`2`, `true`, `"text"`, `[1024, 4096]`, `{ mode = "quality" }`) or JSON, and otherwise the text itself, so `--set quantization.mode=quality` and `--set admin_config.host=0.0.0.0` need no quotes. A list is a TOML array in a `--set` value as in a file (`--set 'video_config.sizes=["1344x768", "768x1344"]'`): quote the assignment, since the shell may expand brackets. One invocation may set a path several times, the last winning, but not both a table and an option inside it.
+A `--set` value is one TOML value, written as the file writes it: `2`, `true`, `"text"`, `[1024, 4096]`, `{ mode = "quality" }`. Text is quoted, so the shell sees `--set 'quantization.mode="quality"'` or `--set admin_config.host=\"0.0.0.0\"`, and a value that is not one TOML value (an unquoted word, JSON's `{"key": ...}` objects, two values) is refused with the quoted form. A list is a TOML array (`--set 'video_config.sizes=["1344x768", "768x1344"]'`): quote the whole assignment, since the shell expands brackets and removes double quotes. One invocation may set a path several times, the last winning, but not both a table and an option inside it.
 
 Every option is checked by its type wherever it is stated, and an error names its path: an unknown option, a value its option does not take, or zero for a positive count. A duration is whole seconds or a value with units (`500ms`, `30s`, `5m`, `1h`). A byte size is whole bytes or an integer with a decimal (`20MB`) or binary (`512MiB`) unit. Paths in options resolve against the server's working directory.
 
@@ -50,7 +49,7 @@ Each host's Build Server (`uniserve build-server serve`, see `architecture.md`) 
 
 ```bash
 uniserve keys /workspace/models/Qwen3-30B-A3B --max-model-len 2048 --max-running-requests 8 \
-  --set dtype=bfloat16 --set attention_backend=trtllm > keys.txt \
+  --set 'dtype="bfloat16"' --set 'attention_backend="trtllm"' > keys.txt \
   && uniserve build-server build --keys keys.txt --packages crates/ops/kernels --target sm_100a \
        --store /var/lib/uniserve/store
 ```
@@ -66,7 +65,6 @@ A configuration file is the tree in TOML, as `GET /admin/config` returns it:
 ```toml
 model = "/workspace/models/FastVideo-FastH3-8-Step-V2"
 served_model_name = "FastH3"
-worker_groups = "configs/minimax_h3/ulysses4.toml"
 max_running_requests = 2
 
 [server_config]
@@ -115,7 +113,7 @@ Three backend-name fields are read with `attention_backend` (`modules_of`, `crat
 | `mem_fraction_static` | `0.7` | The deployment's share of each device's storage for weights, static allocations, graph pools and the KV cache, in (0, 1]: the limit `⌊total × fraction⌋` of the GPU's quota, which both epochs of a configuration change and the host's Transfer Server share (`docs/admin.md`); a deployment group's `mem_fraction_static` overrides it for the group's ranks, and a GPU that holds ranks of several groups has the shares of them all (below) |
 | `tensor_parallel_size` | `1` | Tensor-parallel workers of each scheduler's group without `worker_groups` |
 | `data_parallel_size` | `1` | DP ranks, each a scheduler with its own KV cache and worker groups. Independent replicas each run an engine of their own, and the leader sends a request to the one with the fewest in flight. With `moe_config.expert_parallel`, replicas of one rank each (`tensor_parallel_size` 1) share their experts and exchange tokens, so one engine runs every replica's scheduler and the scheduling policy's `route` names each request's; replicas of several tensor-parallel ranks each shard their experts over their own ranks and stay independent replicas. With `worker_groups`, the file's groups that serve requests form the schedulers as equal consecutive blocks |
-| `worker_groups` | Unset | [Deployment file](#deployment-files) placing worker groups and their blocks |
+| `worker_groups` | Unset | The [deployment layout](#deployment-files): `[[worker_groups]]` tables placing worker groups and their blocks |
 | `host_identity` | `"localhost"` | This node's host name; its daemon runs the ranks assigned to this host |
 | `engine_host` | This node's identity | The joined node that runs the engine and any ranks without an explicit host. Changing it starts a successor epoch there while the HTTP daemon remains on its node |
 | `nnodes` | `1` | Nodes of the deployment, each running one `uniserve serve` |
@@ -431,9 +429,7 @@ Reference videos are decoded through the FFmpeg libraries the engine executable 
 
 ## Deployment files
 
-A configuration update reads the deployment file again, so editing its contents at the same path can move ranks to other devices or hosts. The resolved configuration carries those contents to the engine; subsequent file edits do not change the ranks that configuration launches.
-
-A deployment file, the `worker_groups` option, places worker groups on devices and hosts and names the blocks each runs. It is TOML: one `[[worker_groups]]` table per group and one `[worker_groups.blocks.<name>]` table per block of the group, as in `configs/minimax_h3/fasth3-ulysses4x2.toml`:
+The `worker_groups` option is the deployment layout: it places worker groups on devices and hosts and names the blocks each runs. It is part of the configuration tree, one `[[worker_groups]]` table per group and one `[worker_groups.blocks.<name>]` table per block of the group; a deployment file is a configuration file that states only it, as `configs/minimax_h3/fasth3-ulysses4x2.toml` does, and is given with `--config` beside any other configuration file. A configuration update states the layout it moves to in its own configuration (`PUT /admin/config`).
 
 ```toml
 # FastH3 on eight GPUs of one host: two Ulysses4 denoiser replicas, each with

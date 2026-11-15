@@ -942,8 +942,8 @@ mod tests {
             json!({ "set": ["worker_config.watchdog_timeout=301"] }),
             json!({ "set": ["admin_config.harness_options=[\"dtype\"]"] }),
             json!({ "config": "attention_backend = \"trtllm\"\n" }),
-            json!({ "set": ["attention_backend=trtllm"], "force": true }),
-            json!({ "set": ["attention_backend=trtllm"], "replica": 0 }),
+            json!({ "set": ["attention_backend=\"trtllm\""], "force": true }),
+            json!({ "set": ["attention_backend=\"trtllm\""], "replica": 0 }),
         ] {
             let (status, _, body) = send(&harness, put(refused.clone())).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{refused}: {body}");
@@ -952,7 +952,7 @@ mod tests {
         // of its own, so the apply itself has nothing to move.
         let (status, _, body) = send(
             &harness,
-            put(json!({ "set": ["attention_backend=trtllm"], "deadline_s": 600 })),
+            put(json!({ "set": ["attention_backend=\"trtllm\""], "deadline_s": 600 })),
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -968,7 +968,7 @@ mod tests {
         // A deadline is a positive number of seconds.
         let (status, _, body) = send(
             &admin,
-            put(json!({ "set": ["attention_backend=trtllm"], "deadline_s": -1 })),
+            put(json!({ "set": ["attention_backend=\"trtllm\""], "deadline_s": -1 })),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");

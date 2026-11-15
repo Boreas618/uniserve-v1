@@ -47,7 +47,7 @@ use proto::config::{positive, values};
 /// is unset.
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
 
-/// Options that place ranks without a deployment file, refused beside one.
+/// Options that place ranks without a deployment layout, refused beside `worker_groups`.
 const RANK_LAYOUT_SHORTHAND: [&str; 5] = [
     "tensor_parallel_size",
     "device_config.device",
@@ -215,18 +215,22 @@ pub struct ServerArgs {
     /// `mem_fraction_static` overrides it.
     #[arg(long, default_value_t = ServerArgs::default().mem_fraction_static)]
     pub mem_fraction_static: f64,
-    /// Tensor-parallel workers of each scheduler's group when no
-    /// `worker_groups` file is given.
+    /// Tensor-parallel workers of each scheduler's group when the
+    /// configuration states no `worker_groups`.
     #[arg(long, default_value_t = ServerArgs::default().tensor_parallel_size)]
     pub tensor_parallel_size: NonZeroUsize,
     /// Schedulers, each with its own scheduler, KV cache and worker
-    /// groups. With a `worker_groups` file, its model groups form the engine
+    /// groups. With `worker_groups`, its model groups form the engine
     /// cores as equal consecutive blocks.
     #[arg(long, default_value_t = ServerArgs::default().data_parallel_size)]
     pub data_parallel_size: NonZeroUsize,
-    /// Deployment file placing worker groups and their blocks.
-    #[arg(long, value_name = "FILE")]
-    pub worker_groups: Option<PathBuf>,
+    /// The deployment layout: one `[[worker_groups]]` table per group of
+    /// workers, placing its ranks on devices and hosts and naming the blocks
+    /// it runs. Unset, the rank-layout shorthand (`tensor_parallel_size`,
+    /// `data_parallel_size`, `device_config`) places the ranks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(skip)]
+    pub worker_groups: Option<Vec<proto::config::WorkerGroupConfig>>,
     /// This node's host name; its daemon runs the ranks placed on this
     /// host, and a deployment rank entry without a host names it.
     #[arg(long, default_value_t = ServerArgs::default().host_identity)]
@@ -302,15 +306,18 @@ pub struct ServerArgs {
     // The command line's inputs that are not options: where the options come from, and the
     // shortcuts for the three nested options the flags name. None is part of the configuration's
     // tree, so a printed configuration never carries one.
-    /// TOML file of serving options; the flags and `--set` override it.
+    /// TOML files of serving options, each overriding the ones before it;
+    /// the flags and `--set` override them. A deployment's layout file
+    /// (`[[worker_groups]]`) is one such file.
     #[serde(skip)]
     #[arg(long = "config", value_name = "FILE")]
-    pub config_file: Option<PathBuf>,
+    pub config_files: Vec<PathBuf>,
     /// Set the option at PATH, such as `video_config.max_seconds=10` or
-    /// `moe_config.exchange=deepep`; repeatable, and it overrides the flags
-    /// and the file. VALUE is a TOML value (`2`, `true`, `[1024, 4096]`,
-    /// `{ mode = "balanced" }`) or JSON, and otherwise text; a list is an
-    /// array. One invocation may not set both a table and an option inside it.
+    /// `moe_config.exchange="deepep"`; repeatable, and it overrides the flags
+    /// and the file. VALUE is one TOML value, as the file writes it (`2`,
+    /// `true`, `"deepep"`, `[1024, 4096]`, `{ mode = "balanced" }`): text is
+    /// quoted and a list is an array. One invocation may not set both a table
+    /// and an option inside it.
     #[serde(skip)]
     #[arg(long = "set", value_name = "PATH=VALUE")]
     pub set: Vec<String>,
@@ -385,7 +392,7 @@ impl Default for ServerArgs {
             video_config: VideoConfig::default(),
             media_config: MediaConfig::default(),
             video_job_config: VideoJobConfig::default(),
-            config_file: None,
+            config_files: Vec::new(),
             set: Vec::new(),
             host: None,
             port: None,
@@ -593,12 +600,8 @@ impl ServerArgs {
             .clone()
             .unwrap_or_else(|| self.host_identity.clone());
         let worker_groups = match &self.worker_groups {
-            Some(path) => {
-                let text = std::fs::read_to_string(path)
-                    .with_context(|| format!("reading the deployment file {}", path.display()))?;
-                proto::config::WorkerGroupConfig::parse_file(&text, &engine_host)
-                    .with_context(|| format!("placing the deployment file {}", path.display()))?
-            }
+            Some(stated) => proto::config::WorkerGroupConfig::place(stated.clone(), &engine_host)
+                .context("placing `worker_groups`")?,
             None => proto::config::WorkerGroupConfig::shorthand(
                 &engine_host,
                 &self.device_config,
@@ -669,7 +672,7 @@ impl ServerArgs {
     /// Checks the rules the option types cannot express on their own.
     ///
     /// `stated` records the paths the operator set, so the rank layout
-    /// shorthand is refused beside a deployment file. Rules that need the
+    /// shorthand is refused beside `worker_groups`. Rules that need the
     /// served model's family run at startup instead
     /// ([`Stated::refuse_foreign_options`]).
     ///
@@ -836,8 +839,8 @@ impl ServerArgs {
                 .find(|option| stated.contains(option))
         {
             anyhow::bail!(
-                "`{option}` places ranks without a deployment file; the `worker_groups` file \
-                 states its own rank layout"
+                "`{option}` places ranks without a deployment layout; the stated `worker_groups` \
+                 place their own ranks"
             );
         }
         // The daemon binds `admin_config`'s address, so an empty one fails

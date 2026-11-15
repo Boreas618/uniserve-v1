@@ -54,7 +54,7 @@ def serve(
         "127.0.0.1",
         *engine_selection(),
         "--set",
-        f"build_config.socket={build_server}",
+        f'build_config.socket="{build_server}"',
     ]
     for option in options:
         command += ["--set", option]

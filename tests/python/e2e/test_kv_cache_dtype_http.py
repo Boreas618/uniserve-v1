@@ -64,9 +64,9 @@ def _generate(
         "127.0.0.1",
         *engine_selection(),
         "--set",
-        "dtype=bfloat16",
+        'dtype="bfloat16"',
         "--set",
-        f"attention_backend={ATTENTION_BACKEND}",
+        f'attention_backend="{ATTENTION_BACKEND}"',
         "--set",
         "kv_cache_config.max_tokens=16384",
         "--max-model-len",
@@ -76,7 +76,7 @@ def _generate(
         "--set",
         "kv_cache_config.block_size=64",
         "--set",
-        "chat_config.reasoning_parser=none",
+        'chat_config.reasoning_parser="none"',
         *extra,
     ]
     outputs = []
@@ -131,7 +131,7 @@ def test_an_fp16_cache_serves_a_bf16_model_like_a_bf16_cache(tmp_path: Path):
         tmp_path,
         checkpoint,
         "float16-cache",
-        ["--set", "kv_cache_config.dtype=float16"],
+        ["--set", 'kv_cache_config.dtype="float16"'],
     )
 
     for prompt, expected, actual in zip(

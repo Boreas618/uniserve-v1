@@ -222,17 +222,17 @@ def _serve_command(
         host,
         *engine_selection(),
         "--set",
-        "dtype=bfloat16",
+        'dtype="bfloat16"',
         "--set",
-        f"attention_backend={ATTENTION_BACKEND}",
+        f'attention_backend="{ATTENTION_BACKEND}"',
         "--set",
         "kv_cache_config.max_tokens=32768",
         "--set",
         f"kv_cache_config.block_size={BLOCK_SIZE}",
         "--set",
-        "chat_config.reasoning_parser=none",
+        'chat_config.reasoning_parser="none"',
         "--set",
-        f"storage_config.tcp={address}:0",
+        f'storage_config.tcp="{address}:0"',
         *extra,
     ]
 
@@ -258,7 +258,7 @@ def _follower_deployment(
             qwen3_checkpoint(),
             "0.0.0.0",
             address,
-            ("--set", f"build_config.socket={modules}", *extra),
+            ("--set", f'build_config.socket="{modules}"', *extra),
         )
         server = start_remote_server(
             FOLLOWER,
@@ -405,7 +405,7 @@ def test_an_fp8_host_loads_a_bf16_hosts_blocks_by_converting_them(
             FOLLOWER_DEVICE,
             [
                 "--set",
-                "kv_cache_config.dtype=float8_e4m3fn",
+                'kv_cache_config.dtype="float8_e4m3fn"',
                 "--set",
                 f'kv_cache_config.peers=["{peer}"]',
             ],

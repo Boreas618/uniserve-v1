@@ -199,7 +199,7 @@ def server(
         "127.0.0.1",
         *engine_selection(),
         "--set",
-        f"build_config.socket={build_server['socket']}",
+        f'build_config.socket="{build_server["socket"]}"',
         "--set",
         f"kv_cache_config.host_gib={HOST_GIB}",
     ]

@@ -68,10 +68,11 @@ impl Stated {
 }
 
 impl ServerArgs {
-    /// Resolves the configuration this command line states: the `--config` file, overridden by
-    /// the flags the command line states, overridden by `--set`, with every unstated option at its
-    /// default and `server_config.api_key` falling back to `UNISERVE_API_KEY`. `--host` and
-    /// `--port` state the daemon's own address (`admin_config`). Returns it with the paths the invocation stated.
+    /// Resolves the configuration this command line states: the `--config` files, each
+    /// overriding the ones before it, overridden by the flags the command line states,
+    /// overridden by `--set`, with every unstated option at its default and
+    /// `server_config.api_key` falling back to `UNISERVE_API_KEY`. `--host` and `--port` state the
+    /// daemon's own address (`admin_config`). Returns it with the paths the invocation stated.
     ///
     /// `matches` are the command line's own: a flag counts when the command line states it, which
     /// clap's value source tells apart from the default it parsed beside the stated ones.
@@ -84,13 +85,14 @@ impl ServerArgs {
     /// option or a value its option does not take; the message names the
     /// option's path.
     pub fn resolve(&self, matches: &clap::ArgMatches) -> anyhow::Result<(ServerArgs, Stated)> {
-        let mut tree = match &self.config_file {
-            Some(path) => std::fs::read_to_string(path)
+        let mut tree = Table::new();
+        for path in &self.config_files {
+            let file = std::fs::read_to_string(path)
                 .with_context(|| format!("reading --config {}", path.display()))?
                 .parse::<Table>()
-                .with_context(|| format!("parsing --config {}", path.display()))?,
-            None => Table::new(),
-        };
+                .with_context(|| format!("parsing --config {}", path.display()))?;
+            merge(&mut tree, file);
+        }
         // Each stated flag is the option of its own name, as this value prints it.
         let printed = Value::try_from(self).context("printing the command line's options")?;
         for id in matches.ids() {
@@ -124,20 +126,23 @@ impl ServerArgs {
     }
 }
 
-/// Options stated under a name they no longer have, each with the name to state instead: a
-/// retired name is refused with its successor, rather than as an option no one knows.
-const RETIRED: [(&str, &str); 1] = [("quantization_config", "quantization")];
-
-/// A TOML tree of options as `T`; a retired name is refused with the name to state instead, and
-/// any other key no option takes is refused by the option types, by its path.
-fn deserialize_options<T: serde::de::DeserializeOwned>(tree: Table) -> anyhow::Result<T> {
-    if let Some((retired, current)) = RETIRED
-        .iter()
-        .find(|(retired, _)| tree.contains_key(*retired))
-    {
-        anyhow::bail!("invalid option `{retired}`: the option is retired; state it as `{current}`");
+/// Merges the configuration file `over` into `tree`: a table merges key by key, and any other
+/// value of `over`, an array of tables such as `worker_groups` included, replaces the value of
+/// `tree` at its path.
+fn merge(tree: &mut Table, over: Table) {
+    for (key, value) in over {
+        match (tree.get_mut(&key), value) {
+            (Some(Value::Table(table)), Value::Table(over)) => merge(table, over),
+            (_, value) => {
+                tree.insert(key, value);
+            }
+        }
     }
+}
 
+/// A TOML tree of options as `T`; a key no option takes is refused by the option types, by its
+/// path.
+fn deserialize_options<T: serde::de::DeserializeOwned>(tree: Table) -> anyhow::Result<T> {
     serde_path_to_error::deserialize(Value::Table(tree)).map_err(|error| {
         let path = error.path().to_string();
         let cause = error.into_inner();
@@ -275,24 +280,23 @@ fn assignments(texts: &[String]) -> anyhow::Result<Vec<(Vec<String>, Value)>> {
     Ok(assigned)
 }
 
-/// Reads a `--set` value: a TOML value, else JSON, else the text itself.
+/// Reads a `--set` value: one TOML value, written as the configuration file writes it. A text
+/// value is quoted (`"deepep"`); a number, boolean, array or inline table is not.
+///
+/// # Errors
+///
+/// Fails when the text is not exactly one TOML value, naming the quoted form an unquoted word
+/// takes.
 fn parsed_value(text: &str) -> anyhow::Result<Value> {
-    anyhow::ensure!(!text.trim().is_empty(), "the value is empty");
-
-    // The text is a TOML value when it parses as the only key of a document;
-    // text that adds keys of its own is not one value.
-    if let Ok(document) = format!("value = {text}").parse::<Table>()
-        && document.len() == 1
-        && let Some(value) = document.get("value")
-    {
-        return Ok(value.clone());
-    }
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(text)
-        && let Ok(value) = Value::try_from(json)
-    {
-        return Ok(value);
-    }
-    Ok(Value::String(text.to_owned()))
+    // `toml::Value` parses one value expression: a text holding a second value or a key of its
+    // own is refused rather than read in part.
+    let text = text.trim();
+    text.parse::<Value>().map_err(|error| {
+        anyhow!(
+            "the value is not one TOML value ({}); a text value is quoted, as in `PATH=\"{text}\"`",
+            error.message().trim_end()
+        )
+    })
 }
 
 /// Sets `value` at `path` of `tree`, creating the tables on the way.
@@ -320,7 +324,6 @@ fn set(tree: &mut Table, path: &[String], value: Value) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::time::Duration;
 
     use clap::{FromArgMatches, Parser};
@@ -341,14 +344,14 @@ mod tests {
         Command::from_arg_matches(&matches)?.serve.resolve(&matches)
     }
 
-    fn written(name: &str, body: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "uniserve-options-{name}-{}-{:?}.toml",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::write(&path, body).expect("write test file");
-        path
+    /// A scratch configuration file holding `body`, removed when the path drops.
+    fn written(body: &str) -> tempfile::TempPath {
+        let mut file = tempfile::Builder::new()
+            .suffix(".toml")
+            .tempfile()
+            .expect("creating a scratch file");
+        std::io::Write::write_all(&mut file, body.as_bytes()).expect("writing a scratch file");
+        file.into_temp_path()
     }
 
     /// The file states options by path, a flag overrides the file, and
@@ -356,18 +359,17 @@ mod tests {
     #[test]
     fn set_overrides_flags_which_override_the_file() {
         let file = written(
-            "precedence",
-            "model = \"/models/file\"\nmax_running_requests = 4\n\
+            "model = \"org/file-model\"\nmax_running_requests = 4\n\
              [scheduler_config]\npolicy = \"priority\"\n",
         );
         let file = file.to_str().unwrap();
 
         let (config, _) = resolved(&["--config", file]).unwrap();
-        assert_eq!(config.model.as_deref(), Some("/models/file"));
+        assert_eq!(config.model.as_deref(), Some("org/file-model"));
         assert_eq!(config.max_running_requests.get(), 4);
 
         let (config, _) = resolved(&[
-            "/models/flag",
+            "org/flag-model",
             "--config",
             file,
             "--max-running-requests",
@@ -375,32 +377,68 @@ mod tests {
             "--set",
             "max_running_requests=1",
             "--set",
-            "scheduler_config.policy=fcfs",
+            "scheduler_config.policy=\"fcfs\"",
         ])
         .unwrap();
-        assert_eq!(config.model.as_deref(), Some("/models/flag"));
+        assert_eq!(config.model.as_deref(), Some("org/flag-model"));
         assert_eq!(config.max_running_requests.get(), 1);
         assert_eq!(config.scheduler_config.policy, "fcfs");
         assert_eq!(config.admin_config.port, 0);
     }
 
-    /// A `--set` value is a TOML value, JSON, or text; a list is an array, and durations and
-    /// sizes take units.
+    /// Several `--config` files merge in order: a later file's option replaces an earlier one's,
+    /// tables merge key by key, and a later `[[worker_groups]]` list replaces the earlier list.
     #[test]
-    fn set_values_read_as_toml_json_or_text() {
+    fn later_configuration_files_override_earlier_ones() {
+        let layout = written(
+            "max_running_requests = 4\n[scheduler_config]\npolicy = \"priority\"\nmax_batch = 8\n\
+             [[worker_groups]]\nid = \"first\"\nranks = [\"cpu\"]\nqueue_depth = 2\n\
+             [worker_groups.blocks.model]\n",
+        );
+        let overrides = written(
+            "max_running_requests = 2\n[scheduler_config]\npolicy = \"fcfs\"\n\
+             [[worker_groups]]\nid = \"second\"\nranks = [\"cpu\"]\nqueue_depth = 2\n\
+             [worker_groups.blocks.model]\n",
+        );
+        let (config, stated) = resolved(&[
+            "m",
+            "--config",
+            layout.to_str().unwrap(),
+            "--config",
+            overrides.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(config.max_running_requests.get(), 2);
+        assert_eq!(config.scheduler_config.policy, "fcfs");
+        assert_eq!(config.scheduler_config.max_batch.get(), 8);
+        let groups = config.worker_groups.as_deref().unwrap_or_default();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["second"]
+        );
+        assert!(stated.contains("worker_groups"));
+    }
+
+    /// A `--set` value is one TOML value, as the configuration file writes it: a list is an
+    /// array, a table an inline table, and text, durations and sizes are quoted.
+    #[test]
+    fn set_values_read_as_toml() {
         let (config, _) = resolved(&[
             "--set",
             "video_config.text_capacities=[1024, 10240]",
             "--set",
             "video_config.sizes=[\"1344x768\"]",
             "--set",
-            "quantization={\"mode\":\"balanced\",\"modules\":{\"video_vae\":\"bf16\"}}",
+            "quantization={ mode = \"balanced\", modules = { video_vae = \"bf16\" } }",
             "--set",
             "moe_config={ expert_parallel = true, exchange = \"deepep\" }",
             "--set",
-            "server_config.request_timeout=2m",
+            "server_config.request_timeout=\"2m\"",
             "--set",
-            "admin_config.host=0.0.0.0",
+            "admin_config.host=\"0.0.0.0\"",
         ])
         .unwrap();
         assert_eq!(
@@ -423,6 +461,21 @@ mod tests {
             Some(Duration::from_secs(120))
         );
         assert_eq!(config.admin_config.host, "0.0.0.0");
+    }
+
+    /// A value that is not one TOML value is refused, naming its quoted form, rather than read
+    /// as JSON or as text: an unquoted word, JSON's object syntax and two values.
+    #[test]
+    fn a_value_that_is_not_one_toml_value_is_refused() {
+        for (value, named) in [
+            ("dtype=bfloat16", "PATH=\"bfloat16\""),
+            ("quantization={\"mode\":\"balanced\"}", "not one TOML value"),
+            ("max_running_requests=1 2", "not one TOML value"),
+            ("max_running_requests=", "not one TOML value"),
+        ] {
+            let error = resolved(&["--set", value]).unwrap_err();
+            assert!(format!("{error:#}").contains(named), "{value}: {error:#}");
+        }
     }
 
     /// An unknown option, a value its option does not take, a path through
@@ -455,11 +508,11 @@ mod tests {
                 "moe_config",
             ),
             (
-                vec!["--set", "quantization.mode=fastest"],
+                vec!["--set", "quantization.mode=\"fastest\""],
                 "quantization.mode",
             ),
             (
-                vec!["--set", "quantization.modules.mlp=int4"],
+                vec!["--set", "quantization.modules.mlp=\"int4\""],
                 "quantization.modules.mlp",
             ),
             (
@@ -474,33 +527,6 @@ mod tests {
         ] {
             let error = resolved(&args).unwrap_err();
             assert!(format!("{error:#}").contains(named), "{args:?}: {error:#}");
-        }
-    }
-
-    /// The retired spelling of the precision policy is refused with the
-    /// name to state instead, whether a file, a `--set` assignment or an
-    /// update's assignment states it.
-    #[test]
-    fn the_retired_policy_spelling_is_refused_with_its_successor() {
-        let file = written(
-            "retired",
-            "model = \"m\"\n[quantization_config]\nmode = \"quality\"\n",
-        );
-        let from_file = resolved(&["--config", file.to_str().unwrap()]).unwrap_err();
-        let from_set = resolved(&["m", "--set", "quantization_config.mode=quality"]).unwrap_err();
-        let (config, _) = resolved(&["m"]).unwrap();
-        let from_update = overridden(
-            &config,
-            &["quantization_config={ mode = \"quality\" }".to_owned()],
-        )
-        .unwrap_err();
-
-        for error in [from_file, from_set, from_update] {
-            let message = format!("{error:#}");
-            assert!(
-                message.contains("`quantization_config`") && message.contains("as `quantization`"),
-                "{message}"
-            );
         }
     }
 
@@ -528,15 +554,13 @@ mod tests {
     #[test]
     fn flags_set_their_paths_and_printing_round_trips() {
         let (config, stated) = resolved(&[
-            "/models/m",
+            "org/model",
             "--host",
             "0.0.0.0",
             "--port",
             "9000",
             "--served-model-name",
             "served",
-            "--worker-groups",
-            "deployment.toml",
             "--tensor-parallel-size",
             "2",
             "--data-parallel-size",
@@ -546,7 +570,7 @@ mod tests {
             "--max-model-len",
             "4096",
             "--lora-path",
-            "/adapters/fasth3",
+            "adapter",
             "--mem-fraction-static",
             "0.5",
             "--host-identity",
@@ -566,7 +590,6 @@ mod tests {
             "admin_config.host",
             "admin_config.port",
             "served_model_name",
-            "worker_groups",
             "tensor_parallel_size",
             "data_parallel_size",
             "max_running_requests",
@@ -591,7 +614,7 @@ mod tests {
         use crate::test_support::{CHAT, VIDEO};
 
         for (description, setting) in [
-            (&CHAT, "chat_config.reasoning_parser=none"),
+            (&CHAT, "chat_config.reasoning_parser=\"none\""),
             (&VIDEO, "video_config.max_seconds=5"),
         ] {
             let (config, stated) = resolved(&["m", "--set", setting]).unwrap();
@@ -754,17 +777,17 @@ mod tests {
         let (config, stated) = resolved(&[]).unwrap();
         assert!(config.model.is_none());
         config.validate(&stated).unwrap();
-        let (config, engine) = lowered(&["/models/m"]).unwrap();
-        assert_eq!(config.model(), "/models/m");
-        assert_eq!(config.served_model_name(), "/models/m");
-        assert_eq!(engine.model.model, "/models/m");
+        let (config, engine) = lowered(&["org/model"]).unwrap();
+        assert_eq!(config.model(), "org/model");
+        assert_eq!(config.served_model_name(), "org/model");
+        assert_eq!(engine.model.model, "org/model");
 
-        let file = written("model", "model = \"/models/file\"\n");
+        let file = written("model = \"org/file-model\"\n");
         let (config, _) = lowered(&["--config", file.to_str().unwrap()]).unwrap();
-        assert_eq!(config.model(), "/models/file");
+        assert_eq!(config.model(), "org/file-model");
     }
 
-    /// Without a deployment file each scheduler's group runs one block
+    /// Without `worker_groups` each scheduler's group runs one block
     /// tensor-parallel over its workers; the rank layout shorthand is refused
     /// beside a file.
     #[test]
@@ -776,7 +799,7 @@ mod tests {
             "--data-parallel-size",
             "2",
             "--set",
-            "device_config.device=cpu",
+            "device_config.device=\"cpu\"",
         ])
         .unwrap();
         assert_eq!(engine.parallel.worker_groups.len(), 2);
@@ -789,26 +812,25 @@ mod tests {
         );
 
         let deployment = written(
-            "deployment",
             "[[worker_groups]]\nid = \"model\"\nranks = [\"cpu*2\"]\nqueue_depth = 2\n\
              [worker_groups.blocks.model]\ntensor_parallel_size = 2\n",
         );
         let path = deployment.to_str().unwrap();
-        let (config, engine) = lowered(&["m", "--worker-groups", path]).unwrap();
+        let (config, engine) = lowered(&["m", "--config", path]).unwrap();
         assert_eq!(engine.parallel.worker_groups.len(), 1);
         let (reread, stated) = resolve_text(&printed(&config).unwrap(), &[]).unwrap();
         assert_eq!(reread, config);
         reread.validate(&stated).unwrap();
         for shorthand in [
             ["--tensor-parallel-size", "2"],
-            ["--set", "device_config.device=cpu"],
+            ["--set", "device_config.device=\"cpu\""],
             ["--set", "device_config.queue_depth=3"],
         ] {
-            let mut args = vec!["m", "--worker-groups", path];
+            let mut args = vec!["m", "--config", path];
             args.extend(shorthand);
             let error = lowered(&args).unwrap_err();
             assert!(
-                error.to_string().contains("deployment file"),
+                error.to_string().contains("deployment layout"),
                 "{shorthand:?}: {error}"
             );
         }
@@ -818,13 +840,12 @@ mod tests {
     #[test]
     fn a_deployment_places_unnamed_ranks_on_this_host() {
         let deployment = written(
-            "engine-deployment",
             "[[worker_groups]]\nid = \"model\"\nranks = [\"cpu\", \"rank-1/cpu\"]\nqueue_depth = 2\n\
              [worker_groups.blocks.model]\ntensor_parallel_size = 2\n",
         );
         let (_, engine) = lowered(&[
             "m",
-            "--worker-groups",
+            "--config",
             deployment.to_str().unwrap(),
             "--host-identity",
             "rank-0",
@@ -836,7 +857,11 @@ mod tests {
             .map(|rank| rank.host.as_str())
             .collect::<Vec<_>>();
         assert_eq!(hosts, ["rank-0", "rank-1"]);
-        assert!(lowered(&["m", "--worker-groups", "/nonexistent/deployment.toml"]).is_err());
+        let (config, _) = resolved(&["m", "--set", "worker_groups=[]"]).unwrap();
+        assert!(
+            config.engine_config().is_err(),
+            "a layout names at least one group"
+        );
     }
 
     /// Capture lists and capacities are checked before any rank starts.
@@ -876,7 +901,7 @@ mod tests {
         let (_, engine) = lowered(&[
             "m",
             "--set",
-            "quantization.mode=performance",
+            "quantization.mode=\"performance\"",
             "--set",
             "moe_config={ expert_parallel = true, exchange = \"deepep\" }",
             "--set",
@@ -933,13 +958,13 @@ mod tests {
         };
         assert!(refused("video_config.max_seconds=5", &Chat));
         assert!(!refused("video_config.max_seconds=5", &Video));
-        assert!(refused("chat_config.reasoning_parser=none", &Video));
-        assert!(!refused("chat_config.reasoning_parser=none", &Chat));
+        assert!(refused("chat_config.reasoning_parser=\"none\"", &Video));
+        assert!(!refused("chat_config.reasoning_parser=\"none\"", &Chat));
         // A video pipeline schedules no token batches and renders no chat.
         for token_option in [
             "max_num_batched_tokens=2048",
             "scheduler_config.chunked_prefill_size=512",
-            "chat_config.reasoning_parser=none",
+            "chat_config.reasoning_parser=\"none\"",
         ] {
             assert!(refused(token_option, &Video), "{token_option}");
             assert!(!refused(token_option, &Chat), "{token_option}");

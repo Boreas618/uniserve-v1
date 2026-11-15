@@ -51,7 +51,7 @@ The [FastH3 Preview v1 adapters](https://huggingface.co/FastVideo/FastVideo-Fast
 
 ```bash
 uniserve serve "$H3_ROOT" --lora-path /workspace/models/FastH3-LoRA/vsa-datafree \
-  --worker-groups configs/minimax_h3/ulysses4.toml --served-model-name FastH3 \
+  --config configs/minimax_h3/ulysses4.toml --served-model-name FastH3 \
   --host 0.0.0.0 --max-running-requests 2
 ```
 
@@ -76,7 +76,7 @@ FastH3 text-to-video and keyframe requests:
 
 ```bash
 uniserve serve "$H3_MODEL" \
-  --worker-groups configs/minimax_h3/ulysses4.toml \
+  --config configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
   --max-running-requests 2 \
@@ -87,7 +87,7 @@ Base text-to-video and keyframe requests:
 
 ```bash
 uniserve serve "$H3_ROOT" \
-  --worker-groups configs/minimax_h3/ulysses4.toml --served-model-name MiniMax-H3 \
+  --config configs/minimax_h3/ulysses4.toml --served-model-name MiniMax-H3 \
   --host 0.0.0.0 --set video_config.max_seconds=8 --max-model-len 2048 \
   --set 'video_config.text_capacities=[2048]'
 ```
@@ -96,20 +96,20 @@ Reference requests, with the base reference denoiser or an OmniRef export:
 
 ```bash
 uniserve serve "$H3_ROOT" \
-  --worker-groups configs/minimax_h3/ulysses4-reference.toml \
+  --config configs/minimax_h3/ulysses4-reference.toml \
   --served-model-name MiniMax-H3 --host 0.0.0.0 \
   --set video_config.max_seconds=5 --max-model-len 8192 \
   --set 'video_config.text_capacities=[8192]' \
   --set video_config.max_condition_rows=40960 \
-  --set media_config.directory=/srv/media
+  --set 'media_config.directory="/srv/media"'
 
 uniserve serve "$OMNIREF_EXPORT" \
-  --worker-groups configs/minimax_h3/ulysses4-reference.toml \
+  --config configs/minimax_h3/ulysses4-reference.toml \
   --served-model-name MiniMax-H3-OmniRef --host 0.0.0.0 \
   --set video_config.max_seconds=5 --max-model-len 8192 \
   --set 'video_config.text_capacities=[8192]' \
   --set video_config.max_condition_rows=49152 \
-  --set media_config.directory=/srv/media
+  --set 'media_config.directory="/srv/media"'
 ```
 
 The options can also be kept in a TOML file passed with `--config` ([Configuration](../configuration.md#configuration-file)). A deployment file places each block on devices. These four-GPU files run four-way Ulysses denoising, TP4 text encoding, the latent encoder and one video and audio decoding unit per rank in a `model` worker, and the H.264 encoders, the muxer and the media reader, which decodes condition media. The media blocks run on the host inside the main process, which serves CUDA devices only, so a deployment places them on CUDA ranks; a rank on `cpu` is refused when the node is launched. The media reader runs on a GPU rank: its decoded pixels lie in that GPU's storage, which the condition encoders of the same host read there and those of another host read once the hosts' Storage Servers copied them to it ([Two hosts](#two-hosts)). Check a running server with:
@@ -205,7 +205,7 @@ docker build -f docs/minimax_h3/Dockerfile -t uniserve-h3 .
 docker run --rm --gpus all --shm-size=4g --ulimit memlock=-1 -p 8000:8000 \
   -v "$H3_MODEL:/models/h3:ro" \
   uniserve-h3 serve /models/h3 \
-    --worker-groups configs/minimax_h3/ulysses4.toml \
+    --config configs/minimax_h3/ulysses4.toml \
     --served-model-name FastH3 \
     --host 0.0.0.0 \
     --max-running-requests 2

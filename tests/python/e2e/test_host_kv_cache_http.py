@@ -110,15 +110,15 @@ def _command(checkpoint: str) -> list[str]:
         "127.0.0.1",
         *engine_selection(),
         "--set",
-        "dtype=bfloat16",
+        'dtype="bfloat16"',
         "--set",
-        f"attention_backend={ATTENTION_BACKEND}",
+        f'attention_backend="{ATTENTION_BACKEND}"',
         "--set",
         "kv_cache_config.max_tokens=32768",
         "--set",
         f"kv_cache_config.block_size={BLOCK_SIZE}",
         "--set",
-        "chat_config.reasoning_parser=none",
+        'chat_config.reasoning_parser="none"',
     ]
 
 

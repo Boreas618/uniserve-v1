@@ -265,7 +265,7 @@ def test_a_prefill_group_transfers_requests_to_a_decode_group_on_one_host(
     tmp_path: Path, reference: list[list[str]]
 ):
     log = tmp_path / "server.log"
-    command = _command("--worker-groups", str(_split(tmp_path, None)))
+    command = _command("--config", str(_split(tmp_path, None)))
     with (
         runtime_directory(tmp_path / "storage-server.log") as runtime,
         server_process(
@@ -300,7 +300,7 @@ def test_a_prefill_group_transfers_requests_to_a_decode_group_on_another_host(
     # Storage Servers, which the daemons start with the deployment's
     # settings, load the installed NIXL.
     command = _command(
-        "--worker-groups",
+        "--config",
         str(_split(tmp_path, "rank-1")),
         "--host-identity",
         "rank-0",
@@ -327,7 +327,7 @@ def test_a_prefill_group_transfers_requests_to_a_decode_group_on_another_host(
             tmp_path / "follower.log",
             server,
             devices=FOLLOWER_DEVICE,
-            arguments=("--set", f"build_config.socket={follower_modules}"),
+            arguments=("--set", f'build_config.socket="{follower_modules}"'),
         ),
     ):
         base_url = server.base_url

@@ -531,11 +531,11 @@ def test_only_the_checkpoint_and_kv_cache_dtype_differ_between_cells() -> None:
     assert model(commands[0]) == "/workspace/models/Qwen3-30B-A3B"
     assert model(commands[2]) == "/workspace/models/Qwen3-30B-A3B"
     assert model(commands[1]) == "/workspace/models/Qwen3-30B-A3B-NVFP4"
-    assert "kv_cache_config.dtype=float8_e4m3fn" in commands[2]
+    assert 'kv_cache_config.dtype="float8_e4m3fn"' in commands[2]
     # Today's `auto` selection refuses per-block FP8 pages, so the FP8 cell
     # names the one provider that reads them; the other cells leave the
     # provider to the implementation.
-    assert "attention_backend=torch" in commands[2]
+    assert 'attention_backend="torch"' in commands[2]
     for command in commands[:2]:
         assert not any(
             value.startswith("attention_backend=") for value in command

@@ -155,13 +155,13 @@ def _stream_through_a_kill(
         "127.0.0.1",
         *engine_selection(),
         "--set",
-        "dtype=bfloat16",
+        'dtype="bfloat16"',
         "--set",
-        f"attention_backend={ATTENTION_BACKEND}",
+        f'attention_backend="{ATTENTION_BACKEND}"',
         "--set",
         "kv_cache_config.max_tokens=32768",
         "--set",
-        "chat_config.reasoning_parser=none",
+        'chat_config.reasoning_parser="none"',
         "--set",
         "cuda_graph_config.prefill_token_sizes=[512]",
         "--set",
@@ -255,10 +255,10 @@ def _expert_epoch(topology: str, tmp_path: Path) -> tuple[str, ...]:
     if topology == "replicas":
         return ("--data-parallel-size", "2")
     return (
-        "--worker-groups",
+        "--config",
         str(dedicated_experts(tmp_path)),
         "--set",
-        "moe_config.exchange=deepep",
+        'moe_config.exchange="deepep"',
     )
 
 
@@ -277,7 +277,7 @@ def test_an_expert_epoch_promotes_its_standby_when_its_engine_is_lost(
             "--set",
             "worker_config.standby=true",
             "--set",
-            f"worker_config.standby_storage={standby_storage}",
+            f'worker_config.standby_storage="{standby_storage}"',
         ),
         devices=granted_devices(2),
         standby=True,

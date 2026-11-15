@@ -31,10 +31,15 @@ def test_shipped_profiles_name_deployments_and_workloads_that_exist(
     config = load_config(profile)
 
     for name, server in config.servers.items():
-        if "--worker-groups" not in server.command:
+        # A UniServe server's deployment layout is a configuration file
+        # it is given with `--config`; a reference server's own
+        # `--config` names a file of its own format.
+        if server.command[1:2] != ["serve"] or "--config" not in server.command:
             continue
-        flag = server.command.index("--worker-groups")
+        flag = server.command.index("--config")
         deployment = config.root / server.command[flag + 1]
+        if deployment.suffix != ".toml":
+            continue
         assert deployment.is_file(), f"{name} names {deployment}"
         groups = tomllib.loads(deployment.read_text())["worker_groups"]
         assert groups and all(group["blocks"] for group in groups)

@@ -332,7 +332,7 @@ def test_block_bindings_release_cancelled_requests(
         "--host",
         "127.0.0.1",
         *engine_selection(),
-        "--worker-groups",
+        "--config",
         str(written_deployment(tmp_path, workers)),
         "--max-running-requests",
         str(max_running_requests),
@@ -351,9 +351,9 @@ def test_block_bindings_release_cancelled_requests(
         "--mem-fraction-static",
         "0.92",
         "--set",
-        "dtype=bfloat16",
+        'dtype="bfloat16"',
         "--set",
-        "quantization.mode=balanced",
+        'quantization.mode="balanced"',
     ]
     if two_hosts:
         # The leader binds its join endpoint on a port it picks.
@@ -425,7 +425,7 @@ def test_block_bindings_release_cancelled_requests(
                     server,
                     arguments=(
                         "--set",
-                        f"build_config.socket={follower_modules}",
+                        f'build_config.socket="{follower_modules}"',
                     ),
                 )
             )
@@ -505,7 +505,7 @@ def test_replicas_on_two_hosts_serve_complete_media(tmp_path: Path) -> None:
         "--host",
         "127.0.0.1",
         *engine_selection(),
-        "--worker-groups",
+        "--config",
         str(deployment),
         "--max-running-requests",
         str(max_running_requests),
@@ -547,7 +547,7 @@ def test_replicas_on_two_hosts_serve_complete_media(tmp_path: Path) -> None:
             FOLLOWER,
             tmp_path / "h3-follower.log",
             server,
-            arguments=("--set", f"build_config.socket={follower_modules}"),
+            arguments=("--set", f'build_config.socket="{follower_modules}"'),
         ),
         ThreadPoolExecutor(max_workers=len(payloads)) as pool,
     ):
@@ -591,7 +591,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         str(require_uniserve_binary()),
         "serve",
         model,
-        "--worker-groups",
+        "--config",
         str(deployment),
         *engine_selection(),
         "--served-model-name",

@@ -145,13 +145,13 @@ mod tests {
             let matches = <Cli as clap::CommandFactory>::command().get_matches_from([
                 "uniserve",
                 command,
-                "/models/qwen3",
+                "org/model",
                 "--max-model-len",
                 "2048",
                 "--max-running-requests",
                 "8",
                 "--set",
-                "dtype=bfloat16",
+                "dtype=\"bfloat16\"",
                 "--set",
                 "kv_cache_config.max_tokens=8192",
             ]);
@@ -167,7 +167,7 @@ mod tests {
         };
         let keys = resolve("keys");
         assert_eq!(keys, resolve("serve"));
-        assert_eq!(keys.model.as_deref(), Some("/models/qwen3"));
+        assert_eq!(keys.model.as_deref(), Some("org/model"));
         assert_eq!(keys.max_model_len.map(|length| length.get()), Some(2048));
     }
 }
