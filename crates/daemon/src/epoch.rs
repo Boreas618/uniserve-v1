@@ -819,8 +819,7 @@ pub fn change(previous: &Epoch, next: &Epoch) -> Change {
 /// update's own options and the admin listeners. A change of them is a hot
 /// restart of the daemon.
 pub fn host_options_differ(current: &ServerArgs, target: &ServerArgs) -> bool {
-    crate::options::daemon_options_differ(current, target)
-        || current.update_config != target.update_config
+    current.daemon_part() != target.daemon_part() || current.update_config != target.update_config
 }
 
 #[cfg(test)]

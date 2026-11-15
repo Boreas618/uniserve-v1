@@ -860,7 +860,7 @@ async fn prepared_successor(
             .enumerate()
             .map(|(index, (replica, connection))| {
                 let (options, _) = crate::options::resolve_text(&replica.config, &[])?;
-                let options = crate::options::with_daemon_options(&options, &daemon_options);
+                let options = options.with_daemon_part(daemon_options.daemon_part());
                 let served = replica.served.clone();
                 let observer = Arc::new(crate::observe::Observer::default());
                 let sink = stats_sink(options.model().to_owned(), Arc::clone(&observer), index);

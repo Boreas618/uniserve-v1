@@ -840,7 +840,7 @@ impl Replica {
             retain_devices(&served.engine_config, &mut target_engine);
         }
         let running = self.hold().client().ok_or(UpdateError::NoEngine)?;
-        let daemon_changes = crate::options::daemon_options_differ(&current, &target);
+        let daemon_changes = current.daemon_part() != target.daemon_part();
         let in_place = crate::leader::configurable(
             &comparable(&served.engine_config),
             &comparable(&target_engine),
@@ -878,7 +878,7 @@ impl Replica {
         if daemon_changes {
             return Ok(Applied::Daemon {
                 executable: None,
-                config: Box::new(crate::options::with_daemon_options(&current, &target)),
+                config: Box::new(current.with_daemon_part(target.daemon_part())),
                 then: Some(Box::new(request)),
             });
         }

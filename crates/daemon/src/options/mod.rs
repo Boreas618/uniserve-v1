@@ -458,42 +458,131 @@ impl Default for AdminConfig {
     }
 }
 
-/// `current` with `target`'s daemon options (those `daemon_options_differ`
-/// compares): the configuration a hot restart of the daemon serves when an
-/// update changes both the daemon and what an epoch executes, before the
-/// daemon's successor changes the epoch.
-pub fn with_daemon_options(current: &ServerArgs, target: &ServerArgs) -> ServerArgs {
-    ServerArgs {
-        server_config: target.server_config.clone(),
-        admin_config: target.admin_config.clone(),
-        logging_config: target.logging_config.clone(),
-        chat_config: target.chat_config.clone(),
-        image_fetch_config: target.image_fetch_config.clone(),
-        media_config: target.media_config.clone(),
-        video_job_config: target.video_job_config.clone(),
-        migration_config: target.migration_config.clone(),
-        mm_processor_kwargs: target.mm_processor_kwargs.clone(),
-        ..current.clone()
-    }
+/// The options the daemon reads alone: its HTTP server and listeners, the request and output
+/// processing (the chat options, the model's processor options, the image and condition media
+/// sources), the video jobs, migration, logging, and this host's Build Server, against which an
+/// epoch's modules are prepared. A hot restart of the daemon applies a change of them; every
+/// other option is the engine configuration's, the deployment's layout and hosts', or an
+/// update's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DaemonPart {
+    pub server_config: ServerConfig,
+    pub admin_config: AdminConfig,
+    pub logging_config: LoggingConfig,
+    pub chat_config: ChatConfig,
+    pub image_fetch_config: ImageFetchConfig,
+    pub media_config: MediaConfig,
+    pub video_job_config: VideoJobConfig,
+    pub migration_config: MigrationConfig,
+    pub mm_processor_kwargs: serde_json::Map<String, Value>,
+    pub build_config: build_server::command::Settings,
 }
 
-/// Whether `current` and `target` differ in the options the daemon reads
-/// alone (its HTTP server, the request and output processing, the media
-/// and video jobs, logging and migration), which a hot restart of the
-/// daemon applies; the engine configuration covers every other option.
-pub fn daemon_options_differ(current: &ServerArgs, target: &ServerArgs) -> bool {
-    current.server_config != target.server_config
-        || current.admin_config != target.admin_config
-        || current.logging_config != target.logging_config
-        || current.chat_config != target.chat_config
-        || current.image_fetch_config != target.image_fetch_config
-        || current.media_config != target.media_config
-        || current.video_job_config != target.video_job_config
-        || current.migration_config != target.migration_config
-        || current.mm_processor_kwargs != target.mm_processor_kwargs
-        // This host's Build Server: the daemon reads it alone, and an
-        // epoch's modules are prepared against it (§5.1).
-        || current.build_config != target.build_config
+impl ServerArgs {
+    /// The daemon's part of this configuration.
+    ///
+    /// Every option is named here, so an option added to [`ServerArgs`] does not compile until
+    /// it is placed in the daemon's part or left to the rest of the configuration.
+    pub fn daemon_part(&self) -> DaemonPart {
+        let Self {
+            // The engine configuration, the deployment's layout and hosts, and the updates.
+            model: _,
+            served_model_name: _,
+            max_model_len: _,
+            lora_path: _,
+            dtype: _,
+            quantization: _,
+            attention_backend: _,
+            prefill_attention_backend: _,
+            decode_attention_backend: _,
+            moe_runner_backend: _,
+            max_running_requests: _,
+            max_num_batched_tokens: _,
+            max_logprobs: _,
+            mem_fraction_static: _,
+            tensor_parallel_size: _,
+            data_parallel_size: _,
+            worker_groups: _,
+            host_identity: _,
+            engine_host: _,
+            nnodes: _,
+            node_rank: _,
+            dist_init_addr: _,
+            storage_config: _,
+            load_config: _,
+            kv_cache_config: _,
+            scheduler_config: _,
+            speculative_config: _,
+            update_config: _,
+            device_config: _,
+            moe_config: _,
+            cuda_graph_config: _,
+            worker_config: _,
+            profiling_config: _,
+            video_config: _,
+            // The command line's inputs, which are no option.
+            config_files: _,
+            set: _,
+            host: _,
+            port: _,
+            ready_fd: _,
+            predecessor: _,
+            // The daemon's part.
+            server_config,
+            admin_config,
+            logging_config,
+            chat_config,
+            image_fetch_config,
+            media_config,
+            video_job_config,
+            migration_config,
+            mm_processor_kwargs,
+            build_config,
+        } = self;
+        DaemonPart {
+            server_config: server_config.clone(),
+            admin_config: admin_config.clone(),
+            logging_config: logging_config.clone(),
+            chat_config: chat_config.clone(),
+            image_fetch_config: image_fetch_config.clone(),
+            media_config: media_config.clone(),
+            video_job_config: video_job_config.clone(),
+            migration_config: migration_config.clone(),
+            mm_processor_kwargs: mm_processor_kwargs.clone(),
+            build_config: build_config.clone(),
+        }
+    }
+
+    /// This configuration with `part` as its daemon's part: what a hot restart of the daemon
+    /// serves when an update changes both the daemon and what an epoch executes, before the
+    /// daemon's successor changes the epoch.
+    pub fn with_daemon_part(&self, part: DaemonPart) -> Self {
+        let DaemonPart {
+            server_config,
+            admin_config,
+            logging_config,
+            chat_config,
+            image_fetch_config,
+            media_config,
+            video_job_config,
+            migration_config,
+            mm_processor_kwargs,
+            build_config,
+        } = part;
+        Self {
+            server_config,
+            admin_config,
+            logging_config,
+            chat_config,
+            image_fetch_config,
+            media_config,
+            video_job_config,
+            migration_config,
+            mm_processor_kwargs,
+            build_config,
+            ..self.clone()
+        }
+    }
 }
 
 /// How the deployment moves to a new configuration in another epoch
