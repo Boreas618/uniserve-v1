@@ -94,17 +94,20 @@ pub use vmm::{
     created_bytes,
 };
 
-/// Lock `mutex`, keeping the state a panicking holder left.
+/// Lock `mutex`.
 ///
-/// Every build profile sets `panic = "abort"`, so a holder's panic ends the
-/// process before another thread observes the poisoned lock. Only test
-/// builds, which ignore that setting and unwind, reach the recovery; it
-/// returns the guard rather than raising a second panic in the thread that
-/// locks next.
+/// A poisoned lock is a holder's panic, which every process ends at once
+/// (`panic = "abort"`), so no thread of a process observes one; under a panic
+/// strategy that unwinds, as in a test harness, the thread that locks next
+/// fails with it instead of carrying on with the state the panic left.
 pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned lock is a holder's panic, which ends the process"
+    )]
     mutex
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("a thread panicked while it held a lock of the CUDA boundary")
 }
 
 #[cfg(test)]
