@@ -698,26 +698,19 @@ impl Planes {
     /// Resets units `[first, first + count)` of every column with fills issued on `stream`:
     /// flags zero, scales one, and the values zero when `values`. The index
     /// keys stay as they are: they have no flag, and a unit's next owner reads no key before it
-    /// stored it. The planes of a split cache fill column by column: a fill's rows may not span
-    /// a segment given back, which the driver refuses although no row touches it.
+    /// stored it.
+    ///
+    /// The values are filled with one fill per mapped extent: a column's units are consecutive
+    /// and mapped, while the columns of a split cache lie apart by the segments given back from
+    /// each column's tail, which a fill's range may not span although no row touches them. The
+    /// values are reset only where units are created, so their fills are rare; the flags and
+    /// scales, reset with every allocation, are storages that never split and take one strided
+    /// fill each.
     pub(crate) fn reset_units(
         &self,
         first: u32,
         count: u32,
         values: bool,
-        stream: &Stream,
-    ) -> Result<()> {
-        let split = self.device()?.segments.is_some();
-        self.reset(first, count, (values, split), stream)
-    }
-
-    /// [`Self::reset_units`], the values filled column by column when `split`: a fill's rows may
-    /// not span a segment given back.
-    fn reset(
-        &self,
-        first: u32,
-        count: u32,
-        (values, split): (bool, bool),
         stream: &Stream,
     ) -> Result<()> {
         if count == 0 {
@@ -736,17 +729,11 @@ impl Planes {
                 let base = storage.address() + (first * plane) as u64;
                 let (rows, pitch) = (count * plane, units * plane);
 
-                // SAFETY: every row lies inside a storage this value owns: units
-                // `[first, first + count)` of each column, a column's units apart. The caller
-                // has those units mapped and orders the fills before their readers.
-                unsafe {
-                    if split {
-                        for column in 0..columns {
-                            fill(stream, base + (column * pitch) as u64, 0, 1, rows)?;
-                        }
-                    } else {
-                        fill_rows(stream, base, pitch, 0, 1, rows, columns)?;
-                    }
+                for column in 0..columns {
+                    // SAFETY: the range lies inside a storage this value owns: units
+                    // `[first, first + count)` of one column. The caller has those units mapped
+                    // and orders the fills before their readers.
+                    unsafe { fill(stream, base + (column * pitch) as u64, 0, 1, rows) }?;
                 }
             }
         }
@@ -943,7 +930,7 @@ impl Planes {
             &storages,
             (owner, limit),
             |first, count| {
-                self.reset(first, count, (true, true), stream)?;
+                self.reset_units(first, count, true, stream)?;
                 stream.synchronize().map_err(Error::from)
             },
         );
