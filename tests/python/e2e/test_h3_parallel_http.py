@@ -5,8 +5,8 @@ from __future__ import annotations
 import io
 import json
 import os
-import re
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from itertools import zip_longest
 from pathlib import Path
 
@@ -23,7 +23,6 @@ from tests.python.e2e.http_helpers import (
     find_free_port,
     granted_devices,
     host_asset,
-    log_tail,
     require_uniserve_binary,
     second_host,
     server_process,
@@ -158,17 +157,6 @@ EIGHT_RANK_DENOISER_RANKS = [2, 3, 0, 1, 6, 7, 4, 5]
 FOLLOWER = os.environ.get("UNISERVE_H3_FOLLOWER")
 LEADER_ADDRESS = os.environ.get("UNISERVE_H3_LEADER_ADDRESS")
 
-# A product block is reached only by the ranks of the main process that holds
-# it, so a deployment whose products would pass between the main processes of
-# two hosts is refused when its ranks start, with an error naming each such
-# product, the worker group that writes it and the worker group that reads it,
-# with the hosts of each (docs/minimax_h3/minimax_h3.md, Two hosts).
-CROSSING_REFUSAL = "would pass between the main processes of two hosts"
-CROSSING = re.compile(
-    r"(\w+), written by worker group (\S+) \(hosts ([^)]*)\) "
-    r"and read by worker group (\S+) \(hosts ([^)]*)\)"
-)
-
 
 def _eight_rank_worker_config(parallel_kind: str) -> dict:
     """Place an eight-rank layout's blocks on all eight devices."""
@@ -188,45 +176,6 @@ def _eight_rank_worker_config(parallel_kind: str) -> dict:
         },
         "audio_decoder": {"ranks": [0]},
     }
-
-
-def _assert_refused_across_hosts(
-    command: list[str],
-    base_url: str,
-    log: Path,
-    environment: dict[str, str],
-    address: str,
-) -> None:
-    """The leader of `command`, joined by the second host's daemon at
-    `address`, refuses to start the deployment and exits, naming at least one
-    product with the worker group that writes it and the one that reads it,
-    which together lie on both hosts.
-    """  # noqa: D205
-    assert FOLLOWER is not None
-    # The second host's main process resolves its modules from that host's
-    # Build Server, which the leader asks to prepare the epoch's modules
-    # before any process starts there.
-    with (
-        remote_build_server(FOLLOWER) as follower_modules,
-        second_host(
-            FOLLOWER,
-            log.with_name("h3-follower.log"),
-            address,
-            arguments=("--set", f"build_config.socket={follower_modules}"),
-        ),
-    ):
-        with pytest.raises(RuntimeError, match="server exited early"):
-            with server_process(
-                command, base_url, log, timeout_s=1800, env=environment
-            ):
-                pass
-    text = re.sub(r"\x1b\[[0-9;]*m", "", log.read_text())
-    assert CROSSING_REFUSAL in text, log_tail(log)
-    crossings = CROSSING.findall(text)
-    assert crossings, log_tail(log)
-    for product, writer, written_on, reader, read_on in crossings:
-        hosts = {host.strip() for host in f"{written_on},{read_on}".split(",")}
-        assert {"rank-0", "rank-1"} <= hosts, (product, writer, reader, hosts)
 
 
 @pytest.mark.parametrize(
@@ -441,24 +390,44 @@ def test_block_bindings_release_cancelled_requests(
             leased[: min(visible_devices, local_devices)]
         )
     }
-    if two_hosts:
-        # Every eight-rank layout places its worker groups on all eight
-        # devices, four on each host, so the products its groups write and
-        # read would pass between the two hosts' main processes.
-        _assert_refused_across_hosts(
-            command, base_url, log, environment, address
+    with ExitStack() as deployment:
+        if two_hosts:
+            # Every eight-rank layout places its worker groups on all eight
+            # devices, four on each host: a product its ranks on one host
+            # write and its ranks on the other read is copied between the
+            # hosts by the reading host's Storage Server
+            # (docs/minimax_h3/minimax_h3.md, Two hosts). The second host's
+            # main process resolves its modules from that host's Build
+            # Server, which the leader asks to prepare the epoch's modules
+            # before any process starts there.
+            assert FOLLOWER is not None
+            follower_modules = deployment.enter_context(
+                remote_build_server(FOLLOWER)
+            )
+            deployment.enter_context(
+                second_host(
+                    FOLLOWER,
+                    log.with_name("h3-follower.log"),
+                    address,
+                    arguments=(
+                        "--set",
+                        f"build_config.socket={follower_modules}",
+                    ),
+                )
+            )
+        deployment.enter_context(
+            server_process(
+                command,
+                base_url,
+                # Startup prepares and captures every admitted duration at
+                # both text capacities; two-way tensor or pipeline layouts
+                # took 9 to 11 minutes to become ready on 4 x GB200.
+                log,
+                timeout_s=1800,
+                env=environment,
+            )
         )
-        return
-    with server_process(
-        command,
-        base_url,
-        # Startup prepares and captures every admitted duration at both text
-        # capacities; two-way tensor or pipeline layouts took 9 to 11 minutes
-        # to become ready on 4 x GB200.
-        log,
-        timeout_s=1800,
-        env=environment,
-    ):
+
         # Warm both decode geometries before exercising cancellation. Three
         # disconnects exceed the two provisioned slots and require their reuse.
         for payload, (seconds, _tokens, frames) in zip(
