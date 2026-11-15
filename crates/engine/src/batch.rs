@@ -559,29 +559,78 @@ pub enum Variant {
     Draft,
 }
 
-impl Variant {
-    /// The stage this variant is measured under, as a profiling session's `stages` and the fence
-    /// probes' histograms name it.
-    pub const fn stage(self) -> &'static str {
+/// The stage a forward is measured under: the variants of one computation together, as a
+/// profiling session's `stages` select steps and the fence probes' histograms group them.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Stage {
+    Decode,
+    Verify,
+    Draft,
+    Prefill,
+    TextEncoding,
+    Denoising,
+    VideoDecoding,
+    AudioDecoding,
+    VideoEncoding,
+    AudioEncoding,
+    Muxing,
+    LatentPreparation,
+    MediaReading,
+    ConditionEncoding,
+    ExpertJoin,
+}
+
+impl Stage {
+    /// The stage's name, as a profiling session's request selects it and its file records it.
+    pub const fn name(self) -> &'static str {
         match self {
-            Self::DecodeGreedy | Self::DecodeSampled => "decode",
-            Self::VerifyGreedy | Self::VerifySampled => "verify",
+            Self::Decode => "decode",
+            Self::Verify => "verify",
             Self::Draft => "draft",
+            Self::Prefill => "prefill",
+            Self::TextEncoding => "text_encoding",
+            Self::Denoising => "denoising",
+            Self::VideoDecoding => "video_decoding",
+            Self::AudioDecoding => "audio_decoding",
+            Self::VideoEncoding => "video_encoding",
+            Self::AudioEncoding => "audio_encoding",
+            Self::Muxing => "muxing",
+            Self::LatentPreparation => "latent_preparation",
+            Self::MediaReading => "media_reading",
+            Self::ConditionEncoding => "condition_encoding",
+            Self::ExpertJoin => "expert_join",
+        }
+    }
+}
+
+impl fmt::Display for Stage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl Variant {
+    /// The stage this variant is measured under.
+    pub const fn stage(self) -> Stage {
+        match self {
+            Self::DecodeGreedy | Self::DecodeSampled => Stage::Decode,
+            Self::VerifyGreedy | Self::VerifySampled => Stage::Verify,
+            Self::Draft => Stage::Draft,
             Self::PrefillWrite
             | Self::PrefillOutput
             | Self::PrefillGreedy
-            | Self::PrefillScored => "prefill",
-            Self::Encode => "text_encoding",
-            Self::Denoise => "denoising",
-            Self::Decode => "video_decoding",
-            Self::AudioDecode => "audio_decoding",
-            Self::VideoEncode => "video_encoding",
-            Self::AudioEncode => "audio_encoding",
-            Self::Mux => "muxing",
-            Self::LatentPrepare => "latent_preparation",
-            Self::MediaRead => "media_reading",
-            Self::ConditionEncode => "condition_encoding",
-            Self::ExpertJoin => "expert_join",
+            | Self::PrefillScored => Stage::Prefill,
+            Self::Encode => Stage::TextEncoding,
+            Self::Denoise => Stage::Denoising,
+            Self::Decode => Stage::VideoDecoding,
+            Self::AudioDecode => Stage::AudioDecoding,
+            Self::VideoEncode => Stage::VideoEncoding,
+            Self::AudioEncode => Stage::AudioEncoding,
+            Self::Mux => Stage::Muxing,
+            Self::LatentPrepare => Stage::LatentPreparation,
+            Self::MediaRead => Stage::MediaReading,
+            Self::ConditionEncode => Stage::ConditionEncoding,
+            Self::ExpertJoin => Stage::ExpertJoin,
         }
     }
 

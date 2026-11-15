@@ -17,6 +17,7 @@
 //! once per batch in its one domain: the wait in the worker's queue, the device time, and the
 //! copy and host time.
 
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use crate::batch::{Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase};
@@ -30,17 +31,58 @@ use super::{Output, Scheduler};
 /// How often a scheduler reports: one report per second.
 const STATS_PERIOD: Duration = Duration::from_secs(1);
 
-/// The domains calls are counted in, in the report's order.
-const DOMAINS: [&str; 3] = ["prefill", "decode", "flow"];
+/// The domain a call is counted in: the class of its batch's phase, with media work and the work
+/// of no phase of its own (a latent preparation) counted together as a media request's flow.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Domain {
+    /// Context ingestion: prefills, refills and encodes.
+    Prefill,
+    /// Token progress: decodes and verifications.
+    Decode,
+    /// A media request's work and its latent preparation.
+    Flow,
+}
 
-/// The report a scheduler counts into from its start: every counter zero, with the three domains
-/// in place.
+impl Domain {
+    /// The domain of the calls of a phase of `class`.
+    const fn of(class: PhaseClass) -> Self {
+        match class {
+            PhaseClass::Context => Self::Prefill,
+            PhaseClass::Token => Self::Decode,
+            PhaseClass::Media | PhaseClass::Background => Self::Flow,
+        }
+    }
+
+    /// The domain's name in the report (`DomainSchedulerStats::domain`).
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+            Self::Flow => "flow",
+        }
+    }
+}
+
+/// The domains a report states, in its order: the domain of every phase, each once, in the order
+/// of [`Domain`]. Derived from the phases, so a phase's calls always have their domain's entry.
+static DOMAINS: LazyLock<Vec<Domain>> = LazyLock::new(|| {
+    let mut domains: Vec<Domain> = Phase::ALL
+        .iter()
+        .map(|phase| Domain::of(phase.class()))
+        .collect();
+    domains.sort_unstable();
+    domains.dedup();
+    domains
+});
+
+/// The report a scheduler counts into from its start: every counter zero, with every domain in
+/// place.
 pub(super) fn empty() -> SchedulerStats {
     SchedulerStats {
         domain_stats: DOMAINS
             .iter()
-            .map(|name| DomainSchedulerStats {
-                domain: (*name).to_owned(),
+            .map(|domain| DomainSchedulerStats {
+                domain: domain.name().to_owned(),
                 ..DomainSchedulerStats::default()
             })
             .collect(),
@@ -328,13 +370,18 @@ impl Scheduler {
     }
 }
 
-/// The index in [`DOMAINS`] of the domain a phase's calls are counted in.
+/// The index in [`DOMAINS`], and in a report's `domain_stats`, of the domain a phase's calls are
+/// counted in.
+#[expect(
+    clippy::expect_used,
+    reason = "the domains are derived from every phase, so each phase's domain is among them"
+)]
 fn domain_of(phase: Phase) -> usize {
-    match phase.class() {
-        PhaseClass::Context => 0,
-        PhaseClass::Token => 1,
-        PhaseClass::Media | PhaseClass::Background => 2,
-    }
+    let domain = Domain::of(phase.class());
+    DOMAINS
+        .iter()
+        .position(|stated| *stated == domain)
+        .expect("every phase's domain is a domain of the report")
 }
 
 /// Adds `value` to a counter, which saturates at the wire's limit as `ForwardStats::merge` does.

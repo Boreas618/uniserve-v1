@@ -1285,7 +1285,7 @@ impl Thread {
 
         // A session's window is made of whole steps: its collectors are armed and disarmed
         // between two steps, with nothing of the device in flight.
-        let stage = batch.shape.variant.stage();
+        let stage = batch.shape.variant.stage().name();
         if forwards(&batch)
             && self
                 .session

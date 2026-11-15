@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::batch::Shape;
+use crate::batch::{Shape, Stage};
 use proto::config::{PolicyBudget, SchedulerConfig};
 use proto::request::RequestId;
 use scheduling::decision::{DispatchOutput, Room, Shortage, Victim};
@@ -864,7 +864,7 @@ pub fn ceilings<'a>(
 
     let tokens = buckets
         .iter()
-        .filter(|shape| shape.variant.stage() == "prefill")
+        .filter(|shape| shape.variant.stage() == Stage::Prefill)
         .map(|shape| shape.tokens)
         .max()
         .unwrap_or(u32::MAX);

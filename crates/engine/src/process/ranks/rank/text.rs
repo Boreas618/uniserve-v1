@@ -22,8 +22,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::batch::Phase;
 use crate::batch::product::VISION_FEATURES;
+use crate::batch::{Phase, Stage};
 use crate::memory::buffers::BufferMemory;
 use crate::memory::cache::{CacheLayout, KvCacheMemory};
 use crate::memory::state::StateMemory;
@@ -207,7 +207,7 @@ impl ModelRunner {
         let widest = self
             .buckets()
             .iter()
-            .filter(|bucket| bucket.variant.stage() == "prefill")
+            .filter(|bucket| bucket.variant.stage() == Stage::Prefill)
             .map(|bucket| bucket.tokens)
             .max()
             .unwrap_or(0);

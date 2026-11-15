@@ -170,8 +170,8 @@ fn a_numerical_fault_fails_its_request_alone_and_is_reported_with_its_batch() {
         .iter()
         .position(|id| *id == faulted)
         .unwrap();
-    let call = format!("(call {}.{row}, {:?})", batch.0, Phase::Decode);
-    assert!(message.ends_with(&call), "{message}");
+    let call = format!("call {}.{row} ({:?}) failed", batch.0, Phase::Decode);
+    assert!(message.starts_with(&call), "{message}");
     assert_eq!(harness.tokens(other).len(), 8);
     assert_eq!(harness.failure(), None);
 }

@@ -36,12 +36,15 @@
 //! `free` gives up its blocks (each owner's `Detach`, through the executor) and the request is
 //! forgotten.
 
+use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::batch::media::{SharedMedia, SharedMediaError};
-use crate::batch::{ArtifactHandle, Batch, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase};
+use crate::batch::{
+    ArtifactHandle, Batch, BatchId, BatchOutput, CallOutput, CallStatus, ErrorCode, Phase,
+};
 use proto::config::WorkerGroupRole;
 use proto::request::{
     ArtifactEvent, Event, FinishReason, MediaKind, MigrationCause, PositionLogprobs, RejectionKind,
@@ -56,13 +59,72 @@ use super::{
     monotonic_nanos, unix_secs,
 };
 
-/// The message of a token call that failed for a reason other than its input, a numerical fault or
-/// a fatal failure of its rank (`S/generation/mod.rs:737-742`).
-const CALL_FAILED: &str = "worker status invalid: call_failed";
+/// Why a request fails once its execution began (SD §7.2 "A call's failure"): the message of its
+/// `Error` event is this failure's statement.
+#[derive(Debug, Clone, PartialEq)]
+enum Failure {
+    /// Call `row` of batch `batch`, of `phase`, failed on its rank with `code` and the rank's
+    /// `message`, for a reason that leaves the rank serving and the request's inputs valid (a
+    /// numerical fault included); a video call the rank refused without a reason too.
+    Call {
+        batch: BatchId,
+        row: usize,
+        phase: Phase,
+        code: Option<ErrorCode>,
+        message: Option<String>,
+    },
+    /// Call `row` of batch `batch`, of `phase`, returned an output a call of its phase cannot
+    /// return at the request's progress.
+    Output {
+        batch: BatchId,
+        row: usize,
+        phase: Phase,
+    },
+    /// The request's final muxing call, call `row` of batch `batch`, published no artifact.
+    Unpublished { batch: BatchId, row: usize },
+    /// The artifact the request's final muxing call published could not be opened, for the
+    /// stated reason.
+    Artifact(String),
+}
 
-/// The message of a video request whose call failed or returned an output its call cannot return
-/// (`S/execution/results.rs:185`).
-const MEDIA_CALL_FAILED: &str = "media worker call failed";
+impl fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Call {
+                batch,
+                row,
+                phase,
+                code,
+                message,
+            } => {
+                write!(formatter, "call {}.{row} ({phase:?}) failed", batch.0)?;
+                if let Some(code) = code {
+                    write!(formatter, ": {code}")?;
+                }
+                if let Some(message) = message {
+                    write!(formatter, ": {message}")?;
+                }
+                Ok(())
+            }
+            Self::Output { batch, row, phase } => write!(
+                formatter,
+                "call {}.{row} ({phase:?}) returned an output its call cannot return",
+                batch.0
+            ),
+            Self::Unpublished { batch, row } => write!(
+                formatter,
+                "the final muxing call {}.{row} published no artifact",
+                batch.0
+            ),
+            Self::Artifact(reason) => {
+                write!(
+                    formatter,
+                    "the request's artifact cannot be opened: {reason}"
+                )
+            }
+        }
+    }
+}
 
 /// A batch's output (SD §3.7).
 impl Scheduler {
@@ -158,7 +220,12 @@ impl Scheduler {
                 continue;
             }
             if !valid {
-                self.fail_request(id, MEDIA_CALL_FAILED.to_owned());
+                let output = Failure::Output {
+                    batch: batch.id,
+                    row,
+                    phase: batch.phase,
+                };
+                self.fail_request(id, &output);
                 continue;
             }
 
@@ -281,7 +348,11 @@ impl Scheduler {
         }
 
         let Some(published) = call.media_output else {
-            return self.fail_request(id, "media output was not finalized".to_owned());
+            let unpublished = Failure::Unpublished {
+                batch: batch.id,
+                row,
+            };
+            return self.fail_request(id, &unpublished);
         };
         match open_artifact(&published) {
             Ok(media) => {
@@ -297,8 +368,13 @@ impl Scheduler {
             // (`S/execution/results.rs:57-72`).
             Err(error) => {
                 let message = format!("{:#}", anyhow::Error::new(error));
-                self.send(id, Event::ArtifactUnavailable { message });
-                self.fail_request(id, MEDIA_CALL_FAILED.to_owned());
+                self.send(
+                    id,
+                    Event::ArtifactUnavailable {
+                        message: message.clone(),
+                    },
+                );
+                self.fail_request(id, &Failure::Artifact(message));
             }
         }
     }
@@ -385,12 +461,19 @@ impl Scheduler {
         }
 
         let video = self.requests.get(&id).is_some_and(Request::is_video);
+        let failure = Failure::Call {
+            batch: batch.id,
+            row,
+            phase: batch.phase,
+            code: call.error_code,
+            message: call.error_message.clone(),
+        };
         if call.error_code == Some(ErrorCode::InputError) {
-            // A video request whose rank states no reason fails as any media call does.
+            // A video request whose rank states no reason fails as any other failed call does.
             let message = match (&call.error_message, video) {
                 (Some(message), _) => message.clone(),
                 (None, false) => "the worker refused the request's inputs".to_owned(),
-                (None, true) => return self.fail_request(id, MEDIA_CALL_FAILED.to_owned()),
+                (None, true) => return self.fail_request(id, &failure),
             };
             let rejection = Event::Rejected {
                 kind: RejectionKind::Invalid,
@@ -398,22 +481,14 @@ impl Scheduler {
             };
             return self.finish(id, rejection);
         }
-
-        let message = if video {
-            MEDIA_CALL_FAILED.to_owned()
-        } else {
-            format!(
-                "{CALL_FAILED} (call {}.{row}, {:?})",
-                batch.id.0, batch.phase
-            )
-        };
-        self.fail_request(id, message);
+        self.fail_request(id, &failure);
     }
 
-    /// Fails a request with `message`: a token request is sent `Error` at once and ends with
-    /// `Finished { Error }`, a video request ends with the `Error` (`S/output.rs:976`, the old
-    /// scheduler's `Terminal::Failed`).
-    fn fail_request(&mut self, id: RequestId, message: String) {
+    /// Fails a request for `failure`, which its `Error` event states: a token request is sent
+    /// `Error` at once and ends with `Finished { Error }`, a video request ends with the `Error`
+    /// (`S/output.rs:976`, the old scheduler's `Terminal::Failed`).
+    fn fail_request(&mut self, id: RequestId, failure: &Failure) {
+        let message = failure.to_string();
         if self.requests.get(&id).is_some_and(Request::is_video) {
             return self.finish(id, Event::Error { message });
         }
@@ -2039,7 +2114,7 @@ mod tests {
                 [
                     (ID, Event::Error { message }),
                     (ID, Event::Finished { reason: FinishReason::Error, .. }),
-                ] if message == "worker status invalid: call_failed (call 7.0, Decode)"
+                ] if message == "call 7.0 (Decode) failed: compute_error"
             )
         ));
 

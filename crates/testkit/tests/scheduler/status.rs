@@ -333,8 +333,8 @@ fn an_abort_ends_a_running_request_with_aborted() {
 }
 
 /// A call that failed for a reason other than its input, a numerical fault or its rank's loss
-/// fails its request: an `Error` naming the batch, the row and the phase, then `Finished` with
-/// `Error` (SD §7.2 "A call's failure").
+/// fails its request: an `Error` naming the batch, the row, the phase and the rank's error code,
+/// then `Finished` with `Error` (SD §7.2 "A call's failure").
 #[test]
 fn a_failed_call_fails_its_request_with_an_error_naming_the_call() {
     let mut harness = Deployment::tokens().build();
@@ -350,12 +350,10 @@ fn a_failed_call_fails_its_request_with_an_error_naming_the_call() {
     };
     let failed = harness.batches_of(id).pop().unwrap();
     let row = failed.requests.iter().position(|of| *of == id).unwrap();
+    let call = format!("call {}.{row} ({:?}) failed", failed.id.0, Phase::Decode);
+    assert!(message.starts_with(&call), "{message}");
     assert!(
-        message.ends_with(&format!(
-            "(call {}.{row}, {:?})",
-            failed.id.0,
-            Phase::Decode
-        )),
+        message.contains(ErrorCode::ResourceError.as_str()),
         "{message}"
     );
     let generated = events.len() - 3;
