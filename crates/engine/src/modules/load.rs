@@ -7,9 +7,13 @@
 //! a generation update on a job thread of its own: a call to the Build Server has no deadline of
 //! its own, since a module it does not hold is built first, and a build takes minutes, so no
 //! scheduler, worker or control thread makes one. Each module is loaded into the device's
-//! context as a kernel, a cubin or a native library chosen by the entry it defines.
+//! context as a kernel: a cubin module's image with its launch metadata, or a native module's
+//! library from the store's own file, each the file the Build Server's module contract names for
+//! its form (`build_server::source`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
@@ -25,9 +29,6 @@ use crate::modules::select::{
     Routes, fixed_revisions, interface_agrees, named_backends, selected_slots,
 };
 
-/// The operator a scheduling policy's package fills (`specs/scheduler-design.md` §5).
-const POLICY_OP: &str = "scheduling";
-
 /// The Build Server's selection of a generation's packages for `keys`, every descriptor key the
 /// generation launches by operator, on `targets`, the devices' architectures: the packages by
 /// slot, and the keys each slot's package builds.
@@ -39,7 +40,7 @@ const POLICY_OP: &str = "scheduling";
 ///
 /// An operator this build has no implementation of, the Build Server's refusal, or a key no
 /// installed package covers.
-pub(crate) fn select(
+pub fn select(
     client: &mut Client,
     targets: &[Target],
     named: &Packages,
@@ -94,7 +95,7 @@ pub(crate) fn select(
 /// A device that states no architecture or has no context, the Build Server's refusal to prepare
 /// or resolve a module, a module whose interface or form this build does not install, or the
 /// driver's refusal to load it.
-pub(crate) fn install(
+pub fn install(
     client: &mut Client,
     device: DeviceId,
     packages: &Packages,
@@ -159,10 +160,9 @@ pub(crate) fn install(
                 "building a module for the new generation"
             );
         })
-        .map_err(|error| anyhow::anyhow!("building the new generation: {}", causes(&error)))?;
+        .context("building the new generation")?;
 
     let mut entries = Vec::new();
-    let mut copies = 0_usize;
     for (slot, package) in &prepared {
         let operator = proto::module::operator::named(&slot.op)
             .with_context(|| format!("operator {} has no implementation in this build", slot.op))?;
@@ -177,38 +177,14 @@ pub(crate) fn install(
                         "resolving a module of the new generation"
                     );
                 })
-                .map_err(|error| {
-                    tracing::warn!(
-                        op = %slot.op,
-                        key = %key,
-                        error = ?error,
-                        "resolving this generation's module failed"
-                    );
-                    anyhow::anyhow!("resolving {} for {key}: {}", slot.op, causes(&error))
-                })?;
+                .with_context(|| format!("resolving {} for {key}", slot.op))?;
             interface_agrees(operator, package, module.interface_version)
                 .map_err(anyhow::Error::msg)?;
-            let module = resolved(module)?;
-            if module.copied() {
-                copies += 1;
-            }
+            let module =
+                Resolved::of(module).with_context(|| format!("reading {} for {key}", slot.op))?;
 
-            let entry = match ops::install(&device, operator, key, module.as_ops()?) {
-                Ok(entry) => entry,
-                Err(error) => {
-                    // The refusal that travels is one line; this is the whole value, so a
-                    // failure whose own message is empty still shows which call, status and code
-                    // it carried.
-                    tracing::warn!(
-                        operator,
-                        key = %key,
-                        error = ?error,
-                        "installing this generation's kernel failed"
-                    );
-                    report_missing_entry(&error);
-                    bail!("installing {operator} for {key}: {}", causes(&error));
-                }
-            };
+            let entry = ops::install(&device, operator, key, module.as_ops())
+                .with_context(|| format!("installing {operator} for {key}"))?;
             if let Some(entry) = entry {
                 entries.push(entry);
             }
@@ -217,7 +193,6 @@ pub(crate) fn install(
 
     tracing::info!(
         modules = entries.len(),
-        copies,
         %target,
         "this device's modules are installed for the new generation"
     );
@@ -253,7 +228,7 @@ pub(crate) fn policy(
     );
     let module = client
         .resolve(
-            POLICY_OP,
+            proto::module::POLICY,
             package,
             &target,
             build_server::manifest::SINGLE_KEY,
@@ -265,7 +240,7 @@ pub(crate) fn policy(
                 );
             },
         )
-        .map_err(|error| anyhow::anyhow!("resolving {named} for {target}: {}", causes(&error)))?;
+        .with_context(|| format!("resolving {named} for {target}"))?;
     tracing::info!(
         backend = %package.backend,
         revision = package.revision,
@@ -293,9 +268,7 @@ pub(crate) fn policy(
                 build_server::source::MODULE_WASM
             )
         })?;
-    let mut bytes = Vec::with_capacity(file.size as usize);
-    std::io::Read::read_to_end(&mut &file.file, &mut bytes)
-        .with_context(|| format!("reading {named}'s module"))?;
+    let bytes = read(&file).with_context(|| format!("reading {named}'s module"))?;
 
     let module = crate::scheduler::policy::load(&bytes)
         .map_err(|error| anyhow::anyhow!("loading {named}'s module: {error}"))?;
@@ -334,383 +307,105 @@ pub(crate) fn parameters(package: &PackageRevision) -> Result<Parameters> {
     })
 }
 
-/// One module the Build Server resolved, held open while its kernel loads.
+/// One module the Build Server resolved, in the form `ops::install` takes, each part the file the
+/// Build Server's module contract names for the module's form: a cubin module's image
+/// ([`build_server::source::MODULE_CUBIN`]) with the launch metadata the module names, whose
+/// kernel is the symbol it launches; a native module's library
+/// ([`build_server::source::MODULE_SO`]) with the launch entry the package declared. The Build
+/// Server checks both at build: a cubin module carries its image and metadata naming a kernel,
+/// and a native library defines every entry its package declares.
 ///
-/// The server sends the module's files as open handles rather than as paths, so the image is read
-/// through the handle: a cubin's bytes are small and read once, and a native library is loaded
-/// through the handle's `/proc/self/fd` path, which names the same inode the server sent. Every
-/// handle stays open until the kernel has loaded, so neither read reaches a file that has gone.
-struct Resolved {
-    image: Option<Vec<u8>>,
-    metadata: Option<Vec<u8>>,
-    native: Option<NativeModule>,
-    entry: String,
-}
-
-/// The path `dlopen` loads a native module from.
-///
-/// `dlopen` takes a path, and the handle the Build Server sends has none of its own. The file is
-/// used where it still has a name - glibc keys a loaded object by the name it was opened with, so a
-/// name this process derives from a descriptor would stand for the next module to land on that
-/// number, and one library's handle would serve another. When the store's file has no name left, the
-/// bytes are copied to one this process owns and that copy goes when the module does: `dlopen` maps
-/// the file, so the mapping outlives the name.
-struct NativeModule {
-    path: std::path::PathBuf,
-    /// The copy, when the handle the server sent named no file of its own.
-    copy: Option<std::path::PathBuf>,
-}
-
-impl NativeModule {
-    /// Whether this module was loaded from a copy rather than from the store's own file.
-    fn copied(&self) -> bool {
-        self.copy.is_some()
-    }
-}
-
-impl Drop for NativeModule {
-    fn drop(&mut self) {
-        let Some(copy) = &self.copy else {
-            return;
-        };
-        if let Err(error) = std::fs::remove_file(copy) {
-            tracing::warn!(
-                path = %copy.display(),
-                %error,
-                "removing this process's copy of a native module failed"
-            );
-        }
-    }
-}
-
-/// The file a native module's library is, and the path it is loaded from.
-///
-/// **Never by position.** A `paged_attention` module holds `module.so` beside `cubins/`, and `cubins`
-/// sorts before `module.so`, so taking the first file handed `dlopen` a cubin and the result was
-/// `cannot open shared object file`. The library is the file that defines the entry the package
-/// declared, which is the property `dlopen` is for; a module whose files define it in more than one
-/// place, or in none, is refused by name with its files listed.
-///
-/// A module with siblings is never loaded from a copy, and never from a descriptor number. Its entry
-/// receives no path - `ops::Entry` takes the call structure and the stream - so the object finds its
-/// own `cubins/` from the file it was loaded from: `paged_attention`'s module does it with `dladdr`
-/// of its own entry and takes the directory of `dli_fname`
-/// (`crates/ops/kernels/paged_attention/trtllm/src/entry.cpp`, `module_directory`). `dli_fname` is the
-/// path handed to `dlopen`, so that path must be the module's own file: `/proc/self/fd/<n>` gives the
-/// directory `/proc/self/fd`, and a copy gives the copy's directory. Both are refusals here instead
-/// of a load that dies at the first cubin.
-fn native_library(
-    files: Vec<build_server::ModuleFile>,
-    entry: &str,
-) -> crate::worker::Result<NativeModule> {
-    let invalid = |reason: String| crate::worker::Error::Invalid(reason);
-    let siblings = files.len() > 1;
-    let chosen = match files.len() {
-        0 => return Err(invalid("a native module carries no library".to_owned())),
-        // One file: the module's library is that file, and there is no order to get wrong.
-        1 => 0,
-        _ => {
-            let defining: Vec<usize> = files
-                .iter()
-                .enumerate()
-                .filter(|(_, file)| defines_entry(file, entry))
-                .map(|(index, _)| index)
-                .collect();
-            let names = |chosen: &[usize]| {
-                chosen
-                    .iter()
-                    .filter_map(|index| files.get(*index))
-                    .map(|file| file.name.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            match defining.as_slice() {
-                [only] => *only,
-                [] => {
-                    return Err(invalid(format!(
-                        "no file of this native module defines the entry the package declared \
-                         ({entry}), so nothing in it is that module's library: {}",
-                        names(&(0..files.len()).collect::<Vec<_>>())
-                    )));
-                }
-                several => {
-                    return Err(invalid(format!(
-                        "several files of this native module define the entry the package declared \
-                         ({entry}), so its library is ambiguous: {}",
-                        names(several)
-                    )));
-                }
-            }
-        }
-    };
-    let file = files
-        .into_iter()
-        .nth(chosen)
-        .ok_or_else(|| invalid("the chosen library file is missing".to_owned()))?;
-    if siblings {
-        // The question a reader of a failed load has: where does this object look for the files
-        // beside it? A module that resolves them itself uses the path it was loaded from - `dladdr`
-        // of its own entry - so that directory is where it looks, and `origin` says whether it also
-        // states `$ORIGIN` in a run path, which is the other way a sibling can be found.
-        let module = match std::fs::read_link(format!("/proc/self/fd/{}", as_raw_fd(&file))) {
-            Ok(target) => target,
-            Err(_) => std::path::PathBuf::new(),
-        };
-        tracing::info!(
-            library = %file.name,
-            loaded_from = %module.display(),
-            directory = %module.parent().map(|path| path.display().to_string()).unwrap_or_default(),
-            origin = ?origin_in_runpath(&file),
-            "this native module's library sits beside other files of the module"
-        );
-    }
-    native_module(&file, !siblings)
-}
-
-/// Whether a file defines `entry` among the functions it exports.
-fn defines_entry(file: &build_server::ModuleFile, entry: &str) -> bool {
-    bytes_of(file)
-        .and_then(|bytes| platform::NativeLibrary::defined_functions(&bytes))
-        .is_some_and(|names| names.iter().any(|name| name == entry))
-}
-
-/// The file's bytes, read from the start: the handle the server sent may have been read already.
-fn bytes_of(file: &build_server::ModuleFile) -> Option<Vec<u8>> {
-    use std::io::{Read as _, Seek as _};
-    let mut handle = &file.file;
-    handle.seek(std::io::SeekFrom::Start(0)).ok()?;
-    let mut bytes = Vec::with_capacity(file.size as usize);
-    handle.read_to_end(&mut bytes).ok()?;
-    Some(bytes)
-}
-
-/// Whether the object states `$ORIGIN` in its run path: the one way it can find a sibling file by
-/// its own location. `None` when the object states no run path, or cannot be read.
-fn origin_in_runpath(file: &build_server::ModuleFile) -> Option<bool> {
-    let bytes = bytes_of(file)?;
-    let path = platform::NativeLibrary::run_path(&bytes)?;
-    Some(path.contains("$ORIGIN"))
-}
-
-/// The descriptor behind a module's file, for the line that says where the object will look for its
-/// siblings.
-fn as_raw_fd(file: &build_server::ModuleFile) -> std::os::fd::RawFd {
-    use std::os::fd::AsRawFd as _;
-    file.file.as_raw_fd()
-}
-
-/// The path a native module is loaded from: the store's own file when it still has one, and a copy
-/// this process owns when the handle the server sent has outlived its name.
-fn native_module(
-    file: &build_server::ModuleFile,
-    copy_allowed: bool,
-) -> crate::worker::Result<NativeModule> {
-    use std::io::Read as _;
-    use std::os::fd::AsRawFd as _;
-
-    let invalid = |reason: String| crate::worker::Error::Invalid(reason);
-    let link = format!("/proc/self/fd/{}", file.file.as_raw_fd());
-    if let Ok(target) = std::fs::read_link(&link) {
-        let named = !target.to_string_lossy().ends_with(" (deleted)");
-        if named && target.is_file() {
-            return Ok(NativeModule {
-                path: target,
-                copy: None,
-            });
-        }
-    }
-
-    // The handle names nothing this process can open: the server unlinked the file after sending
-    // it, or the descriptor addresses something that is not a file. One copy, under a name no
-    // other module shares - and only for a module that stands alone, because a copy is a different
-    // location and every path the module resolves from its own location would break.
-    if !copy_allowed {
-        return Err(invalid(format!(
-            "the library of this native module ({}) has no name this process can open, and the \
-             module holds files beside it: loading it from a copy would lose them, because the \
-             entry receives no path and the object finds them through its own location",
-            file.name
-        )));
-    }
-
-    static COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let ordinal = COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!("uniserve-native-{}", std::process::id()));
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| invalid(format!("preparing {}: {error}", directory.display())))?;
-    let name: String = file
-        .name
-        .chars()
-        .map(|held| {
-            if held.is_ascii_alphanumeric() || held == '.' || held == '_' || held == '-' {
-                held
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let path = directory.join(format!("{ordinal}-{name}"));
-    let mut bytes = Vec::with_capacity(file.size as usize);
-    (&file.file)
-        .read_to_end(&mut bytes)
-        .map_err(|error| invalid(format!("reading {}: {error}", file.name)))?;
-    std::fs::write(&path, &bytes)
-        .map_err(|error| invalid(format!("writing {}: {error}", path.display())))?;
-    tracing::warn!(
-        module = %file.name,
-        path = %path.display(),
-        "the store's file has no name this process can open, so the module is loaded from a copy \
-         it owns"
-    );
-    Ok(NativeModule {
-        copy: Some(path.clone()),
-        path,
-    })
+/// A native library is loaded from the store's own file ([`build_server::ModuleFile::path`]),
+/// which the server and this process share on their host and which names the module's bytes for
+/// as long as the store holds them. The object finds the files beside it (a `paged_attention`
+/// module's `cubins/`) from the path it was loaded from (`dladdr` of its own entry), so the path
+/// is the module directory's own file and never a copy or a descriptor's.
+enum Resolved {
+    Cubin {
+        image: Vec<u8>,
+        metadata: Vec<u8>,
+        entry: String,
+    },
+    Native {
+        library: PathBuf,
+        entry: String,
+    },
 }
 
 impl Resolved {
-    /// Whether this module was loaded from a copy rather than from the store's own file: the one
-    /// fact that tells a store whose handles name their files from a store whose do not.
-    fn copied(&self) -> bool {
-        self.native.as_ref().is_some_and(NativeModule::copied)
+    /// Reads `module` into the form `ops::install` takes.
+    ///
+    /// # Errors
+    ///
+    /// A form this process does not install as a kernel (a scheduling policy's wasm, an
+    /// executable), a module that lacks the file or the entry its form names, a file that cannot
+    /// be read, or launch metadata that names no kernel.
+    fn of(module: build_server::Module) -> Result<Self> {
+        let named = |name: &str| {
+            module
+                .files
+                .iter()
+                .find(|file| file.name == name)
+                .with_context(|| format!("the {:?} module carries no {name}", module.form))
+        };
+
+        match module.form {
+            build_server::manifest::ModuleForm::Cubin => {
+                let metadata_name = module
+                    .metadata
+                    .as_deref()
+                    .context("the cubin module names no launch metadata")?;
+                let image = read(named(build_server::source::MODULE_CUBIN)?)?;
+                let metadata = read(named(metadata_name)?)?;
+                let entry = ops::CubinMetadata::parse(&metadata)
+                    .with_context(|| format!("reading the cubin's metadata {metadata_name}"))?
+                    .name;
+                Ok(Self::Cubin {
+                    image,
+                    metadata,
+                    entry,
+                })
+            }
+            build_server::manifest::ModuleForm::Native => {
+                let entry = module
+                    .entries
+                    .get(build_server::manifest::LAUNCH_ENTRY)
+                    .context("the native module states no launch entry")?
+                    .clone();
+                let library = named(build_server::source::MODULE_SO)?.path.clone();
+                Ok(Self::Native { library, entry })
+            }
+            other => bail!("a {other:?} module is not a kernel this process installs"),
+        }
     }
 
     /// The module as `ops::install` takes it.
-    fn as_ops(&self) -> crate::worker::Result<ops::Module<'_>> {
-        match (&self.image, &self.native) {
-            (Some(image), _) => Ok(ops::Module::Cubin {
+    fn as_ops(&self) -> ops::Module<'_> {
+        match self {
+            Self::Cubin {
                 image,
-                metadata: self.metadata.as_deref(),
-                entry: &self.entry,
-            }),
-            (None, Some(native)) => Ok(ops::Module::Native {
-                path: native.path.as_path(),
-                entry: &self.entry,
-            }),
-            (None, None) => Err(crate::worker::Error::Invalid(
-                "a resolved module carries neither a cubin image nor a native library".to_owned(),
-            )),
-        }
-    }
-}
-
-/// An error with every cause behind it, in one line.
-///
-/// A refusal that names only its own variant is the one thing a log cannot act on: `platform: ...`
-/// with the driver's own message behind it says what failed, and the chain is where that message
-/// lives. Each cause is taken from `source`, so nothing here has to know which errors there are.
-fn causes<E: std::error::Error + std::fmt::Debug>(error: &E) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
-        source = cause.source();
-    }
-
-    // A failure whose own message is empty is the one a reader cannot act on, and an error type is
-    // free to have one: the whole value says what it was, so it is what gets said.
-    if text.trim().is_empty() {
-        return format!("{error:?}");
-    }
-    text
-}
-
-/// States what an object defines when the entry a package declared is not among its symbols.
-///
-/// `dlsym` says yes or no and nothing else, so a `NativeSymbol` failure names the entry that was
-/// looked for and leaves "what does this object have" open - the fact that turns the failure
-/// into a fix. The line never changes the failure: the install still returns exactly what it did.
-fn report_missing_entry(error: &ops::Error) {
-    let ops::Error::Platform(platform::Error::NativeSymbol { path, symbol, .. }) = error else {
-        return;
-    };
-    match defined_entries(path) {
-        Some((total, names)) => tracing::warn!(
-            symbol = %symbol,
-            path = %path.display(),
-            defined = total,
-            entries = %names.join(", "),
-            "the object does not define the entry the package declared: these are the entries it \
-             does define"
-        ),
-        None => tracing::warn!(
-            symbol = %symbol,
-            path = %path.display(),
-            "the object does not define the entry the package declared, and this process could \
-             not read the object's own entry table"
-        ),
-    }
-}
-
-/// The functions the object at `path` defines for the dynamic linker: how many, and the first few.
-/// `None` when the file cannot be read or is not an object `platform`'s reader understands.
-fn defined_entries(path: &std::path::Path) -> Option<(usize, Vec<String>)> {
-    let bytes = std::fs::read(path).ok()?;
-    let names = platform::NativeLibrary::defined_functions(&bytes)?;
-    let first = names.iter().take(8).cloned().collect();
-    Some((names.len(), first))
-}
-
-/// Reads a resolved module into the form `ops::install` takes, or refuses a form this build cannot
-/// install: a scheduling policy's wasm package and a package the main process runs as its
-/// own process are not kernels.
-fn resolved(module: build_server::Module) -> crate::worker::Result<Resolved> {
-    use std::io::Read as _;
-
-    let invalid = |reason: String| crate::worker::Error::Invalid(reason);
-    let mut files = module.files.into_iter();
-    match module.form {
-        build_server::manifest::ModuleForm::Cubin => {
-            let mut image = None;
-            let mut metadata = None;
-            for file in &mut files {
-                let mut bytes = Vec::with_capacity(file.size as usize);
-                let mut handle = &file.file;
-                handle
-                    .read_to_end(&mut bytes)
-                    .map_err(|error| invalid(format!("reading {}: {error}", file.name)))?;
-                if module.metadata.as_deref() == Some(file.name.as_str()) {
-                    metadata = Some(bytes);
-                } else {
-                    image = Some(bytes);
-                }
-            }
-            let Some(image) = image else {
-                return Err(invalid("a cubin module carries no image".to_owned()));
-            };
-            // The image's kernel symbol is its metadata's name; without metadata the package names
-            // the entry itself, and `ops` falls back to the module's single entry.
-            let entry = match &metadata {
-                Some(metadata) => {
-                    ops::CubinMetadata::parse(metadata)
-                        .map_err(|error| invalid(format!("the cubin's metadata: {error}")))?
-                        .name
-                }
-                None => String::new(),
-            };
-            Ok(Resolved {
-                image: Some(image),
                 metadata,
-                native: None,
                 entry,
-            })
+            } => ops::Module::Cubin {
+                image,
+                metadata: Some(metadata),
+                entry,
+            },
+            Self::Native { library, entry } => ops::Module::Native {
+                path: library,
+                entry,
+            },
         }
-        build_server::manifest::ModuleForm::Native => {
-            let Some(entry) = module.entries.get(build_server::manifest::LAUNCH_ENTRY) else {
-                return Err(invalid("a native module states no launch entry".to_owned()));
-            };
-            Ok(Resolved {
-                image: None,
-                metadata: None,
-                native: Some(native_library(files.collect(), entry)?),
-                entry: entry.clone(),
-            })
-        }
-        other => Err(invalid(format!(
-            "a {other:?} module is not a kernel this process installs"
-        ))),
     }
+}
+
+/// A module file's bytes, read through the handle the Build Server sent.
+fn read(file: &build_server::ModuleFile) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(file.size as usize);
+    (&file.file)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", file.name))?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -744,107 +439,95 @@ mod tests {
         assert!(parameters(&package("max_batch = \"eight\"")).is_err());
     }
 
-    /// The library of a multi-file native module is chosen by what it defines, never by position.
-    ///
-    /// A `paged_attention` module holds `module.so` beside `cubins/`, and `cubins/` sorts first, so
-    /// the first file is not the library. Here two real objects
-    /// stand in for those files with the library named so it sorts **second**, and the entry declared
-    /// is one only it defines.
-    ///
-    /// The directory is the module, and the mechanism is the package's own: `paged_attention`'s entry
-    /// takes no path and finds `cubins/` from `dladdr` of its own symbol, whose `dli_fname` is the
-    /// path this process handed `dlopen`. So the path must be the module's own file - which is what
-    /// the assertions below hold: the library is that file, it is not a copy, and the sibling sits in
-    /// the directory the object will look in. A `/proc/self/fd/<n>` path would give it
-    /// `/proc/self/fd`, and a copy would give it the copy's directory.
+    /// A native module's library is the file the module contract names, `module.so`, loaded
+    /// from the store's own path whatever the order of its files, so the files beside it are in
+    /// the directory the object looks in; a cubin module's image is `module.cubin` and its kernel
+    /// the one its metadata names, whatever other file the module holds.
     #[test]
-    fn a_native_library_is_the_file_that_defines_the_entry_not_the_first_one() {
-        let Some(libc) = loaded_library("libc.so.6") else {
-            return;
-        };
-        let Some(libm) = loaded_library("libm.so.6") else {
-            return;
-        };
-        let directory =
-            std::env::temp_dir().join(format!("uniserve-native-test-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).expect("a temporary directory for this test");
-        let sibling = directory.join("aa-sibling.so");
-        let library = directory.join("zz-module.so");
-        std::fs::copy(&libm, &sibling).expect("the sibling object is copied");
-        std::fs::copy(&libc, &library).expect("the library object is copied");
+    fn a_module_s_files_are_read_by_the_roles_its_form_names() {
+        let store = tempfile::tempdir().unwrap();
+        let file = |name: &str, bytes: &[u8]| stored(store.path(), name, bytes);
 
-        let module = native_library(
-            vec![
-                opened_file("aa-sibling.so", &sibling),
-                opened_file("zz-module.so", &library),
+        // `cubins/` sorts before `module.so`, as in a `paged_attention` module.
+        let native = build_server::Module {
+            form: build_server::manifest::ModuleForm::Native,
+            files: vec![
+                file("cubins/kernel.cubin", b"cubin"),
+                file(build_server::source::MODULE_SO, b"library"),
             ],
-            "malloc",
-        )
-        .expect("the file that defines the entry is the module's library");
-        assert_eq!(
-            module.path, library,
-            "the library was resolved by position in the module, not by the entry it defines"
-        );
-        assert!(
-            !module.copied(),
-            "the library has a name of its own, so no copy is made"
-        );
-        assert!(
-            module.path.with_file_name("aa-sibling.so").is_file(),
-            "the module's sibling is not reachable from the location the library is loaded from"
-        );
-
-        // The same module with its library unlinked after the handle was taken: a copy would carry
-        // no sibling, so the module is refused by name rather than loaded from one.
-        let nameless = directory.join("nameless.so");
-        std::fs::copy(&libc, &nameless)
-            .expect("the library object is copied under a temporary name");
-        let handle = std::fs::File::open(&nameless).expect("the copy opens");
-        std::fs::remove_file(&nameless).expect("the copy is unlinked, as a store's handle may be");
-
-        let refused = match native_library(
-            vec![
-                opened_file("aa-sibling.so", &sibling),
-                build_server::ModuleFile {
-                    name: "nameless.so".to_owned(),
-                    size: std::fs::metadata(&sibling)
-                        .map(|meta| meta.len())
-                        .unwrap_or_default(),
-                    file: handle,
-                    path: nameless.clone(),
-                },
-            ],
-            "malloc",
-        ) {
-            Ok(_) => panic!("a module with siblings was loaded from a copy"),
-            Err(error) => format!("{error}"),
+            metadata: None,
+            entries: BTreeMap::from([(
+                build_server::manifest::LAUNCH_ENTRY.to_owned(),
+                "launch_attention".to_owned(),
+            )]),
+            interface_version: 1,
         };
+        let Resolved::Native { library, entry } = Resolved::of(native).unwrap() else {
+            panic!("a native module reads as a native library");
+        };
+        assert_eq!(library, store.path().join(build_server::source::MODULE_SO));
+        assert_eq!(entry, "launch_attention");
         assert!(
-            refused.contains("nameless.so") && refused.contains("copy"),
-            "the refusal names neither the file nor the copy: {refused}"
+            library
+                .with_file_name("cubins")
+                .join("kernel.cubin")
+                .is_file(),
+            "the module's sibling is not beside the path the library is loaded from"
         );
 
-        let _ = std::fs::remove_dir_all(&directory);
+        let cubin = build_server::Module {
+            form: build_server::manifest::ModuleForm::Cubin,
+            files: vec![
+                file("launch.json", br#"{"name":"rms_norm_kernel"}"#),
+                file(build_server::source::MODULE_CUBIN, b"image"),
+                file("tuning.json", b"{}"),
+            ],
+            metadata: Some("launch.json".to_owned()),
+            entries: BTreeMap::new(),
+            interface_version: 1,
+        };
+        let Resolved::Cubin { image, entry, .. } = Resolved::of(cubin).unwrap() else {
+            panic!("a cubin module reads as a cubin");
+        };
+        assert_eq!(image, b"image");
+        assert_eq!(entry, "rms_norm_kernel");
     }
 
-    /// The object a pattern names, as the process's own maps record it: a real ELF on this host.
-    fn loaded_library(pattern: &str) -> Option<std::path::PathBuf> {
-        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
-        maps.lines()
-            .filter_map(|line| line.split_whitespace().last())
-            .find(|path| path.contains(pattern) && path.starts_with('/'))
-            .map(std::path::PathBuf::from)
+    /// A module that lacks the file its form names is refused by that name.
+    #[test]
+    fn a_module_without_the_file_its_form_names_is_refused() {
+        let store = tempfile::tempdir().unwrap();
+        let module = build_server::Module {
+            form: build_server::manifest::ModuleForm::Native,
+            files: vec![stored(store.path(), "other.so", b"library")],
+            metadata: None,
+            entries: BTreeMap::from([(
+                build_server::manifest::LAUNCH_ENTRY.to_owned(),
+                "launch".to_owned(),
+            )]),
+            interface_version: 1,
+        };
+
+        let Err(refused) = Resolved::of(module) else {
+            panic!("a native module without module.so was read");
+        };
+        assert!(
+            format!("{refused:#}").contains(build_server::source::MODULE_SO),
+            "{refused:#}"
+        );
     }
 
-    /// One file of a module under test, opened the way the store's handles are.
-    fn opened_file(name: &str, path: &std::path::Path) -> build_server::ModuleFile {
+    /// One file of a module under test, written into `store` and opened as the store's handles
+    /// are.
+    fn stored(store: &std::path::Path, name: &str, bytes: &[u8]) -> build_server::ModuleFile {
+        let path = store.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
         build_server::ModuleFile {
             name: name.to_owned(),
-            size: std::fs::metadata(path)
-                .map(|meta| meta.len())
-                .unwrap_or_default(),
-            file: std::fs::File::open(path).expect("the test's object opens"),
-            path: path.to_path_buf(),
+            size: bytes.len() as u64,
+            file: std::fs::File::open(&path).unwrap(),
+            path,
         }
     }
 }

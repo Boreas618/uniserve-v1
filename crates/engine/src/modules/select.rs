@@ -14,11 +14,16 @@ use proto::module::{ModuleSlot, PackageRevision, Packages, Phase};
 
 /// The descriptor keys of each slot a selection filled, by slot: the keys its package was selected
 /// for, and the only keys that package is asked to build.
-pub(crate) type Routes = BTreeMap<ModuleSlot, Vec<String>>;
+pub type Routes = BTreeMap<ModuleSlot, Vec<String>>;
 
 /// The backends a deployment names for `op`, as the Build Server's selection takes them: each
-/// slot's backend, its phase, and its revision when the daemon pinned one. A slot with a part is
-/// a candidate of the module set, not a preference, so it is none of these.
+/// slot's backend, its phase, and its revision. A slot with a part is a candidate of the module
+/// set, not a preference, so it is none of these.
+///
+/// Every revision of a launch's module set is fixed: the daemon fixes each package the
+/// deployment names, at the revision it states or its latest installed one, before it launches
+/// an epoch or prepares an update (`daemon::engine::control::with_store_modules`), so the engine
+/// passes each one on as it is and the Build Server refuses a revision it does not hold.
 pub(crate) fn named_backends(op: &str, named: &Packages) -> Vec<Preference> {
     named
         .iter()
@@ -26,19 +31,20 @@ pub(crate) fn named_backends(op: &str, named: &Packages) -> Vec<Preference> {
         .map(|(slot, package)| Preference {
             phase: slot.phase,
             backend: package.backend.clone(),
-            revision: (package.revision != 0).then_some(package.revision),
+            revision: Some(package.revision),
         })
         .collect()
 }
 
 /// The revisions the epoch's module set fixed for `op`'s packages, each a backend and its
-/// revision: every slot of the operator whose revision the daemon fixed. The Build Server
-/// selects among exactly these, so a package or a revision installed after the set was fixed is
-/// not run. Empty when the set states none, which leaves the selection to what is installed.
+/// revision: every slot of the operator, named or a candidate. The Build Server selects among
+/// exactly these, so a package or a revision installed after the set was fixed is not run. Empty
+/// when the set names no package of the operator, which leaves the selection to what is
+/// installed.
 pub(crate) fn fixed_revisions(op: &str, named: &Packages) -> Vec<(String, u32)> {
     let mut fixed: Vec<(String, u32)> = named
         .iter()
-        .filter(|(slot, package)| slot.op == op && package.revision != 0)
+        .filter(|(slot, _)| slot.op == op)
         .map(|(_, package)| (package.backend.clone(), package.revision))
         .collect();
     fixed.sort();
@@ -456,7 +462,6 @@ mod tests {
         set.insert(ModuleSlot::all("paged_attention"), package("trtllm", 4));
         set.insert(candidate("trtllm"), package("trtllm", 4));
         set.insert(candidate("triton"), package("triton", 2));
-        set.insert(ModuleSlot::all("gemm"), package("cublas", 0));
 
         assert_eq!(
             fixed_revisions("paged_attention", &set),
@@ -472,14 +477,14 @@ mod tests {
         );
         assert!(
             fixed_revisions("gemm", &set).is_empty(),
-            "a revision the daemon has not fixed is not stated"
+            "an operator the set names no package of leaves the selection to the store"
         );
     }
 
-    /// The named backends of an operator carry their phase, and a revision only once the daemon
-    /// pinned one.
+    /// The named backends of an operator carry their phase and the revision the module set
+    /// fixed.
     #[test]
-    fn named_backends_carry_their_phase_and_pinned_revision() {
+    fn named_backends_carry_their_phase_and_fixed_revision() {
         let mut named = Packages::new();
         named.insert(
             ModuleSlot::phase("paged_attention", Phase::Prefill),
@@ -487,7 +492,7 @@ mod tests {
         );
         named.insert(
             ModuleSlot::phase("paged_attention", Phase::Decode),
-            package("triton", 0),
+            package("triton", 2),
         );
         named.insert(ModuleSlot::all("gemm"), package("cublas", 1));
 
@@ -502,7 +507,7 @@ mod tests {
                 Preference {
                     phase: Some(Phase::Decode),
                     backend: "triton".to_owned(),
-                    revision: None,
+                    revision: Some(2),
                 },
             ]
         );

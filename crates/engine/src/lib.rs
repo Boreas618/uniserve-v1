@@ -26,12 +26,12 @@
 //! | [`runner`] | The runners (causal language model, encoder, vision, denoiser, decoder, media host), graphs, buckets, the sampler | worker |
 //! | [`memory`] | A rank's memory: block tables, product buffers, the KV cache's planes, recurrent state, weights, the division of the quota, the client of the Storage Server (head and rank) | worker, start |
 //! | `profiling`, `parallel` | Profiling sessions and markers; communicators of a rank's groups | worker |
-//! | `modules` | Resolution of packages at the Build Server | start, jobs |
+//! | [`modules`] | Resolution of packages at the Build Server and the load of their modules | start, jobs |
 
 pub mod batch;
 pub mod executor;
 pub mod memory;
-mod modules;
+pub mod modules;
 mod parallel;
 mod process;
 mod profiling;
