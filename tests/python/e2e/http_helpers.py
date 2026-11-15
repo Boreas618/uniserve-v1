@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import os
+import secrets
 import shlex
 import shutil
 import signal
@@ -113,10 +114,44 @@ def granted_devices(count: int) -> str:
     return ",".join(devices[:count])
 
 
+# The lowest port `find_free_port` draws: above the well-known and common
+# service ports.
+PORT_FLOOR = 20000
+
+
+def _ephemeral_floor() -> int:
+    """The lowest port of the kernel's ephemeral range (Linux: 32768)."""
+    try:
+        text = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text()
+        return int(text.split()[0])
+    except (OSError, ValueError, IndexError):
+        return 32768
+
+
 def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+    """A loopback TCP port that is free now and outside the ephemeral range.
+
+    A server binds the port it is given only once it serves, which can be
+    minutes after the port was chosen, and the deployment's processes bind
+    ephemeral ports meanwhile (their ranks' rendezvous listeners, NCCL's
+    bootstrap): a port taken from the ephemeral range can be handed to one of
+    them, so that the test's readiness probe reaches that process and the
+    server cannot bind its port. The port is drawn at random below the range,
+    so concurrent tests seldom draw the same one, and checked free by binding
+    it.
+    """
+    ceiling = _ephemeral_floor()
+    for _ in range(1000):
+        port = PORT_FLOOR + secrets.randbelow(ceiling - PORT_FLOOR)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError(
+        f"no free port between {PORT_FLOOR} and {ceiling} after 1000 draws"
+    )
 
 
 def require_uniserve_binary() -> Path:

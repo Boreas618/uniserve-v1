@@ -17,6 +17,12 @@
 //! sends every member the address table, and each member connects to every
 //! member with a lower index above zero. One round forms the full mesh.
 //!
+//! Every startup connection opens with [`JOIN_MAGIC`] and a bounded frame. The
+//! listeners are ephemeral loopback ports, so another local process may reach
+//! one (an HTTP client probing a port it chose before the daemon bound it); a
+//! connection that does not open with the magic within [`HANDSHAKE_TIMEOUT`]
+//! is closed and the rendezvous goes on accepting members.
+//!
 //! Collective ordering: every member must call the same collectives in the
 //! same order, and one member runs one collective at a time.
 
@@ -40,6 +46,19 @@ const INLINE_SEND_BYTES: usize = 32 << 10;
 pub(crate) const FIXED_RECORD_BYTES: usize = 56;
 
 const CONNECT_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The bytes every startup connection opens with, before its first frame: a
+/// connection without them is not a member of the group.
+const JOIN_MAGIC: [u8; 8] = *b"USHGJOIN";
+
+/// How long an accepted connection may take to open with [`JOIN_MAGIC`]. A
+/// member writes it as soon as it connects; a connection that stays silent
+/// longer is not a member.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The longest startup frame: a member's hello, index or the address table
+/// (one `host:port` line per member).
+const HANDSHAKE_FRAME_BYTES: usize = 1 << 20;
 
 /// One member's connections to every other member of a group.
 pub(crate) struct HostGroup {
@@ -102,9 +121,12 @@ impl HostGroup {
             listener
                 .set_nonblocking(true)
                 .map_err(|error| Error::transport_source("rendezvous listener", error))?;
-            for _ in 1..size {
+            let mut joined = 1;
+            while joined < size {
                 let stream = accept(&listener, deadline)?;
-                let hello = read_frame(&stream)?;
+                let Some(hello) = handshake(&stream, deadline)? else {
+                    continue;
+                };
                 let (member, address) = parse_hello(&hello, size)?;
                 if member == 0 || peers[member].is_some() {
                     return Err(Error::transport(format!(
@@ -113,6 +135,7 @@ impl HostGroup {
                 }
                 table[member] = address;
                 peers[member] = Some(stream);
+                joined += 1;
             }
 
             let encoded = table.join("\n").into_bytes();
@@ -133,11 +156,11 @@ impl HostGroup {
                 .local_addr()
                 .map_err(|error| Error::transport_source("host group listener", error))?
                 .port();
-            write_frame(
+            write_join(
                 &first,
                 format!("{rank}\n{}", SocketAddr::new(interface, port)).as_bytes(),
             )?;
-            let table = String::from_utf8(read_frame(&first)?)
+            let table = String::from_utf8(read_bounded_frame(&first, HANDSHAKE_FRAME_BYTES)?)
                 .map_err(|_| Error::transport("host group address table is not text"))?;
             let table: Vec<&str> = table.split('\n').collect();
             if table.len() != size {
@@ -149,15 +172,19 @@ impl HostGroup {
 
             for (member, address) in table.iter().enumerate().take(rank).skip(1) {
                 let stream = connect(address, deadline)?;
-                write_frame(&stream, rank.to_string().as_bytes())?;
+                write_join(&stream, rank.to_string().as_bytes())?;
                 peers[member] = Some(stream);
             }
             listener
                 .set_nonblocking(true)
                 .map_err(|error| Error::transport_source("host group listener", error))?;
-            for _ in rank + 1..size {
+            let mut joined = rank + 1;
+            while joined < size {
                 let stream = accept(&listener, deadline)?;
-                let member = std::str::from_utf8(&read_frame(&stream)?)
+                let Some(index) = handshake(&stream, deadline)? else {
+                    continue;
+                };
+                let member = std::str::from_utf8(&index)
                     .ok()
                     .and_then(|text| text.parse::<usize>().ok())
                     .filter(|&member| member > rank && member < size)
@@ -168,6 +195,7 @@ impl HostGroup {
                     )));
                 }
                 peers[member] = Some(stream);
+                joined += 1;
             }
         }
 
@@ -466,15 +494,56 @@ fn write_frame(mut stream: &TcpStream, value: &[u8]) -> Result<()> {
         .map_err(|error| Error::transport_source("host group send", error))
 }
 
+/// Open a startup connection: [`JOIN_MAGIC`], then one frame.
+fn write_join(mut stream: &TcpStream, value: &[u8]) -> Result<()> {
+    stream
+        .write_all(&JOIN_MAGIC)
+        .map_err(|error| Error::transport_source("host group send", error))?;
+    write_frame(stream, value)
+}
+
+/// The first frame of an accepted startup connection, or `None` when the
+/// connection is not a member's: it closed, stayed silent for
+/// [`HANDSHAKE_TIMEOUT`] or did not open with [`JOIN_MAGIC`]. The caller drops
+/// such a connection and accepts the next. After the magic, the connection is
+/// a member's, and a malformed or oversized frame is an error.
+fn handshake(stream: &TcpStream, deadline: Instant) -> Result<Option<Vec<u8>>> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    stream
+        .set_read_timeout(Some(HANDSHAKE_TIMEOUT.min(remaining).max(CONNECT_INTERVAL)))
+        .map_err(|error| Error::transport_source("host group connection", error))?;
+    let mut magic = [0; JOIN_MAGIC.len()];
+    let mut reader = stream;
+    if reader.read_exact(&mut magic).is_err() || magic != JOIN_MAGIC {
+        return Ok(None);
+    }
+    stream
+        .set_read_timeout(Some(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(CONNECT_INTERVAL),
+        ))
+        .map_err(|error| Error::transport_source("host group connection", error))?;
+    read_bounded_frame(stream, HANDSHAKE_FRAME_BYTES).map(Some)
+}
+
 /// Read one length-prefixed frame.
 fn read_frame(stream: &TcpStream) -> Result<Vec<u8>> {
+    read_bounded_frame(stream, usize::MAX)
+}
+
+/// Read one length-prefixed frame of at most `limit` bytes; a longer length
+/// is refused before anything is allocated for it.
+fn read_bounded_frame(stream: &TcpStream, limit: usize) -> Result<Vec<u8>> {
     let mut reader = stream;
     let mut length = [0; 8];
     reader
         .read_exact(&mut length)
         .map_err(|error| Error::transport_source("host group receive", error))?;
     let length = usize::try_from(u64::from_le_bytes(length))
-        .map_err(|_| Error::transport("host group frame is too large"))?;
+        .ok()
+        .filter(|&length| length <= limit)
+        .ok_or_else(|| Error::transport("host group frame is too large"))?;
     let mut value = vec![0; length];
     reader
         .read_exact(&mut value)
@@ -510,6 +579,47 @@ mod tests {
                 .map(|handle| handle.join().unwrap())
                 .collect()
         })
+    }
+
+    /// Another local process reaching the rendezvous port (an HTTP client
+    /// probing a port it took for its own) neither stops nor joins the group:
+    /// its connection is closed and the members form the mesh.
+    #[test]
+    fn a_stranger_on_the_rendezvous_does_not_stop_the_group() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let mut stranger = TcpStream::connect(&address).unwrap();
+        stranger
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+        let mut listener = Some(listener);
+        let results: Vec<Vec<Vec<u8>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..3)
+                .map(|rank| {
+                    let listener = listener.take().filter(|_| rank == 0);
+                    let address = address.as_str();
+                    scope.spawn(move || {
+                        let group =
+                            HostGroup::connect(address, listener, rank, 3, Duration::from_secs(30))
+                                .unwrap();
+                        group.all_gather_bytes(&[rank as u8]).unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        for values in results {
+            assert_eq!(values, vec![vec![0], vec![1], vec![2]]);
+        }
+        // The stranger's connection was closed without an answer.
+        let mut answer = Vec::new();
+        stranger
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(stranger.read_to_end(&mut answer).unwrap_or(0), 0);
     }
 
     #[test]
