@@ -2664,10 +2664,12 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "proto",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "toml",
 ]
 
 [[package]]

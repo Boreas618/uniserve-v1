@@ -6,8 +6,8 @@ license.workspace = true
 publish = false
 
 # `uniserve-manager`: the optional external manager of deployments. It knows
-# the daemons only through their HTTP admin API and depends on no workspace
-# crate, so it attaches to and detaches from nodes of any build.
+# the daemons only through their HTTP admin API, whose schema it reads from
+# the interface crate the daemons serve it from (`proto::admin`).
 [[bin]]
 name = "uniserve-manager"
 path = "src/main.rs"
@@ -15,14 +15,19 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+# The admin API's schema (`proto::admin`).
+proto.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
-# Simulated daemons' admin APIs, which the update ordering is tested against.
+# Stand-in daemons' admin APIs, which serve the admin schema the update ordering is tested
+# against.
 axum.workspace = true
+# A package's parameters in the stand-ins' dry runs (`proto::module::PackageRevision`).
+toml.workspace = true
 
 [lints]
 workspace = true

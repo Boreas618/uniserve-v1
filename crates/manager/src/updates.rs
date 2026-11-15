@@ -1,48 +1,40 @@
-//! Updates of several services that share GPUs and hosts:
-//! the manager decides the order in
-//! which their updates run and calls each service's admin API in turn; no
-//! node waits for it, and every step within one service is that service's
-//! own (`PUT /admin/config`, its trial, `POST /admin/config/commit`).
+//! Updates of several services that share GPUs: the manager decides the order in which their
+//! updates run and calls each service's admin API in turn; no node waits for it, and every step
+//! within one service is that service's own (`PUT /admin/config`, its trial, `POST
+//! /admin/config/commit`).
 //!
-//! Each `--node` is the leader daemon of one service (one served model
-//! name). Before it starts a service's update, the manager reads the GPUs
-//! the service's epochs hold (`GET /admin/config`, `gpus`) and asks for the
-//! update's dry run (`PUT /admin/config` with `dry_run`): whether it starts a
-//! new epoch, the GPUs its successor prepares on, each host's host storage
-//! it requires and admits, and whether every GPU and host it uses has the
-//! storage it requires (the dry run's `storage` and `redistribution`). The
-//! decision:
+//! Each `--node` is the leader daemon of one service (one served model name). Before it starts
+//! a service's update, the manager reads the GPUs the service's epochs hold (`GET
+//! /admin/config`, `gpus`, each named by its host and UUID) and asks for the update's dry run
+//! (`PUT /admin/config` with `dry_run`): whether it changes anything and whether it starts a new
+//! epoch, which prepares beside the serving one on the service's GPUs. The decision:
 //!
-//! - Services are taken in the order given. One whose update starts a new
-//!   epoch starts only when no update in progress (preparing, or on trial
-//!   until the manager commits it) holds one of its GPUs, so two services
-//!   that share a GPU are never prepared at once; when its dry run, made just
-//!   then, finds the storage it requires on every GPU and host; and when
-//!   the host storage it requires on a host, beside what the updates in
-//!   progress there required, is within what the host admits. Services
-//!   that share no GPU, and whose host storage fits together, update at
-//!   once.
-//! - A service that cannot start waits, and its dry run is made again whenever an
-//!   update in progress ends: a commit releases the previous epoch's
-//!   storage, which may make it fit.
-//! - Each update runs to its end: applied in place, or a new epoch on
-//!   trial, which the manager commits once it served `--commit-after`
-//!   seconds (completing the service's remaining replica trials), or which
-//!   rolled back by itself meanwhile (`update_config.rollback`). Without
-//!   `--commit-after` the trial stays for the operator, holding its GPUs.
-//! - A failed update or a rolled-back trial stops the services that have
-//!   not started; those in progress go on to their end.
+//! - Services are taken in the order given. One whose update starts a new epoch starts only
+//!   when no update in progress (preparing, or on trial until the manager commits it) holds one
+//!   of its GPUs, so two services that share a GPU are never prepared at once. Services that
+//!   share no GPU update at once.
+//! - A service that cannot start waits, and its dry run is made again whenever an update in
+//!   progress ends, so it starts from what its node states then.
+//! - Each update runs to its end: applied in place, or a new epoch on trial, which the manager
+//!   commits once it served `--commit-after` seconds, or which ended by itself meanwhile
+//!   (`update_config.rollback`), as the node's event log states. Without `--commit-after` the
+//!   trial stays for the operator, holding its GPUs.
+//! - A change of the daemon's own options restarts the daemon in place, and its successor
+//!   applies the rest of the change in an operation of its own: the manager waits for that
+//!   operation's end in the node's event log, which the restart carries over.
+//! - A failed update or a trial that ended without its commit stops the services that have not
+//!   started; those in progress go on to their end.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use serde_json::{Value, json};
+use proto::admin::{
+    ApplyRequest, ConfigChange, ConfigStatus, EventBody, Following, Gpu, OperationKind,
+    OperationResponse, OperationState, Phase, UpdateReport,
+};
 
-use crate::Node;
-
-/// A GPU: its host and its name as `nvidia-smi` prints its UUID.
-type Gpu = (String, String);
+use crate::node::{Node, Polling};
 
 /// What one service's update needs, from its status and its dry run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -52,192 +44,98 @@ pub(crate) struct Needs {
     /// Whether it starts a new epoch, which prepares beside the serving
     /// one and serves on trial.
     pub(crate) epoch: bool,
-    /// The GPUs the service's epochs hold and those its successor prepares
-    /// on.
+    /// The GPUs the service's epochs hold, which a new epoch prepares on.
     pub(crate) gpus: BTreeSet<Gpu>,
-    /// Each host's host storage the update requires and what the host
-    /// admits of new host storage, in bytes, as the dry run found them.
-    pub(crate) hosts: BTreeMap<String, (u64, u64)>,
-    /// Why the update does not fit now: the refusals its dry run states.
-    pub(crate) refusal: Option<String>,
 }
 
 impl Needs {
-    /// What the update of a service needs, from its status (`GET
-    /// /admin/config`) and its dry run's result (`PUT /admin/config` with
-    /// `dry_run`): one replica's report, the reports of every independent
-    /// replica (`replicas`), a group change's report (`previous_epochs`), or
-    /// an idle node's deployment (`deployment`).
-    pub(crate) fn of(status: &Value, result: &Value) -> Self {
-        let mut needs = Self::default();
-        let held = status["gpus"].as_array().into_iter().flatten();
-        needs.gpus.extend(held.filter_map(gpu));
-        if result["change"] != "dry_run" {
-            return needs;
-        }
-        let dry_run = &result["dry_run"];
-        let replicas: Vec<&Value> = match dry_run["replicas"].as_array() {
-            Some(replicas) => replicas.iter().collect(),
-            None => vec![dry_run],
+    /// What the update of a service needs, from its status (`GET /admin/config`) and its dry
+    /// run's change (`PUT /admin/config` with `dry_run`): an update in place or of a
+    /// generation starts no epoch; one of an epoch does, as does an idle node's bring-up of a
+    /// deployment, which holds no GPU before it starts.
+    ///
+    /// # Errors
+    ///
+    /// A dry run that answered a change it made.
+    pub(crate) fn of(status: &ConfigStatus, change: &ConfigChange) -> Result<Self> {
+        use proto::admin::DryRun;
+
+        let gpus = status
+            .gpus
+            .iter()
+            .flatten()
+            .map(|share| share.gpu.clone())
+            .collect();
+        let epoch = match change {
+            ConfigChange::None => return Ok(Self::default()),
+            ConfigChange::DryRun { dry_run } => match dry_run {
+                DryRun::InPlace { .. } | DryRun::Generation { .. } => false,
+                DryRun::Epoch { .. } | DryRun::Deployment { .. } => true,
+            },
+            made => bail!("a dry run answered a change it made: {made:?}"),
         };
-        let mut refusals = Vec::new();
-        for replica in replicas {
-            let epoch = !replica["steps"].is_null()
-                || replica["deployment"].is_string()
-                || replica["previous_epochs"].is_array();
-            needs.epoch |= epoch;
-            needs.changes |= epoch || replica["epoch"] == true || replica["daemon"] == true;
-
-            // The report's `storage` names the GPUs the successor prepares on
-            // beside the serving epoch, and each host's admission.
-            let storage = &replica["storage"];
-            let prepared_gpus = storage["gpus"].as_array().into_iter().flatten();
-            needs.gpus.extend(prepared_gpus.filter_map(gpu));
-            for host in storage["hosts"].as_array().into_iter().flatten() {
-                let (Some(name), Some(required), Some(admits)) = (
-                    host["host"].as_str(),
-                    host["required"].as_u64(),
-                    host["admits"].as_u64(),
-                ) else {
-                    continue;
-                };
-                // A service's replicas update one at a time: the largest
-                // requirement on a host is the update's.
-                let entry = needs.hosts.entry(name.to_owned()).or_default();
-                *entry = (entry.0.max(required), admits);
-            }
-            if storage["feasible"] == false {
-                refusals.push(
-                    storage["refusal"]
-                        .as_str()
-                        .unwrap_or("the storage does not fit")
-                        .to_owned(),
-                );
-            }
-
-            // A successor on other GPUs (another parallel configuration,
-            // another replica's free GPUs) names them in its `redistribution`.
-            let redistributions: Vec<&Value> = match replica["redistribution"].as_array() {
-                Some(reports) => reports.iter().collect(),
-                None => vec![&replica["redistribution"]],
-            };
-            for report in redistributions {
-                let ranks = report["ranks"].as_array().into_iter().flatten();
-                needs.gpus.extend(ranks.filter_map(gpu));
-                if report["feasible"] == false {
-                    refusals.push(
-                        report["refusal"]
-                            .as_str()
-                            .unwrap_or("the target GPUs cannot hold the successor")
-                            .to_owned(),
-                    );
-                }
-            }
-            if replica["feasible"] == false {
-                let group = replica["refusals"].as_array().into_iter().flatten();
-                refusals.extend(group.filter_map(Value::as_str).map(str::to_owned));
-            }
-        }
-        refusals.dedup();
-        needs.refusal = (!refusals.is_empty()).then(|| refusals.join("; "));
-        needs
+        Ok(Self {
+            changes: true,
+            epoch,
+            gpus,
+        })
     }
 }
 
-/// A GPU an entry names with its `host` and `gpu`.
-fn gpu(entry: &Value) -> Option<Gpu> {
-    Some((
-        entry["host"].as_str()?.to_owned(),
-        entry["gpu"].as_str()?.to_owned(),
-    ))
-}
-
-/// Why an update that starts a new epoch waits.
+/// Why an update that starts a new epoch waits: it shares GPU `gpu` with the update in progress
+/// of service `with`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Wait {
-    /// It shares GPU `gpu` with the update in progress of service `with`.
-    Shares { with: usize, gpu: Gpu },
-    /// Its dry run does not fit: the dry run's refusal.
-    Refused(String),
-    /// Host `host` admits `admits` bytes of new host storage, and the
-    /// update requires `required` beside the `others` the updates in
-    /// progress there required.
-    Host {
-        host: String,
-        required: u64,
-        others: u64,
-        admits: u64,
-    },
+pub(crate) struct Wait {
+    with: usize,
+    gpu: Gpu,
 }
 
 impl Wait {
     /// The reason, naming services by their nodes in `nodes`.
     fn describe(&self, nodes: &[Node]) -> String {
-        match self {
-            Wait::Shares {
-                with,
-                gpu: (host, gpu),
-            } => format!(
-                "shares GPU {gpu} of {host} with {}, whose update is in progress",
-                nodes[*with].base
-            ),
-            Wait::Refused(refusal) => format!("its dry run does not fit: {refusal}"),
-            Wait::Host {
-                host,
-                required,
-                others,
-                admits,
-            } => format!(
-                "host {host} admits {admits} bytes of new host storage, and the update \
-                 requires {required} beside the {others} the updates in progress there required"
-            ),
-        }
+        format!(
+            "shares GPU {} with {}, whose update is in progress",
+            self.gpu, nodes[self.with].base
+        )
     }
 }
 
 /// Why the update `candidate` cannot start beside the updates in progress
 /// `beside`, by their services' indices, if it cannot.
 pub(crate) fn conflict(candidate: &Needs, beside: &BTreeMap<usize, Needs>) -> Option<Wait> {
-    for (with, other) in beside {
-        if let Some(gpu) = candidate.gpus.intersection(&other.gpus).next() {
-            return Some(Wait::Shares {
+    beside.iter().find_map(|(with, other)| {
+        candidate
+            .gpus
+            .intersection(&other.gpus)
+            .next()
+            .map(|gpu| Wait {
                 with: *with,
                 gpu: gpu.clone(),
-            });
-        }
-    }
-    if let Some(refusal) = &candidate.refusal {
-        return Some(Wait::Refused(refusal.clone()));
-    }
-    for (host, &(required, admits)) in &candidate.hosts {
-        let others: u64 = beside
-            .values()
-            .filter_map(|other| other.hosts.get(host))
-            .map(|(required, _)| required)
-            .sum();
-        if others > 0 && required + others > admits {
-            return Some(Wait::Host {
-                host: host.clone(),
-                required,
-                others,
-                admits,
-            });
-        }
-    }
-    None
+            })
+    })
 }
 
 /// How an update is applied and its trial ended.
 #[derive(Debug, Clone)]
 pub(crate) struct Options {
-    /// The body of `PUT /admin/config`, without `dry_run`.
-    pub(crate) body: Value,
+    /// The request of `PUT /admin/config`, without `dry_run`.
+    pub(crate) request: ApplyRequest,
     /// How long a new epoch serves on trial before the manager commits it;
     /// `None` leaves it on trial for the operator.
     pub(crate) commit_after: Option<Duration>,
-    /// How often the manager reads a node's status while it waits for an
-    /// operation the node runs on its own.
-    pub(crate) poll: Duration,
+    /// How the manager reads a node's event log while it waits.
+    pub(crate) polling: Polling,
+}
+
+impl Options {
+    /// The request of the update's dry run.
+    fn dry_run(&self) -> ApplyRequest {
+        ApplyRequest {
+            dry_run: true,
+            wait: true,
+            ..self.request.clone()
+        }
+    }
 }
 
 /// How one service's update ended.
@@ -249,14 +147,22 @@ enum Ended {
     OnTrial,
 }
 
-/// Updates every service of `nodes` as the module describes, and fails
-/// with every failed update, rolled-back trial and service that did not
-/// fit, once every update in progress ended.
-pub(crate) async fn apply(nodes: &[Node], options: &Options) -> Result<()> {
-    let mut request = options.body.clone();
-    request["dry_run"] = json!(true);
-    request["wait"] = json!(true);
+/// The dry run of `request` at `node`, and what its update needs.
+async fn needs(node: &Node, request: &ApplyRequest) -> Result<(ConfigChange, Needs)> {
+    let status = node.config().await?;
+    let response: OperationResponse<ConfigChange> = node
+        .send(reqwest::Method::PUT, "/admin/config", request)
+        .await?;
+    let change = response.result.context("the dry run answered no change")?;
+    let needs = Needs::of(&status, &change)?;
+    Ok((change, needs))
+}
 
+/// Updates every service of `nodes` as the module describes, and fails
+/// with every failed update and trial that ended without its commit, once every update in
+/// progress ended.
+pub(crate) async fn apply(nodes: &[Node], options: &Options) -> Result<()> {
+    let request = options.dry_run();
     let mut pending: VecDeque<usize> = (0..nodes.len()).collect();
     // The updates in progress or on trial, and what each needs.
     let mut holding: BTreeMap<usize, Needs> = BTreeMap::new();
@@ -265,22 +171,18 @@ pub(crate) async fn apply(nodes: &[Node], options: &Options) -> Result<()> {
     let mut failures = Vec::new();
     let mut running = tokio::task::JoinSet::new();
     loop {
-        // Make every waiting service's dry run again and start those that fit, in
+        // Make every waiting service's dry run again and start those that may, in
         // order, while no update failed.
         let mut deferred = VecDeque::new();
         while failures.is_empty()
             && let Some(index) = pending.pop_front()
         {
             let node = &nodes[index];
-            let read = async {
-                let status = node.get("/admin/config").await?.unwrap_or(Value::Null);
-                let response = node.put("/admin/config", &request).await?;
-                Ok::<_, anyhow::Error>(Needs::of(&status, &response["result"]))
-            }
-            .await
-            .with_context(|| format!("{}: the dry run of its update", node.base));
-            let needs = match read {
-                Ok(needs) => needs,
+            let needs = match needs(node, &request)
+                .await
+                .with_context(|| format!("{}: the dry run of its update", node.base))
+            {
+                Ok((_, needs)) => needs,
                 Err(error) => {
                     failures.push(format!("{error:#}"));
                     break;
@@ -350,22 +252,11 @@ pub(crate) async fn apply(nodes: &[Node], options: &Options) -> Result<()> {
             }
         );
     }
+    // Without a failure, a service that did not start shares a GPU with a trial the operator
+    // ends: it updates once the manager applies again after it.
     if !unstarted.is_empty() {
-        // A service that waits for a trial the operator ends updates once
-        // the manager applies again after it; one that fits nowhere while
-        // no update is in progress is refused.
-        let behind_trials = pending.iter().all(|index| {
-            matches!(waiting.get(index), Some(Wait::Shares { with, .. }) if on_trial.contains(with))
-        });
-        if behind_trials {
-            println!(
-                "after the trials end, apply again for: {}",
-                unstarted.join(", ")
-            );
-            return Ok(());
-        }
-        bail!(
-            "no update in progress leaves room for: {}",
+        println!(
+            "after the trials end, apply again for: {}",
             unstarted.join(", ")
         );
     }
@@ -373,21 +264,16 @@ pub(crate) async fn apply(nodes: &[Node], options: &Options) -> Result<()> {
 }
 
 /// Reports each service's dry run and the order [`apply`] takes them in from
-/// these: after the services before it that share one of its GPUs,
-/// and once its dry run fits. Changes nothing.
+/// these: after the services before it that share one of its GPUs. Changes nothing.
 pub(crate) async fn dry_run(nodes: &[Node], options: &Options) -> Result<()> {
-    let mut request = options.body.clone();
-    request["dry_run"] = json!(true);
-    request["wait"] = json!(true);
+    let request = options.dry_run();
     let mut services = Vec::new();
     for node in nodes {
-        let status = node.get("/admin/config").await?.unwrap_or(Value::Null);
-        let response = node
-            .put("/admin/config", &request)
+        let (change, needs) = needs(node, &request)
             .await
             .with_context(|| format!("{}: the dry run of its update", node.base))?;
-        println!("{}: {}", node.base, response["result"]);
-        services.push(Needs::of(&status, &response["result"]));
+        println!("{}: {}", node.base, serde_json::to_string(&change)?);
+        services.push(needs);
     }
     for (index, needs) in services.iter().enumerate() {
         let base = &nodes[index].base;
@@ -410,88 +296,152 @@ pub(crate) async fn dry_run(nodes: &[Node], options: &Options) -> Result<()> {
         } else {
             println!("{base}: a new epoch, after {}", after.join(", "));
         }
-        if let Some(refusal) = &needs.refusal {
-            println!("{base}: does not fit now: {refusal}");
-        }
     }
     Ok(())
 }
 
-/// Applies `options.body` to the service `node` serves and runs its
-/// trial to its end: committed once it served `options.commit_after`, with
-/// the service's remaining replica trials, or left on trial without it.
+/// Applies `options.request` to the service `node` serves and runs its trial to its end:
+/// committed once it served `options.commit_after`, or left on trial without it.
 async fn update(node: &Node, options: &Options) -> Result<Ended> {
-    let response = node
-        .put("/admin/config", &options.body)
+    // The events from now on state how what this apply starts ends.
+    let since = node.last_event().await?;
+    let response: OperationResponse<ConfigChange> = node
+        .send(reqwest::Method::PUT, "/admin/config", &options.request)
         .await
         .with_context(|| format!("{} did not change", node.base))?;
-    let mut result = response["result"].clone();
-    println!("{}: {result}", node.base);
-    if result["change"] == "daemon" && result["then"] == "update" {
-        // The hot restart's successor applies the rest of the change in an
-        // operation of its own, after this one.
-        let after = response["id"].as_u64().unwrap_or(0);
-        result = operation_after(node, after, options.poll).await?;
-        println!("{}: {result}", node.base);
-    }
+    let change = response
+        .result
+        .with_context(|| format!("{} answered no change", node.base))?;
+    println!("{}: {}", node.base, serde_json::to_string(&change)?);
+    let update = match change {
+        ConfigChange::Generation { update } | ConfigChange::Epoch { update } => update,
+        ConfigChange::Daemon {
+            then: Some(Following::Update),
+            ..
+        } => match after_restart(node, since, response.operation.id, options.polling).await? {
+            Some(update) => update,
+            None => return Ok(Ended::Done),
+        },
+        ConfigChange::None
+        | ConfigChange::InPlace { .. }
+        | ConfigChange::DryRun { .. }
+        | ConfigChange::Daemon { then: None, .. }
+        | ConfigChange::Deployment { .. } => return Ok(Ended::Done),
+    };
     // An update, in either form, serves on trial once the apply responded.
-    let update = result["update"].clone();
-    if update["phase"] != "trial" {
+    if update.phase != Phase::Trial {
         return Ok(Ended::Done);
     }
     let Some(trial_window) = options.commit_after else {
         return Ok(Ended::OnTrial);
     };
-    tokio::time::sleep(trial_window).await;
-    let status = node.get("/admin/config").await?.unwrap_or(Value::Null);
-    let standing = &status["update"];
-    if standing["update"] != update["update"] || standing["phase"] != "trial" {
+
+    // The trial serves its window unless it ends by itself before, as an update event states.
+    let ended_early = tokio::time::timeout(
+        trial_window,
+        node.wait_for(since, options.polling, |event| match &event.body {
+            EventBody::Update(report) if report.update == update.update && report.phase.ended() => {
+                Some(report.as_ref().clone())
+            }
+            _ => None,
+        }),
+    )
+    .await;
+    if let Ok(ended) = ended_early {
+        let report = ended?;
         bail!(
-            "{}: the trial rolled back before its commit ({})",
+            "{}: the trial ended {} before its commit ({})",
             node.base,
-            standing["failure"]
+            report.phase,
+            describe_failure(&report)
         );
     }
-    let committed = node.post("/admin/config/commit", &json!({})).await?;
-    println!("{}: committed {}", node.base, committed["result"]);
+    // The update stands on trial as the node states it now, which the commit then decides.
+    let standing = node.config().await?.update;
+    match &standing {
+        Some(report) if report.update == update.update && report.phase == Phase::Trial => {}
+        Some(report) if report.update == update.update => bail!(
+            "{}: the trial ended {} before its commit ({})",
+            node.base,
+            report.phase,
+            describe_failure(report)
+        ),
+        _ => bail!(
+            "{}: update {} is no longer the node's",
+            node.base,
+            update.update
+        ),
+    }
+    let committed: OperationResponse<UpdateReport> = node
+        .send(reqwest::Method::POST, "/admin/config/commit", &())
+        .await?;
+    println!(
+        "{}: committed {}",
+        node.base,
+        serde_json::to_string(&committed.result)?
+    );
     Ok(Ended::Done)
 }
 
-/// The result of the first `config` operation `node` ran after operation
-/// `after`, once it ended, reading its status every `poll`.
-async fn operation_after(node: &Node, after: u64, poll: Duration) -> Result<Value> {
-    loop {
-        if let Some(status) = node.get("/admin/status").await? {
-            let last = &status["last_operation"];
-            if status["operation"].is_null()
-                && last["kind"] == "config"
-                && last["id"].as_u64().is_some_and(|id| id > after)
+/// Why the update of `report` did not stand, as its failure states it.
+fn describe_failure(report: &UpdateReport) -> String {
+    report.failure.as_ref().map_or_else(
+        || "no failure stated".to_owned(),
+        |failure| format!("{}: {}", failure.kind, failure.reason),
+    )
+}
+
+/// The update the change that a daemon's hot restart left to its successor started: the
+/// successor applies it in an operation (`config`) after operation `restarted`, whose end the
+/// node's event log after `since` states; `None` when that change started no update.
+async fn after_restart(
+    node: &Node,
+    since: u64,
+    restarted: u64,
+    polling: Polling,
+) -> Result<Option<UpdateReport>> {
+    let operation = node
+        .wait_for(since, polling, |event| match &event.body {
+            EventBody::Operation(operation)
+                if operation.kind == OperationKind::Config
+                    && operation.id > restarted
+                    && operation.state != OperationState::Running =>
             {
-                if last["state"] == "succeeded" {
-                    return Ok(last["result"].clone());
-                }
-                bail!(
-                    "{}: the change after the daemon's hot restart failed: {}",
-                    node.base,
-                    last["error"]
-                );
+                Some(operation.clone())
             }
-        }
-        tokio::time::sleep(poll).await;
+            _ => None,
+        })
+        .await?;
+    if operation.state == OperationState::Failed {
+        bail!(
+            "{}: the change after the daemon's hot restart failed: {}",
+            node.base,
+            operation.error.unwrap_or_default()
+        );
     }
+    // An update is numbered by the operation that applied it.
+    let update = node.config().await?.update;
+    Ok(update.filter(|update| update.update == operation.id))
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use axum::extract::State;
+    use axum::extract::{Query, State};
     use axum::routing::{get, post};
     use axum::{Json, Router};
+    use proto::admin::{
+        ChangeForm, DryRun, EngineLaunch, Event, EventsPage, EventsQuery, Executing,
+        ExecutingState, Failure, FailureKind, GpuShare, GpuUuid, NodeState, Operation,
+        ReplicaStatus, Status,
+    };
+    use proto::module::PackageRevision;
+    use tokio::sync::Notify;
 
     use super::*;
 
-    /// What the simulated daemons were asked, in order (`"{service}:{call}"`),
+    /// What the stand-in daemons were asked, in order (`"{service}:{call}"`),
     /// and the services that committed.
     #[derive(Default)]
     struct Log {
@@ -522,82 +472,253 @@ mod tests {
         }
     }
 
-    /// A service's dry run, as its daemon reports it now.
-    type DryRun = Box<dyn Fn(&Log) -> Value + Send + Sync>;
+    /// How a stand-in daemon's apply goes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Apply {
+        /// A new epoch serves on trial until committed.
+        Trial,
+        /// A new epoch serves on trial and rolls back by itself at once.
+        RollsBack,
+        /// The daemon's own options change: it restarts, and its successor starts the new
+        /// epoch's update in an operation of its own.
+        Restarts,
+    }
 
-    /// One service's leader daemon, as far as the manager reads and drives
-    /// its admin API.
+    /// One service's leader daemon, as far as the manager reads and drives its admin API,
+    /// answering the admin schema the daemons serve.
     struct Daemon {
         name: &'static str,
         /// The GPUs its epochs hold, as `GET /admin/config` names them.
-        gpus: Vec<(&'static str, &'static str)>,
-        dry_run: DryRun,
-        /// Whether its trials roll back by themselves.
-        rolls_back: bool,
-        trial: Mutex<Option<u64>>,
+        gpus: Vec<Gpu>,
+        apply: Apply,
+        /// The update in flight or the last one.
+        update: Mutex<Option<UpdateReport>>,
+        /// Its event log, and what wakes a reader waiting for the next event.
+        events: Mutex<Vec<Event>>,
+        appended: Notify,
+        operations: Mutex<u64>,
         log: Arc<Log>,
     }
 
-    async fn config(State(daemon): State<Arc<Daemon>>) -> Json<Value> {
-        let trial = (*daemon.trial.lock().unwrap()).filter(|_| !daemon.rolls_back);
-        let gpus: Vec<Value> = daemon
+    impl Daemon {
+        fn record(&self, body: EventBody) {
+            let mut events = self.events.lock().unwrap();
+            let seq = events.len() as u64 + 1;
+            events.push(Event {
+                seq,
+                time: 0.0,
+                message: String::new(),
+                body,
+            });
+            drop(events);
+            self.appended.notify_waiters();
+        }
+
+        /// A succeeded operation of `kind`, its start and end recorded in the event log.
+        fn operation(&self, kind: OperationKind) -> Operation {
+            let mut number = self.operations.lock().unwrap();
+            *number += 1;
+            let mut operation = Operation {
+                id: *number,
+                kind,
+                state: OperationState::Running,
+                started: 0.0,
+                ended: None,
+                error: None,
+            };
+            self.record(EventBody::Operation(operation.clone()));
+            operation.state = OperationState::Succeeded;
+            operation.ended = Some(0.0);
+            self.record(EventBody::Operation(operation.clone()));
+            operation
+        }
+
+        /// Update `number` in `phase`, its event recorded, as the daemon's state.
+        fn enter(&self, number: u64, phase: Phase) -> UpdateReport {
+            let failure = (phase == Phase::RolledBack).then(|| {
+                Failure::new(
+                    FailureKind::Threshold(proto::admin::Threshold::FailureRate),
+                    "epoch 2 failed".to_owned(),
+                )
+            });
+            let report = UpdateReport {
+                change: ChangeForm::Epoch,
+                update: number,
+                phase,
+                epoch: 2,
+                rollback: phase == Phase::RolledBack,
+                switch_ms: None,
+                trial_s: None,
+                deadline_s: None,
+                failure,
+                uncompared: Vec::new(),
+                claim_failed: None,
+                generation: None,
+                epoch_form: None,
+                trial: None,
+                transfers: None,
+            };
+            *self.update.lock().unwrap() = Some(report.clone());
+            self.record(EventBody::Update(Box::new(report.clone())));
+            report
+        }
+    }
+
+    async fn status(State(daemon): State<Arc<Daemon>>) -> Json<Status> {
+        let next_event = daemon.events.lock().unwrap().len() as u64 + 1;
+        Json(Status {
+            version: "test".to_owned(),
+            node: NodeState::Idle { last_error: None },
+            operation: None,
+            last_operation: None,
+            next_event,
+        })
+    }
+
+    async fn events(
+        State(daemon): State<Arc<Daemon>>,
+        Query(query): Query<EventsQuery>,
+    ) -> Json<EventsPage> {
+        let read = |daemon: &Daemon| {
+            let events = daemon.events.lock().unwrap();
+            let found: Vec<Event> = events[(query.after as usize).min(events.len())..].to_vec();
+            let next = found.last().map_or(query.after, |event| event.seq);
+            EventsPage {
+                events: found,
+                next,
+                gap: false,
+            }
+        };
+        let notified = daemon.appended.notified();
+        let page = read(&daemon);
+        if !page.events.is_empty() {
+            return Json(page);
+        }
+        let _ = tokio::time::timeout(Duration::from_secs_f64(query.wait), notified).await;
+        Json(read(&daemon))
+    }
+
+    async fn config(State(daemon): State<Arc<Daemon>>) -> Json<ConfigStatus> {
+        let gpus = daemon
             .gpus
             .iter()
-            .map(|(host, gpu)| json!({ "host": host, "gpu": gpu, "used": 1 }))
+            .map(|gpu| GpuShare {
+                gpu: gpu.clone(),
+                total: 80,
+                quota: None,
+                used: 1,
+            })
             .collect();
-        // The update as the daemon reports it: on trial, or rolled back with
-        // its failure.
-        let update = match trial {
-            Some(number) => json!({ "update": number, "phase": "trial" }),
-            None if daemon.rolls_back => json!({
-                "update": 2,
-                "phase": "rolled_back",
-                "failure": { "kind": "sticky", "reason": "epoch 2 failed" },
-            }),
-            None => Value::Null,
+        let replica = ReplicaStatus {
+            config: String::new(),
+            digest: daemon.name.to_owned(),
+            executing: Executing {
+                epoch: 1,
+                state: ExecutingState::Serving,
+                reason: None,
+            },
         };
-        Json(json!({ "gpus": gpus, "update": update }))
+        Json(ConfigStatus {
+            first: Some(replica.clone()),
+            replicas: vec![replica],
+            gpus: Some(gpus),
+            quotas: None,
+            update: daemon.update.lock().unwrap().clone(),
+            unavailable: Vec::new(),
+            epochs: Vec::new(),
+            processes: Vec::new(),
+        })
     }
 
-    async fn change(State(daemon): State<Arc<Daemon>>, Json(body): Json<Value>) -> Json<Value> {
-        if body["dry_run"] == true {
+    async fn change(
+        State(daemon): State<Arc<Daemon>>,
+        Json(request): Json<ApplyRequest>,
+    ) -> Json<OperationResponse<ConfigChange>> {
+        let operation = daemon.operation(OperationKind::Config);
+        if request.dry_run {
             daemon.log.record(format!("{}:dry_run", daemon.name));
-            let report = (daemon.dry_run)(&daemon.log);
-            return Json(json!({
-                "id": 1, "kind": "config", "state": "succeeded",
-                "result": { "change": "dry_run", "dry_run": report },
-            }));
+            let dry_run = DryRun::Epoch {
+                epoch: 2,
+                engine: PackageRevision {
+                    backend: "uniserve".to_owned(),
+                    revision: 1,
+                    arguments: toml::Table::new(),
+                },
+                replicas: 1,
+                engines: vec![vec![EngineLaunch {
+                    host: daemon.gpus[0].host.clone(),
+                    launch_generation: 3,
+                }]],
+                shrink: false,
+            };
+            return Json(OperationResponse {
+                operation,
+                result: Some(ConfigChange::DryRun { dry_run }),
+            });
         }
         daemon.log.record(format!("{}:apply", daemon.name));
-        *daemon.trial.lock().unwrap() = Some(2);
-        Json(json!({
-            "id": 2, "kind": "config", "state": "succeeded",
-            "result": {
-                "change": "epoch",
-                "update": { "update": 2, "phase": "trial", "epoch": 2 },
+        let change = match daemon.apply {
+            Apply::Trial => ConfigChange::Epoch {
+                update: daemon.enter(operation.id, Phase::Trial),
             },
-        }))
+            Apply::RollsBack => {
+                let update = daemon.enter(operation.id, Phase::Trial);
+                // The trial's threshold passes right after the apply answered.
+                let rolling = Arc::clone(&daemon);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    rolling.enter(update.update, Phase::RolledBack);
+                });
+                ConfigChange::Epoch { update }
+            }
+            Apply::Restarts => {
+                // The successor applies the rest of the change once it serves.
+                let successor = Arc::clone(&daemon);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let operation = successor.operation(OperationKind::Config);
+                    successor.enter(operation.id, Phase::Trial);
+                });
+                ConfigChange::Daemon {
+                    pid: 42,
+                    then: Some(Following::Update),
+                }
+            }
+        };
+        Json(OperationResponse {
+            operation,
+            result: Some(change),
+        })
     }
 
-    async fn commit(State(daemon): State<Arc<Daemon>>) -> Json<Value> {
+    async fn commit(State(daemon): State<Arc<Daemon>>) -> Json<OperationResponse<UpdateReport>> {
         daemon.log.record(format!("{}:commit", daemon.name));
-        daemon.trial.lock().unwrap().take();
+        let operation = daemon.operation(OperationKind::Commit);
+        let number = daemon
+            .update
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |update| update.update);
+        let committed = daemon.enter(number, Phase::Committed);
         daemon
             .log
             .committed
             .lock()
             .unwrap()
             .insert(daemon.name.to_owned());
-        Json(json!({
-            "id": 3, "kind": "commit", "state": "succeeded",
-            "result": { "epoch": 2, "previous_epoch": 1 },
-        }))
+        Json(OperationResponse {
+            operation,
+            result: Some(committed),
+        })
     }
 
     /// Serves `daemon`'s admin API on a port of the loopback interface and
     /// returns the manager's node of it.
     async fn serve(daemon: Daemon) -> Node {
         let router = Router::new()
+            .route("/admin/status", get(status))
+            .route("/admin/events", get(events))
             .route("/admin/config", get(config).put(change))
             .route("/admin/config/commit", post(commit))
             .with_state(Arc::new(daemon));
@@ -607,58 +728,42 @@ mod tests {
         Node::new(&format!("http://{address}")).unwrap()
     }
 
-    /// The dry run of a new epoch beside the serving one on `gpus`, requiring
-    /// `required` bytes of host storage of host `rank-0`, which admits
-    /// 1000, and refused for `refusal`, as a daemon's dry run states it.
-    fn epoch(gpus: &[(&str, &str)], required: u64, refusal: Option<&str>) -> Value {
-        let gpus: Vec<Value> = gpus
-            .iter()
-            .map(|(host, gpu)| json!({ "host": host, "gpu": gpu, "feasible": refusal.is_none() }))
-            .collect();
-        json!({
-            "epoch": true,
-            "daemon": false,
-            "steps": [{ "step": "shrink" }, { "step": "prepare" }, { "step": "promote" }],
-            "storage": {
-                "feasible": refusal.is_none(),
-                "refusal": refusal,
-                "gpus": gpus,
-                "hosts": [{ "host": "rank-0", "required": required, "admits": 1000 }],
-            },
-            "redistribution": null,
-        })
+    /// GPU `ordinal` of host `host`.
+    fn gpu(host: &str, ordinal: u8) -> Gpu {
+        Gpu {
+            host: host.to_owned(),
+            gpu: GpuUuid([ordinal; 16]),
+        }
     }
 
-    fn daemon(
-        name: &'static str,
-        gpus: &[(&'static str, &'static str)],
-        dry_run: DryRun,
-        log: &Arc<Log>,
-    ) -> Daemon {
+    fn daemon(name: &'static str, gpus: &[Gpu], apply: Apply, log: &Arc<Log>) -> Daemon {
         Daemon {
             name,
             gpus: gpus.to_vec(),
-            dry_run,
-            rolls_back: false,
-            trial: Mutex::new(None),
+            apply,
+            update: Mutex::new(None),
+            events: Mutex::new(Vec::new()),
+            appended: Notify::new(),
+            operations: Mutex::new(0),
             log: Arc::clone(log),
         }
     }
 
-    /// A dry run that always reports `report`.
-    fn always(report: Value) -> DryRun {
-        Box::new(move |_| report.clone())
-    }
-
     fn options(commit_after: Option<Duration>) -> Options {
         Options {
-            body: json!({ "set": ["worker_config.watchdog_timeout=301"], "wait": true }),
+            request: ApplyRequest {
+                set: vec!["worker_config.engine_revision=2".to_owned()],
+                ..ApplyRequest::default()
+            },
             commit_after,
-            poll: Duration::from_millis(10),
+            polling: Polling {
+                wait: Duration::from_secs(1),
+                retry: Duration::from_millis(10),
+            },
         }
     }
 
-    /// How long the simulated trials serve before the manager commits.
+    /// How long the stand-in trials serve before the manager commits.
     const TRIAL: Duration = Duration::from_millis(200);
 
     /// Two services that share a GPU are never prepared at once: the second
@@ -667,12 +772,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn services_that_share_a_gpu_update_one_after_another() {
         let log = Arc::new(Log::default());
-        let shared = [("rank-0", "GPU-0")];
-        let other = [("rank-1", "GPU-1")];
+        let shared = [gpu("rank-0", 0)];
+        let other = [gpu("rank-1", 1)];
         let nodes = vec![
-            serve(daemon("a", &shared, always(epoch(&shared, 0, None)), &log)).await,
-            serve(daemon("b", &shared, always(epoch(&shared, 0, None)), &log)).await,
-            serve(daemon("c", &other, always(epoch(&other, 0, None)), &log)).await,
+            serve(daemon("a", &shared, Apply::Trial, &log)).await,
+            serve(daemon("b", &shared, Apply::Trial, &log)).await,
+            serve(daemon("c", &other, Apply::Trial, &log)).await,
         ];
         apply(&nodes, &options(Some(TRIAL))).await.unwrap();
         assert!(log.at("c:apply") < log.at("a:commit"), "{:?}", log.calls());
@@ -680,88 +785,24 @@ mod tests {
         assert!(["a", "b", "c"].iter().all(|service| log.committed(service)));
     }
 
-    /// A service on GPUs of its own whose dry run does not fit starts once an
-    /// update ends and its dry run, made again then, fits.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn an_update_starts_once_its_dry_run_fits() {
-        let log = Arc::new(Log::default());
-        let first = [("rank-0", "GPU-0")];
-        let second = [("rank-0", "GPU-1")];
-        let fits_after_first: DryRun = Box::new(move |log: &Log| {
-            let refusal = (!log.committed("a"))
-                .then_some("GPU-1 of rank-0 leaves the serving epoch's KV cache 0 bytes");
-            epoch(&second, 0, refusal)
-        });
-        let nodes = vec![
-            serve(daemon("a", &first, always(epoch(&first, 0, None)), &log)).await,
-            serve(daemon("b", &second, fits_after_first, &log)).await,
-        ];
-        apply(&nodes, &options(Some(TRIAL))).await.unwrap();
-        assert!(log.at("b:apply") > log.at("a:commit"), "{:?}", log.calls());
-        let dry_runs = log
-            .calls()
-            .iter()
-            .filter(|call| *call == "b:dry_run")
-            .count();
-        assert_eq!(dry_runs, 2, "{:?}", log.calls());
-    }
-
-    /// The host storage of updates on one host adds up: an update starts
-    /// beside another on the host only when both fit what it admits.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn host_storage_of_updates_on_one_host_adds_up() {
-        let log = Arc::new(Log::default());
-        let gpus = [
-            [("rank-0", "GPU-0")],
-            [("rank-0", "GPU-1")],
-            [("rank-0", "GPU-2")],
-        ];
-        let nodes = vec![
-            serve(daemon(
-                "a",
-                &gpus[0],
-                always(epoch(&gpus[0], 600, None)),
-                &log,
-            ))
-            .await,
-            serve(daemon(
-                "b",
-                &gpus[1],
-                always(epoch(&gpus[1], 600, None)),
-                &log,
-            ))
-            .await,
-            serve(daemon(
-                "c",
-                &gpus[2],
-                always(epoch(&gpus[2], 300, None)),
-                &log,
-            ))
-            .await,
-        ];
-        apply(&nodes, &options(Some(TRIAL))).await.unwrap();
-        // 600 and 300 fit within 1000 together; 600 and 600 do not.
-        assert!(log.at("c:apply") < log.at("a:commit"), "{:?}", log.calls());
-        assert!(log.at("b:apply") > log.at("a:commit"), "{:?}", log.calls());
-    }
-
-    /// A trial that rolled back stops the services that wait; the manager
-    /// names them.
+    /// A trial that rolled back stops the services that wait, which the manager names, as soon
+    /// as the node's event log states it.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_rolled_back_trial_stops_the_services_that_wait() {
         let log = Arc::new(Log::default());
-        let shared = [("rank-0", "GPU-0")];
-        let rolling_back = Daemon {
-            rolls_back: true,
-            ..daemon("a", &shared, always(epoch(&shared, 0, None)), &log)
-        };
-        let waiting = serve(daemon("b", &shared, always(epoch(&shared, 0, None)), &log)).await;
-        let nodes = vec![serve(rolling_back).await, waiting];
-        let error = apply(&nodes, &options(Some(TRIAL)))
+        let shared = [gpu("rank-0", 0)];
+        let nodes = vec![
+            serve(daemon("a", &shared, Apply::RollsBack, &log)).await,
+            serve(daemon("b", &shared, Apply::Trial, &log)).await,
+        ];
+        let started = std::time::Instant::now();
+        let error = apply(&nodes, &options(Some(Duration::from_secs(60))))
             .await
             .expect_err("a rolled-back trial fails the apply");
+        assert!(started.elapsed() < Duration::from_secs(30));
         let message = format!("{error:#}");
-        assert!(message.contains("rolled back"), "{message}");
+        assert!(message.contains("rolled_back"), "{message}");
+        assert!(message.contains("failure_rate"), "{message}");
         assert!(message.contains(&nodes[1].base), "{message}");
         assert!(
             !log.calls().contains(&"b:apply".to_owned()),
@@ -777,12 +818,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_trial_left_for_the_operator_holds_its_gpus() {
         let log = Arc::new(Log::default());
-        let shared = [("rank-0", "GPU-0")];
-        let other = [("rank-1", "GPU-1")];
+        let shared = [gpu("rank-0", 0)];
+        let other = [gpu("rank-1", 1)];
         let nodes = vec![
-            serve(daemon("a", &shared, always(epoch(&shared, 0, None)), &log)).await,
-            serve(daemon("b", &shared, always(epoch(&shared, 0, None)), &log)).await,
-            serve(daemon("c", &other, always(epoch(&other, 0, None)), &log)).await,
+            serve(daemon("a", &shared, Apply::Trial, &log)).await,
+            serve(daemon("b", &shared, Apply::Trial, &log)).await,
+            serve(daemon("c", &other, Apply::Trial, &log)).await,
         ];
         apply(&nodes, &options(None)).await.unwrap();
         let calls = log.calls();
@@ -795,86 +836,90 @@ mod tests {
         );
     }
 
-    /// An update that fits nowhere while no update is in progress is refused,
-    /// naming its reason.
+    /// A change of the daemon's own options restarts it, and the update its successor starts in
+    /// an operation of its own, which the node's event log states, runs its trial and is
+    /// committed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_update_that_never_fits_is_refused() {
+    async fn the_update_after_a_hot_restart_is_followed_to_its_commit() {
         let log = Arc::new(Log::default());
-        let gpus = [("rank-0", "GPU-0")];
-        let refusal = "GPU-0 of rank-0 leaves the serving epoch's KV cache 0 bytes";
-        let refused = always(epoch(&gpus, 0, Some(refusal)));
-        let nodes = vec![serve(daemon("a", &gpus, refused, &log)).await];
-        let error = apply(&nodes, &options(Some(TRIAL)))
-            .await
-            .expect_err("an update that does not fit is refused");
-        assert!(format!("{error:#}").contains(refusal), "{error:#}");
-        assert_eq!(log.calls(), ["a:dry_run"]);
+        let nodes = vec![serve(daemon("a", &[gpu("rank-0", 0)], Apply::Restarts, &log)).await];
+        apply(&nodes, &options(Some(TRIAL))).await.unwrap();
+        assert!(log.at("a:commit") > log.at("a:apply"), "{:?}", log.calls());
+        assert!(log.committed("a"));
     }
 
-    /// The GPUs an update uses are those its service's epochs hold, those
-    /// its dry run's `storage` prepares on, and its successor's target ranks;
-    /// every refusal of its dry run is kept, and the largest host storage a
-    /// replica requires on a host is the update's.
+    /// The GPUs an update uses are those its service's epochs hold; an update in place or of a
+    /// generation starts no epoch, one that changes nothing needs nothing, and an idle node's
+    /// bring-up starts an epoch on no GPU yet.
     #[test]
-    fn an_updates_needs_come_from_its_status_and_every_replicas_dry_run() {
-        let status = json!({ "gpus": [{ "host": "rank-0", "gpu": "GPU-0" }] });
-        let replica = |gpu: &str, target: &str, required: u64, feasible: bool| {
-            json!({
-                "epoch": true,
-                "steps": [{ "step": "prepare" }],
-                "storage": {
-                    "feasible": true,
-                    "gpus": [{ "host": "rank-0", "gpu": gpu }],
-                    "hosts": [{ "host": "rank-0", "required": required, "admits": 900 }],
-                },
-                "redistribution": {
-                    "feasible": feasible,
-                    "refusal": (!feasible).then_some("GPU-9 has 0 bytes available"),
-                    "ranks": [{ "host": "rank-1", "gpu": target }],
-                },
-            })
+    fn an_updates_needs_come_from_its_status_and_its_dry_run() {
+        let held = vec![gpu("rank-0", 0), gpu("rank-1", 1)];
+        let status = ConfigStatus {
+            first: None,
+            replicas: Vec::new(),
+            gpus: Some(
+                held.iter()
+                    .map(|gpu| GpuShare {
+                        gpu: gpu.clone(),
+                        total: 80,
+                        quota: Some(40),
+                        used: 10,
+                    })
+                    .collect(),
+            ),
+            quotas: None,
+            update: None,
+            unavailable: Vec::new(),
+            epochs: Vec::new(),
+            processes: Vec::new(),
         };
-        let result = json!({
-            "change": "dry_run",
-            "dry_run": { "replicas": [
-                replica("GPU-0", "GPU-8", 100, true),
-                replica("GPU-1", "GPU-9", 300, false),
-            ] },
-        });
-        let needs = Needs::of(&status, &result);
-        assert!(needs.changes && needs.epoch);
-        let gpus: Vec<(&str, &str)> = needs
-            .gpus
-            .iter()
-            .map(|(host, gpu)| (host.as_str(), gpu.as_str()))
-            .collect();
-        assert_eq!(
-            gpus,
-            [
-                ("rank-0", "GPU-0"),
-                ("rank-0", "GPU-1"),
-                ("rank-1", "GPU-8"),
-                ("rank-1", "GPU-9")
-            ]
-        );
-        assert_eq!(
-            needs.hosts,
-            BTreeMap::from([("rank-0".to_owned(), (300, 900))])
-        );
-        assert_eq!(
-            needs.refusal.as_deref(),
-            Some("GPU-9 has 0 bytes available")
-        );
+        let dry_run = |dry_run| ConfigChange::DryRun { dry_run };
+        let package = PackageRevision {
+            backend: "uniserve".to_owned(),
+            revision: 2,
+            arguments: toml::Table::new(),
+        };
+        let epoch = Needs::of(
+            &status,
+            &dry_run(DryRun::Epoch {
+                epoch: 2,
+                engine: package,
+                replicas: 1,
+                engines: Vec::new(),
+                shrink: true,
+            }),
+        )
+        .unwrap();
+        assert!(epoch.changes && epoch.epoch);
+        assert_eq!(epoch.gpus, held.into_iter().collect());
 
-        // A change in place starts no epoch, and one that changes nothing
-        // needs nothing.
-        let in_place = json!({
-            "change": "dry_run",
-            "dry_run": { "epoch": true, "daemon": false, "steps": null },
-        });
-        let needs = Needs::of(&status, &in_place);
-        assert!(needs.changes && !needs.epoch);
-        let unchanged = Needs::of(&status, &json!({ "change": "none" }));
-        assert!(!unchanged.changes);
+        let in_place = Needs::of(
+            &status,
+            &dry_run(DryRun::InPlace {
+                replicas: Vec::new(),
+            }),
+        );
+        assert!(in_place.unwrap().changes);
+        let unchanged = Needs::of(&status, &ConfigChange::None).unwrap();
+        assert_eq!(unchanged, Needs::default());
+        let idle = ConfigStatus {
+            gpus: None,
+            ..status.clone()
+        };
+        let deployment = DryRun::Deployment {
+            deployment: "qwen".to_owned(),
+        };
+        let brought = Needs::of(&idle, &dry_run(deployment)).unwrap();
+        assert!(brought.epoch && brought.gpus.is_empty());
+        // A dry run that answered a change it made is no dry run.
+        assert!(
+            Needs::of(
+                &status,
+                &ConfigChange::Deployment {
+                    deployment: "qwen".to_owned()
+                }
+            )
+            .is_err()
+        );
     }
 }
