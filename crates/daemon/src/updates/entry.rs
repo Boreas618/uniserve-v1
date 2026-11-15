@@ -522,11 +522,9 @@ impl Leader {
             }
         }
 
-        // One launch generation per engine of every target replica's world,
-        // from the deployment's one counter: none collides with a standby's
-        // or with an engine the engine control numbered.
-        let group = crate::engine::control::ENGINE_GROUP;
-        epochs.launched_up_to(group, 0, control.next_engine().saturating_sub(1));
+        // One launch number per engine of every target replica's world, from the deployment's
+        // one allocator, its engine control: none collides with a standby's or with any other
+        // engine of the deployment.
         let launches =
             crate::leader::epoch_launches(&engine, &next.modules, target_epoch).map_err(refused)?;
         let configs: Vec<_> = launches
@@ -537,10 +535,7 @@ impl Leader {
         for args in launches {
             let hosts =
                 crate::engine::control::world_hosts(&args.engine_config).map_err(refused)?;
-            let numbers: Vec<u64> = hosts
-                .iter()
-                .map(|_| epochs.next_generation(group, 0))
-                .collect();
+            let numbers: Vec<u64> = hosts.iter().map(|_| control.launch_number()).collect();
             worlds.push((args, hosts, numbers));
         }
         let serving_configs: Vec<_> = replicas
@@ -613,7 +608,7 @@ impl Leader {
             next.clone(),
             Arc::clone(epochs),
             serving,
-            group.to_owned(),
+            crate::engine::control::ENGINE_GROUP.to_owned(),
             nodes,
             EpochSwitch {
                 epoch: target_epoch,

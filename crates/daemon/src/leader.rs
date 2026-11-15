@@ -2276,9 +2276,7 @@ impl Replica {
         args: Option<proto::config::EngineArgs>,
         stopped: &[u64],
     ) -> anyhow::Result<Arc<EngineClient>> {
-        let generation = updater
-            .epochs()
-            .next_generation(crate::engine::control::ENGINE_GROUP, 0);
+        let generation = control.launch_number();
         let started = async {
             let args = args.context("the replica has no served arguments")?;
             let sink = stats_sink(
@@ -2632,21 +2630,15 @@ impl Replica {
         let Some(mut args) = service::lock(&self.served).clone() else {
             return Ok(());
         };
-        let Some(updater) = self
+        // A replica whose deployment's updater is gone keeps no standby.
+        if self
             .registry
             .upgrade()
             .and_then(|registry| registry.updates.upgrade())
-        else {
+            .is_none()
+        {
             return Ok(());
-        };
-        let epochs = Arc::clone(updater.epochs());
-        // The engine control numbered every engine it started, those of other hosts
-        // included: the standby's numbers come after them.
-        epochs.launched_up_to(
-            crate::engine::control::ENGINE_GROUP,
-            0,
-            control.next_engine().saturating_sub(1),
-        );
+        }
         let rooms = self.standby_rooms(&control).await;
         let options = crate::standby::StandbyOptions {
             enabled: wanted,
@@ -2672,9 +2664,8 @@ impl Replica {
                 .any(|action| matches!(action, crate::standby::Action::Allocate { .. }))
             {
                 for action in &actions {
-                    if let crate::standby::Action::Allocate { host, group, .. } = action {
-                        let generation = epochs.next_generation(group, 0);
-                        standbys.allocated(host, generation);
+                    if let crate::standby::Action::Allocate { host, .. } = action {
+                        standbys.allocated(host, control.launch_number());
                     }
                 }
                 actions = standbys.serve(crate::epoch::Status::Serving, options, &rooms);

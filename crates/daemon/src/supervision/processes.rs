@@ -252,7 +252,7 @@ impl Processes {
     /// id.
     ///
     /// The launch generation is the caller's, allocated once from the
-    /// deployment's one counter ([`Epochs::next_generation`]): an engine is
+    /// deployment's one allocator (`EngineControl::launch_number`): an engine is
     /// started at one number and commanded by it, so a second number taken
     /// here would give one launch two identities.
     pub(crate) fn spawn(

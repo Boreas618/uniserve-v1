@@ -130,17 +130,23 @@ impl EngineControl {
     /// does not connect back, its build speaks a major version this daemon
     /// does not, or it reports that its start failed.
     pub fn start(&self, args: EngineArgs, stats: StatsSink) -> anyhow::Result<EngineClient> {
-        let engine = self.next_engine.fetch_add(1, Ordering::Relaxed);
+        let engine = self.launch_number();
         self.start_at(args, engine, stats)
     }
 
-    /// [`EngineControl::start`] under a number the caller allocated.
+    /// The next launch number of the deployment: the identity of one engine process, which its
+    /// launch states, its process link's hello states and every command and report names.
     ///
-    /// A standby's number comes from the epoch records' one allocator
-    /// ([`crate::epoch::Epochs::next_generation`]), which also numbers the
-    /// launches an epoch switch starts; two counters for one identity would
-    /// drift the day a standby exists, so the standby path does not use
-    /// `next_engine`.
+    /// This control is the deployment's one allocator of them: every engine it starts, a
+    /// standby, the engines of an epoch update's target and an adopted deployment's later
+    /// engines all take their number here, so one number names one process across the
+    /// deployment's hosts.
+    pub(crate) fn launch_number(&self) -> u64 {
+        self.next_engine.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// [`EngineControl::start`] under a number the caller took from [`Self::launch_number`]
+    /// (a standby's, which the standby rules record before it starts).
     ///
     /// # Errors
     ///
@@ -151,12 +157,11 @@ impl EngineControl {
         engine: u64,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
-        self.next_engine.fetch_max(engine + 1, Ordering::Relaxed);
         let hosts = world_hosts(&args.engine_config)?;
         // The peers' numbers follow the scheduler node's from the same counter, so one number names
         // one process of the deployment.
         let numbers: Vec<u64> = std::iter::once(engine)
-            .chain((1..hosts.len()).map(|_| self.next_engine.fetch_add(1, Ordering::Relaxed)))
+            .chain((1..hosts.len()).map(|_| self.launch_number()))
             .collect();
         self.start_world(args, &numbers, stats)
     }
@@ -232,9 +237,6 @@ impl EngineControl {
             build_server: &self.build_server,
         };
         let mut launches = place_world(args, numbers, &interfaces)?;
-        for number in numbers {
-            self.next_engine.fetch_max(number + 1, Ordering::Relaxed);
-        }
 
         let mut inherit = vec![Vec::new(); launches.len()];
         if launches.len() > 1 {
@@ -328,7 +330,8 @@ impl EngineControl {
         &self.request_address
     }
 
-    /// The identity the next engine this control starts takes.
+    /// The launch number [`Self::launch_number`] hands out next, which a restart in place hands to
+    /// the successor ([`Self::adopt`]) and which numbers a deployment's first epoch.
     pub fn next_engine(&self) -> u64 {
         self.next_engine.load(Ordering::Relaxed)
     }
@@ -352,7 +355,6 @@ impl EngineControl {
         let mut clients = Vec::with_capacity(processes.len());
         let mut sinks = std::iter::once(stats);
         for (host, engine) in processes {
-            self.next_engine.fetch_max(engine + 1, Ordering::Relaxed);
             // A peer holds no scheduler, so it reports no statistics.
             let sink = sinks.next().unwrap_or_else(|| Box::new(|_, _, _| {}));
             clients.push(self.join(*engine, epoch, sink)?.on_host(host));

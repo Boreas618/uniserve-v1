@@ -86,7 +86,7 @@ pub struct EpochRecord {
     /// they execute, read from their `Parked` or `Serving` report and never
     /// invented here. It is not a process's identity: that is
     /// [`ManagedProcess::generation`], the launch generation, allocated by
-    /// [`Epochs::next_generation`].
+    /// the deployment's engine control (`EngineControl::launch_number`).
     pub generation: Option<u64>,
 }
 
@@ -122,7 +122,7 @@ pub struct ManagedProcess {
     /// The build identity it was started from.
     pub build: String,
     /// The LAUNCH generation: the identity of this launch of the process,
-    /// which the daemon allocates ([`Epochs::next_generation`]) and the
+    /// which the deployment's engine control allocates (`EngineControl::launch_number`) and the
     /// process names in its launch file and its reports. It is not the
     /// model generation ([`EpochRecord::generation`]), which the engine
     /// numbers for the modules it executes; 0 until launched.
@@ -224,8 +224,6 @@ pub struct Epochs {
     /// node's processes attached it: the processes are the supervisor's to
     /// report, and this record keeps what each of them is.
     supervised: std::sync::OnceLock<std::sync::Arc<Mutex<Vec<ManagedProcess>>>>,
-    /// The last launch generation allocated per worker group and rank.
-    generations: Mutex<BTreeMap<(String, u64), u64>>,
     /// The epoch requests were last moved to: the request path of this daemon follows it by
     /// moving its hold onto that epoch's engine.
     served: tokio::sync::watch::Sender<u64>,
@@ -251,45 +249,6 @@ impl Epochs {
     /// that epoch before.
     pub fn record(&self, epoch: u64, record: EpochRecord) {
         service::lock(&self.records).insert(epoch, record);
-    }
-
-    /// The launch generation to start `group`'s rank `rank` in: one more than
-    /// the highest launch generation this daemon knows,
-    /// which is the one it allocated last for that group and rank or the one
-    /// the process table records — for any group and rank. A standby of a
-    /// serving process is `serving + 1`, and a rank or group without a process
-    /// yet still allocates above every number the deployment has used, so one
-    /// number names one launch across the deployment.
-    ///
-    /// This is the one place a generation is allocated: a caller that
-    /// computed one itself would launch two processes under one number.
-    pub fn next_generation(&self, group: &str, rank: u64) -> u64 {
-        self.allocate(group, rank)
-    }
-
-    /// Records that the deployment launched processes under numbers up to `generation`, which
-    /// were taken elsewhere than [`Self::next_generation`]: the engine control numbers the
-    /// engines of a deployment over several hosts as it starts them, and processes of another node
-    /// are not in this node's process table. Later numbers of `group`'s rank `rank` are above it.
-    pub fn launched_up_to(&self, group: &str, rank: u64, generation: u64) {
-        let mut allocated = service::lock(&self.generations);
-        let last = allocated.entry((group.to_owned(), rank)).or_insert(0);
-        *last = (*last).max(generation);
-    }
-
-    fn allocate(&self, group: &str, rank: u64) -> u64 {
-        let runnning = self
-            .processes()
-            .iter()
-            .map(|process| process.generation)
-            .max()
-            .unwrap_or(0);
-        let mut allocated = service::lock(&self.generations);
-        let key = (group.to_owned(), rank);
-        let last = allocated.get(&key).copied().unwrap_or(0).max(runnning);
-        let next = last + 1;
-        allocated.insert(key, next);
-        next
     }
 
     /// Records that epoch `epoch` switched to `modules` on trial, keeping
@@ -1603,48 +1562,6 @@ mod tests {
         assert_eq!(
             entries[1]["kernels"][0]["package"]["backend"],
             Value::from("trtllm")
-        );
-    }
-
-    /// A launch generation is allocated in one place: one more than the
-    /// highest generation the daemon knows for that group and rank, which is
-    /// the serving epoch's, so a standby of a serving epoch is
-    /// `serving + 1`, and two callers never get one number.
-    #[test]
-    fn a_launch_generation_is_one_more_than_the_serving_epochs() {
-        let epochs = Epochs::new();
-        assert_eq!(epochs.next_generation("engine", 0), 1, "the first launch");
-
-        // A serving process's launch generation is the base: its standby is
-        // one more, and so is the next allocation after that.
-        epochs.set_processes(vec![ManagedProcess {
-            group: "engine".to_owned(),
-            rank: 0,
-            pid: Some(42),
-            epoch: Some(1),
-            build: "2.0.0+0123456789abcdef".to_owned(),
-            generation: 6,
-            state: ProcessState::Serving,
-        }]);
-        assert_eq!(
-            epochs.next_generation("engine", 0),
-            7,
-            "the standby of a serving process is serving + 1"
-        );
-        assert_eq!(
-            epochs.next_generation("engine", 0),
-            8,
-            "an allocation is one more than the last one"
-        );
-        assert_eq!(
-            epochs.next_generation("engine", 1),
-            7,
-            "a rank allocates for itself"
-        );
-        assert_eq!(
-            epochs.next_generation("worker", 0),
-            7,
-            "a group allocates for itself"
         );
     }
 
