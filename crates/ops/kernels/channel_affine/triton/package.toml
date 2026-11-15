@@ -15,6 +15,9 @@ kind = "triton"
 
 [launch]
 kernel = "_channel_affine_kernel"
+# The product and the sum round separately, as the reference's two tensor operations do, so the
+# compiler may not contract them into a fused multiply-add.
+options = { enable_fp_fusion = false }
 warps = { field = "block", steps = [[2048, 8]], otherwise = 4 }
 
 # `pdl` is a word the kernel does not read: the dependent launch is compiled in.

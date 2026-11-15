@@ -14,6 +14,9 @@ kind = "triton"
 
 [launch]
 kernel = "_add_gated_tiles_kernel"
+# The product and the sum round separately, as the reference's two eager operations do, so the
+# compiler may not contract them into a fused multiply-add.
+options = { enable_fp_fusion = false }
 warps = 4
 
 [launch.types]

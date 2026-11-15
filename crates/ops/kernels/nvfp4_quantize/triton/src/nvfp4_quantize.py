@@ -61,20 +61,12 @@ def _rcp_approx(x):
 def _e4m3_byte(x):
     """The saturating round-to-nearest E4M3 byte of FP32 ``x``.
 
-    ``cvt.rn.satfinite.e4m3x2.f32`` stores its first operand in the upper byte;
-    the lower byte encodes ``x``.
+    Triton's conversion to ``float8e4nv`` is the saturating round-to-nearest
+    ``cvt.rn.satfinite.e4m3x2.f32``.
     """
-    pair = tl.inline_asm_elementwise(
-        "{ .reg .b16 pair; "
-        "cvt.rn.satfinite.e4m3x2.f32 pair, $2, $1; "
-        "cvt.u32.u16 $0, pair; }",
-        "=r,f,f",
-        [x, tl.zeros_like(x)],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
+    return x.to(tl.float8e4nv, fp_downcast_rounding="rtne").to(
+        tl.uint8, bitcast=True
     )
-    return (pair & 0xFF).to(tl.uint8)
 
 
 @triton.jit

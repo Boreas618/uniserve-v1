@@ -476,30 +476,6 @@ def _norm_rope_halves(
 
 
 @triton.jit
-def _add_rn(a, b):
-    # Round-to-nearest FP32 sum the compiler cannot fuse with a
-    # neighbouring multiply.
-    return tl.inline_asm_elementwise(
-        "add.rn.f32 $0, $1, $2;",
-        "=r,r,r",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-@triton.jit
-def _mul_rn(a, b):
-    return tl.inline_asm_elementwise(
-        "mul.rn.f32 $0, $1, $2;",
-        "=r,r,r",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-@triton.jit
 def _zero_tile_padding_kernel(
     values,
     variable_block_sizes,
@@ -571,11 +547,11 @@ def _add_gated_tiles_kernel(
     )
     # The product rounds to the storage dtype before the sum, as the two
     # eager operations store it in between.
-    product = _mul_rn(tile_values[None, :], gate_values)
+    product = tile_values[None, :] * gate_values
     product = product.to(
         output.dtype.element_ty, fp_downcast_rounding="rtne"
     ).to(tl.float32)
-    total = _add_rn(tl.load(destination).to(tl.float32), product)
+    total = tl.load(destination).to(tl.float32) + product
     tl.store(
         destination,
         total.to(output.dtype.element_ty, fp_downcast_rounding="rtne"),
@@ -637,11 +613,11 @@ def _compose_gated_rows_kernel(
         + head * fine_stride_head
         + columns[None, :]
     ).to(tl.float32)
-    product = _mul_rn(tile_values[None, :], gate_values)
+    product = tile_values[None, :] * gate_values
     product = product.to(
         output.dtype.element_ty, fp_downcast_rounding="rtne"
     ).to(tl.float32)
-    total = _add_rn(fine_values, product)
+    total = fine_values + product
 
     slot = member
     for index in tl.static_range(len(slots)):
@@ -677,17 +653,11 @@ def _phase_sum(
     fourth = tl.zeros((width,), dtype=tl.float32)
     for step in tl.static_range(tile_rows // 16):
         base = rows + (16 * step + phase) * row_stride + columns
-        first = _add_rn(first, tl.load(base).to(tl.float32))
-        second = _add_rn(
-            second, tl.load(base + 4 * row_stride).to(tl.float32)
-        )
-        third = _add_rn(
-            third, tl.load(base + 8 * row_stride).to(tl.float32)
-        )
-        fourth = _add_rn(
-            fourth, tl.load(base + 12 * row_stride).to(tl.float32)
-        )
-    return _add_rn(_add_rn(_add_rn(first, second), third), fourth)
+        first = first + tl.load(base).to(tl.float32)
+        second = second + tl.load(base + 4 * row_stride).to(tl.float32)
+        third = third + tl.load(base + 8 * row_stride).to(tl.float32)
+        fourth = fourth + tl.load(base + 12 * row_stride).to(tl.float32)
+    return ((first + second) + third) + fourth
 
 @triton.jit
 def _tile_mean(
@@ -711,7 +681,7 @@ def _tile_mean(
     second = _phase_sum(rows, row_stride, columns, 1, width, tile_rows)
     third = _phase_sum(rows, row_stride, columns, 2, width, tile_rows)
     fourth = _phase_sum(rows, row_stride, columns, 3, width, tile_rows)
-    total = _add_rn(_add_rn(first, third), _add_rn(second, fourth))
+    total = (first + third) + (second + fourth)
     return tl.math.div_rn(total, divisor)
 
 @triton.jit

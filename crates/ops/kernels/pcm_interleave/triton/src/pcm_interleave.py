@@ -15,7 +15,7 @@ clipped at full scale, not a wrapping overflow. The rounding is the reference's
 too: ties go to the even neighbour, which is what ``numpy.rint`` and Rust's
 ``f32::round_ties_even`` do, so a program that rounds ties away from zero would
 differ on exactly the half samples and nowhere else. That is why the rounding is
-one PTX instruction (``cvt.rni.f32.f32``, round to nearest integer, ties to even)
+libdevice's ``rint`` (one ``cvt.rni.f32.f32``, round to nearest integer, ties to even)
 rather than an arithmetic trick: the formula is the rule, and the operator's
 tolerance is exact.
 
@@ -27,6 +27,7 @@ arithmetic does not.
 
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 from uniserve_kernels import dependent_launch
 
 
@@ -39,14 +40,7 @@ def _quantize(x):
     the half samples as well as the rest.
     """
     clamped = tl.minimum(tl.maximum(x, -1.0), 1.0) * 32767.0
-    return tl.inline_asm_elementwise(
-        "cvt.rni.f32.f32 $0, $1;",
-        "=r,r",
-        [clamped],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    return libdevice.rint(clamped)
 
 
 @triton.jit

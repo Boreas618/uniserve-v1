@@ -14,32 +14,6 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
-def _add_rn(a, b):
-    # Round-to-nearest FP32 sum the compiler cannot fuse with a neighbouring
-    # multiply.
-    return tl.inline_asm_elementwise(
-        "add.rn.f32 $0, $1, $2;",
-        "=r,r,r",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _mul_rn(a, b):
-    return tl.inline_asm_elementwise(
-        "mul.rn.f32 $0, $1, $2;",
-        "=r,r,r",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
 @triton.jit(
     do_not_specialize=[
         "fine_stride_row",
@@ -102,11 +76,11 @@ def _compose_gated_rows_kernel(
         + head * fine_stride_head
         + columns[None, :]
     ).to(tl.float32)
-    product = _mul_rn(tile_values[None, :], gate_values)
+    product = tile_values[None, :] * gate_values
     product = product.to(
         output.dtype.element_ty, fp_downcast_rounding="rtne"
     ).to(tl.float32)
-    total = _add_rn(fine_values, product)
+    total = fine_values + product
 
     slot = member
     for index in tl.static_range(len(slots)):

@@ -2,8 +2,9 @@
 
 Programs add one tile's gated compression to its rows, ``out + compressed[tile] *
 gate``, with the product and the sum each rounded to the storage dtype as two
-eager element-wise operations round them; the two inline-assembly helpers pin that
-rounding so the compiler cannot fuse the multiply with the sum.
+eager element-wise operations round them: the package compiles with
+``enable_fp_fusion = false``, so the compiler does not contract the two into one
+fused multiply-add.
 
 The kernel body imports nothing but Triton: the launch-time wrapper, its operand
 checks and its torch types stay with the operator's Rust side.
@@ -11,32 +12,6 @@ checks and its torch types stay with the operator's Rust side.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _add_rn(a, b):
-    # Round-to-nearest FP32 sum the compiler cannot fuse with a neighbouring
-    # multiply.
-    return tl.inline_asm_elementwise(
-        "add.rn.f32 $0, $1, $2;",
-        "=r,r,r",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _mul_rn(a, b):
-    return tl.inline_asm_elementwise(
-        "mul.rn.f32 $0, $1, $2;",
-        "=r,r,r",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
 
 
 @triton.jit(
@@ -90,11 +65,11 @@ def _add_gated_tiles_kernel(
     )
     # The product rounds to the storage dtype before the sum, as the two eager
     # operations store it in between.
-    product = _mul_rn(tile_values[None, :], gate_values)
+    product = tile_values[None, :] * gate_values
     product = product.to(
         output.dtype.element_ty, fp_downcast_rounding="rtne"
     ).to(tl.float32)
-    total = _add_rn(tl.load(destination).to(tl.float32), product)
+    total = tl.load(destination).to(tl.float32) + product
     tl.store(
         destination,
         total.to(output.dtype.element_ty, fp_downcast_rounding="rtne"),

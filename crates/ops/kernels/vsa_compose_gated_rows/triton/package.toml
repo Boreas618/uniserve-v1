@@ -16,6 +16,9 @@ kind = "triton"
 # Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds.
 [launch]
 kernel = "_compose_gated_rows_kernel"
+# The product and the sum round separately, as the reference's two eager operations do, so the
+# compiler may not contract them into a fused multiply-add.
+options = { enable_fp_fusion = false }
 warps = 4
 aligned = [
     "output",
