@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from transformers import AutoTokenizer
 
+from tests.python.e2e.build_server import remote_build_server
 from tests.python.e2e.http_helpers import (
     H3_CHECKPOINT,
     engine_selection,
@@ -202,7 +203,18 @@ def _assert_refused_across_hosts(
     which together lie on both hosts.
     """  # noqa: D205
     assert FOLLOWER is not None
-    with second_host(FOLLOWER, log.with_name("h3-follower.log"), address):
+    # The second host's main process resolves its modules from that host's
+    # Build Server, which the leader asks to prepare the epoch's modules
+    # before any process starts there.
+    with (
+        remote_build_server(FOLLOWER) as follower_modules,
+        second_host(
+            FOLLOWER,
+            log.with_name("h3-follower.log"),
+            address,
+            arguments=("--set", f"build_config.socket={follower_modules}"),
+        ),
+    ):
         with pytest.raises(RuntimeError, match="server exited early"):
             with server_process(
                 command, base_url, log, timeout_s=1800, env=environment
@@ -562,7 +574,13 @@ def test_replicas_on_two_hosts_serve_complete_media(tmp_path: Path) -> None:
         return response.content, response.headers["content-type"]
 
     with (
-        second_host(FOLLOWER, tmp_path / "h3-follower.log", address),
+        remote_build_server(FOLLOWER) as follower_modules,
+        second_host(
+            FOLLOWER,
+            tmp_path / "h3-follower.log",
+            address,
+            arguments=("--set", f"build_config.socket={follower_modules}"),
+        ),
         server_process(
             command,
             base_url,
