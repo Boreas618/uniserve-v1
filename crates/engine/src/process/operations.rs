@@ -44,11 +44,6 @@ use crate::process::binding::{Target, WeightBinding};
 use crate::scheduler::{self, Message};
 use crate::worker::Worker;
 
-/// How long a release that makes room waits before it asks a region again for units its requests
-/// still hold: the requests that hold the tail run on, and the release takes it once they let it
-/// go.
-const RESIZE_RETRY: Duration = Duration::from_millis(10);
-
 /// The scheduler at `index` of the session's has stopped: its thread ended, on a fault it
 /// reported itself (`Output::Failed`) or at its shutdown.
 pub(super) fn stopped(index: usize) -> anyhow::Error {
@@ -398,18 +393,21 @@ pub(crate) fn make_room(
 
     for (index, number, scheduler, first, kept) in releases {
         // The region gives back its units from the segment's first on; the requests that hold
-        // some of them run on, and the region is asked again until it reached the units it keeps.
+        // some of them run on, and the scheduler answers once the region reached the units it
+        // keeps, which it does as they let them go.
         let inbox = schedulers
             .get(scheduler)
             .ok_or_else(|| stopped(scheduler))?;
-        loop {
-            let reached = ask(std::slice::from_ref(inbox), |reply| {
-                Message::Resize(number, kept, reply)
-            })?;
-            if reached.first().is_some_and(|reached| *reached <= kept) {
-                break;
-            }
-            std::thread::sleep(RESIZE_RETRY);
+        let reached = ask(std::slice::from_ref(inbox), |reply| {
+            Message::Bound(number, kept, reply)
+        })?;
+        if let Some(&reached) = reached.first()
+            && reached > kept
+        {
+            bail!(
+                "region {number} holds {reached} units, past the {kept} a release of its tail \
+                 keeps: a drain ended its bound before it reached them"
+            );
         }
 
         let (from, withdrawn, groups) = {

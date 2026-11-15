@@ -180,6 +180,12 @@ pub enum Message {
     /// `Resize { region, units }` at the buffer pool, the region by its number; the reply, sent at
     /// its `Resized`, is the units the region reached, which a shrink and a grow may stop short of.
     Resize(u8, u32, Sender<u32>),
+    /// `Resize { region, units }` at the buffer pool, the region by its number, which bounds the
+    /// region to `units` as `Resize` does; the reply is sent once a `Resized` states that the
+    /// region holds no more than `units`, which it reaches as the requests holding units past
+    /// the bound let them go (`resize.rs`), with the units it holds then. A drain that ends the
+    /// bound first is answered with the units the region holds at that moment.
+    Bound(u8, u32, Sender<u32>),
     /// The scheduler's limits, applied in place; the reply refuses a limit above what the
     /// workers hold, which leaves the limits as they were.
     Configure(SchedulerConfig, Sender<Result<(), Error>>),
@@ -389,6 +395,10 @@ pub struct Scheduler {
     /// engine's, or none for the scheduler's own shrink toward the region's bound. The buffer
     /// pool answers the `Resize`s of one queue pair in the order it takes them.
     resizing: Vec<(u8, Option<Sender<u32>>)>,
+    /// The replies owed to `Message::Bound`, each with its region by number: answered once a
+    /// `Resized` states that the region holds no more than its bound, or when a drain ends the
+    /// bound.
+    bounded: Vec<(u8, Sender<u32>)>,
     /// The `List`s submitted, and those answered, which the buffer pool answers in the order it
     /// takes them: a resumed request waits for one asked after it arrived (SD §4.4, §4.5).
     lists_asked: u64,
@@ -572,6 +582,7 @@ impl Scheduler {
             draining: None,
             warm_ups: HashMap::new(),
             resizing: Vec::new(),
+            bounded: Vec::new(),
             lists_asked: 0,
             lists_answered: 0,
             next_batch: 0,
@@ -833,6 +844,7 @@ impl Scheduler {
                 let _ = reply.send(self.flush(seeds, in_flight));
             }
             Message::Resize(region, units, reply) => self.resize(region, units, reply),
+            Message::Bound(region, units, reply) => self.bound(region, units, reply),
             Message::Configure(config, reply) => {
                 let _ = reply.send(self.configure(config));
             }

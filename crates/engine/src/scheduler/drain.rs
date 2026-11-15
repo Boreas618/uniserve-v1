@@ -41,7 +41,7 @@ impl Scheduler {
         // A draining epoch no longer sizes its regions (`resize.rs`): with `shrink` it gives
         // them back, and otherwise the epoch of the same layout serving beside it sizes the
         // regions the two share.
-        self.bounds.fill(None);
+        self.end_bounds();
         self.drain_due(Instant::now());
     }
 

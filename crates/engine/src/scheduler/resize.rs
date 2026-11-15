@@ -11,6 +11,11 @@
 //! A grow that stops short is not asked again: the memory it waits for enters the region's space
 //! by the engine's grants, after which the engine resizes the region itself.
 //!
+//! An engine that must have the units past the bound back before it goes on (a release of the
+//! tail segments that makes room) asks with `Message::Bound` instead of `Message::Resize`: its
+//! reply is owed until a `Resized` states that the region holds no more than the bound
+//! ([`Scheduler::answer_bounds`]), so it waits on that one reply instead of asking again.
+//!
 //! A drain ends the bounds (`drain.rs`): a drain to another layout gives the device memory back
 //! by its own shrink, and a drain beside an epoch of the same layout leaves the regions the two
 //! share to that epoch, which resizes them to what it states when it is promoted, a rollback's
@@ -26,6 +31,22 @@ impl Scheduler {
     /// `reply` with the units the region reached. From here on the region holds at most `units`,
     /// whatever this shrink reaches.
     pub(super) fn resize(&mut self, region: u8, units: u32, reply: Sender<u32>) {
+        self.set_bound(region, units);
+        self.resizing.push((region, Some(reply)));
+    }
+
+    /// `Message::Bound`: `Resize { region, units }` at the buffer pool, bounding the region to
+    /// `units` as [`Scheduler::resize`] does; `reply` is answered once the region holds no more
+    /// than `units` ([`Scheduler::answer_bounds`]).
+    pub(super) fn bound(&mut self, region: u8, units: u32, reply: Sender<u32>) {
+        self.set_bound(region, units);
+        self.resizing.push((region, None));
+        self.bounded.push((region, reply));
+    }
+
+    /// Bounds region `region` (by number) to `units` from here on, and asks the buffer pool for
+    /// that size.
+    fn set_bound(&mut self, region: u8, units: u32) {
         if let Some(bound) = self
             .region_index(region)
             .and_then(|index| self.bounds.get_mut(index))
@@ -33,7 +54,46 @@ impl Scheduler {
             *bound = Some(units);
         }
         self.submit(runtime::Request::Resize { region, units });
-        self.resizing.push((region, Some(reply)));
+    }
+
+    /// Answers each `Message::Bound` of region `region` (by number) whose region holds no more
+    /// than its bound now, with the units it holds, after a `Resized` set the region's capacity.
+    pub(super) fn answer_bounds(&mut self, region: u8) {
+        let Some(index) = self.region_index(region) else {
+            return;
+        };
+        let units = self.capacity.get(index).copied().unwrap_or(0);
+        let reached = self
+            .bounds
+            .get(index)
+            .copied()
+            .flatten()
+            .is_some_and(|bound| units <= bound);
+        if !reached {
+            return;
+        }
+
+        let (answered, owed): (Vec<_>, Vec<_>) = std::mem::take(&mut self.bounded)
+            .into_iter()
+            .partition(|(owed, _)| *owed == region);
+        self.bounded = owed;
+        // A requester that stopped waiting needs no reply.
+        for (_, reply) in answered {
+            let _ = reply.send(units);
+        }
+    }
+
+    /// Answers every `Message::Bound` still owed with the units its region holds now: a drain
+    /// ended the bounds, so no shrink toward them follows.
+    pub(super) fn end_bounds(&mut self) {
+        self.bounds.fill(None);
+        for (region, reply) in std::mem::take(&mut self.bounded) {
+            let units = self
+                .region_index(region)
+                .and_then(|index| self.capacity.get(index).copied())
+                .unwrap_or(0);
+            let _ = reply.send(units);
+        }
     }
 
     /// The units region `region` (an index) holds past its bound, as its last `Resized` stated

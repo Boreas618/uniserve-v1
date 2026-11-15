@@ -1461,8 +1461,9 @@ impl Scheduler {
 
     /// A region's units after a `Resize` (SD §3.8): the reply owed to a `Message::Resize` for the
     /// region, which states them; nothing for the scheduler's own shrink toward the region's
-    /// bound (`resize.rs`); or, for the shrink of a drain, `Output::Shrunk`, which the engine
-    /// divides among the target epoch's schedulers.
+    /// bound or for a `Message::Bound`, whose reply waits until the region reached its bound
+    /// (`resize.rs`); or, for the shrink of a drain, `Output::Shrunk`, which the engine divides
+    /// among the target epoch's schedulers.
     fn resized(&mut self, region: u8, units: u32) {
         if let Some(index) = self.region_index(region)
             && let Some(capacity) = self.capacity.get_mut(index)
@@ -1479,6 +1480,7 @@ impl Scheduler {
             }
             None => self.emit(Output::Shrunk(region, units)),
         }
+        self.answer_bounds(region);
     }
 }
 
@@ -2554,6 +2556,65 @@ mod tests {
                 .try_iter()
                 .any(|output| matches!(output, Output::Shrunk(..)))
         );
+    }
+
+    /// A `Bound` the engine asked for is answered once a `Resized` states that the region holds
+    /// no more than the bound: a shrink that stopped short owes the reply, and the shrink that
+    /// follows as units come free pays it.
+    #[test]
+    fn a_bound_is_answered_once_the_region_reached_it() {
+        let (mut bench, outputs) = scheduler();
+        let (reply, replied) = crossbeam_channel::bounded(1);
+        bench.scheduler.bound(5, 30, reply);
+        let resized = |units| Completion::Resized {
+            units,
+            evicted: Vec::new(),
+        };
+
+        // Requests still hold two units past the bound.
+        answer(&mut bench, &[resized(32)]);
+        assert_eq!(bench.scheduler.capacity[1], 32);
+        assert!(replied.try_recv().is_err());
+
+        // The scheduler's own shrink toward the bound reaches it once they let them go.
+        bench.scheduler.resizing.push((5, None));
+        bench.scheduler.submit(runtime::Request::Resize {
+            region: 5,
+            units: 30,
+        });
+        answer(&mut bench, &[resized(30)]);
+        assert_eq!(replied.try_recv(), Ok(30));
+        assert!(bench.scheduler.bounded.is_empty());
+        assert!(
+            !outputs
+                .try_iter()
+                .any(|output| matches!(output, Output::Shrunk(..)))
+        );
+    }
+
+    /// A drain ends the bounds, so a `Bound` still owed is answered with what its region holds.
+    #[test]
+    fn a_drain_answers_the_bounds_it_ends() {
+        let (mut bench, _outputs) = scheduler();
+        let (reply, replied) = crossbeam_channel::bounded(1);
+        bench.scheduler.bound(5, 10, reply);
+        answer(
+            &mut bench,
+            &[Completion::Resized {
+                units: 32,
+                evicted: Vec::new(),
+            }],
+        );
+        assert!(replied.try_recv().is_err());
+
+        let (drained, _) = crossbeam_channel::bounded(1);
+        bench.scheduler.drain(
+            MigrationCause::Drain,
+            std::time::Instant::now(),
+            false,
+            drained,
+        );
+        assert_eq!(replied.try_recv(), Ok(32));
     }
 
     /// The events a consumer took return their credit, never beyond the window.
