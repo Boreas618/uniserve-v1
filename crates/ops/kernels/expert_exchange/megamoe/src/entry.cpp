@@ -47,7 +47,9 @@ constexpr int kTop = UNISERVE_TOP;
 constexpr int kExperts = UNISERVE_EXPERTS;
 constexpr int kMaxTokens = UNISERVE_MAX_TOKENS;
 constexpr int kLocalExperts = kExperts / kRanks;
-constexpr int kScaleColumns = ((kHidden / 16 + 3) / 4) * 4;
+// A row's activation scales as the kernel reads them (whole 32-bit words of four FP8
+// scales), which the build takes from the compiled kernel.
+constexpr int kScaleColumns = UNISERVE_SCALE_COLUMNS;
 constexpr size_t kLocalWorkspace = UNISERVE_LOCAL_WORKSPACE;
 constexpr size_t kSharedWorkspace = UNISERVE_SHARED_WORKSPACE;
 

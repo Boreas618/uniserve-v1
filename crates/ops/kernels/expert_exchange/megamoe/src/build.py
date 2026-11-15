@@ -119,7 +119,11 @@ def load_kernel_sources(request, staging):
 
 
 def compile_kernel(request, shape, staging):
-    """Compile and export the kernel; answers its two workspace sizes."""
+    """Compile and export the kernel.
+
+    Answers the kernel's local and shared workspace sizes in bytes and the
+    width of a row of its activation scales, which the entry unit lays out.
+    """
     hidden, intermediate, top, experts, tokens, ranks = shape
     # The kernel is traced for the request's target, never for a probed device.
     cute_dsl.configure(request.target)
@@ -138,8 +142,8 @@ def compile_kernel(request, shape, staging):
         Sm100MegaMoEKernel,  # noqa: PLC0415
     )
     from moe_nvfp4_swapab.runner_common import (  # noqa: PLC0415
-        _DataDtype,
-        _ScaleDtype,
+        Nvfp4DataDtype,
+        Nvfp4ScaleDtype,
     )
     from shim.tuner import default_knobs  # noqa: PLC0415
     from src.token_comm import CombineFormat  # noqa: PLC0415
@@ -188,27 +192,30 @@ def compile_kernel(request, shape, staging):
             leading_dim=cutlass_torch.get_leading_dim(tensor)
         )
 
-    scale_columns = (hidden // 16 + 3) // 4 * 4
+    # A row's activation scales as the kernel reads them: whole 32-bit words
+    # of four FP8 scales, one scale per `sf_vec_size` elements.
+    scale_columns = kernel.sf_uint32_per_token * 4
+    vector = kernel.sf_vec_size
     packed = torch.zeros((tokens, hidden // 2), dtype=torch.uint8).view(
-        _DataDtype
+        Nvfp4DataDtype
     )
     scales = torch.zeros((tokens, scale_columns), dtype=torch.uint8).view(
-        _ScaleDtype
+        Nvfp4ScaleDtype
     )
     routes = torch.zeros((tokens, top), dtype=torch.int64)
     weights = torch.zeros((tokens, top), dtype=torch.float32)
     first = torch.zeros((local, width, hidden // 2), dtype=torch.uint8)
-    first = first.transpose(1, 2).view(_DataDtype)
+    first = first.transpose(1, 2).view(Nvfp4DataDtype)
     second = torch.zeros((local, hidden, intermediate // 2), dtype=torch.uint8)
-    second = second.transpose(1, 2).view(_DataDtype)
+    second = second.transpose(1, 2).view(Nvfp4DataDtype)
     first_scales = torch.zeros(
-        (local, width * (hidden // 16)), dtype=torch.uint8
+        (local, width * (hidden // vector)), dtype=torch.uint8
     )
-    first_scales = first_scales.view(_ScaleDtype)
+    first_scales = first_scales.view(Nvfp4ScaleDtype)
     second_scales = torch.zeros(
-        (local, hidden * (intermediate // 16)), dtype=torch.uint8
+        (local, hidden * (intermediate // vector)), dtype=torch.uint8
     )
-    second_scales = second_scales.view(_ScaleDtype)
+    second_scales = second_scales.view(Nvfp4ScaleDtype)
     alpha = torch.zeros((local,), dtype=torch.float32)
     output = torch.zeros((tokens, hidden), dtype=torch.bfloat16)
 
@@ -255,7 +262,8 @@ def compile_kernel(request, shape, staging):
         make_fake_stream(),
     )
     compiled.export_to_c(str(staging), "mega")
-    return kernel.get_workspace_sizes()
+    local_bytes, shared_bytes = kernel.get_workspace_sizes()
+    return local_bytes, shared_bytes, scale_columns
 
 
 def run(command, what):
@@ -281,7 +289,9 @@ def compile(request: Request) -> None:
     compiler = request.toolchain.require_host_compiler()
     with tempfile.TemporaryDirectory(dir=request.output, prefix=".") as scratch:
         staging = pathlib.Path(scratch)
-        local_bytes, shared_bytes = compile_kernel(request, shape, staging)
+        local_bytes, shared_bytes, scale_columns = compile_kernel(
+            request, shape, staging
+        )
         offsets = ", ".join(f"offsets[{rank}]" for rank in range(ranks))
         defines = [
             f"-DUNISERVE_RANKS={ranks}",
@@ -290,6 +300,7 @@ def compile(request: Request) -> None:
             f"-DUNISERVE_TOP={top}",
             f"-DUNISERVE_EXPERTS={experts}",
             f"-DUNISERVE_MAX_TOKENS={tokens}",
+            f"-DUNISERVE_SCALE_COLUMNS={scale_columns}",
             f"-DUNISERVE_LOCAL_WORKSPACE={local_bytes}ull",
             f"-DUNISERVE_SHARED_WORKSPACE={shared_bytes}ull",
             f"-DUNISERVE_OFFSETS={ranks}",

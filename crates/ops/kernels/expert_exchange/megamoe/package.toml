@@ -19,9 +19,12 @@ op = "expert_exchange"
 backend = "megamoe"
 interface_version = 1
 
+# The distributions the build and the pinned kernel import: FlashInfer (the pin's origin),
+# PyTorch (the tensors that describe the kernel's operands, and the kernel's dtype names)
+# and CUDA's Python bindings (the launcher's stream type).
 [toolchain]
 kind = "cute_dsl"
-packages = ["flashinfer-python"]
+packages = ["flashinfer-python", "torch", "cuda-bindings"]
 
 [module.entries]
 launch = "uniserve_expert_exchange_launch"
