@@ -183,6 +183,8 @@ type Admission = (u32, RequestId);
 struct Shared {
     writer: Mutex<Connection>,
     requests: Mutex<HashMap<RequestId, Pending>>,
+    /// Notified whenever the last request in flight ends ([`EngineClient::drained`]).
+    drained: tokio::sync::Notify,
     state: watch::Sender<EngineState>,
     next_id: AtomicU64,
     /// The engine commands awaiting their answer, by identity.
@@ -325,6 +327,7 @@ impl EngineClient {
         let shared = Arc::new(Shared {
             writer: Mutex::new(writer),
             requests: Mutex::default(),
+            drained: tokio::sync::Notify::new(),
             state,
             next_id: AtomicU64::new(1),
             responses: Mutex::default(),
@@ -602,6 +605,21 @@ impl EngineClient {
     /// The requests submitted to the engine that have not ended.
     pub fn in_flight(&self) -> usize {
         lock(&self.shared.requests).len()
+    }
+
+    /// Resolves once no request submitted to the engine is in flight: at once when none is, else
+    /// when the last one ends, by its terminal event or the engine's loss.
+    pub async fn drained(&self) {
+        loop {
+            // Registered before the count is read, so an end between the two is not missed.
+            let ended = self.shared.drained.notified();
+            tokio::pin!(ended);
+            ended.as_mut().enable();
+            if self.in_flight() == 0 {
+                return;
+            }
+            ended.await;
+        }
     }
 
     /// Sends `command`, built with the identity its response matches, and
@@ -1174,6 +1192,7 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
     // tokens, or a video request, to the engine that serves next, and fails
     // any other. No trajectory was stored anywhere new.
     let pending: Vec<(RequestId, Pending)> = lock(&shared.requests).drain().collect();
+    shared.drained.notify_waiters();
     for (_, mut request) in pending {
         if let Some(responder) = request.accepted.take() {
             let _ = responder.send(None);
@@ -1202,6 +1221,9 @@ fn file(shared: &Shared, id: RequestId, event: Event) {
     let _ = pending.events.send(event);
     if terminal {
         requests.remove(&id);
+        if requests.is_empty() {
+            shared.drained.notify_waiters();
+        }
     }
 }
 

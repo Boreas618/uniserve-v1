@@ -32,6 +32,25 @@ enum Serving {
     Closed(String),
 }
 
+/// The changes of a hold from the moment they were taken ([`RequestHold::changes`]): of the
+/// engine that serves, the hold's holding or closing, and its pause.
+pub(crate) struct HoldChanges {
+    serving: watch::Receiver<Serving>,
+    paused: watch::Receiver<bool>,
+}
+
+impl HoldChanges {
+    /// Resolves at the hold's next change; never once the hold is gone, which changes nothing
+    /// more.
+    pub(crate) async fn changed(&mut self) {
+        tokio::select! {
+            Ok(()) = self.serving.changed() => {}
+            Ok(()) = self.paused.changed() => {}
+            else => std::future::pending().await,
+        }
+    }
+}
+
 /// The leader's submissions and the engine that serves them.
 pub struct RequestHold {
     serving: watch::Sender<Serving>,
@@ -137,6 +156,14 @@ impl RequestHold {
     /// Lets submissions through again.
     pub fn resume(&self) {
         self.paused.send_replace(false);
+    }
+
+    /// The hold's changes from now on ([`HoldChanges`]).
+    pub(crate) fn changes(&self) -> HoldChanges {
+        HoldChanges {
+            serving: self.serving.subscribe(),
+            paused: self.paused.subscribe(),
+        }
     }
 
     /// Whether the hold is paused.

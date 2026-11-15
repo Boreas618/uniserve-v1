@@ -69,7 +69,7 @@ impl std::fmt::Debug for LockedSocket {
 /// descriptors: whether it is a Unix socket, and that socket's path, which the
 /// successor owns from then on through the lock that travels after the
 /// socket.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ListenerHandoff {
     /// The Unix socket's path; `None` for a TCP listener.
     unix: Option<PathBuf>,

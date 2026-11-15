@@ -46,32 +46,17 @@ pub(crate) fn run(
 }
 
 /// Serves the resolved configuration until Ctrl-C or SIGTERM, reporting its readiness to
-/// `ready`.
+/// `ready`: the deployment it names, or, without one, the deployments `PUT /admin/config` brings
+/// up (`daemon::serve`).
 async fn serve(
     (config, stated): (daemon::options::ServerArgs, daemon::options::Stated),
     ready: Option<service::ReadyFd>,
 ) -> Result<()> {
-    // A model-less leader serves its admin API until a deployment is
-    // configured. Followers join the leader without loading a model.
-    if config.leads() && !config.states_model() {
-        info!(
-            host = %config.admin_config.host,
-            port = config.admin_config.port,
-            "serving no deployment until PUT /admin/config"
-        );
-        return daemon::node(
-            config.admin_config,
-            config.server_config,
-            config.build_config,
-            crate::served()?,
-            ready,
-            crate::shutdown_signal(),
-        )
-        .await;
-    }
-    info!(model = %config.model(),
-        resident_requests = config.max_running_requests,
-        engine = %config.worker_config.engine, "resolved serving options");
+    info!(
+        model = config.model(),
+        node_rank = config.node_rank,
+        "resolved serving options"
+    );
     daemon::serve(
         config,
         stated,

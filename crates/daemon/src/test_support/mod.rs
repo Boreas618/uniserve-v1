@@ -66,7 +66,7 @@ pub(crate) fn router_with(engine: impl Into<Arc<Leader>>, server: &ServerConfig)
         Arc::new(jobs),
         server,
         server.max_request_body,
-        None,
+        Arc::new(crate::http::handoff::Handoff::new()),
     )
 }
 
@@ -77,6 +77,7 @@ fn admin_state(engine: impl Into<Arc<Leader>>) -> crate::http::admin::AdminState
         CancellationToken::new(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         Arc::new(crate::epoch::Epochs::default()),
+        crate::options::EventLog::default(),
     );
     admin.watch(&leader);
     crate::http::admin::AdminState {

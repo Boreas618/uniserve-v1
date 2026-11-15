@@ -458,11 +458,12 @@ impl Default for ServerArgs {
 }
 
 /// The daemon's listeners (`admin_config`): the address its HTTP server
-/// serves the client API on, and the two Unix sockets that serve the admin
-/// API apart from it, one for the operator and one for a harness. Access to
-/// the admin API is those sockets' file permissions. The daemon binds every
-/// listener when it starts and states their endpoints in its readiness
-/// record.
+/// serves the client API on, and how the admin API, which two Unix sockets of
+/// the daemon's instance directory serve apart from it (`admin.sock` for the
+/// operator, `harness.sock` for a harness), answers. Access to the admin API
+/// is those sockets' file permissions. The daemon binds every listener when it
+/// starts and states their endpoints in its readiness record, which is where a
+/// caller finds them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdminConfig {
@@ -473,35 +474,11 @@ pub struct AdminConfig {
     /// Unix domain socket to listen on instead of TCP; a stale socket file
     /// is replaced and the socket file is removed at shutdown.
     pub uds: Option<String>,
-    /// The Unix socket the operator's admin API listens on, created with
-    /// mode `0600`; unset places it in the daemon's instance directory
-    /// (`admin.sock`).
-    pub admin_uds: Option<String>,
-    /// The Unix socket the harness's subset of the admin API listens on,
-    /// created with mode `0660`, so that the operator grants a harness
-    /// access through the socket's group; unset places it in the daemon's
-    /// instance directory (`harness.sock`).
-    pub harness_uds: Option<String>,
     /// The option paths a harness may set through `PUT /admin/config` on the
     /// harness listener, beside the package selections it may always set.
     pub harness_options: Vec<String>,
-}
-
-impl AdminConfig {
-    /// The Unix socket the operator's admin API listens on, in `instance` unless stated.
-    pub fn admin_socket(&self, instance: &Path) -> PathBuf {
-        self.admin_uds
-            .as_ref()
-            .map_or_else(|| instance.join("admin.sock"), PathBuf::from)
-    }
-
-    /// The Unix socket the harness's subset of the admin API listens on, in `instance` unless
-    /// stated.
-    pub fn harness_socket(&self, instance: &Path) -> PathBuf {
-        self.harness_uds
-            .as_ref()
-            .map_or_else(|| instance.join("harness.sock"), PathBuf::from)
-    }
+    /// The admin API's event log (`GET /admin/events`).
+    pub event_log: EventLog,
 }
 
 impl Default for AdminConfig {
@@ -510,9 +487,40 @@ impl Default for AdminConfig {
             host: "127.0.0.1".to_owned(),
             port: 0,
             uds: None,
-            admin_uds: None,
-            harness_uds: None,
             harness_options: Vec::new(),
+            event_log: EventLog::default(),
+        }
+    }
+}
+
+/// The admin API's event log (`admin_config.event_log`): what it keeps and how long a reader
+/// waits for the next event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EventLog {
+    /// The events the log keeps, the newest; an older one leaves it, and a reader that asks for
+    /// it learns that events were lost (`gap`).
+    pub capacity: NonZeroUsize,
+    /// The longest a `GET /admin/events?wait=S` request waits for a new event; a longer `wait`
+    /// waits this long. It bounds how long a long-polling reader holds a connection.
+    #[serde(with = "values::duration")]
+    pub longest_wait: Duration,
+}
+
+/// The default `admin_config.event_log.capacity`: the events of many updates, each of which
+/// records a few phases and operations, so that a manager that reads after a pause still finds
+/// the events of what it waited on.
+pub const EVENT_LOG_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
+
+/// The default `admin_config.event_log.longest_wait`: a minute, under the idle timeouts of
+/// common HTTP proxies a reader may reach the socket through.
+pub const EVENT_LOG_LONGEST_WAIT: Duration = Duration::from_secs(60);
+
+impl Default for EventLog {
+    fn default() -> Self {
+        Self {
+            capacity: EVENT_LOG_CAPACITY,
+            longest_wait: EVENT_LOG_LONGEST_WAIT,
         }
     }
 }
@@ -1068,19 +1076,6 @@ impl ServerArgs {
                 "`admin_config.host` must not be empty"
             ),
         }
-        for (name, path) in [
-            ("admin_uds", &admin.admin_uds),
-            ("harness_uds", &admin.harness_uds),
-        ] {
-            anyhow::ensure!(
-                path.as_ref().is_none_or(|path| !path.trim().is_empty()),
-                "`admin_config.{name}` must not be empty"
-            );
-        }
-        anyhow::ensure!(
-            admin.admin_uds.is_none() || admin.admin_uds != admin.harness_uds,
-            "`admin_config.admin_uds` and `admin_config.harness_uds` name one socket"
-        );
         anyhow::ensure!(
             self.dist_init_addr
                 .as_ref()

@@ -486,16 +486,17 @@ impl Daemon {
         self.address.as_deref()
     }
 
-    /// Whether the service still runs: a member's ends when the leader's
-    /// connection closes.
-    pub fn is_running(&self) -> bool {
-        self.thread
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished())
+    /// What stops this daemon's service from another thread while one waits for its end
+    /// ([`Daemon::wait`]): the stop [`Daemon::stop`] asks for, without the join.
+    pub fn stopper(&self) -> Stopper {
+        Stopper {
+            requested: Arc::clone(&self.requested),
+            wake: self.wake.clone(),
+        }
     }
 
     /// Waits until the service ends: on a member, when the leader's
-    /// connection closes.
+    /// connection closes; on any node, once a [`Stopper`] stopped it.
     ///
     /// # Errors
     ///
@@ -519,6 +520,22 @@ impl Daemon {
             .join()
             .map_err(|_| anyhow::anyhow!("the daemon's service panicked"))?
             .map(drop)
+    }
+}
+
+/// Stops a daemon's service from any thread ([`Daemon::stopper`]).
+#[derive(Clone)]
+pub struct Stopper {
+    requested: Arc<AtomicBool>,
+    wake: Wake,
+}
+
+impl Stopper {
+    /// Asks the service to stop: it ends every process it supervises and its thread ends, which
+    /// ends the [`Daemon::wait`] of whoever waits for it.
+    pub fn stop(&self) {
+        self.requested.store(true, Ordering::Release);
+        self.wake.wake();
     }
 }
 

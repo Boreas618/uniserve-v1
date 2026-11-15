@@ -48,6 +48,6 @@ pub mod supervision;
 pub(crate) mod test_support;
 pub(crate) mod updates;
 
-pub use crate::http::{node, serve};
+pub use crate::http::serve;
 pub use crate::leader::{Leader, Task};
 pub use crate::supervision::{Daemon, DaemonOptions, JOIN_TIMEOUT};

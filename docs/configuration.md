@@ -147,16 +147,16 @@ Every response states its body's framing in its head: `Content-Length` when its 
 
 ### `admin_config`
 
-**Destination: the daemon's own options.** The daemon's listeners read it: the client API's address, and the two Unix sockets the admin API is served on apart from it ([admin API](admin.md#listeners)). `uniserve serve --host` and `--port` set the address. The daemon binds every listener when it starts and states the endpoints it bound in its readiness record.
+**Destination: the daemon's own options.** The daemon's listeners read it: the client API's address, and how the admin API, which two Unix sockets of the daemon's instance directory serve apart from it ([admin API](admin.md#listeners)), answers. `uniserve serve --host` and `--port` set the address. The daemon binds every listener when it starts and states the endpoints it bound in its readiness record.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `host` | `"127.0.0.1"` | TCP address the daemon's client API listens on |
 | `port` | `0` | TCP port the daemon's client API listens on; `0` picks a free one, which the readiness record states (`client`) |
 | `uds` | Unset | Unix domain socket the client API listens on instead of TCP, owned through the lock `NAME.lock` beside it: a socket file a daemon that is gone left is replaced, a path another daemon owns is refused, and the file is removed at shutdown |
-| `admin_uds` | `admin.sock` in the daemon's instance directory (`daemon.XXXXXX` in `$XDG_RUNTIME_DIR/uniserve`) | Unix socket of the operator's admin API, created with mode `0600`; it serves every admin route |
-| `harness_uds` | `harness.sock` in the daemon's instance directory | Unix socket of the harness's subset of the admin API (apply, commit, rollback, status, events and the update's report), created with mode `0660`: the operator grants a harness access through the socket's group |
 | `harness_options` | `[]` | The option paths a harness may set through `PUT /admin/config` on the harness listener, beside the package selections it may always set (`worker_config.engine`, `worker_config.engine_revision`, `scheduler_config.policy`, `attention_backend`, `prefill_attention_backend`, `decode_attention_backend`, `moe_runner_backend`, `moe_config.exchange`) |
+| `event_log.capacity` | `1024` | The events the admin API's event log keeps, the newest (`GET /admin/events`); a reader that asks for an older one learns that events were lost (`gap`) |
+| `event_log.longest_wait` | `60s` | The longest a `GET /admin/events?wait=S` request waits for a new event; a longer `wait` waits this long |
 
 ### `storage_config`
 

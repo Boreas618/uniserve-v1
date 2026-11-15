@@ -36,18 +36,9 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::openai::ApiError;
-use crate::leader::{Leader, LeaderStatus, UpdateError};
+use crate::leader::{Leader, UpdateError};
 use crate::updates::change::{Applied, ApplyRequest, InFlight};
 use crate::updates::update::Phase;
-
-/// Events the log keeps; older ones leave it.
-const EVENT_CAPACITY: usize = 1024;
-
-/// The longest an events request waits for a new event.
-const MAX_WAIT: Duration = Duration::from_secs(60);
-
-/// How often the admin samples the leader's status for changes.
-const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One entry of the event log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -99,6 +90,8 @@ pub(crate) struct AdminHandoff {
 
 /// The admin's state: the event log and the operations.
 pub(crate) struct Admin {
+    /// What the event log keeps and how long a reader waits (`admin_config.event_log`).
+    log: crate::options::EventLog,
     events: Mutex<VecDeque<AdminEvent>>,
     next_event: AtomicU64,
     appended: Notify,
@@ -135,9 +128,11 @@ impl Admin {
         shutdown: CancellationToken,
         retire: Arc<AtomicBool>,
         epochs: Arc<crate::epoch::Epochs>,
+        log: crate::options::EventLog,
     ) -> Arc<Self> {
         Arc::new(Self {
-            events: Mutex::new(VecDeque::with_capacity(EVENT_CAPACITY)),
+            log,
+            events: Mutex::new(VecDeque::with_capacity(log.capacity.get())),
             next_event: AtomicU64::new(1),
             appended: Notify::new(),
             running: Mutex::new(None),
@@ -184,8 +179,9 @@ impl Admin {
         retire: Arc<AtomicBool>,
         handoff: AdminHandoff,
         epochs: Arc<crate::epoch::Epochs>,
+        log: crate::options::EventLog,
     ) -> Arc<Self> {
-        let admin = Self::with_epochs(shutdown, retire, epochs);
+        let admin = Self::with_epochs(shutdown, retire, epochs, log);
         *service::lock(&admin.events) = handoff.events.into_iter().collect();
         admin
             .next_event
@@ -200,7 +196,7 @@ impl Admin {
     /// Appends an event.
     pub(crate) fn record(&self, kind: &'static str, message: impl Into<String>) {
         let mut events = service::lock(&self.events);
-        if events.len() == EVENT_CAPACITY {
+        if events.len() == self.log.capacity.get() {
             events.pop_front();
         }
         events.push_back(AdminEvent {
@@ -224,7 +220,7 @@ impl Admin {
             _ => serde_json::Map::new(),
         };
         let mut events = service::lock(&self.events);
-        if events.len() == EVENT_CAPACITY {
+        if events.len() == self.log.capacity.get() {
             events.pop_front();
         }
         events.push_back(AdminEvent {
@@ -327,8 +323,8 @@ impl Admin {
         operation
     }
 
-    /// Records the leader's changes of state, sampled every second, and
-    /// every phase its updates enter, until the server stops.
+    /// Records the leader's changes of state, as the leader publishes them, and every phase its
+    /// updates enter, until the server stops.
     pub(crate) fn watch(self: &Arc<Self>, leader: &Arc<Leader>) {
         if let Some(mut transitions) = leader.updates.transitions() {
             let admin = Arc::clone(self);
@@ -338,45 +334,45 @@ impl Admin {
                 }
             });
         }
+        // The changes are taken before the status they follow is read, so none is missed.
+        let mut changes = leader.status_changes();
+        let mut previous = leader.status();
         let admin = Arc::clone(self);
         let leader = Arc::downgrade(leader);
         tokio::spawn(async move {
-            let mut previous: Option<LeaderStatus> = None;
             loop {
+                tokio::select! {
+                    () = admin.shutdown.cancelled() => return,
+                    () = changes.changed() => {}
+                }
                 let Some(status) = leader.upgrade().map(|leader| leader.status()) else {
                     return;
                 };
-                if let Some(previous) = &previous {
-                    if previous.engine != status.engine {
-                        let reason = status
-                            .reason
-                            .as_deref()
-                            .map(|reason| format!(": {reason}"))
-                            .unwrap_or_default();
-                        admin.record(
-                            "engine",
-                            format!(
-                                "the engine went from {} to {}{reason}",
-                                previous.engine, status.engine
-                            ),
-                        );
-                    }
-                    if previous.paused != status.paused {
-                        admin.record(
-                            "deployment",
-                            if status.paused {
-                                "new requests wait"
-                            } else {
-                                "new requests are served"
-                            },
-                        );
-                    }
+                if previous.engine != status.engine {
+                    let reason = status
+                        .reason
+                        .as_deref()
+                        .map(|reason| format!(": {reason}"))
+                        .unwrap_or_default();
+                    admin.record(
+                        "engine",
+                        format!(
+                            "the engine went from {} to {}{reason}",
+                            previous.engine, status.engine
+                        ),
+                    );
                 }
-                previous = Some(status);
-                tokio::select! {
-                    () = admin.shutdown.cancelled() => return,
-                    () = tokio::time::sleep(SAMPLE_INTERVAL) => {}
+                if previous.paused != status.paused {
+                    admin.record(
+                        "deployment",
+                        if status.paused {
+                            "new requests wait"
+                        } else {
+                            "new requests are served"
+                        },
+                    );
                 }
+                previous = status;
             }
         });
     }
@@ -408,24 +404,17 @@ pub(crate) struct Listeners {
 }
 
 impl Listeners {
-    /// Binds the admin sockets `config` states, or `admin.sock` and `harness.sock` in the
-    /// daemon's instance directory `instance`, each taking its path over from whoever holds it
-    /// (a hot restart's predecessor): the operator's with mode `0600`, the harness's with
-    /// `0660`.
+    /// Binds the admin sockets `admin.sock` and `harness.sock` in the daemon's instance
+    /// directory `instance`, each taking its path over from whoever holds it (a hot restart's
+    /// predecessor): the operator's with mode `0600`, the harness's with `0660`.
     ///
     /// # Errors
     ///
     /// Fails when a socket cannot be bound at its path.
-    pub(crate) fn bind(
-        config: &crate::options::AdminConfig,
-        instance: &std::path::Path,
-    ) -> anyhow::Result<Self> {
+    pub(crate) fn bind(instance: &std::path::Path) -> anyhow::Result<Self> {
         use anyhow::Context as _;
 
-        let paths = (
-            config.admin_socket(instance),
-            config.harness_socket(instance),
-        );
+        let paths = (instance.join("admin.sock"), instance.join("harness.sock"));
         let bind = |path: &std::path::Path, mode, name| {
             super::listener::Listener::bind_over(path, mode)
                 .with_context(|| format!("binding the {name} socket {}", path.display()))
@@ -444,17 +433,6 @@ impl Listeners {
             Some(service::Endpoint::unix(&self.paths.1)),
         )
     }
-}
-
-/// Serves the admin API of `state` on the operator's and the harness's sockets until `shutdown`
-/// is cancelled; the two servers run on tasks of their own.
-pub(crate) fn serve(listeners: Listeners, state: AdminState, shutdown: &CancellationToken) {
-    serve_routes(
-        listeners,
-        router(state.clone()),
-        harness_router(state),
-        shutdown,
-    );
 }
 
 /// Serves `admin` on the operator's socket and `harness` on the harness's until `shutdown` is
@@ -571,7 +549,7 @@ async fn events(State(state): State<AdminState>, Query(query): Query<EventsQuery
         )
         .into_response();
     }
-    let wait = Duration::from_secs_f64(query.wait).min(MAX_WAIT);
+    let wait = Duration::from_secs_f64(query.wait).min(state.admin.log.longest_wait);
     let (events, next, gap) = state.admin.events_after(query.after, wait).await;
     Json(json!({ "events": events, "next": next, "gap": gap })).into_response()
 }
@@ -1273,6 +1251,7 @@ mod tests {
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(crate::epoch::Epochs::default()),
+            crate::options::EventLog::default(),
         );
         admin.record("deployment", "first");
         admin.record("deployment", "second");
@@ -1304,13 +1283,14 @@ mod tests {
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(crate::epoch::Epochs::default()),
+            crate::options::EventLog::default(),
         );
-        for index in 0..EVENT_CAPACITY + 2 {
+        for index in 0..crate::options::EVENT_LOG_CAPACITY.get() + 2 {
             admin.record("deployment", format!("event {index}"));
         }
         let (events, _, gap) = admin.events_after(0, Duration::ZERO).await;
         assert!(gap);
-        assert_eq!(events.len(), EVENT_CAPACITY);
+        assert_eq!(events.len(), crate::options::EVENT_LOG_CAPACITY.get());
     }
 
     /// A hot restart's successor reports the epochs and processes of the
@@ -1331,12 +1311,14 @@ mod tests {
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(crate::epoch::Epochs::default()),
+            crate::options::EventLog::default(),
         );
         let admin = Admin::resume(
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
             predecessor.hand_over(),
             Arc::clone(&epochs),
+            crate::options::EventLog::default(),
         );
         let report = admin.epochs().report();
         assert_eq!(report["processes"][0]["pid"], serde_json::json!(42));
@@ -1348,6 +1330,7 @@ mod tests {
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(crate::epoch::Epochs::default()),
+            crate::options::EventLog::default(),
         );
         let first = admin.begin("update").unwrap();
         let refused = admin.begin("flush_cache").unwrap_err();

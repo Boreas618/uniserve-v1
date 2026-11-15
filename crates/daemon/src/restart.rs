@@ -117,6 +117,8 @@ struct Prepare {
     /// The daemon's instance directory, whose sockets the successor binds over and which it
     /// owns once the handover completed.
     instance: std::path::PathBuf,
+    /// How long the node lives, which the successor's node goes on with.
+    lifetime: crate::http::node::Lifetime,
     /// Whether the configuration listens on another address than the
     /// daemon's listener: the successor binds it before the handover.
     rebind: bool,
@@ -179,6 +181,8 @@ pub(crate) struct Restarter {
     listener: std::sync::Mutex<Option<(ListenerHandoff, Vec<OwnedFd>)>>,
     /// The daemon's instance directory, which the successor goes on with.
     instance: std::path::PathBuf,
+    /// How long the daemon's node lives, which the successor's goes on with.
+    lifetime: crate::http::node::Lifetime,
     stated: Stated,
     /// Cancelled once the successor serves: this daemon stops accepting.
     pub(crate) accepting: CancellationToken,
@@ -209,34 +213,30 @@ pub(crate) struct Restarter {
 }
 
 impl Restarter {
-    /// The restarter of the daemon serving with `stated` on `listener`,
-    /// whose service `daemon` holds.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the listener cannot be duplicated.
+    /// The restarter of a deployment serving with `stated` on the client listener of which
+    /// `listener` is a duplicate, whose daemon service `daemon` holds, on a node whose instance
+    /// directory is `instance` and whose lifetime is `lifetime`; `accepting` stops the node
+    /// accepting once a successor serves.
     pub(crate) fn new(
         daemon: Arc<std::sync::Mutex<Option<Daemon>>>,
-        listener: &mut Listener,
+        listener: (ListenerHandoff, Vec<OwnedFd>),
         instance: &std::path::Path,
         stated: Stated,
         accepting: CancellationToken,
-    ) -> anyhow::Result<Self> {
-        Ok(Self {
+        lifetime: crate::http::node::Lifetime,
+    ) -> Self {
+        Self {
             daemon,
-            listener: std::sync::Mutex::new(Some(
-                listener
-                    .hand_over()
-                    .context("duplicating the HTTP listener")?,
-            )),
+            listener: std::sync::Mutex::new(Some(listener)),
             instance: instance.to_owned(),
+            lifetime,
             stated,
             accepting,
             handoff_sent: Arc::new(AtomicBool::new(false)),
             decided: tokio::sync::watch::channel(None).0,
             in_flight: Arc::new(AtomicBool::new(false)),
             handoff: std::sync::Mutex::new(None),
-        })
+        }
     }
 
     /// The registry of the responses in flight, which the HTTP server
@@ -340,6 +340,7 @@ impl Restarter {
                 api_key: options.server_config.api_key.clone(),
                 processes,
                 instance: self.instance.clone(),
+                lifetime: self.lifetime,
                 rebind,
                 interface: proto::ENGINE_INTERFACE_VERSION,
             })),
@@ -919,35 +920,35 @@ async fn prepared_successor(
 
     *service::lock(&leader.replicas.adapters) = adapters;
     let retire = Arc::new(AtomicBool::new(false));
+    // The deployment's end is its node's as the predecessor's node lived.
+    let token = crate::http::node::deployment_token(prepare.lifetime, &shutdown);
     let admin = Admin::resume(
-        shutdown.clone(),
+        token.clone(),
         Arc::clone(&retire),
         admin,
         Arc::clone(&epoch_records),
+        config.admin_config.event_log,
     );
     admin.record(
         "deployment",
         format!("serving {} after a hot restart", leader.served_model_name()),
     );
-    admin.watch(&leader);
     if let Some(request) = then {
         crate::http::admin::apply_after_restart(&admin, &leader, request);
     }
     // The handover completed: the predecessor's instance directory is this daemon's now, and
     // its admin sockets are bound over in it.
     let instance = service::Instance::resume(prepare.instance.clone());
-    let admins = crate::http::admin::Listeners::bind(&config.admin_config, instance.path())?;
+    let admins = crate::http::admin::Listeners::bind(instance.path())?;
     let mut ready = crate::http::Ready::new(None, instance.path());
     {
         let endpoints = ready.endpoints();
         endpoints.client = Some(listener.endpoint()?);
         (endpoints.admin, endpoints.harness) = admins.endpoints();
     }
-    ready.add_storage();
-    admin.set_readiness(ready.record(service::State::Serving));
     let video_jobs = Arc::new(VideoJobs::new(
         config.video_job_config.clone(),
-        shutdown.child_token(),
+        token.child_token(),
     ));
     for (record, artifact) in jobs {
         let media = match artifact {
@@ -1054,26 +1055,34 @@ async fn prepared_successor(
         }
     });
 
-    let daemon = Arc::new(std::sync::Mutex::new(Some(daemon)));
-    let served = crate::http::serve_leader(
-        &config,
-        &stated,
-        Arc::clone(&leader),
+    // From here the successor's node serves the adopted deployment as any node serves one.
+    let start = crate::http::node::Start {
+        families: families.clone(),
+        options: config.clone(),
+        instance,
+        ready,
+        lifetime: prepare.lifetime,
+        shutdown,
+    };
+    let brought = crate::http::node::Brought {
+        config,
+        stated,
+        leader,
         admin,
+        jobs: video_jobs,
+        adopted,
+        daemon: Some(daemon),
+        retire,
+        token,
+    };
+    let ended = crate::http::node::run(
+        start,
         listener,
         admins,
-        instance.path(),
-        video_jobs,
-        adopted,
-        Arc::clone(&daemon),
-        &shutdown,
+        crate::http::node::First::Serving(Box::new(brought)),
     )
     .await;
-    let handoff_sent = served.as_ref().is_ok_and(|handoff_sent| *handoff_sent);
-    if handoff_sent {
-        instance.hand_over();
-    }
-    if handoff_sent {
+    if ended.as_ref().is_ok_and(|ended| ended.handed_over) {
         // A second hot restart may finish this daemon's HTTP requests while
         // its predecessor still has streams. Keep forwarding their admission
         // to the latest owner until that predecessor drains and disconnects.
@@ -1081,8 +1090,7 @@ async fn prepared_successor(
     } else {
         relay.abort();
     }
-    let served = served.map(drop);
-    crate::http::finish(&config, &leader, daemon, retire, handoff_sent, served).await
+    ended.map(drop)
 }
 
 /// The epoch record and the process row of an epoch a restarting daemon

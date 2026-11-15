@@ -486,6 +486,23 @@ impl Leader {
             .collect()
     }
 
+    /// The changes of the deployment's serving state from now on ([`StatusChanges`]): a caller
+    /// takes them before it reads [`Leader::status`], so that a change after the read is one
+    /// they report.
+    pub(crate) fn status_changes(&self) -> StatusChanges {
+        StatusChanges::of(&self.replicas)
+    }
+
+    /// Resolves once no replica's engine has a request in flight: what a deployment's end waits
+    /// for before it shuts its engines down.
+    pub(crate) async fn drained(&self) {
+        for replica in self.replicas() {
+            if let Some(client) = replica.hold().client() {
+                client.drained().await;
+            }
+        }
+    }
+
     /// The deployment's aggregate serving state.
     pub fn status(&self) -> LeaderStatus {
         let replicas: Vec<ReplicaStatus> = self
@@ -1467,6 +1484,74 @@ pub(crate) struct ReplicaStatus {
     in_flight: usize,
     generation: Option<u64>,
     standby: Vec<u64>,
+}
+
+/// The changes of a deployment's serving state ([`Leader::status_changes`]): its set of
+/// replicas, and each replica's hold (the engine that serves it, its holding, closing or pause)
+/// and that engine's lifecycle state. What [`Leader::status`] reads changes only through them.
+pub(crate) struct StatusChanges {
+    replicas: watch::Receiver<Vec<Arc<Replica>>>,
+    holds: Vec<crate::engine::hold::HoldChanges>,
+    engines: Vec<watch::Receiver<EngineState>>,
+}
+
+impl StatusChanges {
+    /// The changes of `replicas` from now on.
+    fn of(replicas: &Replicas) -> Self {
+        let mut changes = Self {
+            replicas: replicas.serving.subscribe(),
+            holds: Vec::new(),
+            engines: Vec::new(),
+        };
+        changes.follow();
+        changes
+    }
+
+    /// Follows the replicas that serve now: their holds and the engines those serve with.
+    fn follow(&mut self) {
+        let current = self.replicas.borrow_and_update().clone();
+        self.holds = current
+            .iter()
+            .map(|replica| replica.hold().changes())
+            .collect();
+        self.engines = current
+            .iter()
+            .filter_map(|replica| replica.hold().client())
+            .map(|client| client.states())
+            .collect();
+    }
+
+    /// Resolves at the deployment's next change of serving state, and follows the replicas and
+    /// engines that serve after it.
+    pub(crate) async fn changed(&mut self) {
+        {
+            let Self {
+                replicas,
+                holds,
+                engines,
+            } = self;
+            let mut waits: Vec<
+                std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
+            > = vec![Box::pin(async move {
+                // A deployment whose replica set is gone changes no more.
+                if replicas.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            })];
+            for hold in holds.iter_mut() {
+                waits.push(Box::pin(hold.changed()));
+            }
+            for engine in engines.iter_mut() {
+                waits.push(Box::pin(async move {
+                    if engine.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }));
+            }
+            futures::future::select_all(waits).await;
+        }
+        self.follow();
+    }
 }
 
 /// What the leader serves, for `GET /admin/status`.
