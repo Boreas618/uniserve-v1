@@ -24,6 +24,9 @@ impl fmt::Display for DeviceId {
 pub enum DeviceAttribute {
     /// Largest row pitch, in bytes, accepted by pitched copies.
     MaxPitch = sys::CU_DEVICE_ATTRIBUTE_MAX_PITCH,
+    /// Shared memory one block may use without opting into more, in bytes: the limit a kernel's
+    /// dynamic shared memory may reach before its function attribute must raise it.
+    MaxSharedMemoryPerBlock = sys::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
     MultiprocessorCount = sys::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
     ComputeCapabilityMajor = sys::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
     ComputeCapabilityMinor = sys::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,

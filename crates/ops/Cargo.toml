@@ -8,10 +8,11 @@ publish = false
 
 # `ops` depends on the CUDA boundary, which makes every driver call, on the tensor library, whose
 # device backend it is and whose element type and layout its operands carry, and on `serde` for
-# the one value the epoch record carries as data (the phase): it loads and launches the modules it
-# is handed and knows no model and no layer.
+# the one value the epoch record carries as data (the phase) and the metadata record a cubin module
+# carries: it loads and launches the modules it is handed and knows no model and no layer.
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 platform.workspace = true
 # The element type of an operand (`DType`); `ops::abi` states its number and spelling for packages.
 tensor.workspace = true

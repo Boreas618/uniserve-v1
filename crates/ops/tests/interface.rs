@@ -83,22 +83,27 @@ fn descriptor_key_reports_an_empty_descriptor_as_empty_text() {
     );
 }
 
+/// A metadata record as Triton writes it, with the fields a launch reads and some it does not.
+const TRITON_RECORD: &str = r#"{
+    "name": "rms_norm_kernel",
+    "num_warps": 8,
+    "shared": 4096,
+    "num_ctas": 2,
+    "launch_pdl": true,
+    "launch_cooperative_grid": false,
+    "signature": {"x_ptr": "*bf16", "rows": "i32", "eps": "fp32"},
+    "global_scratch_size": 1048576,
+    "global_scratch_align": 128,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "num_stages": 3,
+    "cluster_dims": [2, 1, 1],
+    "target": {"arch": 100, "backend": "cuda"}
+}"#;
+
 #[test]
 fn cubin_metadata_reads_triton_fields_and_skips_what_it_does_not_need() {
-    let json = br#"{
-        "name": "rms_norm_kernel",
-        "num_warps": 8,
-        "shared": 4096,
-        "num_ctas": 2,
-        "launch_pdl": true,
-        "launch_cooperative_grid": false,
-        "global_scratch_size": 1048576,
-        "global_scratch_align": 128,
-        "num_stages": 3,
-        "cluster_dims": [2, 1, 1],
-        "target": {"arch": 100, "backend": "cuda"}
-    }"#;
-    let metadata = CubinMetadata::parse(json).unwrap();
+    let metadata = CubinMetadata::parse(TRITON_RECORD.as_bytes()).unwrap();
     assert_eq!(metadata.name, "rms_norm_kernel");
     assert_eq!(metadata.threads(), 8 * 32);
     assert_eq!(metadata.shared, 4096);
@@ -108,19 +113,45 @@ fn cubin_metadata_reads_triton_fields_and_skips_what_it_does_not_need() {
     assert_eq!(metadata.global_scratch_size, 1_048_576);
     assert_eq!(metadata.global_scratch_align, 128);
     assert!(metadata.needs_scratch());
+    // The signature keeps the record's order, which is the kernel's parameter order.
+    let names: Vec<&str> = metadata
+        .signature
+        .iter()
+        .map(|parameter| parameter.name.as_str())
+        .collect();
+    assert_eq!(names, ["x_ptr", "rows", "eps"]);
+    assert!(metadata.signature[0].is_pointer());
+    assert!(!metadata.signature[2].is_pointer());
 }
 
 #[test]
-fn cubin_metadata_defaults_what_triton_omits_and_refuses_what_it_must_have() {
-    let metadata = CubinMetadata::parse(br#"{"name": "copy"}"#).unwrap();
-    assert_eq!(metadata.num_warps, 1);
-    assert_eq!(metadata.threads(), 32);
-    assert_eq!(metadata.num_ctas, 1);
-    assert_eq!(metadata.shared, 0);
-    assert!(!metadata.needs_scratch());
+fn cubin_metadata_refuses_a_record_without_a_field_a_launch_reads() {
+    let record: serde_json::Value = serde_json::from_str(TRITON_RECORD).unwrap();
+    for field in [
+        "name",
+        "num_warps",
+        "shared",
+        "num_ctas",
+        "launch_pdl",
+        "launch_cooperative_grid",
+        "signature",
+        "global_scratch_size",
+        "global_scratch_align",
+        "profile_scratch_size",
+        "profile_scratch_align",
+    ] {
+        let mut partial = record.clone();
+        partial.as_object_mut().unwrap().remove(field);
+        let error = CubinMetadata::parse(partial.to_string().as_bytes()).unwrap_err();
+        assert!(matches!(error, Error::Metadata(_)), "{field}: {error}");
+        assert!(error.to_string().contains(field), "{field}: {error}");
+    }
 
-    let error = CubinMetadata::parse(br#"{"num_warps": 4}"#).unwrap_err();
-    assert!(matches!(error, Error::Metadata(_)));
+    let mut idle = record;
+    idle["num_warps"] = 0.into();
+    let error = CubinMetadata::parse(idle.to_string().as_bytes()).unwrap_err();
+    assert!(error.to_string().contains("0 warps"), "{error}");
+
     let error = CubinMetadata::parse(b"not json").unwrap_err();
     assert!(matches!(error, Error::Metadata(_)));
 }

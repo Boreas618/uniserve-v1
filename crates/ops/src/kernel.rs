@@ -32,18 +32,12 @@
 use std::ffi::c_void;
 
 use platform::{
-    Cluster, Device, DevicePtr, Function, FunctionAttribute, LaunchConfig, Library, NativeLibrary,
-    Stream,
+    Cluster, Device, DeviceAttribute, DevicePtr, Function, FunctionAttribute, LaunchConfig,
+    Library, NativeLibrary, Stream,
 };
 
 use crate::operand::Operand;
 use crate::{Error, Result};
-
-/// The driver's default limit on a kernel's dynamic shared memory, in bytes.
-///
-/// A kernel that declares more needs [`FunctionAttribute::MaxDynamicSharedMemory`] set before its
-/// first launch.
-const DEFAULT_SHARED_LIMIT: u32 = 48 * 1024;
 
 /// The raw stream handle a native entry receives (`void* stream`).
 fn stream_handle(stream: &Stream) -> *mut c_void {
@@ -67,9 +61,13 @@ pub trait NativeCall {
 
 /// A module's launch metadata, in Triton's field names.
 ///
-/// Triton writes this JSON beside every cubin it compiles; `ops` reads those fields directly rather
-/// than defining a manifest of its own, so a module's launch shape travels with the module.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// Triton writes this JSON beside every cubin it compiles, and the Build Server writes the same
+/// record for a cubin it compiles with nvcc; `ops` reads those fields directly rather than
+/// defining a manifest of its own, so a module's launch shape travels with the module. Every field
+/// below is required: a record that lacks one is refused at load instead of launched with a
+/// guessed shape. The record's other keys (Triton's compile options, its version, the target) are
+/// the compiler's and are not read.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Deserialize)]
 pub struct CubinMetadata {
     /// The kernel's symbol in the cubin.
     pub name: String,
@@ -87,7 +85,9 @@ pub struct CubinMetadata {
     ///
     /// Triton drops constexprs from this list, which is what makes it the authority a launch is
     /// checked against: the operator packs one word per entry here, plus the global scratch when the
-    /// module declares one.
+    /// module declares one. The record states it as a JSON object whose key order is the
+    /// parameters' order.
+    #[serde(deserialize_with = "ordered_parameters")]
     pub signature: Vec<Parameter>,
     /// Global scratch bytes the kernel needs, handed to it as one of its last parameters.
     pub global_scratch_size: u64,
@@ -112,77 +112,60 @@ pub struct Parameter {
 }
 
 impl Parameter {
-    /// Read from a string, as the module records one.
-    fn named(name: &str, ty: &str) -> Self {
-        Self {
-            name: name.to_owned(),
-            ty: ty.to_owned(),
-        }
-    }
-
     /// Whether the driver reads a device address out of this parameter.
     pub fn is_pointer(&self) -> bool {
         self.ty.starts_with('*')
     }
 }
 
-impl CubinMetadata {
-    /// The metadata of an image that carries none: only the symbol is known.
-    ///
-    /// A package's cubins carry Triton's metadata record, which is what a launch needs; an image
-    /// that does not carry one is still loadable, and its launch takes the defaults (four warps,
-    /// no dynamic shared memory, one block per cluster, no programmatic dependent launch, no
-    /// global scratch).
-    pub fn named(name: &str) -> Self {
-        Self {
-            name: name.to_owned(),
-            num_warps: 4,
-            shared: 0,
-            num_ctas: 1,
-            launch_pdl: false,
-            launch_cooperative_grid: false,
-            signature: Vec::new(),
-            global_scratch_size: 0,
-            global_scratch_align: 1,
-            profile_scratch_size: 0,
-            profile_scratch_align: 1,
+/// Reads the record's `signature` object into its parameters in the object's own key order, which
+/// is the order the kernel takes them in.
+fn ordered_parameters<'de, D>(deserializer: D) -> std::result::Result<Vec<Parameter>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Ordered;
+
+    impl<'de> serde::de::Visitor<'de> for Ordered {
+        type Value = Vec<Parameter>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an object of the kernel's parameter names and their types")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut parameters = Vec::with_capacity(map.size_hint().unwrap_or(0));
+            while let Some((name, ty)) = map.next_entry::<String, String>()? {
+                parameters.push(Parameter { name, ty });
+            }
+            Ok(parameters)
         }
     }
 
-    /// Read the metadata Triton wrote beside a cubin.
+    deserializer.deserialize_map(Ordered)
+}
+
+impl CubinMetadata {
+    /// Read the metadata record written beside a cubin.
     ///
-    /// Only the fields above are read; other keys are skipped, including the arrays and objects a
-    /// newer Triton may add, so a module from a newer compiler still loads when these fields mean
-    /// what they meant.
+    /// # Errors
+    ///
+    /// [`Error::Metadata`] when the record is not JSON, lacks one of the fields a launch reads, or
+    /// states one with another type; a warp or cluster count of zero is refused the same way.
     pub fn parse(json: &[u8]) -> Result<Self> {
-        let text = std::str::from_utf8(json)
-            .map_err(|error| Error::Metadata(format!("metadata is not UTF-8: {error}")))?;
-        let mut reader = JsonReader::new(text);
-        let fields = reader.object().map_err(Error::Metadata)?;
-        let name = fields
-            .string("name")
-            .ok_or_else(|| Error::Metadata("metadata has no `name`".to_owned()))?;
-        Ok(Self {
-            name: name.to_owned(),
-            num_warps: fields.integer("num_warps").unwrap_or(1).max(1) as u32,
-            shared: fields.integer("shared").unwrap_or(0) as u32,
-            num_ctas: fields.integer("num_ctas").unwrap_or(1).max(1) as u32,
-            launch_pdl: fields.boolean("launch_pdl").unwrap_or(false),
-            launch_cooperative_grid: fields.boolean("launch_cooperative_grid").unwrap_or(false),
-            signature: fields
-                .object("signature")
-                .map(|signature| {
-                    signature
-                        .iter()
-                        .map(|(name, value)| Parameter::named(name, value.as_type()))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            global_scratch_size: fields.integer("global_scratch_size").unwrap_or(0),
-            global_scratch_align: fields.integer("global_scratch_align").unwrap_or(0),
-            profile_scratch_size: fields.integer("profile_scratch_size").unwrap_or(0),
-            profile_scratch_align: fields.integer("profile_scratch_align").unwrap_or(0),
-        })
+        let metadata: Self = serde_json::from_slice(json)
+            .map_err(|error| Error::Metadata(format!("the module's metadata: {error}")))?;
+        if metadata.num_warps == 0 || metadata.num_ctas == 0 {
+            return Err(Error::Metadata(format!(
+                "`{}` states {} warps per block and {} blocks per cluster: a launch needs at \
+                 least one of each",
+                metadata.name, metadata.num_warps, metadata.num_ctas
+            )));
+        }
+        Ok(metadata)
     }
 
     /// The thread block's shape: `num_warps` warps of 32 threads.
@@ -329,10 +312,14 @@ impl Arguments {
         self
     }
 
-    /// The parameter array, for a launch.
-    pub fn parameters(&mut self, metadata: Option<&CubinMetadata>) -> Result<&mut [*mut c_void]> {
-        let needs_scratch = metadata.is_some_and(CubinMetadata::needs_scratch);
-        match (needs_scratch, self.scratch) {
+    /// The parameter array of a launch of the kernel `metadata` describes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Metadata`] when the packed words disagree with the kernel's signature, or the
+    /// global scratch with what the metadata declares.
+    pub fn parameters(&mut self, metadata: &CubinMetadata) -> Result<&mut [*mut c_void]> {
+        match (metadata.needs_scratch(), self.scratch) {
             (true, None) => {
                 return Err(Error::Metadata(
                     "the kernel declares global scratch and the operator passed none".to_owned(),
@@ -353,19 +340,17 @@ impl Arguments {
                 .iter_mut()
                 .map(|word| word.as_mut() as *mut u64 as *mut c_void),
         );
-        if metadata.is_some() {
-            // A cubin module takes two parameters after its own signature, which the compiler's
-            // launcher appends and its PTX declares whatever their size is: the global scratch
-            // address and the profile scratch address. They are values the driver reads at launch,
-            // exactly like the packed words above, so they are passed through slots of their own that
-            // outlive this call.
-            *self.scratch_slot = self.scratch.map_or(0, DevicePtr::address);
-            *self.profile_slot = 0;
-            self.parameters
-                .push(self.scratch_slot.as_mut() as *mut u64 as *mut c_void);
-            self.parameters
-                .push(self.profile_slot.as_mut() as *mut u64 as *mut c_void);
-        }
+        // A cubin module takes two parameters after its own signature, which the compiler's
+        // launcher appends and its PTX declares whatever their size is: the global scratch address
+        // and the profile scratch address. They are values the driver reads at launch, exactly like
+        // the packed words above, so they are passed through slots of their own that outlive this
+        // call.
+        *self.scratch_slot = self.scratch.map_or(0, DevicePtr::address);
+        *self.profile_slot = 0;
+        self.parameters
+            .push(self.scratch_slot.as_mut() as *mut u64 as *mut c_void);
+        self.parameters
+            .push(self.profile_slot.as_mut() as *mut u64 as *mut c_void);
         Ok(&mut self.parameters)
     }
 
@@ -378,12 +363,8 @@ impl Arguments {
     ///
     /// The driver reads one value per parameter at the address it is handed, so a list that is short,
     /// long, or has a scalar where the program reads a pointer is not a near miss: the launch dies in
-    /// the driver, or reads a device address it was never given, and neither names the operator. A
-    /// module that records no signature (one built without Triton's metadata) is launched as before.
-    fn check(&self, metadata: Option<&CubinMetadata>) -> Result<()> {
-        let Some(metadata) = metadata.filter(|metadata| !metadata.signature.is_empty()) else {
-            return Ok(());
-        };
+    /// the driver, or reads a device address it was never given, and neither names the operator.
+    fn check(&self, metadata: &CubinMetadata) -> Result<()> {
         // `parameters` appends the global and the profile scratch address after the packed words, so
         // the launch passes two more words than the operator packed, whatever the scratch sizes are.
         //
@@ -460,7 +441,7 @@ impl Arguments {
 
 /// A C entry of a loaded native library, with the name the package declares for it.
 pub struct NativeEntry {
-    name: &'static str,
+    name: String,
     function: Entry,
 }
 
@@ -469,16 +450,19 @@ impl NativeEntry {
     ///
     /// The entry's signature is the package's interface with `ops`: `int32_t entry(const void* call,
     /// void* stream)`, the call structure being the operator's own `#[repr(C)]` type.
-    pub fn resolve(library: &NativeLibrary, name: &'static str) -> Result<Self> {
+    pub fn resolve(library: &NativeLibrary, name: &str) -> Result<Self> {
         // SAFETY: the convention every package follows is exactly `Entry`; a package that declares
         // another signature for its entry name breaks this interface, which its header states.
         let function = unsafe { library.entry::<Entry>(name)? };
-        Ok(Self { name, function })
+        Ok(Self {
+            name: name.to_owned(),
+            function,
+        })
     }
 
     /// The name the package declares.
-    pub const fn name(&self) -> &'static str {
-        self.name
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -505,13 +489,17 @@ pub enum Kernel {
 impl Kernel {
     /// Load a cubin, fatbin or PTX image on `device` and resolve the kernel its metadata names.
     ///
-    /// A module whose metadata declares a dynamic shared-memory size beyond the driver's default
-    /// has its function's limit raised here, once, before any launch: the launch path never sets an
-    /// attribute, so nothing an operator does can surprise a capture.
+    /// A module whose metadata declares more dynamic shared memory than a block may use without
+    /// opting in (the device's `MaxSharedMemoryPerBlock`) has its function's limit raised here,
+    /// once, before any launch: the launch path never sets an attribute, so nothing an operator
+    /// does can surprise a capture.
     pub fn load_cubin(device: &Device, image: &[u8], metadata: CubinMetadata) -> Result<Self> {
         let library = Library::load(device, image)?;
         let function = library.kernel(&metadata.name)?;
-        if metadata.shared > DEFAULT_SHARED_LIMIT {
+        let default_limit = device
+            .id()
+            .attribute(DeviceAttribute::MaxSharedMemoryPerBlock)?;
+        if i64::from(metadata.shared) > i64::from(default_limit) {
             function.set_attribute(
                 FunctionAttribute::MaxDynamicSharedMemory,
                 metadata.shared as i32,
@@ -529,7 +517,7 @@ impl Kernel {
     /// The library is opened by whoever resolved the module ([`NativeLibrary::open`]); this
     /// resolves the package's C entry and keeps the two together, so the library stays loaded while
     /// any generation or captured graph can call it.
-    pub fn load_native(library: NativeLibrary, entry: &'static str) -> Result<Self> {
+    pub fn load_native(library: NativeLibrary, entry: &str) -> Result<Self> {
         let entry = NativeEntry::resolve(&library, entry)?;
         Ok(Self::Native { library, entry })
     }
@@ -597,7 +585,7 @@ impl Kernel {
                 actual: "native",
             });
         };
-        let parameters = arguments.parameters(Some(metadata))?;
+        let parameters = arguments.parameters(metadata)?;
 
         // The grid is the operator's; the block, the dynamic shared memory, the cluster,
         // programmatic dependent launch and cooperative launch are the module's own metadata.
@@ -669,241 +657,40 @@ impl std::fmt::Debug for Kernel {
     }
 }
 
-/// The scalar fields of Triton's metadata JSON, as read by [`CubinMetadata::parse`].
-struct MetadataFields<'a> {
-    fields: Vec<(&'a str, Scalar<'a>)>,
-}
-
-/// One value of the metadata JSON.
-enum Scalar<'a> {
-    String(&'a str),
-    Number(f64),
-    Bool(bool),
-    Object(MetadataFields<'a>),
-    /// An array, a null, or anything else `ops` reads nothing out of.
-    Other,
-}
-
-impl Scalar<'_> {
-    /// The type text of a signature entry, which the module records as a string.
-    fn as_type(&self) -> &str {
-        match self {
-            Self::String(text) => text,
-            _ => "?",
-        }
-    }
-}
-
-impl<'a> MetadataFields<'a> {
-    fn field(&self, name: &str) -> Option<&Scalar<'a>> {
-        self.fields
-            .iter()
-            .find_map(|(key, value)| (*key == name).then_some(value))
-    }
-
-    fn string(&self, name: &str) -> Option<&'a str> {
-        match self.field(name) {
-            Some(Scalar::String(value)) => Some(value),
-            _ => None,
-        }
-    }
-
-    fn integer(&self, name: &str) -> Option<u64> {
-        match self.field(name) {
-            Some(Scalar::Number(value)) if *value >= 0.0 => Some(*value as u64),
-            _ => None,
-        }
-    }
-
-    fn object(&self, name: &str) -> Option<&MetadataFields<'a>> {
-        match self.field(name) {
-            Some(Scalar::Object(fields)) => Some(fields),
-            _ => None,
-        }
-    }
-
-    /// The fields in the order the module wrote them, which is a parameter's position.
-    fn iter(&self) -> impl Iterator<Item = (&'a str, &Scalar<'a>)> {
-        self.fields.iter().map(|(key, value)| (*key, value))
-    }
-
-    fn boolean(&self, name: &str) -> Option<bool> {
-        match self.field(name) {
-            Some(Scalar::Bool(value)) => Some(*value),
-            _ => None,
-        }
-    }
-}
-
-/// A reader for the flat object Triton's metadata JSON is.
-///
-/// It reads one object of scalar values and skips any array or object it meets, which is all `ops`
-/// needs and less than a general JSON parser would cost in a crate that depends on `platform` only.
-struct JsonReader<'a> {
-    text: &'a str,
-    bytes: usize,
-}
-
-impl<'a> JsonReader<'a> {
-    fn new(text: &'a str) -> Self {
-        Self { text, bytes: 0 }
-    }
-
-    fn object(&mut self) -> std::result::Result<MetadataFields<'a>, String> {
-        self.skip_whitespace();
-        self.expect(b'{')?;
-        let mut fields = Vec::new();
-        loop {
-            self.skip_whitespace();
-            if self.peek() == Some(b'}') {
-                self.bytes += 1;
-                return Ok(MetadataFields { fields });
-            }
-            let key = self.string()?;
-            self.skip_whitespace();
-            self.expect(b':')?;
-            self.skip_whitespace();
-            let value = self.value()?;
-            fields.push((key, value));
-            self.skip_whitespace();
-            match self.peek() {
-                Some(b',') => self.bytes += 1,
-                Some(b'}') => continue,
-                _ => return Err("expected `,` or `}` in the metadata object".to_owned()),
-            }
-        }
-    }
-
-    fn value(&mut self) -> std::result::Result<Scalar<'a>, String> {
-        match self.peek() {
-            Some(b'"') => Ok(Scalar::String(self.string()?)),
-            Some(b't') => {
-                self.literal("true")?;
-                Ok(Scalar::Bool(true))
-            }
-            Some(b'f') => {
-                self.literal("false")?;
-                Ok(Scalar::Bool(false))
-            }
-            Some(b'n') => {
-                self.literal("null")?;
-                Ok(Scalar::Other)
-            }
-            Some(b'[') => {
-                self.skip_nested(b'[', b']')?;
-                Ok(Scalar::Other)
-            }
-            Some(b'{') => Ok(Scalar::Object(self.object()?)),
-            Some(byte) if byte == b'-' || byte.is_ascii_digit() => {
-                let start = self.bytes;
-                while let Some(byte) = self.peek() {
-                    if byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E') {
-                        self.bytes += 1;
-                    } else {
-                        break;
-                    }
-                }
-                let token = &self.text[start..self.bytes];
-                token
-                    .parse::<f64>()
-                    .map(Scalar::Number)
-                    .map_err(|error| format!("`{token}` is not a number in the metadata: {error}"))
-            }
-            _ => Err("unexpected value in the metadata object".to_owned()),
-        }
-    }
-
-    fn string(&mut self) -> std::result::Result<&'a str, String> {
-        self.expect(b'"')?;
-        let start = self.bytes;
-        while let Some(byte) = self.peek() {
-            match byte {
-                b'"' => {
-                    let value = &self.text[start..self.bytes];
-                    self.bytes += 1;
-                    return Ok(value);
-                }
-                b'\\' => {
-                    // Triton's metadata has no escaped key or value `ops` reads; a name with an
-                    // escape is refused rather than unescaped wrongly.
-                    return Err("escaped strings are not supported in kernel metadata".to_owned());
-                }
-                _ => self.bytes += 1,
-            }
-        }
-        Err("unterminated string in the metadata".to_owned())
-    }
-
-    fn skip_nested(&mut self, open: u8, close: u8) -> std::result::Result<(), String> {
-        let mut depth = 0_u32;
-        while let Some(byte) = self.peek() {
-            self.bytes += 1;
-            if byte == open {
-                depth += 1;
-            } else if byte == close {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok(());
-                }
-            } else if byte == b'"' {
-                // Step over a string, so a brace inside it does not count.
-                self.bytes -= 1;
-                self.string()?;
-            }
-        }
-        Err("unterminated array or object in the metadata".to_owned())
-    }
-
-    fn literal(&mut self, text: &str) -> std::result::Result<(), String> {
-        if self.text[self.bytes..].starts_with(text) {
-            self.bytes += text.len();
-            Ok(())
-        } else {
-            Err(format!("expected `{text}` in the metadata"))
-        }
-    }
-
-    fn expect(&mut self, byte: u8) -> std::result::Result<(), String> {
-        if self.peek() == Some(byte) {
-            self.bytes += 1;
-            Ok(())
-        } else {
-            Err(format!(
-                "expected `{}` at byte {} of the metadata",
-                char::from(byte),
-                self.bytes
-            ))
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.text.as_bytes().get(self.bytes).copied()
-    }
-
-    fn skip_whitespace(&mut self) {
-        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
-            self.bytes += 1;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Arguments, CubinMetadata, DevicePtr};
 
-    /// The metadata Triton writes beside a cubin, cut to the fields a launch reads.
-    fn metadata(record: &str) -> CubinMetadata {
-        CubinMetadata::parse(record.as_bytes()).expect("the metadata parses")
+    /// A metadata record of a kernel taking `signature` (a JSON object, in parameter order) and
+    /// `global_scratch_size` bytes of global scratch, the other fields as Triton writes them for a
+    /// plain kernel.
+    fn metadata(signature: &str, global_scratch_size: u64) -> CubinMetadata {
+        let signature: serde_json::Value =
+            serde_json::from_str(signature).expect("the signature is a JSON object");
+        let record = serde_json::json!({
+            "name": "_kernel",
+            "num_warps": 4,
+            "shared": 0,
+            "num_ctas": 1,
+            "launch_pdl": false,
+            "launch_cooperative_grid": false,
+            "signature": signature,
+            "global_scratch_size": global_scratch_size,
+            "global_scratch_align": 1,
+            "profile_scratch_size": 0,
+            "profile_scratch_align": 1,
+        });
+        CubinMetadata::parse(record.to_string().as_bytes()).expect("the metadata parses")
     }
 
     #[test]
     fn a_module_takes_its_own_parameters_and_then_the_two_scratch_addresses() {
-        let module = metadata(r#"{"name":"_kernel","num_warps":4}"#);
+        let module = metadata(r#"{"x":"*bf16","rows":"i32"}"#, 0);
         let mut arguments = Arguments::new();
         arguments.pointer(DevicePtr::from_address(0x1000)).u32(7);
         // The program's two parameters, then the global and the profile scratch address Triton's
         // launcher appends and its PTX declares whatever their size is.
-        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 4);
+        assert_eq!(arguments.parameters(&module).unwrap().len(), 4);
     }
 
     #[test]
@@ -912,25 +699,25 @@ mod tests {
         // appends those two slots itself. A module of two parameters therefore takes two packed
         // words, not four: counting the named entries again refused every module built that way.
         let module = metadata(
-            r#"{"name":"_kernel","signature":{"x":"*bf16","rows":"i32","global_scratch":"*i8","profile_scratch":"*i8"}}"#,
+            r#"{"x":"*bf16","rows":"i32","global_scratch":"*i8","profile_scratch":"*i8"}"#,
+            0,
         );
         let mut arguments = Arguments::new();
         arguments.pointer(DevicePtr::from_address(0x1000)).u32(7);
-        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 4);
+        assert_eq!(arguments.parameters(&module).unwrap().len(), 4);
         let mut long = Arguments::new();
         long.pointer(DevicePtr::from_address(0x1000)).u32(7).u32(1);
-        let error = long.parameters(Some(&module)).unwrap_err().to_string();
+        let error = long.parameters(&module).unwrap_err().to_string();
         assert!(error.contains("declares 2 parameters"), "{error}");
         assert!(error.contains("packed 3"), "{error}");
     }
 
     #[test]
     fn the_parameter_list_must_hold_one_word_per_parameter() {
-        let module =
-            metadata(r#"{"name":"_kernel","signature":{"x":"*bf16","rows":"i32","eps":"fp32"}}"#);
+        let module = metadata(r#"{"x":"*bf16","rows":"i32","eps":"fp32"}"#, 0);
         let mut short = Arguments::new();
         short.pointer(DevicePtr::from_address(0x1000)).u32(7);
-        let error = short.parameters(Some(&module)).unwrap_err().to_string();
+        let error = short.parameters(&module).unwrap_err().to_string();
         assert!(error.contains("_kernel"), "{error}");
         assert!(error.contains("declares 3 parameters"), "{error}");
         assert!(error.contains("packed 2"), "{error}");
@@ -939,39 +726,37 @@ mod tests {
 
     #[test]
     fn a_scalar_where_the_program_reads_an_address_is_refused_by_position() {
-        let module = metadata(r#"{"name":"_kernel","signature":{"x":"*bf16","rows":"i32"}}"#);
+        let module = metadata(r#"{"x":"*bf16","rows":"i32"}"#, 0);
         let mut arguments = Arguments::new();
         arguments.u64(0).u32(7);
-        let error = arguments.parameters(Some(&module)).unwrap_err().to_string();
+        let error = arguments.parameters(&module).unwrap_err().to_string();
         assert!(error.contains("parameter 0 `x` is `*bf16`"), "{error}");
         assert!(error.contains("scalar"), "{error}");
     }
 
     #[test]
     fn global_scratch_is_a_value_the_caller_supplies_and_its_absence_is_refused() {
-        let module =
-            metadata(r#"{"name":"_kernel","signature":{"x":"*bf16"},"global_scratch_size":4096}"#);
+        let module = metadata(r#"{"x":"*bf16"}"#, 4096);
         let mut arguments = Arguments::new();
         arguments.pointer(DevicePtr::from_address(0x1000));
         arguments.scratch(Some(DevicePtr::from_address(0x2000)));
         // One declared parameter and the two scratch addresses.
-        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 3);
+        assert_eq!(arguments.parameters(&module).unwrap().len(), 3);
 
         let mut without = Arguments::new();
         without.pointer(DevicePtr::from_address(0x1000));
-        let error = without.parameters(Some(&module)).unwrap_err().to_string();
+        let error = without.parameters(&module).unwrap_err().to_string();
         assert!(error.contains("global scratch"), "{error}");
     }
 
     #[test]
     fn a_matching_list_packs_one_address_per_word() {
-        let module =
-            metadata(r#"{"name":"_kernel","signature":{"x":"*fp32","out":"*fp32","rows":"i64"}}"#);
+        let module = metadata(r#"{"x":"*fp32","out":"*fp32","rows":"i64"}"#, 0);
         let mut arguments = Arguments::new();
         arguments
             .pointer(DevicePtr::from_address(0x1000))
             .pointer(DevicePtr::from_address(0x2000))
             .u64(4);
-        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 5);
+        assert_eq!(arguments.parameters(&module).unwrap().len(), 5);
     }
 }

@@ -323,8 +323,8 @@ pub(crate) fn parameters(package: &PackageRevision) -> Result<Parameters> {
 enum Resolved {
     Cubin {
         image: Vec<u8>,
+        /// The module's launch metadata record, which names its kernel.
         metadata: Vec<u8>,
-        entry: String,
     },
     Native {
         library: PathBuf,
@@ -357,14 +357,11 @@ impl Resolved {
                     .context("the cubin module names no launch metadata")?;
                 let image = read(named(build_server::source::MODULE_CUBIN)?)?;
                 let metadata = read(named(metadata_name)?)?;
-                let entry = ops::CubinMetadata::parse(&metadata)
-                    .with_context(|| format!("reading the cubin's metadata {metadata_name}"))?
-                    .name;
-                Ok(Self::Cubin {
-                    image,
-                    metadata,
-                    entry,
-                })
+                // The record is refused here, by its file's name, when it lacks a field a launch
+                // reads, before the module reaches `ops::install`.
+                ops::CubinMetadata::parse(&metadata)
+                    .with_context(|| format!("reading the cubin's metadata {metadata_name}"))?;
+                Ok(Self::Cubin { image, metadata })
             }
             build_server::manifest::ModuleForm::Native => {
                 let entry = module
@@ -382,15 +379,7 @@ impl Resolved {
     /// The module as `ops::install` takes it.
     fn as_ops(&self) -> ops::Module<'_> {
         match self {
-            Self::Cubin {
-                image,
-                metadata,
-                entry,
-            } => ops::Module::Cubin {
-                image,
-                metadata: Some(metadata),
-                entry,
-            },
+            Self::Cubin { image, metadata } => ops::Module::Cubin { image, metadata },
             Self::Native { library, entry } => ops::Module::Native {
                 path: library,
                 entry,
@@ -479,7 +468,13 @@ mod tests {
         let cubin = build_server::Module {
             form: build_server::manifest::ModuleForm::Cubin,
             files: vec![
-                file("launch.json", br#"{"name":"rms_norm_kernel"}"#),
+                file(
+                    "launch.json",
+                    br#"{"name":"rms_norm_kernel","num_warps":4,"shared":0,"num_ctas":1,
+                        "launch_pdl":false,"launch_cooperative_grid":false,"signature":{},
+                        "definitions":{},"global_scratch_size":0,"global_scratch_align":1,
+                        "profile_scratch_size":0,"profile_scratch_align":1}"#,
+                ),
                 file(build_server::source::MODULE_CUBIN, b"image"),
                 file("tuning.json", b"{}"),
             ],
@@ -488,11 +483,14 @@ mod tests {
             interface_version: 1,
             executable: None,
         };
-        let Resolved::Cubin { image, entry, .. } = Resolved::of(cubin).unwrap() else {
+        let Resolved::Cubin { image, metadata } = Resolved::of(cubin).unwrap() else {
             panic!("a cubin module reads as a cubin");
         };
         assert_eq!(image, b"image");
-        assert_eq!(entry, "rms_norm_kernel");
+        assert_eq!(
+            ops::CubinMetadata::parse(&metadata).unwrap().name,
+            "rms_norm_kernel"
+        );
     }
 
     /// A module that lacks the file its form names is refused by that name.

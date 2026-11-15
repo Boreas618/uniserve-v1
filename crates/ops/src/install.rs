@@ -9,9 +9,8 @@
 //! Nothing here allocates device memory or launches anything, so it is safe at precopy time and
 //! outside any capture.
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use platform::NativeLibrary;
 
@@ -21,15 +20,13 @@ use crate::kernel::{CubinMetadata, Kernel};
 
 /// One module of a generation layer, as the package delivered it.
 pub enum Module<'a> {
-    /// A cubin, fatbin or PTX image, with its Triton metadata as JSON when the package carries it,
-    /// and the symbol to resolve.
+    /// A cubin, fatbin or PTX image with the metadata record written beside it, which names the
+    /// kernel to resolve and states its launch shape ([`CubinMetadata`]).
     Cubin {
         /// The image itself.
         image: &'a [u8],
-        /// Triton's metadata record for the image, as the package wrote it.
-        metadata: Option<&'a [u8]>,
-        /// The kernel's symbol in the image.
-        entry: &'a str,
+        /// The module's metadata record, as JSON.
+        metadata: &'a [u8],
     },
     /// A shared object the platform loads, and the C entry the package declares.
     Native {
@@ -65,43 +62,14 @@ pub fn install(
 /// Load one module into a kernel.
 fn load(device: &platform::Device, module: Module<'_>) -> Result<Kernel> {
     match module {
-        Module::Cubin {
-            image,
-            metadata,
-            entry,
-        } => {
-            // A module's own metadata names the kernel it holds. One package may build a different
-            // kernel per descriptor, as paged attention does per phase, so a package-wide entry
-            // names only one of them.
-            let metadata = match metadata {
-                Some(json) => CubinMetadata::parse(json)?,
-                None => CubinMetadata::named(entry),
-            };
-            Kernel::load_cubin(device, image, metadata)
+        Module::Cubin { image, metadata } => {
+            // A module's own metadata names the kernel it holds: one package may build a different
+            // kernel per descriptor, as paged attention does per phase.
+            Kernel::load_cubin(device, image, CubinMetadata::parse(metadata)?)
         }
         Module::Native { path, entry } => {
-            let entry = intern(entry)?;
             let library = NativeLibrary::open(path)?;
             Kernel::load_native(library, entry)
         }
     }
-}
-
-/// `entry` as a `&'static str`, one allocation per distinct name.
-///
-/// The platform resolves a native entry by a name that outlives the library, and a package may
-/// install the same entry many times over (one per descriptor key), so the names are kept once.
-fn intern(entry: &str) -> Result<&'static str> {
-    static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
-    let names = NAMES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut names = names.lock().map_err(|_| crate::Error::Unsupported {
-        operation: "install",
-        reason: "an entry name was interned while another thread panicked".to_owned(),
-    })?;
-    if let Some(name) = names.get(entry) {
-        return Ok(name);
-    }
-    let leaked: &'static str = Box::leak(entry.to_owned().into_boxed_str());
-    names.insert(entry.to_owned(), leaked);
-    Ok(leaked)
 }
