@@ -1,15 +1,18 @@
 //! The one logging convention of every `uniserve` process: process-wide tracing configuration and
 //! compact terminal log formatting.
 //!
-//! Every command calls [`init`] once with its process label, before it starts threads or a Tokio
-//! runtime (a host service after it detached). Each event is written as one line of the form
-//! `(<process> pid=<pid>) <LEVEL> <MM-DD HH:MM:SS> [<file>:<line>] <fields>`, where the process is
-//! the label (`Daemon` for `uniserve serve`, `Engine` for an engine process, `StorageServer`,
-//! `BuildServer` and the Storage Server's helpers for the host services), with the active spans,
-//! if any, written as `outer{..}:inner{..}: ` before the fields.
+//! Every command calls [`init`] once with its process label and its [`Levels`], before it starts
+//! threads or a Tokio runtime (a host service after it detached). Each event is written as one
+//! line of the form `(<process> pid=<pid>) <LEVEL> <MM-DD HH:MM:SS> [<file>:<line>] <fields>`,
+//! where the process is the label (`Daemon` for `uniserve serve`, `Engine` for an engine process,
+//! `StorageServer`, `BuildServer` and the Storage Server's helpers for the host services), with
+//! the active spans, if any, written as `outer{..}:inner{..}: ` before the fields.
 //!
-//! `WARN` is printed as `WARNING`, the Python `logging` name, and `--log-level` and
-//! `--log-level-http` take Python level names; `RUST_LOG` refines them (`build_targets_filter`).
+//! The levels are tracing's (`off`, `error`, `warn`, `info`, `debug`, `trace`) and come from the
+//! command line alone: `--log-level` for every target, and the level a module states for the
+//! targets it owns (the daemon's HTTP stack takes `--log-level-http`). The environment states
+//! none. A child process of the same deployment is given its parent's level on its own command
+//! line ([`arguments`]).
 //!
 //! The daemon and the engine log to stdout. A command whose own output is stdout
 //! (`uniserve keys`) and a host service, whose standard error is the log beside its socket,
@@ -17,7 +20,8 @@
 //! `NO_COLOR` is set to a non-empty value, with no terminal detection, so redirected output also
 //! carries escape sequences.
 
-use std::{env, fmt, process};
+use std::sync::OnceLock;
+use std::{fmt, process};
 
 use time::UtcOffset;
 use time::macros::format_description;
@@ -43,10 +47,8 @@ const RESET: &str = "\x1b[0m";
 const LOCAL_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[month]-[day] [hour]:[minute]:[second]");
 
-/// Tracing targets whose level `--log-level-http` sets, overriding, for those
-/// targets, the default level and any `RUST_LOG` directive naming exactly that
-/// target.
-const HTTP_LOG_TARGETS: &[&str] = &["axum", "hyper", "tower_http", "server"];
+/// The level of every target when a process's command line states none.
+pub const DEFAULT_LEVEL: LevelFilter = LevelFilter::INFO;
 
 /// Where a process's log lines are written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,17 +59,63 @@ pub enum Output {
     Stderr,
 }
 
-/// Installs the process-wide tracing subscriber for the CLI binary, writing to `output`.
+/// A process's log levels: one for every target, and one for each set of targets a module owns
+/// and the command line names (the daemon's HTTP stack, `--log-level-http`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Levels {
+    /// The level of every target that no entry of `targets` names.
+    pub default: LevelFilter,
+    /// Target prefixes and their levels, as tracing matches a target (`hyper` covers
+    /// `hyper::proto::h1`), overriding `default`.
+    pub targets: Vec<(&'static str, LevelFilter)>,
+}
+
+impl Levels {
+    /// Every target at `default`, or at [`DEFAULT_LEVEL`] when the command line states none.
+    pub fn new(default: Option<LevelFilter>) -> Self {
+        Self {
+            default: default.unwrap_or(DEFAULT_LEVEL),
+            targets: Vec::new(),
+        }
+    }
+
+    /// These levels with every target of `targets` at `level`; unchanged when no level is
+    /// stated for them.
+    pub fn with(mut self, targets: &[&'static str], level: Option<LevelFilter>) -> Self {
+        if let Some(level) = level {
+            self.targets
+                .extend(targets.iter().map(|target| (*target, level)));
+        }
+        self
+    }
+
+    /// The command-line arguments that give a child process the level of every target
+    /// (`--log-level`, in tracing's lowercase name). Target levels stay with the process whose
+    /// module owns the targets.
+    pub fn arguments(&self) -> Vec<String> {
+        vec![
+            "--log-level".to_owned(),
+            self.default.to_string().to_ascii_lowercase(),
+        ]
+    }
+
+    /// The tracing filter these levels select.
+    fn filter(&self) -> Targets {
+        Targets::new()
+            .with_default(self.default)
+            .with_targets(self.targets.iter().copied())
+    }
+}
+
+/// The levels [`init`] installed: this process's one log configuration.
+static INSTALLED: OnceLock<Levels> = OnceLock::new();
+
+/// Installs the process-wide tracing subscriber with `levels`, writing to `output`, and keeps
+/// `levels` as the process's configuration ([`arguments`]).
 ///
-/// Reads `RUST_LOG` from the environment (see `build_targets_filter` for
-/// precedence). Installation failure, for example because a global subscriber
-/// is already set, is reported on stderr and is not fatal.
-pub fn init(process: &str, log_level: Option<&str>, log_level_http: Option<&str>, output: Output) {
-    let filter = build_targets_filter(
-        log_level,
-        log_level_http,
-        env::var("RUST_LOG").ok().as_deref(),
-    );
+/// Installation failure, for example because a global subscriber is already set, is reported on
+/// stderr and is not fatal.
+pub fn init(process: &str, levels: &Levels, output: Output) {
     let formatter = UniserveEventFormatter::new(process);
     let writer = match output {
         Output::Stdout => BoxMakeWriter::new(std::io::stdout),
@@ -79,7 +127,7 @@ pub fn init(process: &str, log_level: Option<&str>, log_level_http: Option<&str>
             tracing_subscriber::fmt::layer()
                 .event_format(formatter)
                 .with_writer(writer)
-                .with_filter(filter),
+                .with_filter(levels.filter()),
         )
         .try_init()
     {
@@ -87,45 +135,16 @@ pub fn init(process: &str, log_level: Option<&str>, log_level_http: Option<&str>
         // through `tracing`. Surface the failure directly on stderr rather than
         // swallowing it, since it means subsequent log output may be missing.
         eprintln!("failed to install tracing subscriber: {err}");
+        return;
     }
+    let _ = INSTALLED.set(levels.clone());
 }
 
-/// Builds the CLI log filter by merging the default level with Rust-style
-/// target overrides.
-///
-/// Precedence:
-/// - Start from `--log-level` as the default level for all targets.
-/// - A global `RUST_LOG` level such as `warn` overrides the CLI default.
-/// - Explicit `RUST_LOG` targets such as `hyper=info` override the active default
-///   for those targets only.
-/// - `--log-level-http` is applied last, to the `HTTP_LOG_TARGETS`.
-///
-/// An empty or unparsable `RUST_LOG` is ignored, and an unknown Python level
-/// name maps to INFO (see `map_python_log_level`), so a bad value never fails
-/// startup.
-fn build_targets_filter(
-    log_level: Option<&str>,
-    log_level_http: Option<&str>,
-    rust_log: Option<&str>,
-) -> Targets {
-    let mut filter = Targets::new().with_default(map_python_log_level(log_level.unwrap_or("INFO")));
-
-    if let Some(rust_log) = rust_log
-        && !rust_log.is_empty()
-        && let Ok(rust_log_targets) = rust_log.parse::<Targets>()
-    {
-        if let Some(default_level) = rust_log_targets.default_level() {
-            filter = filter.with_default(default_level);
-        }
-        filter = filter.with_targets(rust_log_targets);
-    }
-
-    if let Some(http_level) = log_level_http {
-        let level = map_python_log_level(http_level);
-        filter = filter.with_targets(HTTP_LOG_TARGETS.iter().map(|target| (*target, level)));
-    }
-
-    filter
+/// The command-line arguments that give a child process of this one, such as an engine process
+/// its daemon starts, this process's level of every target (`--log-level`); none before
+/// [`init`]. Target levels stay with the process whose module owns the targets.
+pub fn arguments() -> Vec<String> {
+    INSTALLED.get().map(Levels::arguments).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -175,14 +194,13 @@ impl UniserveEventFormatter {
         writer.write_char(' ')
     }
 
-    /// Writes the level name, spelling WARN as Python's `WARNING`, colored
-    /// when `ansi` is set.
+    /// Writes tracing's name of the level, colored when `ansi` is set.
     fn write_level(&self, writer: &mut Writer<'_>, level: &Level, ansi: bool) -> fmt::Result {
         let (text, color) = match *level {
             Level::TRACE => ("TRACE", WHITE),
             Level::DEBUG => ("DEBUG", WHITE),
             Level::INFO => ("INFO", GREEN),
-            Level::WARN => ("WARNING", YELLOW),
+            Level::WARN => ("WARN", YELLOW),
             Level::ERROR => ("ERROR", RED),
         };
         write_colored(writer, ansi, Some(color), text)
@@ -356,51 +374,33 @@ fn write_colored(
     writer.write_str(text)
 }
 
-/// Maps a Python logging level name, case-insensitively, to a tracing level
-/// filter.
-///
-/// `CRITICAL` and `FATAL` map to ERROR, the most severe tracing level,
-/// `NOTSET` enables everything (TRACE), `WARN` is accepted alongside
-/// `WARNING`, and any other name falls back to INFO.
-fn map_python_log_level(level: &str) -> LevelFilter {
-    match level.to_ascii_uppercase().as_str() {
-        "CRITICAL" | "FATAL" => LevelFilter::ERROR,
-        "ERROR" => LevelFilter::ERROR,
-        "WARNING" | "WARN" => LevelFilter::WARN,
-        "INFO" => LevelFilter::INFO,
-        "DEBUG" => LevelFilter::DEBUG,
-        "NOTSET" => LevelFilter::TRACE,
-        _ => LevelFilter::INFO,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A level stated for a module's targets holds for those targets and their submodules, and
+    /// every other target keeps the default; an unstated one changes nothing.
     #[test]
-    fn rust_log_default_level_overrides_cli_default_level() {
-        let filter = build_targets_filter(Some("DEBUG"), None, Some("warn,hyper=info"));
+    fn target_levels_override_the_default_for_their_targets_alone() {
+        let filter = Levels::new(Some(LevelFilter::ERROR))
+            .with(&["hyper", "axum"], Some(LevelFilter::DEBUG))
+            .with(&["reqwest"], None)
+            .filter();
 
-        assert_eq!(filter.to_string(), "hyper=info,warn");
+        assert!(filter.would_enable("hyper::proto::h1", &Level::DEBUG));
+        assert!(filter.would_enable("axum", &Level::DEBUG));
+        assert!(!filter.would_enable("reqwest", &Level::WARN));
+        assert!(filter.would_enable("daemon::leader", &Level::ERROR));
+        assert!(!filter.would_enable("daemon::leader", &Level::WARN));
     }
 
+    /// A process whose command line states no level logs at INFO.
     #[test]
-    fn http_log_level_applies_to_http_targets() {
-        let filter = build_targets_filter(Some("ERROR"), Some("debug"), None);
+    fn an_unstated_level_is_info() {
+        let filter = Levels::new(None).filter();
 
-        assert!(filter.to_string().contains("axum=debug"));
-        assert!(filter.to_string().contains("hyper=debug"));
-        assert!(filter.to_string().contains("tower_http=debug"));
-        assert!(filter.to_string().contains("server=debug"));
-        assert!(filter.to_string().ends_with(",error"));
-    }
-
-    #[test]
-    fn invalid_cli_level_falls_back_to_info() {
-        let filter = build_targets_filter(Some("bogus"), None, None);
-
-        assert_eq!(filter.to_string(), "info");
+        assert!(filter.would_enable("engine", &Level::INFO));
+        assert!(!filter.would_enable("engine", &Level::DEBUG));
     }
 
     #[test]

@@ -108,6 +108,7 @@ pub async fn record(
                 .arg("--launch")
                 .arg(&file)
                 .arg("--keys")
+                .args(service::logging::arguments())
                 .stderr(Stdio::inherit())
                 .output()
                 .with_context(|| format!("running {}", executable.display()))?;

@@ -264,8 +264,12 @@ fn a_store_build_names_its_keys_target_and_package_tree() {
         )
         .expect("the build command parses");
         // Every refusal comes before the host's devices would be read.
-        build_server::command::run(args, &|| panic!("a refused build reads no device"))
-            .expect_err("the build is refused")
+        build_server::command::run(
+            args,
+            &|| panic!("a refused build reads no device"),
+            &service::logging::Levels::new(None),
+        )
+        .expect_err("the build is refused")
             .to_string()
     };
 

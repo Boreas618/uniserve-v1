@@ -25,12 +25,7 @@ pub(crate) fn run(
     matches: &clap::ArgMatches,
     log: &LogLevels,
 ) -> Result<ExitCode> {
-    logging::init(
-        "Daemon",
-        log.log_level.as_deref(),
-        log.log_level_http.as_deref(),
-        logging::Output::Stdout,
-    );
+    logging::init("Daemon", &log.serving(), logging::Output::Stdout);
     let runtime = crate::runtime()?;
     if let Some(descriptor) = args.predecessor {
         runtime.block_on(async move {

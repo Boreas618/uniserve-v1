@@ -22,12 +22,7 @@ pub(crate) fn run(
     matches: &clap::ArgMatches,
     log: &LogLevels,
 ) -> Result<ExitCode> {
-    logging::init(
-        "Keys",
-        log.log_level.as_deref(),
-        log.log_level_http.as_deref(),
-        logging::Output::Stderr,
-    );
+    logging::init("Keys", &log.levels(), logging::Output::Stderr);
     anyhow::ensure!(
         args.predecessor.is_none(),
         "`--predecessor` hands a serving deployment to a successor daemon; `keys` serves none"

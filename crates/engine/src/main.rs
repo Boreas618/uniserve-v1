@@ -69,12 +69,10 @@ struct Cli {
     /// nothing.
     #[arg(long)]
     keys: bool,
-    /// Log level of UniServe's own code, such as `info` or `debug`.
+    /// Log level of every target (tracing's names: `off`, `error`, `warn`, `info`, `debug`,
+    /// `trace`), `info` when unset; the daemon passes its own.
     #[arg(long)]
-    log_level: Option<String>,
-    /// Log level of the HTTP client libraries.
-    #[arg(long)]
-    log_level_http: Option<String>,
+    log_level: Option<tracing::level_filters::LevelFilter>,
 }
 
 fn main() -> Result<ExitCode> {
@@ -99,8 +97,7 @@ fn main() -> Result<ExitCode> {
         // error.
         logging::init(
             "Engine",
-            cli.log_level.as_deref(),
-            cli.log_level_http.as_deref(),
+            &logging::Levels::new(cli.log_level),
             logging::Output::Stderr,
         );
         let launch: proto::config::EngineArgs = std::fs::read(&launch_file)
@@ -122,8 +119,7 @@ fn main() -> Result<ExitCode> {
     service::raise_descriptor_limit().context("raising the descriptor limit")?;
     logging::init(
         "Engine",
-        cli.log_level.as_deref(),
-        cli.log_level_http.as_deref(),
+        &logging::Levels::new(cli.log_level),
         logging::Output::Stdout,
     );
     engine::run(&launch_file, &registry).map(|()| ExitCode::SUCCESS)

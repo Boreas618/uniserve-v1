@@ -125,12 +125,13 @@ fn main() -> Result<std::process::ExitCode> {
     match cli.command {
         Command::Serve(args) => serve::run(*args, &command_matches(), &cli.log),
         Command::Keys(args) => keys::run(*args, &command_matches(), &cli.log),
-        Command::StorageServer(args) => {
-            storage_server::command::run(*args).map(|()| std::process::ExitCode::SUCCESS)
+        Command::StorageServer(args) => storage_server::command::run(*args, &cli.log.levels())
+            .map(|()| std::process::ExitCode::SUCCESS),
+        Command::BuildServer(args) => {
+            build_server::command::run(*args, &host_targets, &cli.log.levels())
+                .map(|()| std::process::ExitCode::SUCCESS)
+                .map_err(anyhow::Error::new)
         }
-        Command::BuildServer(args) => build_server::command::run(*args, &host_targets)
-            .map(|()| std::process::ExitCode::SUCCESS)
-            .map_err(anyhow::Error::new),
     }
 }
 

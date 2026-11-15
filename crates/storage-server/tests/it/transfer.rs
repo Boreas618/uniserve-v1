@@ -3,7 +3,7 @@
 //! Transfer Server that crashes.
 //!
 //! The server runs on a thread of the test process; its Transfer Server is
-//! the real one (`storage_server::run_transfer_server`), run as the
+//! the real one (`storageserver::run_transfer_server`), run as the
 //! server's child process by this test binary (`stand_in_transfer_server`).
 //! The host tests hide every GPU from it (`CUDA_VISIBLE_DEVICES` empty), so
 //! it copies host storage with the CPU and no GPU is touched. The device
@@ -40,6 +40,8 @@ fn stand_in_transfer_server() {
             // search path otherwise.
             nixl_library: std::env::var_os("NIXL_CAPI_LIBRARY").map(Into::into),
         },
+        // Its warnings and errors alone, beside the test's output.
+        &service::logging::Levels::new(Some(tracing::level_filters::LevelFilter::WARN)),
     )
     .unwrap();
 }
@@ -60,10 +62,6 @@ pub(crate) fn transfer_server(socket: &Path, gpus: Gpus) -> Launch {
         arguments.push("CUDA_VISIBLE_DEVICES=".into());
     }
     arguments.push(format!("STORAGE_TEST_SOCKET={}", socket.display()).into());
-    // Its log at the level the test's environment names, warnings when
-    // unset.
-    let level = std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into());
-    arguments.push(format!("RUST_LOG={level}").into());
     arguments.push(std::env::current_exe().unwrap().into());
     arguments.extend(
         [

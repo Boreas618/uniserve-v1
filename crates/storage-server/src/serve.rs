@@ -68,6 +68,8 @@ pub struct ServeOptions {
     /// the handoff socket at this descriptor, rather than binding the
     /// socket (`crate::restart`).
     pub predecessor: Option<i32>,
+    /// The levels the server and the helpers it starts log at.
+    pub levels: service::logging::Levels,
 }
 
 /// Serve until stopped. Must be called before the process starts a thread:
@@ -86,8 +88,7 @@ pub fn serve(options: ServeOptions) -> anyhow::Result<()> {
     };
     service::logging::init(
         "StorageServer",
-        None,
-        None,
+        &options.levels,
         service::logging::Output::Stderr,
     );
     let served = match options.predecessor {
@@ -106,11 +107,14 @@ pub fn serve(options: ServeOptions) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Fails when the connector cannot reach Mooncake or the server.
-pub fn run_connector(socket: &Path, settings: &Settings) -> anyhow::Result<()> {
+pub fn run_connector(
+    socket: &Path,
+    settings: &Settings,
+    levels: &service::logging::Levels,
+) -> anyhow::Result<()> {
     service::logging::init(
         "MooncakeConnector",
-        None,
-        None,
+        levels,
         service::logging::Output::Stderr,
     );
     let ran = crate::mooncake::run(socket, settings).map_err(anyhow::Error::from);
@@ -129,13 +133,9 @@ pub fn run_connector(socket: &Path, settings: &Settings) -> anyhow::Result<()> {
 pub fn run_transfer_server(
     socket: &Path,
     options: &crate::transfer::Options,
+    levels: &service::logging::Levels,
 ) -> anyhow::Result<()> {
-    service::logging::init(
-        "TransferServer",
-        None,
-        None,
-        service::logging::Output::Stderr,
-    );
+    service::logging::init("TransferServer", levels, service::logging::Output::Stderr);
     let ran = crate::transfer::run(socket, options).map_err(anyhow::Error::from);
     if let Err(error) = &ran {
         tracing::error!("the Transfer Server failed: {error:#}");

@@ -340,6 +340,8 @@ impl Supervisor {
             let (executable, launch) = self.main_process(spawn)?;
             let mut command = Command::new(executable);
             command.arg("--launch").arg(launch);
+            // An engine process logs at this daemon's level.
+            command.args(::service::logging::arguments());
             command
         };
         command.args(&spawn.arguments);

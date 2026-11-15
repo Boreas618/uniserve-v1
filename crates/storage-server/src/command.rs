@@ -209,7 +209,7 @@ impl Mooncake {
 ///
 /// Fails when the server cannot start or fails while serving, or the running
 /// server cannot be reached or refuses the operator's request.
-pub fn run(args: Args) -> anyhow::Result<()> {
+pub fn run(args: Args, levels: &service::logging::Levels) -> anyhow::Result<()> {
     match args.command {
         Command::Serve {
             socket,
@@ -226,22 +226,22 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             predecessor,
         } => mooncake.settings().and_then(|connector| {
             let executable = std::env::current_exe().context("locating this executable")?;
+            // The helpers log at the server's levels; `--log-level` is the executable's own
+            // option, before its command.
+            let helper = |command: &str| {
+                let mut words: Vec<std::ffi::OsString> = vec![executable.clone().into()];
+                words.extend(levels.arguments().into_iter().map(Into::into));
+                words.extend(["storage-server".into(), command.into()]);
+                words
+            };
             crate::serve(crate::ServeOptions {
                 socket: socket.unwrap_or_else(storage::default_socket),
                 daemon,
                 host_reserve_bytes: host_reserve_gib << 30,
                 tcp,
                 connector,
-                connector_command: vec![
-                    executable.clone().into(),
-                    "storage-server".into(),
-                    "connector".into(),
-                ],
-                transfer_command: vec![
-                    executable.into(),
-                    "storage-server".into(),
-                    "transfer".into(),
-                ],
+                connector_command: helper("connector"),
+                transfer_command: helper("transfer"),
                 transfer_chunk: std::time::Duration::from_micros(transfer_chunk_us),
                 nixl_library,
                 transfer_deadline: std::time::Duration::from_secs(transfer_deadline_s),
@@ -249,12 +249,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 buffer_pool_trace,
                 buffer_pool_check,
                 predecessor,
+                levels: levels.clone(),
             })
         }),
         Command::Connector { socket, mooncake } => mooncake
             .settings()
             .and_then(|settings| settings.context("the connector needs --mooncake-master"))
-            .and_then(|settings| crate::run_connector(&socket, &settings)),
+            .and_then(|settings| crate::run_connector(&socket, &settings, levels)),
         Command::Transfer {
             socket,
             chunk_us,
@@ -265,6 +266,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 chunk: std::time::Duration::from_micros(chunk_us),
                 nixl_library,
             },
+            levels,
         ),
         Command::List { socket } => crate::list(
             &socket.unwrap_or_else(storage::default_socket),

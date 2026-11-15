@@ -34,7 +34,7 @@ uniserve serve --config fasth3.toml --set video_config.max_seconds=10
 | `--host-identity` | `host_identity` |
 | `--nnodes`, `--node-rank`, `--dist-init-addr` | `nnodes`, `node_rank`, `dist_init_addr` |
 
-`--log-level` and `--log-level-http` set the log levels of the `uniserve` process; every subcommand takes them, before or after its name.
+`--log-level` sets the log level of every target of the `uniserve` process, and `--log-level-http` the level of the daemon's HTTP stack (the server and the media-fetching client); every subcommand takes them, before or after its name. A level is one of tracing's names (`off`, `error`, `warn`, `info`, `debug`, `trace`), `info` when unset, and any other value is refused. The environment sets no level (`RUST_LOG` is not read). The daemon starts its engine processes at its own `--log-level`, and a Storage Server its helpers at its own; lines name the level as tracing does (`WARN`, not `WARNING`).
 
 A `--set` value is a TOML value (`2`, `true`, `"text"`, `[1024, 4096]`, `{ mode = "quality" }`) or JSON, and otherwise the text itself, so `--set quantization.mode=quality` and `--set server_config.host=0.0.0.0` need no quotes. A list may be comma-separated text (`--set video_config.sizes=1344x768,768x1344`); quoting is safer than brackets, which the shell may expand. One invocation may set a path several times, the last winning, but not both a table and an option inside it.
 

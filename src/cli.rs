@@ -14,6 +14,8 @@
 
 use clap::{Args, Parser, Subcommand};
 use daemon::options::ServerArgs;
+use service::logging;
+use tracing::level_filters::LevelFilter;
 
 /// Top-level parser for the `uniserve` binary.
 #[derive(Debug, Parser)]
@@ -25,16 +27,31 @@ pub(crate) struct Cli {
     pub command: Command,
 }
 
-/// The process's log levels, which every subcommand takes.
+/// The process's log levels, which every subcommand takes: tracing's level names (`off`,
+/// `error`, `warn`, `info`, `debug`, `trace`), any other value refused.
 #[derive(Debug, Clone, Args)]
 #[command(next_help_heading = "Logging")]
 pub(crate) struct LogLevels {
-    /// Log level of UniServe's own code, such as `info` or `debug`.
+    /// Log level of every target, `info` when unset.
     #[arg(long, global = true)]
-    pub log_level: Option<String>,
-    /// Log level of the HTTP server libraries.
+    pub log_level: Option<LevelFilter>,
+    /// Log level of the daemon's HTTP stack (`daemon::http::LOG_TARGETS`), the
+    /// `--log-level` when unset.
     #[arg(long, global = true)]
-    pub log_level_http: Option<String>,
+    pub log_level_http: Option<LevelFilter>,
+}
+
+impl LogLevels {
+    /// The levels of a process that runs no HTTP stack.
+    pub(crate) fn levels(&self) -> logging::Levels {
+        logging::Levels::new(self.log_level)
+    }
+
+    /// The levels of a process that serves the daemon's HTTP stack.
+    pub(crate) fn serving(&self) -> logging::Levels {
+        self.levels()
+            .with(daemon::http::LOG_TARGETS, self.log_level_http)
+    }
 }
 
 /// Supported top-level CLI commands.
@@ -81,12 +98,23 @@ mod tests {
         };
         assert_eq!(
             levels(&["uniserve", "--log-level", "debug", "serve", "m"]),
-            (Some("debug".into()), None)
+            (Some(LevelFilter::DEBUG), None)
         );
         assert_eq!(
             levels(&["uniserve", "serve", "m", "--log-level-http", "warn"]),
-            (None, Some("warn".into()))
+            (None, Some(LevelFilter::WARN))
         );
+    }
+
+    /// A level that is not one of tracing's names is refused, not read as another.
+    #[test]
+    fn an_unknown_log_level_is_refused() {
+        for level in ["bogus", "warning", "critical"] {
+            assert!(
+                Cli::try_parse_from(["uniserve", "--log-level", level, "serve", "m"]).is_err(),
+                "{level} was accepted"
+            );
+        }
     }
 
     /// Every process of the fixed base is one of this binary's commands.

@@ -62,6 +62,13 @@ pub(crate) fn video_body_limit(media: &MediaConfig) -> usize {
 
 const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
+/// The log targets of the HTTP stack this module serves and fetches with, whose level
+/// `--log-level-http` sets: the server (`axum` over `hyper`, `tower_http`'s trace layer) and the
+/// client the API fetches media with (`reqwest` over `hyper` and, for HTTP/2, `h2`). Each is a
+/// target prefix, so a library's submodules follow it. The list belongs with the dependencies
+/// this module declares: a library the module adds is added here.
+pub const LOG_TARGETS: &[&str] = &["axum", "hyper", "hyper_util", "h2", "tower_http", "reqwest"];
+
 /// Runs this node of the deployment until `shutdown` is cancelled.
 ///
 /// Every node starts its daemon first, which supervises the node's worker

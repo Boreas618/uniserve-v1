@@ -237,7 +237,7 @@ def _log_trouble(log: Path, limit: int = 40) -> str:
     are few of them whatever the moment.
     """  # noqa: D205
     try:
-        # The engine writes `WARNING` and `ERROR`; a process that dies writes
+        # The engine writes `WARN` and `ERROR`; a process that dies writes
         # neither, so a panic and the daemon's own account of the loss are
         # matched by their text as well. The handover's own steps are `INFO`
         # and are the only record of how far it got, so the ones that decide
@@ -824,10 +824,7 @@ def test_a_hot_restart_hands_the_deployment_to_a_successor_daemon(
     # it started, does not stop.
     successors: list[int] = []
     try:
-        # The failure excerpts (`_log_trouble`) read the handover's info
-        # lines, which a RUST_LOG in the host's environment would drop; the
-        # successor inherits this environment.
-        with _serving(runtime, log, name, {"RUST_LOG": "info"}) as (
+        with _serving(runtime, log, name) as (
             base_url,
             daemon,
         ):
@@ -851,7 +848,7 @@ def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
     revisions = [engine_revision() for _ in range(2)]
     successors: list[int] = []
     try:
-        with _serve(runtime, log, name, {"RUST_LOG": "info"}) as base_url:
+        with _serve(runtime, log, name) as base_url:
             answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
             _change_epoch(base_url, revisions[0])
             _committed(base_url)

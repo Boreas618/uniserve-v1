@@ -390,9 +390,9 @@ pub type HostTargets<'a> = &'a dyn Fn() -> std::result::Result<Vec<Target>, Stri
 ///
 /// Fails when the server cannot start, the package cannot be installed, or the
 /// running server cannot be reached.
-pub fn run(args: Args, host: HostTargets<'_>) -> Result<()> {
+pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels) -> Result<()> {
     match args.command {
-        Command::Serve(serve) => run_serve(*serve, host),
+        Command::Serve(serve) => run_serve(*serve, host, levels),
         Command::Install { socket, package } => {
             let mut client = Client::connect(&socket_or_default(socket))?;
             let installed = client.install(&absolute(package))?;
@@ -563,7 +563,11 @@ fn run_build(args: BuildArgs, host: HostTargets<'_>) -> Result<()> {
 }
 
 /// Serves until the process is stopped.
-fn run_serve(serve: ServeArgs, host: HostTargets<'_>) -> Result<()> {
+fn run_serve(
+    serve: ServeArgs,
+    host: HostTargets<'_>,
+    levels: &service::logging::Levels,
+) -> Result<()> {
     let socket = serve.settings.socket();
 
     // Forked before any thread exists.
@@ -572,7 +576,7 @@ fn run_serve(serve: ServeArgs, host: HostTargets<'_>) -> Result<()> {
     } else {
         None
     };
-    service::logging::init("BuildServer", None, None, service::logging::Output::Stderr);
+    service::logging::init("BuildServer", levels, service::logging::Output::Stderr);
     // A stop signal makes this descriptor readable, which ends the serving.
     let (stop, _flag) = service::stop_signals()?;
 
