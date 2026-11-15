@@ -7,15 +7,15 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use std::path::Path;
 
 use nn::config::Fields;
 use nn::functional;
 use nn::modules::{Precision, Rotary, RotaryConfig, Spectrum, Yarn};
 use nn::{Checkpoint, CpuWeights, DType, Device, MetaWeights, Tensor, WeightLoader};
-use support::{assert_close, f32_bytes, meta, recorded, sequence, shard, tensor, values};
+use nn_testing::{
+    Recording, assert_close, encode, meta, record, sequence, tensor, values, write_checkpoint,
+};
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
 const F32_TOLERANCE: f32 = 2e-5;
@@ -37,10 +37,14 @@ fn plain(dim: u32) -> RotaryConfig {
 
 /// A checkpoint of one placeholder tensor: a rotary reads no tensor, it publishes its table.
 fn checkpoint(directory: &Path) -> Checkpoint {
-    shard(
+    write_checkpoint(
         directory,
-        "model.safetensors",
-        &[("placeholder", DType::F32, vec![1], f32_bytes(&[0.0]))],
+        &[&[(
+            "placeholder",
+            DType::F32,
+            vec![1],
+            encode(DType::F32, &[0.0]),
+        )]],
     );
     Checkpoint::open(directory).unwrap()
 }
@@ -347,7 +351,7 @@ fn the_factor_function_states_its_axes_in_its_key() {
     let inv_freq = meta(48, DType::F32);
 
     // One axis: every position is one token's.
-    let (single, launches) = recorded(|| {
+    let (single, Recording { launches, .. }) = record(&[], || {
         functional::rotary_factors(&meta(10, DType::I32), &meta(64, DType::F32), &[], false)
     });
     let (cos, sin) = single.unwrap();
@@ -362,7 +366,7 @@ fn the_factor_function_states_its_axes_in_its_key() {
 
     // Three repeated axes of sixteen pairs: one column per rotated pair, one coordinate per
     // axis and token.
-    let (repeated, launches) = recorded(|| {
+    let (repeated, Recording { launches, .. }) = record(&[], || {
         functional::rotary_factors(&meta((3, 10), DType::I32), &inv_freq, &[32, 32, 32], false)
     });
     assert_eq!(repeated.unwrap().0.dims(), [10, 48]);
@@ -372,7 +376,7 @@ fn the_factor_function_states_its_axes_in_its_key() {
     );
 
     // The interleaved cut is another kernel.
-    let (cycled, launches) = recorded(|| {
+    let (cycled, Recording { launches, .. }) = record(&[], || {
         functional::rotary_factors(&meta((3, 10), DType::I32), &inv_freq, &[48, 24, 24], true)
     });
     cycled.unwrap();
@@ -617,8 +621,9 @@ fn the_rotations_state_their_kernels() {
     // The fused form is one launch for the queries and the keys, and a normalization with
     // learned gains is another kernel than one without.
     let fused = |weights: Option<(&Tensor, &Tensor)>, centred| {
-        let (turned, launches) =
-            recorded(|| functional::qk_norm_rope(&query, &key, weights, &cos, &sin, 1e-6, centred));
+        let (turned, Recording { launches, .. }) = record(&[], || {
+            functional::qk_norm_rope(&query, &key, weights, &cos, &sin, 1e-6, centred)
+        });
         let (turned_query, turned_key) = turned.unwrap();
         assert_eq!(turned_query.dims(), query.dims());
         assert_eq!(turned_key.dims(), key.dims());
@@ -642,13 +647,14 @@ fn the_rotations_state_their_kernels() {
 
     // A partial rotation names the channels it turns.
     let narrow = meta((5, 48), DType::F32);
-    let (partial, launches) =
-        recorded(|| functional::qk_norm_rope(&query, &key, None, &narrow, &narrow, 1e-6, false));
+    let (partial, Recording { launches, .. }) = record(&[], || {
+        functional::qk_norm_rope(&query, &key, None, &narrow, &narrow, 1e-6, false)
+    });
     partial.unwrap();
     assert_eq!(launches[0].1, format!("{base}_rotated_96_affine_false"));
 
     // The rotation alone is one launch per tensor.
-    let (turned, launches) = recorded(|| functional::rotary(&key, &cos, &sin));
+    let (turned, Recording { launches, .. }) = record(&[], || functional::rotary(&key, &cos, &sin));
     assert_eq!(turned.unwrap().dims(), key.dims());
     assert_eq!(
         launches,
@@ -661,7 +667,7 @@ fn the_rotations_state_their_kernels() {
 
     // The in-place form turns two ranges of one projection by a table of the caller's type.
     let table = meta((5, 64), DType::BF16);
-    let (turned, launches) = recorded(|| {
+    let (turned, Recording { launches, .. }) = record(&[], || {
         functional::qk_norm_rope_(
             meta((10, 24 * 128), DType::BF16),
             0..8,
@@ -762,7 +768,8 @@ fn a_rotary_reads_one_coordinate_per_axis_into_one_column_per_pair() {
     let rotary = Rotary::load(&repeated, loader.root().pp("rotary_emb")).unwrap();
     assert_eq!((rotary.columns(), rotary.axes()), (48, 3));
 
-    let (computed, launches) = recorded(|| rotary.forward(&meta((3, 10), DType::I32)));
+    let (computed, Recording { launches, .. }) =
+        record(&[], || rotary.forward(&meta((3, 10), DType::I32)));
     let (cos, sin) = computed.unwrap();
     assert_eq!(cos.dims(), [10, 48], "one column per rotated pair");
     assert_eq!((sin.dims(), sin.dtype()), (cos.dims(), DType::F32));
@@ -776,7 +783,7 @@ fn a_rotary_reads_one_coordinate_per_axis_into_one_column_per_pair() {
         )]
     );
 
-    let (flat, launches) = recorded(|| rotary.forward(&meta(30, DType::I32)));
+    let (flat, Recording { launches, .. }) = record(&[], || rotary.forward(&meta(30, DType::I32)));
     assert!(
         flat.is_err(),
         "a sectioned rotation reads axis-major positions"

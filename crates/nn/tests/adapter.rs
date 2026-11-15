@@ -2,21 +2,19 @@
 //! value, a tensor it assigns joins the checkpoint, every other tensor reads as without it, and
 //! a fused weight is retained under a key of its own.
 //!
-//! The adapter's container is the one the tests declare ([`support::Stated`]), as a model family
+//! The adapter's container is the one the tests declare ([`nn_testing::Stated`]), as a model family
 //! declares its own. The shards are written here, header and payload, so no checkpoint and no
 //! device is needed.
 
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use std::path::Path;
 
 use nn::{
     Adapter, Checkpoint, CpuWeights, DType, Shape, Source, WeightLayout, WeightLoader, WeightSource,
 };
-use support::{Stated, encode, shard_stating, values};
+use nn_testing::{Stated, encode, values, write_file};
 
 /// Writes the BF16 shard `name` of `tensors` in `directory`, stating `metadata`; every value
 /// here is exactly representable.
@@ -37,7 +35,7 @@ fn shard(
             )
         })
         .collect();
-    shard_stating(directory, name, metadata, &typed);
+    write_file(&directory.join(name), metadata, &typed);
 }
 
 /// A checkpoint that holds a projection, its bias, a norm and an untouched matrix.

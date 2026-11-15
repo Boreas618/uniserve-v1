@@ -14,6 +14,7 @@ members = [
     "crates/media",
     "crates/models",
     "crates/nn",
+    "crates/nn/testing",
     "crates/ops",
     "crates/ops/derive",
     "crates/processing",
@@ -81,6 +82,7 @@ daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
 media = { path = "crates/media" }
 nn = { path = "crates/nn" }
+nn-testing = { path = "crates/nn/testing" }
 ops = { path = "crates/ops" }
 ops-derive = { path = "crates/ops/derive" }
 models = { path = "crates/models" }

@@ -7,13 +7,11 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use nn::functional::{self, Padding};
 use nn::modules::{Conv1d, Conv3d, ConvConfig, ConvTranspose1d};
-use nn::{Checkpoint, CpuWeights, DType, MetaWeights, WeightLoader};
-use support::{
-    assert_close, f32_bytes, meta, operators, recorded, sequence, shard, tensor, values,
+use nn::{CpuWeights, DType, MetaWeights, WeightLoader};
+use nn_testing::{
+    Recording, assert_close, checkpoint, meta, operators, record, sequence, tensor, values,
 };
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
@@ -21,17 +19,6 @@ const F32_TOLERANCE: f32 = 2e-5;
 
 /// The key of a convolution over FP32 operands: the element types and nothing of the window.
 const F32_KEY: &str = "input_f32_weight_f32_output_f32";
-
-/// The checkpoint at `directory` holding the FP32 tensors `tensors` (name, extents, values).
-fn checkpoint(directory: &std::path::Path, tensors: &[(&str, Vec<usize>, Vec<f32>)]) -> Checkpoint {
-    let typed: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = tensors
-        .iter()
-        .map(|(name, shape, values)| (*name, DType::F32, shape.clone(), f32_bytes(values)))
-        .collect();
-    shard(directory, "model.safetensors", &typed);
-
-    Checkpoint::open(directory).unwrap()
-}
 
 /// The arguments of a one-dimensional convolution, as torch names them.
 #[derive(Clone, Copy)]
@@ -355,6 +342,7 @@ fn the_convolution_modules_load_the_filters_their_torch_arguments_state() {
     let (frame, frame_bias) = (sequence(6 * 4 * 2 * 2 * 2, 19), sequence(6, 20));
     let checkpoint = checkpoint(
         directory.path(),
+        DType::F32,
         &[
             ("conv.weight_v", vec![8, 4, 3], direction.clone()),
             ("conv.weight_g", vec![8, 1, 1], gain.clone()),
@@ -470,6 +458,7 @@ fn each_convolution_is_one_launch_keyed_by_its_element_types() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(
         directory.path(),
+        DType::F32,
         &[
             ("conv.weight", vec![8, 2, 3], sequence(8 * 2 * 3, 23)),
             ("conv.bias", vec![8], sequence(8, 24)),
@@ -495,7 +484,7 @@ fn each_convolution_is_one_launch_keyed_by_its_element_types() {
     };
     let up = ConvTranspose1d::load(&up_config, loader.root().pp("up")).unwrap();
 
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         let out = conv.forward(&meta((2, 4, 16), DType::F32))?;
         Ok((out.dims().to_vec(), up.forward(&out)?.dims().to_vec()))
     });
@@ -513,7 +502,7 @@ fn each_convolution_is_one_launch_keyed_by_its_element_types() {
     };
     let frame = Conv3d::load(&unbiased, loader.root().pp("frame")).unwrap();
     let strides = |channels_last: bool| {
-        recorded(|| {
+        record(&[], || {
             let x = if channels_last {
                 meta((1, 3, 3, 3, 4), DType::F32).permute((0, 4, 1, 2, 3))?
             } else {
@@ -524,11 +513,23 @@ fn each_convolution_is_one_launch_keyed_by_its_element_types() {
         })
     };
 
-    let (first, first_launches) = strides(false);
+    let (
+        first,
+        Recording {
+            launches: first_launches,
+            ..
+        },
+    ) = strides(false);
     assert_eq!(first.unwrap(), (vec![1, 8, 2, 2, 2], vec![64, 8, 4, 2, 1]));
     assert_eq!(first_launches, [("conv", F32_KEY.to_owned())]);
 
-    let (last, last_launches) = strides(true);
+    let (
+        last,
+        Recording {
+            launches: last_launches,
+            ..
+        },
+    ) = strides(true);
     assert_eq!(last.unwrap(), (vec![1, 8, 2, 2, 2], vec![64, 1, 32, 16, 8]));
     assert_eq!(last_launches, first_launches, "the order keys no kernel");
 }
@@ -604,7 +605,7 @@ fn a_causal_pad_fills_the_border_by_its_mode_and_the_front_with_zero_frames() {
 
 #[test]
 fn a_causal_pad_on_a_device_is_a_concatenation_of_generic_primitives() {
-    let (padded, launches) = recorded(|| {
+    let (padded, Recording { launches, .. }) = record(&[], || {
         functional::causal_pad(
             &meta((1, 3, 5, 16, 16), DType::F32),
             [1; 4],

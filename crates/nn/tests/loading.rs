@@ -8,8 +8,6 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -19,8 +17,8 @@ use nn::{
     Checkpoint, CpuWeights, DType, Device, Library, MetaWeights, PipelineIndex, Shape, Source,
     Tensor, WeightKey, WeightLayout, WeightLoader, WeightSource,
 };
+use nn_testing::{Stored, encode, stored, values, write_checkpoint, write_file};
 use ops::fp4::ScaleLayout;
-use support::{encode, f32_bytes, shard, values};
 
 /// The local directory `directory`.
 fn local(directory: &Path) -> Source {
@@ -30,22 +28,6 @@ fn local(directory: &Path) -> Source {
 /// The BF16 values of the tensor `name` of `checkpoint`, as a read returns them.
 fn read_bf16(checkpoint: &Checkpoint, name: &str) -> Vec<f32> {
     ops::values::decode(DType::BF16, &checkpoint.read(name).unwrap()).unwrap()
-}
-
-/// Writes one shard holding BF16 tensors (name, extents, values) and returns its path.
-fn bf16_shard(directory: &Path, tensors: &[(&str, Vec<usize>, Vec<f32>)]) -> std::path::PathBuf {
-    let typed: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = tensors
-        .iter()
-        .map(|(name, shape, values)| {
-            (
-                *name,
-                DType::BF16,
-                shape.clone(),
-                encode(DType::BF16, values),
-            )
-        })
-        .collect();
-    shard(directory, "model.safetensors", &typed)
 }
 
 /// The whole of `tensor`, `shape` elements from its first.
@@ -89,32 +71,19 @@ fn key_of<'k>(keys: &'k [WeightKey], piece: &str) -> &'k WeightKey {
 fn a_checkpoint_is_read_through_its_index() {
     let directory = tempfile::tempdir().unwrap();
     let numbers = [1.0_f32, 2.0, 3.0, 4.0];
-    let first = shard(
-        directory.path(),
-        "model-00001-of-00002.safetensors",
-        &[(
-            "model.embed_tokens.weight",
-            DType::BF16,
-            vec![2, 2],
-            encode(DType::BF16, &numbers),
-        )],
-    );
-    let second = shard(
-        directory.path(),
-        "model-00002-of-00002.safetensors",
-        &[(
-            "lm_head.weight",
-            DType::BF16,
-            vec![2, 2],
-            encode(DType::BF16, &numbers),
-        )],
-    );
-    let index = format!(
-        r#"{{"metadata": {{}}, "weight_map": {{"model.embed_tokens.weight": "{}", "lm_head.weight": "{}"}}}}"#,
-        first.file_name().unwrap().to_string_lossy(),
-        second.file_name().unwrap().to_string_lossy(),
-    );
-    std::fs::write(directory.path().join("model.safetensors.index.json"), index).unwrap();
+    let first: &[Stored<&str>] = &[(
+        "model.embed_tokens.weight",
+        DType::BF16,
+        vec![2, 2],
+        encode(DType::BF16, &numbers),
+    )];
+    let second: &[Stored<&str>] = &[(
+        "lm_head.weight",
+        DType::BF16,
+        vec![2, 2],
+        encode(DType::BF16, &numbers),
+    )];
+    write_checkpoint(directory.path(), &[first, second]);
 
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     assert_eq!(checkpoint.len(), 2);
@@ -145,7 +114,10 @@ fn a_checkpoint_is_read_through_its_index() {
 fn a_file_is_identified_by_the_source_its_caller_states() {
     let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     for directory in [&first, &second] {
-        bf16_shard(directory.path(), &[("weight", vec![2], vec![1.0, 2.0])]);
+        write_checkpoint(
+            directory.path(),
+            &[&stored(DType::BF16, &[("weight", vec![2], vec![1.0, 2.0])])],
+        );
     }
     let identity = |source: Source| {
         Checkpoint::shards(&source, Library::Transformers)
@@ -180,13 +152,16 @@ fn a_file_is_identified_by_the_source_its_caller_states() {
 #[test]
 fn a_reading_names_the_tensors_a_load_never_asked_for() {
     let directory = tempfile::tempdir().unwrap();
-    bf16_shard(
+    write_checkpoint(
         directory.path(),
-        &[
-            ("a", vec![2], vec![1.0, 2.0]),
-            ("b", vec![2], vec![3.0, 4.0]),
-            ("c", vec![2], vec![5.0, 6.0]),
-        ],
+        &[&stored(
+            DType::BF16,
+            &[
+                ("a", vec![2], vec![1.0, 2.0]),
+                ("b", vec![2], vec![3.0, 4.0]),
+                ("c", vec![2], vec![5.0, 6.0]),
+            ],
+        )],
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     checkpoint.read("a").unwrap();
@@ -205,8 +180,14 @@ fn a_reading_names_the_tensors_a_load_never_asked_for() {
     let (transformer, vae) = (root.path().join("transformer"), root.path().join("vae"));
     std::fs::create_dir_all(&transformer).unwrap();
     std::fs::create_dir_all(&vae).unwrap();
-    bf16_shard(&transformer, &[("weight", vec![2], vec![1.0, 2.0])]);
-    bf16_shard(&vae, &[("weight", vec![2], vec![3.0, 4.0])]);
+    write_checkpoint(
+        &transformer,
+        &[&stored(DType::BF16, &[("weight", vec![2], vec![1.0, 2.0])])],
+    );
+    write_checkpoint(
+        &vae,
+        &[&stored(DType::BF16, &[("weight", vec![2], vec![3.0, 4.0])])],
+    );
 
     let stages = BTreeMap::from([
         (
@@ -243,14 +224,14 @@ fn a_shard_set_is_read_only_through_its_librarys_names() {
         encode(DType::BF16, &[1.0, 2.0]),
     )];
 
-    shard(directory.path(), "weights.safetensors", &tensors);
+    write_file(&directory.path().join("weights.safetensors"), &[], &tensors);
     let error = Checkpoint::open(directory.path()).err().expect("refused");
     assert!(error.to_string().contains("model.safetensors"), "{error}");
 
     // A diffusers shard set is read by the diffusers names alone.
-    shard(
-        directory.path(),
-        "diffusion_pytorch_model.safetensors",
+    write_file(
+        &directory.path().join("diffusion_pytorch_model.safetensors"),
+        &[],
         &tensors,
     );
     assert!(Checkpoint::open(directory.path()).is_err());
@@ -258,7 +239,7 @@ fn a_shard_set_is_read_only_through_its_librarys_names() {
     assert!(diffusers.tensor("weight").is_some());
 
     // One shard and an index of several are two statements of one set.
-    shard(directory.path(), "model.safetensors", &tensors);
+    write_checkpoint(directory.path(), &[&tensors]);
     std::fs::write(
         directory.path().join("model.safetensors.index.json"),
         r#"{"weight_map": {"weight": "model.safetensors"}}"#,
@@ -296,21 +277,16 @@ fn a_pipelines_stages_are_the_components_its_index_declares() {
             encode(DType::BF16, &[value]),
         )]
     };
-    shard(
-        &root.path().join("network"),
-        "diffusion_pytorch_model.safetensors",
+    write_file(
+        &root
+            .path()
+            .join("network")
+            .join("diffusion_pytorch_model.safetensors"),
+        &[],
         &tensors(1.0),
     );
-    shard(
-        &root.path().join("text_encoder"),
-        "model.safetensors",
-        &tensors(2.0),
-    );
-    shard(
-        &root.path().join("extra"),
-        "model.safetensors",
-        &tensors(3.0),
-    );
+    write_checkpoint(&root.path().join("text_encoder"), &[&tensors(2.0)]);
+    write_checkpoint(&root.path().join("extra"), &[&tensors(3.0)]);
 
     let source = local(root.path());
     let index = PipelineIndex::read(&source).unwrap();
@@ -368,16 +344,15 @@ fn a_composed_pipeline_reads_each_component_from_its_source() {
         .unwrap();
     }
     let tensors = [("weight", DType::BF16, vec![1], encode(DType::BF16, &[1.0]))];
-    shard(
-        &export.path().join("transformer"),
-        "diffusion_pytorch_model.safetensors",
+    write_file(
+        &export
+            .path()
+            .join("transformer")
+            .join("diffusion_pytorch_model.safetensors"),
+        &[],
         &tensors,
     );
-    shard(
-        &base.path().join("text_encoder"),
-        "model.safetensors",
-        &tensors,
-    );
+    write_checkpoint(&base.path().join("text_encoder"), &[&tensors]);
 
     let (export_source, base_source) = (local(export.path()), local(base.path()));
     let index = PipelineIndex::read(&export_source).unwrap();
@@ -425,7 +400,13 @@ fn a_composed_pipeline_reads_each_component_from_its_source() {
 fn a_region_is_converted_once_and_reused_by_its_key() {
     let directory = tempfile::tempdir().unwrap();
     let numbers: Vec<f32> = (0..8).map(|index| index as f32).collect();
-    bf16_shard(directory.path(), &[("weight", vec![2, 4], numbers.clone())]);
+    write_checkpoint(
+        directory.path(),
+        &[&stored(
+            DType::BF16,
+            &[("weight", vec![2, 4], numbers.clone())],
+        )],
+    );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
 
@@ -466,12 +447,15 @@ fn fused_parts_are_joined_in_the_order_the_operator_reads() {
     let directory = tempfile::tempdir().unwrap();
     let gate: Vec<f32> = (0..4).map(|index| 10.0 + index as f32).collect();
     let up: Vec<f32> = (0..4).map(|index| 20.0 + index as f32).collect();
-    bf16_shard(
+    write_checkpoint(
         directory.path(),
-        &[
-            ("gate", vec![2, 2], gate.clone()),
-            ("up", vec![2, 2], up.clone()),
-        ],
+        &[&stored(
+            DType::BF16,
+            &[
+                ("gate", vec![2, 2], gate.clone()),
+                ("up", vec![2, 2], up.clone()),
+            ],
+        )],
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
@@ -546,7 +530,13 @@ fn a_strided_row_parallel_shard_gathers_its_columns() {
     let directory = tempfile::tempdir().unwrap();
     // Four rows of six elements: row r holds 6r .. 6r+5.
     let numbers: Vec<f32> = (0..24).map(|value| value as f32).collect();
-    bf16_shard(directory.path(), &[("o_proj.weight", vec![4, 6], numbers)]);
+    write_checkpoint(
+        directory.path(),
+        &[&stored(
+            DType::BF16,
+            &[("o_proj.weight", vec![4, 6], numbers)],
+        )],
+    );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
@@ -580,12 +570,15 @@ fn a_strided_row_parallel_shard_gathers_its_columns() {
 #[test]
 fn a_region_of_zeros_is_refused_when_the_load_asks_for_a_value() {
     let directory = tempfile::tempdir().unwrap();
-    bf16_shard(
+    write_checkpoint(
         directory.path(),
-        &[
-            ("v_proj.weight", vec![2, 2], vec![0.0; 4]),
-            ("k_proj.weight", vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]),
-        ],
+        &[&stored(
+            DType::BF16,
+            &[
+                ("v_proj.weight", vec![2, 2], vec![0.0; 4]),
+                ("k_proj.weight", vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]),
+            ],
+        )],
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
@@ -623,16 +616,19 @@ fn a_region_of_zeros_is_refused_when_the_load_asks_for_a_value() {
 #[test]
 fn a_weight_normalized_convolution_is_computed_once_at_load() {
     let directory = tempfile::tempdir().unwrap();
-    bf16_shard(
+    write_checkpoint(
         directory.path(),
-        &[
-            // Two output channels of two elements: v = [[3, 4], [0, 1]].
-            ("conv.weight_v", vec![2, 2], vec![3.0, 4.0, 0.0, 1.0]),
-            // PyTorch keeps the gain as [channels, 1, 1].
-            ("conv.weight_g", vec![2, 1, 1], vec![5.0, 10.0]),
-            ("short.weight_v", vec![2, 2], vec![3.0, 4.0, 0.0, 1.0]),
-            ("short.weight_g", vec![3, 1, 1], vec![5.0, 10.0, 1.0]),
-        ],
+        &[&stored(
+            DType::BF16,
+            &[
+                // Two output channels of two elements: v = [[3, 4], [0, 1]].
+                ("conv.weight_v", vec![2, 2], vec![3.0, 4.0, 0.0, 1.0]),
+                // PyTorch keeps the gain as [channels, 1, 1].
+                ("conv.weight_g", vec![2, 1, 1], vec![5.0, 10.0]),
+                ("short.weight_v", vec![2, 2], vec![3.0, 4.0, 0.0, 1.0]),
+                ("short.weight_g", vec![3, 1, 1], vec![5.0, 10.0, 1.0]),
+            ],
+        )],
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
@@ -665,13 +661,19 @@ fn a_weight_normalized_convolution_is_computed_once_at_load() {
 #[test]
 fn a_computed_weight_is_named_by_its_provenance_and_not_by_its_label_alone() {
     let directory = tempfile::tempdir().unwrap();
-    bf16_shard(directory.path(), &[("weight", vec![1], vec![1.0])]);
+    write_checkpoint(
+        directory.path(),
+        &[&stored(DType::BF16, &[("weight", vec![1], vec![1.0])])],
+    );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let (name, shape) = ("denoiser.video.student_heads.weight", Shape::from(2));
-    let (base, reference) = (f32_bytes(&[0.5, 0.25]), f32_bytes(&[1.0, 2.0]));
+    let (base, reference) = (
+        encode(DType::F32, &[0.5, 0.25]),
+        encode(DType::F32, &[1.0, 2.0]),
+    );
     let constant = |bytes: &[u8], producer: &'static str| {
         loader
             .constant(name, DType::F32, &shape, bytes, producer)
@@ -709,7 +711,10 @@ fn a_computed_weight_is_named_by_its_provenance_and_not_by_its_label_alone() {
 #[test]
 fn a_builder_names_its_constants_by_its_module_path_and_encodes_their_type() {
     let directory = tempfile::tempdir().unwrap();
-    bf16_shard(directory.path(), &[("weight", vec![1], vec![1.0])]);
+    write_checkpoint(
+        directory.path(),
+        &[&stored(DType::BF16, &[("weight", vec![1], vec![1.0])])],
+    );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
@@ -774,14 +779,13 @@ fn a_calibrated_nvfp4_matrix_is_loaded_as_its_fields() {
     // `[4, 64]` encoded: 32 bytes a row of packed pairs, four block scales a row.
     let packed: Vec<u8> = (0..128).map(|byte| byte as u8).collect();
     let scales: Vec<u8> = (0..16).map(|byte| 0x30 + byte).collect();
-    shard(
+    write_checkpoint(
         directory.path(),
-        "model.safetensors",
-        &[
+        &[&[
             ("w", DType::U8, vec![4, 32], packed.clone()),
             ("w_scale", DType::U8, vec![4, 4], scales.clone()),
-            ("w_input", DType::F32, vec![1], f32_bytes(&[0.5])),
-        ],
+            ("w_input", DType::F32, vec![1], encode(DType::F32, &[0.5])),
+        ]],
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
@@ -848,13 +852,12 @@ fn a_calibrated_nvfp4_matrix_is_loaded_as_its_fields() {
 #[test]
 fn a_calibrated_projection_is_read_in_the_spelling_its_export_wrote() {
     let directory = tempfile::tempdir().unwrap();
-    shard(
+    write_checkpoint(
         directory.path(),
-        "model.safetensors",
-        &[
+        &[&[
             ("proj.weight_packed", DType::U8, vec![2, 8], vec![1; 16]),
             ("proj.weight_scale", DType::U8, vec![2, 1], vec![0x38; 2]),
-        ],
+        ]],
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
@@ -902,7 +905,7 @@ fn stack_checkpoint(directory: &Path, experts: u8, scale: DType) -> (Checkpoint,
                 format!("{stem}.weight_scale_2"),
                 DType::F32,
                 vec![1],
-                f32_bytes(&[0.5 * f32::from(expert + 1)]),
+                encode(DType::F32, &[0.5 * f32::from(expert + 1)]),
             ));
         }
     }
@@ -911,7 +914,7 @@ fn stack_checkpoint(directory: &Path, experts: u8, scale: DType) -> (Checkpoint,
         .iter()
         .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
         .collect();
-    shard(directory, "model.safetensors", &named);
+    write_checkpoint(directory, &[&named]);
     (Checkpoint::open(directory).unwrap(), expected)
 }
 
@@ -1035,10 +1038,9 @@ fn a_stack_keeps_its_scale_type_and_arranges_its_rows_at_load() {
 fn a_stack_needs_every_expert_to_agree_on_its_extents() {
     let directory = tempfile::tempdir().unwrap();
     let zeros = |count: usize| vec![0_u8; count];
-    shard(
+    write_checkpoint(
         directory.path(),
-        "model.safetensors",
-        &[
+        &[&[
             (
                 "experts.0.up_proj.weight",
                 DType::U8,
@@ -1055,7 +1057,7 @@ fn a_stack_needs_every_expert_to_agree_on_its_extents() {
                 "experts.0.up_proj.weight_scale_2",
                 DType::F32,
                 vec![1],
-                f32_bytes(&[1.0]),
+                encode(DType::F32, &[1.0]),
             ),
             (
                 "experts.1.up_proj.weight",
@@ -1073,9 +1075,9 @@ fn a_stack_needs_every_expert_to_agree_on_its_extents() {
                 "experts.1.up_proj.weight_scale_2",
                 DType::F32,
                 vec![1],
-                f32_bytes(&[1.0]),
+                encode(DType::F32, &[1.0]),
             ),
-        ],
+        ]],
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let store = CpuWeights::new();
@@ -1107,8 +1109,14 @@ fn a_loader_borrows_another_stage_s_checkpoint_and_keeps_the_store() {
     let (transformer, vae) = (root.path().join("transformer"), root.path().join("vae"));
     std::fs::create_dir_all(&transformer).unwrap();
     std::fs::create_dir_all(&vae).unwrap();
-    bf16_shard(&transformer, &[("weight", vec![2], vec![1.0, 2.0])]);
-    bf16_shard(&vae, &[("weight", vec![2], vec![1.0, 2.0])]);
+    write_checkpoint(
+        &transformer,
+        &[&stored(DType::BF16, &[("weight", vec![2], vec![1.0, 2.0])])],
+    );
+    write_checkpoint(
+        &vae,
+        &[&stored(DType::BF16, &[("weight", vec![2], vec![1.0, 2.0])])],
+    );
 
     let transformer = Checkpoint::open(&transformer).unwrap();
     let vae = Checkpoint::open(&vae).unwrap();
@@ -1132,10 +1140,9 @@ fn a_loader_borrows_another_stage_s_checkpoint_and_keeps_the_store() {
     // an encoded stage is not read at a stated floating-point type.
     let encoded = root.path().join("encoded");
     std::fs::create_dir_all(&encoded).unwrap();
-    shard(
+    write_checkpoint(
         &encoded,
-        "model.safetensors",
-        &[("weight", DType::F8E4M3, vec![2], vec![0x38; 2])],
+        &[&[("weight", DType::F8E4M3, vec![2], vec![0x38; 2])]],
     );
     let encoded = Checkpoint::open(&encoded).unwrap();
     let refused = loader.reborrow(&encoded).err().unwrap();
@@ -1148,16 +1155,19 @@ fn a_loader_borrows_another_stage_s_checkpoint_and_keeps_the_store() {
 /// weight-normalized pair, all BF16 with values in every byte.
 fn dense_checkpoint(directory: &Path) -> Checkpoint {
     let numbers = |count: usize| (1..=count).map(|value| value as f32).collect::<Vec<_>>();
-    bf16_shard(
+    write_checkpoint(
         directory,
-        &[
-            ("proj.weight", vec![4, 8], numbers(32)),
-            ("rows.weight", vec![4, 8], numbers(32)),
-            ("experts.0.up", vec![2, 8], numbers(16)),
-            ("experts.0.gate", vec![2, 8], numbers(16)),
-            ("conv.weight_v", vec![2, 3, 1], numbers(6)),
-            ("conv.weight_g", vec![2, 1, 1], numbers(2)),
-        ],
+        &[&stored(
+            DType::BF16,
+            &[
+                ("proj.weight", vec![4, 8], numbers(32)),
+                ("rows.weight", vec![4, 8], numbers(32)),
+                ("experts.0.up", vec![2, 8], numbers(16)),
+                ("experts.0.gate", vec![2, 8], numbers(16)),
+                ("conv.weight_v", vec![2, 3, 1], numbers(6)),
+                ("conv.weight_g", vec![2, 1, 1], numbers(2)),
+            ],
+        )],
     );
     Checkpoint::open(directory).unwrap()
 }
@@ -1330,10 +1340,9 @@ fn a_meta_load_refuses_what_the_header_contradicts() {
     // A stack whose block scales are stated as wide as the packed values: the published table
     // is the loader's to build, so the header alone refuses it.
     let encoded = tempfile::tempdir().unwrap();
-    shard(
+    write_checkpoint(
         encoded.path(),
-        "model.safetensors",
-        &[
+        &[&[
             (
                 "experts.0.up_proj.weight",
                 DType::U8,
@@ -1350,9 +1359,9 @@ fn a_meta_load_refuses_what_the_header_contradicts() {
                 "experts.0.up_proj.weight_scale_2",
                 DType::F32,
                 vec![1],
-                f32_bytes(&[1.0]),
+                encode(DType::F32, &[1.0]),
             ),
-        ],
+        ]],
     );
     let checkpoint = Checkpoint::open(encoded.path()).unwrap();
     let stack = |loader: &WeightLoader<'_>| {
@@ -1384,15 +1393,14 @@ fn a_meta_load_refuses_what_the_header_contradicts() {
 #[test]
 fn a_tensor_scale_is_refused_by_its_value_over_every_store() {
     let directory = tempfile::tempdir().unwrap();
-    shard(
+    write_checkpoint(
         directory.path(),
-        "model.safetensors",
-        &[(
+        &[&[(
             "proj.weight_scale_2",
             DType::F32,
             vec![1],
-            f32_bytes(&[0.0]),
-        )],
+            encode(DType::F32, &[0.0]),
+        )]],
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let (store, meta) = (CpuWeights::new(), MetaWeights::new());

@@ -7,8 +7,6 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use std::ops::Range;
 use std::path::Path;
 
@@ -19,11 +17,11 @@ use nn::quantization::{Declaration, Nvfp4Stack, UNIFIED_EXPORT, ValueLayout};
 use nn::{
     Checkpoint, CpuWeights, DType, Device, ExpertExchange, MetaWeights, Tensor, WeightLoader,
 };
-use ops::fp4::ScaleLayout;
-use support::{
-    assert_close, encode, f32_bytes, meta, operators, recorded, recorded_split, sequence, shard,
-    tensor, values,
+use nn_testing::{
+    Recording, assert_close, checkpoint, encode, meta, operators, record, sequence, tensor, values,
+    write_checkpoint,
 };
+use ops::fp4::ScaleLayout;
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
 const F32_TOLERANCE: f32 = 1e-4;
@@ -152,7 +150,7 @@ fn topk_softmax_routes_ten_of_five_hundred_and_twelve_experts() {
     assert_eq!(entries(&ids), expected_ids);
     assert_close(&values(&weights), &expected_weights, F32_TOLERANCE);
 
-    let (routed, launches) = recorded(|| {
+    let (routed, Recording { launches, .. }) = record(&[], || {
         functional::topk_softmax(
             &meta((tokens, experts), DType::BF16),
             top as u32,
@@ -781,7 +779,6 @@ fn packed_checkpoint(
         })
         .collect();
 
-    let mut names = Vec::new();
     let mut tensors = vec![(
         "mlp.gate.weight".to_owned(),
         DType::BF16,
@@ -815,25 +812,18 @@ fn packed_checkpoint(
                     format!("{stem}.weight_scale_2"),
                     DType::F32,
                     vec![1],
-                    f32_bytes(&[*tensor_scale]),
+                    encode(DType::F32, &[*tensor_scale]),
                 ),
                 (
                     format!("{stem}.input_scale"),
                     DType::F32,
                     vec![1],
-                    f32_bytes(&[*input_scale]),
+                    encode(DType::F32, &[*input_scale]),
                 ),
             ]);
         }
     }
-    names.extend(tensors.iter().map(|(name, ..)| name.clone()));
-
-    let borrowed: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = names
-        .iter()
-        .zip(tensors)
-        .map(|(name, (_, dtype, shape, bytes))| (name.as_str(), dtype, shape, bytes))
-        .collect();
-    shard(directory, "model.safetensors", &borrowed);
+    write_checkpoint(directory, &[&tensors]);
     std::fs::write(
         directory.join("config.json"),
         r#"{"quantization_config": {"quant_algo": "NVFP4", "quant_method": "modelopt"}}"#,
@@ -1021,13 +1011,7 @@ fn dense_checkpoint(directory: &Path, dtype: DType) -> Checkpoint {
         ]);
     }
 
-    let typed: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = tensors
-        .iter()
-        .map(|(name, shape, values)| (name.as_str(), dtype, shape.clone(), encode(dtype, values)))
-        .collect();
-    shard(directory, "model.safetensors", &typed);
-
-    Checkpoint::open(directory).unwrap()
+    checkpoint(directory, dtype, &tensors)
 }
 
 /// `Σ_routes weight · expert(x)` for every row of `x`, by the block's own router and experts.
@@ -1130,29 +1114,28 @@ fn a_block_reads_stacked_experts_as_it_reads_one_module_each() {
         .iter()
         .flat_map(|[_, _, down]| down.iter().copied())
         .collect();
-    shard(
+    write_checkpoint(
         stacked.path(),
-        "model.safetensors",
-        &[
+        &[&[
             (
                 "mlp.gate.weight",
                 DType::F32,
                 vec![4, 8],
-                f32_bytes(&router),
+                encode(DType::F32, &router),
             ),
             (
                 "mlp.experts.gate_up_proj",
                 DType::F32,
                 vec![4, 12, 8],
-                f32_bytes(&gate_up),
+                encode(DType::F32, &gate_up),
             ),
             (
                 "mlp.experts.down_proj",
                 DType::F32,
                 vec![4, 8, 6],
-                f32_bytes(&down),
+                encode(DType::F32, &down),
             ),
-        ],
+        ]],
     );
     let stacked_checkpoint = Checkpoint::open(stacked.path()).unwrap();
     let stacked_store = CpuWeights::new();
@@ -1266,11 +1249,13 @@ fn a_block_split_over_a_tensor_group_holds_its_share_and_reduces_its_sum() {
     let store = MetaWeights::new();
     let meta_loader = WeightLoader::new(&checkpoint, &store, None);
     let block = MoE::load(&config, meta_loader.root().pp("mlp")).unwrap();
-    let (alone, _) = recorded(|| block.forward(&meta((4, 8), DType::BF16), None, None));
+    let (alone, _) = record(&[], || {
+        block.forward(&meta((4, 8), DType::BF16), None, None)
+    });
     let message = alone.err().unwrap().to_string();
     assert!(message.contains("no group"), "{message}");
 
-    let (grouped, launches) = recorded_split(Some((1, 2)), || {
+    let (grouped, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
         block.forward(&meta((4, 8), DType::BF16), None, None)
     });
     assert_eq!(grouped.unwrap().dims(), [4, 8]);
@@ -1345,11 +1330,13 @@ fn a_tensor_group_holding_whole_experts_runs_its_window_over_every_token_and_red
         (block.experts(), block.local_experts(), block.top()),
         (4, 2, 2)
     );
-    let (alone, _) = recorded(|| block.forward(&meta((4, 8), DType::BF16), None, None));
+    let (alone, _) = record(&[], || {
+        block.forward(&meta((4, 8), DType::BF16), None, None)
+    });
     let message = alone.err().unwrap().to_string();
     assert!(message.contains("no group"), "{message}");
 
-    let (grouped, launches) = recorded_split(Some((1, 2)), || {
+    let (grouped, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
         block.forward(&meta((4, 8), DType::BF16), None, None)
     });
     assert_eq!(grouped.unwrap().dims(), [4, 8]);
@@ -1379,7 +1366,7 @@ fn a_tensor_group_holding_whole_experts_runs_its_window_over_every_token_and_red
 
     // Its ranks hold the same tokens, so an exchange would carry their routes twice.
     let lent = exchange(2, 4, 8, 2);
-    let (exchanged, _) = recorded_split(Some((1, 2)), || {
+    let (exchanged, _) = record(&[Split { size: 2, rank: 1 }], || {
         block.forward(&meta((4, 8), DType::BF16), None, Some(&lent))
     });
     let message = exchanged.err().unwrap().to_string();
@@ -1407,7 +1394,7 @@ fn a_dense_block_states_its_routing_its_products_and_its_combine() {
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let block = MoE::load(&dense_config(), loader.root().pp("mlp")).unwrap();
 
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         block.forward(
             &meta((15, 8), DType::BF16),
             Some(&meta(1, DType::U32)),
@@ -1467,7 +1454,7 @@ fn the_packed_products_name_the_checkpoint_s_scale_type_and_their_activation_lay
         meta_stack(128, 2048, 768, 1),
     );
 
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         let ids = meta((tokens, top), DType::U32);
         let weights = meta((tokens, top), DType::F32);
         let maps = functional::moe_sort(&ids, &weights, 128, 0..128, None)?;
@@ -1600,7 +1587,7 @@ fn a_tensor_group_holding_whole_packed_experts_runs_the_packed_products_over_its
     .unwrap();
     assert_eq!((block.experts(), block.local_experts()), (2, 1));
 
-    let (output, launches) = recorded_split(Some((1, 2)), || {
+    let (output, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
         block.forward(&meta((3, 32), DType::BF16), None, None)
     });
     assert_eq!(output.unwrap().dims(), [3, 32]);
@@ -1671,7 +1658,9 @@ fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
     assert_eq!((block.experts(), block.local_experts()), (4, 2));
 
     // Without the group's exchange the block has no rows to read.
-    let (alone, _) = recorded(|| block.forward(&meta((3, 8), DType::BF16), None, None));
+    let (alone, _) = record(&[], || {
+        block.forward(&meta((3, 8), DType::BF16), None, None)
+    });
     let message = alone.err().unwrap().to_string();
     assert!(message.contains("exchange"), "{message}");
 
@@ -1680,7 +1669,7 @@ fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
     // experts.
     let lent = exchange(2, 4, 8, 2);
     let live_tokens = meta(1, DType::U32);
-    let (output, launches) = recorded_split(Some((1, 2)), || {
+    let (output, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
         block.forward(&meta((3, 8), DType::BF16), Some(&live_tokens), Some(&lent))
     });
     assert_eq!(output.unwrap().dims(), [3, 8]);
@@ -1717,7 +1706,9 @@ fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
     );
 
     // A rank with no tokens of its own joins the step: it sends nothing and serves its peers.
-    let (joined, launches) = recorded_split(Some((1, 2)), || block.join_expert_step(&lent));
+    let (joined, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
+        block.join_expert_step(&lent)
+    });
     joined.unwrap();
     assert_eq!(
         operators(&launches),
@@ -1736,7 +1727,9 @@ fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
         step_rows: 2,
         ..lent.clone()
     };
-    let (stepped, _) = recorded(|| block.forward(&meta((2, 8), DType::BF16), None, Some(&narrow)));
+    let (stepped, _) = record(&[], || {
+        block.forward(&meta((2, 8), DType::BF16), None, Some(&narrow))
+    });
     assert_eq!(stepped.unwrap().dims(), [2, 8]);
 
     // A rank that holds no experts sends its routes and takes its sums back.
@@ -1744,8 +1737,9 @@ fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
         source_only: true,
         ..lent.clone()
     };
-    let (sent, launches) =
-        recorded(|| block.forward(&meta((3, 8), DType::BF16), None, Some(&source)));
+    let (sent, Recording { launches, .. }) = record(&[], || {
+        block.forward(&meta((3, 8), DType::BF16), None, Some(&source))
+    });
     sent.unwrap();
     assert_eq!(
         operators(&launches)[2..],
@@ -1753,12 +1747,16 @@ fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
     );
 
     // More tokens than a rank's block carries, and an exchange of another group, are refused.
-    let (crowded, _) = recorded(|| block.forward(&meta((5, 8), DType::BF16), None, Some(&lent)));
+    let (crowded, _) = record(&[], || {
+        block.forward(&meta((5, 8), DType::BF16), None, Some(&lent))
+    });
     let message = crowded.err().unwrap().to_string();
     assert!(message.contains("5 tokens"), "{message}");
 
     let wider = exchange(4, 4, 8, 2);
-    let (other, _) = recorded(|| block.forward(&meta((3, 8), DType::BF16), None, Some(&wider)));
+    let (other, _) = record(&[], || {
+        block.forward(&meta((3, 8), DType::BF16), None, Some(&wider))
+    });
     let message = other.err().unwrap().to_string();
     assert!(message.contains("4 ranks"), "{message}");
 }
@@ -1786,8 +1784,9 @@ fn a_calibrated_block_over_an_expert_group_runs_in_the_exchange_s_one_launch() {
         fused: true,
         ..exchange(2, 4, 32, 2)
     };
-    let (output, launches) =
-        recorded(|| block.forward(&meta((3, 32), DType::BF16), None, Some(&fused)));
+    let (output, Recording { launches, .. }) = record(&[], || {
+        block.forward(&meta((3, 32), DType::BF16), None, Some(&fused))
+    });
     assert_eq!(output.unwrap().dims(), [3, 32]);
     assert_eq!(
         launches[2..],
@@ -1806,13 +1805,15 @@ fn a_calibrated_block_over_an_expert_group_runs_in_the_exchange_s_one_launch() {
     );
 
     // A join encodes nothing: it has no rows of its own.
-    let (joined, launches) = recorded(|| block.join_expert_step(&fused));
+    let (joined, Recording { launches, .. }) = record(&[], || block.join_expert_step(&fused));
     joined.unwrap();
     assert_eq!(operators(&launches), ["expert_exchange"]);
 
     // Packed experts over a group run fused, and an exchange of two launches refuses them.
     let two = exchange(2, 4, 32, 2);
-    let (refused, _) = recorded(|| block.forward(&meta((3, 32), DType::BF16), None, Some(&two)));
+    let (refused, _) = record(&[], || {
+        block.forward(&meta((3, 32), DType::BF16), None, Some(&two))
+    });
     assert!(refused.err().unwrap().to_string().contains("fused"));
 }
 
@@ -1891,7 +1892,7 @@ fn sigmoid_gated_add_updates_its_target_s_storage() {
     );
 
     // On the device the target is the kernel's one in-out argument.
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         functional::sigmoid_gated_add_(
             meta((rows, 2048), DType::BF16),
             &meta((rows, 2048), DType::BF16),
@@ -1918,35 +1919,34 @@ fn a_shared_expert_adds_its_gated_mlp_into_the_routed_output() {
         sequence(hidden, 95),
     );
     let directory = tempfile::tempdir().unwrap();
-    shard(
+    write_checkpoint(
         directory.path(),
-        "model.safetensors",
-        &[
+        &[&[
             (
                 "mlp.shared_expert.gate_proj.weight",
                 DType::F32,
                 vec![intermediate, hidden],
-                f32_bytes(&gate_proj),
+                encode(DType::F32, &gate_proj),
             ),
             (
                 "mlp.shared_expert.up_proj.weight",
                 DType::F32,
                 vec![intermediate, hidden],
-                f32_bytes(&up_proj),
+                encode(DType::F32, &up_proj),
             ),
             (
                 "mlp.shared_expert.down_proj.weight",
                 DType::F32,
                 vec![hidden, intermediate],
-                f32_bytes(&down_proj),
+                encode(DType::F32, &down_proj),
             ),
             (
                 "mlp.shared_expert_gate.weight",
                 DType::F32,
                 vec![1, hidden],
-                f32_bytes(&gate),
+                encode(DType::F32, &gate),
             ),
-        ],
+        ]],
     );
     let checkpoint = Checkpoint::open(directory.path()).unwrap();
     let config = SharedExpertConfig {
@@ -2002,7 +2002,7 @@ fn a_shared_expert_adds_its_gated_mlp_into_the_routed_output() {
     let store = MetaWeights::new();
     let meta_loader = WeightLoader::new(&checkpoint, &store, None);
     let shared = SharedExpert::load(&config, meta_loader.root().pp("mlp")).unwrap();
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         shared.forward(
             &meta((rows, hidden), DType::F32),
             meta((rows, hidden), DType::F32),

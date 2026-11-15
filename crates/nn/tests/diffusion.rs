@@ -7,30 +7,16 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use nn::modules::{TimestepEmbedding, TimestepEmbeddingConfig, TimestepTable, TimestepTableConfig};
 use nn::{
-    Checkpoint, CpuWeights, DType, Device, MetaWeights, Step, Tensor, WeightLoader, diffusion,
-    functional,
+    CpuWeights, DType, Device, MetaWeights, Step, Tensor, WeightLoader, diffusion, functional,
 };
-use support::{
-    assert_close, f32_bytes, meta, operators, recorded, sequence, shard, tensor, values,
+use nn_testing::{
+    Recording, assert_close, checkpoint, meta, operators, record, sequence, tensor, values,
 };
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
 const F32_TOLERANCE: f32 = 2e-5;
-
-/// The checkpoint at `directory` holding the FP32 tensors `tensors` (name, extents, values).
-fn checkpoint(directory: &std::path::Path, tensors: &[(&str, Vec<usize>, Vec<f32>)]) -> Checkpoint {
-    let typed: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = tensors
-        .iter()
-        .map(|(name, shape, values)| (*name, DType::F32, shape.clone(), f32_bytes(values)))
-        .collect();
-    shard(directory, "model.safetensors", &typed);
-
-    Checkpoint::open(directory).unwrap()
-}
 
 /// `value` rounded into BF16, to nearest even, as the library's conversion rounds it.
 fn bf16(value: f32) -> f32 {
@@ -109,7 +95,7 @@ fn the_solver_formulas_form_their_sums_in_fp32_and_round_once() {
 /// arithmetic and no step-specific kernel.
 #[test]
 fn a_solver_step_on_a_device_is_generic_arithmetic_over_a_host_value() {
-    let (advanced, launches) = recorded(|| {
+    let (advanced, Recording { launches, .. }) = record(&[], || {
         let latents = || meta((16, 3, 4, 4), DType::F32);
         diffusion::euler_step(&latents(), &latents(), STEP)
     });
@@ -159,6 +145,7 @@ fn a_timestep_embedding_projects_activates_and_projects() {
     let (second, second_bias) = (sequence(5 * 6, 5), sequence(5, 6));
     let checkpoint = checkpoint(
         directory.path(),
+        DType::F32,
         &[
             ("time.linear_1.weight", vec![6, 16], first.clone()),
             ("time.linear_1.bias", vec![6], first_bias.clone()),
@@ -204,7 +191,8 @@ fn a_timestep_embedding_projects_activates_and_projects() {
 
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let embedding = TimestepEmbedding::load(&config, loader.root().pp("time")).unwrap();
-    let (out, launches) = recorded(|| embedding.forward(&meta((2, 16), DType::F32)));
+    let (out, Recording { launches, .. }) =
+        record(&[], || embedding.forward(&meta((2, 16), DType::F32)));
     assert_eq!(out.unwrap().dims(), [2, 5]);
     assert_eq!(operators(&launches), ["gemm", "elementwise_unary", "gemm"]);
 }
@@ -223,7 +211,11 @@ const LEVELS: [f32; 6] = [1.0, 0.75, 0.5, 0.25, 1.0, 0.75];
 #[test]
 fn a_timestep_table_holds_each_distinct_level_once() {
     let directory = tempfile::tempdir().unwrap();
-    let checkpoint = checkpoint(directory.path(), &[("placeholder", vec![1], vec![0.0])]);
+    let checkpoint = checkpoint(
+        directory.path(),
+        DType::F32,
+        &[("placeholder", vec![1], vec![0.0])],
+    );
     let store = CpuWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let levels = tensor(&LEVELS, (3, 2), DType::F32);
@@ -280,13 +272,17 @@ fn a_timestep_table_holds_each_distinct_level_once() {
 #[test]
 fn a_step_gathers_its_entries_and_its_rows_on_the_device() {
     let directory = tempfile::tempdir().unwrap();
-    let checkpoint = checkpoint(directory.path(), &[("placeholder", vec![1], vec![0.0])]);
+    let checkpoint = checkpoint(
+        directory.path(),
+        DType::F32,
+        &[("placeholder", vec![1], vec![0.0])],
+    );
     let store = MetaWeights::new();
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let levels = tensor(&LEVELS, (3, 2), DType::F32);
     let table = TimestepTable::load(&TABLE, &levels, loader.root().pp("adaln")).unwrap();
 
-    let (rows, launches) = recorded(|| {
+    let (rows, Recording { launches, .. }) = record(&[], || {
         let entries = table.entries_of(2)?;
         Ok((
             table.layer(1, &entries)?.dims().to_vec(),
@@ -417,7 +413,7 @@ fn a_draw_is_a_function_of_the_seed_and_the_element_alone() {
 
 #[test]
 fn a_draw_states_its_distribution_and_its_key_source() {
-    let (drawn, launches) = recorded(|| {
+    let (drawn, Recording { launches, .. }) = record(&[], || {
         // A latent arrives as a four-axis raster and is drawn through its folded rows.
         functional::philox_normal(&meta((24, 37, 48, 84), DType::F32), 7, 0, 0, 0)?;
         functional::philox_normal_like(&meta((24, 2, 3, 4), DType::F32), 7, 0, 0, 0)?;
@@ -440,7 +436,7 @@ fn a_draw_states_its_distribution_and_its_key_source() {
         .map(|(operator, key)| (operator, key.to_owned()))
     );
 
-    let (refused, _) = recorded(|| {
+    let (refused, _) = record(&[], || {
         functional::philox_normal_rows(&meta((2, 207), DType::BF16), &meta(3, DType::I64), 0, 0, 0)
     });
     assert!(refused.is_err(), "three keys for two rows");
@@ -481,8 +477,9 @@ fn an_adaptive_pool_averages_every_row_over_each_column_window() {
     assert!(functional::adaptive_avg_pool2d(&x, [1, 0]).is_err());
     assert!(functional::adaptive_avg_pool2d(&x.flatten(0, 1).unwrap(), [1, 4]).is_err());
 
-    let (pooled, launches) =
-        recorded(|| functional::adaptive_avg_pool2d(&meta((5, 8, 256), DType::F32), [1, 32]));
+    let (pooled, Recording { launches, .. }) = record(&[], || {
+        functional::adaptive_avg_pool2d(&meta((5, 8, 256), DType::F32), [1, 32])
+    });
     assert_eq!(pooled.unwrap().dims(), [5, 1, 32]);
     assert_eq!(
         launches,

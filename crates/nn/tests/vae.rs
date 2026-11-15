@@ -7,17 +7,17 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use std::ops::Range;
 
 use nn::modules::{
     Activation1d, Activation1dConfig, BigVgan, BigVganConfig, DacEncoder, DacEncoderConfig,
 };
-use nn::{Checkpoint, CpuWeights, DType, MetaWeights, Tensor, WeightLoader, functional, vae};
-use support::{
-    assert_close, f32_bytes, meta, operators, recorded, recorded_split, sequence, shard, tensor,
-    values,
+use nn::{
+    Checkpoint, CpuWeights, DType, MetaWeights, Split, Tensor, WeightLoader, functional, vae,
+};
+use nn_testing::{
+    Recording, assert_close, encode, meta, operators, record, sequence, tensor, values,
+    write_checkpoint,
 };
 
 /// `value` rounded into BF16, to nearest even, as the library's conversion rounds it.
@@ -251,7 +251,7 @@ fn a_tiled_encode_runs_each_tile_and_stitches_the_blocks() {
     // In a group of two, each rank encodes its share and gathers the other's before the
     // stitch; the blend and the assembly are generic primitives.
     let mut encoded = Vec::new();
-    let (raster, launches) = recorded_split(Some((1, 2)), || {
+    let (raster, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
         vae::tiled_encode(&rows, &columns, &[4, 3], DType::F32, |index| {
             encoded.push(index);
             Ok(meta((4, 3, 2, 2), DType::F32))
@@ -406,10 +406,15 @@ fn checkpoint(directory: &std::path::Path, tensors: &[(String, Vec<usize>)]) -> 
         .enumerate()
         .map(|(index, (name, shape))| {
             let values = sequence(shape.iter().product(), 40 + index as u32);
-            (name.as_str(), DType::F32, shape.clone(), f32_bytes(&values))
+            (
+                name.as_str(),
+                DType::F32,
+                shape.clone(),
+                encode(DType::F32, &values),
+            )
         })
         .collect();
-    shard(directory, "model.safetensors", &typed);
+    write_checkpoint(directory, &[&typed]);
 
     Checkpoint::open(directory).unwrap()
 }
@@ -501,7 +506,8 @@ fn a_bigvgan_generator_upsamples_through_its_stages() {
     };
     assert!(BigVgan::load(&odd, loader.root().pp("decoder")).is_err());
 
-    let (waveform, launches) = recorded(|| generator.forward(&meta((2, 4, 16), DType::F32)));
+    let (waveform, Recording { launches, .. }) =
+        record(&[], || generator.forward(&meta((2, 4, 16), DType::F32)));
     assert_eq!(waveform.unwrap().dims(), [2, 1, 32]);
     let count = |name: &str| {
         launches
@@ -527,7 +533,7 @@ fn a_bigvgan_generator_upsamples_through_its_stages() {
             .1,
         "dtype_f32_channels_4_kernel_12_ratio_2_block_256_pdl_false"
     );
-    let (refused, _) = recorded(|| generator.forward(&meta((2, 16), DType::F32)));
+    let (refused, _) = record(&[], || generator.forward(&meta((2, 16), DType::F32)));
     assert!(refused.is_err());
 
     // On the CPU the generator is its modules in order: here one block, so the stage average
@@ -590,7 +596,8 @@ fn a_dac_encoder_widens_and_strides_through_its_stages() {
     };
     assert!(DacEncoder::load(&no_stage, loader.root().pp("enc")).is_err());
 
-    let (latent, launches) = recorded(|| encoder.forward(&meta((2, 1, 16), DType::F32)));
+    let (latent, Recording { launches, .. }) =
+        record(&[], || encoder.forward(&meta((2, 1, 16), DType::F32)));
     assert_eq!(latent.unwrap().dims(), [2, 8, 8]);
     let count = |name: &str| {
         launches
@@ -601,7 +608,7 @@ fn a_dac_encoder_widens_and_strides_through_its_stages() {
     assert_eq!(count("snake"), 3 * 2 + 1 + 1);
     assert_eq!(count("conv"), 1 + 3 * 2 + 1 + 1);
     assert_eq!(count("elementwise_binary"), 3, "one residual add per unit");
-    let (refused, _) = recorded(|| encoder.forward(&meta((2, 1, 15), DType::F32)));
+    let (refused, _) = record(&[], || encoder.forward(&meta((2, 1, 15), DType::F32)));
     assert!(refused.is_err());
 
     // On the CPU a track of whole hops becomes one frame per hop.

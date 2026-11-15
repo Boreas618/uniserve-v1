@@ -1,0 +1,32 @@
+[package]
+name = "nn-testing"
+description = "Test support of the neural-network library and the model families: checkpoints written and embedded by tests, released checkpoints by Hugging Face identifier, meta forwards and their recordings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# A development dependency of `nn` and `models` only, never of a serving build. It depends on
+# `nn`, so `nn`'s own unit tests cannot use it: their build of `nn` is another crate than the
+# one this crate links.
+[dependencies]
+# The library whose checkpoints, tensors, caches and models the tests build.
+nn.workspace = true
+# Meta tensors, the meta context a forward is recorded under, and the operators of the
+# backend's generic primitives.
+ops.workspace = true
+# The families this tree serves, whose names no kernel key may carry.
+processing.workspace = true
+# The precision policy a family opens a checkpoint under.
+proto.workspace = true
+# The safetensors format's own writer.
+safetensors.workspace = true
+# A checkpoint's shard index.
+serde_json.workspace = true
+# Released checkpoints, resolved through the standard Hugging Face cache.
+hf-hub.workspace = true
+# The directories committed fixtures are written out to.
+tempfile.workspace = true
+
+[lints]
+workspace = true

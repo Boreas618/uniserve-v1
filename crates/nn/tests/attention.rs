@@ -7,20 +7,18 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use std::path::Path;
 
 use nn::collective::Split;
-use nn::family::SequenceSplit;
+use nn::family::{CacheShape, SequenceSplit};
 use nn::functional::{self, WeightOrder};
 use nn::modules::{Attention, AttentionConfig, QkNorm, QkvBias, QkvLinearConfig, QkvNames};
 use nn::{
-    Checkpoint, CpuWeights, DType, Device, KvCache, KvPlanes, MetaWeights, NO_SLOT, Phase, Tensor,
+    Checkpoint, CpuWeights, DType, Device, KvCache, MetaWeights, NO_SLOT, Phase, Tensor,
     TokenBatch, WeightLoader,
 };
-use support::{
-    assert_close, encode, meta, operators, recorded, recorded_split, sequence, shard, tensor,
+use nn_testing::{
+    PAGE_TOKENS, Recording, assert_close, checkpoint, meta, operators, record, sequence, tensor,
     values,
 };
 
@@ -224,8 +222,9 @@ fn dense_attention_states_one_kernel_per_sequence_form() {
     let key = meta((16, 4, 128), DType::BF16);
     let offsets = meta(3, DType::U32);
 
-    let (single, one) =
-        recorded(|| functional::dense_attention(&query, &key, &key, 0.088, false, None));
+    let (single, Recording { launches: one, .. }) = record(&[], || {
+        functional::dense_attention(&query, &key, &key, 0.088, false, None)
+    });
     assert_eq!(single.unwrap().dims(), [16, 32, 128]);
     assert_eq!(
         one,
@@ -238,7 +237,7 @@ fn dense_attention_states_one_kernel_per_sequence_form() {
     );
 
     // Sequence tables select another kernel, whose key the scheduled batch path always had.
-    let (packed, two) = recorded(|| {
+    let (packed, Recording { launches: two, .. }) = record(&[], || {
         functional::dense_attention_varlen(
             &query,
             &key,
@@ -264,8 +263,9 @@ fn dense_attention_states_one_kernel_per_sequence_form() {
 
     // Query heads that do not group the key heads are refused before a launch.
     let odd = meta((16, 5, 128), DType::BF16);
-    let (refused, none) =
-        recorded(|| functional::dense_attention(&query, &odd, &odd, 0.088, false, None));
+    let (refused, Recording { launches: none, .. }) = record(&[], || {
+        functional::dense_attention(&query, &odd, &odd, 0.088, false, None)
+    });
     assert!(refused.is_err());
     assert!(none.is_empty());
 }
@@ -281,30 +281,27 @@ const DIM: usize = 8;
 const PAGE: u32 = 4;
 const PAGES: usize = 3;
 
+/// One layer of [`KV_HEADS`] key heads of [`DIM`] elements.
+const ONE_LAYER: CacheShape = CacheShape {
+    layers: 1,
+    kv_heads: KV_HEADS as u32,
+    head_dim: DIM as u32,
+    index_keys: None,
+};
+
 /// A CPU cache of [`PAGES`] zeroed pages of `dtype` in one layer, with the page table `table`
 /// of `rows` rows; E4M3 planes have their page scales.
 fn cache(dtype: DType, table: &[u32], rows: usize) -> KvCache {
-    let zeros = |shape: (usize, usize, usize, usize), dtype| {
-        Tensor::zeros(shape, dtype, &Device::Cpu).unwrap()
-    };
-    let plane = || zeros((PAGES, PAGE as usize, KV_HEADS, DIM), dtype);
-    let per_page = |dtype| zeros((PAGES, 1, 1, 1), dtype);
-    let scale = || (dtype == DType::F8E4M3).then(|| per_page(DType::F32));
-
-    KvCache {
-        block_tables: column(table).reshape((rows, table.len() / rows)).unwrap(),
-        page_size: PAGE,
-        layers: vec![KvPlanes {
-            key: plane(),
-            value: plane(),
-            key_initialized: per_page(DType::U8),
-            value_initialized: per_page(DType::U8),
-            key_scale: scale(),
-            value_scale: scale(),
-            index_keys: None,
-        }],
-        workspace: Tensor::zeros(64, DType::U8, &Device::Cpu).unwrap(),
-    }
+    KvCache::allocate(
+        ONE_LAYER,
+        dtype,
+        PAGES,
+        PAGE,
+        column(table).reshape((rows, table.len() / rows)).unwrap(),
+        Tensor::zeros(64, DType::U8, &Device::Cpu).unwrap(),
+        |shape, dtype| Ok(Tensor::zeros(shape, dtype, &Device::Cpu)?),
+    )
+    .unwrap()
 }
 
 /// A CPU batch of `phase` whose tokens take `slots`, in rows of `seq_lens` keys packed at
@@ -716,7 +713,8 @@ fn the_cache_functions_refuse_what_no_kernel_reads() {
     }
 }
 
-/// A meta batch of `tokens` tokens in one row over 64-token pages.
+/// A meta batch of `tokens` tokens in one row over one page of a deployment's
+/// ([`PAGE_TOKENS`]).
 fn meta_batch(phase: Phase, tokens: usize) -> TokenBatch {
     TokenBatch {
         positions: meta(tokens, DType::I32),
@@ -725,9 +723,9 @@ fn meta_batch(phase: Phase, tokens: usize) -> TokenBatch {
         query_offsets: meta(2, DType::U32),
         logits_rows: meta(1, DType::U32),
         phase,
-        page_size: 64,
+        page_size: PAGE_TOKENS,
         num_tokens: tokens as u32,
-        max_kv_len: 64,
+        max_kv_len: PAGE_TOKENS,
         draft_lens: None,
         rope_positions: None,
         live_tokens: None,
@@ -739,23 +737,23 @@ fn meta_batch(phase: Phase, tokens: usize) -> TokenBatch {
 /// A meta cache of one page of `kv_heads` heads of `head_dim` elements of `dtype`, in one
 /// layer.
 fn meta_cache(dtype: DType, kv_heads: usize, head_dim: usize) -> KvCache {
-    let plane = || meta((1, 64, kv_heads, head_dim), dtype);
-    let scale = || (dtype == DType::F8E4M3).then(|| meta((1, 1, 1, 1), DType::F32));
+    let shape = CacheShape {
+        layers: 1,
+        kv_heads: kv_heads as u32,
+        head_dim: head_dim as u32,
+        index_keys: None,
+    };
 
-    KvCache {
-        block_tables: meta((1, 1), DType::U32),
-        page_size: 64,
-        layers: vec![KvPlanes {
-            key: plane(),
-            value: plane(),
-            key_initialized: meta((1, 1, 1, 1), DType::U8),
-            value_initialized: meta((1, 1, 1, 1), DType::U8),
-            key_scale: scale(),
-            value_scale: scale(),
-            index_keys: None,
-        }],
-        workspace: meta(1 << 21, DType::U8),
-    }
+    KvCache::allocate(
+        shape,
+        dtype,
+        1,
+        PAGE_TOKENS,
+        meta((1, 1), DType::U32),
+        meta(1 << 21, DType::U8),
+        |shape, dtype| Ok(meta(shape, dtype)),
+    )
+    .unwrap()
 }
 
 /// The kernels a write and the attention after it state for `tokens` tokens of 32 query heads
@@ -765,7 +763,7 @@ fn paged_launches(phase: Phase, tokens: usize, dtype: DType) -> Vec<(&'static st
     let query = meta((tokens, 32, 128), DType::BF16);
     let key = meta((tokens, 4, 128), DType::BF16);
 
-    let (attended, launches) = recorded(|| {
+    let (attended, Recording { launches, .. }) = record(&[], || {
         functional::kv_write_(&cache, 0, &batch, &key, &key)?;
         functional::paged_attention(&query, &batch, &cache, 0, 0.088, None, 40_960)
     });
@@ -843,7 +841,8 @@ fn the_arrival_counters_are_cleared_at_the_head_of_the_workspace() {
 
     // Under a meta context the fill is one launch over the counters' megabyte.
     let workspace = meta(1 << 21, DType::U8);
-    let (cleared, launches) = recorded(|| functional::zero_arrival_counters_(&workspace));
+    let (cleared, Recording { launches, .. }) =
+        record(&[], || functional::zero_arrival_counters_(&workspace));
     cleared.unwrap();
     assert_eq!(operators(&launches), ["fill"]);
 
@@ -875,21 +874,6 @@ fn attention_weights(gated: bool) -> Vec<(&'static str, Vec<usize>, Vec<f32>)> {
         ("attn.q_norm.weight", vec![DIM], sequence(DIM, 5)),
         ("attn.k_norm.weight", vec![DIM], sequence(DIM, 6)),
     ]
-}
-
-/// The checkpoint at `directory` holding `weights` as `dtype`.
-fn checkpoint(
-    directory: &Path,
-    dtype: DType,
-    weights: &[(&'static str, Vec<usize>, Vec<f32>)],
-) -> Checkpoint {
-    let typed: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = weights
-        .iter()
-        .map(|(name, shape, values)| (*name, dtype, shape.clone(), encode(dtype, values)))
-        .collect();
-    shard(directory, "model.safetensors", &typed);
-
-    Checkpoint::open(directory).unwrap()
 }
 
 /// The weight `name` of `weights`, as an FP32 CPU tensor.
@@ -1180,7 +1164,7 @@ fn each_qk_norm_form_launches_its_own_kernels() {
             loader.root().pp("attn"),
         )
         .unwrap();
-        let (out, launches) = recorded(|| attention.forward(&hidden, rope));
+        let (out, Recording { launches, .. }) = record(&[], || attention.forward(&hidden, rope));
         assert_eq!(out.unwrap().dims(), [6, HIDDEN]);
 
         let mut expected = vec!["gemm", "gemm", "gemm"];
@@ -1197,11 +1181,11 @@ fn each_qk_norm_form_launches_its_own_kernels() {
     .unwrap();
     let offsets = meta(3, DType::U32);
     let varlen = |max_kv_len| {
-        recorded(|| {
+        record(&[], || {
             attention.forward_varlen(&hidden, rope, &offsets, &offsets, Some(3), max_kv_len)
         })
     };
-    let (packed, launches) = varlen(6);
+    let (packed, Recording { launches, .. }) = varlen(6);
     packed.unwrap();
     assert_eq!(
         launches[4].1,
@@ -1220,7 +1204,7 @@ fn each_qk_norm_form_launches_its_own_kernels() {
         loader.root().pp("attn"),
     )
     .unwrap();
-    let (out, launches) = recorded(|| attention.forward(&hidden, rope));
+    let (out, Recording { launches, .. }) = record(&[], || attention.forward(&hidden, rope));
     assert_eq!(out.unwrap().dims(), [6, HIDDEN]);
     assert_eq!(
         operators(&launches),
@@ -1266,8 +1250,9 @@ fn a_paged_forward_writes_its_layers_planes_then_reads_them() {
     )
     .unwrap();
     let cache = meta_cache(DType::BF16, KV_HEADS, DIM);
-    let (out, launches) =
-        recorded(|| attention.forward_paged(&hidden, Some((&cos, &sin)), &batch, &cache, 0));
+    let (out, Recording { launches, .. }) = record(&[], || {
+        attention.forward_paged(&hidden, Some((&cos, &sin)), &batch, &cache, 0)
+    });
     assert_eq!(out.unwrap().dims(), [tokens, HIDDEN]);
     assert_eq!(
         operators(&launches),
@@ -1295,7 +1280,7 @@ fn a_paged_forward_writes_its_layers_planes_then_reads_them() {
     let cache = meta_cache(DType::BF16, 1, DIM);
 
     let forward = || attention.forward_paged(&hidden, Some((&cos, &sin)), &batch, &cache, 0);
-    let (out, launches) = recorded_split(Some((1, 2)), forward);
+    let (out, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], forward);
     assert_eq!(out.unwrap().dims(), [tokens, HIDDEN]);
     assert_eq!(
         launches[5].1,
@@ -1303,7 +1288,7 @@ fn a_paged_forward_writes_its_layers_planes_then_reads_them() {
          _mask_causal_window_false_len_1024"
     );
 
-    let (alone, _) = recorded(forward);
+    let (alone, _) = record(&[], forward);
     assert!(alone.unwrap_err().to_string().contains("no group"));
 }
 
@@ -1345,7 +1330,7 @@ fn a_sequence_split_member_attends_its_heads_of_every_row_and_returns_its_own_ro
         assert_eq!(attention.query().n(), (held * DIM) as u32, "{projection:?}");
 
         let forward = || attention.forward_paged(&hidden, Some((&cos, &sin)), &batch, &cache, 0);
-        let (out, launches) = recorded_split(Some((1, 2)), forward);
+        let (out, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], forward);
         assert_eq!(out.unwrap().dims(), [share, HIDDEN], "{projection:?}");
 
         let written = launches
@@ -1363,14 +1348,14 @@ fn a_sequence_split_member_attends_its_heads_of_every_row_and_returns_its_own_ro
         );
 
         // The member's rows are its share of the batch's, and its group is its split.
-        let (alone, _) = recorded(forward);
+        let (alone, _) = record(&[], forward);
         assert!(alone.is_err(), "{projection:?}");
         let whole = meta((tokens, HIDDEN), DType::BF16);
-        let (unshared, _) = recorded_split(Some((1, 2)), || {
+        let (unshared, _) = record(&[Split { size: 2, rank: 1 }], || {
             attention.forward_paged(&whole, Some((&cos, &sin)), &batch, &cache, 0)
         });
         assert!(unshared.is_err(), "{projection:?}");
-        let (dense, _) = recorded_split(Some((1, 2)), || {
+        let (dense, _) = record(&[Split { size: 2, rank: 1 }], || {
             attention.forward(&hidden, Some((&cos, &sin)))
         });
         assert!(dense.is_err(), "{projection:?}");

@@ -33,6 +33,8 @@ half.workspace = true
 float8.workspace = true
 
 [dev-dependencies]
+# The integration tests' checkpoints, meta forwards and values (`crates/nn/testing`).
+nn-testing.workspace = true
 tempfile.workspace = true
 
 [lints]

@@ -7,16 +7,13 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use nn::collective::Split;
 use nn::family::Projection;
 use nn::functional;
 use nn::modules::{UlyssesAttention, UlyssesAttentionConfig, VsaAttention, VsaAttentionConfig};
 use nn::{Checkpoint, CpuWeights, DType, Device, MetaWeights, Tensor, WeightLoader};
-use support::{
-    assert_close, encode, meta, operators, recorded, recorded_split, sequence, shard, tensor,
-    values,
+use nn_testing::{
+    Recording, assert_close, checkpoint, meta, operators, record, sequence, tensor, values,
 };
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
@@ -519,24 +516,6 @@ fn the_padding_rows_of_each_tile_become_zeros_in_place() {
 
 // ---- The module -------------------------------------------------------------------------------
 
-/// The checkpoint at `directory` holding the BF16 tensors `tensors` (name, extents, values).
-fn checkpoint(directory: &std::path::Path, tensors: &[(&str, Vec<usize>, Vec<f32>)]) -> Checkpoint {
-    let typed: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = tensors
-        .iter()
-        .map(|(name, shape, values)| {
-            (
-                *name,
-                DType::BF16,
-                shape.clone(),
-                encode(DType::BF16, values),
-            )
-        })
-        .collect();
-    shard(directory, "model.safetensors", &typed);
-
-    Checkpoint::open(directory).unwrap()
-}
-
 /// A layer of `heads` heads `width` wide over `tile_rows`-row tiles with a tile bound of 4096.
 fn vsa_config(
     tile_rows: u32,
@@ -563,6 +542,7 @@ fn a_sparse_layer_states_its_tiles_bounds_and_rotation() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(
         directory.path(),
+        DType::BF16,
         &[
             ("attn.norm_q.weight", vec![256], sequence(256, 19)),
             ("attn.norm_k.weight", vec![256], sequence(256, 20)),
@@ -623,6 +603,7 @@ fn an_attend_prepares_scores_selects_attends_and_compresses() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(
         directory.path(),
+        DType::BF16,
         &[
             ("attn.norm_q.weight", vec![128], sequence(128, 21)),
             ("attn.norm_k.weight", vec![128], sequence(128, 22)),
@@ -646,7 +627,7 @@ fn an_attend_prepares_scores_selects_attends_and_compresses() {
         )
     };
 
-    let (branches, launches) = recorded(|| {
+    let (branches, Recording { launches, .. }) = record(&[], || {
         let (fine, compressed) = attend(rows)?;
         let gate = meta((rows, 4 * 128), DType::BF16);
 
@@ -682,7 +663,7 @@ fn an_attend_prepares_scores_selects_attends_and_compresses() {
     );
 
     // Rows that are not whole tiles are refused before any launch.
-    let (ragged, launches) = recorded(|| attend(rows + 1));
+    let (ragged, Recording { launches, .. }) = record(&[], || attend(rows + 1));
     assert!(ragged.is_err());
     assert!(launches.is_empty());
 }
@@ -693,7 +674,7 @@ fn an_attend_prepares_scores_selects_attends_and_compresses() {
 #[test]
 fn the_select_block_is_the_layout_s_tiles_rounded_up() {
     let block = |tiles: usize| {
-        let (selection, launches) = recorded(|| {
+        let (selection, Recording { launches, .. }) = record(&[], || {
             functional::vsa_select_tiles(
                 &meta((4, 1, tiles), DType::F32),
                 &meta(tiles, DType::U32),
@@ -723,6 +704,7 @@ fn a_sparse_layer_on_the_cpu_is_its_operators_in_order() {
     let (query_gain, key_gain) = (sequence(WIDTH, 23), sequence(WIDTH, 24));
     let checkpoint = checkpoint(
         directory.path(),
+        DType::BF16,
         &[
             ("attn.norm_q.weight", vec![WIDTH], query_gain.clone()),
             ("attn.norm_k.weight", vec![WIDTH], key_gain.clone()),
@@ -828,6 +810,7 @@ fn a_member_of_an_all_gather_group_attends_its_interval_over_every_tile() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(
         directory.path(),
+        DType::BF16,
         &[
             ("attn.norm_q.weight", vec![128], sequence(128, 21)),
             ("attn.norm_k.weight", vec![128], sequence(128, 22)),
@@ -854,7 +837,8 @@ fn a_member_of_an_all_gather_group_attends_its_interval_over_every_tile() {
             first,
         )
     };
-    let (branches, launches) = recorded_split(Some((1, 2)), || attend(2));
+    let (branches, Recording { launches, .. }) =
+        record(&[Split { size: 2, rank: 1 }], || attend(2));
     let (fine, compressed) = branches.unwrap();
     assert_eq!(fine.dims(), [2 * 64, 4 * 128]);
     assert_eq!(
@@ -867,7 +851,7 @@ fn a_member_of_an_all_gather_group_attends_its_interval_over_every_tile() {
         assert!(operators.contains(&operator), "{operators:?}");
     }
 
-    let (past, _) = recorded_split(Some((1, 2)), || attend(3));
+    let (past, _) = record(&[Split { size: 2, rank: 1 }], || attend(3));
     assert!(past.is_err());
 }
 
@@ -902,17 +886,18 @@ fn a_sequence_split_projects_heads_by_its_mode_and_returns_rows() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(
         directory.path(),
+        DType::BF16,
         &[
             ("attn.to_q.weight", vec![64, 32], sequence(64 * 32, 30)),
             ("attn.to_out.weight", vec![32, 64], sequence(32 * 64, 31)),
         ],
     );
-    let split = Some((1, 2));
+    let split = [Split { size: 2, rank: 1 }];
 
     // Four own rows of a sequence of eight; this member's heads are two of four, 32 channels.
     let exchange = ulysses(&checkpoint, Projection::Exchange);
     assert_eq!((exchange.local_heads(), exchange.dtype()), (2, DType::BF16));
-    let (projected, launches) = recorded_split(split, || {
+    let (projected, Recording { launches, .. }) = record(&split, || {
         let rows = exchange.rows(&meta((4, 32), DType::BF16))?;
         exchange.project(0, &rows)
     });
@@ -928,7 +913,7 @@ fn a_sequence_split_projects_heads_by_its_mode_and_returns_rows() {
     );
 
     let gather = ulysses(&checkpoint, Projection::Gather);
-    let (projected, launches) = recorded_split(split, || {
+    let (projected, Recording { launches, .. }) = record(&split, || {
         let rows = gather.rows(&meta((4, 32), DType::BF16))?;
         gather.project(0, &rows)
     });
@@ -940,8 +925,8 @@ fn a_sequence_split_projects_heads_by_its_mode_and_returns_rows() {
     );
 
     // The return: one exchange, the merge of the members' blocks and the output projection.
-    let (returned, launches) =
-        recorded_split(split, || exchange.return_rows(&meta((8, 32), DType::BF16)));
+    let (returned, Recording { launches, .. }) =
+        record(&split, || exchange.return_rows(&meta((8, 32), DType::BF16)));
     assert_eq!(
         returned.unwrap().dims(),
         [4, 32],
@@ -950,7 +935,7 @@ fn a_sequence_split_projects_heads_by_its_mode_and_returns_rows() {
     assert_eq!(operators(&launches), ["copy_strided", "gemm"]);
 
     // The return by intervals: a started exchange, taken up into the interval's rows.
-    let (returned, launches) = recorded_split(split, || {
+    let (returned, Recording { launches, .. }) = record(&split, || {
         let payload = meta((2, 2, 2, 16), DType::BF16);
         let (received, started) = exchange.start_exchange(&payload)?;
         exchange.receive(started, &received)
@@ -958,7 +943,7 @@ fn a_sequence_split_projects_heads_by_its_mode_and_returns_rows() {
     assert_eq!(returned.unwrap().dims(), [2, 32]);
     assert_eq!(operators(&launches), ["copy_strided", "gemm"]);
 
-    let (gathered, _) = recorded_split(split, || {
+    let (gathered, _) = record(&split, || {
         let sequence = meta((8, 32), DType::BF16);
         let started = gather.start_gather(&sequence, 4, 0..2)?;
         gather.finish(started)
@@ -966,12 +951,12 @@ fn a_sequence_split_projects_heads_by_its_mode_and_returns_rows() {
     gathered.unwrap();
 
     // A group of another size, and a forward with none, are refused before any collective.
-    let (refused, _) = recorded_split(Some((1, 4)), || {
+    let (refused, _) = record(&[Split { size: 4, rank: 1 }], || {
         exchange.project(0, &meta((4, 32), DType::BF16))
     });
     let text = refused.err().unwrap().to_string();
     assert!(text.contains("loaded for 2 members"), "{text}");
-    let (refused, _) = recorded(|| exchange.project(0, &meta((4, 32), DType::BF16)));
+    let (refused, _) = record(&[], || exchange.project(0, &meta((4, 32), DType::BF16)));
     assert!(refused.is_err());
 }
 
@@ -983,6 +968,7 @@ fn a_sequence_split_inside_a_tensor_split_holds_its_share_of_the_tensor_rank_s_h
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(
         directory.path(),
+        DType::BF16,
         &[
             ("attn.to_q.weight", vec![64, 32], sequence(64 * 32, 30)),
             ("attn.to_out.weight", vec![32, 64], sequence(32 * 64, 31)),

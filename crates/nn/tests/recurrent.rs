@@ -8,19 +8,17 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
-use std::path::Path;
-
 use nn::collective::Split;
-use nn::family::StateField;
+use nn::family::{StateField, StateShape};
 use nn::functional::{self, WeightOrder};
 use nn::modules::{GatedDeltaNet, GatedDeltaNetConfig};
 use nn::{
-    Checkpoint, CpuWeights, DType, Device, MetaWeights, NO_SLOT, Phase, RecurrentState, Tensor,
-    TokenBatch, WeightLoader,
+    CpuWeights, DType, Device, MetaWeights, NO_SLOT, Phase, RecurrentState, Tensor, TokenBatch,
+    WeightLoader,
 };
-use support::{assert_close, encode, meta, operators, recorded, sequence, shard, tensor, values};
+use nn_testing::{
+    Recording, assert_close, checkpoint, meta, operators, record, sequence, tensor, values,
+};
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
 const F32_TOLERANCE: f32 = 2e-5;
@@ -476,18 +474,12 @@ fn the_rule_refuses_what_its_form_cannot_keep() {
 /// A meta state of one layer of a network of `config`, over four slots, for `tokens` tokens;
 /// `trail` says whether the batch keeps one.
 fn meta_state(config: &GatedDeltaNetConfig, tokens: usize, trail: bool) -> RecurrentState {
-    let buffers = |leading: usize| -> Vec<Vec<Tensor>> {
-        let layer = config
-            .state_fields(DType::BF16)
-            .iter()
-            .map(|field| {
-                meta(
-                    [&[leading][..], field.dims.as_slice()].concat(),
-                    field.dtype,
-                )
-            })
-            .collect();
-        vec![layer]
+    let layer = [StateShape {
+        layers: 1,
+        fields: config.state_fields(DType::BF16),
+    }];
+    let buffers = |leading: usize| {
+        RecurrentState::buffers(&layer, |_| leading, |shape, dtype| Ok(meta(shape, dtype))).unwrap()
     };
 
     RecurrentState {
@@ -527,7 +519,7 @@ fn the_recurrent_functions_state_their_kernels() {
 
     // The convolution's key names its channels and taps.
     let state = meta_state(&config, tokens, false);
-    let (mixed, launches) = recorded(|| {
+    let (mixed, Recording { launches, .. }) = record(&[], || {
         functional::causal_conv1d(
             &meta((tokens, channels), DType::BF16),
             &meta((channels, 4), DType::BF16),
@@ -557,7 +549,7 @@ fn the_recurrent_functions_state_their_kernels() {
             .unwrap();
         let heads = |first, heads| row.narrow(1, first, heads).unwrap();
 
-        recorded(|| {
+        record(&[], || {
             functional::gated_delta_rule(
                 &heads(0, 2),
                 &heads(2, 2),
@@ -576,14 +568,14 @@ fn the_recurrent_functions_state_their_kernels() {
     };
     let base = "dtype_bf16_key_heads_2_value_heads_4_key_dim_4_value_dim_4_block_4";
 
-    let (out, launches) = rule(Phase::Decode, &meta_state(&config, tokens, true));
+    let (out, Recording { launches, .. }) = rule(Phase::Decode, &meta_state(&config, tokens, true));
     assert_eq!(out.unwrap().dims(), [tokens, 4, 4]);
     assert_eq!(
         launches,
         [("gated_delta_rule", format!("{base}_form_recurrent_chunk_1"))]
     );
 
-    let (out, launches) = rule(Phase::Prefill, &state);
+    let (out, Recording { launches, .. }) = rule(Phase::Prefill, &state);
     out.unwrap();
     assert_eq!(
         launches,
@@ -631,7 +623,7 @@ fn request_slots_name_their_window_and_their_slots() {
                 ..state.clone()
             }
         };
-        let (mixed, launches) = recorded(|| {
+        let (mixed, Recording { launches, .. }) = record(&[], || {
             functional::causal_conv1d(
                 &meta((tokens, channels), DType::BF16),
                 &meta((channels, 4), DType::BF16),
@@ -664,7 +656,7 @@ fn request_slots_name_their_window_and_their_slots() {
         .reshape((tokens, channels / 4, 4))
         .unwrap();
     let heads = |first, heads| row.narrow(1, first, heads).unwrap();
-    let (out, launches) = recorded(|| {
+    let (out, Recording { launches, .. }) = record(&[], || {
         functional::gated_delta_rule(
             &heads(0, 2),
             &heads(2, 2),
@@ -696,7 +688,7 @@ fn request_slots_name_their_window_and_their_slots() {
         trail: meta_state(&drafted, tokens, true).trail,
         ..state.clone()
     };
-    let (refused, _) = recorded(|| {
+    let (refused, _) = record(&[], || {
         functional::causal_conv1d(
             &meta((tokens, channels), DType::BF16),
             &meta((channels, 4), DType::BF16),
@@ -751,21 +743,6 @@ fn weights(config: &GatedDeltaNetConfig) -> Vec<(&'static str, Vec<usize>, Vec<f
             filled(vec![hidden, value_width], 9),
         ),
     ]
-}
-
-/// The checkpoint at `directory` holding `weights` as `dtype`.
-fn checkpoint(
-    directory: &Path,
-    dtype: DType,
-    weights: &[(&'static str, Vec<usize>, Vec<f32>)],
-) -> Checkpoint {
-    let typed: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = weights
-        .iter()
-        .map(|(name, shape, values)| (*name, dtype, shape.clone(), encode(dtype, values)))
-        .collect();
-    shard(directory, "model.safetensors", &typed);
-
-    Checkpoint::open(directory).unwrap()
 }
 
 /// The weight `name` of `weights`, as an FP32 CPU tensor of `shape`.
@@ -923,7 +900,8 @@ fn a_gated_delta_net_states_its_fields_and_its_kernels() {
     let hidden = meta((tokens, 16), DType::BF16);
     let prefill = batch(Phase::Prefill, 64, true);
     let state = meta_state(&config, tokens, false);
-    let (out, launches) = recorded(|| network.forward(&hidden, &prefill, &state, 0));
+    let (out, Recording { launches, .. }) =
+        record(&[], || network.forward(&hidden, &prefill, &state, 0));
     assert_eq!(out.unwrap().dims(), [tokens, 16]);
     assert_eq!(
         operators(&launches),
@@ -946,7 +924,7 @@ fn a_gated_delta_net_states_its_fields_and_its_kernels() {
     // A state whose layer holds another number of fields is not this network's.
     let mut short = meta_state(&config, tokens, false);
     short.live[0].pop();
-    let (refused, _) = recorded(|| network.forward(&hidden, &prefill, &short, 0));
+    let (refused, _) = record(&[], || network.forward(&hidden, &prefill, &short, 0));
     assert!(refused.unwrap_err().to_string().contains("two expected"));
 
     // A rank of a tensor-parallel group holds a share of the key heads and of the value heads

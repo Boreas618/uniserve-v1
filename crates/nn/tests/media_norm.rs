@@ -7,8 +7,6 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use nn::collective::Split;
 use nn::functional::{self, Activation, Padding, Rounding};
 use nn::modules::{
@@ -16,23 +14,12 @@ use nn::modules::{
     MlpConfig, ResnetBlock3d, ResnetBlock3dConfig,
 };
 use nn::{Checkpoint, CpuWeights, DType, Device, MetaWeights, Tensor, WeightLoader};
-use support::{
-    assert_close, f32_bytes, meta, operators, recorded, sequence, shard, tensor, values,
+use nn_testing::{
+    Recording, assert_close, checkpoint, meta, operators, record, sequence, tensor, values,
 };
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
 const F32_TOLERANCE: f32 = 2e-5;
-
-/// The checkpoint at `directory` holding the FP32 tensors `tensors` (name, extents, values).
-fn checkpoint(directory: &std::path::Path, tensors: &[(&str, Vec<usize>, Vec<f32>)]) -> Checkpoint {
-    let typed: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = tensors
-        .iter()
-        .map(|(name, shape, values)| (*name, DType::F32, shape.clone(), f32_bytes(values)))
-        .collect();
-    shard(directory, "model.safetensors", &typed);
-
-    Checkpoint::open(directory).unwrap()
-}
 
 /// `value` rounded into BF16, to nearest even, as the library's conversion rounds it.
 fn bf16(value: f32) -> f32 {
@@ -326,7 +313,7 @@ fn the_fused_normalizations_state_their_kernels() {
     let vector = || meta(16, DType::BF16);
     let (weight, scale, bias) = (vector(), vector(), vector());
 
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         let (normalized, stream) =
             functional::scaled_residual_rms_norm_(stream, &update, None, &scale, &weight, 1e-6)?;
         functional::scaled_residual_layer_norm(
@@ -359,7 +346,7 @@ fn the_fused_normalizations_state_their_kernels() {
     // table's row stride; the gated form also stores the sum it normalized.
     let table = meta((4, 3 * 16), DType::BF16);
     let rows = meta(3, DType::U32);
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         let window = |index: usize| table.narrow(1, index * 16, 16);
         let hidden = meta((3, 16), DType::BF16);
 
@@ -571,7 +558,7 @@ fn a_resnet_block_adds_its_input_or_its_projection() {
         .iter()
         .map(|(name, shape, values)| (name.as_str(), shape.clone(), values.clone()))
         .collect();
-    let checkpoint = checkpoint(directory.path(), &named);
+    let checkpoint = checkpoint(directory.path(), DType::F32, &named);
     let same_config = ResnetBlock3dConfig {
         in_channels: 8,
         ..RESNET
@@ -637,7 +624,8 @@ fn a_resnet_block_adds_its_input_or_its_projection() {
     let wide = ResnetBlock3d::load(&RESNET, loader.root().pp("wide")).unwrap();
     let same = ResnetBlock3d::load(&same_config, loader.root().pp("same")).unwrap();
 
-    let (out, launches) = recorded(|| wide.forward(&meta((1, 4, 3, 6, 6), DType::F32)));
+    let (out, Recording { launches, .. }) =
+        record(&[], || wide.forward(&meta((1, 4, 3, 6, 6), DType::F32)));
     assert_eq!(out.unwrap().dims(), [1, 8, 3, 6, 6]);
     assert_eq!(
         operators(&launches),
@@ -655,10 +643,11 @@ fn a_resnet_block_adds_its_input_or_its_projection() {
     assert_eq!(launches[0].1, "dtype_f32");
     assert_eq!(launches[1].1, "dtype_f32");
 
-    let (out, launches) = recorded(|| same.forward(&meta((1, 8, 3, 6, 6), DType::F32)));
+    let (out, Recording { launches, .. }) =
+        record(&[], || same.forward(&meta((1, 8, 3, 6, 6), DType::F32)));
     assert!(out.is_ok());
     assert_eq!(launches.len(), 7, "no projection: {launches:?}");
-    let (refused, _) = recorded(|| same.forward(&meta((1, 4, 3, 6, 6), DType::F32)));
+    let (refused, _) = record(&[], || same.forward(&meta((1, 4, 3, 6, 6), DType::F32)));
     assert!(refused.is_err());
 
     // A normalization without parameters loads none, and one of no groups is refused.
@@ -672,7 +661,8 @@ fn a_resnet_block_adds_its_input_or_its_projection() {
         padding: Padding::Replicate,
     };
     let norm = FrameNorm::load(&bare, loader.root().pp("absent")).unwrap();
-    let (padded, launches) = recorded(|| norm.forward(&meta((1, 8, 3, 6, 6), DType::F32)));
+    let (padded, Recording { launches, .. }) =
+        record(&[], || norm.forward(&meta((1, 8, 3, 6, 6), DType::F32)));
     assert_eq!(padded.unwrap().dims(), [1, 8, 5, 8, 7]);
     assert_eq!(operators(&launches), ["frame_moments", "frame_norm_pad"]);
     assert!(FrameNorm::load(&FrameNormConfig { groups: 0, ..bare }, loader.root()).is_err());
@@ -703,6 +693,7 @@ const ADALN: AdaLnBlockConfig = AdaLnBlockConfig {
 fn adaln_checkpoint(directory: &std::path::Path) -> Checkpoint {
     checkpoint(
         directory,
+        DType::F32,
         &[
             ("block.norm1.weight", vec![HIDDEN], sequence(HIDDEN, 80)),
             ("block.norm2.weight", vec![HIDDEN], sequence(HIDDEN, 81)),
@@ -852,7 +843,7 @@ fn an_adaln_block_states_two_modulated_norms_around_the_attention() {
     let hidden = meta((5, HIDDEN), DType::F32);
 
     let mut attended = None;
-    let (out, launches) = recorded(|| {
+    let (out, Recording { launches, .. }) = record(&[], || {
         block.forward(&table, &rows, &hidden, |input| {
             attended = Some((input.dims().to_vec(), input.dtype()));
             Ok(input.clone())
@@ -880,11 +871,12 @@ fn an_adaln_block_states_two_modulated_norms_around_the_attention() {
 
     // The final norm is one modulated launch of its input's shape, and reads its own table.
     let output_table = meta((2, 2 * HIDDEN), DType::F32);
-    let (out, launches) = recorded(|| norm.forward(&output_table, &rows, &hidden));
+    let (out, Recording { launches, .. }) =
+        record(&[], || norm.forward(&output_table, &rows, &hidden));
     assert_eq!(out.unwrap().dims(), [5, HIDDEN]);
     assert_eq!(operators(&launches), ["modulated_rms_norm"]);
 
-    let (refused, _) = recorded(|| norm.forward(&table, &rows, &hidden));
+    let (refused, _) = record(&[], || norm.forward(&table, &rows, &hidden));
     assert!(refused.is_err());
 }
 

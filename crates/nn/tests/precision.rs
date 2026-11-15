@@ -19,15 +19,15 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use std::path::Path;
 
 use nn::collective::Split;
 use nn::modules::{Linear, LinearConfig, Parallel};
 use nn::quantization::{Declaration, Scheme};
 use nn::{Checkpoint, CpuWeights, DType, MetaWeights, WeightLoader};
-use support::{encode, meta, operators, recorded, sequence, shard, tensor, values};
+use nn_testing::{
+    Recording, encode, meta, operators, record, sequence, tensor, values, write_checkpoint,
+};
 
 /// The FP32 unit roundoff, and BF16's: the accumulation's and the output's.
 const U_F32: f64 = 1.0 / (1u64 << 24) as f64;
@@ -35,15 +35,14 @@ const U_BF16: f64 = 1.0 / 256.0;
 
 /// The dense checkpoint at `directory` holding the BF16 matrix `proj.weight`, `[n, k]`.
 fn dense(directory: &Path, n: usize, k: usize, weight: &[f32]) -> Checkpoint {
-    shard(
+    write_checkpoint(
         directory,
-        "model.safetensors",
-        &[(
+        &[&[(
             "proj.weight",
             DType::BF16,
             vec![n, k],
             encode(DType::BF16, weight),
-        )],
+        )]],
     );
     Checkpoint::open(directory).unwrap()
 }
@@ -274,7 +273,8 @@ fn a_converted_projection_states_its_measurement_and_its_product() {
         )
         .unwrap();
 
-        let (output, launches) = recorded(|| linear.forward(&meta((40, 512), DType::BF16)));
+        let (output, Recording { launches, .. }) =
+            record(&[], || linear.forward(&meta((40, 512), DType::BF16)));
         assert_eq!(output.unwrap().dims(), [40, 256]);
         assert_eq!(operators(&launches), expected, "{scheme:?}");
         assert_eq!(

@@ -7,8 +7,6 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use std::path::Path;
 
 use nn::collective::Split;
@@ -22,33 +20,13 @@ use nn::quantization::Declaration;
 use nn::{
     Adapter, Checkpoint, CpuWeights, DType, Device, MetaWeights, Source, Tensor, WeightLoader,
 };
-use support::{
-    Stated, assert_close, encode, f32_bytes, meta, operators, recorded, recorded_split, sequence,
-    shard, shard_stating, tensor, values,
+use nn_testing::{
+    Recording, Stated, assert_close, checkpoint, encode, meta, operators, record, sequence, tensor,
+    values, write_checkpoint, write_file,
 };
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
 const F32_TOLERANCE: f32 = 2e-5;
-
-/// The checkpoint at `directory` holding the FP32 tensors `tensors` (name, extents, values).
-fn checkpoint(directory: &Path, tensors: &[(&str, Vec<usize>, Vec<f32>)]) -> Checkpoint {
-    typed_checkpoint(directory, DType::F32, tensors)
-}
-
-/// [`checkpoint`], its tensors stored as `dtype`.
-fn typed_checkpoint(
-    directory: &Path,
-    dtype: DType,
-    tensors: &[(&str, Vec<usize>, Vec<f32>)],
-) -> Checkpoint {
-    let typed: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = tensors
-        .iter()
-        .map(|(name, shape, values)| (*name, dtype, shape.clone(), encode(dtype, values)))
-        .collect();
-    shard(directory, "model.safetensors", &typed);
-
-    Checkpoint::open(directory).unwrap()
-}
 
 /// `x [m, k] · weightᵀ` for a weight stored `[n, k]`, plus `bias`.
 fn project(x: &[f32], weight: &[f32], bias: Option<&[f32]>, k: usize) -> Vec<f32> {
@@ -83,6 +61,7 @@ fn a_dense_projection_loads_its_module_and_projects() {
     let (weight, bias) = (sequence(6 * 4, 1), sequence(6, 2));
     let checkpoint = checkpoint(
         directory.path(),
+        DType::F32,
         &[
             ("block.proj.weight", vec![6, 4], weight.clone()),
             ("block.proj.bias", vec![6], bias.clone()),
@@ -119,6 +98,7 @@ fn a_parallel_projection_loads_this_rank_s_block() {
     let (weight, bias) = (sequence(6 * 4, 4), sequence(6, 5));
     let checkpoint = checkpoint(
         directory.path(),
+        DType::F32,
         &[
             ("proj.weight", vec![6, 4], weight.clone()),
             ("proj.bias", vec![6], bias.clone()),
@@ -184,7 +164,7 @@ fn a_parallel_projection_loads_this_rank_s_block() {
 #[test]
 fn a_row_parallel_projection_reduces_under_its_group() {
     let directory = tempfile::tempdir().unwrap();
-    let checkpoint = typed_checkpoint(
+    let checkpoint = checkpoint(
         directory.path(),
         DType::BF16,
         &[("proj.weight", vec![8, 32], sequence(8 * 32, 7))],
@@ -202,13 +182,13 @@ fn a_row_parallel_projection_reduces_under_its_group() {
     )
     .unwrap();
 
-    let (output, launches) = recorded_split(Some((1, 2)), || {
+    let (output, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
         Ok(row.forward(&meta((4, 16), DType::BF16))?.dims().to_vec())
     });
     assert_eq!(output.unwrap(), [4, 8]);
     assert_eq!(operators(&launches), ["gemm"], "the reduction is no kernel");
 
-    let (alone, _) = recorded(|| row.forward(&meta((4, 16), DType::BF16)));
+    let (alone, _) = record(&[], || row.forward(&meta((4, 16), DType::BF16)));
     assert!(alone.unwrap_err().to_string().contains("no group"));
 }
 
@@ -219,6 +199,7 @@ fn several_modules_are_read_as_one_merged_projection() {
     let (first_bias, second_bias) = (sequence(2, 10), sequence(3, 11));
     let checkpoint = checkpoint(
         directory.path(),
+        DType::F32,
         &[
             ("heads.a.weight", vec![2, 4], first.clone()),
             ("heads.a.bias", vec![2], first_bias.clone()),
@@ -268,10 +249,9 @@ fn a_per_tensor_fp8_projection_is_chosen_by_the_checkpoint_s_declaration() {
     // E4M3 values, so the stored weight is exact: two rows of one vector of sixteen, the
     // contraction an FP8 product's kernels load whole.
     let weight: Vec<f32> = [0.5_f32, -1.25, 2.0, 0.375, 1.0, 1.5, -0.75, 3.0].repeat(4);
-    shard(
+    write_checkpoint(
         directory.path(),
-        "model.safetensors",
-        &[
+        &[&[
             (
                 "proj.weight",
                 DType::F8E4M3,
@@ -281,9 +261,19 @@ fn a_per_tensor_fp8_projection_is_chosen_by_the_checkpoint_s_declaration() {
                     .map(|value| e4m3_byte(*value))
                     .collect::<Vec<u8>>(),
             ),
-            ("proj.weight_scale", DType::F32, vec![1], f32_bytes(&[0.5])),
-            ("proj.input_scale", DType::F32, vec![1], f32_bytes(&[0.25])),
-        ],
+            (
+                "proj.weight_scale",
+                DType::F32,
+                vec![1],
+                encode(DType::F32, &[0.5]),
+            ),
+            (
+                "proj.input_scale",
+                DType::F32,
+                vec![1],
+                encode(DType::F32, &[0.25]),
+            ),
+        ]],
     );
     declare(
         directory.path(),
@@ -326,7 +316,8 @@ fn a_per_tensor_fp8_projection_is_chosen_by_the_checkpoint_s_declaration() {
         .declare(&Declaration::read(&checkpoint).unwrap())
         .unwrap();
     let linear = Linear::load(&config, loader.root().pp("proj")).unwrap();
-    let (output, launches) = recorded(|| linear.forward(&meta((3, 16), DType::BF16)));
+    let (output, Recording { launches, .. }) =
+        record(&[], || linear.forward(&meta((3, 16), DType::BF16)));
     output.unwrap();
     assert_eq!(operators(&launches), ["fp8_quantize", "fp8_gemm"]);
 }
@@ -356,10 +347,9 @@ fn nvfp4_checkpoint(directory: &Path) -> (Checkpoint, Vec<u8>, Vec<u8>, f32, f32
         .collect();
     let (weight_scale, input_scale) = (0.5_f32, 0.25_f32);
 
-    shard(
+    write_checkpoint(
         directory,
-        "model.safetensors",
-        &[
+        &[&[
             ("proj.weight", DType::U8, vec![n, k / 2], packed.clone()),
             (
                 "proj.weight_scale",
@@ -371,15 +361,15 @@ fn nvfp4_checkpoint(directory: &Path) -> (Checkpoint, Vec<u8>, Vec<u8>, f32, f32
                 "proj.weight_scale_2",
                 DType::F32,
                 vec![1],
-                f32_bytes(&[weight_scale]),
+                encode(DType::F32, &[weight_scale]),
             ),
             (
                 "proj.input_scale",
                 DType::F32,
                 vec![1],
-                f32_bytes(&[input_scale]),
+                encode(DType::F32, &[input_scale]),
             ),
-        ],
+        ]],
     );
     declare(
         directory,
@@ -483,7 +473,8 @@ fn a_meta_load_of_a_packed_projection_states_the_encoder_and_the_product() {
     let linear = Linear::load(&PACKED, loader.root().pp("proj")).unwrap();
     assert!(linear.is_packed());
 
-    let (output, launches) = recorded(|| linear.forward(&meta((5, 32), DType::BF16)));
+    let (output, Recording { launches, .. }) =
+        record(&[], || linear.forward(&meta((5, 32), DType::BF16)));
     assert_eq!(output.unwrap().dims(), [5, 8]);
     assert_eq!(
         launches,
@@ -517,10 +508,9 @@ fn a_meta_load_of_a_packed_projection_states_the_encoder_and_the_product() {
 #[test]
 fn a_projection_an_adapter_edits_is_loaded_fused() {
     let directory = tempfile::tempdir().unwrap();
-    shard(
+    write_checkpoint(
         directory.path(),
-        "model.safetensors",
-        &[
+        &[&[
             (
                 "proj.weight",
                 DType::BF16,
@@ -533,12 +523,11 @@ fn a_projection_an_adapter_edits_is_loaded_fused() {
                 vec![2],
                 encode(DType::BF16, &[1.0, 1.0]),
             ),
-        ],
+        ]],
     );
     let adapters = tempfile::tempdir().unwrap();
-    shard_stating(
-        adapters.path(),
-        "adapter.safetensors",
+    write_file(
+        &adapters.path().join("adapter.safetensors"),
         &[("carries", "2,1,0")],
         &[
             (
@@ -595,6 +584,7 @@ fn an_attention_s_projections_load_separately_or_as_windows_of_one_module() {
     let fused = sequence(24 * hidden, 15);
     let checkpoint = checkpoint(
         directory.path(),
+        DType::F32,
         &[
             (
                 "attn.q_proj.weight",
@@ -676,6 +666,7 @@ fn an_embedding_gathers_its_table_s_rows() {
     let table = sequence(8 * 3, 20);
     let checkpoint = checkpoint(
         directory.path(),
+        DType::F32,
         &[("embed_tokens.weight", vec![8, 3], table.clone())],
     );
     let store = CpuWeights::new();
@@ -711,7 +702,7 @@ fn an_embedding_gathers_its_table_s_rows() {
 #[test]
 fn a_sharded_embedding_states_its_shard_in_its_kernel() {
     let directory = tempfile::tempdir().unwrap();
-    let checkpoint = typed_checkpoint(
+    let checkpoint = checkpoint(
         directory.path(),
         DType::BF16,
         &[("embed_tokens.weight", vec![32, 8], sequence(32 * 8, 21))],
@@ -728,7 +719,9 @@ fn a_sharded_embedding_states_its_shard_in_its_kernel() {
     )
     .unwrap();
 
-    let (output, launches) = recorded_split(Some((1, 2)), || shard.forward(&meta(5, DType::U32)));
+    let (output, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
+        shard.forward(&meta(5, DType::U32))
+    });
     assert_eq!(output.unwrap().dims(), [5, 8]);
     assert_eq!(
         launches,
@@ -741,7 +734,7 @@ fn a_sharded_embedding_states_its_shard_in_its_kernel() {
 
 /// A checkpoint whose `lm_head.weight` is `[vocabulary, 8]` BF16.
 fn head_checkpoint(directory: &Path, vocabulary: usize) -> Checkpoint {
-    typed_checkpoint(
+    checkpoint(
         directory,
         DType::BF16,
         &[(
@@ -803,7 +796,7 @@ fn a_split_head_gathers_the_shards_of_its_group() {
     .unwrap();
     assert_eq!(head.padded(), 16);
 
-    let (output, launches) = recorded_split(Some((1, 2)), || {
+    let (output, Recording { launches, .. }) = record(&[Split { size: 2, rank: 1 }], || {
         let logits = head.forward(&meta((3, 8), DType::BF16))?;
         Ok((logits.dims().to_vec(), logits.dtype()))
     });
@@ -818,7 +811,7 @@ fn a_split_head_gathers_the_shards_of_its_group() {
 
     // Unsplit, the shard's 16 columns are the whole gathered width and cannot hold a vocabulary
     // of 32: the unpad refuses the call, as the device would.
-    let (unsplit, _) = recorded(|| head.forward(&meta((3, 8), DType::BF16)));
+    let (unsplit, _) = record(&[], || head.forward(&meta((3, 8), DType::BF16)));
     assert!(unsplit.is_err());
 }
 
@@ -845,8 +838,18 @@ fn a_whole_head_gathers_nothing_in_a_group_that_splits_something_else() {
         let logits = head.forward(&meta((3, 8), DType::BF16))?;
         Ok((logits.dims().to_vec(), logits.dtype()))
     };
-    let (grouped, in_group) = recorded_split(Some((1, 2)), forward);
-    let (alone, outside) = recorded_split(None, forward);
+    let (
+        grouped,
+        Recording {
+            launches: in_group, ..
+        },
+    ) = record(&[Split { size: 2, rank: 1 }], forward);
+    let (
+        alone,
+        Recording {
+            launches: outside, ..
+        },
+    ) = record(&[], forward);
 
     assert_eq!(grouped.unwrap(), (vec![3, 32], DType::F32));
     assert_eq!(alone.unwrap(), (vec![3, 32], DType::F32));
@@ -881,6 +884,7 @@ fn a_tied_head_projects_with_the_embedding_s_table() {
     let table = sequence(8 * 4, 24);
     let checkpoint = checkpoint(
         directory.path(),
+        DType::F32,
         &[("embed_tokens.weight", vec![8, 4], table.clone())],
     );
     let store = CpuWeights::new();
@@ -913,6 +917,7 @@ fn the_normalizations_load_their_vectors_and_normalize() {
     let (weight, bias) = (sequence(6, 26), sequence(6, 27));
     let checkpoint = checkpoint(
         directory.path(),
+        DType::F32,
         &[
             ("norm.weight", vec![6], weight.clone()),
             ("norm.bias", vec![6], bias.clone()),
@@ -995,6 +1000,7 @@ fn a_narrowing_normalization_states_the_narrowing_kernel_and_takes_no_residual()
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint(
         directory.path(),
+        DType::F32,
         &[("norm.weight", vec![8], sequence(8, 30))],
     );
     let store = MetaWeights::new();
@@ -1010,7 +1016,7 @@ fn a_narrowing_normalization_states_the_narrowing_kernel_and_takes_no_residual()
     )
     .unwrap();
 
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         let stream = meta((4, 8), DType::F32);
         let narrowed = norm.forward(&stream)?;
         let refused = norm.forward_residual(&stream, &stream);
@@ -1055,6 +1061,7 @@ fn a_gated_mlp_projects_gates_and_projects_back() {
     let packed = [up.clone(), gate.clone()].concat();
     let checkpoint = checkpoint(
         directory.path(),
+        DType::F32,
         &[
             (
                 "mlp.gate_proj.weight",
@@ -1115,7 +1122,7 @@ fn a_gated_mlp_projects_gates_and_projects_back() {
 #[test]
 fn a_gated_mlp_states_the_gate_its_rounding_names() {
     let directory = tempfile::tempdir().unwrap();
-    let checkpoint = typed_checkpoint(
+    let checkpoint = checkpoint(
         directory.path(),
         DType::BF16,
         &[
@@ -1150,7 +1157,7 @@ fn a_gated_mlp_states_the_gate_its_rounding_names() {
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let launched = |rounding, gate_up, module: &str, rows: usize| {
         let mlp = Mlp::load(&mlp_config(rounding, gate_up), loader.root().pp(module)).unwrap();
-        let (output, launches) = recorded(|| {
+        let (output, Recording { launches, .. }) = record(&[], || {
             Ok(mlp
                 .forward(&meta((rows, HIDDEN), DType::BF16))?
                 .dims()
@@ -1185,7 +1192,7 @@ fn a_gated_mlp_states_the_gate_its_rounding_names() {
 
 #[test]
 fn a_dense_projection_states_one_product_whatever_its_weight_order() {
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         let x = meta((4, 16), DType::BF16);
         let stored = Linear::new(meta((8, 16), DType::BF16), None, WeightOrder::NxK)?;
         let computed = Linear::new(

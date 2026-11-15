@@ -2954,6 +2954,7 @@ dependencies = [
  "float8",
  "half",
  "memmap2",
+ "nn-testing",
  "ops",
  "processing",
  "proto",
@@ -2964,6 +2965,20 @@ dependencies = [
  "tempfile",
  "tensor",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "nn-testing"
+version = "2.0.0"
+dependencies = [
+ "hf-hub 0.5.0",
+ "nn",
+ "ops",
+ "processing",
+ "proto",
+ "safetensors",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

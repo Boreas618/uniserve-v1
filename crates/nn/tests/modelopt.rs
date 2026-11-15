@@ -10,14 +10,14 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use std::path::Path;
 
 use nn::modules::{Linear, LinearConfig, Parallel};
 use nn::quantization::{Declaration, ModeloptManifest};
 use nn::{Checkpoint, CpuWeights, DType, Error, MetaWeights, WeightLoader};
-use support::{encode, meta, operators, recorded, sequence, shard, tensor, values};
+use nn_testing::{
+    Recording, encode, meta, operators, record, sequence, tensor, values, write_checkpoint,
+};
 
 /// The largest magnitudes an activation's calibration measured, as the manifest lists them:
 /// the two halves of the fused projection (which agree), the projection back, and the biased
@@ -217,11 +217,7 @@ fn export(directory: &Path, modules: &[(&str, f64)]) -> Checkpoint {
         encode(DType::BF16, &sequence(4 * 32, 40)),
     ));
 
-    let named: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = tensors
-        .iter()
-        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
-        .collect();
-    shard(directory, "model.safetensors", &named);
+    write_checkpoint(directory, &[&tensors]);
 
     let listed: serde_json::Map<String, serde_json::Value> = modules
         .iter()
@@ -397,7 +393,8 @@ fn a_meta_load_of_a_packed_export_states_the_encoder_and_the_product() {
     loader.declare(&declaration(&checkpoint)).unwrap();
 
     let fused = Linear::load(&whole(32, 8, false), loader.root().pp(FUSED)).unwrap();
-    let (output, launches) = recorded(|| fused.forward(&meta((5, 32), DType::BF16)));
+    let (output, Recording { launches, .. }) =
+        record(&[], || fused.forward(&meta((5, 32), DType::BF16)));
     assert_eq!(output.unwrap().dims(), [5, 8]);
     assert_eq!(
         launches,
@@ -419,7 +416,8 @@ fn a_meta_load_of_a_packed_export_states_the_encoder_and_the_product() {
     // are encoded from FP16 and the bias joins the product in it.
     let pinned = loader.root().to_dtype(DType::F16);
     let biased = Linear::load(&whole(32, 4, true), pinned.pp(OUTPUT)).unwrap();
-    let (output, launches) = recorded(|| biased.forward(&meta((5, 32), DType::F16)));
+    let (output, Recording { launches, .. }) =
+        record(&[], || biased.forward(&meta((5, 32), DType::F16)));
     assert_eq!(output.unwrap().dtype(), DType::F16);
     assert_eq!(
         operators(&launches),

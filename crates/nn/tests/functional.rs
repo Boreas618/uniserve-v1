@@ -7,11 +7,9 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-mod support;
-
 use nn::functional::{self, Activation, WeightOrder};
 use nn::{DType, Device, Tensor};
-use support::{assert_close, meta, operators, recorded, sequence, tensor, values};
+use nn_testing::{Recording, assert_close, meta, operators, record, sequence, tensor, values};
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
 const F32_TOLERANCE: f32 = 2e-5;
@@ -708,7 +706,7 @@ fn vocab_unpad_reads_each_column_from_the_shard_that_holds_it() {
 
 #[test]
 fn the_normalizations_state_their_kernels() {
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         let x = meta((5, 8), DType::BF16);
         let weight = meta(8, DType::BF16);
 
@@ -749,7 +747,7 @@ fn the_normalizations_state_their_kernels() {
 
 #[test]
 fn the_gated_activations_state_their_kernels_and_their_row_strides() {
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         let gate = meta((3, 16), DType::BF16);
         let value = meta((3, 16), DType::BF16);
         let packed = meta((3, 32), DType::BF16);
@@ -818,7 +816,7 @@ fn the_gated_activations_state_their_kernels_and_their_row_strides() {
 fn a_packed_projection_goes_wide_on_its_input_span() {
     let width = 14_336_usize;
     let wide = |rows: usize| {
-        let (output, launches) = recorded(|| {
+        let (output, Recording { launches, .. }) = record(&[], || {
             let packed = meta((rows, 2 * width), DType::BF16);
             functional::act_and_mul(
                 &packed.narrow(1, width, width)?,
@@ -837,7 +835,7 @@ fn a_packed_projection_goes_wide_on_its_input_span() {
 
 #[test]
 fn the_plain_activations_are_elementwise_primitives() {
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         let x = meta((3, 8), DType::BF16);
         functional::silu(&x)?;
         functional::gelu(&x)?;
@@ -858,7 +856,7 @@ fn the_plain_activations_are_elementwise_primitives() {
 
 #[test]
 fn the_dense_and_the_fp8_projections_state_their_kernels() {
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         let x = meta((7, 64), DType::BF16);
         let dense = functional::linear(
             &x,
@@ -902,7 +900,7 @@ fn nvfp4_launches(
     input: DType,
     scale: DType,
 ) -> (nn::Result<Vec<usize>>, Vec<(&'static str, String)>) {
-    recorded(|| {
+    let (out, Recording { launches, .. }) = record(&[], || {
         let out = functional::linear_nvfp4(
             &meta((rows, 64), input),
             &meta((8, 32), DType::U8),
@@ -912,7 +910,8 @@ fn nvfp4_launches(
             &meta(1, DType::F32),
         )?;
         Ok(out.dims().to_vec())
-    })
+    });
+    (out, launches)
 }
 
 /// The keys a launch table holds for `operator`.
@@ -972,7 +971,7 @@ fn a_packed_product_is_keyed_per_row_class_and_a_dense_one_is_not() {
 
     // A dense projection's key takes no row count at all.
     let dense = |rows: usize| {
-        recorded(|| {
+        record(&[], || {
             functional::linear(
                 &meta((rows, 64), DType::BF16),
                 &meta((8, 64), DType::BF16),
@@ -981,6 +980,7 @@ fn a_packed_product_is_keyed_per_row_class_and_a_dense_one_is_not() {
             )
         })
         .1
+        .launches
     };
     assert_eq!(dense(1), dense(129));
 }
@@ -1008,7 +1008,7 @@ fn a_packed_projection_encodes_the_activation_it_is_given() {
 
 #[test]
 fn the_embedding_and_the_unpad_state_their_kernels() {
-    let (output, launches) = recorded(|| {
+    let (output, Recording { launches, .. }) = record(&[], || {
         let rows = functional::embedding(&meta(5, DType::U32), &meta((16, 8), DType::BF16), 32)?;
         let logits = functional::vocab_unpad(&meta((3, 32), DType::BF16), 32, 2)?;
 
