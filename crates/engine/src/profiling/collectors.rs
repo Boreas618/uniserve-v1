@@ -782,7 +782,7 @@ fn prepare(
             let per_read =
                 (super::session::DRAIN_PERIOD.as_nanos() as u64).div_ceil(options.interval_ns);
             let samples = (2 * per_read).max(PM_MIN_SAMPLES);
-            PmSampler::sample_bytes(device, &options.metrics)
+            PmSampler::sample_bytes(device, &options.metrics, options.interval_ns)
                 .and_then(|bytes| {
                     PmSampler::enable(
                         device,

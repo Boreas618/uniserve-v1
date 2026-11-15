@@ -18,8 +18,8 @@ use std::ffi::{c_char, c_void};
 
 use super::metrics::{Availability, Counters, Profiler};
 use super::{call, cupti, struct_size};
-use crate::Result;
 use crate::sys::cupti as sys;
+use crate::{Error, Result};
 
 /// `CUPTI_PM_SAMPLING_TRIGGER_MODE_GPU_TIME_INTERVAL`: the interval is in
 /// nanoseconds of a fixed-frequency source.
@@ -34,6 +34,10 @@ const KEEP_LATEST: u32 = sys::CUPTI_PM_SAMPLING_HARDWARE_BUFFER_APPEND_MODE_KEEP
 /// `CUPTI_PM_SAMPLING_DECODE_STOP_REASON_COUNTER_DATA_FULL`: the decode
 /// filled the counter data image before it decoded every record.
 const COUNTER_DATA_FULL: u32 = sys::CUPTI_PM_SAMPLING_DECODE_STOP_REASON_COUNTER_DATA_FULL;
+
+/// The hardware buffer, in bytes, of the sampler [`PmSampler::sample_bytes`] configures to
+/// have CUPTI state image sizes: 1 MiB. The sizes CUPTI states do not depend on it.
+const PROBE_HARDWARE_BUFFER: usize = 1 << 20;
 
 #[repr(C)]
 struct EnableParams {
@@ -201,16 +205,26 @@ impl PmSampler {
         // SAFETY: as above; the configuration outlives the sampler's use
         // (this value owns it).
         unsafe { call(&cupti.pm_set_config, "cuptiPmSamplingSetConfig", &mut set)? };
+        sampler.image = vec![0; sampler.image_size(max_samples.max(1))?];
+        sampler.initialize()?;
+        Ok(sampler)
+    }
+
+    /// The bytes of the counter data image CUPTI states `samples` samples of
+    /// this sampler's metrics take (`cuptiPmSamplingGetCounterDataSize`).
+    fn image_size(&self, samples: u32) -> Result<usize> {
+        let cupti = cupti()?;
         let mut size = DataSizeParams {
             struct_size: struct_size!(DataSizeParams, size),
             private: std::ptr::null_mut(),
-            object: sampler.object,
-            names: sampler.counters.name_pointers().as_ptr(),
-            count: sampler.counters.name_pointers().len(),
-            max_samples: max_samples.max(1),
+            object: self.object,
+            names: self.counters.name_pointers().as_ptr(),
+            count: self.counters.name_pointers().len(),
+            max_samples: samples,
             size: 0,
         };
-        // SAFETY: as above; the names outlive the call.
+        // SAFETY: the struct is CUPTI's parameter struct for a configured
+        // sampler; the names outlive the call.
         unsafe {
             call(
                 &cupti.pm_data_size,
@@ -218,24 +232,32 @@ impl PmSampler {
                 &mut size,
             )?;
         }
-        sampler.image = vec![0; size.size];
-        sampler.initialize()?;
-        Ok(sampler)
+        Ok(size.size)
     }
 
     /// The bytes of counter data one sample of `metrics` takes on the device
-    /// of ordinal `device`: what CUPTI states a counter data image of 1024
-    /// samples takes, per sample. A sampler's hardware buffer is sized from
-    /// it: on GB200 with `nvidia-cuda-cupti` 13.0 the default metrics take
-    /// about 13.6 KB of image per sample and 8 KiB of hardware buffer.
+    /// of ordinal `device`, sampled every `interval_ns` nanoseconds: the
+    /// difference between the images CUPTI states two samples and one sample
+    /// take, which excludes the image's own header. A sampler's hardware
+    /// buffer is sized from it: on GB200 with `nvidia-cuda-cupti` 13.0 the
+    /// default metrics take about 13.6 KB of image per sample and 8 KiB of
+    /// hardware buffer.
+    ///
+    /// CUPTI states image sizes only for a configured sampler, so this
+    /// configures one with a hardware buffer of [`PROBE_HARDWARE_BUFFER`]
+    /// bytes, which the image's size does not depend on.
     ///
     /// # Errors
     ///
     /// Fails as [`Self::enable`] does.
-    pub fn sample_bytes(device: usize, metrics: &[String]) -> Result<usize> {
-        const SAMPLES: u32 = 1024;
-        let sampler = Self::enable(device, metrics, 1_000_000, 1 << 20, SAMPLES)?;
-        Ok(sampler.image.len().div_ceil(SAMPLES as usize))
+    pub fn sample_bytes(device: usize, metrics: &[String], interval_ns: u64) -> Result<usize> {
+        let sampler = Self::enable(device, metrics, interval_ns, PROBE_HARDWARE_BUFFER, 1)?;
+        let (one, two) = (sampler.image_size(1)?, sampler.image_size(2)?);
+        two.checked_sub(one).ok_or_else(|| {
+            Error::invalid(format!(
+                "CUPTI states {two} bytes for two PM samples and {one} for one"
+            ))
+        })
     }
 
     /// Initialize the counter data image for the samples to come.
@@ -426,7 +448,7 @@ mod tests {
         sampler.start()?;
         let started = crate::cupti::timestamp()?;
         for _ in 0..8 {
-            spin.launch(&stream, 132, 200_000)?;
+            spin.occupy(&stream, 200_000)?;
         }
         stream.synchronize()?;
         sampler.stop()?;
@@ -470,7 +492,7 @@ mod tests {
         // past one image.
         let began = std::time::Instant::now();
         while began.elapsed() < std::time::Duration::from_millis(100) {
-            spin.launch(&stream, 132, 20_000)?;
+            spin.occupy(&stream, 20_000)?;
             stream.synchronize()?;
         }
         sampler.stop()?;
