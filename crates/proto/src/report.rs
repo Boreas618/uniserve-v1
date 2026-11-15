@@ -8,12 +8,11 @@
 //! an interval delta. [`ForwardStats`] also travels from workers to the engine
 //! in batch results that report it.
 //!
-//! A snapshot crosses the request interface JSON-encoded
-//! ([`SchedulerStats::encode`]): its fields evolve with every build, each
-//! with a default, so a daemon reads the snapshots of engines of other
-//! builds.
+//! A snapshot crosses the request interface as its Protobuf message
+//! (`request.proto`'s `SchedulerStats`, converted by `wire`).
 
 mod forward;
+mod wire;
 
 pub use forward::{FENCE_BUCKETS_US, FenceHistogram, ForwardStats};
 use serde::{Deserialize, Serialize};
@@ -39,10 +38,8 @@ pub struct PrefixCacheStats {
     #[serde(flatten)]
     pub base: BaseCacheStats,
     /// The part of `base.hits` loaded from the host KV cache, in tokens.
-    #[serde(default)]
     pub host_hits: u64,
     /// The part of `host_hits` read from peer hosts' pools first, in tokens.
-    #[serde(default)]
     pub peer_hits: u64,
     /// The number of requests preempted before this stats update.
     pub preempted_requests: u64,
@@ -67,48 +64,35 @@ pub struct DomainSchedulerStats {
     /// Stable execution-domain name.
     pub domain: String,
     /// Credits currently occupied by in-flight work.
-    #[serde(default)]
     pub active_credits: u64,
     /// Highest active-credit count since the scheduler started.
-    #[serde(default)]
     pub peak_credits: u64,
     /// Calls launched in the interval.
-    #[serde(default)]
     pub launched_calls: u64,
     /// Call results in the interval, including predicated and error results.
-    #[serde(default)]
     pub completed_calls: u64,
     /// Calls skipped by a false predicate.
-    #[serde(default)]
     pub predicated_calls: u64,
     /// Calls that returned an error status or whose credit was reclaimed
     /// after an execution failure.
-    #[serde(default)]
     pub error_calls: u64,
     /// Submission attempts rejected by worker backpressure.
-    #[serde(default)]
     pub backpressure_events: u64,
     /// Scheduling credits returned on completion or execution failure.
-    #[serde(default)]
     pub reclaimed_credits: u64,
     /// Batch result reports in the interval that contained calls of this
     /// domain.
-    #[serde(default)]
     pub completed_batches: u64,
     /// Scheduler time from planning a call to registering it in flight, in
     /// microseconds. Calls of diffusion media requests contribute zero.
-    #[serde(default)]
     pub queue_us: u64,
     /// Worker-reported wait before execution (`TimingCounters::queued_us`),
     /// in microseconds.
-    #[serde(default)]
     pub launch_us: u64,
     /// Device execution time in microseconds.
-    #[serde(default)]
     pub device_us: u64,
     /// Worker completion copy plus host processing time
     /// (`TimingCounters::copy_us` and `host_us`), in microseconds.
-    #[serde(default)]
     pub completion_us: u64,
 }
 
@@ -127,112 +111,71 @@ pub struct SchedulerStats {
     /// Fraction of usable cache blocks not free (gauge). `1.0` means 100% usage.
     pub prefix_cache_usage: f64,
     /// Requests admitted since the previous stats snapshot.
-    #[serde(default)]
     pub num_admitted_reqs: u64,
     /// Average queue wait for requests admitted since the previous snapshot,
     /// in microseconds; zero when none was admitted.
-    #[serde(default)]
     pub avg_queue_wait_us: u64,
     /// Total queue wait for requests admitted since the previous snapshot, in
     /// microseconds.
-    #[serde(default)]
     pub queue_wait_us_total: u64,
     /// Maximum queue wait observed by the scheduler so far, in microseconds
     /// (a lifetime value, not a delta).
-    #[serde(default)]
     pub max_queue_wait_us: u64,
     /// Local prefix-cache query and hit deltas, in tokens.
     pub prefix_cache_stats: PrefixCacheStats,
     /// Worker-local forward/kernel counters since the previous stats snapshot,
     /// or `None` when none of them changed.
-    #[serde(default)]
     pub worker_forward_stats: Option<ForwardStats>,
     /// Worker-reported execution time accumulated in the interval, in microseconds.
-    #[serde(default)]
     pub worker_exec_us: u64,
     /// Submit-to-result time of the interval's batches, accumulated, in microseconds: each
     /// batch's wait in its worker's queue, its device time, and its copy and host time
     /// (`TimingCounters`), from its submission to its output as its workers measured them.
-    #[serde(default)]
     pub batch_roundtrip_us: u64,
     /// Completed batches represented by `worker_exec_us` and
     /// `batch_roundtrip_us` in this interval.
-    #[serde(default)]
     pub batch_count: u64,
     /// Query tokens the `batch_count` batches computed. The scheduler counts them from the calls it
     /// planned, so a report states the interval's throughput whatever its worker reports
     /// (`worker_forward_stats` is empty for a main process).
-    #[serde(default)]
     pub batch_tokens: u64,
     /// Calls whose forward produced non-finite logits in the interval.
-    #[serde(default)]
     pub numerical_faults: u64,
     /// Per-domain accounting, in `prefill`, `decode`, `flow` order.
-    #[serde(default)]
     pub domain_stats: Vec<DomainSchedulerStats>,
     /// Calls left out of a step in the interval because blocks they write had not arrived from
     /// the buffer pool: the request's `Allocate` was still outstanding when the call was due.
-    #[serde(default)]
     pub calls_without_blocks: u64,
     /// Transfers of a request between worker groups, from the group that prefilled it to a decode
     /// group, that the buffer pool answered `Transferred` in the interval.
-    #[serde(default)]
     pub transfers: u64,
     /// Transfers the buffer pool answered `Failed` in the interval; each request ended as
     /// migratable.
-    #[serde(default)]
     pub failed_transfers: u64,
     /// The blocks the target groups of the interval's transfers received: every entry each
     /// `Transferred` states, by class and position, whether its task copied the block or the
     /// target group's memory held it already.
-    #[serde(default)]
     pub transferred_blocks: u64,
     /// Running requests the scheduler preempted in the interval because a request's next call
     /// found no room: each ended as migratable (`Migratable { cause: Drain }`, a video request
     /// with its trajectory stored) for the daemon to resubmit, whether its policy named it or it
     /// was the last admitted of a shortage every running request shared.
-    #[serde(default)]
     pub preempted_requests: u64,
     /// Cached blocks that left the scheduler's regions in the interval: each key a completion
     /// lists as evicted, once per region its request took blocks from (an allocation, a copy, a
     /// prefetch or a shrink taking the eviction order's head), and each key an `Evict` of the
     /// policy's victims removed.
-    #[serde(default)]
     pub evicted_blocks: u64,
     /// Draft-cache blocks running requests gave up in the interval so that another request's next
     /// call had room, each request its whole draft table.
-    #[serde(default)]
     pub given_up_draft_blocks: u64,
     /// The scheduler's steps since it started, each one decision of its policy (a lifetime
     /// value). The main process reports it as `Metrics::steps`, `step_counter` as
     /// `Metrics::batches` and the sum of `batch_tokens` as `Metrics::tokens`.
-    #[serde(default)]
     pub steps: u64,
     /// The calls into the scheduler's policy since it started, over every policy generation it
     /// served (a lifetime value).
-    #[serde(default)]
     pub policy_calls: u64,
     /// The fuel those calls consumed (a lifetime value).
-    #[serde(default)]
     pub policy_fuel: u64,
-}
-
-impl SchedulerStats {
-    /// The JSON encoding the request interface carries.
-    ///
-    /// # Errors
-    ///
-    /// Fails only when serialization fails, which these plain values do not.
-    pub fn encode(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
-    }
-
-    /// Decodes [`Self::encode`]'s encoding.
-    ///
-    /// # Errors
-    ///
-    /// Fails when `bytes` are not a snapshot.
-    pub fn decode(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
-    }
 }

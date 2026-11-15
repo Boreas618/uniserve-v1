@@ -517,9 +517,104 @@ message IndexedPage {
 // One scheduler's statistics of the last reporting interval.
 message Stats {
   uint32 scheduler = 1;
-  // The snapshot (`proto::report::SchedulerStats`), JSON: observability data
-  // whose fields evolve with every build, each with a default.
-  bytes snapshot = 2;
+  // The snapshot (`proto::report::SchedulerStats`, whose documentation states
+  // each field's meaning and whether it is an interval delta or a gauge).
+  SchedulerStats snapshot = 2;
+}
+
+message SchedulerStats {
+  uint64 num_running_reqs = 1;
+  uint64 num_waiting_reqs = 2;
+  uint64 step_counter = 3;
+  uint64 current_wave = 4;
+  double prefix_cache_usage = 5;
+  uint64 num_admitted_reqs = 6;
+  uint64 avg_queue_wait_us = 7;
+  uint64 queue_wait_us_total = 8;
+  uint64 max_queue_wait_us = 9;
+  PrefixCacheStats prefix_cache_stats = 10;
+  // Absent when no worker counter changed in the interval.
+  optional ForwardStats worker_forward_stats = 11;
+  uint64 worker_exec_us = 12;
+  uint64 batch_roundtrip_us = 13;
+  uint64 batch_count = 14;
+  uint64 batch_tokens = 15;
+  uint64 numerical_faults = 16;
+  repeated DomainSchedulerStats domain_stats = 17;
+  uint64 calls_without_blocks = 18;
+  uint64 transfers = 19;
+  uint64 failed_transfers = 20;
+  uint64 transferred_blocks = 21;
+  uint64 preempted_requests = 22;
+  uint64 evicted_blocks = 23;
+  uint64 given_up_draft_blocks = 24;
+  uint64 steps = 25;
+  uint64 policy_calls = 26;
+  uint64 policy_fuel = 27;
+}
+
+message PrefixCacheStats {
+  uint64 requests = 1;
+  uint64 queries = 2;
+  uint64 hits = 3;
+  uint64 host_hits = 4;
+  uint64 peer_hits = 5;
+  uint64 preempted_requests = 6;
+  uint64 preempted_queries = 7;
+  uint64 preempted_hits = 8;
+}
+
+message DomainSchedulerStats {
+  string domain = 1;
+  uint64 active_credits = 2;
+  uint64 peak_credits = 3;
+  uint64 launched_calls = 4;
+  uint64 completed_calls = 5;
+  uint64 predicated_calls = 6;
+  uint64 error_calls = 7;
+  uint64 backpressure_events = 8;
+  uint64 reclaimed_credits = 9;
+  uint64 completed_batches = 10;
+  uint64 queue_us = 11;
+  uint64 launch_us = 12;
+  uint64 device_us = 13;
+  uint64 completion_us = 14;
+}
+
+message ForwardStats {
+  map<string, uint64> mode_counts = 1;
+  map<string, uint64> mode_tokens = 2;
+  map<string, uint64> mode_us = 3;
+  map<string, uint64> stream_us = 4;
+  map<string, uint64> blocking_calls = 5;
+  map<string, FenceHistogram> fence_us = 6;
+  uint64 fence_records_lost = 7;
+  map<string, uint64> profile = 8;
+  uint64 attention_launches = 9;
+  uint64 attention_us = 10;
+  map<string, uint64> attention_backend_counts = 11;
+  uint64 cuda_graph_captures = 12;
+  uint64 cuda_graph_replays = 13;
+  uint64 cuda_graph_misses = 14;
+  uint64 cuda_graph_fallbacks = 15;
+  uint64 cuda_graph_unpadded_tokens = 16;
+  uint64 cuda_graph_padded_tokens = 17;
+  map<string, uint64> cuda_graph_runtime_mode_counts = 18;
+  uint64 text_decode_token_relay_hits = 19;
+  uint64 text_decode_token_relay_misses = 20;
+  uint64 text_decode_position_relay_hits = 21;
+  uint64 text_decode_position_relay_misses = 22;
+  uint64 spec_verify_rows = 23;
+  uint64 spec_verify_draft_tokens = 24;
+  uint64 spec_verify_accepted_tokens = 25;
+  uint64 spec_verify_rejected_tokens = 26;
+  uint64 spec_verify_committed_tokens = 27;
+  map<string, uint64> spec_verify_path_counts = 28;
+}
+
+message FenceHistogram {
+  repeated uint64 buckets = 1;
+  uint64 sum_us = 2;
 }
 
 // ---------------------------------------------------------------- requests

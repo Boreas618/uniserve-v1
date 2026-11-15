@@ -44,16 +44,13 @@ pub struct ForwardStats {
     /// a step's summed durations of the module class's probed instances, or
     /// the step's span between its markers for the class `step`, of the
     /// steps of that stage (a call kind, such as `decode`).
-    #[serde(default)]
     pub fence_us: BTreeMap<String, FenceHistogram>,
     /// Fence probe records the rank's reader lost: overwritten before it
     /// read them.
-    #[serde(default)]
     pub fence_records_lost: u64,
     /// A profiling session's progress on the rank, keyed `{session}/steps`
     /// (the steps of its window the rank recorded), `{session}/bytes` (the
     /// bytes of its file) and `{session}/ended` (1 once its window ended).
-    #[serde(default)]
     pub profile: BTreeMap<String, u64>,
     /// Attention kernel launch count.
     pub attention_launches: u64,

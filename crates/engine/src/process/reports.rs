@@ -125,13 +125,10 @@ impl MainProcess {
             None => self.metrics.queue.push(wire::QueueDepth { rank, depth }),
         }
 
-        match stats.encode() {
-            Ok(snapshot) => self.broadcast(&from_engine::Kind::Stats(wire::Stats {
-                scheduler: rank,
-                snapshot,
-            })),
-            Err(error) => tracing::warn!(%error, "a scheduler's statistics did not encode"),
-        }
+        self.broadcast(&from_engine::Kind::Stats(wire::Stats {
+            scheduler: rank,
+            snapshot: Some((&stats).into()),
+        }));
     }
 
     /// States the process's metrics on every front: the schedulers' sums since the start; the

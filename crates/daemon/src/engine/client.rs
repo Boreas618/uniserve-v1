@@ -900,16 +900,17 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                 // `SchedulerStats` and `RequestStats`, which arrive beside this message.
                 crate::metrics::METRICS.memory.record(&metrics.memory);
             }
-            Some(from_engine::Kind::Stats(report)) => {
-                match SchedulerStats::decode(&report.snapshot) {
-                    Ok(snapshot) => stats(
-                        shared.epoch.load(Ordering::Relaxed),
-                        report.scheduler,
-                        snapshot,
-                    ),
-                    Err(error) => tracing::debug!(%error, "the engine sent unreadable statistics"),
-                }
-            }
+            Some(from_engine::Kind::Stats(report)) => match report.snapshot {
+                Some(snapshot) => stats(
+                    shared.epoch.load(Ordering::Relaxed),
+                    report.scheduler,
+                    SchedulerStats::from(snapshot),
+                ),
+                None => tracing::warn!(
+                    scheduler = report.scheduler,
+                    "the engine sent statistics without a snapshot"
+                ),
+            },
             Some(from_engine::Kind::State(state)) => {
                 // The engine announces its lifecycle; the client keeps what
                 // it last announced.
