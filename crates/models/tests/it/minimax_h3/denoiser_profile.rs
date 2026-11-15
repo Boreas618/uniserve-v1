@@ -19,27 +19,25 @@ use std::sync::Arc;
 
 use models::minimax_h3::stage::Stage;
 use nn::family::{
-    DenoiserSplit, Model, Projection, SequenceSplit, VideoModel, VideoPlacement, VideoServing,
+    ConditionMedia, DenoiserSplit, LayoutCapacity, Model, Projection, SequenceSplit, VideoModel,
+    VideoPlacement,
 };
 use nn::{
-    Clip, ConditionRole, ConditionShape, Conditioning, DType, MetaWeights, Split, VideoRequest,
-    WeightLoader,
+    Clip, ConditionShape, Conditioning, DType, MetaWeights, Split, VideoRequest, WeightLoader,
 };
 use nn_testing::{Recording, Release, meta, record, report};
 use proto::config::{PrecisionMode, Quantization, WeightFormat};
 
 use crate::releases::{FASTH3_4_STEP, FASTH3_4_STEP_NVFP4, FASTH3_8_STEP, MINIMAX_H3};
 
-/// What the profiled deployments serve: the 16:9 resolution, outputs of four to fifteen
-/// seconds and prompts of up to 2048 rows.
-fn serving() -> VideoServing {
-    VideoServing {
-        sizes: vec![(1344, 768)],
-        max_seconds: 15.0,
-        text_capacities: vec![2048],
-        condition_rows: None,
-    }
-}
+/// The resolution the profiled deployments serve: 16:9.
+const CANVAS: (u32, u32) = (1344, 768);
+
+/// The longest prompt the profiled deployments admit, in rows.
+const TEXT_ROWS: u32 = 2048;
+
+/// The least condition rung an engine captures, in rows.
+const LEAST_RUNG: u32 = 1024;
 
 /// The pipeline of `release` as a group that places `network` at `sequence`'s rank holds it,
 /// loaded from the shard headers, in the checkpoint's own representation.
@@ -63,13 +61,19 @@ fn load_under(
     };
     let (checkpoint, opened) = family.open(&release.sources(), quantization)?;
 
+    // The layouts hold the longest prompt and the condition rows the network's tasks are sized
+    // for; the key bound is taken over 1024 frames, as an engine sizes them.
     let stages: BTreeSet<String> = [network.name().to_owned()].into();
     let placement = VideoPlacement {
+        capacity: LayoutCapacity {
+            text_rows: TEXT_ROWS,
+            condition_rows: opened.condition_rows(Some(&stages))?,
+            frames: 1024,
+        },
         stages: Some(stages),
         denoiser: sequence,
         tensor: Split::WHOLE,
         dtype: DType::BF16,
-        serving: serving(),
     };
     let store = MetaWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None);
@@ -77,9 +81,79 @@ fn load_under(
     opened.load(&checkpoint, &mut loader, &placement)
 }
 
-/// The requests the deployment captures for, with the keyframe sets each may open with.
-fn candidates(model: &dyn VideoModel) -> Vec<(VideoRequest, Vec<Vec<ConditionShape>>)> {
-    model.candidates(&serving()).unwrap()
+/// The condition rows the layouts of a deployment of `release` placing `network` hold: those of
+/// the conditions the network's tasks are sized for, as the checkpoint states them.
+fn condition_rows(release: Release, network: Stage) -> u32 {
+    let Model::Video(family) = models::minimax_h3::FAMILY.model else {
+        panic!("MiniMax-H3 is a video family");
+    };
+    let (_, opened) = family
+        .open(&release.sources(), &Quantization::default())
+        .unwrap();
+    let stages: BTreeSet<String> = [network.name().to_owned()].into();
+
+    opened.condition_rows(Some(&stages)).unwrap()
+}
+
+/// The smallest layout the profiled deployments capture: the shortest output a request is
+/// admitted at, of the network's first kind of request, on the least condition rung when the
+/// kind carries conditions; it states none of its conditions.
+fn small(model: &dyn VideoModel) -> VideoRequest {
+    let kind = model.requests().swap_remove(0);
+    let condition_rows = (!kind.roles.is_empty()).then_some(LEAST_RUNG);
+
+    VideoRequest {
+        width: CANVAS.0,
+        height: CANVAS.1,
+        frames: model.timelines(4.0).unwrap()[0],
+        fps: model.frame_rate(),
+        roles: kind.roles,
+        text_tokens: TEXT_ROWS,
+        conditions: Vec::new(),
+        vision_spans: Vec::new(),
+        condition_rows,
+    }
+}
+
+/// The largest layout the profiled deployments capture: a fifteen-second output on the widest
+/// condition rung, `rows` rows, of the network's last kind of request, opened with every
+/// keyframe at the canvas when the kind anchors keyframes, or with the largest image reference
+/// the rung holds when it takes references.
+fn large(model: &dyn VideoModel, rows: u32) -> VideoRequest {
+    let kind = model.requests().pop().unwrap();
+    let frames = model.timeline(15.0).unwrap();
+    let conditions: Vec<ConditionShape> = match kind.media {
+        ConditionMedia::Canvas => kind
+            .roles
+            .iter()
+            .map(|role| ConditionShape {
+                role: *role,
+                frames: 1,
+                height: CANVAS.1,
+                width: CANVAS.0,
+                audio_samples: 0,
+            })
+            .collect(),
+        ConditionMedia::Client => model
+            .largest_conditions(CANVAS, frames, rows)
+            .unwrap()
+            .into_iter()
+            .filter(|reference| reference.frames == 1)
+            .collect(),
+        ConditionMedia::None => Vec::new(),
+    };
+
+    VideoRequest {
+        width: CANVAS.0,
+        height: CANVAS.1,
+        frames,
+        fps: model.frame_rate(),
+        roles: conditions.iter().map(|condition| condition.role).collect(),
+        text_tokens: TEXT_ROWS,
+        conditions,
+        vision_spans: Vec::new(),
+        condition_rows: Some(rows),
+    }
 }
 
 /// Runs one denoising step of `request` on the meta device and returns its recording.
@@ -142,9 +216,8 @@ fn profile(release: Release, network: Stage, sequence: DenoiserSplit) {
     result.unwrap();
     report(&format!("{name}: initialize"), &recording);
 
-    let requests = candidates(model.as_ref());
-    let (small, _) = requests.first().unwrap();
-    let (large, openings) = requests.last().unwrap();
+    let small = &small(model.as_ref());
+    let rows = condition_rows(release, network);
 
     // The prompt's conditioning: the refiner over the text capacity's rows.
     let layout = denoiser.layout(small).unwrap();
@@ -182,23 +255,8 @@ fn profile(release: Release, network: Stage, sequence: DenoiserSplit) {
     );
 
     // The largest layout: the longest output on the widest condition rung, opened with the
-    // largest keyframe set the rung serves, or with an image and a video reference with its
-    // soundtrack when the network takes references.
-    let mut large = large.clone();
-    if let Some(keyframes) = openings.last() {
-        large.conditions.clone_from(keyframes);
-        large.roles = keyframes.iter().map(|keyframe| keyframe.role).collect();
-    } else if large.count(ConditionRole::Reference) > 0 {
-        let reference = |frames: u32, side: u32, audio_samples: u32| ConditionShape {
-            role: ConditionRole::Reference,
-            frames,
-            height: side,
-            width: side,
-            audio_samples,
-        };
-        large.conditions = vec![reference(1, 512, 0), reference(30, 384, 40_000)];
-        large.roles = vec![ConditionRole::Reference; 2];
-    }
+    // largest condition set of its kind.
+    let large = large(model.as_ref(), rows);
     let layout = denoiser.layout(&large).unwrap();
     assert_eq!(layout.video.frames, 107);
     assert_eq!(layout.audio.unwrap().frames, 603);
@@ -321,9 +379,7 @@ fn the_nvfp4_export_profiles_a_small_and_a_large_layout() {
 
 /// The operators a step of the smallest layout the deployment captures launches.
 fn small_step_operators(model: &dyn VideoModel) -> BTreeSet<&'static str> {
-    let requests = candidates(model);
-    let (small, _) = requests.first().unwrap();
-    let recording = step(model, DenoiserSplit::WHOLE, small);
+    let recording = step(model, DenoiserSplit::WHOLE, &small(model));
 
     recording
         .launches
@@ -336,7 +392,7 @@ fn small_step_operators(model: &dyn VideoModel) -> BTreeSet<&'static str> {
 /// video decoder `model` places.
 fn decode_operators(model: &dyn VideoModel) -> BTreeSet<&'static str> {
     let decoder = model.video_decoder().unwrap();
-    let (width, height) = serving().sizes[0];
+    let (width, height) = CANVAS;
     // One temporal unit: the clip's seven latent frames, decoded whole.
     let clip = Clip {
         frames: 7 * 4,

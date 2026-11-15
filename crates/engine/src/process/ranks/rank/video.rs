@@ -43,6 +43,7 @@ use crate::memory::encoders;
 use crate::memory::latent::host::BankPages;
 use crate::parallel::HostGroup;
 use crate::runner::buckets::{Bucket, Buckets};
+use crate::runner::captures::{self, VideoServing};
 use crate::runner::decoder::{DecoderConfig, DecoderRunner, RoundConfig};
 use crate::runner::denoiser::{DenoiserConfig, DenoiserRunner};
 use crate::runner::encoder::{EncoderConfig, EncoderRunner};
@@ -52,7 +53,7 @@ use crate::runner::thread_pool::ThreadPool;
 use crate::runner::{Runner, RunnerId};
 use anyhow::{Context as _, Result, bail};
 use nn::VideoRequest;
-use nn::family::{VideoModel, VideoPlacement, VideoServing};
+use nn::family::{VideoCheckpoint, VideoModel, VideoPlacement};
 use nn::pipeline::{Pipeline, Product};
 use ops::Generation;
 use platform::{Communicator, DeviceId, Stream};
@@ -308,7 +309,7 @@ impl ModelRunner {
             denoiser,
             tensor,
             dtype: self.dtype(),
-            serving: self.video_serving()?,
+            capacity: self.video_serving()?.capacity()?,
         };
         Ok(checkpoint.load(&opened, &mut loader, &placement)?)
     }
@@ -583,7 +584,7 @@ impl ModelRunner {
         // no image.
         let patches = model.format().ok().map(|format| format.patches);
         let warm = match patches {
-            Some(_) => model.warm_prompts(&serving)?,
+            Some(_) => captures::warm_prompts(model, &serving)?,
             None => Vec::new(),
         };
 
@@ -634,7 +635,7 @@ impl ModelRunner {
         model: &dyn VideoModel,
         classes: Classes<'_>,
     ) -> Result<DenoiserConfig> {
-        let candidates = model.candidates(&self.video_serving()?)?;
+        let candidates = captures::candidates(model, &self.video_serving()?)?;
         if candidates.is_empty() {
             bail!("this deployment serves no request layout, so a denoiser would capture nothing");
         }
@@ -1019,7 +1020,7 @@ impl ModelRunner {
         let mut description = Vec::new();
         if let Some(denoiser) = &denoiser {
             buffers += denoiser.device_bytes();
-            description = model.description(&self.video_serving()?)?.details;
+            description = model.description(&self.video_serving()?.sizes)?.details;
             let (tensors, encoding) = denoiser.trajectory_digests();
             let shapes = denoiser.media_shapes()?;
             let largest = shapes.iter().map(|(_, bytes, _)| *bytes).max().unwrap_or(0);
@@ -1300,7 +1301,9 @@ impl ModelRunner {
         }
 
         let denoise_steps = if phases.contains(&Phase::Denoise) {
-            model.description(&self.video_serving()?)?.denoise_steps
+            model
+                .description(&self.video_serving()?.sizes)?
+                .denoise_steps
         } else {
             0
         };
@@ -1412,8 +1415,44 @@ impl ModelRunner {
         (tensors.finish(), encoders::layout())
     }
 
+    /// The condition rows the deployment's denoiser layouts hold: the deployment's statement
+    /// (`video_config.max_condition_rows`), or the rows of the conditions the network it places
+    /// is sized for, as `checkpoint` states them: the network a group's block places, or the
+    /// whole pipeline's one network when the deployment places the whole model.
+    ///
+    /// # Errors
+    ///
+    /// The checkpoint's refusal: a whole pipeline of two networks, which a deployment file
+    /// chooses between.
+    pub(crate) fn condition_capacity(&self, checkpoint: &dyn VideoCheckpoint) -> Result<u32> {
+        if let Some(rows) = self.engine_config().video.max_condition_rows {
+            return Ok(rows);
+        }
+
+        let stages = match self.capability_groups() {
+            None => None,
+            Some(groups) => {
+                let placed =
+                    |name: &str| groups.iter().any(|group| group.blocks.contains_key(name));
+                let network = self
+                    .pipeline()?
+                    .serving(Phase::Denoise)
+                    .find(|block| placed(&block.name));
+                Some(
+                    network
+                        .map(|block| block.name.clone())
+                        .into_iter()
+                        .collect(),
+                )
+            }
+        };
+        checkpoint
+            .condition_rows(stages.as_ref())
+            .context("sizing the condition rows of the deployment's denoiser layouts")
+    }
+
     /// What this video deployment serves: its sizes, its longest output, the prompt capacities it
-    /// captures and the condition rows a request may take.
+    /// captures and the condition rows a layout holds.
     pub(super) fn video_serving(&self) -> Result<VideoServing> {
         let video = &self.engine_config().video;
         let longest = self.engine_config().model.max_model_len;
@@ -1434,7 +1473,9 @@ impl ModelRunner {
                 .max_seconds
                 .context("the leader states a video deployment's longest output")?,
             text_capacities: prompt_capacities(video, longest)?,
-            condition_rows: video.max_condition_rows,
+            condition_rows: self
+                .condition_rows
+                .context("a text deployment sizes no condition rows")?,
         })
     }
 }
@@ -1875,8 +1916,8 @@ fn check_latents(model: &dyn VideoModel) -> Result<()> {
     Ok(())
 }
 
-/// The requests the deployment `serving` captures its denoiser for, each with the denoiser's
-/// layout of it.
+/// The requests the deployment `serving` captures its denoiser for
+/// ([`captures::candidates`]), each with the denoiser's layout of it.
 ///
 /// # Errors
 ///
@@ -1885,7 +1926,7 @@ fn laid_out(model: &dyn VideoModel, serving: &VideoServing) -> Result<Vec<(Video
     let denoiser = model
         .denoiser()
         .context("the rank's share of the checkpoint holds no denoiser to lay requests out")?;
-    let candidates = model.candidates(serving)?;
+    let candidates = captures::candidates(model, serving)?;
     if candidates.is_empty() {
         bail!("this deployment serves no request layout");
     }

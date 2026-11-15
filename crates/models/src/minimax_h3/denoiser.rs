@@ -41,7 +41,7 @@
 //! same rows ([`crate::minimax_h3::transformer`]), so they advance the same latents too.
 
 use nn::diffusion::{add_noise, euler_step, scale_noise};
-use nn::family::{DenoiserSplit, GATHER_AXIS, ULYSSES_AXIS};
+use nn::family::{DenoiserSplit, GATHER_AXIS, LayoutCapacity, ULYSSES_AXIS};
 use nn::modules::{TimestepTable, TimestepTableConfig};
 use nn::{
     ConditionPiece, ConditionRole, Conditioning, DType, Device, MediaInput, Result, Shape, Step,
@@ -50,9 +50,7 @@ use nn::{
 use proto::video::Layout;
 
 use crate::minimax_h3::audio_vae::{AudioEncoder, padded_samples};
-use crate::minimax_h3::config::{
-    AUDIO_CHANNELS, DenoiserConfig, FPS, FRAMES, MAX_FRAMES, VsaConfig,
-};
+use crate::minimax_h3::config::{AUDIO_CHANNELS, DenoiserConfig, FPS, FRAMES, VsaConfig};
 use crate::minimax_h3::modulation::{self, Modulation, VISUAL_CONDITION_TIME};
 use crate::minimax_h3::refiner::TokenRefiner;
 use crate::minimax_h3::transformer::Transformer;
@@ -64,10 +62,6 @@ pub const SAMPLE_DTYPE: DType = DType::F32;
 
 /// The channels of a condition's pixels: RGB.
 const PIXEL_CHANNELS: usize = 3;
-
-/// The least rung of a deployment's condition ladder: the rows of one keyframe of the released
-/// resolutions, which is the smallest condition a request brings.
-const LEAST_CONDITION_RUNG: u32 = 1024;
 
 /// The task a request runs, from the conditions it states.
 fn task_of(request: &VideoRequest) -> VideoTask {
@@ -97,8 +91,7 @@ pub struct Denoiser {
     config: DenoiserConfig,
     /// The text rows every layout holds: the deployment's longest prompt.
     text_rows: u32,
-    /// The condition rows a layout holds at most; a request rides the rung of the condition
-    /// ladder that holds its own.
+    /// The condition rows a layout holds at most; a request rides a rung of at most these rows.
     condition_rows: u32,
     /// This rank's place in the deployment's partition.
     split: DenoiserSplit,
@@ -116,9 +109,9 @@ pub struct Denoiser {
 }
 
 impl Denoiser {
-    /// The denoiser of `config` at `vb` (the network's checkpoint root), for layouts of
-    /// `capacity`'s `(text rows, condition rows)` at `split`'s place, with the condition
-    /// encoders when the deployment places them.
+    /// The denoiser of `config` at `vb` (the network's checkpoint root), for layouts of the
+    /// deployment's `capacity` at `split`'s place, with the condition encoders when the
+    /// deployment places them.
     ///
     /// # Errors
     ///
@@ -127,14 +120,14 @@ impl Denoiser {
     /// weight the loader refuses.
     pub fn load(
         config: &DenoiserConfig,
-        capacity: (u32, u32),
+        capacity: LayoutCapacity,
         split: DenoiserSplit,
         encoders: Option<(VideoEncoder, AudioEncoder)>,
         vb: VarBuilder<'_, '_>,
     ) -> Result<Self> {
         let transformer = &config.transformer;
         let sequence = split.sequence();
-        let (text_rows, condition_rows) = capacity;
+        let (text_rows, condition_rows) = (capacity.text_rows, capacity.condition_rows);
 
         if transformer.head_dim == 0 || transformer.num_attention_heads == 0 {
             return Err(ID.config("a denoiser's transformer has attention heads".to_owned()));
@@ -207,30 +200,6 @@ impl Denoiser {
     /// deployment that places none is refused where its conditions are prepared.
     pub const fn places_encoders(&self) -> bool {
         self.encoders.is_some()
-    }
-
-    /// The condition rows a layout of this deployment may hold, ascending and ending at its
-    /// capacity: one captured graph per rung, and a request rides the smallest rung that holds
-    /// its conditions.
-    ///
-    /// The rungs start at one keyframe and double, with a rung halfway between two doublings
-    /// from four keyframes up, where a request's empty rows start to cost more than their
-    /// graphs. Each is whole capacity units, so a layout of any rung packs.
-    pub fn condition_ladder(&self) -> Vec<u32> {
-        let capacity = self.condition_rows;
-        let unit = self.config.capacity_unit();
-
-        let mut rungs = Vec::new();
-        let mut doubling = LEAST_CONDITION_RUNG;
-        while doubling < capacity {
-            rungs.push(doubling.next_multiple_of(unit));
-            if doubling >= 4 * LEAST_CONDITION_RUNG && doubling + doubling / 2 < capacity {
-                rungs.push((doubling + doubling / 2).next_multiple_of(unit));
-            }
-            doubling *= 2;
-        }
-        rungs.push(capacity);
-        rungs
     }
 
     /// The rows of `cond.text` the condition rows of a request start at, checked against the
@@ -394,18 +363,21 @@ impl Denoiser {
 
 /// The layout row count the deployment's attention is loaded for: the largest of any layout
 /// of `capacity` over every resolution the checkpoint generates and every frame count of the
-/// frame rule up to [`MAX_FRAMES`].
+/// frame rule up to the capacity's longest timeline.
 ///
-/// The bound is taken over the checkpoint's resolutions and frame counts and not the
-/// deployment's sizes and longest output, so the kernels keyed by it are one set for every
-/// deployment of a checkpoint and capacity.
-fn max_rows(config: &DenoiserConfig, capacity: (u32, u32), split: DenoiserSplit) -> Result<u32> {
+/// The bound is taken over the checkpoint's resolutions and not the deployment's sizes, so the
+/// kernels keyed by it are one set for every deployment of a checkpoint and capacity.
+fn max_rows(
+    config: &DenoiserConfig,
+    capacity: LayoutCapacity,
+    split: DenoiserSplit,
+) -> Result<u32> {
     let resolutions = processing::minimax_h3::named_canvases()
         .map_err(|error| ID.config(format!("the resolution rule: {error}")))?;
 
     let mut bound = 0;
     for resolution in &resolutions {
-        for frames in (FRAMES.min_frames..=MAX_FRAMES).step_by(FRAMES.clip_frames as usize) {
+        for frames in (FRAMES.min_frames..=capacity.frames).step_by(FRAMES.clip_frames as usize) {
             let request = VideoRequest {
                 width: resolution.canvas.width,
                 height: resolution.canvas.height,
@@ -417,7 +389,12 @@ fn max_rows(config: &DenoiserConfig, capacity: (u32, u32), split: DenoiserSplit)
                 vision_spans: Vec::new(),
                 condition_rows: None,
             };
-            let layout = packing::layout(&request, &config.transformer, capacity.0, capacity.1)?;
+            let layout = packing::layout(
+                &request,
+                &config.transformer,
+                capacity.text_rows,
+                capacity.condition_rows,
+            )?;
 
             bound = bound.max(layout_rows(&layout, config.vsa.as_ref(), split));
         }

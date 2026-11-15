@@ -51,9 +51,6 @@ use crate::minimax_h3::{ID, VideoTask};
 /// The video VAE's temporal compression: one latent frame covers this many video frames.
 pub const TEMPORAL_COMPRESSION: u32 = 4;
 
-/// The longest generated clip a deployment's bounds are taken over, in frames.
-pub const MAX_FRAMES: u32 = 1024;
-
 /// Steps of the training schedule a DMD student's rungs are stated on.
 pub const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
 

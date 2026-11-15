@@ -31,7 +31,7 @@ use std::path::Path;
 use models::minimax_h3::config::{DenoiserConfig, ScheduleConfig, TransformerConfig, VsaConfig};
 use models::minimax_h3::denoiser::{Denoiser, SAMPLE_DTYPE};
 use models::minimax_h3::{VideoTask, packing};
-use nn::family::{DenoiserSplit, Projection, SequenceSplit};
+use nn::family::{DenoiserSplit, LayoutCapacity, Projection, SequenceSplit};
 use nn::{
     Checkpoint, ConditionRole, ConditionShape, Conditioning, CpuWeights, DType, Denoiser as _,
     Device, MetaWeights, Split, Tensor, VideoRequest, WeightLoader,
@@ -214,6 +214,16 @@ fn request(conditions: Vec<ConditionShape>, condition_rows: Option<u32>) -> Vide
     }
 }
 
+/// Layouts of `text` text rows and `condition` condition rows, the attention's key bound taken
+/// over timelines of up to 1024 frames, as an engine sizes a deployment's.
+fn capacity((text, condition): (u32, u32)) -> LayoutCapacity {
+    LayoutCapacity {
+        text_rows: text,
+        condition_rows: condition,
+        frames: 1024,
+    }
+}
+
 /// The request's latents after its conditioning is prepared and `steps` denoising steps, in a
 /// layout of `capacity`'s text rows and condition capacity, attending densely or through
 /// `vsa`: `(video, audio)`.
@@ -230,8 +240,14 @@ fn stepped(
     let loader = WeightLoader::new(&checkpoint, &store, None);
 
     let config = config(transformer(), vsa);
-    let denoiser =
-        Denoiser::load(&config, capacity, DenoiserSplit::WHOLE, None, loader.root()).unwrap();
+    let denoiser = Denoiser::load(
+        &config,
+        self::capacity(capacity),
+        DenoiserSplit::WHOLE,
+        None,
+        loader.root(),
+    )
+    .unwrap();
     denoiser.initialize().unwrap();
 
     let layout = denoiser.layout(request).unwrap();
@@ -374,7 +390,7 @@ fn a_request_of_a_task_the_network_does_not_serve_is_refused_by_name() {
     let loader = WeightLoader::new(&checkpoint, &store, None);
     let denoiser = Denoiser::load(
         &config(transformer(), None),
-        (64, 64),
+        capacity((64, 64)),
         DenoiserSplit::WHOLE,
         None,
         loader.root(),
@@ -389,7 +405,6 @@ fn a_request_of_a_task_the_network_does_not_serve_is_refused_by_name() {
     // A request without conditions reserves no condition row, whatever the capacity.
     let layout = denoiser.layout(&request(Vec::new(), None)).unwrap();
     assert_eq!((layout.text_rows, layout.condition_rows), (64, 0));
-    assert_eq!(denoiser.condition_ladder(), [64]);
 }
 
 /// A rank of an eight-way Ulysses split steps the largest layout an eight-step student's
@@ -435,8 +450,14 @@ fn an_eight_way_ulysses_rank_steps_the_largest_profiled_layout() {
         };
         let store = MetaWeights::new();
         let loader = WeightLoader::new(&checkpoint, &store, Some(DType::BF16));
-        let denoiser =
-            Denoiser::load(&config, (16_384, 2_048), split, None, loader.root()).unwrap();
+        let denoiser = Denoiser::load(
+            &config,
+            capacity((16_384, 2_048)),
+            split,
+            None,
+            loader.root(),
+        )
+        .unwrap();
 
         // The text capacity's 256 tiles, the condition rung's 32, the audio's 19 and the
         // video's 1782: an odd count of tiles, whose eighth is not whole sixteen-row blocks.

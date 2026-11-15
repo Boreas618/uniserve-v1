@@ -132,6 +132,9 @@ pub(crate) struct ModelRunner {
     /// The media pipeline the checkpoint serves, as its family declares it (`nn::pipeline`),
     /// checked once against the deployment's blocks; `None` for a text deployment.
     pipeline: Option<Arc<nn::pipeline::Pipeline>>,
+    /// The condition rows the denoiser's layouts hold, resolved once against the checkpoint
+    /// (`ModelRunner::condition_capacity`); `None` for a text deployment.
+    condition_rows: Option<u32>,
 }
 
 /// The collective groups one kind of a deployment's parallel groups forms over the host group, and
@@ -222,6 +225,7 @@ impl ModelRunner {
             mapping,
             union: None,
             pipeline: None,
+            condition_rows: None,
         };
 
         // A media checkpoint's pipeline, read once from its family: what every rank of it serves
@@ -236,6 +240,7 @@ impl ModelRunner {
             video::check_blocks(&pipeline, &build.parallel.worker_groups)
                 .context("the deployment places a block its pipeline does not admit")?;
             runner.pipeline = Some(Arc::new(pipeline));
+            runner.condition_rows = Some(runner.condition_capacity(opened.as_ref())?);
         }
         Ok(runner)
     }

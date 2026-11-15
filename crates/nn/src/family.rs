@@ -14,10 +14,11 @@
 //!   calls of one diffusion request.
 //!
 //! The interface is numerical. A family reads its checkpoint and states its mathematical facts
-//! (widths, cache shape, frame rule, the requests its graphs are captured for); it receives the
-//! deployment's mathematical partition ([`Split`], [`SequenceSplit`], [`DenoiserSplit`]) and the
-//! serving bounds ([`VideoServing`]), and it holds no runtime object: execution owns the devices,
-//! streams, memory, graphs and scheduling.
+//! (widths, cache shape, frame rule, the layout of a request and the extents of its conditions);
+//! it receives the deployment's mathematical partition ([`Split`], [`SequenceSplit`],
+//! [`DenoiserSplit`]) and the rows execution sizes its layouts for ([`LayoutCapacity`]), and it
+//! holds no runtime object: execution owns the devices, streams, memory, graphs, the buckets it
+//! captures and warms, and scheduling.
 //!
 //! ## One shape for every family
 //!
@@ -40,11 +41,10 @@ use proto::config::Quantization;
 use tensor::DType;
 
 use crate::capability::{
-    CausalLm, ConditionShape, Decoder, Denoiser, Drafter, Encoder, MediaFormat, Splicer,
-    VideoRequest, Vision,
+    CausalLm, ConditionShape, Decoder, Denoiser, Drafter, Encoder, MediaFormat, Splicer, Vision,
 };
 use crate::collective::Split;
-use crate::{Checkpoint, Result, Sources, WeightLoader};
+use crate::{Checkpoint, ConditionRole, Result, Sources, WeightLoader};
 
 /// One model family a build serves: what execution loads of its checkpoints, beside how they
 /// declare it and what request processing serves ([`processing::Family`]).
@@ -420,6 +420,20 @@ pub trait VideoCheckpoint: Send + Sync {
     /// which a deployment places one.
     fn pipeline(&self) -> crate::pipeline::Pipeline;
 
+    /// The condition rows a layout of the denoiser a rank placing `stages` loads (`None` places
+    /// the whole pipeline) holds when the deployment states no condition capacity: the rows of
+    /// the conditions the network's tasks are sized for at the largest canvas the checkpoint
+    /// generates, in whole capacity units; one unit for a network whose requests carry none.
+    ///
+    /// Execution chooses the capacity it loads the denoiser for ([`LayoutCapacity`]): the
+    /// deployment's, or this one.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `stages` places no network the checkpoint holds, or when the whole pipeline
+    /// holds two networks a deployment chooses between.
+    fn condition_rows(&self, stages: Option<&BTreeSet<String>>) -> Result<u32>;
+
     /// Loads the pipeline's share of `checkpoint`, the checkpoint [`VideoFamily::open`] read, for
     /// `placement`, its weights reached through `loader`.
     ///
@@ -436,7 +450,7 @@ pub trait VideoCheckpoint: Send + Sync {
 }
 
 /// How a deployment splits a video pipeline and sizes it, and this rank's place in the split.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoPlacement {
     /// The stages the deployment places on this rank's group; `None` places the whole
     /// pipeline.
@@ -447,24 +461,67 @@ pub struct VideoPlacement {
     pub tensor: Split,
     /// The element type the deployment computes in.
     pub dtype: DType,
-    /// What the deployment serves.
-    pub serving: VideoServing,
+    /// The rows execution sizes the denoiser's layouts for.
+    pub capacity: LayoutCapacity,
 }
 
-/// What a video deployment serves: the bounds its requests are held to and its graphs are
-/// captured for.
-#[derive(Clone, Debug, PartialEq)]
-pub struct VideoServing {
-    /// The output resolutions it serves, `(width, height)` in pixels.
-    pub sizes: Vec<(u32, u32)>,
-    /// The longest output it serves, in seconds.
-    pub max_seconds: f64,
-    /// The prompt capacities it captures, strictly increasing, the largest the longest prompt it
-    /// admits (`max_model_len`): a request rides the smallest that holds its prompt.
-    pub text_capacities: Vec<u32>,
-    /// The denoiser rows one request's conditions may take; the model's whole condition capacity
-    /// when `None`.
-    pub condition_rows: Option<u32>,
+/// The rows a deployment sizes its denoiser's layouts for, which execution chooses from what it
+/// serves: the denoiser allocates its prompt refiner, its tables and its attention's key bound
+/// for them, and lays every request out within them ([`Denoiser::layout`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutCapacity {
+    /// The text rows every layout holds: the longest prompt the deployment admits.
+    pub text_rows: u32,
+    /// The condition rows a layout holds at most; a request rides a condition rung of at most
+    /// these rows ([`crate::VideoRequest::condition_rows`]).
+    pub condition_rows: u32,
+    /// The longest timeline, in frames, the attention's key bound is taken over, at every canvas
+    /// the checkpoint generates.
+    pub frames: u32,
+}
+
+/// A kind of request a placed denoiser serves, by the conditions it carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestKind {
+    /// The roles of the conditions a request of the kind states, in request order: none for a
+    /// request generated from its prompt alone.
+    pub roles: Vec<ConditionRole>,
+    /// How its conditions' extents are set.
+    pub media: ConditionMedia,
+    /// The most vision blocks one prompt of the kind presents to the text encoder.
+    pub vision_blocks: u32,
+}
+
+/// How the extents of a kind of request's conditions are set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConditionMedia {
+    /// The request carries no condition.
+    None,
+    /// One frame at the generated canvas per role: keyframes, of which a request anchors any
+    /// non-empty subset of the kind's roles, each at most once.
+    Canvas,
+    /// The client's media's own extents: references, bounded by the largest conditions a
+    /// layout's rows hold ([`VideoModel::largest_conditions`]).
+    Client,
+}
+
+/// How a prompt presents a vision block to the text encoder: one `placeholder` token per merged
+/// row, a merged row being `merge · merge` patches of one time step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisionTokens {
+    /// The token id of each placeholder.
+    pub placeholder: u32,
+    /// The patches merged into one row along each spatial side.
+    pub merge: u32,
+}
+
+impl VisionTokens {
+    /// The merged rows, one placeholder each, a block of the `[time, rows, columns]` patch grid
+    /// `grid` presents: every time step's rows and columns merged in `merge · merge` squares.
+    pub const fn tokens(&self, grid: [u32; 3]) -> u32 {
+        let [time, rows, columns] = grid;
+        time * (rows * columns / (self.merge * self.merge))
+    }
 }
 
 /// The collective axes of a partitioned denoiser's forward, in the order execution states their
@@ -640,68 +697,88 @@ pub trait VideoModel: Send + Sync {
     /// The extents one request's conditions may reach on this rank.
     fn condition_bounds(&self) -> ConditionBounds;
 
-    /// The requests a deployment serving `serving` captures its denoiser's graphs for: one per
-    /// distinct layout a request of it may take, each with the condition sets a request of the
-    /// layout may open with.
-    ///
-    /// A capture happens before the first request of a shape, so a model states one request per
-    /// layout its deployment serves and the bucket is derived from it
-    /// ([`Denoiser::layout`]). The second value lists the condition sets, each in request order
-    /// as the request presents them: a request's opening encodes its own conditions eagerly,
-    /// outside any captured graph, so the profile run opens the layout once per set to measure
-    /// that encode and state its kernels. They are not the request's own conditions, which it
-    /// states none of: where the deployment fixes a condition's extents (a keyframe at the
-    /// generated canvas) a set presents them, and where they follow the client's media (a
-    /// reference) the sets bound them, no opening of the layout encoding a larger condition of
-    /// a kind than a set does. The list is empty for a layout whose requests state no
-    /// condition.
+    /// The rasters the pipeline generates, `(width, height)` in pixels, of which a deployment
+    /// serves some.
     ///
     /// # Errors
     ///
-    /// Fails when `serving` states a size, duration or capacity the pipeline does not serve.
-    fn candidates(
+    /// Fails when the checkpoint's canvas rule states no raster of an aspect it names.
+    fn canvases(&self) -> Result<Vec<(u32, u32)>>;
+
+    /// The timelines a request lasting at most `seconds` may take, ascending: every legal frame
+    /// count from the shortest a request is admitted at to the least that lasts `seconds`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `seconds` is no positive duration.
+    fn timelines(&self, seconds: f64) -> Result<Vec<u32>>;
+
+    /// The kinds of request the placed denoiser serves, in the checkpoint's order of its tasks;
+    /// on a rank that places no network, those of every network the checkpoint holds.
+    fn requests(&self) -> Vec<RequestKind>;
+
+    /// The rows a layout's text and condition capacities are whole multiples of.
+    ///
+    /// # Errors
+    ///
+    /// Fails when this rank places no denoiser.
+    fn capacity_unit(&self) -> Result<u32>;
+
+    /// The denoiser rows `conditions` take in a layout of a request at the canvas `canvas`
+    /// (`(width, height)` in pixels), as request processing packs them: a request whose
+    /// conditions take these rows rides a condition rung of at least as many.
+    ///
+    /// # Errors
+    ///
+    /// Fails when this rank places no denoiser, or when the checkpoint states no rule to prepare
+    /// a condition of the set.
+    fn condition_rows(&self, conditions: &[ConditionShape], canvas: (u32, u32)) -> Result<u32>;
+
+    /// The largest conditions whose extents follow the client's media ([`ConditionMedia::Client`])
+    /// that `rows` condition rows hold, for a request at `canvas` lasting at most `frames`
+    /// frames: one of each form the pipeline takes (an image, a video with its soundtrack, a
+    /// track alone) that the rows hold any of.
+    ///
+    /// They bound what an opening of a layout of `rows` rows encodes: none of its conditions is
+    /// larger in pixels, in frames or in samples than the one of its form here. Empty for a
+    /// pipeline whose requests carry no such condition.
+    ///
+    /// # Errors
+    ///
+    /// Fails when this rank places no denoiser.
+    fn largest_conditions(
         &self,
-        serving: &VideoServing,
-    ) -> Result<Vec<(VideoRequest, Vec<Vec<ConditionShape>>)>>;
+        canvas: (u32, u32),
+        frames: u32,
+        rows: u32,
+    ) -> Result<Vec<ConditionShape>>;
 
-    /// The prompts with vision blocks the text encoder's eager encodes are profiled over, for a
-    /// deployment serving `serving`: each as the patch grids (`[time, rows, columns]`) of its
-    /// vision blocks in presentation order and the token ids of a prompt that presents those
-    /// blocks: each block's placeholder tokens, one per merged row, and the tokens that delimit
-    /// the blocks, as the text encoder reads a prompt ([`Encoder::encode`]).
-    ///
-    /// Where the deployment fixes the grids a request presents, one prompt per distinct set of
-    /// grids, as a request of a served resolution presents it. Where the grids follow the
-    /// client's media, prompts that bound every presentation the deployment admits: an encode of
-    /// any admitted prompt takes no more of the region and no more host copies of no more bytes
-    /// than one of these of no fewer tokens.
-    ///
-    /// A prompt that presents vision blocks is encoded eagerly over its own layout and not by a
-    /// captured graph, in the same stream region the captured encodes take their memory from,
-    /// so the text encoder's profile run encodes each beside the captured encodes and the
-    /// region's peak holds the eager vision encode as well. A prompt holding the blocks is at
-    /// least as long as these ids, so it rides only an encode bucket of at least that many
-    /// tokens.
-    ///
-    /// Empty for a deployment whose tasks present no vision block.
+    /// How a prompt presents a vision block to the text encoder.
     ///
     /// # Errors
     ///
-    /// Fails when `serving` states a size the pipeline does not serve, or when a task presents
-    /// vision blocks and the checkpoint states no rule to size them.
-    #[expect(
-        clippy::type_complexity,
-        reason = "each prompt's grids and ids, as the text encoder's runner reads them"
-    )]
-    fn warm_prompts(&self, serving: &VideoServing) -> Result<Vec<(Vec<[u32; 3]>, Vec<u32>)>>;
+    /// Fails when the checkpoint states no rule to size a vision block, or its text encoder no
+    /// vision tower.
+    fn vision_tokens(&self) -> Result<VisionTokens>;
 
-    /// What the placed denoiser serves under `serving`, as the deployment's request processing
-    /// admits requests against it.
+    /// The patch grid `[time, rows, columns]` a frame of `width x height` pixels presents in a
+    /// prompt: a keyframe's, as the text encoder's processor sizes it.
     ///
     /// # Errors
     ///
-    /// Fails when `serving` states a size the pipeline does not serve.
-    fn description(&self, serving: &VideoServing) -> Result<Description>;
+    /// Fails when the checkpoint states no rule to size a vision block, or the processor refuses
+    /// the raster.
+    fn vision_grid(&self, width: u32, height: u32) -> Result<[u32; 3]>;
+
+    /// What the placed denoiser serves at the deployment's `sizes` (`(width, height)` in pixels),
+    /// within the capacity it was loaded for, as the deployment's request processing admits
+    /// requests against it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when this rank places no denoiser, or `sizes` states a size the pipeline does not
+    /// generate.
+    fn description(&self, sizes: &[(u32, u32)]) -> Result<Description>;
 }
 
 /// The extents one request's conditions may reach.

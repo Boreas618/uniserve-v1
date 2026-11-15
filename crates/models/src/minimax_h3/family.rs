@@ -4,9 +4,11 @@
 //! [`FAMILY`] claims the `MiniMaxH3ModularPipeline` class. A deployment's sources compose to one
 //! checkpoint and its [`Config`], a load builds the stages the deployment places on a rank with
 //! the deployment's sequence and tensor splits, and the loaded [`MinimaxH3`] states the
-//! pipeline's own rules to execution: the `17n + 5` frame rule, its resolutions, the requests its
-//! denoiser's graphs are captured for, and the description its request processing admits
-//! requests against.
+//! pipeline's own rules to execution: the `17n + 5` frame rule, its resolutions, the kinds of
+//! request its network serves with the rows their conditions take and the largest references a
+//! layout holds, how a prompt presents a keyframe, and the description its request processing
+//! admits requests against. Execution enumerates the requests it captures and the prompts it
+//! warms from them.
 //!
 //! ## Composition
 //!
@@ -37,23 +39,24 @@
 //! is absent from the loaded pipeline.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use std::sync::Arc;
 
 use nn::family::{
-    ConditionBounds, Description, Family, Model, VideoCheckpoint, VideoFamily, VideoModel,
-    VideoPlacement, VideoServing,
+    ConditionBounds, ConditionMedia, Description, Family, Model, RequestKind, VideoCheckpoint,
+    VideoFamily, VideoModel, VideoPlacement, VisionTokens,
 };
 use nn::pipeline::{Block, Extent, Phase, Pipeline, Product, ProductSpec};
 use nn::{
     Adapter, AudioFormat, Checkpoint, ConditionRole, ConditionShape, DType, Decoder, Encoder,
-    MediaFormat, PipelineIndex, Result, Source, Sources, Splicer, VideoRequest, WeightLoader,
+    MediaFormat, PipelineIndex, Result, Source, Sources, Splicer, WeightLoader,
 };
+use processing::minimax_h3::rules::{VisualRows, condition_tiles};
 use processing::minimax_h3::{
     CANVAS_RULE, ConditionPacking, DenoiserInfo, MIN_SECONDS, PIPELINE_CLASS, PreparedCondition,
     REFERENCE_LIMITS, ReferenceLimits, ServedCanvas, named_canvases,
 };
 use proto::config::{Partition, Quantization};
+use proto::video::Canvas;
 
 use crate::minimax_h3::adapter::FastVideoLora;
 use crate::minimax_h3::audio_vae::{AudioDecoder, AudioEncoder};
@@ -279,6 +282,19 @@ impl VideoCheckpoint for Config {
         pipeline()
     }
 
+    /// The most rows any task a rank placing `stages` serves reserves ([`condition_capacity`]).
+    fn condition_rows(&self, stages: Option<&BTreeSet<String>>) -> nn::Result<u32> {
+        let tasks = served_tasks(&self.tasks(), stages)?;
+
+        Ok(tasks
+            .iter()
+            .map(|task| condition_capacity(self, *task))
+            .collect::<Result<Vec<u32>>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(0))
+    }
+
     fn load(
         &self,
         checkpoint: &Checkpoint,
@@ -393,12 +409,7 @@ impl MinimaxH3 {
         loader: &WeightLoader<'_>,
         placement: &VideoPlacement,
     ) -> Result<Self> {
-        let serving = &placement.serving;
-        let tasks = served_tasks(
-            &config.tasks(),
-            placement.stages.as_ref(),
-            checkpoint.root(),
-        )?;
+        let tasks = served_tasks(&config.tasks(), placement.stages.as_ref())?;
         let stages = stages(config, &tasks, placement.stages.as_ref())?;
         let split = placement.denoiser;
 
@@ -417,25 +428,6 @@ impl MinimaxH3 {
                 )));
             }
         }
-
-        // The text capacity is the deployment's longest prompt; the condition capacity is the
-        // deployment's when it states one, and otherwise the widest its tasks ask for.
-        let text_rows = *serving.text_capacities.last().ok_or_else(|| {
-            ID.config(
-                "this deployment states no prompt capacity, so no layout could hold a prompt"
-                    .to_owned(),
-            )
-        })?;
-        let condition_rows = match serving.condition_rows {
-            Some(rows) => rows,
-            None => tasks
-                .iter()
-                .map(|task| condition_capacity(config, *task))
-                .collect::<Result<Vec<u32>>>()?
-                .into_iter()
-                .max()
-                .unwrap_or(0),
-        };
 
         let mut model = Self {
             config: config.clone(),
@@ -499,7 +491,7 @@ impl MinimaxH3 {
                 stage,
                 Arc::new(Denoiser::load(
                     denoiser,
-                    (text_rows, condition_rows),
+                    placement.capacity,
                     split,
                     encoders,
                     network.root(),
@@ -522,9 +514,6 @@ impl MinimaxH3 {
             )?));
         }
         if stages.contains(Stage::VideoDecoder) {
-            // The deployment's sizes are checked here, where a size the checkpoint does not
-            // generate would otherwise be found at the first decode.
-            served_resolutions(&serving.sizes)?;
             let mut stage = loader.reborrow(checkpoint.stage(Component::Vae.name())?)?;
             stage.declare(&config.video_vae.quantization)?;
 
@@ -539,6 +528,23 @@ impl MinimaxH3 {
     /// The placed denoiser network.
     fn network(&self) -> Option<&Arc<Denoiser>> {
         self.denoiser.as_ref().map(|(_, network)| network)
+    }
+
+    /// The placed denoiser network, which `need` asks of the rank.
+    fn placed(&self, need: &str) -> Result<&Arc<Denoiser>> {
+        self.network()
+            .ok_or_else(|| ID.config(format!("this rank places no denoiser, so {need}")))
+    }
+
+    /// The processor a keyframe is prepared and a vision block sized by.
+    fn processor(&self) -> Result<&processing::qwen_vl::ProcessorConfig> {
+        self.config.processor.as_ref().ok_or_else(|| {
+            ID.checkpoint(
+                "the checkpoint states no processor/video_preprocessor_config.json, so a \
+                 keyframe cannot be prepared nor a vision block sized"
+                    .to_owned(),
+            )
+        })
     }
 
     /// How the placed denoiser lays a request's conditions into its rows, as request
@@ -678,44 +684,152 @@ impl VideoModel for MinimaxH3 {
         }
     }
 
-    fn candidates(
-        &self,
-        serving: &VideoServing,
-    ) -> nn::Result<Vec<(VideoRequest, Vec<Vec<ConditionShape>>)>> {
-        let denoiser = self.network().ok_or_else(|| {
-            ID.config("this rank places no denoiser, so no denoising step could run".to_owned())
-        })?;
-
-        candidates(
-            &self.tasks,
-            serving,
-            &denoiser.condition_ladder(),
-            &self.condition_packing(denoiser)?,
-            self.config.processor.as_ref(),
-        )
+    fn canvases(&self) -> nn::Result<Vec<(u32, u32)>> {
+        Ok(resolutions()?
+            .into_iter()
+            .map(|served| (served.canvas.width, served.canvas.height))
+            .collect())
     }
 
-    fn warm_prompts(&self, serving: &VideoServing) -> nn::Result<Vec<(Vec<[u32; 3]>, Vec<u32>)>> {
+    /// Every frame count of the `17n + 5` rule from the shortest duration request processing
+    /// admits ([`MIN_SECONDS`]) to the least covering `seconds`.
+    fn timelines(&self, seconds: f64) -> nn::Result<Vec<u32>> {
+        let longest = timeline(seconds)?;
+        let shortest = timeline(MIN_SECONDS)?;
+
+        Ok((shortest..=longest)
+            .step_by(FRAMES.clip_frames as usize)
+            .collect())
+    }
+
+    /// `t2va` carries no condition; `fl2va` anchors the first frame, the last or both, each a
+    /// keyframe at the canvas presented in the prompt; `ref2va` carries references of the
+    /// client's media, each image and video presented in the prompt, up to the declared limits
+    /// ([`REFERENCE_LIMITS`]).
+    fn requests(&self) -> Vec<RequestKind> {
+        self.tasks
+            .iter()
+            .map(|task| match task {
+                VideoTask::TextToVideoAudio => RequestKind {
+                    roles: Vec::new(),
+                    media: ConditionMedia::None,
+                    vision_blocks: 0,
+                },
+                VideoTask::FirstLastToVideoAudio => RequestKind {
+                    roles: vec![ConditionRole::FirstFrame, ConditionRole::LastFrame],
+                    media: ConditionMedia::Canvas,
+                    vision_blocks: 2,
+                },
+                VideoTask::ReferenceToVideoAudio => RequestKind {
+                    roles: vec![ConditionRole::Reference],
+                    media: ConditionMedia::Client,
+                    vision_blocks: (REFERENCE_LIMITS.images + REFERENCE_LIMITS.videos)
+                        .clamp(1, REFERENCE_LIMITS.total.max(1)),
+                },
+            })
+            .collect()
+    }
+
+    fn capacity_unit(&self) -> nn::Result<u32> {
+        let denoiser = self.placed("no layout is sized")?;
+        Ok(denoiser.config().capacity_unit())
+    }
+
+    /// A keyframe is prepared as request processing prepares it, fitted to the canvas, and
+    /// takes the tiles its patches pack into; a reference takes the tiles of its own extents
+    /// ([`reference_rows`]).
+    fn condition_rows(
+        &self,
+        conditions: &[ConditionShape],
+        (width, height): (u32, u32),
+    ) -> nn::Result<u32> {
+        let denoiser = self.placed("no condition is laid out")?;
+        let packing = self.condition_packing(denoiser)?;
+        let canvas = Canvas { width, height };
+
+        let mut rows: u32 = 0;
+        for (order, condition) in conditions.iter().enumerate() {
+            let taken = if condition.role == ConditionRole::Reference {
+                reference_rows(condition, &packing)
+            } else {
+                let processor = self.processor()?;
+                let image = processing::ImageMetadata {
+                    width: condition.width,
+                    height: condition.height,
+                };
+                let prepared = PreparedCondition::keyframe(
+                    order,
+                    condition.role,
+                    &image,
+                    canvas,
+                    order,
+                    true,
+                    processor,
+                )
+                .map_err(|error| ID.config(format!("a keyframe of {width}x{height}: {error}")))?;
+
+                processing::minimax_h3::condition_rows(&[prepared], canvas, &packing)
+            };
+            rows = rows.saturating_add(taken);
+        }
+        Ok(rows)
+    }
+
+    fn largest_conditions(
+        &self,
+        canvas: (u32, u32),
+        frames: u32,
+        rows: u32,
+    ) -> nn::Result<Vec<ConditionShape>> {
+        let denoiser = self.placed("no condition is laid out")?;
+        if !self.tasks.contains(&VideoTask::ReferenceToVideoAudio) {
+            return Ok(Vec::new());
+        }
+        Ok(largest_references(
+            canvas,
+            frames,
+            rows,
+            &self.condition_packing(denoiser)?,
+        ))
+    }
+
+    /// A placeholder is the tower's image token, and the processor merges its patches in
+    /// squares of its merge side.
+    fn vision_tokens(&self) -> nn::Result<VisionTokens> {
+        let processor = self.processor()?;
         let placeholder = self
             .config
             .text_encoder
             .vision
             .as_ref()
-            .map(|vision| vision.image_token_id);
-        warm_prompts(
-            &self.tasks,
-            serving,
-            (self.config.processor.as_ref(), placeholder),
-        )
+            .map(|vision| vision.image_token_id)
+            .ok_or_else(|| {
+                ID.checkpoint(
+                    "the text encoder states no vision tower, so no prompt presents a vision \
+                     block"
+                        .to_owned(),
+                )
+            })?;
+
+        Ok(VisionTokens {
+            placeholder,
+            merge: processor.merge_size.max(1),
+        })
     }
 
-    /// What the placed denoiser serves under `serving`: the tasks of the placed network, its
-    /// fixed schedule and shifts, the deployment's resolutions, the reference limits and the
-    /// condition packing.
-    fn description(&self, serving: &VideoServing) -> nn::Result<Description> {
-        let denoiser = self.network().ok_or_else(|| {
-            ID.config("this rank places no denoiser, so it serves no task".to_owned())
-        })?;
+    fn vision_grid(&self, width: u32, height: u32) -> nn::Result<[u32; 3]> {
+        let grid = self
+            .processor()?
+            .image_grid(height, width)
+            .map_err(|error| ID.config(format!("a keyframe of {width}x{height}: {error}")))?;
+        Ok([grid.t, grid.h, grid.w])
+    }
+
+    /// What the placed denoiser serves at `sizes`: the tasks of the placed network, its fixed
+    /// schedule and shifts, the deployment's resolutions, the reference limits and the condition
+    /// packing of the capacity it was loaded for.
+    fn description(&self, sizes: &[(u32, u32)]) -> nn::Result<Description> {
+        let denoiser = self.placed("it serves no task")?;
         let tasks: Vec<VideoTask> = VideoTask::ALL
             .into_iter()
             .filter(|task| self.tasks.contains(task))
@@ -728,7 +842,7 @@ impl VideoModel for MinimaxH3 {
             schedule_points: steps + 1,
             video_shift: f64::from(schedule.video_shift),
             audio_shift: f64::from(schedule.audio_shift),
-            canvases: served_resolutions(&serving.sizes)?,
+            canvases: served_resolutions(sizes)?,
             references: if tasks.contains(&VideoTask::ReferenceToVideoAudio) {
                 REFERENCE_LIMITS
             } else {
@@ -809,16 +923,11 @@ fn stages(
 /// one network's. A group that places no network (a text encoder's group, a decoder's) serves
 /// beside whichever network the deployment places elsewhere, so its stages serve every task the
 /// checkpoint states.
-fn served_tasks(
-    stated: &[VideoTask],
-    stages: Option<&BTreeSet<String>>,
-    checkpoint: &Path,
-) -> Result<Vec<VideoTask>> {
+fn served_tasks(stated: &[VideoTask], stages: Option<&BTreeSet<String>>) -> Result<Vec<VideoTask>> {
     if stated.is_empty() {
-        return Err(ID.config(format!(
-            "the checkpoint {} states no task, so no network can be sized for one",
-            checkpoint.display()
-        )));
+        return Err(ID.config(
+            "the checkpoint states no task, so no network can be sized for one".to_owned(),
+        ));
     }
 
     let Some(stages) = stages else {
@@ -827,11 +936,11 @@ fn served_tasks(
             return Ok(stated.to_vec());
         }
 
-        return Err(ID.config(format!(
-            "the checkpoint {} holds two networks and this deployment places the whole \
-             pipeline: a deployment file that places one of them chooses it",
-            checkpoint.display()
-        )));
+        return Err(ID.config(
+            "the checkpoint holds two networks and this deployment places the whole pipeline: \
+             a deployment file that places one of them chooses it"
+                .to_owned(),
+        ));
     };
 
     if !NETWORKS.iter().any(|stage| stages.contains(stage.name())) {
@@ -845,8 +954,7 @@ fn served_tasks(
         .collect();
     if served.is_empty() {
         return Err(ID.config(format!(
-            "the checkpoint {} states {stated:?} and the deployment places no network of them",
-            checkpoint.display()
+            "the checkpoint states {stated:?} and the deployment places no network of them"
         )));
     }
     Ok(served)
@@ -958,167 +1066,47 @@ fn served_resolutions(sizes: &[(u32, u32)]) -> Result<Vec<ServedCanvas>> {
         .collect()
 }
 
-/// The requests a deployment captures its denoiser's graphs for: one per (task, size, frame
-/// count, prompt capacity, condition rung) the deployment serves. An `fl2va` request also
-/// states the keyframe sets a request of its layout may open with ([`keyframe_openings`]), and
-/// a `ref2va` one the reference sets that bound those its requests open with
-/// ([`reference_openings`]).
-fn candidates(
-    tasks: &[VideoTask],
-    serving: &VideoServing,
-    ladder: &[u32],
-    packing: &ConditionPacking,
-    processor: Option<&processing::qwen_vl::ProcessorConfig>,
-) -> Result<Vec<(VideoRequest, Vec<Vec<ConditionShape>>)>> {
-    let longest = timeline(serving.max_seconds)?;
-    let shortest = timeline(MIN_SECONDS)?;
-    let frame_counts: Vec<u32> = (shortest..=longest)
-        .step_by(FRAMES.clip_frames as usize)
-        .collect();
-
-    let mut candidates = Vec::new();
-    for resolution in served_resolutions(&serving.sizes)? {
-        for task in tasks.iter().copied() {
-            // `fl2va` anchors both keyframes. A `ref2va` reference's raster follows the
-            // client's media, so its request states a reference's role, which makes it a
-            // `ref2va` request, states no raster and rides its rung's condition rows.
-            let roles = match task {
-                VideoTask::FirstLastToVideoAudio => {
-                    vec![ConditionRole::FirstFrame, ConditionRole::LastFrame]
-                }
-                VideoTask::ReferenceToVideoAudio => vec![ConditionRole::Reference],
-                VideoTask::TextToVideoAudio => Vec::new(),
-            };
-            let rungs: Vec<Option<u32>> = if task.conditioned() {
-                ladder.iter().copied().map(Some).collect()
-            } else {
-                vec![None]
-            };
-            let openings = match task {
-                VideoTask::FirstLastToVideoAudio => {
-                    keyframe_openings(&resolution, ladder, packing, processor)?
-                }
-                VideoTask::ReferenceToVideoAudio => {
-                    reference_openings(&resolution, longest, ladder, packing)
-                }
-                VideoTask::TextToVideoAudio => Vec::new(),
-            };
-
-            for frames in frame_counts.iter().copied() {
-                for capacity in &serving.text_capacities {
-                    for rung in rungs.iter().copied() {
-                        let request = VideoRequest {
-                            width: resolution.canvas.width,
-                            height: resolution.canvas.height,
-                            frames,
-                            fps: FPS,
-                            roles: roles.clone(),
-                            text_tokens: *capacity,
-                            conditions: Vec::new(),
-                            vision_spans: Vec::new(),
-                            condition_rows: rung,
-                        };
-                        let opened = openings
-                            .iter()
-                            .filter(|(served, _)| Some(*served) == rung)
-                            .map(|(_, set)| set.clone())
-                            .collect();
-
-                        candidates.push((request, opened));
-                    }
-                }
-            }
-        }
-    }
-    Ok(candidates)
-}
-
-/// The keyframe sets an `fl2va` request of `resolution` may present, each with the rung of
-/// `ladder` that serves it: every non-empty subset of the anchors, each keyframe fitted to the
-/// resolution by request processing's own rule, on the smallest rung holding the rows it packs
-/// into.
-fn keyframe_openings(
-    resolution: &ServedCanvas,
-    ladder: &[u32],
-    packing: &ConditionPacking,
-    processor: Option<&processing::qwen_vl::ProcessorConfig>,
-) -> Result<Vec<(u32, Vec<ConditionShape>)>> {
-    let processor = processor.ok_or_else(|| {
-        ID.checkpoint(
-            "the deployment serves fl2va and the checkpoint states no \
-             processor/video_preprocessor_config.json, so a keyframe cannot be prepared"
-                .to_owned(),
-        )
-    })?;
-    let (width, height) = (resolution.canvas.width, resolution.canvas.height);
-
-    // An image of the resolution's own size: the preparation fits every image onto it.
-    let image = processing::ImageMetadata { width, height };
-    let anchors = [ConditionRole::FirstFrame, ConditionRole::LastFrame];
-
-    let mut openings = Vec::new();
-    for mask in 1_u32..(1 << anchors.len()) {
-        let roles: Vec<ConditionRole> = anchors
-            .iter()
-            .enumerate()
-            .filter(|(bit, _)| mask & (1 << bit) != 0)
-            .map(|(_, role)| *role)
-            .collect();
-
-        let prepared = roles
-            .iter()
-            .enumerate()
-            .map(|(order, role)| {
-                PreparedCondition::keyframe(
-                    order,
-                    *role,
-                    &image,
-                    resolution.canvas,
-                    order,
-                    true,
-                    processor,
-                )
-            })
-            .collect::<std::result::Result<Vec<_>, String>>()
-            .map_err(|error| ID.config(format!("a keyframe of {width}x{height}: {error}")))?;
-
-        let rows = processing::minimax_h3::condition_rows(&prepared, resolution.canvas, packing);
-        let Some(rung) = ladder.iter().copied().find(|rung| *rung >= rows) else {
-            continue;
-        };
-
-        let shapes = roles
-            .iter()
-            .map(|role| keyframe(*role, resolution))
-            .collect();
-        openings.push((rung, shapes));
-    }
-    Ok(openings)
-}
-
-/// The reference sets a `ref2va` request of `resolution` opens its layout's profile with, each
-/// with the rung of `ladder` that serves it: per rung, the largest image an admitted request
-/// presents that the rung's rows hold, the longest and widest video with its soundtrack they
-/// hold, and the longest track alone they hold.
-///
-/// A reference's raster and length follow the client's media, so no set of the deployment's is
-/// a request's own. The profile run opens each set, which states every kernel a reference's
-/// encode launches (their keys follow element types and not extents) and the most of the
-/// runner's region an opening takes: an opening encodes its references one after another, and
-/// on its rung none is larger in pixels, in frames or in samples than one of these. An image
-/// reference is encoded at a short edge of at most the declared edge
-/// ([`REFERENCE_LIMITS`]`.image_short_edge`) within the canvas rule's aspects, so the largest
-/// is that edge by four times it, fewer cells where the rung holds fewer, as square as they
-/// divide. A video reference is put on the canvas of its aspect and lasts at most the generated
-/// video: the longest lasts `longest` frames, the deployment's longest output, at
-/// `resolution`'s canvas, its frames and then its sides halved until its rows fit the rung.
-fn reference_openings(
-    resolution: &ServedCanvas,
-    longest: u32,
-    ladder: &[u32],
-    packing: &ConditionPacking,
-) -> Vec<(u32, Vec<ConditionShape>)> {
+/// Denoiser rows one reference `shape` takes in a layout of `packing`: its track's rows in whole
+/// tiles, then an image's patch rows in whole tiles, or the video tiles that cover a video's
+/// `(latent frames, patch rows, patch columns)` token grid, each tile `packing.tile_rows` rows.
+fn reference_rows(shape: &ConditionShape, packing: &ConditionPacking) -> u32 {
     // A condition row is one latent patch of the raster's cells, which the packing tiles.
+    let cell = processing::minimax_h3::PATCH_PIXELS;
+    let (audio, visual) = packing::condition_rows(shape);
+    let grid = [
+        FRAMES.latent_frames(shape.frames),
+        shape.height / cell,
+        shape.width / cell,
+    ];
+    let visual = match (shape.frames, visual) {
+        (_, 0) => VisualRows::None,
+        (1, rows) => VisualRows::Patches(rows as u32),
+        _ => VisualRows::Grid(grid),
+    };
+
+    condition_tiles(audio as u32, visual, packing).saturating_mul(packing.tile_rows.get())
+}
+
+/// The largest references a layout of `rows` condition rows holds, for a request at `canvas`
+/// lasting at most `longest` frames: the largest image an admitted request presents that the
+/// rows hold, the longest and widest video with its soundtrack they hold, and the longest track
+/// alone they hold, in that order, each present when the rows hold any of its form.
+///
+/// A reference's raster and length follow the client's media, so these bound what a request's
+/// references are and are none of a request's own: an opening of the layout encodes its
+/// references one after another, and none is larger in pixels, in frames or in samples than one
+/// of these. An image reference is encoded at a short edge of at most the declared edge
+/// ([`REFERENCE_LIMITS`]`.image_short_edge`) within the canvas rule's aspects, so the largest
+/// is that edge by four times it, fewer cells where the rows hold fewer, as square as they
+/// divide. A video reference is put on the canvas of its aspect and lasts at most the generated
+/// video: the longest lasts `longest` frames at `canvas`, its frames and then its sides halved
+/// until its rows fit.
+fn largest_references(
+    (width, height): (u32, u32),
+    longest: u32,
+    rows: u32,
+    packing: &ConditionPacking,
+) -> Vec<ConditionShape> {
     let cell = processing::minimax_h3::PATCH_PIXELS;
     let reference = |frames: u32, height: u32, width: u32, audio_samples: u32| ConditionShape {
         role: ConditionRole::Reference,
@@ -1127,250 +1115,57 @@ fn reference_openings(
         width,
         audio_samples,
     };
-    let rows = |shape: &ConditionShape| -> u32 {
-        let (audio, visual) = packing::condition_rows(shape);
-        let grid = [
-            FRAMES.latent_frames(shape.frames),
-            shape.height / cell,
-            shape.width / cell,
-        ];
-        let visual = match (shape.frames, visual) {
-            (_, 0) => processing::minimax_h3::rules::VisualRows::None,
-            (1, rows) => processing::minimax_h3::rules::VisualRows::Patches(rows as u32),
-            _ => processing::minimax_h3::rules::VisualRows::Grid(grid),
-        };
-        let tiles = processing::minimax_h3::rules::condition_tiles(audio as u32, visual, packing);
-        tiles.saturating_mul(packing.tile_rows.get())
-    };
     let samples = |frames: u32| frames * AUDIO_SAMPLE_RATE / FPS;
+    let holds = |shape: &ConditionShape| reference_rows(shape, packing) <= rows;
 
-    let mut openings: Vec<(u32, Vec<ConditionShape>)> = Vec::new();
-    for &rung in ladder {
-        let mut sets = Vec::new();
+    let mut largest = Vec::new();
 
-        // The image of the most cells the rung holds within the declared edge and the widest
-        // aspect, as square as they divide.
-        let tile = packing.tile_rows.get();
-        let cells = rung / tile * tile;
-        let (narrow, wide) = (CANVAS_RULE.widest.1.max(1), CANVAS_RULE.widest.0);
-        let short = (REFERENCE_LIMITS.image_short_edge / cell).max(1);
-        let side = (f64::from(cells).sqrt() as u32).clamp(1, short);
-        let long = (cells / side).min(side * wide / narrow);
-        if long > 0 {
-            sets.push(reference(1, side * cell, long * cell, 0));
-        }
-
-        // The longest video at the widest raster the rung holds, with its soundtrack.
-        let (mut height, mut width) = (resolution.canvas.height, resolution.canvas.width);
-        'video: while height >= cell && width >= cell {
-            let mut frames = FRAMES.align_down(longest);
-            while let Some(count) = frames {
-                let video = reference(count, height, width, samples(count));
-                if rows(&video) <= rung {
-                    sets.push(video);
-                    break 'video;
-                }
-                frames = count
-                    .checked_sub(FRAMES.clip_frames)
-                    .filter(|shorter| FRAMES.is_legal(*shorter));
-            }
-            height = (height / 2 / cell) * cell;
-            width = (width / 2 / cell) * cell;
-        }
-
-        // The longest track alone the rung holds.
-        let mut track = samples(longest);
-        while track > 0 {
-            let audio = reference(0, 0, 0, track);
-            if rows(&audio) <= rung {
-                sets.push(audio);
-                break;
-            }
-            track /= 2;
-        }
-
-        // Each set on the smallest rung that holds it, as a request of it rides.
-        for set in sets {
-            let taken = rows(&set);
-            if let Some(served) = ladder.iter().copied().find(|served| *served >= taken) {
-                let opening = (served, vec![set]);
-                if !openings.contains(&opening) {
-                    openings.push(opening);
-                }
-            }
-        }
+    // The image of the most cells the rows hold within the declared edge and the widest aspect,
+    // as square as they divide.
+    let tile = packing.tile_rows.get();
+    let cells = rows / tile * tile;
+    let (narrow, wide) = (CANVAS_RULE.widest.1.max(1), CANVAS_RULE.widest.0);
+    let short = (REFERENCE_LIMITS.image_short_edge / cell).max(1);
+    let side = (f64::from(cells).sqrt() as u32).clamp(1, short);
+    let long = (cells / side).min(side * wide / narrow);
+    if long > 0 {
+        largest.push(reference(1, side * cell, long * cell, 0));
     }
-    openings
-}
 
-/// The prompts with vision blocks whose eager encodes a deployment's text encoder is profiled
-/// over ([`VideoModel::warm_prompts`]).
-///
-/// - `fl2va` fixes its grids: per served resolution, a prompt of each keyframe count, each
-///   keyframe at the processor's grid of the resolution.
-/// - `ref2va` presents its references at grids that follow the client's media, so it warms the
-///   prompts that bound every presentation it admits ([`reference_prompts`]).
-/// - `t2va` presents none.
-///
-/// A prompt's ids present each block as the text encoder reads a vision block: one `placeholder`
-/// (the tower's image token) per merged row, between two text tokens that stand for the block's
-/// `<|vision_start|>` and `<|vision_end|>` markers. An encode's work follows from the placeholder
-/// runs and the prompt's length alone, so any text token stands for a marker.
-#[expect(
-    clippy::type_complexity,
-    reason = "each prompt's grids and ids, as `VideoModel::warm_prompts` states them"
-)]
-fn warm_prompts(
-    tasks: &[VideoTask],
-    serving: &VideoServing,
-    (processor, placeholder): (Option<&processing::qwen_vl::ProcessorConfig>, Option<u32>),
-) -> Result<Vec<(Vec<[u32; 3]>, Vec<u32>)>> {
-    /// The keyframes an `fl2va` prompt presents at most: the first frame and the last.
-    const KEYFRAMES: u32 = 2;
-
-    let keyframes = tasks.contains(&VideoTask::FirstLastToVideoAudio);
-    let references = tasks.contains(&VideoTask::ReferenceToVideoAudio);
-    if !keyframes && !references {
-        return Ok(Vec::new());
-    }
-    let processor = processor.ok_or_else(|| {
-        ID.checkpoint(
-            "the deployment serves vision blocks and the checkpoint states no \
-             processor/video_preprocessor_config.json, so the vision grid a block presents \
-             cannot be sized"
-                .to_owned(),
-        )
-    })?;
-    let placeholder = placeholder.ok_or_else(|| {
-        ID.checkpoint(
-            "the deployment serves vision blocks and the text encoder states no vision tower, \
-             so no prompt presents one"
-                .to_owned(),
-        )
-    })?;
-
-    let mut prompts: Vec<(Vec<[u32; 3]>, Vec<u32>)> = Vec::new();
-    if keyframes {
-        for resolution in served_resolutions(&serving.sizes)? {
-            let (width, height) = (resolution.canvas.width, resolution.canvas.height);
-            let grid = processor
-                .image_grid(height, width)
-                .map_err(|error| ID.config(format!("a keyframe of {width}x{height}: {error}")))?;
-
-            // Each temporal step of a block presents one run of merged tokens.
-            let tokens = grid.t * processor.block_tokens(grid);
-            let grids = [[grid.t, grid.h, grid.w]];
-            for count in 1..=KEYFRAMES {
-                let prompt = presented(&grids.repeat(count as usize), &[tokens], placeholder);
-                if !prompts.contains(&prompt) {
-                    prompts.push(prompt);
-                }
+    // The longest video at the widest raster the rows hold, with its soundtrack.
+    let (mut height, mut width) = (height, width);
+    'video: while height >= cell && width >= cell {
+        let mut frames = FRAMES.align_down(longest);
+        while let Some(count) = frames {
+            let video = reference(count, height, width, samples(count));
+            if holds(&video) {
+                largest.push(video);
+                break 'video;
             }
+            frames = count
+                .checked_sub(FRAMES.clip_frames)
+                .filter(|shorter| FRAMES.is_legal(*shorter));
         }
+        height = (height / 2 / cell) * cell;
+        width = (width / 2 / cell) * cell;
     }
-    if references {
-        for prompt in reference_prompts(serving, processor.merge_size, placeholder) {
-            if !prompts.contains(&prompt) {
-                prompts.push(prompt);
-            }
+
+    // The longest track alone the rows hold.
+    let mut track = samples(longest);
+    while track > 0 {
+        let audio = reference(0, 0, 0, track);
+        if holds(&audio) {
+            largest.push(audio);
+            break;
         }
+        track /= 2;
     }
-    Ok(prompts)
-}
-
-/// The prompts that bound every `ref2va` presentation a deployment serving `serving` admits:
-/// per prompt capacity, the capacity's tokens presenting vision rows in one block, and in as
-/// many blocks as a request presents at most, every token but the blocks' markers a vision
-/// row; each block an image of one time step and `merge` (the tower's merge side) patch rows,
-/// its merged rows sharing the blocks' rows as evenly as they divide.
-///
-/// An admitted presentation rides a capacity of at least its tokens (the deployment refuses a
-/// prompt longer than its largest), and every condition with a vision view presents one grid,
-/// so it presents at most that capacity less two markers per grid as vision rows, in at most
-/// [`REFERENCE_LIMITS`]' images and videos. The text encoder's host values and the region its
-/// eager encode computes in grow with the vision rows and the grids that present them, and an
-/// image of one time step costs the most of any grid per merged row: the position table is
-/// sampled for every frame, and a video's time steps share their frame's. The capacity's
-/// presentation in one grid holds the largest grid any admitted prompt encodes, and in the most
-/// grids the most host copies (`Graphs::input_peak` holds every forward of no more copies and
-/// no more bytes than a profiled one).
-fn reference_prompts(
-    serving: &VideoServing,
-    merge: u32,
-    placeholder: u32,
-) -> Vec<(Vec<[u32; 3]>, Vec<u32>)> {
-    // The markers around each block's run of placeholders.
-    const MARKERS: u32 = 2;
-    let blocks =
-        (REFERENCE_LIMITS.images + REFERENCE_LIMITS.videos).clamp(1, REFERENCE_LIMITS.total.max(1));
-    let merge = merge.max(1);
-
-    let mut prompts = Vec::new();
-    for &capacity in &serving.text_capacities {
-        for count in [1, blocks] {
-            // Each block holds at least one vision row beside its markers.
-            if capacity < count * (MARKERS + 1) {
-                continue;
-            }
-            let rows = capacity - count * MARKERS;
-            let shares: Vec<u32> = (0..count)
-                .map(|block| rows / count + u32::from(block < rows % count))
-                .collect();
-
-            // A block of `share` merged rows is `merge` patch rows by `merge · share` columns.
-            let grids: Vec<[u32; 3]> = shares
-                .iter()
-                .map(|share| [1, merge, merge * share])
-                .collect();
-            prompts.push(presented(&grids, &shares, placeholder));
-        }
-    }
-    prompts
-}
-
-/// The prompt that presents `grids`, block `i` of `tokens[i]` merged rows (the last entry
-/// standing for every later block), as the text encoder reads a vision block: its placeholders
-/// between two marker tokens.
-fn presented(grids: &[[u32; 3]], tokens: &[u32], placeholder: u32) -> (Vec<[u32; 3]>, Vec<u32>) {
-    /// The text token that stands for a block's markers.
-    const MARKER: u32 = 0;
-
-    let mut ids = Vec::new();
-    for index in 0..grids.len() {
-        let rows = tokens.get(index).or(tokens.last()).copied().unwrap_or(0);
-        ids.push(MARKER);
-        ids.extend(std::iter::repeat_n(placeholder, rows as usize));
-        ids.push(MARKER);
-    }
-    (grids.to_vec(), ids)
+    largest
 }
 
 #[cfg(test)]
 mod tests {
-    use processing::qwen_vl::ProcessorConfig;
-
     use super::*;
-
-    /// The released processor: 16-pixel patches merged 2x2, an image budget of 64Ki to 16Mi
-    /// pixels.
-    fn processor() -> ProcessorConfig {
-        ProcessorConfig::parse(
-            r#"{"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
-                "size": {"shortest_edge": 65536, "longest_edge": 16777216}}"#,
-            r#"{"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
-                "size": {"shortest_edge": 4096, "longest_edge": 25165824}}"#,
-        )
-        .unwrap()
-    }
-
-    fn serving() -> VideoServing {
-        VideoServing {
-            sizes: vec![(1344, 768)],
-            max_seconds: 4.0,
-            text_capacities: vec![2048],
-            condition_rows: None,
-        }
-    }
 
     /// The pipeline execution runs is one it can run: its products' phases and its blocks'
     /// phases are phases of it, and each product and block is declared once.
@@ -1386,14 +1181,13 @@ mod tests {
     /// is one network's, and a checkpoint that states no task serves nothing.
     #[test]
     fn the_served_tasks_are_those_of_the_checkpoints_one_network() {
-        let checkpoint = Path::new("/models/fasth3");
         let tasks = [
             VideoTask::TextToVideoAudio,
             VideoTask::FirstLastToVideoAudio,
         ];
-        assert_eq!(served_tasks(&tasks, None, checkpoint).unwrap(), tasks);
+        assert_eq!(served_tasks(&tasks, None).unwrap(), tasks);
 
-        let none = served_tasks(&[], None, checkpoint).unwrap_err();
+        let none = served_tasks(&[], None).unwrap_err();
         assert!(none.to_string().contains("states no task"), "{none}");
 
         let both = [
@@ -1401,7 +1195,7 @@ mod tests {
             VideoTask::ReferenceToVideoAudio,
         ];
         assert!(
-            served_tasks(&both, None, checkpoint).is_err(),
+            served_tasks(&both, None).is_err(),
             "two networks need a deployment file to choose between them"
         );
     }
@@ -1410,7 +1204,6 @@ mod tests {
     /// none of the checkpoint's networks is refused.
     #[test]
     fn a_placed_network_chooses_the_tasks() {
-        let checkpoint = Path::new("/models/minimax-h3");
         let both = [
             VideoTask::TextToVideoAudio,
             VideoTask::ReferenceToVideoAudio,
@@ -1420,24 +1213,19 @@ mod tests {
         };
 
         assert_eq!(
-            served_tasks(
-                &both,
-                Some(&placed(&["transformer_ref", "text_encoder"])),
-                checkpoint
-            )
-            .unwrap(),
+            served_tasks(&both, Some(&placed(&["transformer_ref", "text_encoder"])),).unwrap(),
             [VideoTask::ReferenceToVideoAudio]
         );
 
         // A group that places no network serves beside the one the deployment places.
         assert_eq!(
-            served_tasks(&both, Some(&placed(&["text_encoder"])), checkpoint).unwrap(),
+            served_tasks(&both, Some(&placed(&["text_encoder"]))).unwrap(),
             both
         );
 
         // A network the checkpoint does not hold serves no task.
         let base = [VideoTask::TextToVideoAudio];
-        assert!(served_tasks(&base, Some(&placed(&["transformer_ref"])), checkpoint).is_err());
+        assert!(served_tasks(&base, Some(&placed(&["transformer_ref"]))).is_err());
     }
 
     /// Every task places the text encoder, the decoders and the splice with its network; a
@@ -1543,259 +1331,45 @@ mod tests {
         assert_eq!(capacity(VideoTask::ReferenceToVideoAudio), 2112);
     }
 
-    /// An `fl2va` deployment admits, per served resolution, a prompt of one keyframe and one
-    /// of both anchors, each keyframe at the processor's grid of the resolution; a `t2va` one
-    /// admits none.
+    /// The largest references a rung of OmniRef's tiling holds: an image, a video with its
+    /// soundtrack and a track alone, none taking more rows than the rung, whatever the client's
+    /// media are. The widest rung holds the largest image a request presents (the declared short
+    /// edge by four times it) and the longest video at the canvas; a rung too small for a video
+    /// at the canvas holds one of halved sides.
     #[test]
-    fn a_keyframe_presents_the_grid_of_its_resolution() {
-        // 768x1344 pixels are 48x84 patches of one temporal step, which merge to 1008 tokens:
-        // a keyframe's run of placeholders between its two markers.
-        const IMAGE: u32 = 151_655;
-        let prompts = warm_prompts(
-            &[VideoTask::FirstLastToVideoAudio],
-            &serving(),
-            (Some(&processor()), Some(IMAGE)),
-        )
-        .unwrap();
-        let grids: Vec<&Vec<[u32; 3]>> = prompts.iter().map(|(grids, _)| grids).collect();
-        assert_eq!(grids, [&vec![[1, 48, 84]], &vec![[1, 48, 84], [1, 48, 84]]]);
-        for (grids, ids) in &prompts {
-            let placeholders = ids.iter().filter(|id| **id == IMAGE).count();
-            assert_eq!(placeholders, 1008 * grids.len());
-            assert_eq!(ids.len(), 1010 * grids.len());
-            // Each block is one run of placeholders, apart from the next.
-            let runs = ids
-                .chunk_by(|left, right| (*left == IMAGE) == (*right == IMAGE))
-                .filter(|run| run[0] == IMAGE)
-                .count();
-            assert_eq!(runs, grids.len());
-        }
-
-        assert_eq!(
-            warm_prompts(&[VideoTask::TextToVideoAudio], &serving(), (None, None)).unwrap(),
-            Vec::new()
-        );
-        assert!(
-            warm_prompts(
-                &[VideoTask::FirstLastToVideoAudio],
-                &serving(),
-                (None, Some(IMAGE))
-            )
-            .is_err(),
-            "an fl2va deployment cannot size a keyframe without the processor"
-        );
-        assert!(
-            warm_prompts(
-                &[VideoTask::FirstLastToVideoAudio],
-                &serving(),
-                (Some(&processor()), None)
-            )
-            .is_err(),
-            "an fl2va deployment presents no keyframe without a vision tower"
-        );
-    }
-
-    /// A `ref2va` deployment, whose references present grids that follow the client's media,
-    /// warms per prompt capacity the capacity's tokens presenting vision rows in one block and
-    /// in the most blocks a request presents (its images and videos), every token beside the
-    /// blocks' markers a vision row, each block's grid merging to its run of placeholders.
-    #[test]
-    fn a_reference_deployment_warms_the_most_vision_rows_each_capacity_presents() {
-        const IMAGE: u32 = 151_655;
-        let serving = VideoServing {
-            text_capacities: vec![1024, 8192],
-            ..serving()
-        };
-        let prompts = warm_prompts(
-            &[VideoTask::ReferenceToVideoAudio],
-            &serving,
-            (Some(&processor()), Some(IMAGE)),
-        )
-        .unwrap();
-
-        let most = REFERENCE_LIMITS.images + REFERENCE_LIMITS.videos;
-        let shape: Vec<(usize, usize)> = prompts
-            .iter()
-            .map(|(grids, ids)| (ids.len(), grids.len()))
-            .collect();
-        assert_eq!(
-            shape,
-            [
-                (1024, 1),
-                (1024, most as usize),
-                (8192, 1),
-                (8192, most as usize)
-            ]
-        );
-        for (grids, ids) in &prompts {
-            // Two markers a block, and every other token a placeholder.
-            let placeholders = ids.iter().filter(|id| **id == IMAGE).count();
-            assert_eq!(placeholders, ids.len() - 2 * grids.len());
-
-            // Each block is one run, of the merged rows its grid's patches make.
-            let runs: Vec<usize> = ids
-                .chunk_by(|left, right| (*left == IMAGE) == (*right == IMAGE))
-                .filter(|run| run[0] == IMAGE)
-                .map(<[u32]>::len)
-                .collect();
-            let merged: Vec<usize> = grids
-                .iter()
-                .map(|[time, rows, columns]| (time * rows * columns / 4) as usize)
-                .collect();
-            assert_eq!(runs, merged);
-        }
-    }
-
-    /// A `ref2va` layout's profile opens with, per rung, the largest image, the longest and
-    /// widest video with its soundtrack and the longest track alone the rung's rows hold, each
-    /// on the smallest rung that holds it, as a request of it rides, whatever the client's media
-    /// are; a rung too small for a video at the canvas holds one of halved sides.
-    #[test]
-    fn a_reference_rung_opens_with_the_largest_references_it_holds() {
+    fn a_rung_holds_the_largest_reference_of_each_form() {
         // OmniRef's tiling: 128-row tiles, a video's token grid in tiles of 4 x 4 x 8 tokens.
         let packing = ConditionPacking::tiled(49_152, 128, [4, 4, 8]).unwrap();
-        let ladder = [1024, 49_152];
-        let candidates = candidates(
-            &[VideoTask::ReferenceToVideoAudio],
-            &serving(),
-            &ladder,
-            &packing,
-            Some(&processor()),
-        )
-        .unwrap();
-        assert_eq!(candidates.len(), 2, "one request per rung");
+        // A four-second request at 1344x768: 107 frames.
+        let largest = |rows| largest_references((1344, 768), 107, rows, &packing);
 
-        let mut kinds = Vec::new();
-        for (request, sets) in &candidates {
-            let rung = request.condition_rows.unwrap();
-            for set in sets {
-                let [reference] = set.as_slice() else {
-                    panic!("one reference a set: {set:?}");
-                };
+        for rows in [1024, 49_152] {
+            let references = largest(rows);
+            let forms: Vec<(bool, bool)> = references
+                .iter()
+                .map(|reference| (reference.frames > 0, reference.audio_samples > 0))
+                .collect();
+            assert_eq!(
+                forms,
+                [(true, false), (true, true), (false, true)],
+                "{rows}"
+            );
+
+            for reference in &references {
                 assert_eq!(reference.role, ConditionRole::Reference);
-                kinds.push((reference.frames > 0, reference.audio_samples > 0));
-
-                // The smallest rung that holds the set is the one it opens.
-                let (audio, visual) = packing::condition_rows(reference);
-                assert!(audio + visual <= rung as usize, "{reference:?} on {rung}");
+                assert!(
+                    reference_rows(reference, &packing) <= rows,
+                    "{reference:?} in {rows} rows"
+                );
             }
         }
-        // An image, a video with its soundtrack and a track alone.
-        for kind in [(true, false), (true, true), (false, true)] {
-            assert!(kinds.contains(&kind), "{kinds:?}");
-        }
 
-        // The widest rung holds the largest image a request presents: the declared short edge
-        // by four times it.
-        let image = candidates
-            .iter()
-            .flat_map(|(_, sets)| sets.iter().flatten())
-            .filter(|reference| reference.frames == 1)
-            .map(|reference| (reference.height, reference.width))
-            .max();
-        assert_eq!(image, Some((2048, 8192)));
-
-        // The widest rung holds the longest video at the canvas; the narrowest one of halved
-        // sides.
-        let video = |rung: u32| {
-            let (_, sets) = candidates
-                .iter()
-                .find(|(request, _)| request.condition_rows == Some(rung))
-                .unwrap();
-            sets.iter()
-                .flatten()
-                .find(|reference| reference.frames > 1)
-                .copied()
-                .unwrap()
-        };
+        let widest = largest(49_152);
+        assert_eq!((widest[0].height, widest[0].width), (2048, 8192));
         assert_eq!(
-            (
-                video(49_152).frames,
-                video(49_152).width,
-                video(49_152).height
-            ),
+            (widest[1].frames, widest[1].width, widest[1].height),
             (107, 1344, 768)
         );
-        assert!(video(1024).width < 1344);
-    }
-
-    /// An `fl2va` layout opens with the keyframe sets its rung serves, each keyframe at the
-    /// resolution's raster: one keyframe (either anchor) on the rung that holds one frame,
-    /// both on the rung that holds two, and a `t2va` layout with none.
-    #[test]
-    fn a_rung_opens_with_the_keyframes_it_holds() {
-        // Row for row: a 1344x768 keyframe is 42x24 latent patches, 1008 rows.
-        let packing = ConditionPacking::dense(2048);
-        let candidates = candidates(
-            &[
-                VideoTask::TextToVideoAudio,
-                VideoTask::FirstLastToVideoAudio,
-            ],
-            &serving(),
-            &[1024, 2048],
-            &packing,
-            Some(&processor()),
-        )
-        .unwrap();
-
-        // One request per task and rung at the one size, frame count and prompt capacity.
-        assert_eq!(candidates.len(), 3);
-        assert!(candidates.iter().all(|(request, _)| request.frames == 107));
-
-        // A request states the task it is captured for by the roles of its conditions.
-        let tasks: Vec<VideoTask> = candidates
-            .iter()
-            .map(|(request, _)| {
-                VideoTask::of(
-                    request.count(ConditionRole::FirstFrame),
-                    request.count(ConditionRole::LastFrame),
-                    request.count(ConditionRole::Reference),
-                )
-            })
-            .collect();
-        assert_eq!(
-            tasks,
-            [
-                VideoTask::TextToVideoAudio,
-                VideoTask::FirstLastToVideoAudio,
-                VideoTask::FirstLastToVideoAudio,
-            ]
-        );
-        let reference = super::candidates(
-            &[VideoTask::ReferenceToVideoAudio],
-            &serving(),
-            &[1024],
-            &packing,
-            None,
-        )
-        .unwrap();
-        assert_eq!(reference[0].0.roles, [ConditionRole::Reference]);
-        assert_eq!(reference[0].0.condition_rows, Some(1024));
-
-        let resolution = &served_resolutions(&[(1344, 768)]).unwrap()[0];
-        let opened = |rung: Option<u32>| -> Vec<Vec<ConditionShape>> {
-            candidates
-                .iter()
-                .find(|(request, _)| request.condition_rows == rung)
-                .unwrap()
-                .1
-                .clone()
-        };
-
-        assert_eq!(opened(None), Vec::<Vec<ConditionShape>>::new());
-        assert_eq!(
-            opened(Some(1024)),
-            vec![
-                vec![keyframe(ConditionRole::FirstFrame, resolution)],
-                vec![keyframe(ConditionRole::LastFrame, resolution)],
-            ]
-        );
-        assert_eq!(
-            opened(Some(2048)),
-            vec![vec![
-                keyframe(ConditionRole::FirstFrame, resolution),
-                keyframe(ConditionRole::LastFrame, resolution),
-            ]]
-        );
+        assert!(largest(1024)[1].width < 1344);
     }
 }

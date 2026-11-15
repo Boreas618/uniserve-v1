@@ -85,7 +85,7 @@ pub(crate) struct EncoderConfig {
     /// The class of the vision pixels product, which a prompt with vision blocks reads.
     pub pixels: u8,
     /// The prompts with vision blocks its eager encodes are profiled over
-    /// (`nn::family::VideoModel::warm_prompts`): those the deployment admits whose grids it
+    /// ([`crate::runner::captures::warm_prompts`]): those the deployment admits whose grids it
     /// fixes, and those that bound the presentations whose grids follow the client's media;
     /// each prompt's grids and the token ids that present them. Empty for an encoder that takes
     /// no image.

@@ -44,7 +44,7 @@
 //! ## Buckets
 //!
 //! One bucket per distinct layout of each served request shape, from the deployment's
-//! candidates (`nn::family::VideoModel::candidates`) in their order: the model's layout of a
+//! candidates ([`super::captures::candidates`]) in their order: the model's layout of a
 //! candidate is the bucket's extent, and candidates its padding collapses onto one layout share
 //! the bucket of the first, which is the request its graph is captured from. A step's bucket is
 //! captured; a preparation's bucket of the same extent is profiled and run eagerly
@@ -139,8 +139,8 @@ type Moves = (PitchedBatch, PitchedBatch, Vec<(u8, u32)>);
 pub(crate) struct DenoiserConfig {
     /// The phases the runner serves: a video request's latent preparation and its steps.
     pub phases: Vec<Phase>,
-    /// The requests the deployment serves (`nn::family::VideoModel::candidates`): one per layout a
-    /// request may take, each with the condition sets a request of it may open with.
+    /// The requests the deployment serves ([`crate::runner::captures::candidates`]): one per
+    /// layout a request may take, each with the condition sets a request of it may open with.
     pub candidates: Vec<(VideoRequest, Vec<Vec<ConditionShape>>)>,
     /// The element type of the conditioning the text encoder writes, which the stack reads.
     pub stack: DType,

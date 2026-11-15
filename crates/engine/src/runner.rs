@@ -89,6 +89,8 @@
 //! that start with its batches through it, on its own stream.
 
 pub mod buckets;
+// What a video deployment captures and warms, from its model's declarations.
+pub(crate) mod captures;
 pub mod causal_lm;
 // The host conversions of condition media: an image's patch rows for the vision runner, a
 // video request's condition pixels and tracks for the media host.
