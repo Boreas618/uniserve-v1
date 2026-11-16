@@ -775,7 +775,7 @@ def _restart_while_streaming(
     # changes the epoch in an operation of its own.
     previous = successors[-1]
     before = admin.next_event(server)
-    both = _apply(server, "admin_config.host=127.0.0.1", CHANGE)
+    both = _apply(server, 'admin_config.host="127.0.0.1"', CHANGE)
     assert both["change"] == "daemon", both
     assert both["then"] == "update", both
     successors.append(both["pid"])
@@ -1416,8 +1416,13 @@ def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
                     "the previous epoch kept more than its weights",
                 )
             except TimeoutError as timeout:
+                held = [
+                    entry
+                    for entry in admin.reservations(server)
+                    if previous in entry["epochs"]
+                ]
                 raise AssertionError(
-                    f"the previous epoch keeps {sorted(kept())}"
+                    f"the previous epoch keeps {json.dumps(held)}"
                 ) from timeout
         before_rollback = admin.next_event(server)
         rolled = admin.operation(
