@@ -71,19 +71,25 @@ pub(crate) struct Node {
     /// ([`crate::engine::control::host_scopes`]): the scopes its workers
     /// retain their tensors under, which every claim of the epoch there states.
     scopes: Vec<process::Scope>,
+    /// The layout its replica lays its device memory out in
+    /// ([`proto::config::EngineConfig::layout`]), which names its device regions: two engines of
+    /// one layout share their regions and the segments in them.
+    layout: proto::config::Layout,
 }
 
 impl Node {
     /// The engine of launch generation `launch` on `host`, whose first rank
     /// is group rank `rank`, of the world whose scheduler node's main
-    /// process is of launch generation `head`, and whose epoch's ranks on
-    /// `host` have the storage scopes `scopes`.
+    /// process is of launch generation `head`, whose epoch's ranks on
+    /// `host` have the storage scopes `scopes`, and whose replica lays its
+    /// device memory out in `layout`.
     pub(crate) fn new(
         host: String,
         rank: u32,
         launch: u64,
         head: u64,
         scopes: Vec<process::Scope>,
+        layout: proto::config::Layout,
     ) -> Self {
         Self {
             host,
@@ -92,7 +98,21 @@ impl Node {
             head,
             generation: None,
             scopes,
+            layout,
         }
+    }
+
+    /// Whether this engine's device memory moves across the switch to or from the engines on the
+    /// other side of it, which lay their memory out in `others`: when none of them lays its memory out as this one does,
+    /// this one's regions are its own, so its drain gives their memory back (`shrink`) and its
+    /// promotion grows into what the other side gives back. An engine whose layout one of
+    /// `others` (their layouts) shares names the same regions, which hold the same segments for both: it keeps
+    /// them through its drain and grows into nothing at its promotion.
+    fn moves_across<'a>(
+        &self,
+        others: impl IntoIterator<Item = &'a proto::config::Layout>,
+    ) -> bool {
+        !others.into_iter().any(|other| *other == self.layout)
     }
 }
 
@@ -117,9 +137,10 @@ pub(crate) struct EpochSwitch {
     /// How long a draining engine steps its requests after its `Drain`
     /// (`update_config.drain_s`).
     pub(crate) drain: Duration,
-    /// Whether the two epochs' layouts differ: the side that drains gives its
-    /// device memory back as it drains, and the side promoted grows into it.
-    pub(crate) shrink: bool,
+    /// The layouts the target replicas lay their device memory out in, one per replica: a
+    /// serving engine whose layout none of them shares drains with `shrink`
+    /// ([`Node::moves_across`]).
+    pub(crate) target_layouts: Vec<proto::config::Layout>,
     /// Epochs an earlier update dropped whose storage the next claim retires.
     pub(crate) retire: Vec<u64>,
 }
@@ -398,7 +419,10 @@ impl Update {
                         target: trial.switch.launches.len(),
                     },
                     drain_s: trial.switch.drain.as_secs_f64(),
-                    shrink: trial.switch.shrink,
+                    shrink: self
+                        .nodes
+                        .iter()
+                        .any(|node| node.moves_across(&trial.switch.target_layouts)),
                     previous_epoch_kept: trial.kept,
                     host_refused: trial.host_refused.clone(),
                     moved_to_host_bytes: trial.moved_bytes,
@@ -577,6 +601,7 @@ impl Update {
                         .as_ref()
                         .map_or(launch.engine, |world| world.scheduler),
                     crate::engine::control::host_scopes(&launch.engine_config, &launch.host),
+                    launch.engine_config.layout(),
                 ));
             }
         }
@@ -764,8 +789,9 @@ impl Update {
             }
             // On the way back the targets drain beside the previous epoch, which grows into what
             // they give back on the host the release names.
-            (Phase::Switching, true, Some(report::Kind::Shrunk(shrunk))) if trial.switch.shrink => {
-                grow_on(processes, &shrunk.host, &self.nodes);
+            (Phase::Switching, true, Some(report::Kind::Shrunk(shrunk))) => {
+                let growing = growing(&self.nodes, trial.targets.iter().map(|node| &node.layout));
+                grow_on(processes, &shrunk.host, &growing);
             }
             // A target that fails while the switch runs back is stopped: it
             // drains nothing more.
@@ -804,10 +830,9 @@ impl Update {
             }
             // A serving engine draining across layouts gave device memory back on the host the
             // release names: the targets with ranks there grow into it, one release at a time.
-            (Phase::Switching | Phase::Trial, false, Some(report::Kind::Shrunk(shrunk)))
-                if trial.switch.shrink =>
-            {
-                grow_on(processes, &shrunk.host, &trial.targets);
+            (Phase::Switching | Phase::Trial, false, Some(report::Kind::Shrunk(shrunk))) => {
+                let growing = growing(&trial.targets, self.nodes.iter().map(|node| &node.layout));
+                grow_on(processes, &shrunk.host, &growing);
             }
             _ => {}
         }
@@ -1102,7 +1127,10 @@ impl Update {
                         processes.command(
                             &node.host,
                             node.launch,
-                            promote(trial.switch.recompute, trial.switch.shrink),
+                            promote(
+                                trial.switch.recompute,
+                                node.moves_across(&trial.switch.target_layouts),
+                            ),
                         );
                     }
                 }
@@ -1124,7 +1152,10 @@ impl Update {
         processes.command(
             &node.host,
             node.launch,
-            promote(trial.switch.recompute, trial.switch.shrink),
+            promote(
+                trial.switch.recompute,
+                node.moves_across(&trial.switch.target_layouts),
+            ),
         );
     }
 
@@ -1172,9 +1203,13 @@ impl Update {
                 }
             }
             Form::Epoch(trial) => {
-                let promotion = promote(trial.switch.recompute, trial.switch.shrink);
                 for target in &trial.targets {
-                    processes.command(&target.host, target.launch, promotion.clone());
+                    let grow = target.moves_across(self.nodes.iter().map(|node| &node.layout));
+                    processes.command(
+                        &target.host,
+                        target.launch,
+                        promote(trial.switch.recompute, grow),
+                    );
                 }
             }
         }
@@ -1187,10 +1222,11 @@ impl Update {
         if let Form::Epoch(trial) = &mut self.form {
             if !trial.draining && trial.serving.len() == trial.targets.len() {
                 trial.draining = true;
-                let drain = drain(serving, &trial.switch);
                 for (index, node) in self.nodes.iter().enumerate() {
                     if !trial.drained.contains(&index) {
-                        processes.command(&node.host, node.launch, drain.clone());
+                        let shrink = node.moves_across(&trial.switch.target_layouts);
+                        let drain = drain(serving, &trial.switch, shrink);
+                        processes.command(&node.host, node.launch, drain);
                     }
                 }
             }
@@ -1255,10 +1291,12 @@ impl Update {
                 }
                 if !trial.targets_draining {
                     trial.targets_draining = true;
-                    let drain = drain(trial.switch.epoch, &trial.switch);
                     for (index, target) in trial.targets.iter().enumerate() {
                         if !trial.target_left.contains(&index) {
-                            processes.command(&target.host, target.launch, drain.clone());
+                            let shrink =
+                                target.moves_across(self.nodes.iter().map(|node| &node.layout));
+                            let drain = drain(trial.switch.epoch, &trial.switch, shrink);
+                            processes.command(&target.host, target.launch, drain);
                         }
                     }
                 }
@@ -1317,12 +1355,26 @@ pub(crate) fn promote(recompute: bool, grow: bool) -> process::Command {
     command(command::Kind::Promote(process::Promote { recompute, grow }))
 }
 
-/// The drain of the engines executing `epoch` in `switch`: the deadline from
-/// now, and `shrink` when the two epochs' layouts differ.
-fn drain(epoch: u64, switch: &EpochSwitch) -> process::Command {
+/// The drain of an engine executing `epoch` in `switch`: the deadline from
+/// now, and `shrink` when the engine's device memory moves to the other side
+/// of the switch ([`Node::moves_across`]).
+fn drain(epoch: u64, switch: &EpochSwitch, shrink: bool) -> process::Command {
     command(command::Kind::Drain(process::Drain {
         epoch,
         deadline_ms: u64::try_from(switch.drain.as_millis()).unwrap_or(u64::MAX),
-        shrink: switch.shrink,
+        shrink,
     }))
+}
+
+/// The engines of `side` that grow into the memory the other side's engines, which lay their
+/// memory out in `other`, give back: those whose device memory moves across the switch
+/// ([`Node::moves_across`]).
+fn growing<'a>(
+    side: &[Node],
+    other: impl IntoIterator<Item = &'a proto::config::Layout> + Clone,
+) -> Vec<Node> {
+    side.iter()
+        .filter(|engine| engine.moves_across(other.clone()))
+        .cloned()
+        .collect()
 }

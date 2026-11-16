@@ -192,24 +192,6 @@ fn differing(served: &EngineConfig, target: &EngineConfig) -> Vec<&'static str> 
     parts
 }
 
-/// Whether the replicas `target` places lay their device regions out
-/// otherwise than the replicas `serving` runs: another parallel configuration
-/// (degrees, forms, worker groups, devices, hosts) or another number of
-/// replicas, another slot count, KV layout (block size, cache precision) or
-/// set of graph buckets. Two epochs of one layout name the same regions; two
-/// of different layouts have regions of their own over the same device
-/// memory, so the drain gives the serving epoch's back (`shrink`) and the
-/// target grows into it. The cache's size and its tiers are no layout. The
-/// engine names its device KV regions by the same layout
-/// (`EngineConfig::layout`).
-fn layouts_differ(serving: &[EngineConfig], target: &[EngineConfig]) -> bool {
-    serving.len() != target.len()
-        || serving
-            .iter()
-            .zip(target)
-            .any(|(serving, target)| serving.layout() != target.layout())
-}
-
 impl Leader {
     /// Applies a configuration change as operation `number`, as the module
     /// describes: the least the change needs.
@@ -473,6 +455,13 @@ impl Leader {
             let config = service::lock(&replica.config)
                 .engine_config()
                 .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+            // The layout the replica serves in, from what its engines were launched with.
+            let layout = service::lock(&replica.served)
+                .as_ref()
+                .map(|served| served.engine_config.layout())
+                .ok_or_else(|| {
+                    UpdateError::Refused("a replica with an engine serves no launch".to_owned())
+                })?;
             let ranks = crate::engine::control::world_hosts(&config)
                 .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
             let first_of = |host: &str| {
@@ -500,7 +489,14 @@ impl Leader {
                 })?;
             for (rank, process) in placed {
                 let scopes = crate::engine::control::host_scopes(&config, &process.host);
-                nodes.push(Node::new(process.host, rank, process.engine, head, scopes));
+                nodes.push(Node::new(
+                    process.host,
+                    rank,
+                    process.engine,
+                    head,
+                    scopes,
+                    layout.clone(),
+                ));
             }
         }
         Ok(nodes)
@@ -611,7 +607,17 @@ impl Leader {
                     .map(|args| args.engine_config.clone())
             })
             .collect();
-        let shrink = layouts_differ(&serving_configs, &configs);
+        // A replica's layout (`EngineConfig::layout`: its parallel configuration with its devices
+        // and hosts, slot count, KV layout and graph buckets, not the cache's size or tiers) names
+        // its device regions. A serving replica whose layout a target replica shares keeps its
+        // regions and their segments, which that target maps, through its drain; one whose layout
+        // no target shares gives its memory back (`shrink`), and the targets of layouts of their
+        // own grow into it (`Node::moves_across`). A change of the replica count alone keeps the
+        // layout of every replica it leaves in place.
+        let target_layouts: Vec<_> = configs.iter().map(EngineConfig::layout).collect();
+        let shrink = serving_configs
+            .iter()
+            .any(|serving| !target_layouts.contains(&serving.layout()));
         if request.dry_run {
             return Ok(Applied::DryRun(DryRun::Epoch {
                 epoch: target_epoch,
@@ -687,7 +693,7 @@ impl Leader {
                 keeps: options.previous_epoch,
                 recompute: request.in_flight == InFlight::Recompute,
                 drain: Duration::from_secs_f64(options.drain_s),
-                shrink,
+                target_layouts,
                 retire: self.updates.take_retire(),
             },
             deadline,
@@ -1089,16 +1095,15 @@ mod tests {
     }
 
     /// The target's layout differs from the serving one's in its parallel
-    /// configuration, its devices, its slot count, its KV layout, its graph
-    /// buckets and its number of replicas, and not in the cache's size or its
-    /// tiers.
+    /// configuration, its devices, its slot count, its KV layout and its graph
+    /// buckets, and not in the cache's size or its tiers.
     #[test]
     fn a_layout_is_the_parallel_configuration_slots_kv_layout_and_graph_buckets() {
         let served = config();
         let same = |change: &dyn Fn(&mut EngineConfig)| {
             let mut target = served.clone();
             change(&mut target);
-            !layouts_differ(std::slice::from_ref(&served), &[target])
+            served.layout() == target.layout()
         };
         assert!(same(&|_| {}));
         assert!(same(
@@ -1120,7 +1125,6 @@ mod tests {
             target.cuda_graph.decode_batch_sizes =
                 Some(vec![std::num::NonZeroU32::new(2).unwrap()]);
         }));
-        assert!(layouts_differ(&[served.clone(), served.clone()], &[served]));
     }
 
     /// The status names the epoch that executes; the engine reads no storage

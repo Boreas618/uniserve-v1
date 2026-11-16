@@ -102,12 +102,44 @@ impl Deployment {
             PREVIOUS,
             PREVIOUS,
             scopes(0..1),
+            self.layout(),
         )];
         if engines == 2 {
             self.engines.serve(SECOND);
-            nodes.push(Node::new(HOST.to_owned(), 1, SECOND, SECOND, scopes(1..2)));
+            nodes.push(Node::new(
+                HOST.to_owned(),
+                1,
+                SECOND,
+                SECOND,
+                scopes(1..2),
+                self.layout(),
+            ));
         }
         nodes
+    }
+
+    /// The layout the serving engines and, unless a test moves them across layouts
+    /// ([`Self::across_layouts`]), the targets lay their device memory out in.
+    fn layout(&self) -> proto::config::Layout {
+        self.target.engine.layout()
+    }
+
+    /// Moves `switch`'s targets to another layout than the serving engines' (another slot
+    /// count): their regions are their own, so the serving engines give their memory back as
+    /// they drain and the targets grow into it.
+    fn across_layouts(&self, switch: &mut EpochSwitch) {
+        for (launch, _) in &mut switch.launches {
+            launch.engine_config.max_running_requests = launch
+                .engine_config
+                .max_running_requests
+                .checked_add(1)
+                .expect("a slot count below the maximum");
+        }
+        switch.target_layouts = switch
+            .launches
+            .iter()
+            .map(|(launch, _)| launch.engine_config.layout())
+            .collect();
     }
 
     /// A generation update numbered `number` over `engines` serving engines.
@@ -135,6 +167,7 @@ impl Deployment {
             PREVIOUS,
             PREVIOUS,
             scopes(0..1),
+            self.layout(),
         )];
         self.epoch_over(number, nodes, switch, deadline)
     }
@@ -160,7 +193,7 @@ impl Deployment {
             keeps: PreviousEpoch::Parked,
             recompute: false,
             drain: Duration::from_secs_f64(UpdateConfig::default().drain_s),
-            shrink: false,
+            target_layouts: vec![self.layout()],
             retire: Vec::new(),
         }
     }
@@ -676,7 +709,7 @@ fn the_drain_states_its_deadline_and_shrinks_across_layouts() {
     let mut deployment = Deployment::new(Refusals::default());
     let mut switch = deployment.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
     switch.drain = Duration::from_millis(2_500);
-    switch.shrink = true;
+    deployment.across_layouts(&mut switch);
     let nodes = deployment.nodes(1);
     let update = deployment.epoch_over(1, nodes, switch, None);
     deployment.apply(update);
@@ -722,7 +755,9 @@ fn a_release_of_a_draining_engine_grows_the_targets_on_its_host() {
     for shrink in [true, false] {
         let mut deployment = Deployment::new(Refusals::default());
         let mut switch = deployment.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
-        switch.shrink = shrink;
+        if shrink {
+            deployment.across_layouts(&mut switch);
+        }
         let nodes = deployment.nodes(1);
         let update = deployment.epoch_over(1, nodes, switch, None);
         deployment.apply(update);
@@ -757,7 +792,7 @@ fn a_release_grows_the_scheduler_node_of_each_target_world_with_an_engine_on_its
     let mut peer = target_launch(OTHER, 2, SPAWNED_PEER);
     peer.world = Some(world);
     let mut switch = deployment.switch(vec![(head, vec![1, 2]), (peer, Vec::new())]);
-    switch.shrink = true;
+    deployment.across_layouts(&mut switch);
     let nodes = deployment.nodes(1);
     let update = deployment.epoch_over(1, nodes, switch, None);
     deployment.apply(update);
@@ -795,8 +830,22 @@ fn an_epoch_update_covers_every_node_of_both_epochs() {
         })
         .collect();
     let nodes = vec![
-        Node::new(HOST.to_owned(), 0, PREVIOUS, PREVIOUS, scopes(0..2)),
-        Node::new(OTHER.to_owned(), 2, SECOND, PREVIOUS, scopes(2..4)),
+        Node::new(
+            HOST.to_owned(),
+            0,
+            PREVIOUS,
+            PREVIOUS,
+            scopes(0..2),
+            deployment.layout(),
+        ),
+        Node::new(
+            OTHER.to_owned(),
+            2,
+            SECOND,
+            PREVIOUS,
+            scopes(2..4),
+            deployment.layout(),
+        ),
     ];
     let switch = deployment.switch(vec![
         (target_launch(HOST, 0, SPAWNED), vec![1, 2]),
@@ -944,7 +993,7 @@ fn an_epoch_update_moves_two_replicas_to_one() {
     let mut deployment = Deployment::new(Refusals::default());
     let nodes = deployment.nodes(2);
     let mut switch = deployment.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
-    switch.shrink = true;
+    deployment.across_layouts(&mut switch);
     let update = deployment.epoch_over(1, nodes, switch, None);
     deployment.apply(update);
 
@@ -959,6 +1008,56 @@ fn an_epoch_update_moves_two_replicas_to_one() {
     );
     assert_eq!(deployment.status()["phase"], "trial");
     assert_eq!(*deployment.epochs.served().borrow(), TARGET);
+}
+
+/// A replica added on another host leaves the layout of the replica already serving: the
+/// serving engine, whose regions and segments the target of its layout maps, drains without
+/// giving its memory back, that target is promoted without growing, and only the new replica's
+/// engine, of a layout of its own, grows. The update reports no shrink.
+#[test]
+fn a_replica_added_beside_a_kept_layout_moves_no_memory_of_it() {
+    let mut deployment = Deployment::new(Refusals::default());
+    let mut switch = deployment.switch(vec![
+        (target_launch(HOST, 0, SPAWNED), Vec::new()),
+        (target_launch(OTHER, 1, SPAWNED_PEER), Vec::new()),
+    ]);
+    let added = &mut switch.launches[1].0.engine_config;
+    added.max_running_requests = added
+        .max_running_requests
+        .checked_add(1)
+        .expect("a slot count below the maximum");
+    switch.target_layouts = switch
+        .launches
+        .iter()
+        .map(|(launch, _)| launch.engine_config.layout())
+        .collect();
+    let nodes = deployment.nodes(1);
+    let update = deployment.epoch_over(1, nodes, switch, None);
+    deployment.apply(update);
+
+    assert_eq!(
+        deployment.engines.received(SPAWNED),
+        [command::Kind::Promote(process::Promote {
+            recompute: false,
+            grow: false,
+        })]
+    );
+    assert_eq!(
+        deployment.engines.received(SPAWNED_PEER),
+        [command::Kind::Promote(process::Promote {
+            recompute: false,
+            grow: true,
+        })]
+    );
+    assert_eq!(
+        deployment.engines.received(PREVIOUS),
+        [command::Kind::Drain(process::Drain {
+            epoch: SERVING,
+            deadline_ms: 5_000,
+            shrink: false,
+        })]
+    );
+    assert_eq!(deployment.status()["shrink"].as_bool(), Some(false));
 }
 
 /// The switch waits for every target before it drains: a second target that
