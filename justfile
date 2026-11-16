@@ -59,7 +59,7 @@ test-python-gpu *pytest:
 [doc("The missing-state tests (GPU) under compute-sanitizer's memcheck; arguments go to pytest")]
 test-python-sanitizer *pytest:
     {{ just_executable() }} e2e="{{ e2e }}" test-python-gpu --engine memcheck --time-scale 20 \
-        --serve-set mem_fraction_static=0.6 --serve-set worker_config.watchdog_timeout=2h \
+        --serve-set mem_fraction_static=0.6 --serve-set 'worker_config.watchdog_timeout="2h"' \
         -m "e2e and gpu and missing_state" "$@"
 
 [doc("Run all checks")]

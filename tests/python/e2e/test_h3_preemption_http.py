@@ -260,7 +260,7 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
         # its drain ends the request at a step boundary and the target
         # continues the trajectory.
         job, update = _change_under_a_denoising_request(
-            server, "worker_config.watchdog_timeout=6m"
+            server, 'worker_config.watchdog_timeout="6m"'
         )
         assert update["shrink"] is False, update
         media.assert_same_media(
