@@ -3,11 +3,12 @@ read its answers.
 
 One helper per question, shared by every case: a deployment's metrics
 (``/metrics``, read with Prometheus' own text parser), a streamed answer's
-events (the evaluator's SSE reader), and the deployment files a case writes.
+events, and the deployment files a case writes.
 """  # noqa: D205
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -15,8 +16,6 @@ from typing import Any
 import httpx
 import tomli_w
 from prometheus_client.parser import text_string_to_metric_families
-
-from uniserve_eval.transport.sse import iter_sse_events
 
 
 def metric(base_url: str, name: str, **labels: str) -> float:
@@ -46,12 +45,38 @@ def post_sse(
     payload: dict[str, Any],
     timeout_s: float = 600.0,
 ) -> list[dict[str, Any]]:
-    """Every event of the streamed answer to `payload` at `endpoint`."""
+    """Every event of the streamed answer to `payload` at `endpoint`, each
+    the JSON value of its ``data`` lines, and ``{"type": "sse_done"}`` for the
+    ``[DONE]`` that ends an OpenAI stream.
+
+    The answer is read as Server-Sent Events: an event's ``data:`` lines are
+    joined by newlines (a single space after the colon dropped) and a blank
+    line, or the end of the stream, dispatches it; comments and other fields
+    are ignored.
+    """  # noqa: D205
+    events: list[dict[str, Any]] = []
+    data: list[str] = []
+
+    def dispatch() -> None:
+        if not data:
+            return
+        text = "\n".join(data)
+        data.clear()
+        events.append(
+            {"type": "sse_done"} if text == "[DONE]" else json.loads(text)
+        )
+
     with httpx.stream(
         "POST", f"{base_url}{endpoint}", json=payload, timeout=timeout_s
     ) as response:
         response.raise_for_status()
-        return list(iter_sse_events(response.iter_lines()))
+        for line in response.iter_lines():
+            if not line:
+                dispatch()
+            elif line.startswith("data:"):
+                data.append(line.removeprefix("data:").removeprefix(" "))
+    dispatch()
+    return events
 
 
 def written_deployment(

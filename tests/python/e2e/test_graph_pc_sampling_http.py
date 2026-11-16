@@ -20,8 +20,6 @@ from uniserve_testing.deployments import Deployments
 from uniserve_testing.profiling import Load
 from uniserve_testing.servers import Server
 
-from uniserve_eval.profile import ProfileFile
-
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.gpu,
@@ -87,19 +85,19 @@ def test_pc_samples_name_the_kernels_graphs_launch(
     assert session["end_reason"] == "window", session
 
     [path] = sorted(output.glob("*.sqlite"))
-    with ProfileFile(path) as profile:
-        states = {
-            (row["name"], row["state"]) for row in profile.rows("collectors")
-        }
-        assert {state for _, state in states} == {"prepared", "ended"}, states
-        names = {row["id"]: row["text"] for row in profile.rows("strings")}
-        in_graphs = {
-            names[kernel["name"]]
-            for kernel in profile.rows("kernel")
-            if kernel["graph"]
-        }
-        sampled = {row["function"] for row in profile.rows("pc_sample")}
-        takes = list(profile.rows("pc_take"))
+    states = {
+        (row["name"], row["state"])
+        for row in profiling.table(path, "collectors")
+    }
+    assert {state for _, state in states} == {"prepared", "ended"}, states
+    names = {row["id"]: row["text"] for row in profiling.table(path, "strings")}
+    in_graphs = {
+        names[kernel["name"]]
+        for kernel in profiling.table(path, "kernel")
+        if kernel["graph"]
+    }
+    sampled = {row["function"] for row in profiling.table(path, "pc_sample")}
+    takes = profiling.table(path, "pc_take")
     assert in_graphs, "the timeline recorded no kernel inside a CUDA graph"
     # Samples of the kernels that ran inside the decode step's graphs are
     # attributed to their functions.

@@ -10,8 +10,8 @@ Qwen3 serves on the GPU the module's lease holds:
   worker, together running every collector: CUPTI's activity records and
   API calls with the fence records and PC sampling's counts (its records
   of graph kernels need ``profiling_config.graph_pc_sampling``), PM
-  samples, and range metrics; the reader states each file's contents and
-  the Perfetto converter turns it into a trace. One session runs at a time,
+  samples, and range metrics, each in its table of the file's schema
+  (``crates/engine/src/profiling/schema.sql``). One session runs at a time,
   and one naming two collectors of the device's performance monitors is
   refused.
 - A range_metrics session reserves its range profiler pass's device storage,
@@ -37,8 +37,6 @@ from uniserve_testing import admin, chat, client, profiling
 from uniserve_testing.deployments import Deployments
 from uniserve_testing.profiling import Load
 from uniserve_testing.servers import Server
-
-from uniserve_eval.profile import ProfileFile, convert
 
 pytestmark = [
     pytest.mark.e2e,
@@ -203,34 +201,36 @@ def test_a_session_records_its_collectors_into_its_file(
     assert ended["bytes_written"] > 0, ended
 
     [path] = sorted(output.glob("*.sqlite"))
-    with ProfileFile(path) as profile:
-        summary = profile.summary()
-        print(json.dumps(summary, indent=2))
-        # Every collector ran to the session's end; none failed to start.
-        states = {
-            (row["name"], row["state"]) for row in profile.rows("collectors")
-        }
-        assert {state for _, state in states} == {"prepared", "ended"}, states
-        assert {name for name, _ in states} == set(collectors), states
-        rows = summary["rows"]
-        for table in (*tables, "steps", "clocks"):
-            assert rows.get(table, 0) > 0, table
-        steps = list(profile.rows("steps"))
-        taken = [step for step in steps if step["selected"]]
-        assert len(taken) == 40
-        assert {step["stage"] for step in taken} == {"decode"}
-        if "fence_timeline" in collectors:
-            # The fence records the session kept are the calls of the module
-            # classes its request named.
-            modules = {item["module"] for item in profile.fence_intervals()}
-            assert modules, "the session kept no fence record"
-            assert all(fnmatchcase(module, LAYERS) for module in modules), (
-                modules
-            )
+    (version,) = profiling.table(path, "schema_version")
+    assert version["version"] >= 2, version
+    # Every collector ran to the session's end; none failed to start.
+    states = {
+        (row["name"], row["state"])
+        for row in profiling.table(path, "collectors")
+    }
+    assert {state for _, state in states} == {"prepared", "ended"}, states
+    assert {name for name, _ in states} == set(collectors), states
+    for name in (*tables, "steps", "clocks"):
+        assert profiling.table(path, name), name
+    steps = profiling.table(path, "steps")
+    taken = [step for step in steps if step["selected"]]
+    assert len(taken) == 40
+    assert {step["stage"] for step in taken} == {"decode"}
     if "fence_timeline" in collectors:
-        trace = convert([path])
-        names = {event.get("name") or "" for event in trace["traceEvents"]}
-        assert any(fnmatchcase(name, LAYERS) for name in names), sorted(names)
+        # The fence records the session kept are the calls of the module
+        # classes its request named: each probe's entry (an even id below
+        # the step markers' 0xFFFFE) names the module class it fences.
+        probes = {
+            row["probe"]: row["module"]
+            for row in profiling.table(path, "fence_probe")
+        }
+        modules = {
+            probes[row["probe"] - row["probe"] % 2]
+            for row in profiling.table(path, "fence")
+            if row["probe"] < 0xFFFFE
+        }
+        assert modules, "the session kept no fence record"
+        assert all(fnmatchcase(module, LAYERS) for module in modules), modules
 
 
 def _process_bytes(server: Server) -> int:

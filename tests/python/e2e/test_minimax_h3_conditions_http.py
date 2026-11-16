@@ -1,7 +1,8 @@
 """MiniMax-H3 checkpoints serve keyframe and reference requests.
 
 Serves the published Ulysses-4 deployments and sends the seed-42 requests
-of the packaged conditioned workloads (``uniserve_eval/workloads/minimax_h3``):
+of the conditioned workloads of the evaluation guide
+(``docs/minimax_h3/evaluation/workloads``):
 the official first-frame request (W3) on the base release's ``transformer``
 deployment and on a FastH3 DMD student of it, and the image-plus-audio (W4)
 and official video-plus-audio (W5) reference requests on the
@@ -20,7 +21,6 @@ resolves to.
 
 from __future__ import annotations
 
-import importlib.resources
 import json
 import shutil
 from contextlib import AbstractContextManager
@@ -38,10 +38,9 @@ pytestmark = [
     pytest.mark.model("minimax_h3"),
 ]
 
-#: The evaluator's packaged MiniMax-H3 workloads.
-WORKLOADS = (
-    importlib.resources.files("uniserve_eval") / "workloads" / "minimax_h3"
-)
+#: The MiniMax-H3 workloads of the evaluation guide, by their path in the
+#: repository.
+WORKLOADS = Path("docs", "minimax_h3", "evaluation", "workloads")
 
 #: The reference media the workloads name, by their paths in it.
 INPUTS = assets.CHECKPOINTS["minimax-h3-inputs"]
@@ -62,9 +61,10 @@ def inputs(tmp_path: Path) -> Path:
     return directory
 
 
-def _request(workload: str, inputs: Path) -> dict[str, Any]:
-    """The seed-42 request of a packaged referenced workload, its reference
-    media copied into the media directory `inputs`.
+def _request(repository: Path, workload: str, inputs: Path) -> dict[str, Any]:
+    """The seed-42 request of the referenced workload `workload` of
+    `repository`'s evaluation guide (:data:`WORKLOADS`), its reference media
+    copied into the media directory `inputs`.
 
     A workload's warmup manifest holds its seed-42 request: the prompt, the
     frame count and the reference media in request order, named by their
@@ -75,7 +75,7 @@ def _request(workload: str, inputs: Path) -> dict[str, Any]:
     server's own default holds: the first keyframe's canvas for fl2va, the
     deployment's first served size for ref2va.
     """  # noqa: D205
-    manifest = WORKLOADS / f"{workload}-warmup.jsonl"
+    manifest = repository / WORKLOADS / f"{workload}-warmup.jsonl"
     row = json.loads(manifest.read_text().splitlines()[0])
     references = []
     for reference in row["input_references"]:
@@ -142,7 +142,7 @@ FIRST_FRAME_OPTIONS = (
 def test_base_first_frame_request(
     deployments: Deployments, repository: Path, inputs: Path, tmp_path: Path
 ) -> None:
-    request = _request("w3", inputs)
+    request = _request(repository, "w3", inputs)
     with (
         _serve(
             deployments,
@@ -171,7 +171,7 @@ def test_fasth3_first_frame_request(
     deployments: Deployments, repository: Path, inputs: Path, tmp_path: Path
 ) -> None:
     """A FastH3 DMD student serves its partition's keyframe requests."""
-    request = _request("w3", inputs)
+    request = _request(repository, "w3", inputs)
     # The student generates 16:9 at 768p; eight seconds and a 2048-token
     # prompt capacity admit W3, and the deployment provisions the two
     # keyframes a request may bring in tiles of their own.
@@ -245,7 +245,9 @@ REFERENCE_OPTIONS = (
 def test_base_reference_requests(
     deployments: Deployments, repository: Path, inputs: Path, tmp_path: Path
 ) -> None:
-    requests = {name: _request(name, inputs) for name in ("w4", "w5")}
+    requests = {
+        name: _request(repository, name, inputs) for name in ("w4", "w5")
+    }
     with _serve(
         deployments,
         repository,
@@ -280,7 +282,9 @@ def test_omniref_reference_requests(
 ) -> None:
     # The OmniRef export reads the parts it omits from the Hugging Face
     # cache at the base revision it pins.
-    requests = {name: _request(name, inputs) for name in ("w4", "w5")}
+    requests = {
+        name: _request(repository, name, inputs) for name in ("w4", "w5")
+    }
     with _serve(
         deployments,
         repository,
@@ -320,7 +324,7 @@ def test_omniref_refuses_conditions_above_capacity(
     # Each of W4's condition products fits its bound, and the server counts
     # its conditions in the denoiser's tiles and refuses it; the deployment
     # then serves its image-only form.
-    packed = _request("w4", inputs)
+    packed = _request(repository, "w4", inputs)
     image_only = {
         **packed,
         "input_references": packed["input_references"][:1],

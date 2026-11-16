@@ -33,8 +33,7 @@ jobs:
       # vendored FFmpeg serves builds that run from cargo's target directory
       # alone. The kernel checks that launch through the installed `uniserve`
       # (`tests/python/kernels/tensor`) need it.
-      - run: uv sync --locked --no-install-project --extra dev --extra test --extra bench
-      - run: .venv/bin/python -m ruff check uniserve_eval tests
-      - run: .venv/bin/python -m ruff format --check uniserve_eval tests
-      - run: .venv/bin/python -m mypy
+      - run: uv sync --locked --no-install-project --extra dev --extra test
+      - run: .venv/bin/python -m ruff check tests
+      - run: .venv/bin/python -m ruff format --check tests
       - run: .venv/bin/python -m pytest -m "unit and not gpu"

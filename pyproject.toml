@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 # The repository's Python environment. This project is what `uv sync` builds
 # and installs: the `uniserve` executable, onto the environment's `bin/`, with
-# the development, test and evaluation tools beside it. Its Python packages are
+# the development and test tools beside it. Its Python packages are
 # the workspace's members (`[tool.uv.workspace]`). The Build Server keeps its
 # own locked environment (`crates/build-server/python`), the one place a
 # compiler runs Python.
@@ -27,9 +27,6 @@ dependencies = []
 test = [
     "httpx",
     "pytest>=8.1",
-    # The evaluator's transport tests serve canned responses from aiohttp's
-    # test servers (`aiohttp_raw_server`).
-    "pytest-aiohttp",
     "pytest-timeout>=2.3",
     # The GPU recipe runs the e2e cases on parallel workers, each case on the
     # GPUs it leases (tests/python/e2e/conftest.py).
@@ -46,12 +43,7 @@ test = [
 dev = [
     "build>=1.2",
     "markdown-it-py<4.0",
-    "mypy>=1.11",
-    "pyright>=1.1",
     "ruff>=0.6",
-]
-bench = [
-    "uniserve-eval[datasets]",
 ]
 # The NCCL and CUPTI of this environment's GPU tools (PyTorch), at the releases
 # the serving processes require. The serving processes themselves open NCCL
@@ -63,7 +55,6 @@ gpu = [
 ]
 
 [tool.uv.sources]
-uniserve-eval = { workspace = true }
 uniserve-kernels = { workspace = true }
 uniserve-testing = { workspace = true }
 
@@ -71,7 +62,7 @@ uniserve-testing = { workspace = true }
 # Build Server's environment is a project of its own with its own lock, which
 # holds the compilers apart from the development tools.
 [tool.uv.workspace]
-members = ["crates/ops/python", "tests/support", "uniserve_eval"]
+members = ["crates/ops/python", "tests/support"]
 exclude = ["crates/build-server/python"]
 
 [tool.uv]
@@ -91,9 +82,8 @@ override-dependencies = [
 ]
 
 [tool.setuptools]
-# The benchmark driver is packaged independently
-# (`uniserve_eval/pyproject.toml`); this distribution ships the executable
-# alone.
+# This distribution ships the executables alone; its Python packages are the
+# workspace's members.
 packages = []
 
 # The one executable of every UniServe process, installed onto PATH as
@@ -168,19 +158,3 @@ ignore = [
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
-
-[tool.mypy]
-# Use the invoking Python version so installed dependency stubs match CI's runtime.
-files = ["uniserve_eval"]
-warn_unused_configs = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-no_implicit_optional = true
-check_untyped_defs = true
-ignore_missing_imports = true
-
-[tool.pyright]
-typeCheckingMode = "basic"
-include = ["uniserve_eval"]
-exclude = ["refs", "target", ".venv"]
-reportMissingImports = "warning"

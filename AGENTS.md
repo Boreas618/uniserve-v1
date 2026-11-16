@@ -19,7 +19,7 @@ The authorized objective governs all work. Measure progress by delivered behavio
 
 ### Environment and Discovery
 
-- Work from the repository root and use the repository environment explicitly, normally `.venv/bin/python`, so commands do not silently select a different interpreter. Follow the README installation steps for a basic editable installation; for a complete developer environment use `uv sync --locked --python /usr/bin/python3.12 --extra dev --extra test --extra bench` and add `--extra gpu` for GPU development, including FastH3. Preserve the lockfile and do not replace pinned accelerator packages with ad hoc versions during formal validation.
+- Work from the repository root and use the repository environment explicitly, normally `.venv/bin/python`, so commands do not silently select a different interpreter. Follow the README installation steps for a basic editable installation; for a complete developer environment use `uv sync --locked --python /usr/bin/python3.12 --extra dev --extra test` and add `--extra gpu` for GPU development, including FastH3. Preserve the lockfile and do not replace pinned accelerator packages with ad hoc versions during formal validation.
 - Begin with `git status --short`, then use `rg` and `rg --files` to locate owners, callers, tests, configuration, and documentation. Read the relevant public contract and implementation before editing. Treat pre-existing modifications as user work and do not reformat, stage, revert, or overwrite unrelated files.
 - Use the repository's existing public interfaces and ownership boundaries. When a change crosses Rust crates, model, executor, or evaluation packages, trace the complete request and data path before deciding where the behavior belongs.
 
@@ -33,7 +33,7 @@ The authorized objective governs all work. Measure progress by delivered behavio
 
 ### Serving, Evaluation, and Artifacts
 
-- Start serving through `uniserve serve <model> --served-model-name <name>` and inspect `uniserve serve --help` for current options. Resolve evaluation configuration with `.venv/bin/uniserve-eval --config <profiles> plan <profile>` before an artifact-producing run, then execute the fixed profile with the matching `run` command.
+- Start serving through `uniserve serve <model> --served-model-name <name>` and inspect `uniserve serve --help` for current options. Resolve evaluation configuration with `target/release/uniserve-eval plan --config <profile> <point>` (`cargo build --release -p eval`) before an artifact-producing run, then execute the fixed profile with the matching `run` command.
 - Keep generated checkpoints, profiles, logs, media, and benchmark outputs under `artifacts/` in stable domain-specific paths. The directory is Git-ignored; commit only source, tests, release documentation, and small fixtures that are required to reproduce behavior. Never add credentials, local model assets, downloaded dependencies, or machine-specific caches.
 - Apply the benchmark and evaluation rules below to every formal measurement. Run measurement points serially, preserve failed or superseded evidence outside the canonical result path, and make the canonical artifact unambiguous rather than overwriting history silently.
 

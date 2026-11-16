@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import io
 from collections.abc import Callable
+from fractions import Fraction
 from typing import Any
 
 import av
@@ -22,16 +23,6 @@ import numpy as np
 import pytest
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
-from uniserve_eval.transport.video import inspect_video_bytes
-from uniserve_eval.types import (
-    BenchmarkPoint,
-    DecodedVideo,
-    LoadConfig,
-    MetricDefinition,
-    TaskName,
-    VideoConfig,
-)
 from uniserve_testing import client
 from uniserve_testing.assets import Checkpoint
 from uniserve_testing.servers import Server
@@ -124,25 +115,138 @@ def tokenizer(checkpoint: Checkpoint) -> PreTrainedTokenizerBase:
     )
 
 
+#: The MiniMax-H3 benchmark description a case's exact-length prompt is cut
+#: from or extended past: a two-shot paper-craft tutorial with its
+#: soundscape, in the model's structured prompt format.
+PROMPT = (
+    "integrated_multimodal_description: [Shot 1] A 9-second 16:9 widescreen "
+    "educational documentary tutorial in clean paper-textured motion-graphics "
+    "design, following one illustrated paper-craft instructor at a neatly "
+    "gridded tabletop. The instructor places a coral square of paper on the "
+    "grid, aligns its corners, and folds it diagonally into a sharp crease; "
+    'a Japanese title card reading "折り紙ランタン" appears at the upper left, '
+    'while a thin animated guide line and the label "谷折り" appear beside '
+    "the crease. The overhead camera makes a measured push-in as the "
+    "instructor smooths the fold, with small geometric accents tracking the "
+    "paper edges. [Shot 2] At 00:04.500, the same instructor unfolds the "
+    "paper, rotates it a quarter turn, and presses the intersecting creases "
+    "into a compact lantern shape; the camera cuts to a close three-quarter "
+    "tabletop view and makes a short lateral track to reveal the dimensional "
+    "form. Animated arrows trace the final fold, and the Japanese completion "
+    'card "完成" settles along the lower edge as the instructor places the '
+    "lantern in a small cardboard tray. overall_soundscape: Close ASMR foley "
+    "records the paper's dry flex and crisp crease, fingertip taps on the "
+    "matte work surface, and a soft sleeve rustle, with a quiet studio room "
+    "tone underneath. A small cardboard tray clicks when the instructor sets "
+    "the finished lantern down, while gentle breathing remains audible. "
+    "non_diegetic_music: N/A"
+)
+
+#: The sentence repeated, whole or in part, past the end of :data:`PROMPT`.
+FILLER = (
+    " A coherent continuation preserves the scene, motion, lighting, and sound."
+)
+
+
 def exact_prompt(tokenizer: PreTrainedTokenizerBase, tokens: int) -> str:
-    """The evaluator's MiniMax-H3 benchmark prompt (its ``minimax-h3``
-    dataset) cut or extended to exactly `tokens` tokens of `tokenizer`, so a
-    request lands in the text capacity its length selects.
+    """:data:`PROMPT` cut or extended with :data:`FILLER` to exactly
+    `tokens` tokens of `tokenizer` (special tokens not counted), so a request
+    lands in the text capacity its length selects.
+
+    The ids are cut and decoded, and the text is encoded again, since
+    decoding need not preserve the count; a text that measures otherwise
+    fails the calling case.
     """  # noqa: D205
-    point = BenchmarkPoint(
-        name="exact-prompt",
-        server="uniserve",
-        task=TaskName.VIDEO,
-        model="MiniMax-H3",
-        dataset=MiniMaxH3Dataset.name,
-        # The dataset reads the prompt length alone; the metric a point must
-        # protect is never read.
-        metrics=(MetricDefinition(("videos_per_second",), "higher"),),
-        load=LoadConfig(num_prompts=1),
-        video=VideoConfig(prompt_tokens=tokens),
+    base = tokenizer.encode(PROMPT, add_special_tokens=False)
+    filler = tokenizer.encode(FILLER, add_special_tokens=False)
+    ids = base[:tokens]
+    while len(ids) < tokens:
+        ids.extend(filler[: tokens - len(ids)])
+
+    prompt = tokenizer.decode(
+        ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
-    (example,) = MiniMaxH3Dataset(point).load(tokenizer)
-    return example.prompt
+    measured = len(tokenizer.encode(prompt, add_special_tokens=False))
+    assert measured == tokens, (measured, tokens)
+    return prompt
+
+
+@dataclasses.dataclass(frozen=True)
+class Video:
+    """What the full decoding of an MP4 found: its one video stream's
+    raster, frame count, average frame rate and codec; its one audio stream's
+    codec, channel count, sample rate and samples per channel; the variance
+    of the video's RGB values (in bytes) and the RMS of its audio samples (as
+    fractions of full scale).
+    """  # noqa: D205
+
+    width: int
+    height: int
+    frames: int
+    fps: Fraction
+    video_codec: str
+    audio_codec: str
+    audio_channels: int
+    audio_sample_rate: int
+    audio_samples: int
+    video_variance: float
+    audio_rms: float
+
+
+def inspected(data: bytes) -> Video:
+    """The MP4 `data` decoded completely. It holds exactly one video and one
+    audio stream, each decoding at least one frame, with one raster and one
+    audio layout and rate throughout.
+    """  # noqa: D205
+    with av.open(io.BytesIO(data), mode="r", format="mp4") as container:
+        (video,) = container.streams.video
+        (audio,) = container.streams.audio
+        frames = samples = 0
+        layouts = set()
+        # Sums over every value: count, sum and sum of squares of the RGB
+        # bytes; count and sum of squares of the audio samples.
+        pixels = np.zeros(3)
+        pcm = np.zeros(2)
+        for frame in container.decode(video=0, audio=0):
+            if isinstance(frame, av.VideoFrame):
+                frames += 1
+                assert (frame.width, frame.height) == (
+                    video.codec_context.width,
+                    video.codec_context.height,
+                )
+                values = frame.to_ndarray(format="rgb24").astype(np.float64)
+                pixels += (values.size, values.sum(), np.square(values).sum())
+                continue
+
+            # `samples` counts per channel. An integer format is scaled to
+            # full scale; a float format is at full scale already.
+            samples += frame.samples
+            layouts.add((len(frame.layout.channels), frame.sample_rate))
+            values = frame.to_ndarray()
+            scale = 1.0
+            if np.issubdtype(values.dtype, np.integer):
+                limits = np.iinfo(values.dtype.str)
+                scale = max(abs(limits.min), limits.max)
+            values = values.astype(np.float64) / scale
+            pcm += (values.size, np.square(values).sum())
+
+    assert frames > 0 and samples > 0, (frames, samples)
+    ((channels, rate),) = layouts
+    assert video.average_rate is not None
+    mean = pixels[1] / pixels[0]
+    return Video(
+        width=video.codec_context.width,
+        height=video.codec_context.height,
+        frames=frames,
+        fps=Fraction(video.average_rate),
+        video_codec=video.codec_context.name,
+        audio_codec=audio.codec_context.name,
+        audio_channels=channels,
+        audio_sample_rate=rate,
+        audio_samples=samples,
+        video_variance=max(0.0, pixels[2] / pixels[0] - mean**2),
+        audio_rms=float(np.sqrt(pcm[1] / pcm[0])),
+    )
 
 
 def assert_video(
@@ -152,9 +256,9 @@ def assert_video(
     size: str,
     frames: int,
     media_format: MediaFormat,
-) -> DecodedVideo:
-    """Hold the MP4 `data` to the shape its request resolved to and to its
-    model's `media_format`, and return what its decoding found.
+) -> None:
+    """Hold the MP4 `data`, answered as `content_type`, to the shape its
+    request resolved to and to its model's `media_format`.
 
     The video is `size` (``WxH``) with `frames` frames, at the format's frame
     rate in its video codec; its soundtrack is in the format's codec, channel
@@ -162,11 +266,12 @@ def assert_video(
     frame; and neither stream is constant, as a generated video moves and
     sounds.
     """  # noqa: D205
-    media = inspect_video_bytes(data, declared_mime=content_type)
+    assert content_type.partition(";")[0].strip() == "video/mp4", content_type
+    media = inspected(data)
     width, height = (int(side) for side in size.split("x"))
     assert (media.width, media.height) == (width, height), size
-    assert media.frame_count == frames, size
-    assert media.fps_numerator == media_format.fps * media.fps_denominator
+    assert media.frames == frames, size
+    assert media.fps == media_format.fps
     assert media.video_codec == media_format.video_codec
     assert (
         media.audio_codec,
@@ -178,9 +283,9 @@ def assert_video(
         media_format.audio_sample_rate,
     )
     frame_s = 1 / media_format.fps
-    assert abs(media.audio_duration_s - frames * frame_s) <= frame_s
+    audio_s = media.audio_samples / media.audio_sample_rate
+    assert abs(audio_s - frames * frame_s) <= frame_s
     assert media.video_variance > 0 and media.audio_rms > 0, size
-    return media
 
 
 def assert_generated(
@@ -189,7 +294,7 @@ def assert_generated(
     size: str,
     frames: int,
     media_format: MediaFormat,
-) -> DecodedVideo:
+) -> None:
     """Hold the answer of ``POST /v1/videos/sync`` to its request: it
     succeeded, its headers state the shape generated (``x-video-size``,
     ``x-video-num-frames``, ``x-video-fps``), and its MP4 is that shape in
@@ -201,7 +306,7 @@ def assert_generated(
         response.headers["x-video-num-frames"],
         response.headers["x-video-fps"],
     ) == (size, str(frames), str(media_format.fps))
-    return assert_video(
+    assert_video(
         response.content,
         response.headers["content-type"],
         size=size,

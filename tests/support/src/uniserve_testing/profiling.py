@@ -5,17 +5,19 @@ A profiling module serves one deployment for all of its cases (:func:`serve`,
 on the module's lease, with the module's own options beside
 :data:`OPTIONS`); its cases keep decode steps running with :class:`Load`,
 start sessions with :func:`start`, end them with :func:`stop` or wait for
-their windows to end with :func:`ended`, and read the fence probes' counts
-with :func:`fence_steps`.
+their windows to end with :func:`ended`, read the fence probes' counts
+with :func:`fence_steps`, and read a session's file with :func:`table`.
 """  # noqa: D205
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from fnmatch import fnmatchcase
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -221,3 +223,22 @@ def fence_steps(server: Server, stage: str, module: str) -> int:
             ):
                 total += int(sample.value)
     return total
+
+
+def table(path: Path, name: str) -> list[dict[str, Any]]:
+    """Every row of the table `name` of the session file `path`, opened
+    read-only, as a mapping of its columns; none when the file has no such
+    table. The file's tables and their identifiers are the schema its
+    ``schema_version`` states (``crates/engine/src/profiling/schema.sql``).
+    """  # noqa: D205
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+        db.row_factory = sqlite3.Row
+        tables = {
+            row[0]
+            for row in db.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table'"
+            )
+        }
+        if name not in tables:
+            return []
+        return [dict(row) for row in db.execute(f'SELECT * FROM "{name}"')]

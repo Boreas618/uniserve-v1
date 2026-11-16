@@ -111,7 +111,7 @@ CHECKPOINTS: dict[str, Checkpoint] = {
         "5ea076f35b84da4c3c82217112fa733d8eea2ae1",
     ),
     # The reference media of the MiniMax-H3 protocol's referenced workloads
-    # (`uniserve_eval/workloads/minimax_h3`).
+    # (`docs/minimax_h3/evaluation/workloads`).
     "minimax-h3-inputs": Checkpoint(
         None,
         kind="dataset",

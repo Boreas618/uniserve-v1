@@ -2,7 +2,7 @@
 
 UniServe serves FastH3 8-Step text-to-video-with-audio and keyframe-conditioned generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 and MiniMax-H3 guide](docs/minimax_h3/minimax_h3.md) covers every deployment, precision and option. The same guide covers the base MiniMax-H3 checkpoint's text-to-video, keyframe and reference requests and FastH3 OmniRef reference requests.
 
-UniServe is a Rust serving system. Rust owns the control and data planes and the numerical computation alike: HTTP admission, scheduling, the main processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. No serving process carries a Python interpreter: Python appears in the Build Server alone, as the compiler of Triton and CuTe DSL kernel packages, and in the evaluation client `uniserve_eval`.
+UniServe is a Rust serving system. Rust owns the control and data planes and the numerical computation alike: HTTP admission, scheduling, the main processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. No serving process carries a Python interpreter: Python appears in the Build Server alone, as the compiler of Triton and CuTe DSL kernel packages, and in the Python tests.
 
 The executable serves two model families, Qwen3-MoE (chat) and MiniMax-H3 (video generation), each registered once in `src/main.rs`. A server resolves its checkpoint to the family that claims the class it declares, serves exactly that model and exposes one served-model identity.
 
@@ -148,16 +148,17 @@ Run `uniserve serve --help` for the flags; [Configuration](docs/configuration.md
 
 ## Reproduce the measurements
 
-The serving evaluator runs HTTP workloads against a server, validates every response, and writes reproducible result bundles. `uniserve_eval/fast_h3.toml` holds the deployments and workload of the UniServe FastH3 post, and `uniserve_eval/fast_h3_h200.toml` the H200 measurements in the FastH3 guide. The `bench` extra installs the evaluator; `uv sync` keeps exactly the extras it names, so name `gpu` beside it:
+The serving evaluator, `uniserve-eval` (`tools/eval`), runs HTTP workloads against a server, validates every response, and writes reproducible result bundles. It holds no model or campaign: each run is given a profile that states its servers and points, written at use. The [evaluation guide](docs/minimax_h3/evaluation.md) writes the profiles of the UniServe FastH3 post and the H200 measurements in the FastH3 guide; for example, the four-GB200 BF16 points:
 
 ```bash
-uv sync --locked --extra gpu --extra bench
-export UNISERVE_FAST_H3_MODEL=<local copy of FastVideo/FastVideo-FastH3-8-Step-V2>
-.venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml plan gb200-4-bf16
-.venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml run gb200-4-bf16
+cargo build --release -p eval
+# The shell functions of the guide's "Writing a run", then its FastH3 block, write
+# artifacts/minimax_h3/fasth3-gb200-4-bf16.toml.
+target/release/uniserve-eval plan --config artifacts/minimax_h3/fasth3-gb200-4-bf16.toml gb200-4-bf16
+target/release/uniserve-eval run --config artifacts/minimax_h3/fasth3-gb200-4-bf16.toml gb200-4-bf16
 ```
 
-The [evaluation guide](docs/minimax_h3/evaluation.md) lists every suite and the two-host procedure.
+The guide states every campaign's points and the two-host procedure.
 
 ## Text and expert parallelism
 
@@ -184,7 +185,27 @@ just test-python-gpu
 just test-python-gpu tests/python/e2e/test_h3_parallel_http.py
 ```
 
-The serving evaluator runs HTTP workloads against serving models, measures performance, validates response correctness, and writes reproducible result bundles. Benchmark points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
+The serving evaluator (`tools/eval`, `cargo build --release -p eval`) runs HTTP workloads against serving models, measures performance, validates response correctness, and writes reproducible result bundles. A profile names the servers a run starts (`[servers.<name>]`: the command, its environment and the address it serves) and the points it measures (`[benchmarks.<name>]`: the server, the task, the dataset and its source, the load, the sampling and the metrics each point protects), and `[suites.<name>]` lists points measured in order. Values may name environment variables as `${NAME}` or `${NAME:-default}`. A text point over ShareGPT at 16 requests per second:
+
+```toml
+[servers.qwen]
+host = "127.0.0.1"
+port = 18081
+command = ["uniserve", "serve", "--model-dir", "${MODEL}", "--served-model-name", "Qwen3-30B-A3B", "--host", "127.0.0.1", "--port", "18081"]
+
+[benchmarks.qwen-sharegpt-r16]
+server = "qwen"
+task = "text"
+model = "Qwen3-30B-A3B"
+dataset = "sharegpt"
+dataset_revision = "192ab2185289094fc556ec8ce5ce1e8e587154ca"
+tokenizer = "${MODEL}"
+load = { num_prompts = 200, request_rate = 16.0, warmup_requests = 1, seed = 42 }
+sampling = { temperature = 0.0, sampling_seed = 42, ignore_eos = true, stream = true }
+metrics = { output_throughput = "higher", mean_ttft_ms = "lower" }
+```
+
+`uniserve-eval plan --config <profile> <point or suite>` prints what a run would start and send; `run` measures it into `<output root>/<point>`.
 
 For decision-session replay, give every row of a JSON Lines workload a non-empty `session_id`. The evaluator preserves file order within each session and sends the next decision only after that session's previous response. Set `load.request_rate = inf`; the sessions run concurrently, one request in flight per session. A session trace has no repeated-row warmup: each initial cold request is included in the measured trace. Session identifiers are benchmark metadata and are not sent to the model. Rows without session identifiers retain the seeded shuffled workload behavior.
 
@@ -218,7 +239,9 @@ crates/media/           H.264/AAC output encoding and MP4 muxing, conditional me
 crates/build-server/  The Build Server: builds packages into modules, keeps them and hands them out; one host service per host and user
 crates/testkit/         Test doubles at the engine's seams: the executor of a worker group (`FakeExecutor`), the Storage Server's buffer pool in process (`InProcessPool`) and a fake engine over both; never in a serving build
 crates/manager/         `uniserve-manager`: an optional multi-node manager, a client of each node's `/admin`
-uniserve_eval/          Serving evaluator, profiles, and request workloads
+tools/eval/             `uniserve-eval`, the serving evaluator
+tools/profile/          `uniserve-profile`, the reader of profiling sessions and of Nsight Systems and cProfile captures
+tools/verification/     The buffer pool's design model and its checks
 configs/                Deployment files: H3 (`minimax_h3/`) and dedicated experts (`afd/`)
 docs/architecture.md    Processes, the rank planes and the request path
 docs/configuration.md   The serving option tree, configuration files and deployment files

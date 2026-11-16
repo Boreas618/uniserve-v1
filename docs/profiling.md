@@ -1,6 +1,6 @@
 # Execution profiling
 
-A serving deployment profiles itself without restarting a process or pausing service. Every main process subscribes to NVIDIA's CUPTI once, as it starts, and every collector below shares that subscription: two counters and the fence probes are always on and exported as Prometheus metrics, and a profiling session (`/admin/profile`) attaches further collectors to the executing epoch at a step boundary and detaches them at another, writing one SQLite file per rank that `uniserve_eval.profile` reads and converts to a Perfetto trace. Captures of Nsight Systems and cProfile are read by the execution sanitizer, which produces hints about host waits, GIL ownership, copies and language crossings. Neither changes execution, rejects a request or establishes that an operation is unnecessary: inspect each finding in its workload context, then measure any optimization without the diagnostic instrumentation.
+A serving deployment profiles itself without restarting a process or pausing service. Every main process subscribes to NVIDIA's CUPTI once, as it starts, and every collector below shares that subscription: two counters and the fence probes are always on and exported as Prometheus metrics, and a profiling session (`/admin/profile`) attaches further collectors to the executing epoch at a step boundary and detaches them at another, writing one SQLite file per rank that `uniserve-profile` reads and converts to a Perfetto trace. It also reads captures of Nsight Systems and cProfile, producing hints about host waits, GIL ownership, copies and language crossings. Neither changes execution, rejects a request or establishes that an operation is unnecessary: inspect each finding in its workload context, then measure any optimization without the diagnostic instrumentation.
 
 ## CUPTI in a main process
 
@@ -121,11 +121,12 @@ Each rank writes one SQLite file per session, in UniServe's own schema: every ra
 Every time is in nanoseconds of one of two clocks: CUPTI's (about `CLOCK_REALTIME`), for CUPTI's records, the steps and PM samples; and each device's `%globaltimer`, for the fence records. `clocks` holds samples of them at the session's start and end: CUPTI's clock with `CLOCK_REALTIME` and `CLOCK_MONOTONIC`, and each device's `%globaltimer`, read by a kernel that stores it into pinned host storage, followed on its stream by a host function that reads the host's clocks once the kernel completed, with half the host's time from the kernel's launch to that function as the sample's uncertainty. A client aligns a clock through the sample of least uncertainty. CUPTI's records carry the correlation id of the API call that issued them, a graph's nodes that of its launch.
 
 ```bash
-.venv/bin/python -m uniserve_eval.profile summary profiles/profile-1-epoch1-rank0.sqlite
-.venv/bin/python -m uniserve_eval.profile perfetto profiles/profile-1-*.sqlite -o trace.json
+cargo build --release -p profile     # target/release/uniserve-profile
+target/release/uniserve-profile summary profiles/profile-1-epoch1-rank0.sqlite
+target/release/uniserve-profile perfetto profiles/profile-1-*.sqlite -o trace.json
 ```
 
-`summary` states each file's session, worker, collectors and rows by table. `perfetto` writes one trace of a session's files in the Trace Event Format, which the Perfetto UI opens: a process per worker, with a track per CUDA stream, host thread and device's fence probes (each probed module instance's call a slice, nested as the calls nest), the steps, and counter tracks for PM samples, all on CUPTI's clock. `uniserve_eval.profile.ProfileFile` reads a file from Python.
+`summary` states each file's session, worker, collectors and rows by table. `perfetto` writes one trace of a session's files in the Trace Event Format, which the Perfetto UI opens: a process per worker, with a track per CUDA stream, host thread and device's fence probes (each probed module instance's call a slice, nested as the calls nest), the steps, and counter tracks for PM samples, all on CUPTI's clock. Any SQLite client reads a file by the schema; `uniserve-profile` is the `profile` crate's command line (`tools/profile`).
 
 ## Capture and inspect a CUDA timeline with Nsight Systems
 
@@ -141,8 +142,8 @@ nsys profile \
   --export=sqlite --output="$CAPTURE" \
   uniserve serve "$MODEL" --set profiling_config.nvtx_ranges=true
 
-.venv/bin/python -m uniserve_eval.sanitizer trace "$CAPTURE.sqlite"
-.venv/bin/python -m uniserve_eval.sanitizer trace "$CAPTURE.sqlite" --json
+target/release/uniserve-profile trace "$CAPTURE.sqlite"
+target/release/uniserve-profile trace "$CAPTURE.sqlite" --json
 ```
 
 The reader uses the Nsight Systems 2025.4 SQLite export schema. It opens the file read-only. `--scope PREFIX` selects synchronous NVTX ranges by name, defaulting to `uniserve.`; repeated `--rule NAME` options select individual rules. Hints do not cause a failing exit status. Invalid inputs or unreadable exports do.
@@ -163,15 +164,15 @@ CUDA Graph execution does not itself need the GIL once submitted. Python prepara
 
 Coverage counts describe recorded activities. A missing activity, missing stack or unmatched scope is a coverage gap. No hints does not mean no unnecessary synchronization. GPU graph-level capture does not expose every graph node; Python metadata accesses and dependency relationships between independent batches are not inferred from CUDA timing. Use Nsight's timeline and native reports for GPU gaps, utilization and stream dependencies.
 
-CUDA's [synchronization semantics](https://docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html) depend on operation and memory kind. Nsight's [analysis guide](https://docs.nvidia.com/nsight-systems/AnalysisGuide/index.html) describes the export and built-in reports. The sanitizer's rules are advisory interpretations of those activities.
+CUDA's [synchronization semantics](https://docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html) depend on operation and memory kind. Nsight's [analysis guide](https://docs.nvidia.com/nsight-systems/AnalysisGuide/index.html) describes the export and built-in reports. The `trace` rules are advisory interpretations of those activities.
 
 ## Inspect Python/native call edges
 
-A Python client of the server, such as the evaluator, can be read the same way: standard cProfile captures some Python/native calls and callbacks. Select the native function names to inspect; the analyzer matches builtin labels, with no assumptions about installation paths.
+A Python client of the server can be read the same way: standard cProfile captures some Python/native calls and callbacks. Select the native function names to inspect; the analyzer matches builtin labels, with no assumptions about installation paths.
 
 ```bash
 .venv/bin/python -m cProfile -o "$CALLS" "$CLIENT"
-.venv/bin/python -m uniserve_eval.sanitizer calls "$CALLS" \
+target/release/uniserve-profile calls "$CALLS" \
   --native "$NATIVE"
 ```
 

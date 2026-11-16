@@ -27,6 +27,8 @@ members = [
     "crates/storage-server",
     "crates/tensor",
     "crates/testkit",
+    "tools/eval",
+    "tools/profile",
 ]
 
 [package]

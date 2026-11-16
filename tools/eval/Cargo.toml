@@ -1,0 +1,47 @@
+[package]
+name = "eval"
+description = "Measures a serving system through its public HTTP interface: one measurement point per run, and the checks of runs against their controls."
+version = "2.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "uniserve-eval"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures.workspace = true
+hf-hub.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+image.workspace = true
+indexmap = { workspace = true, features = ["serde"] }
+libc.workspace = true
+media.workspace = true
+# GSM8K's, Beans' and UEval's splits on the Hub are Parquet.
+parquet = { version = "57", default-features = false, features = ["snap", "zstd", "flate2", "flate2-rust_backened", "lz4", "json"] }
+regex = "1.12"
+reqwest = { workspace = true, features = ["json", "stream", "multipart"] }
+serde.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokenizers.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process", "net", "io-util", "signal", "sync", "fs"] }
+toml.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+
+[lints]
+workspace = true

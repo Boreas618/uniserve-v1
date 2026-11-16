@@ -9,9 +9,9 @@
 set positional-arguments
 
 # A Python command, in the repository's environment with the extras of the
-# development tools, the tests and the evaluator (docs/testing.md), which uv
+# development tools and the tests (docs/testing.md), which uv
 # first brings up to date with the lockfile.
-uv_run := "uv run --locked --extra dev --extra test --extra bench"
+uv_run := "uv run --locked --extra dev --extra test"
 
 # Where a GPU suite writes what a run leaves: pytest's temporary directory,
 # which holds every server's log, and the JUnit report. `just e2e=DIR <recipe>`
@@ -34,11 +34,10 @@ test-rust *cargo:
 bench-build *cargo:
     cargo bench --workspace --no-run "$@"
 
-[doc("Lint: fmt + clippy + ruff + mypy")]
+[doc("Lint: fmt + clippy + ruff")]
 lint: fmt clippy
-    {{ uv_run }} ruff check uniserve_eval tests
-    {{ uv_run }} ruff format --check uniserve_eval tests
-    {{ uv_run }} mypy
+    {{ uv_run }} ruff check tests
+    {{ uv_run }} ruff format --check tests
 
 # The kernel checks run on Triton's interpreter.
 [doc("Fast Python tests (CPU only); arguments go to pytest")]

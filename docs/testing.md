@@ -4,7 +4,7 @@ The repository's checks run from the `justfile`: `just lint`, `just test-rust`, 
 
 ## The Python tests
 
-The Python tests run in the repository's environment (`uv sync --locked --extra dev --extra test --extra bench`), which installs the root project's executables (`uniserve` and `uniserve-manager`, a release build) and the test-support package `uniserve-testing` (`tests/support`). The package is a pytest plugin, which pytest loads through its `pytest11` entry point, and the helpers the test directories share; a test module imports them by name (`uniserve_testing.servers`, `uniserve_testing.chat`, ...), never by its place in the tree, and pytest imports each test module on its own (`--import-mode=importlib`). The tests run the `uniserve` the environment installed, so a change to the Rust sources is tested once `uv sync` has installed it again.
+The Python tests run in the repository's environment (`uv sync --locked --extra dev --extra test`), which installs the root project's executables (`uniserve` and `uniserve-manager`, a release build) and the test-support package `uniserve-testing` (`tests/support`). The package is a pytest plugin, which pytest loads through its `pytest11` entry point, and the helpers the test directories share; a test module imports them by name (`uniserve_testing.servers`, `uniserve_testing.chat`, ...), never by its place in the tree, and pytest imports each test module on its own (`--import-mode=importlib`). The tests run the `uniserve` the environment installed, so a change to the Rust sources is tested once `uv sync` has installed it again.
 
 A plain `pytest` deselects the GPU end-to-end cases (`addopts` in `pyproject.toml` holds `-m "not (e2e and gpu)"`); a run that states its own marker expression replaces it: `-m "unit and not gpu"` is the fast suite, `-m "e2e and gpu"` the GPU suite.
 
@@ -75,7 +75,7 @@ A two-host case runs on this host and a second one when `--peer-host` names the 
 With the Build Server environment's `bin` directory (`crates/build-server/python/.venv/bin`) on the search path:
 
 ```bash
-uv sync --locked --extra dev --extra test --extra bench
+uv sync --locked --extra dev --extra test
 uv sync --locked --project crates/build-server/python
 just test-python-gpu
 ```

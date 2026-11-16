@@ -1,0 +1,27 @@
+[package]
+name = "profile"
+description = "Reads profiling evidence: a session's per-worker SQLite files, as a summary or a Perfetto trace; Nsight Systems exports and cProfile call graphs, as advisory execution hints."
+version = "2.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "uniserve-profile"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+regex = "1.12"
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

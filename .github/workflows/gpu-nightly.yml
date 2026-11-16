@@ -36,7 +36,7 @@ jobs:
       - run: rustup toolchain install
       - uses: astral-sh/setup-uv@v6
       - uses: extractions/setup-just@v2
-      - run: uv sync --locked --extra dev --extra test --extra bench --extra gpu
+      - run: uv sync --locked --extra dev --extra test --extra gpu
       - run: uv sync --locked --project crates/build-server/python
       # The Build Server runs its toolchain environment's program from the
       # search path (crates/build-server/python/README.md).

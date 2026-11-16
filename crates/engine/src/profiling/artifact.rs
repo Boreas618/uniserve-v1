@@ -4,7 +4,7 @@
 //! file format, and which the writer applies to each file it creates. A file states its version
 //! and its own schema (`schema_version`, and SQLite's `sqlite_schema`); a reader reads the files
 //! of the version it was written for, and a release writes one version. Its table and column
-//! names are the file format `uniserve_eval.profile` reads: the range markers' stamps are the
+//! names are the file format `tools/profile` reads: the range markers' stamps are the
 //! table `fence`, the markers `fence_probe`, and a module's class the column `module`.
 //!
 //! Every raw record kind has a table of its own, beside the tables that describe them: `metadata`

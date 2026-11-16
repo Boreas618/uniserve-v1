@@ -1,7 +1,7 @@
 -- The schema of a profiling session's file (`crates/engine/src/profiling/artifact.rs`), version 2.
 --
 -- The writer creates every file with this schema and states its version in `schema_version`; a
--- reader reads the files of the version it was written for (`uniserve_eval.profile`). Times are
+-- reader reads the files of the version it was written for (`tools/profile`). Times are
 -- nanoseconds in the clock `metadata`'s `doc.clocks` names for each table, and the meaning of each
 -- table's identifiers is stated under `doc.<table>`.
 
