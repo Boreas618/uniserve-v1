@@ -38,7 +38,7 @@ use proto::admin::{DeploymentStatus, Phase, ServingState, UpdateStatus};
 use proto::request::Request;
 use proto::request::wire;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::api::input::media::MediaConnector;
 use crate::api::input::video::{ProcessedVideo, VideoService};
@@ -2864,21 +2864,43 @@ impl Replica {
         if !wanted {
             return Ok(());
         }
+        debug!(model = %self.model_name, "keeping the replica's standby");
         let Some(control) = self.control.get().cloned() else {
+            debug!("no standby: the replica has no engine control");
             return Ok(());
         };
         let _starting = self.standby_starting.lock().await;
         let Some(serving) = self.hold.client() else {
+            debug!("no standby: no engine serves the replica");
             return Ok(());
         };
-        if !keeps_standby(wanted, serving.state(), self.serves_serving_epoch()) {
+        let serves_epoch = self.serves_serving_epoch();
+        if !keeps_standby(wanted, serving.state(), serves_epoch) {
+            debug!(
+                state = ?serving.state(),
+                serves_epoch,
+                "no standby: the serving engine keeps none"
+            );
             return Ok(());
+        }
+        // A standby of another epoch than the one the replica serves stood beside the engine a
+        // switch replaced: it is ended with its read-only claim on that epoch, whatever states
+        // the replaced engine passed through on its way out.
+        let served_epoch = service::lock(&self.served).as_ref().map(|args| args.epoch);
+        let stale = service::lock(&self.standby)
+            .as_ref()
+            .is_some_and(|standby| Some(standby.client.epoch()) != served_epoch);
+        if stale {
+            self.drop_standby();
         }
         {
             let mut slot = service::lock(&self.standby);
             match slot.as_ref().map(|standby| standby.client.state()) {
-                // A parked standby is the one this replica wants.
-                Some(EngineState::Parked) => return Ok(()),
+                // A parked standby of the served epoch is the one this replica wants.
+                Some(EngineState::Parked) => {
+                    debug!("no new standby: a parked one stands beside the replica");
+                    return Ok(());
+                }
                 // A standby that failed or ended is replaced: dropping the
                 // client closes its control connections, and its processes end.
                 Some(_) => *slot = None,
@@ -2886,6 +2908,7 @@ impl Replica {
             }
         }
         let Some(mut args) = service::lock(&self.served).clone() else {
+            debug!("no standby: the replica has no served arguments");
             return Ok(());
         };
         // A replica whose deployment's updater is gone keeps no standby.
@@ -2895,6 +2918,7 @@ impl Replica {
             .and_then(|registry| registry.updates.upgrade())
             .is_none()
         {
+            debug!("no standby: the deployment's updater is gone");
             return Ok(());
         }
         let rooms = self.standby_rooms(&control).await;
