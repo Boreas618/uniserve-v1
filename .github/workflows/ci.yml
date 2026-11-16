@@ -16,11 +16,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: extractions/setup-just@v2
       # The runner has no FFmpeg 8.1, so the media crate builds the pinned FFmpeg 8.1.2 and
-      # libx264 from source (its `vendored` feature), which assembles x86-64 kernels with nasm.
-      - run: sudo apt-get update && sudo apt-get install -y nasm
+      # libx264 from source (its `vendored` feature), which assembles x86-64 kernels with nasm;
+      # bindgen loads libclang to generate the NVTX and NIXL bindings.
+      - run: sudo apt-get update && sudo apt-get install -y nasm libclang-18-dev
       - run: just fmt
       - run: just clippy --features media/vendored
-      - run: just test-rust --features media/vendored
+      # Every test package runs past a failure, so one does not hide the others.
+      - run: just test-rust --no-fail-fast --features media/vendored
       - run: just bench-build --features media/vendored
 
   python:
