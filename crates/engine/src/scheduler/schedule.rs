@@ -899,8 +899,8 @@ impl Scheduler {
             return;
         };
 
+        self.trace_starved(id, now);
         if self.running.len() > 1 || !self.waiting.is_empty() {
-            self.trace_starved(id, now);
             let terminal = self.finished(id, FinishReason::Error, None);
             self.finish(id, terminal);
         } else {
@@ -912,11 +912,12 @@ impl Scheduler {
         }
     }
 
-    /// States why the starvation bound ends running request `id` at `now`: how long it made no
-    /// progress, the call it waits to make, the blocks it asks for ahead of it and whether the
-    /// blocks it holds cover that call, the units of a region it waits to see since a shortage
-    /// with the region's `available` and `retiring` words, and its tables' counts. What the
-    /// request's end with `FinishReason::Error` states nothing more of.
+    /// States why the starvation bound ends running request `id` at `now`, or fails the scheduler
+    /// with it: how long it made no progress, the call it waits to make, the blocks it asks for
+    /// ahead of it and whether the blocks it holds cover that call, the units of a region it
+    /// waits to see since a shortage with the region's `available` and `retiring` words, its
+    /// tables' counts, and the event credit its consumer left it. What the request's end with
+    /// `FinishReason::Error`, or the scheduler's failure, states nothing more of.
     fn trace_starved(&self, id: RequestId, now: Instant) {
         let Some(request) = self.requests.get(&id) else {
             return;
@@ -940,6 +941,7 @@ impl Scheduler {
             ahead = ?self.ahead(request),
             ?short,
             blocks = ?request.blocks,
+            event_credit = request.event_credit,
             "the starvation bound ends a running request that made no progress"
         );
     }
