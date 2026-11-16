@@ -1409,11 +1409,16 @@ def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
                     if previous in entry["epochs"]
                 }
 
-            server.wait_until(
-                lambda: kept() == {"weights"},
-                ADMITTED_S,
-                "the previous epoch kept more than its weights",
-            )
+            try:
+                server.wait_until(
+                    lambda: kept() == {"weights"},
+                    ADMITTED_S,
+                    "the previous epoch kept more than its weights",
+                )
+            except TimeoutError as timeout:
+                raise AssertionError(
+                    f"the previous epoch keeps {sorted(kept())}"
+                ) from timeout
         before_rollback = admin.next_event(server)
         rolled = admin.operation(
             server, "config/rollback", {"reason": "the check"}
