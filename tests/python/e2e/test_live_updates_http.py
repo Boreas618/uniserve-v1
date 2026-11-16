@@ -794,7 +794,9 @@ def _restart_while_streaming(
     _commit(server)
     served = tomllib.loads(admin.config(server)["config"])
     assert served["cuda_graph_config"]["decode_batch_sizes"] == [1, 2, 8]
-    assert served["admin_config"]["host"] == "127.0.0.1", served
+    # `127.0.0.1` is the host's default, which the configuration, stating only
+    # what differs from the defaults, leaves out.
+    assert "host" not in served.get("admin_config", {}), served
     assert _ask(both_url, name, "Say hello.")
     updates.wait_for_end(previous)
 
