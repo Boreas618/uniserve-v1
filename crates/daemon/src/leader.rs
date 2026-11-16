@@ -280,6 +280,10 @@ pub(crate) fn epoch_hosts(config: &proto::config::EngineConfig) -> anyhow::Resul
 /// Replicas whose experts are sharded over each one's own tensor-parallel ranks are independent
 /// and keep the flag.
 ///
+/// Each independent replica's engine host is the host of its first rank: its scheduler node
+/// holds its rank 0 and its schedulers ([`crate::engine::control::world_hosts`]), so a replica
+/// the deployment places on another host (`device_config.worker_hosts`) runs its engine there.
+///
 /// # Errors
 ///
 /// Fails when the worker groups do not form equal replicas, or when a deployment that shards its
@@ -320,6 +324,9 @@ pub(crate) fn replica_configs(
             let mut replica = config.clone();
             replica.parallel.data_parallel_size = std::num::NonZeroUsize::MIN;
             replica.parallel.worker_groups = groups.to_vec();
+            if let Some(first) = groups.iter().flat_map(|group| group.ranks.iter()).next() {
+                replica.parallel.engine_host = first.host.clone();
+            }
             replica
         })
         .collect())
@@ -4264,6 +4271,32 @@ mod tests {
         assert!(replicas.iter().all(|replica| {
             replica.parallel.data_parallel_size.get() == 1 && replica.scheduler == config.scheduler
         }));
+    }
+
+    /// Replicas spread over a second host run their engines where their ranks are: each one's
+    /// scheduler node is the host of its first rank, and its world places.
+    #[test]
+    fn replicas_on_another_host_run_their_engine_there() {
+        let mut options = crate::options::ServerArgs {
+            data_parallel_size: std::num::NonZeroUsize::new(4).unwrap(),
+            host_identity: "rank-1".to_owned(),
+            ..Default::default()
+        };
+        options.device_config.worker_hosts = vec!["rank-2".to_owned()];
+        let config = options.engine_config().expect("the configuration resolves");
+
+        let replicas = super::replica_configs(&config).unwrap();
+        let hosts: Vec<&str> = replicas
+            .iter()
+            .map(|replica| replica.parallel.engine_host.as_str())
+            .collect();
+        assert_eq!(hosts, ["rank-1", "rank-1", "rank-2", "rank-2"]);
+        for replica in &replicas {
+            let world = crate::engine::control::world_hosts(replica).expect("the replica places");
+            assert_eq!(world.len(), 1);
+            assert_eq!(world[0].host, replica.parallel.engine_host);
+        }
+        assert_eq!(super::epoch_hosts(&config).unwrap(), ["rank-1", "rank-2"]);
     }
 
     /// Schedulers that exchange experts communicate, so they stay in one replica.
