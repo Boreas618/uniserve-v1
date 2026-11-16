@@ -278,7 +278,7 @@ pub enum FailureKind {
     PolicyRolledBack,
     /// A main process exited, as its daemon observed it.
     ProcessExit,
-    /// An engine could not prepare the update's modules.
+    /// The update could not prepare: a serving engine its modules, or a target engine its start.
     PrepareFailed,
     /// An engine rolled the update back by itself.
     RolledBack,

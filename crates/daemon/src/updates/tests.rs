@@ -387,6 +387,41 @@ fn a_failed_preparation_abandons_the_update_and_nothing_changed() {
     );
 }
 
+/// A target whose start fails before it parks abandons the epoch update as a
+/// failed preparation with the engine's reason, the kind the leader states
+/// when the same target does not join: the serving epoch serves on.
+#[test]
+fn a_target_that_does_not_start_abandons_the_update_as_a_failed_preparation() {
+    let mut deployment = Deployment::new(Refusals::default());
+    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    deployment
+        .updater
+        .apply(update)
+        .expect("no update is in flight");
+
+    let reason = "the GPU's quota cannot hold the rank's graph pool";
+    deployment.engines.report(
+        SPAWNED,
+        process::Report {
+            kind: Some(process::report::Kind::Fault(process::Fault {
+                kind: process::FaultKind::Start.into(),
+                reason: reason.to_owned(),
+                device: None,
+            })),
+        },
+    );
+    deployment.run();
+
+    let status = deployment.status();
+    assert_eq!(status["phase"], "abandoned");
+    assert_eq!(status["failure"]["kind"], "prepare_failed");
+    assert_eq!(status["failure"]["reason"], reason);
+    assert!(
+        deployment.engines.received(PREVIOUS).is_empty(),
+        "nothing that serves changed"
+    );
+}
+
 /// With two serving engines the switch begins only once both prepared, and
 /// one that cannot prepare abandons the update for both.
 #[test]

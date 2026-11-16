@@ -754,9 +754,17 @@ impl Update {
                     .record(trial.switch.epoch, trial.switch.record.clone());
                 trial.parked.insert(target);
             }
+            // A target's engines prepare by starting and parking, so whatever a target reports
+            // failing before it parked is the update's failed preparation, with the engine's
+            // reason: the one kind the leader states when the same target does not join, which
+            // of the two arrives first.
             (Phase::Preparing, _, _) => {
                 if let Some(failure) = Failure::of_report(&report) {
-                    self.abandon(processes, failure);
+                    let prepare = Failure {
+                        kind: FailureKind::PrepareFailed,
+                        ..failure
+                    };
+                    self.abandon(processes, prepare);
                 }
             }
             (Phase::Switching, false, Some(report::Kind::Serving(serving))) => {
