@@ -187,6 +187,16 @@ pub(crate) fn by_host(
 /// them ([`grow_regions`]), which each reaches as far as its space's free ranges go. Returns each
 /// region's number with the units it reached.
 ///
+/// The regions grow in rounds, each creating at most twice the segments per region of the round
+/// before, from one, and resizing the schedulers' regions after it, until a round creates none.
+/// The driver creates a segment's parts one at a time (one allocation per column of each plane,
+/// some 6,000 for a 64-segment region of a data-parallel rank of a 48-layer model, which take
+/// seconds), and the ranks of one process create no faster at once than one after another, so a
+/// grow that created each region whole before resizing any left every region without units
+/// until the last was created: a promotion of an engine whose drain gave all its memory back, a
+/// rollback's, admitted nothing for as long. Rounds give every region units within the first,
+/// and double what each holds every round after, in as many rounds as the bits of its count.
+///
 /// # Errors
 ///
 /// A rank's failure or refusal, the Storage Server's refusal of a grant, or a scheduler that
@@ -196,8 +206,15 @@ pub(crate) fn grow(
     head: &Mutex<StorageClient>,
     binding: &WeightBinding,
 ) -> Result<Vec<(u8, u32)>> {
-    create_fitting(&mut lock(head), binding, None)?;
-    grow_regions(schedulers, head)
+    let mut round = 1_u32;
+    loop {
+        let created = create_fitting(&mut lock(head), binding, None, Some(round))?;
+        let reached = grow_regions(schedulers, head)?;
+        if created == 0 {
+            return Ok(reached);
+        }
+        round = round.saturating_mul(2);
+    }
 }
 
 /// The ranks' side of a grow ([`grow`]) and of a warm start: the ranks of each device region of
@@ -212,7 +229,9 @@ pub(crate) fn grow(
 /// when a start creates its regions: such a region is created whole, and refused, naming the
 /// capacity and the warm processes of this process's ranks, when a rank's quota cannot hold what
 /// it gave back even as the epochs it starts beside drain (`Room::elsewhere`); what those epochs
-/// hold now it grows into by `Grow` as they drain.
+/// hold now it grows into by `Grow` as they drain. `limit` caps the segments each region creates,
+/// a round of a grow's ([`grow`]); `None` creates every one that fits. Returns the segments the
+/// head granted, over every region.
 ///
 /// # Errors
 ///
@@ -222,27 +241,32 @@ pub(crate) fn create_fitting(
     head: &mut StorageClient,
     binding: &WeightBinding,
     capacity: Option<u64>,
-) -> Result<()> {
+    limit: Option<u32>,
+) -> Result<usize> {
     let mut regions = device_regions(head)?;
     regions.sort_by_key(|(.., state)| !*state);
 
+    let mut created = 0;
     for (index, number, name, groups, _) in regions {
         if let Some(tokens) = capacity {
             whole(binding, &groups, number, (&name, tokens))?;
         }
         let fitting = binding.fitting_segments(&groups, number)?;
+        let fitting = limit.map_or(fitting, |limit| fitting.min(limit));
         if fitting == 0 {
             continue;
         }
+
         let tables = binding.create_segments(&groups, number, Some(fitting))?;
         let granted = grant_held(head, index, &tables)?;
+        created += granted;
         tracing::info!(
             region = %name,
             granted,
             "the ranks created the segments their quotas hold and the head granted them"
         );
     }
-    Ok(())
+    Ok(created)
 }
 
 /// Gives back, once a start's ranks are warm, the tail segments of each device region that

@@ -310,7 +310,7 @@ pub(crate) fn wake(
     binding
         .restore_graphs()
         .context("restoring the graph pools")?;
-    epoch::create_fitting(&mut lock(head), binding, None)?;
+    epoch::create_fitting(&mut lock(head), binding, None, None)?;
 
     // The regions are grown first, so the first request admitted finds its units.
     let reached = epoch::grow_regions(schedulers, head)?;

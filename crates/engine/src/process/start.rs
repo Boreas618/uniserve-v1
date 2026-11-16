@@ -667,7 +667,7 @@ pub(crate) fn start(
             .kv_cache
             .max_tokens
             .map(NonZeroU64::get);
-        epoch::create_fitting(&mut head, &binding, capacity)?;
+        epoch::create_fitting(&mut head, &binding, capacity, None)?;
     }
 
     // The always-on counters, once the ranks are warm: every stream a runner computes on is
