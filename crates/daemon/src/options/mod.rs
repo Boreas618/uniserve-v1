@@ -608,10 +608,12 @@ impl Default for EventLog {
 
 /// The options the daemon reads alone: its HTTP server and listeners, the request and output
 /// processing (the chat options, the model's processor options, the image and condition media
-/// sources), the video jobs, migration, logging, and this host's Build Server, against which an
-/// epoch's modules are prepared. A hot restart of the daemon applies a change of them; every
-/// other option is the engine configuration's, the deployment's layout and hosts', or an
-/// update's.
+/// sources), the video jobs, migration, logging, this host's Build Server, against which an
+/// epoch's modules are prepared, and the updates' options, whose statistics window each
+/// replica's observer is sized to when it starts. A hot restart of the daemon applies a change
+/// of them; every other option is the engine configuration's or the deployment's layout and
+/// hosts'. An update's own assignments to `update_config` govern that update alone and change
+/// no option of the daemon's (`updates::change::resolve`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DaemonPart {
     pub server_config: ServerConfig,
@@ -624,6 +626,7 @@ pub struct DaemonPart {
     pub migration_config: MigrationConfig,
     pub mm_processor_kwargs: serde_json::Map<String, Value>,
     pub build_config: build_server::command::Settings,
+    pub update_config: UpdateConfig,
 }
 
 impl ServerArgs {
@@ -633,7 +636,7 @@ impl ServerArgs {
     /// it is placed in the daemon's part or left to the rest of the configuration.
     pub fn daemon_part(&self) -> DaemonPart {
         let Self {
-            // The engine configuration, the deployment's layout and hosts, and the updates.
+            // The engine configuration and the deployment's layout and hosts.
             model: _,
             model_dir: _,
             served_model_name: _,
@@ -663,7 +666,6 @@ impl ServerArgs {
             kv_cache_config: _,
             scheduler_config: _,
             speculative_config: _,
-            update_config: _,
             device_config: _,
             moe_config: _,
             cuda_graph_config: _,
@@ -688,6 +690,7 @@ impl ServerArgs {
             migration_config,
             mm_processor_kwargs,
             build_config,
+            update_config,
         } = self;
         DaemonPart {
             server_config: server_config.clone(),
@@ -700,6 +703,7 @@ impl ServerArgs {
             migration_config: migration_config.clone(),
             mm_processor_kwargs: mm_processor_kwargs.clone(),
             build_config: build_config.clone(),
+            update_config: update_config.clone(),
         }
     }
 
@@ -718,6 +722,7 @@ impl ServerArgs {
             migration_config,
             mm_processor_kwargs,
             build_config,
+            update_config,
         } = part;
         Self {
             server_config,
@@ -730,6 +735,7 @@ impl ServerArgs {
             migration_config,
             mm_processor_kwargs,
             build_config,
+            update_config,
             ..self.clone()
         }
     }

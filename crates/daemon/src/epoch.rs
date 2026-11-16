@@ -555,12 +555,10 @@ pub fn change(previous: &Epoch, next: &Epoch) -> Change {
 }
 
 /// Whether `current` and `target` differ in the options the daemon reads
-/// alone: its HTTP server, the request and output processing, the media and
-/// video jobs, migration, the model's processor options, logging, the
-/// update's own options and the admin listeners. A change of them is a hot
-/// restart of the daemon.
+/// alone ([`crate::options::DaemonPart`]). A change of them is a hot restart
+/// of the daemon.
 pub fn host_options_differ(current: &ServerArgs, target: &ServerArgs) -> bool {
-    current.daemon_part() != target.daemon_part() || current.update_config != target.update_config
+    current.daemon_part() != target.daemon_part()
 }
 
 #[cfg(test)]
@@ -922,6 +920,13 @@ mod tests {
                 change(&base, &next),
                 Change::Host,
                 "{what} is the daemon's own option"
+            );
+            // The hot restart's successor serves the daemon's options the change states, so
+            // the change it applies again (`"then": "update"`) restarts nothing.
+            let successor = base.config.with_daemon_part(next.config.daemon_part());
+            assert!(
+                !host_options_differ(&successor, &next.config),
+                "the successor of a change of {what} serves it"
             );
         }
         for (what, edit) in &epoch {

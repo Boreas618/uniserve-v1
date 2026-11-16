@@ -922,7 +922,7 @@ impl Replica {
             retain_devices(&served.engine_config, &mut target_engine);
         }
         let running = self.hold().client().ok_or(UpdateError::NoEngine)?;
-        let daemon_changes = current.daemon_part() != target.daemon_part();
+        let daemon_changes = crate::epoch::host_options_differ(&current, &target);
         let in_place = crate::leader::configurable(
             &comparable(&served.engine_config),
             &comparable(&target_engine),
