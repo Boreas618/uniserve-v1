@@ -202,8 +202,9 @@ fn a_stop_ends_every_generation_of_one_group_only() {
     assert!(kept.runs(), "a stop ended another group");
 }
 
-/// A stop that names one generation ends that launch of the group, and
-/// leaves the standby launched beside it running.
+/// A stop that names one generation ends that launch of the group, reports
+/// its exit as every launch's exit is reported, and leaves the standby
+/// launched beside it running.
 #[test]
 fn a_stop_of_one_generation_leaves_the_groups_other_launches() {
     let directory = tempfile::tempdir().unwrap();
@@ -219,6 +220,20 @@ fn a_stop_of_one_generation_leaves_the_groups_other_launches() {
     assert_eq!(reply.error, "");
     assert!(!serving.runs());
     assert!(standby.runs(), "a stop of one generation ended another");
+
+    // The update that stopped a previous epoch's engine keeps its weights on
+    // this exit.
+    let exit = engine.exit();
+    assert_eq!(
+        (exit.host.as_str(), exit.group.as_str(), exit.generation),
+        ("node", "group", 0)
+    );
+    engine.request(request::Kind::Nodes(Default::default()));
+    assert_eq!(
+        engine.reported_exits(),
+        0,
+        "the standby's exit was reported"
+    );
 }
 
 #[test]

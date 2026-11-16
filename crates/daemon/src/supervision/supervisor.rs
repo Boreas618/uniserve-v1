@@ -129,6 +129,30 @@ struct Key {
     generation: u64,
 }
 
+impl Key {
+    /// The exit of the process of this key on `host`, which ended as `status` states, with the
+    /// asker of its launch.
+    fn exit(self, host: &str, status: String) -> (Asker, Exit) {
+        let Self {
+            asker,
+            group,
+            rank,
+            generation,
+            ..
+        } = self;
+        (
+            asker,
+            Exit {
+                host: host.to_owned(),
+                group,
+                rank,
+                generation,
+                status,
+            },
+        )
+    }
+}
+
 /// A listening socket held for a group until a process inherits it.
 struct Reservation {
     owner: Owner,
@@ -145,6 +169,10 @@ pub(crate) struct Supervisor {
     children: HashMap<Key, Child>,
     reservations: HashMap<u64, Reservation>,
     next_reservation: u64,
+    /// The exits of the processes a stop ended, which [`Supervisor::exits`] reports with the
+    /// next exits it reaps: a stopped engine ends as every engine does, for its asker and the
+    /// updater, which keeps a previous epoch's weights on that exit.
+    stopped: Vec<(Asker, Exit)>,
     /// This node's Build Server, which an engine started here resolves its modules from:
     /// it is started on the first such spawn when it does not serve yet, and its socket is the one
     /// the launch file names. `None` keeps the socket the launch states.
@@ -247,6 +275,7 @@ impl Supervisor {
             children: HashMap::new(),
             reservations: HashMap::new(),
             next_reservation: 1,
+            stopped: Vec::new(),
             build_server: None,
         })
     }
@@ -414,8 +443,9 @@ impl Supervisor {
         })
     }
 
-    /// Stops every process of `owner`'s `group` without reporting its exit,
-    /// and closes the group's reservations, ahead of the group's next launch.
+    /// Stops every process of `owner`'s `group`, of launch generation `generation` when one is
+    /// named, and reports each exit with the next [`Supervisor::exits`]; a stop of the whole
+    /// group also closes its reservations, ahead of its next launch.
     pub(crate) fn stop(&mut self, owner: Owner, group: &str, generation: Option<u64>) {
         let stopped: Vec<Key> = self
             .children
@@ -427,7 +457,13 @@ impl Supervisor {
             })
             .cloned()
             .collect();
-        self.terminate(stopped);
+        let ended = self.terminate(stopped);
+        let host = self.host.clone();
+        self.stopped.extend(
+            ended
+                .into_iter()
+                .map(|(key, status)| key.exit(&host, status)),
+        );
         // A group's reservations serve every launch of it; they end with the
         // group.
         if generation.is_none() {
@@ -446,7 +482,8 @@ impl Supervisor {
             .filter(|key| key.asker == Asker::Connection(connection) || Some(key.owner) == owner)
             .cloned()
             .collect();
-        self.terminate(ended);
+        // Their asker or their owner is gone, and with it whoever would read their exits.
+        let _ = self.terminate(ended);
         if let Some(owner) = owner {
             self.reservations.retain(|_, held| held.owner != owner);
         }
@@ -455,7 +492,8 @@ impl Supervisor {
     /// Ends every process this daemon supervises.
     pub(crate) fn terminate_all(&mut self) {
         let all: Vec<Key> = self.children.keys().cloned().collect();
-        self.terminate(all);
+        // The daemon ends with them: no one reads their exits.
+        let _ = self.terminate(all);
         self.reservations.clear();
     }
 
@@ -479,36 +517,26 @@ impl Supervisor {
             };
             exited.push((key.clone(), status, success));
         }
-        exited
-            .into_iter()
-            .map(|(key, status, success)| {
-                self.children.remove(&key);
-                let Key {
-                    owner,
-                    asker,
-                    group,
-                    rank,
-                    generation,
-                } = key;
-                // The report names the owner the process was spawned for, its rank and how it
-                // ended; what the process explained of its end is in its own log.
-                if success {
-                    tracing::info!(?owner, %group, rank, generation, "a process exited");
-                } else {
-                    tracing::warn!(?owner, %group, rank, generation, %status, "a process exited");
-                }
-                (
-                    asker,
-                    Exit {
-                        host: self.host.clone(),
-                        group,
-                        rank,
-                        generation,
-                        status,
-                    },
-                )
-            })
-            .collect()
+        let mut reported = std::mem::take(&mut self.stopped);
+        for (key, status, success) in exited {
+            self.children.remove(&key);
+            // The report names the owner the process was spawned for, its rank and how it
+            // ended; what the process explained of its end is in its own log.
+            let Key {
+                owner,
+                group,
+                rank,
+                generation,
+                ..
+            } = &key;
+            if success {
+                tracing::info!(?owner, %group, rank, generation, "a process exited");
+            } else {
+                tracing::warn!(?owner, %group, rank, generation, %status, "a process exited");
+            }
+            reported.push(key.exit(&self.host, status));
+        }
+        reported
     }
 
     /// The descriptors that turn readable when a supervised process exits, one per process: the
@@ -517,20 +545,33 @@ impl Supervisor {
         self.children.values().map(Child::exit_descriptor)
     }
 
-    /// Kills the processes of `keys`, then reaps each one.
-    fn terminate(&mut self, keys: Vec<Key>) {
+    /// Kills the processes of `keys`, then reaps each one; returns each key with how its process
+    /// ended.
+    fn terminate(&mut self, keys: Vec<Key>) -> Vec<(Key, String)> {
         let mut ending = Vec::with_capacity(keys.len());
         for key in keys {
             if let Some(mut child) = self.children.remove(&key) {
                 if let Err(error) = child.kill() {
                     tracing::warn!(group = %key.group, rank = key.rank, %error, "a process could not be stopped");
                 }
-                ending.push(child);
+                ending.push((key, child));
             }
         }
-        for mut child in ending {
-            let _ = child.wait();
-        }
+        ending
+            .into_iter()
+            .map(|(key, mut child)| {
+                let status = match child.wait() {
+                    Ok(Exited::Status(status)) => status.to_string(),
+                    Ok(Exited::Unread) => {
+                        "stopped (adopted from the previous daemon, whose child it was; its \
+                         status is not readable here)"
+                            .to_owned()
+                    }
+                    Err(error) => format!("exit status unreadable: {error}"),
+                };
+                (key, status)
+            })
+            .collect()
     }
 }
 
