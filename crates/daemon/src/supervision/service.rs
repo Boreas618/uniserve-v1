@@ -169,7 +169,8 @@ impl Local {
                 Err(error) => reply.error = error,
             },
             Some(request::Kind::Stop(stop)) => {
-                self.supervisor.stop(owner, &stop.group, stop.generation);
+                self.supervisor
+                    .stop(owner, asker, &stop.group, stop.generation);
                 reply.kind = Some(reply::Kind::Stopped(Stopped {}));
             }
             Some(request::Kind::Reserve(reserve)) => {

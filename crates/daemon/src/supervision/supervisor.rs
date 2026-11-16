@@ -169,9 +169,11 @@ pub(crate) struct Supervisor {
     children: HashMap<Key, Child>,
     reservations: HashMap<u64, Reservation>,
     next_reservation: u64,
-    /// The exits of the processes a stop ended, which [`Supervisor::exits`] reports with the
-    /// next exits it reaps: a stopped engine ends as every engine does, for its asker and the
-    /// updater, which keeps a previous epoch's weights on that exit.
+    /// The exits of the processes a stop ended, each with the asker of the stop, which
+    /// [`Supervisor::exits`] reports with the next exits it reaps: to the updater, which keeps a
+    /// previous epoch's weights on that exit, and to the leader that stopped a process of
+    /// another node. The asker of the process's launch is not told: it reads an exit as its
+    /// engine's unexpected end, and the stop's reply already ended what it asked for.
     stopped: Vec<(Asker, Exit)>,
     /// This node's Build Server, which an engine started here resolves its modules from:
     /// it is started on the first such spawn when it does not serve yet, and its socket is the one
@@ -444,9 +446,16 @@ impl Supervisor {
     }
 
     /// Stops every process of `owner`'s `group`, of launch generation `generation` when one is
-    /// named, and reports each exit with the next [`Supervisor::exits`]; a stop of the whole
-    /// group also closes its reservations, ahead of its next launch.
-    pub(crate) fn stop(&mut self, owner: Owner, group: &str, generation: Option<u64>) {
+    /// named, and reports each exit to `asker`, the asker of the stop, with the next
+    /// [`Supervisor::exits`]; a stop of the whole group also closes its reservations, ahead of
+    /// its next launch.
+    pub(crate) fn stop(
+        &mut self,
+        owner: Owner,
+        asker: Asker,
+        group: &str,
+        generation: Option<u64>,
+    ) {
         let stopped: Vec<Key> = self
             .children
             .keys()
@@ -459,11 +468,10 @@ impl Supervisor {
             .collect();
         let ended = self.terminate(stopped);
         let host = self.host.clone();
-        self.stopped.extend(
-            ended
-                .into_iter()
-                .map(|(key, status)| key.exit(&host, status)),
-        );
+        self.stopped.extend(ended.into_iter().map(|(key, status)| {
+            let (_, exit) = key.exit(&host, status);
+            (asker, exit)
+        }));
         // A group's reservations serve every launch of it; they end with the
         // group.
         if generation.is_none() {
