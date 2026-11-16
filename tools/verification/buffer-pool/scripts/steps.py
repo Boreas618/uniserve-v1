@@ -83,7 +83,8 @@ import sys
 import tempfile
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# The modules a window's TLC run reads: the model, the pool alone and the trace.
+MODEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "model")
 TOOLS = os.environ.get("TLA_TOOLS", "/workspace/dev/tools/tla")
 UNIT = re.compile(r"\b(\d+):(\d+)\b")
 
@@ -1332,7 +1333,7 @@ def check(job):
     directory = os.path.join(work, f"run{run}")
     os.makedirs(directory, exist_ok=True)
     for module in ("KvCore.tla", "MC_Pool.tla", "KvTrace.tla"):
-        shutil.copy(os.path.join(HERE, module), directory)
+        shutil.copy(os.path.join(MODEL, module), directory)
     slot_group = Fn((slot, regions[slot.split(":")[0]][1]) for slot in units["rows"])
     memory = Fn((group, info[0]) for group, info in layout[0])
     kv_region = Fn((group, "r" + info[2][0]) for group, info in layout[0])
@@ -1400,7 +1401,7 @@ def check(job):
         "GroupParts": "<- TraceGroupParts", "Readers": "<- TraceReaders",
     }
     # MC_Pool's model values: the names on the first line of its CONSTANTS.
-    pool = open(os.path.join(HERE, "MC_Pool.tla")).read()
+    pool = open(os.path.join(MODEL, "MC_Pool.tla")).read()
     declared = re.search(r"^CONSTANTS ([^\n]*)", pool, flags=re.M).group(1)
     constants.update({name: f"= {name}" for name in re.findall(r"\w+", declared)})
     with open(os.path.join(directory, "MC_Trace.cfg"), "w") as out:

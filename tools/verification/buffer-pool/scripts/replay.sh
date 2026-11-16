@@ -20,7 +20,7 @@ trace=$(cd "$1" && pwd)
 work=${REPLAY_WORK:-$(mktemp -d)}
 mkdir -p "$work/states"
 
-if ! (cd "$here/../../.." && cargo run --release -p storage-server --features verification \
+if ! (cd "$here/../../../.." && cargo run --release -p storage-server --features verification \
         --bin buffer-pool-verify -- replay "$trace" --states "$work/states") \
         > "$work/replay.log" 2>&1; then
     echo "FAIL  replay of $trace: $(tail -1 "$work/replay.log" | cut -c1-600)"

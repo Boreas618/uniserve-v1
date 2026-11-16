@@ -1,7 +1,7 @@
 //! Every request sequence of small configurations, enumerated: no sequence
 //! breaks an invariant, and every state reached is written in the terms of
 //! the design model so that it can be compared with the states of the
-//! model's buffer pool (`tools/verification/buffer-pool/agreement.sh`), and every
+//! model's buffer pool (`tools/verification/buffer-pool/scripts/agreement.sh`), and every
 //! transition with the input that made it, so that it can be compared with
 //! the model's steps (`agreement_steps.sh`), both through
 //! `buffer-pool-verify enumerate`. The pool is driven by the inputs the
@@ -833,7 +833,7 @@ impl Driver {
 
 /// A transition the model does not allow, made by hand: a commit takes
 /// effect while the stamp it waits for is not reached (R3). The step check
-/// of `tools/verification/buffer-pool/agreement_steps.sh` is to report it.
+/// of `tools/verification/buffer-pool/scripts/agreement_steps.sh` is to report it.
 fn forged() -> Result<String, String> {
     let mut driver = Driver::new(SHAPES[0])?;
     driver.apply(Step::Attach(1, 0))?;

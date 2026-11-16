@@ -11,8 +11,12 @@ set -u
 T=${TLA_TOOLS:-/workspace/dev/tools/tla}
 module=$1; config=${2:-$1}; shift; [ $# -gt 0 ] && shift; [ "${1:-}" = "--" ] && shift
 logs=${TLC_LOGS:-$(mktemp -d)}; mkdir -p "$logs"
-cd "$(dirname "$0")"
-cfg="$config.cfg"; name="$config"
+# The configurations are run from configs/; the modules they extend lie in
+# model/, properties/ and proof/, which TLC searches as its library.
+here=$(cd "$(dirname "$0")/.." && pwd)
+cd "$here/configs"
+spec="$module.tla"; [ -f "$spec" ] || spec="$here/model/$module.tla"
+cfg="$here/configs/$config.cfg"; name="$config"
 if [ -n "${RULES:-}" ]; then
     name="$name-$RULES"; sed "s/Rules <- AllRules/Rules <- $RULES/" "$cfg" > "$logs/$name.cfg"; cfg="$logs/$name.cfg"
 fi
@@ -28,8 +32,8 @@ if [ -n "${ONLY:-}" ]; then
 fi
 log="$logs/$name.log"
 "$T"/jdk-21.0.13+9/bin/java -XX:+UseParallelGC -Xmx${TLC_HEAP:-32g} \
-    -DTLA-Library="$T/tlaps/lib/tlapm/stdlib" -cp "$T/tla2tools.jar" tlc2.TLC \
-    -workers ${TLC_WORKERS:-32} -noGenerateSpecTE -metadir "$logs/states-$name" -config "$cfg" "$@" "$module" > "$log" 2>&1
+    -DTLA-Library="$here/model:$here/properties:$here/proof:$T/tlaps/lib/tlapm/stdlib" -cp "$T/tla2tools.jar" tlc2.TLC \
+    -workers ${TLC_WORKERS:-32} -noGenerateSpecTE -metadir "$logs/states-$name" -config "$cfg" "$@" "$spec" > "$log" 2>&1
 status=$?
 grep -E "^Error: (Invariant|Action property|Temporal|Deadlock|.*is violated)|^State [0-9]+: <|states generated,|Model checking completed|The depth of the complete|Finished in|Error: " "$log" \
     | sed -E 's/^(State [0-9]+: <[A-Za-z]+(\([^)]*\))?).*/\1>/'

@@ -10,7 +10,7 @@ import os
 import re
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "properties")
 PINS = os.path.join(HERE, "pins.sha256")
 
 

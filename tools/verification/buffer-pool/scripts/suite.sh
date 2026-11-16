@@ -109,7 +109,7 @@ for part in $parts; do
                 fi
             done <<< "$validation" ;;
         addresses)
-            answers=$("${TLA_TOOLS:-/workspace/dev/tools/tla}"/tlaps/lib/tlapm/backends/bin/z3 addresses.smt2 | sort | uniq -c | tr -s ' ' | tr '\n' ';')
+            answers=$("${TLA_TOOLS:-/workspace/dev/tools/tla}"/tlaps/lib/tlapm/backends/bin/z3 ../proof/addresses.smt2 | sort | uniq -c | tr -s ' ' | tr '\n' ';')
             if [ "$answers" = " 13 unsat;" ]; then echo "ok    addresses: 13 goals unsat" >> "$results"
             else echo "FAIL  addresses: expected 13 unsat, got:$answers" >> "$results"; fi ;;
     esac

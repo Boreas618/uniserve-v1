@@ -13,7 +13,7 @@ cd "$(dirname "$0")"
 work=${AGREEMENT_WORK:-$(mktemp -d)}
 mkdir -p "$work/rust"
 
-if ! (cd ../../.. && cargo run --release -p storage-server --features verification \
+if ! (cd ../../../.. && cargo run --release -p storage-server --features verification \
         --bin buffer-pool-verify -- enumerate --states "$work/rust") > "$work/enumeration.log" 2>&1; then
     echo "FAIL  the enumeration of the Rust buffer pool: $(tail -1 "$work/enumeration.log")"
     exit 1
@@ -24,7 +24,7 @@ status=0
 for shape in ${*:-core copies transfer tiers cross parts trial}; do
     config=MC_Pool$(echo "${shape:0:1}" | tr a-z A-Z)${shape:1}
     # A configuration with constants of its own has a module of its own over MC_Pool.
-    module=MC_Pool; [ -f "$config.tla" ] && module=$config
+    module=MC_Pool; [ -f "../configs/$config.tla" ] && module=$config
     rm -f "$work/$shape.dump"; mkfifo "$work/$shape.dump"
     TLC_LOGS="$work/logs" ./tlc.sh "$module" "$config" -- -dump "$work/$shape" > "$work/$shape.tlc" 2>&1 &
     if result=$(python3 agreement.py "$shape" "$work/$shape.dump" "$work/rust/$shape.txt"); then

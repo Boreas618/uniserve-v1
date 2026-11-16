@@ -2,3 +2,4 @@
 states/
 _apalache-out/
 *_TTrace_*
+*.log
