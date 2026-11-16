@@ -575,6 +575,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
             "seed",
             "num_inference_steps",
             "guidance_scale",
+            "priority",
             "input_references",
             "extra_params",
         }

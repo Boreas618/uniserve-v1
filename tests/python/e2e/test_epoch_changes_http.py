@@ -92,7 +92,7 @@ OPTIONS = (
     "--set",
     "kv_cache_config.max_tokens=32768",
     "--set",
-    "chat_config.reasoning_parser=none",
+    'chat_config.reasoning_parser="none"',
     "--set",
     "cuda_graph_config.prefill_token_sizes=[512]",
     "--set",
@@ -782,8 +782,8 @@ def _model_change(previous_epoch: str) -> tuple[str, str]:
     a case asks for it before its deployment starts.
     """  # noqa: D205
     return (
-        f"model={CHECKPOINTS['qwen3-other-weights'].model}",
-        f"update_config.previous_epoch={previous_epoch}",
+        f'model="{CHECKPOINTS["qwen3-other-weights"].model}"',
+        f'update_config.previous_epoch="{previous_epoch}"',
     )
 
 

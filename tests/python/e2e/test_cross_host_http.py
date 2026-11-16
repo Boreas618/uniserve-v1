@@ -97,7 +97,7 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
         "--set",
         "kv_cache_config.max_tokens=32768",
         "--set",
-        "chat_config.reasoning_parser=none",
+        'chat_config.reasoning_parser="none"',
         "--set",
         "cuda_graph_config.prefill_token_sizes=[512]",
         "--set",

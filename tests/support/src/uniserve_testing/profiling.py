@@ -40,7 +40,7 @@ OPTIONS = (
     "--set",
     "max_num_batched_tokens=512",
     "--set",
-    "chat_config.reasoning_parser=none",
+    'chat_config.reasoning_parser="none"',
     "--set",
     "cuda_graph_config.prefill_token_sizes=[512]",
     "--set",

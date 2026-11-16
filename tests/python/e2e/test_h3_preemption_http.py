@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import os
 import signal
+import tomllib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
@@ -59,6 +60,7 @@ from typing import Any
 
 import httpx
 import pytest
+import tomli_w
 from uniserve_testing import admin, assets, client, media
 from uniserve_testing.deployments import Deployments
 from uniserve_testing.servers import Server
@@ -201,10 +203,11 @@ def _denoised(steps: int) -> Callable[[dict[str, Any]], bool]:
 
 
 def _change_under_a_denoising_request(
-    server: Server, *assignments: str
+    server: Server, *assignments: str, **fields: object
 ) -> tuple[str, dict]:
-    """Applies `assignments` as an epoch change while a video job denoises
-    on the serving epoch; returns the job and the update as its trial began.
+    """Applies `assignments` and the request's other `fields` (a target
+    ``config``) as an epoch change while a video job denoises on the serving
+    epoch; returns the job and the update as its trial began.
 
     The job starts once the target prepares. The serving engine's process
     is paused after the job's first denoising step and continued once the
@@ -214,7 +217,9 @@ def _change_under_a_denoising_request(
     """  # noqa: D205
     after = admin.next_event(server)
     with ThreadPoolExecutor(max_workers=1) as pool:
-        change = pool.submit(admin.apply, server, *assignments, DRAIN_AT_ONCE)
+        change = pool.submit(
+            admin.apply, server, *assignments, DRAIN_AT_ONCE, **fields
+        )
         admin.wait_for_phase(server, "preparing", after=after)
         job = _start_job(server)
         media.wait_for_job(server, job, _denoised(1), "the job did not denoise")
@@ -276,11 +281,18 @@ def test_a_video_request_continues_under_another_parallel_configuration(
         # The drain ends the Ulysses-2 epoch's request at a step boundary, as
         # the epoch change of the other test does; the target, another
         # layout, denoises on the first GPU alone.
+        # The target configuration is the served one with the target's
+        # worker groups: a `config` states a whole configuration, as
+        # `--config` does.
         target = _deployment(
             tmp_path / "target", denoising_ranks=1, fraction=CHANGE_FRACTION
         )
+        configuration = tomllib.loads(admin.config(server)["config"])
+        configuration["worker_groups"] = tomllib.loads(target.read_text())[
+            "worker_groups"
+        ]
         job, update = _change_under_a_denoising_request(
-            server, f"worker_groups={target}"
+            server, config=tomli_w.dumps(configuration)
         )
         assert update["shrink"] is True, update
         video = media.job_video(server, job).content

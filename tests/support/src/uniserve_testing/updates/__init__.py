@@ -54,9 +54,9 @@ from uniserve_testing.servers import environment
 #: are the deployment's defaults: the installed package of the highest
 #: priority for each key, and the widest prefill graph it captures.
 PROFILE = (
-    "dtype=bfloat16",
+    'dtype="bfloat16"',
     "kv_cache_config.max_tokens=32768",
-    "chat_config.reasoning_parser=none",
+    'chat_config.reasoning_parser="none"',
     "cuda_graph_config.prefill_token_sizes=[512]",
     "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
 )

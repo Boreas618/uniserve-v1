@@ -347,8 +347,8 @@ def _deployment(
 ) -> list[str]:
     """The assignments that bring the deployment `name` up on an idle node."""
     return [
-        f"model={CHECKPOINTS['qwen3'].model}",
-        f"served_model_name={name}",
+        f'model="{CHECKPOINTS["qwen3"].model}"',
+        f'served_model_name="{name}"',
         f"kv_cache_config.host_gib={HOST_CACHE_GIB}",
         *OPTIONS,
         *deployments.assignments(),
@@ -757,7 +757,7 @@ def _restart_while_streaming(
     # A change of the listening address restarts the daemon on it: the new
     # address serves, and the old one closes once the replaced daemon exits.
     previous = successors[-1]
-    moved = _apply(server, "admin_config.host=localhost")
+    moved = _apply(server, 'admin_config.host="localhost"')
     assert moved["change"] == "daemon", moved
     successors.append(moved["pid"])
     # The successor binds the new address, on a port it picks, once it holds
@@ -1247,7 +1247,7 @@ def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
             server, name, "relaunched-after-a-switch", standby=False
         )
         result = _apply(
-            server, revisions[1], "update_config.previous_epoch=weights"
+            server, revisions[1], 'update_config.previous_epoch="weights"'
         )
         assert result["change"] == "epoch", result
         _rollback(server)
@@ -1346,7 +1346,7 @@ def _slower_target(
         build_server.resolve(
             repeated.op, repeated.backend, repeated.revision, key=key
         )
-    return (engine, f"decode_attention_backend={repeated.backend}")
+    return (engine, f'decode_attention_backend="{repeated.backend}"')
 
 
 @pytest.mark.parametrize("previous_epoch", ["parked", "weights", "host"])
@@ -1367,7 +1367,7 @@ def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
         answer = _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32)
         stream = _start_count(server, name)
         result = _apply(
-            server, revision, f"update_config.previous_epoch={previous_epoch}"
+            server, revision, f'update_config.previous_epoch="{previous_epoch}"'
         )
         assert result["change"] == "epoch", result
         if previous_epoch != "parked":
@@ -1833,7 +1833,7 @@ def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
         answer = _ask(server.base_url, name, RECOVERY_PROMPT, tokens=32)
         stream = _start_count(server, name)
         result = _apply(
-            server, f"model={other}", "update_config.previous_epoch=host"
+            server, f'model="{other}"', 'update_config.previous_epoch="host"'
         )
         assert result["change"] == "epoch", result
 

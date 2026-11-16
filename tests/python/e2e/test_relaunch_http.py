@@ -80,7 +80,7 @@ OPTIONS = (
     "--set",
     "kv_cache_config.max_tokens=32768",
     "--set",
-    "chat_config.reasoning_parser=none",
+    'chat_config.reasoning_parser="none"',
     "--set",
     "cuda_graph_config.prefill_token_sizes=[512]",
     "--set",

@@ -15,10 +15,12 @@ import dataclasses
 import io
 from collections.abc import Callable
 from fractions import Fraction
+from pathlib import Path
 from typing import Any
 
 import av
 import httpx
+import huggingface_hub
 import numpy as np
 import pytest
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -102,17 +104,26 @@ def tokenizer(checkpoint: Checkpoint) -> PreTrainedTokenizerBase:
 
     The server offers no tokenize endpoint, so a case that sends a prompt of
     an exact token length counts the tokens with the pipeline's own
-    tokenizer. Skips the calling case when no repository publishes the
-    checkpoint.
+    tokenizer. The folder is resolved through the Hugging Face cache, every
+    file of it fetched there unless the cache holds it or the host is
+    offline (``HF_HUB_OFFLINE``), and the tokenizer is read from that
+    directory: given a repository instead, the reader first looks for a
+    model configuration in the folder, which a pipeline's tokenizer folder
+    has none of, and an offline host cannot answer that it is absent. Skips
+    the calling case when no repository publishes the checkpoint.
     """  # noqa: D205
     if checkpoint.repository is None:
         pytest.skip(checkpoint.unpublished)
     folder = (
         f"{checkpoint.folder}/tokenizer" if checkpoint.folder else "tokenizer"
     )
-    return AutoTokenizer.from_pretrained(
-        checkpoint.repository, revision=checkpoint.revision, subfolder=folder
+    snapshot = huggingface_hub.snapshot_download(
+        checkpoint.repository,
+        revision=checkpoint.revision,
+        repo_type=checkpoint.kind,
+        allow_patterns=[f"{folder}/*"],
     )
+    return AutoTokenizer.from_pretrained(Path(snapshot) / folder)
 
 
 #: The MiniMax-H3 benchmark description a case's exact-length prompt is cut
