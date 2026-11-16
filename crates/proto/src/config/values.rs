@@ -110,9 +110,14 @@ pub mod duration {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
-        match NumberOrText::deserialize(deserializer)? {
+        of(NumberOrText::deserialize(deserializer)?)
+    }
+
+    /// The duration a stated number of seconds or text names.
+    pub(super) fn of<E: de::Error>(value: NumberOrText) -> Result<Duration, E> {
+        match value {
             NumberOrText::Number(seconds) => Ok(Duration::from_secs(seconds)),
-            NumberOrText::Text(text) => parse_duration(&text).map_err(de::Error::custom),
+            NumberOrText::Text(text) => parse_duration(&text).map_err(E::custom),
         }
     }
 }
@@ -130,10 +135,14 @@ pub mod optional_duration {
             .serialize(serializer)
     }
 
+    /// Reads `null`, the form an unset duration is written in, as `None`; a TOML file, which has
+    /// no null, states the option or omits it.
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Option<Duration>, D::Error> {
-        duration::deserialize(deserializer).map(Some)
+        Option::<NumberOrText>::deserialize(deserializer)?
+            .map(duration::of)
+            .transpose()
     }
 }
 
@@ -146,10 +155,15 @@ pub mod bytes {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
-        match NumberOrText::deserialize(deserializer)? {
-            NumberOrText::Number(0) => Err(de::Error::custom("a byte size must be positive")),
+        of(NumberOrText::deserialize(deserializer)?)
+    }
+
+    /// The positive byte size a stated number or text names.
+    pub(super) fn of<E: de::Error>(value: NumberOrText) -> Result<u64, E> {
+        match value {
+            NumberOrText::Number(0) => Err(E::custom("a byte size must be positive")),
             NumberOrText::Number(bytes) => Ok(bytes),
-            NumberOrText::Text(text) => parse_bytes(&text).map_err(de::Error::custom),
+            NumberOrText::Text(text) => parse_bytes(&text).map_err(E::custom),
         }
     }
 }
@@ -165,10 +179,14 @@ pub mod optional_bytes {
         }
     }
 
+    /// Reads `null`, the form an unset size is written in, as `None`; a TOML file, which has no
+    /// null, states the option or omits it.
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Option<u64>, D::Error> {
-        bytes::deserialize(deserializer).map(Some)
+        Option::<NumberOrText>::deserialize(deserializer)?
+            .map(bytes::of)
+            .transpose()
     }
 }
 
@@ -225,5 +243,35 @@ mod tests {
         let printed = |size| toml::Value::try_from(Size(size)).unwrap();
         assert_eq!(printed(512 << 20), toml::Value::String("512MiB".into()));
         assert_eq!(printed(20_000_000), toml::Value::Integer(20_000_000));
+    }
+
+    /// An optional duration and byte size read back what they are written as, unset (`null`)
+    /// included, as a client reads the configuration a daemon reports.
+    #[test]
+    fn optional_values_read_back_what_they_write() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Optional {
+            #[serde(with = "optional_duration")]
+            duration: Option<Duration>,
+            #[serde(with = "optional_bytes")]
+            bytes: Option<u64>,
+        }
+        for value in [
+            Optional {
+                duration: None,
+                bytes: None,
+            },
+            Optional {
+                duration: Some(Duration::from_secs(90)),
+                bytes: Some(512 << 20),
+            },
+        ] {
+            let written = serde_json::to_string(&value).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Optional>(&written).unwrap(),
+                value,
+                "{written}"
+            );
+        }
     }
 }
