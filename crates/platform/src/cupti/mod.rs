@@ -127,7 +127,6 @@ cupti_table! {
         activity_enable = "cuptiActivityEnable": fn(u32);
         activity_disable = "cuptiActivityDisable": fn(u32);
         flush_all = "cuptiActivityFlushAll": fn(u32);
-        flush_period = "cuptiActivityFlushPeriod": fn(u32);
         next_record = "cuptiActivityGetNextRecord": fn(*mut u8, usize, *mut *mut u8);
         stream_id = "cuptiGetStreamIdEx": fn(*mut c_void, *mut c_void, u8, *mut u32);
         context_id = "cuptiGetContextId": fn(*mut c_void, *mut u32);

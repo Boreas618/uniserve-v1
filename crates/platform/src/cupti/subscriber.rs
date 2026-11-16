@@ -8,11 +8,14 @@
 //! the dispatch below. Enabling is reference-counted per callback and per
 //! activity kind, so collectors that share one start and stop independently.
 //!
-//! Activity buffers are delivered as CUPTI completes them; CUPTI's own worker
-//! thread delivers every buffer whose records completed every
-//! [`FLUSH_PERIOD`] (`cuptiActivityFlushPeriod`), which issues no CUDA
-//! synchronization, and a collector that needs the records of operations in
-//! flight forces a flush ([`flush`]).
+//! Activity buffers are delivered as CUPTI completes them, and the
+//! subscription's flush thread has CUPTI deliver every buffer whose records
+//! completed every [`FLUSH_PERIOD`] (`cuptiActivityFlushAll` without the
+//! forced flag), full or not, which issues no CUDA synchronization. CUPTI's
+//! own periodic flush (`cuptiActivityFlushPeriod`) returns only full buffers,
+//! so the records of a light workload would wait for a megabyte of others. A
+//! collector that needs the records of operations in flight forces a flush
+//! ([`flush`]).
 
 use std::alloc::Layout;
 use std::collections::HashMap;
@@ -25,8 +28,8 @@ use super::{check, cupti};
 use crate::sys::cupti as sys;
 use crate::{Error, Result, lock};
 
-/// How often CUPTI's worker thread delivers the buffers whose records
-/// completed.
+/// How often the subscription's flush thread has CUPTI deliver the buffers
+/// whose records completed.
 pub const FLUSH_PERIOD: Duration = Duration::from_millis(100);
 
 /// `CUPTI_CB_DOMAIN_DRIVER_API`.
@@ -105,11 +108,20 @@ pub fn subscribe() -> Result<()> {
                 unsafe { (cupti.register_buffers)(on_buffer_requested, on_buffer_completed) },
                 "cuptiActivityRegisterCallbacks",
             )?;
-            check(
-                // SAFETY: takes the period in milliseconds by value.
-                unsafe { (cupti.flush_period)(FLUSH_PERIOD.as_millis() as u32) },
-                "cuptiActivityFlushPeriod",
-            )?;
+            // The flush thread lives as long as the subscription, which is the
+            // process's: it only asks CUPTI to deliver what completed.
+            std::thread::Builder::new()
+                .name("cupti-flush".to_owned())
+                .spawn(|| {
+                    loop {
+                        std::thread::sleep(FLUSH_PERIOD);
+                        flush(false);
+                    }
+                })
+                .map_err(|error| Error::Thread {
+                    name: "cupti-flush",
+                    source: std::sync::Arc::new(error),
+                })?;
             Ok(subscription)
         })
         .as_ref()

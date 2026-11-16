@@ -595,6 +595,41 @@ pub(crate) mod tests {
             capture.end()?.instantiate()
         }
 
+        /// The records of a few operations, far fewer than a buffer holds, reach the stream's
+        /// time within a few flush periods with no forced flush: the always-on counters read
+        /// them so.
+        #[test]
+        #[ignore = "requires a CUDA device"]
+        fn completed_operations_are_delivered_without_a_forced_flush() -> Result<()> {
+            let _serial = lock(&crate::cupti::tests::SERIAL);
+            let device = DeviceId(0);
+            let stream = Stream::new(device)?;
+            let storage = DeviceAllocation::linear(device, FILL_BYTES)?;
+            let activity = StreamActivity::start([("device", &stream)], false)?;
+            let _ = take();
+
+            fills(&storage, &stream, 4)?;
+            stream.synchronize()?;
+            let deadline = std::time::Instant::now() + 20 * FLUSH_PERIOD;
+            let mut busy_us = 0;
+            while busy_us == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(FLUSH_PERIOD);
+                busy_us += take()
+                    .streams
+                    .iter()
+                    .filter(|stream| stream.name == "device")
+                    .map(|stream| stream.busy_us)
+                    .sum::<u64>();
+            }
+            assert!(
+                busy_us > 0,
+                "no record arrived within {:?}",
+                20 * FLUSH_PERIOD
+            );
+            drop(activity);
+            Ok(())
+        }
+
         #[test]
         #[ignore = "requires a CUDA device"]
         fn a_stream_counts_its_operations_once_and_its_idle_time_as_gap() -> Result<()> {
