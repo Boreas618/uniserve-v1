@@ -13,8 +13,12 @@ version = "2.0.0"
 description = "The pytest plugin and helpers of UniServe's Python tests"
 requires-python = ">=3.12"
 dependencies = [
+    # The decoding of the MP4s the video cases receive (`uniserve_testing.media`),
+    # and the arrays their frames and samples are compared as.
+    "av>=14",
     "httpx",
     "huggingface-hub",
+    "numpy",
     "nvidia-ml-py",
     "pillow>=10.4",
     "prometheus-client",
