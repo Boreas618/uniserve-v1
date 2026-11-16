@@ -117,8 +117,9 @@ pub struct UpdateReport {
     pub epoch: u64,
     /// Whether the update is rolling back or rolled back.
     pub rollback: bool,
-    /// How long the switch took, once it ended.
-    pub switch_ms: Option<u128>,
+    /// How long the switch took, once it ended, in milliseconds. A `u64`: the report crosses the
+    /// hot restart's handoff in MessagePack, which has no 128-bit integers.
+    pub switch_ms: Option<u64>,
     /// How long the update has been on trial.
     pub trial_s: Option<f64>,
     /// The seconds left before the deadline rolls the update back.

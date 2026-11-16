@@ -1175,6 +1175,35 @@ mod tests {
 
     use super::*;
 
+    /// An update's report, which the takeover carries to the successor, crosses the handoff's
+    /// MessagePack whole once its switch ended: the codec has no 128-bit integers, so a field of
+    /// one would fail every hot restart taken after an update.
+    #[test]
+    fn an_update_report_crosses_the_handoff() {
+        use proto::admin::{ChangeForm, Phase, UpdateReport};
+
+        let report = UpdateReport {
+            change: ChangeForm::Epoch,
+            update: 3,
+            phase: Phase::Trial,
+            epoch: 2,
+            rollback: false,
+            switch_ms: Some(1_234),
+            trial_s: Some(4.5),
+            deadline_s: None,
+            failure: None,
+            uncompared: Vec::new(),
+            claim_failed: None,
+            generation: None,
+            epoch_form: None,
+            trial: None,
+            transfers: None,
+        };
+        let encoded = service::msgpack::encode(&report).expect("the report encodes");
+        let decoded: UpdateReport = service::msgpack::decode(&encoded).expect("the report decodes");
+        assert_eq!(decoded, report);
+    }
+
     /// The adopted epoch states the configuration it serves, and its process
     /// row the launch generation its engine reported, so a later switch
     /// compares against it and numbers its engines above it. The record's

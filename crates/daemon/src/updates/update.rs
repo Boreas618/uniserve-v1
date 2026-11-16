@@ -435,7 +435,9 @@ impl Update {
             phase: self.phase,
             epoch: self.target_epoch(),
             rollback: self.back,
-            switch_ms: self.switched_in.map(|switched| switched.as_millis()),
+            switch_ms: self
+                .switched_in
+                .map(|switched| u64::try_from(switched.as_millis()).unwrap_or(u64::MAX)),
             trial_s: self.trial_began.map(|began| began.elapsed().as_secs_f64()),
             deadline_s: self.deadline.map(|deadline| {
                 deadline
