@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ::engine::scheduler::policy;
 use anyhow::Result;
@@ -68,6 +68,11 @@ pub fn packaged_arguments(ceilings: &Limits) -> Parameters {
 /// `ceilings`: the policy `engine::Engine::new` instantiates on every scheduler and, with several,
 /// the route.
 ///
+/// The module is compiled once per test process and shared: compiling it is the costly step (a
+/// debug build takes seconds of a core), and an engine instantiates the module it is given on
+/// the module's own engine, so every fake engine of a suite can share one compilation, as every
+/// scheduler of a deployment shares the module its store served.
+///
 /// # Errors
 ///
 /// When this host has no policy engine, or the module does not load.
@@ -76,9 +81,17 @@ pub fn packaged_arguments(ceilings: &Limits) -> Parameters {
 ///
 /// As [`packaged_module`] and [`packaged_parameters`].
 pub fn packaged_policy(ceilings: &Limits) -> Result<(Arc<wasmtime::Module>, Parameters)> {
-    let module = policy::load(&packaged_module())
-        .map_err(|error| anyhow::anyhow!("loading the arrival policy module: {error}"))?;
-    Ok((Arc::new(module), packaged_arguments(ceilings)))
+    static MODULE: OnceLock<std::result::Result<Arc<wasmtime::Module>, String>> = OnceLock::new();
+
+    let module = MODULE
+        .get_or_init(|| {
+            policy::load(&packaged_module())
+                .map(Arc::new)
+                .map_err(|error| format!("loading the arrival policy module: {error}"))
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)?;
+    Ok((module, packaged_arguments(ceilings)))
 }
 
 /// The module of the workspace's default policy package ([`module`]), as a deployment's store
