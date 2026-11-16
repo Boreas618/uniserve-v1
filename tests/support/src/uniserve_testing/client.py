@@ -26,9 +26,11 @@ def metric(base_url: str, name: str, **labels: str) -> float:
     """  # noqa: D205
     text = httpx.get(f"{base_url}/metrics", timeout=10).text
     total = 0.0
+    # The samples are matched by their own names, whatever family the parser
+    # files them under: a counter's samples carry the `_total` suffix its
+    # `TYPE` line does not, and the text parser then files them under a
+    # family of their own name rather than the counter's.
     for family in text_string_to_metric_families(text):
-        if family.name != name:
-            continue
         for sample in family.samples:
             if sample.name not in (name, f"{name}_total"):
                 continue

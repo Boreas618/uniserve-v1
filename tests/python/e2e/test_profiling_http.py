@@ -287,7 +287,9 @@ def test_a_epoch_change_ends_the_session_of_the_epoch_it_replaces(
         session = profiling.session(served)
         assert session["state"] == "ended", session
         assert session["end_reason"] == "epoch change", session
-        assert session["files"][0]["file"]["rows"]["kernel"] > 0, session
+        # A rank's file is `written` with its rows by table, or `failed`.
+        file = session["files"][0]["file"]["written"]
+        assert file["rows"]["kernel"] > 0, session
         committed = admin.operation(served, "config/commit")
         assert committed.status_code == 200, committed.text
 
@@ -315,7 +317,8 @@ def test_the_guard_releases_collectors_then_ends_the_session(
         current = profiling.session(served) or {}
         return [
             (action["action"], action["collector"])
-            for action in current.get("guard", [])
+            for replica in current.get("replicas", [])
+            for action in replica["guard"]
         ]
 
     with Load(served) as load:
