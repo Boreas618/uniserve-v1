@@ -1337,11 +1337,12 @@ def _slower_target(
         updates.derived(repository, "paged_attention", "repeated", directory)
     )
 
-    # The decode keys the serving package's modules were built for, whatever
-    # its revision: the store holds a module per key a deployment launched.
+    # The decode keys the serving package's modules were built for, each with
+    # the device target it was built for, whatever its revision: the store
+    # holds a module per key and target a deployment launched.
     decode = sorted(
         {
-            module["descriptor"]
+            (module["target"], module["descriptor"])
             for package in build_server.list()
             if (package["op"], package["backend"])
             == ("paged_attention", "trtllm")
@@ -1350,9 +1351,13 @@ def _slower_target(
         }
     )
     assert decode, "the deployment's attention built no decode key"
-    for key in decode:
+    for target, key in decode:
         build_server.resolve(
-            repeated.op, repeated.backend, repeated.revision, key=key
+            repeated.op,
+            repeated.backend,
+            repeated.revision,
+            key=key,
+            target=target,
         )
     return (engine, f'decode_attention_backend="{repeated.backend}"')
 

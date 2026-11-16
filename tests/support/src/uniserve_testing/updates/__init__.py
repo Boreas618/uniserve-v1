@@ -75,6 +75,31 @@ def assigned(*assignments: str) -> list[str]:
     return [option for value in assignments for option in ("--set", value)]
 
 
+def inline(value: object) -> str:
+    """`value` written as one TOML value, the form an assignment's right side
+    takes: a table inline, an array of tables an array of inline tables.
+
+    Raises:
+        TypeError: For a value TOML has no form of.
+    """  # noqa: D205
+    # A bool is an int to Python, so it is matched first.
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return repr(value)
+    if isinstance(value, str):
+        # A JSON string is a TOML basic string: the same quotes and escapes.
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(inline(item) for item in value) + "]"
+    if isinstance(value, dict):
+        fields = (
+            f"{json.dumps(key)} = {inline(item)}" for key, item in value.items()
+        )
+        return "{ " + ", ".join(fields) + " }"
+    raise TypeError(f"TOML has no value of {type(value).__name__}")
+
+
 def derived(
     repository: Path, mutations: str, variant: str, directory: Path
 ) -> Path:

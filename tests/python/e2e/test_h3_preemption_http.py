@@ -60,8 +60,7 @@ from typing import Any
 
 import httpx
 import pytest
-import tomli_w
-from uniserve_testing import admin, assets, client, media
+from uniserve_testing import admin, assets, client, media, updates
 from uniserve_testing.deployments import Deployments
 from uniserve_testing.servers import Server
 
@@ -281,18 +280,15 @@ def test_a_video_request_continues_under_another_parallel_configuration(
         # The drain ends the Ulysses-2 epoch's request at a step boundary, as
         # the epoch change of the other test does; the target, another
         # layout, denoises on the first GPU alone.
-        # The target configuration is the served one with the target's
-        # worker groups: a `config` states a whole configuration, as
-        # `--config` does.
+        # The target is the served configuration with the target's worker
+        # groups, assigned as one TOML value: with assignments alone, the
+        # drain is this update's own option and the daemon's stay as served.
         target = _deployment(
             tmp_path / "target", denoising_ranks=1, fraction=CHANGE_FRACTION
         )
-        configuration = tomllib.loads(admin.config(server)["config"])
-        configuration["worker_groups"] = tomllib.loads(target.read_text())[
-            "worker_groups"
-        ]
+        groups = tomllib.loads(target.read_text())["worker_groups"]
         job, update = _change_under_a_denoising_request(
-            server, config=tomli_w.dumps(configuration)
+            server, f"worker_groups={updates.inline(groups)}"
         )
         assert update["shrink"] is True, update
         video = media.job_video(server, job).content
