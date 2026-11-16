@@ -183,8 +183,16 @@ impl IntoResponse for ApiError {
     /// Converts the error into an HTTP response. A `503` states no `Retry-After`: an
     /// overloaded engine knows no time at which its waiting queue has room, so a client retries
     /// on its own backoff.
+    ///
+    /// A server error (`500`) is also logged with its message: the body is the only other place
+    /// its cause appears, and the access log states the status alone.
     fn into_response(self) -> Response {
-        (self.status_code(), Json(self.to_error_response())).into_response()
+        let status = self.status_code();
+        let body = self.to_error_response();
+        if status == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!(message = %body.error.message, "a request failed with a server error");
+        }
+        (status, Json(body)).into_response()
     }
 }
 
