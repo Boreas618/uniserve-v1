@@ -933,14 +933,21 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         assert _bytes_of(server, "weights") == weights
 
 
+#: The bytes the ballast of a full GPU leaves free: room for a target's CUDA
+#: context, so its start reaches its storage, and not for its graph pool.
+TARGET_ROOM = 2 * GIB
+
+
 def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
     deployments: Deployments, lease: Lease
 ):
     """A target beside a full GPU ends the update and changes nothing that serves.
 
     A target prepares beside the serving epoch, which keeps its regions until
-    it drains. With the GPU's free storage held by another process, the
-    target's start finds no room and fails, the update is abandoned before any
+    it drains: the target starts with what the GPU has free. With another
+    process holding all of it but ``TARGET_ROOM``, room for the target's CUDA
+    context and no more, the target finds no room for its graph pool, so its
+    start fails, the update is abandoned before any
     switch (the apply answers ``409`` with the abandoned update,
     ``docs/admin.md``), and the stream goes on with the serving epoch's regions
     as they were.
@@ -952,7 +959,7 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
         serving = admin.config(server)["executing"]["epoch"]
         cache = _bytes_of(server, "cache_segment", serving)
         stream = _streaming(server, name)
-        with updates.ballast(lease) as held:
+        with updates.ballast(lease, leave=TARGET_ROOM) as held:
             print(f"ballast holds {held / GIB:.1f} GiB")
             # The apply waits until the update reached its trial or ended
             # before it: abandoned, it answers 409 with the update.
@@ -963,9 +970,10 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
             update = result["update"]
             print("epoch switch under pressure:", json.dumps(update))
             # The target's start failed before it joined: a failed
-            # preparation.
+            # preparation, whose reason names the storage it did not find.
             assert update["phase"] == "abandoned", update
             assert update["failure"]["kind"] == "prepare_failed", update
+            assert "graph pool" in update["failure"]["reason"], update
         _assert_counts_from_one(stream, 200)
         # The serving epoch's quota reserves at least the KV cache it held.
         assert admin.config(server)["executing"]["epoch"] == serving

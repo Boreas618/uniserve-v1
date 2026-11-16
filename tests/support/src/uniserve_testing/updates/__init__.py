@@ -314,16 +314,16 @@ def successors() -> Iterator[list[int]]:
 
 
 @contextmanager
-def ballast(lease: Lease) -> Iterator[int]:
-    """Hold the free storage of the leased GPU in a process of its own until
-    the block ends; the bytes it holds.
+def ballast(lease: Lease, leave: int) -> Iterator[int]:
+    """Hold the free storage of the leased GPU but ``leave`` bytes in a process
+    of its own until the block ends; the bytes it holds.
 
     The process (:mod:`uniserve_testing.updates.ballast`) sees the leased
-    GPU alone, holds every byte the device lets it allocate, and ends when
-    its input closes, which frees them.
+    GPU alone, holds what the device lets it allocate of its free storage
+    but ``leave`` bytes, and ends when its input closes, which frees them.
     """  # noqa: D205
     process = subprocess.Popen(
-        [sys.executable, "-m", BALLAST],
+        [sys.executable, "-m", BALLAST, str(leave)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
