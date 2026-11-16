@@ -1,5 +1,5 @@
 //! `buffer-pool-verify`: the checks of the Rust buffer pool against its design model
-//! (`specs/buffer-pool.md` §18-19, `support/verification/buffer-pool`), built with the crate's
+//! (`specs/buffer-pool.md` §18-19, `tools/verification/buffer-pool`), built with the crate's
 //! `verification` feature.
 //!
 //! - `enumerate` (L1) enumerates every request sequence of the model's small configurations on

@@ -5,7 +5,7 @@
 //!
 //! [`replay`] drives a new buffer pool with a trace's inputs, checks every completion it
 //! produces against the run's, and writes after every input the pool's state in the terms of
-//! the design model ([`stated`]), which `support/verification/buffer-pool/steps.py` checks against the
+//! the design model ([`stated`]), which `tools/verification/buffer-pool/steps.py` checks against the
 //! model's steps. The enumeration of small configurations ([`super::enumeration`]) drives its
 //! pools with the same inputs ([`apply`]) and writes its states in the same terms.
 
@@ -304,7 +304,7 @@ impl SessionNames {
     }
 }
 
-/// An input to `pool` as `support/verification/buffer-pool/steps.py` reads it: its
+/// An input to `pool` as `tools/verification/buffer-pool/steps.py` reads it: its
 /// kind, and what it names in the terms of [`stated`] (owners and groups
 /// qualified by their session's name, positions by number, keys by their
 /// 32 bytes in hex, stamps as `<group>:<sequence>`, a request's session as
@@ -516,7 +516,7 @@ fn stated_request(request: &Request, session: &str) -> String {
 }
 
 /// What a state in the model's terms leaves out and the model has no terms
-/// for, in lines that start with `#`, which `support/verification/buffer-pool/steps.py`
+/// for, in lines that start with `#`, which `tools/verification/buffer-pool/steps.py`
 /// reads and `agreement.py` never sees: the class of each key cached in a
 /// class other than 0 (the model has one class, so a key cached in another is
 /// outside its terms, A6; a key with no such line is of the class 0), each
@@ -673,7 +673,7 @@ pub(crate) fn layout(pool: &BufferPool, names: &SessionNames) -> String {
 /// one `release` line per group and stamp a release waits for), and the
 /// tasks with their keys and the host parts a prefetch writes, a task of
 /// several keys as one per key. A block a waiting commit holds states its
-/// memories too. A unit is `region:unit`, a key its 32 bytes in hex. `support/verification/buffer-pool/agreement.py` writes the
+/// memories too. A unit is `region:unit`, a key its 32 bytes in hex. `tools/verification/buffer-pool/agreement.py` writes the
 /// model's states in the same lines.
 pub(crate) fn stated(
     pool: &BufferPool,
