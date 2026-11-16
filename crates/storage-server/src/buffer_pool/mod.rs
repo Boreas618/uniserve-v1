@@ -17,7 +17,7 @@
 //! returns runs to a region: it needs the last reference.
 //!
 //! The rules R1 to R11 of the design are guards of this module; each is
-//! marked where it stands. The design model is `verification/buffer-pool`.
+//! marked where it stands. The design model is `support/verification/buffer-pool`.
 //!
 //! The types that hold blocks take the reference to a block as a parameter,
 //! a shared `Rc<Block>` by default: the pool's whole state also travels as

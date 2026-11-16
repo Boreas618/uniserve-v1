@@ -55,7 +55,7 @@ test = false
 doc = false
 bench = false
 
-# The checks of the buffer pool against its design model (`verification/buffer-pool`).
+# The checks of the buffer pool against its design model (`support/verification/buffer-pool`).
 [[bin]]
 name = "buffer-pool-verify"
 path = "src/bin/buffer-pool-verify.rs"

@@ -31,13 +31,13 @@ The model of `specs/buffer-pool.md` and what checks it. Nothing here needs a dev
 The tools are TLC (`tla2tools.jar` 1.8.0) under a JDK 21, Apalache 0.63.0, TLAPS (`tlapm`) and z3 4.8.9; the scripts read their directory from `TLA_TOOLS`.
 
 ```bash
-verification/buffer-pool/suite.sh                         # everything; about 50 minutes on 144 cores
-verification/buffer-pool/suite.sh pins mutations hazards  # the quick parts
-verification/buffer-pool/tlc.sh MC_Trial                  # one configuration
-verification/buffer-pool/agreement.sh                     # L1; about 25 minutes
-verification/buffer-pool/agreement_steps.sh               # L1 step by step, core; about 4 minutes, most of it the enumeration
-verification/buffer-pool/replay.sh TRACE_DIR              # a run's trace: its replay, and its states against the model
-verification/buffer-pool/mutations.py                     # L4; about 5 minutes, edits the crate in place and restores it
+support/verification/buffer-pool/suite.sh                         # everything; about 50 minutes on 144 cores
+support/verification/buffer-pool/suite.sh pins mutations hazards  # the quick parts
+support/verification/buffer-pool/tlc.sh MC_Trial                  # one configuration
+support/verification/buffer-pool/agreement.sh                     # L1; about 25 minutes
+support/verification/buffer-pool/agreement_steps.sh               # L1 step by step, core; about 4 minutes, most of it the enumeration
+support/verification/buffer-pool/replay.sh TRACE_DIR              # a run's trace: its replay, and its states against the model
+support/verification/buffer-pool/mutations.py                     # L4; about 5 minutes, edits the crate in place and restores it
 tlapm --threads 48 --stretch 6 KvProof.tla                # the proof, in this directory: then KvFrame,
                                                           # KvStep1..KvStep11, KvStep, KvProofP7, KvSafeP7
 apalache-mc check --init=Init --inv=IndInv --length=0 --cinit=ConstInit MC_Apalache.tla

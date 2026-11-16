@@ -18,7 +18,7 @@ import re
 import subprocess
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+ROOT = pathlib.Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "crates/storage-server/src/buffer_pool"
 
 # rule: what is left out, and the replacements (file, text, replacement).
