@@ -304,12 +304,24 @@ impl HostTier {
             self.runs(layout, memory, copy)?;
         }
 
+        // Timing events bracket the issue: the copy stream's device time is theirs
+        // (`profiling::copies`), as CUPTI records no batch of copies.
+        let timing = EventFlags {
+            timing: true,
+            ..EventFlags::default()
+        };
         let issued = || -> Result<Event> {
+            let started = Event::new(timing);
+            started.record(&self.stream)?;
             self.load(layout, memory, loads, &self.stream)?;
             if let Some(conversion) = &self.conversion {
                 conversion.load(planes, converted, &self.stream)?;
             }
             self.store(layout, memory, stores, &self.stream)?;
+
+            let ended = Event::new(timing);
+            ended.record(&self.stream)?;
+            crate::profiling::copies::record(started, ended);
 
             let copied = Event::new(EventFlags::default());
             copied.record(&self.stream)?;

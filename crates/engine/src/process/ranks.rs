@@ -197,9 +197,9 @@ pub(crate) struct LoadedRank {
     /// The device's graph and scratch pools, which the runners' graphs address, once the rank is
     /// opened; `None` for a meta start.
     pub(crate) pool: Option<Arc<Mutex<GraphPool>>>,
-    /// The streams the rank's runners compute on (`device`) and its copies run on (`copy`),
-    /// named as the always-on counters record their device time
-    /// (`crate::profiling::counters::Counters::start`); empty for a meta start.
+    /// The streams the rank's runners compute on, named `device` as the always-on counters
+    /// record their device time (`crate::profiling::counters::Counters::start`); empty for a
+    /// meta start. The copy streams are timed by events instead (`crate::profiling::copies`).
     pub(crate) streams: Vec<(&'static str, Stream)>,
     /// Every kernel the rank launches: its profile run's, and from its opening those its cache
     /// and recurrent state launch over the units its region numbers.
@@ -3509,10 +3509,8 @@ fn open_media_runners(
             .with_context(|| format!("profiling the rank's runner {}", id.0))?;
         serving.push(runner);
     }
+    // The media host's copy stream is timed by events around its copies (`profiling::copies`).
     let copies = pool.as_ref().map(|_| stream()).transpose()?;
-    if let Some(copies) = &copies {
-        streams.push(("copy", copies.clone()));
-    }
     if let Some(media) =
         model_runner.media_host(model.as_ref(), (&memory, copies), host, kernels, classes)?
     {
@@ -3563,7 +3561,7 @@ pub(crate) fn bind(
             if let Loaded::Text(_) = &rank.loaded
                 && let Some((_, devices, host)) = stated_regions(rank, layout)?
             {
-                set_regions(rank, (devices, host), opened, None)?;
+                set_regions(rank, (devices, host), opened)?;
             }
             continue;
         };
@@ -3619,7 +3617,6 @@ pub(crate) fn bind(
         // The stores and loads the buffer pool asks of this rank copy between its units and its
         // part of each group's host region, unit `u` of the region being page `u`; a converted
         // load reads its part of the group's converted-load source region, its source buffer.
-        let mut copies = None;
         if host_named.iter().any(Option::is_some) {
             let named = |regions: &[Option<u8>]| -> Vec<Option<&str>> {
                 regions
@@ -3637,24 +3634,22 @@ pub(crate) fn bind(
                 .map_host_parts(
                     &client,
                     (&names, &sources, part),
-                    stream.clone(),
+                    stream,
                     Arc::clone(&rank.kernels),
                 )
                 .context("mapping the rank's parts of the host KV regions")?;
             for name in names.into_iter().chain(sources).flatten() {
                 stated((name.to_owned(), host.clone(), part, Vec::new()))?;
             }
-            copies = Some(stream);
         }
-        set_regions(rank, ((kv, states), host_regions), opened, copies)?;
+        set_regions(rank, ((kv, states), host_regions), opened)?;
     }
     Ok(places)
 }
 
 /// Tells the cache of text rank `rank` the numbers of the regions its copies name, its KV region
 /// `kv`, its state region `states` and per cache group its host region and its converted-load
-/// source region, by the session's answer `opened`, and keeps the stream its copies to and from
-/// its host parts run on (`copies`, `None` for a rank that maps none).
+/// source region, by the session's answer `opened`.
 ///
 /// # Errors
 ///
@@ -3663,7 +3658,6 @@ fn set_regions(
     rank: &mut LoadedRank,
     ((kv, states), (host, sources)): ((u8, Option<u8>), HostRegions),
     opened: &Opened,
-    copies: Option<Stream>,
 ) -> Result<()> {
     let number = |index: u8| -> Result<u8> {
         opened
@@ -3686,10 +3680,6 @@ fn set_regions(
         sources: numbered(sources)?,
     })?;
     drop(cache);
-
-    if let Some(stream) = copies {
-        rank.streams.push(("copy", stream));
-    }
     Ok(())
 }
 

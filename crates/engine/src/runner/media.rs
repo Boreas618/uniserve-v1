@@ -833,7 +833,21 @@ impl Runner for MediaHost {
             )));
         }
 
-        self.memory.copy(copies, self.stream.as_ref())
+        let Some(stream) = &self.stream else {
+            return self.memory.copy(copies, None);
+        };
+        // Timing events bracket the issue: the copy stream's device time is theirs
+        // (`profiling::copies`), as CUPTI records no batch of copies.
+        let timing = platform::EventFlags {
+            timing: true,
+            ..platform::EventFlags::default()
+        };
+        let (started, ended) = (platform::Event::new(timing), platform::Event::new(timing));
+        started.record(stream)?;
+        self.memory.copy(copies, Some(stream))?;
+        ended.record(stream)?;
+        crate::profiling::copies::record(started, ended);
+        Ok(())
     }
 
     /// The rank's media memory: its product buffer and its parts of host regions

@@ -32,6 +32,7 @@
 
 pub(crate) mod artifact;
 pub(crate) mod collectors;
+pub(crate) mod copies;
 pub(crate) mod counters;
 pub(crate) mod markers;
 pub(crate) mod pc_sampling;
@@ -168,6 +169,16 @@ pub(crate) fn forward_stats(
                 *stats.stream_us.entry(time).or_default() += us;
             }
         }
+    }
+
+    // The copy streams' busy time, timed by events around each issue of host copies.
+    let copied_us = copies::take_us();
+    if copied_us > 0 {
+        let time = proto::report::StreamTime {
+            stream: "copy".to_owned(),
+            state: "busy".to_owned(),
+        };
+        *stats.stream_us.entry(time).or_default() += copied_us;
     }
 
     if let Some(markers) = markers::Markers::installed() {

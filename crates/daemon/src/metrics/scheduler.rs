@@ -524,11 +524,11 @@ impl SchedulerMetrics {
             worker_stream_us: keyed(
                 registry,
                 "uniserve:worker_stream_us",
-                "Worker stream device time in microseconds from the profiler's activity records, \
-                 for the primary stream (device) and the host KV cache copy stream (copy): the \
-                 union of the kernels, copies and fills on the stream, graph nodes included \
-                 (busy), the stream's idle time between them (gap), and records too far out of \
-                 order to merge (late).",
+                "Worker stream device time in microseconds: for the primary stream (device), from the \
+                 profiler's activity records, the union of the kernels, copies and fills on the \
+                 stream, graph nodes included (busy), the stream's idle time between them (gap), \
+                 and records too far out of order to merge (late); for the host copy streams \
+                 (copy), the time between the CUDA events around each issue of copies (busy).",
             ),
             worker_blocking_calls: keyed(
                 registry,
