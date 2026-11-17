@@ -1751,6 +1751,43 @@ fn a_lost_rank_s_reservation_is_kept_for_its_relaunch() {
     assert_eq!(quota_of(&mut head).usage(), 400);
 }
 
+/// A new head's claim stands once every process of the previous claim is out,
+/// so nothing those processes reserved is kept: a deployment started again,
+/// whose new head numbers its epoch as the previous one did, reserves its
+/// processes against the whole quota.
+#[test]
+fn a_new_head_keeps_nothing_the_previous_claim_s_processes_reserved() {
+    let server = Running::start();
+    let mut previous = head(&server.socket);
+    let claim = previous
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
+    previous.publish(vec![1]).unwrap();
+    let mut rank = epoch_worker(&server.socket, scope("text", 0), 1, claim);
+    rank.reserve(
+        GPU,
+        1000,
+        Some(700),
+        vec![(Item::Process, 300), (Item::GraphPool, 200)],
+    )
+    .unwrap();
+    rank.close().unwrap();
+    assert_eq!(quota_of(&mut previous).usage(), 500);
+    previous.close().unwrap();
+
+    let mut started = head(&server.socket);
+    let claim = started
+        .claim(Claimant::Head, 1, vec![scope("text", 0)], Vec::new())
+        .unwrap();
+    started.publish(vec![1]).unwrap();
+    assert_eq!(quota_of(&mut started).usage(), 0);
+
+    let mut rank = epoch_worker(&server.socket, scope("text", 0), 1, claim);
+    rank.reserve(GPU, 1000, Some(700), vec![(Item::Process, 600)])
+        .unwrap();
+    assert_eq!(quota_of(&mut started).usage(), 600);
+}
+
 /// A rank that withdraws its reservations before its connection ends, as a
 /// worker that ends in order does, leaves nothing reserved, and a lost
 /// rank's reservation ends with its epoch's retirement.

@@ -1189,6 +1189,9 @@ impl Server {
         }
         if held.is_none() {
             discarded.clear();
+            // Every process of the previous claim is out (above): nothing it
+            // reserved is kept for a relaunch the new head will not make.
+            self.quotas.claim_anew(deployment);
         }
         self.deployments.insert(
             deployment.to_owned(),

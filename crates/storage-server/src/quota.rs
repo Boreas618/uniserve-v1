@@ -26,8 +26,13 @@
 //!   retirement or the deployment, or when its epoch keeps its weights alone
 //!   ([`Request::KeepWeights`]): the head stopped that epoch's processes, and
 //!   nothing replaces them until a rollback starts them again, which reserves
-//!   afresh, so what they reserved ends with them however they ended. The
-//!   Transfer Server's reservations end with its connection.
+//!   afresh, so what they reserved ends with them however they ended. Every
+//!   kept reservation of a deployment also ends when a new head claims it
+//!   ([`Request::Claim`]), which stands only once every process of the
+//!   previous claim is out: the new head's processes reserve afresh and
+//!   relaunch none of the previous claim's, though its epochs may take the
+//!   same numbers. The Transfer Server's reservations end with its
+//!   connection.
 //!
 //! The limit of a deployment's quota is `⌊total × fraction⌋` of the whole
 //! GPU, which its workers state with their reservations; while two epochs
@@ -220,6 +225,18 @@ impl Quotas {
             .retain(|(scope, epoch), _| scope.deployment != deployment || !retired.contains(epoch));
         self.weights_only
             .retain(|(of, epoch)| of != deployment || !retired.contains(epoch));
+    }
+
+    /// A new head claimed `deployment`, once every process of the previous
+    /// claim was out: the reservations kept for those processes end, since no
+    /// process of the new claim relaunches them and each of its processes
+    /// reserves afresh, and so does the rule that keeps none for the processes
+    /// of the previous head's stopped epochs, whose numbers the new head's
+    /// epochs may take.
+    pub(crate) fn claim_anew(&mut self, deployment: &str) {
+        self.lost
+            .retain(|(scope, _), _| scope.deployment != deployment);
+        self.weights_only.retain(|(of, _)| of != deployment);
     }
 
     /// Every limit and kept reservation of `deployment` ends: it is no
