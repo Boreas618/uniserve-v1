@@ -80,6 +80,29 @@ override-dependencies = [
     "nvidia-nccl-cu13==2.30.4; sys_platform == 'linux'",
     "nvidia-cuda-cupti==13.4.92; sys_platform == 'linux'",
 ]
+# What the root project's executables are built from, so that `uv sync` and
+# `uv run` build them again after any of it changes rather than install the
+# build uv cached: the Cargo workspace's manifests, lockfile and pinned
+# toolchain, the Rust sources and build scripts, and the files those compile
+# in (Protobuf schemas, the media shim, and the templates, schemas, tables and
+# modules embedded with `include_str!` and `include_bytes!`).
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "rust-toolchain.toml" },
+    { file = "build.rs" },
+    { file = "src/**/*.rs" },
+    { file = "crates/**/*.rs" },
+    { file = "crates/**/*.toml" },
+    { file = "crates/**/*.proto" },
+    { file = "crates/**/*.c" },
+    { file = "crates/**/*.jinja" },
+    { file = "crates/**/*.sql" },
+    { file = "crates/**/*.json" },
+    { file = "crates/**/*.wat" },
+    { file = "crates/**/*.ptx" },
+]
 
 [tool.setuptools]
 # This distribution ships the executables alone; its Python packages are the
