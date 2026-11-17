@@ -125,6 +125,10 @@ pub struct ServerConfig {
     /// The root of what builds keep between them ([`Cache`]): pinned sources,
     /// cargo's target directory, vendored registry sources and workspaces.
     pub cache: PathBuf,
+    /// The source tree whose Python environment compiles Triton, CuTe DSL and
+    /// CUDA packages ([`crate::tree`]); `None` for a server with no such
+    /// toolchain, which serves what is installed and the read-only stores.
+    pub source: Option<PathBuf>,
 }
 
 /// A Build Server: what is installed, the module store, the toolchains and
@@ -180,7 +184,7 @@ impl BuildServer {
             }
         }
         let store = Arc::new(Store::open(roots)?);
-        let toolchains = Arc::new(Toolchains::discover());
+        let toolchains = Arc::new(Toolchains::discover(config.source.as_deref()));
         let queue = Queue::new(
             Arc::clone(&store),
             Arc::clone(&toolchains),
@@ -542,6 +546,55 @@ impl BuildServer {
             backend,
             revision,
         })
+    }
+
+    /// Installs the package in `directory` unless its latest revision was
+    /// installed from the same build inputs ([`Self::installed`]), and returns
+    /// that revision or the new one. Modules built under an unchanged revision
+    /// stay the ones `prepare` reaches.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::installed`] and [`Self::install`] fail.
+    pub fn install_if_changed(&self, directory: &Path) -> Result<protocol::Package> {
+        match self.installed(directory)? {
+            Some(installed) => Ok(installed),
+            None => self.install(directory),
+        }
+    }
+
+    /// Installs the serving packages of the source tree `source`
+    /// ([`crate::tree::packages`]), each unless its latest revision was
+    /// installed from the same build inputs ([`Self::install_if_changed`]), so
+    /// a deployment selects from the tree this server was started with.
+    ///
+    /// A package whose toolchain this host lacks is not installed, and the
+    /// reason is logged: as for a missing toolchain anywhere, only a
+    /// deployment that needs the package fails, naming the package it lacks.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tree cannot be read or a package cannot be installed for
+    /// any other reason, such as an invalid manifest.
+    pub fn install_tree(&self, source: &Path) -> Result<()> {
+        for directory in crate::tree::packages(source)? {
+            match self.install_if_changed(&directory) {
+                Ok(package) => tracing::info!(
+                    op = %package.op,
+                    backend = %package.backend,
+                    revision = package.revision,
+                    "a package of the source tree is installed"
+                ),
+                Err(Error::Toolchain { kind, message }) => tracing::warn!(
+                    package = %directory.display(),
+                    toolchain = %kind,
+                    "a package of the source tree is not installed, for this host lacks its \
+                     toolchain: {message}"
+                ),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// The latest installed revision of the package in `directory` when that

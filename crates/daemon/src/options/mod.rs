@@ -168,6 +168,7 @@ impl ServerArgs {
             set: Every,
             host: Every,
             port: Every,
+            source: Every,
             ready_fd: Every,
             predecessor: Every,
         });
@@ -437,7 +438,7 @@ pub struct ServerArgs {
     pub video_job_config: VideoJobConfig,
 
     // The command line's inputs that are not options: where the options come from, and the
-    // shortcuts for the three nested options the flags name. None is part of the configuration's
+    // shortcuts for the four nested options the flags name. None is part of the configuration's
     // tree, so a printed configuration never carries one.
     /// TOML files of serving options, each overriding the ones before it;
     /// the flags and `--set` override them. A deployment's layout file
@@ -462,6 +463,12 @@ pub struct ServerArgs {
     #[serde(skip)]
     #[arg(long)]
     pub port: Option<u16>,
+    /// The UniServe source tree this host's Build Server builds from
+    /// (`build_config.source`): its compiler environment and the serving
+    /// packages it installs.
+    #[serde(skip)]
+    #[arg(long, value_name = "DIR")]
+    pub source: Option<PathBuf>,
     /// The inherited descriptor the daemon writes its readiness record to
     /// (`service::Readiness`, one JSON line per state): once its listeners
     /// are bound (`listening`, with their endpoints) and once it serves
@@ -532,6 +539,7 @@ impl Default for ServerArgs {
             set: Vec::new(),
             host: None,
             port: None,
+            source: None,
             ready_fd: None,
             predecessor: None,
         }
@@ -677,6 +685,7 @@ impl ServerArgs {
             set: _,
             host: _,
             port: _,
+            source: _,
             ready_fd: _,
             predecessor: _,
             // The daemon's part.

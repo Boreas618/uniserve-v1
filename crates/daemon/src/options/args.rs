@@ -71,7 +71,9 @@ impl ServerArgs {
     /// Resolves the configuration this command line states: the `--config` files, each
     /// overriding the ones before it, overridden by the flags the command line states,
     /// overridden by `--set`, with every unstated option at its default. `--host` and `--port`
-    /// state the daemon's own address (`admin_config`). Returns it with the paths the invocation stated.
+    /// state the daemon's own address (`admin_config`), and `--source` the source tree of the
+    /// host's Build Server (`build_config.source`), made absolute. Returns it with the paths the
+    /// invocation stated.
     ///
     /// `matches` are the command line's own: a flag counts when the command line states it, which
     /// clap's value source tells apart from the default it parsed beside the stated ones.
@@ -116,6 +118,17 @@ impl ServerArgs {
                 &mut tree,
                 &path("admin_config", "port"),
                 Value::Integer(i64::from(value)),
+            )?;
+        }
+        if let Some(value) = &self.source {
+            // Absolute, so the Build Server the daemon starts, and a daemon that succeeds this one,
+            // read the tree this command line was started in.
+            let source = std::path::absolute(value)
+                .with_context(|| format!("resolving --source {}", value.display()))?;
+            set(
+                &mut tree,
+                &path("build_config", "source"),
+                Value::String(source.to_string_lossy().into_owned()),
             )?;
         }
         for (path, value) in assignments(&self.set)? {
@@ -576,10 +589,16 @@ mod tests {
             "0",
             "--dist-init-addr",
             "rank-0:5000",
+            "--source",
+            "/srv/uniserve",
             "--set",
             "quantization={ mode = \"quality\", modules = { mlp = \"bf16\" } }",
         ])
         .unwrap();
+        assert_eq!(
+            config.build_config.source.as_deref(),
+            Some(std::path::Path::new("/srv/uniserve"))
+        );
         for path in [
             "model",
             "admin_config.host",
@@ -595,6 +614,7 @@ mod tests {
             "nnodes",
             "node_rank",
             "dist_init_addr",
+            "build_config.source",
         ] {
             assert!(stated.contains(path), "{path} is set by its flag");
         }

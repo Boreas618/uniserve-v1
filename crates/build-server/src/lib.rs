@@ -13,7 +13,8 @@
 //! `python/` holds the Build Server's own Python environment: its toolchain
 //! description and the compile drivers of [`source`]. Triton, CuTe DSL and
 //! CUDA compilation are the only Python in the system, and they run there,
-//! never in the main process.
+//! never in the main process. A server takes the environment and the serving
+//! packages from the source tree it is started with ([`tree`]).
 //!
 //! The pieces of the design:
 //!
@@ -62,6 +63,7 @@ pub mod source;
 pub mod store;
 pub mod target;
 pub mod toolchain;
+pub mod tree;
 
 pub use builder::{BuildState, Limits, Urgency};
 pub use manifest::{Manifest, ManifestError, ModuleForm, SourceKind, ToolchainKind};

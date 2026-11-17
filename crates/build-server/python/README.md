@@ -10,9 +10,9 @@ It is **not** the repository's `.venv`, which holds the `uniserve` executable wi
 uv sync --locked --project crates/build-server/python
 ```
 
-This writes `python/.venv` (git-ignored) from `pyproject.toml` and `uv.lock` with an interpreter that meets `requires-python`, and installs the environment's program, `uniserve-build-server`, in its `bin` directory. The Build Server runs that program from its search path, as any installed program is run, so a host puts the environment's `bin` directory on the search path of the processes that start Build Servers (a daemon, or `uniserve build-server serve`).
+A Build Server runs this itself when it starts, in the source tree it is given (`uniserve build-server serve --source DIR`, a deployment's `build_config.source`), and so do `uniserve build-server launch --source DIR` and `build --source DIR`. It writes `python/.venv` (git-ignored) from `pyproject.toml` and `uv.lock` with an interpreter that meets `requires-python`, or brings an existing environment to the lock, and installs the environment's program, `uniserve-build-server`, in its `bin` directory, which the server runs from there. Servers of one tree share the environment; uv serializes their syncs.
 
-A server without the environment is not an error: the Triton, CuTe DSL and nvcc toolchains are recorded as missing with the reason, and only a build that needs them fails.
+A server without a source tree, or whose environment uv cannot create, is not an error: the Triton, CuTe DSL and nvcc toolchains are recorded as missing with the reason, and only a build that needs them fails.
 
 ## The toolchain description
 

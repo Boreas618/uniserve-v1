@@ -3,15 +3,19 @@
 //! The Build Server compiles with two declared toolchains, and finds neither by
 //! guessing a path:
 //!
-//! - **Its Python environment** (`python/`, locked by `python/uv.lock`), which
-//!   holds the Triton and CuTe DSL compilers and describes the CUDA toolkit,
-//!   cuDNN and the host C++ compiler it resolved. The server runs the environment's
-//!   program, `uniserve-build-server toolchain --json`, from its search path
-//!   once when it starts and keeps the description ([`Report`]): the versions,
-//!   the environment's distributions, its interpreter and the digest of its
-//!   compile driver. Every compilation of a Triton, CuTe DSL or CUDA package
-//!   runs through that interpreter with the description handed back in its
-//!   request (`crate::source`).
+//! - **Its Python environment** ([`Environment`]): the locked project
+//!   `crates/build-server/python` of the source tree the server builds from
+//!   (`--source`, [`crate::tree`]), which holds the Triton and CuTe DSL
+//!   compilers and describes the CUDA toolkit, cuDNN and the host C++ compiler
+//!   it resolved. When the server starts, uv creates the environment or brings
+//!   it to the tree's lock, and the server runs the environment's program,
+//!   `uniserve-build-server toolchain --json`, from the environment itself and
+//!   keeps the description ([`Report`]): the versions, the environment's
+//!   distributions, its interpreter and the digest of its compile driver.
+//!   Every compilation of a Triton, CuTe DSL or CUDA package runs through that
+//!   interpreter with the description handed back in its request
+//!   (`crate::source`). A server started without a source tree has no
+//!   environment.
 //! - **cargo**, from rustup: the `cargo` program runs the toolchain the
 //!   workspace's pinned `rust-toolchain.toml` names, and its release is read
 //!   from the structured fields of `cargo -vV` in the workspace it builds.
@@ -39,6 +43,63 @@ use crate::{Error, Result};
 
 /// The program of the Build Server's Python environment.
 pub const ENVIRONMENT_PROGRAM: &str = "uniserve-build-server";
+
+/// uv, which creates the Python environment from its project's lock.
+pub const UV: &str = "uv";
+
+/// The Build Server's Python environment: the locked project of a source tree
+/// ([`crate::tree::ENVIRONMENT_PROJECT`]) as uv installs it, in the project's
+/// own `.venv`.
+#[derive(Clone, Debug)]
+pub struct Environment {
+    /// The environment's program, [`ENVIRONMENT_PROGRAM`] in its `bin`.
+    program: PathBuf,
+}
+
+impl Environment {
+    /// The environment of the source tree `source`, created, or brought to the
+    /// tree's lock, by `uv sync --locked`: an environment already at the lock
+    /// is left as it is, so servers of one tree share it.
+    ///
+    /// # Errors
+    ///
+    /// Why there is no environment: uv cannot be run, or its sync fails, with
+    /// what uv said.
+    pub fn sync(source: &Path) -> std::result::Result<Environment, String> {
+        let project = source.join(crate::tree::ENVIRONMENT_PROJECT);
+        // The project's own `.venv`, whatever environment the starter runs in:
+        // `uv run` names its own project's environment in `VIRTUAL_ENV`, and
+        // `UV_PROJECT_ENVIRONMENT` would move this project's.
+        let synced = Command::new(UV)
+            .args(["sync", "--locked", "--project"])
+            .arg(&project)
+            .env_remove("VIRTUAL_ENV")
+            .env_remove("UV_PROJECT_ENVIRONMENT")
+            .output()
+            .map_err(|error| {
+                format!(
+                    "the Build Server's Python environment cannot be created: {UV} cannot be \
+                     run ({error}); install uv"
+                )
+            })?;
+        if !synced.status.success() {
+            return Err(format!(
+                "{UV} sync --locked --project {} failed with {}: {}",
+                project.display(),
+                synced.status,
+                String::from_utf8_lossy(&synced.stderr).trim()
+            ));
+        }
+        Ok(Environment {
+            program: project.join(".venv/bin").join(ENVIRONMENT_PROGRAM),
+        })
+    }
+
+    /// A command of the environment's program.
+    pub fn command(&self) -> Command {
+        Command::new(&self.program)
+    }
+}
 
 /// cargo, as rustup installs it: a proxy that runs the toolchain the
 /// directory's `rust-toolchain.toml` names.
@@ -134,17 +195,17 @@ impl Report {
     ///
     /// # Errors
     ///
-    /// Why the environment cannot describe itself: its program is not on this
-    /// host's search path, fails, or prints no description.
-    pub fn read() -> std::result::Result<Report, String> {
-        let described = Command::new(ENVIRONMENT_PROGRAM)
+    /// Why the environment cannot describe itself: its program cannot be run,
+    /// fails, or prints no description.
+    pub fn read(environment: &Environment) -> std::result::Result<Report, String> {
+        let described = environment
+            .command()
             .args(["toolchain", "--json"])
             .output()
             .map_err(|error| {
                 format!(
-                    "the Build Server's Python environment cannot be run ({ENVIRONMENT_PROGRAM}: \
-                     {error}): install the `uniserve-build-server` distribution with its lock and \
-                     put its program on the search path"
+                    "the Build Server's Python environment cannot be run ({}: {error})",
+                    environment.program.display()
                 )
             })?;
         if !described.status.success() {
@@ -280,12 +341,24 @@ pub struct Toolchains {
 }
 
 impl Toolchains {
-    /// Reads the Python environment's description once.
+    /// Creates the Python environment of the source tree `source` and reads its
+    /// description once.
     ///
-    /// A missing environment is recorded with its reason; it does not fail the
-    /// server, because only a build that needs it does.
-    pub fn discover() -> Toolchains {
-        Toolchains::from_report(Report::read())
+    /// No source tree, or an environment that cannot be created or describe
+    /// itself, is recorded with its reason; it does not fail the server,
+    /// because only a build that needs the environment does.
+    pub fn discover(source: Option<&Path>) -> Toolchains {
+        let environment = match source {
+            Some(source) => {
+                Environment::sync(source).and_then(|environment| Report::read(&environment))
+            }
+            None => Err(
+                "this Build Server has no source tree (`--source`, `build_config.source`), \
+                 whose Python environment compiles Triton, CuTe DSL and CUDA packages"
+                    .to_owned(),
+            ),
+        };
+        Toolchains::from_report(environment)
     }
 
     /// The toolchains a given description states, or none with the reason.

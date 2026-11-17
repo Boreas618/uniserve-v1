@@ -121,6 +121,7 @@ fn deployment() -> Settings {
             PathBuf::from("/shared/uniserve/modules"),
         ],
         upstream: Some(PathBuf::from("/run/uniserve/leader.sock")),
+        source: Some(PathBuf::from("/srv/uniserve")),
         read_only_stores: vec![PathBuf::from("/opt/uniserve/store")],
         targets: vec![arch().to_string(), other_arch().to_string()],
         max_jobs: Some(2),

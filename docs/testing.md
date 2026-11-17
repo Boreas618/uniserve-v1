@@ -33,13 +33,13 @@ pytest tests/python/kernels --kernel-device cuda    # compiled for and launched 
 
 The interpreter is the default. A test marked `gpu` needs a device (a libdevice call, a dependent launch, a built native module, a device's own rounding) and is skipped with that reason on the interpreter; a test without the mark runs in both modes, on host tensors for the interpreter and on the device otherwise. In the `cuda` mode a host without a CUDA device skips every check.
 
-A check that launches what a Triton package's launch table states for a descriptor key asks the environment's `uniserve build-server launch`, which runs the Build Server's environment program `uniserve-build-server` from the search path (`uv sync --locked --project crates/build-server/python` creates that environment); a `gpu` check of a native or cubin module loads the module a Build Server of the session builds.
+A check that launches what a Triton package's launch table states for a descriptor key asks the environment's `uniserve build-server launch --source` with the repository, which creates the repository's Build Server environment with uv and evaluates the table there; a `gpu` check of a native or cubin module loads the module a Build Server of the session builds.
 
 ## GPU end-to-end tests
 
 The HTTP tests under `tests/python/e2e` start real servers on the host's GPUs. `just test-python-gpu` runs every test marked `e2e and gpu`; `just test-python-sanitizer` runs those marked `missing_state` under compute-sanitizer's memcheck. The nightly workflow (`.github/workflows/gpu-nightly.yml`) runs both recipes:
 
-- every process of every test deployment runs the `uniserve` executable the environment installed; the run's Build Server compiles kernels with its toolchain environment, whose program `uniserve-build-server` must be on the search path;
+- every process of every test deployment runs the `uniserve` executable the environment installed; the run's Build Server serves from the repository (`--source`): it compiles kernels with the toolchain environment uv creates from the repository, and installs the repository's packages before it serves;
 - its serving processes take the NVIDIA driver, NCCL and CUPTI from the host's default loader path, and FFmpeg as the build found it through pkg-config: the host provides the releases the [README](../README.md#requirements) names, and a process refuses an older driver, NCCL or CUPTI by name;
 - the recipe runs pytest on one pytest-xdist worker per GPU the run may lease (`-n auto`, which the plugin answers with the count of `--e2e-devices`, else of the GPUs NVML reports), and each case leases the GPUs it serves on (`tests/python/e2e/conftest.py`), so independent cases run beside one another on different GPUs while a case that observes host-wide state runs alone; the cases of a module that serves one deployment for all of them stay on one worker (`--dist loadgroup`). Leases are advisory locks a case takes under one allocator lock, blocking on a GPU until its holder releases it;
 - the recipe writes pytest's temporary directory, which holds every server's log, and a JUnit report to `artifacts/e2e/<UTC time>/`, or to the directory `just e2e=DIR test-python-gpu` names.
@@ -72,11 +72,8 @@ A two-host case runs on this host and a second one when `--peer-host` names the 
 
 ### Example
 
-With the Build Server environment's `bin` directory (`crates/build-server/python/.venv/bin`) on the search path:
-
 ```bash
 uv sync --locked --extra dev --extra test
-uv sync --locked --project crates/build-server/python
 just test-python-gpu
 ```
 

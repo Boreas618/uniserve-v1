@@ -127,7 +127,7 @@ def build_server(
     module installs its revisions at a server of its own, which no other
     module's deployment resolves at.
     """
-    with builds.tree_build_server(
+    with builds.build_server(
         uniserve,
         repository,
         tmp_path_factory.mktemp("build-server"),

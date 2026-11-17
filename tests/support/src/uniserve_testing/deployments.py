@@ -424,13 +424,11 @@ def remote_build_server(
     the tree's packages installed, until the block ends; the settings it
     serves with, as its readiness record states them.
 
-    A main process resolves its modules at its own host's Build Server, and
-    nothing distributes the leader's package revisions to another host's
-    server, so the case installs the tree's packages there itself from this
-    repository's path, which the other host must mount at the same path
-    (``specs/ad-hoc.md`` §9, AU-001). The server starts detached
-    (``--daemon``) and its starter prints its readiness record once it
-    serves.
+    A main process resolves its modules at its own host's Build Server, which
+    installs the tree's packages from its source tree, this repository's
+    path, which the other host must mount at the same path. The server starts
+    detached (``--daemon``) and its starter prints its readiness record once
+    it has installed them and serves.
     """  # noqa: D205
     started = host.run(
         "env",
@@ -438,6 +436,8 @@ def remote_build_server(
         "uniserve",
         "build-server",
         "serve",
+        "--source",
+        str(repository),
         "--package-root",
         f"{runtime}/packages",
         "--store-root",
@@ -448,15 +448,6 @@ def remote_build_server(
     record = json.loads(started.splitlines()[-1])
     socket = socket_path(record["endpoints"]["build"])
     try:
-        for package in builds.tree_packages(repository):
-            host.run(
-                "uniserve",
-                "build-server",
-                "install",
-                "--socket",
-                str(socket),
-                str(package),
-            )
         yield record["settings"]
     finally:
         # The Build Server has no stop request: it ends on SIGTERM, and it

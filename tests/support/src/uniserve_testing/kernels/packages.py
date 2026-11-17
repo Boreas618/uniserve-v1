@@ -218,13 +218,20 @@ class Launches:
     """
 
     def __init__(
-        self, uniserve: Path, kernels: Path, logs: Path, source: Any
+        self,
+        uniserve: Path,
+        repository: Path,
+        kernels: Path,
+        logs: Path,
+        source: Any,
     ) -> None:
-        """``uniserve`` is the executable, ``kernels`` the package tree,
-        ``logs`` a directory for each command's standard error, and
-        ``source(op)`` this session's import of a package's kernel module.
+        """``uniserve`` is the executable, ``repository`` the source tree
+        whose Build Server environment states the launches, ``kernels`` the
+        package tree, ``logs`` a directory for each command's standard error,
+        and ``source(op)`` this session's import of a package's kernel module.
         """  # noqa: D205
         self._uniserve = uniserve
+        self._repository = repository
         self._kernels = kernels
         self._logs = logs
         self._source = source
@@ -275,9 +282,8 @@ class Launches:
         """The running command of ``op``'s Triton package for ``target``.
 
         The command runs with the tests' declared environment
-        (:func:`uniserve_testing.servers.environment`): its search path names
-        the Build Server's toolchain program, and no setting of the session
-        (Triton's mode among them) reaches the driver.
+        (:func:`uniserve_testing.servers.environment`), so no setting of the
+        session (Triton's mode among them) reaches the driver.
         """
         command = self._commands.get((op, target))
         if command is None:
@@ -287,6 +293,8 @@ class Launches:
                     str(self._uniserve),
                     "build-server",
                     "launch",
+                    "--source",
+                    str(self._repository),
                     str(self._kernels / op / "triton"),
                     "--target",
                     target,

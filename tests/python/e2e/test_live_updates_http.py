@@ -80,7 +80,7 @@ def build_server(
     an installed revision is what a later epoch selects, so they install at
     a server of their own, which no other module's deployment resolves at.
     """
-    with builds.tree_build_server(
+    with builds.build_server(
         uniserve,
         repository,
         tmp_path_factory.mktemp("build-server"),

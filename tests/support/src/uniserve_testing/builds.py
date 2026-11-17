@@ -3,19 +3,16 @@
 A deployment's epoch is resolved at its host's Build Server before its main
 processes serve, and a package's module exists nowhere else, so every test
 that serves names one, as does a kernel check that loads a built module.
-:func:`build_server` starts one over an empty package root and store under a
+:func:`build_server` starts one over a fresh package root and store under a
 runtime directory of its own, where it binds its default socket, which its
-readiness record states (``endpoints.build``). It builds for the
-architectures of this host's devices, which it reads from the driver itself,
-and runs its toolchain environment's program ``uniserve-build-server`` from
-the search path. :class:`BuildServer` installs packages and resolves modules
-with the ``--json`` forms of ``uniserve build-server install`` and
+readiness record states (``endpoints.build``), with the repository as its
+source tree (``--source``): its Build Server environment compiles, and the
+server installs the tree's serving packages (every kernel package of the
+operator tree, the scheduling policy and the engine) before it serves. It
+builds for the architectures of this host's devices, which it reads from the
+driver itself. :class:`BuildServer` installs further packages and resolves
+modules with the ``--json`` forms of ``uniserve build-server install`` and
 ``resolve``.
-
-The tree's packages (:func:`tree_packages`) are the serving deployments'
-own: every kernel package of the operator tree, laid out as the Build
-Server's package trees are (``<op>/<backend>/package.toml``), the scheduling
-policy and the engine.
 """
 
 from __future__ import annotations
@@ -36,22 +33,18 @@ import tomli_w
 
 from uniserve_testing.servers import Server, environment, launch, socket_path
 
-#: How long a Build Server takes to serve, in seconds: it describes its
-#: toolchains first, which imports the compilers of its environment.
-START_S = 120.0
+#: How long a Build Server takes to serve, in seconds: uv brings its
+#: environment to the tree's lock, it describes its toolchains, which imports
+#: the compilers of the environment, and it installs the tree's packages,
+#: which snapshots the engine's whole workspace.
+START_S = 300.0
 
-#: The program of the Build Server's toolchain environment, which the server
-#: runs from the search path (``crates/build-server/python``).
-TOOLCHAIN_PROGRAM = "uniserve-build-server"
-
-#: The tree's packages, relative to the repository: the kernel packages'
-#: tree, the scheduling policy and the engine.
+#: The tree's packages, relative to the repository, that tests install or
+#: read themselves: the kernel packages' tree, the scheduling policy and the
+#: engine.
 KERNEL_TREE = Path("crates", "ops", "kernels")
 POLICY_PACKAGE = Path("crates", "scheduling", "policies", "arrival")
 ENGINE_PACKAGE = Path("crates", "engine")
-
-#: The manifest that makes a directory a package.
-MANIFEST = "package.toml"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -191,27 +184,12 @@ def build_config(settings: dict[str, Any]) -> str:
     return tomli_w.dumps({"build_config": settings})
 
 
-def require_toolchain() -> None:
-    """Refuse a session whose search path holds no toolchain environment.
-
-    Raises:
-        RuntimeError: Naming how to install it: without its program no
-            kernel package builds, and the first module would fail.
-    """
-    if shutil.which(TOOLCHAIN_PROGRAM) is None:
-        raise RuntimeError(
-            f"no {TOOLCHAIN_PROGRAM} on the search path: install the Build "
-            "Server's environment (`uv sync --locked --project "
-            "crates/build-server/python`) and put its program on the path"
-        )
-
-
 @contextmanager
 def build_server(
-    uniserve: Path, work: Path, *, scale: float = 1.0
+    uniserve: Path, repository: Path, work: Path, *, scale: float = 1.0
 ) -> Iterator[BuildServer]:
-    """A Build Server over an empty package root and store under `work`,
-    until the block ends.
+    """A Build Server over a fresh package root and store under `work`,
+    with `repository` as its source tree, until the block ends.
 
     The server binds its default socket in a runtime directory of its own,
     which this creates in the system's temporary directory: a Unix socket's
@@ -219,14 +197,17 @@ def build_server(
     artifacts. Its package root and store live as long as the block: a
     revision counts from 1 in a fresh package root, so a store kept across
     runs would answer a changed package with the module older source built.
+    It serves once it has installed the tree's packages, so a deployment's
+    start builds what it launches and later deployments reuse it.
     """  # noqa: D205
-    require_toolchain()
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
     server = launch(
         [
             str(uniserve),
             "build-server",
             "serve",
+            "--source",
+            str(repository),
             "--package-root",
             str(work / "packages"),
             "--store-root",
@@ -242,39 +223,6 @@ def build_server(
     finally:
         server.stop()
         shutil.rmtree(runtime, ignore_errors=True)
-
-
-@contextmanager
-def tree_build_server(
-    uniserve: Path, repository: Path, work: Path, *, scale: float = 1.0
-) -> Iterator[BuildServer]:
-    """A Build Server (:func:`build_server`) with every package of the tree
-    installed (:func:`tree_packages`), until the block ends.
-
-    Installing copies a package's source and registers its revision; a
-    deployment's profile runs name every descriptor key it launches, and
-    the server builds each on its first prepare, so a deployment's start
-    builds what it launches and later deployments reuse it.
-    """  # noqa: D205
-    with build_server(uniserve, work, scale=scale) as server:
-        for package in tree_packages(repository):
-            server.install(package)
-        yield server
-
-
-def tree_packages(repository: Path) -> list[Path]:
-    """The tree's serving packages, in a stable order: every kernel package
-    of the operator tree, the scheduling policy and the engine.
-    """  # noqa: D205
-    tree = repository / KERNEL_TREE
-    kernels = sorted(
-        backend
-        for op in tree.iterdir()
-        if op.is_dir()
-        for backend in op.iterdir()
-        if (backend / MANIFEST).is_file()
-    )
-    return [*kernels, repository / POLICY_PACKAGE, repository / ENGINE_PACKAGE]
 
 
 def derived_package(

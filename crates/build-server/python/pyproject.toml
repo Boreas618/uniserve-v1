@@ -14,10 +14,9 @@
 #   uv sync --locked --project crates/build-server/python
 #
 # creates the environment from this file and `uv.lock` with an interpreter that
-# meets `requires-python` (uv installs one when the host has none). The Build
-# Server runs `uniserve-build-server` from its search path, so the environment's
-# `bin` directory is where the host's programs are found, as for any installed
-# program.
+# meets `requires-python` (uv installs one when the host has none). A Build
+# Server runs it when it starts, in the source tree it is given (`--source`),
+# and runs `uniserve-build-server` from the environment's `bin` directory.
 [project]
 name = "uniserve-build-server"
 version = "2.0.0"

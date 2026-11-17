@@ -53,10 +53,10 @@ through a fixture of this module or of the plugin:
   launch table states for descriptor ``key`` on ``target`` (the kernel of
   ``kernel_source(op)``, its signature, its compile-time values and its
   options), from ``uniserve build-server launch`` run by the environment's
-  ``uniserve`` (the plugin's ``uniserve``); a key the package does not state
-  raises :class:`~uniserve_testing.kernels.packages.RefusedLaunchError` with
-  its reason. The command runs the Build Server's toolchain program
-  ``uniserve-build-server``, which must be on the search path.
+  ``uniserve`` (the plugin's ``uniserve``) with the repository's Build Server
+  environment; a key the package does not state raises
+  :class:`~uniserve_testing.kernels.packages.RefusedLaunchError` with its
+  reason.
 - ``launch_target``: the target a check's stated launch names, the session
   device's (``module_target``) or, on the interpreter,
   :data:`INTERPRETED_TARGET`.
@@ -139,13 +139,18 @@ def kernel_source(kernels: Path) -> Callable[..., ModuleType]:
 @pytest.fixture(scope="session")
 def stated_launch(
     uniserve: Path,
+    repository: Path,
     kernels: Path,
     kernel_source: Callable[..., ModuleType],
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[Launches]:
     """``stated_launch(op, key, target)``: what a launch table states."""
     launches = Launches(
-        uniserve, kernels, tmp_path_factory.mktemp("launch"), kernel_source
+        uniserve,
+        repository,
+        kernels,
+        tmp_path_factory.mktemp("launch"),
+        kernel_source,
     )
     yield launches
     launches.close()
@@ -186,11 +191,11 @@ def launch_target(interpreted: bool, request: pytest.FixtureRequest) -> str:
 
 @pytest.fixture(scope="session")
 def build_server(
-    uniserve: Path, tmp_path_factory: pytest.TempPathFactory
+    uniserve: Path, repository: Path, tmp_path_factory: pytest.TempPathFactory
 ) -> Iterator[builds.BuildServer]:
-    """The session's Build Server, over an empty package root and store."""
+    """The session's Build Server, over a fresh package root and store."""
     with builds.build_server(
-        uniserve, tmp_path_factory.mktemp("build-server")
+        uniserve, repository, tmp_path_factory.mktemp("build-server")
     ) as server:
         yield server
 

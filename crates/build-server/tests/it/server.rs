@@ -280,7 +280,7 @@ fn an_installation_records_the_hosts_toolchain_or_is_refused_without_it() {
 
     // What this host has, as the server discovers it when it opens.
     let installed = config.package_root.join("rms_norm/triton/1");
-    match Toolchains::discover().identity(ToolchainKind::Triton, &source) {
+    match Toolchains::discover(config.source.as_deref()).identity(ToolchainKind::Triton, &source) {
         Err(missing) => {
             let refused = server
                 .install(&source)

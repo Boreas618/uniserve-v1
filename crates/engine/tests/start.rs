@@ -52,6 +52,8 @@ fn build_server(directory: &Path) -> (PathBuf, std::os::unix::net::UnixStream) {
         limits: build_server::builder::Limits::default(),
         targets: Vec::new(),
         cache: directory.join("cache"),
+        // The policy package is built by cargo, which needs no Python environment.
+        source: None,
     };
     let socket = directory.join("build-server.sock");
     // The socket is bound before the server serves, so a client connects at once.

@@ -27,7 +27,7 @@
 //! Building into an existing store extends it. A package whose build inputs
 //! (its files, and the toolchain with its compile driver and pins) are
 //! unchanged since its latest installed revision keeps that revision
-//! ([`BuildServer::installed`]), so modules built earlier stay the ones the
+//! ([`BuildServer::install_if_changed`]), so modules built earlier stay the ones the
 //! store serves, and only a package of changed inputs is installed as a new
 //! revision, whose modules are built again.
 //!
@@ -352,10 +352,7 @@ fn install(server: &BuildServer, directory: &Path) -> Result<Vec<(String, Manife
 /// that one was installed from the same build inputs, and returns its backend
 /// and manifest.
 fn install_package(server: &BuildServer, directory: &Path) -> Result<(String, Manifest)> {
-    let installed = match server.installed(directory)? {
-        Some(installed) => installed,
-        None => server.install(directory)?,
-    };
+    let installed = server.install_if_changed(directory)?;
     let manifest = Manifest::load(directory).map_err(|source| Error::Manifest {
         package: directory.to_path_buf(),
         source: Box::new(source),

@@ -27,30 +27,27 @@ Install uv and rustup from the host's packages or their releases, then run from 
 
 ```bash
 rustup toolchain install
-uv sync --locked --extra gpu
-uv sync --locked --project crates/build-server/python
-source .venv/bin/activate
 ```
 
-`rustup toolchain install` installs the release `rust-toolchain.toml` pins. The first sync builds the `uniserve` executable; uv selects the interpreter by the project's `requires-python`. The native libraries come from the host, where the standard mechanisms find them, and nothing points the build or the processes at them:
+`rustup toolchain install` installs the release `rust-toolchain.toml` pins. `uv run uniserve ...` from the repository root builds the `uniserve` executable into the repository's environment (`.venv`) the first time, and again after a change, before it runs it; `uv sync --locked` builds it alone. uv selects the interpreter by the project's `requires-python`. The native libraries come from the host, where the standard mechanisms find them, and nothing points the build or the processes at them:
 
 - The NVIDIA driver, NCCL and CUPTI are opened at run time by their sonames from the default loader path, as NVIDIA's distribution packages install them (`/etc/ld.so.conf.d` registers any other directory that holds them). A process refuses a library older than the release the table above names with an error that names it, before it uses it.
 - FFmpeg 8.1 is found at build time through pkg-config, at exactly the library versions of that release: a distribution package, or an installation prefix whose `lib/pkgconfig` the build's `PKG_CONFIG_PATH` names and whose `lib` the loader configuration (`/etc/ld.so.conf.d`, then `ldconfig`) registers. A host whose distribution lacks FFmpeg 8.1 builds the FFmpeg 8.1.2 release and libx264 into such a prefix with their own build systems, configured as [the media crate](crates/media/README.md) configures them.
 - A build that runs from its target directory, such as a development or CI build, can instead build the pinned FFmpeg 8.1.2 and libx264 from source with `--features media/vendored` (it needs curl, tar, xz, make, a C compiler and, on x86-64, nasm). Its executables find those libraries through their run path into the target directory.
 
-The second sync creates the Build Server's own environment, the locked compilers of the kernel packages ([its README](crates/build-server/python/README.md)); the Build Server compiles the kernel packages with it and the CUDA toolkit NVIDIA's packages register with pkg-config. The Build Server runs the environment's program `uniserve-build-server` from its search path, so the environment's `bin` directory (`crates/build-server/python/.venv/bin`) must be on the search path of the processes that start Build Servers: a daemon, or `uniserve build-server serve`. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages.
+A deployment names the source tree it serves from with `--source` (`build_config.source`). The host's Build Server, which the daemon starts, creates its own environment from that tree with uv, the locked compilers of the kernel packages ([its README](crates/build-server/python/README.md)), and installs the tree's engine, scheduling policy and kernel packages before it serves; it compiles the kernel packages with that environment and the CUDA toolkit NVIDIA's packages register with pkg-config. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages.
 
 For RDMA transfers between hosts, install the pinned UCX and NIXL builds described in [NIXL transfers](docs/nixl.md).
 
 ## Quickstart
 
-Serve the checkpoint on four GPUs:
+Build and serve the checkpoint on four GPUs, from the repository root:
 
 ```bash
-uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 \
+uv run uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 --source . \
   --config configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
-  --host 0.0.0.0 \
+  --host 0.0.0.0 --port 8000 \
   --max-running-requests 2 \
   --max-model-len 2048
 ```
@@ -117,7 +114,7 @@ The metrics endpoint publishes scheduler, worker, request and HTTP metrics in on
 UniServe's options form one tree, following TensorRT-LLM's serving configuration: the options most deployments state sit at its top level, and the rest in `*_config` tables, one per part of the system. `uniserve serve` reads the tree from a `--config` TOML file, from flags for the most common options, and from repeatable `--set PATH=VALUE` assignments that reach any option by its path, each overriding the last:
 
 ```bash
-uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 --config configs/minimax_h3/ulysses4.toml \
+uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 --source . --config configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 --max-running-requests 2 \
   --set 'quantization.mode="balanced"'
 ```

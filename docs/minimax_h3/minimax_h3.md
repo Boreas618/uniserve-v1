@@ -17,12 +17,9 @@ apt-get update
 apt-get install -y build-essential python3.12-dev pkg-config cmake git curl ca-certificates
 
 rustup toolchain install
-uv sync --locked --extra gpu
-uv sync --locked --project crates/build-server/python
-source .venv/bin/activate
 ```
 
-`rustup toolchain install` installs the Rust release `rust-toolchain.toml` pins. The first sync builds the `uniserve` executable. The second creates the Build Server's own environment, the locked compilers of the kernel packages (Triton, the CuTe DSL, FlashInfer and FlashAttention-4), whose program `uniserve-build-server` the Build Server runs from its search path, so the environment's `bin` directory (`crates/build-server/python/.venv/bin`) must be on the search path of the processes that start Build Servers. The Build Server compiles a kernel the first time a deployment asks for it, for the target GPU, with that environment and the CUDA toolkit NVIDIA's packages register with pkg-config.
+`rustup toolchain install` installs the Rust release `rust-toolchain.toml` pins. `uv run uniserve serve ... --source .` from the repository root builds the `uniserve` executable the first time and serves. The host's Build Server, which the daemon starts, creates its own environment from the source tree with uv, the locked compilers of the kernel packages (Triton, the CuTe DSL, FlashInfer and FlashAttention-4), and installs the tree's packages. It compiles a kernel the first time a deployment asks for it, for the target GPU, with that environment and the CUDA toolkit NVIDIA's packages register with pkg-config.
 
 ## Checkpoints
 
@@ -53,9 +50,9 @@ hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
   vsa-datafree/adapter_model.safetensors --local-dir fasth3-adapter
 hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree \
   fastvideo_inference.json --local-dir fasth3-adapter/vsa-datafree
-uniserve serve MiniMaxAI/MiniMax-H3 --lora-dir fasth3-adapter/vsa-datafree \
+uniserve serve MiniMaxAI/MiniMax-H3 --source . --lora-dir fasth3-adapter/vsa-datafree \
   --config configs/minimax_h3/ulysses4.toml --served-model-name FastH3 \
-  --host 0.0.0.0 --max-running-requests 2
+  --host 0.0.0.0 --port 8000 --max-running-requests 2
 ```
 
 The adapter is fused into the partition its contract names once, as each rank loads its weights: every element of an edited parameter is `(lora_B @ lora_A + diff) + base`, evaluated in FP32 and rounded once to the base tensor's element type, the container's own reconstruction with no `alpha` (a scale of one), and a parameter the adapter does not edit is read unchanged. The deployment then serves that student for every request, as its full export would: the contract's tasks from the partition it names, on the contract's schedule at the base schedulers' shifts, with the contract's attention. A request cannot select or drop the adapter; another adapter is another deployment, and changing `lora` or `lora_dir` with `PUT /admin/config` starts a new epoch. An adapter is refused at startup when its directory holds no `adapter_model.safetensors` or no contract, when its metadata states another container or other tensor counts or another rank than it carries, when it edits a tensor the partition does not hold, with other extents, or assigns one it does, or when the checkpoint is a FastH3 export rather than the base release.
@@ -79,10 +76,10 @@ hf download MiniMaxAI/MiniMax-H3 --revision <base_model_revision> \
 FastH3 text-to-video and keyframe requests:
 
 ```bash
-uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 \
+uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 --source . \
   --config configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
-  --host 0.0.0.0 \
+  --host 0.0.0.0 --port 8000 \
   --max-running-requests 2 \
   --max-model-len 2048
 ```
@@ -90,26 +87,26 @@ uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 \
 Base text-to-video and keyframe requests:
 
 ```bash
-uniserve serve MiniMaxAI/MiniMax-H3 \
+uniserve serve MiniMaxAI/MiniMax-H3 --source . \
   --config configs/minimax_h3/ulysses4.toml --served-model-name MiniMax-H3 \
-  --host 0.0.0.0 --set video_config.max_seconds=8 --max-model-len 2048 \
+  --host 0.0.0.0 --port 8000 --set video_config.max_seconds=8 --max-model-len 2048 \
   --set 'video_config.text_capacities=[2048]'
 ```
 
 Reference requests, with the base reference denoiser or an OmniRef export:
 
 ```bash
-uniserve serve MiniMaxAI/MiniMax-H3 \
+uniserve serve MiniMaxAI/MiniMax-H3 --source . \
   --config configs/minimax_h3/ulysses4-reference.toml \
-  --served-model-name MiniMax-H3 --host 0.0.0.0 \
+  --served-model-name MiniMax-H3 --host 0.0.0.0 --port 8000 \
   --set video_config.max_seconds=5 --max-model-len 8192 \
   --set 'video_config.text_capacities=[8192]' \
   --set video_config.max_condition_rows=40960 \
   --set 'media_config.directory="/srv/media"'
 
-uniserve serve FastVideo/FastVideo-FastH3-Omni-8-Step-V1 \
+uniserve serve FastVideo/FastVideo-FastH3-Omni-8-Step-V1 --source . \
   --config configs/minimax_h3/ulysses4-reference.toml \
-  --served-model-name MiniMax-H3-OmniRef --host 0.0.0.0 \
+  --served-model-name MiniMax-H3-OmniRef --host 0.0.0.0 --port 8000 \
   --set video_config.max_seconds=5 --max-model-len 8192 \
   --set 'video_config.text_capacities=[8192]' \
   --set video_config.max_condition_rows=49152 \
@@ -174,7 +171,7 @@ A deployment of several ranks needs NCCL 2.30.4 or later on the loader's default
 The two-host files name their hosts `rank-0` and `rank-1` (a rank entry without a host runs on the leader's own). Start the leader on `rank-0` with `--host-identity rank-0 --nnodes 2 --dist-init-addr <rank-0 address>:<port>`, a port free on `rank-0`; it logs `awaiting the deployment's other nodes` and binds that port on every interface. Then start the daemon of `rank-1` with the same environment and build; it takes no model and joins the leader, and the leader starts its workers on `rank-1` once its own start completes. A worker compiled from other sources than the leader is refused at registration, naming both builds:
 
 ```bash
-uniserve serve --nnodes 2 --node-rank 1 --dist-init-addr <rank-0 address>:<port> --host-identity rank-1
+uniserve serve --source . --nnodes 2 --node-rank 1 --dist-init-addr <rank-0 address>:<port> --host-identity rank-1
 ```
 
 Each host's main process holds the products of a request its ranks write: the condition media, the conditioning, the latents, the decoded and encoded video units with their splice tails, and the track. A product its ranks on one host write and ranks on the other read is copied between the two hosts' memories by the Transfer Server of the reading host's Storage Server, over NVLink where the two hosts share a fabric and over the network otherwise, after the call that writes it and before the call that reads it; the server places each request's stages on replicas that need no copy whenever one serves the stage. `fasth3-ulysses4x2-two-host.toml` places each replica's text encoder, denoiser, decoders, codecs, muxer and media reader on one host, so its requests copy nothing between hosts. `ulysses8-two-host.toml` and `ulysses8-reference-two-host.toml` place one `model` worker across both hosts beside a `muxer` and a `reader` worker on `rank-0`: the condition media the reader decodes and the conditioning the text encoder's first rank writes on `rank-0` are copied to `rank-1` before its latent preparation, and in `ulysses8-two-host.toml` the vision pixels before its text encoding. Every rank decodes its own units of each decode round into its host's memory and keeps its latents there, a round's splice tail passes from one decoder rank to the next over the decoder ranks' communicator inside the call, each host encodes the units its own ranks decoded, and the encoded units of `rank-1` are copied to `rank-0` for the muxer. A copy that fails ends its request as migratable, and the daemon submits it again.
@@ -307,7 +304,7 @@ Each encoded element differs from its value by at most what its format's roundin
 
 | Symptom | Remedy |
 | --- | --- |
-| A kernel package's compile error in the Build Server's log | Check what `uniserve-build-server toolchain` reports (the CUDA 13 toolkit through `pkg-config cudart-13.0`, and the C++ compiler), and run the Build Server's `uv sync` above again. |
+| A kernel package's compile error in the Build Server's log | Check what `crates/build-server/python/.venv/bin/uniserve-build-server toolchain` reports (the CUDA 13 toolkit through `pkg-config cudart-13.0`, and the C++ compiler). |
 | `unsupported FastH3 checkpoint` | Use a checkpoint from the table above; the message names the `fastvideo_inference.json` field it cannot serve. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `quantization` for a packed NVFP4 checkpoint. |
 | `the video VAE decoder computes in fp16` | Select `video_vae = "fp16"` or `"nvfp4"`. |

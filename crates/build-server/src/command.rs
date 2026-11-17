@@ -31,7 +31,9 @@
 //! section 6.1). The targets it builds for are the `--target`s it is given,
 //! or else the architectures of this host's devices, read from the driver's
 //! device attributes without a context. Its toolchains are its own
-//! (`crate::toolchain`): no option names a compiler.
+//! (`crate::toolchain`): no option names a compiler. The source tree it is
+//! given (`--source`, [`crate::tree`]) holds its Python environment and the
+//! serving packages the upstream server installs when it starts.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Write};
@@ -47,7 +49,7 @@ use crate::protocol::Client;
 use crate::server::{BuildServer, ServerConfig};
 use crate::store::Root;
 use crate::target::Target;
-use crate::toolchain::{ENVIRONMENT_PROGRAM, PeakMemory};
+use crate::toolchain::{ENVIRONMENT_PROGRAM, Environment, PeakMemory};
 use crate::{Error, Manifest, Result, default_socket};
 
 /// The `build-server` command's arguments.
@@ -126,6 +128,10 @@ pub enum Command {
     /// order, the compile-time values, the aligned arguments' attributes and
     /// the options, or why the package states none.
     Launch {
+        /// The source tree whose Build Server environment evaluates the
+        /// launch table ([`crate::tree`]).
+        #[arg(long, value_name = "DIR")]
+        source: PathBuf,
         /// The package directory.
         package: PathBuf,
         /// The target the compilations are stated for, such as `sm_100a`.
@@ -164,6 +170,11 @@ pub struct BuildArgs {
     /// under `modules`. An existing store is extended.
     #[arg(long, value_name = "DIR")]
     pub store: PathBuf,
+    /// The source tree whose Build Server environment compiles Triton, CuTe
+    /// DSL and CUDA packages ([`crate::tree`]); without it only packages that
+    /// need no such toolchain build.
+    #[arg(long, value_name = "DIR")]
+    pub source: Option<PathBuf>,
     /// How many builds may run at once, and how many compiler processes each
     /// may run (4 when unset).
     #[arg(long, value_name = "COUNT")]
@@ -190,7 +201,7 @@ pub struct ServeArgs {
 }
 
 /// How a Build Server serves: its socket, its roots, its upstream, its
-/// targets and its limits.
+/// source tree, its targets and its limits.
 ///
 /// The same settings are `serve`'s flags and a deployment's `build_config`
 /// table. A daemon prepares an epoch's package revisions at [`Settings::socket`], and
@@ -218,6 +229,14 @@ pub struct Settings {
     #[arg(long, value_name = "PATH")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream: Option<PathBuf>,
+    /// The UniServe source tree this server builds from ([`crate::tree`]):
+    /// uv creates its Build Server environment, which compiles Triton, CuTe
+    /// DSL and CUDA packages, and the upstream server installs its serving
+    /// packages when it starts. Unset, the server has no such toolchain and
+    /// installs nothing by itself.
+    #[arg(long, value_name = "DIR")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<PathBuf>,
     /// A store this server serves and never writes: a directory `build
     /// --store` made, such as the one a release ships. Its packages and
     /// modules are served with no toolchain; repeatable.
@@ -331,6 +350,9 @@ impl Settings {
         if let Some(upstream) = &self.upstream {
             push("upstream", path(upstream));
         }
+        if let Some(source) = &self.source {
+            push("source", path(source));
+        }
         for store in &self.read_only_stores {
             push("read-only-store", path(store));
         }
@@ -408,6 +430,7 @@ impl Settings {
             limits,
             targets,
             cache: service::cache_directory()?.join("build-server"),
+            source: self.source.clone().map(absolute),
         })
     }
 
@@ -568,16 +591,29 @@ pub fn run(args: Args, host: HostTargets<'_>, levels: &service::logging::Levels)
             Ok(())
         }
         Command::Launch {
+            source,
             package,
             target,
             keys,
         } => {
+            let environment =
+                Environment::sync(&absolute(source)).map_err(|message| Error::Toolchain {
+                    kind: ToolchainKind::Triton,
+                    message,
+                })?;
             let (package, target) = (absolute(package), Target::new(target));
             let mut out = std::io::stdout().lock();
             if keys.is_empty() {
-                state_launches(&package, &target, std::io::stdin().lock().lines(), &mut out)
+                let lines = std::io::stdin().lock().lines();
+                state_launches(&environment, &package, &target, lines, &mut out)
             } else {
-                state_launches(&package, &target, keys.into_iter().map(Ok), &mut out)
+                state_launches(
+                    &environment,
+                    &package,
+                    &target,
+                    keys.into_iter().map(Ok),
+                    &mut out,
+                )
             }
         }
         Command::Build(build) => run_build(*build, host),
@@ -654,11 +690,10 @@ struct Undeclared<'a> {
 ///
 /// Each key is read by the Build Server's own reader of the key grammar, as a
 /// build reads it, and its table is evaluated by the Triton driver of the Build
-/// Server's Python environment (`uniserve-build-server launch`,
-/// [`ENVIRONMENT_PROGRAM`] on the search path), which imports the package's
-/// kernel module from its source directory once. A key is answered and `out`
-/// flushed before the next key is read, so a caller may write keys one at a
-/// time to a running command and read each answer back.
+/// Server's Python environment `environment` (`uniserve-build-server launch`),
+/// which imports the package's kernel module from its source directory once. A
+/// key is answered and `out` flushed before the next key is read, so a caller
+/// may write keys one at a time to a running command and read each answer back.
 ///
 /// # Errors
 ///
@@ -666,6 +701,7 @@ struct Undeclared<'a> {
 /// GPU target, or a program that fails; [`Error::Toolchain`] when the program
 /// cannot be run; [`Error::Io`] when a key cannot be read or an answer written.
 pub fn state_launches(
+    environment: &Environment,
     package: &Path,
     target: &Target,
     keys: impl IntoIterator<Item = std::io::Result<String>>,
@@ -690,7 +726,8 @@ pub fn state_launches(
 
     // The program's standard error stays the command's: a defect of the driver
     // reaches the caller as its own traceback.
-    let mut program = std::process::Command::new(ENVIRONMENT_PROGRAM)
+    let mut program = environment
+        .command()
         .arg("launch")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -699,7 +736,7 @@ pub fn state_launches(
             kind: ToolchainKind::Triton,
             message: format!(
                 "{ENVIRONMENT_PROGRAM}, the program of the Build Server's Python environment, \
-                 cannot be run from the search path: {error}"
+                 cannot be run: {error}"
             ),
         })?;
     // Both streams were asked for as pipes, so the child holds both.
@@ -848,6 +885,7 @@ fn run_build(args: BuildArgs, host: HostTargets<'_>) -> Result<()> {
         package_root: Some(store.join(crate::build::PACKAGES)),
         store_roots: vec![store.join(crate::build::MODULES)],
         targets: args.target.iter().cloned().collect(),
+        source: args.source,
         max_jobs: args.max_jobs,
         peak_memory: args.peak_memory,
         ..Settings::default()
@@ -939,6 +977,11 @@ fn run_serve(
 
     let config = serve.settings.config(serve.settings.targets(host)?)?;
     let server = std::sync::Arc::new(BuildServer::open(&config)?);
+    // The upstream installs its source tree's serving packages before it
+    // serves, so the first deployment that asks selects from them.
+    if let (Some(source), None) = (&config.source, &config.upstream) {
+        server.install_tree(source)?;
+    }
     let record = crate::readiness(&socket, &serve.settings);
     let lock = starting.finish(&record)?;
     if let Some(mut ready) = ready {

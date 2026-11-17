@@ -55,8 +55,15 @@ pub(crate) fn exclusive() -> MutexGuard<'static, ()> {
     SERVERS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The repository this crate is part of: the source tree whose Build Server
+/// environment the test servers compile with.
+pub(crate) fn repository() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
 /// The configuration of an upstream Build Server over fresh directories in
-/// `directory`, on a host that builds for [`arch`].
+/// `directory`, on a host that builds for [`arch`], with the repository's
+/// Build Server environment ([`repository`]).
 ///
 /// The package root and the writable store root are named as a store build
 /// names them (`build_server::build::PACKAGES` and `MODULES`), so the
@@ -73,6 +80,7 @@ pub(crate) fn config(directory: &Path) -> ServerConfig {
         limits: Limits::default(),
         targets: vec![arch()],
         cache: directory.join("cache"),
+        source: Some(repository()),
     }
 }
 

@@ -117,15 +117,16 @@ def build_server(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[BuildServer]:
     """The run's Build Server, with every package of the tree installed
-    (:func:`uniserve_testing.builds.tree_build_server`).
+    (:func:`uniserve_testing.builds.build_server`).
 
-    A deployment's epoch is resolved at its host's Build Server, and the one
-    a daemon starts by itself holds no package. A module whose cases install
+    A deployment's epoch is resolved at its host's Build Server, which the
+    run starts itself so that its package root and store are the run's own.
+    A module whose cases install
     revisions of their own overrides this fixture with a server of its own,
     since a revision installed here is what every later deployment of the
     session would select.
     """  # noqa: D205
-    with builds.tree_build_server(
+    with builds.build_server(
         uniserve,
         repository,
         tmp_path_factory.mktemp("build-server"),
