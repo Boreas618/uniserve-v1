@@ -9,7 +9,8 @@ AllRules == {"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10", "R11"}
 (* Two epochs; the first has two groups over memories m1 and m2, the       *)
 (* second one group over m1; one KV region; one host unit. g2 reads the   *)
 (* class owners of g1 hold, and copies host copies with both host parts,  *)
-(* the other groups with pa alone. `Resize` moves u2 and the host unit.   *)
+(* the other groups with pa alone. `Resize` moves u2, the host unit and   *)
+(* g3's slot row.                                                          *)
 ConstInit ==
     /\ Units = {"u1", "u2"}
     /\ Slots = {"s1", "s2", "s3"}
@@ -28,8 +29,8 @@ ConstInit ==
     /\ UnitRegion = [u \in {"u1", "u2"} |-> "kv"]
     /\ UnitChunk = [u \in {"u1", "u2"} |-> u]
     /\ GroupRegion = [g \in {"g1", "g2", "g3"} |-> "kv"]
-    /\ InitialUnits = {"u1", "u2", "h1"}
-    /\ Movable = {"u2", "h1"}
+    /\ InitialUnits = {"u1", "u2", "h1", "s1", "s2", "s3"}
+    /\ Movable = {"u2", "h1", "s3"}
     /\ MaxBatch = 2
     /\ MaxRequests = 2
     /\ MaxCopies = 2
@@ -48,7 +49,7 @@ IndInit ==
     /\ free = Gen(6) /\ ostate = Gen(2) /\ ogroup = Gen(2) /\ oslot = Gen(2)
     /\ table = Gen(2) /\ cache = Gen(1) /\ hcache = Gen(1)
     /\ deferred = Gen(3) /\ copies = Gen(2) /\ ncopy = Gen(1) /\ tasks = Gen(2)
-    /\ valid = Gen(3) /\ vis = Gen(1) /\ member = Gen(3) /\ trial = Gen(2)
+    /\ valid = Gen(3) /\ vis = Gen(1) /\ member = Gen(6) /\ trial = Gen(2)
     /\ dbt = Gen(3) /\ launched = Gen(3) /\ inflight = Gen(3) /\ handoff = Gen(3)
     /\ requests = Gen(3)
     /\ alloc = Gen(6) /\ sharedKey = Gen(6) /\ remote = Gen(1) /\ lost = Gen(2)
@@ -67,7 +68,7 @@ Next2 == /\ \/ \E o \in Owners, p \in Positions, k \in Keys : Clone(o, p, k) \/ 
          /\ UNCHANGED rare
 Next3 == /\ \/ \E k \in Keys : Evict(k) \/ EvictHost(k)
             \/ \E e \in Epochs : CommitUpdate(e) \/ Rollback(e)
-            \/ \E u \in Units \cup HostUnits : Shrink(u) \/ Grow(u)
+            \/ \E u \in AllUnits : Shrink(u) \/ Grow(u)
          /\ UNCHANGED rare
 Next4 == /\ \/ Issue
             \/ \E g \in Groups, r \in requests : ExecStamp(g, r)

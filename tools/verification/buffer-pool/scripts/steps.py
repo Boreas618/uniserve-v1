@@ -548,9 +548,9 @@ ACTS = {"attach": ["Attach"], "allocate": ["Allocate"], "pin": ["Pin"], "clone":
         # counts as reached, as `Advance`s of their words), and the device
         # regions no other session names close, their cached blocks evicted.
         "close": ["Lose", "Advance", "Evict", "Shrink"],
-        # A resize of a device region or of the host region: a shrink evicts
-        # in the installed order, the device copies or the host copies of the
-        # region it shrinks.
+        # A resize of a KV region, a group's slot region or the host region:
+        # a shrink of a KV or host region evicts in the installed order, the
+        # device copies or the host copies of the region it shrinks.
         "resize": ["Evict", "EvictHost", "Shrink", "Grow"]}
 
 
@@ -1306,11 +1306,11 @@ def check(job):
         ordered = Seq(sorted(start["copies"], key=tla))
         finishes = Set(Rec(ok=line["ok"], at=ordered.index(line["copy"]) + 1, after=line["after"])
                        for line in start["finishes"])
-        # The device and host units in their regions: those the first state
-        # names, free or held. A unit of the window it does not name is
-        # outside its region (one a resize grows), or one the run's universe
-        # has beyond this window's.
-        member = Set(unit for unit in units["kv"] + units["host"]
+        # The device units, slot rows and host units in their regions: those
+        # the first state names, free or held. A unit of the window it does
+        # not name is outside its region (one a resize grows), or one the
+        # run's universe has beyond this window's.
+        member = Set(unit for unit in units["kv"] + units["rows"] + units["host"]
                      if re.search(rf"(?<![\d:]){re.escape(unit)}(?![\d])", "\n".join(item["lines"][0])))
         begin = Rec(state=Raw(define("S", start)), member=member, copies=ordered, finishes=finishes)
 
@@ -1370,9 +1370,10 @@ def check(job):
         "TraceGroupParts": tla(group_parts),
         "TraceReaders": tla(readers),
         "TraceRules": "AllRules",
-        # Every device and host unit: a window's start states which are in
-        # their regions (KvTrace's `Start`), and `Resize` may move any.
-        "TraceRegionUnits": "TraceUnits \\cup TraceHostUnits",
+        # Every device unit, slot row and host unit: a window's start states
+        # which are in their regions (KvTrace's `Start`), and `Resize` may
+        # move any.
+        "TraceRegionUnits": "TraceUnits \\cup TraceSlots \\cup TraceHostUnits",
     }
     module = [
         "---- MODULE MC_Trace ----",

@@ -100,8 +100,10 @@ LEMMA AttachPool ==
     BY TypeFacts
   <1>2. \A v \in AllUnits : Held(v)' <=> Held(v) \/ v = s
     BY AttachHeld
-  <1>3. s \notin Units /\ s \notin HostUnits /\ s \in AllUnits /\ s # NONE
-    BY DEF AllUnits
+  (* The slot row was free, so it is in its group's slot region.           *)
+  <1>3. /\ s \notin Units /\ s \notin HostUnits /\ s \in AllUnits /\ s # NONE
+        /\ s \in member
+    BY DEF AllUnits, AttachAt, IndInv, Regions
   <1>4. TypeOK'
     BY <1>1, <1>3 DEF AttachAt, TypeOK, rare, AllUnits
   <1>5. /\ DOMAIN dbt' = Groups
@@ -154,7 +156,7 @@ LEMMA AttachPool ==
     <2> QED
       BY <2>1, <2>2
   <1>9. Outside'
-    <2>1. \A v \in Units \cup HostUnits : alloc'[v] = alloc[v]
+    <2>1. \A v \in AllUnits \ member : alloc'[v] = alloc[v]
       BY <1>1, <1>3 DEF AttachAt, TypeOK, AllUnits
     <2> QED
       BY <2>1 DEF AttachAt, IndInv, Outside
@@ -672,10 +674,10 @@ LEMMA AllocatePool ==
     <2> QED
       BY <2>1, <2>2
   <1>11. Outside'
-    <2> SUFFICES ASSUME NEW v \in (Units \cup HostUnits) \ member'
+    <2> SUFFICES ASSUME NEW v \in AllUnits \ member'
                  PROVE  alloc'[v] = NONE /\ sharedKey'[v] = NONE
       BY DEF Outside
-    <2>1. v # u /\ v \in AllUnits /\ v \in (Units \cup HostUnits) \ member
+    <2>1. v # u /\ v \in AllUnits \ member
       BY DEF AllocateAt, AllUnits
     <2>2. alloc[v] = NONE /\ sharedKey[v] = NONE
       BY <2>1 DEF IndInv, Outside

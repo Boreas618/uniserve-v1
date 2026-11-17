@@ -99,13 +99,10 @@ TypeInv ==
 (* The buffer pool: whom each unit is allocated to.                        *)
 
 FreeClean == \A u \in free : alloc[u] = NONE /\ sharedKey[u] = NONE /\ ~Held(u)
-(* A device or host unit outside its region is allocated to nobody, so it  *)
-(* joins its region free.                                                  *)
-Outside == \A u \in (Units \cup HostUnits) \ member : alloc[u] = NONE /\ sharedKey[u] = NONE
-Regions ==
-    /\ member \subseteq Units \cup HostUnits
-    /\ (free \cap (Units \cup HostUnits)) \subseteq member
-    /\ OneRegion
+(* A unit outside its region is allocated to nobody, so it joins its       *)
+(* region free.                                                            *)
+Outside == \A u \in AllUnits \ member : alloc[u] = NONE /\ sharedKey[u] = NONE
+Regions == member \subseteq AllUnits /\ free \subseteq member /\ OneRegion
 
 (* A unit is allocated only to an owner that was attached.                 *)
 AllocOwner == \A u \in AllUnits : alloc[u] \in Owners => ostate[alloc[u]] # "new"

@@ -50,7 +50,7 @@ LEMMA UnitsOfRegions ==
                     /\ IsFiniteSet(UnitsIn(r))
                     /\ \A u \in UnitsIn(r) : InRegion(u)
   OBVIOUS
-<1>1. member \subseteq Units \cup HostUnits
+<1>1. member \subseteq AllUnits
   BY DEF IndInv, Regions
 <1>2. CASE r \in {<<"device", UnitRegion[u]>> : u \in Units}
   <2>1. PICK v \in Units : r = <<"device", UnitRegion[v]>>
@@ -72,14 +72,14 @@ LEMMA UnitsOfRegions ==
     BY <1>3
   <2>2. r[1] = "slots" /\ r[2] = g
     BY <2>1
-  <2>3. UnitsIn(r) = {s \in Slots : SlotGroup[s] = r[2]}
+  <2>3. UnitsIn(r) = {s \in member \cap Slots : SlotGroup[s] = r[2]}
     BY <2>2 DEF UnitsIn
   <2>4. UnitsIn(r) \subseteq Slots
     BY <2>3
   <2>5. IsFiniteSet(UnitsIn(r))
     BY <2>4, Finite, FS_Subset
-  <2>6. \A u \in UnitsIn(r) : u \notin Units \cup HostUnits
-    BY <2>4, Sizes
+  <2>6. \A u \in UnitsIn(r) : u \in member
+    BY <2>3
   <2> QED
     BY <2>4, <2>5, <2>6 DEF AllUnits, InRegion
 <1>4. CASE r \in {<<"host", "host">>}

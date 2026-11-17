@@ -248,8 +248,9 @@ LEMMA TransferDue_Start ==
         /\ \A t \in tasks : t.kind = "replicate" => t.o # d.o
         /\ \A x \in deferred : x.kind = "replicate" => x.o # d.o
     BY TransferDue_Facts, TransferDue_Effect DEF Live
-  (* The new slot row: free, so nothing holds it.                          *)
-  <1>4. /\ s \in Slots /\ s \in free /\ SlotGroup[s] = d.to
+  (* The new slot row: free, so nothing holds it, and in its group's slot   *)
+  (* region.                                                               *)
+  <1>4. /\ s \in Slots /\ s \in free /\ SlotGroup[s] = d.to /\ s \in member
         /\ alloc[s] = NONE /\ sharedKey[s] = NONE /\ ~Held(s)
         /\ \A o \in Owners : oslot[o] # s
         /\ \A x \in deferred : s \notin x.units
@@ -261,8 +262,10 @@ LEMMA TransferDue_Start ==
       BY <2>1 DEF IndInv, FreeClean
     <2>3. \A t \in tasks : t.held
       BY DEF IndInv, TasksOk
+    <2>4. s \in member
+      BY <2>1 DEF IndInv, Regions
     <2> QED
-      BY <2>1, <2>2, <2>3 DEF Held, HeldIn
+      BY <2>1, <2>2, <2>3, <2>4 DEF Held, HeldIn
   (* The owner and the units its task holds.                               *)
   <1>5. /\ oslot[d.o] \in Slots /\ alloc[oslot[d.o]] = d.o /\ oslot[d.o] # s
         /\ TableUnits(d.o) \subseteq Units

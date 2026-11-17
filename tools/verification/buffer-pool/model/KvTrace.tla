@@ -156,9 +156,9 @@ Matches(st) ==
 (* owner of a save whose owner is gone a gone owner of its session. Each   *)
 (* epoch's trial and whether its session is closed, and each copy's        *)
 (* visibility (R8), are as the state states them. `x.member` is the device *)
-(* and host units in their regions, `x.copies` the copies in flight in an  *)
-(* order that numbers them, and `x.finishes` the waiting `Finish`es by the *)
-(* index of their copy.                                                    *)
+(* units, slot rows and host units in their regions, `x.copies` the copies *)
+(* in flight in an order that numbers them, and `x.finishes` the waiting   *)
+(* `Finish`es by the index of their copy.                                  *)
 
 Start(x) ==
     LET st == x.state
@@ -391,8 +391,8 @@ Step(in) ==
                                     /\ UNCHANGED rare
     \/ "CommitUpdate" \in in.acts /\ \E e \in Epochs : CommitUpdate(e) /\ UNCHANGED rare
     \/ "Rollback" \in in.acts /\ \E e \in Epochs : Rollback(e) /\ UNCHANGED rare
-    \/ "Shrink" \in in.acts /\ \E u \in Units \cup HostUnits : Shrink(u) /\ UNCHANGED rare
-    \/ "Grow" \in in.acts /\ \E u \in Units \cup HostUnits : Grow(u) /\ UNCHANGED rare
+    \/ "Shrink" \in in.acts /\ \E u \in AllUnits : Shrink(u) /\ UNCHANGED rare
+    \/ "Grow" \in in.acts /\ \E u \in AllUnits : Grow(u) /\ UNCHANGED rare
     \* A prefetch of several keys brings them in order, as the Rust buffer
     \* pool's task does.
     \* A session's end: its engine is lost (A7).

@@ -2176,16 +2176,25 @@ LEMMA FinishDue_Host ==
     <2>2. NoLeak'
       BY <1>2, <1>4, <2>0 DEF NoLeak, InRegion, AllUnits
     <2>3. Outside' /\ Regions'
-      <3>1. \A x \in G : x \in Units \cup HostUnits => x \in member
-        BY <1>4, <2>0 DEF NoLeak, InRegion, AllUnits
+      (* A reclaimed unit was held, so it is in its region (NoLeak).        *)
+      <3>1. \A x \in G : x \in member
+        <4> SUFFICES ASSUME NEW x \in G PROVE x \in member
+          OBVIOUS
+        <4>1. x \in AllUnits /\ Held(x)
+          BY <1>2, <1>4
+        <4> QED
+          BY <4>1, <2>0 DEF NoLeak, InRegion
       (* The host block the copy writes is allocated, so it is in its region. *)
       <3>2. w \in member
-        BY <1>1, <2>0 DEF Outside, NONE
+        <4>1. w \in AllUnits /\ alloc[w] # NONE
+          BY <1>1 DEF AllUnits, NONE
+        <4> QED
+          BY <4>1, <2>0 DEF Outside
       <3>3. Outside'
-        <4> SUFFICES ASSUME NEW v \in (Units \cup HostUnits) \ member'
+        <4> SUFFICES ASSUME NEW v \in AllUnits \ member'
                      PROVE  alloc'[v] = NONE /\ sharedKey'[v] = NONE
           BY DEF Outside
-        <4>1. v # w /\ v \in AllUnits /\ v \in (Units \cup HostUnits) \ member
+        <4>1. v # w /\ v \in AllUnits \ member
           BY <3>2 DEF AllUnits
         <4> QED
           BY <1>3, <2>0, <4>1 DEF Outside

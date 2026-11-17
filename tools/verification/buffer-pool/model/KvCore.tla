@@ -54,10 +54,10 @@ CONSTANTS
     \* @type: Str -> Str;
     GroupRegion, \* [Groups -> regions]: the KV region of a group's scheduler
     \* @type: Set(Str);
-    InitialUnits, \* the device and host units that are in their regions at the start
+    InitialUnits, \* the device units, slot rows and host units in their regions at the start
     \* @type: Set(Str);
-    Movable,     \* the device and host units `Resize` may take out of their region or put
-                 \* into it
+    Movable,     \* the device units, slot rows and host units `Resize` may take out of their
+                 \* region or put into it
     \* @type: Int;
     MaxBatch,    \* the batches a group launches (a bound of the model)
     \* @type: Int;
@@ -115,10 +115,12 @@ VARIABLES
     vis,         \* [Keys -> [d, h]]: per key, the epoch on trial its device copy and its host
                  \* copy are visible to alone, or NONE for a copy every epoch may use
     \* @type: Set(Str);
-    member,      \* the device and host units that are in their region; a device unit
-                 \* outside is memory of the deployment's free quota on the device, or of
-                 \* another region, and a host unit outside is memory of the host pool's
-                 \* numbering that its region does not hold
+    member,      \* the device units, slot rows and host units that are in their region; a
+                 \* device unit outside is memory of the deployment's free quota on the
+                 \* device, or of another region, a slot row outside is memory of the
+                 \* ranks' own processes that its group's slot region does not hold, and a
+                 \* host unit outside is memory of the host pool's numbering that its
+                 \* region does not hold
     \* @type: Str -> Str;
     trial,       \* [Epochs -> {"no", "yes", "rolled"}]: whether an epoch is on trial, or was
                  \* and its update was rolled back
@@ -1258,10 +1260,12 @@ Lose(e) ==
                    remote, bad>>
 
 (* `Resize`, a shrink: a free unit leaves its region. A device unit's      *)
-(* memory returns to the deployment's free quota on the device; a host     *)
-(* unit stays in the numbering the host pool was created with, outside its *)
-(* region. A shrink takes no block that anything holds; a shared block     *)
-(* without a pin leaves by `Evict` first, or on the host by `EvictHost`.   *)
+(* memory returns to the deployment's free quota on the device; a slot row *)
+(* stays memory of the ranks' own processes and a host unit stays in the   *)
+(* numbering the host pool was created with, each outside its region. A    *)
+(* shrink takes no block that anything holds and no slot row an owner      *)
+(* holds; a shared block without a pin leaves by `Evict` first, or on the  *)
+(* host by `EvictHost`.                                                    *)
 Shrink(u) ==
     /\ u \in free \cap Movable
     /\ free' = free \ {u}
@@ -1270,8 +1274,8 @@ Shrink(u) ==
                    valid, vis, trial, plane, alloc, sharedKey>>
 
 (* `Resize`, a grow: a unit joins its region. R10: a device unit's memory  *)
-(* has left every other region. No other region occupies a host unit's     *)
-(* memory, so a host unit has no chunk.                                    *)
+(* has left every other region. No other region occupies the memory of a   *)
+(* slot row or of a host unit, so neither has a chunk.                     *)
 Grow(u) ==
     /\ u \in Movable \ member
     /\ On("R10") /\ u \in Units => \A v \in member \cap Units : UnitChunk[v] # UnitChunk[u]
@@ -1302,7 +1306,7 @@ Rollback(e) ==
 -----------------------------------------------------------------------------
 
 Init ==
-    /\ free = InitialUnits \cup Slots
+    /\ free = InitialUnits
     /\ member = InitialUnits
     /\ ostate = [o \in Owners |-> "new"]
     /\ ogroup = [o \in Owners |-> NONE]
@@ -1350,7 +1354,7 @@ Serving ==
     \/ \E t \in tasks, ok \in BOOLEAN : TransferEnd(t, ok) \/ ReplicateEnd(t, ok)
     \/ \E g \in Groups, o \in Owners, p \in Positions : MapEarly(g, o, p)
     \/ \E e \in Epochs : CommitUpdate(e) \/ Rollback(e)
-    \/ \E u \in Units \cup HostUnits : Shrink(u) \/ Grow(u)
+    \/ \E u \in AllUnits : Shrink(u) \/ Grow(u)
 
 Next ==
     \/ Serving /\ UNCHANGED rare
@@ -1374,13 +1378,13 @@ TableHolders(u) ==
         \cup {x \in Owners \X {SLOT} : oslot[x[1]] = u}
 CopyWriters(u) == {c \in copies : c.write = u /\ ~c.fill}
 CacheKeys(u) == {k \in Keys : cache[k] = u \/ hcache[k] = u}
-(* A slot row is in its group's slot region throughout; a device or a host *)
-(* unit is in its region while it is a member.                             *)
-InRegion(u) == u \in Units \cup HostUnits => u \in member
+(* A device unit, a slot row or a host unit is in its region while it is a *)
+(* member.                                                                 *)
+InRegion(u) == u \in member
 
 TypeOK ==
     /\ free \subseteq AllUnits
-    /\ member \subseteq Units \cup HostUnits
+    /\ member \subseteq AllUnits
     /\ ostate \in [Owners -> {"new", "live", "gone"}]
     /\ ogroup \in [Owners -> Groups \cup {NONE}]
     /\ oslot \in [Owners -> Slots \cup {NONE}]

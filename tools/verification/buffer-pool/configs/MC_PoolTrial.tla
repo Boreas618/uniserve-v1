@@ -16,5 +16,5 @@ MCTrialUnitRegion == [u \in Units |-> IF u = a1 THEN "A" ELSE "B"]
 MCTrialGroupRegion == [g \in Groups |-> IF g = ga THEN "A" ELSE "B"]
 MCTrialUnitChunk == [u \in Units |-> 1]
 MCTrialMovable == Units
-MCTrialInitialUnits == {a1}
+MCTrialInitialUnits == {a1} \cup Slots
 =============================================================================

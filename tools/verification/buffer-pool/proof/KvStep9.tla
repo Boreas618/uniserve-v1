@@ -231,7 +231,7 @@ LEMMA PrefetchInv ==
     <2> QED
       BY <2>1, <2>2
   <1>11. Outside' /\ Regions' /\ AllocOwner' /\ SharedIff' /\ SharedCached' /\ CacheShared'
-    <2>1. \A v \in (Units \cup HostUnits) \ member : alloc'[v] = alloc[v]
+    <2>1. \A v \in AllUnits \ member : alloc'[v] = alloc[v]
       BY <1>3, <1>4 DEF AllUnits
     <2>2. Outside' /\ Regions'
       BY <2>1 DEF PrefetchAt, IndInv, Outside, Regions, OneRegion
@@ -734,10 +734,10 @@ LEMMA PrefetchCachedInv ==
     <2>1. t.h \in member
       BY <1>2, <1>3 DEF IndInv, Outside, NONE
     <2>2. Outside'
-      <3> SUFFICES ASSUME NEW v \in (Units \cup HostUnits) \ member'
+      <3> SUFFICES ASSUME NEW v \in AllUnits \ member'
                    PROVE  alloc'[v] = NONE /\ sharedKey'[v] = NONE
         BY DEF Outside
-      <3>1. v # t.h /\ v \in AllUnits /\ v \in (Units \cup HostUnits) \ member
+      <3>1. v # t.h /\ v \in AllUnits \ member
         BY <2>1 DEF AllUnits
       <3>2. alloc[v] = NONE /\ sharedKey[v] = NONE
         BY <3>1 DEF IndInv, Outside
@@ -926,7 +926,7 @@ LEMMA PrefetchDroppedInv ==
     <2> QED
       BY <2>2, <2>3
   <1>9. Outside' /\ Regions' /\ AllocOwner' /\ SharedIff' /\ SharedCached' /\ CacheShared'
-    <2>1. \A v \in (Units \cup HostUnits) \ member : alloc'[v] = alloc[v] /\ sharedKey'[v] = sharedKey[v]
+    <2>1. \A v \in AllUnits \ member : alloc'[v] = alloc[v] /\ sharedKey'[v] = sharedKey[v]
       BY <1>3, <1>4 DEF AllUnits
     <2>4. Outside'
       BY <2>1 DEF IndInv, Outside

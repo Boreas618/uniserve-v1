@@ -1,7 +1,9 @@
 ------------------------------ MODULE MC_Resize -----------------------------
 (* Two epochs of different layouts: each has a region of its own over the  *)
 (* same device memory, which moves from the serving epoch's region to the  *)
-(* target's by `Resize`.                                                   *)
+(* target's by `Resize`; and each group a slot region of its own, the      *)
+(* target's slot row outside its region at the start, which `Resize` puts  *)
+(* in and takes out.                                                       *)
 EXTENDS KvInductive, KvP7, TLC
 
 CONSTANTS ga, gb, sa, sb, e1, e2, o1, o2, a1, a2, b1, b2
@@ -16,8 +18,8 @@ MCUnitRegion == [u \in Units |-> IF u \in {a1, a2} THEN "A" ELSE "B"]
 MCGroupRegion == [g \in Groups |-> IF g = ga THEN "A" ELSE "B"]
 (* Unit i of either region occupies chunk i of the device memory.          *)
 MCUnitChunk == [u \in Units |-> IF u \in {a1, b1} THEN 1 ELSE 2]
-MCMovable == Units
-MCInitialUnits == {a1, a2}
+MCMovable == Units \cup Slots
+MCInitialUnits == {a1, a2, sa}
 AllRules == {"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10", "R11"}
 NoR10 == AllRules \ {"R10"}
 
@@ -26,4 +28,8 @@ NoR10 == AllRules \ {"R10"}
 (* serving epoch's owner still holds one of its own.                       *)
 NeverBoth == ~(\E p \in Positions : table[o1][p].k = "private")
              \/ ~(\E p \in Positions : table[o2][p].k = "private")
+(* Witness: false in some reachable state, which shows that the search     *)
+(* reaches the serving epoch's slot row outside its region while the       *)
+(* target's owner holds a block.                                           *)
+NeverSlotMoved == ~(sa \notin member /\ \E p \in Positions : table[o2][p].k = "private")
 =============================================================================

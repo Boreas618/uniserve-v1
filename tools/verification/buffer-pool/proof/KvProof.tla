@@ -21,7 +21,7 @@ ASSUME Sizes ==
     /\ SlotGroup \in [Slots -> Groups]
     /\ GroupEpoch \in [Groups -> Epochs]
     /\ OwnerEpoch \in [Owners -> Epochs]
-    /\ InitialUnits \subseteq Units \cup HostUnits /\ Movable \subseteq Units \cup HostUnits
+    /\ InitialUnits \subseteq AllUnits /\ Movable \subseteq AllUnits
     /\ TrialEpochs \subseteq Epochs /\ Losable \subseteq Epochs
     /\ Eager \in BOOLEAN
     /\ \A u, v \in InitialUnits \cap Units : u # v => UnitChunk[u] # UnitChunk[v]
@@ -41,7 +41,7 @@ THEOREM InitInv == Init => IndInv
 <1> USE Sizes, Design DEF Init, NONE, SLOT, AllUnits, Rows, Empty, Private, Shared, NoEntry, NoStamp
 <1>1. TypeInv
   <2>1. TypeOK
-    <3>1. free \subseteq AllUnits /\ member \subseteq Units \cup HostUnits
+    <3>1. free \subseteq AllUnits /\ member \subseteq AllUnits
       OBVIOUS
     <3>2. ostate \in [Owners -> {"new", "live", "gone"}]
           /\ ogroup \in [Owners -> Groups \cup {NONE}]

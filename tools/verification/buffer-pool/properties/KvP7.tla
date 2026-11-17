@@ -10,12 +10,12 @@ Capacities ==
         \cup {<<"slots", g>> : g \in Groups}
         \cup {<<"host", "host">>}
 
-(* The units in a region; a KV region and the host region hold the units   *)
-(* that are their members.                                                 *)
+(* The units in a region: the members of a KV region, of a group's slot    *)
+(* region or of the host region.                                           *)
 \* @type: (<<Str, Str>>) => Set(Str);
 UnitsIn(r) ==
     CASE r[1] = "device" -> {u \in member \cap Units : UnitRegion[u] = r[2]}
-      [] r[1] = "slots" -> {s \in Slots : SlotGroup[s] = r[2]}
+      [] r[1] = "slots" -> {s \in member \cap Slots : SlotGroup[s] = r[2]}
       [] OTHER -> member \cap HostUnits
 
 (* What a unit that something holds is observed as (§8): the first that    *)
