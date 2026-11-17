@@ -15,7 +15,8 @@ publish = false
 libc.workspace = true
 # The MessagePack codec of the protocols whose messages are serde types (`msgpack`).
 rmp-serde.workspace = true
-rustix = { workspace = true, features = ["net"] }
+# `process`: the calling user's id, which owns the fallback runtime directory (`runtime`).
+rustix = { workspace = true, features = ["net", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 signal-hook-registry.workspace = true

@@ -4,8 +4,12 @@
 //! Every runtime file of UniServe lives under `$XDG_RUNTIME_DIR/uniserve` ([`RuntimeDirectory`]),
 //! a directory only its user enters (mode 0700). The XDG Base Directory specification makes the
 //! runtime directory the place for a user's sockets and other non-essential runtime files, owned
-//! by the user, mode 0700, and removed at the user's logout; a process run without one has no
-//! place for them and is refused rather than given a shared fallback.
+//! by the user, mode 0700, and removed at the user's logout. A process run without one, such as
+//! one started outside a login session, falls back, as the specification directs, to a directory
+//! of the same capabilities with a warning: the session directory `/run/user/<uid>` when the
+//! system has one for the user, else `uniserve-<uid>` in the system's temporary directory, which
+//! the user alone owns and enters ([`fallback`]). Every process of the user without the variable
+//! finds the same directory, so its services and their clients meet there.
 //!
 //! The host services keep their files beside their socket in that directory
 //! ([`crate::host`]). Every other server owns an instance directory there ([`Instance`]): it
@@ -21,6 +25,9 @@ use std::path::{Path, PathBuf};
 /// The environment variable that names the user's runtime directory.
 const XDG_RUNTIME_DIR: &str = "XDG_RUNTIME_DIR";
 
+/// Where the login sessions of a system keep each user's runtime directory, `<uid>` inside it.
+const SESSION_RUNTIME: &str = "/run/user";
+
 /// The name of UniServe's directory inside the user's runtime directory.
 const UNISERVE: &str = "uniserve";
 
@@ -33,26 +40,34 @@ const PRIVATE: u32 = 0o700;
 pub struct RuntimeDirectory(PathBuf);
 
 impl RuntimeDirectory {
-    /// The calling user's: `uniserve` inside the directory `XDG_RUNTIME_DIR` names.
+    /// The calling user's: `uniserve` inside the directory `XDG_RUNTIME_DIR` names, or, when it
+    /// names no absolute directory, inside the user's fallback runtime directory ([`fallback`]),
+    /// with a warning.
     ///
     /// # Errors
     ///
-    /// `NotFound` when `XDG_RUNTIME_DIR` is unset, empty or not absolute, and what
-    /// [`RuntimeDirectory::within`] fails with.
+    /// What [`fallback`] and [`RuntimeDirectory::within`] fail with.
     pub fn of_user() -> io::Result<Self> {
-        let runtime = std::env::var_os(XDG_RUNTIME_DIR)
+        let named = std::env::var_os(XDG_RUNTIME_DIR)
             .map(PathBuf::from)
-            .filter(|runtime| runtime.is_absolute())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "{XDG_RUNTIME_DIR} names no absolute directory: UniServe keeps its \
-                         sockets in the user's runtime directory, which the login session \
-                         provides (or which the caller creates, mode 0700, and names there)"
-                    ),
-                )
-            })?;
+            .filter(|runtime| runtime.is_absolute());
+        let runtime = match named {
+            Some(runtime) => runtime,
+            None => {
+                let uid = rustix::process::getuid().as_raw();
+                let runtime = fallback(Path::new(SESSION_RUNTIME), &std::env::temp_dir(), uid)?;
+                // Once per process: a process resolves its runtime directory for every socket.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        runtime = %runtime.display(),
+                        "{XDG_RUNTIME_DIR} names no absolute directory, so UniServe keeps its \
+                         sockets in this runtime directory of the user's instead"
+                    );
+                });
+                runtime
+            }
+        };
         Self::within(&runtime)
     }
 
@@ -148,6 +163,58 @@ impl Drop for Instance {
     }
 }
 
+/// The runtime directory of the user `uid` when no `XDG_RUNTIME_DIR` names one: `<uid>` in the
+/// session runtime directories `sessions` (`/run/user`) when it is a directory the user owns and
+/// alone enters, else `uniserve-<uid>` in the temporary directory `temporary`, created with mode
+/// 0700 when absent. A directory shared by the system's users may hold an entry of that name
+/// that another user made, so an existing one is used only when it is a directory, not a symbolic
+/// link, that the user owns and alone enters.
+///
+/// # Errors
+///
+/// `PermissionDenied` naming the directory when the one in `temporary` exists and is not such a
+/// directory; otherwise what creating it fails with.
+fn fallback(sessions: &Path, temporary: &Path, uid: u32) -> io::Result<PathBuf> {
+    let session = sessions.join(uid.to_string());
+    if private_to(&session, uid)? {
+        return Ok(session);
+    }
+
+    let directory = temporary.join(format!("{UNISERVE}-{uid}"));
+    match std::fs::DirBuilder::new().mode(PRIVATE).create(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    if private_to(&directory, uid)? {
+        Ok(directory)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a directory that user {uid} owns and alone enters, so it cannot be \
+                 that user's runtime directory: remove it, or name a runtime directory in \
+                 {XDG_RUNTIME_DIR}",
+                directory.display()
+            ),
+        ))
+    }
+}
+
+/// Whether `path` is a directory, not a symbolic link, that the user `uid` owns and no other user
+/// may enter or read; `false` when nothing is there.
+fn private_to(path: &Path, uid: u32) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            Ok(metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o077 == 0)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Creates `directory` with mode 0700 when absent, and makes an existing one 0700: a socket in it
 /// is then reachable by its owner alone, whatever the socket file's own mode.
 fn create_private(directory: &Path) -> io::Result<()> {
@@ -165,6 +232,68 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
 
     use super::*;
+
+    /// Without `XDG_RUNTIME_DIR`, the user's session directory is the runtime directory when the
+    /// system has one that is the user's alone; else a directory of the user's own in the
+    /// temporary directory is, created private and found again by every later process.
+    #[test]
+    fn a_user_without_a_runtime_directory_falls_back_to_a_private_one() {
+        let uid = rustix::process::getuid().as_raw();
+        let root = tempfile::tempdir().unwrap();
+        let (sessions, temporary) = (root.path().join("run-user"), root.path().join("tmp"));
+        std::fs::create_dir_all(&temporary).unwrap();
+
+        let created = fallback(&sessions, &temporary, uid).unwrap();
+        assert_eq!(created, temporary.join(format!("uniserve-{uid}")));
+        assert_eq!(std::fs::metadata(&created).unwrap().mode() & 0o777, PRIVATE);
+        assert_eq!(fallback(&sessions, &temporary, uid).unwrap(), created);
+
+        let session = sessions.join(uid.to_string());
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(PRIVATE)
+            .create(&session)
+            .unwrap();
+        assert_eq!(fallback(&sessions, &temporary, uid).unwrap(), session);
+    }
+
+    /// A fallback directory in the shared temporary directory that others may enter, or that is a
+    /// symbolic link, is refused, and nothing is changed: another user may have put it there.
+    #[test]
+    fn a_fallback_directory_others_may_enter_is_refused() {
+        let uid = rustix::process::getuid().as_raw();
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("run-user");
+
+        let open = root.path().join("open");
+        std::fs::create_dir_all(open.join(format!("uniserve-{uid}"))).unwrap();
+        std::fs::set_permissions(
+            open.join(format!("uniserve-{uid}")),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let refused = fallback(&sessions, &open, uid).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::metadata(open.join(format!("uniserve-{uid}")))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o755
+        );
+
+        let linked = root.path().join("linked");
+        let target = root.path().join("elsewhere");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(PRIVATE)
+            .create(&target)
+            .unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&target, linked.join(format!("uniserve-{uid}"))).unwrap();
+        let refused = fallback(&sessions, &linked, uid).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+    }
 
     /// A runtime directory that does not exist is refused, and no directory is created for it.
     #[test]
