@@ -381,9 +381,15 @@ pub struct Scheduler {
     /// The kernel and policy generation batches are assembled for.
     generation: Arc<AtomicU64>,
     paused: bool,
-    /// Whether the scheduler stopped, on a fault (`fail`) or at `Shutdown`: it takes no message
-    /// and no step from then on, and its loop ends.
+    /// Whether the scheduler stopped, on a fault (`fail`), once a `Shutdown` settled
+    /// ([`Scheduler::settle_shutdown`]), or when the inbox lost its last sender: it takes no
+    /// message and no step from then on, and its loop ends.
     stopped: bool,
+    /// Whether `Shutdown` arrived: every request has ended, and the scheduler takes steps only
+    /// until the copies its workers hold and the stores to the host it offered have ended (BP
+    /// §20: host copies in flight get a grace time at shutdown). It offers no other store, and
+    /// a pause does not hold the batches that run the copies.
+    closing: bool,
     /// The replies owed to `Pause` once nothing is in flight.
     boundary: Vec<Sender<()>>,
     /// The reply, cause, deadline and whether memory is given back, of a drain under way.
@@ -580,6 +586,7 @@ impl Scheduler {
             generation,
             paused: false,
             stopped: false,
+            closing: false,
             boundary: Vec::new(),
             draining: None,
             warm_ups: HashMap::new(),
@@ -761,7 +768,7 @@ impl Scheduler {
                 match inbox.try_recv() {
                     Ok(message) => Some(message),
                     Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => return self.shutdown(),
+                    Err(TryRecvError::Disconnected) => return self.abandon(),
                 }
             } else {
                 let deadline = self.next_deadline();
@@ -775,7 +782,7 @@ impl Scheduler {
                 self.queue.disarm();
                 match received {
                     Ok(message) => message,
-                    Err(_) => return self.shutdown(),
+                    Err(_) => return self.abandon(),
                 }
             };
 
@@ -904,7 +911,9 @@ impl Scheduler {
         self.start_transfers();
 
         let admitted = self.running.len().saturating_sub(running);
-        let batches = if self.paused {
+        // A closing scheduler forms the batches that run its copies whether or not it is paused:
+        // it holds no request, and a parked epoch's stores end only so.
+        let batches = if self.paused && !self.closing {
             Vec::new()
         } else {
             self.step += 1;
@@ -935,6 +944,7 @@ impl Scheduler {
         self.shrink_to_bounds();
         self.reply_at_boundary();
         self.publish_stats(now);
+        self.settle_shutdown();
         formed
     }
 
@@ -1287,10 +1297,29 @@ impl Scheduler {
         }
     }
 
-    /// `Shutdown`: every request the scheduler holds ends, aborted, at once, and the scheduler
-    /// stops (`S/control.rs:73-102`). A terminal still held, behind calls in flight or the
-    /// daemon's decoder, is sent now: nothing more runs.
+    /// `Shutdown`: every request the scheduler holds ends, aborted, at once
+    /// (`S/control.rs:73-102`), and the scheduler stops once the copies its workers hold and the
+    /// stores to the host it offered have ended ([`Scheduler::settle_shutdown`]): the host copies
+    /// in flight get their grace time (BP §20). The steps go on meanwhile, paused or not, to read
+    /// the answers and hand the copies to the workers, but offer nothing more to the host; each
+    /// copy's own bound ends the wait for it (SD §4.4).
     fn shutdown(&mut self) {
+        self.abort_all();
+        self.closing = true;
+        self.settle_shutdown();
+    }
+
+    /// No sender of the inbox is left: the engine that owns the scheduler has gone, and no step
+    /// of its workers runs a copy any more. Every request ends, aborted, and the scheduler stops
+    /// at once.
+    fn abandon(&mut self) {
+        self.abort_all();
+        self.stopped = true;
+    }
+
+    /// Ends every request the scheduler holds, aborted. A terminal still held, behind calls in
+    /// flight or the daemon's decoder, is sent now: the request computes nothing more.
+    fn abort_all(&mut self) {
         let ids: Vec<RequestId> = self.requests.keys().copied().collect();
         for id in ids {
             self.cancel(id, FinishReason::Aborted);
@@ -1302,7 +1331,35 @@ impl Scheduler {
                 self.send(id, terminal);
             }
         }
-        self.stopped = true;
+    }
+
+    /// Stops a closing scheduler once nothing it waits for at shutdown is left: no copy its
+    /// workers hold, and no `Store` to the host and no copy's `Finish` held, being stamped or
+    /// outstanding. A `Store` is answered `Copy`, its copy runs, and the copy's `Finish` is
+    /// answered with what was stored.
+    fn settle_shutdown(&mut self) {
+        let waits = |request: &runtime::Request| {
+            matches!(
+                request,
+                runtime::Request::Store {
+                    tier: Tier::Host,
+                    ..
+                } | runtime::Request::Finish { .. }
+            )
+        };
+        let storing = !self.copies.is_empty()
+            || self.held.iter().any(waits)
+            || self
+                .stamping
+                .values()
+                .any(|(request, _, following)| waits(request) || following.iter().any(waits))
+            || self
+                .outstanding
+                .values()
+                .any(|(_, request, _)| waits(request));
+        if self.closing && !storing {
+            self.stopped = true;
+        }
     }
 }
 

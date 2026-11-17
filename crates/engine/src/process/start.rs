@@ -371,9 +371,11 @@ impl Engine {
 
     /// Ends the epoch in the order its parts depend on one another:
     ///
-    /// 1. every scheduler is told to shut down, which ends every request it holds as aborted;
-    ///    each output it sends until its channel closes goes to `forward` with the scheduler's
-    ///    index, the events of those requests among them, and its thread is joined;
+    /// 1. every scheduler is told to shut down, which ends every request it holds as aborted
+    ///    and stops it once the copies its workers hold and its stores to the host have ended,
+    ///    the workers running them meanwhile; each output it sends until its channel closes goes
+    ///    to `forward` with the scheduler's index, the events of those requests among them, and
+    ///    its thread is joined;
     /// 2. the workers' queues close, ending the job in flight and cancelling the rest, and
     ///    their threads are joined;
     /// 3. the peer links close, which the epoch's other main processes read as this one's end,

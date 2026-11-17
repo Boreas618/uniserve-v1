@@ -265,7 +265,11 @@ impl Scheduler {
 
         // Blocks ahead of the running requests, held ahead of the step's admissions (SD §4.4).
         self.allocate_ahead();
-        self.offload(&output.offload);
+        // A closing scheduler offers nothing more to the host: the grace of its shutdown is for
+        // the stores already offered (`Scheduler::shutdown`).
+        if !self.closing {
+            self.offload(&output.offload);
+        }
         for prefetch in &output.prefetch {
             self.prefetch(RequestId(prefetch.0));
         }

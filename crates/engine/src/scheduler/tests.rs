@@ -1211,6 +1211,73 @@ fn the_loop_ends_at_shutdown_and_once_its_inbox_has_no_sender() {
     }
 }
 
+/// A store to the host in flight when `Shutdown` arrives gets its grace time (BP §20): the
+/// scheduler hands its copy to the workers, writes the copy's `Finish`, and stops once that is
+/// answered with what was stored. A scheduler with nothing in flight stops at once.
+#[test]
+fn a_store_in_flight_at_shutdown_ends_before_the_scheduler_stops() {
+    let mut idle = bench(1024);
+    idle.scheduler.apply(Message::Shutdown);
+    assert!(idle.scheduler.stopped);
+
+    let mut bench = bench(1024);
+    let store = runtime::Request::Store {
+        group: A,
+        keys: vec![key(1)],
+        tier: Tier::Host,
+    };
+    bench.scheduler.submit(store.clone());
+    bench.scheduler.post().unwrap();
+    let [(id, _)] = bench.take()[..] else {
+        panic!("the `Store` was written");
+    };
+
+    bench.scheduler.apply(Message::Shutdown);
+    assert!(!bench.scheduler.stopped, "a store is in flight");
+
+    // The buffer pool answers the store with its copy, which the workers are handed to run.
+    let copy = Completion::Copy {
+        group: A,
+        keys: vec![key(1)],
+        from: vec![(4, 2, 1)],
+        to: vec![(9, 0, 1)],
+        evicted: Vec::new(),
+        encodings: None,
+        parts: Vec::new(),
+    };
+    bench.complete(id, &copy);
+    bench.scheduler.step();
+    assert!(
+        bench
+            .maps()
+            .iter()
+            .any(|(group, _, mapped, request, _)| *group == A
+                && *mapped == id
+                && *request == store),
+        "the copy was handed to the workers"
+    );
+    assert!(!bench.scheduler.stopped, "the copy runs");
+
+    // The workers ran it: its `Finish` is written, and its answer ends the store.
+    let finish = runtime::Request::Finish {
+        copy: id,
+        ok: true,
+        after: vec![(A, 1)],
+    };
+    bench.scheduler.stamped(vec![finish.clone()]);
+    bench.scheduler.step();
+    let taken = bench.take();
+    let [(finished, ref written)] = taken[..] else {
+        panic!("the `Finish` was written: {taken:?}");
+    };
+    assert_eq!(*written, finish);
+    assert!(!bench.scheduler.stopped, "the `Finish` is unanswered");
+
+    bench.complete(finished, &Completion::Stored { keys: vec![key(1)] });
+    bench.scheduler.step();
+    assert!(bench.scheduler.stopped);
+}
+
 /// The executor's failed job outside a batch stops the scheduler at once: `run` returns, and the
 /// engine is told with `Output::Failed`, which carries the executor's error.
 #[test]
