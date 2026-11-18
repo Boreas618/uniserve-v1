@@ -3,9 +3,10 @@
 //! [`Processes`] owns the deployment's engines for the daemon's life: it starts
 //! and stops them through the leader service, commands the engine of one launch
 //! generation, and turns what the engines report into the update's [`Event`]s.
-//! It is also the writer of the node's process table (`GET /admin/config`):
-//! every launch is one row, from `Starting` at its spawn to `Parked`,
-//! `Serving`, `Stopped` or `Failed`.
+//! It is also the writer of the node's process table: every launch is one
+//! row, from `Starting` at its spawn to `Parked`, `Serving`, `Stopped` or
+//! `Failed`, and each state a row enters is a `process` event of the
+//! deployment's observation store.
 //!
 //! A launch generation is the identity of one process: the daemon launches an
 //! engine under it, the engine states it in the hello of its process link,
@@ -23,6 +24,7 @@ use proto::admin::{ManagedProcess, ProcessState};
 use proto::process::{self, Command, Exit, Report, Request, Spawn};
 
 use crate::epoch::Epochs;
+use crate::observation::record::Recorder;
 use crate::supervision::{ProcessCommands, ToService};
 
 /// The update's ends of the leader service: requests down, and what the
@@ -83,6 +85,8 @@ pub(crate) struct Processes {
     /// The deployment's name, which every claim states.
     deployment: String,
     link: ProcessLink,
+    /// Writes each state a launch enters as a `process` event.
+    recorder: Recorder,
     /// The launches by launch generation. The generation is unique across the
     /// deployment's engine group, so a number names one launch.
     launches: BTreeMap<u64, Launch>,
@@ -94,12 +98,19 @@ pub(crate) struct Processes {
 }
 
 impl Processes {
-    /// The engine processes of `deployment`, commanded through `link`.
-    pub(crate) fn new(epochs: Arc<Epochs>, deployment: String, link: ProcessLink) -> Self {
+    /// The engine processes of `deployment`, commanded through `link`, whose states `recorder`
+    /// writes.
+    pub(crate) fn new(
+        epochs: Arc<Epochs>,
+        deployment: String,
+        link: ProcessLink,
+        recorder: Recorder,
+    ) -> Self {
         Self {
             epochs,
             deployment,
             link,
+            recorder,
             launches: BTreeMap::new(),
             stopping: BTreeSet::new(),
             queued: VecDeque::new(),
@@ -176,10 +187,22 @@ impl Processes {
                 epoch: launch.epoch,
                 build: String::new(),
                 generation,
-                state,
+                state: state.clone(),
             });
         }
         self.epochs.set_processes(processes);
+        self.recorder.process(
+            &launch.host,
+            &ManagedProcess {
+                group: launch.group.clone(),
+                rank: launch.rank,
+                pid: launch.pid,
+                epoch: launch.epoch,
+                build: String::new(),
+                generation,
+                state,
+            },
+        );
     }
 
     /// One report the engine of launch generation `generation` sent on its process link.
@@ -431,10 +454,22 @@ mod tests {
 
     /// The processes of a deployment whose engines and nodes are fakes.
     fn processes() -> (Arc<Epochs>, Engines, Processes) {
+        let (epochs, engines, processes, _) = recorded();
+        (epochs, engines, processes)
+    }
+
+    /// The processes of [`processes`] with the recorder their `process` events go through.
+    fn recorded() -> (Arc<Epochs>, Engines, Processes, Recorder) {
         let epochs = Arc::new(Epochs::default());
         let (engines, link) = Engines::link(Refusals::default());
-        let processes = Processes::new(Arc::clone(&epochs), "deployment".to_owned(), link);
-        (epochs, engines, processes)
+        let recorder = crate::test_support::recorder();
+        let processes = Processes::new(
+            Arc::clone(&epochs),
+            "deployment".to_owned(),
+            link,
+            recorder.clone(),
+        );
+        (epochs, engines, processes, recorder)
     }
 
     fn spawn(host: &str, generation: u64) -> Spawn {
@@ -515,10 +550,11 @@ mod tests {
     }
 
     /// An exit the daemon asked for is a stop; one it did not ask for is a
-    /// failure with the status the node read.
-    #[test]
-    fn a_stop_is_stopped_and_an_exit_nobody_asked_for_failed() {
-        let (epochs, engines, mut processes) = processes();
+    /// failure with the status the node read. Each state a process entered is a
+    /// `process` event of the observation store.
+    #[tokio::test]
+    async fn a_stop_is_stopped_and_an_exit_nobody_asked_for_failed() {
+        let (epochs, engines, mut processes, recorder) = recorded();
         for generation in [7, 8] {
             processes
                 .spawn(spawn("n0", generation), &launch())
@@ -537,6 +573,39 @@ mod tests {
         let rows = epochs.processes();
         assert_eq!(rows[0].state, ProcessState::Stopped);
         assert_eq!(rows[1].state, ProcessState::Failed("signal: 11".to_owned()));
+
+        let events = recorder
+            .store()
+            .query(
+                "SELECT fields['generation'] AS generation, fields['state'] AS state, \
+                 fields['reason'] AS reason FROM events \
+                 WHERE kind = 'process' AND labels['host'] = 'n0' AND labels['group'] = 'engine' \
+                 ORDER BY time, generation",
+            )
+            .await
+            .unwrap();
+        let events: serde_json::Value = serde_json::from_slice(&events.json().unwrap()).unwrap();
+        let states: Vec<(&str, &str)> = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["generation"].as_str().unwrap(),
+                    row["state"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("7", "starting"),
+                ("8", "starting"),
+                ("7", "stopped"),
+                ("8", "failed")
+            ]
+        );
+        assert_eq!(events[3]["reason"], "signal: 11");
     }
 
     /// A claim names the deployment, the epoch, its scopes and what it

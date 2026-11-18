@@ -112,7 +112,7 @@ const EAGER: &str = "eager";
 ///   to now, and what other threads added ([`counters::add_blocking`]);
 /// - the device time of the process's observed streams (`stream_us`);
 /// - the per-step module times the device's range markers measured, as histograms by
-///   stage and class, and the stamps its reader lost (`fence_us`, `fence_records_lost`);
+///   stage and class, and the stamps its reader lost (`fence_seconds`, `fence_records_lost`);
 /// - the progress of `session`, the rank's profiling session (`profile`).
 ///
 /// Called by the rank's worker, on its own thread, once per batch result. It never waits for
@@ -183,7 +183,7 @@ pub(crate) fn forward_stats(
 
     if let Some(markers) = markers::Markers::installed() {
         markers.read_device(device);
-        (stats.fence_us, stats.fence_records_lost) = markers.take(device);
+        (stats.fence_seconds, stats.fence_records_lost) = markers.take(device);
     }
     if let Some(session) = session {
         stats.profile = session.progress();
@@ -192,7 +192,7 @@ pub(crate) fn forward_stats(
     let observed = !stats.mode_counts.is_empty()
         || !stats.blocking_calls.is_empty()
         || !stats.stream_us.is_empty()
-        || !stats.fence_us.is_empty()
+        || !stats.fence_seconds.is_empty()
         || stats.fence_records_lost > 0
         || !stats.profile.is_empty();
     observed.then_some(stats)

@@ -133,8 +133,8 @@ impl MainProcess {
     /// device time the workers spent in forwards and the kernels their serving forwards
     /// launched (`Worker::counters`); and what each device maps now, against the limit of its
     /// GPU's quota: each pool of its allocators and its KV regions' planes
-    /// (`WeightBinding::memory`), which the daemon exports as `uniserve:memory_budget` and
-    /// `uniserve:memory_mapped`.
+    /// (`WeightBinding::memory`), which the daemon records as `uniserve_memory_budget_bytes` and
+    /// `uniserve_memory_mapped_bytes`.
     pub(super) fn metrics(&mut self) {
         let Some(engine) = self.engine.as_ref() else {
             return;

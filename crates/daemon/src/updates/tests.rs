@@ -63,7 +63,12 @@ impl Deployment {
         let epochs = Arc::new(Epochs::default());
         let (mut engines, link) = Engines::link(refusals);
         engines.serve(PREVIOUS);
-        let processes = Processes::new(Arc::clone(&epochs), "deployment".to_owned(), link);
+        let processes = Processes::new(
+            Arc::clone(&epochs),
+            "deployment".to_owned(),
+            link,
+            crate::test_support::recorder(),
+        );
         let updater = Updater::new(Arc::clone(&epochs), processes);
         let transitions = updater.transitions().expect("the log is read once");
 

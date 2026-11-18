@@ -5,13 +5,14 @@
 use crate::request::wire;
 
 use super::{
-    BaseCacheStats, BlockingCall, DomainSchedulerStats, FenceHistogram, FenceStep, ForwardStats,
-    PrefixCacheStats, ProfileProgress, SchedulerStats, StreamTime,
+    BaseCacheStats, BlockingCall, DomainSchedulerStats, FenceStep, ForwardStats, PrefixCacheStats,
+    ProfileProgress, SchedulerStats, StreamTime,
 };
 
 impl From<&SchedulerStats> for wire::SchedulerStats {
     fn from(stats: &SchedulerStats) -> Self {
         Self {
+            revision: stats.revision,
             num_running_reqs: stats.num_running_reqs,
             num_waiting_reqs: stats.num_waiting_reqs,
             step_counter: stats.step_counter,
@@ -46,6 +47,7 @@ impl From<&SchedulerStats> for wire::SchedulerStats {
 impl From<wire::SchedulerStats> for SchedulerStats {
     fn from(stats: wire::SchedulerStats) -> Self {
         Self {
+            revision: stats.revision,
             num_running_reqs: stats.num_running_reqs,
             num_waiting_reqs: stats.num_waiting_reqs,
             step_counter: stats.step_counter,
@@ -182,8 +184,8 @@ impl From<&ForwardStats> for wire::ForwardStats {
                     count,
                 })
                 .collect(),
-            fence_us: stats
-                .fence_us
+            fence_seconds: stats
+                .fence_seconds
                 .iter()
                 .map(|(step, histogram)| wire::FenceStep {
                     stage: step.stage.clone(),
@@ -249,8 +251,8 @@ impl From<wire::ForwardStats> for ForwardStats {
                     (key, calls.count)
                 })
                 .collect(),
-            fence_us: stats
-                .fence_us
+            fence_seconds: stats
+                .fence_seconds
                 .into_iter()
                 .map(|step| {
                     let key = FenceStep {
@@ -313,24 +315,6 @@ impl From<wire::ProfileProgress> for ProfileProgress {
     }
 }
 
-impl From<&FenceHistogram> for wire::FenceHistogram {
-    fn from(histogram: &FenceHistogram) -> Self {
-        Self {
-            buckets: histogram.buckets.clone(),
-            sum_us: histogram.sum_us,
-        }
-    }
-}
-
-impl From<wire::FenceHistogram> for FenceHistogram {
-    fn from(histogram: wire::FenceHistogram) -> Self {
-        Self {
-            buckets: histogram.buckets,
-            sum_us: histogram.sum_us,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,9 +323,9 @@ mod tests {
     /// domains in order, the worker counters with their fence histograms, and their absence.
     #[test]
     fn a_snapshot_reads_back_as_itself() {
-        let mut fence = FenceHistogram::default();
-        fence.observe(40);
-        fence.observe(9_000);
+        let mut fence = crate::histogram::Histogram::new();
+        fence.observe(40e-6);
+        fence.observe(9e-3);
         let forward = ForwardStats {
             mode_counts: [("graph".to_owned(), 7)].into(),
             stream_us: [(
@@ -360,7 +344,7 @@ mod tests {
                 1,
             )]
             .into(),
-            fence_us: [(
+            fence_seconds: [(
                 FenceStep {
                     stage: "decode".to_owned(),
                     module: "step".to_owned(),
@@ -372,6 +356,7 @@ mod tests {
             ..ForwardStats::default()
         };
         let stats = SchedulerStats {
+            revision: 12,
             num_running_reqs: 4,
             prefix_cache_usage: 0.25,
             prefix_cache_stats: PrefixCacheStats {

@@ -60,7 +60,6 @@ minijinja-contrib.workspace = true
 # The Build Server's client, which an epoch's modules are selected with
 # (`epoch`, the generation layer of a change).
 build-server.workspace = true
-prometheus-client.workspace = true
 prost.workspace = true
 processing.workspace = true
 proto.workspace = true
@@ -98,8 +97,6 @@ validator.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-# The values of the histograms the tests read back (`Histogram::count`, `sum`).
-prometheus-client = { workspace = true, features = ["test-util"] }
 # The paused clock of the tests that wait on a deadline (`tokio::time::pause`).
 tokio = { workspace = true, features = ["test-util"] }
 expect-test.workspace = true

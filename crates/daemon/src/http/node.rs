@@ -52,7 +52,8 @@ use crate::api::openai::ApiError;
 use crate::api::openai::video_jobs::VideoJobs;
 use crate::config::{Config, ServerConfig, Stated};
 use crate::leader::Leader;
-use crate::observation::{Format, Kind, Store};
+use crate::observation::record::Recorder;
+use crate::observation::{Format, Kind};
 use crate::policy::Package;
 use crate::policy::revision::{KEPT, Outcome, Record, Revisions};
 use crate::restart::Restarter;
@@ -157,8 +158,8 @@ pub(crate) struct Start {
     pub(crate) deployment: String,
     /// The deployment's revisions on this node.
     pub(crate) revisions: Arc<Revisions>,
-    /// The deployment's observation store, which `/admin/query` reads.
-    pub(crate) store: Store,
+    /// The deployment's writer of its observation store, which `/admin/query` reads.
+    pub(crate) recorder: Recorder,
     pub(crate) instance: service::Instance,
     pub(crate) ready: Ready,
     pub(crate) shutdown: CancellationToken,
@@ -178,7 +179,7 @@ pub(crate) struct Node {
     server: ServerConfig,
     deployment: String,
     revisions: Arc<Revisions>,
-    store: Store,
+    recorder: Recorder,
     instance: PathBuf,
     ready: Mutex<Ready>,
     /// The responses in flight a hot restart pauses and hands over, and the gate that admits
@@ -253,7 +254,7 @@ pub(crate) async fn run(
         options,
         deployment,
         revisions,
-        store,
+        recorder,
         instance,
         ready,
         shutdown,
@@ -269,7 +270,7 @@ pub(crate) async fn run(
         server: options.server_config.clone(),
         deployment,
         revisions,
-        store,
+        recorder,
         instance: instance.path().to_owned(),
         ready: Mutex::new(ready),
         handoff: Arc::new(Handoff::new()),
@@ -447,6 +448,7 @@ impl Node {
                 }
                 self.revisions
                     .converged(number, began.elapsed().as_secs_f64(), KEPT)?;
+                self.recorder.serve(number, brought.leader.replicas().len());
                 self.observe_revision(number);
                 self.serve(brought).await
             }
@@ -578,12 +580,12 @@ impl Node {
             .context("the node's daemon leads no deployment")?
             .to_owned();
         let (updates, awake) = daemon
-            .updater(self.deployment.clone())
+            .updater(self.deployment.clone(), self.recorder.clone())
             .context("the leader's daemon commands no engine")?;
         Daemon::advance_updates(Arc::clone(&updates), awake)
             .context("starting the updater's thread")?;
         let leader = tokio::select! {
-            leader = Leader::start(&self.families, &config, &stated, address, &self.instance, updates, (revision, lock)) => leader,
+            leader = Leader::start(&self.families, &config, &stated, address, &self.instance, updates, self.recorder.clone(), revision, lock) => leader,
             () = token.cancelled() => {
                 stop_daemon(Some(daemon)).await?;
                 return Ok(None);
@@ -976,6 +978,14 @@ impl Node {
                 .map_err(|refused| refused.message.clone()),
         );
         recorded.map_err(Refused::state)?;
+        match &ended {
+            Ok(true) => {
+                self.recorder.serve(number, leader.replicas().len());
+                self.observe_revision(number);
+            }
+            Ok(false) => {}
+            Err(_) => self.observe_revision(number),
+        }
         ended?;
         self.revisions.record(number).map_err(Refused::state)
     }
@@ -1028,7 +1038,9 @@ impl Node {
             _ => serde_json::Map::new(),
         };
         let labels = [(crate::observation::WRITER.to_owned(), record.writer.clone())].into();
-        self.store.append(Kind::Revision, labels, fields, number);
+        self.recorder
+            .store()
+            .append(Kind::Revision, labels, fields, number);
     }
 
     /// The client API: the serving deployment's routes, or `503` while none serves.
@@ -1228,12 +1240,12 @@ async fn query(State(node): State<Arc<Node>>, request: Request) -> Response {
         HeaderValue::from_static(format.media()),
     )];
     match format {
-        Format::Sse => match node.store.subscribe(&sql, after).await {
+        Format::Sse => match node.recorder.store().subscribe(&sql, after).await {
             Ok(stream) => (content, axum::body::Body::from_stream(stream)).into_response(),
             Err(error) => Refused::new(StatusCode::BAD_REQUEST, error.to_string()).into_response(),
         },
         Format::Json | Format::Ipc => {
-            let encoded = match node.store.query(&sql).await {
+            let encoded = match node.recorder.store().query(&sql).await {
                 Ok(rows) if format == Format::Json => rows.json(),
                 Ok(rows) => rows.ipc(),
                 Err(error) => {
@@ -1452,6 +1464,7 @@ mod tests {
             config.video_job_config.clone(),
             shutdown.child_token(),
         ));
+        let recorder = leader.recorder().clone();
         let brought = Brought {
             config: config.clone(),
             stated: package.stated.clone(),
@@ -1469,11 +1482,7 @@ mod tests {
             options: config.clone(),
             deployment: "sim".to_owned(),
             revisions: Arc::clone(&revisions),
-            store: Store::new(
-                Arc::new(crate::observation::System),
-                crate::observation::Retention::default(),
-            )
-            .unwrap(),
+            recorder: recorder.clone(),
             ready: Ready::new(None, instance.path()),
             instance,
             shutdown: shutdown.clone(),

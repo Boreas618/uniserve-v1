@@ -804,6 +804,8 @@ message SchedulerStats {
   uint64 steps = 25;
   uint64 policy_calls = 26;
   uint64 policy_fuel = 27;
+  // The configuration revision of the step values the scheduler last read.
+  uint64 revision = 28;
 }
 
 message PrefixCacheStats {
@@ -841,7 +843,7 @@ message ForwardStats {
   map<string, uint64> mode_us = 3;
   repeated StreamTime stream_us = 4;
   repeated BlockingCalls blocking_calls = 5;
-  repeated FenceStep fence_us = 6;
+  repeated FenceStep fence_seconds = 6;
   uint64 fence_records_lost = 7;
   uint64 attention_launches = 9;
   uint64 attention_us = 10;
@@ -876,9 +878,15 @@ message ProfileProgress {
   uint64 windows_ended = 3;
 }
 
-message FenceHistogram {
-  repeated uint64 buckets = 1;
-  uint64 sum_us = 2;
+// A distribution of observed values (`proto::histogram::Histogram`): their count, sum and
+// extremes, and the count of each nonempty bucket by key, a bucket being an interval between
+// consecutive powers of 2^(1/8).
+message Histogram {
+  uint64 count = 1;
+  double sum = 2;
+  double min = 3;
+  double max = 4;
+  map<sint64, uint64> buckets = 5;
 }
 
 // The device time of one state of one observed stream (`ForwardStats.stream_us`).
@@ -896,12 +904,12 @@ message BlockingCalls {
   uint64 count = 3;
 }
 
-// The fence probes' step durations of one stage and module class
-// (`ForwardStats.fence_us`).
+// The fence probes' step durations of one stage and module class, in seconds
+// (`ForwardStats.fence_seconds`).
 message FenceStep {
   string stage = 1;
   string module = 2;
-  FenceHistogram histogram = 3;
+  Histogram histogram = 3;
 }
 
 // ---------------------------------------------------------------- requests

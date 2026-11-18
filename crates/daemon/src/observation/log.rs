@@ -1,11 +1,11 @@
 //! Periodic logging of generation throughput and scheduler occupancy.
 //!
-//! The statistics sources feed the log as they record their families: every finished request's
-//! token usage ([`StatsLog::usage`], from `stats::StatLogger`) and every scheduler's interval
-//! report ([`StatsLog::scheduler`], from the leader's statistics sink). The log keeps one
+//! The deployment's [`super::record::Recorder`] feeds the log as it writes the observation store:
+//! every finished request's token usage ([`StatsLog::usage`]) and every scheduler's interval
+//! report ([`StatsLog::scheduler`]). The log keeps one
 //! interval's sums and each scheduler's latest occupancy; the logger takes them once per
-//! `logging_config.stats_interval` and logs one line of structured fields. It reads no metric
-//! family back.
+//! `logging_config.stats_interval` and logs one line of structured fields. It reads no row
+//! back.
 //!
 //! An interval's throughput counts the tokens of the requests that finished in it, so a request
 //! whose stream ended before its usage report adds none. Occupancy is the latest report of every
@@ -13,7 +13,7 @@
 //! next interval's line.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tokio_util::task::AbortOnDropHandle;
@@ -21,7 +21,7 @@ use tracing::{debug, info};
 
 use proto::report::SchedulerStats;
 
-use crate::metrics::{Metrics, SchedulerLabels};
+use super::record::{Recorder, Scheduler};
 
 /// The sums of one interval of the statistics log.
 #[derive(Debug, Default)]
@@ -36,7 +36,7 @@ struct Interval {
     prefix_cache_hits: u64,
     /// Each scheduler's latest occupancy: running and waiting requests, and
     /// its cache usage.
-    occupancy: BTreeMap<(String, u32, u32), (u64, u64, f64)>,
+    occupancy: BTreeMap<(u32, u32), (u64, u64, f64)>,
 }
 
 /// What the statistics sources feed the statistics log.
@@ -54,12 +54,12 @@ impl StatsLog {
     }
 
     /// Adds one scheduler's interval report.
-    pub(crate) fn scheduler(&self, labels: &SchedulerLabels, stats: &SchedulerStats) {
+    pub(crate) fn scheduler(&self, at: Scheduler, stats: &SchedulerStats) {
         let mut interval = service::lock(&self.interval);
         interval.prefix_cache_queries += stats.prefix_cache_stats.base.queries;
         interval.prefix_cache_hits += stats.prefix_cache_stats.base.hits;
         interval.occupancy.insert(
-            (labels.model_name.clone(), labels.replica, labels.scheduler),
+            (at.replica, at.scheduler),
             (
                 stats.num_running_reqs,
                 stats.num_waiting_reqs,
@@ -84,18 +84,18 @@ pub(crate) struct StatsLogger {
 }
 
 impl StatsLogger {
-    /// Starts the background task that logs `metrics`' statistics log every `period`.
+    /// Starts the background task that logs `recorder`'s statistics log every `period`.
     ///
     /// Must be called within a Tokio runtime, since it spawns onto the current one.
-    pub(crate) fn start(metrics: Arc<Metrics>, period: Duration) -> Self {
-        let task = AbortOnDropHandle::new(tokio::spawn(run(metrics, period)));
+    pub(crate) fn start(recorder: Recorder, period: Duration) -> Self {
+        let task = AbortOnDropHandle::new(tokio::spawn(run(recorder, period)));
         Self { _task: task }
     }
 }
 
-/// Logs `metrics`' statistics log every `period` until its task is aborted.
-async fn run(metrics: Arc<Metrics>, period: Duration) {
-    let log = &metrics.log;
+/// Logs `recorder`'s statistics log every `period` until its task is aborted.
+async fn run(recorder: Recorder, period: Duration) {
+    let log = recorder.log();
     let mut ticks = tokio::time::interval(period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick fires at once and starts the first interval.

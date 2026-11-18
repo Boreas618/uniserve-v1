@@ -178,10 +178,7 @@ pub fn launch() -> EngineArgs {
     };
     let modules = proto::module::ModuleSet {
         engine: package("uniserve", ""),
-        // A prefill of up to 32 tokens and a batch of up to two rows: what the buckets capture.
-        policy: policy_revision(
-            "chunked_prefill_size = 32\nmax_batch = 2\nmax_num_batched_tokens = 32",
-        ),
+        policy: policy_revision(""),
         kernels: Default::default(),
     };
     let sizes = |sizes: &[u32]| {
@@ -220,7 +217,13 @@ pub fn launch() -> EngineArgs {
         decode_attention_backend: None,
         moe_runner_backend: None,
         device: Default::default(),
-        scheduler: Default::default(),
+        // A prefill of up to 32 tokens and a batch of up to two rows: what the buckets capture.
+        scheduler: proto::config::SchedulerConfig {
+            chunked_prefill_size: NonZeroUsize::new(32),
+            max_batch: NonZeroUsize::new(2).unwrap(),
+            max_num_batched_tokens: 32,
+            ..Default::default()
+        },
         media: Default::default(),
         mem_fraction_static: 0.9,
         load: Default::default(),

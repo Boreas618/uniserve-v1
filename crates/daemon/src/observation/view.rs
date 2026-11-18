@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::events::{Event, Kind};
-use super::histogram::Histogram;
+use proto::histogram::Histogram;
 use super::stats::{Instrument, Value};
 use super::{Store, WRITER, nanos};
 
@@ -204,6 +204,36 @@ impl Window {
                 let (below, above) = (rank.floor() as usize, rank.ceil() as usize);
                 Some(values[below] + (values[above] - values[below]) * (rank - rank.floor()))
             }
+        }
+    }
+
+    /// The smallest value: a histogram's smallest observation, or the smallest bucket value of
+    /// a counter or gauge.
+    pub fn min(&self) -> Option<f64> {
+        match self.instrument? {
+            _ if self.buckets.is_empty() => None,
+            Instrument::Histogram => self.histogram().min(),
+            Instrument::Counter | Instrument::Gauge => self.numbers().reduce(f64::min),
+        }
+    }
+
+    /// The largest value: a histogram's largest observation, or the largest bucket value of a
+    /// counter or gauge.
+    pub fn max(&self) -> Option<f64> {
+        match self.instrument? {
+            _ if self.buckets.is_empty() => None,
+            Instrument::Histogram => self.histogram().max(),
+            Instrument::Counter | Instrument::Gauge => self.numbers().reduce(f64::max),
+        }
+    }
+
+    /// The number of values: a histogram's observations, or the buckets of a counter or gauge
+    /// that hold a value.
+    pub fn count(&self) -> Option<f64> {
+        match self.instrument? {
+            _ if self.buckets.is_empty() => None,
+            Instrument::Histogram => Some(self.histogram().count() as f64),
+            Instrument::Counter | Instrument::Gauge => Some(self.buckets.len() as f64),
         }
     }
 

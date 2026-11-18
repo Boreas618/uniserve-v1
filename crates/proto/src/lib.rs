@@ -32,6 +32,7 @@ extern crate self as proto;
 pub mod admin;
 pub mod catalog;
 pub mod config;
+pub mod histogram;
 pub mod media;
 pub mod module;
 pub mod profile;
@@ -70,7 +71,7 @@ pub mod handoff {
 /// that interface's hello: the Storage Server's protocol
 /// (`storage::protocol::VERSION`) at the Storage Server, the buffer pool's
 /// runtime interface (`storage::runtime::VERSION`) when a session opens.
-pub const ENGINE_INTERFACE_VERSION: u32 = 10;
+pub const ENGINE_INTERFACE_VERSION: u32 = 11;
 
 impl process::Refusal {
     /// The refusal of a peer whose hello states version `offered` of the engine

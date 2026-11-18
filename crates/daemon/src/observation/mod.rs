@@ -17,8 +17,10 @@
 //! seconds and bytes, counters ending in `_total`; colons are reserved for
 //! recording rules.
 //!
-//! Writers are the daemon's handling of engine reports, the apply path and
-//! the program host (`Store::add`, `set`, `observe`, `merge`, `append`).
+//! Writers are the deployment's [`record::Recorder`] (engine reports, finished
+//! requests, the HTTP layer, engine processes and the revision served), the
+//! apply path and the program host (`Store::add`, `set`, `observe`, `merge`,
+//! `append`).
 //! Readers are `/admin/query` (`Store::query` with `Rows::json` or
 //! `Rows::ipc`, and `Store::subscribe` for an SSE stream of `events`), and
 //! control programs (`Store::stats`, `Store::events`).
@@ -31,7 +33,8 @@
 //! (an hour by default, at most `Retention::capacity`).
 
 mod events;
-mod histogram;
+pub(crate) mod log;
+pub(crate) mod record;
 mod stats;
 pub mod table;
 mod view;
@@ -54,9 +57,9 @@ use futures::stream::BoxStream;
 use tokio::sync::watch;
 
 pub use self::events::{Event, Fields, Kind};
-pub use self::histogram::Histogram;
 pub use self::stats::Instrument;
 pub use self::view::{Events, Series, Stats, Window};
+pub use proto::histogram::Histogram;
 
 /// The labels of a row, by key: its place in the deployment (replica,
 /// scheduler, group, rank, device, stream, module, operator, descriptor

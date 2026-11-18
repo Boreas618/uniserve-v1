@@ -315,6 +315,8 @@ impl Scheduler {
             .checked_div(report.num_admitted_reqs)
             .unwrap_or(0);
         report.steps = self.step;
+        // The interval ran under the step values the scheduler last read.
+        report.revision = self.budget.revision;
         report.policy_calls = self.policy.calls;
         report.policy_fuel = self.policy.fuel;
 

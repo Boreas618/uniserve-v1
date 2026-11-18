@@ -21,10 +21,9 @@
 //!   (`api::events::Events`);
 //! - `engine`: starting the engine process and the client of the request
 //!   interface it serves;
-//! - `options`: the serving option tree (`options::Config`);
-//! - `metrics`: the Prometheus registry the daemon exports;
+//! - `config`: the serving option tree (`config::Config`);
 //! - `observation`: the deployment's observation store, the `stats` and
-//!   `events` tables queried with SQL;
+//!   `events` tables queried with SQL, and its writers (`observation::record`);
 //! - `programs`: the policy package's programs the leader runs or hands the Storage Servers;
 //! - `restart`: the hot restart that hands a deployment to a successor
 //!   daemon.
@@ -37,7 +36,6 @@ pub mod experts;
 pub mod http;
 mod interference;
 mod leader;
-pub mod metrics;
 pub mod migration;
 pub mod observation;
 pub mod observe;

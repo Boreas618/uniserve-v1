@@ -458,15 +458,16 @@ impl Daemon {
     /// tokens that wake the thread advancing it. `None` on a member daemon, which commands no
     /// deployment's engines. The records (`Updater::epochs`) report the node's processes from
     /// the table the service writes as they start and end; the updater's `Processes` adds what
-    /// each launch is.
+    /// each launch is, and writes each process's start, report and exit through `recorder`.
     pub(crate) fn updater(
         &self,
         deployment: String,
+        recorder: crate::observation::record::Recorder,
     ) -> Option<(Arc<crate::updates::Updater>, std::sync::mpsc::Receiver<()>)> {
         let link = self.process_link()?;
         let awake = ::service::lock(&self.awake).take()?;
         let epochs = Arc::new(crate::epoch::Epochs::new(self.table.clone()?));
-        let processes = processes::Processes::new(Arc::clone(&epochs), deployment, link);
+        let processes = processes::Processes::new(Arc::clone(&epochs), deployment, link, recorder);
         Some((
             Arc::new(crate::updates::Updater::new(epochs, processes)),
             awake,

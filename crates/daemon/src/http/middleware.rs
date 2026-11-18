@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use crate::metrics::{HttpHandlerLabels, HttpRequestLabels, Metrics};
+use crate::observation::record::Recorder;
 use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{MatchedPath, Request};
 use axum::http::header::{HeaderName, RETRY_AFTER};
@@ -208,7 +208,8 @@ impl ConcurrencyLimit {
     }
 }
 
-/// Records the API server's HTTP metrics (`metrics::api_server`).
+/// Records each request of the API server into the observation store
+/// (`uniserve_http_requests_total`, `uniserve_http_request_duration_seconds`).
 ///
 /// It wraps the API's routes alone (the router's fallback is outside it), so
 /// every request it sees matched a route's path: the `handler` label is that
@@ -220,7 +221,7 @@ impl ConcurrencyLimit {
 /// dropped: an SSE handler returns its body at once, so observing at handler
 /// return would record a near-zero duration.
 pub(crate) async fn track_http_metrics(
-    metrics: Arc<Metrics>,
+    recorder: Recorder,
     request: Request,
     next: Next,
 ) -> Response {
@@ -243,7 +244,7 @@ pub(crate) async fn track_http_metrics(
     guard_body(
         response,
         MetricsGuard {
-            metrics,
+            recorder,
             started_at,
             method,
             handler,
@@ -256,8 +257,8 @@ pub(crate) async fn track_http_metrics(
 /// fully sent (or aborted). Carries the labels and start time captured at
 /// request entry.
 struct MetricsGuard {
-    /// The deployment's registry the request is recorded into.
-    metrics: Arc<Metrics>,
+    /// The deployment's writer the request is recorded through.
+    recorder: Recorder,
     started_at: Instant,
     method: &'static str,
     handler: String,
@@ -268,24 +269,8 @@ impl Drop for MetricsGuard {
     /// Records request count and end-to-end body delivery latency.
     fn drop(&mut self) {
         let elapsed = self.started_at.elapsed().as_secs_f64();
-        let metrics = &self.metrics.api_server;
-
-        metrics
-            .http_requests
-            .get_or_create(&HttpRequestLabels {
-                method: self.method.to_owned(),
-                status: self.status,
-                handler: self.handler.clone(),
-            })
-            .inc();
-
-        metrics
-            .http_request_duration_seconds
-            .get_or_create(&HttpHandlerLabels {
-                method: self.method.to_owned(),
-                handler: self.handler.clone(),
-            })
-            .observe(elapsed);
+        self.recorder
+            .http(self.method, self.status, &self.handler, elapsed);
     }
 }
 

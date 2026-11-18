@@ -31,7 +31,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::metrics::{Metrics, RequestLabels, SchedulerLabels};
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use proto::admin::{DeploymentStatus, Phase, ServingState, UpdateStatus};
@@ -53,9 +52,9 @@ use crate::config::{Config, ReasoningParser, Stated};
 use crate::engine::client::{EngineClient, EngineReport, EngineState, StatsSink, SubmitError};
 use crate::engine::control::EngineControl;
 use crate::engine::hold::{HoldState, RequestHold};
-use crate::metrics::log_stats::StatsLogger;
-use crate::metrics::stats::{self as metrics, RequestStats};
 use crate::migration::{Migrator, RequestEvents};
+use crate::observation::log::StatsLogger;
+use crate::observation::record::{self, Recorded, Recorder};
 
 /// One model served over its engine process.
 ///
@@ -79,8 +78,8 @@ pub struct Leader {
     pub(crate) updates: Arc<crate::updates::Updater>,
     /// Whether every request logs a summary line when it ends.
     log_requests: bool,
-    /// The deployment's metrics, which its route renders.
-    metrics: Arc<Metrics>,
+    /// The deployment's writer of the observation store.
+    recorder: Recorder,
     /// Periodic throughput logging, stopped with the engine.
     _stats_logger: Option<StatsLogger>,
 }
@@ -177,13 +176,12 @@ pub(crate) struct EpochTarget {
     pub(crate) keep: bool,
 }
 
-/// Records what replica `replica`'s engine reports into the deployment's
-/// `metrics` under `model_name`: each scheduler's statistics, also read by
-/// `observer` for each epoch's rates, and its main process's allocators.
+/// Records what replica `replica`'s engine reports into the deployment's observation store
+/// through `recorder`: each scheduler's statistics, also read by `observer` for each epoch's
+/// rates, and its main process's allocators.
 pub(crate) fn stats_sink(
-    model_name: String,
     observer: Arc<crate::observe::Observer>,
-    metrics: Arc<Metrics>,
+    recorder: Recorder,
     replica: usize,
 ) -> StatsSink {
     let replica = replica as u32;
@@ -194,20 +192,15 @@ pub(crate) fn stats_sink(
             stats,
         } => {
             observer.record(epoch, scheduler, &stats);
-            let labels = SchedulerLabels {
-                model_name: model_name.clone(),
-                replica,
-                scheduler,
-            };
-            metrics.record_scheduler(&labels, &stats);
+            recorder.scheduler(record::Scheduler { replica, scheduler }, &stats);
         }
-        EngineReport::Memory(devices) => metrics.memory.record(replica, &devices),
+        EngineReport::Memory(devices) => recorder.memory(replica, &devices),
     })
 }
 
 /// How many requests ended since the daemon started, and how many failed.
 pub(crate) fn request_counts() -> (u64, u64) {
-    let counts = &metrics::OUTCOMES;
+    let counts = &record::OUTCOMES;
     (
         counts.ended.load(Ordering::Relaxed),
         counts.failed.load(Ordering::Relaxed),
@@ -369,9 +362,6 @@ pub(crate) struct Prepared {
     renderer: LoadedRenderer,
     /// The deployment's engine configuration, with the facts the model's files determine.
     pub(crate) engine: proto::config::EngineConfig,
-    /// The deployment's metrics, sized to the model's context, which its
-    /// engines' statistics sinks record into before the leader exists.
-    pub(crate) metrics: Arc<Metrics>,
 }
 
 /// Where a submitted request is served: its replica, and the scheduler of that
@@ -384,13 +374,9 @@ pub(crate) struct Placement {
 }
 
 impl Placement {
-    /// The request metrics' labels of a request of `model_name` served here.
-    fn labels(self, model_name: &str) -> RequestLabels {
-        RequestLabels {
-            model_name: model_name.to_owned(),
-            replica: self.replica,
-            scheduler: self.scheduler,
-        }
+    /// Where a request served here was measured: its replica and its scheduler.
+    fn at(self) -> (u32, Option<u32>) {
+        (self.replica, self.scheduler)
     }
 }
 
@@ -843,10 +829,12 @@ impl Leader {
     /// option paths the operator set; `daemon` is this node's daemon's
     /// process socket, through which the engine process and every worker
     /// start, and `instance` the daemon's instance directory, where the engines' request socket
-    /// lies. `revision` is the configuration revision the deployment starts at, whose step
-    /// values the engines' schedulers begin with, and `lock` the module revisions its apply
-    /// fixed when it starts again, `None` to fix them now. The engine's start blocks until every
-    /// rank has loaded the model, so it runs on the blocking pool.
+    /// lies. `recorder` writes the deployment's observation store, which the engines' reports,
+    /// its requests and its HTTP layer record into. `revision` is the configuration revision the
+    /// deployment starts at, whose step values the engines' schedulers begin with, and `lock` the
+    /// module revisions its apply fixed when it starts again, `None` to fix them now. The
+    /// engine's start blocks until every rank has loaded the model, so it runs on the blocking
+    /// pool.
     ///
     /// # Errors
     ///
@@ -856,6 +844,12 @@ impl Leader {
     /// ([`Config::engine_config`]), when the engine process fails to
     /// start, or when the model cannot be bound to the capabilities its
     /// workers report.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the model families, the options as validated and as stated, the node's daemon \
+                  and instance, the deployment's updater and observation writer, and the \
+                  revision started with its module lock"
+    )]
     pub(crate) async fn start(
         families: &processing::Registry,
         config: &Config,
@@ -863,7 +857,9 @@ impl Leader {
         daemon: String,
         instance: &std::path::Path,
         updates: Arc<crate::updates::Updater>,
-        (revision, lock): (u64, Option<crate::epoch::ModuleSet>),
+        recorder: Recorder,
+        revision: u64,
+        lock: Option<crate::epoch::ModuleSet>,
     ) -> anyhow::Result<Self> {
         let prepared = Self::prepare(families, config, stated).await?;
         info!(parallel = ?prepared.engine.parallel, "starting the engine process");
@@ -916,12 +912,11 @@ impl Leader {
         let span = crate::observe::span(&config.update_config);
         let clients =
             futures::future::join_all(launches.into_iter().enumerate().map(|(index, args)| {
-                let model = config.model().to_owned();
                 let starting = Arc::clone(&control);
-                let metrics = Arc::clone(&prepared.metrics);
+                let recorder = recorder.clone();
                 tokio::task::spawn_blocking(move || {
                     let observer = Arc::new(crate::observe::Observer::new(span));
-                    let sink = stats_sink(model, Arc::clone(&observer), metrics, index);
+                    let sink = stats_sink(Arc::clone(&observer), recorder, index);
                     let client = starting.start(args.clone(), sink)?;
                     Ok::<_, anyhow::Error>((client, args, observer))
                 })
@@ -943,6 +938,7 @@ impl Leader {
             served,
             observer,
             updates,
+            recorder,
         )?;
         for (index, (client, served, observer)) in clients.enumerate() {
             let replica = Replica::new(
@@ -950,7 +946,7 @@ impl Leader {
                 config,
                 Arc::new(client),
                 observer,
-                Arc::clone(&leader.metrics),
+                leader.recorder.clone(),
                 index + 1,
                 Arc::downgrade(&leader.replicas),
                 Arc::clone(&leader.replicas.adapters),
@@ -1086,24 +1082,28 @@ impl Leader {
                 .get_or_insert_with(|| family.default_max_seconds());
         }
 
-        let metrics = Arc::new(Metrics::new(model_config.max_model_len));
         Ok(Prepared {
             families: families.clone(),
             model_config,
             tokenizer,
             renderer,
             engine,
-            metrics,
         })
     }
 
     /// The leader of `prepared`'s model over the engine `client` serves,
-    /// which `control` started (or adopted) with the arguments `served`.
+    /// which `control` started (or adopted) with the arguments `served`, its
+    /// statistics read through `observer` and recorded through `recorder`.
     ///
     /// # Errors
     ///
     /// Fails when the model cannot be bound to the capabilities the
     /// engine's workers report.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the options, the prepared model, the engine's control, client and served \
+                  arguments, and the deployment's observer, updater and recorder"
+    )]
     pub(crate) fn finish(
         config: &Config,
         prepared: Prepared,
@@ -1112,6 +1112,7 @@ impl Leader {
         served: proto::config::EngineArgs,
         observer: Arc<crate::observe::Observer>,
         updates: Arc<crate::updates::Updater>,
+        recorder: Recorder,
     ) -> anyhow::Result<Self> {
         let Prepared {
             families,
@@ -1119,7 +1120,6 @@ impl Leader {
             tokenizer,
             renderer,
             engine: _,
-            metrics,
         } = prepared;
         let info = client.info().clone();
 
@@ -1175,7 +1175,7 @@ impl Leader {
             processor,
             config,
             observer,
-            metrics,
+            recorder,
             updates,
         )?;
         let replica = Arc::clone(&engine.replicas.serving.borrow()[0]);
@@ -1200,7 +1200,7 @@ impl Leader {
         processor: Processor,
         options: &Config,
         observer: Arc<crate::observe::Observer>,
-        metrics: Arc<Metrics>,
+        recorder: Recorder,
         updates: Arc<crate::updates::Updater>,
     ) -> anyhow::Result<Self> {
         let served_model_name = options.served_model_name().to_owned();
@@ -1210,7 +1210,7 @@ impl Leader {
         let logging = &options.logging_config;
         let stats_logger = logging
             .log_stats
-            .then(|| StatsLogger::start(Arc::clone(&metrics), logging.stats_interval));
+            .then(|| StatsLogger::start(recorder.clone(), logging.stats_interval));
         let replica_options = Config {
             model: Some(model_name.clone()),
             served_model_name: Some(served_model_name.clone()),
@@ -1228,7 +1228,7 @@ impl Leader {
                             &replica_options,
                             client,
                             Arc::clone(&observer),
-                            Arc::clone(&metrics),
+                            recorder.clone(),
                             index,
                             std::sync::Weak::clone(registry),
                             Arc::clone(&adapters),
@@ -1254,7 +1254,7 @@ impl Leader {
             images,
             updates,
             log_requests: logging.log_requests,
-            metrics,
+            recorder,
             _stats_logger: stats_logger,
         })
     }
@@ -1264,9 +1264,9 @@ impl Leader {
         &self.processor
     }
 
-    /// The deployment's metrics.
-    pub(crate) fn metrics(&self) -> &Arc<Metrics> {
-        &self.metrics
+    /// The deployment's writer of the observation store.
+    pub(crate) fn recorder(&self) -> &Recorder {
+        &self.recorder
     }
 
     /// The single model name the API serves.
@@ -1355,10 +1355,8 @@ impl Leader {
             .submit(request.into())
             .await
             .map_err(ServeError::from)?;
-        let labels = placement.labels(&self.model_name);
         let log = self.log_requests.then_some(request_id);
-        let stats =
-            crate::metrics::stats::StatLogger::new(Arc::clone(&self.metrics), labels, started, log);
+        let stats = record::Request::new(self.recorder.clone(), placement.at(), started, log);
         // Dropping the events on a failure cancels the request in its engine.
         let output = crate::api::output::OutputProcessor::new(
             self.processor.tokenizer(),
@@ -1383,15 +1381,10 @@ impl Leader {
         request_id: &str,
         replica: u32,
         started: std::time::Instant,
-    ) -> crate::metrics::stats::StatLogger {
+    ) -> record::Request {
         // The process that handed the request over named its replica alone.
-        let labels = RequestLabels {
-            model_name: self.model_name.clone(),
-            replica,
-            scheduler: None,
-        };
         let log = self.log_requests.then(|| request_id.to_owned());
-        crate::metrics::stats::StatLogger::new(Arc::clone(&self.metrics), labels, started, log)
+        record::Request::new(self.recorder.clone(), (replica, None), started, log)
     }
 
     /// Takes one request's engine event stream over from the process that
@@ -1477,15 +1470,9 @@ impl Leader {
         placement: Placement,
         output: RequestOutputStream,
     ) -> RequestOutputStream {
-        let labels = placement.labels(&self.model_name);
         let log = self.log_requests.then_some(request_id);
-        Box::pin(RequestStats::new(
-            output,
-            Arc::clone(&self.metrics),
-            labels,
-            started,
-            log,
-        ))
+        let request = record::Request::new(self.recorder.clone(), placement.at(), started, log);
+        Box::pin(Recorded::new(output, request))
     }
 
     /// Submits one tokenized request to the engine, which routes it to its
@@ -1936,9 +1923,9 @@ pub(crate) struct Replica {
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
     /// Every engine's scheduler statistics, which the status reads.
     pub(crate) observer: Arc<crate::observe::Observer>,
-    /// The deployment's metrics, which the statistics sinks of the engines
-    /// this replica starts record into.
-    pub(crate) metrics: Arc<Metrics>,
+    /// The deployment's writer of the observation store, which the statistics sinks of the
+    /// engines this replica starts record through.
+    pub(crate) recorder: Recorder,
     /// The profiling session that runs, or the last that ended
     /// (`crate::profiling`).
     pub(crate) profiles: crate::profiling::Profiles,
@@ -1969,7 +1956,7 @@ impl Replica {
     #[expect(
         clippy::too_many_arguments,
         reason = "a replica's model families, options and engine, the two readers of its \
-                  engine's reports (its observer and the deployment's metrics), and its place in \
+                  engine's reports (its observer and the deployment's recorder), and its place in \
                   the replica set with the set's adapters"
     )]
     pub(crate) fn new(
@@ -1977,7 +1964,7 @@ impl Replica {
         options: &Config,
         client: Arc<EngineClient>,
         observer: Arc<crate::observe::Observer>,
-        metrics: Arc<Metrics>,
+        recorder: Recorder,
         ordinal: usize,
         registry: std::sync::Weak<Replicas>,
         adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
@@ -1999,7 +1986,7 @@ impl Replica {
             sleep_paused: AtomicBool::new(false),
             adapters,
             observer,
-            metrics,
+            recorder,
             profiles: crate::profiling::Profiles::default(),
             standby: std::sync::Mutex::new(None),
             domain: std::sync::Mutex::new(None),
@@ -2263,12 +2250,7 @@ impl Replica {
                 .zip(&observers)
                 .enumerate()
                 .map(|(index, (target, observer))| {
-                    let sink = stats_sink(
-                        self.model_name.clone(),
-                        Arc::clone(observer),
-                        Arc::clone(&self.metrics),
-                        index,
-                    );
+                    let sink = stats_sink(Arc::clone(observer), self.recorder.clone(), index);
                     let (control, processes) = (Arc::clone(&control), target.1.clone());
                     tokio::task::spawn_blocking(move || {
                         control.join_target(&processes, epoch, sink)
@@ -2342,7 +2324,7 @@ impl Replica {
                         &config,
                         Arc::clone(client),
                         Arc::clone(&observers[index]),
-                        Arc::clone(&self.metrics),
+                        self.recorder.clone(),
                         index,
                         Arc::downgrade(&registry),
                         Arc::clone(&self.adapters),
@@ -2548,9 +2530,8 @@ impl Replica {
         let started = async {
             let args = args.context("the replica has no served arguments")?;
             let sink = stats_sink(
-                self.model_name.clone(),
                 Arc::clone(&self.observer),
-                Arc::clone(&self.metrics),
+                self.recorder.clone(),
                 self.ordinal,
             );
             let starting = Arc::clone(control);
@@ -2593,9 +2574,8 @@ impl Replica {
             .context("the replica has no served arguments")?;
         self.hold.hold();
         let sink = stats_sink(
-            self.model_name.clone(),
             Arc::clone(&self.observer),
-            Arc::clone(&self.metrics),
+            self.recorder.clone(),
             self.ordinal,
         );
         let client =
@@ -3048,9 +3028,8 @@ impl Replica {
             crate::standby::Storage::Suspended => crate::config::StandbyStorage::Suspended,
         };
         let sink = stats_sink(
-            self.model_name.clone(),
             Arc::clone(&self.observer),
-            Arc::clone(&self.metrics),
+            self.recorder.clone(),
             self.ordinal,
         );
         let numbers: Vec<u64> = generations
@@ -3840,40 +3819,45 @@ mod tests {
         (status, document)
     }
 
-    /// Waits until the metrics `reached`.
-    async fn metrics_reach(reached: impl Fn() -> bool) {
-        while !reached() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    /// The rows `sql` selects from `engine`'s observation store.
+    async fn rows(engine: &Leader, sql: &str) -> Vec<serde_json::Value> {
+        let rows = engine.recorder().store().query(sql).await.unwrap();
+        serde_json::from_slice(&rows.json().unwrap()).unwrap()
     }
 
-    /// The request labels of scheduler `scheduler` of replica 0 of `model_name`.
-    fn request_labels(model_name: &str, scheduler: u32) -> crate::metrics::RequestLabels {
-        crate::metrics::RequestLabels {
-            model_name: model_name.to_owned(),
-            replica: 0,
-            scheduler: Some(scheduler),
-        }
+    /// The sum of the values of metric `name` measured at scheduler `scheduler` of replica 0,
+    /// with `and` a further condition of the rows.
+    async fn total(engine: &Leader, name: &str, scheduler: u32, and: &str) -> f64 {
+        let sql = format!(
+            "SELECT coalesce(sum(value), 0) AS total FROM stats WHERE name = '{name}' \
+             AND labels['replica'] = '0' AND labels['scheduler'] = '{scheduler}' {and}"
+        );
+        rows(engine, &sql).await[0]["total"].as_f64().unwrap()
     }
 
-    /// How many requests of scheduler `scheduler` of replica 0 of `model_name`
-    /// ended as `outcome` in `engine`'s metrics.
-    fn outcomes(
-        engine: &Leader,
-        model_name: &str,
-        scheduler: u32,
-        outcome: crate::metrics::Outcome,
-    ) -> u64 {
-        let labels = crate::metrics::OutcomeLabels {
-            served: request_labels(model_name, scheduler),
-            outcome,
-        };
-        engine
-            .metrics()
-            .request
-            .request_outcomes
-            .get(&labels)
-            .map_or(0, |count| count.get())
+    /// The observations histogram `name` holds at scheduler `scheduler` of replica 0: their
+    /// count and sum.
+    async fn observed(engine: &Leader, name: &str, scheduler: u32) -> (u64, f64) {
+        let sql = format!(
+            "SELECT histogram FROM stats WHERE name = '{name}' \
+             AND labels['replica'] = '0' AND labels['scheduler'] = '{scheduler}'"
+        );
+        rows(engine, &sql)
+            .await
+            .iter()
+            .fold((0, 0.0), |(count, sum), row| {
+                let histogram = &row["histogram"];
+                (
+                    count + histogram["count"].as_u64().unwrap(),
+                    sum + histogram["sum"].as_f64().unwrap(),
+                )
+            })
+    }
+
+    /// How many requests of scheduler `scheduler` of replica 0 ended as `outcome`.
+    async fn outcomes(engine: &Leader, scheduler: u32, outcome: &str) -> f64 {
+        let and = format!("AND labels['outcome'] = '{outcome}'");
+        total(engine, "uniserve_requests_total", scheduler, &and).await
     }
 
     /// A text request that generates until the simulator's EOS.
@@ -4074,25 +4058,19 @@ mod tests {
 
             let (status, document) = pending.await.unwrap();
             assert_eq!(status, axum::http::StatusCode::OK, "{document}");
-            let seconds = engine
-                .metrics()
-                .request
-                .e2e_request_latency_seconds
-                .get_or_create(&request_labels(engine_model, 0))
-                .sum();
+            let (_, seconds) = observed(&engine, "uniserve_e2e_request_latency_seconds", 0).await;
             assert!(seconds >= wait.as_secs_f64(), "{seconds} s");
             engine.shutdown().await.unwrap();
         });
     }
 
-    /// A completed request is recorded once in the request metrics under its
-    /// engine's model name: the token counters and token histograms carry the
-    /// counts of its usage report, its finish reason is counted, and each
-    /// latency histogram whose input it carries holds one observation.
+    /// A completed request is recorded once in the observation store under the scheduler that
+    /// served it: the token counters and token histograms carry the counts of its usage report,
+    /// its finish reason is counted, each latency histogram whose input it carries holds one
+    /// observation, and one `request` event states its lengths.
     #[tokio::test]
-    async fn completed_request_is_recorded_in_request_metrics() {
-        let engine_model = "request-metrics-model";
-        let engine = Arc::new(letter_engine(engine_model, ending));
+    async fn completed_request_is_recorded_in_the_store() {
+        let engine = Arc::new(letter_engine("request-metrics-model", ending));
         let router = router(Arc::clone(&engine));
 
         let (status, document) = chat(&router, &chat_request(3, &[], false)).await;
@@ -4101,30 +4079,32 @@ mod tests {
         assert_eq!(document["usage"]["completion_tokens"], 3);
         let prompt_tokens = &document["usage"]["prompt_tokens"];
 
-        let request = &engine.metrics().request;
-        let labels = request_labels(engine_model, 0);
+        assert_eq!(outcomes(&engine, 0, "length").await, 1.0);
         assert_eq!(
-            outcomes(&engine, engine_model, 0, crate::metrics::Outcome::Length),
-            1
+            total(&engine, "uniserve_prompt_tokens_total", 0, "").await,
+            prompt_tokens.as_f64().unwrap()
         );
         assert_eq!(
-            request.prompt_tokens.get_or_create(&labels).get(),
-            prompt_tokens.as_u64().unwrap()
+            total(&engine, "uniserve_generation_tokens_total", 0, "").await,
+            3.0
         );
-        assert_eq!(request.generation_tokens.get_or_create(&labels).get(), 3);
         for histogram in [
-            &request.request_prompt_tokens,
-            &request.request_generation_tokens,
-            &request.e2e_request_latency_seconds,
-            &request.request_queue_time_seconds,
-            &request.time_to_first_token_seconds,
+            "uniserve_request_prompt_tokens",
+            "uniserve_request_generation_tokens",
+            "uniserve_e2e_request_latency_seconds",
+            "uniserve_request_queue_time_seconds",
+            "uniserve_time_to_first_token_seconds",
         ] {
-            let observed = histogram.get_or_create(&labels);
-            assert_eq!(
-                prometheus_client::metrics::histogram::Histogram::count(&observed),
-                1
-            );
+            assert_eq!(observed(&engine, histogram, 0).await.0, 1, "{histogram}");
         }
+        let events = rows(
+            &engine,
+            "SELECT fields FROM events WHERE kind = 'request' AND labels['scheduler'] = '0'",
+        )
+        .await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["fields"]["output_tokens"], "3");
+        assert_eq!(events[0]["fields"]["outcome"], "length");
         engine.shutdown().await.unwrap();
     }
 
@@ -4188,11 +4168,10 @@ mod tests {
 
     /// Each request is recorded under the scheduler that served it.
     #[tokio::test]
-    async fn request_metrics_name_the_engine_core_that_served_each_request() {
-        let engine_model = "core-metrics-model";
+    async fn requests_are_recorded_under_the_scheduler_that_served_each() {
         let engine = Arc::new(engine_of(
             crate::test_support::CHAT,
-            testkit::launch(engine_model, 2),
+            testkit::launch("core-metrics-model", 2),
             Fixture::new(text_fake),
         ));
         let router = router(Arc::clone(&engine));
@@ -4207,13 +4186,8 @@ mod tests {
 
         for scheduler in 0..2 {
             assert_eq!(
-                outcomes(
-                    &engine,
-                    engine_model,
-                    scheduler,
-                    crate::metrics::Outcome::Length
-                ),
-                1,
+                outcomes(&engine, scheduler, "length").await,
+                1.0,
                 "scheduler {scheduler}"
             );
         }
@@ -4225,8 +4199,7 @@ mod tests {
     /// reached a usage report, adds nothing to the token metrics.
     #[tokio::test]
     async fn disconnected_request_is_recorded_as_aborted_without_token_usage() {
-        let engine_model = "disconnect-metrics-model";
-        let engine = Arc::new(letter_engine(engine_model, |fake| fake));
+        let engine = Arc::new(letter_engine("disconnect-metrics-model", |fake| fake));
         let router = router(Arc::clone(&engine));
 
         let mut stream = send_streamed(
@@ -4243,18 +4216,25 @@ mod tests {
         // The connection is gone: the body's frames have no reader.
         drop(stream);
 
-        let request = &engine.metrics().request;
-        let labels = request_labels(engine_model, 0);
-        metrics_reach(|| outcomes(&engine, engine_model, 0, crate::metrics::Outcome::Abort) == 1)
-            .await;
-        let latency = request.e2e_request_latency_seconds.get_or_create(&labels);
+        while outcomes(&engine, 0, "abort").await < 1.0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(
-            prometheus_client::metrics::histogram::Histogram::count(&latency),
+            observed(&engine, "uniserve_e2e_request_latency_seconds", 0)
+                .await
+                .0,
             1
         );
-        drop(latency);
-        assert!(request.generation_tokens.get(&labels).is_none());
-        assert!(request.request_generation_tokens.get(&labels).is_none());
+        assert_eq!(
+            total(&engine, "uniserve_generation_tokens_total", 0, "").await,
+            0.0
+        );
+        assert_eq!(
+            observed(&engine, "uniserve_request_generation_tokens", 0)
+                .await
+                .0,
+            0
+        );
         engine.shutdown().await.unwrap();
     }
 

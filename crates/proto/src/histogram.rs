@@ -1,4 +1,5 @@
-//! The distribution a histogram stat holds in one time bucket.
+//! A distribution of observed values, as the observation store keeps a histogram stat and as an
+//! engine reports one (the fence probes' step durations, `report::ForwardStats::fence_seconds`).
 //!
 //! Every histogram shares one bucket scheme, so any two merge without
 //! agreeing on bounds first: a bucket is an interval between consecutive
@@ -8,6 +9,8 @@
 //! every estimate.
 
 use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
 
 /// Buckets per power of two.
 const SCALE: f64 = 8.0;
@@ -20,7 +23,7 @@ const OFFSET: i64 = 1 << 20;
 
 /// A distribution of observed values: their count, sum, extremes and the
 /// count of each nonempty bucket.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Histogram {
     count: u64,
     sum: f64,
@@ -141,6 +144,30 @@ impl Histogram {
             let (lower, upper) = bounds(key);
             (lower, upper, count)
         })
+    }
+}
+
+impl From<&Histogram> for crate::request::wire::Histogram {
+    fn from(histogram: &Histogram) -> Self {
+        Self {
+            count: histogram.count,
+            sum: histogram.sum,
+            min: histogram.min,
+            max: histogram.max,
+            buckets: histogram.buckets.clone().into_iter().collect(),
+        }
+    }
+}
+
+impl From<crate::request::wire::Histogram> for Histogram {
+    fn from(histogram: crate::request::wire::Histogram) -> Self {
+        Self {
+            count: histogram.count,
+            sum: histogram.sum,
+            min: histogram.min,
+            max: histogram.max,
+            buckets: histogram.buckets.into_iter().collect(),
+        }
     }
 }
 

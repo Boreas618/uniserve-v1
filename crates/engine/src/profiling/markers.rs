@@ -69,7 +69,8 @@ use crossbeam_channel::Sender;
 use ops::{Arguments, Kernel, KernelEntry, LaunchGrid};
 use platform::{DeviceAllocation, DeviceId, DevicePtr, PinnedBuffer, Stream};
 use proto::config::ProfilingConfig;
-use proto::report::{FenceHistogram, FenceStep};
+use proto::histogram::Histogram;
+use proto::report::FenceStep;
 
 use super::artifact::{ClockRow, Message};
 use crate::worker::{Error, Result};
@@ -213,7 +214,7 @@ struct DeviceMarkers {
     /// The steps whose begin marker was launched and whose end was not read, in launch order.
     launched: Mutex<VecDeque<Launched>>,
     /// Histograms of completed steps since the last take, by `{stage}/{class}`.
-    histograms: Mutex<BTreeMap<FenceStep, FenceHistogram>>,
+    histograms: Mutex<BTreeMap<FenceStep, Histogram>>,
     /// Where the stamps read go while a session keeps them: the class patterns it keeps (empty
     /// for every class) and its file's writer.
     tap: Mutex<Option<(Vec<String>, Sender<Message>)>>,
@@ -633,20 +634,20 @@ impl Markers {
                 histograms
                     .entry(step_of("step"))
                     .or_default()
-                    .observe(end.saturating_sub(begin.time) / 1000);
+                    .observe(seconds(end.saturating_sub(begin.time)));
             }
             for (class, ns) in class_time(&instances.instance_classes, &mut open) {
                 histograms
                     .entry(step_of(&instances.classes[class - 1]))
                     .or_default()
-                    .observe(ns / 1000);
+                    .observe(seconds(ns));
             }
         }
     }
 
-    /// The histograms of `device`'s steps completed since the last take, in microseconds by stage
-    /// and class, and its stamps lost.
-    pub(crate) fn take(&self, device: DeviceId) -> (BTreeMap<FenceStep, FenceHistogram>, u64) {
+    /// The histograms of `device`'s steps completed since the last take, in seconds by stage and
+    /// class, and its stamps lost.
+    pub(crate) fn take(&self, device: DeviceId) -> (BTreeMap<FenceStep, Histogram>, u64) {
         let Ok(markers) = self.device(device) else {
             return Default::default();
         };
@@ -1019,6 +1020,11 @@ fn switch_words(classes: &[String], enabled: bool, off: &[String]) -> (Vec<u32>,
     (words, switched_off)
 }
 
+/// A duration of `%globaltimer` nanoseconds in the seconds a report's histograms hold.
+fn seconds(nanoseconds: u64) -> f64 {
+    nanoseconds as f64 * 1e-9
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1209,7 +1215,7 @@ mod tests {
                 stage: "decode".to_owned(),
                 module: module.to_owned(),
             };
-            histograms[&step].buckets.iter().sum::<u64>()
+            histograms[&step].count()
         };
         assert_eq!(lost, 0);
         assert_eq!(steps("step"), 2);

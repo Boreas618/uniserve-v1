@@ -15,7 +15,7 @@ mod forward;
 mod wire;
 
 pub use forward::{
-    BlockingCall, FENCE_BUCKETS_US, FenceHistogram, FenceStep, ForwardStats, ProfileProgress,
+    BlockingCall, FenceStep, ForwardStats, ProfileProgress,
     StreamTime,
 };
 use serde::{Deserialize, Serialize};
@@ -102,6 +102,9 @@ pub struct DomainSchedulerStats {
 /// Serializable scheduler snapshot for one reporting interval.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerStats {
+    /// The configuration revision of the step values the scheduler last read
+    /// (`config::Tuning`): the revision the interval's measurements ran under.
+    pub revision: u64,
     /// Running token and media requests (gauge).
     pub num_running_reqs: u64,
     /// Token and media requests waiting for admission (gauge).

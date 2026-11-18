@@ -18,7 +18,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
-use super::histogram::Histogram;
+use proto::histogram::Histogram;
 use super::{Error, Labels, Retention};
 
 /// How a metric's writes combine within a time bucket.

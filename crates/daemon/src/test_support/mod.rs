@@ -175,8 +175,6 @@ pub(crate) fn fake_engine(
     Receiver<proto::process::Report>,
 ) {
     let (engine, epoch) = (launch.engine, launch.epoch);
-    let model_name = launch.engine_config.model.model.clone();
-    let max_model_len = launch.engine_config.model.max_model_len;
     // The policy module the engine's schedulers instantiate is made on the test's own thread, so
     // that a module that cannot be made fails the test rather than the engine's start.
     testkit::packaged_module();
@@ -201,11 +199,10 @@ pub(crate) fn fake_engine(
         info,
         state,
         crate::leader::stats_sink(
-            model_name,
             std::sync::Arc::new(crate::observe::Observer::new(crate::observe::span(
                 &crate::config::UpdateConfig::default(),
             ))),
-            std::sync::Arc::new(crate::metrics::Metrics::new(max_model_len)),
+            recorder(),
             0,
         ),
         None,
@@ -456,7 +453,6 @@ pub(crate) fn leader_over(
             .unwrap(),
         ),
     };
-    let metrics = std::sync::Arc::new(crate::metrics::Metrics::new(model.max_model_len));
     let processor = Processor::new(
         model,
         tokenizer,
@@ -484,10 +480,20 @@ pub(crate) fn leader_over(
         processor,
         &options,
         observer,
-        metrics,
+        recorder(),
         test_updater(),
     )
     .unwrap()
+}
+
+/// A recorder of a store of its own, at revision 1.
+pub(crate) fn recorder() -> crate::observation::record::Recorder {
+    let store = crate::observation::Store::new(
+        std::sync::Arc::new(crate::observation::System),
+        crate::observation::Retention::default(),
+    )
+    .expect("the default retention is consistent");
+    crate::observation::record::Recorder::new(store, 1)
 }
 
 /// A response as a client reads it off an HTTP/1.1 connection.
@@ -824,6 +830,7 @@ pub(crate) fn test_updater() -> Arc<crate::updates::Updater> {
         Arc::clone(&epochs),
         "deployment".to_owned(),
         link,
+        recorder(),
     );
     Arc::new(crate::updates::Updater::new(epochs, processes))
 }

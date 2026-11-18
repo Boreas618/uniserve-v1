@@ -24,13 +24,11 @@ use crate::supervision::Daemon;
 use anyhow::{Context as _, Result};
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
-use axum::http::header::CONTENT_TYPE;
 use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
-use thiserror_ext::AsReport as _;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -54,8 +52,6 @@ pub(crate) fn video_body_limit(media: &MediaConfig, server: &ServerConfig) -> us
     });
     server.max_request_body.saturating_add(encoded)
 }
-
-const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
 /// The log targets of the HTTP stack this module serves and fetches with, whose level
 /// `--log-level-http` sets: the server (`axum` over `hyper`, `tower_http`'s trace layer) and the
@@ -203,12 +199,15 @@ pub async fn serve(
         families,
         options: package.config.clone(),
         deployment,
+        recorder: crate::observation::record::Recorder::new(
+            crate::observation::Store::new(
+                Arc::new(crate::observation::System),
+                crate::observation::Retention::default(),
+            )
+            .context("creating the observation store")?,
+            revisions.current()?.unwrap_or(0),
+        ),
         revisions,
-        store: crate::observation::Store::new(
-            Arc::new(crate::observation::System),
-            crate::observation::Retention::default(),
-        )
-        .context("creating the observation store")?,
         instance,
         ready,
         shutdown,
@@ -276,9 +275,9 @@ pub(crate) fn retire_deployment(deployment: &str) -> Result<()> {
 /// Assembles the router of the tasks `engine` serves, whose handoffable responses register with
 /// `handoff`, the node's registry of the responses a hot restart hands over.
 ///
-/// Every engine serves the operational routes `/health` and `/metrics`,
-/// which take no API key and are not counted in HTTP metrics, and `/version`,
-/// which takes the key but is not counted. `GET /v1/models` and the routes of
+/// Every engine serves the operational route `/health`, which takes no API key
+/// and is not recorded, and `/version`, which takes the key but is not
+/// recorded. `GET /v1/models` and the routes of
 /// each served task (`Leader::supported_tasks`) take the key and are counted.
 /// The generation routes (chat completions, image generation and synchronous
 /// video) share the in-flight limit. A path no
@@ -286,9 +285,9 @@ pub(crate) fn retire_deployment(deployment: &str) -> Result<()> {
 ///
 /// Layers apply from the outside in: request ID (which also sets the
 /// `X-Request-Id` response header when enabled), tracing, body limit, API
-/// key, HTTP metrics, the concurrency limit, and the request timeout, so a
-/// shed or timed-out request is counted in HTTP metrics and carries its
-/// request ID.
+/// key, the HTTP record (`middleware::track_http_metrics`), the concurrency
+/// limit, and the request timeout, so a shed or timed-out request is recorded
+/// and carries its request ID.
 pub(crate) fn router(
     engine: Arc<Leader>,
     jobs: Arc<VideoJobs>,
@@ -296,8 +295,8 @@ pub(crate) fn router(
     video_body_limit: usize,
     handoff: Arc<handoff::Handoff>,
 ) -> Router {
-    // Every route and layer records into, and renders, the deployment's own registry.
-    let metrics = Arc::clone(engine.metrics());
+    // Every route is recorded into the deployment's own observation store.
+    let recorder = engine.recorder().clone();
     let timeout = |router: Router| match server.request_timeout {
         Some(timeout) => router.layer(from_fn(move |request: Request, next: Next| {
             middleware::enforce_timeout(timeout, request, next)
@@ -345,12 +344,11 @@ pub(crate) fn router(
     let generation = limited(timeout(generation), |message| {
         ApiError::service_unavailable("server_overloaded", message).into_response()
     });
-    let api = timeout(api).merge(generation).layer(from_fn({
-        let metrics = Arc::clone(&metrics);
-        move |request: Request, next: Next| {
-            middleware::track_http_metrics(Arc::clone(&metrics), request, next)
-        }
-    }));
+    let api = timeout(api)
+        .merge(generation)
+        .layer(from_fn(move |request: Request, next: Next| {
+            middleware::track_http_metrics(recorder.clone(), request, next)
+        }));
 
     let mut authenticated = Router::new().route("/version", get(version)).merge(api);
     if let Some(key) = &server.api_key {
@@ -365,10 +363,6 @@ pub(crate) fn router(
     Router::new()
         .route("/health", get(health))
         .with_state(engine)
-        .route(
-            "/metrics",
-            get(move || scrape_metrics(Arc::clone(&metrics))),
-        )
         .merge(authenticated)
         .fallback(not_found)
         // Sets the limit that axum's body extractors (`Json`, `Multipart`,
@@ -387,18 +381,6 @@ async fn health(State(engine): State<Arc<Leader>>) -> StatusCode {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
-    }
-}
-
-/// Renders the deployment's metrics in OpenMetrics text format.
-async fn scrape_metrics(metrics: Arc<crate::metrics::Metrics>) -> Response {
-    match metrics.render() {
-        Ok(body) => ([(CONTENT_TYPE, OPENMETRICS_CONTENT_TYPE)], body).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to render metrics: {}", error.as_report()),
-        )
-            .into_response(),
     }
 }
 
@@ -901,10 +883,10 @@ mod tests {
         assert!(not_found(&body), "{body}");
     }
 
-    /// With an API key, every route but `/health` and `/metrics` requires it,
-    /// and a refusal still names its request.
+    /// With an API key, every route but `/health` requires it, and a refusal
+    /// still names its request.
     #[tokio::test]
-    async fn the_api_key_guards_every_route_but_health_and_metrics() {
+    async fn the_api_key_guards_every_route_but_health() {
         let router = router_with(
             served_engine(crate::test_support::CHAT),
             &ServerConfig {
@@ -914,10 +896,12 @@ mod tests {
             },
         );
 
-        for path in ["/health", "/metrics"] {
-            let response = router.clone().oneshot(get_request(path)).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{path}");
-        }
+        let response = router
+            .clone()
+            .oneshot(get_request("/health"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         for path in ["/version", "/v1/models"] {
             let (status, headers, body) = send(&router, get_request(path)).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
@@ -1020,10 +1004,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// HTTP metrics label a request by its route template and method, and
-    /// count an extension method under `other`.
+    /// The HTTP record labels a request by its route template and method, and
+    /// counts an extension method under `other`.
     #[tokio::test]
-    async fn http_metrics_bound_the_method_label() {
+    async fn the_http_record_bounds_the_method_label() {
         let engine = Arc::new(served_engine(crate::test_support::CHAT));
         let router = router(Arc::clone(&engine));
         let request = Request::builder()
@@ -1035,20 +1019,18 @@ mod tests {
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         drop(response);
 
-        let labels = crate::metrics::HttpRequestLabels {
-            method: "other".to_owned(),
-            status: "4xx",
-            handler: "/v1/models".to_owned(),
-        };
-        assert!(
-            engine
-                .metrics()
-                .api_server
-                .http_requests
-                .get_or_create(&labels)
-                .get()
-                >= 1
-        );
+        let rows = engine
+            .recorder()
+            .store()
+            .query(
+                "SELECT sum(value) AS n FROM stats WHERE name = 'uniserve_http_requests_total' \
+                 AND labels['method'] = 'other' AND labels['status'] = '4xx' \
+                 AND labels['handler'] = '/v1/models'",
+            )
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&rows.json().unwrap()).unwrap();
+        assert!(rows[0]["n"].as_f64().unwrap() >= 1.0, "{rows}");
     }
 
     /// Binds a loopback listener on an ephemeral port and returns it with
@@ -1093,6 +1075,7 @@ mod tests {
                 config.video_job_config.clone(),
                 token.child_token(),
             ));
+            let recorder = engine.recorder().clone();
             let brought = node::Brought {
                 config: config.clone(),
                 stated: crate::config::Stated::default(),
@@ -1114,10 +1097,7 @@ mod tests {
                 options: config,
                 deployment: "sim".to_owned(),
                 revisions,
-                store: crate::observation::Store::new(
-                    Arc::new(crate::observation::System),
-                    crate::observation::Retention::default(),
-                )?,
+                recorder,
                 instance,
                 ready,
                 shutdown,

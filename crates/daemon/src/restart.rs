@@ -844,8 +844,21 @@ async fn prepared_successor(
         service_fds,
     )
     .context("resuming the node's daemon service")?;
+    // The deployment's revisions and its observation store, which the adopted engines' processes
+    // and reports write from the first one on.
+    let revisions = Arc::new(crate::policy::revision::Revisions::open(
+        crate::policy::revision::directory(&prepare.deployment)?,
+    )?);
+    let recorder = crate::observation::record::Recorder::new(
+        crate::observation::Store::new(
+            Arc::new(crate::observation::System),
+            crate::observation::Retention::default(),
+        )
+        .context("creating the observation store")?,
+        revisions.current()?.unwrap_or(0),
+    );
     let (updates, awake) = daemon
-        .updater(prepare.deployment.clone())
+        .updater(prepare.deployment.clone(), recorder.clone())
         .context("the leader's daemon commands no engine")?;
     let epoch_records = Arc::clone(updates.epochs());
     Daemon::advance_updates(Arc::clone(&updates), awake)
@@ -853,7 +866,7 @@ async fn prepared_successor(
     let control = Arc::new(control);
     let adopting = Arc::clone(&control);
     let daemon_options = config.clone();
-    let metrics = Arc::clone(&prepared.metrics);
+    let reporting = recorder.clone();
     let adopted = tokio::task::spawn_blocking(move || {
         replicas
             .into_iter()
@@ -869,12 +882,7 @@ async fn prepared_successor(
                 let observer = Arc::new(crate::observe::Observer::new(crate::observe::span(
                     &options.update_config,
                 )));
-                let sink = stats_sink(
-                    options.model().to_owned(),
-                    Arc::clone(&observer),
-                    Arc::clone(&metrics),
-                    index,
-                );
+                let sink = stats_sink(Arc::clone(&observer), reporting.clone(), index);
                 let client = adopting.adopt(
                     replica.engine,
                     replica.next_engine,
@@ -901,6 +909,7 @@ async fn prepared_successor(
             served,
             observer,
             updates,
+            recorder.clone(),
         )
         .context("finishing the deployment the takeover names")?,
     );
@@ -932,7 +941,7 @@ async fn prepared_successor(
             &options,
             Arc::new(client),
             observer,
-            Arc::clone(leader.metrics()),
+            recorder.clone(),
             index + 1,
             Arc::downgrade(&leader.replicas),
             Arc::clone(&leader.replicas.adapters),
@@ -1082,19 +1091,12 @@ async fn prepared_successor(
     });
 
     // From here the successor's node serves the adopted deployment as any node serves one.
-    let revisions = Arc::new(crate::policy::revision::Revisions::open(
-        crate::policy::revision::directory(&prepare.deployment)?,
-    )?);
     let start = crate::http::node::Start {
         families: families.clone(),
         options: config.clone(),
         deployment: prepare.deployment.clone(),
         revisions,
-        store: crate::observation::Store::new(
-            Arc::new(crate::observation::System),
-            crate::observation::Retention::default(),
-        )
-        .context("creating the observation store")?,
+        recorder,
         instance,
         ready,
         shutdown,
