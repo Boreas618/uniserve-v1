@@ -17,6 +17,16 @@ pub struct StreamTime {
     pub state: String,
 }
 
+/// One operator launch of a descriptor key: the key of
+/// [`ForwardStats::kernel_launches`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct KernelLaunch {
+    /// The operator, as its package names it (`gemm`, `index`, ...).
+    pub operator: String,
+    /// The descriptor key its launch was bound under.
+    pub key: String,
+}
+
 /// One driver call one serving thread made that waited for the device: the
 /// key of [`ForwardStats::blocking_calls`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -81,6 +91,11 @@ pub struct ForwardStats {
     /// Fence probe records the rank's reader lost: overwritten before it
     /// read them.
     pub fence_records_lost: u64,
+    /// The operator launches of the rank's serving forwards, by operator and descriptor key:
+    /// each entry of a replayed graph's launch table, and of the profile run's table of a
+    /// forward run eagerly. A rank states them about once a second rather than with every
+    /// batch, and a report holds what accumulated since the rank last stated them.
+    pub kernel_launches: BTreeMap<KernelLaunch, u64>,
     /// Each profiling session's progress on the rank, by session.
     pub profile: BTreeMap<u64, ProfileProgress>,
     /// Attention kernel launch count.
@@ -152,6 +167,7 @@ impl ForwardStats {
     pub fn merge(&mut self, other: &Self) {
         add_counts(&mut self.stream_us, &other.stream_us);
         add_counts(&mut self.blocking_calls, &other.blocking_calls);
+        add_counts(&mut self.kernel_launches, &other.kernel_launches);
         for (target, values) in [
             (&mut self.mode_counts, &other.mode_counts),
             (&mut self.mode_tokens, &other.mode_tokens),
@@ -247,6 +263,7 @@ impl ForwardStats {
             && self.stream_us.is_empty()
             && self.blocking_calls.is_empty()
             && self.fence_seconds.is_empty()
+            && self.kernel_launches.is_empty()
             && self.fence_records_lost == 0
             && self.profile.is_empty()
             && self.attention_launches == 0

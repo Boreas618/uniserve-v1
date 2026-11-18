@@ -484,6 +484,13 @@ impl Recorder {
             at.insert("state".to_owned(), time.state.clone());
             self.add("uniserve_stream_seconds_total", &at, revision, seconds(us));
         }
+        // The kernel inventory: what each operator launched under each descriptor key, which
+        // `uniserve build-server build --keys` reads a deployment's key list from.
+        for (launch, &count) in &worker.kernel_launches {
+            let mut at = with(labels, "op", &launch.operator);
+            at.insert("descriptor".to_owned(), launch.key.clone());
+            self.add("uniserve_kernel_launches_total", &at, revision, count as f64);
+        }
         for (call, &count) in &worker.blocking_calls {
             let mut at = with(labels, "thread", &call.thread);
             at.insert("call".to_owned(), call.call.clone());
@@ -915,8 +922,9 @@ mod tests {
         assert_eq!(moved[0]["n"], 0);
     }
 
-    /// A domain's calls and times are counted under their domain and kind, and the fence probes'
-    /// step durations are one histogram per phase and module class, in seconds.
+    /// A domain's calls and times are counted under their domain and kind, the fence probes'
+    /// step durations are one histogram per phase and module class, in seconds, and the kernel
+    /// inventory is one counter per operator and descriptor key.
     #[tokio::test]
     async fn breakdowns_are_labelled_by_their_keys() {
         let recorder = recorder();
@@ -938,6 +946,14 @@ mod tests {
                         module: "step".to_owned(),
                     },
                     fence,
+                )]
+                .into(),
+                kernel_launches: [(
+                    proto::report::KernelLaunch {
+                        operator: "gemm".to_owned(),
+                        key: "m128_n256".to_owned(),
+                    },
+                    96,
                 )]
                 .into(),
                 ..ForwardStats::default()
@@ -975,6 +991,17 @@ mod tests {
         .await;
         assert_eq!(step[0]["histogram"]["count"], 2);
         assert_eq!(step[0]["histogram"]["max"], 0.004);
+        let kernels = rows(
+            store,
+            "SELECT labels['op'] AS op, labels['descriptor'] AS descriptor, sum(value) AS launches \
+             FROM stats WHERE name = 'uniserve_kernel_launches_total' GROUP BY 1, 2",
+        )
+        .await;
+        assert_eq!(kernels.len(), 1);
+        assert_eq!(
+            (&kernels[0]["op"], &kernels[0]["descriptor"], &kernels[0]["launches"]),
+            (&"gemm".into(), &"m128_n256".into(), &96.0.into())
+        );
     }
 
     /// A finished request is one `request` event with its lengths and latencies, and one count

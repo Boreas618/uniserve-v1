@@ -5,8 +5,8 @@
 use crate::request::wire;
 
 use super::{
-    BaseCacheStats, BlockingCall, DomainSchedulerStats, FenceStep, ForwardStats, PrefixCacheStats,
-    ProfileProgress, SchedulerStats, StreamTime,
+    BaseCacheStats, BlockingCall, DomainSchedulerStats, FenceStep, ForwardStats, KernelLaunch,
+    PrefixCacheStats, ProfileProgress, SchedulerStats, StreamTime,
 };
 
 impl From<&SchedulerStats> for wire::SchedulerStats {
@@ -194,6 +194,15 @@ impl From<&ForwardStats> for wire::ForwardStats {
                 })
                 .collect(),
             fence_records_lost: stats.fence_records_lost,
+            kernel_launches: stats
+                .kernel_launches
+                .iter()
+                .map(|(launch, &count)| wire::KernelLaunches {
+                    operator: launch.operator.clone(),
+                    key: launch.key.clone(),
+                    count,
+                })
+                .collect(),
             profile: stats
                 .profile
                 .iter()
@@ -260,6 +269,17 @@ impl From<wire::ForwardStats> for ForwardStats {
                         module: step.module,
                     };
                     (key, step.histogram.map(Into::into).unwrap_or_default())
+                })
+                .collect(),
+            kernel_launches: stats
+                .kernel_launches
+                .into_iter()
+                .map(|launch| {
+                    let key = KernelLaunch {
+                        operator: launch.operator,
+                        key: launch.key,
+                    };
+                    (key, launch.count)
                 })
                 .collect(),
             fence_records_lost: stats.fence_records_lost,
@@ -350,6 +370,14 @@ mod tests {
                     module: "step".to_owned(),
                 },
                 fence,
+            )]
+            .into(),
+            kernel_launches: [(
+                KernelLaunch {
+                    operator: "gemm".to_owned(),
+                    key: "m128_n256".to_owned(),
+                },
+                9,
             )]
             .into(),
             spec_verify_accepted_tokens: 3,

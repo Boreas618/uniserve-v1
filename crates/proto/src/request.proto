@@ -867,6 +867,8 @@ message ForwardStats {
   map<string, uint64> spec_verify_path_counts = 28;
   // Each profiling session's progress on the rank, by session.
   map<uint64, ProfileProgress> profile = 29;
+  // The operator launches of the rank's serving forwards by operator and descriptor key.
+  repeated KernelLaunches kernel_launches = 30;
 }
 
 // One profiling session's progress on a rank: the steps of its window it
@@ -894,6 +896,13 @@ message StreamTime {
   string stream = 1;
   string state = 2;
   uint64 us = 3;
+}
+
+// The launches of one operator under one descriptor key (`ForwardStats.kernel_launches`).
+message KernelLaunches {
+  string operator = 1;
+  string key = 2;
+  uint64 count = 3;
 }
 
 // The driver calls one serving thread made that waited for the device

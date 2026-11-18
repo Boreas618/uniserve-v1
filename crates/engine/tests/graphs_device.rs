@@ -557,6 +557,10 @@ fn a_replay_computes_what_the_eager_forward_and_the_host_formula_compute() -> Ou
         assert!(!captured.is_empty());
     }
 
+    // Every forward counts each launch of its table under its operator and key, a replay and
+    // an eager forward of one bucket alike.
+    let mut launched = std::collections::BTreeMap::new();
+    bench.runner.graphs.take_kernels();
     for (ids, bound) in [(vec![3_u32, 7, 11, 2], 32_u32), (vec![5, 9], 48)] {
         let replayed = bench.step(&ids, bound)?;
 
@@ -569,7 +573,20 @@ fn a_replay_computes_what_the_eager_forward_and_the_host_formula_compute() -> Ou
         assert_eq!(replayed, eager);
 
         assert!(close(&replayed, &host_logits(&ids, bound)?));
+        for (operator, key, _) in bench.runner.graphs.launch_table(&bucket).unwrap() {
+            // A graph break is an entry of the table, not a launch.
+            if operator == ops::breaks::BREAK {
+                continue;
+            }
+            let launch = proto::report::KernelLaunch {
+                operator: operator.to_owned(),
+                key,
+            };
+            *launched.entry(launch).or_insert(0_u64) += 2;
+        }
     }
+    assert_eq!(bench.runner.graphs.take_kernels(), launched);
+    assert!(bench.runner.graphs.take_kernels().is_empty());
     Ok(())
 }
 

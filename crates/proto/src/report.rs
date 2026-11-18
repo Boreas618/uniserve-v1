@@ -14,10 +14,7 @@
 mod forward;
 mod wire;
 
-pub use forward::{
-    BlockingCall, FenceStep, ForwardStats, ProfileProgress,
-    StreamTime,
-};
+pub use forward::{BlockingCall, FenceStep, ForwardStats, KernelLaunch, ProfileProgress, StreamTime};
 use serde::{Deserialize, Serialize};
 
 /// Cache query and hit counters for one reporting interval.

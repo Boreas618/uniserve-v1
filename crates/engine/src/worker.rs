@@ -38,7 +38,7 @@
 //! - a **wait** for stream events, which deferred storage release hangs on;
 //! - a **control operation**: a closure the worker calls with its runners. This is how a
 //!   memory owner or the engine runs what must happen at a batch boundary, with nothing in
-//!   flight on the device: suspending and restoring graph storage, a weight update. Work a
+//!   flight on the device: suspending and restoring graph storage, an expert commit. Work a
 //!   storage owner decides on another thread is issued this way too, so nothing but the worker
 //!   issues on the device's streams.
 //!
@@ -201,6 +201,10 @@ use self::capture::{Capturer, Key, Readiness, Work};
 /// whether it was issued; and the runners, by index, that were handed copies, whose copies the
 /// batch's end waits for.
 type Started = (Vec<(RequestId, bool)>, Vec<usize>);
+
+/// How often a rank states its serving forwards' operator launches with a batch result
+/// (`ForwardStats::kernel_launches`): the daemon's statistics period.
+const KERNEL_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A control operation: what the worker calls with its runners at a batch boundary, with
 /// nothing in flight on the device. The runners are in the order the worker was given them,
@@ -568,6 +572,7 @@ impl Worker {
             session: None,
             blocking: Calls::default(),
             forwards: (0, 0),
+            kernels_stated: std::time::Instant::now(),
             tables,
             copy_budget,
             sequences,
@@ -1019,6 +1024,8 @@ struct Thread {
     /// The runners' serving forwards, graphs replayed and forwards run eagerly, summed over the
     /// runners, when its last batch output left ([`Thread::forwards`]).
     forwards: (u64, u64),
+    /// When the rank last stated its operator launches ([`KERNEL_PERIOD`]).
+    kernels_stated: std::time::Instant,
     /// The rank's device block tables.
     tables: BlockTables,
     /// The bytes, summed over the group's ranks, that the copies started with one batch may
@@ -1475,6 +1482,23 @@ impl Thread {
                 ran,
                 step_us,
             );
+            // The operator launches go with a result about once a second: expanding the steps'
+            // forwards through their launch tables costs a map entry per launch of a table.
+            if self.kernels_stated.elapsed() >= KERNEL_PERIOD {
+                self.kernels_stated = std::time::Instant::now();
+                let mut kernels = BTreeMap::new();
+                for runner in &self.runners {
+                    for (launch, count) in runner.graphs().take_kernels() {
+                        *kernels.entry(launch).or_default() += count;
+                    }
+                }
+                if !kernels.is_empty() {
+                    output
+                        .forward_stats
+                        .get_or_insert_with(Default::default)
+                        .kernel_launches = kernels;
+                }
+            }
         }
         self.counters.steps.fetch_add(1, Ordering::Relaxed);
 

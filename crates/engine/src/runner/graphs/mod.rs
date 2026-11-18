@@ -79,7 +79,9 @@ mod input_buffer;
 mod shadow;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use proto::report::KernelLaunch;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -226,6 +228,14 @@ struct State {
     /// forwards run eagerly ([`Graphs::forwards`]).
     replays: u64,
     eager: u64,
+    /// The serving forwards not yet counted by operator and key, by bucket and the generation
+    /// of the graph replayed (`None` for a forward run eagerly, which launched what the
+    /// bucket's profile run did). A step only adds to its entry; [`Graphs::take_kernels`]
+    /// expands the entries through their launch tables, and a graph is expanded before it is
+    /// released ([`State::settle`]).
+    pending: HashMap<(Bucket, Option<u64>), u64>,
+    /// The operator launches counted from `pending` and not yet taken.
+    kernels: BTreeMap<KernelLaunch, u64>,
 }
 
 /// The step prepared for a bucket ([`Graphs::prepare_inputs`], [`Graphs::unpaired`]).
@@ -834,6 +844,7 @@ impl Graphs {
             launches,
             replays,
             uses,
+            pending,
             ..
         } = &mut *state;
         let graph = graphs.get_mut(&(*bucket, generation)).ok_or_else(|| {
@@ -864,6 +875,7 @@ impl Graphs {
         *launches += executable.kernel_nodes();
         *replays += 1;
         *uses.entry(*bucket).or_default() += 1;
+        *pending.entry((*bucket, Some(generation))).or_default() += 1;
 
         Ok(graph.outputs.clone())
     }
@@ -908,6 +920,7 @@ impl Graphs {
             });
             state.launches += launched;
             state.eager += 1;
+            *state.pending.entry((*bucket, None)).or_default() += 1;
         }
         outputs
     }
@@ -918,6 +931,15 @@ impl Graphs {
     /// launch none.
     pub(crate) fn launches(&self) -> u64 {
         self.state.borrow().launches
+    }
+
+    /// The operator launches of the serving forwards since the last take, by operator and
+    /// descriptor key: each entry of a replayed graph's launch table, and of the profile run's
+    /// table of a forward run eagerly.
+    pub fn take_kernels(&self) -> BTreeMap<KernelLaunch, u64> {
+        let mut state = self.state.borrow_mut();
+        state.settle();
+        std::mem::take(&mut state.kernels)
     }
 
     /// The serving forwards of these graphs since they were made, by how they ran: the graphs
@@ -1496,6 +1518,7 @@ impl Graphs {
             })
             .copied()
             .collect();
+        state.settle();
         for key in replaced {
             state.graphs.remove(&key);
         }
@@ -1540,6 +1563,7 @@ impl Graphs {
             }
             state.serving = kept;
         }
+        state.settle();
         state
             .graphs
             .retain(|(_, generation), _| *generation != number);
@@ -1722,6 +1746,31 @@ impl State {
             launches: 0,
             replays: 0,
             eager: 0,
+            pending: HashMap::new(),
+            kernels: BTreeMap::new(),
+        }
+    }
+
+    /// Counts every pending forward by operator and descriptor key, through the launch table of
+    /// the graph it replayed or the profile run of the bucket it ran eagerly. A forward whose
+    /// table is gone counts nothing; every graph is settled before it is released.
+    fn settle(&mut self) {
+        for ((bucket, generation), forwards) in self.pending.drain() {
+            let table = match generation {
+                Some(generation) => self.graphs.get(&(bucket, generation)).map(|graph| &graph.table),
+                None => self.profiles.get(&bucket),
+            };
+            for (operator, key, _) in table.into_iter().flatten() {
+                // A graph break is an entry of the table, not a launch.
+                if *operator == BREAK {
+                    continue;
+                }
+                let launch = KernelLaunch {
+                    operator: (*operator).to_owned(),
+                    key: key.clone(),
+                };
+                *self.kernels.entry(launch).or_default() += forwards;
+            }
         }
     }
 
