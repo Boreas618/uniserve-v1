@@ -17,11 +17,17 @@ publish = false
 # The strict push parser a JSON tool call is read with as it streams.
 actson.workspace = true
 anyhow.workspace = true
+# The record batches of the observation tables and their JSON and Arrow IPC encodings.
+arrow.workspace = true
 asynk-strim-attr.workspace = true
+# The `TableProvider` trait of DataFusion, which the observation tables implement, is an async trait.
+async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
+# The SQL engine the observation tables are queried with (`observation`).
+datafusion.workspace = true
 # The tokenizer's decoder chain, which the served tokenizer loads.
 fastokens.workspace = true
 futures.workspace = true

@@ -130,6 +130,10 @@ half = "2.5.0"
 # A push JSON parser, which reads a streamed tool call's object byte by byte as it is generated.
 actson = "2.1.0"
 anyhow = "1.0.100"
+# The columnar format the observation tables are stored, queried and returned in: the record
+# batches DataFusion scans, the JSON rows and the Arrow IPC stream `/admin/query` answers with.
+# The version is the one DataFusion is built on.
+arrow = { version = "59.2.0", default-features = false, features = ["ipc", "json"] }
 async-stream = "0.3.6"
 async-trait = "0.1.89"
 arc-swap = "1.9.0"
@@ -140,6 +144,8 @@ base64 = "0.22.1"
 bytemuck = "1.25.0"
 bitflags = { version = "2.10.0", features = ["serde"] }
 bytes = "1.11.1"
+# The SQL engine the observation tables are queried with (`/admin/query`).
+datafusion = { version = "55.3.0", default-features = false, features = ["sql", "nested_expressions"] }
 clap = { version = "4.5.38", features = ["derive", "env"] }
 criterion = "0.5.1"
 educe = "0.6.0"
