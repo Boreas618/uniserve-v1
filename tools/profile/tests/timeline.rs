@@ -229,6 +229,34 @@ fn overlapping_spans_that_do_not_nest_take_another_track() {
     );
 }
 
+/// The ranks of two worker groups, the schedulers of a replica and the
+/// Storage Servers of two hosts are processes of their own, named by every
+/// label that places them.
+#[test]
+fn every_placing_label_separates_processes() {
+    let at = |labels: Value| json!({"labels": labels, "fields": {"start": "0", "end": "1", "stage": "s"}});
+    let rows = json!([
+        at(json!({"process": "worker", "replica": "0", "group": "0", "rank": "0"})),
+        at(json!({"process": "worker", "replica": "0", "group": "1", "rank": "0"})),
+        at(json!({"process": "scheduler", "replica": "0", "scheduler": "1"})),
+        at(json!({"process": "storage", "host": "rank-1"})),
+        at(json!({"process": "storage", "host": "rank-2"}))
+    ]);
+    let trace = timeline::convert(&spans(&rows)).expect("a trace");
+
+    let names: Vec<String> = processes(&trace).into_keys().collect();
+    assert_eq!(
+        names,
+        [
+            "scheduler (replica 0, scheduler 1)",
+            "storage (host rank-1)",
+            "storage (host rank-2)",
+            "worker (replica 0, group 0, rank 0)",
+            "worker (replica 0, group 1, rank 0)",
+        ]
+    );
+}
+
 /// A span without its times names the span and the missing field.
 #[test]
 fn a_span_without_its_end_is_refused() {

@@ -3,21 +3,24 @@
 //!
 //! The engine-side timeline writes every host stage and every timed kernel as
 //! a row of the observation store's `events` table with `kind = 'span'`:
-//! labels `replica`, `process` (`daemon`, `scheduler`, `worker`, `storage`)
-//! and, for a worker, `rank`; fields `start` and `end` (nanoseconds since the
-//! Unix epoch on the host clock), `request` (a request's id) or `batch` (a
-//! batch id), and `stage` (a host stage's name) or `kernel` (the kernel's
-//! `op` and `descriptor` are labels). A row that names both a request and a
-//! batch is the scheduler's membership record of the request in the batch.
+//! labels `process` (`daemon`, `scheduler`, `worker`, `storage`), an engine's
+//! `replica`, a daemon's or Storage Server's `host`, a scheduler's `scheduler`
+//! and a worker's `group` and `rank`; fields `start` and `end` (nanoseconds
+//! since the Unix epoch on the host clock), `request` (a request's trace id)
+//! or `batch` (`<epoch>.<batch id>`), and `stage` (a host stage's name) or
+//! `kernel` (the kernel's operator; `op`, `descriptor` and `module` are
+//! labels). A row that names both a request and a batch is the scheduler's
+//! membership record of the request in the batch.
 //!
-//! The trace has a process per place a span ran (replica, process, rank),
-//! ordered daemon, scheduler, worker, storage. In each, the spans of one
-//! request share a track and the spans of batches share tracks of their
-//! own; a span that overlaps an earlier one of its track without nesting in
-//! it takes another track of the same name. A membership record is a slice
-//! on its request's track, and a flow arrow joins it to the first span of
-//! its batch in every process, so a request's batches and their kernels are
-//! one click away. Times start at the earliest span, in microseconds.
+//! The trace has a process per place a span ran (replica, host, process,
+//! scheduler, group, rank), ordered daemon, scheduler, worker, storage. In
+//! each, the spans of one request share a track and the spans of batches
+//! share tracks of their own; a span that overlaps an earlier one of its
+//! track without nesting in it takes another track of the same name. A
+//! membership record is a slice on its request's track, and a flow arrow
+//! joins it to the first span of its batch in every process, so a request's
+//! batches and their kernels are one click away. Times start at the earliest
+//! span, in microseconds.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,7 +35,7 @@ use crate::perfetto::{document, slice, track};
 
 /// The labels that place a span's process; every other label is an argument
 /// of its slice.
-const PLACE: [&str; 3] = ["replica", "process", "rank"];
+const PLACE: [&str; 6] = ["replica", "host", "process", "scheduler", "group", "rank"];
 
 /// The fields that time a span; every other field is an argument of its
 /// slice.
@@ -132,8 +135,12 @@ fn ordinal(value: Option<&String>) -> Ordinal {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Place {
     replica: Ordinal,
+    /// The node of a daemon's or a Storage Server's span.
+    host: Ordinal,
     /// The process's position in a request's path, then its name.
     process: (u8, String),
+    scheduler: Ordinal,
+    group: Ordinal,
     rank: Ordinal,
 }
 
@@ -152,19 +159,28 @@ impl Place {
         };
         Ok(Self {
             replica: ordinal(span.labels.get("replica")),
+            host: ordinal(span.labels.get("host")),
             process: (position, process.clone()),
+            scheduler: ordinal(span.labels.get("scheduler")),
+            group: ordinal(span.labels.get("group")),
             rank: ordinal(span.labels.get("rank")),
         })
     }
 
-    /// The process's name in the trace, such as `worker (replica 0, rank 3)`.
+    /// The process's name in the trace, such as `worker (replica 0, group 1, rank 3)`.
     fn name(&self) -> String {
         let mut place = Vec::new();
-        if let Some(replica) = &self.replica.1 {
-            place.push(format!("replica {replica}"));
-        }
-        if let Some(rank) = &self.rank.1 {
-            place.push(format!("rank {rank}"));
+        let named = [
+            ("replica", &self.replica),
+            ("host", &self.host),
+            ("scheduler", &self.scheduler),
+            ("group", &self.group),
+            ("rank", &self.rank),
+        ];
+        for (label, value) in named {
+            if let Some(value) = &value.1 {
+                place.push(format!("{label} {value}"));
+            }
         }
         if place.is_empty() {
             self.process.1.clone()
