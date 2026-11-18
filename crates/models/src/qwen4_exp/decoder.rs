@@ -15,7 +15,7 @@
 //! into the streams. That boundary is the one vLLM's kernel chain and its fused layer kernels
 //! have, so a layer is the unit either computes.
 
-use nn::family::TextPlacement;
+use nn::family::{ExpertOrder, TextPlacement};
 use nn::functional::Rounding;
 use nn::modules::{
     GateUp, GatedDeltaNet, GatedDeltaNetConfig, MlpConfig, MoE, Rotary, SharedExpert,
@@ -65,8 +65,10 @@ impl DecoderLayer {
     /// `linear` loads a gated delta network as the mixer in place of indexed attention, and
     /// `ple` the PLE layer the layer holds. The routed experts are held at the placement's share
     /// of them (its window of the expert group's slots, or of the tensor group's when that group
-    /// holds whole experts) in the slots `order` states, or in the checkpoint's order when it
-    /// states none.
+    /// holds whole experts). `stack` is the layer's index in the model's own decoder stack and
+    /// the deployment's expert order, which name its routed block and its slots
+    /// ([`nn::causal_lm::MoeConfig::block`]); `None` for a layer outside the stack, which holds
+    /// its experts in the checkpoint's order.
     ///
     /// # Errors
     ///
@@ -77,7 +79,7 @@ impl DecoderLayer {
         linear: bool,
         ple: bool,
         placement: &TextPlacement,
-        order: Option<&Vec<u32>>,
+        stack: Option<(u32, &ExpertOrder)>,
     ) -> Result<Self> {
         let (tensor, draft_tokens) = (placement.tensor, placement.draft_tokens);
         let (text, moe) = (&config.text, &config.moe);
@@ -100,7 +102,7 @@ impl DecoderLayer {
             )
         };
 
-        let block = moe.block(text.hidden_size, text.hidden_act, placement, order);
+        let block = moe.block(text.hidden_size, text.hidden_act, placement, stack);
         let shared = SharedExpertConfig {
             mlp: MlpConfig {
                 hidden: text.hidden_size,

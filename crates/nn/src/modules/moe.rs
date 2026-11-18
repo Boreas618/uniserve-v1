@@ -30,6 +30,15 @@
 //! not depend on where they lie. A deployment that redistributes its experts states another
 //! order, and the same checkpoint loads under it.
 //!
+//! ## Expert load
+//!
+//! A block of the model's own stack is named among its routed layers ([`MoEConfig::name`]),
+//! and a serving forward counts, by that name, the tokens each of its experts takes: the top-k of
+//! [`MoE::forward`] adds each route of a live token into the counters execution's context lends
+//! the layer ([`ops::moe::ExpertLoad`]), at the expert's own id, so the counts do not depend on
+//! the order either. A forward under a context that lends none, and [`MoE::route`], count
+//! nothing.
+//!
 //! ## Parallelism
 //!
 //! Over a tensor-parallel group ([`MoEConfig::split`]) a rank holds its block of every expert's
@@ -115,6 +124,11 @@ pub struct MoEConfig {
     pub tensor_experts: bool,
     /// The expert group's split of the slots: this rank holds one contiguous window of them.
     pub exchange: Split,
+    /// The block's module path among the model's routed layers
+    /// ([`crate::causal_lm::expert_module`]): the name a deployment's expert order and
+    /// execution's expert load state the layer by. `None` for a block outside the model's own
+    /// decoder stack, such as a drafter's, which neither names.
+    pub name: Option<String>,
 }
 
 /// How a checkpoint's architecture stores a block's dense experts, as its schema declares it.
@@ -179,6 +193,9 @@ pub struct MoE {
     /// Ranks of the tensor-parallel group the experts' gated width or slots are split over:
     /// above one, the output is a partial sum the forward reduces.
     reduce: u32,
+    /// The layer's name among the model's routed layers, by which its forwards find the
+    /// expert load execution lends ([`MoEConfig::name`]).
+    name: Option<String>,
 }
 
 impl MoE {
@@ -321,6 +338,7 @@ impl MoE {
             // The tensor group sums its ranks' outputs whether it divides each expert's width
             // or the slots.
             reduce: config.split.size(),
+            name: config.name.clone(),
         })
     }
 
@@ -622,12 +640,33 @@ impl MoE {
     ///
     /// Rows of another width, or an operator's refusal.
     pub fn route(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.select(x, None, None)
+    }
+
+    /// The forward's routing of `x`: [`MoE::route`], with each route of the batch's live token
+    /// rows (`live_tokens`, every row without it) counted into the layer's expert load when the
+    /// installed context lends one under the block's name.
+    fn routed_ids(&self, x: &Tensor, live_tokens: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
+        let load = self.name.as_deref().and_then(ops::moe::layer_load);
+
+        self.select(x, live_tokens, load.as_ref())
+    }
+
+    /// The router's product and top-k over `x`, adding the live routes into `load` when given.
+    fn select(
+        &self,
+        x: &Tensor,
+        live_tokens: Option<&Tensor>,
+        load: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
         functional::topk_softmax(
             &self.router.forward(x)?,
             self.top,
             self.renormalize,
             None,
             Some(&self.map),
+            live_tokens,
+            load,
         )
     }
 
@@ -729,7 +768,7 @@ impl MoE {
 
     /// The block over this rank's own experts: every route's products, and their weighted sum.
     fn routed(&self, x: &Tensor, live_tokens: Option<&Tensor>) -> Result<Tensor> {
-        let (ids, weights) = self.route(x)?;
+        let (ids, weights) = self.routed_ids(x, live_tokens)?;
         let maps =
             functional::moe_sort(&ids, &weights, self.count, self.local.clone(), live_tokens)?;
 
@@ -786,7 +825,7 @@ impl MoE {
 
         // The top-k writes slots, so no expert's own id leaves the rank and a peer sorts by the
         // order the stacks are laid out in.
-        let (ids, weights) = self.route(x)?;
+        let (ids, weights) = self.routed_ids(x, live_tokens)?;
         self.exchange_routes(x, &ids, &weights, live_tokens, exchange)
     }
 

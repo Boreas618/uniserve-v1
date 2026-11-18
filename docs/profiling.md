@@ -42,6 +42,26 @@ Each probe thus costs about a microsecond of every step even when switched off, 
 
 `profiling_config.fence_probes = false` switches every probe off in place: a package that states it, applied with `PUT /admin/policy`, has the process write its devices' switches, and the graphs keep their probes, each of which then returns at once. Changing `fence_modules` changes which modules carry probes in the captured graphs, which is a new epoch (`docs/admin.md`).
 
+## Expert load
+
+A serving deployment counts the tokens each expert of each routed layer processes, always on, from the router's top-k: the input an expert redistribution balances (`moe_config.expert_order`, [admin](admin.md#expert-redistribution)). Each rank's runner owns one `[experts]` I64 counter per routed layer in its device memory, zeroed when the runner is made, and its launching context lends the counters to the forwards by the layer's module path (`ops::moe::ExpertLoad`). The top-k kernel that selects a layer's experts adds one to the counter of the logical expert of each route of a live token, before the logical-to-physical map writes the route's slot, so the counts do not depend on where the experts lie, and a captured bucket's rows past its batch (beyond `live_tokens`) count nothing. The counters are launch values of the same kernel, so a graph captured with them adds into them on every replay and an eager forward does the same; no kernel is added and no descriptor changes. A rehearsal and a paired forward count nothing, so every served token is counted once.
+
+About once a second, with a batch result, the worker copies its runners' counters to page-locked host memory behind everything its stream holds and records an event behind the copy; the next period reads the copy once that event has completed and states what each counter gained, so no step waits for the device and the counts reach the daemon one period after the steps that made them. The ranks of a tensor-parallel group route the same tokens, so only its first rank counts; pipeline stages and sequence members count their own layers and rows, and a batch's output adds its ranks' counts. A sequence member is not lent the batch's live count, so its share of a bucket's padding rows is counted with its tokens. The daemon records the counts as one counter per expert:
+
+| Metric | Labels | What it counts |
+| --- | --- | --- |
+| `uniserve_expert_tokens_total` | `replica`, `scheduler`, `layer`, `expert` | Tokens the router sent to expert `expert` (the model's own expert id, `0..experts`) of the routed layer at module path `layer` (`layers.N.mlp.experts`, the key `moe_config.expert_order` states it by); an expert that took no token in an interval writes no row |
+
+```sql
+-- Each expert's share of a layer's tokens over the last ten minutes
+SELECT labels['expert'] AS expert, sum(value) AS tokens FROM stats
+WHERE name = 'uniserve_expert_tokens_total' AND labels['layer'] = 'layers.0.mlp.experts'
+  AND time > now() - INTERVAL '10 minutes'
+GROUP BY 1 ORDER BY tokens DESC;
+```
+
+**Cost.** Counting adds no launch: each route of a live token costs its top-k one device-wide atomic add, and the host's read is one copy of `8 · Σ experts` bytes a second (48 KiB for Qwen3-30B-A3B's 48 layers of 128 experts), issued behind the stream and never waited for. On GB200 the 48 router launches of one Qwen3-30B-A3B step (BF16 scores over 128 experts, top 8, with the logical-to-physical map), replayed as one CUDA graph, took 163.8 µs a step before the counting and 178.3 µs counting a batch of 1 token, 168.1 and 178.3 µs at 32 tokens, and 174.2 and 193.0 µs at 256 tokens (medians of 30 rounds of 200 replays, standard deviation below 0.1 µs): about 10 µs of a decode step, which against the 6.7 ms step of one request decoding 149.2 tokens a second is 0.15%, and 17 µs at 256 tokens. A rank that counts nothing (a tensor group's other ranks) passes null counters and pays the 4 µs or less the two launch values cost.
+
 ## Profiling sessions
 
 A session attaches collectors to every worker of the executing epoch for a window of steps or seconds, and leaves one SQLite file per worker in a directory it names. A session is the `[profiling_config.session]` table of the deployment's policy package, applied with `PUT /admin/policy` as every change is ([Policy](admin.md#policy)), so one session runs at a time: while the serving revision states the table, the serving epoch's workers run its session from the engine's next step boundary; a package that changes the table ends the running session and starts the one it states, and a package without it ends the running session. The change takes effect at a step and starts no epoch. The table's keys are the fields below:

@@ -496,6 +496,19 @@ impl Recorder {
                 count as f64,
             );
         }
+        // The tokens each routed layer's experts took, by the model's own expert id: what a
+        // redistribution of the experts balances (`moe_config.expert_order`).
+        for (layer, tokens) in &worker.expert_tokens {
+            let at = with(labels, "layer", layer);
+            for (expert, &count) in tokens.iter().enumerate() {
+                self.add(
+                    "uniserve_expert_tokens_total",
+                    &with(&at, "expert", &expert.to_string()),
+                    revision,
+                    count as f64,
+                );
+            }
+        }
         for (call, &count) in &worker.blocking_calls {
             let mut at = with(labels, "thread", &call.thread);
             at.insert("call".to_owned(), call.call.clone());
@@ -940,8 +953,9 @@ mod tests {
     }
 
     /// A domain's calls and times are counted under their domain and kind, the fence probes'
-    /// step durations are one histogram per phase and module class, in seconds, and the kernel
-    /// inventory is one counter per operator and descriptor key.
+    /// step durations are one histogram per phase and module class, in seconds, the kernel
+    /// inventory is one counter per operator and descriptor key, and the experts' tokens one
+    /// counter per routed layer and expert.
     #[tokio::test]
     async fn breakdowns_are_labelled_by_their_keys() {
         let recorder = recorder();
@@ -973,6 +987,7 @@ mod tests {
                     96,
                 )]
                 .into(),
+                expert_tokens: [("layers.3.mlp.experts".to_owned(), vec![5, 0, 2])].into(),
                 ..ForwardStats::default()
             }),
             ..SchedulerStats::default()
@@ -1023,6 +1038,26 @@ mod tests {
             ),
             (&"gemm".into(), &"m128_n256".into(), &96.0.into())
         );
+        // An expert no token was routed to in the interval writes no row.
+        let experts = rows(
+            store,
+            "SELECT labels['replica'] AS replica, labels['scheduler'] AS scheduler, \
+             labels['layer'] AS layer, labels['expert'] AS expert, sum(value) AS tokens \
+             FROM stats WHERE name = 'uniserve_expert_tokens_total' GROUP BY 1, 2, 3, 4 \
+             ORDER BY 4",
+        )
+        .await;
+        assert_eq!(experts.len(), 2);
+        for (row, (expert, tokens)) in experts.iter().zip([("0", 5.0), ("2", 2.0)]) {
+            assert_eq!(
+                (&row["replica"], &row["scheduler"], &row["layer"]),
+                (&"0".into(), &"0".into(), &"layers.3.mlp.experts".into())
+            );
+            assert_eq!(
+                (&row["expert"], &row["tokens"]),
+                (&expert.into(), &tokens.into())
+            );
+        }
     }
 
     /// A finished request is one `request` event with its lengths and latencies, and one count

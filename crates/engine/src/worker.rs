@@ -202,9 +202,10 @@ use self::capture::{Capturer, Key, Readiness, Work};
 /// batch's end waits for.
 type Started = (Vec<(RequestId, bool)>, Vec<usize>);
 
-/// How often a rank states its serving forwards' operator launches with a batch result
-/// (`ForwardStats::kernel_launches`): the daemon's statistics period.
-const KERNEL_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often a rank states with a batch result what its serving forwards accumulated beside the
+/// batches: their operator launches (`ForwardStats::kernel_launches`) and the tokens their routed
+/// layers' experts took (`ForwardStats::expert_tokens`). The daemon's statistics period.
+const COUNT_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A control operation: what the worker calls with its runners at a batch boundary, with
 /// nothing in flight on the device. The runners are in the order the worker was given them,
@@ -572,7 +573,7 @@ impl Worker {
             session: None,
             blocking: Calls::default(),
             forwards: (0, 0),
-            kernels_stated: std::time::Instant::now(),
+            counts_stated: std::time::Instant::now(),
             tables,
             copy_budget,
             sequences,
@@ -1024,8 +1025,8 @@ struct Thread {
     /// The runners' serving forwards, graphs replayed and forwards run eagerly, summed over the
     /// runners, when its last batch output left ([`Thread::forwards`]).
     forwards: (u64, u64),
-    /// When the rank last stated its operator launches ([`KERNEL_PERIOD`]).
-    kernels_stated: std::time::Instant,
+    /// When the rank last stated its operator launches and expert tokens ([`COUNT_PERIOD`]).
+    counts_stated: std::time::Instant,
     /// The rank's device block tables.
     tables: BlockTables,
     /// The bytes, summed over the group's ranks, that the copies started with one batch may
@@ -1482,21 +1483,33 @@ impl Thread {
                 ran,
                 step_us,
             );
-            // The operator launches go with a result about once a second: expanding the steps'
-            // forwards through their launch tables costs a map entry per launch of a table.
-            if self.kernels_stated.elapsed() >= KERNEL_PERIOD {
-                self.kernels_stated = std::time::Instant::now();
-                let mut kernels = BTreeMap::new();
+            // The operator launches and the expert tokens go with a result about once a second:
+            // expanding the steps' forwards through their launch tables costs a map entry per
+            // launch of a table, and the experts' counters are read from the device behind the
+            // stream.
+            if self.counts_stated.elapsed() >= COUNT_PERIOD {
+                self.counts_stated = std::time::Instant::now();
+                let mut counted = proto::report::ForwardStats::default();
                 for runner in &self.runners {
                     for (launch, count) in runner.graphs().take_kernels() {
-                        *kernels.entry(launch).or_default() += count;
+                        *counted.kernel_launches.entry(launch).or_default() += count;
+                    }
+                    // A read the driver refused leaves the counters on the device, whose next
+                    // read states them; the batch's own work is not the read's.
+                    match runner.graphs().take_expert_tokens() {
+                        Ok(tokens) => counted.add_expert_tokens(&tokens),
+                        Err(error) => tracing::warn!(
+                            device = ?self.device,
+                            %error,
+                            "the expert load could not be read"
+                        ),
                     }
                 }
-                if !kernels.is_empty() {
+                if !counted.is_empty() {
                     output
                         .forward_stats
                         .get_or_insert_with(Default::default)
-                        .kernel_launches = kernels;
+                        .merge(&counted);
                 }
             }
         }

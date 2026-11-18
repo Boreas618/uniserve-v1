@@ -200,17 +200,25 @@ impl MoeConfig {
     }
 
     /// The sparse MoE block of a layer of `hidden`-wide rows whose experts gate by
-    /// `activation`, at the ranks `placement` states, its experts in the slots `order` states
-    /// (the checkpoint's own order where it states none): a `gate` router over the list
-    /// `experts`, each expert's `gate_proj`, `up_proj` and `down_proj`, laid out as the
-    /// architecture declares ([`Self::layout`]).
+    /// `activation`, at the ranks `placement` states: a `gate` router over the list `experts`,
+    /// each expert's `gate_proj`, `up_proj` and `down_proj`, laid out as the architecture
+    /// declares ([`Self::layout`]).
+    ///
+    /// `stack` is the block's decoder layer in the model's own stack and the deployment's
+    /// expert order: the block is named by the layer's module ([`expert_module`]), its experts
+    /// held in the slots the order states for it (the checkpoint's own order where it states
+    /// none). A block outside the stack, such as a drafter's, takes `None`: it is named by
+    /// nothing and holds its experts in the checkpoint's order.
     pub fn block(
         &self,
         hidden: u32,
         activation: Activation,
         placement: &TextPlacement,
-        order: Option<&Vec<u32>>,
+        stack: Option<(u32, &ExpertOrder)>,
     ) -> MoEConfig {
+        let name = stack.map(|(layer, _)| expert_module(layer));
+        let order = stack.and_then(|(_, order)| order.get(name.as_deref()?));
+
         MoEConfig {
             hidden,
             intermediate: self.moe_intermediate_size,
@@ -230,6 +238,7 @@ impl MoeConfig {
             split: placement.tensor,
             tensor_experts: placement.tensor_experts,
             exchange: placement.experts,
+            name,
         }
     }
 }

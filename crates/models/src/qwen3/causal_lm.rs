@@ -42,7 +42,7 @@
 
 use std::ops::Range;
 
-use nn::causal_lm::{CausalLmConfig, expert_module};
+use nn::causal_lm::CausalLmConfig;
 use nn::family::{
     CacheShape, ExpertOrder, ExpertShape, SequenceSplit, StateShape, TextModel, TextPlacement,
     TokenHistory,
@@ -168,7 +168,7 @@ impl Qwen3ForCausalLm {
                     text.linear_layers[layer as usize],
                     config.routes(layer),
                     placement,
-                    order.get(&expert_module(layer)),
+                    Some((layer, order)),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
