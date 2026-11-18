@@ -158,6 +158,8 @@ itertools = "0.14.0"
 jsonschema = { version = "0.61.2", default-features = false }
 libc = "0.2.177"
 libloading = "0.8.9"
+# The logging facade a program writes with; its records reach the host through `uniserve.log`.
+log = "0.4.32"
 nvtx = { version = "2.0.0", default-features = false, features = ["std"] }
 llm-multimodal = { git = "https://github.com/vllm-project/llm-multimodal", rev = "5b558989844d1c7af3e43d0f604069ffd9c06320" }
 # Keep scheduler heap mappings out of transparent-huge-page collapse.

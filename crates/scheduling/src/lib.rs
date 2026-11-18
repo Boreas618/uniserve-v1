@@ -1,13 +1,25 @@
-//! The interface between the scheduling mechanism and a scheduling policy.
+//! The interface between the deployment and its programs: the program SDK.
 //!
-//! This crate is compiled into every policy module (wasm32) and into the
-//! mechanism (native), so both sides are built from the same types and the same
-//! wire format. It holds, as design §4.4 gives them, the policy interface, the
-//! events the mechanism hands to the policy, the decisions the policy returns,
-//! the snapshot and views a policy reads, and the parameters and limits of a
-//! policy package.
+//! A policy package's programs are crates compiled to wasm32 modules, each run by a host in its
+//! own instance. This crate is compiled into every program and into every host, so both sides
+//! are built from the same types and the same wire format.
 //!
-//! # One version per release
+//! # Programs
+//!
+//! Every program implements [`program::Program`] (`new`, `step`) and exports itself with
+//! [`export!`]; [`program`] states the exports, the host functions and the call convention, and
+//! [`prelude`] is what a program crate starts from. The inputs and outputs of the programs are
+//! [`control`] (the leader daemon's control programs: [`control::State`] in, a configuration
+//! out), [`routing`] (the leader daemon's routing program: [`routing::Routing`] in,
+//! [`routing::Route`] out) and [`kv`] (the Storage Servers' KV program: handoff paths and
+//! tiering moves).
+//!
+//! # The scheduling policy
+//!
+//! A scheduler's program is the scheduling policy, which keeps its own interface: the policy
+//! interface, the events the mechanism hands to the policy, the decisions the policy returns,
+//! the snapshot and views a policy reads, and the parameters and limits of a policy package
+//! (design §4.4).
 //!
 //! The mechanism and a policy speak one version of this interface,
 //! [`INTERFACE_VERSION`]: a module states the version it was compiled against
@@ -15,8 +27,6 @@
 //! module of another. Every message is decoded as exactly the type this
 //! release declares, so a kind of event, a field or a value of an enum that
 //! the release does not have is refused rather than skipped.
-//!
-//! # The ABI
 //!
 //! A policy module exports the functions named in [`wire`]: `sched_alloc` and
 //! `sched_free` for the linear-memory buffers, and one function per decision
@@ -36,11 +46,16 @@
 pub const INTERFACE_VERSION: u32 = 5;
 
 pub mod abi;
+pub mod control;
 pub mod decision;
 pub mod event;
 pub mod ids;
+pub mod kv;
 pub mod limits;
 pub mod policy;
+pub mod prelude;
+pub mod program;
+pub mod routing;
 pub mod time;
 pub mod view;
 pub mod wire;

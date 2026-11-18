@@ -38,6 +38,12 @@ use crate::wire::{decode, encode, pack};
 /// from the pointer and the same length.
 #[unsafe(no_mangle)]
 pub extern "C" fn sched_alloc(len: u32) -> u32 {
+    allocate(len)
+}
+
+/// A fresh buffer of exactly `len` bytes, which [`release`] frees with the same length: the
+/// allocation behind every module's `alloc` export.
+pub fn allocate(len: u32) -> u32 {
     let len = len as usize;
     let buffer = vec![0u8; len].into_boxed_slice();
     let Ok(ptr) = u32::try_from(Box::into_raw(buffer) as *mut u8 as usize) else {
@@ -55,6 +61,18 @@ pub extern "C" fn sched_alloc(len: u32) -> u32 {
 /// packed, with the length it was allocated or packed with.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sched_free(ptr: u32, len: u32) {
+    // SAFETY: the caller's obligations are `release`'s.
+    unsafe { release(ptr, len) }
+}
+
+/// Frees the buffer of `len` bytes at `ptr` that [`allocate`] or a packed reply made: the
+/// release behind every module's `free` export.
+///
+/// # Safety
+///
+/// `ptr` must come from [`allocate`] or from a reply buffer this module packed, with the length
+/// it was allocated or packed with.
+pub unsafe fn release(ptr: u32, len: u32) {
     if ptr == 0 {
         return;
     }
@@ -87,13 +105,19 @@ fn read<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> T {
 fn reply<T: serde::Serialize>(reply: &T, what: &str) -> u64 {
     let bytes =
         encode(reply).unwrap_or_else(|error| panic!("{what} reply does not encode: {error}"));
+    hand(&bytes)
+}
+
+/// Copies `bytes` into a fresh buffer and packs its pointer and length, `0` for no bytes: the
+/// reply buffer the host reads and frees with the module's `free` export.
+pub fn hand(bytes: &[u8]) -> u64 {
     if bytes.is_empty() {
         return 0;
     }
     let Ok(len) = u32::try_from(bytes.len()) else {
         panic!("a reply fits in a u32 length");
     };
-    let ptr = sched_alloc(len);
+    let ptr = allocate(len);
     // SAFETY: the buffer is exactly `len` bytes, freshly allocated, and
     // nothing else holds it.
     unsafe {
