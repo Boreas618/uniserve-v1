@@ -13,8 +13,12 @@
 //! - **Rehearsal.** A kernel whose first use is host work a capture cannot record (a native
 //!   entry that builds its runner or allocates its workspace on first use) is first used by a
 //!   rehearsal ([`Graphs::rehearse`]): the forward runs eagerly over idle inputs, under a
-//!   rehearsal context ([`ops::Context::rehearsal`]), on a stream of its own and in device memory
-//!   of its own, so it writes no tensor a serving forward reads and meets no other rank.
+//!   rehearsal context ([`ops::Context::rehearsal`]), in device memory of its own, so it writes no
+//!   tensor a serving forward reads and meets no other rank. Its kernels are ordered on the
+//!   runner's stream, between the serving replays: a native library keeps scratch of its own per
+//!   shape (cuBLASLt's workspace of a matmul) that the graphs which call the same library use as
+//!   well, and a rehearsal running beside a replay on another stream writes it while the replay
+//!   reads it.
 //! - **Capture.** The forward is captured on a stream beside the serving one
 //!   ([`Graphs::capture`]), with its launch table, its input copies and its output tensors, and
 //!   instantiated. A capture launches nothing: it only records, so it runs while the runner
@@ -399,9 +403,10 @@ impl Graphs {
     /// Graphs of a rehearsal, for the rehearsal instance of the runner's forward
     /// (`Runner::capturer`): their input tensors and allocator region are a device allocation as
     /// large as the runner's region, made at the first rehearsal and held until
-    /// [`Graphs::release_rehearsal`], and each rehearsal runs on a stream of their own under a
-    /// rehearsal context ([`ops::Context::rehearsal`]). Graphs that hold no device give graphs
-    /// that hold none, whose rehearsals run nothing.
+    /// [`Graphs::release_rehearsal`], and each rehearsal runs under a rehearsal context
+    /// ([`ops::Context::rehearsal`]) on the runner's stream, between its replays (module
+    /// documentation). Graphs that hold no device give graphs that hold none, whose rehearsals
+    /// run nothing.
     ///
     /// # Errors
     ///
@@ -415,7 +420,7 @@ impl Graphs {
         let state = self.state.borrow();
         let kernels = Arc::clone(&state.serving);
         let values = self.input_peak();
-        let stream = Stream::new(cuda.stream.device())?;
+        let stream = cuda.stream.clone();
         let buffer = InputBuffer::pinned(cuda.stream.device(), self.inputs, values, 1)?;
 
         let graphs = Self {
@@ -989,10 +994,11 @@ impl Graphs {
     }
 
     /// Rehearses `bucket` under `kernels`: its forward runs eagerly once over idle inputs
-    /// ([`Forward::idle_inputs`]), on these graphs' stream and in their own device memory, under
-    /// a rehearsal context that issues no collective and no expert exchange. A kernel whose
-    /// first use is host work a capture cannot record does that work here. Returns once the
-    /// stream ran the forward. Graphs that hold no device run nothing.
+    /// ([`Forward::idle_inputs`]), on the runner's stream between its replays and in these
+    /// graphs' own device memory, under a rehearsal context that issues no collective and no
+    /// expert exchange. A kernel whose first use is host work a capture cannot record does that
+    /// work here. Returns once the stream ran the forward. Graphs that hold no device run
+    /// nothing.
     ///
     /// The memory is a region as large as the runner's, allocated at the first rehearsal and
     /// kept for the next ones until [`Graphs::release_rehearsal`]. It is zeroed before each
@@ -1035,17 +1041,17 @@ impl Graphs {
         rehearsal.set_kernels(Arc::clone(kernels));
         self.lend_values(&rehearsal, slot)?;
 
-        let outputs = {
+        let rehearsed = {
             let _guard = rehearsal.enter();
             runner.forward(bucket)
         };
-        drop(outputs.map(drop));
 
         // The forward's copies read the slot, and its kernels the memory: both are free once the
-        // stream ran it.
+        // stream ran what the forward issued, whether it ran to its end or not.
         self.with_buffer(|buffer| buffer.release(slot, &cuda.stream))?;
-        cuda.stream.synchronize()?;
-        Ok(())
+        cuda.done.record(&cuda.stream)?;
+        cuda.done.synchronize()?;
+        rehearsed.map(drop)
     }
 
     /// Releases the memory of the rehearsals, once the generation they served is captured.

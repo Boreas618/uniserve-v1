@@ -1372,6 +1372,64 @@ fn an_executable_takes_a_capture_of_its_topology_in_place() {
     );
 }
 
+/// What an executable costs as the graph it runs grows: the host time of its
+/// instantiation (`cuGraphInstantiate`), of an update of an executable of the
+/// same topology in place (`cuGraphExecUpdate`), and the device memory the
+/// instantiation takes, for graphs of 64 to 8192 kernel nodes. Printed as one
+/// JSON line per size; the update holds because both graphs are one topology.
+#[test]
+#[ignore = "requires a CUDA device; a measurement"]
+fn instantiation_and_update_costs_by_node_count() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let library = kernels(&device);
+    let write = library.kernel("write").unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+    let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
+    let mut out = storage.address();
+
+    // A chain of `nodes` launches of the one kernel, each writing `value`.
+    let mut captured = |nodes: usize, value: u32| {
+        let mut value = value;
+        let capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
+        for _ in 0..nodes {
+            let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut value).cast()];
+            write
+                .launch_ex(
+                    &stream,
+                    &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
+                    &mut parameters,
+                )
+                .unwrap();
+        }
+        capture.end().unwrap()
+    };
+
+    for nodes in [64, 256, 1024, 4096, 8192] {
+        let first = captured(nodes, 1);
+        let second = captured(nodes, 2);
+        assert_eq!(second.node_count().unwrap(), nodes);
+
+        let free = DEVICE.memory_info().unwrap().free;
+        let began = std::time::Instant::now();
+        let exec = first.instantiate().unwrap();
+        let instantiate = began.elapsed();
+        let bytes = free.saturating_sub(DEVICE.memory_info().unwrap().free);
+
+        let began = std::time::Instant::now();
+        exec.update(&second).unwrap();
+        let update = began.elapsed();
+
+        exec.launch(&stream).unwrap();
+        stream.synchronize().unwrap();
+        println!(
+            "{{\"nodes\":{nodes},\"instantiate_us\":{},\"update_us\":{},\"bytes\":{bytes}}}",
+            instantiate.as_micros(),
+            update.as_micros()
+        );
+    }
+}
+
 /// A tensor map encodes the layout a TMA kernel moves: the driver encodes a
 /// two-dimensional description of device storage, a one-dimensional tensor
 /// reaches it as rank two with a trailing dimension of one, and a rank the
