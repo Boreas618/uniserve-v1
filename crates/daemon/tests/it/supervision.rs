@@ -310,12 +310,12 @@ fn a_daemon_serves_engines_of_its_own_version_alone() {
 fn a_killed_daemon_takes_its_processes_with_it() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("process.sock");
-    let build_server = BuildServerStandIn::serve(directory.path(), false, 0);
+    let _build_server = BuildServerStandIn::serve(directory.path(), false, 0);
     let mut host = std::process::Command::new(env!("CARGO_BIN_EXE_daemon-host"))
         .arg("--socket")
         .arg(&socket)
-        .arg("--build-server")
-        .arg(build_server.socket())
+        // The host's runtime directory holds its deployment's Build Server, the stand-in.
+        .env("XDG_RUNTIME_DIR", directory.path())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -333,4 +333,54 @@ fn a_killed_daemon_takes_its_processes_with_it() {
     host.kill().unwrap();
     host.wait().unwrap();
     process.wait();
+}
+
+/// A GPU belongs to one deployment: on a node whose GPU an engine of one deployment runs on, a
+/// second deployment's engine that names the GPU is refused before it starts, with an error that
+/// names the first deployment, and starts once the first deployment's daemon ended.
+#[test]
+fn a_gpu_of_another_deployment_refuses_the_engine_naming_it() {
+    let directory = tempfile::tempdir().unwrap();
+    // Both deployments' daemons run on one node: they claim in its one registration file.
+    let registration = directory.path().join("gpus");
+    let start = |deployment: &str| {
+        let build_server =
+            BuildServerStandIn::serve_for(&directory.path().join(deployment), deployment, false, 0);
+        let mut options = single_node(
+            "node",
+            directory.path().join(format!("{deployment}.sock")),
+            &build_server,
+        );
+        options.deployment = deployment.to_owned();
+        options.gpus = registration.clone();
+        (Daemon::start(options, None).unwrap(), build_server)
+    };
+    let on_gpus = |generation: u64, gpus: Vec<u32>| {
+        let mut spawn = sleeper("node", "group", 0, generation);
+        let mut args: proto::config::EngineArgs = serde_json::from_slice(&spawn.launch).unwrap();
+        args.devices = gpus;
+        spawn.launch = serde_json::to_vec(&args).unwrap();
+        spawn
+    };
+
+    let (first, _first_builds) = start("first");
+    let mut engine = Engine::connect(first.address().unwrap());
+    let running = engine.start(on_gpus(1, vec![0, 1]));
+    assert!(running.runs());
+
+    let (second, _second_builds) = start("second");
+    let mut other = Engine::connect(second.address().unwrap());
+    let refused = other.request(request::Kind::Spawn(on_gpus(1, vec![1])));
+    assert!(refused.kind.is_none(), "{refused:?}");
+    assert!(
+        refused.error.contains("GPU 1") && refused.error.contains("deployment first"),
+        "{}",
+        refused.error
+    );
+
+    // The first deployment's claims end with its daemon.
+    drop(engine);
+    drop(first);
+    let started = other.start(on_gpus(2, vec![1]));
+    assert!(started.runs());
 }

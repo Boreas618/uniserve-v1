@@ -166,6 +166,9 @@ pub(crate) struct Supervisor {
     host: String,
     /// The node's runtime directory, where the deployment's Build Server keeps its socket.
     runtime: ::service::RuntimeDirectory,
+    /// The deployment's claims of the node's GPUs, which every engine's devices are claimed in
+    /// before it starts.
+    gpus: super::gpus::Gpus,
     /// The deployment whose processes these are: its Build Server on this node resolves their
     /// engine package.
     deployment: String,
@@ -272,7 +275,7 @@ impl Lifeline {
 
 impl Supervisor {
     /// The supervisor of the processes of `deployment` on host `host`, whose runtime directory
-    /// is `runtime`.
+    /// is `runtime`, claiming the GPUs its engines run on in `gpus`.
     ///
     /// # Errors
     ///
@@ -281,10 +284,12 @@ impl Supervisor {
         host: String,
         runtime: ::service::RuntimeDirectory,
         deployment: String,
+        gpus: super::gpus::Gpus,
     ) -> std::io::Result<Self> {
         Ok(Self {
             host,
             runtime,
+            gpus,
             deployment,
             lifeline: Lifeline::new()?,
             children: HashMap::new(),
@@ -326,11 +331,24 @@ impl Supervisor {
     /// The executable is the engine package the launch's module set names, resolved at this
     /// node's Build Server: every node runs the revision the epoch fixed, built for its own
     /// platform.
-    fn main_process(&self, spawn: &Spawn) -> Result<(PathBuf, OwnedFd), String> {
+    fn main_process(&mut self, spawn: &Spawn) -> Result<(PathBuf, OwnedFd), String> {
         let mut launch: proto::config::EngineArgs =
             serde_json::from_slice(&spawn.launch).map_err(|error| {
                 format!("reading the launch of engine {}: {error}", spawn.generation)
             })?;
+        // The engine's GPUs are the deployment's before it starts: a GPU of another deployment
+        // refuses the spawn, naming that deployment.
+        let gpus = launch
+            .devices
+            .iter()
+            .map(|&ordinal| super::gpus::physical(ordinal))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.gpus.claim(&gpus).map_err(|refusal| {
+            format!(
+                "claiming the GPUs of engine {}: {refusal}",
+                spawn.generation
+            )
+        })?;
         if let Some(settings) = &self.build_server {
             let socket = crate::engine::control::ensure_build_server(
                 &self.runtime,
@@ -624,7 +642,8 @@ impl Supervisor {
     /// Hands every process and reservation to this daemon's successor in a
     /// hot restart, which goes on with them ([`Supervisor::adopt`]): their
     /// keys, and a pidfd for each process followed by each reservation's
-    /// socket, then the lifeline's read and write ends, in `descriptors`.
+    /// socket, then the lifeline's read and write ends, and last the GPU registration's, in
+    /// `descriptors`.
     /// This daemon supervises nothing afterwards.
     ///
     /// # Errors
@@ -649,6 +668,8 @@ impl Supervisor {
         }
         descriptors.push(self.lifeline.read.try_clone()?);
         descriptors.push(self.lifeline.write.try_clone()?);
+        let (gpus, registration) = self.gpus.hand_over()?;
+        descriptors.push(registration);
         // The successor supervises them now; dropping a spawned child's
         // handle neither kills nor waits for it.
         self.children.clear();
@@ -656,6 +677,7 @@ impl Supervisor {
             ProcessesHandoff {
                 runtime: self.runtime.clone(),
                 deployment: self.deployment.clone(),
+                gpus,
                 build_server: self.build_server.clone(),
                 processes,
                 reservations,
@@ -677,6 +699,12 @@ impl Supervisor {
         descriptors: Vec<OwnedFd>,
     ) -> std::io::Result<Self> {
         let mut descriptors = descriptors.into_iter();
+        let registration = descriptors.next_back().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the handoff lacks the GPU registration's descriptor",
+            )
+        })?;
         let mut next = || {
             descriptors.next().ok_or_else(|| {
                 std::io::Error::new(
@@ -685,7 +713,12 @@ impl Supervisor {
                 )
             })
         };
-        let mut supervisor = Self::new(host, handoff.runtime, handoff.deployment)?;
+        let mut supervisor = Self::new(
+            host,
+            handoff.runtime,
+            handoff.deployment,
+            super::gpus::Gpus::adopt(handoff.gpus, registration),
+        )?;
         supervisor.build_server = handoff.build_server;
         for process in handoff.processes {
             let child = Child::adopt(process.pid, next()?);
@@ -740,6 +773,8 @@ impl Drop for Supervisor {
 pub(crate) struct ProcessesHandoff {
     pub(crate) runtime: ::service::RuntimeDirectory,
     pub(crate) deployment: String,
+    /// The deployment's GPU claims, whose registration descriptor is the handoff's last.
+    pub(crate) gpus: super::gpus::Handoff,
     pub(crate) build_server: Option<build_server::command::Settings>,
     pub(crate) processes: Vec<ProcessHandoff>,
     pub(crate) reservations: Vec<ReservationHandoff>,

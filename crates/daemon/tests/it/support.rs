@@ -41,6 +41,7 @@ pub(crate) fn single_node(
     DaemonOptions {
         deployment: DEPLOYMENT.to_owned(),
         runtime: build_server.runtime(),
+        gpus: build_server.runtime().path().join("gpus"),
         nnodes: 1,
         node_rank: 0,
         host: host.to_owned(),
@@ -341,9 +342,20 @@ impl BuildServerStandIn {
     /// `prepare` answers only once [`Self::release`] lets it, as one building the engine's
     /// executable does.
     pub(crate) fn serve(node: &std::path::Path, held: bool, raise: u32) -> Self {
+        Self::serve_for(node, DEPLOYMENT, held, raise)
+    }
+
+    /// Serves as the Build Server of `deployment` in the runtime directory within `node`, as
+    /// [`Self::serve`] serves [`DEPLOYMENT`]'s.
+    pub(crate) fn serve_for(
+        node: &std::path::Path,
+        deployment: &str,
+        held: bool,
+        raise: u32,
+    ) -> Self {
         std::fs::create_dir_all(node).unwrap();
         let runtime = service::RuntimeDirectory::within(node).unwrap();
-        let socket = build_server::socket(&runtime, DEPLOYMENT).unwrap();
+        let socket = build_server::socket(&runtime, deployment).unwrap();
         let (listener, starting) = service::host::bind::<build_server::command::Settings>(&socket)
             .unwrap()
             .owned(&socket)

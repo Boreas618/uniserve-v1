@@ -17,6 +17,7 @@
 //! its sockets, connections, processes and claims.
 
 mod claims;
+pub(crate) mod gpus;
 
 pub(crate) mod processes;
 mod service;
@@ -98,6 +99,9 @@ pub struct DaemonOptions {
     /// the deployment's Storage Server and Build Server keep their sockets in the deployment's
     /// directory there.
     pub runtime: ::service::RuntimeDirectory,
+    /// The node's GPU registration file, where the daemon claims the GPUs its engines run on
+    /// for the deployment ([`gpus::node`] on every node).
+    pub gpus: PathBuf,
     /// Nodes of the deployment.
     pub nnodes: u32,
     /// This node's rank; the leader is rank 0.
@@ -569,6 +573,12 @@ fn local(
             options.host.clone(),
             options.runtime.clone(),
             options.deployment.clone(),
+            gpus::Gpus::open(&options.gpus, &options.deployment).with_context(|| {
+                format!(
+                    "opening the GPU registration file {}",
+                    options.gpus.display()
+                )
+            })?,
         )
         .context("creating the daemon's lifeline")?
         .with_build_server(options.build_server.clone()),
@@ -740,6 +750,7 @@ mod tests {
             DaemonOptions {
                 deployment: "model".to_owned(),
                 runtime: ::service::RuntimeDirectory::within(directory.path()).unwrap(),
+                gpus: directory.path().join(gpus::NODE),
                 nnodes: 1,
                 node_rank: 0,
                 host: "localhost".to_owned(),

@@ -51,6 +51,7 @@ impl Deployment {
             } else {
                 leader.runtime()
             },
+            gpus: directory.path().join(format!("{host}.gpus")),
             nnodes: 2,
             node_rank,
             host: host.to_owned(),
@@ -165,6 +166,7 @@ fn a_node_joins_a_running_deployment_and_the_next_engine_runs_processes_there() 
     let options = |nnodes: u32, node_rank: u32, host: &str| DaemonOptions {
         deployment: crate::support::DEPLOYMENT.to_owned(),
         runtime: build_server.runtime(),
+        gpus: directory.path().join(format!("{host}.gpus")),
         nnodes,
         node_rank,
         host: host.to_owned(),

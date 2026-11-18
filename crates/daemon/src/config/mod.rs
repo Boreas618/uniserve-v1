@@ -977,6 +977,7 @@ impl Config {
         DaemonOptions {
             deployment: deployment.to_owned(),
             runtime,
+            gpus: crate::supervision::gpus::node(),
             nnodes: identity.nodes,
             node_rank: identity.rank,
             host: identity.host.clone(),

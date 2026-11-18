@@ -1,10 +1,10 @@
 //! A node's daemon in a process of its own, for the daemon's tests of what ends with a daemon
 //! that is killed, and of what a node holds at its own host's Storage Server.
 //!
-//! `daemon-host --socket PATH --build-server PATH` starts the daemon of a single node `node`
-//! whose process socket is `PATH` and whose host's Build Server serves at the second `PATH`,
-//! writes the line `serving` to its standard output once the daemon serves, and serves until the
-//! process is killed.
+//! `daemon-host --socket PATH` starts the daemon of a single node `node` of the deployment
+//! `deployment`, whose process socket is `PATH` and whose deployment's Build Server and Storage
+//! Server serve in the process's runtime directory, writes the line `serving` to its standard
+//! output once the daemon serves, and serves until the process is killed.
 //!
 //! With `--host NAME --nnodes N --node-rank R --join ENDPOINT`, the daemon is node `R` on host
 //! `NAME` of a deployment of `N` nodes. Its leader (node 0) binds its join listener at `ENDPOINT`
@@ -68,6 +68,8 @@ fn main() -> anyhow::Result<()> {
             // The deployment's servers are the ones its runtime directory, the variable's, holds.
             deployment: "deployment".to_owned(),
             runtime: service::RuntimeDirectory::of_user()?,
+            // The host's registration file, in its runtime directory: each process is a host.
+            gpus: service::RuntimeDirectory::of_user()?.path().join("gpus"),
             nnodes,
             node_rank,
             host,

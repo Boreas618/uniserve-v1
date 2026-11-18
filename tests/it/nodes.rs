@@ -57,6 +57,7 @@ fn a_follower_joins_the_first_host() {
             // The deployment is named by its package's directory.
             deployment: "model".into(),
             runtime: service::RuntimeDirectory::within(directory.path()).unwrap(),
+            gpus: directory.path().join("gpus"),
             nnodes: 2,
             node_rank: 0,
             host: "leader".into(),
