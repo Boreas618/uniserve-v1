@@ -579,6 +579,11 @@ pub struct ChatCompletionRequest {
     pub return_token_ids: Option<bool>,
     /// Caller-provided salt folded into the prompt-cache isolation key.
     pub cache_salt: Option<String>,
+    /// The caller's key of the requests that share a prompt prefix, OpenAI's field for a
+    /// conversation or an application's requests: the request's session, which its `request`
+    /// event states and the routing program reads as its session hint. It partitions no cache;
+    /// `cache_salt` does.
+    pub prompt_cache_key: Option<String>,
 }
 
 impl ChatCompletionRequest {

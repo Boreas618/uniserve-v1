@@ -433,7 +433,11 @@ impl Leader {
     ///
     /// Every replica serves both phases, so the request is computed and decoded where the
     /// route's prefill names: a deployment of mixed replicas hands no request between two.
-    async fn route(&self, request: &Request) -> Result<(Arc<Replica>, Option<u32>), SubmitError> {
+    async fn route(
+        &self,
+        request: &Request,
+        session: Option<&str>,
+    ) -> Result<(Arc<Replica>, Option<u32>), SubmitError> {
         let least = self.replica_for_request().await?;
         if !self.router.routes() {
             return Ok((least, None));
@@ -473,7 +477,7 @@ impl Leader {
             request: scheduling::routing::Request {
                 prompt: u32::try_from(prompt).unwrap_or(u32::MAX),
                 prefix: Vec::new(),
-                session: None,
+                session: session.map(str::to_owned),
             },
             replicas: views,
         };
@@ -1385,6 +1389,7 @@ impl Leader {
         crate::api::openai::ApiError,
     > {
         let started = Instant::now();
+        let session = request.prompt_cache_key.clone();
         let image_urls = if self.processor.supports_image_input() {
             request.image_urls()
         } else {
@@ -1408,11 +1413,12 @@ impl Leader {
 
         let compile_us = elapsed_us(started);
         let (events, placement) = self
-            .submit(request.into())
+            .submit(request.into(), session.as_deref())
             .await
             .map_err(ServeError::from)?;
         let log = self.log_requests.then_some(request_id);
-        let stats = record::Request::new(self.recorder.clone(), placement.at(), started, log);
+        let stats = record::Request::new(self.recorder.clone(), placement.at(), started, log)
+            .session(session);
         // Dropping the events on a failure cancels the request in its engine.
         let output = crate::api::output::OutputProcessor::new(
             self.processor.tokenizer(),
@@ -1504,7 +1510,7 @@ impl Leader {
             .process(&request_id, &request, self.processor.config().max_model_len)
             .await?;
         let prompt_tokens = request.prompt_token_ids.len();
-        let (events, placement) = self.submit(Request::Diffusion(request)).await?;
+        let (events, placement) = self.submit(Request::Diffusion(request), None).await?;
         let output = crate::api::output::media_output(
             request_id.clone(),
             started,
@@ -1531,7 +1537,8 @@ impl Leader {
         Box::pin(Recorded::new(output, request))
     }
 
-    /// Submits one tokenized request to the engine, which routes it to its
+    /// Submits one tokenized request of session `session` (the caller's `prompt_cache_key`, the
+    /// routing program's session hint) to the engine, which routes it to its
     /// least loaded live scheduler; while no engine is ready, the request
     /// waits in the hold until one is.
     ///
@@ -1544,8 +1551,9 @@ impl Leader {
     pub(crate) async fn submit(
         &self,
         request: Request,
+        session: Option<&str>,
     ) -> Result<(RequestEvents, Placement), SubmitError> {
-        let (replica, scheduler) = self.route(&request).await?;
+        let (replica, scheduler) = self.route(&request, session).await?;
         let (events, scheduler) = replica.migrator.submit(request, scheduler).await?;
         let placement = Placement {
             replica: replica.ordinal as u32,
@@ -3813,7 +3821,7 @@ mod tests {
         }
         assert!(!engine.is_healthy());
 
-        let error = engine.submit(text_request()).await.err();
+        let error = engine.submit(text_request(), None).await.err();
         assert!(matches!(
             error,
             Some(crate::engine::client::SubmitError::Unavailable(_))
@@ -3840,7 +3848,10 @@ mod tests {
         let mut streams = Vec::new();
         let mut serving = Vec::new();
         for _ in 0..2 {
-            let (stream, core) = engine.submit(text_request()).await.expect("submit request");
+            let (stream, core) = engine
+                .submit(text_request(), None)
+                .await
+                .expect("submit request");
             streams.push(stream);
             serving.push(core);
         }
@@ -3862,7 +3873,7 @@ mod tests {
             states.changed().await.expect("the client states its end");
         }
         assert!(engine.is_healthy());
-        let (mut stream, replica) = engine.submit(text_request()).await.unwrap();
+        let (mut stream, replica) = engine.submit(text_request(), None).await.unwrap();
         assert_eq!(replica.replica, 1);
         let mut finished = false;
         while let Some(event) = stream.recv().await {

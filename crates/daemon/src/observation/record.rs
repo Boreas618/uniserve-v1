@@ -489,7 +489,12 @@ impl Recorder {
         for (launch, &count) in &worker.kernel_launches {
             let mut at = with(labels, "op", &launch.operator);
             at.insert("descriptor".to_owned(), launch.key.clone());
-            self.add("uniserve_kernel_launches_total", &at, revision, count as f64);
+            self.add(
+                "uniserve_kernel_launches_total",
+                &at,
+                revision,
+                count as f64,
+            );
         }
         for (call, &count) in &worker.blocking_calls {
             let mut at = with(labels, "thread", &call.thread);
@@ -631,6 +636,8 @@ pub(crate) struct Request {
     arrived: SystemTime,
     /// The request's id, logged in a summary line when it ends if request logging is on.
     log: Option<String>,
+    /// The caller's session of the request (`prompt_cache_key`), which its event states.
+    session: Option<String>,
     recorded: bool,
 }
 
@@ -653,8 +660,15 @@ impl Request {
             started,
             arrived,
             log,
+            session: None,
             recorded: false,
         }
+    }
+
+    /// The recorder of a request of the caller's session `session`.
+    pub(crate) fn session(mut self, session: Option<String>) -> Self {
+        self.session = session;
+        self
     }
 
     /// Records the request as `outcome`, with the usage of a finished request, unless it was
@@ -705,6 +719,9 @@ impl Request {
         fields.insert("arrival".to_owned(), arrived.into());
         fields.insert("outcome".to_owned(), outcome.name().into());
         fields.insert("latency".to_owned(), latency.into());
+        if let Some(session) = &self.session {
+            fields.insert("session".to_owned(), session.clone().into());
+        }
         if let Some(usage) = usage {
             usage_metrics(recorder, &labels, revision, usage);
             recorder.inner.log.usage(
@@ -999,7 +1016,11 @@ mod tests {
         .await;
         assert_eq!(kernels.len(), 1);
         assert_eq!(
-            (&kernels[0]["op"], &kernels[0]["descriptor"], &kernels[0]["launches"]),
+            (
+                &kernels[0]["op"],
+                &kernels[0]["descriptor"],
+                &kernels[0]["launches"]
+            ),
             (&"gemm".into(), &"m128_n256".into(), &96.0.into())
         );
     }
@@ -1021,7 +1042,8 @@ mod tests {
                 total_us: 60_000,
             },
         };
-        let mut finished = Request::new(recorder.clone(), (0, Some(1)), Instant::now(), None);
+        let mut finished = Request::new(recorder.clone(), (0, Some(1)), Instant::now(), None)
+            .session(Some("conversation-7".to_owned()));
         finished.record(Outcome::Length, Some(&usage));
         finished.record(Outcome::Error, None);
         drop(finished);
@@ -1045,6 +1067,7 @@ mod tests {
         assert_eq!(fields["cached_tokens"], "8");
         assert_eq!(fields["ttft"], "0.02");
         assert_eq!(fields["tpot"], "0.01");
+        assert_eq!(fields["session"], "conversation-7");
         assert_eq!(events[0]["revision"], 7);
         assert_eq!(events[1]["fields"]["outcome"], "abort");
 
