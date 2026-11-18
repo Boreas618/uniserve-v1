@@ -274,7 +274,12 @@ class Sample(NamedTuple):
 
 
 def gauge(
-    server: Server, name: str, *, after: int | None = None, **labels: str
+    server: Server,
+    name: str,
+    *,
+    after: int | None = None,
+    sampled: bool = False,
+    **labels: str,
 ) -> list[Sample]:
     """The values of the gauge `name` in the latest whole second that holds
     a value of one of its series holding every label of `labels`: one value
@@ -293,7 +298,12 @@ def gauge(
     second of the span holds the leader's sampling (:data:`SAMPLED`), so a
     deployment that just began to serve is read once its first second was
     sampled. A gauge stated only when what it states changes is read with
-    ``after=0``, over the store's whole retention.
+    ``after=0``, over the store's whole retention. A gauge the leader samples
+    itself (``crates/daemon/src/status.rs``) and states only while what it
+    states stands, such as a replica's serving launch generation, is read
+    with `sampled`: the read after `after` waits for a whole second holding
+    the leader's sampling, as one without `after` does, so a series the
+    leader did not state then is none rather than awaited.
 
     Raises:
         TimeoutError: When no whole second after `after` was recorded in
@@ -313,7 +323,7 @@ def gauge(
     # sampling.
     awaited = (
         window
-        if after is not None
+        if after is not None and not sampled
         else (
             f"name = {literal(SAMPLED)} AND CAST(time AS BIGINT) > {lower} "
             "AND time < date_trunc('second', now())"
@@ -501,18 +511,28 @@ class Replica(NamedTuple):
     standby: list[int]
 
 
-def replica(server: Server, ordinal: int = 0) -> Replica:
-    """Replica `ordinal`'s :class:`Replica`, from the leader's gauges."""
+def replica(
+    server: Server, ordinal: int = 0, *, after: int | None = None
+) -> Replica:
+    """Replica `ordinal`'s :class:`Replica`, from the leader's gauges: as
+    the leader last sampled them, or, with `after`, as it sampled them in a
+    second after the moment `after` of the daemon's clock (an event's time,
+    :func:`now`), once one was sampled.
+    """  # noqa: D205
     at = str(ordinal)
+
+    def sampled(name: str) -> list[Sample]:
+        return gauge(server, name, after=after, sampled=True, replica=at)
+
     states = [
         sample.labels["state"]
-        for sample in gauge(server, "uniserve_replica_state", replica=at)
+        for sample in sampled("uniserve_replica_state")
         if sample.value == 1
     ]
-    epochs = gauge(server, "uniserve_replica_epoch", replica=at)
-    generations = gauge(server, "uniserve_replica_generation", replica=at)
+    epochs = sampled("uniserve_replica_epoch")
+    generations = sampled("uniserve_replica_generation")
     standby = sorted(
-        gauge(server, "uniserve_replica_standby_generation", replica=at),
+        sampled("uniserve_replica_standby_generation"),
         key=lambda sample: int(sample.labels["member"]),
     )
     return Replica(

@@ -273,9 +273,11 @@ class Streaming:
         self.done.result()
 
 
-def _executing(server: Server) -> int:
-    """The epoch that serves, as the leader states replica 0's."""
-    serving = admin.replica(server)
+def _executing(server: Server, after: int | None = None) -> int:
+    """The epoch that serves, as the leader states replica 0's: as it last
+    sampled it, or in a second after the moment `after` when stated.
+    """  # noqa: D205
+    serving = admin.replica(server, after=after)
     assert serving.state == "serving", serving
     assert serving.epoch is not None, serving
     return serving.epoch
@@ -314,9 +316,11 @@ def _on_trial(server: Server, changes: Config) -> Iterator[Trial]:
         assert update["phase"] == "trial", update
         assert update["change"] == "epoch", update
         print(f"switch: {update['switch_ms']} ms")
-        yield Trial(
-            update, _executing(server), answer, after, began=entered.time
-        )
+        # The switch promoted the target before the trial began, so replica 0
+        # executes it in every second the leader sampled since.
+        executing = _executing(server, entered.time)
+        assert executing == update["epoch"], (executing, update)
+        yield Trial(update, executing, answer, after, began=entered.time)
 
 
 def _committed(trial: Trial) -> dict[str, Any]:
