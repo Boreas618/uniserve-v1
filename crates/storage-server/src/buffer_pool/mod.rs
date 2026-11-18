@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use storage::ServerSettings;
 use storage::protocol::Key;
 use storage::runtime::{
-    Cause, Completion, GroupId, OwnerId, Request, RequestId, Segments, Stamps, Tier,
+    Cause, Completion, GroupId, Groups, OwnerId, Request, RequestId, Segments, Stamps, Tier,
 };
 
 pub(crate) use image::FORMAT;
@@ -1621,16 +1621,16 @@ impl BufferPool {
     }
 
     fn list(&self, client: ClientId) -> Completion {
-        // The session's groups: each one's number and its own bit, which admission keeps within
-        // a byte (`LISTED_GROUPS`).
-        let groups: Vec<(GroupId, u8)> = self
+        // The session's groups: each one's number and its own bit of a set of `Groups`, which
+        // admission numbers below `GROUPS`.
+        let groups: Vec<(GroupId, Groups)> = self
             .groups
             .keys()
             .filter(|(of, _)| *of == client)
-            .map(|&(_, group)| (group, 1 << group.0))
+            .map(|&(_, group)| (group, group.bit()))
             .collect();
 
-        let mut keys: Vec<(Key, u8, u16, u8, u8, u8)> = Vec::new();
+        let mut keys: Vec<(Key, u8, u16, u8, Groups, Groups)> = Vec::new();
         for (key, entry) in &self.cache {
             // The groups that hold the device copy: those that may pin it, the copy in the
             // group's region of the class and valid in the memory the group reads it in

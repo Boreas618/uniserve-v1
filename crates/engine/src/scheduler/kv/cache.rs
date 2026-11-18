@@ -22,7 +22,7 @@ use std::time::Instant;
 use proto::config::SchedulerConfig;
 use scheduling::{EncodingId, EncodingView, Event, Nanos, PageId, PageView};
 use storage::Key;
-use storage::runtime::{self, Cause, Completion, GroupId, Tier};
+use storage::runtime::{self, Cause, Completion, GroupId, Groups, Tier};
 
 use super::super::{Request, WorkerGroup, monotonic_nanos};
 use super::Kv;
@@ -57,10 +57,10 @@ pub(crate) struct Cached {
     pub tokens: u16,
     /// The tiers that hold a copy: [`DEVICE`], [`HOST`], [`REMOTE`].
     pub tiers: u8,
-    /// The worker groups that hold its device copy, one bit per group number: the copy lies in
-    /// the group's region of its class, valid in the memory the group reads it in, so a `Pin` of
-    /// the group finds it and the group's orders may evict it.
-    pub groups: u8,
+    /// The worker groups that hold its device copy, a set of [`Groups`]: the copy lies in the
+    /// group's region of its class, valid in the memory the group reads it in, so a `Pin` of the
+    /// group finds it and the group's orders may evict it.
+    pub groups: Groups,
     /// Requests of this scheduler holding it.
     pub pins: u32,
     /// Its last use, in nanoseconds of the host's monotonic clock (`monotonic_nanos`): its rank
@@ -105,7 +105,7 @@ impl Cached {
     /// Whether its device copy is in the eviction order of `group`'s regions of its class: valid
     /// in the group's memory, and held by no request of this scheduler.
     fn ordered_in(&self, group: GroupId) -> bool {
-        self.pins == 0 && self.tiers & DEVICE != 0 && self.groups & bit(group) != 0
+        self.pins == 0 && self.tiers & DEVICE != 0 && self.groups & group.bit() != 0
     }
 }
 
@@ -116,10 +116,10 @@ impl Kv {
     /// the request of the owner `asked` acts for, `None` once that owner is forgotten. The answer
     /// to a `Finish` speaks for the copy's request as the scheduler kept it, narrowed to the keys
     /// the copy covers ([`covered`]): the caller passes that request as `asked`, with `copy` the
-    /// groups that stamped the `Finish` (the copy's group), as bits of [`Cached::groups`].
+    /// groups that stamped the `Finish` (the copy's group), as a set of [`Groups`].
     pub(crate) fn learn(
         &mut self,
-        (asked, copy): (&runtime::Request, Option<u8>),
+        (asked, copy): (&runtime::Request, Option<Groups>),
         holder: Option<&Request>,
         completion: &Completion,
         groups: &[WorkerGroup],
@@ -241,13 +241,13 @@ impl Kv {
                 // The answer states one block per leading key it pinned.
                 let (held, rest) = keys.split_at(blocks.len().min(keys.len()));
                 for key in held {
-                    self.hold(key, (*class, 0), (bit(group), 1, now), groups, told);
+                    self.hold(key, (*class, 0), (group.bit(), 1, now), groups, told);
                 }
                 // The keys after the pinned ones are not valid in the group; the first `host` of
                 // them have a host copy, and the next one none.
                 let host = usize::try_from(*host).unwrap_or(usize::MAX).min(rest.len());
                 for (at, key) in rest.iter().enumerate() {
-                    self.invalidate(key, bit(group), groups, told);
+                    self.invalidate(key, group.bit(), groups, told);
                     let tiers = if at < host { HOST } else { 0 };
                     if at <= host {
                         self.change_row(key, Some((*class, 0)), groups, told, |row| {
@@ -335,14 +335,14 @@ impl Kv {
             (R::Evict { .. }, Completion::Evicted { keys }, None) => {
                 count += keys.len();
                 for key in keys {
-                    self.invalidate(key, u8::MAX, groups, told);
+                    self.invalidate(key, Groups::MAX, groups, told);
                 }
             }
             // A key `cache` believed held that the buffer pool does not hold, or a host copy
             // another layout wrote that this one cannot read, is a miss from now on.
             (R::Clone { owner, key, .. }, Completion::Refused { cause: Cause::Key }, None) => {
                 if let Some(group) = attached(*owner) {
-                    self.invalidate(key, bit(group), groups, told);
+                    self.invalidate(key, group.bit(), groups, told);
                 }
             }
             (
@@ -429,7 +429,7 @@ impl Kv {
         &mut self,
         key: &Key,
         fresh: (u8, u16),
-        (holders, pins, used): (u8, u32, u64),
+        (holders, pins, used): (Groups, u32, u64),
         groups: &[WorkerGroup],
         told: &mut Vec<Event>,
     ) {
@@ -450,7 +450,7 @@ impl Kv {
     /// `cache`.
     fn listed(
         &mut self,
-        keys: &[(Key, u8, u16, u8, u8, u8)],
+        keys: &[(Key, u8, u16, u8, Groups, Groups)],
         groups: &[WorkerGroup],
         told: &mut Vec<Event>,
     ) {
@@ -505,7 +505,7 @@ impl Kv {
         let holders = groups
             .iter()
             .filter(there)
-            .fold(0, |bits, group| bits | bit(group.id()));
+            .fold(0, |bits, group| bits | group.id().bit());
         self.invalidate(key, holders, groups, told);
     }
 
@@ -514,7 +514,7 @@ impl Kv {
     fn invalidate(
         &mut self,
         key: &Key,
-        holders: u8,
+        holders: Groups,
         groups: &[WorkerGroup],
         told: &mut Vec<Event>,
     ) {
@@ -771,7 +771,7 @@ impl Kv {
                 .cache
                 .get(&Cached::id(key))
                 .filter(|row| row.key == *key)?;
-            let device = DEVICE * u8::from(row.groups & bit(group) != 0);
+            let device = DEVICE * u8::from(row.groups & group.bit() != 0);
             Some(row.tiers & (device | HOST | REMOTE))
         };
         keys.iter().map(|key| tiers(key).unwrap_or(0)).collect()
@@ -852,7 +852,7 @@ impl Kv {
         groups
             .iter()
             .map(WorkerGroup::id)
-            .find(|group| row.groups & bit(*group) != 0)
+            .find(|group| row.groups & group.bit() != 0)
     }
 
     /// Every block of `cache` as a policy's snapshot states it (SD §5.2): a `PageView` per KV
@@ -1086,15 +1086,10 @@ impl Kv {
     }
 }
 
-/// The bit of `group` in [`Cached::groups`].
-pub(crate) fn bit(group: GroupId) -> u8 {
-    1u8.checked_shl(u32::from(group.0)).unwrap_or(0)
-}
-
-/// The groups that stamped a request, as bits of [`Cached::groups`]: those whose device block
-/// tables held its entry.
-pub(crate) fn stamped_groups(after: &runtime::Stamps) -> u8 {
-    after.iter().fold(0, |bits, &(group, _)| bits | bit(group))
+/// The groups that stamped a request, as a set of [`Groups`]: those whose device block tables
+/// held its entry.
+pub(crate) fn stamped_groups(after: &runtime::Stamps) -> Groups {
+    after.iter().fold(0, |bits, &(group, _)| bits | group.bit())
 }
 
 /// `request` as the scheduler applies its answer `completion`: a `Load` or a `Store` answered

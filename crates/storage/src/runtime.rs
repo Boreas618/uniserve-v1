@@ -29,7 +29,7 @@ use crate::{Error, Key, Result, Segment};
 
 /// The version of this interface that this build's engine and buffer pool
 /// speak, the one version either accepts.
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 
 /// The clock every instant of this interface is stated in: the host's
 /// monotonic clock (`CLOCK_MONOTONIC`), in nanoseconds since an unspecified
@@ -59,9 +59,28 @@ pub struct RequestId(pub u64);
 pub struct OwnerId(pub u64);
 
 /// A worker group of the session's engine epoch. The engine numbers the
-/// groups of its session, so a group is one scheduler's.
+/// groups of its session below [`GROUPS`], so a group is one scheduler's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GroupId(pub u8);
+
+/// The most worker groups a session states, numbered `0..GROUPS`: a set of a session's groups
+/// ([`Groups`]) has one bit per group. It equals the most memories a deployment's sessions state
+/// at once (a block's validity has one bit per memory, and a group's device memory is one of
+/// them), so only groups that share their ranks could number more.
+pub const GROUPS: u8 = Groups::BITS as u8;
+
+/// A set of a session's worker groups: bit `n` stands for `GroupId(n)`.
+pub type Groups = u64;
+
+impl GroupId {
+    /// The group's bit in a set of [`Groups`]; none for a number at or past [`GROUPS`], which no
+    /// session states.
+    pub fn bit(self) -> Groups {
+        Groups::from(1u8)
+            .checked_shl(u32::from(self.0))
+            .unwrap_or(0)
+    }
+}
 
 /// Where a copy of a block lies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -564,14 +583,14 @@ pub enum Completion {
     /// device, bit 1 host, bit 2 remote), the groups that hold its device
     /// copy (the copy a `Pin` of the group finds: in the group's region of
     /// the class, valid in the memory the group reads it in, visible to the
-    /// session's epoch) and the groups whose host parts hold its host copy (a
-    /// bit per group each). A device copy only in a region of another session
+    /// session's epoch) and the groups whose host parts hold its host copy,
+    /// each a set of [`Groups`]. A device copy only in a region of another session
     /// (an epoch of another layout on the same device) states no device tier.
     /// The keys some queue pair's installed eviction order names come first,
     /// each at its earliest place in any such order, least recently used
     /// first; the others follow in the order of their keys.
     Listing {
-        keys: Vec<(Key, u8, u16, u8, u8, u8)>,
+        keys: Vec<(Key, u8, u16, u8, Groups, Groups)>,
     },
     /// The region's units after the resize, and the keys evicted for a shrink.
     Resized {
@@ -1244,8 +1263,8 @@ impl Completion {
                     writer.byte(*class);
                     writer.short(*tokens);
                     writer.byte(*tiers);
-                    writer.byte(*groups);
-                    writer.byte(*hosts);
+                    writer.long(*groups);
+                    writer.long(*hosts);
                 }
             }
             Self::Resized { units, evicted } => {
@@ -1345,15 +1364,16 @@ impl Completion {
                 evicted: reader.keys()?,
             },
             18 => Self::Listing {
-                keys: (0..reader.length(38)?)
+                // A key, its class, tokens and tiers, and its two sets of groups: 52 bytes.
+                keys: (0..reader.length(52)?)
                     .map(|_| {
                         Ok((
                             reader.key()?,
                             reader.byte()?,
                             reader.short()?,
                             reader.byte()?,
-                            reader.byte()?,
-                            reader.byte()?,
+                            reader.long()?,
+                            reader.long()?,
                         ))
                     })
                     .collect::<Result<_>>()?,
@@ -1584,7 +1604,14 @@ mod tests {
                 evicted: vec![key(8)],
             },
             Completion::Listing {
-                keys: vec![(key(6), 0, 64, 0b011, 0b01, 0b10)],
+                keys: vec![(
+                    key(6),
+                    0,
+                    64,
+                    0b011,
+                    0b01 | GroupId(63).bit(),
+                    0b10 | GroupId(8).bit(),
+                )],
             },
             Completion::Resized {
                 units: 100,

@@ -3,7 +3,9 @@
 //! [`BufferPool::check`].
 
 use storage::protocol::Key;
-use storage::runtime::{Cause, Completion, GroupId, Lender, OwnerId, Request, RequestId, Tier};
+use storage::runtime::{
+    Cause, Completion, GROUPS, GroupId, Groups, Lender, OwnerId, Request, RequestId, Tier,
+};
 
 use super::{BufferPool, Class, Group, Memories, Validity};
 
@@ -294,7 +296,7 @@ impl Fixture {
         self.pool.regions[usize::from(region)].free_units()
     }
 
-    fn listing(&mut self) -> Vec<(Key, u8, u16, u8, u8, u8)> {
+    fn listing(&mut self) -> Vec<(Key, u8, u16, u8, Groups, Groups)> {
         match self.ask(Request::List) {
             Some(Completion::Listing { keys }) => keys,
             other => panic!("list answered {other:?}"),
@@ -967,13 +969,13 @@ fn a_listing_states_no_group_holding_a_block_of_another_layout_s_region() {
 
     // Each session lists its own block as held by its group and the other's as no device copy:
     // with no host copy, not at all.
-    let held = |listing: Vec<(Key, u8, u16, u8, u8, u8)>| -> Vec<(Key, u8, u8)> {
+    let held = |listing: Vec<(Key, u8, u16, u8, Groups, Groups)>| -> Vec<(Key, u8, Groups)> {
         let listed = listing.into_iter();
         listed
             .map(|(key, _, _, tiers, held, _)| (key, tiers, held))
             .collect()
     };
-    assert_eq!(held(fixture.listing()), [(key(7), 1, 1 << PREFILL.0)]);
+    assert_eq!(held(fixture.listing()), [(key(7), 1, PREFILL.bit())]);
     let listed = fixture.submit(queue, Request::List);
     let Some(Completion::Listing { keys }) = fixture.answer(listed) else {
         panic!("no listing")
@@ -3147,4 +3149,58 @@ fn memories_no_session_uses_any_more_leave_their_numbers_to_later_sessions() {
     let mut many = processes_layout(vec![stated(0, "gpu 0", 1, vec![vec![0]])]);
     many.groups[0].parts = vec![(0..64).map(|part| ("host".to_owned(), part)).collect()];
     assert!(pool.admit(100, &many).is_err());
+}
+
+/// A session states up to `GROUPS` worker groups, as many as a set of `Groups` has bits: a
+/// layout of a text group and eight replicas over their own devices opens, and the listing
+/// states a block the ninth group committed in its own memory as held by that group alone.
+#[test]
+fn a_listing_states_a_group_numbered_past_eight() {
+    let groups = (0..9)
+        .map(|id| stated(id, &format!("gpu {id}"), 1, vec![vec![0]]))
+        .collect();
+    let mut fixture = Fixture {
+        pool: processes(groups),
+        number: 0,
+    };
+    let ninth = GroupId(8);
+    fixture.attach(1, ninth);
+    fixture.allocate(1, 0, 1);
+    assert_eq!(
+        fixture.commit(1, 0, 7, Vec::new()),
+        Some(Completion::Committed)
+    );
+
+    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b001, ninth.bit(), 0)]);
+}
+
+/// Every group number below `GROUPS` is a bit of a listing's sets, so a layout of `GROUPS` groups
+/// over one device memory lists a block of that memory as held by each of them; a group numbered
+/// `GROUPS` is refused.
+#[test]
+fn a_session_states_groups_numbered_below_the_bits_of_a_set() {
+    let over_one_memory = |ids: std::ops::Range<u8>| -> Vec<storage::runtime::Group> {
+        ids.map(|id| stated(id, "gpu", 1, vec![vec![0]])).collect()
+    };
+    let mut fixture = Fixture {
+        pool: processes(over_one_memory(0..GROUPS)),
+        number: 0,
+    };
+    let last = GroupId(GROUPS - 1);
+    fixture.attach(1, last);
+    fixture.allocate(1, 0, 1);
+    assert_eq!(
+        fixture.commit(1, 0, 7, Vec::new()),
+        Some(Completion::Committed)
+    );
+    assert_eq!(fixture.listing(), [(key(7), KV, 64, 0b001, Groups::MAX, 0)]);
+
+    let mut pool = BufferPool::new((1_000, 1_000));
+    let refused = pool.admit(SERVING, &processes_layout(over_one_memory(1..GROUPS + 1)));
+    assert_eq!(
+        refused,
+        Err(format!(
+            "group {GROUPS} is numbered past the {GROUPS} groups a session states"
+        ))
+    );
 }

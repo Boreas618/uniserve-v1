@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use storage::protocol::Segment;
-use storage::runtime::{GroupId, Open, Segments, Tier, VERSION};
+use storage::runtime::{GROUPS, GroupId, Open, Segments, Tier, VERSION};
 
 use super::{
     BufferPool, Class, ClientId, Deferred, Group, Memories, Region, Validity, disowned,
@@ -23,10 +23,6 @@ use super::{
 /// The most regions a pool numbers at once: a run names its region by a byte (§11), and a
 /// region's number is reused once the region is closed (every session that named it ended).
 const REGIONS: usize = u8::MAX as usize;
-
-/// The most worker groups a session states: a key of a `Listing` names the groups that hold or
-/// can load it as the bits of a byte.
-const LISTED_GROUPS: u8 = u8::BITS as u8;
 
 /// How a region numbers the units of its memory space: the space, the
 /// bytes of a unit, and the first unit it may allocate with the limit of
@@ -303,7 +299,8 @@ impl BufferPool {
     /// twice, a region stated again with another tier, space, unit size or
     /// reserved units, a segment that cannot join its space's table, an index
     /// that names no region of the right tier, a group of no scheduler's or
-    /// of two, a group numbered at or past [`LISTED_GROUPS`], more than [`Memories::CAPACITY`]
+    /// of two, a group numbered at or past [`GROUPS`] (a `Listing` states a key's groups as a set
+    /// of [`storage::runtime::Groups`]), more than [`Memories::CAPACITY`]
     /// memories and host parts in use at once, or more regions than a run can number.
     pub fn admit(&mut self, client: ClientId, open: &Open) -> Result<Vec<(u8, u32)>, String> {
         if self.sessions.contains_key(&client) {
@@ -680,9 +677,9 @@ impl BufferPool {
             if !ids.insert(group.id) {
                 return Err(format!("group {} is stated twice", group.id.0));
             }
-            if group.id.0 >= LISTED_GROUPS {
+            if group.id.0 >= GROUPS {
                 return Err(format!(
-                    "group {} is numbered past the {LISTED_GROUPS} groups a session states",
+                    "group {} is numbered past the {GROUPS} groups a session states",
                     group.id.0
                 ));
             }
