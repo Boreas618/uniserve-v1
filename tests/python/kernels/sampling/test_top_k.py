@@ -131,7 +131,7 @@ def test_every_row_keeps_its_largest_logits_lower_id_first(
         logits[0, 1] = 2.0
         logits[0, 40] = 5.0
     if masked_tail:
-        # A `-inf` tail, as `filter_candidates` leaves it.
+        # A `-inf` tail, as a ban mask leaves it.
         logits[:, vocabulary // 2 :] = float("-inf")
     values = torch.full(
         (rows, width), float("nan"), dtype=torch.float32, device=torch_device

@@ -609,9 +609,6 @@ impl CausalLmRunner {
             SamplerConfig {
                 vocabulary,
                 slots: config.slots,
-                // A request may ask for any top-k, so a drawn row keeps the whole vocabulary
-                // as its candidates.
-                width: vocabulary,
                 candidates: config.candidates,
                 extras: 0,
             },

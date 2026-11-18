@@ -590,6 +590,10 @@ impl Op for LayerNorm {
     }
 }
 
+/// Columns one `softmax` program reads at a time: a chunk of the row, so a row may be a whole
+/// vocabulary.
+pub const SOFTMAX_TILE: u32 = 8192;
+
 /// One compilation of `softmax`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SoftmaxDescriptor {
@@ -605,13 +609,13 @@ pub struct SoftmaxDescriptor {
 
 impl SoftmaxDescriptor {
     /// The compilation that takes the softmax of rows of `columns` elements of `dtype`: one
-    /// program reads a row in chunks of the candidates' tile ([`crate::sampler::CANDIDATE_TILE`]),
-    /// so a row may be a whole vocabulary of candidates.
+    /// program reads a row in chunks of [`SOFTMAX_TILE`] columns, so a row may be a whole
+    /// vocabulary.
     pub fn new(dtype: DType, columns: u32) -> Self {
         Self {
             dtype,
             columns,
-            tile: crate::sampler::CANDIDATE_TILE,
+            tile: SOFTMAX_TILE,
             pdl: PDL,
         }
     }

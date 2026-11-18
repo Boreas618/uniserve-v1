@@ -103,8 +103,8 @@ pub use residual_norm::{
 pub use rotary::{grid_positions, qk_norm_rope, qk_norm_rope_, rotary, rotary_factors};
 pub use rows::place_rows_;
 pub use sampling::{
-    argmax, candidate_order, filter_candidates_, inverse_cdf, log_softmax, logits_shape,
-    logprob_gather, softmax, top_k, top_logprobs,
+    argmax, log_softmax, logits_shape, logprob_gather, sampling_from_logits, softmax, top_k,
+    top_logprobs,
 };
 pub use sparse::sparse_attention;
 pub use vsa::{

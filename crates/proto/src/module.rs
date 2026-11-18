@@ -260,9 +260,7 @@ pub mod operator {
     pub const QK_NORM_ROPE: &str = "qk_norm_rope";
     pub const LOGITS_SHAPE: &str = "logits_shape";
     pub const TOP_K: &str = "top_k";
-    pub const FILTER_CANDIDATES: &str = "filter_candidates";
-    pub const CANDIDATE_ORDER: &str = "candidate_order";
-    pub const INVERSE_CDF: &str = "inverse_cdf";
+    pub const SAMPLING_FROM_LOGITS: &str = "sampling_from_logits";
     pub const ARGMAX: &str = "argmax";
     pub const LOG_SOFTMAX: &str = "log_softmax";
     pub const LOGPROB_GATHER: &str = "logprob_gather";
@@ -361,9 +359,7 @@ pub mod operator {
         QK_NORM_ROPE,
         LOGITS_SHAPE,
         TOP_K,
-        FILTER_CANDIDATES,
-        CANDIDATE_ORDER,
-        INVERSE_CDF,
+        SAMPLING_FROM_LOGITS,
         ARGMAX,
         LOG_SOFTMAX,
         LOGPROB_GATHER,

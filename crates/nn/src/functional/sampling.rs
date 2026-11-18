@@ -2,23 +2,21 @@
 //! log-probabilities of the chosen token.
 //!
 //! ```text
-//! logits_shape        shaped = penalize(adjust(logits)) / temperature
-//! top_k               the `width` largest entries of a row, descending, with their token ids
-//! filter_candidates_  the row's top-k width, nucleus and min-p thresholds: a dropped one is -inf
-//! candidate_order     the candidates in ascending token id
-//! softmax             p = exp(x − max x) / Σ exp(x − max x)
-//! inverse_cdf         the first candidate whose cumulative mass exceeds draw · Σ p
-//! argmax              the largest entry's column, the lowest among equals
-//! log_softmax         x − (max x + ln Σ exp(x − max x))
-//! logprob_gather      one token's log-probability and its competition rank
-//! top_logprobs        the `n` largest entries of a row, descending, with their token ids
+//! logits_shape          shaped = penalize(adjust(logits)) / temperature
+//! sampling_from_logits  one token per row under its top-k width, nucleus and min-p thresholds,
+//!                       drawn in ascending token id from one uniform draw
+//! argmax                the largest entry's column, the lowest among equals
+//! log_softmax           x − (max x + ln Σ exp(x − max x))
+//! logprob_gather        one token's log-probability and its competition rank
+//! top_logprobs          the `n` largest entries of a row, descending, with their token ids
+//! top_k                 the `width` largest entries of a row, descending, with their token ids
+//! softmax               p = exp(x − max x) / Σ exp(x − max x)
 //! ```
 //!
-//! A drawn token is `logits_shape`, `top_k`, `filter_candidates_`, `candidate_order`, `softmax`
-//! and `inverse_cdf`, in that order; a greedy token is `logits_shape` and `argmax`. The candidates
-//! reach the draw in ascending token id, so a fixed draw selects the same token whatever order
-//! the selection kept equal scores in. No function here generates randomness: a draw is a
-//! uniform value its caller computes.
+//! A drawn token is `logits_shape` and `sampling_from_logits`; a greedy token is `logits_shape`
+//! and `argmax`. The draw walks the kept candidates in ascending token id, so a fixed draw
+//! selects the same token whatever order equal scores are kept in. No function here generates
+//! randomness: a draw is a uniform value its caller computes.
 //!
 //! ## Rows and columns
 //!
@@ -39,12 +37,10 @@
 use ops::Operand;
 use ops::norm::{Softmax, SoftmaxArgs, SoftmaxDescriptor};
 use ops::sampler::{
-    ArgMax, ArgMaxArgs, ArgMaxDescriptor, CandidateOrder, FilterArgs, FilterCandidates,
-    FilterDescriptor, INDEX, InverseCdf, InverseCdfArgs, InverseCdfDescriptor, LogSoftmax,
-    LogSoftmaxArgs, LogSoftmaxDescriptor, LogitsShape, LogprobArgs, LogprobDescriptor,
-    LogprobGather, OrderArgs, OrderDescriptor, ShapeArgs, ShapeDescriptor, TopK, TopKArgs,
-    TopKDescriptor, TopLogprobs, TopLogprobsArgs, TopLogprobsDescriptor, ban_words,
-    top_k_workspace,
+    ArgMax, ArgMaxArgs, ArgMaxDescriptor, INDEX, LogSoftmax, LogSoftmaxArgs, LogSoftmaxDescriptor,
+    LogitsShape, LogprobArgs, LogprobDescriptor, LogprobGather, SamplingArgs, SamplingDescriptor,
+    SamplingFromLogits, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor, TopLogprobs,
+    TopLogprobsArgs, TopLogprobsDescriptor, ban_words, top_k_workspace,
 };
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE, TOP_K, TOP_P};
 use tensor::{D, DType, Device, Tensor};
@@ -69,12 +65,6 @@ const PRESENCE: usize = 6;
 
 /// The first index the kernels read as negative: an index at or above it names nothing.
 const UNNAMED: u32 = 1 << 31;
-
-/// Columns the CPU formulas accumulate a row's cumulative sum over at a time. The tensor
-/// library's cumulative sum is a product with a triangular matrix of the row's width squared,
-/// so a vocabulary-wide row is summed chunk by chunk with the total carried between chunks, as
-/// the kernels carry it between tiles.
-const CUMULATIVE_CHUNK: usize = 1024;
 
 /// The widest row the CPU formulas order: a key and a column are combined in one FP64 value,
 /// which is exact while `2³² · columns` stays below `2⁵³`.
@@ -157,34 +147,6 @@ fn choose(mask: &Tensor, on_true: &Tensor, on_false: &Tensor) -> Result<Tensor> 
 /// zero or more.
 fn named(indices: &Tensor) -> Result<Tensor> {
     Ok(indices.broadcast_lt(&integer(UNNAMED, indices)?)?)
-}
-
-/// The inclusive cumulative sum of each row of `x`, FP32 `[rows, columns]`, summed in chunks of
-/// [`CUMULATIVE_CHUNK`] columns with each chunk's total carried into the next.
-fn cumulative(x: &Tensor) -> Result<Tensor> {
-    let (rows, columns) = (x.dims()[0], x.dims()[1]);
-    let chunks = columns.div_ceil(CUMULATIVE_CHUNK);
-    if chunks == 1 {
-        return Ok(x.cumsum(D::Minus1)?);
-    }
-
-    let padded = chunks * CUMULATIVE_CHUNK;
-    let within = x
-        .pad_with_zeros(1, 0, padded - columns)?
-        .reshape((rows, chunks, CUMULATIVE_CHUNK))?
-        .cumsum(D::Minus1)?;
-
-    // The mass before a chunk is the sum of the totals of the chunks before it.
-    let totals = within.narrow(2, CUMULATIVE_CHUNK - 1, 1)?.squeeze(2)?;
-    let before = totals
-        .narrow(1, 0, chunks - 1)?
-        .pad_with_zeros(1, 1, 0)?
-        .cumsum(D::Minus1)?;
-
-    Ok(within
-        .broadcast_add(&before.unsqueeze(2)?)?
-        .reshape((rows, padded))?
-        .narrow(1, 0, columns)?)
 }
 
 /// The order-preserving unsigned keys of `values`, FP32: a negative value's bits inverted and
@@ -583,303 +545,234 @@ impl Fused for TopKCall<'_> {
     }
 }
 
-/// Applies each row's own thresholds to its candidates, in place: `(values, valid)`, the
-/// candidates with every dropped one `-inf`, and `[rows]` I32 that is `1` for a row whose
-/// candidates form a usable distribution.
+/// One token per row, drawn from the row's shaped logits under its top-k width, its nucleus
+/// threshold and its min-p threshold: `(tokens, valid)`, `[rows]` U32 and `[rows]` I32.
 ///
 /// ```text
-/// limit    = top_k > 0 ? floor(min(top_k, width)) : width
-/// x        = column < limit ? values : -inf                       the row's top-k width
-/// p        = softmax(x);  before = Σ p of the columns before
-/// x        = before > top_p ? -inf : x                            the nucleus
-/// x        = min_p ≤ 0 or x ≥ max(x) + ln(min_p) ? x : -inf       min-p
-/// valid    = no x is NaN or +inf, and some x is finite
+/// order    = the row's columns by descending logit, equal logits in ascending token id
+/// limit    = top_k > 0 ? floor(min(top_k, vocabulary)) : vocabulary
+/// kept     = the first `limit` positions of the order                  the top-k width
+/// m_j      = exp(x_j − max x) in units of 2⁻⁴⁰, rounded to the nearest   a position's mass
+/// kept     = the kept positions whose predecessors' Σ m is at most
+///            floor(top_p · Σ_kept m)                                     the nucleus, top_p < 1
+/// kept     = the kept positions with x ≥ max x + ln(min_p)               min-p, min_p > 0
+/// token    = the first kept token by id whose cumulative Σ m exceeds floor(draw · Σ_kept m)
+/// valid    = the kept candidates hold no NaN and no +inf, and the largest logit is finite
 /// ```
 ///
-/// `values` is FP32 `[rows, width]` in descending order ([`top_k`]'s), `ids` its U32 token
-/// ids, which the kernel takes and does not read, and `parameters` `[rows,
-/// PARAMETER_COLUMNS]` FP32. The nucleus keeps the first candidate whose cumulative mass
-/// crosses `top_p`, so a row keeps its largest candidate under any threshold of zero or more;
-/// min-p is measured against the largest candidate the nucleus left. A row of a min-p above
-/// one, or of logits that are all `-inf`, keeps nothing and reports `0`: the function does
-/// not branch on that, its reader does.
+/// The draw inverts the kept candidates' distribution in ascending token id, so a fixed draw
+/// selects the same token whatever order equal logits were kept in, and a draw of zero selects the
+/// lowest kept token id with mass. A candidate's mass is the softmax numerator held as an integer,
+/// so the nucleus's comparison and the draw's cumulative are exact sums and the kernel's launch
+/// is deterministic. The order is of the logits' bit patterns, so `+0.0` is above `-0.0`; a
+/// positive NaN is above every logit and a negative NaN below. The nucleus keeps the first
+/// candidate whatever its threshold of zero or more, and min-p is measured against the row's
+/// largest logit. A row whose width keeps nothing, whose nucleus is negative, whose min-p
+/// threshold is NaN or above its largest logit, or whose logits are all `-inf` keeps nothing;
+/// it reports `0` and holds token `0`, as does a row whose kept candidates hold a NaN or `+inf`.
+/// The function does not branch on that, its reader does.
+///
+/// `logits` is FP32 `[rows, vocabulary]`, `parameters` `[rows, PARAMETER_COLUMNS]` FP32 and
+/// `draws` `[rows]` FP32 uniform values in `[0, 1)`.
 ///
 /// # Errors
 ///
-/// When a tensor is not the shape or element type stated above, `values` is a strided view
-/// (it is filtered in its own storage), or the operator refuses its arguments.
-pub fn filter_candidates_(
-    values: Tensor,
-    ids: &Tensor,
+/// When a tensor is not the shape or element type stated above, or the operator refuses its
+/// arguments.
+pub fn sampling_from_logits(
+    logits: &Tensor,
     parameters: &Tensor,
+    draws: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = FilterCandidatesCall::OWNER;
+    const OWNER: &str = SamplingCall::OWNER;
 
-    let (rows, width) = matrix(OWNER, "candidates", &values)?;
-    let parameter_columns = PARAMETER_COLUMNS as usize;
+    let (rows, vocabulary) = matrix(OWNER, "logits", logits)?;
     require(
         OWNER,
-        "candidates",
-        &values,
+        "logits",
+        logits,
         DType::F32,
-        &[Some(rows), Some(width)],
-    )?;
-    require(
-        OWNER,
-        "candidate ids",
-        ids,
-        DType::U32,
-        &[Some(rows), Some(width)],
+        &[Some(rows), Some(vocabulary)],
     )?;
     require(
         OWNER,
         "parameters",
         parameters,
         DType::F32,
-        &[Some(rows), Some(parameter_columns)],
+        &[Some(rows), Some(PARAMETER_COLUMNS as usize)],
     )?;
-    if !values.is_contiguous() {
-        return Err(Error::shape(
-            OWNER,
-            "strided candidates have no storage of their own to be filtered in".to_owned(),
-        ));
-    }
+    require(OWNER, "draws", draws, DType::F32, &[Some(rows)])?;
 
-    compute(FilterCandidatesCall {
-        values,
-        ids,
+    compute(SamplingCall {
+        logits,
         parameters,
+        draws,
         rows,
-        width,
     })
 }
 
-/// A checked call of [`filter_candidates_`]: `rows` rows of `width` candidates.
-struct FilterCandidatesCall<'t> {
-    values: Tensor,
-    ids: &'t Tensor,
+/// A checked call of [`sampling_from_logits`] over `rows` rows.
+struct SamplingCall<'t> {
+    logits: &'t Tensor,
     parameters: &'t Tensor,
+    draws: &'t Tensor,
     rows: usize,
-    width: usize,
 }
 
-impl FilterCandidatesCall<'_> {
-    const OWNER: &'static str = "filter_candidates_";
+impl SamplingCall<'_> {
+    const OWNER: &'static str = "sampling_from_logits";
 }
 
-impl Fused for FilterCandidatesCall<'_> {
+impl Fused for SamplingCall<'_> {
     type Output = (Tensor, Tensor);
 
     fn device(&self) -> &Device {
-        self.values.device()
+        self.logits.device()
     }
 
     fn cpu(self) -> Result<(Tensor, Tensor)> {
         let Self {
-            values,
+            logits,
             parameters,
+            draws,
             rows,
-            width,
-            ..
         } = self;
 
-        let dropped = Tensor::full(f32::NEG_INFINITY, (rows, width), &Device::Cpu)?;
-        let column = Tensor::arange(0_u32, width as u32, &Device::Cpu)?.to_dtype(ACCUMULATE)?;
-        let parameter = |offset: usize| parameters.narrow(1, offset, 1);
-        let (top_k, top_p, min_p) = (
-            parameter(TOP_K as usize)?,
-            parameter(TOP_P as usize)?,
-            parameter(MIN_P)?,
-        );
+        let logits = logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        let parameters = parameters.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        let draws = draws.to_dtype(DType::F32)?.to_vec1::<f32>()?;
 
-        // 1. The row's top-k width: a width that is not positive keeps every candidate.
-        let whole = Tensor::full(width as f32, (rows, 1), &Device::Cpu)?;
-        let limit = top_k
-            .gt(0.0_f32)?
-            .where_cond(&top_k.minimum(width as f32)?.floor()?, &whole)?;
-        let kept = column
-            .unsqueeze(0)?
-            .broadcast_lt(&limit)?
-            .where_cond(&values, &dropped)?;
-
-        // 2. The nucleus: a candidate is dropped when the mass before it is above `top_p`.
-        let terms = kept.broadcast_sub(&kept.max_keepdim(1)?)?.exp()?;
-        let probabilities = terms.broadcast_div(&terms.sum_keepdim(1)?)?;
-        let before = (cumulative(&probabilities)? - &probabilities)?;
-        let kept = before.broadcast_gt(&top_p)?.where_cond(&dropped, &kept)?;
-
-        // 3. Min-p, against the largest candidate the nucleus left.
-        let threshold = (kept.max_keepdim(1)? + min_p.log()?)?;
-        let passes = kept
-            .broadcast_ge(&threshold)?
-            .broadcast_maximum(&min_p.le(0.0_f32)?)?;
-        let kept = passes.where_cond(&kept, &dropped)?;
-
-        // 4. Whether what is left is a distribution.
-        let count =
-            |mask: Tensor| -> Result<Tensor> { Ok(mask.to_dtype(ACCUMULATE)?.sum_keepdim(1)?) };
-        let not_a_number = kept.ne(&kept)?;
-        let infinite = kept.eq(f32::INFINITY)?;
-        let finite = kept
-            .eq(&kept)?
-            .mul(&kept.ne(f32::INFINITY)?)?
-            .mul(&kept.ne(f32::NEG_INFINITY)?)?;
-        let valid = count(not_a_number)?
-            .eq(0.0_f32)?
-            .mul(&count(infinite)?.eq(0.0_f32)?)?
-            .mul(&count(finite)?.gt(0.0_f32)?)?
-            .to_dtype(DType::I32)?
-            .squeeze(1)?;
-
-        values.slice_set(&kept, 0, 0)?;
-        Ok((values, valid))
-    }
-
-    fn launch(self) -> Result<(Tensor, Tensor)> {
-        let Self {
-            values,
-            ids,
-            parameters,
-            rows,
-            width,
-        } = self;
-
-        let valid = ops::empty(rows, DType::I32)?;
-        ops::launch::<FilterCandidates>(
-            &FilterDescriptor::new(extent(Self::OWNER, "candidates", width)?),
-            FilterArgs {
-                values: ops::operand(&values)?,
-                ids: signed(ids)?,
-                parameters: ops::operand(parameters)?,
-                valid: ops::operand(&valid)?,
-            },
-        )?;
-        Ok((values, valid))
-    }
-}
-
-/// Each row's candidates in ascending token id: `(values, ids)` in the shapes and element types
-/// of the candidates given.
-///
-/// Column `k` of a row is the candidate with the row's `k`-th smallest id, so the first
-/// columns hold the candidates whose id is a token of the `vocabulary` and the columns after
-/// them hold `-inf` and [`NO_SLOT`], which carry no mass and name no token. The permutation is
-/// by id alone: a dropped candidate keeps its place among the ids with its `-inf`. A row holds
-/// each token once; where it does not, the equal ids take consecutive columns in an order the
-/// kernel does not fix.
-///
-/// `values` is FP32 `[rows, width]` and `ids` U32 `[rows, width]`.
-///
-/// # Errors
-///
-/// When the two are not candidates of one shape, the vocabulary is narrower than a row, or the
-/// operator refuses its arguments.
-pub fn candidate_order(values: &Tensor, ids: &Tensor, vocabulary: u32) -> Result<(Tensor, Tensor)> {
-    const OWNER: &str = CandidateOrderCall::OWNER;
-
-    let (rows, width) = matrix(OWNER, "candidates", values)?;
-    require(
-        OWNER,
-        "candidates",
-        values,
-        DType::F32,
-        &[Some(rows), Some(width)],
-    )?;
-    require(
-        OWNER,
-        "candidate ids",
-        ids,
-        DType::U32,
-        &[Some(rows), Some(width)],
-    )?;
-    if (vocabulary as usize) < width {
-        return Err(Error::shape(
-            OWNER,
-            format!("rows of {width} candidates of a vocabulary of {vocabulary}"),
-        ));
-    }
-
-    compute(CandidateOrderCall {
-        values,
-        ids,
-        vocabulary,
-        rows,
-        width,
-    })
-}
-
-/// A checked call of [`candidate_order`]: `rows` rows of `width` candidates.
-struct CandidateOrderCall<'t> {
-    values: &'t Tensor,
-    ids: &'t Tensor,
-    vocabulary: u32,
-    rows: usize,
-    width: usize,
-}
-
-impl CandidateOrderCall<'_> {
-    const OWNER: &'static str = "candidate_order";
-}
-
-impl Fused for CandidateOrderCall<'_> {
-    type Output = (Tensor, Tensor);
-
-    fn device(&self) -> &Device {
-        self.values.device()
-    }
-
-    fn cpu(self) -> Result<(Tensor, Tensor)> {
-        let Self {
-            values,
-            ids,
-            vocabulary,
-            rows,
-            width,
-        } = self;
-
-        let unnamed = Tensor::full(NO_SLOT, (rows, width), &Device::Cpu)?;
-        let dropped = Tensor::full(f32::NEG_INFINITY, (rows, width), &Device::Cpu)?;
-
-        // An id that is no token sorts past every token and leaves its column unnamed.
-        let token = ids.broadcast_lt(&integer(vocabulary, ids)?)?;
-        let order = token.where_cond(ids, &unnamed)?.arg_sort_last_dim(true)?;
-        let placed = token.gather(&order, 1)?;
+        let mut tokens = Vec::with_capacity(rows);
+        let mut valid = Vec::with_capacity(rows);
+        for ((row, parameters), &draw) in logits.iter().zip(&parameters).zip(&draws) {
+            let drawn = draw_from(
+                row,
+                parameters[TOP_K as usize],
+                parameters[TOP_P as usize],
+                parameters[MIN_P],
+                draw,
+            );
+            tokens.push(drawn.unwrap_or(0));
+            valid.push(i32::from(drawn.is_some()));
+        }
 
         Ok((
-            placed.where_cond(&values.gather(&order, 1)?, &dropped)?,
-            placed.where_cond(&ids.gather(&order, 1)?, &unnamed)?,
+            Tensor::from_vec(tokens, rows, &Device::Cpu)?,
+            Tensor::from_vec(valid, rows, &Device::Cpu)?,
         ))
     }
 
     fn launch(self) -> Result<(Tensor, Tensor)> {
         let Self {
-            values,
-            ids,
-            vocabulary,
+            logits,
+            parameters,
+            draws,
             rows,
-            width,
         } = self;
 
-        let ordered_values = ops::empty((rows, width), DType::F32)?;
-        let ordered_ids = ops::empty((rows, width), DType::U32)?;
-
-        // The kernel counts the candidates of each id rather than comparing them, in scratch as
-        // wide as the id space, which is its own for the launch.
-        let counts = ops::empty((rows, vocabulary as usize), DType::I32)?;
-
-        ops::launch::<CandidateOrder>(
-            &OrderDescriptor::new(),
-            OrderArgs {
-                values: ops::operand(values)?,
-                ids: signed(ids)?,
-                ordered_values: ops::operand(&ordered_values)?,
-                ordered_ids: signed(&ordered_ids)?,
-                counts: ops::operand(&counts)?,
-                vocabulary: u64::from(vocabulary),
+        let tokens = ops::empty(rows, DType::U32)?;
+        let valid = ops::empty(rows, DType::I32)?;
+        ops::launch::<SamplingFromLogits>(
+            &SamplingDescriptor::new(),
+            SamplingArgs {
+                logits: ops::operand(logits)?,
+                parameters: ops::operand(parameters)?,
+                draws: ops::operand(draws)?,
+                tokens: signed(&tokens)?,
+                valid: ops::operand(&valid)?,
             },
         )?;
-        Ok((ordered_values, ordered_ids))
+        Ok((tokens, valid))
     }
+}
+
+/// A mass's unit: 2⁻⁴⁰ of the largest logit's.
+const MASS_UNIT: f32 = 1_099_511_627_776.0;
+
+/// The order-preserving key of an FP32 value: a negative value's bits inverted and every other
+/// value's sign bit set, so keys compare as the values do and `+0.0` is above `-0.0`.
+const fn key_of(value: f32) -> u32 {
+    let bits = value.to_bits();
+    if bits >> 31 == 1 {
+        !bits
+    } else {
+        bits | 1 << 31
+    }
+}
+
+/// `floor(fraction · total)` for a fraction in `[0, 1)`: an FP32 fraction times `2⁶⁴` is an
+/// integer, so the product is exact.
+fn share(total: u64, fraction: f32) -> u64 {
+    let scaled = (f64::from(fraction) * 2.0_f64.powi(64)) as u128;
+    ((u128::from(total) * scaled) >> 64) as u64
+}
+
+/// The token [`sampling_from_logits`] draws from one row, `None` for a row that keeps nothing
+/// usable: the operator's rule, position by position.
+fn draw_from(row: &[f32], top_k: f32, top_p: f32, min_p: f32, draw: f32) -> Option<u32> {
+    let vocabulary = row.len();
+    let keys: Vec<u32> = row.iter().map(|&value| key_of(value)).collect();
+    let mut order: Vec<usize> = (0..vocabulary).collect();
+    order.sort_by_key(|&token| (std::cmp::Reverse(keys[token]), token));
+
+    // The keys of the infinities: above `+inf`'s are the positive NaNs, below `-inf`'s the
+    // negative ones.
+    let largest = keys[order[0]];
+    let negative_nans = keys
+        .iter()
+        .filter(|&&key| key < key_of(f32::NEG_INFINITY))
+        .count();
+    let limit = if top_k > 0.0 {
+        top_k.min(vocabulary as f32).floor() as usize
+    } else {
+        vocabulary
+    };
+    let maximum = row[order[0]];
+    // A NaN min-p applies, and its threshold keeps nothing.
+    let min_p_applies = min_p > 0.0 || min_p.is_nan();
+    let threshold = maximum + min_p.ln();
+    let usable = largest < key_of(f32::INFINITY)
+        && largest > key_of(f32::NEG_INFINITY)
+        && limit > 0
+        && limit <= vocabulary - negative_nans
+        && (top_p >= 0.0 || top_p.is_nan())
+        && (!min_p_applies || maximum >= threshold);
+    if !usable {
+        return None;
+    }
+
+    // The masses, then the prefix each filter keeps: the width, the nucleus, min-p.
+    let mass = |token: usize| ((row[token] - maximum).exp() * MASS_UNIT).round_ties_even() as u64;
+    let mut kept = limit;
+    if top_p < 1.0 && !top_p.is_nan() {
+        let nucleus = share(order[..limit].iter().map(|&token| mass(token)).sum(), top_p);
+        let mut before = 0;
+        kept = 0;
+        for &token in &order[..limit] {
+            if before > nucleus {
+                break;
+            }
+            kept += 1;
+            before += mass(token);
+        }
+    }
+    if min_p_applies {
+        kept = order[..kept]
+            .iter()
+            .take_while(|&&token| row[token] >= threshold)
+            .count();
+    }
+
+    // The draw, over the kept tokens in token order.
+    let mut chosen = order[..kept].to_vec();
+    chosen.sort_unstable();
+    let total = chosen.iter().map(|&token| mass(token)).sum();
+    let target = share(total, draw.clamp(0.0, 1.0 - f32::EPSILON / 2.0));
+    let mut running = 0;
+    chosen.into_iter().find_map(|token| {
+        running += mass(token);
+        (mass(token) > 0 && running > target).then_some(token as u32)
+    })
 }
 
 /// The softmax of the rows of `x`: `exp(x − max x) / Σ exp(x − max x)`, in `x`'s shape and
@@ -942,126 +835,6 @@ impl Fused for SoftmaxCall<'_> {
             },
         )?;
         like_rows(out, x)
-    }
-}
-
-/// One token per row, drawn from its candidates by inverting their cumulative distribution:
-/// `[rows]` U32.
-///
-/// ```text
-/// token = ids[first column c with p[0] + … + p[c] > draw · Σ p]
-///       = the largest id that holds mass, when no column crosses
-/// ```
-///
-/// `probabilities` is FP32 `[rows, width]`, `ids` the candidates' U32 token ids and `draws`
-/// `[rows]` FP32 uniform values in `[0, 1)`. The cumulative runs in the order given, which a
-/// caller makes ascending token id ([`candidate_order`]). A candidate without mass is never
-/// selected, so a draw of zero selects the first candidate that holds some. A row whose
-/// candidates hold no mass at all, or a NaN, selects token `0`: it has no distribution, which
-/// [`filter_candidates_`] reports.
-///
-/// # Errors
-///
-/// When a tensor is not the shape or element type stated above, or the operator refuses its
-/// arguments.
-pub fn inverse_cdf(probabilities: &Tensor, ids: &Tensor, draws: &Tensor) -> Result<Tensor> {
-    const OWNER: &str = InverseCdfCall::OWNER;
-
-    let (rows, width) = matrix(OWNER, "probabilities", probabilities)?;
-    require(
-        OWNER,
-        "probabilities",
-        probabilities,
-        DType::F32,
-        &[Some(rows), Some(width)],
-    )?;
-    require(
-        OWNER,
-        "candidate ids",
-        ids,
-        DType::U32,
-        &[Some(rows), Some(width)],
-    )?;
-    require(OWNER, "draws", draws, DType::F32, &[Some(rows)])?;
-
-    compute(InverseCdfCall {
-        probabilities,
-        ids,
-        draws,
-        rows,
-        width,
-    })
-}
-
-/// A checked call of [`inverse_cdf`]: `rows` rows of `width` candidates.
-struct InverseCdfCall<'t> {
-    probabilities: &'t Tensor,
-    ids: &'t Tensor,
-    draws: &'t Tensor,
-    rows: usize,
-    width: usize,
-}
-
-impl InverseCdfCall<'_> {
-    const OWNER: &'static str = "inverse_cdf";
-}
-
-impl Fused for InverseCdfCall<'_> {
-    type Output = Tensor;
-
-    fn device(&self) -> &Device {
-        self.probabilities.device()
-    }
-
-    fn cpu(self) -> Result<Tensor> {
-        let Self {
-            probabilities,
-            ids,
-            draws,
-            rows,
-            width,
-        } = self;
-
-        let target = draws
-            .unsqueeze(1)?
-            .broadcast_mul(&probabilities.sum_keepdim(1)?)?;
-        let crossed = cumulative(probabilities)?.broadcast_gt(&target)?;
-
-        // The first column that crosses, or the width when none does.
-        let column = Tensor::arange(0_u32, width as u32, &Device::Cpu)?;
-        let past = Tensor::full(width as u32, (rows, width), &Device::Cpu)?;
-        let first = choose(&crossed, &column.unsqueeze(0)?, &past)?.min_keepdim(1)?;
-        let found = first.lt(width as u32)?;
-        let drawn = ids.gather(&found.where_cond(&first, &first.zeros_like()?)?, 1)?;
-
-        let fallback = probabilities
-            .gt(0.0_f32)?
-            .where_cond(ids, &ids.zeros_like()?)?
-            .max_keepdim(1)?;
-
-        Ok(found.where_cond(&drawn, &fallback)?.squeeze(1)?)
-    }
-
-    fn launch(self) -> Result<Tensor> {
-        let Self {
-            probabilities,
-            ids,
-            draws,
-            rows,
-            width,
-        } = self;
-
-        let tokens = ops::empty(rows, DType::U32)?;
-        ops::launch::<InverseCdf>(
-            &InverseCdfDescriptor::new(extent(Self::OWNER, "candidates", width)?),
-            InverseCdfArgs {
-                probabilities: ops::operand(probabilities)?,
-                ids: signed(ids)?,
-                draws: ops::operand(draws)?,
-                tokens: signed(&tokens)?,
-            },
-        )?;
-        Ok(tokens)
     }
 }
 
@@ -1753,148 +1526,155 @@ mod tests {
         assert_eq!(top_k(&logits, 4).unwrap().0.dims(), [2, 4]);
     }
 
-    // ---- filter_candidates_ -------------------------------------------------------------------
+    // ---- sampling_from_logits ----------------------------------------------------------------
 
-    /// The filter's rule over one descending row, in FP64: the kept candidates and the rest
-    /// `-inf`, with the row's validity.
-    fn filtered_row(values: &[f32], top_k: f32, top_p: f32, min_p: f32) -> (Vec<f32>, i32) {
-        let limit = if top_k > 0.0 {
-            top_k.min(values.len() as f32) as usize
-        } else {
-            values.len()
-        };
-        let mut kept: Vec<f32> = values
-            .iter()
-            .enumerate()
-            .map(|(column, value)| {
-                if column < limit {
-                    *value
-                } else {
-                    f32::NEG_INFINITY
-                }
-            })
+    /// The tokens a row draws for `draws` evenly spaced draws, `(i + 0.5) / draws`, and the
+    /// share of the draws each token took.
+    fn draw_shares(row: &[f32], top_k: f32, top_p: f32, min_p: f32, draws: usize) -> Vec<f64> {
+        let uniforms: Vec<f32> = (0..draws)
+            .map(|draw| (draw as f32 + 0.5) / draws as f32)
             .collect();
+        let parameters = parameter_row(1.0, top_k, top_p, min_p, [1.0, 0.0, 0.0]).repeat(draws);
+        let (tokens, valid) = sampling_from_logits(
+            &tensor(&row.repeat(draws), (draws, row.len())),
+            &tensor(&parameters, (draws, PARAMETER_COLUMNS as usize)),
+            &tensor(&uniforms, draws),
+        )
+        .unwrap();
+        assert!(read::<i32>(&valid).iter().all(|&valid| valid == 1));
 
-        let mass = probabilities(&kept);
-        let mut before = 0.0;
-        for (column, mass) in mass.iter().enumerate() {
-            if before > f64::from(top_p) {
-                kept[column] = f32::NEG_INFINITY;
-            }
-            before += mass;
+        let mut shares = vec![0.0; row.len()];
+        for token in read::<u32>(&tokens) {
+            shares[token as usize] += 1.0 / draws as f64;
         }
-
-        let largest = kept.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        for value in &mut kept {
-            if min_p > 0.0 && f64::from(*value) < f64::from(largest) + f64::from(min_p).ln() {
-                *value = f32::NEG_INFINITY;
-            }
-        }
-
-        let valid = kept.iter().any(|value| value.is_finite());
-        (kept, i32::from(valid))
+        shares
     }
 
     #[test]
-    fn filter_candidates_applies_the_top_k_width_the_nucleus_and_min_p() {
-        // Candidates of probabilities 0.5, 0.3, 0.15 and 0.05, descending.
-        let row: Vec<f32> = [0.5_f32, 0.3, 0.15, 0.05].iter().map(|p| p.ln()).collect();
-        let cases = [
-            // The row's own top-k of two.
-            (2.0, 1.0, 0.0),
-            // A nucleus of 0.7: the mass before the third candidate is 0.8.
-            (0.0, 0.7, 0.0),
+    fn sampling_from_logits_draws_from_the_top_k_nucleus_and_min_p_candidates() {
+        // Probabilities 0.05, 0.5, 0.15 and 0.3 at tokens 0 to 3: in descending order tokens 1,
+        // 3, 2 and 0.
+        let row: Vec<f32> = [0.05_f32, 0.5, 0.15, 0.3].iter().map(|p| p.ln()).collect();
+        let cases: [((f32, f32, f32), [f64; 4]); 6] = [
+            // The whole row.
+            ((0.0, 1.0, 0.0), [0.05, 0.5, 0.15, 0.3]),
+            // A top-k of two: tokens 1 and 3, renormalized.
+            ((2.0, 1.0, 0.0), [0.0, 0.625, 0.0, 0.375]),
+            // A nucleus of 0.7: the mass before token 2 is 0.8, above it.
+            ((0.0, 0.7, 0.0), [0.0, 0.625, 0.0, 0.375]),
             // A nucleus of zero keeps the largest candidate alone.
-            (0.0, 0.0, 0.0),
+            ((0.0, 0.0, 0.0), [0.0, 1.0, 0.0, 0.0]),
             // Min-p of 0.2 drops what is below a fifth of the largest probability.
-            (0.0, 1.0, 0.2),
-            // All three: three candidates renormalized, a nucleus that keeps them, and a min-p
-            // of a half that drops the third.
-            (3.0, 0.9, 0.5),
-            // A min-p above one drops every candidate.
-            (0.0, 1.0, 2.0),
+            ((0.0, 1.0, 0.2), [0.0, 0.5 / 0.95, 0.15 / 0.95, 0.3 / 0.95]),
+            // A top-k of three, a nucleus that keeps the three (the mass before token 2 is 0.8 of
+            // 0.95) and a min-p of a half that drops token 2.
+            ((3.0, 0.9, 0.5), [0.0, 0.625, 0.0, 0.375]),
         ];
 
-        let parameters: Vec<f32> = cases
-            .iter()
-            .flat_map(|(top_k, top_p, min_p)| {
-                parameter_row(1.0, *top_k, *top_p, *min_p, [1.0, 0.0, 0.0])
-            })
-            .collect();
-        let values = tensor(&row.repeat(cases.len()), (cases.len(), 4));
-        let ids = tensor(&[0_u32, 1, 2, 3].repeat(cases.len()), (cases.len(), 4));
+        // Evenly spaced draws take each kept token's share of the kept mass, to the spacing.
+        const DRAWS: usize = 4000;
+        for ((top_k, top_p, min_p), expected) in cases {
+            let shares = draw_shares(&row, top_k, top_p, min_p, DRAWS);
+            for (share, expected) in shares.iter().zip(expected) {
+                assert!(
+                    (share - expected).abs() <= 2.0 / DRAWS as f64,
+                    "top-k {top_k}, top-p {top_p}, min-p {min_p}: {shares:?}, {expected:?}"
+                );
+            }
+        }
+    }
 
-        let (kept, valid) = filter_candidates_(
-            values.clone(),
-            &ids,
-            &tensor(&parameters, (cases.len(), PARAMETER_COLUMNS as usize)),
+    #[test]
+    fn sampling_from_logits_inverts_the_kept_distribution_in_token_order() {
+        // Tokens 2, 5 and 7 hold the mass, equally; token 6 is banned.
+        let mut row = [-30.0_f32; 8];
+        row[2] = 1.0;
+        row[5] = 1.0;
+        row[6] = f32::NEG_INFINITY;
+        row[7] = 1.0;
+        let draws = [0.0_f32, 0.3, 0.34, 0.66, 0.67, 0.999_999_9];
+        let parameters = parameter_row(1.0, 3.0, 1.0, 0.0, [1.0, 0.0, 0.0]).repeat(draws.len());
+
+        let (tokens, valid) = sampling_from_logits(
+            &tensor(&row.repeat(draws.len()), (draws.len(), 8)),
+            &tensor(&parameters, (draws.len(), PARAMETER_COLUMNS as usize)),
+            &tensor(&draws, draws.len()),
         )
         .unwrap();
 
-        let expected: Vec<(Vec<f32>, i32)> = cases
-            .iter()
-            .map(|(top_k, top_p, min_p)| filtered_row(&row, *top_k, *top_p, *min_p))
-            .collect();
-        let expected_values: Vec<f32> =
-            expected.iter().flat_map(|(kept, _)| kept.clone()).collect();
-        let expected_valid: Vec<i32> = expected.iter().map(|(_, valid)| *valid).collect();
-
-        assert_eq!(bits(&read::<f32>(&kept)), bits(&expected_values));
-        assert_eq!(read::<i32>(&valid), expected_valid);
-
-        // The kept counts of the six cases, and the one row that is no distribution.
-        let counts: Vec<usize> = expected
-            .iter()
-            .map(|(kept, _)| kept.iter().filter(|value| value.is_finite()).count())
-            .collect();
-        assert_eq!(counts, [2, 2, 1, 3, 2, 0]);
-        assert_eq!(expected_valid, [1, 1, 1, 1, 1, 0]);
-
-        // The candidates are filtered where they lie.
-        assert_eq!(bits(&read::<f32>(&values)), bits(&expected_values));
+        // A draw of zero takes the lowest kept token, the highest draws the last one.
+        assert_eq!(read::<u32>(&tokens), [2, 2, 5, 5, 7, 7]);
+        assert_eq!(read::<i32>(&valid), [1; 6]);
     }
 
     #[test]
-    fn filter_candidates_reports_a_row_with_no_finite_candidate_or_a_nan() {
+    fn sampling_from_logits_keeps_the_lowest_tokens_of_equal_logits_a_width_cuts() {
+        // Five equal largest logits; a top-k of three keeps tokens 1, 4 and 6 of them.
+        let row = [0.0_f32, 2.0, 0.0, -1.0, 2.0, 0.0, 2.0, 2.0, 2.0];
+        let shares = draw_shares(&row, 3.0, 1.0, 0.0, 300);
+
+        let kept: Vec<usize> = (0..row.len())
+            .filter(|&token| shares[token] > 0.0)
+            .collect();
+        assert_eq!(kept, [1, 4, 6]);
+    }
+
+    #[test]
+    fn sampling_from_logits_reports_a_row_that_keeps_nothing_usable() {
         let rows = [
+            // No finite logit.
             [f32::NEG_INFINITY; 3],
+            // A NaN or +inf among the candidates.
             [1.0, f32::NAN, 0.0],
             [f32::INFINITY, 1.0, 0.0],
+            // A width that keeps nothing, a negative nucleus, a min-p above one.
+            [2.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+            // A usable row.
             [2.0, 1.0, 0.0],
         ];
-        let parameters = parameter_row(1.0, 0.0, 1.0, 0.0, [1.0, 0.0, 0.0]).repeat(4);
+        let parameters = [
+            (0.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.5, 1.0, 0.0),
+            (0.0, -0.1, 0.0),
+            (0.0, 1.0, 2.0),
+            (0.0, 1.0, 0.0),
+        ]
+        .iter()
+        .flat_map(|(top_k, top_p, min_p)| {
+            parameter_row(1.0, *top_k, *top_p, *min_p, [1.0, 0.0, 0.0])
+        })
+        .collect::<Vec<f32>>();
 
-        let (_, valid) = filter_candidates_(
-            tensor(&rows.concat(), (4, 3)),
-            &tensor(&[0_u32, 1, 2].repeat(4), (4, 3)),
-            &tensor(&parameters, (4, PARAMETER_COLUMNS as usize)),
+        let (tokens, valid) = sampling_from_logits(
+            &tensor(&rows.concat(), (rows.len(), 3)),
+            &tensor(&parameters, (rows.len(), PARAMETER_COLUMNS as usize)),
+            &tensor(&[0.9_f32; 7], 7),
         )
         .unwrap();
 
-        assert_eq!(read::<i32>(&valid), [0, 0, 0, 1]);
+        // The usable row's masses are 0.665, 0.245 and 0.090 of its total, so a draw of 0.9
+        // lands on token 1.
+        assert_eq!(read::<i32>(&valid), [0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(read::<u32>(&tokens), [0, 0, 0, 0, 0, 0, 1]);
     }
 
-    // ---- candidate_order ----------------------------------------------------------------------
-
     #[test]
-    fn candidate_order_sorts_by_token_and_fills_the_columns_no_token_takes() {
-        let dropped = f32::NEG_INFINITY;
-        let values = [0.5, dropped, 0.1, 0.2, 0.7, 0.6, 0.4, 0.3];
-        let ids = [7, 2, 9, 0, 5, 12, 1, NO_SLOT];
+    fn sampling_from_logits_refuses_columns_of_another_shape_or_type() {
+        let logits = tensor(&[0.0_f32; 8], (2, 4));
+        let parameters = tensor(&[0.0_f32; 16], (2, PARAMETER_COLUMNS as usize));
+        let draws = tensor(&[0.5_f32; 2], 2);
 
-        let (ordered_values, ordered_ids) =
-            candidate_order(&tensor(&values, (2, 4)), &tensor(&ids, (2, 4)), 10).unwrap();
-
-        // Row 0 is a permutation: a dropped candidate keeps its place among the ids. Row 1
-        // holds two ids that are no token of a vocabulary of ten.
-        assert_eq!(
-            read::<u32>(&ordered_ids),
-            [0, 2, 7, 9, 1, 5, NO_SLOT, NO_SLOT]
+        assert!(sampling_from_logits(&logits, &parameters, &tensor(&[0.5_f32; 3], 3)).is_err());
+        assert!(sampling_from_logits(&logits, &tensor(&[0.0_f32; 8], (2, 4)), &draws).is_err());
+        assert!(
+            sampling_from_logits(&logits.to_dtype(DType::BF16).unwrap(), &parameters, &draws)
+                .is_err()
         );
-        assert_eq!(
-            bits(&read::<f32>(&ordered_values)),
-            bits(&[0.2, dropped, 0.5, 0.1, 0.4, 0.7, dropped, dropped])
-        );
+        assert!(sampling_from_logits(&logits, &parameters, &draws).is_ok());
     }
 
     // ---- softmax ------------------------------------------------------------------------------
@@ -1919,94 +1699,6 @@ mod tests {
         // A row with no finite entry has no distribution.
         let empty = softmax(&tensor(&[f32::NEG_INFINITY; 3], (1, 3))).unwrap();
         assert!(read::<f32>(&empty).iter().all(|value| value.is_nan()));
-    }
-
-    // ---- inverse_cdf --------------------------------------------------------------------------
-
-    /// The first column whose inclusive cumulative mass exceeds `draw` times the row's mass.
-    fn first_crossing(mass: &[f32], draw: f32) -> Option<usize> {
-        let target = f64::from(draw) * mass.iter().map(|mass| f64::from(*mass)).sum::<f64>();
-        let mut cumulative = 0.0;
-
-        mass.iter().position(|mass| {
-            cumulative += f64::from(*mass);
-            cumulative > target
-        })
-    }
-
-    #[test]
-    fn inverse_cdf_selects_the_first_candidate_whose_cumulative_mass_passes_the_draw() {
-        let mass = [0.1_f32, 0.0, 0.2, 0.3, 0.4];
-        let ids = [3_u32, 5, 8, 20, 31];
-        let draws = [0.0_f32, 0.05, 0.15, 0.45, 0.95, 0.999];
-
-        let tokens = inverse_cdf(
-            &tensor(&mass.repeat(draws.len()), (draws.len(), 5)),
-            &tensor(&ids.repeat(draws.len()), (draws.len(), 5)),
-            &tensor(&draws, draws.len()),
-        )
-        .unwrap();
-
-        let expected: Vec<u32> = draws
-            .iter()
-            .map(|draw| ids[first_crossing(&mass, *draw).unwrap()])
-            .collect();
-        assert_eq!(read::<u32>(&tokens), expected);
-
-        // The cumulative masses are 0.1, 0.1, 0.3, 0.6 and 1: a draw of zero selects the first
-        // candidate with mass, and the candidate without mass is never selected.
-        assert_eq!(expected, [3, 3, 8, 20, 31, 31]);
-    }
-
-    #[test]
-    fn inverse_cdf_draws_against_the_rows_own_mass() {
-        // Masses that sum to two: a draw is a share of that.
-        let tokens = inverse_cdf(
-            &tensor(&[0.5_f32, 1.5, 0.5, 1.5], (2, 2)),
-            &tensor(&[4_u32, 9, 4, 9], (2, 2)),
-            &tensor(&[0.2_f32, 0.3], 2),
-        )
-        .unwrap();
-
-        assert_eq!(read::<u32>(&tokens), [4, 9]);
-    }
-
-    #[test]
-    fn inverse_cdf_selects_token_zero_for_a_row_with_no_mass() {
-        let tokens = inverse_cdf(
-            &tensor(&[0.0_f32, 0.0, f32::NAN, f32::NAN], (2, 2)),
-            &tensor(&[4_u32, 9, 4, 9], (2, 2)),
-            &tensor(&[0.5_f32, 0.5], 2),
-        )
-        .unwrap();
-
-        assert_eq!(read::<u32>(&tokens), [0, 0]);
-    }
-
-    /// A row wider than one chunk of the cumulative sum: the mass before a chunk is carried
-    /// into it, so a draw selects the same candidate wherever the chunks' borders fall.
-    #[test]
-    fn inverse_cdf_carries_the_cumulative_mass_across_a_wide_row() {
-        const WIDTH: usize = 2500;
-
-        let mass = vec![1.0 / WIDTH as f32; WIDTH];
-        let ids: Vec<u32> = (0..WIDTH as u32).map(|column| 2 * column).collect();
-        // The first columns past the middle and past the first chunk's 1024, and the last one.
-        let draws = [0.5002_f32, 0.4098, 0.9999];
-
-        let tokens = inverse_cdf(
-            &tensor(&mass.repeat(draws.len()), (draws.len(), WIDTH)),
-            &tensor(&ids.repeat(draws.len()), (draws.len(), WIDTH)),
-            &tensor(&draws, draws.len()),
-        )
-        .unwrap();
-
-        let expected: Vec<u32> = draws
-            .iter()
-            .map(|draw| ids[first_crossing(&mass, *draw).unwrap()])
-            .collect();
-        assert_eq!(read::<u32>(&tokens), expected);
-        assert_eq!(expected, [2 * 1250, 2 * 1024, 2 * 2499]);
     }
 
     // ---- argmax -------------------------------------------------------------------------------
@@ -2154,41 +1846,24 @@ mod tests {
     }
 
     #[test]
-    fn a_draw_states_its_five_kernels() {
+    fn a_draw_states_its_kernel() {
         let (output, launches) = recorded(|| {
-            let (values, ids) = top_k(&meta((3, 100), DType::F32), 16)?;
-            let (values, valid) = filter_candidates_(
-                values,
-                &ids,
+            let (tokens, valid) = sampling_from_logits(
+                &meta((3, 100), DType::F32),
                 &meta((3, PARAMETER_COLUMNS as usize), DType::F32),
+                &meta(3, DType::F32),
             )?;
-            let (values, ids) = candidate_order(&values, &ids, 100)?;
-            let tokens = inverse_cdf(&softmax(&values)?, &ids, &meta(3, DType::F32))?;
 
-            Ok([values, ids, valid, tokens].map(|out| (out.dims().to_vec(), out.dtype())))
+            Ok([tokens, valid].map(|out| (out.dims().to_vec(), out.dtype())))
         });
 
         assert_eq!(
             output.unwrap(),
-            [
-                (vec![3, 16], DType::F32),
-                (vec![3, 16], DType::U32),
-                (vec![3], DType::I32),
-                (vec![3], DType::U32),
-            ]
+            [(vec![3], DType::U32), (vec![3], DType::I32)]
         );
         assert_eq!(
             stated(&launches),
-            [
-                ("top_k", "dtype_f32_tile_2048_ids_i32_pdl_false"),
-                ("filter_candidates", "width_16_tile_8192_ids_i32_pdl_false"),
-                ("candidate_order", "values_f32_ids_i32_pdl_false"),
-                ("softmax", "dtype_f32_columns_16_tile_8192_pdl_false"),
-                (
-                    "inverse_cdf",
-                    "width_16_tile_8192_ids_i32_tokens_i32_pdl_false"
-                ),
-            ]
+            [("sampling_from_logits", "logits_f32_tokens_i32")]
         );
     }
 

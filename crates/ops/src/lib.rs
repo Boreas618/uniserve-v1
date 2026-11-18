@@ -95,8 +95,7 @@
 //! | [`logits::VocabUnpad`] | `vocab_unpad` | [`logits`] |
 //! | [`sampler::LogitsShape`] | `logits_shape` | [`sampler`] |
 //! | [`sampler::TopK`] | `top_k` | [`sampler`] |
-//! | [`sampler::FilterCandidates`] | `filter_candidates` | [`sampler`] |
-//! | [`sampler::InverseCdf`] | `inverse_cdf` | [`sampler`] |
+//! | [`sampler::SamplingFromLogits`] | `sampling_from_logits` | [`sampler`] |
 //! | [`sampler::ArgMax`] | `argmax` | [`sampler`] |
 //! | [`sampler::LogSoftmax`] | `log_softmax` | [`sampler`] |
 //! | [`sampler::LogprobGather`] | `logprob_gather` | [`sampler`] |

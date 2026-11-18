@@ -857,7 +857,11 @@ fn a_profile_run_states_the_launches_of_every_bucket_and_the_runner_s_memory() {
         // A greedy variant takes the argmax and draws nothing; any other draws.
         let greedy = usize::from(bucket.variant.greedy());
         assert_eq!(count(&launches, "argmax"), greedy, "{bucket}");
-        assert_eq!(count(&launches, "inverse_cdf"), 1 - greedy, "{bucket}");
+        assert_eq!(
+            count(&launches, "sampling_from_logits"),
+            1 - greedy,
+            "{bucket}"
+        );
 
         // The chosen tokens are scored once, and a scoring bucket scores its tokens besides,
         // sixty-four to a chunk.
@@ -3314,7 +3318,11 @@ fn the_verification_and_drafter_buckets_are_profiled_and_captured() {
                 }
                 let greedy = usize::from(bucket.variant.greedy());
                 assert_eq!(count(&launches, "argmax"), greedy, "{bucket}");
-                assert_eq!(count(&launches, "inverse_cdf"), 1 - greedy, "{bucket}");
+                assert_eq!(
+                    count(&launches, "sampling_from_logits"),
+                    1 - greedy,
+                    "{bucket}"
+                );
 
                 // The agreed lengths are one reduction over the rows' runs.
                 assert_eq!(count(&launches, reduce), 1, "{bucket}");

@@ -235,6 +235,21 @@ target/release/uniserve-profile timeline --admin "unix:$admin" --from "$FROM_NS"
 
 The conditions combine; none selects every span the store retains. The trace has a process per place a span ran (the daemon, each replica's scheduler, each worker rank and each Storage Server), ordered along a request's path; in each, a track per request for that request's spans and tracks for the batches' spans, each slice carrying its span's other labels and fields as arguments. Spans of one track that overlap without nesting take a further track of the same name. A membership record is a slice on its request's track, with a flow arrow to its batch's first span in every process. Times start at the earliest span, in microseconds.
 
+## The draw's cost in a decode step
+
+A drawn token is two launches: `logits_shape`, then `sampling_from_logits`, one block per row, which finds the row's top-k, nucleus and min-p boundaries by radix selection over the logits' order-preserving keys and draws in ascending token id with integer masses, ordering nothing (`ops::sampler::SamplingFromLogits`). When the first 11-bit digit bounds a row's candidates to 2048 tokens, as a top-k width of 20 does, the block reads the row twice and selects among the candidates in shared memory; a nucleus alone reads it three times; a width or a nucleus wider than that is selected digit by digit over the row. The draw's own step is the same whatever the request's filters, because the bucket's graph launches the one kernel for every row.
+
+On GB200, one block replaying the kernel alone in a CUDA graph over Qwen3-30B-A3B's 151936-token rows took 41 µs a row at the checkpoint's defaults (top-k 20, top-p 0.95), 70 µs for a nucleus of 0.95 alone and 42 µs for the whole row, at one row and at 32 rows alike. In a serving step's kernel timeline at 32 requests (`kernel_instance = 0`) its median was 46.0 µs of a 7.68 ms device step.
+
+The decode step time under the checkpoint's generation defaults was measured as the fence probes were (Qwen3-30B-A3B in bfloat16 on one GB200, requests that state no sampling parameter and decode 512 tokens each, five 60 s windows a point after 20 s, the step time as the point's forward seconds over its graph replays), on one source tree with and without this kernel; the selection it replaced kept the whole vocabulary as candidates, sorted (`top_k`, a single program per row, 10.2 ms a step in a single request's kernel timeline), filtered, reordered by token id (2.6 ms), normalized and inverted:
+
+| Requests | Sorted selection | `sampling_from_logits` | Greedy, same server |
+| --- | --- | --- | --- |
+| 1 | 35.49 ± 0.50 ms | 9.207 ± 0.058 ms | 9.83 ± 0.32 ms |
+| 32 | 41.45 ± 0.51 ms | 15.076 ± 0.022 ms | 12.21 ± 0.31 ms |
+
+The spread is the standard deviation of the windows (three for the greedy points); the host ran other work throughout, which moved single windows by up to 3%. At one request the drawn step equals the greedy one within that spread. At 32 requests the drawn step is 2.9 ms longer than the greedy one while its kernel takes 46 µs of the device step, so the remainder lies outside the draw's kernel.
+
 ## Capture and inspect a CUDA timeline with Nsight Systems
 
 Set `profiling_config.nvtx_ranges = true` in the deployment to start its ranges on; a session's `timeline` collector also switches them on while it runs. Each worker, the thread of one device, marks every job it runs with a synchronous range of the `uniserve.worker` domain named for the job's kind: `uniserve.worker.execute`, `resume`, `pass`, `shadow`, `map`, `stamp`, `capture`, `prepare`, `switch`, `commit`, `rollback`, `profile` and `control`; `execute`, `resume` and `shadow` carry the batch ID as a numeric payload. Native ranges use the NVIDIA NVTX SDK directly and issue no CUDA operations. Nsight Systems holds CUPTI's subscription in the processes it traces, so their sessions run no CUPTI collector.

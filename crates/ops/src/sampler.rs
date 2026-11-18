@@ -16,26 +16,20 @@
 //!    without that rule every greedy request would be shaped into `inf` and `nan` logits. The
 //!    shaped row is then the penalized logits themselves, so the row's largest candidate is its
 //!    greedy token.
-//! 2. `top_k` keeps the `width` largest logits of each row, sorted, with the vocabulary id of each.
-//! 3. `filter_candidates` applies the row's top-k width, its nucleus threshold and its min-p
-//!    threshold, and reports whether the row's candidates form a usable distribution.
-//! 4. `softmax` over the candidates (the shared operator in [`crate::norm`]).
-//! 5. `inverse_cdf` draws one token per row from one uniform draw, inverting the row's cumulative
-//!    distribution in the candidate order the layer supplies; the operator has no order of its own
-//!    and inverts in the order it receives. **That order is the
-//!    candidates sorted by token id**, not the descending logit order `top_k` leaves behind: the
-//!    layer reorders by token id before the draw so that an inverse-CDF draw is deterministic for a
-//!    fixed random value whatever order the top-k kernel produced, and matches the general path,
-//!    which selects in vocabulary order. The sort is a step of its
-//!    own between the filtering and the draw, because the operator that filters does not reorder
-//!    rows. A consequence worth stating: a draw of zero selects the *lowest token id* of each row's
-//!    candidates, not its largest logit — no draw path produces a greedy token.
-//! 6. `argmax` picks the largest candidate, which is a row's greedy token: with the divide-by-one
-//!    rule the shaped row keeps the logits' order, so its largest candidate is the temperature-zero
+//! 2. `sampling_from_logits` draws one token per row from one uniform draw, under the row's top-k
+//!    width, its nucleus threshold and its min-p threshold, and reports whether the row's kept
+//!    candidates form a usable distribution. It inverts the kept candidates' cumulative
+//!    distribution **in ascending token id**, so a draw is deterministic for a fixed random value
+//!    whatever order equal logits are kept in. A consequence worth stating: a draw of zero selects
+//!    the *lowest token id* of each row's kept candidates, not its largest logit — no draw path
+//!    produces a greedy token.
+//! 3. `argmax` picks the largest shaped logit, which is a row's greedy token: with the divide-by-one
+//!    rule the shaped row keeps the logits' order, so its largest entry is the temperature-zero
 //!    token. The layer computes it separately — an argmax, gathered across the tensor-parallel
-//!    ranks — because no draw can produce it once the
-//!    candidates are in token order.
-//! 7. `log_softmax` and `logprob_gather` report the log-probability of the tokens the caller asks
+//!    ranks — because no draw produces it.
+//! 4. `top_k` keeps the `width` largest entries of each row, sorted, with the vocabulary id of
+//!    each: a selection of a model's own (Qwen4's kept attention groups), not a step of the draw.
+//! 5. `log_softmax` and `logprob_gather` report the log-probability of the tokens the caller asks
 //!    for.
 //!
 //! Tolerances: the shaping and the filtering only combine FP32 values step by step and are compared
@@ -60,10 +54,6 @@ use proto::module::sampler::PARAMETER_COLUMNS;
 /// The element type the sampling kernels read an index as: a token id, a slot or a mask index
 /// reaches them as `I32`, where the entry that names nothing is `-1`.
 pub const INDEX: DType = DType::I32;
-
-/// Columns one program of the candidates' filter, distribution and draw reads at a time: a
-/// chunk of the row, so a candidate width may be the whole vocabulary.
-pub const CANDIDATE_TILE: u32 = 8192;
 
 /// The most columns one program of `logits_shape` shapes: one register tile of its kernel, so a
 /// row is shaped by `ceil(vocabulary / SHAPE_TILE)` programs side by side. The shaping is one
@@ -452,212 +442,135 @@ impl Op for TopK {
     }
 }
 
-/// One compilation of `filter_candidates`.
+/// One compilation of `sampling_from_logits`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct FilterDescriptor {
-    /// How many candidates a row carries.
-    ///
-    /// A runtime value, not a compilation: the program walks the row in `tile`-sized chunks, so one
-    /// module serves every candidate count and neither this nor the tile is a request the deployment
-    /// has to enumerate.
-    pub width: u32,
-    /// The tile the program walks the row in: a chunk, never the row.
-    pub tile: u32,
-    /// Element type of the emitted vocabulary ids.
-    pub ids: DType,
-    /// Launch with programmatic dependent launch.
-    pub pdl: bool,
+pub struct SamplingDescriptor {
+    /// Element type of the shaped logits.
+    pub logits: DType,
+    /// Element type of the emitted tokens.
+    pub tokens: DType,
 }
 
-impl FilterDescriptor {
-    /// The compilation that filters rows of `width` candidates.
-    pub fn new(width: u32) -> Self {
+impl SamplingDescriptor {
+    /// The compilation that draws from FP32 shaped logits.
+    pub fn new() -> Self {
         Self {
-            width,
-            tile: CANDIDATE_TILE,
-            ids: INDEX,
-            pdl: PDL,
+            logits: DType::F32,
+            tokens: INDEX,
         }
     }
 }
 
-impl fmt::Display for FilterDescriptor {
+impl Default for SamplingDescriptor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for SamplingDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The vocabulary and the row count are launch values: one module serves every model.
         Key::new()
-            .field("width", self.width)
-            .field("tile", self.tile)
-            .field("ids", abi::name(self.ids))
-            .field("pdl", self.pdl)
+            .field("logits", abi::name(self.logits))
+            .field("tokens", abi::name(self.tokens))
             .finish(formatter)
     }
 }
 
-/// The arguments of `filter_candidates`.
+/// The widest vocabulary `sampling_from_logits` draws from: the kernel's draw sums its row in at
+/// most one segment of 1024 tokens per thread of its block of 1024.
+pub const SAMPLING_MAX_VOCABULARY: u64 = 1 << 20;
+
+/// The arguments of `sampling_from_logits`.
 #[derive(Clone)]
-pub struct FilterArgs {
-    /// `[rows, width]` FP32 candidates, descending; a dropped candidate is written as `-inf`.
-    pub values: Operand,
-    /// `[rows, width]` the vocabulary ids of the candidates.
-    pub ids: Operand,
-    /// `[rows, PARAMETER_COLUMNS]` f32 request parameters.
+pub struct SamplingArgs {
+    /// `[rows, vocabulary]` FP32 shaped logits, unit stride along the vocabulary.
+    pub logits: Operand,
+    /// `[rows, PARAMETER_COLUMNS]` FP32 request parameters: the top-k width, the nucleus
+    /// threshold and the min-p threshold are read.
     pub parameters: Operand,
-    /// `[rows]` i32: 1 when the row's kept candidates form a usable distribution.
+    /// `[rows]` FP32 uniform draws in `[0, 1)`.
+    pub draws: Operand,
+    /// `[rows]` the drawn token of each row, written.
+    pub tokens: Operand,
+    /// `[rows]` I32, written: `1` for a row whose kept candidates form a distribution.
     pub valid: Operand,
 }
 
-/// Apply the top-k width, the nucleus threshold and the min-p threshold to the candidates.
-pub struct FilterCandidates;
+/// One token per row, drawn from the row's shaped logits under its top-k width, its nucleus
+/// threshold and its min-p threshold.
+///
+/// In the row's descending order (equal logits in ascending token id; `+0.0` above `-0.0`), the
+/// three filters each keep a prefix, applied in this order:
+///
+/// ```text
+/// limit    = top_k > 0 ? floor(min(top_k, vocabulary)) : vocabulary
+/// kept     = the first `limit` positions                               the top-k width
+/// m_j      = exp(x_j − max x) in units of 2⁻⁴⁰, rounded                each position's mass
+/// kept     = kept positions j with Σ_{i<j} m_i ≤ floor(top_p · Σ_kept m)  the nucleus (top_p < 1)
+/// kept     = kept positions with x_j ≥ max x + ln(min_p)               min-p (min_p > 0)
+/// token    = the first kept token by id whose cumulative mass exceeds floor(draw · Σ_kept m)
+/// ```
+///
+/// The draw inverts the kept candidates' cumulative distribution in ascending token id, so a fixed
+/// draw selects the same token whatever order equal logits are kept in, and a draw of zero selects
+/// the lowest kept token id with mass. The masses are integers, so the nucleus's comparison and
+/// the cumulative are exact and a launch is deterministic. A row reports `0` and holds token `0`
+/// when it keeps nothing (a width below one, a negative nucleus, a min-p threshold above the
+/// largest logit or NaN, no finite logit) or when its kept candidates hold a NaN or `+inf`.
+///
+/// The kernel orders nothing: it finds each filter's boundary by radix selection over the logits'
+/// order-preserving keys and draws in one more walk of the row in token order (the package's
+/// source states the passes).
+pub struct SamplingFromLogits;
 
-impl Op for FilterCandidates {
-    const NAME: &'static str = proto::module::operator::FILTER_CANDIDATES;
+impl Op for SamplingFromLogits {
+    const NAME: &'static str = proto::module::operator::SAMPLING_FROM_LOGITS;
 
-    type Descriptor = FilterDescriptor;
-    type Args<'a> = FilterArgs;
+    type Descriptor = SamplingDescriptor;
+    type Args<'a> = SamplingArgs;
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        let width = u64::from(descriptor.width);
-        let rows = args.values.rows();
-        args.values.require_row(Self::NAME, DType::F32, width)?;
-        args.ids.require_shape(Self::NAME, &[rows, width])?;
-        if args.ids.dtype != descriptor.ids {
+        if descriptor.logits != DType::F32 {
+            return Err(Error::Unsupported {
+                operation: Self::NAME,
+                reason: format!(
+                    "shaped logits of {} are not drawn from: the shaping writes FP32",
+                    abi::name(descriptor.logits)
+                ),
+            });
+        }
+        if args.logits.rank() != 2 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!("the logits are a matrix, found {:?}", args.logits.dims()),
+            ));
+        }
+        let rows = args.logits.rows();
+        let vocabulary = args.logits.last();
+        if vocabulary == 0 || vocabulary > SAMPLING_MAX_VOCABULARY {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "expected {} ids, found {}",
-                    abi::name(descriptor.ids),
-                    abi::name(args.ids.dtype)
+                    "a vocabulary of {vocabulary} is outside 1..={SAMPLING_MAX_VOCABULARY}, the \
+                     widest row the draw sums"
                 ),
             ));
         }
+        args.logits
+            .require_row(Self::NAME, descriptor.logits, vocabulary)?;
+        i32::try_from(rows).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!("{rows} rows do not fit a kernel parameter"),
+            )
+        })?;
         args.parameters
             .require_shape(Self::NAME, &[rows, u64::from(PARAMETER_COLUMNS)])?;
-        args.valid.require_shape(Self::NAME, &[rows])?;
-        if args.valid.dtype != DType::I32 {
+        if args.parameters.dtype != DType::F32 || !args.parameters.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
-                format!(
-                    "expected i32 validity flags, found {}",
-                    abi::name(args.valid.dtype)
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
-        let width = u64::from(descriptor.width);
-        let rows = args.values.rows();
-
-        let mut arguments = Arguments::new(Self::NAME);
-        arguments
-            .view("values_ptr", &args.values)
-            .view("ids_ptr", &args.ids)
-            .view("parameters_ptr", &args.parameters)
-            .view("valid_ptr", &args.valid)
-            .u64("rows", rows)
-            .u64("width", width);
-        kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
-    }
-
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
-        FilterArgs {
-            values: twins.in_place(args.values),
-            valid: twins.shadow_of(args.valid),
-            ..args
-        }
-    }
-
-    fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
-        // A threshold comparison over values the previous step produced; both implementations see
-        // the same candidates. A decision that differs is a sampling defect, not a rounding.
-        Tolerance::exact()
-    }
-}
-
-/// One compilation of `inverse_cdf`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct InverseCdfDescriptor {
-    /// How many candidates a row carries.
-    pub width: u32,
-    /// Lanes one program walks at a time: a chunk of the row, not the row, so the walk costs the
-    /// same registers at any width.
-    pub tile: u32,
-    /// Element type of the candidate vocabulary ids.
-    pub ids: DType,
-    /// The element type of an emitted token.
-    pub tokens: DType,
-    /// Launch with programmatic dependent launch.
-    pub pdl: bool,
-}
-
-impl InverseCdfDescriptor {
-    /// The compilation that draws from rows of `width` candidates.
-    pub fn new(width: u32) -> Self {
-        Self {
-            width,
-            tile: CANDIDATE_TILE,
-            ids: INDEX,
-            tokens: INDEX,
-            pdl: PDL,
-        }
-    }
-}
-
-impl fmt::Display for InverseCdfDescriptor {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
-            .field("width", self.width)
-            .field("tile", self.tile)
-            .field("ids", abi::name(self.ids))
-            .field("tokens", abi::name(self.tokens))
-            .field("pdl", self.pdl)
-            .finish(formatter)
-    }
-}
-
-/// The arguments of `inverse_cdf`.
-#[derive(Clone)]
-pub struct InverseCdfArgs {
-    /// `[rows, width]` FP32 candidate probabilities, in the order the caller supplies them; the layer
-    /// sorts by token id first, so the draw does not depend on
-    /// the order the top-k kernel happened to produce.
-    pub probabilities: Operand,
-    /// `[rows, width]` the vocabulary ids of the candidates.
-    pub ids: Operand,
-    /// `[rows]` f32 uniform draws in `[0, 1)`.
-    pub draws: Operand,
-    /// `[rows]` the chosen token of each row.
-    pub tokens: Operand,
-}
-
-/// One token per row, drawn from its candidate probabilities.
-pub struct InverseCdf;
-
-impl Op for InverseCdf {
-    const NAME: &'static str = proto::module::operator::INVERSE_CDF;
-
-    type Descriptor = InverseCdfDescriptor;
-    type Args<'a> = InverseCdfArgs;
-
-    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        let width = u64::from(descriptor.width);
-        let rows = args.probabilities.rows();
-        args.probabilities
-            .require_row(Self::NAME, DType::F32, width)?;
-        args.ids.require_shape(Self::NAME, &[rows, width])?;
-        if args.ids.dtype != descriptor.ids {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "expected {} ids, found {}",
-                    abi::name(descriptor.ids),
-                    abi::name(args.ids.dtype)
-                ),
+                "the parameters are row-major FP32 rows".to_owned(),
             ));
         }
         args.draws.require_shape(Self::NAME, &[rows])?;
@@ -678,40 +591,57 @@ impl Op for InverseCdf {
                 ),
             ));
         }
+        args.valid.require_shape(Self::NAME, &[rows])?;
+        if args.valid.dtype != DType::I32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected i32 validity flags, found {}",
+                    abi::name(args.valid.dtype)
+                ),
+            ));
+        }
         Ok(())
     }
 
     fn launch(
         kernel: &Kernel,
-        descriptor: &Self::Descriptor,
+        _descriptor: &Self::Descriptor,
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let rows = args.probabilities.rows();
+        let rows = args.logits.rows();
+        let vocabulary = args.logits.last();
+        let row_stride = args.logits.stride(0);
 
+        // One block draws one row.
         let mut arguments = Arguments::new(Self::NAME);
-        // The row count and the width are both runtime values: the program walks the row in tiles
-        // of the descriptor's `tile` lanes, so no block covers the row and nothing in the
-        // signature depends on its width.
         arguments
-            .view("probabilities_ptr", &args.probabilities)
-            .view("ids_ptr", &args.ids)
-            .view("draws_ptr", &args.draws)
-            .view("tokens_ptr", &args.tokens)
-            .u64("rows", rows)
-            .u32("width", descriptor.width);
+            .view("logits", &args.logits)
+            .i64(
+                "row_stride",
+                i64::try_from(row_stride)
+                    .map_err(|_| Error::argument(Self::NAME, "a row stride above i64::MAX"))?,
+            )
+            .i32("rows", rows as i32)
+            .i32("vocabulary", vocabulary as i32)
+            .view("parameters", &args.parameters)
+            .view("draws", &args.draws)
+            .view("tokens", &args.tokens)
+            .view("valid", &args.valid);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
-        InverseCdfArgs {
+        SamplingArgs {
             tokens: twins.shadow_of(args.tokens),
+            valid: twins.shadow_of(args.valid),
             ..args
         }
     }
 
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
-        // A sample is a token id: two implementations that differ have sampled from different
+        // A sample is a token id: two implementations that differ have drawn from different
         // distributions, which no rounding bound excuses.
         Tolerance::exact()
     }
@@ -1248,254 +1178,5 @@ impl Op for TopLogprobs {
     // A selection moves values and ids; two implementations must keep the same ones.
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
         Tolerance::exact()
-    }
-}
-
-/// One compilation of `candidate_order`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct OrderDescriptor {
-    /// Element type of the candidate values, which the permutation does not change.
-    pub values: DType,
-    /// Element type of the candidate ids.
-    pub ids: DType,
-    /// Launch with programmatic dependent launch.
-    pub pdl: bool,
-}
-
-impl OrderDescriptor {
-    /// The compilation that orders FP32 candidates by their ids.
-    pub fn new() -> Self {
-        Self {
-            values: DType::F32,
-            ids: INDEX,
-            pdl: PDL,
-        }
-    }
-}
-
-impl Default for OrderDescriptor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for OrderDescriptor {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The candidate count is a launch value: the reference's width follows the request's top-k,
-        // so an extent here would recompile the sampler per request.
-        Key::new()
-            .field("values", abi::name(self.values))
-            .field("ids", abi::name(self.ids))
-            .field("pdl", self.pdl)
-            .finish(formatter)
-    }
-}
-
-/// The arguments of `candidate_order`.
-#[derive(Clone)]
-pub struct OrderArgs {
-    /// `[rows, width]` the candidate values (probabilities or shaped logits — the permutation is the
-    /// same for either).
-    pub values: Operand,
-    /// `[rows, width]` the candidate token ids.
-    pub ids: Operand,
-    /// `[rows, width]` the values in ascending token order.
-    ///
-    /// Every slot of the row is written. A candidate's rank is the count of smaller ids before it,
-    /// so the first `k` slots hold `k` candidates and the rest hold the program's sentinel: value
-    /// [`f32::NEG_INFINITY`] and id `-1`. A slot nothing wrote is therefore not a reading anyone has
-    /// to interpret — it cannot be mistaken for the legitimate token `0`, and a draw does not select
-    /// it because it carries no mass.
-    pub ordered_values: Operand,
-    /// `[rows, width]` the ids in ascending token order, whole to the width as [`Self::ordered_values`]
-    /// is: the counted candidates first, then `-1`.
-    pub ordered_ids: Operand,
-    /// `[rows, vocabulary]` i32 scratch, one count per token id and then the rank each id's next
-    /// candidate takes.
-    ///
-    /// The program counts rather than compares, because a row's candidates may be the whole
-    /// vocabulary: an ordering that compares every candidate with every other is quadratic in the
-    /// vocabulary, and 151936 candidates in one program is sixteen seconds. This buffer is the id
-    /// space's, and the program owns it for the duration of the launch. It doubles as the rank
-    /// counter — each candidate takes the value its id holds and increments it — so two candidates
-    /// with one id land in consecutive slots instead of overwriting each other.
-    pub counts: Operand,
-    /// The id space `counts` covers: the model's vocabulary.
-    pub vocabulary: u64,
-}
-
-/// Put each row's candidates in ascending token order.
-///
-/// This is the step between filtering and drawing. [`InverseCdf`] inverts a cumulative distribution
-/// in the order it is given and sorts nothing, while the reference reorders the candidates **by token
-/// id** before the draw "so inverse-CDF draws are deterministic for a fixed random value independent
-/// of top-k kernel ordering, and matches the general path, which selects in vocabulary order"
-/// Without this step a draw would depend on the order the top-k program happened to produce.
-///
-/// It permutes and nothing else: the row's greedy token is not read here. `Sampler::greedy` takes it
-/// from `argmax` over the shaped **full-vocabulary** row, where a column is a token id, so the index
-/// is the token and "lowest index among ties" is `torch.max`'s rule;
-/// reading a second greedy token from the candidate set here would be a second answer to the same
-/// question, and the two would eventually disagree about a tie.
-pub struct CandidateOrder;
-
-impl Op for CandidateOrder {
-    const NAME: &'static str = proto::module::operator::CANDIDATE_ORDER;
-
-    type Descriptor = OrderDescriptor;
-    type Args<'a> = OrderArgs;
-
-    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        let rows = args.values.rows();
-        let width = args.values.last();
-        if width == 0 {
-            return Err(Error::argument(
-                Self::NAME,
-                "a row without candidates has no order".to_owned(),
-            ));
-        }
-        for (name, view, dtype) in [
-            ("values", &args.values, descriptor.values),
-            ("ids", &args.ids, descriptor.ids),
-            ("ordered_values", &args.ordered_values, descriptor.values),
-            ("ordered_ids", &args.ordered_ids, descriptor.ids),
-        ] {
-            view.require_shape(Self::NAME, &[rows, width])?;
-            if view.dtype != dtype {
-                return Err(Error::argument(
-                    Self::NAME,
-                    format!(
-                        "the {name} are {} over [{rows}, {width}], the view says {}",
-                        abi::name(dtype),
-                        abi::name(view.dtype)
-                    ),
-                ));
-            }
-            // A permutation written through rows that interleave would move each other's elements:
-            // the program writes one row contiguously, so every view must be packed.
-            if !view.is_row_major() {
-                return Err(Error::argument(
-                    Self::NAME,
-                    format!(
-                        "the {name} are written row-major; found {:?}",
-                        view.strides()
-                    ),
-                ));
-            }
-        }
-
-        if args.vocabulary < width {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "a row of {width} candidates names ids in a vocabulary of {}: the id space \
-                     cannot be narrower than the candidates it holds",
-                    args.vocabulary
-                ),
-            ));
-        }
-        args.counts
-            .require_shape(Self::NAME, &[rows, args.vocabulary])?;
-        if args.counts.dtype != DType::I32 {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "the counts are i32 over [{rows}, {}], the view says {}",
-                    args.vocabulary,
-                    abi::name(args.counts.dtype)
-                ),
-            ));
-        }
-        if !args.counts.is_row_major() {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "the counts are written row-major; found {:?}",
-                    args.counts.strides()
-                ),
-            ));
-        }
-        // The kernel takes the candidate count and the id space as signed 32-bit parameters.
-        i32::try_from(width).map_err(|_| {
-            Error::argument(
-                Self::NAME,
-                format!("{width} candidates do not fit a kernel parameter"),
-            )
-        })?;
-        i32::try_from(args.vocabulary).map_err(|_| {
-            Error::argument(
-                Self::NAME,
-                format!(
-                    "a vocabulary of {} does not fit a kernel parameter",
-                    args.vocabulary
-                ),
-            )
-        })?;
-        Ok(())
-    }
-
-    fn launch(
-        kernel: &Kernel,
-        _descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
-        let rows = args.values.rows();
-        let width = args.values.last();
-
-        let mut arguments = Arguments::new(Self::NAME);
-        // The scratch is the program's own: neither twin rule applies to it, and a shadow run gets
-        // its own buffer only if the caller gives it one.
-        arguments
-            .view("values_ptr", &args.values)
-            .view("ids_ptr", &args.ids)
-            .view("ordered_values_ptr", &args.ordered_values)
-            .view("ordered_ids_ptr", &args.ordered_ids)
-            .view("counts_ptr", &args.counts)
-            .u64("rows", rows)
-            .u64("width", width)
-            .u64("vocabulary", args.vocabulary);
-        kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
-    }
-
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
-        OrderArgs {
-            ordered_values: twins.shadow_of(args.ordered_values),
-            ordered_ids: twins.shadow_of(args.ordered_ids),
-            ..args
-        }
-    }
-
-    fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
-        // A permutation: an implementation that differs has ordered a different candidate set, and
-        // the token it selects from a draw is then a different token, which no rounding bound covers.
-        Tolerance::exact()
-    }
-}
-
-#[cfg(test)]
-mod order_tests {
-    use super::*;
-
-    #[test]
-    fn the_key_names_the_types_and_not_the_candidate_count() {
-        let descriptor = OrderDescriptor {
-            values: DType::F32,
-            ids: DType::I32,
-            pdl: false,
-        };
-        assert_eq!(descriptor.to_string(), "values_f32_ids_i32_pdl_false");
-    }
-
-    #[test]
-    fn the_bound_is_exact_because_a_permutation_has_no_rounding() {
-        let descriptor = OrderDescriptor {
-            values: DType::F32,
-            ids: DType::I32,
-            pdl: false,
-        };
-        let bound = CandidateOrder::tolerance(&descriptor);
-        assert_eq!(bound.atol, 0.0);
-        assert_eq!(bound.rtol, 0.0);
     }
 }

@@ -9,24 +9,23 @@
 //!
 //! ## The two selections
 //!
-//! A drawn token is a fixed sequence of launches over one row per sequence being sampled
+//! A drawn token is two launches over one row per sequence being sampled
 //! ([`Sampler::forward`]):
 //!
 //! ```text
-//! logits [rows, vocabulary]  → logits_shape      → shaped [rows, vocabulary] f32
-//! shaped                     → top_k             → values [rows, width] f32, ids [rows, width]
-//! values + ids               → filter_candidates → values (dropped = -inf), valid [rows]
-//! values + ids               → candidate_order   → the same rows in ascending token id
-//! ordered values             → softmax           → probabilities [rows, width] f32
-//! probabilities + draws      → inverse_cdf       → tokens [rows]
+//! logits [rows, vocabulary]  → logits_shape          → shaped [rows, vocabulary] f32
+//! shaped + draws             → sampling_from_logits  → tokens [rows], valid [rows]
 //! ```
+//!
+//! The draw keeps the candidates the row's top-k width, nucleus and min-p thresholds keep of the
+//! whole vocabulary, and inverts their distribution in ascending token id.
 //!
 //! A greedy token is another sequence ([`Sampler::greedy`]), which is why a bucket is one or
 //! the other:
 //!
 //! ```text
-//! logits [rows, vocabulary]  → logits_shape      → shaped [rows, vocabulary] f32
-//! shaped                     → argmax            → tokens [rows]
+//! logits [rows, vocabulary]  → logits_shape          → shaped [rows, vocabulary] f32
+//! shaped                     → argmax                → tokens [rows]
 //! ```
 //!
 //! ## Reported log-probabilities
@@ -72,13 +71,13 @@
 //! greedy takes [`Sampler::greedy`]. A greedy row beside a drawn row is served by the draw:
 //! [`parameters`] encodes it with a top-k width of one, so its candidate set is its largest
 //! shaped logit and its draw, whatever the uniform, selects it. The two selections agree on
-//! ties, because `top_k` orders equal scores by ascending token id and `argmax` returns the
-//! lowest column. The one tie they order differently is between the two zeros: `top_k` orders
-//! bit patterns and puts `+0.0` above `-0.0`, where `argmax` compares them equal.
+//! ties, because the draw's width keeps equal scores by ascending token id and `argmax` returns
+//! the lowest column. The one tie they order differently is between the two zeros: the draw
+//! orders bit patterns and puts `+0.0` above `-0.0`, where `argmax` compares them equal.
 //!
 //! ## Rows that cannot be sampled
 //!
-//! `filter_candidates` reports, per row, whether the row's kept candidates form a usable
+//! `sampling_from_logits` reports, per row, whether the row's kept candidates form a usable
 //! distribution: a row keeps nothing when its min-p is above one or when every logit is `-inf`
 //! (an empty allowed set, every token banned). The sampler does not branch on it, since the
 //! value is device data inside a captured graph: [`Sampler::forward`] returns the flags beside
@@ -118,11 +117,6 @@ pub(crate) struct SamplerConfig {
     pub vocabulary: u32,
     /// The request slots the two per-slot tables hold a row for.
     pub slots: u32,
-    /// The candidates a drawn row keeps: at most the vocabulary. A request's top-k is served
-    /// only up to this width and a request that states none draws from this many, so a
-    /// selection over a wider candidate list is the forward of a sampler of that width over
-    /// the same two tables.
-    pub width: u32,
     /// The most likely tokens a scored row reports beside its own: the deployment's
     /// `max_logprobs`, and zero to report none. The selection that finds them bounds the count
     /// by the vocabulary (215 over 151936 tokens), and a count past the bound is refused by
@@ -159,14 +153,12 @@ impl Sampler {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] for an empty vocabulary or no slots, a candidate width that is not
-    /// between one and the vocabulary, more reported candidates than the vocabulary has
-    /// tokens, or a table that is not `[slots, vocabulary]` in its element type.
+    /// [`Error::Invalid`] for an empty vocabulary or no slots, more reported candidates than the
+    /// vocabulary has tokens, or a table that is not `[slots, vocabulary]` in its element type.
     pub(crate) fn new(config: SamplerConfig, counts: Tensor, bias: Tensor) -> Result<Self> {
         let SamplerConfig {
             vocabulary,
             slots,
-            width,
             candidates,
             ..
         } = config;
@@ -174,11 +166,6 @@ impl Sampler {
         if vocabulary == 0 || slots == 0 {
             return Err(Error::Invalid(format!(
                 "a sampler of {vocabulary} tokens over {slots} slots has nothing to select"
-            )));
-        }
-        if width == 0 || width > vocabulary {
-            return Err(Error::Invalid(format!(
-                "a candidate width of {width} is outside 1..={vocabulary}"
             )));
         }
         if candidates > vocabulary {
@@ -221,9 +208,9 @@ impl Sampler {
     /// - `extras`: `[rows, extras]` U32, the tokens each row counts besides its slot's, for a
     ///   sampler whose config states some.
     ///
-    /// A row draws from the candidates its own top-k, nucleus and min-p keep of its `width`
-    /// largest shaped logits, in ascending token id, so a draw selects the same token whatever
-    /// order equal scores were kept in. `valid` is `1` for a row whose candidates form a
+    /// A row draws from the candidates its own top-k, nucleus and min-p keep of its shaped
+    /// logits, in ascending token id, so a draw selects the same token whatever order equal
+    /// scores were kept in. `valid` is `1` for a row whose candidates form a
     /// distribution; a row whose flag is `0` holds token `0` and its reader does not use it.
     ///
     /// # Errors
@@ -244,20 +231,11 @@ impl Sampler {
         bans: &Tensor,
         extras: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
-        // The shaped rows are read by the selection of the candidates and by nothing after it.
-        let (values, ids) = {
-            let shaped = self.shape(logits, slots, parameters, adjustments, bans, extras)?;
-            functional::top_k(&shaped, self.config.width)?
-        };
-        let (values, valid) = functional::filter_candidates_(values, &ids, parameters)?;
+        let shaped = self.shape(logits, slots, parameters, adjustments, bans, extras)?;
 
-        // Token order, so the draw does not depend on the order the selection kept equal
-        // scores in.
-        let (values, ids) = functional::candidate_order(&values, &ids, self.config.vocabulary)?;
-        let probabilities = functional::softmax(&values)?;
-        let tokens = functional::inverse_cdf(&probabilities, &ids, draws)?;
-
-        Ok((tokens, valid))
+        Ok(functional::sampling_from_logits(
+            &shaped, parameters, draws,
+        )?)
     }
 
     /// Takes each row's largest shaped logit as its token, the lowest id among equal ones:
@@ -732,7 +710,7 @@ mod tests {
         )
     }
 
-    /// A sampler over `tables` that keeps every token as a candidate.
+    /// A sampler over `tables`.
     fn sampler(tables: &(Tensor, Tensor), candidates: u32) -> Sampler {
         let [slots, vocabulary] = *tables.0.dims() else {
             panic!("a table is [slots, vocabulary]");
@@ -740,7 +718,6 @@ mod tests {
         let config = SamplerConfig {
             vocabulary: vocabulary as u32,
             slots: slots as u32,
-            width: vocabulary as u32,
             candidates,
             extras: 0,
         };
@@ -1081,44 +1058,6 @@ mod tests {
         assert_eq!(tokens, [1, 1, 3, 3, 4]);
     }
 
-    /// A request's top-k is served up to the sampler's candidate width, so a selection over a
-    /// wider candidate list is the forward of a wider sampler over the same tables.
-    #[test]
-    fn a_wider_sampler_over_the_same_tables_keeps_more_candidates() {
-        let tables = tables(MASS.len(), 1);
-        let of_width = |width: u32| {
-            let config = SamplerConfig {
-                vocabulary: MASS.len() as u32,
-                slots: 1,
-                width,
-                candidates: 0,
-                extras: 0,
-            };
-            Sampler::new(config, tables.0.clone(), tables.1.clone()).unwrap()
-        };
-        let logits = mass_logits();
-        let uniforms = [0.5_f32, 0.99];
-        let select = |width: u32, top_k: f32| {
-            let (tokens, _) = draw(
-                &of_width(width),
-                &[&logits[..]; 2],
-                &[0; 2],
-                &[with(request(1.0), TOP_K as usize, top_k); 2],
-                &uniforms,
-            );
-            tokens
-        };
-
-        // A top-k of four over two candidates is the two, and over six it is the four; a
-        // request that states no top-k draws from the width.
-        let two = uniforms.map(|uniform| drawn(&kept(&MASS, 2, 1.0, 0.0), uniform));
-        let four = uniforms.map(|uniform| drawn(&kept(&MASS, 4, 1.0, 0.0), uniform));
-        assert_eq!(select(2, 4.0), two);
-        assert_eq!(select(6, 4.0), four);
-        assert_eq!(select(2, 0.0), two);
-        assert_eq!((two, four), ([1, 3], [2, 4]));
-    }
-
     // ---- Penalties and the count table --------------------------------------------------------
 
     #[test]
@@ -1194,7 +1133,6 @@ mod tests {
         let config = SamplerConfig {
             vocabulary: 6,
             slots: 1,
-            width: 6,
             candidates: 0,
             extras: 2,
         };
@@ -1696,13 +1634,12 @@ mod tests {
     }
 
     /// The same forwards over meta tensors are a profile run: each selection states its
-    /// operators in launch order, with the keys of the config's widths.
+    /// operators in launch order, with their keys.
     #[test]
     fn each_forward_states_its_launch_sequence_under_a_meta_context() {
         let config = SamplerConfig {
             vocabulary: 1000,
             slots: 8,
-            width: 64,
             candidates: 5,
             extras: 0,
         };
@@ -1756,14 +1693,7 @@ mod tests {
                     "logits_shape",
                     "dtype_f32_vocabulary_1000_block_1024_extras_0_divide_true_pdl_false"
                 ),
-                ("top_k", "dtype_f32_tile_2048_ids_i32_pdl_false"),
-                ("filter_candidates", "width_64_tile_8192_ids_i32_pdl_false"),
-                ("candidate_order", "values_f32_ids_i32_pdl_false"),
-                ("softmax", "dtype_f32_columns_64_tile_8192_pdl_false"),
-                (
-                    "inverse_cdf",
-                    "width_64_tile_8192_ids_i32_tokens_i32_pdl_false"
-                ),
+                ("sampling_from_logits", "logits_f32_tokens_i32"),
             ]
         );
 
@@ -1824,7 +1754,6 @@ mod tests {
         let config = SamplerConfig {
             vocabulary: 6,
             slots: 2,
-            width: 6,
             candidates: 6,
             extras: 0,
         };
@@ -1834,11 +1763,8 @@ mod tests {
         let built = build(config, tables(6, 2)).unwrap();
         assert_eq!(*built.config(), config);
 
-        // The width is how many candidates a row keeps: not zero, not more than the vocabulary;
-        // and a row reports no more candidates than it has tokens.
+        // A row reports no more candidates than it has tokens.
         for refused in [
-            SamplerConfig { width: 0, ..config },
-            SamplerConfig { width: 7, ..config },
             SamplerConfig {
                 candidates: 7,
                 ..config

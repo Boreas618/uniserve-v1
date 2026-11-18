@@ -1,0 +1,49 @@
+# The sampling_from_logits operator's CUDA backend: design 5.2's package.
+#
+# The module is a cubin. One block of `warps` warps draws one row's token: it
+# finds the row's top-k, nucleus and min-p boundaries by radix selection over
+# the logits' order-preserving keys, lists the candidates in shared memory when
+# the first digit bounds them, and draws in ascending token id with integer
+# masses, so a launch is exact and deterministic. The vocabulary and the row
+# count are launch values, so one module serves every model.
+
+op = "sampling_from_logits"
+backend = "nvcc"
+interface_version = 1
+
+[module]
+form = "cubin"
+
+[source]
+kind = "cuda"
+
+[compile]
+units = ["src/sampling_from_logits.cu"]
+standard = "c++20"
+
+[compile.definitions]
+UNISERVE_WARPS = { parameter = "warps" }
+
+# The parameters in the operator's packed order.
+[compile.kernel]
+name = "uniserve_sampling_from_logits"
+warps = { parameter = "warps" }
+signature = [
+    ["logits", "*fp32"],
+    ["row_stride", "i64"],
+    ["rows", "i32"],
+    ["vocabulary", "i32"],
+    ["parameters", "*fp32"],
+    ["draws", "*fp32"],
+    ["tokens", "*i32"],
+    ["valid", "*i32"],
+]
+
+# `logits_f32_tokens_i32`.
+[[kernel.descriptors]]
+dimensions = { logits = ["f32"], tokens = ["i32"] }
+
+[parameters]
+# The warps of one block, which draws one row: the block's threads split the
+# histogram's 2048 bins and the candidate list's 2048 slots evenly.
+warps = 32
