@@ -1668,7 +1668,7 @@ fn replicas_in_engines_of_their_own_name_regions_of_their_own() {
     }
 }
 
-/// A target of another layout, here other graph buckets, which the daemon drains to with
+/// A target of another layout, here KV pages of another block size, which the daemon drains to with
 /// `shrink` (`specs/buffer-pool.md` §14, "A change of layout"), names a KV region of its own and
 /// maps none of the serving epoch's segments, while a successor of the same layout names the
 /// serving epoch's region and maps them.
@@ -1688,8 +1688,7 @@ fn a_target_of_another_layout_maps_none_of_the_serving_epochs_segments() {
     same.epoch = 2;
     let mut other = serving.clone();
     other.epoch = 3;
-    other.engine_config.cuda_graph.decode_batch_sizes =
-        Some(vec![std::num::NonZeroU32::new(1).unwrap()]);
+    other.engine_config.kv_cache.block_size = std::num::NonZeroU32::new(32);
     assert_eq!(serving.engine_config.layout(), same.engine_config.layout());
     assert_ne!(serving.engine_config.layout(), other.engine_config.layout());
 

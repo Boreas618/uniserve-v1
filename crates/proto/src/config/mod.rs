@@ -397,14 +397,14 @@ pub struct SchedulerConfig {
     /// The most draft tokens a verification carries per request
     /// (`speculative_config.num_draft_tokens`); zero when the deployment does not speculate.
     #[serde(skip)]
-    #[reload(epoch)]
+    #[reload(generation)]
     pub draft_tokens: usize,
     /// The captured graph sizes the ranks state, in tokens, ascending and without duplicates:
     /// `Room.graph_tiers`, the bound a scheduled batch must fit. Empty when they state none, and on a
     /// reconfigure, which carries no graph catalog: a worker then runs its own captured catalog or
     /// eagerly, and the tier bound is honest but vacuous.
     #[serde(skip)]
-    #[reload(epoch)]
+    #[reload(generation)]
     pub graph_tiers: Vec<u32>,
     /// What the scheduling policy module runs within: the fuel of each call into it, and the
     /// bounds of the starvation timeout and the prefetch threshold its limits may declare.
@@ -745,9 +745,12 @@ impl Tuning {
 #[serde(default, deny_unknown_fields)]
 pub struct SpeculativeConfig {
     /// The most draft tokens one verification carries per request; zero
-    /// does not speculate. The draft cache and the drafter's work belong
-    /// to the epoch, so a change of it is an epoch change.
-    #[reload(epoch)]
+    /// does not speculate. The verification buckets hold the drafts, so a
+    /// change between two counts above zero is a kernel generation, whose
+    /// graphs the serving engines capture in the background; a change from
+    /// or to zero loads or releases the drafter and its draft cache, which
+    /// an epoch lays out ([`drafts_effect`]).
+    #[reload(by = drafts_effect)]
     pub num_draft_tokens: u32,
     /// The speedup speculation gives a request, the decode steps' time one
     /// of its verification steps takes the place of, stated in place of
@@ -759,6 +762,17 @@ pub struct SpeculativeConfig {
     /// negative, measured when unset.
     #[reload(program)]
     pub refill_token_cost: Option<f64>,
+}
+
+/// How a change of `speculative_config.num_draft_tokens` from `previous` to `next` takes effect: a
+/// kernel generation between two counts above zero, whose graphs hold the drafts; an epoch from
+/// or to zero, which loads or releases the drafter's weights and lays its draft cache out.
+pub fn drafts_effect(previous: Option<&u32>, next: &u32) -> crate::reload::Effect {
+    match previous {
+        Some(previous) if previous == next => crate::reload::Effect::Generation,
+        Some(previous) if *previous > 0 && *next > 0 => crate::reload::Effect::Generation,
+        _ => crate::reload::Effect::Epoch,
+    }
 }
 
 /// The kind of device the command line's shorthand places every rank on (`device_config.device`).
@@ -1615,9 +1629,12 @@ pub struct ProfilingConfig {
     /// its CUDA graphs and keeps it enabled, stopped between sessions, so
     /// that sessions attribute the samples of graph kernels. CUPTI then
     /// refuses PM sampling, the range profiler and whole-graph activity
-    /// records, so sessions of those are refused. The graphs are captured
-    /// at an epoch's start, so a change takes a new epoch.
-    #[reload(epoch)]
+    /// records, so sessions of those are refused. CUPTI attributes only the
+    /// graphs captured while it samples, so a change is a kernel generation:
+    /// the serving engines switch CUPTI's mode, capture every graph again
+    /// under it in the background and switch to them whole, and switch the
+    /// mode back when the generation is given back.
+    #[reload(generation)]
     pub graph_pc_sampling: bool,
     /// Whether the engine's NVTX ranges (the `uniserve.worker` domain and
     /// the scheduler's and control thread's ranges) are emitted from the
@@ -2140,7 +2157,7 @@ impl EngineConfig {
             parallel,
             max_running_requests,
             max_num_batched_tokens: _,
-            max_logprobs,
+            max_logprobs: _,
             device,
             scheduler: _,
             roles: _,
@@ -2149,7 +2166,7 @@ impl EngineConfig {
             load,
             kv_cache,
             moe,
-            cuda_graph,
+            cuda_graph: _,
             worker,
             speculative,
             video,
@@ -2191,7 +2208,7 @@ impl EngineConfig {
             fence_probes: _,
             fence_modules: _,
             fence_probes_off: _,
-            graph_pc_sampling,
+            graph_pc_sampling: _,
             nvtx_ranges: _,
             session: _,
             kernel_instance: _,
@@ -2203,7 +2220,6 @@ impl EngineConfig {
             model,
             parallel,
             max_running_requests: *max_running_requests,
-            max_logprobs: *max_logprobs,
             device: *device,
             devices,
             worker_hosts,
@@ -2212,7 +2228,6 @@ impl EngineConfig {
             kv_cache,
             expert_parallel: *expert_parallel,
             beside_rows: *beside_rows,
-            cuda_graph,
             engine,
             engine_revision: *engine_revision,
             mesh,
@@ -2220,22 +2235,26 @@ impl EngineConfig {
             standby_storage: *standby_storage,
             host_threads: *host_threads,
             host_queue_depth: *host_queue_depth,
-            num_draft_tokens: *num_draft_tokens,
+            speculates: *num_draft_tokens > 0,
             video,
-            graph_pc_sampling: *graph_pc_sampling,
         }
     }
 
     /// Takes from `target` the values a kernel generation moves the serving engines to (the
-    /// probes' places, `profiling_config.kernel_instance` and `fence_modules`, and
-    /// `moe_config.microbatches`): what a relaunch and a standby start from once the generation
-    /// committed.
+    /// probes' places, `profiling_config.kernel_instance` and `fence_modules`,
+    /// `moe_config.microbatches`, and the graph options: the bucket catalog, `max_logprobs`,
+    /// `speculative_config.num_draft_tokens` and `profiling_config.graph_pc_sampling`): what a
+    /// relaunch and a standby start from once the generation committed.
     pub fn take_generation(&mut self, target: &EngineConfig) {
         self.profiling.kernel_instance = target.profiling.kernel_instance;
         self.profiling
             .fence_modules
             .clone_from(&target.profiling.fence_modules);
         self.moe.microbatches = target.moe.microbatches;
+        self.cuda_graph.clone_from(&target.cuda_graph);
+        self.max_logprobs = target.max_logprobs;
+        self.speculative.num_draft_tokens = target.speculative.num_draft_tokens;
+        self.profiling.graph_pc_sampling = target.profiling.graph_pc_sampling;
     }
 
     /// The options this configuration's kernel generations capture the CUDA graphs for
@@ -2256,7 +2275,6 @@ impl EngineConfig {
             max_running_requests: self.max_running_requests,
             block_size: self.kv_cache.block_size,
             dtype: self.kv_cache.dtype,
-            cuda_graph: self.cuda_graph.clone(),
         }
     }
 }
@@ -2269,7 +2287,6 @@ pub struct BuildPart<'a> {
     pub model: &'a ModelConfig,
     pub parallel: &'a ParallelConfig,
     pub max_running_requests: NonZeroUsize,
-    pub max_logprobs: u32,
     pub device: DeviceKind,
     pub devices: &'a [u32],
     pub worker_hosts: &'a [String],
@@ -2279,7 +2296,6 @@ pub struct BuildPart<'a> {
     pub expert_parallel: bool,
     /// The expert union's middle capture class, which the captured graphs are shaped for.
     pub beside_rows: NonZeroU32,
-    pub cuda_graph: &'a CudaGraphConfig,
     pub engine: &'a str,
     pub engine_revision: Option<u32>,
     pub mesh: &'a Option<String>,
@@ -2287,9 +2303,10 @@ pub struct BuildPart<'a> {
     pub standby_storage: StandbyStorage,
     pub host_threads: Option<NonZeroUsize>,
     pub host_queue_depth: NonZeroUsize,
-    pub num_draft_tokens: u32,
+    /// Whether the epoch speculates, which loads the drafter and lays the draft cache out; the
+    /// count of drafts is a kernel generation's (`drafts_effect`).
+    pub speculates: bool,
     pub video: &'a VideoConfig,
-    pub graph_pc_sampling: bool,
 }
 
 impl BuildPart<'_> {
@@ -2307,7 +2324,8 @@ impl BuildPart<'_> {
 
 /// What lays an epoch's device memory out (`specs/buffer-pool.md` §14, "A change of layout"): the
 /// parallel configuration, whose worker groups state the devices and the hosts; the request slots;
-/// the KV cache's block size and element type; and the graph buckets. Two epochs of one layout
+/// and the KV cache's block size and element type. The graph buckets are not part of it: a kernel
+/// generation changes them in place, and the KV units lie as they lay. Two epochs of one layout
 /// name the same device KV regions and share their blocks, and an epoch of another layout opens
 /// regions of its own, into which the serving epoch's device memory moves as it drains, so the
 /// engine names its regions by the layout's identity and the daemon drains with `shrink` exactly
@@ -2318,7 +2336,6 @@ pub struct Layout {
     pub max_running_requests: NonZeroUsize,
     pub block_size: Option<NonZeroU32>,
     pub dtype: Option<PrefixCacheDtype>,
-    pub cuda_graph: CudaGraphConfig,
 }
 
 impl Layout {

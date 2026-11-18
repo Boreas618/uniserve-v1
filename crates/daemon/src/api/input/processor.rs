@@ -51,6 +51,10 @@ pub struct Processor {
     renderer: RequestRenderer,
     // Worker-advertised generation features and resource limits.
     pub(super) limits: GenerationLimits,
+    /// The candidates a request may ask for at a position: the workers' `max_logprobs`, which
+    /// a kernel generation of other candidates moves while the processor serves
+    /// ([`Processor::set_max_logprobs`]).
+    max_logprobs: std::sync::atomic::AtomicU32,
     pub(super) parse_reasoning: bool,
     // The family's image processor, when the family takes images and the workers encode them.
     images: Option<Arc<dyn ImageProcessor>>,
@@ -328,10 +332,23 @@ impl Processor {
             config,
             tokenizer,
             renderer,
+            max_logprobs: std::sync::atomic::AtomicU32::new(limits.max_logprobs),
             limits,
             parse_reasoning,
             images: None,
         })
+    }
+
+    /// The candidates a request may ask for at a position from now on: the serving engines'
+    /// graphs compute this many, of a kernel generation that captured them for another count.
+    pub fn set_max_logprobs(&self, max_logprobs: u32) {
+        self.max_logprobs
+            .store(max_logprobs, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The candidates a request may ask for at a position now ([`Processor::set_max_logprobs`]).
+    pub fn max_logprobs(&self) -> u32 {
+        self.max_logprobs.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Takes image parts through `images`, the family's bound image processor, when the workers
@@ -479,7 +496,7 @@ impl Processor {
                     request,
                     &self.config.sampling_defaults,
                     &self.tokenizer,
-                    self.limits.max_logprobs,
+                    self.max_logprobs(),
                 )?,
                 max_und_tokens: 0,
                 include_stop_token: request.include_stop_str_in_output,
@@ -506,7 +523,11 @@ impl Processor {
             self.tokenize(request, &images, &mut generation)?;
             generation.validate()?;
             // The workers compute a position's candidates in their graphs, as many as they state.
-            self.limits.covers_logprobs(&generation.sampling)?;
+            GenerationLimits {
+                max_logprobs: self.max_logprobs(),
+                ..GenerationLimits::default()
+            }
+            .covers_logprobs(&generation.sampling)?;
 
             let lowering = handoff::Lowering {
                 // Detokenization needs the prompt after ownership moves to the engine.

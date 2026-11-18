@@ -858,8 +858,9 @@ impl EngineClient {
     /// What a generation update to the kernel packages `kernels` would take on every rank's
     /// device beside the serving graphs, each rank's device's extra bytes, room and the KV units
     /// its cache would give up; measured without installing anything, empty when it replaces no
-    /// kernel and, unless `recapture` (a generation that places the probes elsewhere), captures
-    /// no bucket again.
+    /// kernel and, unless `recapture` (a generation that places the probes elsewhere) or
+    /// `graphs` (the generation's graph options where they differ from the serving ones, whose
+    /// shapes the engine measures), captures no bucket again.
     ///
     /// # Errors
     ///
@@ -868,7 +869,9 @@ impl EngineClient {
         &self,
         kernels: &proto::module::Packages,
         recapture: bool,
+        graphs: Option<&proto::config::GraphOptions>,
     ) -> Result<Vec<wire::DeviceRoom>, String> {
+        let graphs = graphs.map(wire::GraphOptions::from);
         let kernels: Vec<wire::RoomKernel> = kernels
             .iter()
             .map(|(slot, package)| wire::RoomKernel {
@@ -885,7 +888,7 @@ impl EngineClient {
                     id,
                     kernels,
                     recapture,
-                    graphs: None,
+                    graphs,
                 })
             })
             .await?

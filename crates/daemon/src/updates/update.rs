@@ -618,7 +618,8 @@ impl Update {
     }
 
     /// `Prepare` to every serving engine, with the target's kernel and policy
-    /// modules and where its kernel probes lie.
+    /// modules, where its kernel probes lie, and the options its graphs are
+    /// captured for.
     fn prepare_generation(&mut self, processes: &mut Processes) {
         let modules = &self.target.modules;
         let prepare = command(command::Kind::Prepare(process::Prepare {
@@ -636,7 +637,7 @@ impl Update {
                 .fence_modules
                 .clone()
                 .map(|patterns| process::FenceModules { patterns }),
-            graphs: None,
+            graphs: Some((&self.target.engine.graph_options()).into()),
         }));
         for node in &self.nodes {
             processes.command(&node.host, node.launch, prepare.clone());

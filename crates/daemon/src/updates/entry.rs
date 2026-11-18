@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use proto::admin::InFlight;
+use proto::admin::{InFlight, Phase};
 use proto::config::EngineConfig;
 use proto::reload::{Effect, Effects, Reload as _};
 use tracing::info;
@@ -60,10 +60,12 @@ const DAEMON_STEPS: [&str; 8] = [
     "profiling_config.span_window",
 ];
 
-/// Whether `target` places the kernel probes elsewhere than `serving`: a kernel generation,
-/// whose captures move them.
-fn probes_move(serving: &EngineConfig, target: &EngineConfig) -> bool {
+/// Whether `target`'s graphs are captured otherwise than `serving`'s: it places the kernel probes
+/// elsewhere, or states other graph options (`EngineConfig::graph_options`). A kernel
+/// generation, which captures every graph again.
+fn graphs_move(serving: &EngineConfig, target: &EngineConfig) -> bool {
     serving.profiling.kernel_instance != target.profiling.kernel_instance
+        || serving.graph_options() != target.graph_options()
 }
 
 /// Whether `changes` switch the fence probes.
@@ -250,7 +252,7 @@ impl Leader {
         } else if named == Change::Generation
             || record.kernels != next.modules.kernels
             || record.policy != next.modules.policy
-            || probes_move(&record.config, &next.engine)
+            || graphs_move(&record.config, &next.engine)
         {
             Effect::Generation
         } else {
@@ -309,7 +311,8 @@ impl Leader {
         .await
         .map_err(|error| UpdateError::Failed(anyhow::anyhow!("fixing the kernels: {error}")))?
         .map_err(|error| UpdateError::Refused(format!("fixing the kernels: {error:#}")))?;
-        // A generation that places the probes elsewhere captures every bucket again.
+        // A generation that places the probes elsewhere captures every bucket again, and one of
+        // other graph options every bucket of the shapes they give the runners.
         let probes = |engine: &EngineConfig| {
             (
                 engine.profiling.kernel_instance,
@@ -317,11 +320,15 @@ impl Leader {
             )
         };
         let current = service::lock(&self.replicas()[0].config).engine_config();
-        let recapture = match (target.engine_config(), current) {
-            (Ok(target), Ok(current)) => probes(&target) != probes(&current),
-            _ => false,
+        let (recapture, graphs) = match (target.engine_config(), current) {
+            (Ok(target), Ok(current)) => {
+                let options = target.graph_options();
+                let graphs = (options != current.graph_options()).then_some(options);
+                (probes(&target) != probes(&current), graphs)
+            }
+            _ => (false, None),
         };
-        if fixed.kernels == record.kernels && !recapture {
+        if fixed.kernels == record.kernels && !recapture && graphs.is_none() {
             return Ok(Vec::new());
         }
         let mut rooms = Vec::new();
@@ -330,7 +337,7 @@ impl Leader {
                 continue;
             };
             let measured = client
-                .measure_room(&fixed.kernels, recapture)
+                .measure_room(&fixed.kernels, recapture, graphs.as_ref())
                 .await
                 .map_err(|error| {
                     UpdateError::Failed(anyhow::anyhow!("measuring the generation's room: {error}"))
@@ -447,7 +454,41 @@ impl Leader {
             nodes,
             options.trial,
         );
-        let report = self.updates.apply(update)?;
+        // A request the daemon admits asks the engines for no more candidates than both
+        // generations' graphs compute until the update ends: the target's count from its commit,
+        // and the serving one's again after a rollback.
+        let processor = self.processor();
+        let serving_logprobs = processor.max_logprobs();
+        let target_logprobs = next.engine.max_logprobs;
+        processor.set_max_logprobs(serving_logprobs.min(target_logprobs));
+        let report = match self.updates.apply(update) {
+            Ok(report) => report,
+            Err(refused) => {
+                processor.set_max_logprobs(serving_logprobs);
+                return Err(refused);
+            }
+        };
+        let updater = Arc::clone(&self.updates);
+        tokio::spawn(async move {
+            let mut phases = updater.watch();
+            loop {
+                match updater.phase_of(number) {
+                    Some(Phase::Committed) => {
+                        processor.set_max_logprobs(target_logprobs);
+                        return;
+                    }
+                    Some(Phase::RolledBack | Phase::Abandoned) | None => {
+                        processor.set_max_logprobs(serving_logprobs);
+                        return;
+                    }
+                    Some(_) => {}
+                }
+                if phases.changed().await.is_err() {
+                    processor.set_max_logprobs(serving_logprobs);
+                    return;
+                }
+            }
+        });
         for replica in self.replicas() {
             replica.follow(
                 Arc::clone(&self.updates),
@@ -986,8 +1027,10 @@ mod tests {
             graph_pc_sampling: true,
             ..served.profiling_config.clone()
         }));
+        // CUPTI attributes the graphs captured while it samples: a kernel generation captures
+        // them again.
         assert!(!switches_probes(&sampled));
-        assert_eq!(Effects::of(&sampled).heaviest(), Some(Effect::Epoch));
+        assert_eq!(Effects::of(&sampled).heaviest(), Some(Effect::Generation));
         // The probed modules are captured into the graphs, again by a kernel generation.
         let moved = changed(&profiled(proto::config::ProfilingConfig {
             fence_modules: Some(vec!["*.TransformerLayer".to_owned()]),
@@ -1051,10 +1094,11 @@ mod tests {
     }
 
     /// The target's layout differs from the serving one's in its parallel
-    /// configuration, its devices, its slot count, its KV layout and its graph
-    /// buckets, and not in the cache's size or its tiers.
+    /// configuration, its devices, its slot count and its KV layout, and not in
+    /// the cache's size, its tiers or the graph buckets, which a kernel
+    /// generation changes in place.
     #[test]
-    fn a_layout_is_the_parallel_configuration_slots_kv_layout_and_graph_buckets() {
+    fn a_layout_is_the_parallel_configuration_slots_and_kv_layout() {
         let served = Config::default()
             .engine_config()
             .expect("the configuration resolves");
@@ -1079,7 +1123,7 @@ mod tests {
         assert!(!same(
             &|target| target.kv_cache.block_size = std::num::NonZeroU32::new(32)
         ));
-        assert!(!same(&|target| {
+        assert!(same(&|target| {
             target.cuda_graph.decode_batch_sizes =
                 Some(vec![std::num::NonZeroU32::new(2).unwrap()]);
         }));

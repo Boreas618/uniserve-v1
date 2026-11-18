@@ -326,8 +326,10 @@ pub struct Config {
     /// The most likely tokens a request may ask for at a generated or a
     /// prompt position (`top_logprobs`, `prompt_logprobs`), which every
     /// sampling graph computes; a request asking for more is refused. Token
-    /// models only.
-    #[reload(epoch)]
+    /// models only. A change is a kernel generation: the serving engines
+    /// capture every graph again for the new candidates in the background and
+    /// switch to them whole.
+    #[reload(generation)]
     pub max_logprobs: u32,
     /// Each rank's share of its device's total storage for weights, static
     /// allocations and the KV cache, in (0, 1]. A deployment group's
@@ -395,7 +397,7 @@ pub struct Config {
     pub device_config: DeviceConfig,
     #[reload(fields)]
     pub moe_config: MoeConfig,
-    #[reload(epoch)]
+    #[reload(generation)]
     pub cuda_graph_config: CudaGraphConfig,
     #[reload(fields)]
     pub worker_config: WorkerConfig,

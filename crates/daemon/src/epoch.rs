@@ -714,13 +714,10 @@ mod tests {
             ("lora", |config: &mut Config| {
                 config.lora = Some("org/adapter".to_owned())
             }),
+            // Speculating from none loads the drafter and lays its draft cache out.
             (
                 "speculative_config.num_draft_tokens",
                 |config: &mut Config| config.speculative_config.num_draft_tokens = 4,
-            ),
-            (
-                "profiling_config.graph_pc_sampling",
-                |config: &mut Config| config.profiling_config.graph_pc_sampling = true,
             ),
         ];
         // The package backends and the package parameters: a `Generation` change.
@@ -734,9 +731,22 @@ mod tests {
                 |config: &mut Config| config.speculative_config.refill_token_cost = Some(0.5),
             ),
             // The options the graphs are captured with.
+            ("max_logprobs", |config: &mut Config| {
+                config.max_logprobs = 5
+            }),
+            ("cuda_graph_config", |config: &mut Config| {
+                config.cuda_graph_config.decode_batch_sizes = Some(vec![
+                    NonZeroU32::new(1).unwrap(),
+                    NonZeroU32::new(4).unwrap(),
+                ])
+            }),
             ("moe_config.microbatches", |config: &mut Config| {
                 config.moe_config.microbatches = NonZeroU32::new(2).unwrap()
             }),
+            (
+                "profiling_config.graph_pc_sampling",
+                |config: &mut Config| config.profiling_config.graph_pc_sampling = true,
+            ),
             ("profiling_config.fence_modules", |config: &mut Config| {
                 config.profiling_config.fence_modules = Some(vec!["*.Attention".to_owned()])
             }),
@@ -849,6 +859,15 @@ mod tests {
                 "{what} builds a new epoch"
             );
         }
+        // Between two counts above zero the drafts are the verification buckets' shape, which a
+        // kernel generation captures; back to none an epoch releases the drafter.
+        let drafting = |drafts: u32| {
+            let mut config = Config::default();
+            config.speculative_config.num_draft_tokens = drafts;
+            Epoch::of(config).expect("the configuration resolves")
+        };
+        assert_eq!(change(&drafting(2), &drafting(4)), Change::Generation);
+        assert_eq!(change(&drafting(2), &base), Change::Epoch);
         // Switched on, the capability needs the storage a new epoch lays out.
         let mut uncached = Config::default();
         uncached.kv_cache_config.prefix_caching = false;
