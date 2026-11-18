@@ -9,13 +9,15 @@ Three stages, each a test, because they fail for different reasons:
    mean (two E2M1 codes a byte, the low nibble first; one E4M3 scale per
    sixteen elements of the contraction, relative to the row's factor) and
    compares the decoded tile with the input, each element within half a step
-   of E2M1 at its block's scale. What can fail: the E2M1 rounding, the code
+   of E2M1 at its block's scale of the FP32 quotient the encoder rounds
+   (:data:`QUOTIENT_ERROR`). What can fail: the E2M1 rounding, the code
    order inside a byte, the E4M3 scale's own encoding (exponent bias 7,
    subnormals below 2^-6, saturation at 448) and the scale bytes' layout. A
    row of zeros must encode to zeros with a finite factor.
 2. **The consumer against the same bytes.** Torch multiplies the producer's
-   codes and scale bytes in FP64 and the built ``nvfp4_gemm`` module multiplies
-   them on the device.
+   codes, scale bytes and row factor in FP64 and the built ``nvfp4_gemm``
+   module multiplies them on the device, the row factor as the product's
+   alpha.
 3. **The two against each other.** If the producer passes and the consumer
    fails, one field of the interface between the two modules is wrong; if the
    producer fails, the consumer was never the question.
@@ -40,6 +42,7 @@ import pytest
 import torch
 from uniserve_testing.kernels import chain
 from uniserve_testing.kernels.gemm import nvfp4
+from uniserve_testing.kernels.tensor.operands import UNIT, gamma
 
 pytestmark = pytest.mark.unit
 
@@ -131,22 +134,31 @@ def decode(values, scales, token_scale, rows, columns, layout):
     return codes * block_scales(scales, rows, columns, layout) * factor
 
 
-def half_step(unit):
-    """Half the distance to the next E2M1 code, in units of the block's scale.
+#: The relative error of the quotient the encoder rounds to E2M1: it computes
+#: ``x · rcp(fl(s · t))`` in FP32 for an element ``x``, its block's scale ``s``
+#: and the row's factor ``t``, which is one rounding of the product, the
+#: approximate reciprocal's (``rcp.approx.ftz.f32`` errs by at most one ulp,
+#: two unit roundoffs) and one of the multiplication: ``γ₄(u_f32)`` of the
+#: exact ``x / (s · t)``. An exact quotient on a midpoint between two codes
+#: rounds to either within it.
+QUOTIENT_ERROR = gamma(4, UNIT["f32"])
 
-    This is the encoding's own bound, not a chosen tolerance: a decoded code
-    is correct when the exact quotient lies within half a step of it.
-    """
+
+def half_step(unit):
+    """Half the E2M1 interval the quotient ``unit`` lies in, in units of the
+    block's scale.
+
+    This is the encoding's own bound, not a chosen tolerance: a decoded code is
+    correct when the quotient lies within half a step of it. The interval
+    starts at the largest code at or below ``|unit|``; a quotient at or above
+    the last code saturates to it, and its interval is the last one, ``[4, 6]``
+    (a block's E4M3 scale rounds down by at most a sixteenth, so its largest
+    element's quotient stays below 6.4).
+    """  # noqa: D205
     codes = torch.tensor(nvfp4.E2M1, dtype=torch.float64, device=unit.device)
-    magnitude = unit.abs()
-    upper = torch.searchsorted(codes, magnitude, right=False)
-    upper = upper.clamp(max=len(nvfp4.E2M1) - 1)
-    lower = torch.searchsorted(codes, magnitude, right=True) - 1
-    lower = lower.clamp(min=0)
-    # A quotient above the last code saturates, so its step is the last
-    # interval.
-    span = (codes[upper] - codes[lower]).clamp(min=0.5)
-    return 0.5 * span
+    lower = torch.searchsorted(codes, unit.abs(), right=True) - 1
+    lower = lower.clamp(min=0, max=len(nvfp4.E2M1) - 2)
+    return 0.5 * (codes[lower + 1] - codes[lower])
 
 
 def test_the_decoders_are_the_formats_definitions():
@@ -350,7 +362,9 @@ def test_the_producers_bytes_decode_to_its_input(
     unit = torch.where(
         scale_of_element != 0, exact / scale_of_element, torch.zeros_like(exact)
     )
-    bound = half_step(unit) * scale_of_element.abs()
+    bound = (
+        half_step(unit) + QUOTIENT_ERROR * unit.abs()
+    ) * scale_of_element.abs()
     deviation = (decoded - exact).abs()
     # `~(deviation <= bound)`: the comparison must fail on a NaN.
     outside = ~(deviation <= bound)
@@ -407,25 +421,21 @@ GEMM_KEY = (
     f"epilogue_none_m_{ROWS}_n_{COLUMNS}_k_{COLUMNS}"
 )
 
-#: The unit roundoffs of the consumer's accumulation and of its BF16 output.
-F32_ROUNDOFF = 2.0**-24
-BF16_ROUNDOFF = 2.0**-8
-
 
 @pytest.mark.gpu
 def test_the_consumer_multiplies_the_producers_bytes(
     torch_device, kernel_module
 ):
-    """The activation codes and their scales are the producer's own output
-    buffers; the weight stack and its scale bytes are generated here, in the
-    atom layout the gemm's descriptor declares. The reference multiplies the
-    decoded bytes in FP64, so a wrong scale address shows up as a wrong number
-    rather than as a different rounding.
-
-    The comparison is the contraction's own bound, `Tolerance::dot`:
-    `2 γ_k sqrt(k)` plus the output's rounding. A failure also counts the
-    elements the operator's declared `Tolerance::rounding(2, F32, BF16)`
-    refuses.
+    """The activation codes, their scales and the rows' factor are the
+    producer's own output buffers; the weight stack and its scale bytes are
+    generated here, in the atom layout the gemm's descriptor declares, with a
+    tensor scale of one. The factor is the same in every row (the reciprocal
+    of the global scale), so it is the product's alpha, as the linear layer
+    folds it with the tensor scales into one number. The reference multiplies
+    the decoded bytes and the factor in FP64, so a wrong scale address shows
+    up as a wrong number rather than as a different rounding, and the
+    comparison is the operator's declared bound
+    (:func:`~uniserve_testing.kernels.gemm.nvfp4.gemm_tolerance`).
     """  # noqa: D205
     layout = "swizzled_128x4"
     producer = quantize_module(kernel_module, torch_device, layout)
@@ -465,7 +475,7 @@ def test_the_consumer_multiplies_the_producers_bytes(
     weight_scales = block_scales(weight_scale_bytes, n, k, layout)
     exact = (decoded_a * activation_scales) @ (decoded_b * weight_scales).T
 
-    alpha = torch.ones(1, dtype=torch.float32, device=torch_device)
+    alpha = token_scale[:1].clone()
     out = torch.zeros(ROWS, n, dtype=torch.bfloat16, device=torch_device)
     call = nvfp4.GemmCall(
         input=values.data_ptr(),
@@ -488,17 +498,13 @@ def test_the_consumer_multiplies_the_producers_bytes(
     )
 
     difference = (out.to(torch.float64) - exact).abs()
-    magnitude = exact.abs().clamp(min=1e-30)
-    declared = 2 * 2 * F32_ROUNDOFF + BF16_ROUNDOFF
-    contraction = 2 * F32_ROUNDOFF * math.sqrt(k) + BF16_ROUNDOFF
-    outside_declared = int((~(difference <= declared * magnitude)).sum())
-    outside_contraction = int((~(difference <= contraction * magnitude)).sum())
-    assert outside_contraction == 0, (
-        f"{ROWS}x{n} over k={k}: {outside_contraction} of {ROWS * n} outside "
-        f"the contraction's rtol {contraction:.3e} ({outside_declared} outside "
-        f"the declared rtol {declared:.3e}); max |gemm - exact| "
-        f"{difference.max().item():.4e}, max relative "
-        f"{float((difference / magnitude).max()):.4e}"
+    atol, rtol = nvfp4.gemm_tolerance(k, "bf16")
+    # `~(difference <= bound)`: the comparison must fail on a NaN.
+    outside = int((~(difference <= atol + rtol * exact.abs())).sum())
+    assert outside == 0, (
+        f"{ROWS}x{n} over k={k}: {outside} of {ROWS * n} outside the "
+        f"operator's declared rtol {rtol:.3e}; max |gemm - exact| "
+        f"{difference.max().item():.4e}"
     )
 
 
