@@ -111,8 +111,9 @@ impl Bundle {
             .unwrap_or_default()
     }
 
-    /// The checkpoint the daemon's command served: the first value after
-    /// `serve`, or the directory `--model-dir` names there.
+    /// The checkpoint the daemon's command served: the `model` (or `model_dir`) of the policy
+    /// package `uniserve serve` names, read from its `config.toml`; `None` when the command names
+    /// no package or the package no longer reads.
     fn model_argument(&self) -> Option<String> {
         let command: Vec<String> = self
             .launch()
@@ -125,11 +126,16 @@ impl Bundle {
             })
             .collect();
         let index = command.iter().position(|word| word == "serve")?;
-        let rest = &command[index + 1..];
-        if rest.first().map(String::as_str) == Some("--model-dir") {
-            return rest.get(1).cloned();
-        }
-        rest.first().filter(|word| !word.starts_with('-')).cloned()
+        let package = command[index + 1..]
+            .iter()
+            .find(|word| !word.starts_with('-'))?;
+        let text = std::fs::read_to_string(Path::new(package).join("config.toml")).ok()?;
+        let config: toml::Table = text.parse().ok()?;
+        config
+            .get("model")
+            .or_else(|| config.get("model_dir"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
     }
 
     fn describe(&self) -> Result<Value> {

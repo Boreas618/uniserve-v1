@@ -1625,15 +1625,15 @@ fn local_devices(host: &str, config: &proto::config::EngineConfig) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::ServerArgs;
+    use crate::config::Config;
 
     /// A launch places the scheduler node's process on the engine host's devices, as the
     /// deployment's ranks name them, with the interfaces the leader states and none it does not.
     #[test]
     fn a_launch_places_the_process_on_the_engine_hosts_devices() {
-        let mut options = ServerArgs {
+        let mut options = Config {
             model: Some("model".to_owned()),
-            host_identity: "rank-0".to_owned(),
+            hosts: vec!["rank-0".to_owned()],
             tensor_parallel_size: std::num::NonZeroUsize::new(2).unwrap(),
             ..Default::default()
         };
@@ -1665,9 +1665,9 @@ mod tests {
     /// host's first and holding rank 0, each with its own run of the group's ranks.
     #[test]
     fn a_group_over_two_hosts_is_one_process_per_host() {
-        let mut options = ServerArgs {
+        let mut options = Config {
             model: Some("model".to_owned()),
-            host_identity: "rank-0".to_owned(),
+            hosts: vec!["rank-0".to_owned()],
             tensor_parallel_size: std::num::NonZeroUsize::new(4).unwrap(),
             ..Default::default()
         };
@@ -1693,7 +1693,7 @@ mod tests {
 
     /// The epoch's module set every launch file states.
     fn modules() -> proto::module::ModuleSet {
-        crate::epoch::modules_of(&ServerArgs::default())
+        crate::epoch::modules_of(&Config::default())
     }
 
     /// A worker group `id` of `role` whose ranks are `ranks`, each a host and a GPU of it, in rank
@@ -1726,9 +1726,9 @@ mod tests {
     fn two_host_launches(
         groups: Vec<proto::config::WorkerGroupConfig>,
     ) -> Vec<(String, u32, Vec<u32>, u32, bool, u64)> {
-        let options = ServerArgs {
+        let options = Config {
             model: Some("model".to_owned()),
-            host_identity: "rank-0".to_owned(),
+            hosts: vec!["rank-0".to_owned()],
             ..Default::default()
         };
         let mut config = options.engine_config().expect("the configuration resolves");
@@ -1809,10 +1809,10 @@ mod tests {
             directory.path().join("build-server.sock"),
         )
         .unwrap();
-        let mut options = ServerArgs {
+        let mut options = Config {
             model: Some("model".to_owned()),
             served_model_name: Some("model".to_owned()),
-            host_identity: "rank-0".to_owned(),
+            hosts: vec!["rank-0".to_owned()],
             ..Default::default()
         };
         options.device_config.devices = vec![0];
@@ -1863,10 +1863,10 @@ mod tests {
             directory.path().join("build-server.sock"),
         )
         .unwrap();
-        let mut options = ServerArgs {
+        let mut options = Config {
             model: Some("model".to_owned()),
             served_model_name: Some("model".to_owned()),
-            host_identity: "rank-0".to_owned(),
+            hosts: vec!["rank-0".to_owned()],
             data_parallel_size: std::num::NonZeroUsize::new(2).unwrap(),
             ..Default::default()
         };

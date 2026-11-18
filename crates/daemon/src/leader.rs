@@ -49,13 +49,13 @@ use crate::api::input::{
 use crate::api::model::ModelConfig;
 use crate::api::output::RequestOutputStream;
 use crate::api::protocol::VideoGenerationRequest;
+use crate::config::{Config, ReasoningParser, Stated};
 use crate::engine::client::{EngineClient, EngineReport, EngineState, StatsSink, SubmitError};
 use crate::engine::control::EngineControl;
 use crate::engine::hold::{HoldState, RequestHold};
 use crate::metrics::log_stats::StatsLogger;
 use crate::metrics::stats::{self as metrics, RequestStats};
 use crate::migration::{Migrator, RequestEvents};
-use crate::options::{ReasoningParser, ServerArgs, Stated};
 
 /// One model served over its engine process.
 ///
@@ -152,7 +152,7 @@ pub(crate) enum Following {
     /// a commit makes `config` and `modules` what a relaunch and a standby
     /// start from.
     Generation {
-        config: Box<ServerArgs>,
+        config: Box<Config>,
         modules: crate::epoch::ModuleSet,
     },
     /// The target engines of another epoch serve the deployment from the
@@ -169,7 +169,7 @@ pub(crate) struct EpochTarget {
     /// by host and launch generation, the scheduler node's first.
     pub(crate) targets: Vec<(proto::config::EngineArgs, Vec<(String, u64)>)>,
     /// The configuration the target serves.
-    pub(crate) config: Box<ServerArgs>,
+    pub(crate) config: Box<Config>,
     /// The epoch the target serves.
     pub(crate) epoch: u64,
     /// Whether the requests in flight at the switch continue with the state they reached
@@ -760,7 +760,7 @@ impl Leader {
     /// Loads the configured model and starts the engine process that serves
     /// it, with its schedulers and worker processes.
     ///
-    /// `config` must have passed [`ServerArgs::validate`]; `stated` holds the
+    /// `config` must have passed [`Config::validate`]; `stated` holds the
     /// option paths the operator set; `daemon` is this node's daemon's
     /// process socket, through which the engine process and every worker
     /// start, and `instance` the daemon's instance directory, where the engines' request socket
@@ -772,23 +772,24 @@ impl Leader {
     /// Fails when the model assets cannot be resolved, when an option of
     /// another model family was stated ([`Stated::refuse_foreign_options`]),
     /// when the options do not resolve into an engine configuration
-    /// ([`ServerArgs::engine_config`]), when the engine process fails to
+    /// ([`Config::engine_config`]), when the engine process fails to
     /// start, or when the model cannot be bound to the capabilities its
     /// workers report.
     pub(crate) async fn start(
         families: &processing::Registry,
-        config: &ServerArgs,
+        config: &Config,
         stated: &Stated,
         daemon: String,
         instance: &std::path::Path,
         updates: Arc<crate::updates::Updater>,
+        lock: Option<crate::epoch::ModuleSet>,
     ) -> anyhow::Result<Self> {
         let prepared = Self::prepare(families, config, stated).await?;
         info!(parallel = ?prepared.engine.parallel, "starting the engine process");
         let control = Arc::new(EngineControl::new(
             &config.request_socket(instance),
             daemon,
-            config.host_identity.clone(),
+            config.leader_host(),
             config.served_model_name().to_owned(),
             crate::engine::control::ensure_build_server(&config.build_config)?,
         )?);
@@ -798,14 +799,15 @@ impl Leader {
         // selects, each module built at every host the epoch runs on. Every
         // launch file states it, so an engine resolves what its profile runs
         // name and serves, and a relaunch and a standby run exactly what their
-        // epoch runs.
+        // epoch runs. A revision that starts again runs the revisions its
+        // apply fixed (`lock`), never what `latest` names by now.
         let local = crate::engine::control::BuildServer {
             host: control.host().to_owned(),
             socket: config.build_config.socket()?,
             targets: Vec::new(),
         };
         let hosts = epoch_hosts(&prepared.engine)?;
-        let named = crate::epoch::modules_of(config);
+        let named = lock.unwrap_or_else(|| crate::epoch::modules_of(config));
         let modules = fix_modules(local, Some(Arc::clone(&control)), hosts.clone(), named)
             .await
             .map_err(anyhow::Error::from)
@@ -918,6 +920,14 @@ impl Leader {
         Ok(leader)
     }
 
+    /// The module set the deployment's first replica serves: what its epoch's apply fixed, and a
+    /// committed generation since. `None` before an engine serves.
+    pub(crate) fn modules(&self) -> Option<crate::epoch::ModuleSet> {
+        let replicas = self.replicas();
+        let served = service::lock(&replicas.first()?.served);
+        served.as_ref().map(|args| args.modules.clone())
+    }
+
     /// What a leader prepares before it has an engine: the model's files
     /// and the engine configuration of the engine that serves it, as
     /// [`Leader::start`] describes.
@@ -927,7 +937,7 @@ impl Leader {
     /// As [`Leader::start`], before the engine starts.
     pub(crate) async fn prepare(
         families: &processing::Registry,
-        config: &ServerArgs,
+        config: &Config,
         stated: &Stated,
     ) -> anyhow::Result<Prepared> {
         // The process's one view of the Hugging Face Hub, from the standard environment, through
@@ -1007,7 +1017,7 @@ impl Leader {
     /// Fails when the model cannot be bound to the capabilities the
     /// engine's workers report.
     pub(crate) fn finish(
-        config: &ServerArgs,
+        config: &Config,
         prepared: Prepared,
         control: Arc<EngineControl>,
         client: EngineClient,
@@ -1100,7 +1110,7 @@ impl Leader {
         families: processing::Registry,
         clients: Vec<Arc<EngineClient>>,
         processor: Processor,
-        options: &ServerArgs,
+        options: &Config,
         observer: Arc<crate::observe::Observer>,
         metrics: Arc<Metrics>,
         updates: Arc<crate::updates::Updater>,
@@ -1113,7 +1123,7 @@ impl Leader {
         let stats_logger = logging
             .log_stats
             .then(|| StatsLogger::start(Arc::clone(&metrics), logging.stats_interval));
-        let replica_options = ServerArgs {
+        let replica_options = Config {
             model: Some(model_name.clone()),
             served_model_name: Some(served_model_name.clone()),
             ..options.clone()
@@ -1428,7 +1438,7 @@ pub(crate) struct EngineHandoff {
     pub(crate) engine: u64,
     pub(crate) next_engine: u64,
     pub(crate) served: proto::config::EngineArgs,
-    pub(crate) config: ServerArgs,
+    pub(crate) config: Config,
     /// New requests wait (`Leader::pause`).
     pub(crate) paused: bool,
     /// The engine sleeps, and whether its sleep paused new requests.
@@ -1598,7 +1608,7 @@ impl From<WeightsInFlight> for wire::WeightsInFlight {
 
 /// The deployment `config` describes, refused as a request when it does not resolve: its
 /// deployment file does not read or does not place.
-pub(crate) fn deployment(config: &ServerArgs) -> Result<crate::epoch::Epoch, UpdateError> {
+pub(crate) fn deployment(config: &Config) -> Result<crate::epoch::Epoch, UpdateError> {
     crate::epoch::Epoch::of(config.clone()).map_err(|error| {
         UpdateError::Refused(format!("the configuration does not resolve: {error:#}"))
     })
@@ -1621,45 +1631,6 @@ pub enum UpdateError {
     /// still serves.
     #[error(transparent)]
     Failed(#[from] anyhow::Error),
-}
-
-/// Whether `updated` differs from `served` in its scheduling limits alone, within
-/// `capacity`, the batch the running engine's workers were started for: at
-/// most as many calls and tokens a step and running requests. The
-/// schedulers take such limits in place; any other change starts a standby
-/// engine.
-pub(crate) fn configurable(
-    served: &proto::config::EngineConfig,
-    updated: &proto::config::EngineConfig,
-    capacity: &wire::BatchCapacity,
-) -> bool {
-    let limits = |config: &proto::config::EngineConfig| {
-        (
-            config.scheduler.max_batch,
-            config.scheduler.max_queued_requests,
-            config.scheduler.chunked_prefill_size,
-            config.max_num_batched_tokens,
-            config.max_running_requests,
-        )
-    };
-    let mut same_otherwise = updated.clone();
-    same_otherwise.scheduler = served.scheduler.clone();
-    same_otherwise.max_num_batched_tokens = served.max_num_batched_tokens;
-    same_otherwise.max_running_requests = served.max_running_requests;
-    // A step's tokens left to the engine's default stay as they were.
-    let tokens = match updated.max_num_batched_tokens {
-        Some(tokens) => u64::try_from(tokens.get())
-            .is_ok_and(|tokens| tokens <= capacity.max_num_batched_tokens),
-        None => served.max_num_batched_tokens.is_none(),
-    };
-    let within = |value: std::num::NonZeroUsize, bound: u32| {
-        u32::try_from(value.get()).is_ok_and(|value| value <= bound)
-    };
-    same_otherwise == *served
-        && limits(served) != limits(updated)
-        && tokens
-        && (capacity.max_batch == 0 || within(updated.scheduler.max_batch, capacity.max_batch))
-        && within(updated.max_running_requests, capacity.max_running_requests)
 }
 
 /// Whether the daemon processes requests for the checkpoint in the directory `path` as it does
@@ -1863,7 +1834,7 @@ pub(crate) struct Replica {
     pub(crate) served: std::sync::Mutex<Option<proto::config::EngineArgs>>,
     /// The options the serving engine's configuration was resolved from, which
     /// an update overrides.
-    pub(crate) config: std::sync::Mutex<ServerArgs>,
+    pub(crate) config: std::sync::Mutex<Config>,
     /// The model their statistics are labelled with.
     pub(crate) model_name: String,
     /// Held while an engine is replaced, by an epoch change, a commit, a
@@ -1915,7 +1886,7 @@ impl Replica {
     )]
     pub(crate) fn new(
         families: processing::Registry,
-        options: &ServerArgs,
+        options: &Config,
         client: Arc<EngineClient>,
         observer: Arc<crate::observe::Observer>,
         metrics: Arc<Metrics>,
@@ -1975,7 +1946,7 @@ impl Replica {
     /// daemon does beside the update's own phase machine.
     ///
     /// For both forms it reads the trial's thresholds (`options.rollback`)
-    /// and rolls the update back at its `deadline`. For the generation form
+    /// and commits the update once its trial lasted `options.trial`. For the generation form
     /// it keeps the committed configuration and module set, and replaces the
     /// standby with one of them. For the epoch form, which the first replica
     /// follows for the whole deployment, it joins every target replica's
@@ -1984,14 +1955,13 @@ impl Replica {
     /// update rolls back.
     ///
     /// The task wakes on the update's own progress
-    /// ([`crate::updates::Updater::watch`]), on the deadline and, during the
+    /// ([`crate::updates::Updater::watch`]), at the trial's end and, during the
     /// trial, on the interval the thresholds are read at.
     pub(crate) fn follow(
         self: &Arc<Self>,
         updater: Arc<crate::updates::Updater>,
         number: u64,
-        options: crate::options::UpdateConfig,
-        deadline: Option<Instant>,
+        options: crate::config::UpdateConfig,
         following: Following,
     ) {
         // The update's options may read back further than the deployment's own: every replica
@@ -2010,35 +1980,34 @@ impl Replica {
             match following {
                 Following::Generation { config, modules } => {
                     replica
-                        .follow_generation(&updater, number, &options, deadline, *config, modules)
+                        .follow_generation(&updater, number, &options, *config, modules)
                         .await;
                 }
                 Following::Epoch(target) => {
                     // The epoch form's follower holds both epochs' launch
                     // arguments and configurations across its whole wait.
-                    Box::pin(replica.follow_epoch(&updater, number, &options, deadline, target))
-                        .await;
+                    Box::pin(replica.follow_epoch(&updater, number, &options, target)).await;
                 }
             }
         });
     }
 
     /// Waits for the next thing an update's follower acts on: the update's
-    /// progress, its `deadline` (which rolls it back, once), or, once its
-    /// trial began, the next report of the replicas `trial` observes, on
-    /// which the trial's thresholds are read (a threshold passed rolls it
-    /// back). Returns update `number`'s phase afterwards; `None` once another
+    /// progress, its trial's end (which commits it), or, once its trial
+    /// began, the next report of the replicas `trial` observes, on which the
+    /// trial's thresholds are read (a threshold passed rolls it back).
+    /// Returns update `number`'s phase afterwards; `None` once another
     /// update, or none, is what the updater states.
     async fn next_phase(
         updater: &crate::updates::Updater,
         number: u64,
         phases: &mut watch::Receiver<Option<(u64, Phase)>>,
-        deadline: &mut Option<Instant>,
         trial: &mut [watch::Receiver<u64>],
     ) -> Option<Phase> {
+        let ends = updater.ends(number);
         let expiry = async {
-            match *deadline {
-                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+            match ends {
+                Some(ends) => tokio::time::sleep_until(ends.into()).await,
                 None => std::future::pending().await,
             }
         };
@@ -2049,10 +2018,7 @@ impl Replica {
                     return None;
                 }
             }
-            () = expiry => {
-                *deadline = None;
-                updater.expire(number);
-            }
+            () = expiry => updater.conclude(number),
             () = reading => {
                 if let Some(failure) = updater.read_trial(number, request_counts()) {
                     warn!(
@@ -2075,9 +2041,8 @@ impl Replica {
         self: &Arc<Self>,
         updater: &Arc<crate::updates::Updater>,
         number: u64,
-        options: &crate::options::UpdateConfig,
-        mut deadline: Option<Instant>,
-        config: ServerArgs,
+        options: &crate::config::UpdateConfig,
+        config: Config,
         modules: crate::epoch::ModuleSet,
     ) {
         let mut phases = updater.watch();
@@ -2130,7 +2095,7 @@ impl Replica {
                 Some(Phase::RolledBack | Phase::Abandoned) | None => return,
                 Some(Phase::Preparing | Phase::Switching | Phase::Trial) => {}
             }
-            phase = Self::next_phase(updater, number, &mut phases, &mut deadline, &mut trial).await;
+            phase = Self::next_phase(updater, number, &mut phases, &mut trial).await;
         }
     }
 
@@ -2148,8 +2113,7 @@ impl Replica {
         self: &Arc<Self>,
         updater: &Arc<crate::updates::Updater>,
         number: u64,
-        options: &crate::options::UpdateConfig,
-        mut deadline: Option<Instant>,
+        options: &crate::config::UpdateConfig,
         target: EpochTarget,
     ) {
         let EpochTarget {
@@ -2259,7 +2223,7 @@ impl Replica {
                         return;
                     }
                 }
-                next = Self::next_phase(updater, number, &mut phases, &mut deadline, &mut []) => {
+                next = Self::next_phase(updater, number, &mut phases, &mut []) => {
                     phase = next;
                 }
             }
@@ -2449,7 +2413,6 @@ impl Replica {
                     updater,
                     number,
                     &mut phases,
-                    &mut deadline,
                     &mut trial,
                 ) => phase = next,
             }
@@ -2993,8 +2956,8 @@ impl Replica {
             epoch: serving.epoch(),
         });
         args.standby_storage = match storage {
-            crate::standby::Storage::Resident => crate::options::StandbyStorage::Resident,
-            crate::standby::Storage::Suspended => crate::options::StandbyStorage::Suspended,
+            crate::standby::Storage::Resident => crate::config::StandbyStorage::Resident,
+            crate::standby::Storage::Suspended => crate::config::StandbyStorage::Suspended,
         };
         let sink = stats_sink(
             self.model_name.clone(),
@@ -4207,56 +4170,9 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
-    /// Scheduling alone, within the batch the workers were started for, is
-    /// taken in place; a limit beyond it, any other change, or no change
-    /// starts a standby engine.
-    #[test]
-    fn scheduling_within_the_workers_batch_changes_in_place() {
-        use super::configurable;
-        use proto::request::wire;
-
-        let base = crate::options::ServerArgs::default()
-            .engine_config()
-            .expect("the configuration resolves");
-        let config = |batch: usize, tokens: Option<usize>, running: usize| {
-            let mut config = base.clone();
-            config.scheduler.max_batch = std::num::NonZeroUsize::new(batch).unwrap();
-            config.max_num_batched_tokens = tokens.and_then(std::num::NonZeroUsize::new);
-            config.max_running_requests = std::num::NonZeroUsize::new(running).unwrap();
-            config
-        };
-        let served = config(128, None, 128);
-        let capacity = wire::BatchCapacity {
-            max_batch: 128,
-            max_num_batched_tokens: 8192,
-            max_running_requests: 128,
-        };
-        let within = [config(64, Some(4096), 64), config(128, Some(8192), 128)];
-        for updated in &within {
-            assert!(configurable(&served, updated, &capacity), "{updated:?}");
-        }
-        let mut captured_otherwise = within[0].clone();
-        captured_otherwise.cuda_graph.decode_batch_sizes =
-            Some(vec![std::num::NonZeroU32::new(8).unwrap()]);
-        let beyond = [
-            config(256, None, 128),
-            config(128, Some(16384), 128),
-            config(128, None, 256),
-            served.clone(),
-            captured_otherwise,
-        ];
-        for updated in &beyond {
-            assert!(!configurable(&served, updated, &capacity), "{updated:?}");
-        }
-        // A step's tokens the served configuration states cannot return to the
-        // engine's default in place.
-        let stated = config(128, Some(4096), 128);
-        assert!(!configurable(&stated, &config(128, None, 128), &capacity));
-    }
-
     /// The device strings of `ranks` local ranks of a default deployment's device kind.
     fn rank_devices(ranks: std::ops::Range<u32>) -> Vec<String> {
-        let kind = crate::options::ServerArgs::default().device_config.device;
+        let kind = crate::config::Config::default().device_config.device;
         ranks
             .map(|rank| kind.rank_device(rank).to_string())
             .collect()
@@ -4265,7 +4181,7 @@ mod tests {
     /// The engine configuration of a deployment of `data` schedulers of `tensor` ranks each,
     /// with expert parallelism (`moe_config.expert_parallel`) when `experts` holds.
     fn deployment(tensor: usize, data: usize, experts: bool) -> proto::config::EngineConfig {
-        let mut options = crate::options::ServerArgs {
+        let mut options = crate::config::Config {
             tensor_parallel_size: std::num::NonZeroUsize::new(tensor).unwrap(),
             data_parallel_size: std::num::NonZeroUsize::new(data).unwrap(),
             ..Default::default()
@@ -4301,9 +4217,9 @@ mod tests {
     /// scheduler node is the host of its first rank, and its world places.
     #[test]
     fn replicas_on_another_host_run_their_engine_there() {
-        let mut options = crate::options::ServerArgs {
+        let mut options = crate::config::Config {
             data_parallel_size: std::num::NonZeroUsize::new(4).unwrap(),
-            host_identity: "rank-1".to_owned(),
+            hosts: vec!["rank-1".to_owned()],
             ..Default::default()
         };
         options.device_config.worker_hosts = vec!["rank-2".to_owned()];
@@ -4345,7 +4261,7 @@ mod tests {
     #[test]
     fn tensor_parallel_replicas_sharding_their_experts_are_independent() {
         let config = deployment(2, 2, true);
-        let modules = crate::epoch::modules_of(&crate::options::ServerArgs::default());
+        let modules = crate::epoch::modules_of(&crate::config::Config::default());
         let launches = super::epoch_launches(&config, &modules, 7).unwrap();
         let devices: Vec<Vec<String>> = launches
             .iter()

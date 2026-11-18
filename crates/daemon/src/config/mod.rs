@@ -1,22 +1,18 @@
-//! Serving options: one typed configuration tree, read from a TOML file,
-//! a few command-line flags and `--set PATH=VALUE` assignments.
+//! The deployment's configuration: one typed tree, the `config.toml` of a policy package.
 //!
-//! [`ServerArgs`] is the single declaration of every option, its type and
-//! its default. Its top level holds the options most deployments state; the
-//! rest sit in `*_config` tables, one per owner of the behavior they
-//! configure (`cuda_graph_config` for graph capture, `moe_config` for expert
-//! parallelism, `video_config` for video generation, and so on).
-//! [`ServerArgs::resolve`] reads the tree: a `--config` file first, then the
-//! flags that name a path of it, then `--set` assignments, each overriding the
-//! last. The tree is the server's configuration: each part of the server reads
-//! its own table, and [`ServerArgs::engine_config`] resolves what of it builds
-//! the engine processes.
+//! [`Config`] is the single declaration of every option, its type, its default and how a change
+//! of it takes effect (`#[reload(...)]`, [`proto::reload`]). Its top level holds the options
+//! most deployments state; the rest sit in `*_config` tables, one per owner of the behavior they
+//! configure (`cuda_graph_config` for graph capture, `moe_config` for expert parallelism,
+//! `video_config` for video generation, and so on). [`parse`] reads a package's `config.toml`;
+//! each part of the server reads its own table, and [`Config::engine_config`] resolves what of
+//! it builds the engine processes. No option comes from the command line, and none states which
+//! node serves it: a node finds its place in `hosts` by its own host name ([`Identity`]).
 //!
-//! Some options configure what one kind of model serves: the token batch
-//! budgets, `chat_config` and `image_fetch_config` chat models, and
-//! `video_config`, `media_config` and `video_job_config` video models. Startup
-//! refuses such an option stated for a checkpoint of another kind rather than
-//! ignoring it ([`Stated::refuse_foreign_options`]).
+//! Some options configure what one kind of model serves: the token batch budgets,
+//! `chat_config` and `image_fetch_config` chat models, and `video_config`, `media_config` and
+//! `video_job_config` video models. A start refuses such an option stated for a checkpoint of
+//! another kind rather than ignoring it ([`Stated::refuse_foreign_options`]).
 
 mod args;
 
@@ -26,6 +22,7 @@ use std::time::Duration;
 
 use crate::supervision::DaemonOptions;
 use anyhow::Context as _;
+use proto::reload::Reload;
 use proto::request::ModelDtype;
 pub use proto::request::StandbyStorage;
 use serde::{Deserialize, Serialize};
@@ -34,8 +31,8 @@ use serde_json::Value;
 use processing::Family;
 use processing::Serving;
 
-pub use args::{Stated, overridden, printed, resolve_text};
-use proto::admin::{PreviousEpoch, RollbackConfig};
+pub use args::{Stated, parse, printed};
+use proto::admin::{InFlight, PreviousEpoch, RollbackConfig};
 pub use proto::config::{
     ChatConfig, ChatTemplateContentFormat, CudaGraphConfig, DeviceConfig, ImageFetchConfig,
     KvCacheConfig, LoadConfig, LoggingConfig, MediaConfig, MigrationConfig, MoeConfig,
@@ -108,13 +105,13 @@ macro_rules! classified {
     }};
 }
 
-impl ServerArgs {
+impl Config {
     /// The scope of every option that is not every deployment's, by configuration path: the
     /// classification of every field of the configuration, and of the tables classified field
     /// by field.
     fn scoped_options() -> impl Iterator<Item = (&'static str, Scope)> {
         use Scope::{Every, Kind as Of, Shorthand};
-        let top = classified!(ServerArgs, "", {
+        let top = classified!(Config, "", {
             model: Every,
             model_dir: Every,
             served_model_name: Every,
@@ -136,11 +133,8 @@ impl ServerArgs {
             tensor_parallel_size: Shorthand,
             data_parallel_size: Every,
             worker_groups: Every,
-            host_identity: Every,
+            hosts: Every,
             engine_host: Every,
-            nnodes: Every,
-            node_rank: Every,
-            dist_init_addr: Every,
             server_config: Every,
             admin_config: Every,
             storage_config: Every,
@@ -163,14 +157,6 @@ impl ServerArgs {
             video_config: Of(Kind::Video),
             media_config: Of(Kind::Video),
             video_job_config: Of(Kind::Video),
-            // The command line's inputs, which are no option and are never stated.
-            config_files: Every,
-            set: Every,
-            host: Every,
-            port: Every,
-            source: Every,
-            ready_fd: Every,
-            predecessor: Every,
         });
         let scheduler = classified!(SchedulerConfig, "scheduler_config.", {
             policy: Every,
@@ -237,7 +223,7 @@ impl Stated {
     /// video pipeline states a chat option, or a chat model states a video
     /// table.
     pub fn refuse_foreign_options(&self, family: &Family) -> anyhow::Result<()> {
-        for (path, scope) in ServerArgs::scoped_options() {
+        for (path, scope) in Config::scoped_options() {
             if let Scope::Kind(kind) = scope
                 && !kind.serves(family)
                 && self.contains(path)
@@ -254,28 +240,28 @@ impl Stated {
 }
 
 /// Every serving option.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, clap::Args)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Reload)]
 #[serde(default, deny_unknown_fields)]
-pub struct ServerArgs {
+pub struct Config {
     /// The Hugging Face checkpoint the deployment serves, `<owner>/<name>[@<revision>][/<folder>]`:
     /// a repository at its default branch or at a branch, tag or commit, and the folder of it that
     /// holds the checkpoint when it is not the root, read from the standard cache's snapshot of
     /// the revision; this or `model_dir` is required.
-    #[arg(value_name = "MODEL")]
+    #[reload(epoch)]
     pub model: Option<String>,
     /// A local checkpoint directory the deployment serves, read in place, instead of a
     /// repository (`model`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "DIR")]
+    #[reload(epoch)]
     pub model_dir: Option<PathBuf>,
     /// The single model name the API serves; `model` when unset.
-    #[arg(long)]
+    #[reload(epoch)]
     pub served_model_name: Option<String>,
     /// Longest sequence a request may reach, in tokens. Unset, a checkpoint
     /// with a root `config.json` uses its `max_position_embeddings` (8192
     /// when it declares none) and a video pipeline its family's default
     /// prompt bound.
-    #[arg(long)]
+    #[reload(epoch)]
     pub max_model_len: Option<NonZeroU32>,
     /// A weight adapter fused into the checkpoint's weights at load, for
     /// every request of the deployment: the Hugging Face repository, or the
@@ -283,208 +269,149 @@ pub struct ServerArgs {
     /// that holds the adapter in its family's declared file beside the
     /// contract of the student it is. Video families only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "REPOSITORY")]
+    #[reload(epoch)]
     pub lora: Option<String>,
     /// The adapter (`lora`) as a local directory holding it, read in place.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "DIR")]
+    #[reload(epoch)]
     pub lora_dir: Option<PathBuf>,
     /// Element type of parameters and activations.
-    #[arg(skip = ServerArgs::default().dtype)]
+    #[reload(epoch)]
     pub dtype: ModelDtype,
     /// Precision policy: a `mode` and representations selected by module
     /// under `modules`, which the model family interprets and refuses when
     /// it does not serve them; empty selects the checkpoint's own
     /// quantization.
-    #[arg(skip)]
+    #[reload(epoch)]
     pub quantization: proto::config::Quantization,
     /// Options of the model's multimodal processor; the processor refuses
     /// one it does not take.
-    #[arg(skip)]
+    #[reload(daemon)]
     pub mm_processor_kwargs: serde_json::Map<String, Value>,
     /// Attention package (the paged-attention operator's backend) for every
     /// attention call, by its backend name; unset, the Build Server selects
     /// each attention descriptor key's package among the installed ones that
     /// cover it, by manifest priority.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(skip)]
+    #[reload(generation)]
     pub attention_backend: Option<String>,
     /// The attention package that fills prompt processing; unset takes
     /// `attention_backend` (`prefill_attention_backend`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(skip)]
+    #[reload(generation)]
     pub prefill_attention_backend: Option<String>,
     /// The attention package that fills one decoding token; unset takes
     /// `attention_backend` (`decode_attention_backend`, §5.2).
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(skip)]
+    #[reload(generation)]
     pub decode_attention_backend: Option<String>,
     /// The grouped expert GEMM package (`moe_runner_backend`, §5.1, §9);
     /// unset lets the daemon resolve it when it prepares the epoch.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(skip)]
+    #[reload(generation)]
     pub moe_runner_backend: Option<String>,
     /// This host's Build Server (`build_config`): the socket the daemon
     /// prepares an epoch's modules at (§5.1, §6.3), the Build Server's
     /// default socket when unset, and the settings it starts the host's
     /// Build Server with when none serves there. A host-layer value: the
     /// daemon reads it alone, and a change of it is a hot restart.
-    #[arg(skip)]
+    #[reload(daemon)]
     pub build_config: build_server::command::Settings,
     /// Concurrently resident requests, clamped to what the workers hold.
-    #[arg(long, default_value_t = ServerArgs::default().max_running_requests)]
+    #[reload(epoch)]
     pub max_running_requests: NonZeroUsize,
     /// Token work admitted in one scheduling step, 8192 when unset; token
     /// models only.
-    #[arg(skip)]
+    #[reload(step)]
     pub max_num_batched_tokens: Option<NonZeroUsize>,
     /// The most likely tokens a request may ask for at a generated or a
     /// prompt position (`top_logprobs`, `prompt_logprobs`), which every
     /// sampling graph computes; a request asking for more is refused. Token
     /// models only.
-    #[arg(long, default_value_t = ServerArgs::default().max_logprobs)]
+    #[reload(epoch)]
     pub max_logprobs: u32,
     /// Each rank's share of its device's total storage for weights, static
     /// allocations and the KV cache, in (0, 1]. A deployment group's
     /// `mem_fraction_static` overrides it.
-    #[arg(long, default_value_t = ServerArgs::default().mem_fraction_static)]
+    #[reload(epoch)]
     pub mem_fraction_static: f64,
     /// Tensor-parallel workers of each scheduler's group when the
     /// configuration states no `worker_groups`.
-    #[arg(long, default_value_t = ServerArgs::default().tensor_parallel_size)]
+    #[reload(epoch)]
     pub tensor_parallel_size: NonZeroUsize,
     /// Schedulers, each with its own scheduler, KV cache and worker
     /// groups. With `worker_groups`, its model groups form the engine
     /// cores as equal consecutive blocks.
-    #[arg(long, default_value_t = ServerArgs::default().data_parallel_size)]
+    #[reload(epoch)]
     pub data_parallel_size: NonZeroUsize,
     /// The deployment layout: one `[[worker_groups]]` table per group of
     /// workers, placing its ranks on devices and hosts and naming the blocks
     /// it runs. Unset, the rank-layout shorthand (`tensor_parallel_size`,
     /// `data_parallel_size`, `device_config`) places the ranks.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(skip)]
+    #[reload(epoch)]
     pub worker_groups: Option<Vec<proto::config::WorkerGroupConfig>>,
-    /// This node's host name; its daemon runs the ranks placed on this
-    /// host, and a deployment rank entry without a host names it.
-    #[arg(long, default_value_t = ServerArgs::default().host_identity)]
-    pub host_identity: String,
+    /// The deployment's nodes, by host name, the leader first: each node runs `uniserve serve`
+    /// with the same package, finds itself in the list by its own host name (`uname -n`), and
+    /// joins the leader at `admin_config.join` of the first host. Empty, the deployment is one
+    /// node on whichever host serves it.
+    #[reload(epoch)]
+    pub hosts: Vec<String>,
     /// Host running the engine and ranks whose configuration omits a host.
-    /// Unset uses this node's identity. The engine can move to another
-    /// joined node through an epoch change; the daemon's identity stays local.
-    #[arg(skip)]
+    /// Unset uses the leader's host. The engine can move to another
+    /// node of `hosts` through an epoch change; the daemon stays on its node.
+    #[reload(epoch)]
     pub engine_host: Option<String>,
-    /// Nodes of the deployment, each running one `uniserve serve`.
-    #[arg(long, default_value_t = ServerArgs::default().nnodes)]
-    pub nnodes: NonZeroU32,
-    /// This node's rank among `nnodes`. The leader, rank 0, serves the API
-    /// and runs the engine; every other node runs only its daemon, which
-    /// joins the leader's.
-    #[arg(long, default_value_t = ServerArgs::default().node_rank)]
-    pub node_rank: u32,
-    /// The leader's join endpoint (`host:port`): on the leader, the host its
-    /// members reach it at and the port it binds on every interface (port 0
-    /// picks one, which its readiness record states as `join`); on a member,
-    /// the endpoint the leader's readiness record states. Required with
-    /// several nodes.
-    #[arg(long, value_name = "HOST:PORT")]
-    pub dist_init_addr: Option<service::Endpoint>,
-    #[arg(skip)]
+    #[reload(daemon)]
     pub server_config: ServerConfig,
     /// The daemon's listeners (`admin_config`): the client API's address and
     /// the admin API's Unix sockets. How the HTTP server answers is
     /// `server_config`'s.
-    #[arg(skip)]
+    #[reload(daemon)]
     pub admin_config: AdminConfig,
     /// The settings of the Storage Server of every host the deployment
     /// serves on (`storage_config`): a daemon that starts a host's server
     /// starts it with them, and one that finds a server serving with others
     /// refuses to share it.
-    #[arg(skip)]
+    #[reload(storage)]
     pub storage_config: storage::ServerSettings,
-    #[arg(skip)]
+    #[reload(epoch)]
     pub load_config: LoadConfig,
-    #[arg(skip)]
+    #[reload(epoch)]
     pub kv_cache_config: KvCacheConfig,
-    #[arg(skip)]
+    #[reload(fields)]
     pub scheduler_config: SchedulerConfig,
-    #[arg(skip)]
+    #[reload(fields)]
     pub speculative_config: SpeculativeConfig,
-    #[arg(skip)]
+    #[reload(daemon)]
     pub migration_config: MigrationConfig,
-    #[arg(skip)]
+    #[reload(daemon)]
     pub update_config: UpdateConfig,
-    #[arg(skip)]
+    #[reload(epoch)]
     pub device_config: DeviceConfig,
-    #[arg(skip)]
+    #[reload(fields)]
     pub moe_config: MoeConfig,
-    #[arg(skip)]
+    #[reload(epoch)]
     pub cuda_graph_config: CudaGraphConfig,
-    #[arg(skip)]
+    #[reload(epoch)]
     pub worker_config: WorkerConfig,
-    #[arg(skip)]
+    #[reload(fields)]
     pub profiling_config: ProfilingConfig,
-    #[arg(skip)]
+    #[reload(daemon)]
     pub logging_config: LoggingConfig,
-    #[arg(skip)]
+    #[reload(daemon)]
     pub chat_config: ChatConfig,
-    #[arg(skip)]
+    #[reload(daemon)]
     pub image_fetch_config: ImageFetchConfig,
-    #[arg(skip)]
+    #[reload(epoch)]
     pub video_config: VideoConfig,
-    #[arg(skip)]
+    #[reload(daemon)]
     pub media_config: MediaConfig,
-    #[arg(skip)]
+    #[reload(daemon)]
     pub video_job_config: VideoJobConfig,
-
-    // The command line's inputs that are not options: where the options come from, and the
-    // shortcuts for the four nested options the flags name. None is part of the configuration's
-    // tree, so a printed configuration never carries one.
-    /// TOML files of serving options, each overriding the ones before it;
-    /// the flags and `--set` override them. A deployment's layout file
-    /// (`[[worker_groups]]`) is one such file.
-    #[serde(skip)]
-    #[arg(long = "config", value_name = "FILE")]
-    pub config_files: Vec<PathBuf>,
-    /// Set the option at PATH, such as `video_config.max_seconds=10` or
-    /// `moe_config.exchange="deepep"`; repeatable, and it overrides the flags
-    /// and the file. VALUE is one TOML value, as the file writes it (`2`,
-    /// `true`, `"deepep"`, `[1024, 4096]`, `{ mode = "balanced" }`): text is
-    /// quoted and a list is an array. One invocation may not set both a table
-    /// and an option inside it.
-    #[serde(skip)]
-    #[arg(long = "set", value_name = "PATH=VALUE")]
-    pub set: Vec<String>,
-    /// TCP address the daemon's own server listens on (`admin_config.host`).
-    #[serde(skip)]
-    #[arg(long)]
-    pub host: Option<String>,
-    /// TCP port the daemon's own server listens on (`admin_config.port`).
-    #[serde(skip)]
-    #[arg(long)]
-    pub port: Option<u16>,
-    /// The UniServe source tree this host's Build Server builds from
-    /// (`build_config.source`): its compiler environment and the serving
-    /// packages it installs.
-    #[serde(skip)]
-    #[arg(long, value_name = "DIR")]
-    pub source: Option<PathBuf>,
-    /// The inherited descriptor the daemon writes its readiness record to
-    /// (`service::Readiness`, one JSON line per state): once its listeners
-    /// are bound (`listening`, with their endpoints) and once it serves
-    /// (`serving`).
-    #[serde(skip)]
-    #[arg(long, value_name = "FD")]
-    pub ready_fd: Option<i32>,
-    /// The descriptor of the handoff socket to the daemon this one succeeds,
-    /// whose deployment it takes over, as `POST /admin/restart` starts its
-    /// successor (`daemon::restart`); every other argument is ignored.
-    #[serde(skip)]
-    #[arg(long, hide = true, value_name = "FD")]
-    pub predecessor: Option<i32>,
 }
 
-impl Default for ServerArgs {
+impl Default for Config {
     fn default() -> Self {
         Self {
             model: None,
@@ -510,11 +437,8 @@ impl Default for ServerArgs {
             tensor_parallel_size: NonZeroUsize::MIN,
             data_parallel_size: NonZeroUsize::MIN,
             worker_groups: None,
-            host_identity: this_host(),
+            hosts: Vec::new(),
             engine_host: None,
-            nnodes: NonZeroU32::MIN,
-            node_rank: 0,
-            dist_init_addr: None,
             server_config: ServerConfig::default(),
             admin_config: AdminConfig::default(),
             storage_config: storage::ServerSettings::default(),
@@ -535,13 +459,6 @@ impl Default for ServerArgs {
             video_config: VideoConfig::default(),
             media_config: MediaConfig::default(),
             video_job_config: VideoJobConfig::default(),
-            config_files: Vec::new(),
-            set: Vec::new(),
-            host: None,
-            port: None,
-            source: None,
-            ready_fd: None,
-            predecessor: None,
         }
     }
 }
@@ -563,9 +480,10 @@ pub struct AdminConfig {
     /// Unix domain socket to listen on instead of TCP; a stale socket file
     /// is replaced and the socket file is removed at shutdown.
     pub uds: Option<String>,
-    /// The option paths a harness may set through `PUT /admin/config` on the
-    /// harness listener, beside the package selections it may always set.
-    pub harness_options: Vec<String>,
+    /// The TCP port the leader accepts the deployment's other nodes on, on every interface,
+    /// and the port they join it at on the first host of `hosts`; bound only by a deployment
+    /// of several nodes.
+    pub join: u16,
     /// The admin API's event log (`GET /admin/events`).
     pub event_log: EventLog,
 }
@@ -576,11 +494,15 @@ impl Default for AdminConfig {
             host: "127.0.0.1".to_owned(),
             port: 0,
             uds: None,
-            harness_options: Vec::new(),
+            join: JOIN_PORT,
             event_log: EventLog::default(),
         }
     }
 }
+
+/// The default `admin_config.join`: a fixed port, since the other nodes of a deployment reach the
+/// leader at it before they can read anything the leader reports.
+pub const JOIN_PORT: u16 = 29700;
 
 /// The admin API's event log (`admin_config.event_log`): what it keeps and how long a reader
 /// waits for the next event.
@@ -614,151 +536,20 @@ impl Default for EventLog {
     }
 }
 
-/// The options the daemon reads alone: its HTTP server and listeners, the request and output
-/// processing (the chat options, the model's processor options, the image and condition media
-/// sources), the video jobs, migration, logging, this host's Build Server, against which an
-/// epoch's modules are prepared, and the updates' options, whose statistics window each
-/// replica's observer is sized to when it starts. A hot restart of the daemon applies a change
-/// of them; every other option is the engine configuration's or the deployment's layout and
-/// hosts'. An update's own assignments to `update_config` govern that update alone and change
-/// no option of the daemon's (`updates::change::resolve`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct DaemonPart {
-    pub server_config: ServerConfig,
-    pub admin_config: AdminConfig,
-    pub logging_config: LoggingConfig,
-    pub chat_config: ChatConfig,
-    pub image_fetch_config: ImageFetchConfig,
-    pub media_config: MediaConfig,
-    pub video_job_config: VideoJobConfig,
-    pub migration_config: MigrationConfig,
-    pub mm_processor_kwargs: serde_json::Map<String, Value>,
-    pub build_config: build_server::command::Settings,
-    pub update_config: UpdateConfig,
-}
-
-impl ServerArgs {
-    /// The daemon's part of this configuration.
-    ///
-    /// Every option is named here, so an option added to [`ServerArgs`] does not compile until
-    /// it is placed in the daemon's part or left to the rest of the configuration.
-    pub fn daemon_part(&self) -> DaemonPart {
-        let Self {
-            // The engine configuration and the deployment's layout and hosts.
-            model: _,
-            model_dir: _,
-            served_model_name: _,
-            max_model_len: _,
-            lora: _,
-            lora_dir: _,
-            dtype: _,
-            quantization: _,
-            attention_backend: _,
-            prefill_attention_backend: _,
-            decode_attention_backend: _,
-            moe_runner_backend: _,
-            max_running_requests: _,
-            max_num_batched_tokens: _,
-            max_logprobs: _,
-            mem_fraction_static: _,
-            tensor_parallel_size: _,
-            data_parallel_size: _,
-            worker_groups: _,
-            host_identity: _,
-            engine_host: _,
-            nnodes: _,
-            node_rank: _,
-            dist_init_addr: _,
-            storage_config: _,
-            load_config: _,
-            kv_cache_config: _,
-            scheduler_config: _,
-            speculative_config: _,
-            device_config: _,
-            moe_config: _,
-            cuda_graph_config: _,
-            worker_config: _,
-            profiling_config: _,
-            video_config: _,
-            // The command line's inputs, which are no option.
-            config_files: _,
-            set: _,
-            host: _,
-            port: _,
-            source: _,
-            ready_fd: _,
-            predecessor: _,
-            // The daemon's part.
-            server_config,
-            admin_config,
-            logging_config,
-            chat_config,
-            image_fetch_config,
-            media_config,
-            video_job_config,
-            migration_config,
-            mm_processor_kwargs,
-            build_config,
-            update_config,
-        } = self;
-        DaemonPart {
-            server_config: server_config.clone(),
-            admin_config: admin_config.clone(),
-            logging_config: logging_config.clone(),
-            chat_config: chat_config.clone(),
-            image_fetch_config: image_fetch_config.clone(),
-            media_config: media_config.clone(),
-            video_job_config: video_job_config.clone(),
-            migration_config: migration_config.clone(),
-            mm_processor_kwargs: mm_processor_kwargs.clone(),
-            build_config: build_config.clone(),
-            update_config: update_config.clone(),
-        }
-    }
-
-    /// This configuration with `part` as its daemon's part: what a hot restart of the daemon
-    /// serves when an update changes both the daemon and what an epoch executes, before the
-    /// daemon's successor changes the epoch.
-    pub fn with_daemon_part(&self, part: DaemonPart) -> Self {
-        let DaemonPart {
-            server_config,
-            admin_config,
-            logging_config,
-            chat_config,
-            image_fetch_config,
-            media_config,
-            video_job_config,
-            migration_config,
-            mm_processor_kwargs,
-            build_config,
-            update_config,
-        } = part;
-        Self {
-            server_config,
-            admin_config,
-            logging_config,
-            chat_config,
-            image_fetch_config,
-            media_config,
-            video_job_config,
-            migration_config,
-            mm_processor_kwargs,
-            build_config,
-            update_config,
-            ..self.clone()
-        }
-    }
-}
-
-/// How the deployment moves to a new configuration in another epoch
-/// (`update_config`, `PUT /admin/config`): what of the previous epoch its
-/// trial keeps for a rollback, when the trial rolls back by itself, how the
-/// transfers yield to the serving epoch, and how long the switch lets the
-/// requests in flight run on. A value an update states in its own assignments
-/// governs that update alone.
+/// How the deployment moves to a new configuration in a generation or another epoch
+/// (`update_config`): how long the trial lasts before it commits, what of the previous epoch it
+/// keeps for a rollback, when it rolls back by itself, how the transfers yield to the serving
+/// epoch, how long the switch lets the requests in flight run on, and how they continue.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
+    /// How long a trial lasts: an update that no fault and no threshold rolled back by then
+    /// commits, and the kept side is released.
+    #[serde(with = "values::duration")]
+    pub trial: Duration,
+    /// How the requests an epoch's switch migrates continue on the target: `keep`, finding
+    /// their committed blocks by their keys, or `recompute`, computing their state again.
+    pub in_flight: InFlight,
     /// What the previous epoch keeps while the new one is on trial.
     pub previous_epoch: PreviousEpoch,
     /// When a trial rolls back without the operator: a fatal worker error,
@@ -788,6 +579,10 @@ pub struct UpdateConfig {
     pub drain_s: f64,
 }
 
+/// The default `update_config.trial`: half a minute of serving on the new, within which a fault
+/// or a threshold the operator set rolls it back.
+pub const TRIAL: Duration = Duration::from_secs(30);
+
 /// The default `update_config.drain_s`: the seconds a switch lets the
 /// requests in flight end by themselves.
 pub const DRAIN_S: f64 = 5.0;
@@ -803,6 +598,8 @@ pub const BASELINE_BATCHES: NonZeroU32 = NonZeroU32::new(20).unwrap();
 impl Default for UpdateConfig {
     fn default() -> Self {
         Self {
+            trial: TRIAL,
+            in_flight: InFlight::Keep,
             previous_epoch: PreviousEpoch::Parked,
             rollback: RollbackConfig::default(),
             transfer_slowdown: None,
@@ -813,7 +610,7 @@ impl Default for UpdateConfig {
     }
 }
 
-impl ServerArgs {
+impl Config {
     /// The configuration this deployment's epoch engines are built from.
     ///
     /// The executable's identity is this crate's [`proto::BUILD`]: today the
@@ -824,7 +621,7 @@ impl ServerArgs {
         let engine_host = self
             .engine_host
             .clone()
-            .unwrap_or_else(|| self.host_identity.clone());
+            .unwrap_or_else(|| self.leader_host());
         let worker_groups = match &self.worker_groups {
             Some(stated) => proto::config::WorkerGroupConfig::place(stated.clone(), &engine_host)
                 .context("placing `worker_groups`")?,
@@ -883,7 +680,7 @@ impl ServerArgs {
     /// The configured model as it is stated: the repository (`model`) or the
     /// directory (`model_dir`).
     ///
-    /// Empty while unstated; [`ServerArgs::validate`] refuses that.
+    /// Empty while unstated; [`Config::validate`] refuses that.
     pub fn model(&self) -> &str {
         stated(self.model.as_deref(), self.model_dir.as_deref()).unwrap_or_default()
     }
@@ -939,19 +736,18 @@ impl ServerArgs {
     /// admits.
     pub fn validate(&self, stated: &Stated) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.node_rank < self.nnodes.get(),
-            "`node_rank` {} lies outside the {} nodes `nnodes` states",
-            self.node_rank,
-            self.nnodes
+            self.states_model(),
+            "the package names no model: set `model` or `model_dir` in its `config.toml`"
         );
+        let mut hosts = std::collections::BTreeSet::new();
+        for host in &self.hosts {
+            anyhow::ensure!(!host.trim().is_empty(), "`hosts` names an empty host");
+            anyhow::ensure!(hosts.insert(host), "`hosts` names {host} twice");
+        }
         anyhow::ensure!(
-            self.nnodes.get() == 1 || self.dist_init_addr.is_some(),
-            "a deployment of several nodes needs the leader's address: set `dist_init_addr`"
-        );
-        anyhow::ensure!(
-            !self.leads() || self.states_model() || self.nnodes.get() == 1,
-            "`model` is required on the leader of several nodes: name MODEL on the command line \
-             or set `model` in --config"
+            self.hosts.len() < 2 || self.admin_config.join != 0,
+            "`admin_config.join` is the port the other nodes reach the leader at: a deployment of \
+             several nodes states a fixed one"
         );
         // A token bound the deployment states above its own graph catalog is
         // refused here, by the option, before any weight loads: the engine
@@ -960,7 +756,7 @@ impl ServerArgs {
         // instead (`crates/scheduling/src/limits.rs`). A stated value is never
         // clamped — the deployment either means it or is wrong.
         // A checkpoint is stated once; the resolver checks a repository's name when it resolves
-        // the checkpoint (`ServerArgs::model_source`).
+        // the checkpoint (`Config::model_source`).
         for (name, repository, directory) in [
             ("model", self.model.is_some(), self.model_dir.is_some()),
             ("lora", self.lora.is_some(), self.lora_dir.is_some()),
@@ -1133,12 +929,6 @@ impl ServerArgs {
                 "`admin_config.host` must not be empty"
             ),
         }
-        anyhow::ensure!(
-            self.dist_init_addr
-                .as_ref()
-                .is_none_or(|endpoint| endpoint.port().is_some()),
-            "`dist_init_addr` is the leader's TCP endpoint (`host:port`)"
-        );
         // The model holds the capacity to its own bounds when its processor
         // is bound; a duration that is no positive number admits nothing.
         if let Some(seconds) = self.video_config.max_seconds {
@@ -1150,10 +940,19 @@ impl ServerArgs {
         Ok(())
     }
 
-    /// Whether this node is the leader, which serves the API and runs the
-    /// engine.
-    pub fn leads(&self) -> bool {
-        self.node_rank == 0
+    /// This node's place in the deployment: its own host name found in `hosts`, or, for a
+    /// deployment that lists no hosts, the one node on this host.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `hosts` lists hosts and this host's name is not one of them.
+    pub fn identity(&self) -> anyhow::Result<Identity> {
+        Identity::of(&self.hosts, &this_host(), self.admin_config.join)
+    }
+
+    /// The leader's host: the first of `hosts`, or this host for a deployment that lists none.
+    pub fn leader_host(&self) -> String {
+        self.hosts.first().cloned().unwrap_or_else(this_host)
     }
 
     /// The leader's request socket, which its engine processes connect back
@@ -1166,13 +965,13 @@ impl ServerArgs {
 
     /// The options of this node's daemon. The leader's process socket lies in the daemon's
     /// instance directory `instance`; the node's Storage Server, when it has none, starts with the
-    /// deployment's [`ServerArgs::storage_settings`].
-    pub fn daemon_options(&self, instance: &Path) -> DaemonOptions {
+    /// deployment's [`Config::storage_settings`].
+    pub fn daemon_options(&self, identity: &Identity, instance: &Path) -> DaemonOptions {
         DaemonOptions {
-            nnodes: self.nnodes.get(),
-            node_rank: self.node_rank,
-            host: self.host_identity.clone(),
-            dist_init_addr: self.dist_init_addr.clone(),
+            nnodes: identity.nodes,
+            node_rank: identity.rank,
+            host: identity.host.clone(),
+            dist_init_addr: identity.join.clone(),
             socket: instance.join("process.sock"),
             join_timeout: crate::supervision::JOIN_TIMEOUT,
             build_server: self.build_config.clone(),
@@ -1182,12 +981,12 @@ impl ServerArgs {
 
     /// The settings of the Storage Server of every host the deployment serves on: its
     /// `storage_config`, with the Mooncake connector `kv_cache_config.mooncake` states. A
-    /// deployment that other nodes may join (`dist_init_addr`) has its servers accept other
-    /// hosts on every interface, on a port each picks, unless `storage_config.tcp` states an
-    /// endpoint: the other nodes' Transfer Servers read their storage.
+    /// deployment of several nodes has its servers accept other hosts on every interface, on a
+    /// port each picks, unless `storage_config.tcp` states an endpoint: the other nodes'
+    /// Transfer Servers read their storage.
     pub fn storage_settings(&self) -> storage::Settings {
         let mut server = self.storage_config.clone();
-        if server.tcp.is_none() && self.dist_init_addr.is_some() {
+        if server.tcp.is_none() && self.hosts.len() > 1 {
             server.tcp = Some(service::Endpoint::Tcp {
                 host: std::net::Ipv4Addr::UNSPECIFIED.to_string(),
                 port: 0,
@@ -1200,8 +999,65 @@ impl ServerArgs {
     }
 }
 
-/// This host's name, `uname(2)`'s node name: the host identity a node states unless its
-/// configuration names another, and the host its unplaced ranks run on.
+/// A node's place in its deployment (`specs/configuration.md` §9, item 2): no option states it;
+/// it follows from the package's `hosts` and the host name of the node that serves the package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    /// This node's host name, which the ranks a deployment layout places on it name.
+    pub host: String,
+    /// This node's position in `hosts`; the leader is 0.
+    pub rank: u32,
+    /// The deployment's nodes.
+    pub nodes: u32,
+    /// The endpoint the leader accepts the other nodes on (`admin_config.join` on the first
+    /// host), for a deployment of several nodes.
+    pub join: Option<service::Endpoint>,
+}
+
+impl Identity {
+    /// The place of the node on host `this` in a deployment of `hosts` whose leader accepts
+    /// the others at port `join`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `hosts` lists hosts and `this` is not one of them.
+    pub fn of(hosts: &[String], this: &str, join: u16) -> anyhow::Result<Self> {
+        let Some(leader) = hosts.first() else {
+            return Ok(Self {
+                host: this.to_owned(),
+                rank: 0,
+                nodes: 1,
+                join: None,
+            });
+        };
+        let rank = hosts.iter().position(|host| host == this).with_context(|| {
+            format!(
+                "this host, {this}, is not one of the deployment's hosts ({}): serve the package \
+                 on one of them",
+                hosts.join(", ")
+            )
+        })?;
+        let nodes = u32::try_from(hosts.len()).context("the deployment lists too many hosts")?;
+        Ok(Self {
+            host: this.to_owned(),
+            rank: u32::try_from(rank).context("the deployment lists too many hosts")?,
+            nodes,
+            join: (nodes > 1).then(|| service::Endpoint::Tcp {
+                host: leader.clone(),
+                port: join,
+            }),
+        })
+    }
+
+    /// Whether this node is the leader, which serves the API, applies every package and runs
+    /// the engines' control.
+    pub fn leads(&self) -> bool {
+        self.rank == 0
+    }
+}
+
+/// This host's name, `uname(2)`'s node name: how a node finds itself in `hosts`, and the host a
+/// deployment that lists none runs on.
 fn this_host() -> String {
     rustix::system::uname()
         .nodename()

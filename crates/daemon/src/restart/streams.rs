@@ -523,7 +523,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::options::VideoJobConfig;
+    use crate::config::VideoJobConfig;
     use crate::test_support::{
         configured_tokenizer, fake_client, leader_over, test_model, text_fake,
     };
@@ -603,7 +603,7 @@ mod tests {
             state: b"not a stream's handoff".to_vec(),
         };
         let mut socket_taken = false;
-        let keep_alive = crate::options::ServerConfig::default().stream_keep_alive;
+        let keep_alive = crate::config::ServerConfig::default().stream_keep_alive;
         let adoption = adopt(&leader, vec![record], &jobs, keep_alive, &mut || {
             socket_taken = true;
             anyhow::bail!("a refused response must not take a descriptor")
@@ -650,7 +650,7 @@ mod tests {
         .encode_to_vec();
 
         let mut socket_taken = false;
-        let keep_alive = crate::options::ServerConfig::default().stream_keep_alive;
+        let keep_alive = crate::config::ServerConfig::default().stream_keep_alive;
         let adoption = adopt(&leader, vec![record], &jobs, keep_alive, &mut || {
             socket_taken = true;
             anyhow::bail!("a refused response must not take a descriptor")

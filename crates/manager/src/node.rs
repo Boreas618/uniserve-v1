@@ -3,8 +3,8 @@
 
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
-use proto::admin::{ConfigStatus, Event, EventsPage, EventsQuery, Status};
+use anyhow::{Context as _, Result};
+use proto::admin::{EventsPage, EventsQuery, Status};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -122,9 +122,25 @@ impl Node {
         self.get("/admin/status").await
     }
 
-    /// `GET /admin/config`: the deployment's configuration and what its epochs hold.
-    pub(crate) async fn config(&self) -> Result<ConfigStatus> {
-        self.get("/admin/config").await
+    /// `PUT /admin/policy` of the package `archive` (a tar archive of its directory), forcing a
+    /// target a rollback marked unavailable when `force`: the revision's record as the node
+    /// answers it once the change converged, or why it did not.
+    pub(crate) async fn put_policy(
+        &self,
+        archive: Vec<u8>,
+        force: bool,
+    ) -> Result<serde_json::Value> {
+        let path = if force {
+            "/admin/policy?force=true"
+        } else {
+            "/admin/policy"
+        };
+        let request = self
+            .http
+            .put(format!("{}{path}", self.url))
+            .header(reqwest::header::CONTENT_TYPE, "application/x-tar")
+            .body(archive);
+        Ok(self.exchange(request, path).await?)
     }
 
     /// The sequence number of the node's last event: a reader from it reads what happens from
@@ -157,30 +173,6 @@ impl Node {
                 }
                 Err(Failure::Answered(error)) => return Err(error),
             }
-        }
-    }
-
-    /// Reads the node's events after `after` until `found` finds what it waits for in one.
-    /// Events that left the node's log before they were read fail the wait: what it waits for
-    /// may be among them.
-    pub(crate) async fn wait_for<T>(
-        &self,
-        mut after: u64,
-        polling: Polling,
-        mut found: impl FnMut(&Event) -> Option<T>,
-    ) -> Result<T> {
-        loop {
-            let page = self.events(after, polling).await?;
-            if page.gap {
-                bail!(
-                    "{}: events after {after} left the node's log before they were read",
-                    self.base
-                );
-            }
-            if let Some(found) = page.events.iter().find_map(&mut found) {
-                return Ok(found);
-            }
-            after = page.next;
         }
     }
 }

@@ -295,8 +295,8 @@ impl Updater {
         Some(report)
     }
 
-    /// Rolls the update in flight back with `failure` as its reason, and
-    /// returns it as it stands; `None` when no update is in flight.
+    /// Rolls the update in flight back with `failure` as its reason, and returns it as it
+    /// stands; `None` when no update is in flight.
     pub(crate) fn rollback(&self, failure: Failure) -> Option<UpdateReport> {
         let mut state = self.lock();
         let State {
@@ -332,17 +332,22 @@ impl Updater {
         Some(failure)
     }
 
-    /// Rolls update `number` back if its deadline passed.
-    pub(crate) fn expire(&self, number: u64) {
-        let mut state = self.lock();
-        let State {
-            processes, update, ..
-        } = &mut *state;
-        let Some(update) = update.as_mut().filter(|update| update.number() == number) else {
-            return;
-        };
-        update.expire(processes, Instant::now());
-        self.settle(&mut state);
+    /// When update `number`'s trial ends and it commits by itself, while it stands on trial.
+    pub(crate) fn ends(&self, number: u64) -> Option<Instant> {
+        self.lock()
+            .update
+            .as_ref()
+            .filter(|update| update.number() == number)
+            .and_then(Update::ends)
+    }
+
+    /// Commits update `number` once its trial reached its end with nothing rolling it back: a
+    /// fault and every threshold the operator set roll a trial back before its end, so a trial
+    /// that reached it stands.
+    pub(crate) fn conclude(&self, number: u64) {
+        if self.ends(number).is_some_and(|ends| ends <= Instant::now()) {
+            self.commit();
+        }
     }
 
     /// The trial `begin` makes, given when the update's switch began (what

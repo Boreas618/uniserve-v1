@@ -49,11 +49,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::api::openai::video_jobs::{VideoJob, VideoJobs};
+use crate::config::Stated;
 use crate::engine::control::EngineControl;
 use crate::http::admin::{Admin, Journal, JournalHandoff};
 use crate::http::listener::{Listener, ListenerHandoff};
 use crate::leader::{Leader, stats_sink};
-use crate::options::Stated;
 use crate::supervision::{Daemon, ServiceHandoff};
 
 pub(crate) mod requests;
@@ -117,8 +117,8 @@ struct Prepare {
     /// The daemon's instance directory, whose sockets the successor binds over and which it
     /// owns once the handover completed.
     instance: std::path::PathBuf,
-    /// How long the node lives, which the successor's node goes on with.
-    lifetime: crate::http::node::Lifetime,
+    /// The deployment's name, which names its persistent state the successor goes on with.
+    deployment: String,
     /// Whether the configuration listens on another address than the
     /// daemon's listener: the successor binds it before the handover.
     rebind: bool,
@@ -143,7 +143,9 @@ struct Takeover {
     service_descriptors: usize,
     journal: JournalHandoff,
     jobs: Vec<(VideoJob, Option<u64>)>,
-    then: Option<proto::admin::ApplyRequest>,
+    /// The revision the change that restarted the daemon converges to: the successor
+    /// converges the rest of it.
+    then: Option<u64>,
     /// Whether the leader's admissions were paused (new requests waited) when the predecessor
     /// handed over: the successor's admissions start as the predecessor's ended, so a hot
     /// restart never reopens them.
@@ -181,8 +183,8 @@ pub(crate) struct Restarter {
     listener: std::sync::Mutex<Option<(ListenerHandoff, Vec<OwnedFd>)>>,
     /// The daemon's instance directory, which the successor goes on with.
     instance: std::path::PathBuf,
-    /// How long the daemon's node lives, which the successor's goes on with.
-    lifetime: crate::http::node::Lifetime,
+    /// The deployment's name, which names its persistent state.
+    deployment: String,
     stated: Stated,
     /// Cancelled once the successor serves: this daemon stops accepting.
     pub(crate) accepting: CancellationToken,
@@ -213,23 +215,23 @@ pub(crate) struct Restarter {
 }
 
 impl Restarter {
-    /// The restarter of a deployment serving with `stated` on the client listener of which
-    /// `listener` is a duplicate, whose daemon service `daemon` holds, on a node whose instance
-    /// directory is `instance` and whose lifetime is `lifetime`; `accepting` stops the node
-    /// accepting once a successor serves.
+    /// The restarter of the deployment `deployment` serving with `stated` on the client
+    /// listener of which `listener` is a duplicate, whose daemon service `daemon` holds, on a
+    /// node whose instance directory is `instance`; `accepting` stops the node accepting once a
+    /// successor serves.
     pub(crate) fn new(
         daemon: Arc<std::sync::Mutex<Option<Daemon>>>,
         listener: (ListenerHandoff, Vec<OwnedFd>),
         instance: &std::path::Path,
+        deployment: String,
         stated: Stated,
         accepting: CancellationToken,
-        lifetime: crate::http::node::Lifetime,
     ) -> Self {
         Self {
             daemon,
             listener: std::sync::Mutex::new(Some(listener)),
             instance: instance.to_owned(),
-            lifetime,
+            deployment,
             stated,
             accepting,
             handoff_sent: Arc::new(AtomicBool::new(false)),
@@ -261,8 +263,8 @@ impl Restarter {
     /// service was handed over, this daemon serves on.
     pub(crate) async fn restart(
         &self,
-        config: Option<crate::options::ServerArgs>,
-        then: Option<Box<proto::admin::ApplyRequest>>,
+        config: Option<crate::config::Config>,
+        then: Option<u64>,
         leader: &Arc<Leader>,
         admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
@@ -294,8 +296,8 @@ impl Restarter {
     /// The restart itself, up to the successor serving.
     async fn hand_over(
         &self,
-        config: Option<crate::options::ServerArgs>,
-        then: Option<Box<proto::admin::ApplyRequest>>,
+        config: Option<crate::config::Config>,
+        then: Option<u64>,
         leader: &Arc<Leader>,
         admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
@@ -322,11 +324,11 @@ impl Restarter {
         // The listener binds the daemon's own address (`admin_config`): a
         // change of it is the rebind this successor makes before the
         // handover, and the previous daemon keeps serving if the bind fails.
-        let address = |admin: &crate::options::AdminConfig| {
+        let address = |admin: &crate::config::AdminConfig| {
             (admin.host.clone(), admin.port, admin.uds.clone())
         };
         let rebind = address(&options.admin_config) != address(&handoff[0].config.admin_config);
-        let config = crate::options::printed(&options)?;
+        let config = crate::config::printed(&options)?;
         let processes = ::service::lock(&self.daemon)
             .as_ref()
             .and_then(Daemon::address)
@@ -340,7 +342,7 @@ impl Restarter {
                 api_key: options.server_config.api_key.clone(),
                 processes,
                 instance: self.instance.clone(),
-                lifetime: self.lifetime,
+                deployment: self.deployment.clone(),
                 rebind,
                 interface: proto::ENGINE_INTERFACE_VERSION,
             })),
@@ -380,7 +382,7 @@ impl Restarter {
                 engine: replica.engine,
                 next_engine: replica.next_engine,
                 served: replica.served.clone(),
-                config: crate::options::printed(&replica.config)?,
+                config: crate::config::printed(&replica.config)?,
                 paused: replica.paused,
                 asleep: replica.asleep,
                 sleep_paused: replica.sleep_paused,
@@ -432,7 +434,7 @@ impl Restarter {
                     service_descriptors: service_count,
                     journal: admin.journal.hand_over(),
                     jobs: job_records,
-                    then: then.map(|request| *request),
+                    then,
                     admissions_paused: leader.status().paused,
                     modules: leader.epochs().serving().map(|(_, record)| {
                         proto::module::ModuleSet {
@@ -724,7 +726,7 @@ async fn prepared_successor(
     })
     .await
     .context("the check of the Storage Server's protocol did not complete")??;
-    let (mut config, _) = crate::options::resolve_text(&prepare.config, &[])?;
+    let (mut config, _) = crate::config::parse(&prepare.config)?;
     config.server_config.api_key = prepare.api_key;
     let stated = Stated::from_paths(prepare.stated);
     let prepared = Leader::prepare(families, &config, &stated).await?;
@@ -743,7 +745,7 @@ async fn prepared_successor(
     let control = EngineControl::new(
         &config.request_socket(&prepare.instance),
         prepare.processes.clone(),
-        config.host_identity.clone(),
+        config.leader_host(),
         config.served_model_name().to_owned(),
         crate::engine::control::ensure_build_server(&config.build_config)?,
     )?;
@@ -821,7 +823,7 @@ async fn prepared_successor(
         .map(|_| next())
         .collect::<anyhow::Result<Vec<_>>>()?;
     let daemon = Daemon::resume(
-        config.host_identity.clone(),
+        config.leader_host(),
         Some(prepare.processes.clone()),
         service,
         service_fds,
@@ -842,8 +844,12 @@ async fn prepared_successor(
             .into_iter()
             .enumerate()
             .map(|(index, (replica, connection))| {
-                let (options, _) = crate::options::resolve_text(&replica.config, &[])?;
-                let options = options.with_daemon_part(daemon_options.daemon_part());
+                let (mut options, _) = crate::config::parse(&replica.config)?;
+                proto::reload::Reload::take(
+                    &mut options,
+                    &daemon_options,
+                    proto::reload::Effect::Daemon,
+                );
                 let served = replica.served.clone();
                 let observer = Arc::new(crate::observe::Observer::new(crate::observe::span(
                     &options.update_config,
@@ -930,7 +936,7 @@ async fn prepared_successor(
     *service::lock(&leader.replicas.adapters) = adapters;
     let retire = Arc::new(AtomicBool::new(false));
     // The deployment's end is its node's as the predecessor's node lived.
-    let token = crate::http::node::deployment_token(prepare.lifetime, &shutdown);
+    let token = shutdown.clone();
     // The node's journal goes on in the successor, which the adopted deployment writes.
     let admin = Admin::new(
         token.clone(),
@@ -941,9 +947,6 @@ async fn prepared_successor(
         "serving {} after a hot restart",
         leader.served_model_name()
     ));
-    if let Some(request) = then {
-        crate::http::admin::apply_after_restart(&admin, &leader, request);
-    }
     // The handover completed: the predecessor's instance directory is this daemon's now, and
     // its admin sockets are bound over in it.
     let instance = service::Instance::resume(prepare.instance.clone());
@@ -1064,12 +1067,16 @@ async fn prepared_successor(
     });
 
     // From here the successor's node serves the adopted deployment as any node serves one.
+    let revisions = Arc::new(crate::policy::revision::Revisions::open(
+        crate::policy::revision::directory(&prepare.deployment)?,
+    )?);
     let start = crate::http::node::Start {
         families: families.clone(),
         options: config.clone(),
+        deployment: prepare.deployment.clone(),
+        revisions,
         instance,
         ready,
-        lifetime: prepare.lifetime,
         shutdown,
     };
     let brought = crate::http::node::Brought {
@@ -1082,6 +1089,7 @@ async fn prepared_successor(
         daemon: Some(daemon),
         retire,
         token,
+        then,
     };
     let ended = crate::http::node::run(
         start,
@@ -1115,7 +1123,7 @@ async fn prepared_successor(
 fn adopted_epoch(
     epoch: u64,
     engine: u64,
-    options: &crate::options::ServerArgs,
+    options: &crate::config::Config,
     modules: Option<proto::module::ModuleSet>,
 ) -> anyhow::Result<(crate::epoch::EpochRecord, proto::admin::ManagedProcess)> {
     let deployment = crate::epoch::Epoch::of(options.clone())?;
@@ -1211,7 +1219,7 @@ mod tests {
     /// see and does not invent.
     #[test]
     fn an_adopted_epoch_records_the_build_it_serves_and_the_generation_it_runs_at() {
-        let options = crate::options::ServerArgs::default();
+        let options = crate::config::Config::default();
         let (record, process) =
             adopted_epoch(7, 12, &options, None).expect("the configuration resolves");
         assert_eq!(record.status, proto::admin::EpochState::Serving);

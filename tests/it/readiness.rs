@@ -26,9 +26,17 @@ fn pipe() -> (OwnedFd, OwnedFd) {
     unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) }
 }
 
+/// A policy package in `directory` whose `config.toml` is `text`; returns its directory.
+fn package(directory: &Path, text: &str) -> std::path::PathBuf {
+    let package = directory.join("model");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("config.toml"), text).unwrap();
+    package
+}
+
 /// `uniserve ARGUMENTS --ready-fd 3`, the readiness pipe's write end at descriptor 3, under the
-/// runtime directory `runtime` and with no device visible; returns the child and the pipe's read
-/// end.
+/// runtime and state directory `runtime` and with no device visible; returns the child and the
+/// pipe's read end.
 fn spawn_ready(runtime: &Path, arguments: &[&str]) -> (Child, ReadyReader) {
     let (reader, writer) = pipe();
     let write_end = writer.as_raw_fd();
@@ -37,6 +45,7 @@ fn spawn_ready(runtime: &Path, arguments: &[&str]) -> (Child, ReadyReader) {
         .args(arguments)
         .args(["--ready-fd", &READY_FD.to_string()])
         .env("XDG_RUNTIME_DIR", runtime)
+        .env("XDG_STATE_HOME", runtime)
         .env("CUDA_VISIBLE_DEVICES", "");
     // SAFETY: dup2 is async-signal-safe; the duplicate is not close-on-exec, so the child
     // inherits it at its number.
@@ -123,14 +132,19 @@ fn a_storage_server_reports_what_it_bound_and_stops_on_request() {
     );
 }
 
-/// A daemon asked for port 0 binds its client listener and its admin sockets, in an instance
-/// directory of its own inside the runtime directory, before it serves, and states them in its
-/// readiness record: first listening, then serving. Its admin socket answers once it serves, and
-/// its instance directory goes with it.
+/// A daemon whose package asks for port 0 binds its client listener and its admin sockets, in
+/// an instance directory of its own inside the runtime directory, before its deployment starts,
+/// and states them in its readiness record. Its admin socket answers its status while the
+/// deployment comes up, and its instance directory goes with it.
 #[test]
 fn a_daemon_reports_the_listeners_it_bound_on_port_0() {
     let runtime = tempfile::tempdir().unwrap();
-    let (mut daemon, mut ready) = spawn_ready(runtime.path(), &["serve", "--port", "0"]);
+    let package = package(
+        runtime.path(),
+        "model = \"org/model\"\n[admin_config]\nport = 0\n",
+    );
+    let (mut daemon, mut ready) =
+        spawn_ready(runtime.path(), &["serve", package.to_str().unwrap()]);
 
     let listening: Readiness = ready.wait(State::Listening, START).unwrap();
     let instance = listening.instance.clone().expect("an instance directory");
@@ -142,8 +156,6 @@ fn a_daemon_reports_the_listeners_it_bound_on_port_0() {
     let admin = listening.endpoints.admin.clone().expect("an admin socket");
     assert_eq!(admin, Endpoint::unix(instance.join("admin.sock")));
 
-    let serving: Readiness = ready.wait(State::Serving, START).unwrap();
-    assert_eq!(serving.endpoints, listening.endpoints);
     let mut stream = std::os::unix::net::UnixStream::connect(admin.path().unwrap()).unwrap();
     std::io::Write::write_all(
         &mut stream,
@@ -161,16 +173,20 @@ fn a_daemon_reports_the_listeners_it_bound_on_port_0() {
     assert!(!instance.exists());
 }
 
-/// A daemon run without a runtime directory has nowhere to put its sockets and is refused.
+/// A package that names no model is refused before the daemon binds anything, naming what it
+/// lacks.
 #[test]
-fn a_daemon_without_a_runtime_directory_is_refused() {
+fn a_package_without_a_model_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let package = package(directory.path(), "[admin_config]\nport = 0\n");
     let refused = Command::new(env!("CARGO_BIN_EXE_uniserve"))
-        .args(["serve", "--port", "0"])
-        .env_remove("XDG_RUNTIME_DIR")
+        .arg("serve")
+        .arg(&package)
+        .env("XDG_STATE_HOME", directory.path())
         .output()
         .unwrap();
     assert!(!refused.status.success());
     let message =
         String::from_utf8_lossy(&refused.stderr) + String::from_utf8_lossy(&refused.stdout);
-    assert!(message.contains("XDG_RUNTIME_DIR"), "{message}");
+    assert!(message.contains("names no model"), "{message}");
 }

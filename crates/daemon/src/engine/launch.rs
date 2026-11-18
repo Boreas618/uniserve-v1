@@ -85,14 +85,14 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::options::ServerArgs;
+    use crate::config::Config;
 
     /// The launch of a standby (engine 7) of epoch 12 beside the process of epoch 11 it succeeds,
     /// with a rebalanced expert order.
     fn launch() -> EngineArgs {
         use proto::request::wire::{ExpertOrder, Predecessor};
         EngineArgs {
-            engine_config: ServerArgs::default()
+            engine_config: Config::default()
                 .engine_config()
                 .expect("the configuration resolves"),
             epoch: 12,
@@ -111,13 +111,13 @@ mod tests {
             processes: "unix:processes.sock".to_owned(),
             engine: 7,
             build_server: "build-server.sock".to_owned(),
-            modules: crate::epoch::modules_of(&crate::options::ServerArgs::default()),
+            modules: crate::epoch::modules_of(&crate::config::Config::default()),
             devices: vec![0, 1],
             group: "engine".to_owned(),
             rank: 0,
             scheduler_node: true,
             world: None,
-            standby_storage: crate::options::StandbyStorage::Resident,
+            standby_storage: crate::config::StandbyStorage::Resident,
             queue_depth: 4,
             world_size: 1,
         }

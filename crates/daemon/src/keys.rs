@@ -16,9 +16,9 @@ use std::process::{Command, Stdio};
 use anyhow::Context as _;
 use proto::config::EngineArgs;
 
+use crate::config::{Config, Stated};
 use crate::engine::control::{BuildServer, Interfaces, ensure_build_server, place};
 use crate::leader::{Leader, fix_modules, replica_configs};
-use crate::options::{ServerArgs, Stated};
 
 /// The launch of every engine the deployment `config` starts on this node, in replica
 /// order; `stated` holds the option paths the operator set, and `families` the families whose
@@ -31,7 +31,7 @@ use crate::options::{ServerArgs, Stated};
 /// configuration, the replicas are not independent, or a process cannot be placed on this node.
 pub async fn launches(
     families: &processing::Registry,
-    config: &ServerArgs,
+    config: &Config,
     stated: &Stated,
 ) -> anyhow::Result<Vec<EngineArgs>> {
     let prepared = Leader::prepare(families, config, stated).await?;
@@ -70,7 +70,7 @@ pub async fn launches(
 /// a recording process fails or prints a line that is no `operator<TAB>key`.
 pub async fn record(
     families: &processing::Registry,
-    config: &ServerArgs,
+    config: &Config,
     stated: &Stated,
 ) -> anyhow::Result<BTreeMap<String, BTreeSet<String>>> {
     let launches = launches(families, config, stated).await?;
@@ -85,7 +85,7 @@ pub async fn record(
     };
     // Every launch runs on this host: no other host prepares, and no daemon reaches one.
     let local = BuildServer {
-        host: config.host_identity.clone(),
+        host: config.leader_host(),
         socket: socket.clone(),
         targets: Vec::new(),
     };

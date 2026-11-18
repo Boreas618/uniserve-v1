@@ -28,15 +28,18 @@ pub struct Status {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum NodeState {
-    /// No deployment: a `PUT /admin/config` brings one up. `last_error` is why the last
-    /// deployment failed to come up or to come down.
+    /// No deployment: before the node's deployment came up, or after it came down. `last_error`
+    /// is why the last deployment failed to come up or to come down.
     Idle { last_error: Option<String> },
     /// The deployment `name` comes up.
     Starting { name: String },
-    /// A deployment serves: its status, and the daemon's readiness record once it reported
+    /// A deployment serves: its status, what it executes and owns (`report`: its replicas'
+    /// epochs, the update in flight or the last one, the GPUs' quotas, the epochs' records and
+    /// the processes the daemon manages), and the daemon's readiness record once it reported
     /// serving.
     Serving {
         deployment: Box<DeploymentStatus>,
+        report: Option<Box<super::ConfigStatus>>,
         readiness: Option<Box<service::Readiness>>,
     },
     /// The deployment `name` comes down.

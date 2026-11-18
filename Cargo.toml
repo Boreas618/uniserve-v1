@@ -72,6 +72,8 @@ workspace = true
 # The process's own memory mappings, which the allocator test reads through the kernel's
 # process file system.
 procfs.workspace = true
+# This host's name, which a node of the integration tests finds itself by in `hosts`.
+rustix.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 
@@ -214,6 +216,8 @@ socket2 = "0.6.3"
 # Names derived from enum variants (a storage request's name in the server's log), and the count
 # and iteration of an enum whose variants index a layout, derived from its declaration.
 strum = { version = "0.27.2", features = ["derive"] }
+# The archive a policy package travels in (`PUT /admin/policy`).
+tar = { version = "0.4.44", default-features = false }
 tempfile = "3.23.0"
 thiserror = "2.0.16"
 thiserror-ext = "0.3.0"

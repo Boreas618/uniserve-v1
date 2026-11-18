@@ -1,4 +1,5 @@
-//! The serving command's follower role needs no model on its command line.
+//! A node other than the leader finds its place in the package's `hosts` by its host name and
+//! joins the leader at the first host's join port; it starts no model of its own.
 
 use std::process::{Child, Command};
 
@@ -13,29 +14,39 @@ impl Drop for Follower {
     }
 }
 
+/// This host's name, which a node finds itself by in `hosts`.
+fn this_host() -> String {
+    rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[test]
-fn a_follower_joins_without_a_model() {
+fn a_follower_joins_the_first_host() {
     let directory = tempfile::tempdir().unwrap();
-    // The leader's join listener is bound first, on a port the kernel picks, and the follower is
-    // given the endpoint it bound.
+    // The leader's join listener is bound first, on a port the kernel picks, and the package
+    // names the leader by an address this host reaches and the port it bound.
     let (join, endpoint) = Daemon::bind_join(&"127.0.0.1:0".parse().unwrap()).unwrap();
-    let address = endpoint.to_string();
+    let port = endpoint.port().unwrap();
+    let package = directory.path().join("model");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("config.toml"),
+        format!(
+            "model = \"org/model\"\nhosts = [\"127.0.0.1\", \"{}\"]\n[admin_config]\njoin = {port}\n",
+            this_host()
+        ),
+    )
+    .unwrap();
     let _follower = Follower(
         Command::new(env!("CARGO_BIN_EXE_uniserve"))
-            .args([
-                "serve",
-                "--nnodes",
-                "2",
-                "--node-rank",
-                "1",
-                "--host-identity",
-                "follower",
-                "--dist-init-addr",
-                &address,
-            ])
+            .arg("serve")
+            .arg(&package)
             // The follower creates its instance directory in the user's runtime directory, which
             // a process names by the XDG variable (`service::RuntimeDirectory`).
             .env("XDG_RUNTIME_DIR", directory.path())
+            .env("XDG_STATE_HOME", directory.path())
             .spawn()
             .unwrap(),
     );

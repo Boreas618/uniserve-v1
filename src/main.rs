@@ -11,10 +11,9 @@
 //! daemon, and on the leader the application, [`serve`]), `keys` (a
 //! deployment's recorded key list, [`keys`]), and the host services
 //! `storage-server` and `build-server`, whose commands are their crates' own.
-//! `serve` installs
-//! tracing and builds the Tokio runtime; its module hands the resolved
-//! configuration to `daemon::serve` with a cancellation token that fires on
-//! Ctrl-C or SIGTERM. The host services run before any thread exists,
+//! `serve` installs tracing and builds the Tokio runtime; its module hands the
+//! policy package it reads to `daemon::serve` with a cancellation token that
+//! fires on Ctrl-C or SIGTERM. The host services run before any thread exists,
 //! because a service started with `--daemon` forks.
 //!
 //! The runtime and the cancellation token are the executable's own: every
@@ -68,19 +67,10 @@ pub(crate) fn shutdown_signal() -> CancellationToken {
 
 /// Starts the UniServe command-line process.
 fn main() -> Result<std::process::ExitCode> {
-    // The serving commands read which flags their command line states, so they keep its matches.
-    let matches = <Cli as clap::CommandFactory>::command().get_matches();
-    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
-        .unwrap_or_else(|error| error.exit());
-    let command_matches = || {
-        matches
-            .subcommand()
-            .map(|(_, matches)| matches.clone())
-            .unwrap_or_default()
-    };
+    let cli = <Cli as clap::Parser>::parse();
     match cli.command {
-        Command::Serve(args) => serve::run(*args, &command_matches(), &cli.log),
-        Command::Keys(args) => keys::run(*args, &command_matches(), &cli.log),
+        Command::Serve(args) => serve::run(*args, &cli.log),
+        Command::Keys(args) => keys::run(&args.package, &cli.log),
         Command::StorageServer(args) => storage_server::command::run(*args, &cli.log.levels())
             .map(|()| std::process::ExitCode::SUCCESS),
         Command::BuildServer(args) => {

@@ -29,7 +29,7 @@ use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio_util::either::Either;
 use tracing::trace;
 
-use crate::options::AdminConfig;
+use crate::config::AdminConfig;
 
 /// Runtime listener type used by the OpenAI-compatible HTTP server, which is
 /// either a TCP listener or a Unix-domain listener.
@@ -309,7 +309,7 @@ impl axum::serve::Listener for Listener {
 #[cfg(test)]
 mod tests {
     use super::Listener;
-    use crate::options::AdminConfig;
+    use crate::config::AdminConfig;
 
     /// The listener options of a Unix-domain socket at `path`.
     fn uds(path: &std::path::Path) -> AdminConfig {

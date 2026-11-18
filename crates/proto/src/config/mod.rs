@@ -319,63 +319,77 @@ pub const DEFAULT_SCHEDULING_POLICY: &str = "arrival";
 /// engine starts a scheduler it resolves the rest from the configuration and the ranks' captured
 /// catalog ([`SchedulerConfig::of`]): those fields are never read from a configuration file and
 /// never written to one.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, crate::reload::Reload)]
 #[serde(default, deny_unknown_fields)]
 pub struct SchedulerConfig {
     /// The scheduling policy package's backend (`arrival`): a package the Build Server holds.
+    #[reload(program)]
     pub policy: String,
     /// The order the policy's waiting queue admits by (its `order` argument): by arrival, or by
     /// the request's own priority and then arrival; the package's default when unset.
+    #[reload(program)]
     pub order: Option<QueueOrder>,
     /// Waiting requests, and finished ones with undelivered events, before
     /// a submission is refused as overloaded; unbounded when unset.
+    #[reload(step)]
     pub max_queued_requests: Option<NonZeroUsize>,
     /// Prompt tokens one request prefills in one step, the scheduling policy's
     /// `chunked_prefill_size` argument; unset, the policy package's manifest declares it
     /// (`[parameters]`), which is its one source. Token models only.
+    #[reload(step)]
     pub chunked_prefill_size: Option<NonZeroUsize>,
     /// Calls assembled into one forward batch; once resolved, the largest bucket of the ranks'
     /// catalog, which is what the workers accept.
+    #[reload(step)]
     pub max_batch: NonZeroUsize,
     /// Token budget of one generation scheduling pass, resolved: the configuration's
     /// `max_num_batched_tokens`, or what the ranks' catalog bounds a step to. Each selected call is
     /// charged its token work, which for a denoising call covers its latent units and guidance
     /// branches.
     #[serde(skip)]
+    #[reload(epoch)]
     pub max_num_batched_tokens: usize,
     /// Maximum concurrently running requests, token and media together, resolved from the
     /// configuration's `max_running_requests`.
     #[serde(skip)]
+    #[reload(epoch)]
     pub max_running_requests: usize,
     /// The most draft tokens a verification carries per request
     /// (`speculative_config.num_draft_tokens`); zero when the deployment does not speculate.
     #[serde(skip)]
+    #[reload(epoch)]
     pub draft_tokens: usize,
     /// The captured graph sizes the ranks state, in tokens, ascending and without duplicates:
     /// `Room.graph_tiers`, the bound a scheduled batch must fit. Empty when they state none, and on a
     /// reconfigure, which carries no graph catalog: a worker then runs its own captured catalog or
     /// eagerly, and the tier bound is honest but vacuous.
     #[serde(skip)]
+    #[reload(epoch)]
     pub graph_tiers: Vec<u32>,
     /// What the scheduling policy module runs within: the fuel of each call into it, and the
     /// bounds of the starvation timeout and the prefetch threshold its limits may declare.
+    #[reload(program)]
     pub policy_budget: PolicyBudget,
     /// The tokens of the deployment's KV page, resolved from `kv_cache_config.block_size`
     /// ([`KvCacheConfig::block_tokens`]): the block a class whose blocks hold no tokens is counted
     /// in.
     #[serde(skip)]
+    #[reload(epoch)]
     pub block_tokens: u32,
     /// The time a copy may take whatever its size, resolved from
     /// `kv_cache_config.prefetch_timeout_base`.
     #[serde(skip)]
+    #[reload(epoch)]
     pub prefetch_timeout_base: Duration,
     /// The time a copy may take for every 1024 tokens it moves, resolved from
     /// `kv_cache_config.prefetch_timeout_per_ki_token`.
     #[serde(skip)]
+    #[reload(epoch)]
     pub prefetch_timeout_per_ki_token: Duration,
     /// How often the scheduler reports its statistics, resolved from
     /// `worker_config.report_period`.
     #[serde(skip)]
+    #[reload(epoch)]
     pub report_period: Duration,
 }
 
@@ -508,20 +522,23 @@ impl SchedulerConfig {
 /// change moved, verifies none while its draft cache is refilled with the
 /// idle prefill budget of the steps, when the refill policy finds it worth
 /// its cost.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, crate::reload::Reload)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpeculativeConfig {
     /// The most draft tokens one verification carries per request; zero
     /// does not speculate. The draft cache and the drafter's work belong
     /// to the epoch, so a change of it is an epoch change.
+    #[reload(epoch)]
     pub num_draft_tokens: u32,
     /// The speedup speculation gives a request, the decode steps' time one
     /// of its verification steps takes the place of, stated in place of
     /// the one the epoch measures; at least one, measured when unset.
+    #[reload(program)]
     pub expected_speedup: Option<f64>,
     /// The time of evaluating one context token in a refill, in steps of
     /// decoding, stated in place of the one the epoch measures; not
     /// negative, measured when unset.
+    #[reload(program)]
     pub refill_token_cost: Option<f64>,
 }
 
@@ -701,26 +718,30 @@ impl Default for DeviceConfig {
 pub const DEFAULT_EXPERT_EXCHANGE: &str = "alltoall";
 
 /// Mixture-of-experts parallelism (`moe_config`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, crate::reload::Reload)]
 #[serde(default, deny_unknown_fields)]
 pub struct MoeConfig {
     /// Shard routed experts across the deployment's expert workers, across
     /// schedulers of one rank each, or otherwise over the tensor-parallel
     /// ranks of each scheduler's worker group, each rank holding whole
     /// experts ([`EngineConfig::expert_union`]).
+    #[reload(epoch)]
     pub expert_parallel: bool,
     /// The expert-exchange package's backend, which reaches sharded experts (`alltoall`,
     /// `megamoe`, `deepep`): a package the Build Server holds. Unset, a deployment whose
     /// schedulers exchange experts runs [`DEFAULT_EXPERT_EXCHANGE`], and one that exchanges no
     /// token names none.
+    #[reload(generation)]
     pub exchange: Option<String>,
     /// Microbatches overlapping attention with dedicated expert workers.
+    #[reload(epoch)]
     pub microbatches: NonZeroU32,
     /// The rows per rank of the middle capture class of an expert union's steps: a step in which
     /// another member prefills a few prompts while this one decodes, which neither the decode
     /// class nor the class of the union's whole capacity fits well. Not captured when the decode
     /// class reaches it or it is within a quarter of the whole capacity
     /// ([`DEFAULT_BESIDE_ROWS`] unless stated).
+    #[reload(epoch)]
     pub beside_rows: NonZeroU32,
 }
 
@@ -1209,21 +1230,24 @@ mod media {
 /// The workers' always-on profiling (`profiling_config`): the fence
 /// probes at the entry and exit of the model's modules, which export
 /// per-step durations by module class (`docs/profiling.md`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, crate::reload::Reload)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProfilingConfig {
     /// Whether the probes record: the device switch every probe reads,
     /// changed in place, at the engine's next step boundary.
+    #[reload(step)]
     pub fence_probes: bool,
     /// Name patterns (`*` matches any run) of the module classes whose
     /// instances carry probes in the CUDA graphs an epoch captures; a change
     /// takes a new epoch. Empty for no probe; the model family's step stack
     /// (the decoder or denoiser stack, one instance per step) when unset.
+    #[reload(epoch)]
     pub fence_modules: Option<Vec<String>>,
     /// Name patterns (`*` matches any run) of the probed module classes whose
     /// probes are off while `fence_probes` is on: the classes whose
     /// probes cost more than the always-on budget. Changed in place, at the
     /// engine's next step boundary, as `fence_probes` is.
+    #[reload(step)]
     pub fence_probes_off: Vec<String>,
     /// Whether every worker enables CUPTI's PC sampling before it captures
     /// its CUDA graphs and keeps it enabled, stopped between sessions, so
@@ -1231,12 +1255,14 @@ pub struct ProfilingConfig {
     /// refuses PM sampling, the range profiler and whole-graph activity
     /// records, so sessions of those are refused. The graphs are captured
     /// at an epoch's start, so a change takes a new epoch.
+    #[reload(epoch)]
     pub graph_pc_sampling: bool,
     /// Whether the engine's NVTX ranges (the `uniserve.worker` domain and
     /// the scheduler's and control thread's ranges) are emitted from the
     /// epoch's start, for a profiler that records them, such as Nsight
     /// Systems; a session's `timeline` collector turns them on while it
     /// records either way. A change takes a new epoch.
+    #[reload(epoch)]
     pub nvtx_ranges: bool,
 }
 

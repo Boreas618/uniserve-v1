@@ -21,7 +21,7 @@
 //!   (`api::events::Events`);
 //! - `engine`: starting the engine process and the client of the request
 //!   interface it serves;
-//! - `options`: the serving option tree (`options::ServerArgs`);
+//! - `options`: the serving option tree (`options::Config`);
 //! - `metrics`: the Prometheus registry the daemon exports;
 //! - `observation`: the deployment's observation store, the `stats` and
 //!   `events` tables queried with SQL;
@@ -31,6 +31,7 @@
 //!   that records the modules they launch (`uniserve keys`).
 
 pub mod api;
+pub mod config;
 pub mod engine;
 pub mod epoch;
 pub mod experts;
@@ -42,7 +43,7 @@ pub mod metrics;
 pub mod migration;
 pub mod observation;
 pub mod observe;
-pub mod options;
+pub mod policy;
 pub mod profiling;
 pub mod restart;
 pub mod standby;

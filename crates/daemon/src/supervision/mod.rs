@@ -107,7 +107,7 @@ pub struct DaemonOptions {
     /// modules from (`build_config`).
     pub build_server: build_server::command::Settings,
     /// The settings of the Storage Server of every node the deployment serves on
-    /// (`ServerArgs::storage_settings`). The leader gives them to every claim of the
+    /// (`Config::storage_settings`). The leader gives them to every claim of the
     /// deployment, so the Storage Server a node starts for it serves with them.
     pub storage: storage::Settings,
 }

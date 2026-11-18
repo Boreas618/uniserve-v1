@@ -7,7 +7,7 @@
 //! | --- | --- |
 //! | `Preparing` | Every engine acknowledged it is ready, or one failed: the update is `Abandoned` and nothing changed |
 //! | `Switching` | Every engine acknowledged the switch |
-//! | `Trial` | A commit or a rollback: the submitter's or the operator's decision, a fault, a threshold or the deadline |
+//! | `Trial` | A commit once the trial lasted `update_config.trial`, or a rollback: a fault or a threshold |
 //! | `Committed`, `RolledBack` | — |
 //!
 //! Its two forms differ only in what `Preparing` and `Switching` do:
@@ -224,8 +224,9 @@ pub(crate) struct Update {
     commit_asked: bool,
     /// A rollback asked while the switch ran.
     rollback_asked: Option<Failure>,
-    /// When a trial not committed rolls back by itself.
-    deadline: Option<Instant>,
+    /// How long the trial lasts: once it passed without a rollback, the update commits
+    /// (`update_config.trial`).
+    trial: Duration,
     /// When the switch began, and how long it took.
     switch_began: Option<Instant>,
     switched_in: Option<Duration>,
@@ -247,7 +248,7 @@ impl Update {
         serving: Recorded,
         group: String,
         nodes: Vec<Node>,
-        deadline: Option<Instant>,
+        trial: Duration,
     ) -> Self {
         Self::new(
             number,
@@ -257,7 +258,7 @@ impl Update {
             serving,
             group,
             nodes,
-            deadline,
+            trial,
         )
     }
 
@@ -272,7 +273,7 @@ impl Update {
         group: String,
         nodes: Vec<Node>,
         switch: EpochSwitch,
-        deadline: Option<Instant>,
+        trial: Duration,
     ) -> Self {
         let kept = switch.keeps;
         let form = Form::Epoch(Box::new(EpochTrial {
@@ -293,9 +294,7 @@ impl Update {
             weights_kept: BTreeSet::new(),
             relaunch_due: BTreeSet::new(),
         }));
-        Self::new(
-            number, target, form, epochs, serving, group, nodes, deadline,
-        )
+        Self::new(number, target, form, epochs, serving, group, nodes, trial)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -307,7 +306,7 @@ impl Update {
         serving: Recorded,
         group: String,
         nodes: Vec<Node>,
-        deadline: Option<Instant>,
+        trial: Duration,
     ) -> Self {
         Self {
             number,
@@ -324,7 +323,7 @@ impl Update {
             failure: None,
             commit_asked: false,
             rollback_asked: None,
-            deadline,
+            trial,
             switch_began: None,
             switched_in: None,
             trial_began: None,
@@ -439,11 +438,9 @@ impl Update {
                 .switched_in
                 .map(|switched| u64::try_from(switched.as_millis()).unwrap_or(u64::MAX)),
             trial_s: self.trial_began.map(|began| began.elapsed().as_secs_f64()),
-            deadline_s: self.deadline.map(|deadline| {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_secs_f64()
-            }),
+            deadline_s: self
+                .ends()
+                .map(|ends| ends.saturating_duration_since(Instant::now()).as_secs_f64()),
             failure: self.failure.clone(),
             uncompared: self.uncompared.clone(),
             claim_failed: self.claim_failed.clone(),
@@ -1027,8 +1024,7 @@ impl Update {
         }
     }
 
-    /// The submitter or the operator rolls back, or the trial did (a
-    /// threshold, the deadline): the kept side serves again and the new is
+    /// The trial rolls back (a fault, a threshold): the kept side serves again and the new is
     /// released. Before the switch the update is abandoned; while the switch
     /// runs it is rolled back once the switch ended.
     pub(crate) fn rollback(&mut self, processes: &mut Processes, failure: Failure) {
@@ -1043,18 +1039,11 @@ impl Update {
         }
     }
 
-    /// Rolls the update back when its deadline passed at `now`.
-    pub(crate) fn expire(&mut self, processes: &mut Processes, now: Instant) {
-        if self.deadline.is_some_and(|deadline| deadline <= now) && !self.phase.ended() {
-            self.deadline = None;
-            self.rollback(
-                processes,
-                Failure::new(
-                    FailureKind::Deadline,
-                    "the trial was not committed by its deadline".to_owned(),
-                ),
-            );
-        }
+    /// When the trial ends and the update commits by itself, while it stands on trial.
+    pub(crate) fn ends(&self) -> Option<Instant> {
+        self.trial_began
+            .filter(|_| self.phase == Phase::Trial)
+            .map(|began| began + self.trial)
     }
 
     /// Drops the new before anything served it: the engines discard what they

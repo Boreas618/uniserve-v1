@@ -15,15 +15,10 @@
 //! - `status`: what each node serves.
 //! - `watch`: follows each node's event log until interrupted (attach and
 //!   detach).
-//! - `config`: each node's configuration status, as the node answers it.
-//! - `apply`: changes each node's configuration (`PUT /admin/config`): an
-//!   idle node (`uniserve serve` without a model) brings the deployment
-//!   up, a serving one changes it in place or in a new epoch on trial,
-//!   which `--commit-after` commits once it served that long. Each node is
-//!   one service's leader: the manager decides the order of their updates
-//!   from the GPUs their epochs hold ([`updates`]), so that two services that share a GPU
-//!   never prepare at once.
-//! - `commit`, `rollback`: end each node's trial.
+//! - `apply`: applies a policy package to each node's deployment (`PUT /admin/policy`), one
+//!   node after another, stopping at the first whose change does not converge. Each node is
+//!   one deployment's leader, and a GPU belongs to one deployment, so the changes of several
+//!   deployments never contend for a device.
 //! - `shutdown`: brings each node's deployment down, releasing its storage
 //!   unless `--keep-storage`.
 //! - `restart`: a rolling hot restart of each node's daemon, one node after
@@ -31,24 +26,20 @@
 //! - `pause`, `continue`, `flush-cache`: the generation and cache operations
 //!   of each node.
 //!
-//! What the manager waits for, the end of an operation a node runs on its own and the end of
-//! a trial, it reads from the node's event log by long poll (`GET /admin/events`).
+//! A node answers an apply once its change converged or did not; what else the manager
+//! follows it reads from the node's event log by long poll (`GET /admin/events`).
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
-use proto::admin::{
-    ApplyRequest, InFlight, NodeState, OperationResponse, Paused, Restart, Restarted,
-    RollbackRequest, Shutdown, UpdateReport,
-};
+use proto::admin::{NodeState, OperationResponse, Paused, Restart, Restarted, Shutdown};
 use serde::de::DeserializeOwned;
 
 use node::{Node, Polling};
 
 mod node;
-mod updates;
 
 /// The manager's command line.
 #[derive(Debug, Parser)]
@@ -84,43 +75,16 @@ enum Command {
         #[arg(long)]
         from_start: bool,
     },
-    /// Each node's configuration status.
-    Config,
-    /// Change each node's configuration: an idle node brings the
-    /// deployment up, a serving one changes it in place or in a new epoch
-    /// on trial. Nodes whose services share a GPU update one after another;
-    /// a failure stops the nodes not started.
+    /// Apply the policy package in a directory (its `config.toml` and `programs/`) to each
+    /// node's deployment, one node after another; a change that does not converge stops the
+    /// nodes not reached.
     Apply {
-        /// The whole TOML configuration, as `uniserve serve --config` reads
-        /// it; each node's current one when unset.
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// `PATH=VALUE` assignments over it.
-        #[arg(long = "set")]
-        set: Vec<String>,
-        /// Continue the requests in flight at a promotion with the state
-        /// they reached (`keep`) or compute it again (`recompute`).
-        #[arg(long, default_value = "keep", value_parser = wire::<InFlight>)]
-        in_flight: InFlight,
-        /// Report each node's dry run and the order the manager decides, and
-        /// change nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Apply a configuration a rollback marked unavailable.
+        /// The package's directory.
+        package: PathBuf,
+        /// Apply a target a rollback marked unavailable.
         #[arg(long)]
         force: bool,
-        /// Commit a node's new epoch once it served on trial this many
-        /// seconds, before a node that shares a GPU with it changes; a
-        /// trial that rolled back meanwhile stops the nodes not started.
-        /// Without it, each new epoch stays on trial for the operator, and
-        /// the nodes that share its GPUs wait.
-        #[arg(long)]
-        commit_after: Option<u64>,
     },
-    /// Commit each node's epoch on trial.
-    Commit,
-    /// Roll each node's epoch on trial back to the previous epoch.
-    Rollback,
     /// Bring each node's deployment down.
     Shutdown {
         /// Keep the deployment's weights and caches retained for a restart
@@ -139,12 +103,6 @@ enum Command {
     FlushCache,
 }
 
-/// A command-line value as the admin schema spells it (`keep`, `recompute`).
-fn wire<T: DeserializeOwned>(text: &str) -> Result<T, String> {
-    serde_json::from_value(serde_json::Value::String(text.to_owned()))
-        .map_err(|error| error.to_string())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -160,72 +118,16 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Status => status(&nodes).await,
         Command::Watch { from_start } => watch(nodes, from_start, polling).await,
-        Command::Config => {
+        Command::Apply { package, force } => {
+            let archive = archive(&package)?;
             for node in &nodes {
-                let config = node.config().await?;
-                println!("{}: {}", node.base, serde_json::to_string_pretty(&config)?);
-            }
-            Ok(())
-        }
-        Command::Apply {
-            config,
-            set,
-            in_flight,
-            dry_run,
-            force,
-            commit_after,
-        } => {
-            let config = match config {
-                Some(path) => Some(
-                    std::fs::read_to_string(&path)
-                        .with_context(|| format!("reading {}", path.display()))?,
-                ),
-                None => None,
-            };
-            let options = updates::Options {
-                request: ApplyRequest {
-                    config,
-                    set,
-                    in_flight,
-                    force,
-                    ..ApplyRequest::default()
-                },
-                commit_after: commit_after.map(Duration::from_secs),
-                polling,
-            };
-            if dry_run {
-                updates::dry_run(&nodes, &options).await
-            } else {
-                updates::apply(&nodes, &options).await
-            }
-        }
-        Command::Commit => {
-            for node in &nodes {
-                let response: OperationResponse<UpdateReport> = node
-                    .send(reqwest::Method::POST, "/admin/config/commit", &())
-                    .await?;
-                println!(
-                    "{}: {}",
-                    node.base,
-                    serde_json::to_string(&response.result)?
-                );
-            }
-            Ok(())
-        }
-        Command::Rollback => {
-            for node in &nodes {
-                let response: OperationResponse<UpdateReport> = node
-                    .send(
-                        reqwest::Method::POST,
-                        "/admin/config/rollback",
-                        &RollbackRequest::default(),
-                    )
-                    .await?;
-                println!(
-                    "{}: {}",
-                    node.base,
-                    serde_json::to_string(&response.result)?
-                );
+                let record = node
+                    .put_policy(archive.clone(), force)
+                    .await
+                    .with_context(|| {
+                        format!("{} did not converge; later nodes are untouched", node.base)
+                    })?;
+                println!("{}: {}", node.base, serde_json::to_string(&record)?);
             }
             Ok(())
         }
@@ -265,6 +167,24 @@ async fn main() -> Result<()> {
         Command::Continue => each::<()>(&nodes, "/admin/continue_generation").await,
         Command::FlushCache => each::<()>(&nodes, "/admin/flush_cache").await,
     }
+}
+
+/// The policy package in `directory` as a tar archive of its directory, as `PUT /admin/policy`
+/// carries it: `config.toml`, and `programs/` when the package has programs.
+fn archive(directory: &std::path::Path) -> Result<Vec<u8>> {
+    let mut builder = tar::Builder::new(Vec::new());
+    builder
+        .append_path_with_name(directory.join("config.toml"), "config.toml")
+        .with_context(|| format!("archiving {}/config.toml", directory.display()))?;
+    let programs = directory.join("programs");
+    if programs.is_dir() {
+        builder
+            .append_dir_all("programs", &programs)
+            .with_context(|| format!("archiving {}", programs.display()))?;
+    }
+    builder
+        .into_inner()
+        .context("finishing the package archive")
 }
 
 /// Posts `path`, an operation whose result is `R`, to every node.
@@ -350,8 +270,8 @@ mod tests {
 
     use super::*;
 
-    /// The command line's definition is one clap accepts, and it reads the admin schema's
-    /// spelling of its values.
+    /// The command line's definition is one clap accepts, and `apply` takes a package's
+    /// directory.
     #[test]
     fn the_command_line_is_well_formed() {
         Cli::command().debug_assert();
@@ -362,31 +282,35 @@ mod tests {
             "--node",
             "http://10.0.0.3:8000",
             "apply",
-            "--set",
-            "max_running_requests=8",
-            "--in-flight",
-            "recompute",
-            "--commit-after",
-            "60",
+            "qwen3",
+            "--force",
         ])
         .unwrap();
         assert_eq!(cli.nodes.len(), 2);
-        assert!(matches!(
-            cli.command,
-            Command::Apply {
-                commit_after: Some(60),
-                in_flight: InFlight::Recompute,
-                ..
-            }
-        ));
-        let refused = Cli::try_parse_from([
-            "uniserve-manager",
-            "--node",
-            "http://10.0.0.2:8000",
-            "apply",
-            "--in-flight",
-            "abort",
-        ]);
-        assert!(refused.is_err());
+        assert!(matches!(cli.command, Command::Apply { force: true, .. }));
+        assert!(
+            Cli::try_parse_from(["uniserve-manager", "--node", "x", "apply", "--set", "a=1"])
+                .is_err()
+        );
+    }
+
+    /// A package's archive holds its `config.toml` and its programs, under the names the
+    /// package's directory gives them.
+    #[test]
+    fn a_package_is_archived_as_its_directory() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::write(package.path().join("config.toml"), "model = \"m\"\n").unwrap();
+        std::fs::create_dir_all(package.path().join("programs/chunk")).unwrap();
+        std::fs::write(package.path().join("programs/chunk/lib.rs"), "").unwrap();
+        let archive = archive(package.path()).unwrap();
+        let mut names: Vec<String> = tar::Archive::new(archive.as_slice())
+            .entries()
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.header().entry_type().is_file())
+            .map(|entry| entry.path().unwrap().display().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["config.toml", "programs/chunk/lib.rs"]);
     }
 }

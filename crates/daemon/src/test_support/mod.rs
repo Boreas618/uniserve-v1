@@ -37,10 +37,10 @@ use crate::api::input::{Processor, RequestRenderer};
 use crate::api::model::{ModelConfig, SamplingDefaults};
 use crate::api::openai::video_jobs::VideoJobs;
 use crate::api::tokenizer::DynTokenizer;
+use crate::config::ChatTemplateContentFormat;
+use crate::config::{Config, LoggingConfig, ServerConfig, VideoJobConfig};
 use crate::engine::client::{EngineClient, EngineInfo, EngineState};
 use crate::leader::Leader;
-use crate::options::ChatTemplateContentFormat;
-use crate::options::{LoggingConfig, ServerArgs, ServerConfig, VideoJobConfig};
 
 /// Served model name the test engines serve under.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
@@ -76,7 +76,7 @@ fn admin_state(engine: impl Into<Arc<Leader>>) -> crate::http::admin::AdminState
     let admin = crate::http::admin::Admin::new(
         CancellationToken::new(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        crate::http::admin::Journal::new(crate::options::EventLog::default()),
+        crate::http::admin::Journal::new(crate::config::EventLog::default()),
     );
     admin.watch(&leader);
     crate::http::admin::AdminState {
@@ -203,7 +203,7 @@ pub(crate) fn fake_engine(
         crate::leader::stats_sink(
             model_name,
             std::sync::Arc::new(crate::observe::Observer::new(crate::observe::span(
-                &crate::options::UpdateConfig::default(),
+                &crate::config::UpdateConfig::default(),
             ))),
             std::sync::Arc::new(crate::metrics::Metrics::new(max_model_len)),
             0,
@@ -465,7 +465,7 @@ pub(crate) fn leader_over(
         false,
     )
     .unwrap();
-    let options = ServerArgs {
+    let options = Config {
         model: Some(model_name),
         served_model_name: Some(SERVED_MODEL.to_owned()),
         logging_config: LoggingConfig {
@@ -473,7 +473,7 @@ pub(crate) fn leader_over(
             log_stats: false,
             ..LoggingConfig::default()
         },
-        ..ServerArgs::default()
+        ..Config::default()
     };
     let observer = std::sync::Arc::new(crate::observe::Observer::new(crate::observe::span(
         &options.update_config,

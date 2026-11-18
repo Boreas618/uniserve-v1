@@ -8,12 +8,13 @@
 //! (`storage_server::command`, `build_server::command`). `engine` (a node's
 //! main process for one epoch) is started by the daemon and hidden from the
 //! help. The binary's own options, its log levels, are global; each command
-//! declares its own. `serve` and `keys` take the serving command line
-//! (`daemon::options::ServerArgs`), which resolves one configuration from a
-//! `--config` file, a few flags and `--set` assignments.
+//! declares its own. `serve` and `keys` take a policy package, a directory
+//! whose `config.toml` is the deployment's whole configuration
+//! (`daemon::policy::Package`); no option comes from the command line.
+
+use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use daemon::options::ServerArgs;
 use service::logging;
 use tracing::level_filters::LevelFilter;
 
@@ -57,31 +58,50 @@ impl LogLevels {
 /// Supported top-level CLI commands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Run this node's daemon; on the leader (node rank 0), also the
-    /// UniServe OpenAI server, whose Rust engine and scheduler run
-    /// in-process and drive forward-only workers. Without a model, a
-    /// single-node daemon serves its admin API alone until `PUT
-    /// /admin/config` brings a deployment up.
-    #[command(
-        override_usage = "uniserve serve [MODEL] [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
-    )]
-    Serve(Box<ServerArgs>),
-    /// Print the modules the deployment's main processes launch, as the key
-    /// list `uniserve build-server build --keys` reads (`operator<TAB>key`
-    /// lines, sorted, each once), and exit. Takes `serve`'s options and starts
-    /// the deployment's ranks on this node's devices as `serve` does, loading
-    /// the model from its checkpoint's headers; no weight is read, and no
-    /// daemon, Storage Server, communicator or Build Server is started.
-    #[command(
-        override_usage = "uniserve keys MODEL [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
-    )]
-    Keys(Box<ServerArgs>),
+    /// Serve the policy package in PACKAGE on this node: the node finds itself in the
+    /// package's `hosts` by its host name; the leader (the first host, or this host when the
+    /// package lists none) applies the package and serves the OpenAI API, and every other node
+    /// joins it. While it serves, `PUT /admin/policy` applies another package.
+    Serve(Box<ServeArgs>),
+    /// Print the modules the main processes of the package in PACKAGE launch, as the key list
+    /// `uniserve build-server build --keys` reads (`operator<TAB>key` lines, sorted, each
+    /// once), and exit. Starts the deployment's ranks on this node's devices as `serve` does,
+    /// loading the model from its checkpoint's headers; no weight is read, and no daemon,
+    /// Storage Server or communicator is started.
+    Keys(Box<KeysArgs>),
     /// The Storage Server of this host and the operator's commands against
     /// it.
     StorageServer(Box<storage_server::command::Args>),
     /// The Build Server of this host and the operator's commands against
     /// it.
     BuildServer(Box<build_server::command::Args>),
+}
+
+/// `uniserve serve`'s arguments: the package, and the descriptors a caller or a predecessor
+/// passes, which are no option of the configuration.
+#[derive(Debug, Args)]
+pub(crate) struct ServeArgs {
+    /// The policy package: a directory holding `config.toml` and, optionally, `programs/`.
+    /// Its name is the deployment's, which names its persistent state on every node.
+    #[arg(value_name = "PACKAGE", required_unless_present = "predecessor")]
+    pub package: Option<PathBuf>,
+    /// The inherited descriptor the daemon writes its readiness record to (one JSON line per
+    /// state): once its listeners are bound (`listening`, with their endpoints) and once it
+    /// serves (`serving`).
+    #[arg(long, value_name = "FD")]
+    pub ready_fd: Option<i32>,
+    /// The descriptor of the handoff socket to the daemon this one succeeds, whose deployment
+    /// it takes over, as a daemon restart starts its successor (`daemon::restart`).
+    #[arg(long, hide = true, value_name = "FD")]
+    pub predecessor: Option<i32>,
+}
+
+/// `uniserve keys`'s arguments.
+#[derive(Debug, Args)]
+pub(crate) struct KeysArgs {
+    /// The policy package whose deployment's keys are recorded.
+    #[arg(value_name = "PACKAGE")]
+    pub package: PathBuf,
 }
 
 #[cfg(test)]
@@ -137,37 +157,21 @@ mod tests {
         }
     }
 
-    /// `keys` takes `serve`'s options and resolves them to the same configuration, so the
-    /// key list it prints is the one of the deployment `serve` starts with the same command line.
+    /// `serve` takes a package and nothing else of the configuration: a serving option is no
+    /// flag.
     #[test]
-    fn keys_resolves_the_serving_configuration() {
-        let resolve = |command: &str| {
-            let matches = <Cli as clap::CommandFactory>::command().get_matches_from([
-                "uniserve",
-                command,
-                "org/model",
-                "--max-model-len",
-                "2048",
-                "--max-running-requests",
-                "8",
-                "--set",
-                "dtype=\"bfloat16\"",
-                "--set",
-                "kv_cache_config.max_tokens=8192",
-            ]);
-            let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).expect("parses");
-            let (_, command_matches) = matches.subcommand().expect("a command");
-            let args = match cli.command {
-                Command::Serve(args) | Command::Keys(args) => args,
-                _ => panic!("{command} takes the serving options"),
-            };
-            args.resolve(command_matches)
-                .expect("the options resolve")
-                .0
+    fn serve_takes_a_package_alone() {
+        let cli = Cli::try_parse_from(["uniserve", "serve", "qwen3"]).expect("parses");
+        let Command::Serve(args) = cli.command else {
+            panic!("serve parses as serve");
         };
-        let keys = resolve("keys");
-        assert_eq!(keys, resolve("serve"));
-        assert_eq!(keys.model.as_deref(), Some("org/model"));
-        assert_eq!(keys.max_model_len.map(|length| length.get()), Some(2048));
+        assert_eq!(args.package.as_deref(), Some(std::path::Path::new("qwen3")));
+        for flag in ["--max-running-requests", "--config", "--set", "--port"] {
+            assert!(
+                Cli::try_parse_from(["uniserve", "serve", "qwen3", flag, "1"]).is_err(),
+                "{flag} is no flag of serve"
+            );
+        }
+        assert!(Cli::try_parse_from(["uniserve", "serve"]).is_err());
     }
 }

@@ -36,9 +36,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use proto::admin::{
-    ApplyRequest, ConfigChange, Event, EventBody, EventsPage, EventsQuery, Following, NodeState,
-    Operation, OperationKind, OperationResponse, OperationState, Paused, Phase, Restart, Restarted,
-    RollbackRequest, Shutdown, Status, UpdateReport,
+    Event, EventBody, EventsPage, EventsQuery, NodeState, Operation, OperationKind,
+    OperationResponse, OperationState, Paused, Restart, Restarted, Shutdown, Status,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -47,7 +46,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::openai::ApiError;
 use crate::leader::{Leader, UpdateError};
-use crate::updates::change::Applied;
 
 /// The node's event log and operations' record as a hot restart hands them to the successor.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -82,7 +80,7 @@ impl Refusal {
 /// whole life, every deployment it serves writes it, and a hot restart hands it on.
 pub(crate) struct Journal {
     /// What the event log keeps and how long a reader waits (`admin_config.event_log`).
-    log: crate::options::EventLog,
+    log: crate::config::EventLog,
     events: Mutex<VecDeque<Event>>,
     next_event: AtomicU64,
     appended: Notify,
@@ -102,7 +100,7 @@ fn now() -> f64 {
 
 impl Journal {
     /// An empty journal under `log`.
-    pub(crate) fn new(log: crate::options::EventLog) -> Arc<Self> {
+    pub(crate) fn new(log: crate::config::EventLog) -> Arc<Self> {
         Arc::new(Self {
             log,
             events: Mutex::new(VecDeque::with_capacity(log.capacity.get())),
@@ -117,7 +115,7 @@ impl Journal {
 
     /// A journal that goes on with the event log and the operations' record of the daemon a hot
     /// restart replaced.
-    pub(crate) fn resume(handoff: JournalHandoff, log: crate::options::EventLog) -> Arc<Self> {
+    pub(crate) fn resume(handoff: JournalHandoff, log: crate::config::EventLog) -> Arc<Self> {
         let journal = Self::new(log);
         *service::lock(&journal.events) = handoff.events.into_iter().collect();
         journal
@@ -439,36 +437,20 @@ pub(crate) fn serve_routes(
     }
 }
 
-/// The harness's routes: the verbs of an update and what it reads to decide
-/// one. Apply is checked against what a harness may set.
+/// The harness's routes: what a harness reads to decide a change, which it applies through the
+/// node's `PUT /admin/policy` as any writer does.
 pub(crate) fn harness_router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/status", get(status))
         .route("/admin/events", get(deployment_events))
-        .route(
-            "/admin/config",
-            get(config).put(|State(state): State<AdminState>, body| {
-                apply_config(Caller::Harness, state, body)
-            }),
-        )
-        .route("/admin/config/commit", post(commit))
-        .route("/admin/config/rollback", post(rollback))
         .with_state(state)
 }
 
-/// The operator's routes: every admin route.
+/// The operator's routes: every admin route of the deployment.
 pub(crate) fn router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/status", get(status))
         .route("/admin/events", get(deployment_events))
-        .route(
-            "/admin/config",
-            get(config).put(|State(state): State<AdminState>, body| {
-                apply_config(Caller::Operator, state, body)
-            }),
-        )
-        .route("/admin/config/commit", post(commit))
-        .route("/admin/config/rollback", post(rollback))
         .route("/admin/pause_generation", post(pause_generation))
         .route("/admin/continue_generation", post(continue_generation))
         .route("/admin/flush_cache", post(flush_cache))
@@ -487,13 +469,22 @@ pub(crate) fn router(state: AdminState) -> Router {
         .with_state(state)
 }
 
-/// `GET /admin/status` while the deployment serves: the deployment's status, the node's
-/// operations and the next event's sequence number. The node answers the route itself while no
-/// deployment serves (`super::node`).
+/// `GET /admin/status` while the deployment serves: the deployment's status and what it
+/// executes and owns (`Leader::config_status`), the node's operations and the next event's
+/// sequence number. The node answers the route itself while no deployment serves
+/// (`super::node`).
 async fn status(State(state): State<AdminState>) -> Json<Status> {
     let readiness = service::lock(&state.admin.readiness).clone().map(Box::new);
+    let report = match state.leader.config_status().await {
+        Ok(report) => Some(Box::new(report)),
+        Err(error) => {
+            tracing::warn!("reading the deployment's report failed: {error:#}");
+            None
+        }
+    };
     Json(state.admin.journal.status(NodeState::Serving {
         deployment: Box::new(state.leader.status()),
+        report,
         readiness,
     }))
 }
@@ -581,263 +572,8 @@ where
     }
 }
 
-/// `GET /admin/config`: the configuration, its digest, the replicas' epochs, the update in
-/// flight or the last one, the configurations a rollback marked unavailable, every item of the
-/// GPUs' quotas, the epochs' records and the processes the daemon manages
-/// (`Leader::config_status`).
-async fn config(State(state): State<AdminState>) -> Response {
-    match state.leader.config_status().await {
-        Ok(status) => Json(status).into_response(),
-        Err(error) => ApiError::server_error(format!("{error:#}")).into_response(),
-    }
-}
-
-/// Who calls an admin route: the operator on its socket, which serves every route and option,
-/// or a harness on the harness socket, which may set the package selections and the options
-/// `admin_config.harness_options` lists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Caller {
-    Operator,
-    Harness,
-}
-
-/// `PUT /admin/config` for `caller`: changes the deployment to a configuration
-/// (`Leader::apply`), in place, by a hot restart of the daemon, or as an
-/// update on trial. An empty body applies the current configuration and waits.
-///
-/// The `config` operation ends once the change is applied or its update
-/// started, so a commit or a rollback can follow at once. With `wait`, the
-/// response comes when the update reached its trial or ended before it.
-async fn apply_config(caller: Caller, state: AdminState, bytes: axum::body::Bytes) -> Response {
-    let request: ApplyRequest = match body(&bytes) {
-        Ok(request) => request,
-        Err(response) => return *response,
-    };
-    apply(&state, request, caller).await
-}
-
-/// Applies `request` for `caller`.
-async fn apply(state: &AdminState, request: ApplyRequest, caller: Caller) -> Response {
-    let leader = Arc::clone(&state.leader);
-    let journal = Arc::clone(&state.admin.journal);
-    let admin = Arc::clone(&state.admin);
-    let jobs = Arc::clone(&state.jobs);
-    let restarter = state.restarter.clone();
-    let wait = request.wait;
-    if caller == Caller::Harness
-        && let Err(refusal) = leader.harness_may_apply(&request)
-    {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": { "message": refusal, "type": "forbidden" } })),
-        )
-            .into_response();
-    }
-    let mut phases = leader.updates.watch();
-    let applying = Arc::clone(&leader);
-    let operation = match journal.begin(OperationKind::Config) {
-        Ok(operation) => operation,
-        Err(refusal) => return refusal.response(),
-    };
-    let number = operation.id;
-    let ended = tokio::spawn({
-        let journal = Arc::clone(&journal);
-        let operation = operation.clone();
-        async move {
-            // The change's future holds the model files it resolves.
-            let applied = match Box::pin(applying.apply(request, number)).await {
-                Ok(Applied::Daemon { config, then }) => match restarter {
-                    None => Err((
-                        StatusCode::BAD_REQUEST,
-                        "the change is of the daemon's own options, and this daemon does not \
-                         restart in place"
-                            .to_owned(),
-                    )),
-                    Some(restarter) => {
-                        // The successor applies the rest of the change in an operation of its
-                        // own.
-                        let then_follows = then.is_some().then_some(Following::Update);
-                        restarter
-                            .restart(Some(*config), then, &applying, &admin, &jobs)
-                            .await
-                            .map(|pid| ConfigChange::Daemon {
-                                pid,
-                                then: then_follows,
-                            })
-                            .map_err(|error| {
-                                (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
-                            })
-                    }
-                },
-                applied => applied_result(applied),
-            };
-            match applied {
-                Ok(change) => (
-                    StatusCode::OK,
-                    OperationResponse {
-                        operation: journal.end(operation, Ok(())),
-                        result: Some(change),
-                    },
-                ),
-                Err((status, error)) => (
-                    status,
-                    OperationResponse {
-                        operation: journal.end(operation, Err(error)),
-                        result: None,
-                    },
-                ),
-            }
-        }
-    });
-    if !wait {
-        let running = OperationResponse::<ConfigChange> {
-            operation,
-            result: None,
-        };
-        return (StatusCode::ACCEPTED, Json(running)).into_response();
-    }
-    let (status, mut response) = match ended.await {
-        Ok(ended) => ended,
-        Err(error) => {
-            return ApiError::server_error(format!("the operation's task ended: {error}"))
-                .into_response();
-        }
-    };
-    let Some(ConfigChange::Generation { update } | ConfigChange::Epoch { update }) =
-        response.result.as_mut()
-    else {
-        return (status, Json(response)).into_response();
-    };
-
-    // The update runs on by itself: the response states it as it stands when
-    // its trial begins or it ends before one.
-    loop {
-        phases.borrow_and_update();
-        let moving = matches!(
-            leader.updates.phase_of(number),
-            Some(Phase::Preparing | Phase::Switching)
-        );
-        if !moving || phases.changed().await.is_err() {
-            break;
-        }
-    }
-    let status = if matches!(
-        leader.updates.phase_of(number),
-        Some(Phase::Trial | Phase::Committed)
-    ) {
-        StatusCode::OK
-    } else {
-        StatusCode::CONFLICT
-    };
-    // The operation is the one that started the update; its result states the update as it
-    // stands now: the one in flight, or the one that ended last, which is this one.
-    if let Some(standing) = leader.updates.status() {
-        *update = standing;
-    }
-    (status, Json(response)).into_response()
-}
-
-/// What `PUT /admin/config` states for a change that needs no hot restart of
-/// the daemon, or why it failed.
-fn applied_result(
-    applied: Result<Applied, UpdateError>,
-) -> Result<ConfigChange, (StatusCode, String)> {
-    match applied {
-        Ok(Applied::Unchanged) => Ok(ConfigChange::None),
-        Ok(Applied::InPlace(in_place)) => Ok(ConfigChange::InPlace { in_place }),
-        Ok(Applied::DryRun(dry_run)) => Ok(ConfigChange::DryRun { dry_run }),
-        Ok(Applied::Update(update)) => Ok(started(*update)),
-        Ok(Applied::Daemon { .. }) => Err((
-            StatusCode::CONFLICT,
-            "the daemon's own options changed again after its hot restart".to_owned(),
-        )),
-        Err(error) => Err((
-            update_status(&error),
-            format!("{:#}", anyhow::Error::from(error)),
-        )),
-    }
-}
-
-/// The change an update that started states, by its form.
-fn started(update: UpdateReport) -> ConfigChange {
-    match update.change {
-        proto::admin::ChangeForm::Generation => ConfigChange::Generation { update },
-        proto::admin::ChangeForm::Epoch => ConfigChange::Epoch { update },
-    }
-}
-
-/// Applies `request`, the rest of a change whose daemon options the hot
-/// restart that started this daemon applied, as an operation of its own
-/// (`config`), which `GET /admin/status` and the event log report.
-pub(crate) fn apply_after_restart(
-    admin: &Arc<Admin>,
-    leader: &Arc<crate::leader::Leader>,
-    request: ApplyRequest,
-) {
-    let journal = Arc::clone(&admin.journal);
-    let operation = match journal.begin(OperationKind::Config) {
-        Ok(operation) => operation,
-        Err(refusal) => {
-            admin.record(format!(
-                "the change after the hot restart did not start: {}",
-                match refusal {
-                    Refusal::Running(other) =>
-                        format!("operation {} ({}) runs", other.id, other.kind),
-                    Refusal::HandedOver => "the node was handed to a successor".to_owned(),
-                }
-            ));
-            return;
-        }
-    };
-    let leader = Arc::clone(leader);
-    tokio::spawn(async move {
-        let applied = Box::pin(leader.apply(request, operation.id)).await;
-        let ended = applied_result(applied)
-            .map(drop)
-            .map_err(|(_, error)| error);
-        journal.end(operation, ended);
-    });
-}
-
-/// `POST /admin/config/commit`: commits the update in flight
-/// (`Leader::commit`).
-async fn commit(State(state): State<AdminState>) -> Response {
-    let leader = Arc::clone(&state.leader);
-    run(&state.admin, OperationKind::Commit, true, async move {
-        leader.commit().await.map_err(|error| {
-            (
-                update_status(&error),
-                format!("{:#}", anyhow::Error::from(error)),
-            )
-        })
-    })
-    .await
-}
-
-/// `POST /admin/config/rollback`: rolls the update in flight back
-/// (`Leader::rollback`).
-async fn rollback(State(state): State<AdminState>, bytes: axum::body::Bytes) -> Response {
-    let request: RollbackRequest = match body(&bytes) {
-        Ok(request) => request,
-        Err(response) => return *response,
-    };
-    let leader = Arc::clone(&state.leader);
-    run(&state.admin, OperationKind::Rollback, true, async move {
-        let reason = request
-            .reason
-            .unwrap_or_else(|| "the trial was rolled back by decision".to_owned());
-        leader.rollback(reason).await.map_err(|error| {
-            (
-                update_status(&error),
-                format!("{:#}", anyhow::Error::from(error)),
-            )
-        })
-    })
-    .await
-}
-
-/// The status of a failed update.
-fn update_status(error: &UpdateError) -> StatusCode {
+/// The status a failed change of the deployment, or a failed operation on it, is answered with.
+pub(crate) fn update_status(error: &UpdateError) -> StatusCode {
     match error {
         UpdateError::InProgress => StatusCode::CONFLICT,
         UpdateError::Refused(_) => StatusCode::BAD_REQUEST,
@@ -1181,7 +917,7 @@ mod tests {
 
     /// A journal under the default event log.
     fn journal() -> Arc<Journal> {
-        Journal::new(crate::options::EventLog::default())
+        Journal::new(crate::config::EventLog::default())
     }
 
     #[tokio::test]
@@ -1214,12 +950,12 @@ mod tests {
     #[tokio::test]
     async fn a_reader_behind_the_log_is_told_of_the_gap() {
         let journal = journal();
-        for index in 0..crate::options::EVENT_LOG_CAPACITY.get() + 2 {
+        for index in 0..crate::config::EVENT_LOG_CAPACITY.get() + 2 {
             journal.record(EventBody::Deployment, format!("event {index}"));
         }
         let page = journal.events_after(0, Duration::ZERO).await;
         assert!(page.gap);
-        assert_eq!(page.events.len(), crate::options::EVENT_LOG_CAPACITY.get());
+        assert_eq!(page.events.len(), crate::config::EVENT_LOG_CAPACITY.get());
     }
 
     /// One operation runs at a time; its start and end are events that carry it, and a journal
@@ -1242,7 +978,7 @@ mod tests {
             Some(&EventBody::Operation(ended))
         );
 
-        let successor = Journal::resume(journal.hand_over(), crate::options::EventLog::default());
+        let successor = Journal::resume(journal.hand_over(), crate::config::EventLog::default());
         assert!(matches!(
             journal.begin(OperationKind::FlushCache),
             Err(Refusal::HandedOver)

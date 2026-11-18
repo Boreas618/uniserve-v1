@@ -445,7 +445,7 @@ mod tests {
 
     /// A launch that names the engine it succeeds, so the engine parks.
     fn launch() -> proto::config::EngineArgs {
-        let options = crate::options::ServerArgs::default();
+        let options = crate::config::Config::default();
         let mut launch = proto::config::EngineArgs::new(
             options.engine_config().expect("the configuration resolves"),
             crate::epoch::modules_of(&options),

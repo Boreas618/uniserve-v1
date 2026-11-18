@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 
 use proto::admin::{EpochState, Failure};
 
-use crate::options::StandbyStorage;
+use crate::config::StandbyStorage;
 
 /// One node's engine of an epoch, as the standby rules see it.
 #[derive(Debug, Clone, PartialEq, Eq)]

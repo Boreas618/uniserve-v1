@@ -85,7 +85,7 @@ pub(crate) struct Limits {
 
 impl Limits {
     /// The limits `server` states.
-    pub(crate) fn of(server: &crate::options::ServerConfig) -> Self {
+    pub(crate) fn of(server: &crate::config::ServerConfig) -> Self {
         Self {
             head_bytes: server.max_request_head,
         }
@@ -1784,7 +1784,7 @@ mod tests {
     fn server(app: Router) -> Server {
         Server {
             app,
-            limits: Limits::of(&crate::options::ServerConfig::default()),
+            limits: Limits::of(&crate::config::ServerConfig::default()),
             admitting: Admissions::default(),
         }
     }

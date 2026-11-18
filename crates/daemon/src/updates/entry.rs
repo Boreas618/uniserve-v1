@@ -1,43 +1,44 @@
-//! The update entry: one change of the deployment's configuration, applied
-//! as the least it needs (`PUT /admin/config`).
+//! The update entry: one change of the deployment's configuration, executed as its declared
+//! effects (`specs/configuration.md` §7).
 //!
-//! A change moves one of four things, decided by comparing what it moves
-//! ([`crate::epoch::change`]) once the target's module set is fixed at the
-//! Build Servers:
+//! The target is a whole configuration, compared with the current one option by option
+//! ([`proto::reload::changes`]) and merged into the effects each component executes
+//! ([`proto::reload::Effects`]):
 //!
-//! - the daemon's own options: a hot restart of the daemon, whose successor
-//!   applies what else the change states;
-//! - the engine package, the build configuration or the checkpoint: an update
-//!   in its epoch form, target engines started beside the serving ones;
-//! - kernel or policy packages, the policy's parameters included: an update
-//!   in its generation form, inside the serving engines;
-//! - nothing an engine executes: in place, or nothing at all.
+//! - the daemon's own options: a hot restart of the daemon, whose successor applies what else
+//!   the change states;
+//! - an epoch (the engine package, the build configuration, the checkpoint) or a replaced
+//!   Storage Server: an update in its epoch form, target engines started beside the serving
+//!   ones;
+//! - kernel or program modules: an update in its generation form, inside the serving engines,
+//!   once the target's module set is fixed at the Build Servers, so a revision installed since
+//!   the serving epoch's apply is a change too;
+//! - step options: in place, at the engines' next step.
 //!
-//! `Leader::apply` decides in that order and starts the update;
-//! `Leader::commit` and `Leader::rollback` decide it. The update itself is
-//! `crate::updates::update::Update`, advanced by the engines'
-//! acknowledgements; what the daemon does beside it for a replica (moving
-//! requests to the engine that serves, reading the trial's thresholds,
-//! enforcing the deadline) is [`Replica::follow`].
+//! `Leader::apply` decides in that order and starts the update, which commits by itself once
+//! its trial lasted `update_config.trial`. The update itself is
+//! `crate::updates::update::Update`, advanced by the engines' acknowledgements; what the daemon
+//! does beside it for a replica (moving requests to the engine that serves, reading the trial's
+//! thresholds, committing at the trial's end) is [`Replica::follow`].
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use proto::admin::{
-    ApplyRequest, ConfigStatus, DryRun, EngineLaunch, Executing, ExecutingState, Failure,
-    FailureKind, Gpu, GpuShare, GpuUuid, InFlight, InPlaceChange, NodeUsage, Quotas, ReplicaDryRun,
-    ReplicaStatus, Switched, UpdateReport,
+    ConfigStatus, Executing, ExecutingState, Gpu, GpuShare, GpuUuid, InFlight, InPlaceChange,
+    NodeUsage, Quotas, ReplicaStatus, Switched,
 };
 use proto::config::EngineConfig;
+use proto::reload::{Effect, Effects, Reload as _};
 use tracing::info;
 
+use crate::config::{Config, Stated};
 use crate::engine::client::EngineState;
 use crate::engine::hold::HoldState;
 use crate::epoch::{Change, Epoch};
 use crate::leader::{Leader, Replica, UpdateError};
-use crate::options::ServerArgs;
-use crate::updates::change::{Applied, resolve};
+use crate::updates::change::Applied;
 use crate::updates::update::{EpochSwitch, Node, Update};
 
 /// The GPUs the deployment's epochs hold storage on, from every node's storage report.
@@ -61,94 +62,20 @@ fn deployment_gpus(nodes: &[NodeUsage]) -> Vec<GpuShare> {
         .collect()
 }
 
-/// Whether `target` differs from `served` in the profiler ranges' switch
-/// alone, which the workers change in place. Every other part of the
-/// profiling configuration shapes the CUDA graphs an epoch captures at its
-/// start, the modules it times and whether PC sampling was enabled before
-/// the capture (`profiling_config.graph_pc_sampling`), and takes a new
-/// epoch.
-fn switches_probes_only(served: &EngineConfig, target: &EngineConfig) -> bool {
-    let mut switched = comparable(served);
-    switched.profiling.fence_probes = target.profiling.fence_probes;
-    switched
-        .profiling
-        .fence_probes_off
-        .clone_from(&target.profiling.fence_probes_off);
-    switched == comparable(target)
-}
+/// The options the workers switch in place, at the engine's next step boundary: the fence
+/// probes' switch and the classes whose probes stay off. Every other profiling option shapes the
+/// CUDA graphs an epoch captures.
+const FENCE_SWITCHES: [&str; 2] = [
+    "profiling_config.fence_probes",
+    "profiling_config.fence_probes_off",
+];
 
-/// The parts of `config` a replica compares in place: all of it but what a
-/// module selection owns (the package backends, the scheduling policy, the
-/// expert exchange and the speculative cost figures). A change reaches a
-/// replica only once the module set has accounted for those.
-///
-/// Every field of the configuration is named here, so a field added to it does not compile
-/// until it is classified as compared or as a module selection's.
-fn comparable(config: &EngineConfig) -> EngineConfig {
-    let EngineConfig {
-        executable,
-        model,
-        parallel,
-        deployment,
-        max_running_requests,
-        max_num_batched_tokens,
-        max_logprobs,
-        attention_backend: _,
-        prefill_attention_backend: _,
-        decode_attention_backend: _,
-        moe_runner_backend: _,
-        device,
-        scheduler,
-        media,
-        mem_fraction_static,
-        load,
-        kv_cache,
-        moe,
-        cuda_graph,
-        worker,
-        speculative,
-        video,
-        profiling,
-    } = config.clone();
-    EngineConfig {
-        executable,
-        model,
-        parallel,
-        deployment,
-        max_running_requests,
-        max_num_batched_tokens,
-        max_logprobs,
-        // The package backends are the module set's.
-        attention_backend: None,
-        prefill_attention_backend: None,
-        decode_attention_backend: None,
-        moe_runner_backend: None,
-        device,
-        // The scheduling policy's package is the module set's; its parameters are compared.
-        scheduler: proto::config::SchedulerConfig {
-            policy: proto::config::SchedulerConfig::default().policy,
-            ..scheduler
-        },
-        media,
-        mem_fraction_static,
-        load,
-        kv_cache,
-        // The expert exchange's package is the module set's.
-        moe: proto::config::MoeConfig {
-            exchange: None,
-            ..moe
-        },
-        cuda_graph,
-        worker,
-        // The speculative cost figures are the scheduling policy package's parameters.
-        speculative: proto::config::SpeculativeConfig {
-            expected_speedup: None,
-            refill_token_cost: None,
-            ..speculative
-        },
-        video,
-        profiling,
-    }
+/// Whether `changes` are the fence probes' switches alone.
+fn switches_probes_only(changes: &[proto::reload::Change]) -> bool {
+    !changes.is_empty()
+        && changes
+            .iter()
+            .all(|change| FENCE_SWITCHES.contains(&change.path.as_str()))
 }
 
 /// Keeps an existing replica's assigned devices when an update changes its
@@ -169,46 +96,24 @@ fn retain_devices(served: &EngineConfig, target: &mut EngineConfig) {
     }
 }
 
-/// The options that select a deployment's packages: the engine package, the
-/// scheduling policy and each operator's implementation. A harness may set
-/// them without the operator listing them.
-pub(crate) const MODULE_OPTIONS: [&str; 8] = [
-    "worker_config.engine",
-    "worker_config.engine_revision",
-    "scheduler_config.policy",
-    "attention_backend",
-    "prefill_attention_backend",
-    "decode_attention_backend",
-    "moe_runner_backend",
-    "moe_config.exchange",
-];
-
-/// The parts of a change no form of update moves.
-fn differing(served: &EngineConfig, target: &EngineConfig) -> Vec<&'static str> {
-    let mut parts = Vec::new();
-    if served.deployment != target.deployment {
-        parts.push("the deployment");
-    }
-    parts
-}
-
 impl Leader {
-    /// Applies a configuration change as operation `number`, as the module
-    /// describes: the least the change needs.
+    /// Changes the deployment to `target`, whose `config.toml` states `stated`, as operation
+    /// `number`: the least its declared effects need (module documentation).
     ///
-    /// An update it starts runs on after this returns: its phases end on the
-    /// engines' acknowledgements, and `GET /admin/status`, the events and
-    /// `GET /admin/config` report it.
+    /// An update it starts runs on after this returns: its phases end on the engines'
+    /// acknowledgements, it commits by itself at its trial's end, and `GET /admin/status` and
+    /// the events report it.
     ///
     /// # Errors
     ///
     /// `UpdateError::InProgress` while another change or update runs;
-    /// `UpdateError::Refused` for a configuration that does not parse or
-    /// validate, one a rollback marked unavailable unless `force`, a module
+    /// `UpdateError::Refused` for a target a rollback marked unavailable unless `force`, a module
     /// set the Build Servers cannot select, or a change no form moves.
     pub(crate) async fn apply(
         &self,
-        request: ApplyRequest,
+        target: Config,
+        stated: Stated,
+        force: bool,
         number: u64,
     ) -> Result<Applied, UpdateError> {
         let _replacing = self
@@ -217,145 +122,70 @@ impl Leader {
             .try_lock()
             .map_err(|_| UpdateError::InProgress)?;
         let replicas = self.replicas();
-        if !request.dry_run && self.updates.in_flight().is_some() {
+        if self.updates.in_flight().is_some() {
             return Err(UpdateError::InProgress);
         }
         let current = service::lock(&replicas[0].config).clone();
-        let (target, _stated, options) = resolve(&current, &request)?;
-
-        let named_previous = crate::leader::deployment(&current)?;
-        let named_next = crate::leader::deployment(&target)?;
-        let named = crate::epoch::change(&named_previous, &named_next);
+        if target.served_model_name() != current.served_model_name() {
+            return Err(UpdateError::Refused(
+                "the served model name names the deployment's storage: serve another package \
+                 instead"
+                    .into(),
+            ));
+        }
+        // The one selection of an apply: every interface's revision is fixed at the Build
+        // Servers before anything is compared, so a revision installed since the serving epoch
+        // was applied is a change. The daemon's own options change first, by a hot restart whose
+        // successor applies the change again, so nothing is selected for them.
+        let named = crate::epoch::change(
+            &crate::leader::deployment(&current)?,
+            &crate::leader::deployment(&target)?,
+        );
         if named == Change::Host {
-            return self.apply_in_place(request).await;
+            return self.apply_in_place(target, stated).await;
         }
-
-        // The one selection of an apply: every interface's revision is fixed
-        // at the Build Servers before anything is compared, so a revision
-        // installed since the serving epoch was applied is a change. A dry
-        // run of an epoch change starts nothing and selects nothing.
-        let mut next = named_next;
-        if !(request.dry_run && named == Change::Epoch) {
-            next.modules = self.fix_modules(&target).await?;
-        }
+        let mut next = crate::leader::deployment(&target)?;
+        next.modules = self.fix_modules(&target).await?;
         let Some((serving, record)) = self.updates.epochs().serving() else {
-            return self.apply_in_place(request).await;
+            return self.apply_in_place(target, stated).await;
         };
-        let change = if named == Change::Epoch || record.engine != next.modules.engine {
-            Change::Epoch
+        let form = if named == Change::Epoch || record.engine != next.modules.engine {
+            Effect::Epoch
         } else if record.kernels != next.modules.kernels || record.policy != next.modules.policy {
-            Change::Generation
+            Effect::Generation
         } else {
-            Change::None
+            return self.apply_in_place(target, stated).await;
         };
-        if change == Change::None {
-            return self.apply_in_place(request).await;
-        }
-        if !request.force
-            && let Some(mark) = self.updates.unavailable(&next)
-        {
+        if !force && let Some(mark) = self.updates.unavailable(&next) {
             return Err(UpdateError::Refused(format!(
                 "the configuration was rolled back from epoch {} ({}); apply it again with force",
                 mark.epoch, mark.reason
             )));
         }
-        let deadline = request
-            .deadline_s
-            .map(|seconds| Instant::now() + Duration::from_secs_f64(seconds));
-
-        match change {
-            Change::Epoch => {
-                Box::pin(self.epoch_update(
-                    number, &current, &target, next, serving, &options, &request, deadline,
-                ))
+        let options = target.update_config.clone();
+        if form == Effect::Epoch {
+            Box::pin(self.epoch_update(number, &current, &target, next, serving, &options)).await
+        } else {
+            self.generation_update(number, next, serving, &options)
                 .await
-            }
-            _ => {
-                self.generation_update(number, next, serving, &options, &request, deadline)
-                    .await
-            }
         }
     }
 
-    /// Whether a harness may apply `request`: it selects packages
-    /// ([`MODULE_OPTIONS`]) and sets only the options the operator lists for
-    /// it (`admin_config.harness_options`), by assignment. A whole
-    /// configuration, one replica of the deployment and `force` are the
-    /// operator's.
-    ///
-    /// # Errors
-    ///
-    /// The refusal, naming what the harness may not state.
-    pub(crate) fn harness_may_apply(&self, request: &ApplyRequest) -> Result<(), String> {
-        if request.config.is_some() {
-            return Err(
-                "a harness states assignments (`set`), not a whole configuration".to_owned(),
-            );
-        }
-        if request.force {
-            return Err("applying a configuration a rollback marked unavailable (`force`) is the operator's".to_owned());
-        }
-        if request.replica.is_some() {
-            return Err("a harness applies to the deployment, not to one replica".to_owned());
-        }
-        let allowed = service::lock(&self.replicas()[0].config)
-            .admin_config
-            .harness_options
-            .clone();
-        for assignment in &request.set {
-            let path = assignment
-                .split_once('=')
-                .map_or(assignment.as_str(), |(path, _)| path)
-                .trim();
-            let permitted =
-                MODULE_OPTIONS.contains(&path) || allowed.iter().any(|option| option == path);
-            if !permitted {
-                return Err(format!(
-                    "a harness may not set `{path}`: it is neither a package selection nor an \
-                     option the operator lists in `admin_config.harness_options`"
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// The per-replica path of a change that starts no update: the daemon's
-    /// own options (a hot restart), the options the workers switch in place,
-    /// or nothing.
-    async fn apply_in_place(&self, request: ApplyRequest) -> Result<Applied, UpdateError> {
-        let replicas = self.replicas();
-        let indices: Vec<_> = match request.replica {
-            Some(index) => vec![index],
-            None => (0..replicas.len()).collect(),
-        };
-        // What each replica the change reaches would change, for a dry run, or changed.
-        let mut dry_runs = Vec::new();
+    /// The per-replica path of a change that starts no update: the daemon's own options (a
+    /// hot restart), the options the engines take at their next step, or nothing.
+    async fn apply_in_place(&self, target: Config, stated: Stated) -> Result<Applied, UpdateError> {
         let mut changed = Vec::new();
-        for index in indices.iter().copied() {
-            let replica = replicas
-                .get(index)
-                .ok_or_else(|| UpdateError::Refused(format!("no replica {index}")))?;
-            match Box::pin(replica.apply(request.clone())).await? {
-                applied @ Applied::Daemon { .. } => {
-                    if request.replica.is_some() {
-                        return Err(UpdateError::Refused(
-                            "daemon options apply to the deployment, not one replica".to_owned(),
-                        ));
-                    }
-                    return Ok(applied);
-                }
-                Applied::DryRun(DryRun::InPlace { replicas }) => dry_runs.extend(replicas),
+        for replica in self.replicas() {
+            match Box::pin(replica.apply(target.clone(), stated.clone())).await? {
+                applied @ (Applied::Daemon { .. } | Applied::Update(_)) => return Ok(applied),
                 Applied::InPlace(changes) => changed.extend(changes),
-                applied @ (Applied::DryRun(_) | Applied::Update(_)) => return Ok(applied),
                 Applied::Unchanged => {}
             }
         }
-        Ok(if !dry_runs.is_empty() {
-            Applied::DryRun(DryRun::InPlace { replicas: dry_runs })
-        } else if !changed.is_empty() {
-            Applied::InPlace(changed)
-        } else {
+        Ok(if changed.is_empty() {
             Applied::Unchanged
+        } else {
+            Applied::InPlace(changed)
         })
     }
 
@@ -363,10 +193,7 @@ impl Leader {
     /// this host's Build Server's `cover` selects it, with every module built
     /// on every host `target`'s processes run on before anything starts from
     /// it.
-    async fn fix_modules(
-        &self,
-        target: &ServerArgs,
-    ) -> Result<crate::epoch::ModuleSet, UpdateError> {
+    async fn fix_modules(&self, target: &Config) -> Result<crate::epoch::ModuleSet, UpdateError> {
         let named = crate::epoch::modules_of(target);
         // A daemon that starts no engine of its own has no Build Server to
         // select at, no daemons of other hosts to reach, and no engine to move.
@@ -398,16 +225,8 @@ impl Leader {
         number: u64,
         next: Epoch,
         serving: crate::epoch::Recorded,
-        options: &crate::options::UpdateConfig,
-        request: &ApplyRequest,
-        deadline: Option<Instant>,
+        options: &crate::config::UpdateConfig,
     ) -> Result<Applied, UpdateError> {
-        if request.dry_run {
-            return Ok(Applied::DryRun(DryRun::Generation {
-                epoch: serving.number(),
-                modules: crate::updates::change::modules_report(&next.modules),
-            }));
-        }
         let nodes = self.serving_nodes()?;
         if nodes.is_empty() {
             return Err(UpdateError::NoEngine);
@@ -419,7 +238,7 @@ impl Leader {
             serving,
             crate::engine::control::ENGINE_GROUP.to_owned(),
             nodes,
-            deadline,
+            options.trial,
         );
         let report = self.updates.apply(update)?;
         for replica in self.replicas() {
@@ -427,7 +246,6 @@ impl Leader {
                 Arc::clone(&self.updates),
                 number,
                 options.clone(),
-                deadline,
                 crate::leader::Following::Generation {
                     config: Box::new(next.config.clone()),
                     modules: next.modules.clone(),
@@ -515,13 +333,11 @@ impl Leader {
     async fn epoch_update(
         &self,
         number: u64,
-        current: &ServerArgs,
-        target: &ServerArgs,
+        current: &Config,
+        target: &Config,
         next: Epoch,
         serving: crate::epoch::Recorded,
-        options: &crate::options::UpdateConfig,
-        request: &ApplyRequest,
-        deadline: Option<Instant>,
+        options: &crate::config::UpdateConfig,
     ) -> Result<Applied, UpdateError> {
         let refused = |error: anyhow::Error| UpdateError::Refused(format!("{error:#}"));
         let replicas = self.replicas();
@@ -554,7 +370,7 @@ impl Leader {
         let engine = Leader::prepare(
             &self.families,
             target,
-            &crate::options::Stated::from_paths(Vec::new()),
+            &crate::config::Stated::from_paths(Vec::new()),
         )
         .await
         .map_err(refused)?
@@ -599,14 +415,6 @@ impl Leader {
             let numbers: Vec<u64> = hosts.iter().map(|_| control.launch_number()).collect();
             worlds.push((args, hosts, numbers));
         }
-        let serving_configs: Vec<_> = replicas
-            .iter()
-            .filter_map(|replica| {
-                service::lock(&replica.served)
-                    .as_ref()
-                    .map(|args| args.engine_config.clone())
-            })
-            .collect();
         // A replica's layout (`EngineConfig::layout`: its parallel configuration with its devices
         // and hosts, slot count, KV layout and graph buckets, not the cache's size or tiers) names
         // its device regions. A serving replica whose layout a target replica shares keeps its
@@ -615,31 +423,6 @@ impl Leader {
         // own grow into it (`Node::moves_across`). A change of the replica count alone keeps the
         // layout of every replica it leaves in place.
         let target_layouts: Vec<_> = configs.iter().map(EngineConfig::layout).collect();
-        let shrink = serving_configs
-            .iter()
-            .any(|serving| !target_layouts.contains(&serving.layout()));
-        if request.dry_run {
-            return Ok(Applied::DryRun(DryRun::Epoch {
-                epoch: target_epoch,
-                engine: next.modules.engine.clone(),
-                replicas: worlds.len(),
-                engines: worlds
-                    .iter()
-                    .map(|(_, hosts, numbers)| {
-                        hosts
-                            .iter()
-                            .zip(numbers)
-                            .map(|(host, number)| EngineLaunch {
-                                host: host.host.clone(),
-                                launch_generation: *number,
-                            })
-                            .collect()
-                    })
-                    .collect(),
-                shrink,
-            }));
-        }
-
         // Each target world's launch files. A target starts parked: its launch
         // names the epoch it succeeds.
         let mut launches = Vec::new();
@@ -691,12 +474,12 @@ impl Leader {
                 record,
                 launches,
                 keeps: options.previous_epoch,
-                recompute: request.in_flight == InFlight::Recompute,
+                recompute: options.in_flight == InFlight::Recompute,
                 drain: Duration::from_secs_f64(options.drain_s),
                 target_layouts,
                 retire: self.updates.take_retire(),
             },
-            deadline,
+            options.trial,
         );
         // A profiling session does not cross epochs: its ranks write their
         // files while the epoch still executes, before the switch drains it.
@@ -706,25 +489,15 @@ impl Leader {
             Arc::clone(&self.updates),
             number,
             options.clone(),
-            deadline,
             crate::leader::Following::Epoch(crate::leader::EpochTarget {
                 control: Arc::clone(control),
                 targets,
                 config: Box::new(target.clone()),
                 epoch: target_epoch,
-                keep: request.in_flight == InFlight::Keep,
+                keep: options.in_flight == InFlight::Keep,
             }),
         );
         Ok(Applied::Update(Box::new(report)))
-    }
-
-    /// Commits the update in flight: the decision is recorded before the kept
-    /// side is released.
-    pub(crate) async fn commit(&self) -> Result<UpdateReport, UpdateError> {
-        let _replacing = self.replicas.replacing.lock().await;
-        self.updates.commit().ok_or_else(|| {
-            UpdateError::Refused("no update is in flight: there is nothing to commit".to_owned())
-        })
     }
 
     /// Ends every replica's running profiling session, because its epoch stops executing.
@@ -733,24 +506,6 @@ impl Leader {
             let client = replica.hold().client();
             crate::profiling::end_for_epoch(&replica, client.as_deref(), reason).await;
         }
-    }
-
-    /// Rolls the update in flight back, with `reason` as the operator's or
-    /// the submitter's own account.
-    pub(crate) async fn rollback(&self, reason: String) -> Result<UpdateReport, UpdateError> {
-        let _replacing = self.replicas.replacing.lock().await;
-        if self.updates.in_flight().is_some() {
-            self.end_profiles("rollback").await;
-        }
-        self.updates
-            .rollback(Failure::new(FailureKind::Decision, reason))
-            .ok_or_else(|| {
-                UpdateError::Refused(
-                    "no update is in flight: the deployment already serves the configuration \
-                     the file states"
-                        .into(),
-                )
-            })
     }
 
     /// Reports the configuration and resource ownership of the replicas.
@@ -823,7 +578,7 @@ impl Replica {
     /// Fails when the configuration cannot be printed.
     pub(crate) fn config_status(&self) -> anyhow::Result<ReplicaStatus> {
         let config = service::lock(&self.config).clone();
-        let printed = crate::options::printed(&config)?;
+        let printed = crate::config::printed(&config)?;
         let digest = crate::updates::digest_of(&printed);
         let hold = self.hold();
         let slot = |epoch: u64, state: ExecutingState| Executing {
@@ -868,18 +623,19 @@ impl Replica {
         })
     }
 
-    /// Applies what of `request` no update moves: nothing for the current
-    /// configuration; the workers' own switch for the profiler ranges; the
-    /// record of scheduling limits the policy package already took; and a
-    /// hot restart of the daemon for its own options.
+    /// Applies what of `target` no update moves: nothing for the current configuration; the
+    /// daemon's own options, by a hot restart; the fence probes' switch, which the workers make
+    /// at their next step; and the record of the other options that take effect at a step, which
+    /// the engines' scheduling module received with its generation.
     ///
     /// # Errors
     ///
-    /// Refuses another change in progress (`409`), a configuration that does
-    /// not parse or validate, and a change no form of update moves.
+    /// Refuses another change in progress (`409`), and a target whose model files process
+    /// requests otherwise than the served ones.
     pub(crate) async fn apply(
         self: &Arc<Self>,
-        request: ApplyRequest,
+        target: Config,
+        stated: Stated,
     ) -> Result<Applied, UpdateError> {
         let _replacing = self
             .replacing
@@ -891,16 +647,25 @@ impl Replica {
             ));
         }
         let current = service::lock(&self.config).clone();
-        let (target, stated, _) = resolve(&current, &request)?;
-        if target == current && target.worker_groups.is_none() {
+        let changes = proto::reload::changes(Some(&current), &target);
+        if changes.is_empty() {
             return Ok(Applied::Unchanged);
+        }
+        // The daemon orchestrates what changes in its own options: a hot restart applies them
+        // first, and its successor applies the rest of the change.
+        if Effects::of(&changes).daemon {
+            let mut successor = current;
+            successor.take(&target, Effect::Daemon);
+            return Ok(Applied::Daemon {
+                config: Box::new(successor),
+            });
         }
         let served = service::lock(&self.served)
             .clone()
             .ok_or(UpdateError::NoEngine)?;
-        // The target's engine configuration is resolved as a deployment's
-        // start resolves it: from the options, completed by what the model's
-        // files determine, and divided into the deployment's replicas.
+        // The target's engine configuration is resolved as a deployment's start resolves it:
+        // from the options, completed by what the model's files determine, and divided into the
+        // deployment's replicas.
         let prepared = Leader::prepare(&self.families, &target, &stated)
             .await
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
@@ -922,58 +687,9 @@ impl Replica {
             retain_devices(&served.engine_config, &mut target_engine);
         }
         let running = self.hold().client().ok_or(UpdateError::NoEngine)?;
-        let daemon_changes = crate::epoch::host_options_differ(&current, &target);
-        let in_place = crate::leader::configurable(
-            &comparable(&served.engine_config),
-            &comparable(&target_engine),
-            &running.info().capacity,
-        );
-        // A successor serving other model files processes requests as the
-        // daemon does only with the same tokenizer, templates, generation
-        // defaults and model facts.
-        let served_model = &served.engine_config.model;
-        if served_model.model != target_engine.model.model {
-            crate::leader::same_processing(
-                &self.families,
-                &served_model.model,
-                &target_engine.model.model,
-            )
-            .await
-            .map_err(UpdateError::Refused)?;
-            if !served_model.processes_as(&target_engine.model) {
-                return Err(UpdateError::Refused(format!(
-                    "the model at {} has other generation limits, control tokens or context \
-                     length than the served model, which change how requests are processed: \
-                     deploy it instead",
-                    target_engine.model.model
-                )));
-            }
-        }
-        // A dry run states what the change would do and changes nothing: no
-        // handover, no engine command, no configuration written back.
-        if request.dry_run {
-            return Ok(Applied::DryRun(DryRun::InPlace {
-                replicas: vec![ReplicaDryRun {
-                    replica: self.ordinal,
-                    daemon: daemon_changes,
-                    scheduling: in_place,
-                    fence_probes: switches_probes_only(&served.engine_config, &target_engine),
-                }],
-            }));
-        }
-        // The daemon orchestrates what changes in its own options: a hot
-        // restart applies them first, and its successor applies the change
-        // again, which then leaves the daemon's options as they are.
-        if daemon_changes {
-            return Ok(Applied::Daemon {
-                config: Box::new(current.with_daemon_part(target.daemon_part())),
-                then: Some(Box::new(request)),
-            });
-        }
-        // The fence probes' switch alone changes in place: every worker
-        // writes its device switch at the engine's next step boundary, and
-        // the graphs that captured the probes stay.
-        if switches_probes_only(&served.engine_config, &target_engine) {
+        // The fence probes' switch changes in place: every worker writes its device switch at
+        // the engine's next step boundary, and the graphs that captured the probes stay.
+        let switched = if switches_probes_only(&changes) {
             let enabled = target_engine.profiling.fence_probes;
             let off = target_engine.profiling.fence_probes_off.clone();
             running
@@ -987,35 +703,27 @@ impl Replica {
                 ?off,
                 "the workers switched the fence probes in place"
             );
-            let mut args = served;
-            args.engine_config = target_engine;
-            *service::lock(&self.served) = Some(args);
-            *service::lock(&self.config) = target;
-            return Ok(Applied::InPlace(vec![InPlaceChange {
-                replica: self.ordinal,
-                switched: Switched::FenceProbes,
-            }]));
-        }
-        // A scheduling limit is a parameter of the policy package, so a generation update has
-        // moved the schedulers to it or they run it already. What is left is the record of it
-        // here: the arguments the next apply compares with.
-        if in_place {
-            let mut args = served;
-            args.engine_config = target_engine;
-            *service::lock(&self.served) = Some(args);
-            *service::lock(&self.config) = target;
-            return Ok(Applied::InPlace(vec![InPlaceChange {
-                replica: self.ordinal,
-                switched: Switched::SchedulingLimits,
-            }]));
-        }
-        // Every change an update moves was decided before this path: what
-        // reaches here changed nothing an epoch is built from and no module,
-        // and is none of the options changed in place either.
-        Err(UpdateError::Refused(format!(
-            "no form of update moves the change ({}): deploy the configuration instead",
-            differing(&served.engine_config, &target_engine).join(", ")
-        )))
+            Switched::FenceProbes
+        } else if changes.iter().all(|change| change.effect == Effect::Step) {
+            // The scheduling limits travel with the scheduling module's generation, which moved
+            // the schedulers before this path: what is left is the record of them.
+            Switched::SchedulingLimits
+        } else {
+            // Every change an update moves was decided before this path.
+            let paths: Vec<_> = changes.iter().map(|change| change.path.as_str()).collect();
+            return Err(UpdateError::Refused(format!(
+                "no form of update moves the change of {}",
+                paths.join(", ")
+            )));
+        };
+        let mut args = served;
+        args.engine_config = target_engine;
+        *service::lock(&self.served) = Some(args);
+        *service::lock(&self.config) = target;
+        Ok(Applied::InPlace(vec![InPlaceChange {
+            replica: self.ordinal,
+            switched,
+        }]))
     }
 }
 
@@ -1023,20 +731,13 @@ impl Replica {
 mod tests {
     use super::*;
 
-    /// The default deployment's engine configuration.
-    fn config() -> EngineConfig {
-        crate::options::ServerArgs::default()
-            .engine_config()
-            .expect("the configuration resolves")
-    }
-
     /// The fence probes' switch, and a module's probes switched off, change in place; the
     /// probed modules and PC sampling shape the captured graphs and take a new epoch.
     #[test]
     fn only_the_fence_probes_switch_changes_profiling_in_place() {
-        let profiled = |profiling: proto::config::ProfilingConfig| EngineConfig {
-            profiling,
-            ..config()
+        let profiled = |profiling: proto::config::ProfilingConfig| Config {
+            profiling_config: profiling,
+            ..Config::default()
         };
         let served = profiled(proto::config::ProfilingConfig {
             fence_probes: true,
@@ -1045,53 +746,33 @@ mod tests {
             graph_pc_sampling: false,
             nvtx_ranges: false,
         });
+        let changed = |target: &Config| proto::reload::changes(Some(&served), target);
         let switched = profiled(proto::config::ProfilingConfig {
             fence_probes: false,
-            ..served.profiling.clone()
+            ..served.profiling_config.clone()
         });
-        assert!(switches_probes_only(&served, &switched));
+        assert!(switches_probes_only(&changed(&switched)));
         // A module's probes switch off in place too.
         let thinned = profiled(proto::config::ProfilingConfig {
             fence_probes_off: vec!["*.Attention".to_owned()],
-            ..served.profiling.clone()
+            ..served.profiling_config.clone()
         });
-        assert!(switches_probes_only(&served, &thinned));
+        assert!(switches_probes_only(&changed(&thinned)));
         for epoch in [
             proto::config::ProfilingConfig {
                 graph_pc_sampling: true,
-                ..served.profiling.clone()
+                ..served.profiling_config.clone()
             },
             proto::config::ProfilingConfig {
                 fence_modules: Some(vec!["*.TransformerLayer".to_owned()]),
-                ..served.profiling.clone()
+                ..served.profiling_config.clone()
             },
         ] {
-            assert!(!switches_probes_only(&served, &profiled(epoch)));
+            let changes = changed(&profiled(epoch));
+            assert!(!switches_probes_only(&changes));
+            assert_eq!(Effects::of(&changes).heaviest(), Some(Effect::Epoch));
         }
-    }
-
-    /// A change of the scheduling limits alone, within the batch the workers were started for, is
-    /// in place, and a value a module selection owns does not stand in its way: the module set was
-    /// compared before the change reached the replica.
-    #[test]
-    fn a_scheduling_change_is_in_place_beside_what_a_module_selection_owns() {
-        let mut served = config();
-        served.scheduler.max_batch = std::num::NonZeroUsize::new(8).unwrap();
-        served.max_running_requests = std::num::NonZeroUsize::new(8).unwrap();
-        let mut target = served.clone();
-        target.max_running_requests = std::num::NonZeroUsize::new(4).unwrap();
-        target.attention_backend = Some("attention-c".to_owned());
-        let capacity = proto::request::wire::BatchCapacity {
-            max_batch: 8,
-            max_num_batched_tokens: 8192,
-            max_running_requests: 8,
-        };
-        assert!(crate::leader::configurable(
-            &comparable(&served),
-            &comparable(&target),
-            &capacity
-        ));
-        assert!(!crate::leader::configurable(&served, &target, &capacity));
+        assert!(!switches_probes_only(&[]));
     }
 
     /// The target's layout differs from the serving one's in its parallel
@@ -1099,7 +780,9 @@ mod tests {
     /// buckets, and not in the cache's size or its tiers.
     #[test]
     fn a_layout_is_the_parallel_configuration_slots_kv_layout_and_graph_buckets() {
-        let served = config();
+        let served = Config::default()
+            .engine_config()
+            .expect("the configuration resolves");
         let same = |change: &dyn Fn(&mut EngineConfig)| {
             let mut target = served.clone();
             change(&mut target);

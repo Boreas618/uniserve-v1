@@ -37,10 +37,10 @@ use tracing::{info, warn};
 
 use crate::api::openai::video_jobs::VideoJobs;
 use crate::api::openai::{self, ApiError, chat_completions, videos};
+use crate::config::{Config, MediaConfig, ServerConfig};
 use crate::http::listener::Listener;
 use crate::http::middleware::ConcurrencyLimit;
 use crate::leader::{Leader, Task};
-use crate::options::{MediaConfig, ServerArgs, ServerConfig, Stated};
 
 /// The HTTP body limit of the video submission routes, in bytes.
 ///
@@ -142,52 +142,54 @@ pub(crate) fn create_instance() -> Result<service::Instance> {
         .context("creating the daemon's instance directory")
 }
 
-/// Runs this node until `shutdown` is cancelled, or with its deployment.
+/// Runs this node of the deployment `deployment`, whose package `package` is, until `shutdown`
+/// is cancelled, or with its deployment.
 ///
-/// The leader (node rank 0) first creates its instance directory and binds every listener it
-/// has: the client API, the two admin sockets and, when other nodes join the deployment its
-/// configuration names (`dist_init_addr`, port 0 allowed), the join listener. It reports them in
-/// its readiness record (`ready`, [`service::State::Listening`]), so a caller learns the
-/// endpoints before the slow start, and then serves as its node ([`node::run`]): the deployment
-/// its configuration names (`model`), which the node lives as long as, or, without one, the
-/// deployments `PUT /admin/config` brings up. The record that states
-/// [`service::State::Serving`] follows the deployment's start, or the node's when it starts with
-/// none.
+/// The node finds its place in the package's `hosts` by its host name. The leader first creates
+/// its instance directory and binds every listener it has: the client API, the two admin
+/// sockets and, for a deployment of several nodes, the join listener (`admin_config.join`). It
+/// reports them in its readiness record (`ready`, [`service::State::Listening`]), so a caller
+/// learns the endpoints before the slow start, and then serves as its node ([`node::run`]): it
+/// applies the package as the deployment's start, from nothing or from the deployment's current
+/// revision (`crate::policy::revision`), and serves the deployment. The record that states
+/// [`service::State::Serving`] follows the deployment's start.
 ///
 /// Another node runs only its daemon, which joins the leader's and supervises the node's
 /// processes, until `shutdown` or until the leader's connection closes.
 ///
 /// # Errors
 ///
-/// Fails when the configuration is invalid, the instance directory or a listener cannot be made,
-/// the daemon cannot start or fails, the deployment cannot start or fails to come down, or the
-/// server fails.
+/// Fails when the package is invalid or does not name this host, the instance directory, the
+/// state directory or a listener cannot be made, the daemon cannot start or fails, the
+/// deployment cannot start or fails to come down, or the server fails.
 pub async fn serve(
-    config: ServerArgs,
-    stated: Stated,
+    package: crate::policy::Package,
+    deployment: String,
     families: processing::Registry,
     ready: Option<service::ReadyFd>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    config
-        .validate(&stated)
+    package
+        .config
+        .validate(&package.stated)
         .context("invalid serving configuration")?;
-    if !config.leads() {
-        return member(config, ready, shutdown).await;
+    let identity = package.config.identity()?;
+    if !identity.leads() {
+        return member(package.config, identity, ready, shutdown).await;
     }
 
+    let revisions =
+        crate::policy::revision::Revisions::open(crate::policy::revision::directory(&deployment)?)?;
+    revisions.abandon()?;
+    let revisions = Arc::new(revisions);
     let instance = create_instance()?;
     let mut ready = Ready::new(ready, instance.path());
     // Every listener is bound before the slow start, and reported.
-    let listener = Listener::bind(&config.admin_config)
+    let listener = Listener::bind(&package.config.admin_config)
         .await
         .context("failed to bind the daemon's listener")?;
     let admins = admin::Listeners::bind(instance.path())?;
-    // A model stated as a repository or as a local directory configures the node's deployment.
-    let join = match &config.dist_init_addr {
-        Some(endpoint) if config.states_model() => Some(Daemon::bind_join(endpoint)?),
-        _ => None,
-    };
+    let join = identity.join.as_ref().map(Daemon::bind_join).transpose()?;
     {
         let endpoints = ready.endpoints();
         endpoints.client = Some(listener.endpoint()?);
@@ -196,25 +198,18 @@ pub async fn serve(
     }
     ready.report(service::State::Listening);
 
-    let (lifetime, first) = if config.states_model() {
-        (
-            node::Lifetime::Deployment,
-            node::First::Configured {
-                config: Box::new(config.clone()),
-                stated,
-                join,
-            },
-        )
-    } else {
-        (node::Lifetime::Deployments, node::First::Idle)
-    };
     let start = node::Start {
         families,
-        options: config,
+        options: package.config.clone(),
+        deployment,
+        revisions,
         instance,
         ready,
-        lifetime,
         shutdown,
+    };
+    let first = node::First::Package {
+        package: Box::new(package),
+        join,
     };
     node::run(start, listener, admins, first).await.map(drop)
 }
@@ -222,14 +217,15 @@ pub async fn serve(
 /// Runs a node other than the leader: its daemon joins the leader's and supervises this node's
 /// processes until `shutdown`, or until the leader's connection closes and the service ends.
 async fn member(
-    config: ServerArgs,
+    config: Config,
+    identity: crate::config::Identity,
     ready: Option<service::ReadyFd>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let instance = create_instance()?;
     let mut ready = Ready::new(ready, instance.path());
     ready.report(service::State::Listening);
-    let options = config.daemon_options(instance.path());
+    let options = config.daemon_options(&identity, instance.path());
     let starting = tokio::task::spawn_blocking(move || Daemon::start(options, None));
     let daemon = tokio::select! {
         daemon = starting => daemon
@@ -238,7 +234,7 @@ async fn member(
         () = shutdown.cancelled() => return Ok(()),
     };
     ready.report(service::State::Serving);
-    info!(node_rank = config.node_rank, host = %config.host_identity, "serving this node's processes for the leader");
+    info!(node_rank = identity.rank, host = %identity.host, "serving this node's processes for the leader");
     let stopper = daemon.stopper();
     let mut ended = tokio::task::spawn_blocking(move || daemon.wait());
     tokio::select! {
@@ -527,28 +523,17 @@ mod tests {
                 "new requests are served",
             ]
         );
-        // An update this leader cannot run (it has no engine process of its
-        // own) fails and is logged as failed.
-        let request = Request::builder()
-            .method("PUT")
-            .uri("/admin/config")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({ "set": ["worker_config.watchdog_timeout=301"] }).to_string(),
-            ))
-            .unwrap();
-        let (status, _, body) = send(&app, request).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert_eq!(body["state"], json!("failed"));
-        // Its configuration and epochs read back.
-        let (status, _, body) = send(&app, get_request("/admin/config")).await;
+        // The status reports what the deployment executes: its first replica's configuration,
+        // and no update.
+        let (status, _, body) = send(&app, get_request("/admin/status")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            body["config"]
+            body["report"]["config"]
                 .as_str()
-                .is_some_and(|config| !config.is_empty())
+                .is_some_and(|config| !config.is_empty()),
+            "{body}"
         );
-        assert!(body["update"].is_null());
+        assert!(body["report"]["update"].is_null());
     }
 
     /// A path of `method` and `uri` with an empty JSON body.
@@ -562,19 +547,12 @@ mod tests {
     }
 
     /// The admin API is not served with the client API; the operator's
-    /// listener serves every admin route, and the harness's the verbs of an
-    /// update and what it reads to decide one, never the operator's
+    /// listener serves every admin route of the deployment, and the harness's
+    /// what a harness reads to decide a change, never the operator's
     /// operations.
     #[tokio::test]
     async fn each_listener_serves_its_own_routes() {
-        let update_routes = [
-            ("GET", "/admin/status"),
-            ("GET", "/admin/events"),
-            ("GET", "/admin/config"),
-            ("PUT", "/admin/config"),
-            ("POST", "/admin/config/commit"),
-            ("POST", "/admin/config/rollback"),
-        ];
+        let update_routes = [("GET", "/admin/status"), ("GET", "/admin/events")];
         let operator_routes = [
             ("POST", "/admin/pause_generation"),
             ("POST", "/admin/continue_generation"),
@@ -634,57 +612,6 @@ mod tests {
         // The client API is not an admin route of either listener.
         assert!(!serves(&admin, "POST", "/v1/chat/completions").await);
         assert!(!serves(&harness, "GET", "/v1/models").await);
-    }
-
-    /// A harness applies package selections and the options the operator
-    /// lists for it; another option, a whole configuration and `force` are
-    /// refused before anything is resolved. The operator's listener takes
-    /// the same request.
-    #[tokio::test]
-    async fn a_harness_sets_only_what_the_operator_allows() {
-        let put = |body: Value| {
-            Request::builder()
-                .method("PUT")
-                .uri("/admin/config")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap()
-        };
-        let harness = harness_router(served_engine(crate::test_support::CHAT));
-        for refused in [
-            json!({ "set": ["worker_config.watchdog_timeout=301"] }),
-            json!({ "set": ["admin_config.harness_options=[\"dtype\"]"] }),
-            json!({ "config": "attention_backend = \"trtllm\"\n" }),
-            json!({ "set": ["attention_backend=\"trtllm\""], "force": true }),
-            json!({ "set": ["attention_backend=\"trtllm\""], "replica": 0 }),
-        ] {
-            let (status, _, body) = send(&harness, put(refused.clone())).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{refused}: {body}");
-        }
-        // A package selection passes the check: this leader starts no engine
-        // of its own, so the apply itself has nothing to move.
-        let (status, _, body) = send(
-            &harness,
-            put(json!({ "set": ["attention_backend=\"trtllm\""], "deadline_s": 600 })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-
-        let admin = admin_router(served_engine(crate::test_support::CHAT));
-        let (status, _, body) = send(
-            &admin,
-            put(json!({ "set": ["worker_config.watchdog_timeout=301"] })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-
-        // A deadline is a positive number of seconds.
-        let (status, _, body) = send(
-            &admin,
-            put(json!({ "set": ["attention_backend=\"trtllm\""], "deadline_s": -1 })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
 
     /// A sleep the engine does not take fails by name, and the deployment
@@ -1113,10 +1040,10 @@ mod tests {
     /// Binds a loopback listener on an ephemeral port and returns it with
     /// its address.
     async fn loopback() -> (Listener, String) {
-        let listener = Listener::bind(&crate::options::AdminConfig {
+        let listener = Listener::bind(&crate::config::AdminConfig {
             host: "127.0.0.1".to_owned(),
             port: 0,
-            ..crate::options::AdminConfig::default()
+            ..crate::config::AdminConfig::default()
         })
         .await
         .unwrap();
@@ -1130,7 +1057,7 @@ mod tests {
     fn spawn_server(
         engine: &Arc<Leader>,
         listener: Listener,
-        config: ServerArgs,
+        config: Config,
         runtime: &std::path::Path,
         shutdown: &CancellationToken,
     ) -> tokio::task::JoinHandle<Result<()>> {
@@ -1141,7 +1068,7 @@ mod tests {
             let instance = service::Instance::create(&runtime, "daemon")?;
             let admins = admin::Listeners::bind(instance.path())?;
             let ready = Ready::new(None, instance.path());
-            let token = node::deployment_token(node::Lifetime::Deployment, &shutdown);
+            let token = shutdown.clone();
             let retire = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let admin = admin::Admin::new(
                 token.clone(),
@@ -1154,7 +1081,7 @@ mod tests {
             ));
             let brought = node::Brought {
                 config: config.clone(),
-                stated: Stated::default(),
+                stated: crate::config::Stated::default(),
                 leader: engine,
                 admin,
                 jobs,
@@ -1162,13 +1089,19 @@ mod tests {
                 daemon: None,
                 retire,
                 token,
+                then: None,
             };
+            let state = tempfile::tempdir()?;
+            let revisions = Arc::new(crate::policy::revision::Revisions::open(
+                state.path().join("sim"),
+            )?);
             let start = node::Start {
                 families: processing::Registry::new([]).unwrap(),
                 options: config,
+                deployment: "sim".to_owned(),
+                revisions,
                 instance,
                 ready,
-                lifetime: node::Lifetime::Deployment,
                 shutdown,
             };
             node::run(
@@ -1193,7 +1126,7 @@ mod tests {
         let server = spawn_server(
             &engine,
             listener,
-            ServerArgs::default(),
+            Config::default(),
             runtime.path(),
             &shutdown,
         );
@@ -1231,7 +1164,7 @@ mod tests {
         let (listener, address) = loopback().await;
         let runtime = tempfile::tempdir().unwrap();
         let budget = Duration::from_secs(30);
-        let mut config = ServerArgs::default();
+        let mut config = Config::default();
         config.server_config.shutdown_timeout = budget;
         let shutdown = CancellationToken::new();
         let server = spawn_server(&engine, listener, config, runtime.path(), &shutdown);

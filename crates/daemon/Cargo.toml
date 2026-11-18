@@ -31,6 +31,8 @@ datafusion.workspace = true
 # The tokenizer's decoder chain, which the served tokenizer loads.
 fastokens.workspace = true
 futures.workspace = true
+# The times a revision's record states, in RFC 3339.
+humantime.workspace = true
 # The checkpoint's own files and the Hub's cache layout.
 hf-hub.workspace = true
 http-body.workspace = true
@@ -72,6 +74,8 @@ serde-aux.workspace = true
 serde_json.workspace = true
 serde-json-fmt.workspace = true
 serde_path_to_error.workspace = true
+# The archive a policy package travels in (`PUT /admin/policy`, `GET /admin/policy`).
+tar.workspace = true
 serde_with.workspace = true
 sha2.workspace = true
 # The Storage Server's claim and protocol; content digests of media, in the key chain the cache

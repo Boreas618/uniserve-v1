@@ -13,14 +13,17 @@ use proto::process::{self, command};
 use proto::report::SchedulerStats;
 use testkit::process::Refusals;
 
+use crate::config::{Config, UpdateConfig};
 use crate::epoch::{Epoch, EpochRecord, Epochs, PackageRevision, Recorded};
 use crate::observe::Observer;
-use crate::options::{ServerArgs, UpdateConfig};
 use crate::supervision::processes::Processes;
 use crate::test_support::Engines;
 use crate::updates::trial::{Baseline, Trial};
 use crate::updates::update::{EpochSwitch, Node, Update};
 use crate::updates::{Transition, Updater};
+
+/// A trial long enough that no test reaches its end, so only a decision ends it.
+const LONG: Duration = Duration::from_secs(3600);
 
 /// The epoch that serves when a test begins, and the epoch form's target.
 const SERVING: u64 = 1;
@@ -64,7 +67,7 @@ impl Deployment {
         let updater = Updater::new(Arc::clone(&epochs), processes);
         let transitions = updater.transitions().expect("the log is read once");
 
-        let serving = Epoch::of(ServerArgs::default()).expect("the configuration resolves");
+        let serving = Epoch::of(Config::default()).expect("the configuration resolves");
         let recorded = epochs.record(
             SERVING,
             EpochRecord {
@@ -143,7 +146,7 @@ impl Deployment {
     }
 
     /// A generation update numbered `number` over `engines` serving engines.
-    fn generation(&mut self, number: u64, engines: usize, deadline: Option<Instant>) -> Update {
+    fn generation(&mut self, number: u64, engines: usize, trial: Duration) -> Update {
         let nodes = self.nodes(engines);
         Update::generation(
             number,
@@ -152,13 +155,13 @@ impl Deployment {
             self.recorded,
             "engine".to_owned(),
             nodes,
-            deadline,
+            trial,
         )
     }
 
     /// An epoch update numbered `number` from the one serving engine to one
     /// target engine on the same node, whose previous epoch keeps `keeps`.
-    fn epoch(&self, number: u64, keeps: PreviousEpoch, deadline: Option<Instant>) -> Update {
+    fn epoch(&self, number: u64, keeps: PreviousEpoch, trial: Duration) -> Update {
         let mut switch = self.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
         switch.keeps = keeps;
         let nodes = vec![Node::new(
@@ -169,7 +172,7 @@ impl Deployment {
             scopes(0..1),
             self.layout(),
         )];
-        self.epoch_over(number, nodes, switch, deadline)
+        self.epoch_over(number, nodes, switch, trial)
     }
 
     /// The epoch form's target: epoch [`TARGET`], started from `launches`,
@@ -205,7 +208,7 @@ impl Deployment {
         number: u64,
         nodes: Vec<Node>,
         switch: EpochSwitch,
-        deadline: Option<Instant>,
+        trial: Duration,
     ) -> Update {
         Update::epoch(
             number,
@@ -215,7 +218,7 @@ impl Deployment {
             "engine".to_owned(),
             nodes,
             switch,
-            deadline,
+            trial,
         )
     }
 
@@ -275,7 +278,7 @@ fn scopes(ranks: std::ops::Range<u32>) -> Vec<process::Scope> {
 /// The launch file of the target engine `launch` on `host`, whose first rank
 /// is group rank `rank`: it starts parked, succeeding the serving epoch.
 fn target_launch(host: &str, rank: u32, launch: u64) -> proto::config::EngineArgs {
-    let options = ServerArgs::default();
+    let options = Config::default();
     let mut args = proto::config::EngineArgs::new(
         options.engine_config().expect("the configuration resolves"),
         crate::epoch::modules_of(&options),
@@ -317,7 +320,7 @@ fn decision(reason: &str) -> Failure {
 #[test]
 fn a_generation_update_serves_on_trial_and_a_commit_keeps_it() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.generation(1, 1, None);
+    let update = deployment.generation(1, 1, LONG);
     let report = deployment.apply(update);
     assert_eq!(report["change"], "generation");
     assert_eq!(report["phase"], "preparing");
@@ -369,7 +372,7 @@ fn a_failed_preparation_abandons_the_update_and_nothing_changed() {
         .engines
         .engine(PREVIOUS)
         .refuse_prepare("the package has no module for this key");
-    let update = deployment.generation(1, 1, None);
+    let update = deployment.generation(1, 1, LONG);
     deployment.apply(update);
 
     assert_eq!(deployment.entered(), ["preparing", "abandoned"]);
@@ -393,7 +396,7 @@ fn a_failed_preparation_abandons_the_update_and_nothing_changed() {
 #[test]
 fn a_target_that_does_not_start_abandons_the_update_as_a_failed_preparation() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
     deployment
         .updater
         .apply(update)
@@ -427,7 +430,7 @@ fn a_target_that_does_not_start_abandons_the_update_as_a_failed_preparation() {
 #[test]
 fn every_engine_acknowledges_before_the_phase_moves() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.generation(1, 2, None);
+    let update = deployment.generation(1, 2, LONG);
     deployment
         .updater
         .apply(update)
@@ -452,7 +455,7 @@ fn every_engine_acknowledges_before_the_phase_moves() {
 
     // A second deployment whose second engine refuses.
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.generation(1, 2, None);
+    let update = deployment.generation(1, 2, LONG);
     deployment
         .engines
         .engine(SECOND)
@@ -473,7 +476,7 @@ fn every_engine_acknowledges_before_the_phase_moves() {
 #[test]
 fn a_fault_on_trial_rolls_a_generation_update_back() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.generation(1, 1, None);
+    let update = deployment.generation(1, 1, LONG);
     deployment.apply(update);
     deployment.entered();
 
@@ -505,7 +508,7 @@ fn a_fault_on_trial_rolls_a_generation_update_back() {
 #[test]
 fn a_stalled_job_on_trial_rolls_every_engine_back() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.generation(1, 2, None);
+    let update = deployment.generation(1, 2, LONG);
     deployment.apply(update);
 
     deployment.engines.report(
@@ -536,7 +539,7 @@ fn a_stalled_job_on_trial_rolls_every_engine_back() {
 #[test]
 fn a_rollback_by_decision_returns_to_the_kept_generation() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.generation(1, 1, None);
+    let update = deployment.generation(1, 1, LONG);
     deployment.apply(update);
 
     let report = deployment
@@ -566,31 +569,25 @@ fn a_rollback_by_decision_returns_to_the_kept_generation() {
     assert_eq!(deployment.updater.unavailable(&deployment.serving), None);
 }
 
-/// A trial not committed by its deadline is rolled back by the daemon; one
-/// committed before it is not.
+/// A trial that reached its end with nothing rolling it back commits; one that has not reached
+/// it decides nothing.
 #[test]
-fn a_trial_not_committed_by_its_deadline_rolls_back() {
+fn a_trial_commits_at_its_end() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.generation(1, 1, Some(Instant::now()));
+    let update = deployment.generation(1, 1, Duration::ZERO);
     deployment.apply(update);
     assert_eq!(deployment.status()["phase"], "trial");
 
-    deployment.updater.expire(1);
+    deployment.updater.conclude(1);
     deployment.run();
-    assert_eq!(deployment.status()["phase"], "rolled_back");
-    assert_eq!(deployment.status()["failure"]["kind"], "deadline");
-    assert_eq!(deployment.engines.engine(PREVIOUS).generation(), 1);
-
-    // A deadline that has not passed decides nothing, and a commit ends it.
-    let mut deployment = Deployment::new(Refusals::default());
-    let later = Instant::now() + Duration::from_secs(3600);
-    let update = deployment.generation(2, 1, Some(later));
-    deployment.apply(update);
-    deployment.updater.expire(2);
-    assert_eq!(deployment.updater.in_flight(), Some((2, Phase::Trial)));
-    assert!(deployment.updater.commit().is_some());
-    deployment.updater.expire(2);
     assert_eq!(deployment.status()["phase"], "committed");
+
+    let mut deployment = Deployment::new(Refusals::default());
+    let update = deployment.generation(2, 1, LONG);
+    deployment.apply(update);
+    deployment.updater.conclude(2);
+    assert_eq!(deployment.updater.in_flight(), Some((2, Phase::Trial)));
+    assert!(deployment.updater.ends(2).is_some());
 }
 
 /// One update is in flight at a time, and a commit asked before the trial is
@@ -598,12 +595,12 @@ fn a_trial_not_committed_by_its_deadline_rolls_back() {
 #[test]
 fn one_update_is_in_flight_and_an_early_commit_is_kept() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.generation(1, 1, None);
+    let update = deployment.generation(1, 1, LONG);
     deployment
         .updater
         .apply(update)
         .expect("no update is in flight");
-    let second = deployment.generation(2, 1, None);
+    let second = deployment.generation(2, 1, LONG);
     assert!(matches!(
         deployment.updater.apply(second),
         Err(crate::leader::UpdateError::InProgress)
@@ -618,7 +615,7 @@ fn one_update_is_in_flight_and_an_early_commit_is_kept() {
     // The slot is free again, and the update's follower still reads how
     // it ended once another is in flight.
     assert_eq!(deployment.updater.phase_of(1), Some(Phase::Committed));
-    let third = deployment.generation(3, 1, None);
+    let third = deployment.generation(3, 1, LONG);
     assert!(deployment.updater.apply(third).is_ok());
     assert_eq!(deployment.updater.phase_of(1), Some(Phase::Committed));
     assert_eq!(deployment.updater.phase_of(3), Some(Phase::Preparing));
@@ -630,7 +627,7 @@ fn one_update_is_in_flight_and_an_early_commit_is_kept() {
 #[test]
 fn an_engine_lost_on_trial_rolls_the_record_back() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.generation(1, 1, None);
+    let update = deployment.generation(1, 1, LONG);
     deployment.apply(update);
 
     deployment.engines.exit(HOST, PREVIOUS, "signal: 11");
@@ -654,7 +651,7 @@ fn an_engine_lost_on_trial_rolls_the_record_back() {
 #[test]
 fn an_epoch_update_promotes_the_target_and_then_drains_the_serving_engine() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
     deployment
         .updater
         .apply(update)
@@ -746,7 +743,7 @@ fn the_drain_states_its_deadline_and_shrinks_across_layouts() {
     switch.drain = Duration::from_millis(2_500);
     deployment.across_layouts(&mut switch);
     let nodes = deployment.nodes(1);
-    let update = deployment.epoch_over(1, nodes, switch, None);
+    let update = deployment.epoch_over(1, nodes, switch, LONG);
     deployment.apply(update);
 
     assert_eq!(
@@ -794,7 +791,7 @@ fn a_release_of_a_draining_engine_grows_the_targets_on_its_host() {
             deployment.across_layouts(&mut switch);
         }
         let nodes = deployment.nodes(1);
-        let update = deployment.epoch_over(1, nodes, switch, None);
+        let update = deployment.epoch_over(1, nodes, switch, LONG);
         deployment.apply(update);
 
         deployment.engines.report(PREVIOUS, shrunk(HOST));
@@ -829,7 +826,7 @@ fn a_release_grows_the_scheduler_node_of_each_target_world_with_an_engine_on_its
     let mut switch = deployment.switch(vec![(head, vec![1, 2]), (peer, Vec::new())]);
     deployment.across_layouts(&mut switch);
     let nodes = deployment.nodes(1);
-    let update = deployment.epoch_over(1, nodes, switch, None);
+    let update = deployment.epoch_over(1, nodes, switch, LONG);
     deployment.apply(update);
 
     for host in [OTHER, HOST, "rank-9"] {
@@ -886,7 +883,7 @@ fn an_epoch_update_covers_every_node_of_both_epochs() {
         (target_launch(HOST, 0, SPAWNED), vec![1, 2]),
         (target_launch(OTHER, 2, SPAWNED_PEER), Vec::new()),
     ]);
-    let update = deployment.epoch_over(1, nodes, switch, None);
+    let update = deployment.epoch_over(1, nodes, switch, LONG);
     deployment.apply(update);
 
     let spawns = deployment.engines.spawns();
@@ -963,7 +960,7 @@ fn a_commit_publishes_the_target_at_every_node_that_claimed_it() {
             (target_launch(HOST, 0, SPAWNED), Vec::new()),
             (target_launch(OTHER, 2, SPAWNED_PEER), Vec::new()),
         ]);
-        let update = deployment.epoch_over(1, nodes, switch, None);
+        let update = deployment.epoch_over(1, nodes, switch, LONG);
         deployment.apply(update);
         assert_eq!(deployment.status()["phase"], "trial");
     };
@@ -1029,7 +1026,7 @@ fn an_epoch_update_moves_two_replicas_to_one() {
     let nodes = deployment.nodes(2);
     let mut switch = deployment.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
     deployment.across_layouts(&mut switch);
-    let update = deployment.epoch_over(1, nodes, switch, None);
+    let update = deployment.epoch_over(1, nodes, switch, LONG);
     deployment.apply(update);
 
     assert_eq!(deployment.engines.spawns().len(), 1);
@@ -1067,7 +1064,7 @@ fn a_replica_added_beside_a_kept_layout_moves_no_memory_of_it() {
         .map(|(launch, _)| launch.engine_config.layout())
         .collect();
     let nodes = deployment.nodes(1);
-    let update = deployment.epoch_over(1, nodes, switch, None);
+    let update = deployment.epoch_over(1, nodes, switch, LONG);
     deployment.apply(update);
 
     assert_eq!(
@@ -1106,7 +1103,7 @@ fn requests_go_to_the_target_from_its_first_serving() {
         (target_launch(HOST, 0, SPAWNED_PEER), Vec::new()),
     ]);
     let nodes = deployment.nodes(1);
-    let update = deployment.epoch_over(1, nodes, switch, None);
+    let update = deployment.epoch_over(1, nodes, switch, LONG);
     deployment
         .updater
         .apply(update)
@@ -1132,7 +1129,7 @@ fn a_refused_spawn_or_claim_abandons_the_update() {
         spawn: Some("no device is free".to_owned()),
         ..Default::default()
     });
-    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
     deployment.apply(update);
     assert_eq!(deployment.status()["phase"], "abandoned");
     assert_eq!(deployment.status()["failure"]["kind"], "spawn_failed");
@@ -1143,7 +1140,7 @@ fn a_refused_spawn_or_claim_abandons_the_update() {
         claim: Some("the Storage Server refused".to_owned()),
         ..Default::default()
     });
-    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
     deployment.apply(update);
     assert_eq!(deployment.status()["failure"]["kind"], "claim_failed");
     assert_eq!(deployment.engines.stops(), vec![Some(SPAWNED)]);
@@ -1156,7 +1153,7 @@ fn a_refused_spawn_or_claim_abandons_the_update() {
 #[test]
 fn a_target_lost_while_preparing_abandons_the_update() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
     deployment
         .updater
         .apply(update)
@@ -1174,7 +1171,7 @@ fn a_target_lost_while_preparing_abandons_the_update() {
 #[test]
 fn a_rollback_before_the_switch_abandons_an_epoch_update() {
     let deployment = Deployment::new(Refusals::default());
-    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
     deployment
         .updater
         .apply(update)
@@ -1195,7 +1192,7 @@ fn a_rollback_before_the_switch_abandons_an_epoch_update() {
 #[test]
 fn a_rollback_on_trial_promotes_the_previous_epoch_before_the_target_drains() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
     deployment.apply(update);
     deployment.entered();
 
@@ -1278,7 +1275,7 @@ fn a_threshold_reads_the_trial_from_the_switchs_end_and_the_status_keeps_its_inp
     assert_eq!(deployment.updater.read_trial(1, (0, 0)), None, "no update");
 
     observer.record(SERVING, 0, &steps(10_666, 400));
-    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
     deployment
         .updater
         .apply(update)
@@ -1353,7 +1350,7 @@ fn a_threshold_reads_the_trial_from_the_switchs_end_and_the_status_keeps_its_inp
 #[test]
 fn a_target_that_faults_on_trial_is_stopped_instead_of_drained() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
     deployment.apply(update);
 
     let fault = deployment
@@ -1382,7 +1379,7 @@ fn a_target_that_faults_on_trial_is_stopped_instead_of_drained() {
 #[test]
 fn a_target_that_exits_on_trial_rolls_the_update_back() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
     deployment.apply(update);
 
     deployment.engines.exit(HOST, SPAWNED, "signal: 11");
@@ -1398,7 +1395,7 @@ fn a_target_that_exits_on_trial_rolls_the_update_back() {
 #[test]
 fn a_target_that_fails_while_switching_leaves_the_serving_engine_serving() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
     deployment
         .updater
         .apply(update)
@@ -1419,17 +1416,16 @@ fn a_target_that_fails_while_switching_leaves_the_serving_engine_serving() {
     assert_eq!(*deployment.epochs.served().borrow(), SERVING);
 }
 
-/// A deadline rolls an epoch update on trial back as a decision does.
+/// An epoch update on trial commits at its trial's end as a decision does: the target serves on.
 #[test]
-fn a_deadline_rolls_an_epoch_update_back() {
+fn an_epoch_trial_commits_at_its_end() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.epoch(1, PreviousEpoch::Parked, Some(Instant::now()));
+    let update = deployment.epoch(1, PreviousEpoch::Parked, Duration::ZERO);
     deployment.apply(update);
-    deployment.updater.expire(1);
+    deployment.updater.conclude(1);
     deployment.run();
-    assert_eq!(deployment.status()["phase"], "rolled_back");
-    assert_eq!(deployment.status()["failure"]["kind"], "deadline");
-    assert_eq!(*deployment.epochs.served().borrow(), SERVING);
+    assert_ne!(deployment.status()["phase"], "rolled_back");
+    assert_ne!(*deployment.epochs.served().borrow(), SERVING);
 }
 
 /// A previous epoch that keeps its weights alone is stopped when the trial
@@ -1438,7 +1434,7 @@ fn a_deadline_rolls_an_epoch_update_back() {
 #[test]
 fn a_previous_epoch_kept_as_weights_is_relaunched_for_a_rollback() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.epoch(1, PreviousEpoch::Weights, None);
+    let update = deployment.epoch(1, PreviousEpoch::Weights, LONG);
     deployment.apply(update);
     assert_eq!(deployment.engines.stops(), vec![Some(PREVIOUS)]);
 
@@ -1489,7 +1485,7 @@ fn a_node_that_refuses_host_storage_keeps_the_weights_on_its_gpus() {
         host_storage: Some("the host holds no room".to_owned()),
         ..Default::default()
     });
-    let update = deployment.epoch(1, PreviousEpoch::Host, None);
+    let update = deployment.epoch(1, PreviousEpoch::Host, LONG);
     deployment.apply(update);
     // The previous epoch's engine, which the trial stopped, exits: its node reports the exit as
     // it reports every engine's.
@@ -1511,7 +1507,7 @@ fn a_node_that_refuses_host_storage_keeps_the_weights_on_its_gpus() {
 #[test]
 fn a_serving_engine_lost_during_the_switch_is_not_drained() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.epoch(1, PreviousEpoch::Parked, None);
+    let update = deployment.epoch(1, PreviousEpoch::Parked, LONG);
     deployment
         .updater
         .apply(update)
@@ -1551,12 +1547,14 @@ fn a_standby_is_promoted_on_its_process_link() {
 #[test]
 fn the_unavailable_marks_cross_a_daemon_handover() {
     let mut deployment = Deployment::new(Refusals::default());
-    let update = deployment.generation(1, 1, None);
+    let update = deployment.generation(1, 1, LONG);
     deployment.apply(update);
-    deployment.updater.rollback(decision("worse"));
+    let fault = deployment.engines.engine(PREVIOUS).fault("worse");
+    deployment.engines.report(PREVIOUS, fault);
     deployment.run();
     let marks = deployment.updater.unavailable_marks();
     assert_eq!(marks.len(), 1);
+    let reason = marks[0].reason.clone();
 
     let successor = Deployment::new(Refusals::default());
     assert_eq!(successor.updater.unavailable(&deployment.target), None);
@@ -1566,6 +1564,6 @@ fn the_unavailable_marks_cross_a_daemon_handover() {
             .updater
             .unavailable(&deployment.target)
             .map(|mark| mark.reason),
-        Some("worse".to_owned())
+        Some(reason)
     );
 }

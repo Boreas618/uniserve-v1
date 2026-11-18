@@ -42,8 +42,8 @@ use proto::admin::{StepTime, Throttled};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::config::UpdateConfig;
 use crate::observe::{Observer, Sample};
-use crate::options::UpdateConfig;
 
 /// The power-of-two range of `tokens` query tokens per batch: 0 for one
 /// token, `k` for `(2^(k-1), 2^k]`.

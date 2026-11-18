@@ -20,14 +20,13 @@ proto.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
+# The archive a policy package travels in (`PUT /admin/policy`).
+tar.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
-# Stand-in daemons' admin APIs, which serve the admin schema the update ordering is tested
-# against.
-axum.workspace = true
-# A package's parameters in the stand-ins' dry runs (`proto::module::PackageRevision`).
-toml.workspace = true
+# The package directories `apply` archives.
+tempfile.workspace = true
 
 [lints]
 workspace = true

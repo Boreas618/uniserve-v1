@@ -189,7 +189,7 @@ impl Observer {
 /// reader reads back from a report's arrival. A trial's baseline is the `rollback.window` before
 /// the switch began, read once the switch's drain ended; the transfers' control reads its
 /// `baseline` before the preparation began.
-pub(crate) fn span(options: &crate::options::UpdateConfig) -> Duration {
+pub(crate) fn span(options: &crate::config::UpdateConfig) -> Duration {
     let trial =
         options.rollback.window.unwrap_or_default() + Duration::from_secs_f64(options.drain_s);
     trial.max(options.baseline)

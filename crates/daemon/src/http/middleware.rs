@@ -363,7 +363,7 @@ impl<G: Unpin> HttpBody for GuardedBody<G> {
 
 #[cfg(test)]
 mod tests {
-    use crate::options::ServerConfig;
+    use crate::config::ServerConfig;
     use crate::test_support::{SERVED_MODEL, post_json, router_with, send, served_engine};
     use axum::http::StatusCode;
 

@@ -254,7 +254,7 @@ pub(crate) fn sleeper(host: &str, group: &str, rank: u32, generation: u64) -> Sp
 /// The arguments of a stand-in engine of package `package`: a default deployment's engine
 /// configuration with a module set whose engine package is `package`.
 pub(crate) fn engine_args(package: &str) -> proto::config::EngineArgs {
-    let config = daemon::options::ServerArgs::default()
+    let config = daemon::config::Config::default()
         .engine_config()
         .expect("the default configuration resolves");
     let mut modules = module_set();
