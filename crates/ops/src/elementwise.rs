@@ -47,14 +47,16 @@
 //! relu      max(x, 0)                   sign      (x > 0) − (x < 0)
 //! sigmoid   1 / (1 + exp(−x))           silu      x / (1 + exp(−x))
 //! gelu      x / (1 + exp(−√(8/π) · x · (1 + 0.044715 · x²)))
-//! gelu_erf  (erf(x / √2) + 1) · 0.5 · x
+//! gelu_erf  0.5 · x · erfc(−x / √2)
 //! round     the nearest integer, a half away from zero
 //! affine    x · a + b                   powf      xᵃ
 //! elu       x > 0 ? x : (exp(x) − 1) · a
 //! ```
 //!
 //! `gelu` is the tanh approximation `0.5·x·(1 + tanh(√(2/π)·x·(1 + 0.044715·x²)))` written as one
-//! logistic, which is the same function with one exponential and no cancellation at either end. `a`
+//! logistic, which is the same function with one exponential and no cancellation at either end.
+//! `gelu_erf` is the exact GELU `x·Φ(x)` through the complementary error function, which keeps its
+//! relative accuracy where `1 + erf(x/√2)` cancels (to exactly zero in FP32 below `x ≈ −5.5`). `a`
 //! and `b` are the scalars of the call, converted to the type the function evaluates in. On an
 //! integer element only the functions closed over the integers exist ([`UnaryFunction::integral`]).
 
@@ -70,6 +72,23 @@ use crate::operand::Operand;
 use crate::strided;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
+
+/// `erfc`'s condition number at the exact GELU's argument, at its largest over the inputs whose
+/// GELU is a normal value of `dtype`, rounded up.
+///
+/// A relative error `δ` of `z = −x/√2` moves `erfc(z)` by `κ(z)·δ` relative to itself, with
+/// `κ(z) = 2z·exp(−z²) / (√π·erfc(z))`, which is below one for a positive input and approaches
+/// `2z² + 1` as the input grows negative. The GELU is about `exp(−z²) / √(2π)` there, so it reaches
+/// the type's smallest normal value `m` at `z² = −ln(√(2π)·m)`: the largest condition a normal
+/// result carries, `2z² + 1`, is 19 for FP16, 174 for BF16 and FP32 and 1416 for FP64. Below `m` the
+/// result is subnormal and the output's [`tolerance::underflow`] unit bounds it.
+fn erfc_condition(dtype: DType) -> u64 {
+    // The smallest normal value is the subnormal unit scaled by the significand's `2^(p−1)`, and
+    // the unit roundoff is `2^−p`.
+    let normal = tolerance::underflow(dtype) / (2.0 * tolerance::unit_roundoff(dtype));
+    let squared = -((2.0 * std::f64::consts::PI).sqrt() * normal).ln();
+    (2.0 * squared + 1.0).ceil() as u64
+}
 
 /// The function one compilation of `elementwise_unary` evaluates.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -166,7 +185,8 @@ impl UnaryFunction {
             Self::Sigmoid | Self::Silu => 3,
             // The exponential, the difference from one and the product with the scalar.
             Self::Elu => 3,
-            // The scaled argument, the error function, the sum with one and the product.
+            // The rounded constant `√½` and the scaled argument, the complementary error function
+            // and the product.
             Self::GeluErf => 4,
             // The square, its two products and the sum that form the argument, then the scale,
             // the exponential, the sum with one and the quotient.
@@ -362,10 +382,16 @@ impl Op for ElementwiseUnary {
             // exponential of a rounded argument carries that rounding scaled by the argument. The
             // product with the value scales either by at most the envelope, once per
             // implementation.
-            UnaryFunction::Gelu | UnaryFunction::GeluErf | UnaryFunction::Elu => {
-                Tolerance::rounding(roundings, compute, dtype).with_atol(
-                    2.0 * tolerance::VALUE_ENVELOPE * tolerance::unit_roundoff(compute) as f32,
-                )
+            UnaryFunction::Gelu | UnaryFunction::Elu => Tolerance::rounding(
+                roundings, compute, dtype,
+            )
+            .with_atol(2.0 * tolerance::VALUE_ENVELOPE * tolerance::unit_roundoff(compute) as f32),
+            // `0.5·x·erfc(z)` cancels nowhere, so it is relative to its own result down to the
+            // output's subnormals. The argument's two roundings (the constant and the product)
+            // reach the result scaled by `erfc`'s condition number at `z`, and the function's own
+            // last place and the product add one each.
+            UnaryFunction::GeluErf => {
+                Tolerance::rounding(2 * erfc_condition(dtype) + 2, compute, dtype)
             }
             // Products, quotients, sums of one sign and library functions accurate to their last
             // place: each rounds relative to its own result.
@@ -946,6 +972,22 @@ mod tests {
             Tolerance::rounding(3, DType::F32, DType::F32).rtol
         );
         assert_eq!(elu.atol, 16.0 * tolerance::unit_roundoff(DType::F32) as f32);
+
+        // The exact GELU is relative down to the output's subnormals, its argument's two
+        // roundings scaled by `erfc`'s condition at the smallest normal result.
+        let conditions = [
+            (DType::F16, 19),
+            (DType::BF16, 174),
+            (DType::F32, 174),
+            (DType::F64, 1416),
+        ];
+        for (dtype, condition) in conditions {
+            assert_eq!(erfc_condition(dtype), condition, "{dtype:?}");
+            assert_eq!(
+                tolerance(UnaryFunction::GeluErf, dtype),
+                Tolerance::rounding(2 * condition + 2, tolerance::accumulate(dtype), dtype)
+            );
+        }
     }
 
     fn binary(lhs: Operand, rhs: Operand, function: BinaryFunction) -> BinaryArgs {

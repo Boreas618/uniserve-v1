@@ -14,19 +14,27 @@ What is covered:
   two ends of a saturating activation (``gelu``, ``gelu_erf``, ``silu``,
   ``sigmoid``), and the neighbourhood of zero where ``elu``'s difference
   cancels; ``powf`` also over a base of either sign under a whole exponent;
+- **the exact GELU's negative tail** on every floating element type: inputs
+  down to ``-40``, across the threshold where the program changes form and
+  into the output's subnormals, held to their own magnitude, which a GELU
+  that cancelled ``1 + erf(x / sqrt(2))`` to zero cannot meet;
 - **the functions closed over the integers** on every integer element type,
   wrapping as the element type does;
 - **every layout** of :data:`~uniserve_testing.kernels.tensor.operands.LAYOUTS`.
 
-``tanh``, ``powf`` and every exponential (``exp``, and the one inside
-``gelu``, ``silu``, ``sigmoid`` and ``elu``) call libdevice, which Triton's
-interpreter cannot evaluate. Numpy's ``tanh``, ``power`` and ``exp`` stand in
-for those calls there (:func:`interpreted_libdevice`), so the interpreter run
+``tanh``, ``powf``, ``gelu_erf``'s ``erfc`` and ``erfcx`` and every
+exponential (``exp``, and the one inside ``gelu``, ``gelu_erf``, ``silu``,
+``sigmoid`` and ``elu``) call libdevice, which Triton's interpreter cannot
+evaluate. Numpy's ``tanh``, ``power`` and ``exp`` and torch's ``erfc`` and
+``erfcx`` stand in for those calls there (:func:`interpreted_libdevice`), so
+the interpreter run
 holds which values reach them, in which order, and where the results are
 stored; the calls' own last place is libdevice's, and a device run holds it
 to the bound. A BF16 output is rounded to nearest on a device and truncated by
 the interpreter, which the comparison allows for.
 """
+
+import math
 
 import numpy as np
 import pytest
@@ -115,6 +123,14 @@ class Libdevice:
     def pow(base, exponent):
         return Libdevice._applied(np.power, base, exponent)
 
+    @staticmethod
+    def erfc(value):
+        return Libdevice._applied(erfc, value)
+
+    @staticmethod
+    def erfcx(value):
+        return Libdevice._applied(erfcx, value)
+
 
 @pytest.fixture(scope="module", autouse=True)
 def interpreted_libdevice(interpreted, kernel_source):
@@ -145,8 +161,44 @@ def erf(x):
 
 
 def erfc(x):
-    """The complementary error function of a float64 array."""
+    """The complementary error function of an array, in its own type."""
     return torch.erfc(torch.from_numpy(np.ascontiguousarray(x))).numpy()
+
+
+def erfcx(x):
+    """The scaled complementary error function ``exp(x^2) erfc(x)`` of an
+    array, in its own type.
+    """  # noqa: D205
+    tensor = torch.from_numpy(np.ascontiguousarray(x))
+    return torch.special.erfcx(tensor).numpy()
+
+
+def erfc_condition(dtype):
+    """`erfc_condition` of `crates/ops/src/elementwise.rs`: `erfc`'s
+    condition number `2 z^2 + 1` where the exact GELU, about
+    `exp(-z^2) / sqrt(2 pi)`, reaches the type's smallest normal value,
+    rounded up.
+    """  # noqa: D205
+    normal = operands.UNDERFLOW[dtype] / (2.0 * operands.UNIT[dtype])
+    squared = -math.log(math.sqrt(2.0 * math.pi) * normal)
+    return math.ceil(2.0 * squared + 1.0)
+
+
+def exact_gelu(x):
+    """`x Phi(x)` of a float64 array, relative to its own result down to
+    float64's subnormals.
+
+    `0.5 x erfc(-x / sqrt(2))` for an input above `-5`; below it the tail
+    `-exp(ln(-0.5 x erfcx(z)) - x^2 / 2)`, `z = -x / sqrt(2)`, whose one
+    exponential rounds a subnormal result once, where torch's `erfc` returns
+    zero for any argument whose square exceeds float64's exponent range
+    (an input below about `-37.7`).
+    """  # noqa: D205
+    z = -x / np.sqrt(2.0)
+    direct = 0.5 * x * erfc(z)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tail = -np.exp(np.log(-0.5 * x * erfcx(z)) - 0.5 * x * x)
+    return np.where(x < -5.0, tail, direct)
 
 
 def formula(function, x, a, b):
@@ -176,7 +228,7 @@ def formula(function, x, a, b):
                     )
                 )
             ),
-            "gelu_erf": lambda: erfc(-x / np.sqrt(2.0)) * 0.5 * x,
+            "gelu_erf": lambda: exact_gelu(x),
             "erf": lambda: erf(x),
             "relu": lambda: np.maximum(x, 0.0),
             "silu": lambda: x / (1.0 + np.exp(-x)),
@@ -220,7 +272,11 @@ def bound(function, dtype):
         return operands.EXACT
     if function == "affine":
         return operands.dot(roundings, dtype)
-    if function in ("gelu", "gelu_erf", "elu"):
+    if function == "gelu_erf":
+        # The argument's two roundings scaled by `erfc`'s condition, the
+        # function's last place and the product.
+        return operands.rounding(2 * erfc_condition(dtype) + 2, dtype)
+    if function in ("gelu", "elu"):
         unit = operands.UNIT[operands.accumulate(dtype)]
         return operands.with_atol(
             operands.rounding(roundings, dtype), 2.0 * VALUE_ENVELOPE * unit
@@ -325,3 +381,28 @@ def test_a_function_wraps_on_an_integer_type(dtype, seed, function, primitives):
 def test_every_layout_is_traversed(dtype, function, layout, primitives):
     view = primitives.view(layout, dtype, 31)
     check(primitives, function, dtype, layout, view)
+
+
+#: Inputs of the exact GELU's negative tail: down to `-40`, past every
+#: type's subnormals, through the program's change of form at `-12`.
+NEGATIVE_TAIL = (-40.0, -4.0, 4097)
+
+
+#: The element types of the tail: a BF16 output runs on a device, because
+#: Triton's interpreter narrows an FP32 subnormal into BF16 wrongly (it stores
+#: -7.8e-45 as -5.9e-39, neither a truncation nor a rounding of it), and the
+#: tail's BF16 results are FP32 subnormals past `x = -13.2`.
+TAIL_TYPES = [
+    pytest.param(dtype, marks=pytest.mark.gpu) if dtype == "bf16" else dtype
+    for dtype in operands.FLOATS
+]
+
+
+@pytest.mark.parametrize("dtype", TAIL_TYPES)
+def test_the_exact_gelu_keeps_its_negative_tail(dtype, primitives):
+    """`x Phi(x)` of a strongly negative input is tiny, never zero while the
+    output type holds it, and relative to its own magnitude.
+    """  # noqa: D205
+    inputs = torch.linspace(*NEGATIVE_TAIL, dtype=torch.float64)
+    x = primitives.tensor(inputs, dtype)
+    check(primitives, "gelu_erf", dtype, "negative tail", x)

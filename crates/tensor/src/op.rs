@@ -863,13 +863,16 @@ impl UnaryOpT for GeluErf {
     fn f16(v: f16) -> f16 {
         f16::from_f64(Self::f64(v.to_f64()))
     }
+    // `x·Φ(x)` through the complementary error function: `1 + erf(x/√2)` cancels for a negative
+    // input (to exactly zero in FP32 below `x ≈ −5.5`), while `erfc(−x/√2)` keeps its relative
+    // accuracy, so a strongly negative input keeps its tail of tiny values.
     #[inline(always)]
     fn f32(v: f32) -> f32 {
-        (crate::cpu::erf::erf_f32(v * std::f32::consts::FRAC_1_SQRT_2) + 1.) * 0.5 * v
+        0.5 * v * crate::cpu::erf::erfc_f32(-v * std::f32::consts::FRAC_1_SQRT_2)
     }
     #[inline(always)]
     fn f64(v: f64) -> f64 {
-        (crate::cpu::erf::erf_f64(v * std::f64::consts::FRAC_1_SQRT_2) + 1.) * 0.5 * v
+        0.5 * v * crate::cpu::erf::erfc_f64(-v * std::f64::consts::FRAC_1_SQRT_2)
     }
     #[inline(always)]
     fn f8e4m3(v: f8e4m3) -> f8e4m3 {

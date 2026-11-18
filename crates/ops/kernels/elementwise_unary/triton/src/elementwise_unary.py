@@ -15,14 +15,18 @@ recip     1 / x                     sqr      x * x
 relu      max(x, 0)                 sign     (x > 0) - (x < 0)
 sigmoid   1 / (1 + exp(-x))         silu     x / (1 + exp(-x))
 gelu      x / (1 + exp(-sqrt(8/pi) * x * (1 + 0.044715 * x^2)))
-gelu_erf  (erf(x / sqrt(2)) + 1) * 0.5 * x
+gelu_erf  0.5 * x * erfc(-x / sqrt(2))
 round     the nearest integer, a half away from zero
 affine    x * a + b                 powf     x^a
 elu       x > 0 ? x : (exp(x) - 1) * a
 ```
 
 ``gelu`` is the tanh approximation written as one logistic: the same function
-with one exponential and no cancellation at either end. ``a`` and ``b`` are the
+with one exponential and no cancellation at either end. ``gelu_erf`` is the
+exact GELU ``x Phi(x)`` through the complementary error function, which keeps
+its relative accuracy where ``1 + erf(x / sqrt(2))`` cancels (to exactly zero
+in FP32 below about ``x = -5.5``), so a strongly negative input keeps its tail
+of tiny values. ``a`` and ``b`` are the
 launch's scalars, in the computing type. On an integer element only the
 functions closed over the integers are compiled, and ``ceil``, ``floor`` and
 ``round`` are the identity there.
@@ -41,6 +45,10 @@ from uniserve_kernels import dependent_launch, strided
 _SQRT_8_OVER_PI = tl.constexpr(1.5957691216057308)
 _SQRT_HALF = tl.constexpr(0.7071067811865476)
 
+#: The input below which ``gelu_erf`` takes its scaled tail form: there
+#: ``erfc(-x / sqrt(2))`` is still normal in FP32 (about ``4e-33``).
+_GELU_TAIL = tl.constexpr(-12.0)
+
 
 @triton.jit
 def _exponential(value):
@@ -54,6 +62,30 @@ def _exponential(value):
     units in the last place.
     """
     return libdevice.exp(value)
+
+
+@triton.jit
+def _exact_gelu(value):
+    """``x Phi(x) = 0.5 x erfc(z)``, ``z = -x / sqrt(2)``, relative to its own
+    result for either sign of ``x``.
+
+    For a positive input ``erfc(z)`` lies in ``[1, 2]`` and equals
+    ``1 + erf(x / sqrt(2))`` to its rounding. A negative input's ``erfc(z)``
+    falls below FP32's smallest normal past ``x = -13.0``, where libdevice,
+    compiled flushing subnormals to zero, returns zero; below ``_GELU_TAIL``
+    the result is therefore ``erfcx(z) exp(-z^2)``, the scaled function (about
+    ``1 / (z sqrt(pi))``) times the Gaussian, with the Gaussian split into two
+    normal factors ``exp(-x^2 / 4)``. Every factor stays normal down to
+    ``x = -18.7``, and only the last plain multiply, which keeps subnormals,
+    steps below ``2^-126``. FP64 evaluates the same two forms in itself. An
+    unselected lane's overflow (``erfcx`` of a large negative ``z``) is
+    discarded by the select.
+    """
+    z = -value * _SQRT_HALF
+    head = 0.5 * value * libdevice.erfc(z)
+    root = _exponential(-0.25 * value * value)
+    tail = 0.5 * value * libdevice.erfcx(z) * root * root
+    return tl.where(value < _GELU_TAIL, tail, head)
 
 
 @triton.jit
@@ -99,7 +131,7 @@ def _evaluated(
         inner = _SQRT_8_OVER_PI * value * (1.0 + 0.044715 * value * value)
         result = value / (1.0 + _exponential(-inner))
     elif FUNCTION == "gelu_erf":
-        result = (tl.erf(value * _SQRT_HALF) + 1.0) * 0.5 * value
+        result = _exact_gelu(value)
     elif FUNCTION == "erf":
         result = tl.erf(value)
     elif FUNCTION == "relu":
