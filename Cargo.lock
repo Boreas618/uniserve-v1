@@ -4683,6 +4683,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "policy-role"
+version = "2.0.0"
+dependencies = [
+ "program",
+ "program-testing",
+ "scheduling",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "policy-ttft"
 version = "2.0.0"
 dependencies = [

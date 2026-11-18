@@ -122,6 +122,7 @@ args = { ranks = 4 }
 | `expert-order` | control | `uniserve_expert_tokens_total` by `layer` and `expert` | `moe_config.expert_order` |
 | `layout` | control | `uniserve_scheduler_running_requests` mean, `uniserve_generation_tokens_total` rate | the options of the named layouts (`worker_groups`, ...) |
 | `backend` | control | `uniserve_step_device_seconds` p50 of phase `decode` by `module`, `uniserve_kernel_launches_total` of its operator by `descriptor` | `profiling_config.fence_modules`, `fence_probes`, `fence_probes_off`; `[kernels.<op>]` |
+| `role` | control (planning) | `uniserve_ttft_seconds` and `uniserve_tpot_seconds` p99, `uniserve_scheduler_running_requests` by `replica` | `replicas.<id>.role` |
 | `ttft` | routing | each request and the replicas' roles, queued prefill tokens, remaining batch time, running requests, reservable pages and prefix hits | the request's prefill and decode replicas |
 
 **`chunk`** trades time to first token against time per output token through the prefill chunk. Every period it reads each replica's p99 TTFT and TPOT over the last `window`: while any replica's TPOT is over `tpot` it halves the chunk, down to `low`; while no replica's TPOT is and any replica's TTFT is over `ttft` it doubles it, up to `high`; otherwise it changes nothing. An unset chunk is the step's whole token budget, read as `max_num_batched_tokens` when that is stated and as `high` otherwise. The chunk takes effect at each scheduler's next step.
@@ -190,6 +191,18 @@ worker_groups = [
 | `margin` | `0.05` | How much faster, as a fraction of the probe's time, the other backend's record must be |
 | `interval` | `"10m"` | The least time between two probes |
 | `weight` | `0.3` | The weight of each probe's time in a record's moving average |
+| `pause` | `"1h"` | How long a rolled-back change holds the program back |
+
+**`role`** plans the replicas' roles in place. Every period it reads the deployment's p99 TTFT and TPOT over the last `window`: when TTFT is over `ttft` while TPOT is below `(1 - room)` times `tpot`, the decode replica with the fewest running requests becomes a prefill replica; when TPOT is over `tpot` while TTFT is below `(1 - room)` times `ttft`, the prefill replica with the fewest running requests becomes a decode replica. Each role keeps at least `keep` replicas, mixed replicas never change, and a change waits `interval` after the program's last one. A replica is built mixed, so the change takes effect at its next step: it finishes the requests of its former role and admits those of its new one, its process, weights and KV staying.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `ttft` | Required | The p99 time to first token target |
+| `tpot` | Required | The p99 time per output token target |
+| `room` | `0.2` | The fraction below its target the other side's p99 must be for it to give a replica |
+| `window` | `"1m"` | The span the p99s and running requests are read over |
+| `interval` | `"5m"` | The least time between two changes of the program's own |
+| `keep` | `1` | The replicas each role keeps at least |
 | `pause` | `"1h"` | How long a rolled-back change holds the program back |
 
 **`ttft`** routes each request to the prefill replica predicted to give its first token soonest: the replica's running batch completes (`remaining`), then its queued prefill tokens and the prompt's tokens it does not hold (its longest prefix hit on any tier) are computed at `rate` tokens per second; ties go to fewer running requests, then to the first replica. A replica that also decodes decodes what it computed; otherwise the decode replica is the one with the fewest running requests among those that can reserve the prompt's pages (`page` tokens each), which a push of its KV needs, or among every decode replica when none can. A deployment without a replica of a role gets a route the leader refuses and replaces by its own rule, and the program logs why.
