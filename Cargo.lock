@@ -3655,6 +3655,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "program"
+version = "2.0.0"
+dependencies = [
+ "scheduling",
+ "serde",
+ "serde_json",
+ "wasmtime",
+]
+
+[[package]]
+name = "program-chunk"
+version = "2.0.0"
+dependencies = [
+ "scheduling",
+ "serde",
+]
+
+[[package]]
+name = "program-fastest"
+version = "2.0.0"
+dependencies = [
+ "scheduling",
+ "serde",
+]
+
+[[package]]
+name = "program-kv"
+version = "2.0.0"
+dependencies = [
+ "scheduling",
+ "serde",
+]
+
+[[package]]
 name = "prometheus-client"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

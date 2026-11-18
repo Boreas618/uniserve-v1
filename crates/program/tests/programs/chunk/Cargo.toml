@@ -1,0 +1,20 @@
+[package]
+name = "program-chunk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The control program that halves the prefill chunk when TPOT is over its target and doubles it when TTFT is: the host's test of a control program."
+
+[lib]
+# A program is compiled to `wasm32-unknown-unknown` and run by the program host; the library
+# form is what the workspace's native checks read.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The program SDK.
+scheduling.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

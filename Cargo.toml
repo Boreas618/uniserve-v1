@@ -18,6 +18,10 @@ members = [
     "crates/ops",
     "crates/ops/derive",
     "crates/processing",
+    "crates/program",
+    "crates/program/tests/programs/chunk",
+    "crates/program/tests/programs/fastest",
+    "crates/program/tests/programs/kv",
     "crates/build-server",
     "crates/proto",
     "crates/proto/derive",
@@ -90,6 +94,7 @@ ops = { path = "crates/ops" }
 ops-derive = { path = "crates/ops/derive" }
 models = { path = "crates/models" }
 processing = { path = "crates/processing" }
+program = { path = "crates/program" }
 build-server = { path = "crates/build-server" }
 proto = { path = "crates/proto" }
 proto-derive = { path = "crates/proto/derive" }

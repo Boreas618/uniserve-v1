@@ -1,0 +1,20 @@
+[package]
+name = "program-kv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "A KV program that pulls a handoff's pages from the nearest tier holding them and demotes device pages above a watermark: the host's test of a KV program."
+
+[lib]
+# A program is compiled to `wasm32-unknown-unknown` and run by the program host; the library
+# form is what the workspace's native checks read.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The program SDK.
+scheduling.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

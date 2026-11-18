@@ -1,0 +1,20 @@
+[package]
+name = "program-fastest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The routing program that sends a request to the replicas that finish it soonest: the host's test of a routing program."
+
+[lib]
+# A program is compiled to `wasm32-unknown-unknown` and run by the program host; the library
+# form is what the workspace's native checks read.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The program SDK.
+scheduling.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

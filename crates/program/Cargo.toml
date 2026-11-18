@@ -1,0 +1,19 @@
+[package]
+name = "program"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The program host: runs a policy package's wasm32 programs in wasmtime with fuel, their host functions, and their saved state; linked by the daemon, the Storage Server and the engine."
+
+[dependencies]
+# The program interface: the exports, the host functions and the messages they carry.
+scheduling.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The runtime of the program modules: compiles them, meters each call's fuel, links the host
+# functions. No WASI: a program reaches nothing but its host functions.
+wasmtime.workspace = true
+
+[lints]
+workspace = true
