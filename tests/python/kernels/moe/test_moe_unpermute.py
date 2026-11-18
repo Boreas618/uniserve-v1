@@ -26,7 +26,9 @@ wrong while every product is right:
 
 The reference accumulates in the operator's order and rounds once; rows are
 compared with `Tolerance::dot(top, f32, output)`, the operator's own bound for
-a `top`-term reduction, and the module must write nothing into its inputs.
+a `top`-term reduction of mixed-sign products, whose relative term is held
+against the output's largest magnitude because an element can cancel below
+its own terms; the module must write nothing into its inputs.
 """
 
 import ctypes
@@ -247,12 +249,17 @@ def test_the_combine_is_the_operators_sum_in_route_order(
             f"{int((~named).sum())} padding rows reached the output"
         )
     relative = bound(TOP, ROUNDOFF[out_element])
+    # The bound cancels (`Tolerance::cancels`): its relative term is taken
+    # against the output's largest |reference|, the order of `Σ|aᵢbᵢ|`, not
+    # against an element that cancelled below its own products.
+    peak = float(want[~empty].abs().max())
     error = (got - want).abs()[~empty]
     # A difference that is not a number is never inside a bound.
-    outside = ~(error <= relative * want.abs()[~empty])
+    outside = ~(error <= relative * peak)
     position = int(outside.reshape(-1).nonzero()[0]) if outside.any() else 0
     assert not bool(outside.any()), (
         f"{int(outside.sum())} of {error.numel()} combined values are outside "
-        f"rtol {relative:.3e}; max |out - reference| = "
-        f"{float(torch.nan_to_num(error).max()):.6g}; first at {position}"
+        f"rtol {relative:.3e} of the largest |reference| {peak:.6g}; max "
+        f"|out - reference| = {float(torch.nan_to_num(error).max()):.6g}; "
+        f"first at {position}"
     )
