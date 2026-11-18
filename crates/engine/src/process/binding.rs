@@ -404,6 +404,34 @@ fn rejected(what: &str, error: impl std::fmt::Display) -> Error {
     Error::Invalid(format!("{what}: {error}"))
 }
 
+/// Removes the profile at `path` a refused session start created, with the write-ahead log and
+/// shared-memory index SQLite keeps beside it (`path` with `-wal` and `-shm` appended) where they
+/// remain.
+///
+/// # Errors
+///
+/// When a file that exists cannot be removed.
+fn remove_artifact(path: &std::path::Path) -> Result<()> {
+    let sidecars = ["-wal", "-shm"].map(|suffix| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    });
+    for file in std::iter::once(path.to_path_buf()).chain(sidecars) {
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::transport_source(
+                    format!("removing {}", file.display()),
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The digest a set of weights is known by, from `names`, each weight's name (its key's text) in
 /// their load's order: what roots the prefix hash chains of the pages computed with them, so a
 /// page of another checkpoint never matches.
@@ -1093,6 +1121,12 @@ impl WeightBinding {
                         rank: number,
                     })
                     .and_then(ProfileAnswer::stopped)?;
+                // A refused start recorded nothing and its response names no file, so the file
+                // the rank created goes with it: the daemon starts the session once more under
+                // the same name after the cache made room, and that start creates it afresh.
+                if let Some(path) = &response.path {
+                    remove_artifact(path)?;
+                }
                 responses.push(proto::profile::RankStart {
                     refused: Some(format!(
                         "range_metrics holds {held} bytes of device storage for its range \
