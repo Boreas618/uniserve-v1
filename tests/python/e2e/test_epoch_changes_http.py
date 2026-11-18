@@ -24,11 +24,12 @@ alone, with the same usage.
   epoch alone. The deployment runs on one GPU, as two schedulers sharing
   their experts (``data_parallel_size = 2`` with expert parallelism), or as
   attention and expert workers exchanging through DeepEP.
-- A change of the graph buckets is another layout (``shrink``): the target
-  opens regions of its own, the serving engines give their device memory
-  back as their requests end, and the target grows into it, so no segment
-  is ever held by both epochs. A cached prompt reaches the target through
-  the host tier, where the write policy stored its blocks.
+- A change of the request slots (``max_running_requests``) is another
+  layout (``shrink``): the target opens regions of its own, the serving
+  engines give their device memory back as their requests end, and the
+  target grows into it, so no segment is ever held by both epochs. A cached
+  prompt reaches the target through the host tier, where the write policy
+  stored its blocks.
 - A change of the model's files keeps the layout and changes every key: the
   target loads its weights beside the serving epoch's and reads none of its
   blocks; the commit leaves its weights alone on the GPU, and a rollback,
@@ -107,10 +108,9 @@ OPTIONS: Config = {
         "decode_batch_sizes": [1, 2, 4, 8],
     },
 }
-# A change of another layout: graphs of other decode batch sizes.
-OTHER_LAYOUT: Config = {
-    "cuda_graph_config": {"decode_batch_sizes": [1, 2, 4, 8, 16]}
-}
+# A change of another layout: fewer request slots than the default 128, which
+# lay the epoch's device memory out anew (`proto::config::Layout`).
+OTHER_LAYOUT: Config = {"max_running_requests": 64}
 # The items of a GPU's quota an epoch holds while it serves.
 EPOCH_ITEMS = ("weights", "cache_segment", "graph_pool", "process")
 
@@ -766,7 +766,7 @@ def test_a_change_of_the_engine_alone_invalidates_nothing(
 def test_a_change_of_layout_moves_device_memory_and_reaches_the_host_tier(
     deployments: Deployments,
 ):
-    """A change of the graph buckets is another layout. The target opens
+    """A change of the request slots is another layout. The target opens
     regions of its own; the serving engines give their device memory back as
     their requests end or migrate, and the target grows into it, segment by
     segment, so no segment is held by the two epochs at once (R10). The
@@ -810,8 +810,8 @@ def test_a_change_of_layout_moves_device_memory_and_reaches_the_host_tier(
             assert found["host_hits"] == found["hits"], found
             _committed(trial)
 
-        graphs = admin.policy(server).config["cuda_graph_config"]
-        assert graphs["decode_batch_sizes"] == [1, 2, 4, 8, 16], graphs
+        configured = admin.policy(server).config
+        assert configured["max_running_requests"] == 64, configured
         _released(server, trial.epoch, engines_before)
         streaming.join()
         reference, reference_usage = _ask(server)

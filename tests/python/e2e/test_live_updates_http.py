@@ -14,8 +14,8 @@ directory it serves under (the ``runtime`` fixture).
   new requests wait while the package states ``paused`` and are served once
   it no longer does; a change of ``flush`` evicts the device copies of the
   cached blocks; scheduling limits change at the next step while a request
-  streams, and a change of the decode batch sizes is an epoch change under
-  the same stream, which commits once its trial (``update_config.trial``)
+  streams, and a change of the request slots is an epoch change under the
+  same stream, which commits once its trial (``update_config.trial``)
   passed; the manager applies a package to the node.
 - A hot restart, which a change of the daemon's own options starts, hands
   the deployment and its responses in flight to a successor daemon, and a
@@ -87,9 +87,9 @@ FAULT_TRIAL = "60s"
 OPTIONS = merged(updates.PROFILE, {"update_config": {"trial": TRIAL}})
 
 
-#: A change of the options that only a new epoch executes: graphs of other
-#: decode batch sizes.
-CHANGE = {"cuda_graph_config": {"decode_batch_sizes": [1, 2, 8]}}
+#: A change of the options that only a new epoch executes: fewer request slots
+#: than the default 128, which lay the epoch's device memory out anew.
+CHANGE = {"max_running_requests": 64}
 
 #: The options of a deployment whose KV cache takes the device storage its
 #: share leaves, rather than a fixed token count.
@@ -563,8 +563,8 @@ def test_a_serving_deployment_answers_its_admin_api(deployments: Deployments):
         assert after_flush == 0, after_flush
 
         # Scheduling limits change at the next step under a streaming
-        # request, and other decode batch sizes by an epoch change under the
-        # same stream.
+        # request, and the request slots by an epoch change under the same
+        # stream.
         stream = _streaming(server, name)
         limits = _apply(server, {"scheduler_config": {"max_batch": 4}})
         assert limits["effect"] == "step", limits
@@ -876,7 +876,7 @@ def _restart_while_streaming(
     assert ended.labels["update"] == str(both["revision"]), (ended, both)
     # The configuration is the target's from then on.
     served = admin.policy(server).config
-    assert served["cuda_graph_config"]["decode_batch_sizes"] == [1, 2, 8]
+    assert served["max_running_requests"] == 64, served
     assert served["admin_config"]["host"] == "127.0.0.1", served
     assert _ask(both_url, name, "Say hello.")
     updates.wait_for_end(previous)
