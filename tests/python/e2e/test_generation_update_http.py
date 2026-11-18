@@ -279,8 +279,13 @@ def _reapply(server: Server) -> httpx.Response:
 
 def _update(server: Server) -> int:
     """Apply the newly installed revisions as a generation update, answered
-    once it stood its trial and committed, and return when the store
-    recorded its commit (the daemon's clock, an event's time).
+    once it stood its trial and committed, and return the moment before the
+    second in which the store recorded its commit (the daemon's clock).
+
+    The store keeps a gauge's values by the second they fell in, which is
+    earlier than an event of that second: the leader records the update's
+    modules in the second of its commit or later, so a read after the
+    returned moment finds them.
     """  # noqa: D205
     before = admin.now(server)
     admin.revision(_reapply(server))
@@ -291,8 +296,11 @@ def _update(server: Server) -> int:
         phase=("committed", "abandoned", "rolled_back"),
     )
     assert update.fields["phase"] == "committed", update.fields
-    return update.time
+    return update.time - update.time % SECOND_NS - 1
 
+
+#: A second of the daemon's clock, in nanoseconds.
+SECOND_NS = 1_000_000_000
 
 #: The interfaces of a module set that are no kernel package: the engine and
 #: the scheduling policy (``proto::module``).
@@ -318,7 +326,7 @@ def epoch_record(server: Server, after: int = 0) -> Modules:
 
     The leader records a change's modules once the change converged, which
     is after its update committed: the record of an update is read with
-    `after` the time of its commit (:func:`_update`), which waits for it.
+    `after` the moment :func:`_update` returns, which waits for it.
     """  # noqa: D205
     running = {
         (
