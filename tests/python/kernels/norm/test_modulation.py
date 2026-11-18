@@ -174,6 +174,9 @@ def launch_modulated(kernels, operands, strides, width, block, eps, flags):
         HAS_UPDATE=flags["update"],
         FP8_OUTPUT=flags["fp8"],
         RETAIN=flags["retain"],
+        # The launch table's warps and options: no rounding fuses away.
+        num_warps=8 if width >= 2048 else 4,
+        enable_fp_fusion=False,
     )
 
 
@@ -194,6 +197,8 @@ def launch_gated(kernels, hidden, update, gate, indices, stride, width):
         rows,
         WIDTH=width,
         BLOCK=GATED_BLOCK,
+        # The launch table's options: the gated product rounds before the sum.
+        enable_fp_fusion=False,
     )
 
 
