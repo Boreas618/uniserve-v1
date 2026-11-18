@@ -133,6 +133,15 @@ pub fn hand(bytes: &[u8]) -> u64 {
 #[macro_export]
 macro_rules! export_policy {
     ($policy:ty) => {
+        /// The module's statement that it is a scheduling program and of the policy interface
+        /// version it was compiled against ([`crate::program::SECTION`]), which its hosts read
+        /// before they link it.
+        #[cfg(target_arch = "wasm32")]
+        #[used]
+        #[unsafe(link_section = "uniserve.program")]
+        static PROGRAM_SECTION: [u8; 5] =
+            $crate::program::section($crate::program::Kind::Scheduling, $crate::INTERFACE_VERSION);
+
         /// The policy of this module. `sched_init` fills it; see the module
         /// documentation for why one mutable slot is sound.
         static mut POLICY: ::core::option::Option<$policy> = ::core::option::Option::None;

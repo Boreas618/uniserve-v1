@@ -254,6 +254,9 @@ wasmtime = { version = "50.0.1", default-features = false, features = [
 ] }
 # The WebAssembly text assembler the policy host's tests build their fault modules with.
 wat = "1.263.0"
+# The WebAssembly reader the program host and the Build Server read a program module's custom
+# section with (`scheduling::program::SECTION`): the version wasmtime itself parses with.
+wasmparser = { version = "0.261.0", default-features = false, features = ["std"] }
 
 [workspace.lints.clippy]
 clone_on_ref_ptr = "warn"

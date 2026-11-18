@@ -14,6 +14,8 @@ serde_json.workspace = true
 # The runtime of the program modules: compiles them, meters each call's fuel, links the host
 # functions. No WASI: a program reaches nothing but its host functions.
 wasmtime.workspace = true
+# Reads the section a module states its kind and interface version in, before it is linked.
+wasmparser.workspace = true
 
 [lints]
 workspace = true

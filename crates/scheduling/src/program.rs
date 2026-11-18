@@ -26,6 +26,10 @@
 //! | `save` | `() -> u64` | | the program's state |
 //! | `restore` | `(ptr: u32, len: u32) -> u64` | a state `save` replied | `0`, or the text of why the state is not the program's type |
 //!
+//! The module also holds the custom section [`SECTION`], which states the program's [`Kind`]
+//! (from its `Input`) and the version of the interface it was compiled against: a host reads it
+//! before it links the module, so a package names a program's source and never its kind.
+//!
 //! Every message and reply is JSON of its type ([`crate::wire::encode`]) in a buffer of the
 //! module's linear memory; a reply is packed as `ptr << 32 | len` ([`crate::wire::pack`]), and
 //! the host copies it out and frees it. A program fails only by trapping: a panic, a message
@@ -56,8 +60,8 @@ use serde::de::DeserializeOwned;
 pub trait Program: Serialize + DeserializeOwned {
     /// What the package's `args` table for the program deserializes to.
     type Args: DeserializeOwned;
-    /// What one step reads.
-    type Input: DeserializeOwned;
+    /// What one step reads, which makes the program the [`Kind`] its input is read by.
+    type Input: Input;
     /// What one step gives.
     type Output: Serialize;
 
@@ -66,6 +70,117 @@ pub trait Program: Serialize + DeserializeOwned {
 
     /// Reads one input and gives one output.
     fn step(&mut self, input: &Self::Input) -> Self::Output;
+}
+
+/// The kinds of program, by where they run and what they read: a module states its kind
+/// ([`SECTION`]), so a package's `config.toml` names a program's source and never its kind.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// The leader daemon's control program: [`crate::control::State`] in, a configuration out.
+    Control,
+    /// The leader daemon's routing program: [`crate::routing::Routing`] in,
+    /// [`crate::routing::Route`] out.
+    Routing,
+    /// Every Storage Server's KV program: [`crate::kv::Hook`] in, [`crate::kv::Action`] out.
+    Kv,
+    /// Every scheduler's scheduling policy ([`crate::policy::Policy`]).
+    Scheduling,
+}
+
+impl Kind {
+    /// Every kind.
+    pub const ALL: [Kind; 4] = [Kind::Control, Kind::Routing, Kind::Kv, Kind::Scheduling];
+
+    /// The kind's name, as `events` and the configuration's reports name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Control => "control",
+            Kind::Routing => "routing",
+            Kind::Kv => "kv",
+            Kind::Scheduling => "scheduling",
+        }
+    }
+
+    /// The kind's number in a module's [`SECTION`].
+    pub const fn code(self) -> u8 {
+        match self {
+            Kind::Control => 1,
+            Kind::Routing => 2,
+            Kind::Kv => 3,
+            Kind::Scheduling => 4,
+        }
+    }
+
+    /// The kind numbered `code` in a module's [`SECTION`]; `None` for a number of no kind.
+    pub fn of_code(code: u8) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|kind| kind.code() == code)
+    }
+
+    /// The version of the interface a program of this kind speaks: [`INTERFACE_VERSION`], or the
+    /// scheduling policy interface's own ([`crate::INTERFACE_VERSION`]).
+    pub fn interface_version(self) -> u32 {
+        match self {
+            Kind::Control | Kind::Routing | Kind::Kv => INTERFACE_VERSION,
+            Kind::Scheduling => crate::INTERFACE_VERSION,
+        }
+    }
+}
+
+/// What a program reads in a step: the input of one kind of program.
+pub trait Input: DeserializeOwned {
+    /// The kind of program that reads it.
+    const KIND: Kind;
+}
+
+impl Input for crate::control::State {
+    const KIND: Kind = Kind::Control;
+}
+
+impl Input for crate::routing::Routing {
+    const KIND: Kind = Kind::Routing;
+}
+
+impl Input for crate::kv::Hook {
+    const KIND: Kind = Kind::Kv;
+}
+
+/// A KV program's handoff hook is a program of its own inside the KV program ([`crate::kv::Kv`]).
+impl Input for crate::kv::Handoff {
+    const KIND: Kind = Kind::Kv;
+}
+
+/// A KV program's tiering hook is a program of its own inside the KV program ([`crate::kv::Kv`]).
+impl Input for crate::kv::Tiering {
+    const KIND: Kind = Kind::Kv;
+}
+
+/// The version of the program interface of the control, routing and KV programs: the exports,
+/// the host functions and the messages of this module and of [`crate::control`],
+/// [`crate::routing`] and [`crate::kv`]. Every change that is not an addition raises it.
+pub const INTERFACE_VERSION: u32 = 1;
+
+/// The custom section of a program module that states what it is: its [`Kind`]'s code, then the
+/// version of the interface it was compiled against as a little-endian `u32` ([`section`]). The
+/// export macros write it ([`export!`](crate::export), [`export_policy!`](crate::export_policy));
+/// a host reads it before it links the module, and a Build Server records it.
+pub const SECTION: &str = "uniserve.program";
+
+/// The bytes of a module's [`SECTION`] for a program of `kind` compiled against `version`.
+pub const fn section(kind: Kind, version: u32) -> [u8; 5] {
+    let version = version.to_le_bytes();
+    [kind.code(), version[0], version[1], version[2], version[3]]
+}
+
+/// The kind and interface version a module's [`SECTION`] states; `None` when the bytes are not
+/// such a statement.
+pub fn stated(bytes: &[u8]) -> Option<(Kind, u32)> {
+    let [code, a, b, c, d] = *bytes else {
+        return None;
+    };
+    Some((Kind::of_code(code)?, u32::from_le_bytes([a, b, c, d])))
 }
 
 /// The import module of the host functions.
@@ -156,6 +271,16 @@ macro_rules! export {
             fn program<P: $crate::program::Program>() {}
             program::<$program>();
         };
+
+        // The module's statement of its kind and interface version, which its host reads before
+        // it links it.
+        #[cfg(target_arch = "wasm32")]
+        #[used]
+        #[unsafe(link_section = "uniserve.program")]
+        static PROGRAM_SECTION: [u8; 5] = $crate::program::section(
+            <<$program as $crate::program::Program>::Input as $crate::program::Input>::KIND,
+            $crate::program::INTERFACE_VERSION,
+        );
 
         #[cfg(target_arch = "wasm32")]
         const _: () = {

@@ -10,8 +10,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use program::{
-    Budget, Call, Config, Control, Error, Filter, Function, Host, Instance, Level, Module, Query,
-    Reason, Record, Report, State,
+    Budget, Call, Config, Control, Error, Filter, Function, Host, Instance, Kind, Level, Module,
+    Query, Reason, Record, Report, State,
 };
 use scheduling::kv::{
     Directory, Found, Handoff, Holding, Hook, Key, Location, Move, Node, Path, Tier, Tiering,
@@ -389,8 +389,31 @@ fn a_routing_program_routes_with_log_alone() {
     );
     assert!(logs.lock().unwrap().is_empty());
 
-    // A control program imports `uniserve.stats`, which a routing host does not offer.
+    // A control program is not linked as a routing program.
     let error = Module::<Logger>::new(&wasm("chunk")).err();
+    assert!(matches!(error, Some(Error::Load(_))), "{error:?}");
+}
+
+/// Each module states its kind of program, which its input decides, and the version of the
+/// interface it speaks; a host links only the kinds it runs.
+#[test]
+fn a_module_states_its_kind() {
+    let version = scheduling::program::INTERFACE_VERSION;
+    assert_eq!(program::kind(&wasm("chunk")), Ok((Kind::Control, version)));
+    assert_eq!(
+        program::kind(&wasm("fastest")),
+        Ok((Kind::Routing, version))
+    );
+    assert_eq!(program::kind(&wasm("kv")), Ok((Kind::Kv, version)));
+    assert_eq!(
+        Module::<Leader>::control(&wasm("chunk")).unwrap().kind(),
+        Kind::Control
+    );
+
+    // A routing program is no control program, and a module of no kind is no program.
+    let error = Module::<Leader>::control(&wasm("fastest")).err();
+    assert!(matches!(error, Some(Error::Load(_))), "{error:?}");
+    let error = program::kind(b"\0asm\x01\0\0\0").err();
     assert!(matches!(error, Some(Error::Load(_))), "{error:?}");
 }
 

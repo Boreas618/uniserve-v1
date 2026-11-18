@@ -43,7 +43,7 @@ use std::sync::OnceLock;
 pub use host::{Control, Host};
 pub use instance::{Budget, Call, Error, Instance, Reason, Usage};
 pub use scheduling::control::{Config, Filter, Function, Query, Record, Report, State};
-pub use scheduling::program::Level;
+pub use scheduling::program::{Kind, Level};
 
 /// The process's one wasmtime engine, which compiles and runs every program module.
 ///
@@ -69,37 +69,107 @@ pub fn engine() -> Result<&'static wasmtime::Engine, Error> {
     engine.as_ref().map_err(|error| Error::Load(error.clone()))
 }
 
+/// The kind of program the module `bytes` is and the version of the interface it was compiled
+/// against, as its section states them (`scheduling::program::SECTION`): what decides which host
+/// runs it and with which host functions.
+///
+/// # Errors
+///
+/// [`Error::Load`] when the bytes are no module, or it states no kind or states it twice.
+pub fn kind(bytes: &[u8]) -> Result<(Kind, u32), Error> {
+    let mut stated = None;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        let payload =
+            payload.map_err(|error| Error::Load(format!("the bytes are not a module: {error}")))?;
+        let wasmparser::Payload::CustomSection(section) = payload else {
+            continue;
+        };
+        if section.name() != scheduling::program::SECTION {
+            continue;
+        }
+        if stated.is_some() {
+            return Err(Error::Load(format!(
+                "the module states its kind twice (`{}`)",
+                scheduling::program::SECTION
+            )));
+        }
+        stated = Some(scheduling::program::stated(section.data()).ok_or_else(|| {
+            Error::Load(format!(
+                "the module's `{}` section states no kind of program",
+                scheduling::program::SECTION
+            ))
+        })?);
+    }
+    stated.ok_or_else(|| {
+        Error::Load(format!(
+            "the module states no kind (`{}`): it was not built with the program SDK's export \
+             macros",
+            scheduling::program::SECTION
+        ))
+    })
+}
+
 /// A program module, compiled by [`engine`] and linked with the host functions its embedder
 /// `H` answers; instantiated by [`Instance::new`] and [`Instance::restore`].
 ///
 /// Cloning shares the compiled code.
 pub struct Module<H: 'static> {
     pre: wasmtime::InstancePre<instance::Context<H>>,
+    kind: Kind,
 }
 
 impl<H: 'static> Clone for Module<H> {
     fn clone(&self) -> Self {
         Self {
             pre: self.pre.clone(),
+            kind: self.kind,
         }
     }
 }
 
+impl<H: 'static> Module<H> {
+    /// The kind of program the module states it is.
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+}
+
 impl<H: Host> Module<H> {
-    /// Compiles `bytes`, a wasm32 module, as a routing, KV or other program: linked with
-    /// `uniserve.log` only.
+    /// Compiles `bytes`, a wasm32 module of a routing or KV program: linked with `uniserve.log`
+    /// only.
     ///
     /// # Errors
     ///
-    /// [`Error::Load`] when the bytes are not a module, it imports anything else, or it lacks
-    /// the memory or an export of the program interface, or has one of another signature.
+    /// [`Error::Load`] when the bytes are not a module, it states another kind ([`kind`]) or
+    /// another version of the program interface, it imports anything else, or it lacks the
+    /// memory or an export of the program interface, or has one of another signature.
     pub fn new(bytes: &[u8]) -> Result<Self, Error> {
         let mut linker = wasmtime::Linker::new(engine()?);
         host::log(&mut linker)?;
-        Self::link(bytes, &linker)
+        Self::link(bytes, &linker, &[Kind::Routing, Kind::Kv])
     }
 
-    fn link(bytes: &[u8], linker: &wasmtime::Linker<instance::Context<H>>) -> Result<Self, Error> {
+    fn link(
+        bytes: &[u8],
+        linker: &wasmtime::Linker<instance::Context<H>>,
+        kinds: &[Kind],
+    ) -> Result<Self, Error> {
+        let (kind, version) = kind(bytes)?;
+        if !kinds.contains(&kind) {
+            return Err(Error::Load(format!(
+                "the module is a {} program, which this host does not run",
+                kind.name()
+            )));
+        }
+        if version != kind.interface_version() {
+            return Err(Error::Load(format!(
+                "the module speaks version {version} of the {} program interface and this host \
+                 version {}",
+                kind.name(),
+                kind.interface_version()
+            )));
+        }
+
         let module = wasmtime::Module::new(engine()?, bytes)
             .map_err(|error| Error::Load(format!("the bytes are not a program module: {error}")))?;
         instance::check(&module)?;
@@ -107,7 +177,7 @@ impl<H: Host> Module<H> {
         let pre = linker
             .instantiate_pre(&module)
             .map_err(|error| Error::Load(format!("the module does not link: {error}")))?;
-        Ok(Self { pre })
+        Ok(Self { pre, kind })
     }
 }
 
@@ -122,6 +192,6 @@ impl<H: Control> Module<H> {
         let mut linker = wasmtime::Linker::new(engine()?);
         host::log(&mut linker)?;
         host::control(&mut linker)?;
-        Self::link(bytes, &linker)
+        Self::link(bytes, &linker, &[Kind::Control])
     }
 }
