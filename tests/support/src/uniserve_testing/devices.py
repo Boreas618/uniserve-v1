@@ -11,10 +11,11 @@ of the user's in the system's temporary directory, so the concurrent runs
 of one user on one host respect one another; a host lock beside them is held
 shared by every case and exclusively by a case that observes the whole host.
 A lease is taken under an allocator lock that one case at a time holds: it
-takes the free GPUs it finds and blocks on each further one it needs until
-its holder releases it, so a case that needs many GPUs is not starved by
-cases that need few, and no case polls. A lease's holder never needs the
-allocator lock to release, so a blocked allocator always proceeds.
+takes the free GPUs it finds and then whichever further GPUs their holders
+release first, trying every GPU it lacks each :data:`POLL_S` seconds, so a
+case that needs many GPUs is not starved by cases that need few, and a GPU
+that frees is taken while the case waits on another. A lease's holder never
+needs the allocator lock to release, so a waiting allocator always proceeds.
 """
 
 from __future__ import annotations
@@ -23,12 +24,17 @@ import dataclasses
 import fcntl
 import os
 import tempfile
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import IO
 
 import pynvml
+
+#: How often, in seconds, a lease short of GPUs tries the ones it lacks: a
+#: case holds its GPUs for minutes, so a fraction of a second is negligible.
+POLL_S = 0.5
 
 
 def host_devices() -> tuple[int, ...]:
@@ -96,26 +102,26 @@ def lease_gpus(
         )
         held: list[int] = []
         with _lock(directory / "allocator.lock", fcntl.LOCK_EX):
-            # The free GPUs first, without waiting.
-            for device in devices:
+            # The free GPUs, then whichever further GPU its holder releases
+            # first: waiting on one GPU in particular would leave another
+            # that frees meanwhile idle, and every case queued behind this
+            # one with it.
+            while True:
+                for device in devices:
+                    if len(held) == wanted:
+                        break
+                    if device in held:
+                        continue
+                    try:
+                        handle = _lock(
+                            directory / f"gpu{device}.lock",
+                            fcntl.LOCK_EX | fcntl.LOCK_NB,
+                        )
+                    except BlockingIOError:
+                        continue
+                    stack.callback(handle.close)
+                    held.append(device)
                 if len(held) == wanted:
                     break
-                try:
-                    handle = _lock(
-                        directory / f"gpu{device}.lock",
-                        fcntl.LOCK_EX | fcntl.LOCK_NB,
-                    )
-                except BlockingIOError:
-                    continue
-                stack.callback(handle.close)
-                held.append(device)
-            # Then each further one as its holder releases it.
-            for device in devices:
-                if len(held) == wanted:
-                    break
-                if device in held:
-                    continue
-                handle = _lock(directory / f"gpu{device}.lock", fcntl.LOCK_EX)
-                stack.callback(handle.close)
-                held.append(device)
+                time.sleep(POLL_S)
         yield Lease(tuple(sorted(held)))
