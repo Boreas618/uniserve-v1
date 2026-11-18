@@ -342,7 +342,10 @@ message Consumed {
 message Takeover {
   // The events the response's previous consumer took in all: the engine
   // sends the new consumer the events after this position, then the ones
-  // the request goes on producing.
+  // the request goes on producing. The position counts as the consumer's
+  // `Consumed` report of it, which the new consumer's reports go on from: a
+  // report of it the previous consumer sends on its own connection may
+  // arrive before the takeover or after it, and one after it is ignored.
   uint64 events = 1;
   // The engine's identity of the request (`Accepted.engine_request`).
   uint64 engine_request = 2;

@@ -24,7 +24,10 @@
 //! the terminal event. A `Takeover` names a request by the engine's identity, moves its stream to
 //! the front it arrives on under the identity that front gives it, and replays the events past
 //! the position it names; a position older than the journal is refused by name rather than served
-//! as a stream with a hole in it.
+//! as a stream with a hole in it. The position a takeover names is what the previous consumer
+//! took, so it counts as that consumer's last `Consumed` report: the credit the scheduler holds
+//! back does not depend on whether the previous front's own last report arrives before the
+//! takeover or after it.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -333,12 +336,8 @@ impl MainProcess {
                 let Some(stream) = self.streams.get_mut(&id) else {
                     return;
                 };
-                let taken = stream.consume(consumed.events);
-                if taken == 0 {
-                    return;
-                }
-                let credit = u32::try_from(taken).unwrap_or(u32::MAX);
-                (stream.scheduler, Message::Consumed(id, credit))
+                let (scheduler, taken) = (stream.scheduler, stream.consume(consumed.events));
+                return self.return_credit(id, scheduler, taken);
             }
             Kind::Takeover(_) => return,
             Kind::Acknowledge(acknowledge) => {
@@ -354,6 +353,18 @@ impl MainProcess {
         };
         if let Some(inbox) = self.inbox_of(scheduler) {
             let _ = inbox.send(message);
+        }
+    }
+
+    /// Returns `taken` events of request `id`'s credit to scheduler `scheduler`, which serves
+    /// it: the events its consumer took since the position last counted. None returns nothing.
+    fn return_credit(&self, id: RequestId, scheduler: usize, taken: u64) {
+        if taken == 0 {
+            return;
+        }
+        let credit = u32::try_from(taken).unwrap_or(u32::MAX);
+        if let Some(inbox) = self.inbox_of(scheduler) {
+            let _ = inbox.send(Message::Consumed(id, credit));
         }
     }
 
@@ -396,6 +407,14 @@ impl MainProcess {
     /// it the identity `local`, from position `from`: the stream moves to `front` under `local`
     /// and the events past `from` are written there again; a position older than what is kept is
     /// refused by name.
+    ///
+    /// `from` is the position the previous consumer took the stream to, so the takeover counts
+    /// it as consumed and returns the credit of the events taken past the last `Consumed` report
+    /// to the scheduler. The previous consumer's own report of that position travels on its own
+    /// front, which no order binds to this one: arriving first, it leaves the takeover nothing
+    /// to return; arriving after, it names an identity the stream no longer carries and is
+    /// dropped. Either way the scheduler gets the credit once, and the new consumer, which counts
+    /// its reports from `from`, never waits on credit that only the dropped report would return.
     fn take_over(&mut self, front: usize, local: RequestId, id: RequestId, from: u64) {
         let Some(stream) = self.streams.get_mut(&id) else {
             // A request that ended before its takeover, or a front that named another identity:
@@ -414,11 +433,13 @@ impl MainProcess {
                 stream.front = front;
                 stream.local = local;
                 self.named.insert((front, local), id);
+                let (scheduler, taken) = (stream.scheduler, stream.consume(from));
                 for (mut event, media) in replay {
                     // The journal holds the events as the previous front read them.
                     event.request = local.0;
                     self.send(front, from_engine::Kind::Event(event), media.as_ref());
                 }
+                self.return_credit(id, scheduler, taken);
                 tracing::info!(request = id.0, front, from, "a request was taken over");
             }
             Err(refusal) => {
@@ -561,6 +582,16 @@ impl MainProcess {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixStream;
+    use std::sync::Mutex;
+
+    use arc_swap::ArcSwap;
+    use crossbeam_channel::Receiver;
+    use proto::request::wire::{command, to_engine};
+    use service::Connection;
+
+    use super::super::start::{Engine, SchedulerThread, step_budget};
+    use super::super::{Input, shapes};
     use super::*;
 
     /// An event of request 9, distinct by its message.
@@ -630,6 +661,176 @@ mod tests {
         stream.record(event("6"), None);
         assert_eq!(messages(stream.replay(5).unwrap()), ["6"]);
         assert!(stream.replay(4).is_err());
+    }
+
+    /// The engine's identity of the request a hot restart hands over, and the identities its
+    /// launching daemon's front and its successor's give it.
+    const ENGINE: RequestId = RequestId(1);
+    const PREDECESSOR: RequestId = RequestId(4);
+    const SUCCESSOR: RequestId = RequestId(1);
+
+    /// The event window both daemons state in their welcome.
+    const WINDOW: u32 = 64;
+
+    /// A control thread of the fixture's launch serving over `front` and `process`, whose engine
+    /// runs one scheduler; the returned receiver reads what the control thread sends that
+    /// scheduler.
+    fn serving(front: UnixStream, process: UnixStream) -> (MainProcess, Receiver<Message>) {
+        let launch = testkit::serving::launch();
+        let config = &launch.engine_config;
+        let mut main = MainProcess::new(
+            Connection::new(front).unwrap(),
+            std::num::NonZeroU32::new(WINDOW).unwrap(),
+            Connection::new(process).unwrap(),
+            launch.clone(),
+        )
+        .unwrap();
+
+        // An engine of no rank: one scheduler, whose inbox the test reads.
+        let (inbox, mailbox) = crossbeam_channel::unbounded();
+        let (_output, outputs) = crossbeam_channel::unbounded();
+        let limits = proto::request::GenerationLimits::default();
+        let ceilings = crate::scheduler::policy::ceilings([], &config.scheduler.policy_budget);
+        let scheduling = proto::config::SchedulerConfig::of(
+            config,
+            config.scheduler.max_batch.get(),
+            step_budget(config, &ceilings),
+            Vec::new(),
+        );
+        main.engine = Some(Engine {
+            schedulers: vec![SchedulerThread {
+                inbox,
+                outputs,
+                shadow: Arc::default(),
+                thread: std::thread::spawn(|| {}),
+            }],
+            graphs: shapes::Bounds::of(Vec::new(), ceilings, limits.clone(), scheduling).scheduling,
+            limits,
+            capacities: Vec::new(),
+            ceilings,
+            tuning: Arc::new(ArcSwap::from_pointee(proto::config::Tuning::of(
+                config,
+                launch.revision,
+            ))),
+            max_running_requests: config.max_running_requests.get(),
+            served: Arc::new(crate::batch::Generations::new(1, 1)),
+            session: Box::new(|| Ok(())),
+            workers: Vec::new(),
+            groups: None,
+            binding: Arc::new(crate::process::binding::WeightBinding::new(
+                Vec::new(),
+                crate::process::binding::Target::default(),
+                Vec::new(),
+            )),
+            head: None,
+            build: None,
+            kernels: proto::module::Packages::new(),
+            remotes: Vec::new(),
+            upstream: None,
+            prepared: None,
+            liveness: None,
+            counters: Arc::new(Mutex::new(None)),
+            streams: Arc::new(Vec::new()),
+            video: Vec::new(),
+        });
+        (main, mailbox)
+    }
+
+    /// The frame of front `front` that reports `events` of the request it names `local`
+    /// consumed.
+    fn consumed(front: usize, local: RequestId, events: u64) -> Input {
+        let kind = command::Kind::Consumed(wire::Consumed { events });
+        frame(front, local, kind)
+    }
+
+    /// The frame of front `front` for the request it names `local`, of kind `kind`.
+    fn frame(front: usize, local: RequestId, kind: command::Kind) -> Input {
+        let command = wire::Command {
+            request: local.0,
+            kind: Some(kind),
+        };
+        let frame = wire::ToEngine {
+            kind: Some(to_engine::Kind::Command(command)),
+        };
+        Input::Frame(front, Box::new(frame), Vec::new())
+    }
+
+    /// The scheduler writes `count` token events of the request.
+    fn generate(main: &mut MainProcess, count: usize) {
+        let token = Event::TextToken {
+            id: 7,
+            logprob: None,
+        };
+        main.events(vec![(ENGINE, token); count]);
+    }
+
+    /// The credit the control thread returned the scheduler for the request so far.
+    fn credit(mailbox: &Receiver<Message>) -> u64 {
+        mailbox
+            .try_iter()
+            .map(|message| match message {
+                Message::Consumed(ENGINE, events) => u64::from(events),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// A hot restart hands a request's stream over at the position the predecessor's consumer
+    /// took it to, 40, while the engine last counted the report of 32: the predecessor reports
+    /// every 32 events. The successor counts its reports from 40, and the predecessor's report of
+    /// 40 travels on its own front, which no order binds to the successor's. Whichever arrives
+    /// first, and whenever the predecessor's front closes, the scheduler gets the credit of the
+    /// 40 events back once, and the successor's reports return the credit of each event past
+    /// them: a window of 64 events never holds the 40 the predecessor took.
+    #[test]
+    fn a_takeover_counts_its_position_as_consumed_whichever_front_reports_first() {
+        for report_first in [false, true] {
+            let (engine_front, _predecessor) = UnixStream::pair().unwrap();
+            let (engine_process, _daemon_process) = UnixStream::pair().unwrap();
+            let (mut main, mailbox) = serving(engine_front, engine_process);
+            main.streams
+                .insert(ENGINE, RequestStream::new(0, PREDECESSOR, 0));
+            main.named.insert((0, PREDECESSOR), ENGINE);
+
+            // The predecessor's consumer takes 40 events and reports 32 of them.
+            generate(&mut main, 40);
+            main.input(consumed(0, PREDECESSOR, 32));
+            assert_eq!(credit(&mailbox), 32);
+
+            // The successor attaches and takes the stream over at 40; the predecessor's report
+            // of 40 arrives before or after its takeover; then the predecessor's front closes.
+            let (engine_successor, _successor) = UnixStream::pair().unwrap();
+            let successor = Connection::new(engine_successor).unwrap();
+            let window = std::num::NonZeroU32::new(WINDOW).unwrap();
+            main.attached("successor", Ok((successor, window)));
+            let takeover = command::Kind::Takeover(wire::Takeover {
+                events: 40,
+                engine_request: ENGINE.0,
+            });
+            if report_first {
+                main.input(consumed(0, PREDECESSOR, 40));
+            }
+            main.input(frame(1, SUCCESSOR, takeover));
+            if !report_first {
+                main.input(consumed(0, PREDECESSOR, 40));
+            }
+            main.input(Input::FrontClosed(0));
+            assert_eq!(
+                credit(&mailbox),
+                8,
+                "the predecessor reported first: {report_first}"
+            );
+
+            // The request goes on streaming to the successor, whose reports count from 40.
+            generate(&mut main, 32);
+            main.input(consumed(1, SUCCESSOR, 72));
+            assert_eq!(
+                credit(&mailbox),
+                32,
+                "the predecessor reported first: {report_first}"
+            );
+            assert_eq!(main.streams[&ENGINE].front, 1);
+        }
     }
 
     /// A request that names a scheduler of the engine goes to it, whatever the load.

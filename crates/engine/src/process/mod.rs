@@ -562,9 +562,17 @@ impl MainProcess {
                 Some(wire::to_engine::Kind::ConditionPart(_)) | None => {}
             },
             Input::FrontClosed(front) => {
+                // A hot restart's successor may have taken every stream of the front over
+                // already: only the streams still written to it wait for a takeover.
+                let streamed = self
+                    .streams
+                    .values()
+                    .filter(|stream| stream.front == front)
+                    .count();
                 tracing::warn!(
                     front,
-                    "a daemon front closed; its requests wait for a takeover"
+                    streamed,
+                    "a daemon front closed; the requests it still streams wait for a takeover"
                 );
                 if let Some(slot) = self.fronts.get_mut(front)
                     && let Some(connection) = slot.take()
