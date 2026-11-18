@@ -16,7 +16,7 @@ All three cells also record `checkpoint = "Qwen3-30B-A3B"`; the column shows the
 
 The BF16 and FP8 KV cells serve the Qwen3-MoE checkpoint at `/workspace/models/Qwen3-30B-A3B`. The NVFP4 cell serves a local copy of `nvidia/Qwen3-30B-A3B-NVFP4`, a ModelOpt unified export whose own `config.json` declares its quantization, so a host without the export cannot run the NVFP4 cell. The cells differ in the checkpoint path and the KV cache dtype, and the FP8 KV cell also names an attention provider (see [FP8 KV pages](#fp8-kv-pages)). Each cell's `provenance` is its identity in the comparison.
 
-No cell states `dtype` or `quantization`: the checkpoint's own representation is used, and `quantization_config` and its precision presets are retired in favour of the checkpoint representation and the `quantization` field. The serving capacity is build configuration: `--mem-fraction-static 0.80` and `kv_cache_config.max_tokens = 65536`, and a host may lower either without making a cell's two runs incomparable, as long as both runs of the cell state the same values.
+No cell states `dtype` or `quantization`: the checkpoint's own representation is used, and `quantization_config` and its precision presets are retired in favour of the checkpoint representation and the `quantization` field. The serving capacity is build configuration: `mem_fraction_static = 0.80` and `kv_cache_config.max_tokens = 65536`, and a host may lower either without making a cell's two runs incomparable, as long as both runs of the cell state the same values.
 
 ## Dataset and sample set
 
@@ -59,7 +59,7 @@ The factor is the two-sided 95% normal quantile the evaluator computes (Wichura'
 The FP8 KV cell is the BF16 checkpoint with `kv_cache_config.dtype = float8_e4m3fn`. It is the only cell that names an attention provider, and **the two implementations name different ones**, because a provider is a name in each implementation's own registry:
 
 - **The baseline** (the Python worker's tree) uses `torch`, the only provider that reads per-block FP8 pages at head dimension 128; the automatic selection raises for them, and every native paged provider refuses a per-block FP8 cache. Its reference run states `--set 'attention_backend="torch"'`.
-- **The candidate** reads the planes in its own attention layer, not through a provider: `nn::modules::Attention::forward_paged` writes and reads the layer's pages through `nn::functional::kv_write_` and `nn::functional::paged_attention`, which accept a cache whose two planes are both `F8E4M3` over a BF16 compute type (`crates/nn/src/functional/attention.rs:808-826`) and require each FP8 page's scale (`page_scale`, `:461-501`), and the model's attention is always that paged operator. `--set attention_backend` does not choose a provider on this side: the option (default `"auto"`, `crates/daemon/src/options/mod.rs:336`) names the package of the `paged_attention` operator in the epoch's module set (`attention_packages`, `crates/daemon/src/epoch.rs:656-690`), and `auto` names none, so the Build Server selects for each kernel key the package of highest priority that declares it. Of the operator's two packages, `trtllm` reads a cache of the queries' own type only, and `triton` (`crates/ops/kernels/paged_attention/triton/package.toml`) is the one that reads E4M3 planes with their page scales, so `auto` selects `triton` for this cell. The cell therefore states `auto`, a name the path accepts, rather than a provider name; `torch`, the baseline's, is not one of the candidate's attention packages.
+- **The candidate** reads the planes in its own attention layer, not through a provider: `nn::modules::Attention::forward_paged` writes and reads the layer's pages through `nn::functional::kv_write_` and `nn::functional::paged_attention`, which accept a cache whose two planes are both `F8E4M3` over a BF16 compute type (`crates/nn/src/functional/attention.rs:808-826`) and require each FP8 page's scale (`page_scale`, `:461-501`), and the model's attention is always that paged operator. `attention_backend` does not choose a provider on this side: the option (unset by default, `crates/daemon/src/config/mod.rs`) names the package of the `paged_attention` operator in the epoch's module set (`attention_packages`, `crates/daemon/src/epoch.rs:656-690`), and an unset option names none, so the Build Server selects for each kernel key the package of highest priority that declares it. Of the operator's two packages, `trtllm` reads a cache of the queries' own type only, and `triton` (`crates/ops/kernels/paged_attention/triton/package.toml`) is the one that reads E4M3 planes with their page scales, so `auto` selects `triton` for this cell. The cell therefore states `auto`, a name the path accepts, rather than a provider name; `torch`, the baseline's, is not one of the candidate's attention packages.
 
 The BF16 and NVFP4 cells name no attention backend, so each implementation selects the provider it has.
 
@@ -67,27 +67,45 @@ The BF16 and NVFP4 cells name no attention backend, so each implementation selec
 
 Both sides run the evaluator of this checkout, `tools/eval`; only the server each run starts differs. The reference side is a **second checkout of the baseline tree**, `git worktree add "$HOME/gsm8k-reference" f1de185a2` with its own `uv sync`, so the two implementations never share an environment: the daemon resolves its other processes through `$VIRTUAL_ENV/bin/uniserve`, so each server runs with its own tree's environment. The candidate side installs its root package's release binary into this checkout's environment, and `cmp` proves the installed copy is the build; `--help` does not.
 
-A cell's point is written at use from the cell's values in [Checkpoint and cells](#checkpoint-and-cells); `cell` below writes it for one side, the server command naming that side's executable and environment:
+A cell's point is written at use from the cell's values in [Checkpoint and cells](#checkpoint-and-cells); `cell` below writes it for one side, the server command naming that side's executable and environment. Both sides serve the same options, one policy package per cell and side: the candidate serves the package's directory, and the reference tree, whose `serve` reads its options from a configuration file, the package's `config.toml` (`--config`):
 
 ```bash
 cargo build --release -p eval        # target/release/uniserve-eval
 EVAL=$PWD/target/release/uniserve-eval
 GSM8K=                               # a local copy of the test split, or empty to download it
 
-# cell NAME CHECKPOINT PRECISION KV_DTYPE TREE [ATTENTION]: the profile of one cell's run, on
-# the server of TREE (the reference worktree or this checkout), with the attention provider
-# ATTENTION when it is given.
+# cell NAME CHECKPOINT PRECISION KV_DTYPE SIDE [ATTENTION]: the profile of one cell's run on SIDE
+# (reference or candidate), on the server of that side's tree, with the attention provider ATTENTION
+# when it is given. Its policy package is artifacts/qwen3_moe/packages/SIDE/NAME.
 cell() {
-  local attention=
-  [ -n "${6:-}" ] && attention="\"--set\", 'attention_backend=\"$6\"', "
+  local package=$PWD/artifacts/qwen3_moe/packages/$5/$1 tree=$PWD attention= command
+  [ -n "${6:-}" ] && attention="attention_backend = \"$6\""
+  mkdir -p "$package"
+  cat > "$package/config.toml" <<EOF
+model_dir = "$2"
+served_model_name = "Qwen3-30B-A3B"
+tensor_parallel_size = 1
+max_running_requests = 64
+max_num_batched_tokens = 16384
+mem_fraction_static = 0.80
+$attention
+admin_config = { host = "127.0.0.1", port = 18081 }
+scheduler_config = { chunked_prefill_size = 16384 }
+kv_cache_config = { max_tokens = 65536, block_size = 64, dtype = "$4" }
+EOF
+  command="\"$tree/.venv/bin/uniserve\", \"serve\", \"$package\""
+  if [ "$5" = reference ]; then
+    tree=$REFERENCE
+    command="\"$tree/.venv/bin/uniserve\", \"serve\", \"--config\", \"$package/config.toml\""
+  fi
   cat <<EOF
 [servers.$1]
 host = "127.0.0.1"
 port = 18081
-command = ["$5/.venv/bin/uniserve", "serve", "--model-dir", "$2", "--served-model-name", "Qwen3-30B-A3B", "--host", "127.0.0.1", "--port", "18081", "--tensor-parallel-size", "1", "--max-running-requests", "64", "--set", "max_num_batched_tokens=16384", "--set", "scheduler_config.chunked_prefill_size=16384", "--set", "kv_cache_config.max_tokens=65536", "--set", "kv_cache_config.block_size=64", "--set", 'kv_cache_config.dtype="$4"', $attention"--mem-fraction-static", "0.80"]
+command = [$command]
 [servers.$1.environment]
 CUDA_VISIBLE_DEVICES = "0"
-VIRTUAL_ENV = "$5/.venv"
+VIRTUAL_ENV = "$tree/.venv"
 
 [benchmarks.$1]
 server = "$1"
@@ -111,14 +129,14 @@ cmp target/release/uniserve .venv/bin/uniserve   # silent: the installed copy is
 BF16=/workspace/models/Qwen3-30B-A3B
 NVFP4=<local directory of the NVFP4 export>
 for side in reference candidate; do
-  tree=$REFERENCE fp8=torch
+  fp8=torch
   # The candidate reads FP8 pages in its own attention layer and names no provider.
-  [ $side = candidate ] && tree=$PWD fp8=auto
+  [ $side = candidate ] && fp8=
   out=$PWD/artifacts/qwen3_moe/gsm8k-$side
   mkdir -p "$out"
-  cell qwen3-moe-gsm8k-bf16 $BF16 bfloat16 bfloat16 $tree > "$out/bf16.toml"
-  cell qwen3-moe-gsm8k-nvfp4 $NVFP4 nvfp4 bfloat16 $tree > "$out/nvfp4.toml"
-  cell qwen3-moe-gsm8k-bf16-fp8-kv $BF16 bfloat16 float8_e4m3fn $tree $fp8 > "$out/fp8-kv.toml"
+  cell qwen3-moe-gsm8k-bf16 $BF16 bfloat16 bfloat16 $side > "$out/bf16.toml"
+  cell qwen3-moe-gsm8k-nvfp4 $NVFP4 nvfp4 bfloat16 $side > "$out/nvfp4.toml"
+  cell qwen3-moe-gsm8k-bf16-fp8-kv $BF16 bfloat16 float8_e4m3fn $side $fp8 > "$out/fp8-kv.toml"
   for profile in bf16:qwen3-moe-gsm8k-bf16 nvfp4:qwen3-moe-gsm8k-nvfp4 fp8-kv:qwen3-moe-gsm8k-bf16-fp8-kv; do
     $EVAL plan --config "$out/${profile%%:*}.toml" "${profile#*:}"
     $EVAL run --config "$out/${profile%%:*}.toml" "${profile#*:}" --output-root "$out" || break 2

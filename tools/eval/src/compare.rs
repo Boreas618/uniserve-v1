@@ -111,9 +111,11 @@ impl Bundle {
             .unwrap_or_default()
     }
 
-    /// The checkpoint the daemon's command served: the `model` (or `model_dir`) of the policy
-    /// package `uniserve serve` names, read from its `config.toml`; `None` when the command names
-    /// no package or the package no longer reads.
+    /// The checkpoint the daemon's command served: the `model` (or `model_dir`) of the
+    /// configuration `uniserve serve` names, read from the `config.toml` of the policy package it
+    /// names, or from the configuration file it names (`--config FILE`, as a tree that predates
+    /// policy packages serves, such as a quality comparison's reference); `None` when the command
+    /// names neither or the file no longer reads.
     fn model_argument(&self) -> Option<String> {
         let command: Vec<String> = self
             .launch()
@@ -126,10 +128,17 @@ impl Bundle {
             })
             .collect();
         let index = command.iter().position(|word| word == "serve")?;
-        let package = command[index + 1..]
-            .iter()
-            .find(|word| !word.starts_with('-'))?;
-        let text = std::fs::read_to_string(Path::new(package).join("config.toml")).ok()?;
+        let named = Path::new(
+            command[index + 1..]
+                .iter()
+                .find(|word| !word.starts_with('-'))?,
+        );
+        let file = if named.is_dir() {
+            named.join("config.toml")
+        } else {
+            named.to_path_buf()
+        };
+        let text = std::fs::read_to_string(file).ok()?;
         let config: toml::Table = text.parse().ok()?;
         config
             .get("model")
