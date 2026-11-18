@@ -2,8 +2,10 @@
 
 A state bank stores each field block-major: axis 0 selects a block and the
 trailing axes are the block's own, **at the field's own strides**. One
-descriptor's blocks start 2048 elements apart while a block's content covers
-1088; another's are packed. ``cache_block_snapshot`` reads blocks out of such
+descriptor's blocks start 3072 elements apart while a block's 2048 elements
+span 2528, its 128-element rows 160 apart; another's are packed. A bank's
+strides never make two elements of it share an address, so a scatter into it
+has one answer. ``cache_block_snapshot`` reads blocks out of such
 a bank into a snapshot of flattened rows and ``cache_block_scatter`` writes the
 rows back into blocks, so both turn a column of a flattened block into an
 offset through those axes, and both checks build their bank as a strided view
@@ -34,12 +36,12 @@ CASES = {
         "block": 1024,
         "blocks": [3, 0, 7, 1],
     },
-    # Blocks 2048 elements apart whose content covers 1088: the gaps inside a
-    # block are the check.
-    "a bank whose blocks hold 2048 elements in 1088": {
+    # Blocks 3072 elements apart whose 128-element rows are 160 apart: the
+    # gaps inside a block and between blocks are the check.
+    "a bank with gaps inside and between its blocks": {
         "dtype": torch.bfloat16,
         "shape": (1024, 16, 2, 64),
-        "strides": (2048, 64, 64, 1),
+        "strides": (3072, 160, 64, 1),
         "width": 2048,
         "block": 1024,
         "blocks": [0, 5, 2],
@@ -51,7 +53,7 @@ CASES = {
     "a placeholding index": {
         "dtype": torch.uint8,
         "shape": (1024, 16, 2, 64),
-        "strides": (2048, 64, 64, 1),
+        "strides": (3072, 160, 64, 1),
         "width": 2048,
         "block": 1024,
         "blocks": [-1, 4, 1019, 1023, 1024, 9],

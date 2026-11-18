@@ -5,8 +5,9 @@ The first half of the prefix cache's block copy:
 the same blocks elsewhere without a host read between the two launches. It
 reads a block-major bank at the field's own strides
 (:mod:`uniserve_testing.kernels.memory.banks`), the arithmetic that can be wrong
-without a build noticing: a bank whose blocks are 2048 elements apart while a
-block's content covers 1088 comes back as a shifted row and no error.
+without a build noticing: a bank whose blocks are 3072 elements apart while a
+block's 128-element rows are 160 apart comes back as a shifted row and no
+error.
 
 So the bank holds distinct values at its own strides and zeros in its gaps,
 and every snapshot row must be the block its index names, element for
