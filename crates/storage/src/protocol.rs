@@ -155,7 +155,7 @@ use crate::runtime::{Open, Opened};
 /// speaks: the one version either accepts. Each process that talks to the
 /// server checks it at its own `Hello`, independently of the other
 /// interfaces it speaks.
-pub const VERSION: u32 = 31;
+pub const VERSION: u32 = 32;
 
 /// How long a server of another host may take to answer a request it answers from what it holds
 /// (a hello, a borrow or return of a lend, a task's submission or cancellation, a connector's
@@ -1525,6 +1525,50 @@ pub enum Request {
     /// From a head: the spans the server keeps in its rings (`service::span`), which a read of
     /// the deployment's request timelines gathers. Responded with [`Response::Spans`].
     Spans,
+    /// From another host's Storage Server ([`Role::Peer`]), every period of its
+    /// `storage_config.directory_period_ms`: what its node `node` holds of `deployment`'s pages
+    /// on each tier, which replaces what this server's cluster directory held of that node. The
+    /// directory forgets the node when the connection closes, and the node's next report on a
+    /// new connection states it again. Responded with [`Response::Recorded`].
+    Holdings {
+        deployment: String,
+        node: String,
+        tiers: Vec<Holding>,
+    },
+    /// From a head: how much of each chain of page keys (a request's prefix, rooted at one
+    /// seed) every node of the deployment holds on its device and host tiers, and Mooncake
+    /// Store, as this server's cluster directory knows them: each count is the chain's leading
+    /// pages held, and may lag what the tiers hold, which costs only reuse. A server that holds
+    /// no directory (one that reports to another) knows its own node alone. Responded with
+    /// [`Response::Hits`], one entry per chain in order.
+    Hits { chains: Vec<Vec<Key>> },
+}
+
+/// The pages one tier of a node holds, as a node reports them to the cluster directory
+/// ([`Request::Holdings`]): least recently used first, and the pages the tier can hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Holding {
+    pub tier: crate::runtime::Tier,
+    pub keys: Vec<Key>,
+    pub capacity: u64,
+}
+
+/// How much of one chain of page keys the cluster directory knows held ([`Request::Hits`]):
+/// per node, its leading pages on each tier; and its leading pages in Mooncake Store.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hits {
+    pub nodes: Vec<NodeHits>,
+    pub store: u32,
+}
+
+/// The leading pages of a chain one node holds on its device tier (the device caches of its
+/// replicas) and on its host tier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeHits {
+    /// The node's host name.
+    pub node: String,
+    pub device: u32,
+    pub host: u32,
 }
 
 /// A deployment's KV program as its head sets it on a Storage Server
@@ -1736,6 +1780,12 @@ pub enum Response {
     /// The server's spans, as a [`Request::Spans`] read them.
     Spans {
         spans: Vec<service::span::Span>,
+    },
+    /// A [`Request::Holdings`] replaced its node's entries.
+    Recorded,
+    /// What the cluster directory knows held of each chain of a [`Request::Hits`].
+    Hits {
+        hits: Vec<Hits>,
     },
     Error {
         kind: ErrorKind,

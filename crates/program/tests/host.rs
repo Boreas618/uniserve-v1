@@ -571,6 +571,7 @@ fn a_kv_program_answers_both_hooks() {
                     capacity: 6,
                 }],
             }],
+            store: Vec::new(),
         },
     };
     let moves: Vec<Move> = kv.step(&Hook::<&Handoff, _>::Tiering(&tiering)).unwrap();

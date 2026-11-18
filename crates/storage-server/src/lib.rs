@@ -35,6 +35,7 @@
 pub mod buffer_pool;
 mod child;
 pub mod command;
+mod directory;
 mod error;
 mod handoff;
 mod kv_storage;
@@ -265,6 +266,9 @@ pub struct Server {
     stopping: Option<ClientId>,
     /// The deployments' KV programs ([`programs`]).
     programs: programs::Programs,
+    /// The cluster directory: this node's reports, and on the leader's node every node's
+    /// ([`directory`]).
+    directory: directory::Directory,
 }
 
 impl Server {
@@ -304,6 +308,7 @@ impl Server {
             readiness: None,
             stopping: None,
             programs: programs::Programs::default(),
+            directory: directory::Directory::new(host_name()?, &settings)?,
             settings,
         };
         let trace = server.settings.server.buffer_pool_trace.clone();
@@ -352,6 +357,7 @@ impl Server {
         self.shootdowns.set_deadline(settings.shoot_down());
         self.kv_storage.process.configure(settings);
         self.transfers.process.configure(settings);
+        self.directory.configure(settings);
         if let Some(transfer_server) = self.transfers.client {
             self.events.push((
                 transfer_server,
@@ -467,6 +473,10 @@ impl Server {
         for timer in self.programs.timers() {
             fds.push(PollFd::from_borrowed_fd(timer, PollFlags::IN));
         }
+        // The directory's period and the master's events.
+        for descriptor in self.directory.descriptors() {
+            fds.push(PollFd::from_borrowed_fd(descriptor, PollFlags::IN));
+        }
         // Every wait is a descriptor's: the loop sleeps until one is ready.
         match poll(&mut fds, None) {
             Ok(_) | Err(rustix::io::Errno::INTR) => {}
@@ -506,6 +516,7 @@ impl Server {
         self.kv_storage.process.reap();
         self.transfers.process.reap();
         self.start_children();
+        self.step_directory();
         self.step_programs();
         self.take_notices();
         self.settle_lost();
@@ -1111,6 +1122,22 @@ impl Server {
             (Request::Spans, Role::Head { .. }) => {
                 let spans = service::span::spans(&service::span::records(), |_| None);
                 Ok(Handling::Response(Response::Spans { spans }, Vec::new()))
+            }
+            (
+                Request::Holdings {
+                    deployment,
+                    node,
+                    tiers,
+                },
+                Role::Peer,
+            ) => {
+                self.directory
+                    .record(deployment, node.clone(), Some(id), tiers.clone());
+                Ok(Handling::Response(Response::Recorded, Vec::new()))
+            }
+            (Request::Hits { chains }, Role::Head { deployment, .. }) => {
+                let hits = self.directory.hits(&deployment, chains);
+                Ok(Handling::Response(Response::Hits { hits }, Vec::new()))
             }
             (
                 request,
@@ -2198,6 +2225,8 @@ impl Server {
         let Some(client) = self.clients.remove(&id) else {
             return;
         };
+        // The nodes it reported to the directory report again on a new connection.
+        self.directory.gone(id);
         // What the process reserved ends with it: the storage it reserved is its
         // own, which the driver frees as the process ends. A worker's that is
         // lost is kept for its relaunch while its epoch is claimed.
@@ -2434,31 +2463,29 @@ impl Server {
         }
     }
 
+    /// Reports this node's pages to the cluster directory once its period came: what every
+    /// deployment's buffer pool holds, recorded here and sent to the leader node's server
+    /// ([`directory`]).
+    fn step_directory(&mut self) {
+        self.directory.take_events();
+        if !self.directory.due() {
+            return;
+        }
+        match self.sessions.thread.call(|pools| pools.holdings()) {
+            Ok(holdings) => self.directory.report(holdings),
+            Err(error) => tracing::warn!(%error, "the buffer pools' holdings are not read"),
+        }
+    }
+
     /// Steps the KV programs whose period came: each saves its state, and on the leader's node
-    /// steps its tiering hook over the directory of this node's pool, whose moves into Mooncake
-    /// Store the server makes ([`programs`]): it holds the host copies, has its connector write
-    /// their pages, and lets them go once every page's task ended.
+    /// steps its tiering hook over the cluster directory ([`directory`]), whose moves into
+    /// Mooncake Store of this node's host pages the server makes ([`programs`]): it holds the
+    /// host copies, has its connector write their pages, and lets them go once every page's
+    /// task ended.
     fn step_programs(&mut self) {
-        let node = rustix::system::uname()
-            .nodename()
-            .to_string_lossy()
-            .into_owned();
         for deployment in self.programs.due() {
-            let named = deployment.clone();
-            let holdings = match self
-                .sessions
-                .thread
-                .call(move |pools| pools.holdings(&named))
-            {
-                Ok(holdings) => holdings,
-                Err(error) => {
-                    tracing::warn!(deployment, %error, "the buffer pool's holdings are not read");
-                    Vec::new()
-                }
-            };
-            let upload = self
-                .programs
-                .tiering(&deployment, programs::directory(node.clone(), holdings));
+            let view = self.directory.view(&deployment);
+            let upload = self.programs.tiering(&deployment, view);
             if upload.keys.is_empty() {
                 continue;
             }

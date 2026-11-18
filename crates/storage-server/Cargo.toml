@@ -35,11 +35,17 @@ serde_json.workspace = true
 service.workspace = true
 storage.workspace = true
 thiserror.workspace = true
+# The cluster directory's subscription to Mooncake's object events (`directory::events`): a
+# ZMQ SUB socket on a thread of its own, which runs its own single-threaded runtime.
+tokio = { workspace = true, features = ["rt", "time"] }
+zeromq.workspace = true
 # The connector's settings document on its standard input.
 toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The master's event batches, as the tests' publishers encode them.
+rmp.workspace = true
 # The integration tests replay the traces their servers record (`buffer_pool::replay`).
 storage-server = { path = ".", features = ["verification"] }
 tempfile.workspace = true

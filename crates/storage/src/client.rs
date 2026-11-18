@@ -931,6 +931,34 @@ impl Client {
             other => Err(unexpected("spans", &other)),
         }
     }
+
+    /// See [`Request::Holdings`]: reports what node `node` holds of `deployment`'s pages to the
+    /// cluster directory of the server this client is connected to as a [`Role::Peer`].
+    pub fn report_holdings(
+        &mut self,
+        deployment: String,
+        node: String,
+        tiers: Vec<crate::protocol::Holding>,
+    ) -> Result<()> {
+        let request = Request::Holdings {
+            deployment,
+            node,
+            tiers,
+        };
+        match self.request(&request, &[])?.0 {
+            Response::Recorded => Ok(()),
+            other => Err(unexpected("holdings", &other)),
+        }
+    }
+
+    /// See [`Request::Hits`]: how much of each of `chains` the cluster directory knows held, one
+    /// entry per chain in order.
+    pub fn hits(&mut self, chains: Vec<Vec<Key>>) -> Result<Vec<crate::protocol::Hits>> {
+        match self.request(&Request::Hits { chains }, &[])?.0 {
+            Response::Hits { hits } => Ok(hits),
+            other => Err(unexpected("hits", &other)),
+        }
+    }
 }
 
 /// The tensors of a response to a `Get`, with one descriptor per storage.

@@ -1104,6 +1104,29 @@ impl LeaderService {
         }
     }
 
+    /// Has `settings`, the Storage Server settings of the node of `host`, name the cluster
+    /// directory's server (`storage::ServerSettings::directory`): none on the leader's node,
+    /// whose server holds the directory, and the leader's server's TCP endpoint on every other.
+    /// A leader whose server accepts no other hosts leaves every node to its own directory.
+    fn direct(&mut self, host: &str, settings: &mut proto::process::StorageSettings) {
+        settings.directory = if host == self.host {
+            String::new()
+        } else {
+            match self.local.claims.endpoint() {
+                Ok(endpoint) => endpoint.unwrap_or_default(),
+                Err(error) => {
+                    tracing::warn!(
+                        host,
+                        error = format!("{error:#}"),
+                        "the node reports to no cluster directory: the leader's Storage Server \
+                         has no endpoint"
+                    );
+                    String::new()
+                }
+            }
+        };
+    }
+
     /// Routes one request, served for `owner` as `asker` asked: served here for this node,
     /// forwarded to the node's daemon otherwise, whose reply comes back later. A stop applies to
     /// every node and gets its reply once every node stopped the group: it waits in `stops` for
@@ -1119,15 +1142,31 @@ impl LeaderService {
             });
         }
         // A claim that states no Storage Server settings takes the deployment's, here or on the
-        // member it goes to: the server a node starts for the claim then serves with them.
+        // member it goes to: the server a node starts for the claim then serves with them. The
+        // settings a node's server serves with name the leader's server as the cluster
+        // directory's on every node but this one.
         let stated;
         let request = match &request.kind {
-            Some(request::Kind::Claim(claim)) if claim.storage.is_none() => {
+            Some(request::Kind::Claim(claim)) => {
                 let mut claim = claim.clone();
-                claim.storage = Some(self.local.claims.settings().into());
+                let storage = claim
+                    .storage
+                    .get_or_insert_with(|| self.local.claims.settings().into());
+                self.direct(&claim.host, storage);
                 stated = Request {
                     id: request.id,
                     kind: Some(request::Kind::Claim(claim)),
+                };
+                &stated
+            }
+            Some(request::Kind::ConfigureStorage(configure)) => {
+                let mut configure = configure.clone();
+                if let Some(storage) = &mut configure.storage {
+                    self.direct(&configure.host, storage);
+                }
+                stated = Request {
+                    id: request.id,
+                    kind: Some(request::Kind::ConfigureStorage(configure)),
                 };
                 &stated
             }

@@ -1133,16 +1133,25 @@ impl Pools {
         }
     }
 
-    /// What `deployment`'s pool holds on each tier ([`BufferPool::holdings`]); nothing for a
-    /// deployment without a pool here.
-    pub(crate) fn holdings(
-        &self,
-        deployment: &str,
-    ) -> Vec<(storage::runtime::Tier, Vec<Key>, u64)> {
+    /// What every deployment's pool holds on each tier ([`BufferPool::holdings`]), as this
+    /// node reports it to the cluster directory.
+    pub(crate) fn holdings(&self) -> Vec<(String, Vec<storage::protocol::Holding>)> {
         self.deployments
-            .get(deployment)
-            .map(|hosted| hosted.pool.holdings())
-            .unwrap_or_default()
+            .iter()
+            .map(|(deployment, hosted)| {
+                let tiers = hosted
+                    .pool
+                    .holdings()
+                    .into_iter()
+                    .map(|(tier, keys, capacity)| storage::protocol::Holding {
+                        tier,
+                        keys,
+                        capacity,
+                    })
+                    .collect();
+                (deployment.clone(), tiers)
+            })
+            .collect()
     }
 
     /// Every pool as an operator's listing states it.

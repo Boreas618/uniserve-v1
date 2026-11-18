@@ -790,6 +790,9 @@ impl Server {
             readiness: None,
             stopping: None,
             programs: crate::programs::Programs::resume(handoff.programs),
+            // The directory is not handed over: every node, this one among them, states its
+            // pages again with its next report, on the connections the successor goes on with.
+            directory: crate::directory::Directory::new(crate::host_name()?, &handoff.settings)?,
             settings: handoff.settings.clone(),
         };
         server.watch_pools(handoff.settings.server.buffer_pool_trace.clone());

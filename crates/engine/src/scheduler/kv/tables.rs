@@ -4253,6 +4253,7 @@ mod tests {
                 transport: storage::connector::Transport::Tcp,
                 device: String::new(),
                 segment_gib: 0,
+                events: None,
             }),
             ..KvCacheConfig::default()
         };

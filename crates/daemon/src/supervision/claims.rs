@@ -308,6 +308,23 @@ impl ClaimHolder {
             .with_context(|| format!("connecting to the Storage Server at {}", socket.display()))
     }
 
+    /// The TCP endpoint (`host:port`) other nodes reach this node's Storage Server at, starting
+    /// the server with the deployment's settings when none serves; `None` when it accepts no
+    /// other hosts.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the server cannot be started or its readiness record read.
+    pub(crate) fn endpoint(&self) -> anyhow::Result<Option<String>> {
+        let socket = self.socket()?;
+        let record = match service::host::running::<storage::Settings>(&socket)? {
+            Some(record) => record,
+            None => self.serve(&self.settings)?,
+        };
+        let tcp = self.tcp(&record);
+        Ok((!tcp.is_empty()).then_some(tcp))
+    }
+
     /// The `host:port` other nodes reach the server of `record` at: this node's address, on the
     /// port it bound; empty when they reach it not.
     fn tcp(&self, record: &storage::Readiness) -> String {

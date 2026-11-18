@@ -89,6 +89,14 @@ pub struct ServerSettings {
     pub child_restart_s: u64,
     /// The longest wait before a child process starts again, in seconds. Default 300.
     pub child_restart_max_s: u64,
+    /// The TCP endpoint (`host:port`) of the Storage Server of the deployment's leader node,
+    /// which holds the cluster directory: this server reports its node's pages there every
+    /// `directory_period_ms`. Unset on the leader's node, whose server holds the directory. The
+    /// leader's daemon states it for every node from its own server's endpoint.
+    pub directory: Option<service::Endpoint>,
+    /// How often the server reports its node's pages to the cluster directory, in milliseconds:
+    /// what the directory states of a node lags its pages by up to this period. Default 1000.
+    pub directory_period_ms: u64,
     /// How long a process the server shot down, or an engine's process it follows, may take
     /// after its exit to leave every GPU whose storage it held, in seconds: past it the
     /// shoot-down fails (the GPU needs a reset) and the requests that waited for it fail.
@@ -111,6 +119,8 @@ impl Default for ServerSettings {
             child_restart_s: 5,
             child_restart_max_s: 300,
             shoot_down_s: 60,
+            directory: None,
+            directory_period_ms: 1000,
         }
     }
 }
@@ -146,6 +156,11 @@ impl ServerSettings {
         Duration::from_secs(self.shoot_down_s)
     }
 
+    /// How often the server reports its node's pages to the cluster directory.
+    pub fn directory_period(&self) -> Duration {
+        Duration::from_millis(self.directory_period_ms.max(1))
+    }
+
     /// Whether a server serving with these settings needs a new process to serve with `next`;
     /// otherwise the running server takes `next` at once (`Request::Configure`).
     ///
@@ -159,7 +174,7 @@ impl ServerSettings {
     /// too. Every other setting the server reads each time it acts on it: the host reserve at an
     /// admission, the deadlines at a task's start, the chunk and progress period at the Transfer
     /// Server's next chunk, the waits before a child starts again and the shoot-down's deadline
-    /// when they begin.
+    /// when they begin; the cluster directory's leader and period at the next report.
     pub fn restarts(&self, next: &Self) -> bool {
         // Every setting is named, so a new one does not compile until it is classified here.
         let Self {
@@ -175,6 +190,8 @@ impl ServerSettings {
             child_restart_s: _,
             child_restart_max_s: _,
             shoot_down_s: _,
+            directory: _,
+            directory_period_ms: _,
         } = self;
         let traced = buffer_pool_trace.is_some();
         let deadlines = *transfer_deadline_s != next.transfer_deadline_s
@@ -249,6 +266,7 @@ mod tests {
                 transport: connector::Transport::Rdma,
                 device: "mlx5_0,mlx5_1".into(),
                 segment_gib: 4,
+                events: Some("10.0.0.1:50053".parse().unwrap()),
             }),
         };
         let document = settings.document().unwrap();
@@ -271,6 +289,8 @@ mod tests {
             child_restart_s: 1,
             child_restart_max_s: 10,
             shoot_down_s: 20,
+            directory: Some("10.0.0.1:7100".parse().unwrap()),
+            directory_period_ms: 250,
             ..serving.clone()
         };
         assert!(!serving.restarts(&taken));
@@ -322,6 +342,7 @@ mod tests {
                 transport: connector::Transport::Tcp,
                 device: String::new(),
                 segment_gib: 4,
+                events: None,
             }),
             ..Settings::default()
         };

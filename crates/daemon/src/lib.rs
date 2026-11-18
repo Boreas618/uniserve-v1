@@ -34,6 +34,7 @@
 
 pub mod api;
 pub mod config;
+pub(crate) mod directory;
 pub mod engine;
 pub mod epoch;
 pub mod experts;

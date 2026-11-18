@@ -32,6 +32,12 @@ impl From<&storage::Settings> for StorageSettings {
             child_restart_s: server.child_restart_s,
             child_restart_max_s: server.child_restart_max_s,
             shoot_down_s: server.shoot_down_s,
+            directory: server
+                .directory
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            directory_period_ms: server.directory_period_ms,
             connector: settings
                 .connector
                 .as_ref()
@@ -45,6 +51,11 @@ impl From<&storage::Settings> for StorageSettings {
                     .into(),
                     device: connector.device.clone(),
                     segment_gib: connector.segment_gib,
+                    events: connector
+                        .events
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
                 }),
         }
     }
@@ -60,11 +71,13 @@ impl TryFrom<&StorageSettings> for storage::Settings {
     /// Fails when an endpoint, the metadata service or the transport is no value of its kind.
     fn try_from(message: &StorageSettings) -> Result<Self, Self::Error> {
         let path = |text: &str| (!text.is_empty()).then(|| std::path::PathBuf::from(text));
-        let tcp = if message.tcp.is_empty() {
-            None
-        } else {
-            Some(message.tcp.parse().map_err(|error| format!("{error}"))?)
+        let endpoint = |text: &str| -> Result<Option<service::Endpoint>, String> {
+            if text.is_empty() {
+                return Ok(None);
+            }
+            text.parse().map(Some).map_err(|error| format!("{error}"))
         };
+        let tcp = endpoint(&message.tcp)?;
         let connector = match &message.connector {
             None => None,
             Some(connector) => Some(storage::connector::Settings {
@@ -85,6 +98,7 @@ impl TryFrom<&StorageSettings> for storage::Settings {
                 },
                 device: connector.device.clone(),
                 segment_gib: connector.segment_gib,
+                events: endpoint(&connector.events)?,
             }),
         };
         let nixl_transports = match NixlTransports::try_from(message.nixl_transports) {
@@ -111,6 +125,8 @@ impl TryFrom<&StorageSettings> for storage::Settings {
                 child_restart_s: message.child_restart_s,
                 child_restart_max_s: message.child_restart_max_s,
                 shoot_down_s: message.shoot_down_s,
+                directory: endpoint(&message.directory)?,
+                directory_period_ms: message.directory_period_ms,
             },
             connector,
         })
@@ -129,6 +145,8 @@ mod tests {
                 tcp: Some("0.0.0.0:0".parse().unwrap()),
                 transfer_calibration: Some("transfer.json".into()),
                 nixl_transports: storage::settings::Transports::Rdma,
+                directory: Some("10.0.0.1:7100".parse().unwrap()),
+                directory_period_ms: 250,
                 ..storage::ServerSettings::default()
             },
             connector: Some(storage::connector::Settings {
@@ -137,6 +155,7 @@ mod tests {
                 transport: storage::connector::Transport::Rdma,
                 device: "mlx5_0".into(),
                 segment_gib: 4,
+                events: Some("10.0.0.1:50053".parse().unwrap()),
             }),
         };
         let message = StorageSettings::from(&settings);

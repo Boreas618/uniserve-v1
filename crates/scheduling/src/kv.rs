@@ -105,11 +105,17 @@ pub struct Tiering {
 }
 
 /// The cluster directory: which pages each node of the deployment holds on each of its tiers, as
-/// the nodes last reported them. It may lag the pages' authoritative state on their nodes, which
-/// costs only reuse: a page a move names that is gone is skipped.
+/// the nodes last reported them, and which pages Mooncake Store holds, as its master's object
+/// events stated them. It may lag the pages' authoritative state on their nodes and in the
+/// store, which costs only reuse: a page a move names that is gone is skipped.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Directory {
+    /// Every node that reported, the node of the Storage Server that steps the hook first.
     pub nodes: Vec<Node>,
+    /// The pages Mooncake Store holds; empty when the directory subscribes to no master's
+    /// events (`kv_cache_config.mooncake.events`).
+    #[serde(default)]
+    pub store: Vec<Key>,
 }
 
 /// One node of the directory.

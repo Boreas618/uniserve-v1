@@ -40,6 +40,13 @@ pub struct Settings {
     /// the default, makes the hosts clients of segments others provide.
     #[serde(default)]
     pub segment_gib: u64,
+    /// The master's KV event publisher (`host:port`, its `--kv_events_bind_endpoint`), whose
+    /// stored and removed object events the cluster directory subscribes to, so that routing
+    /// sees which pages Mooncake holds; none, the default, leaves the directory without
+    /// Mooncake's pages. The server that holds the directory (the leader node's) subscribes
+    /// when it starts.
+    #[serde(default)]
+    pub events: Option<service::Endpoint>,
 }
 
 impl Settings {

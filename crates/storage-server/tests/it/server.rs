@@ -73,8 +73,28 @@ impl Running {
         Self::serving(host_reserve_gib, |_| {}, None)
     }
 
+    /// A server that serves with `settings`, with no children.
+    pub(crate) fn with_settings(settings: ::storage::Settings) -> Self {
+        Self::serving_with(settings, |_| {}, None)
+    }
+
     fn serving(
         host_reserve_gib: u64,
+        configure: impl FnOnce(&mut Server) + Send + 'static,
+        children: Option<Children>,
+    ) -> Self {
+        let settings = ::storage::Settings {
+            server: ::storage::ServerSettings {
+                host_reserve_gib,
+                ..::storage::ServerSettings::default()
+            },
+            connector: None,
+        };
+        Self::serving_with(settings, configure, children)
+    }
+
+    fn serving_with(
+        settings: ::storage::Settings,
         configure: impl FnOnce(&mut Server) + Send + 'static,
         children: Option<Children>,
     ) -> Self {
@@ -88,13 +108,6 @@ impl Running {
         let address = tcp.local_addr().unwrap().to_string();
         let record = readiness(&socket, Some(&address));
         let lock = starting.finish(&record).unwrap();
-        let settings = ::storage::Settings {
-            server: ::storage::ServerSettings {
-                host_reserve_gib,
-                ..::storage::ServerSettings::default()
-            },
-            connector: None,
-        };
         Self::on_thread(directory, socket, address, move || {
             let mut server = Server::new(listener, settings, children).unwrap();
             configure(&mut server);

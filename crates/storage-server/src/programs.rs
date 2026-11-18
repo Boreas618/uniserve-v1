@@ -7,12 +7,13 @@
 //!   full pages reach the decode replica. The answer is local, a call into the instance on the
 //!   server's own thread, so the handoff's critical path takes no network hop.
 //! - **Tiering**, every period on the leader node's server
-//!   ([`KvProgram::tiering`]): the program reads the directory of what this node holds, from its
-//!   buffer pools, and gives the moves to make. The server carries out what it can itself: a
-//!   copy of a host page into Mooncake Store, through its connector. A page on a device moves
-//!   through the engine that maps it, a page read into host memory takes a block only a
-//!   scheduler's prefetch allocates, and the directory holds this node alone, so every other
-//!   move is skipped with its reason.
+//!   ([`KvProgram::tiering`]): the program reads the cluster directory, which that server holds
+//!   (`crate::directory`: every node's device and host pages, and Mooncake Store's), and gives
+//!   the moves to make. The server carries out what it can itself: a copy of a host page of its
+//!   own node into Mooncake Store, through its connector. A page on a device moves through the
+//!   engine that maps it, a page read into host memory takes a block only a scheduler's prefetch
+//!   allocates, and a page of another node is that node's server's to move, so every other move
+//!   is skipped with its reason.
 //!
 //! The server checks every output and takes the default rule on one it cannot use: a handoff
 //! pushes over the first transport both sides have. A program that fails (a panic, past its fuel
@@ -40,7 +41,7 @@ use std::time::{Duration, SystemTime};
 use ::storage::protocol::{KvProgram, ProgramEvent, ProgramRecord, ProgramStart};
 use program::{Budget, Error, Host, Instance, Kind, Level, Module};
 use scheduling::kv::{
-    Directory, Handoff, Holding, Hook, Key, Location, Move, Node, Path, Tier, Tiering, Transport,
+    Directory, Handoff, Hook, Key, Location, Move, Path, Tier, Tiering, Transport,
 };
 
 use crate::timer::Timer;
@@ -388,8 +389,8 @@ impl Programs {
         tiering
     }
 
-    /// One tiering step of `deployment`'s program over `directory`, this node's holdings, and
-    /// its state saved after it: the moves this server carries out. Every other move is
+    /// One tiering step of `deployment`'s program over `directory`, the cluster directory with
+    /// this node first, and its state saved after it: the moves this server carries out. Every other move is
     /// recorded, refused when the directory has no such place, skipped when it is one this
     /// server cannot move between.
     pub(crate) fn tiering(&mut self, deployment: &str, directory: Directory) -> Upload {
@@ -615,36 +616,14 @@ fn carried(directory: &Directory, found: Move) -> Carried {
             "the move of {key:?} reads into host memory, whose blocks only a scheduler's prefetch \
              allocates"
         )),
-        _ => Carried::Skipped(format!(
-            "the move of {key:?} leaves this node, which the directory alone holds"
+        (Tier::Host, Tier::Store) => Carried::Skipped(format!(
+            "the move of {key:?} copies a host page of node {}, whose own server holds it",
+            from.node
         )),
-    }
-}
-
-/// The directory of this node, `node`, from its pool's holdings
-/// ([`crate::buffer_pool::BufferPool::holdings`]).
-pub(crate) fn directory(
-    node: String,
-    holdings: Vec<(::storage::runtime::Tier, Vec<::storage::protocol::Key>, u64)>,
-) -> Directory {
-    let tiers = holdings
-        .into_iter()
-        .filter_map(|(tier, keys, capacity)| {
-            let tier = match tier {
-                ::storage::runtime::Tier::Device => Tier::Device,
-                ::storage::runtime::Tier::Host => Tier::Host,
-                ::storage::runtime::Tier::Remote => return None,
-            };
-            let keys = keys.into_iter().map(|key| Key(key.0)).collect();
-            Some(Holding {
-                tier,
-                keys,
-                capacity,
-            })
-        })
-        .collect();
-    Directory {
-        nodes: vec![Node { name: node, tiers }],
+        _ => Carried::Skipped(format!(
+            "the move of {key:?} goes between nodes or out of Mooncake Store, which no server \
+             carries out"
+        )),
     }
 }
 

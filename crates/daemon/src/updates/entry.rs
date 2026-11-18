@@ -845,14 +845,16 @@ impl Replica {
         {
             retain_devices(&served.engine_config, &mut target_engine);
         }
-        self.take(
+        // The take holds the whole configuration across its waits: boxed, so this future stays
+        // small.
+        Box::pin(self.take(
             &current,
             target,
             &changes,
             target_engine,
             Some(served),
             revision,
-        )
+        ))
         .await
     }
 

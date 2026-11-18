@@ -82,6 +82,8 @@ pub struct Leader {
     /// The routing program every new request is routed through, while one runs
     /// (`crate::programs`).
     router: Arc<crate::programs::Router>,
+    /// The cluster directory the routing program's prefix hits are read from.
+    directory: Arc<crate::directory::Directory>,
     /// Periodic throughput logging, stopped with the engine.
     _stats_logger: Option<StatsLogger>,
 }
@@ -160,6 +162,9 @@ struct Candidate {
     role: Role,
     running: u32,
     load: Option<crate::observe::Load>,
+    /// How its prefix is looked up in the cluster directory; `None` for an engine run elsewhere
+    /// or one that keys no pages.
+    placed: Option<crate::directory::Placed>,
 }
 
 /// Every scheduler of `serving`'s engines, in the deployment's order of replicas and schedulers.
@@ -171,6 +176,20 @@ fn candidates(serving: &[Arc<Replica>]) -> Vec<Candidate> {
         };
         let epoch = client.epoch();
         let running = client.in_flight_by_scheduler();
+        // Every scheduler of an engine keys its pages from the engine's seeds, on the engine's
+        // node: its scheduler node.
+        let placed = {
+            let served = service::lock(&replica.served);
+            let seed = client.info().prefix_seeds.first().copied();
+            served
+                .as_ref()
+                .zip(seed)
+                .map(|(args, seed)| crate::directory::Placed {
+                    seed,
+                    block: args.engine_config.kv_cache.block_tokens(),
+                    host: args.engine_config.parallel.engine_host.clone(),
+                })
+        };
         for (scheduler, running) in running.into_iter().enumerate() {
             let scheduler = u32::try_from(scheduler).unwrap_or(u32::MAX);
             candidates.push(Candidate {
@@ -180,6 +199,7 @@ fn candidates(serving: &[Arc<Replica>]) -> Vec<Candidate> {
                 replica: Arc::clone(replica),
                 scheduler,
                 running,
+                placed: placed.clone(),
             });
         }
     }
@@ -193,12 +213,38 @@ fn loads(candidates: &[Candidate]) -> Vec<(Role, u32)> {
     candidates.iter().map(load).collect()
 }
 
+/// The prefix of the prompt `tokens` of isolation key `isolation` the cluster directory knows
+/// each candidate holds, by tier, with the prompt's page keys
+/// (`crate::directory::Directory::hits`); a candidate whose `placed` entry is `None` holds none.
+/// Blocks on the directory's answer.
+fn prefix(
+    directory: &crate::directory::Directory,
+    (tokens, isolation): (&[u32], Option<u64>),
+    placed: &[Option<crate::directory::Placed>],
+) -> (Vec<storage::Key>, Vec<Vec<scheduling::routing::Hit>>) {
+    let known: Vec<(usize, crate::directory::Placed)> = placed
+        .iter()
+        .enumerate()
+        .filter_map(|(index, placed)| Some((index, placed.clone()?)))
+        .collect();
+    let replicas: Vec<crate::directory::Placed> =
+        known.iter().map(|(_, placed)| placed.clone()).collect();
+    let (keys, found) = directory.hits(tokens, isolation, &replicas);
+    let mut hits = vec![Vec::new(); placed.len()];
+    for ((index, _), found) in known.iter().zip(found) {
+        hits[*index] = found;
+    }
+    (keys, hits)
+}
+
 /// The routing program's input for `request` of session `session` over `candidates`: each
-/// scheduler's role, requests in flight and latest report's load.
+/// scheduler's role, requests in flight and latest report's load, and the prefix the cluster
+/// directory knows it holds (`prefix`: the prompt's page keys and each candidate's hits).
 fn routing(
     request: &Request,
     session: Option<&str>,
     candidates: &[Candidate],
+    (keys, hits): (Vec<storage::Key>, Vec<Vec<scheduling::routing::Hit>>),
 ) -> scheduling::routing::Routing {
     let prompt = match request {
         Request::Generation(generation) => generation.prompt_token_ids.len(),
@@ -206,7 +252,8 @@ fn routing(
     };
     let replicas = candidates
         .iter()
-        .map(|candidate| {
+        .zip(hits)
+        .map(|(candidate, hits)| {
             let load = candidate.load.unwrap_or_default();
             let usage = |tier, pages: proto::report::Pages| scheduling::routing::Usage {
                 tier,
@@ -224,14 +271,17 @@ fn routing(
                     usage(scheduling::kv::Tier::Host, load.host),
                 ],
                 reservable: load.device.capacity.saturating_sub(load.device.used),
-                hits: Vec::new(),
+                hits,
             }
         })
         .collect();
     scheduling::routing::Routing {
         request: scheduling::routing::Request {
             prompt: u32::try_from(prompt).unwrap_or(u32::MAX),
-            prefix: Vec::new(),
+            prefix: keys
+                .into_iter()
+                .map(|key| scheduling::kv::Key(key.0))
+                .collect(),
             session: session.map(str::to_owned),
         },
         replicas,
@@ -644,11 +694,31 @@ impl Leader {
             return Ok((least, target));
         }
 
-        let route = self
-            .router
-            .routes()
-            .then(|| self.router.route(&routing(request, session, &candidates)))
-            .flatten()
+        let route = if self.router.routes() {
+            // The directory answers over a socket: the question waits off the runtime's threads.
+            let directory = Arc::clone(&self.directory);
+            let prompt = match request {
+                Request::Generation(generation) => (
+                    generation.prompt_token_ids.clone(),
+                    generation.cache.isolation_key,
+                ),
+                Request::Diffusion(_) => (Vec::new(), None),
+            };
+            let placed: Vec<_> = candidates
+                .iter()
+                .map(|candidate| candidate.placed.clone())
+                .collect();
+            let hits = tokio::task::spawn_blocking(move || {
+                prefix(&directory, (&prompt.0, prompt.1), &placed)
+            })
+            .await
+            .map_err(|error| SubmitError::Unavailable(format!("routing failed: {error}")))?;
+            self.router
+                .route(&routing(request, session, &candidates, hits))
+        } else {
+            None
+        };
+        let route = route
             .map(|route| (route.prefill, route.decode))
             .or_else(|| pair(&loads(&candidates), request));
         Ok(match route {
@@ -1390,6 +1460,7 @@ impl Leader {
         for replica in replicas.serving.borrow().iter() {
             replica.monitor();
         }
+        let directory = Arc::new(crate::directory::Directory::new(updates.deployment()));
         Ok(Self {
             families,
             served_model_name: std::sync::Mutex::new(Arc::from(served_model_name)),
@@ -1399,6 +1470,7 @@ impl Leader {
             log_requests: logging.log_requests,
             recorder,
             router: Arc::default(),
+            directory,
             _stats_logger: stats_logger,
         })
     }

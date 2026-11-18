@@ -359,6 +359,11 @@ message StorageSettings {
   uint64 transfer_progress_ms = 14;
   NixlTransports nixl_transports = 15;
   uint64 shoot_down_s = 16;
+  // The TCP endpoint of the leader node's Storage Server, which holds the
+  // cluster directory this server reports its node's pages to; empty on the
+  // leader's node.
+  string directory = 17;
+  uint64 directory_period_ms = 18;
 }
 
 enum NixlTransports {
@@ -375,6 +380,8 @@ message MooncakeConnector {
   MooncakeTransport transport = 3;
   string device = 4;
   uint64 segment_gib = 5;
+  // The master's KV event publisher (`host:port`); empty for none.
+  string events = 6;
 }
 
 enum MooncakeTransport {
