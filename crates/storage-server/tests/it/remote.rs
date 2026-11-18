@@ -39,6 +39,7 @@ fn rdma_host(fabric: bool) -> Running {
         gpus: true,
         reads: true,
         fabric,
+        mooncake: false,
     };
     let settings = ::storage::ServerSettings {
         nixl_transports: Transports::Rdma,
@@ -680,13 +681,19 @@ mod device {
         );
     }
 
-    /// A server whose Transfer Server copies on this process's GPUs, its copies from another
-    /// host paced at the Transfer Engine's rate
-    /// ([`engine_calibration`](crate::transfer::engine_calibration)).
+    /// A server whose Transfer Server copies on this process's GPUs and crosses to other
+    /// servers' storage over the Transfer Engine, at the rate the calibration step timed for its
+    /// READs.
     fn engine_host() -> crate::server::Running {
+        let paths = crate::transfer::Paths {
+            gpus: true,
+            reads: false,
+            fabric: false,
+            mooncake: true,
+        };
+        let calibration = crate::transfer::calibration(paths);
         let settings = ::storage::ServerSettings::default();
-        let options =
-            storage_server::transfer::Options::of(&settings, crate::transfer::engine_calibration());
+        let options = storage_server::transfer::Options::of(&settings, calibration);
         let server = crate::server::Running::with_children(Some(storage_server::Children {
             program: crate::server::helper(),
             connector: None,

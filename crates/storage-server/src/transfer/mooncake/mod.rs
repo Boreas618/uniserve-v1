@@ -23,9 +23,11 @@
 mod capi;
 mod engine;
 mod library;
+mod topology;
 
 pub(crate) use capi::SegmentId;
 pub(crate) use engine::{Batch, Engine, Registration, Span};
+pub(crate) use topology::Topology;
 
 pub(crate) use crate::Error;
 
@@ -34,6 +36,14 @@ pub(crate) use crate::Error;
 pub(crate) const RELEASE: &str = "0.3.13.post1";
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// The settings the Transfer Engine reads from the environment when an engine starts, which the
+/// `storage-server` command states in its process before any thread starts
+/// ([`crate::command::run`]), so its Transfer Server and its calibration step, and every child
+/// it starts, hold them: device storage registers through its dma-buf (`WITH_NVIDIA_PEERMEM=0`),
+/// as UCX registers it for NIXL, since the server's device storage is CUDA VMM allocations,
+/// which the engine's default, a registration of the address through nvidia-peermem, refuses.
+pub(crate) const ENVIRONMENT: [(&str, &str); 1] = [("WITH_NVIDIA_PEERMEM", "0")];
 
 /// The name of a return code of the C API, as `include/error.h` names it.
 pub(crate) fn code_name(code: i32) -> &'static str {

@@ -210,7 +210,8 @@ impl Network {
                 let host = crate::host_name().map_err(|error| {
                     format!("naming this host for the Transfer Engine: {error}")
                 })?;
-                let engine = mooncake::Engine::new(&host)
+                let engine = mooncake::Topology::of_host()
+                    .and_then(|topology| mooncake::Engine::new(&host, &topology))
                     .map_err(|error| format!("starting the Transfer Engine: {error}"))?;
                 tracing::info!(segment = engine.name(), "started the Transfer Engine");
                 Ok(engine)
@@ -397,7 +398,7 @@ impl Network {
                     ThreadKey {
                         link,
                         runner: Runner::Network,
-                        path: Some(RemotePath::Read),
+                        path: Some(remote_path(transport)),
                     },
                     Piece {
                         task,
@@ -463,7 +464,7 @@ impl Network {
                 ThreadKey {
                     link,
                     runner: Runner::Network,
-                    path: Some(RemotePath::Read),
+                    path: Some(remote_path(transport)),
                 },
                 read,
             ));
@@ -712,6 +713,14 @@ pub(super) fn register(
         .metadata()
         .map_err(|error| format!("exporting the NIXL agent's metadata: {error}"))?;
     Ok((metadata, ranges))
+}
+
+/// The calibrated path of copies with another host over `transport`.
+fn remote_path(transport: Transport) -> RemotePath {
+    match transport {
+        Transport::Nixl => RemotePath::Read,
+        Transport::Mooncake => RemotePath::Mooncake,
+    }
 }
 
 /// A range another host's agent registered, as this agent's READs name it.

@@ -17,43 +17,36 @@ mod device {
 
     use crate::server::{Running, engine_head, head, key, memfd, scope, tensor, transfer_child};
     use crate::sessions::{
-        HEADS, KV, Scheduler, imported_units, kv_bytes, kv_layout, kv_runs, layout, lend_two_pages,
-        rank, write_pages,
+        HEADS, KV, Scheduler, attach_decode, imported_units, kv_bytes, kv_layout, kv_runs, layout,
+        lend_pages, lend_two_pages, rank, write_pages,
     };
     use crate::transfer::device::{device_bytes, device_storage, gpus, record};
-    use crate::transfer::{Paths, calibration, engine_calibration, read, transfer_pid};
+    use crate::transfer::{Paths, calibration, read, transfer_pid};
     use scheduling::kv::Transport;
 
-    /// A server whose Transfer Server copies on every GPU the driver shows and, with `reads`,
-    /// reads other servers' storage through NIXL at the rate its calibration states. The
-    /// servers' records go to the case's output, filtered by `RUST_LOG`.
-    fn gpu_server(reads: bool) -> Running {
+    /// A server whose Transfer Server copies on every GPU the driver shows and crosses to other
+    /// servers' storage over each of `crossing`, at the rates the calibration step timed for it;
+    /// with `reachable`, other hosts reach it at this host's name. The servers' records go to the
+    /// case's output, filtered by `RUST_LOG`.
+    fn gpu_server(crossing: &[Transport], reachable: bool) -> Running {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_writer(std::io::stderr)
             .try_init();
         let paths = Paths {
             gpus: true,
-            reads,
+            reads: crossing.contains(&Transport::Nixl),
             fabric: false,
+            mooncake: crossing.contains(&Transport::Mooncake),
         };
-        let server = Running::with_children(Some(transfer_child(calibration(paths))));
+        let children = Some(transfer_child(calibration(paths)));
+        let server = if reachable {
+            Running::reachable(children)
+        } else {
+            Running::with_children(children)
+        };
         transfer_pid(&server.socket, None);
         server
-    }
-
-    /// A server whose Transfer Server copies on every GPU the driver shows and crosses to other
-    /// servers' storage over `transport`: NIXL at the rate the calibration step timed, the
-    /// Transfer Engine at the rate [`engine_calibration`] states.
-    fn crossing_server(transport: Transport) -> Running {
-        match transport {
-            Transport::Nixl => gpu_server(true),
-            Transport::Mooncake => {
-                let server = Running::with_children(Some(transfer_child(engine_calibration())));
-                transfer_pid(&server.socket, None);
-                server
-            }
-        }
     }
 
     /// A rank of `group` whose units lie in GPU storage on `gpu`, holding `heads` heads from
@@ -159,7 +152,7 @@ mod device {
     /// here.
     fn on_one_host(push: bool) {
         let [first, second, third] = gpus::<3>();
-        let server = gpu_server(false);
+        let server = gpu_server(&[], false);
         let claim = head(&server.socket)
             .claim(
                 Claimant::Head,
@@ -220,8 +213,8 @@ mod device {
     /// replica's server and a push on the prefill replica's.
     fn across_servers(push: bool, transport: Transport) {
         let [first, second, third] = gpus::<3>();
-        let lending = crossing_server(transport);
-        let importing = crossing_server(transport);
+        let lending = gpu_server(&[transport], false);
+        let importing = gpu_server(&[transport], false);
         let lending_claim = head(&lending.socket)
             .claim(Claimant::Head, 0, vec![scope("prefill", 0)], Vec::new())
             .unwrap();
@@ -306,5 +299,182 @@ mod device {
     #[ignore = "requires three CUDA devices, Mooncake Transfer Engine and a usable RDMA port"]
     fn an_import_pushed_into_this_server_s_gpus_is_written_through_the_transfer_engine() {
         across_servers(true, Transport::Mooncake);
+    }
+
+    /// The environment variable that names the second host of the cases across two hosts: an
+    /// ssh destination that mounts this repository at the same path, has the GPUs, RDMA ports,
+    /// NIXL and Mooncake packages of this host, and reaches it by its host name.
+    const PEER_HOST: &str = "UNISERVE_PEER_HOST";
+
+    /// The second host's half of the handoff cases across two hosts ([`across_hosts`]), which
+    /// they run there as this case of this test executable: a server other hosts reach, whose
+    /// prefill rank on the first GPU lends two pages, calibrated for both transports. It states
+    /// the lend on its standard output, `lent ENDPOINT SESSION OWNER`, and holds it until its
+    /// standard input ends.
+    #[test]
+    #[ignore = "the second host's half of the handoff cases across two hosts, which they start there"]
+    fn the_lending_half_of_a_handoff_across_hosts() {
+        use std::io::{Read as _, Write as _};
+
+        let [first] = gpus::<1>();
+        let lending = gpu_server(&[Transport::Nixl, Transport::Mooncake], true);
+        let claim = head(&lending.socket)
+            .claim(Claimant::Head, 0, vec![scope("prefill", 0)], Vec::new())
+            .unwrap();
+        let prefill = device_rank(
+            &lending.socket,
+            claim,
+            ("prefill", 0, "gpu0", 0),
+            first,
+            (0, HEADS),
+        );
+        let mut engine = engine_head(&lending.socket, 0);
+        let (opened, descriptors) = engine.open_pool(layout(0)).unwrap();
+        let mut schedulers = Scheduler::all(&opened, descriptors);
+        let lender = lend_pages(&mut schedulers[0], &opened, |units| {
+            upload(&prefill.allocation, &pages(units, (0, HEADS)));
+        });
+
+        let mut out = std::io::stdout().lock();
+        writeln!(
+            out,
+            "lent {} {} {}",
+            lending.tcp, lender.session, lender.owner.0
+        )
+        .unwrap();
+        out.flush().unwrap();
+        drop(out);
+        let mut rest = Vec::new();
+        std::io::stdin().read_to_end(&mut rest).unwrap();
+    }
+
+    /// The second host's half, run there over ssh, which ends with its standard input.
+    struct LendingHost {
+        child: std::process::Child,
+    }
+
+    impl Drop for LendingHost {
+        fn drop(&mut self) {
+            drop(self.child.stdin.take());
+            if self.child.wait().is_err() {
+                let _ = self.child.kill();
+            }
+        }
+    }
+
+    /// Starts [`the_lending_half_of_a_handoff_across_hosts`] on the second host ([`PEER_HOST`])
+    /// and returns it with the lend it states.
+    fn lending_host() -> (LendingHost, Lender) {
+        use std::io::BufRead as _;
+        use std::process::{Command, Stdio};
+
+        let peer =
+            std::env::var(PEER_HOST).unwrap_or_else(|_| panic!("{PEER_HOST} names no second host"));
+        let executable = std::env::current_exe().unwrap();
+        let directory = std::env::current_dir().unwrap();
+        let remote = format!(
+            "cd {} && {} handoff::device::the_lending_half_of_a_handoff_across_hosts \
+             --exact --ignored --nocapture --test-threads 1",
+            directory.display(),
+            executable.display()
+        );
+        let mut child = Command::new("ssh")
+            .args(["-o", "BatchMode=yes", &peer, &remote])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let host = LendingHost { child };
+        for line in std::io::BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            // The test harness states the case's name on the same line before the case's own
+            // output.
+            let Some((_, lent)) = line.split_once("lent ") else {
+                continue;
+            };
+            let [endpoint, session, owner] = lent.split(' ').collect::<Vec<_>>()[..] else {
+                panic!("{peer} stated the lend as {line:?}");
+            };
+            let lender = Lender {
+                endpoint: Some(endpoint.to_owned()),
+                session: session.parse().unwrap(),
+                owner: OwnerId(owner.parse().unwrap()),
+            };
+            return (host, lender);
+        }
+        panic!("the lending half on {peer} ended before it lent");
+    }
+
+    /// The decode replica's engine and its two ranks on this host's first two GPUs; the prefill
+    /// replica's engine and rank on the second host ([`lending_host`]). The two hosts' Transfer
+    /// Servers reach each other's GPU storage over `transport` through their RDMA ports: a read
+    /// runs on this host's Transfer Server and a push on the second host's.
+    fn across_hosts(push: bool, transport: Transport) {
+        let [first, second] = gpus::<2>();
+        let importing = gpu_server(&[transport], true);
+        let claim = head(&importing.socket)
+            .claim(
+                Claimant::Head,
+                0,
+                vec![scope("decode", 1), scope("decode", 2)],
+                Vec::new(),
+            )
+            .unwrap();
+        let decode = [
+            device_rank(
+                &importing.socket,
+                claim,
+                ("decode", 1, "gpu1", 0),
+                first,
+                (0, 1),
+            ),
+            device_rank(
+                &importing.socket,
+                claim,
+                ("decode", 2, "gpu1", 1),
+                second,
+                (1, 1),
+            ),
+        ];
+        let mut engine = engine_head(&importing.socket, 0);
+        let (opened, descriptors) = engine.open_pool(layout(0)).unwrap();
+        let mut decode_scheduler = Scheduler::all(&opened, descriptors).remove(1);
+        attach_decode(&mut decode_scheduler);
+
+        let (lending, lender) = lending_host();
+        let started = std::time::Instant::now();
+        let units = imported_units(decode_scheduler.ask(import(lender, push, transport)));
+        eprintln!(
+            "{transport:?} {} across hosts in {:?}",
+            if push { "push" } else { "read" },
+            started.elapsed()
+        );
+        assert_imported(&[&decode[0], &decode[1]], &units);
+        drop(lending);
+    }
+
+    #[test]
+    #[ignore = "requires a second host (UNISERVE_PEER_HOST), two CUDA devices on each, NIXL and RDMA ports"]
+    fn an_import_reads_a_lend_on_another_host_through_nixl() {
+        across_hosts(false, Transport::Nixl);
+    }
+
+    #[test]
+    #[ignore = "requires a second host (UNISERVE_PEER_HOST), two CUDA devices on each, NIXL and RDMA ports"]
+    fn an_import_pushed_from_another_host_is_written_through_nixl() {
+        across_hosts(true, Transport::Nixl);
+    }
+
+    #[test]
+    #[ignore = "requires a second host (UNISERVE_PEER_HOST), two CUDA devices on each, Mooncake Transfer Engine and RDMA ports"]
+    fn an_import_reads_a_lend_on_another_host_through_the_transfer_engine() {
+        across_hosts(false, Transport::Mooncake);
+    }
+
+    #[test]
+    #[ignore = "requires a second host (UNISERVE_PEER_HOST), two CUDA devices on each, Mooncake Transfer Engine and RDMA ports"]
+    fn an_import_pushed_from_another_host_is_written_through_the_transfer_engine() {
+        across_hosts(true, Transport::Mooncake);
     }
 }

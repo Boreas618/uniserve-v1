@@ -47,6 +47,8 @@ pub(crate) struct Paths {
     pub(crate) gpus: bool,
     pub(crate) reads: bool,
     pub(crate) fabric: bool,
+    /// Copies from another host by the Transfer Engine's READs.
+    pub(crate) mooncake: bool,
 }
 
 impl Paths {
@@ -55,6 +57,7 @@ impl Paths {
         gpus: false,
         reads: false,
         fabric: false,
+        mooncake: false,
     };
 }
 
@@ -84,43 +87,13 @@ pub(crate) fn calibration(paths: Paths) -> Calibration {
     if paths.fabric {
         command.arg("--fabric");
     }
+    if paths.mooncake {
+        command.arg("--mooncake-reads");
+    }
     let status = command.status().unwrap();
     assert!(status.success(), "the calibration step failed: {status}");
     let calibration = Calibration::read(&output).unwrap();
     calibrated.insert(paths, calibration.clone());
-    calibration
-}
-
-/// This host's calibration of its GPUs, with a rate of copies from another host into each of its
-/// ends that paces the Transfer Engine's transfers. The calibration step times those copies with
-/// NIXL READs; the cases that cross hosts over the Transfer Engine state the rate it keeps on one
-/// host's adapters instead, a third of the 78 GB/s it reached between two GB200 hosts' GPUs
-/// (`docs/mooncake.md`).
-pub(crate) fn engine_calibration() -> Calibration {
-    use storage_server::transfer::calibration::{Cost, RemoteCost, RemotePath};
-
-    let mut calibration = calibration(Paths {
-        gpus: true,
-        reads: false,
-        fabric: false,
-    });
-    let ends: Vec<LinkEnd> = calibration
-        .gpus
-        .iter()
-        .map(|context| LinkEnd::Device { gpu: context.gpu })
-        .chain([LinkEnd::Host])
-        .collect();
-    calibration.remote = ends
-        .into_iter()
-        .map(|destination| RemoteCost {
-            path: RemotePath::Read,
-            destination,
-            cost: Cost {
-                bytes_per_second: 25_000_000_000,
-                overhead_ns: 20_000,
-            },
-        })
-        .collect();
     calibration
 }
 

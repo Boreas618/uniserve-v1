@@ -682,14 +682,33 @@ pub(crate) fn lend_two_pages(
     opened: &Opened,
     write: impl FnOnce(&[u32]),
 ) -> Lender {
-    let attach = |scheduler: &mut Scheduler, owner: u64, group| {
-        let attach = Request::Attach {
-            owner: OwnerId(owner),
-            group,
-        };
-        assert!(matches!(scheduler.ask(attach), Completion::Attached { .. }));
+    let lender = lend_pages(&mut schedulers[0], opened, write);
+    attach_decode(&mut schedulers[1]);
+    lender
+}
+
+/// Attaches owner `owner` to `group` through `scheduler`.
+fn attach(scheduler: &mut Scheduler, owner: u64, group: GroupId) {
+    let attach = Request::Attach {
+        owner: OwnerId(owner),
+        group,
     };
-    attach(&mut schedulers[0], 1, PREFILL);
+    assert!(matches!(scheduler.ask(attach), Completion::Attached { .. }));
+}
+
+/// The decode scheduler attaches owner 2, which imports a lend.
+pub(crate) fn attach_decode(decode: &mut Scheduler) {
+    attach(decode, 2, DECODE);
+}
+
+/// The prefill scheduler's half of [`lend_two_pages`]: owner 1 allocates two blocks, `write`
+/// fills their units, and the owner lends them.
+pub(crate) fn lend_pages(
+    prefill: &mut Scheduler,
+    opened: &Opened,
+    write: impl FnOnce(&[u32]),
+) -> Lender {
+    attach(prefill, 1, PREFILL);
     let allocate = Request::Allocate {
         owner: OwnerId(1),
         class: KV,
@@ -697,7 +716,7 @@ pub(crate) fn lend_two_pages(
         count: 2,
         units: 0,
     };
-    let Completion::Allocated { runs, .. } = schedulers[0].ask(allocate) else {
+    let Completion::Allocated { runs, .. } = prefill.ask(allocate) else {
         panic!("no units");
     };
     let lent: Vec<u32> = runs.into_iter().map(|(_, first, _)| first).collect();
@@ -707,8 +726,7 @@ pub(crate) fn lend_two_pages(
         lease: 60_000_000_000,
         after: Vec::new(),
     };
-    assert_eq!(schedulers[0].ask(lend), Completion::Done);
-    attach(&mut schedulers[1], 2, DECODE);
+    assert_eq!(prefill.ask(lend), Completion::Done);
     Lender {
         endpoint: None,
         session: opened.session,

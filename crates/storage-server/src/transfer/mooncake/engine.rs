@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use super::capi::{self, Api, BatchId, Handle, SegmentId};
 use super::library;
+use super::topology::Topology;
 use super::{Error, Result};
 
 /// The metadata service of every engine these bindings create: peer-to-peer handshakes, in
@@ -22,9 +23,8 @@ const ANY_LOCATION: &CStr = c"*";
 /// The engine is created with peer-to-peer handshakes ([`P2P_HANDSHAKE`]): it listens on a port
 /// of its own for other engines' handshakes, which fetch the description of its segment (the
 /// storage it registered, remotely accessible) and set its RDMA connections up, and its name
-/// ([`Engine::name`], `host:port`) is the segment name another engine opens it by. It discovers
-/// the host's topology and installs the transports the host has (RDMA over every usable adapter,
-/// TCP without one) when it starts.
+/// ([`Engine::name`], `host:port`) is the segment name another engine opens it by. Its RDMA
+/// transport is installed with the NIC priority matrix its creator states ([`Topology`]).
 ///
 /// The engine is synchronized within: its clones, registrations and batches call it from any
 /// thread at once.
@@ -58,14 +58,14 @@ fn check(call: &'static str, code: c_int) -> Result<()> {
 
 impl Engine {
     /// Creates an engine that other hosts reach at `host` (an address or a host name of this
-    /// host), on a port it picks. Loads the Transfer Engine's library from the loader's default
-    /// search path on first use.
+    /// host), on a port it picks, whose RDMA transport takes the devices `topology` states.
+    /// Loads the Transfer Engine's library from the loader's default search path on first use.
     ///
     /// # Errors
     ///
     /// Fails when the library cannot be loaded, or the engine cannot start: no port to listen
     /// on, or a transport that does not install.
-    pub(crate) fn new(host: &str) -> Result<Self> {
+    pub(crate) fn new(host: &str, topology: &Topology) -> Result<Self> {
         let api = library::api()?;
         let c_host = CString::new(host).map_err(|_| {
             Error::TransferEngineArgument("a host's name holds no NUL byte".to_owned())
@@ -79,12 +79,32 @@ impl Engine {
                 c_host.as_ptr(),
                 c_host.as_ptr(),
                 0,
-                1,
+                0,
             )
         };
         if handle.is_null() {
             return Err(Error::TransferEngine {
                 call: "creating an engine",
+                code: -1,
+            });
+        }
+
+        // The RDMA transport takes the matrix as its first argument.
+        let matrix = CString::new(topology.json()).map_err(|_| {
+            Error::TransferEngineArgument("a device's name holds no NUL byte".to_owned())
+        })?;
+        let mut arguments = [
+            matrix.as_ptr().cast_mut().cast::<c_void>(),
+            std::ptr::null_mut(),
+        ];
+        // SAFETY: a live engine and a NUL-terminated argument list whose string outlives the
+        // call, which parses it; a null transport is one that did not install.
+        let transport = unsafe { (api.install)(handle, c"rdma".as_ptr(), arguments.as_mut_ptr()) };
+        if transport.is_null() {
+            // SAFETY: the engine created above, which nothing else holds.
+            unsafe { (api.destroy)(handle) };
+            return Err(Error::TransferEngine {
+                call: "installing the RDMA transport",
                 code: -1,
             });
         }

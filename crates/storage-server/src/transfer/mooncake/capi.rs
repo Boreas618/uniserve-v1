@@ -108,6 +108,7 @@ pub(crate) struct Api {
     pub(crate) create:
         unsafe extern "C" fn(*const c_char, *const c_char, *const c_char, u64, c_int) -> Handle,
     pub(crate) destroy: unsafe extern "C" fn(Handle),
+    pub(crate) install: unsafe extern "C" fn(Handle, *const c_char, *mut *mut c_void) -> Handle,
     pub(crate) local_name: unsafe extern "C" fn(Handle, *mut c_char, usize) -> c_int,
     pub(crate) register:
         unsafe extern "C" fn(Handle, *mut c_void, usize, *const c_char, c_int) -> c_int,
@@ -137,6 +138,7 @@ impl Api {
         Ok(Self {
             create: entry!(library, "createTransferEngine"),
             destroy: entry!(library, "destroyTransferEngine"),
+            install: entry!(library, "installTransport"),
             local_name: entry!(library, "getLocalIpAndPort"),
             register: entry!(library, "registerLocalMemory"),
             unregister: entry!(library, "unregisterLocalMemory"),

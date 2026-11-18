@@ -214,6 +214,10 @@ fn this_program(levels: &service::logging::Levels) -> anyhow::Result<Program> {
 /// Fails when the server cannot start or fails while serving, or the running
 /// server cannot be reached or refuses the operator's request.
 pub fn run(args: Args, levels: &service::logging::Levels) -> anyhow::Result<()> {
+    for (name, value) in crate::transfer::mooncake::ENVIRONMENT {
+        // SAFETY: the caller has started no thread, so none reads the environment meanwhile.
+        unsafe { std::env::set_var(name, value) };
+    }
     match args.command {
         Command::Serve {
             deployment,

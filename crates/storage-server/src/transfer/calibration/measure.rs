@@ -26,6 +26,10 @@
 //!   another agent of this process registered, both agents limited to RDMA
 //!   ([`Transports::Rdma`]), so the bytes cross the host's RDMA ports as a READ from another
 //!   host's does.
+//! - **Transfer Engine READs** (`--mooncake-reads`): Mooncake Transfer Engine READs into host
+//!   storage and into each GPU from host storage another engine of this process registered,
+//!   over the RDMA transport each engine installs, as the Transfer Server's engine READs another
+//!   host's storage.
 
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -42,8 +46,8 @@ use platform::{
 use super::{Calibration, Cost, LinkCost, Method, RemoteCost, RemotePath};
 use crate::Error;
 use crate::transfer::devices::{Gpu, Gpus};
-use crate::transfer::nixl;
 use crate::transfer::storage::{HostMap, nixl_key};
+use crate::transfer::{mooncake, nixl};
 
 /// The `storage-server calibrate` command's arguments.
 #[derive(Debug, Clone, clap::Args)]
@@ -70,6 +74,11 @@ pub struct Arguments {
     /// READs from another host run; needs NIXL and a usable RDMA port.
     #[arg(long)]
     pub reads: bool,
+    /// Also time Mooncake Transfer Engine READs into host storage and each GPU through the
+    /// host's RDMA ports, as the Transfer Engine's READs from another host run; needs the
+    /// Transfer Engine (`docs/mooncake.md`) and a usable RDMA port.
+    #[arg(long)]
+    pub mooncake_reads: bool,
 }
 
 /// Runs the step: calibrates the host as `arguments` state and writes the record to its output.
@@ -198,6 +207,9 @@ pub fn calibrate(arguments: &Arguments) -> Result<Calibration, Error> {
         }
         if arguments.reads {
             remote.extend(timing.reads(&gpus, &scratch)?);
+        }
+        if arguments.mooncake_reads {
+            remote.extend(timing.engine_reads(&gpus, &scratch)?);
         }
     }
     // The measurement's storage is released before the contexts are measured.
@@ -470,6 +482,58 @@ impl Timing {
     }
 
     /// The rate of the method's timed copies in `seconds`.
+    /// The cost of Transfer Engine READs into host storage and into each GPU's scratch, from
+    /// host storage another engine of this process registered: the reading engine opens the
+    /// source engine's segment by the peer-to-peer handshake, as it opens another host's.
+    fn engine_reads(&self, gpus: &Gpus, scratch: &[Scratch]) -> Result<Vec<RemoteCost>, Error> {
+        let host = crate::host_name()?;
+        let topology = mooncake::Topology::of_host()?;
+        let source = mooncake::Engine::new(&host, &topology)?;
+        let reader = mooncake::Engine::new(&host, &topology)?;
+
+        let source_storage = HostMap::new(&host_buffer(None, self.sample)?, self.sample, true)?;
+        // SAFETY: `source_storage` maps the range writable until after the registration drops,
+        // and nothing in this process references its bytes.
+        let _source = unsafe { source.register(source_storage.address(), self.sample) }?;
+        let segment = reader.open(source.name())?;
+
+        let host_storage = HostMap::new(&host_buffer(None, self.sample)?, self.sample, true)?;
+        let mut destinations = vec![(LinkEnd::Host, host_storage.address())];
+        for (gpu, own) in gpus.iter().zip(scratch) {
+            destinations.push((LinkEnd::Device { gpu: gpu.uuid }, own.destination.address()));
+        }
+        let mut costs = Vec::with_capacity(destinations.len());
+        for (destination, address) in destinations {
+            // SAFETY: the host buffer or the GPU's scratch maps the range writable until after
+            // the registration drops, and nothing in this process references its bytes.
+            let _registration = unsafe { reader.register(address, self.sample) }?;
+            let read = |len: usize| -> Result<Duration, Error> {
+                let span = mooncake::Span {
+                    local: address,
+                    remote: source_storage.address(),
+                    len: len as u64,
+                };
+                let started = Instant::now();
+                reader.read(segment, &[span])?.wait(started)?;
+                Ok(started.elapsed())
+            };
+            // The first READ over the connection also sets it up.
+            read(self.sample)?;
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..self.method.samples {
+                elapsed += read(self.sample)?;
+            }
+            let bytes_per_second = self.rate(elapsed.as_secs_f64())?;
+            let overhead = self.least(|| read(self.page))?;
+            costs.push(RemoteCost {
+                path: RemotePath::Mooncake,
+                destination,
+                cost: cost(bytes_per_second, overhead),
+            });
+        }
+        Ok(costs)
+    }
+
     fn rate(&self, seconds: f64) -> Result<u64, Error> {
         if seconds <= 0.0 {
             return Err(Error::Calibration(

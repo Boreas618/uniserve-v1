@@ -503,10 +503,12 @@ impl Shared {
         };
         let end = match (path, thread.runner) {
             // A WRITE's local end is its source, whose RDMA rate the READs into it measure.
-            (RemotePath::Read, _) if matches!(link.destination, LinkEnd::Remote { .. }) => {
+            (RemotePath::Read | RemotePath::Mooncake, _)
+                if matches!(link.destination, LinkEnd::Remote { .. }) =>
+            {
                 link.source.clone()
             }
-            (RemotePath::Read, _) => link.destination.clone(),
+            (RemotePath::Read | RemotePath::Mooncake, _) => link.destination.clone(),
             (RemotePath::Fabric, Runner::Device(device)) => {
                 let gpu = self
                     .gpus

@@ -16,7 +16,7 @@ use super::{Error, Result};
 const UCX: &CStr = c"UCX";
 
 /// How an agent's UCX backend reaches other hosts: the transports it takes and the RDMA ports
-/// it may open ([`super::ports::usable`]).
+/// it may open ([`crate::transfer::ports::usable`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Backend {
     pub(crate) transports: Transports,
@@ -31,10 +31,11 @@ impl Backend {
     ///
     /// Fails when the kernel states no RDMA device or no usable port.
     pub(crate) fn of_host(transports: Transports) -> Result<Self> {
-        let class = super::ports::CLASS;
-        let ports = super::ports::usable(std::path::Path::new(class)).map_err(|error| {
-            Error::NixlArgument(format!("reading the host's RDMA ports in {class}: {error}"))
-        })?;
+        let class = crate::transfer::ports::CLASS;
+        let ports =
+            crate::transfer::ports::usable(std::path::Path::new(class)).map_err(|error| {
+                Error::NixlArgument(format!("reading the host's RDMA ports in {class}: {error}"))
+            })?;
         if ports.is_empty() {
             return Err(Error::NixlArgument(
                 "the host has no usable RDMA port (an active link that holds an address)"

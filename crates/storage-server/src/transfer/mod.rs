@@ -69,6 +69,7 @@ mod devices;
 pub(crate) mod mooncake;
 mod network;
 pub(crate) mod nixl;
+mod ports;
 mod storage;
 mod threads;
 

@@ -308,7 +308,6 @@ impl Server {
             &crate::command::successor_entry(theirs.as_raw_fd()),
             &[theirs.as_fd()],
             Stdio::null(),
-            &[],
         )?;
         drop(theirs);
         let pid = process.id();

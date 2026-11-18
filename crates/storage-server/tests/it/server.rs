@@ -62,6 +62,13 @@ impl Running {
         Self::serving(0, |_| {}, children)
     }
 
+    /// A server that runs `children` and accepts other hosts on every address of this host,
+    /// which they reach at this host's name ([`Running::tcp`]).
+    pub(crate) fn reachable(children: Option<Children>) -> Self {
+        let settings = ::storage::Settings::default();
+        Self::listening(settings, |_| {}, children, "0.0.0.0:0")
+    }
+
     /// A server that `configure` sets up before it serves, with no children.
     pub(crate) fn configured(configure: impl FnOnce(&mut Server) + Send + 'static) -> Self {
         Self::serving(0, configure, None)
@@ -98,14 +105,34 @@ impl Running {
         configure: impl FnOnce(&mut Server) + Send + 'static,
         children: Option<Children>,
     ) -> Self {
+        Self::listening(settings, configure, children, "127.0.0.1:0")
+    }
+
+    /// A server that accepts other hosts on `bind`: on the loopback address, or on every address
+    /// of this host, which other hosts reach at its name.
+    fn listening(
+        settings: ::storage::Settings,
+        configure: impl FnOnce(&mut Server) + Send + 'static,
+        children: Option<Children>,
+        bind: &str,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("storage.sock");
         let (listener, starting) = service::host::bind::<::storage::Settings>(&socket)
             .unwrap()
             .owned(&socket)
             .unwrap();
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = tcp.local_addr().unwrap().to_string();
+        let tcp = std::net::TcpListener::bind(bind).unwrap();
+        let bound = tcp.local_addr().unwrap();
+        let address = if bound.ip().is_unspecified() {
+            let host = rustix::system::uname()
+                .nodename()
+                .to_string_lossy()
+                .into_owned();
+            format!("{host}:{}", bound.port())
+        } else {
+            bound.to_string()
+        };
         let record = readiness(&socket, Some(&address));
         let lock = starting.finish(&record).unwrap();
         Self::on_thread(directory, socket, address, move || {
