@@ -115,6 +115,7 @@ impl Leader {
         stated: Stated,
         force: bool,
         number: u64,
+        revision: u64,
     ) -> Result<Applied, UpdateError> {
         let _replacing = self
             .replicas
@@ -142,19 +143,19 @@ impl Leader {
             &crate::leader::deployment(&target)?,
         );
         if named == Change::Host {
-            return self.apply_in_place(target, stated).await;
+            return self.apply_in_place(target, stated, revision).await;
         }
         let mut next = crate::leader::deployment(&target)?;
         next.modules = self.fix_modules(&target).await?;
         let Some((serving, record)) = self.updates.epochs().serving() else {
-            return self.apply_in_place(target, stated).await;
+            return self.apply_in_place(target, stated, revision).await;
         };
         let form = if named == Change::Epoch || record.engine != next.modules.engine {
             Effect::Epoch
         } else if record.kernels != next.modules.kernels || record.policy != next.modules.policy {
             Effect::Generation
         } else {
-            return self.apply_in_place(target, stated).await;
+            return self.apply_in_place(target, stated, revision).await;
         };
         if !force && let Some(mark) = self.updates.unavailable(&next) {
             return Err(UpdateError::Refused(format!(
@@ -164,7 +165,10 @@ impl Leader {
         }
         let options = target.update_config.clone();
         if form == Effect::Epoch {
-            Box::pin(self.epoch_update(number, &current, &target, next, serving, &options)).await
+            Box::pin(
+                self.epoch_update(number, &current, &target, next, serving, &options, revision),
+            )
+            .await
         } else {
             self.generation_update(number, next, serving, &options)
                 .await
@@ -173,10 +177,15 @@ impl Leader {
 
     /// The per-replica path of a change that starts no update: the daemon's own options (a
     /// hot restart), the options the engines take at their next step, or nothing.
-    async fn apply_in_place(&self, target: Config, stated: Stated) -> Result<Applied, UpdateError> {
+    async fn apply_in_place(
+        &self,
+        target: Config,
+        stated: Stated,
+        revision: u64,
+    ) -> Result<Applied, UpdateError> {
         let mut changed = Vec::new();
         for replica in self.replicas() {
-            match Box::pin(replica.apply(target.clone(), stated.clone())).await? {
+            match Box::pin(replica.apply(target.clone(), stated.clone(), revision)).await? {
                 applied @ (Applied::Daemon { .. } | Applied::Update(_)) => return Ok(applied),
                 Applied::InPlace(changes) => changed.extend(changes),
                 Applied::Unchanged => {}
@@ -335,6 +344,7 @@ impl Leader {
         next: Epoch,
         serving: crate::epoch::Recorded,
         options: &crate::config::UpdateConfig,
+        revision: u64,
     ) -> Result<Applied, UpdateError> {
         let refused = |error: anyhow::Error| UpdateError::Refused(format!("{error:#}"));
         let replicas = self.replicas();
@@ -400,7 +410,8 @@ impl Leader {
         // one allocator, its engine control: none collides with a standby's or with any other
         // engine of the deployment.
         let launches =
-            crate::leader::epoch_launches(&engine, &next.modules, target_epoch).map_err(refused)?;
+            crate::leader::epoch_launches(&engine, &next.modules, target_epoch, revision)
+                .map_err(refused)?;
         let configs: Vec<_> = launches
             .iter()
             .map(|args| args.engine_config.clone())
@@ -633,6 +644,7 @@ impl Replica {
         self: &Arc<Self>,
         target: Config,
         stated: Stated,
+        revision: u64,
     ) -> Result<Applied, UpdateError> {
         let _replacing = self
             .replacing
@@ -702,8 +714,16 @@ impl Replica {
             );
             Switched::FenceProbes
         } else if changes.iter().all(|change| change.effect == Effect::Step) {
-            // The scheduling limits travel with the scheduling module's generation, which moved
-            // the schedulers before this path: what is left is the record of them.
+            // The step values: every scheduler reads them from its next step on, and its
+            // batches name the revision they are of.
+            let tuning = proto::config::Tuning::of(&target_engine, revision);
+            running.tune(&tuning).await.map_err(|error| {
+                anyhow::anyhow!("the engine did not take the step values: {error}")
+            })?;
+            info!(
+                revision,
+                "the schedulers take the step values at their next step"
+            );
             Switched::SchedulingLimits
         } else {
             // Every change an update moves was decided before this path.
@@ -713,8 +733,10 @@ impl Replica {
                 paths.join(", ")
             )));
         };
+        // A relaunch and a standby start from what serves now, of this revision.
         let mut args = served;
         args.engine_config = target_engine;
+        args.revision = revision;
         *service::lock(&self.served) = Some(args);
         *service::lock(&self.config) = target;
         Ok(Applied::InPlace(vec![InPlaceChange {

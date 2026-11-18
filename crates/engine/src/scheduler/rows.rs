@@ -538,6 +538,7 @@ impl Scheduler {
     pub(super) fn seal(&self, batch: &mut Batch) -> ValidationResult<()> {
         batch.kernels = self.generations.kernels();
         batch.policy = self.generations.policy();
+        batch.revision = self.budget.revision;
         batch.new_slots.sort_unstable_by_key(|new| new.slot);
         if let Some(shape) = self.shape(batch) {
             batch.shape = shape;
@@ -1111,6 +1112,7 @@ mod tests {
             phase,
             kernels: 0,
             policy: 0,
+            revision: 0,
             shape: Shape::decode(0, Variant::DecodeGreedy),
             requests: Vec::new(),
             columns: Columns::default(),

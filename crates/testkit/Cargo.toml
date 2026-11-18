@@ -49,6 +49,8 @@ toml.workspace = true
 wasmtime.workspace = true
 
 [dev-dependencies]
+# The step values a scheduler of the harness reads at every step, which a case replaces.
+arc-swap.workspace = true
 # The media pipeline a video deployment's groups state: MiniMax-H3's, as its family declares it
 # (`nn::pipeline`).
 models.workspace = true

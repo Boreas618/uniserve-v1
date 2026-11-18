@@ -22,6 +22,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+# The step values every scheduler reads from its next step on, one snapshot the control thread
+# replaces (`proto::config::Tuning`).
+arc-swap.workspace = true
 # Byte views of plain numeric slices handed to device copies.
 bytemuck.workspace = true
 clap.workspace = true

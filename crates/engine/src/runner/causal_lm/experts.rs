@@ -371,6 +371,7 @@ impl Member {
             phase: step.phase,
             kernels: step.kernels,
             policy: step.policy,
+            revision: step.revision,
             shape: BatchShape::decode(1, Variant::ExpertJoin),
             requests: Vec::new(),
             columns: Columns::default(),

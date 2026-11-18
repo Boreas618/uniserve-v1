@@ -191,6 +191,7 @@ impl Node {
             Box::new(groups),
             output,
             Arc::clone(&served),
+            crate::scheduler::tests::tuned(),
         )
         .unwrap();
         let thread = std::thread::spawn(move || scheduler.run(messages));

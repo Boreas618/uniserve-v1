@@ -14,7 +14,6 @@ use std::num::NonZeroUsize;
 
 use engine::batch::{Batch, Phase};
 use engine::scheduler::Message;
-use proto::config::SchedulerConfig;
 use proto::request::{Event, FinishReason, RejectionKind, RequestId};
 use storage::runtime::Request;
 
@@ -73,16 +72,6 @@ fn written(harness: &Harness, id: RequestId) -> Vec<i32> {
         .iter()
         .flat_map(|batch| row_positions(batch, id))
         .collect()
-}
-
-/// A configuration of the scheduler's limits, every other field at its default.
-fn limits(running: usize, batch: usize, tokens: usize) -> SchedulerConfig {
-    SchedulerConfig {
-        max_running_requests: running,
-        max_batch: NonZeroUsize::new(batch).unwrap(),
-        max_num_batched_tokens: tokens,
-        ..SchedulerConfig::default()
-    }
 }
 
 /// The waiting queue's bound counts the requests that wait, not those that run, and a request
@@ -443,49 +432,38 @@ fn a_terminal_is_sent_behind_a_full_window() {
     harness.settle(100);
 }
 
-/// `Configure` refuses a limit above what the workers were started for, and leaves the limits
-/// as they were; a limit within them serves from the next step on (SD §2.4 `Configure`; §7.1
-/// "`Configure` refuses a value above the workers' capacity").
+/// A change of the step values serves from the next step on, without a new policy instance:
+/// a queue bound that arrives refuses the submissions beyond it, and one that leaves admits them
+/// again (`specs/configuration.md` §7, step values).
 #[test]
-fn configure_applies_limits_in_place_and_refuses_what_the_workers_cannot_hold() {
-    // Eight slots, buckets of eight rows and 64 tokens.
-    let mut harness = Deployment::tokens().build();
-    let refusals = [
-        (limits(9, 8, 64), "max_running_requests"),
-        (limits(8, 9, 64), "max_batch"),
-        (limits(8, 8, 65), "max_num_batched_tokens"),
-    ];
-    for (config, limit) in refusals {
-        let (reply, replied) = crossbeam_channel::bounded(1);
-        harness.apply(Message::Configure(config, reply));
-        let refusal = replied.try_recv().unwrap().unwrap_err().to_string();
-        assert!(refusal.contains(limit), "{refusal}");
-    }
+fn step_values_take_effect_at_the_next_step() {
+    let mut harness = Deployment::tokens().slots(1).build();
+    let running = harness.submit(token(1, 6, 4));
+    harness.run_until(10, |harness| !harness.tokens(running).is_empty());
+    let overloaded = Some((
+        RejectionKind::Overloaded,
+        "scheduler waiting queue is full".to_owned(),
+    ));
 
-    // The limits are as they were: three requests run at once.
-    let ids: Vec<RequestId> = (1..=3).map(|id| harness.submit(token(id, 6, 6))).collect();
-    let mut most = 0;
-    for _ in 0..100 {
-        harness.step();
-        most = most.max(live(&harness, &ids));
-    }
-    assert_eq!(most, 3);
-    harness.settle(100);
+    // No bound: two requests wait beside the running one.
+    let first = harness.submit(token(2, 6, 4));
+    let second = harness.submit(token(3, 6, 4));
+    assert!(harness.events(first).is_empty() && harness.events(second).is_empty());
 
-    // One running request from here on.
-    let (reply, replied) = crossbeam_channel::bounded(1);
-    harness.apply(Message::Configure(limits(1, 8, 64), reply));
-    assert!(replied.try_recv().unwrap().is_ok());
-    let ids: Vec<RequestId> = (4..=6).map(|id| harness.submit(token(id, 6, 6))).collect();
-    for _ in 0..300 {
-        if ids.iter().all(|id| harness.terminal(*id).is_some()) {
-            break;
-        }
-        harness.step();
-        assert!(live(&harness, &ids) <= 1);
-    }
-    harness.settle(100);
-    for id in &ids {
-        assert_eq!(harness.tokens(*id).len(), 6);
+    // A bound of two arrives: the queue is at it from the next step on.
+    harness.tune(|tuning| tuning.max_queued_requests = NonZeroUsize::new(2));
+    harness.step();
+    let refused = harness.submit(token(4, 6, 4));
+    assert_eq!(rejection(&harness, refused), overloaded);
+
+    // The bound leaves again: the queue takes one more.
+    harness.tune(|tuning| tuning.max_queued_requests = None);
+    harness.step();
+    let taken = harness.submit(token(5, 6, 4));
+    assert_ne!(rejection(&harness, taken), overloaded);
+
+    harness.settle(400);
+    for id in [running, first, second, taken] {
+        assert_eq!(harness.tokens(id).len(), 4, "{}", harness.summary());
     }
 }

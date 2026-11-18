@@ -1379,6 +1379,7 @@ fn batch(number: u64) -> Batch {
         phase: Phase::Decode,
         kernels: 1,
         policy: 1,
+        revision: 0,
         shape: Shape::decode(1, Variant::DecodeGreedy),
         requests: vec![proto::request::RequestId(number)],
         columns: Columns::default(),

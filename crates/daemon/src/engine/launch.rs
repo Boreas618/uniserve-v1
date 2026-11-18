@@ -97,6 +97,7 @@ mod tests {
                 .expect("the configuration resolves"),
             deployment: "model".to_owned(),
             epoch: 12,
+            revision: 3,
             predecessor: Some(Predecessor { epoch: 11 }),
             expert_order: [(
                 "model.layers.0.mlp".to_owned(),
@@ -144,6 +145,7 @@ mod tests {
         let expected = [
             "engine_config",
             "epoch",
+            "revision",
             "predecessor",
             "expert_order",
             "host",

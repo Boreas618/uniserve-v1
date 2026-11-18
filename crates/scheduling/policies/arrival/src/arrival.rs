@@ -84,13 +84,6 @@ impl TryFrom<Parameters> for Arrival {
     /// are part of the package); the state arrives in `init`.
     fn try_from(parameters: Parameters) -> Result<Self, Unstated> {
         let limits = Limits {
-            chunked_prefill_size: stated(parameters.chunked_prefill_size, "chunked_prefill_size")?,
-            max_queued_requests: parameters.max_queued_requests,
-            max_batch: stated(parameters.max_batch, "max_batch")?,
-            max_num_batched_tokens: stated(
-                parameters.max_num_batched_tokens,
-                "max_num_batched_tokens",
-            )?,
             prefetch_min_tokens: stated(parameters.prefetch_min_tokens, "prefetch_min_tokens")?,
             timeout: stated(parameters.timeout, "timeout")?,
         };
@@ -210,7 +203,7 @@ impl Arrival {
         let chunk = prefill_chunk(
             start,
             view.prefill_tokens.max(view.prompt_tokens),
-            self.limits.chunked_prefill_size,
+            room.chunk_tokens,
             share,
             room.page_tokens,
         );
@@ -705,9 +698,6 @@ mod tests {
     fn arguments(order: QueueOrder) -> Parameters {
         Parameters {
             order: Some(order),
-            chunked_prefill_size: Some(8192),
-            max_batch: Some(128),
-            max_num_batched_tokens: Some(8192),
             prefetch_min_tokens: Some(256),
             timeout: Some(Nanos(30_000_000_000)),
             prefill_window: Some(WINDOW),
@@ -790,6 +780,7 @@ mod tests {
     fn room(tokens: u32, calls: usize) -> Room {
         Room {
             token_budget: tokens,
+            chunk_tokens: 8192,
             call_budget: calls,
             page_tokens: 16,
             ..Room::default()
@@ -824,8 +815,8 @@ mod tests {
     /// that says which call it is next is the mechanism's to state.**
     ///
     /// A waiting request the mechanism admitted
-    /// is prefilled in the next step, chunked only by
-    /// `limits().chunked_prefill_size` and the step's budget. It schedules that
+    /// is prefilled in the next step, chunked only by the
+    /// room's `chunk_tokens` and the step's budget. It schedules that
     /// work by the phase the views carry (`RequestView::phase`), because the
     /// phase says which of the request's calls runs next and what it costs;
     /// without one it schedules nothing, since a policy cannot invent a phase id
@@ -1393,6 +1384,7 @@ mod tests {
         }]);
         let room = Room {
             token_budget: 1024,
+            chunk_tokens: 8192,
             call_budget: 8,
             page_tokens: 16,
             prefill_tokens: Some(64),

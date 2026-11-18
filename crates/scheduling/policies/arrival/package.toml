@@ -9,7 +9,7 @@ backend = "arrival"
 # The policy interface the module implements (`scheduling::INTERFACE_VERSION`),
 # which the Build Server records with the module: the engine refuses a module
 # whose record, or whose own `sched_interface_version`, states another.
-interface_version = 5
+interface_version = 6
 
 # The policy is built with the workspace's pinned Rust toolchain.
 [toolchain]
@@ -20,17 +20,12 @@ form = "wasm"
 
 # Every parameter the policy requires, with its default: the arguments a
 # revision runs with are these, replaced by the ones the deployment states
-# (`scheduling::limits::Parameters`). `max_num_batched_tokens` has no default:
-# the scheduler states its own step budget where the deployment states none.
-# `max_queued_requests` has none either: unstated, the queue is unbounded.
+# (`scheduling::limits::Parameters`). The step's budget and prefill chunk are
+# the deployment's configuration, which each step's room states.
 [parameters]
 # The order the waiting queue admits by: "arrival", or "priority" (the
 # request's own priority, lower first, then arrival).
 order = "arrival"
-# Tokens of one prefill chunk.
-chunked_prefill_size = 8192
-# Calls per step.
-max_batch = 128
 # The smallest prefix-hit deepening worth fetching from the host KV cache, in
 # tokens: a shorter hit is computed faster than it is fetched.
 prefetch_min_tokens = 256

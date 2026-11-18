@@ -84,17 +84,11 @@ struct Script {
 
 impl Script {
     /// A script that admits `requests` and names a prefill and a decode of each in every step,
-    /// with the deployment's chunk and steps of [`Deployment::tokens`]: chunks of 16 tokens, 8
-    /// calls and 64 tokens a step. An id that names no waiting request, or a phase its request
+    /// under the policy budget's own limits. An id that names no waiting request, or a phase its request
     /// is not ready for, is the scheduler's to skip.
     fn serving(requests: &[u64]) -> Self {
         Self {
-            limits: Limits {
-                chunked_prefill_size: 16,
-                max_batch: 8,
-                max_num_batched_tokens: 64,
-                ..policy::ceilings([], &proto::config::PolicyBudget::default())
-            },
+            limits: policy::ceilings([], &proto::config::PolicyBudget::default()).limits,
             init: Init::Serves,
             observe: None,
             replies: vec![driving(requests, 0)],
@@ -258,15 +252,33 @@ fn packaged() -> Arc<Module> {
     load(&testkit::packaged_module())
 }
 
-/// The arguments of the packaged policy on [`Deployment::tokens`]: chunks of `chunk` tokens, the
-/// deployment's 8 calls and 64 tokens a step, and the package's defaults for the rest.
-fn chunked(chunk: u32) -> Parameters {
+/// The arguments of the packaged policy admitting its waiting queue by the request's priority,
+/// then arrival, and the package's defaults for the rest.
+fn by_priority() -> Parameters {
     Parameters {
-        chunked_prefill_size: Some(chunk),
-        max_batch: Some(8),
-        max_num_batched_tokens: Some(64),
+        order: Some(scheduling::QueueOrder::Priority),
         ..testkit::packaged_parameters()
     }
+}
+
+/// Which of `low` (priority 5) and `high` (priority 1), submitted in that order behind a request
+/// that holds the deployment's one slot, the serving policy admits first: `low` by arrival,
+/// `high` by priority.
+fn admitted_first(harness: &mut Harness, ids: (u64, u64, u64)) -> RequestId {
+    let (holding, low, high) = ids;
+    let running = harness.submit(token(holding, 6, 4));
+    harness.run_until(10, |harness| !harness.tokens(running).is_empty());
+    let mut low = token(low, 6, 2);
+    low.priority = 5;
+    let mut high = token(high, 6, 2);
+    high.priority = 1;
+    let (low, high) = (harness.submit(low), harness.submit(high));
+    harness.settle(300);
+    let first = harness
+        .sent()
+        .map(|(id, _)| *id)
+        .find(|id| *id == low || *id == high);
+    first.expect("both waiting requests are served")
 }
 
 /// Sends `SetPolicy`, as the engine switches a generation's policy, and returns its reply.
@@ -359,7 +371,7 @@ fn observe_and_dispatch_are_called_once_per_step_and_limits_once_per_instance() 
     let mut harness = Deployment::tokens().build();
     let id = harness.submit(token(1, 10, 20));
     harness.run(10);
-    set_policy(&mut harness, packaged(), chunked(8)).unwrap();
+    set_policy(&mut harness, packaged(), by_priority()).unwrap();
     harness.run(5);
     rollback(&mut harness).unwrap();
     harness.settle(100);
@@ -387,8 +399,8 @@ fn a_trap_exhausted_fuel_or_limits_above_a_ceiling_refuse_a_switch_and_leave_the
         ..Script::serving(&[])
     };
     let wide = Parameters {
-        max_num_batched_tokens: Some(1024),
-        ..chunked(8)
+        timeout: Some(scheduling::Nanos(60_000_000_000)),
+        ..testkit::packaged_parameters()
     };
     let refusals = [
         (
@@ -404,8 +416,7 @@ fn a_trap_exhausted_fuel_or_limits_above_a_ceiling_refuse_a_switch_and_leave_the
         (
             packaged(),
             wide,
-            "its limits are outside the ceilings: max_num_batched_tokens is 1024, above the \
-             ceiling of 64",
+            "its limits are outside the ceilings: timeout is 60000000000 ns",
         ),
     ];
     for (module, parameters, fault) in refusals {
@@ -425,11 +436,7 @@ fn a_trap_exhausted_fuel_or_limits_above_a_ceiling_refuse_a_switch_and_leave_the
     );
     let id = harness.submit(token(1, 20, 2));
     harness.settle(100);
-    assert_eq!(
-        chunks(&harness, id),
-        [8, 8, 4],
-        "the serving policy's chunk"
-    );
+    assert_eq!(chunks(&harness, id), [8, 8, 4], "the deployment's chunk");
     assert_eq!(harness.tokens(id).len(), 2);
 }
 
@@ -564,13 +571,12 @@ fn a_decision_beyond_a_limit_is_cut_to_it() {
     const CALLS: usize = 2;
     const TOKENS: u32 = 32;
     let mut harness = Deployment::tokens().build();
+    harness.tune(|tuning| {
+        tuning.chunked_prefill_size = std::num::NonZeroUsize::new(CHUNK as usize);
+        tuning.max_batch = std::num::NonZeroUsize::new(CALLS).unwrap();
+        tuning.max_num_batched_tokens = std::num::NonZeroUsize::new(TOKENS as usize);
+    });
     let greedy = Script {
-        limits: Limits {
-            chunked_prefill_size: CHUNK,
-            max_batch: CALLS,
-            max_num_batched_tokens: TOKENS,
-            ..policy::ceilings([], &proto::config::PolicyBudget::default())
-        },
         replies: vec![driving(&[1, 2, 3], 1_000)],
         ..Script::serving(&[])
     };
@@ -663,40 +669,35 @@ fn ids_in_the_wrong_state_are_skipped() {
 }
 
 /// A rollback makes the policy the last switch replaced serve again, once; a committed switch
-/// keeps nothing to roll back to (SD §3.9). Which policy serves shows in its chunk.
+/// keeps nothing to roll back to (SD §3.9). Which policy serves shows in the order it admits
+/// waiting requests by.
 #[test]
 fn rollback_serves_the_replaced_policy_again_and_commit_drops_it() {
-    let mut harness = Deployment::tokens().build();
-    set_policy(&mut harness, packaged(), chunked(8)).unwrap();
-    let first = harness.submit(token(1, 20, 2));
-    harness.settle(100);
+    let mut harness = Deployment::tokens().slots(1).build();
+    set_policy(&mut harness, packaged(), by_priority()).unwrap();
     assert_eq!(
-        chunks(&harness, first),
-        [8, 8, 4],
+        admitted_first(&mut harness, (1, 2, 3)),
+        RequestId(3),
         "the switch's policy serves"
     );
 
     rollback(&mut harness).unwrap();
-    let second = harness.submit(token(2, 20, 2));
-    harness.settle(100);
     assert_eq!(
-        chunks(&harness, second),
-        [20],
+        admitted_first(&mut harness, (4, 5, 6)),
+        RequestId(5),
         "the replaced policy serves again"
     );
     assert!(rollback(&mut harness).is_err(), "one rollback per switch");
 
-    set_policy(&mut harness, packaged(), chunked(8)).unwrap();
+    set_policy(&mut harness, packaged(), by_priority()).unwrap();
     harness.apply(Message::CommitPolicy);
     assert!(
         rollback(&mut harness).is_err(),
         "a committed switch keeps nothing"
     );
-    let third = harness.submit(token(3, 20, 2));
-    harness.settle(100);
     assert_eq!(
-        chunks(&harness, third),
-        [8, 8, 4],
+        admitted_first(&mut harness, (7, 8, 9)),
+        RequestId(9),
         "the committed policy serves"
     );
 }

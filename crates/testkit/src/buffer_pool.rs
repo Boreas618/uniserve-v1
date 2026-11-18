@@ -696,6 +696,7 @@ mod tests {
             phase: Phase::Prefill,
             kernels: 0,
             policy: 0,
+            revision: 0,
             shape: Shape::prefill(1, tokens as u32, Variant::PrefillOutput),
             requests: vec![proto::request::RequestId(1)],
             columns: Columns {

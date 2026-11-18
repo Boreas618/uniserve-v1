@@ -1938,7 +1938,7 @@ mod tests {
 
         // The deployment's first epoch is numbered as its first engine is.
         let epoch = control.next_engine();
-        let launches = crate::leader::epoch_launches(&config, &modules(), epoch).unwrap();
+        let launches = crate::leader::epoch_launches(&config, &modules(), epoch, 0).unwrap();
         assert_eq!(launches.len(), 2, "two independent replicas");
         let placed: Vec<EngineArgs> = launches
             .iter()

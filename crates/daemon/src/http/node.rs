@@ -412,7 +412,7 @@ impl Node {
                 "the package is the current revision, which starts as its apply fixed it"
             );
             return match self
-                .bring(&stored.package, join, stored.lock.clone())
+                .bring(&stored.package, stored.record.revision, join, stored.lock.clone())
                 .await?
             {
                 Some(brought) => self.serve(brought).await,
@@ -428,7 +428,7 @@ impl Node {
             revision = number,
             "the deployment starts with a new revision"
         );
-        match self.bring(&package, join, None).await {
+        match self.bring(&package, number, join, None).await {
             Ok(Some(brought)) => {
                 if let Some(modules) = brought.leader.modules() {
                     self.revisions.lock(number, &modules)?;
@@ -461,7 +461,7 @@ impl Node {
                     "the package did not come up ({error:#}); the current revision starts"
                 );
                 match self
-                    .bring(&stored.package, None, stored.lock.clone())
+                    .bring(&stored.package, stored.record.revision, None, stored.lock.clone())
                     .await?
                 {
                     Some(brought) => self.serve(brought).await,
@@ -471,9 +471,9 @@ impl Node {
         }
     }
 
-    /// Brings the deployment of `package` up, as its start: its daemon, its engines (with the
-    /// module revisions `lock` fixed, or those its apply fixes now), its admin state and video
-    /// jobs; `None` when the node stopped first. `join` is the join listener the node bound at
+    /// Brings the deployment of `package`, revision `revision`, up, as its start: its daemon, its
+    /// engines (with the module revisions `lock` fixed, or those its apply fixes now), its admin
+    /// state and video jobs; `None` when the node stopped first. `join` is the join listener the node bound at
     /// start, or `None` to bind one now for a deployment of several nodes.
     ///
     /// The deployment's daemon starts first and, on a deployment of several nodes, waits until
@@ -485,6 +485,7 @@ impl Node {
     async fn bring(
         &self,
         package: &Package,
+        revision: u64,
         join: Option<(::service::Listener, ::service::Endpoint)>,
         lock: Option<crate::epoch::ModuleSet>,
     ) -> Result<Option<Brought>> {
@@ -494,7 +495,7 @@ impl Node {
         self.set(Serving::Starting(name.clone()));
         self.journal
             .record(EventBody::Deployment, format!("{name} comes up"));
-        let brought = self.bring_up(config, stated, join, lock).await;
+        let brought = self.bring_up(config, stated, revision, join, lock).await;
         match &brought {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -525,6 +526,7 @@ impl Node {
         &self,
         config: Config,
         stated: Stated,
+        revision: u64,
         join: Option<(::service::Listener, ::service::Endpoint)>,
         lock: Option<crate::epoch::ModuleSet>,
     ) -> Result<Option<Brought>> {
@@ -562,7 +564,7 @@ impl Node {
         Daemon::advance_updates(Arc::clone(&updates), awake)
             .context("starting the updater's thread")?;
         let leader = tokio::select! {
-            leader = Leader::start(&self.families, &config, &stated, address, &self.instance, updates, lock) => leader,
+            leader = Leader::start(&self.families, &config, &stated, address, &self.instance, updates, (revision, lock)) => leader,
             () = token.cancelled() => {
                 stop_daemon(Some(daemon)).await?;
                 return Ok(None);
@@ -840,6 +842,7 @@ impl Node {
                     package.stated.clone(),
                     force,
                     id,
+                    number,
                 ))
                 .await
             }

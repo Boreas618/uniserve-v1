@@ -66,8 +66,8 @@ impl MainProcess {
             .unwrap_or_default();
 
         // A bound no captured bucket states binds nothing, which the wire states as zero.
-        let max_batch = u32::try_from(engine.ceilings.max_batch).unwrap_or(0);
-        let max_num_batched_tokens = match engine.ceilings.max_num_batched_tokens {
+        let max_batch = u32::try_from(engine.ceilings.rows).unwrap_or(0);
+        let max_num_batched_tokens = match engine.ceilings.tokens {
             u32::MAX => 0,
             tokens => u64::from(tokens),
         };

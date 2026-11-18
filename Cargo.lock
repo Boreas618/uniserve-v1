@@ -145,6 +145,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84a22b5d51209f6de83d37a0b33d320acb8da88823e42a94c075140708f032a5"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2260,6 +2269,7 @@ name = "engine"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "build-server",
  "bytemuck",
  "clap",
@@ -6116,6 +6126,7 @@ name = "testkit"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "build-server",
  "crossbeam-channel",
  "engine",

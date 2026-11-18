@@ -66,13 +66,16 @@ use crate::profiling::counters::Counters;
 use crate::worker::Worker;
 use crate::worker::completion::Outcome;
 use anyhow::{Context as _, Result, bail};
+use arc_swap::ArcSwap;
 use build_server::Target;
 use crossbeam_channel::{Receiver, Sender};
 use ops::KernelEntry;
 use platform::DeviceId;
-use proto::config::{DeviceKind, EngineArgs, EngineConfig, SchedulerConfig, WorkerGroupConfig};
+use proto::config::{
+    DeviceKind, EngineArgs, EngineConfig, SchedulerConfig, Tuning, WorkerGroupConfig,
+};
 use proto::request::{GenerationFeatures, GenerationLimits};
-use scheduling::limits::{Limits, Parameters};
+use scheduling::limits::Parameters;
 use scheduling::view::{RankView, Snapshot};
 use storage::QueuePair;
 use storage::runtime::{GroupId, Open, Opened, Segments};
@@ -89,7 +92,7 @@ use crate::parallel::Rendezvous;
 use crate::process::binding::{Target as LoadTarget, WeightBinding};
 use crate::process::ranks::rank::ModelRunner;
 use crate::process::ranks::rank::text::Keys;
-use crate::scheduler::policy::{self, Policy};
+use crate::scheduler::policy::{self, Ceilings, Policy};
 use crate::scheduler::{Message, Output, Scheduler};
 
 /// The started epoch: its schedulers and the ranks they drive (module documentation).
@@ -103,9 +106,11 @@ pub struct Engine {
     pub(crate) limits: GenerationLimits,
     /// What each worker group of the session serves, by its number.
     pub(crate) capacities: Vec<(GroupId, Capacity)>,
-    /// The ceilings a policy of this engine declares its limits within: those of every group's
-    /// captured buckets.
-    pub(crate) ceilings: Limits,
+    /// What every group's captured buckets bound a step to, and the bounds a policy of this
+    /// engine declares its limits within.
+    pub(crate) ceilings: Ceilings,
+    /// The step values every scheduler reads from its next step on, which a `Tune` replaces.
+    pub(crate) tuning: Arc<ArcSwap<Tuning>>,
     /// The requests every scheduler runs at once as it started: the deployment's
     /// `max_running_requests`, within the slots the groups' ranks hold.
     pub(crate) max_running_requests: usize,
@@ -246,6 +251,8 @@ impl Engine {
             &ceilings,
         );
         let served = Arc::new(Generations::new(FIRST_GENERATION, FIRST_GENERATION));
+        // The schedulers' first step values are the launch's, of the revision it states.
+        let tuning = Arc::new(ArcSwap::from_pointee(Tuning::of(config, launch.revision)));
 
         // The schedulers' limits as the deployment states them, which each scheduler lowers to
         // what its groups' workers captured; the captured sizes in tokens are the graph tiers.
@@ -300,6 +307,7 @@ impl Engine {
                 executor,
                 output,
                 Arc::clone(&served),
+                Arc::clone(&tuning),
             )
             .with_context(|| format!("starting scheduler {index}"))?;
             features |= scheduler.limits().features;
@@ -334,7 +342,11 @@ impl Engine {
                 ..Snapshot::default()
             };
             Some(Policy::new(
-                module, parameters, snapshot, &ceilings, budget,
+                module,
+                parameters,
+                snapshot,
+                &ceilings.limits,
+                budget,
             )?)
         } else {
             None
@@ -346,6 +358,7 @@ impl Engine {
             limits,
             capacities,
             ceilings,
+            tuning,
             max_running_requests,
             served,
             session,
@@ -921,6 +934,11 @@ fn start_peer(
         limits: launch.engine_config.model.generation_limits.clone(),
         capacities,
         ceilings,
+        // A peer runs no scheduler: its step values are the launch's and go nowhere.
+        tuning: Arc::new(ArcSwap::from_pointee(Tuning::of(
+            &launch.engine_config,
+            launch.revision,
+        ))),
         // A peer runs no scheduler: the scheduler node serves the deployment's requests within
         // its ranks' slots, and the peer states the launch's bound.
         max_running_requests: launch.engine_config.max_running_requests.get(),
@@ -944,18 +962,20 @@ fn start_peer(
 
 /// The tokens one scheduling step holds (`SchedulerConfig::max_num_batched_tokens`, SD §7.1): the
 /// deployment's `max_num_batched_tokens`; when it states none, what the workers' captured catalog
-/// bounds a step to, the widest prefill bucket of `ceilings`; and the configuration's default
-/// only when no group captured a prefill bucket. A scheduler budgets each step by its policy's
-/// declared limit, which is this figure when the policy's package states none
-/// (`scheduler::policy::budgeted`).
-pub(crate) fn step_budget(config: &EngineConfig, ceilings: &Limits) -> usize {
-    let captured = match ceilings.max_num_batched_tokens {
-        u32::MAX => config.scheduler.max_num_batched_tokens,
+/// bounds a step to, the widest prefill bucket of `ceilings`; and the longest sequence only when
+/// no group captured a prefill bucket. A scheduler budgets each step by the step values it
+/// reads, and by this figure where they state no token budget (`scheduler::Budget`).
+pub(crate) fn step_budget(config: &EngineConfig, ceilings: &Ceilings) -> usize {
+    // A deployment that captured no prefill bucket (a media pipeline) admits its longest
+    // sequence in one step.
+    let captured = match ceilings.tokens {
+        u32::MAX => usize::try_from(config.model.max_model_len).unwrap_or(usize::MAX),
         tokens => usize::try_from(tokens).unwrap_or(usize::MAX),
     };
     config
         .max_num_batched_tokens
         .map_or(captured, NonZeroUsize::get)
+        .max(1)
 }
 
 /// `configured`, the generation limits a launch states, lowered to what the worker groups of
@@ -971,10 +991,10 @@ pub(crate) fn step_budget(config: &EngineConfig, ceilings: &Limits) -> usize {
 fn lowered(
     configured: GenerationLimits,
     capacities: &[(GroupId, Capacity)],
-    ceilings: &Limits,
+    ceilings: &Ceilings,
 ) -> GenerationLimits {
     let mut limits = configured;
-    let tokens = ceilings.max_num_batched_tokens;
+    let tokens = ceilings.tokens;
 
     // The grid tokens and the feature bytes a group of the kind that computes `phase` holds;
     // nothing when no group does.

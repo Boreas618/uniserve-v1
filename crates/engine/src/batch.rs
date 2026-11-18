@@ -153,6 +153,9 @@ pub struct Batch {
     /// The generation of the scheduling program the batch was formed under. It changes at one
     /// batch boundary of every scheduler and involves no graph.
     pub policy: u64,
+    /// The configuration revision of the step values the batch was assembled under: the
+    /// snapshot its step began with (`proto::config::Tuning`), the same on every rank.
+    pub revision: u64,
     /// The rows, tokens, variant and extent the scheduler wrote: what selects the bucket.
     pub shape: Shape,
     /// The requests the batch advances, one call each, in row order: the order of
@@ -1394,6 +1397,7 @@ mod tests {
             phase: Phase::Verify,
             kernels: 0,
             policy: 0,
+            revision: 0,
             shape: Shape::prefill(4, 8, Variant::VerifyGreedy),
             requests: vec![RequestId(7), RequestId(9)],
             columns: Columns {
@@ -1520,6 +1524,7 @@ mod tests {
             phase: Phase::Denoise,
             kernels: 0,
             policy: 0,
+            revision: 0,
             shape: Shape {
                 rows: 1,
                 tokens: 0,

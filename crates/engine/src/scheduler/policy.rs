@@ -27,7 +27,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::batch::{Shape, Stage};
-use proto::config::{PolicyBudget, SchedulerConfig};
+use proto::config::PolicyBudget;
 use proto::request::RequestId;
 use scheduling::decision::{DispatchOutput, Room, Shortage, Victim};
 use scheduling::event::Event;
@@ -349,8 +349,8 @@ impl Policy {
                 continue;
             }
 
-            // A refill is offered as a step of the policy's own token limit sizes it.
-            let tokens = Some(self.limits.max_num_batched_tokens);
+            // A refill is offered as a step of the room's token budget sizes it.
+            let tokens = Some(room.token_budget);
             let view = view(request, groups, tokens);
             if self.told.get(&id) == Some(&view) {
                 continue;
@@ -769,55 +769,10 @@ fn malformed(call: Call, message: impl Into<String>) -> PolicyError {
     }
 }
 
-/// Refuses limits outside `ceilings` (`H/limits.rs:30-93`): a count that is zero or above its
-/// ceiling, an unbounded queue against a bounded ceiling or a bound above it, a prefetch threshold
-/// below the floor, and a starvation bound that is zero or above the ceiling's. A limit is
-/// refused rather than clamped, since the policy's own decisions are sized to the limits it
-/// declared.
+/// Refuses limits outside `ceilings`, the deployment's policy budget: a prefetch threshold below
+/// the floor, and a starvation bound that is zero or above the ceiling's. A limit is refused
+/// rather than clamped, since the policy's own decisions are sized to the limits it declared.
 fn check(limits: &Limits, ceilings: &Limits) -> Result<(), PolicyError> {
-    let counts = [
-        (
-            "chunked_prefill_size",
-            u64::from(limits.chunked_prefill_size),
-            u64::from(ceilings.chunked_prefill_size),
-        ),
-        (
-            "max_batch",
-            limits.max_batch as u64,
-            ceilings.max_batch as u64,
-        ),
-        (
-            "max_num_batched_tokens",
-            u64::from(limits.max_num_batched_tokens),
-            u64::from(ceilings.max_num_batched_tokens),
-        ),
-    ];
-    for (name, limit, ceiling) in counts {
-        if limit == 0 {
-            return Err(PolicyError::Limits(format!("{name} is zero")));
-        }
-        if limit > ceiling {
-            return Err(PolicyError::Limits(format!(
-                "{name} is {limit}, above the ceiling of {ceiling}"
-            )));
-        }
-    }
-
-    // An unbounded queue exceeds any bound; a policy may bound its queue tighter than the ceiling.
-    match (limits.max_queued_requests, ceilings.max_queued_requests) {
-        (Some(queued), Some(ceiling)) if queued > ceiling => {
-            return Err(PolicyError::Limits(format!(
-                "max_queued_requests is {queued}, above the ceiling of {ceiling}"
-            )));
-        }
-        (None, Some(ceiling)) => {
-            return Err(PolicyError::Limits(format!(
-                "max_queued_requests is unbounded, above the ceiling of {ceiling}"
-            )));
-        }
-        _ => {}
-    }
-
     // A policy may prefetch more eagerly than the floor, never more sparingly.
     if limits.prefetch_min_tokens < ceilings.prefetch_min_tokens {
         return Err(PolicyError::Limits(format!(
@@ -835,28 +790,29 @@ fn check(limits: &Limits, ceilings: &Limits) -> Result<(), PolicyError> {
     Ok(())
 }
 
-/// The parameters a scheduler instantiates its policy with (SD §5.2, §7.1): the package's
-/// arguments, with a step's token budget, where they state none, the scheduler's own `config`
-/// resolved (`SchedulerConfig::max_num_batched_tokens`: the deployment's, else the widest prefill
-/// bucket its workers captured). The policy's declared limits budget every step, so a package
-/// that leaves the budget to the deployment is given the deployment's, not the guest's default.
-pub(super) fn budgeted(mut parameters: Parameters, config: &SchedulerConfig) -> Parameters {
-    if parameters.max_num_batched_tokens.is_none() {
-        parameters.max_num_batched_tokens = u32::try_from(config.max_num_batched_tokens).ok();
-    }
-    parameters
+/// What a scheduler's groups bound its steps to, and the bounds of its policy's limits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ceilings {
+    /// Tokens of one step, and of one prefill chunk: the widest prefill bucket the workers
+    /// captured; `u32::MAX` when they captured none, and nothing binds.
+    pub tokens: u32,
+    /// Calls of one step: the largest bucket's rows; `usize::MAX` when none binds.
+    pub rows: usize,
+    /// The deployment's policy budget's bounds of the policy's own limits (its prefetch
+    /// threshold and starvation bound).
+    pub limits: Limits,
 }
 
-/// The ceilings a scheduler's policy declares its limits within (SD §5.2), from what the
-/// workers of its groups captured and the deployment's `budget`: the step's tokens and a prefill
-/// chunk at most the widest prefill bucket's tokens, its calls at most the largest bucket's rows,
-/// a prefetch threshold of at least the budget's smallest and a starvation bound of at most the
-/// budget's longest. A bound no captured bucket states (no group captured a prefill, or any,
-/// bucket: no such batch is formed) does not bind. The queue bound is the policy's own.
+/// The ceilings of a scheduler whose workers captured the buckets of `capacities`, under the
+/// deployment's policy `budget` (SD §5.2): the step's tokens and a prefill chunk at most the
+/// widest prefill bucket's tokens, its calls at most the largest bucket's rows, a prefetch
+/// threshold of at least the budget's smallest and a starvation bound of at most the budget's
+/// longest. A bound no captured bucket states (no group captured a prefill, or any, bucket: no
+/// such batch is formed) does not bind.
 pub fn ceilings<'a>(
     capacities: impl IntoIterator<Item = &'a Capacity>,
     budget: &PolicyBudget,
-) -> Limits {
+) -> Ceilings {
     let buckets: Vec<&Shape> = capacities
         .into_iter()
         .flat_map(|capacity| &capacity.buckets)
@@ -874,32 +830,28 @@ pub fn ceilings<'a>(
         .max()
         .unwrap_or(usize::MAX);
 
-    Limits {
-        chunked_prefill_size: tokens,
-        max_queued_requests: None,
-        max_batch: rows,
-        max_num_batched_tokens: tokens,
-        prefetch_min_tokens: budget.min_prefetch_tokens,
-        timeout: Nanos(u64::try_from(budget.max_timeout.as_nanos()).unwrap_or(u64::MAX)),
+    Ceilings {
+        tokens,
+        rows,
+        limits: Limits {
+            prefetch_min_tokens: budget.min_prefetch_tokens,
+            timeout: Nanos(u64::try_from(budget.max_timeout.as_nanos()).unwrap_or(u64::MAX)),
+        },
     }
 }
 
 /// The policy generation (SD §3.9).
 impl Scheduler {
     /// A new generation's policy serves from this step on, instantiated on the scheduler's state
-    /// now with its package's parameters ([`budgeted`]); the one it replaces is kept for rollback.
-    /// On failure the serving policy is untouched and the error is the reply to `SetPolicy`.
+    /// now with its package's parameters; the one it replaces is kept for rollback. On failure
+    /// the serving policy is untouched and the error is the reply to `SetPolicy`.
     pub(super) fn set_policy(
         &mut self,
         module: Arc<Module>,
         parameters: Parameters,
     ) -> Result<(), Error> {
         let snapshot = self.snapshot();
-        let ceilings = ceilings(
-            self.groups.iter().map(|group| &group.capacity),
-            &self.config.policy_budget,
-        );
-        let parameters = budgeted(parameters, &self.config);
+        let ceilings = self.ceilings.limits;
         self.policy.switch(module, parameters, snapshot, &ceilings)
     }
 
@@ -955,7 +907,7 @@ pub(crate) mod tests {
     /// The policy modules of the policy host's own tests, each a module of the interface's
     /// exports in a `.wat` file beside this module (`policy/`), assembled by `wat`: one that
     /// decides nothing, and modules that fault in a stated way. Each states the interface version
-    /// it implements, which is this release's (`scheduling::INTERFACE_VERSION`, 5) for all but
+    /// it implements, which is this release's (`scheduling::INTERFACE_VERSION`, 6) for all but
     /// [`Fixture::Stale`]: a module of another release is refused at instantiation, so a fixture
     /// of a stale version fails every case that instantiates it.
     #[derive(Clone, Copy, Debug)]
@@ -1000,31 +952,23 @@ pub(crate) mod tests {
         crate::modules::load::parameters(&testkit::serving::policy_revision(stated)).unwrap()
     }
 
-    /// The limits [`Fixture::Idle`] and [`Fixture::Router`] declare: chunks and steps of 8192
-    /// tokens, 128 calls a step, a 256-token prefetch threshold, a 30 s starvation bound and an
-    /// unbounded queue, which the ceilings of workers that captured no bucket hold.
+    /// The limits [`Fixture::Idle`] and [`Fixture::Router`] declare: a 256-token prefetch
+    /// threshold and a 30 s starvation bound, which the default policy budget holds.
     pub(crate) fn idle_limits() -> Limits {
         Limits {
-            chunked_prefill_size: 8192,
-            max_queued_requests: None,
-            max_batch: 128,
-            max_num_batched_tokens: 8192,
             prefetch_min_tokens: 256,
             timeout: Nanos(30_000_000_000),
         }
     }
 
-    /// Arguments that state a deployment's limits, and the ceilings of workers that captured
-    /// exactly that much.
-    fn limited(tokens: u32, calls: usize) -> (Parameters, Limits) {
-        let parameters = packaged_arguments(&format!(
-            "chunked_prefill_size = {tokens}\nmax_batch = {calls}\nmax_num_batched_tokens = {tokens}"
-        ));
+    /// Arguments that state a starvation bound of `seconds`, and the policy budget's bounds that
+    /// hold a bound of `seconds` at most.
+    fn limited(seconds: u64) -> (Parameters, Limits) {
+        let nanos = seconds * 1_000_000_000;
+        let parameters = packaged_arguments(&format!("timeout = {nanos}"));
         let ceilings = Limits {
-            chunked_prefill_size: tokens,
-            max_batch: calls,
-            max_num_batched_tokens: tokens,
-            ..ceilings([], &PolicyBudget::default())
+            timeout: Nanos(nanos),
+            ..ceilings([], &PolicyBudget::default()).limits
         };
         (parameters, ceilings)
     }
@@ -1051,7 +995,7 @@ pub(crate) mod tests {
     /// `dispatch` per step.
     #[test]
     fn a_packaged_policy_admits_what_arrived_in_its_order() {
-        let (parameters, ceilings) = limited(512, 8);
+        let (parameters, ceilings) = limited(8);
         // Request 1 arrives first with the less urgent priority (a lower value is more urgent).
         let first = waiting(1, 5, &[1, 2, 3]);
         let second = waiting(2, 1, &[4, 5]);
@@ -1069,8 +1013,7 @@ pub(crate) mod tests {
                 &PolicyBudget::default(),
             )
             .unwrap();
-            assert_eq!(policy.limits.max_batch, 8, "{name}");
-            assert_eq!(policy.limits.max_num_batched_tokens, 512, "{name}");
+            assert_eq!(policy.limits.timeout, Nanos(8_000_000_000), "{name}");
             assert_eq!(policy.calls, 2, "{name}: init and limits");
 
             for id in [1, 2] {
@@ -1091,12 +1034,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// Limits above a ceiling refuse the instantiation; a switch they refuse leaves the serving
-    /// policy as it was.
+    /// Limits beyond the policy budget's bounds refuse the instantiation; a switch they refuse
+    /// leaves the serving policy as it was.
     #[test]
     fn limits_above_a_ceiling_refuse_the_policy() {
-        let (parameters, ceilings) = limited(512, 8);
-        let (wide, _) = limited(1024, 8);
+        let (parameters, ceilings) = limited(8);
+        let (wide, _) = limited(16);
         let budget = PolicyBudget::default();
         let refused = Policy::new(
             packaged("arrival"),
@@ -1125,7 +1068,7 @@ pub(crate) mod tests {
             refused,
             Err(Error::Policy(PolicyError::Limits(_)))
         ));
-        assert_eq!(policy.limits.max_num_batched_tokens, 512);
+        assert_eq!(policy.limits.timeout, Nanos(8_000_000_000));
         assert!(policy.previous.is_none());
     }
 
@@ -1133,8 +1076,8 @@ pub(crate) mod tests {
     /// committed switch has nothing to roll back to.
     #[test]
     fn a_switch_keeps_the_replaced_policy_for_one_rollback() {
-        let (serving, ceilings) = limited(512, 8);
-        let (next, _) = limited(256, 4);
+        let (serving, ceilings) = limited(8);
+        let (next, _) = limited(4);
         let mut policy = Policy::new(
             packaged("arrival"),
             serving,
@@ -1152,11 +1095,11 @@ pub(crate) mod tests {
                 &ceilings,
             )
             .unwrap();
-        assert_eq!(policy.limits.max_batch, 4);
+        assert_eq!(policy.limits.timeout, Nanos(4_000_000_000));
         assert!(policy.previous.is_some());
 
         policy.rollback(Snapshot::default()).unwrap();
-        assert_eq!(policy.limits.max_batch, 8);
+        assert_eq!(policy.limits.timeout, Nanos(8_000_000_000));
         assert!(matches!(
             policy.rollback(Snapshot::default()),
             Err(Error::InvalidRequest(_))
@@ -1202,7 +1145,7 @@ pub(crate) mod tests {
 
         let mut policy = Policy::new(
             packaged("arrival"),
-            packaged_arguments("max_num_batched_tokens = 8192"),
+            packaged_arguments(""),
             Snapshot::default(),
             &ceilings,
             &budget,
@@ -1238,16 +1181,13 @@ pub(crate) mod tests {
             min_prefetch_tokens: 512,
             ..PolicyBudget::default()
         };
-        let limits = ceilings([&capacity], &budget);
-        assert_eq!(limits.max_num_batched_tokens, 4096);
-        assert_eq!(limits.chunked_prefill_size, 4096);
-        assert_eq!(limits.max_batch, 64);
-        assert_eq!(limits.prefetch_min_tokens, 512);
-        assert_eq!(limits.timeout, Nanos(12_000_000_000));
+        let ceilings = ceilings([&capacity], &budget);
+        assert_eq!((ceilings.tokens, ceilings.rows), (4096, 64));
+        assert_eq!(ceilings.limits.prefetch_min_tokens, 512);
+        assert_eq!(ceilings.limits.timeout, Nanos(12_000_000_000));
 
-        let unbound = ceilings([&super::super::tests::capacity()], &budget);
-        assert_eq!(unbound.max_num_batched_tokens, u32::MAX);
-        assert_eq!(unbound.max_batch, usize::MAX);
+        let unbound = super::ceilings([&super::super::tests::capacity()], &budget);
+        assert_eq!((unbound.tokens, unbound.rows), (u32::MAX, usize::MAX));
     }
 
     /// A module states the version of the policy interface it was compiled against, and one of
@@ -1259,7 +1199,7 @@ pub(crate) mod tests {
         assert!(
             Policy::new(
                 packaged("arrival"),
-                limited(512, 8).0,
+                limited(30).0,
                 Snapshot::default(),
                 &ceilings,
                 &budget,
@@ -1369,7 +1309,7 @@ pub(crate) mod tests {
         const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
         let held = |id: u64| (0..BLOCKS).map(move |index| spread(id * BLOCKS + index));
 
-        let (parameters, ceilings) = limited(8192, 128);
+        let (parameters, ceilings) = limited(30);
         let snapshot = Snapshot {
             phases: text_phases(),
             ..Snapshot::default()
@@ -1503,7 +1443,7 @@ pub(crate) mod tests {
             scheduler.requests.insert(request.id, request);
             scheduler.running.push(RequestId(id));
         }
-        let (parameters, ceilings) = limited(8192, 512);
+        let (parameters, ceilings) = limited(30);
         let snapshot = scheduler.snapshot();
         scheduler.policy = Policy::new(
             packaged("arrival"),
@@ -1581,7 +1521,7 @@ pub(crate) mod tests {
     #[test]
     fn a_policy_instantiates_on_the_snapshot_of_a_warm_cache() {
         const LIMIT: u64 = DEFAULT_POLICY_CALL_FUEL.get() / 2;
-        let (parameters, ceilings) = limited(8192, 128);
+        let (parameters, ceilings) = limited(30);
         let snapshot = Snapshot {
             requests: (1..=128)
                 .map(|id| decoding(id, GuestStatus::Running, 500, 16))

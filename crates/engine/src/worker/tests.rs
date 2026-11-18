@@ -384,6 +384,7 @@ fn batch(id: u64, phase: Phase, rows: u32) -> Batch {
         phase,
         kernels: 1,
         policy: 1,
+        revision: 0,
         shape: BatchShape::decode(rows, Variant::DecodeGreedy),
         requests: vec![RequestId(id)],
         columns: Columns::default(),

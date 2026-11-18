@@ -187,11 +187,10 @@ impl Scheduler {
         }
     }
 
-    /// Whether the waiting queue is at the bound the serving policy declared.
+    /// Whether the waiting queue is at the bound the step values state.
     fn queue_full(&self) -> bool {
-        self.policy
-            .limits
-            .max_queued_requests
+        self.budget
+            .queued
             .is_some_and(|bound| self.waiting.len() >= bound)
     }
 
@@ -239,8 +238,7 @@ impl Scheduler {
                 return Vec::new();
             }
         };
-        let limits = self.policy.limits;
-        let mut budget = (limits.max_num_batched_tokens, limits.max_batch);
+        let mut budget = (self.budget.tokens, self.budget.calls);
         let mut batches: Vec<Batch> = Vec::new();
 
         // 1. Running requests first, in the policy's order (vLLM: "First, schedule the RUNNING
@@ -493,7 +491,6 @@ impl Scheduler {
         if budget.1 == 0 {
             return None;
         }
-        let limits = &self.policy.limits;
         let capacity = request
             .placement
             .get(phase.index())
@@ -508,8 +505,8 @@ impl Scheduler {
                     .num_prompt_tokens
                     .saturating_sub(request.num_computed_tokens);
                 let chunk = match asked {
-                    0 => limits.chunked_prefill_size,
-                    asked => asked.min(limits.chunked_prefill_size),
+                    0 => self.budget.chunk,
+                    asked => asked.min(self.budget.chunk),
                 };
                 // A model with a recurrent state ends the chunk where it keeps a checkpoint it
                 // holds writable.
@@ -556,6 +553,7 @@ impl Scheduler {
             phase,
             kernels: self.generations.kernels(),
             policy: self.generations.policy(),
+            revision: self.budget.revision,
             shape: Shape {
                 rows: 0,
                 tokens: 0,
@@ -1758,7 +1756,7 @@ mod tests {
     fn a_call_takes_its_tokens_and_one_call_from_the_step() {
         let mut bench = bench(1024);
         let scheduler = &mut bench.scheduler;
-        scheduler.policy.limits.chunked_prefill_size = 8;
+        scheduler.tune(|tuning| tuning.chunked_prefill_size = std::num::NonZeroUsize::new(8));
         let mut request = Request::new(tokens(1, &[1; 20], 4).into(), 1, Instant::now(), WINDOW, 0);
 
         let mut budget = (100, 3);
@@ -1832,7 +1830,7 @@ mod tests {
             .collect();
         assert_eq!(arrived, [1, 2, 3, 4]);
 
-        scheduler.policy.limits.max_queued_requests = Some(4);
+        scheduler.tune(|tuning| tuning.max_queued_requests = std::num::NonZeroUsize::new(4));
         scheduler.add_request(tokens(5, &[1], 8).into(), WINDOW);
         assert_eq!(scheduler.waiting.len(), 4);
         assert!(!scheduler.requests.contains_key(&RequestId(5)));
@@ -2076,9 +2074,9 @@ mod tests {
         let mut bench = bench(4096);
         bench.scheduler.policy = Policy::new(
             packaged("arrival"),
-            packaged_arguments("max_num_batched_tokens = 8192"),
+            packaged_arguments(""),
             Snapshot::default(),
-            &ceilings([], &proto::config::PolicyBudget::default()),
+            &ceilings([], &proto::config::PolicyBudget::default()).limits,
             &proto::config::PolicyBudget::default(),
         )
         .unwrap();

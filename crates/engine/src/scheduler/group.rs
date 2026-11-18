@@ -582,6 +582,7 @@ mod tests {
             Box::new(Idle),
             output,
             Arc::new(crate::batch::Generations::default()),
+            crate::scheduler::tests::tuned(),
         )
         .unwrap();
         scheduler.available = free.to_vec();
@@ -662,6 +663,7 @@ mod tests {
             phase,
             kernels: 0,
             policy: 0,
+            revision: 0,
             shape: Shape::decode(0, Variant::DecodeGreedy),
             requests: (0..calls).map(RequestId).collect(),
             columns: Columns::default(),

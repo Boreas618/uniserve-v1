@@ -1534,6 +1534,7 @@ mod tests {
             Box::new(Stamps(Arc::clone(&stamped))),
             output,
             Arc::new(crate::batch::Generations::default()),
+            crate::scheduler::tests::tuned(),
         )
         .unwrap();
         (scheduler, stamped)
@@ -1722,6 +1723,7 @@ mod tests {
             phase: Phase::TextEncode,
             kernels: 0,
             policy: 0,
+            revision: 0,
             shape: Shape::decode(1, Variant::Encode),
             requests: vec![id],
             columns: Columns::default(),
@@ -2214,6 +2216,7 @@ mod tests {
             Box::new(Stamps(Arc::clone(&stamped))),
             output,
             Arc::new(crate::batch::Generations::default()),
+            crate::scheduler::tests::tuned(),
         )
         .unwrap();
         (scheduler, stamped, outputs)
@@ -2294,6 +2297,7 @@ mod tests {
             phase: Phase::TextEncode,
             kernels: 0,
             policy: 0,
+            revision: 0,
             shape: Shape::decode(1, Variant::Encode),
             requests: Vec::new(),
             columns: Columns::default(),

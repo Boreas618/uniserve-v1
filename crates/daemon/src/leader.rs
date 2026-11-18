@@ -348,12 +348,14 @@ pub(crate) fn epoch_launches(
     config: &proto::config::EngineConfig,
     modules: &crate::epoch::ModuleSet,
     epoch: u64,
+    revision: u64,
 ) -> anyhow::Result<Vec<proto::config::EngineArgs>> {
     Ok(replica_configs(config)?
         .into_iter()
         .map(|replica| {
             let mut args = proto::config::EngineArgs::new(replica, modules.clone());
             args.epoch = epoch;
+            args.revision = revision;
             args
         })
         .collect())
@@ -791,8 +793,10 @@ impl Leader {
     /// option paths the operator set; `daemon` is this node's daemon's
     /// process socket, through which the engine process and every worker
     /// start, and `instance` the daemon's instance directory, where the engines' request socket
-    /// lies. The engine's start blocks until every rank has loaded the
-    /// model, so it runs on the blocking pool.
+    /// lies. `revision` is the configuration revision the deployment starts at, whose step
+    /// values the engines' schedulers begin with, and `lock` the module revisions its apply
+    /// fixed when it starts again, `None` to fix them now. The engine's start blocks until every
+    /// rank has loaded the model, so it runs on the blocking pool.
     ///
     /// # Errors
     ///
@@ -809,7 +813,7 @@ impl Leader {
         daemon: String,
         instance: &std::path::Path,
         updates: Arc<crate::updates::Updater>,
-        lock: Option<crate::epoch::ModuleSet>,
+        (revision, lock): (u64, Option<crate::epoch::ModuleSet>),
     ) -> anyhow::Result<Self> {
         let prepared = Self::prepare(families, config, stated).await?;
         info!(parallel = ?prepared.engine.parallel, "starting the engine process");
@@ -857,7 +861,7 @@ impl Leader {
         // The deployment's first epoch takes the number of its first engine, and every replica
         // starts in it.
         let epoch = control.next_engine();
-        let launches = epoch_launches(&prepared.engine, &modules, epoch)?;
+        let launches = epoch_launches(&prepared.engine, &modules, epoch, revision)?;
         // Each replica's statistics are kept for the longest span its updates read back.
         let span = crate::observe::span(&config.update_config);
         let clients =
@@ -4296,7 +4300,7 @@ mod tests {
     fn tensor_parallel_replicas_sharding_their_experts_are_independent() {
         let config = deployment(2, 2, true);
         let modules = crate::epoch::modules_of(&crate::config::Config::default());
-        let launches = super::epoch_launches(&config, &modules, 7).unwrap();
+        let launches = super::epoch_launches(&config, &modules, 7, 0).unwrap();
         let devices: Vec<Vec<String>> = launches
             .iter()
             .map(|launch| {

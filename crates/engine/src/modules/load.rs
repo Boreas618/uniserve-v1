@@ -425,20 +425,18 @@ mod tests {
         };
 
         let stated = parameters(&package(
-            "max_batch = 8\ntimeout = 1000\nexpected_speedup = 1.5",
+            "prefetch_min_tokens = 8\ntimeout = 1000\nexpected_speedup = 1.5",
         ))
         .unwrap();
-        assert_eq!(stated.max_batch, Some(8));
+        assert_eq!(stated.prefetch_min_tokens, Some(8));
         assert_eq!(stated.timeout, Some(scheduling::time::Nanos(1000)));
         assert_eq!(stated.expected_speedup, Some(1.5));
-        assert_eq!(stated.chunked_prefill_size, None);
+        assert_eq!(stated.prefill_window, None);
 
-        let unknown = parameters(&package("max_batches = 8")).unwrap_err();
-        assert!(
-            format!("{unknown:#}").contains("max_batches"),
-            "{unknown:#}"
-        );
-        assert!(parameters(&package("max_batch = \"eight\"")).is_err());
+        // The step's budget is the deployment's configuration, no argument of a policy.
+        let unknown = parameters(&package("max_batch = 8")).unwrap_err();
+        assert!(format!("{unknown:#}").contains("max_batch"), "{unknown:#}");
+        assert!(parameters(&package("timeout = \"eight\"")).is_err());
     }
 
     /// A native module's library is the file the module contract names, `module.so`, loaded

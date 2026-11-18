@@ -550,6 +550,7 @@ fn batch(shape: BatchShape, columns: Columns) -> Batch {
         phase,
         kernels: 1,
         policy: 1,
+        revision: 0,
         shape,
         requests: (0..columns.calls() as u64)
             .map(|call| RequestId(100 + call))
@@ -2198,6 +2199,7 @@ fn the_members_of_a_step_agree_on_the_most_tokens_any_of_them_sends() {
         phase,
         kernels: 1,
         policy: 1,
+        revision: 0,
         shape: crate::batch::Shape::decode(1, Variant::DecodeGreedy),
         requests: Vec::new(),
         columns: Columns::default(),
@@ -2662,6 +2664,7 @@ fn a_batch_with_no_rows_writes_the_tables_and_runs_the_copies_without_a_forward(
         phase: Phase::Decode,
         kernels: 0,
         policy: 0,
+        revision: 0,
         shape: BatchShape::decode(0, Variant::DecodeGreedy),
         requests: Vec::new(),
         columns: Columns::default(),

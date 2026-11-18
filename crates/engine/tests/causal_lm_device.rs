@@ -378,6 +378,7 @@ fn batch(kind: Phase, variant: Variant, slot: u32, mut columns: Columns) -> Batc
         phase: kind,
         kernels: 1,
         policy: 1,
+        revision: 0,
         shape: BatchShape::prefill(1, tokens, variant),
         requests: vec![RequestId(1)],
         columns,

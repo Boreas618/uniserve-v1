@@ -836,6 +836,7 @@ mod tests {
             phase: Phase::TextEncode,
             kernels: 0,
             policy: 0,
+            revision: 0,
             shape: Shape {
                 rows: 2,
                 tokens: 8,

@@ -764,7 +764,7 @@ mod tests {
                 Arc::clone(&module),
                 Default::default(),
                 snapshot,
-                &ceilings,
+                &ceilings.limits,
                 &budget,
             )
             .unwrap()

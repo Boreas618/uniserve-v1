@@ -26,13 +26,14 @@
 //! (class `c` is cache group `c`), each block one unit of its region, the encoder outputs, one per
 //! media product kind, and the stored trajectories.
 
+use engine::batch::Generations;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::ops::Range;
-use engine::batch::Generations;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, unbounded};
 use engine::batch::Capacity;
 use engine::batch::cache::CacheGroupKind;
@@ -41,8 +42,8 @@ use engine::batch::{
 };
 use engine::scheduler::{Message, Output, Scheduler, policy};
 use proto::config::{
-    BlockConfig, KvCacheConfig, SchedulerConfig, WorkerGroupConfig, WorkerGroupId, WorkerGroupRole,
-    WorkerRank,
+    BlockConfig, KvCacheConfig, SchedulerConfig, Tuning, WorkerGroupConfig, WorkerGroupId,
+    WorkerGroupRole, WorkerRank,
 };
 use proto::report::SchedulerStats;
 use proto::request::{
@@ -50,7 +51,6 @@ use proto::request::{
     GenerationLimits, GenerationRequest, ImageEncoder, ImageEncoderInput, ImageInput,
     MigrationCause, RequestId, Trajectory,
 };
-use scheduling::limits::Parameters;
 use service::lock;
 use storage::protocol::BlockState;
 use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
@@ -134,12 +134,12 @@ pub(crate) struct Deployment {
     /// The rows of the largest captured bucket, and the tokens of the widest prefill bucket.
     rows: u32,
     tokens: u32,
-    /// The prefill chunk the policy declares.
+    /// The prefill chunk the step values state.
     chunk: u32,
-    /// Whether the policy's package states the step's token budget (the widest prefill bucket's
-    /// tokens); otherwise the scheduler gives its policy the budget of its configuration.
+    /// Whether the step values state the step's token budget (the widest prefill bucket's
+    /// tokens); otherwise the scheduler takes the widest captured bucket's.
     states_budget: bool,
-    /// The bound of the waiting queue the policy declares.
+    /// The bound of the waiting queue the step values state.
     queued: Option<usize>,
     queue_depth: usize,
     /// The bytes of each ring of the queue pair.
@@ -430,6 +430,7 @@ impl Deployment {
         let module = Arc::new(policy::load(&testkit::packaged_module()).unwrap());
         let (output, outputs) = unbounded();
         let config = self.scheduler_config();
+        let tuning = Arc::new(ArcSwap::from_pointee(self.tuning()));
         let scheduler = Scheduler::new(
             config.clone(),
             limits(),
@@ -439,16 +440,18 @@ impl Deployment {
             ends.remove(0),
             groups,
             module,
-            self.parameters(),
+            testkit::packaged_parameters(),
             Box::new(fake.clone()),
             output,
             Arc::new(Generations::default()),
+            Arc::clone(&tuning),
         )
         .unwrap_or_else(|refusal| panic!("the scheduler refuses the deployment: {refusal}"));
 
         let mut harness = Harness {
             scheduler,
             config,
+            tuning,
             pool,
             fake,
             inbox: messages,
@@ -819,16 +822,18 @@ impl Deployment {
         }
     }
 
-    /// The arguments of the packaged policy: the deployment's chunk, step tokens (unless the
-    /// deployment leaves them to the scheduler) and calls, its queue bound, and the package's
-    /// defaults for the rest.
-    fn parameters(&self) -> Parameters {
-        Parameters {
-            chunked_prefill_size: Some(self.chunk),
-            max_queued_requests: self.queued,
-            max_batch: Some(self.rows as usize),
-            max_num_batched_tokens: self.states_budget.then_some(self.tokens),
-            ..testkit::packaged_parameters()
+    /// The step values of the deployment: its chunk, step tokens (unless it leaves them to the
+    /// widest captured bucket), calls and queue bound, of revision 0.
+    fn tuning(&self) -> Tuning {
+        Tuning {
+            revision: 0,
+            chunked_prefill_size: NonZeroUsize::new(self.chunk as usize),
+            max_batch: NonZeroUsize::new(self.rows as usize).unwrap_or(NonZeroUsize::MIN),
+            max_num_batched_tokens: self
+                .states_budget
+                .then(|| NonZeroUsize::new(self.tokens as usize))
+                .flatten(),
+            max_queued_requests: self.queued.and_then(NonZeroUsize::new),
         }
     }
 }
@@ -952,6 +957,8 @@ pub(crate) struct Harness {
     pub(crate) scheduler: Scheduler,
     /// The configuration the scheduler was built with.
     pub(crate) config: SchedulerConfig,
+    /// The step values the scheduler reads at every step, as its engine shares them.
+    tuning: Arc<ArcSwap<Tuning>>,
     pub(crate) pool: InProcessPool,
     pub(crate) fake: FakeExecutor,
     /// The scheduler's inbox, which the fake's outputs and stamped requests reach.
@@ -1122,6 +1129,14 @@ impl Harness {
     /// Applies a message from the engine or the daemon between two steps, as the loop applies each
     /// one it takes (`Cancel`, `Acknowledge`, `Consumed`, `Pause`, `Drain`, ...), and records what
     /// the scheduler reported at once.
+    /// Replaces the step values by `change` of them, as the engine's `Tune` does: the scheduler
+    /// reads them from its next step on.
+    pub(crate) fn tune(&mut self, change: impl FnOnce(&mut Tuning)) {
+        let mut tuning = Tuning::clone(&self.tuning.load());
+        change(&mut tuning);
+        self.tuning.store(Arc::new(tuning));
+    }
+
     pub(crate) fn apply(&mut self, message: Message) {
         self.scheduler.apply(message);
         self.record.extend(self.outputs.try_iter());

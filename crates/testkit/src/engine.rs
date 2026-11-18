@@ -169,7 +169,7 @@ fn start(launch: &EngineArgs, fixture: Fixture) -> Result<Engine> {
         capacities.iter().map(|(_, capacity)| capacity),
         &launch.engine_config.scheduler.policy_budget,
     );
-    let policy = crate::packaged_policy(&ceilings)?;
+    let policy = crate::packaged_policy(&ceilings.limits)?;
 
     let mut inboxes = Vec::with_capacity(open.schedulers.len());
     let engine = Engine::new(

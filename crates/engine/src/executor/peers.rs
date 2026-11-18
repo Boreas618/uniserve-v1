@@ -1009,6 +1009,7 @@ mod tests {
             phase: Phase::Decode,
             kernels: 0,
             policy: 0,
+            revision: 0,
             shape: Shape::decode(1, Variant::DecodeGreedy),
             requests: Vec::new(),
             columns: Columns::default(),

@@ -214,6 +214,7 @@ mod tests {
     fn step(tokens: u32, calls: usize, prefill: Option<u32>) -> Shares {
         Shares::of(&Room {
             token_budget: tokens,
+            chunk_tokens: 8192,
             call_budget: calls,
             prefill_tokens: prefill,
             ..Room::default()
@@ -261,6 +262,7 @@ mod tests {
     fn the_room_of_a_step_is_its_own_budgets() {
         let room = Room {
             token_budget: 100,
+            chunk_tokens: 8192,
             call_budget: 8,
             prefill_tokens: Some(40),
             ..Room::default()

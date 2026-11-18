@@ -382,7 +382,21 @@ message EngineCommand {
     // Switch the fence probes the graphs captured on or off in place, at
     // the next step boundary; answered with `FenceSwitches`.
     SwitchFences switch_fences = 28;
+    // Replace the step values every scheduler reads from its next step on
+    // (`proto::config::Tuning`); answered with no reports.
+    Tune tune = 29;
   }
+}
+
+// The step values of configuration revision `revision`
+// (`proto::config::Tuning`); an unset value is the deployment's default.
+message Tune {
+  uint64 id = 1;
+  uint64 revision = 2;
+  optional uint64 chunked_prefill_size = 3;
+  uint64 max_batch = 4;
+  optional uint64 max_num_batched_tokens = 5;
+  optional uint64 max_queued_requests = 6;
 }
 
 message CommitExperts {

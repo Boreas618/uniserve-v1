@@ -72,7 +72,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::batch::{Batch, BatchId, BatchOutput, Capacity, Generations, Phase};
 use crate::executor::Executor;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use proto::config::{SchedulerConfig, WorkerGroupConfig};
+use arc_swap::ArcSwap;
+use proto::config::{SchedulerConfig, Tuning, WorkerGroupConfig};
 use proto::report::SchedulerStats;
 use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, FinishReason, GenerationLimits, MigrationCause, RequestId};
@@ -82,7 +83,7 @@ use storage::{Interest, Key, QueuePair, Signals};
 
 pub(crate) use cache::Cached;
 pub(crate) use group::WorkerGroup;
-use policy::{Policy, PolicyError, ceilings};
+use policy::{Ceilings, Policy, PolicyError, ceilings};
 pub(crate) use request::{Blocks, Request, RequestStatus};
 use schedule::Deferred;
 pub(crate) use view::view_of;
@@ -187,9 +188,6 @@ pub enum Message {
     /// the bound let them go (`resize.rs`), with the units it holds then. A drain that ends the
     /// bound first is answered with the units the region holds at that moment.
     Bound(u8, u32, Sender<u32>),
-    /// The scheduler's limits, applied in place; the reply refuses a limit above what the
-    /// workers hold, which leaves the limits as they were.
-    Configure(SchedulerConfig, Sender<Result<(), Error>>),
     /// End every request the scheduler holds, aborted, and stop.
     Shutdown,
 }
@@ -224,6 +222,55 @@ pub enum Output {
     Failed(Error),
 }
 
+/// What one step may assemble (`specs/configuration.md` §7, step values): the step values of the
+/// snapshot the step began with, lowered to what the groups' workers captured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Budget {
+    /// The configuration revision the values are of, which the step's batches name.
+    pub(crate) revision: u64,
+    /// Tokens of the step.
+    pub(crate) tokens: u32,
+    /// Calls of the step.
+    pub(crate) calls: usize,
+    /// Prompt tokens one request prefills in the step, at most `tokens`.
+    pub(crate) chunk: u32,
+    /// Waiting requests before a submission is refused; unbounded when `None`.
+    pub(crate) queued: Option<usize>,
+}
+
+impl Budget {
+    /// The budget of a step under `tuning` within `ceilings`, for a scheduler resolved to
+    /// `config`: a value the snapshot leaves unstated is the scheduler's own (the step's tokens:
+    /// the widest captured prefill bucket's, else the longest sequence) or the step's tokens (the
+    /// prefill chunk); the calls are at most the running requests; every value is at least one
+    /// and at most what the workers captured.
+    pub(crate) fn of(tuning: &Tuning, ceilings: &Ceilings, config: &SchedulerConfig) -> Self {
+        let count = |value: NonZeroUsize| u32::try_from(value.get()).unwrap_or(u32::MAX);
+        let resolved = u32::try_from(config.max_num_batched_tokens).unwrap_or(u32::MAX);
+        let tokens = tuning
+            .max_num_batched_tokens
+            .map_or(resolved, count)
+            .clamp(1, ceilings.tokens.max(1));
+        let chunk = tuning
+            .chunked_prefill_size
+            .map_or(tokens, count)
+            .clamp(1, tokens);
+        let calls = tuning
+            .max_batch
+            .get()
+            .min(ceilings.rows)
+            .min(config.max_running_requests)
+            .max(1);
+        Self {
+            revision: tuning.revision,
+            tokens,
+            calls,
+            chunk,
+            queued: tuning.max_queued_requests.map(NonZeroUsize::get),
+        }
+    }
+}
+
 /// The scheduler of one data-parallel rank and its state (SD §2.1, §2.5).
 ///
 /// Invariants: every id in `waiting` or `running` is in `requests` with the matching status; an
@@ -239,6 +286,14 @@ pub enum Output {
 /// which is how the layout of a group and a class names it too.
 pub struct Scheduler {
     config: SchedulerConfig,
+    /// The engine's current step values, which every scheduler of the engine shares and the
+    /// control thread replaces when a change of them arrives (`Tune`).
+    tuning: Arc<ArcSwap<Tuning>>,
+    /// What the step that runs may assemble: the snapshot of `tuning` it began with, lowered to
+    /// the ceilings ([`Budget::of`]).
+    budget: Budget,
+    /// What the groups' workers captured bounds a step to, and the bounds of the policy's limits.
+    ceilings: Ceilings,
     /// The generation limits requests are checked against at their arrival: the model's sizing
     /// facts lowered to what the groups' workers hold (SD §7.1), with the features the groups'
     /// phases serve.
@@ -458,6 +513,7 @@ impl Scheduler {
         executor: Box<dyn Executor>,
         output: Sender<Output>,
         generations: Arc<Generations>,
+        tuning: Arc<ArcSwap<Tuning>>,
     ) -> Result<Self, Error> {
         let stated = layout.schedulers.get(scheduler).ok_or_else(|| {
             Error::Storage(format!("the session states no scheduler {scheduler}"))
@@ -500,9 +556,15 @@ impl Scheduler {
             &config.policy_budget,
         );
         let snapshot = view::snapshot_of(&workers);
-        let parameters = policy::budgeted(parameters, &config);
-        let policy = Policy::new(module, parameters, snapshot, &bounds, &config.policy_budget)
-            .map_err(Error::Policy)?;
+        let policy = Policy::new(
+            module,
+            parameters,
+            snapshot,
+            &bounds.limits,
+            &config.policy_budget,
+        )
+        .map_err(Error::Policy)?;
+        let budget = Budget::of(&tuning.load(), &bounds, &config);
 
         // The page seeds every group of the scheduler states for its cache groups, one per class
         // in class order: one key chain serves all of them, so groups that state seeds must state
@@ -541,6 +603,9 @@ impl Scheduler {
         };
         let mut scheduler = Self {
             config,
+            tuning,
+            budget,
+            ceilings: bounds,
             limits,
             epoch: layout.epoch,
             requests: HashMap::new(),
@@ -611,7 +676,7 @@ impl Scheduler {
     }
 
     /// The requests this scheduler runs at once: the deployment's `max_running_requests`, within
-    /// the slots its groups hold, until a `Configure` changes it.
+    /// the slots its groups hold.
     pub(crate) fn max_running_requests(&self) -> usize {
         self.config.max_running_requests
     }
@@ -687,9 +752,9 @@ fn resolved(mut config: SchedulerConfig, groups: &[WorkerGroup]) -> Result<Sched
         groups.iter().map(|group| &group.capacity),
         &config.policy_budget,
     );
-    let tokens = usize::try_from(ceilings.max_num_batched_tokens).unwrap_or(usize::MAX);
+    let tokens = usize::try_from(ceilings.tokens).unwrap_or(usize::MAX);
     config.max_num_batched_tokens = config.max_num_batched_tokens.clamp(1, tokens.max(1));
-    if let Some(rows) = NonZeroUsize::new(ceilings.max_batch) {
+    if let Some(rows) = NonZeroUsize::new(ceilings.rows) {
         config.max_batch = config.max_batch.min(rows);
     }
     Ok(config)
@@ -854,9 +919,6 @@ impl Scheduler {
             }
             Message::Resize(region, units, reply) => self.resize(region, units, reply),
             Message::Bound(region, units, reply) => self.bound(region, units, reply),
-            Message::Configure(config, reply) => {
-                let _ = reply.send(self.configure(config));
-            }
             Message::Shutdown => self.shutdown(),
         }
     }
@@ -881,6 +943,10 @@ impl Scheduler {
             return false;
         }
         let _range = crate::profiling::ranges::range(c"uniserve.scheduler.step", None);
+
+        // The step values this step reads, whatever arrives while it runs: the snapshot the
+        // control thread replaces is taken once here.
+        self.budget = Budget::of(&self.tuning.load(), &self.ceilings, &self.config);
 
         // What the buffer pool published before this look at the pair: anything it publishes
         // later keeps the loop from sleeping after the step (`run`).
@@ -1208,53 +1274,6 @@ impl Scheduler {
                 input.cache.write = false;
             }
         }
-    }
-
-    /// `Configure` (SD §2.4): `config`'s limits serve from the next step on, but the epoch's own,
-    /// which the workers were started for: its drafts per verification and the graph sizes they
-    /// captured. The policy's limits, which budget a step, change with the policy (`SetPolicy`).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidRequest`] naming the first limit above what the workers hold: running
-    /// requests beyond their slots, a step's tokens beyond the widest prefill bucket, its calls
-    /// beyond the largest bucket's rows (`S/run.rs:287-347`). The limits are then unchanged.
-    fn configure(&mut self, config: SchedulerConfig) -> Result<(), Error> {
-        let ceilings = ceilings(
-            self.groups.iter().map(|group| &group.capacity),
-            &config.policy_budget,
-        );
-        let held = |value: Option<u32>| value.map_or(usize::MAX, |value| value as usize);
-        let limits = [
-            (
-                "max_running_requests",
-                config.max_running_requests,
-                held(slots(&self.groups)),
-            ),
-            (
-                "max_num_batched_tokens",
-                config.max_num_batched_tokens,
-                held(Some(ceilings.max_num_batched_tokens)),
-            ),
-            ("max_batch", config.max_batch.get(), ceilings.max_batch),
-        ];
-        if let Some((name, value, held)) = limits.into_iter().find(|&(_, value, held)| value > held)
-        {
-            return Err(Error::InvalidRequest(format!(
-                "scheduler_config.{name} = {value} exceeds the {held} the workers were started \
-                 for; an epoch change starts workers for it"
-            )));
-        }
-
-        self.config = SchedulerConfig {
-            max_num_batched_tokens: config.max_num_batched_tokens.max(1),
-            max_running_requests: config.max_running_requests.max(1),
-            draft_tokens: self.config.draft_tokens,
-            graph_tiers: std::mem::take(&mut self.config.graph_tiers),
-            block_tokens: self.config.block_tokens,
-            ..config
-        };
-        Ok(())
     }
 
     /// Stops the scheduler on a fault it cannot recover from (SD §3.7). A `Finished` held for the

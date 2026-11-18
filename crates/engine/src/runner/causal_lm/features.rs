@@ -368,6 +368,7 @@ mod tests {
             phase: Phase::Prefill,
             kernels: 0,
             policy: 0,
+            revision: 0,
             shape: Shape::prefill(2, 12, Variant::PrefillWrite),
             requests: Vec::new(),
             columns: Columns {

@@ -514,6 +514,68 @@ impl SchedulerConfig {
     }
 }
 
+/// The options every scheduler reads at its next step (`specs/configuration.md` §7, step values),
+/// with the configuration revision they belong to.
+///
+/// An engine keeps the current values in one snapshot its schedulers share; each step takes the
+/// snapshot once when it begins and uses it for the whole step, and every batch it assembles
+/// names the snapshot's revision, so all ranks of a batch read one configuration. A change of
+/// them replaces the snapshot (the engine command `Tune`) and takes effect at each scheduler's
+/// next step, without a new policy instance or a new process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tuning {
+    /// The configuration revision the values are of.
+    pub revision: u64,
+    /// Prompt tokens one request prefills in one step; the step's tokens when unstated.
+    pub chunked_prefill_size: Option<NonZeroUsize>,
+    /// Calls one batch assembles at most.
+    pub max_batch: NonZeroUsize,
+    /// Token work one step admits; the widest captured prefill bucket's, else the longest
+    /// sequence, when unstated.
+    pub max_num_batched_tokens: Option<NonZeroUsize>,
+    /// Waiting requests before a submission is refused as overloaded; unbounded when unstated.
+    pub max_queued_requests: Option<NonZeroUsize>,
+}
+
+impl Tuning {
+    /// The step values `config` states, as of `revision`.
+    pub fn of(config: &EngineConfig, revision: u64) -> Self {
+        Self {
+            revision,
+            chunked_prefill_size: config.scheduler.chunked_prefill_size,
+            max_batch: config.scheduler.max_batch,
+            max_num_batched_tokens: config.max_num_batched_tokens,
+            max_queued_requests: config.scheduler.max_queued_requests,
+        }
+    }
+
+    /// The engine command that delivers these values, numbered `id`.
+    pub fn command(&self, id: u64) -> crate::request::wire::Tune {
+        let count = |value: NonZeroUsize| u64::try_from(value.get()).unwrap_or(u64::MAX);
+        crate::request::wire::Tune {
+            id,
+            revision: self.revision,
+            chunked_prefill_size: self.chunked_prefill_size.map(count),
+            max_batch: count(self.max_batch),
+            max_num_batched_tokens: self.max_num_batched_tokens.map(count),
+            max_queued_requests: self.max_queued_requests.map(count),
+        }
+    }
+
+    /// The values a `Tune` command delivers; `None` for one whose batch is zero calls, which
+    /// no deployment states.
+    pub fn of_command(command: &crate::request::wire::Tune) -> Option<Self> {
+        let count = |value: u64| usize::try_from(value).ok().and_then(NonZeroUsize::new);
+        Some(Self {
+            revision: command.revision,
+            chunked_prefill_size: command.chunked_prefill_size.and_then(count),
+            max_batch: count(command.max_batch)?,
+            max_num_batched_tokens: command.max_num_batched_tokens.and_then(count),
+            max_queued_requests: command.max_queued_requests.and_then(count),
+        })
+    }
+}
+
 /// Speculative decoding with the model's drafter (`speculative_config`).
 ///
 /// A deployment that speculates verifies each running request's draft
@@ -1834,6 +1896,11 @@ pub struct EngineArgs {
     /// The expert order each MoE module loads, keyed by module, once the daemon has rebalanced the
     /// experts; empty for the checkpoint's own order.
     pub expert_order: BTreeMap<String, ExpertOrder>,
+    /// The configuration revision the process starts with: its schedulers' first snapshot of
+    /// the step values ([`Tuning`]), which every batch they assemble names until another
+    /// revision's values arrive.
+    #[serde(default)]
+    pub revision: u64,
     /// The deployment, by its policy package's name: the name its daemon, Storage Server and
     /// Build Server on every node serve it under, which keys its claims and pages at the
     /// Storage Server.
@@ -1930,6 +1997,7 @@ impl EngineArgs {
             epoch: 0,
             predecessor: None,
             expert_order: BTreeMap::new(),
+            revision: 0,
             deployment: String::new(),
             host: String::new(),
             requests: String::new(),

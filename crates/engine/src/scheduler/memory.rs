@@ -626,13 +626,9 @@ impl Scheduler {
     }
 
     /// The first chunk of a prompt computed from token `from` (SD §7.1): the prompt left, at
-    /// most the policy's chunk and step budgets, at least one token.
+    /// most the step's chunk and token budget, at least one token.
     fn first_chunk(&self, request: &Request, from: u32) -> u32 {
-        let limits = &self.policy.limits;
-        let limit = limits
-            .chunked_prefill_size
-            .min(limits.max_num_batched_tokens)
-            .max(1);
+        let limit = self.budget.chunk.min(self.budget.tokens).max(1);
         request
             .num_prompt_tokens
             .saturating_sub(from)
@@ -688,7 +684,7 @@ impl Scheduler {
         let state = self
             .state_shape(request)
             .map(|(class, block, _)| (class, block));
-        let budget = self.policy.limits.max_num_batched_tokens;
+        let budget = self.budget.tokens;
         // A refill is planned only for a request placed for one: no group of a model that keeps
         // a recurrent state serves a refill, and a request split across prefill and decode groups
         // never refills (SD §3.5 `place`). The checkpoint a refill that never runs keeps would
@@ -2849,9 +2845,10 @@ mod tests {
             Box::new(Stamps(Arc::clone(&stamped))),
             output,
             Arc::new(crate::batch::Generations::default()),
+            crate::scheduler::tests::tuned(),
         )
         .unwrap();
-        scheduler.policy.limits.chunked_prefill_size = 8;
+        scheduler.tune(|tuning| tuning.chunked_prefill_size = std::num::NonZeroUsize::new(8));
         let mut session = Session {
             scheduler,
             pool,
@@ -3026,6 +3023,7 @@ mod tests {
             phase,
             kernels: 0,
             policy: 0,
+            revision: 0,
             shape: Shape::decode(1, Variant::DecodeGreedy),
             requests: Vec::new(),
             columns: Columns {
@@ -3982,7 +3980,9 @@ mod tests {
     fn an_admission_needs_its_first_chunk_or_what_its_prompt_needs_in_chunks() {
         // SD §7.2: blocks of 64 tokens, a 1000-token prompt and chunks of 512.
         let mut session = serving(&[full(64), window(128, 64)], KvCacheConfig::default());
-        session.scheduler.policy.limits.chunked_prefill_size = 512;
+        session
+            .scheduler
+            .tune(|tuning| tuning.chunked_prefill_size = std::num::NonZeroUsize::new(512));
         let id = session.request(1, (1..=1000).collect());
 
         // Without a hit: every block of the full class, and of the window what a chunk's window

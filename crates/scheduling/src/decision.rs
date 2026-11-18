@@ -71,12 +71,15 @@ pub struct Room {
     pub kv_units: u64,
     /// Free request slots.
     pub slots: usize,
-    /// This step's token cap (the policy's `max_num_batched_tokens`, already
-    /// clamped to the build config's ceiling). It is the step's own budget: work
-    /// submitted in earlier steps was charged to those steps.
+    /// This step's token cap (the deployment's `max_num_batched_tokens`, clamped to the
+    /// captured graphs' ceiling). It is the step's own budget: work submitted in earlier steps
+    /// was charged to those steps.
     pub token_budget: u32,
-    /// This step's call cap (`max_batch`).
+    /// This step's call cap (`scheduler_config.max_batch`, clamped likewise).
     pub call_budget: usize,
+    /// The most prompt tokens one request prefills in this step
+    /// (`scheduler_config.chunked_prefill_size`, at most `token_budget`).
+    pub chunk_tokens: u32,
     /// The captured graph tiers, in tokens, ascending.
     pub graph_tiers: Vec<u32>,
     /// The KV page size in tokens, so a policy can clip a prefill chunk at a

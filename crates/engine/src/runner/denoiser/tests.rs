@@ -248,6 +248,7 @@ fn batch(variant: Variant, step: u32, results: Vec<u32>, reads: u32) -> Batch {
         phase,
         kernels: 0,
         policy: 0,
+        revision: 0,
         shape: Shape {
             rows: 1,
             tokens: 0,

@@ -79,6 +79,7 @@ use crate::modules::load;
 use crate::modules::select::changed_operators;
 use crate::process::binding::Target;
 use crate::scheduler::{Message, Output};
+use proto::config::Tuning;
 
 /// Builds the started epoch from the launch: the binary's rank start, or a test's fakes. It
 /// runs on a thread of its own while the control thread serves.
@@ -874,7 +875,7 @@ impl MainProcess {
         let shadows = engine.shadows();
         let workers = engine.workers.clone();
         let binding = Arc::clone(&engine.binding);
-        let ceilings = engine.ceilings;
+        let ceilings = engine.ceilings.limits;
         let budget = self.launch.engine_config.scheduler.policy_budget;
         let serving = kernels_of(&self.serving);
         // A preparation whose shadow pass no running request reaches within the epoch's
@@ -1017,7 +1018,7 @@ impl MainProcess {
         self.generation = generation;
         let snapshot = self.snapshot();
         if let Some(Err(error)) = self.engine.as_mut().and_then(|engine| {
-            let ceilings = engine.ceilings;
+            let ceilings = engine.ceilings.limits;
             let route = engine.route.as_mut()?;
             Some(route.switch(module, parameters, snapshot, &ceilings))
         }) {
@@ -1384,6 +1385,19 @@ impl MainProcess {
                     off: switch.off,
                 };
                 self.on_ranks(front, switch.id, Ok(operation));
+            }
+            Kind::Tune(tune) => {
+                // The step values every scheduler reads from its next step on: one store of the
+                // snapshot they share, which a step that runs does not see.
+                let tuned = match (self.engine.as_ref(), Tuning::of_command(&tune)) {
+                    (None, _) => Err(starting()),
+                    (_, None) => Err(anyhow::anyhow!("a step of no call")),
+                    (Some(engine), Some(tuning)) => {
+                        engine.tuning.store(Arc::new(tuning));
+                        Ok(None)
+                    }
+                };
+                self.operated(front, tune.id, tuned);
             }
             Kind::ResizeCache(resize) => self.resize_cache(front, &resize),
             Kind::UpdateWeights(update) => self.update_weights(front, update),

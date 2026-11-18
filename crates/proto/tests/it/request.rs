@@ -272,3 +272,38 @@ fn limits_come_back_from_their_message_unchanged() {
     let message = wire::GenerationLimits::from(&limits);
     assert_eq!(GenerationLimits::from(message), limits);
 }
+
+/// The step values a `Tune` command carries come back as they went in, stated and unstated
+/// values alike, and a command of a step of no call is refused.
+#[test]
+fn step_values_come_back_from_their_command() {
+    use std::num::NonZeroUsize;
+
+    use proto::config::Tuning;
+
+    for tuning in [
+        Tuning {
+            revision: 42,
+            chunked_prefill_size: NonZeroUsize::new(4096),
+            max_batch: NonZeroUsize::new(64).unwrap(),
+            max_num_batched_tokens: NonZeroUsize::new(8192),
+            max_queued_requests: NonZeroUsize::new(32),
+        },
+        Tuning {
+            revision: 1,
+            chunked_prefill_size: None,
+            max_batch: NonZeroUsize::MIN,
+            max_num_batched_tokens: None,
+            max_queued_requests: None,
+        },
+    ] {
+        let command = tuning.command(7);
+        assert_eq!(command.id, 7);
+        assert_eq!(Tuning::of_command(&command), Some(tuning));
+    }
+    let empty = wire::Tune {
+        max_batch: 0,
+        ..wire::Tune::default()
+    };
+    assert_eq!(Tuning::of_command(&empty), None);
+}

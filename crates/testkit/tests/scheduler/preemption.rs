@@ -439,14 +439,10 @@ fn a_mutual_shortage_preempts_the_last_admitted_of_the_lowest_priority() {
     );
 }
 
-/// Serves the packaged policy again with a starvation bound of `timeout`, the deployment's other
-/// limits as `Deployment::tokens` states them (chunks and steps of 64 tokens, 8 calls a step).
+/// Serves the packaged policy again with a starvation bound of `timeout`.
 fn starve_after(harness: &mut Harness, timeout: Duration) {
     let module = Arc::new(policy::load(&testkit::packaged_module()).unwrap());
     let parameters = Parameters {
-        chunked_prefill_size: Some(64),
-        max_batch: Some(8),
-        max_num_batched_tokens: Some(64),
         timeout: Some(Nanos(u64::try_from(timeout.as_nanos()).unwrap())),
         ..testkit::packaged_parameters()
     };

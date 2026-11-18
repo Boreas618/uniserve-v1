@@ -343,8 +343,9 @@ impl Scheduler {
             step: self.step,
             kv_units,
             slots: free.min(admissible),
-            token_budget: self.policy.limits.max_num_batched_tokens,
-            call_budget: self.policy.limits.max_batch,
+            token_budget: self.budget.tokens,
+            call_budget: self.budget.calls,
+            chunk_tokens: self.budget.chunk,
             graph_tiers: self.config.graph_tiers.clone(),
             page_tokens,
             prefill_tokens: None,
@@ -362,7 +363,7 @@ impl Scheduler {
     /// the groups of [`snapshot_of`]. A refill is offered as a step of the serving policy's
     /// token limit sizes it.
     pub(super) fn snapshot(&self) -> Snapshot {
-        let tokens = Some(self.policy.limits.max_num_batched_tokens);
+        let tokens = Some(self.budget.tokens);
         let requests = self
             .waiting
             .iter()

@@ -5,9 +5,14 @@
 //! changes, and the Build Server hands the package revision every declared parameter, the
 //! deployment's value where it states one and the declared default otherwise. The process hands
 //! those arguments to the policy at instantiation as [`Parameters`], and the policy returns its
-//! [`Limits`] once. The mechanism checks the limits against the build config's ceilings; a limit
-//! above a ceiling, or zero where the mechanism requires a positive count, is a policy failure
-//! (design §4.4).
+//! [`Limits`] once. The mechanism checks the limits against its budget's bounds; a limit outside
+//! them is a policy failure (design §4.4).
+//!
+//! The step's own budget, its tokens, calls and prefill chunk, and the waiting queue's bound are
+//! the deployment's configuration, not the policy's: the scheduler reads them from the
+//! configuration snapshot each step begins with and states them in the step's
+//! [`Room`](crate::Room), so a change of them takes effect at the next step without a new policy
+//! instance.
 
 use std::fmt;
 
@@ -35,15 +40,6 @@ pub enum QueueOrder {
 pub struct Parameters {
     /// The order the waiting queue admits by.
     pub order: Option<QueueOrder>,
-    /// Tokens of one prefill chunk.
-    pub chunked_prefill_size: Option<u32>,
-    /// The waiting queue's bound; unbounded when unstated.
-    pub max_queued_requests: Option<usize>,
-    /// Calls per step.
-    pub max_batch: Option<usize>,
-    /// Tokens per step. A package declares no default: the mechanism states the scheduler's own
-    /// step budget where the deployment states none.
-    pub max_num_batched_tokens: Option<u32>,
     /// The smallest prefix-hit deepening the policy asks for, in tokens.
     pub prefetch_min_tokens: Option<u32>,
     /// How long a running request that waits for no transfer may go without progressing before
@@ -88,19 +84,10 @@ pub fn stated<T>(value: Option<T>, name: &'static str) -> Result<T, Unstated> {
 
 /// The limits a policy declares, read once at instantiation.
 ///
-/// The mechanism clamps its own hard constraints by them and rejects a
-/// declaration that exceeds a build config ceiling; they are decisions of the
-/// policy, not the mechanism's.
+/// The mechanism holds the policy to them and rejects a declaration outside the deployment's
+/// policy budget; they are decisions of the policy, not the mechanism's.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Limits {
-    /// Tokens of one prefill chunk.
-    pub chunked_prefill_size: u32,
-    /// The waiting queue's bound; `None` queues without bound.
-    pub max_queued_requests: Option<usize>,
-    /// Calls per step.
-    pub max_batch: usize,
-    /// Tokens per step.
-    pub max_num_batched_tokens: u32,
     /// The smallest prefix-hit deepening the policy asks for.
     pub prefetch_min_tokens: u32,
     /// How long a running request may go without progressing before the

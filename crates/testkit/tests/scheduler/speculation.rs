@@ -342,10 +342,12 @@ fn a_refill_that_does_not_pay_is_never_run() {
     let mut harness = refilling().build();
     // A verification saves nothing over a decode: no refill is worth a token.
     let module = Arc::new(policy::load(&testkit::packaged_module()).unwrap());
+    harness.tune(|tuning| {
+        tuning.chunked_prefill_size = std::num::NonZeroUsize::new(8);
+        tuning.max_batch = std::num::NonZeroUsize::new(8).unwrap();
+        tuning.max_num_batched_tokens = std::num::NonZeroUsize::new(8);
+    });
     let parameters = Parameters {
-        chunked_prefill_size: Some(8),
-        max_batch: Some(8),
-        max_num_batched_tokens: Some(8),
         expected_speedup: Some(1.0),
         refill_token_cost: Some(1.0),
         ..testkit::packaged_parameters()

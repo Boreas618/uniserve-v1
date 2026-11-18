@@ -300,6 +300,7 @@ fn dealt(
         phase,
         kernels: 0,
         policy: 0,
+        revision: 0,
         shape: Shape {
             rows: 1,
             tokens: 0,

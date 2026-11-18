@@ -1665,6 +1665,7 @@ mod tests {
             phase,
             kernels: 0,
             policy: 0,
+            revision: 0,
             shape: Shape {
                 rows: u32::try_from(rows.len()).unwrap(),
                 tokens: 0,
@@ -2128,6 +2129,7 @@ mod tests {
             phase: Phase::Decode,
             kernels: 0,
             policy: 0,
+            revision: 0,
             shape: Shape::decode(1, Variant::DecodeGreedy),
             requests: vec![RequestId(100 + id)],
             columns: Columns::default(),

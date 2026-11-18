@@ -813,6 +813,22 @@ impl EngineClient {
         }
     }
 
+    /// Replaces the step values every scheduler of the engine reads from its next step on
+    /// (`proto::config::Tuning`).
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason the engine refused them, or when the engine ends first.
+    pub async fn tune(&self, tuning: &proto::config::Tuning) -> Result<(), String> {
+        match self
+            .ask(|id| wire::engine_command::Kind::Tune(tuning.command(id)))
+            .await?
+        {
+            None => Ok(()),
+            other => Err(unexpected("tune", other)),
+        }
+    }
+
     /// Switches the fence probes on (`enabled`) or off, with the probed classes `off` switched
     /// off whatever `enabled` says, in place at the next step boundary; returns each process's
     /// switch.

@@ -11,8 +11,10 @@ use std::time::{Duration, Instant};
 use crate::batch::cache::CacheGroupKind;
 use crate::batch::{Phase, Shape, Variant};
 use crossbeam_channel::{Receiver, Sender};
+use arc_swap::ArcSwap;
 use proto::config::{
-    BlockConfig, BlockDistribution, HostBlock, SchedulerConfig, WorkerGroupConfig, WorkerRank,
+    BlockConfig, BlockDistribution, HostBlock, SchedulerConfig, Tuning, WorkerGroupConfig,
+    WorkerRank,
 };
 use proto::request::wire::WeightsInFlight;
 use proto::request::{GenerationLimits, GenerationRequest};
@@ -204,6 +206,7 @@ fn built(
         Box::new(Recording(Arc::clone(&executor))),
         output,
         Arc::new(crate::batch::Generations::default()),
+        crate::scheduler::tests::tuned(),
     )?;
 
     Ok(Bench {
@@ -829,9 +832,9 @@ fn a_marked_request_is_told_at_the_next_dispatch() {
     let scheduler = &mut bench.scheduler;
     scheduler.policy = Policy::new(
         packaged("arrival"),
-        packaged_arguments("max_num_batched_tokens = 8192"),
+        packaged_arguments(""),
         Snapshot::default(),
-        &ceilings([], &proto::config::PolicyBudget::default()),
+        &ceilings([], &proto::config::PolicyBudget::default()).limits,
         &proto::config::PolicyBudget::default(),
     )
     .unwrap();
@@ -1062,12 +1065,14 @@ fn the_startup_checks_refuse_a_deployment_its_workers_cannot_serve() {
     assert!(built(1024, SchedulerConfig::default(), beside, idle()).is_ok());
 }
 
-/// `Configure` refuses a limit above what the workers hold, naming it: running requests beyond
-/// the slots of the groups that serve a phase together, a step's tokens beyond the widest prefill
-/// bucket, its calls beyond the largest bucket's rows (SD §7.1). Limits within them are taken.
+/// A step's budget is the step values of the snapshot it began with, lowered to what the
+/// workers captured: a step's tokens and its prefill chunk at most the widest prefill bucket's
+/// tokens, its calls at most the largest bucket's rows; a value the snapshot leaves unstated is
+/// the ceiling's. The batches of the step name the snapshot's revision (SD §7.1;
+/// `specs/configuration.md` §7, step values).
 #[test]
-fn configure_refuses_a_limit_above_what_the_workers_hold() {
-    // Both groups prefill over 16 slots each and captured one bucket of 8 rows and 512 tokens.
+fn a_step_takes_the_step_values_it_began_with_within_the_workers_capture() {
+    // Both groups prefill and captured one bucket of 8 rows and 512 tokens.
     let prefills = Capacity {
         phases: 1 << Phase::Prefill.index(),
         buckets: vec![Shape::prefill(8, 512, Variant::PrefillWrite)],
@@ -1076,56 +1081,49 @@ fn configure_refuses_a_limit_above_what_the_workers_hold() {
     let groups = configs()
         .into_iter()
         .map(|config| (config, prefills.clone()));
-    // A policy whose limits the buckets hold.
-    let parameters = packaged_arguments(
-        "chunked_prefill_size = 512\nmax_batch = 8\nmax_num_batched_tokens = 512",
-    );
-    let policy = (packaged("arrival"), parameters);
+    let policy = (packaged("arrival"), packaged_arguments(""));
     let Ok(mut bench) = built(1024, SchedulerConfig::default(), groups.collect(), policy) else {
         panic!("the startup checks pass both groups");
     };
-    let mut configure = |config| {
-        let (reply, replied) = crossbeam_channel::bounded(1);
-        bench.scheduler.apply(Message::Configure(config, reply));
-        replied.try_recv().unwrap()
-    };
 
-    let within = SchedulerConfig {
-        max_running_requests: 32,
-        max_num_batched_tokens: 512,
-        max_batch: NonZeroUsize::new(8).unwrap(),
-        ..SchedulerConfig::default()
-    };
-    let beyond = [
-        (
-            "max_running_requests",
-            SchedulerConfig {
-                max_running_requests: 33,
-                ..within.clone()
-            },
-        ),
-        (
-            "max_num_batched_tokens",
-            SchedulerConfig {
-                max_num_batched_tokens: 513,
-                ..within.clone()
-            },
-        ),
-        (
-            "max_batch",
-            SchedulerConfig {
-                max_batch: NonZeroUsize::new(9).unwrap(),
-                ..within.clone()
-            },
-        ),
-    ];
-    for (name, config) in beyond {
-        let Err(super::Error::InvalidRequest(message)) = configure(config) else {
-            panic!("{name} beyond the workers is refused");
-        };
-        assert!(message.contains(name), "{message}");
-    }
-    assert!(configure(within).is_ok());
+    bench.scheduler.tune(|tuning| {
+        tuning.revision = 7;
+        tuning.max_batch = NonZeroUsize::new(4).unwrap();
+        tuning.max_num_batched_tokens = NonZeroUsize::new(256);
+        tuning.chunked_prefill_size = NonZeroUsize::new(64);
+        tuning.max_queued_requests = NonZeroUsize::new(3);
+    });
+    bench.scheduler.step();
+    assert_eq!(
+        bench.scheduler.budget,
+        super::Budget {
+            revision: 7,
+            tokens: 256,
+            calls: 4,
+            chunk: 64,
+            queued: Some(3),
+        }
+    );
+
+    // Values above the capture are lowered to it; unstated ones take the capture's.
+    bench.scheduler.tune(|tuning| {
+        tuning.revision = 8;
+        tuning.max_batch = NonZeroUsize::new(9).unwrap();
+        tuning.max_num_batched_tokens = None;
+        tuning.chunked_prefill_size = NonZeroUsize::new(4096);
+        tuning.max_queued_requests = None;
+    });
+    bench.scheduler.step();
+    assert_eq!(
+        bench.scheduler.budget,
+        super::Budget {
+            revision: 8,
+            tokens: 512,
+            calls: 8,
+            chunk: 512,
+            queued: None,
+        }
+    );
 }
 
 /// A flush evicts every cached block the scheduler knows of by `Evict`, as many keys per record
@@ -1306,4 +1304,27 @@ fn a_failed_executor_job_stops_the_loop_and_reaches_the_engine() {
 /// the queue pair, the views or the placement, which no policy decision reaches.
 pub(crate) fn idle_policy() -> Arc<wasmtime::Module> {
     fixture(Fixture::Idle)
+}
+
+/// The step values of a scheduler of the tests, which no deployment changes: the default batch,
+/// and the capture's tokens and the default chunk.
+pub(crate) fn tuned() -> Arc<ArcSwap<Tuning>> {
+    Arc::new(ArcSwap::from_pointee(Tuning {
+        revision: 0,
+        chunked_prefill_size: None,
+        max_batch: NonZeroUsize::new(proto::config::DEFAULT_MAX_BATCH).unwrap(),
+        max_num_batched_tokens: None,
+        max_queued_requests: None,
+    }))
+}
+
+impl Scheduler {
+    /// Replaces the step values the scheduler's engine shares by `change` of them, as the
+    /// engine's `Tune` does, and takes them as the next step begins.
+    pub(crate) fn tune(&mut self, change: impl FnOnce(&mut Tuning)) {
+        let mut tuning = Tuning::clone(&self.tuning.load());
+        change(&mut tuning);
+        self.tuning.store(Arc::new(tuning));
+        self.budget = super::Budget::of(&self.tuning.load(), &self.ceilings, &self.config);
+    }
 }

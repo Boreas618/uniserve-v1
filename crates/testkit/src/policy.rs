@@ -44,8 +44,8 @@ pub fn packaged_parameters() -> Parameters {
         })
 }
 
-/// The arguments the packaged policy runs under in an engine whose groups' captured buckets bound
-/// it by `ceilings` (`engine::scheduler::policy::ceilings`): every limit states its ceiling, so the
+/// The arguments the packaged policy runs under in an engine whose policy budget bounds its limits
+/// by `ceilings` (`engine::scheduler::policy::ceilings`): every limit states its bound, so the
 /// limits the module declares are the ones a scheduler checks a policy against and cannot be
 /// refused, and every other parameter is the package's default.
 ///
@@ -54,10 +54,6 @@ pub fn packaged_parameters() -> Parameters {
 /// As [`packaged_parameters`].
 pub fn packaged_arguments(ceilings: &Limits) -> Parameters {
     Parameters {
-        chunked_prefill_size: Some(ceilings.chunked_prefill_size),
-        max_queued_requests: ceilings.max_queued_requests,
-        max_batch: Some(ceilings.max_batch),
-        max_num_batched_tokens: Some(ceilings.max_num_batched_tokens),
         prefetch_min_tokens: Some(ceilings.prefetch_min_tokens),
         timeout: Some(ceilings.timeout),
         ..packaged_parameters()
@@ -210,32 +206,13 @@ fn member(backend: &str) -> (PathBuf, String, PathBuf) {
 mod tests {
     use super::*;
 
-    /// The ceilings of groups whose buckets hold `calls` calls and prefills of `tokens` tokens.
-    fn ceilings(calls: usize, tokens: u32) -> Limits {
-        Limits {
-            chunked_prefill_size: tokens,
-            max_batch: calls,
-            max_num_batched_tokens: tokens,
-            ..policy::ceilings([], &proto::config::PolicyBudget::default())
-        }
-    }
-
-    /// The arguments state every limit at its ceiling, so the limits the module declares are the
+    /// The arguments state every limit at its bound, so the limits the module declares are the
     /// ones the mechanism checks a policy against, and every other parameter at the package's
     /// default.
     #[test]
     fn the_packaged_arguments_state_the_ceilings_and_the_package_defaults() {
-        let ceilings = ceilings(8, 1024);
+        let ceilings = policy::ceilings([], &proto::config::PolicyBudget::default()).limits;
         let arguments = packaged_arguments(&ceilings);
-        assert_eq!(arguments.max_batch, Some(ceilings.max_batch));
-        assert_eq!(
-            arguments.max_num_batched_tokens,
-            Some(ceilings.max_num_batched_tokens)
-        );
-        assert_eq!(
-            arguments.chunked_prefill_size,
-            Some(ceilings.chunked_prefill_size)
-        );
         assert_eq!(
             arguments.prefetch_min_tokens,
             Some(ceilings.prefetch_min_tokens)
@@ -246,15 +223,5 @@ mod tests {
         assert_eq!(arguments.order, defaults.order);
         assert_eq!(arguments.prefill_window, defaults.prefill_window);
         assert!(defaults.order.is_some() && defaults.prefill_window.is_some());
-    }
-
-    /// An engine whose buckets hold two calls is given arguments of two calls, not the package's
-    /// default of more, which its ceilings would refuse.
-    #[test]
-    fn an_engine_of_fewer_calls_states_fewer() {
-        let small = packaged_arguments(&ceilings(2, 64));
-        assert_eq!(small.max_batch, Some(2));
-        assert_eq!(small.max_num_batched_tokens, Some(64));
-        assert!(packaged_parameters().max_batch > Some(2));
     }
 }

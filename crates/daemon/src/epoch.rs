@@ -395,71 +395,21 @@ fn attention_packages(config: &Config) -> Vec<(KernelKey, PackageRevision)> {
         .collect()
 }
 
-/// The scheduling policy package's parameters: the configuration's values the
-/// scheduling policy decides with, inside the build config's bounds.
+/// The scheduling policy package's parameters: the configuration's values the scheduling policy
+/// decides with. The step's budget, its prefill chunk and the waiting queue's bound are no
+/// argument of the policy: the schedulers read them at every step (`proto::config::Tuning`).
 fn policy_arguments(config: &Config) -> toml::Table {
     #[derive(Serialize)]
     struct Arguments {
         #[serde(skip_serializing_if = "Option::is_none")]
         order: Option<proto::config::QueueOrder>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        chunked_prefill_size: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        max_queued_requests: Option<u32>,
-        max_batch: u32,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        max_num_batched_tokens: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         expected_speedup: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         refill_token_cost: Option<f64>,
     }
-    let scheduler = &config.scheduler_config;
-    // The token bound this launch gives its workers, which is the same
-    // `max_num_batched_tokens` its engine configuration states: the policy's
-    // declared limits are these bounds, not a second opinion about them. A
-    // prefill chunk that the deployment states larger than its token bound is
-    // refused by the mechanism (`PolicyError::BadLimits`), never clamped here.
-    // The token bound is the deployment's stated budget, and when it states
-    // none the largest shape its captured graphs bound a batch to — the figure
-    // the engine admits a batch under (`proto::catalog::largest_tier`, read by
-    // both ends). Without this fallback a deployment that captures a 512-token
-    // prefill graph and states no budget hands its policy the guest's 8192-token
-    // default, and the mechanism refuses the epoch's limits against the graph's
-    // ceiling after the weights are loaded. A stated bound above the catalog is
-    // refused at load (`Config::validate`), never clamped here.
-    let token_bound = config
-        .max_num_batched_tokens
-        .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX))
-        .or_else(|| config.cuda_graph_config.tiers().tokens)
-        // A media deployment captures no token graph, and its prompt is the most one batch holds.
-        .or_else(|| config.max_model_len.map(|length| length.get()));
-    // A batch of requests is bounded by the largest captured decode graph, and
-    // the deployment's batch is the smaller of its own and that: a deployment
-    // that leaves the batch at its default means the catalog's figure, and one
-    // that states more than its graphs capture is refused at load
-    // (`Config::validate`), never clamped here.
-    let max_batch = u32::try_from(scheduler.max_batch.get()).unwrap_or(u32::MAX);
-    let max_batch = config
-        .cuda_graph_config
-        .tiers()
-        .rows
-        .map_or(max_batch, |rows| max_batch.min(rows));
-    // A batch holds running requests, so the deployment's bound on those bounds it as well: a media
-    // deployment captures no decode graph, and its bound is the only one it states.
-    let max_batch =
-        max_batch.min(u32::try_from(config.max_running_requests.get()).unwrap_or(u32::MAX));
     let arguments = Arguments {
-        order: scheduler.order,
-        chunked_prefill_size: scheduler
-            .chunked_prefill_size
-            .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX))
-            .or(token_bound),
-        max_queued_requests: scheduler
-            .max_queued_requests
-            .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX)),
-        max_batch,
-        max_num_batched_tokens: token_bound,
+        order: config.scheduler_config.order,
         expected_speedup: config.speculative_config.expected_speedup,
         refill_token_cost: config.speculative_config.refill_token_cost,
     };
@@ -660,120 +610,33 @@ mod tests {
         assert_eq!((processes[0].pid, processes[0].epoch), (Some(42), Some(3)));
     }
 
-    /// The policy's declared limits are the launch's own bounds: the token
-    /// bound the deployment gives its workers is the policy's
-    /// `max_num_batched_tokens`, or the largest shape its captured graphs bound
-    /// a batch to when it states no budget; an unstated prefill chunk is that
-    /// same bound, so the policy's limits cannot disagree with the workers'
-    /// `BatchCapacity`. A deployment that states a chunk larger than
-    /// its bound keeps its own value here — the mechanism refuses it
-    /// (`PolicyError::BadLimits`), and `Config::validate` refuses it at
-    /// load by the option's name, rather than this code clamping it.
+    /// The step's budget, its prefill chunk and the waiting queue's bound are step values, no
+    /// argument of the scheduling policy: the policy's package is the same whatever they are,
+    /// and the launch's step values state them as the deployment does.
     #[test]
-    fn the_policys_limits_are_the_launchs_own_token_bound() {
+    fn the_steps_budget_is_a_step_value_not_a_policy_argument() {
         let mut config = Config {
-            max_num_batched_tokens: NonZeroUsize::new(8192),
+            max_num_batched_tokens: NonZeroUsize::new(4096),
             ..Default::default()
         };
-        config.scheduler_config.chunked_prefill_size = None;
+        config.scheduler_config.chunked_prefill_size = NonZeroUsize::new(1024);
+        config.scheduler_config.max_batch = NonZeroUsize::new(16).unwrap();
+        config.scheduler_config.max_queued_requests = NonZeroUsize::new(8);
         let modules = crate::epoch::modules_of(&config);
         assert_eq!(
-            modules.policy.arguments["max_num_batched_tokens"],
-            toml::Value::Integer(8192)
-        );
-        assert_eq!(
-            modules.policy.arguments["chunked_prefill_size"],
-            toml::Value::Integer(8192),
-            "an unstated chunk is the deployment's own token bound"
+            modules.policy,
+            crate::epoch::modules_of(&Config::default()).policy
         );
 
-        // A stated chunk above the bound is stated, not clamped: the
-        // mechanism's `BadLimits` is the refusal.
-        config.scheduler_config.chunked_prefill_size = NonZeroUsize::new(16384);
-        let modules = crate::epoch::modules_of(&config);
-        assert_eq!(
-            modules.policy.arguments["chunked_prefill_size"],
-            toml::Value::Integer(16384)
+        let tuning = proto::config::Tuning::of(
+            &config.engine_config().expect("the configuration resolves"),
+            5,
         );
-
-        // A deployment that states a graph catalog and no budget gives its
-        // policy the largest shape the catalog bounds a batch to: the same
-        // figure the engine admits a batch under, so a policy that states no
-        // bound of its own never declares more than the engine built for.
-        let mut config = Config::default();
-        config.cuda_graph_config.prefill_token_sizes = Some(vec![
-            NonZeroU32::new(128).unwrap(),
-            NonZeroU32::new(512).unwrap(),
-        ]);
-        config.cuda_graph_config.decode_batch_sizes = Some(vec![
-            NonZeroU32::new(1).unwrap(),
-            NonZeroU32::new(8).unwrap(),
-        ]);
-        let modules = crate::epoch::modules_of(&config);
-        assert_eq!(
-            modules.policy.arguments["max_num_batched_tokens"],
-            toml::Value::Integer(512),
-            "an unstated budget is the largest shape the captured graphs bound a batch to"
-        );
-        assert_eq!(
-            modules.policy.arguments["chunked_prefill_size"],
-            toml::Value::Integer(512),
-            "and an unstated chunk is that same bound"
-        );
-
-        // The batch the policy may hold follows the same catalog: the
-        // deployment's own batch, or the largest decode graph when it states
-        // none, and a catalog that grows with a new epoch moves the derived
-        // figure with it.
-        let mut config = Config::default();
-        config.cuda_graph_config.decode_batch_sizes = Some(vec![
-            NonZeroU32::new(1).unwrap(),
-            NonZeroU32::new(2).unwrap(),
-            NonZeroU32::new(4).unwrap(),
-            NonZeroU32::new(8).unwrap(),
-        ]);
-        let modules = crate::epoch::modules_of(&config);
-        assert_eq!(
-            modules.policy.arguments["max_batch"],
-            toml::Value::Integer(8),
-            "an unstated batch is the largest decode graph the deployment captured"
-        );
-        config
-            .cuda_graph_config
-            .decode_batch_sizes
-            .as_mut()
-            .unwrap()
-            .push(NonZeroU32::new(16).unwrap());
-        let modules = crate::epoch::modules_of(&config);
-        assert_eq!(
-            modules.policy.arguments["max_batch"],
-            toml::Value::Integer(16),
-            "and it moves with the catalog a new epoch captures"
-        );
-        // A batch the deployment states below the catalog keeps its own value.
-        config.scheduler_config.max_batch = NonZeroUsize::new(4).unwrap();
-        let modules = crate::epoch::modules_of(&config);
-        assert_eq!(
-            modules.policy.arguments["max_batch"],
-            toml::Value::Integer(4)
-        );
-
-        // A deployment that states no token bound and no catalog states no
-        // limit, and the mechanism's ceilings are the workers' own.
-        let config = Config::default();
-        let modules = crate::epoch::modules_of(&config);
-        assert!(
-            !modules
-                .policy
-                .arguments
-                .contains_key("max_num_batched_tokens")
-        );
-        assert!(
-            !modules
-                .policy
-                .arguments
-                .contains_key("chunked_prefill_size")
-        );
+        assert_eq!(tuning.revision, 5);
+        assert_eq!(tuning.max_num_batched_tokens, NonZeroUsize::new(4096));
+        assert_eq!(tuning.chunked_prefill_size, NonZeroUsize::new(1024));
+        assert_eq!(tuning.max_batch.get(), 16);
+        assert_eq!(tuning.max_queued_requests, NonZeroUsize::new(8));
     }
 
     /// The order a deployment states for its waiting queue is the policy's `order` argument;
@@ -876,18 +739,6 @@ mod tests {
                 config.scheduler_config.order = Some(proto::config::QueueOrder::Priority)
             }),
             (
-                "scheduler_config.chunked_prefill_size",
-                |config: &mut Config| {
-                    config.scheduler_config.chunked_prefill_size = NonZeroUsize::new(2048)
-                },
-            ),
-            ("scheduler_config.max_batch", |config: &mut Config| {
-                config.scheduler_config.max_batch = NonZeroUsize::new(8).unwrap()
-            }),
-            ("max_num_batched_tokens", |config: &mut Config| {
-                config.max_num_batched_tokens = NonZeroUsize::new(4096)
-            }),
-            (
                 "speculative_config.expected_speedup",
                 |config: &mut Config| config.speculative_config.expected_speedup = Some(2.5),
             ),
@@ -909,8 +760,40 @@ mod tests {
             }),
         ];
 
+        // The step values: in place, at the schedulers' next step.
+        let step: Vec<Case> = vec![
+            (
+                "scheduler_config.chunked_prefill_size",
+                |config: &mut Config| {
+                    config.scheduler_config.chunked_prefill_size = NonZeroUsize::new(2048)
+                },
+            ),
+            ("scheduler_config.max_batch", |config: &mut Config| {
+                config.scheduler_config.max_batch = NonZeroUsize::new(8).unwrap()
+            }),
+            (
+                "scheduler_config.max_queued_requests",
+                |config: &mut Config| {
+                    config.scheduler_config.max_queued_requests = NonZeroUsize::new(8)
+                },
+            ),
+            ("max_num_batched_tokens", |config: &mut Config| {
+                config.max_num_batched_tokens = NonZeroUsize::new(4096)
+            }),
+        ];
+
         let base = Epoch::of(Config::default()).expect("the configuration resolves");
         assert_eq!(change(&base, &base), Change::None, "no change");
+        for (what, edit) in &step {
+            let next = Epoch::of(set(*edit)).expect("the configuration resolves");
+            assert_eq!(change(&base, &next), Change::None, "{what} moves no update");
+            let changes = proto::reload::changes(Some(&base.config), &next.config);
+            assert_eq!(
+                proto::reload::Effects::of(&changes).heaviest(),
+                Some(proto::reload::Effect::Step),
+                "{what} takes effect at the next step"
+            );
+        }
 
         for (what, edit) in host_frontend.iter().chain(host_daemon.iter()) {
             let next = Epoch::of(set(*edit)).expect("the configuration resolves");
@@ -1066,10 +949,6 @@ mod tests {
         // The scheduling policy package's backend is the policy's name, and its
         // parameters are the configuration's values it reads, as TOML strings.
         assert_eq!(modules.policy.backend, "arrival");
-        assert_eq!(
-            modules.policy.arguments["max_batch"],
-            toml::Value::Integer(128)
-        );
         let scheduler = SchedulerConfig {
             max_queued_requests: NonZeroUsize::new(16),
             chunked_prefill_size: NonZeroUsize::new(2048),
@@ -1082,18 +961,6 @@ mod tests {
         };
         stated.speculative_config.expected_speedup = Some(2.5);
         let modules = crate::epoch::modules_of(&stated);
-        assert_eq!(
-            modules.policy.arguments["chunked_prefill_size"],
-            toml::Value::Integer(2048)
-        );
-        assert_eq!(
-            modules.policy.arguments["max_queued_requests"],
-            toml::Value::Integer(16)
-        );
-        assert_eq!(
-            modules.policy.arguments["max_num_batched_tokens"],
-            toml::Value::Integer(4096)
-        );
         assert_eq!(
             modules.policy.arguments["expected_speedup"],
             toml::Value::Float(2.5)
