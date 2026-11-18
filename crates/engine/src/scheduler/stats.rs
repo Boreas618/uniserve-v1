@@ -334,7 +334,8 @@ impl Scheduler {
     /// trajectories are sized per request (SD §4.4).
     pub(super) fn kv_regions(&self) -> Vec<usize> {
         let mut regions: Vec<usize> = self
-            .classes
+            .kv
+            .classes()
             .iter()
             .zip(0u8..)
             .filter(|(class, _)| class.units > 0 && !class.state_in_slot)
@@ -369,7 +370,8 @@ impl Scheduler {
     fn host_regions(&self) -> Vec<usize> {
         let host =
             |(_, (_, region)): &(usize, &(u8, storage::runtime::Region))| region.tier == Tier::Host;
-        self.regions
+        self.kv
+            .regions()
             .iter()
             .enumerate()
             .filter(host)
@@ -382,8 +384,8 @@ impl Scheduler {
     fn pages(&self, regions: &[usize]) -> Pages {
         let mut pages = Pages::default();
         for &region in regions {
-            let capacity = self.capacity.get(region).copied().unwrap_or(0);
-            let available = self.available.get(region).copied().unwrap_or(0);
+            let capacity = self.kv.capacity(region);
+            let available = self.kv.available(region);
             pages.capacity += u64::from(capacity);
             pages.used += u64::from(capacity.saturating_sub(available));
         }
@@ -393,8 +395,8 @@ impl Scheduler {
     fn cache_usage(&self) -> f64 {
         let (mut units, mut free) = (0_u64, 0_u64);
         for region in self.kv_regions() {
-            let capacity = self.capacity.get(region).copied().unwrap_or(0);
-            let available = self.available.get(region).copied().unwrap_or(0);
+            let capacity = self.kv.capacity(region);
+            let available = self.kv.available(region);
             units += u64::from(capacity);
             free += u64::from(available.min(capacity));
         }
@@ -738,7 +740,7 @@ mod tests {
 
         // The bench's KV regions are 0 and 1, 64 units each; region 2 holds sized products and
         // region 3 the slot rows, neither of which is the cache.
-        scheduler.available = vec![32, 64, 0, 0];
+        *scheduler.kv.available_mut() = vec![32, 64, 0, 0];
         scheduler.running = vec![RequestId(1), RequestId(2)];
         scheduler.waiting.push_back(RequestId(3));
         // Request 1 runs with 200 of its 300 prompt tokens to compute; the bench holds no

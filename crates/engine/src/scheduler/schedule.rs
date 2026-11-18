@@ -26,8 +26,8 @@ use service::span::{self, Stage};
 use storage::Key;
 use storage::runtime::{self, GroupId, OwnerId, Tier};
 
-use super::cache::{DEVICE, HOST};
 use super::group::variants;
+use super::kv;
 use super::update::migratable;
 use super::view::{call_view, replica_views, view_of};
 use super::{Error, Request, RequestStatus, Scheduler, WorkerGroup};
@@ -129,7 +129,7 @@ impl Scheduler {
         // continuation by this epoch unless it carries a name.
         let drafts = u32::try_from(self.config.draft_tokens).unwrap_or(u32::MAX);
         let mut request = Request::new(input, self.epoch, Instant::now(), window, drafts);
-        request.listing = self.lists_asked;
+        request.listing = self.kv.lists_asked();
         let at = if request.resumes() {
             self.waiting
                 .iter()
@@ -416,7 +416,9 @@ impl Scheduler {
 
         // What the call writes lies within the blocks the request holds and can write; beyond
         // them, its `Allocate` is outstanding and nothing waits for it.
-        if is_token(phase) && !self.holds_blocks_for(request, phase, tokens) {
+        if is_token(phase)
+            && !kv::holds_blocks_for(request, (phase, tokens), &self.groups, &self.config)
+        {
             refund(budget, tokens);
             self.count_without_blocks();
             return false;
@@ -548,20 +550,20 @@ impl Scheduler {
                 };
                 // A model with a recurrent state ends the chunk where it keeps a checkpoint it
                 // holds writable.
-                let tokens = self.fit_chunk(request, phase, chunk.min(left).min(budget.0));
+                let tokens =
+                    kv::fit_chunk(request, phase, chunk.min(left).min(budget.0), &self.groups);
                 request.clip_to_images(tokens).max(1)
             }
             Phase::Refill => {
-                let state = self
-                    .state_shape(request)
-                    .map(|(class, block, _)| (class, block));
+                let state =
+                    kv::state_shape(request, &self.groups).map(|(class, block, _)| (class, block));
                 // The rows of a refill start where the draft cache ends; a gap that restarts the
                 // draft cache from a checkpoint it no longer holds is not one chunk.
                 if request.refill_start(state) != request.num_draft_tokens {
                     return None;
                 }
                 let chunk = request.refill_chunk(budget.0, state);
-                match self.fit_chunk(request, phase, chunk) {
+                match kv::fit_chunk(request, phase, chunk, &self.groups) {
                     0 => return None,
                     tokens => tokens,
                 }
@@ -677,9 +679,7 @@ impl Scheduler {
             // Waiting for units since its last shortage: it asks again once they show, or once
             // nothing given up is still on its way back, when it is short again.
             if let Some(&(region, units)) = self.short.get(&id) {
-                if self.available.get(region).copied().unwrap_or(0) < units
-                    && self.returning(region)
-                {
+                if self.kv.available(region) < units && self.returning(region) {
                     continue;
                 }
                 self.short.remove(&id);
@@ -687,18 +687,18 @@ impl Scheduler {
             let Some(request) = self.requests.get(&id) else {
                 continue;
             };
-            let Some(owner) = self.kv_owner(request) else {
+            let Some(owner) = kv::kv_owner(request) else {
                 continue;
             };
 
-            for (class, at, count, needed) in self.ahead(request) {
+            for (class, at, count, needed) in kv::ahead(request, &self.kv_step()) {
                 if count == 0 || outstanding.contains(&(owner, class)) {
                     continue;
                 }
                 let Some(regions) = self.class_regions(owner, class) else {
                     continue;
                 };
-                let each = self.block_units(class, 0).unwrap_or(0);
+                let each = self.kv.block_units(class, 0).unwrap_or(0);
                 // The units of `region` the other short requests wait for.
                 let waited = |region: usize| {
                     self.short
@@ -713,7 +713,7 @@ impl Scheduler {
                 let short = |blocks: u32, waits: bool| {
                     let units = blocks.saturating_mul(each);
                     regions.iter().copied().find(|&region| {
-                        let available = self.available.get(region).copied().unwrap_or(0);
+                        let available = self.kv.available(region);
                         let free = if waits {
                             available.saturating_sub(waited(region))
                         } else {
@@ -739,9 +739,7 @@ impl Scheduler {
                 let units = count.saturating_mul(each);
 
                 for &region in &regions {
-                    if let Some(available) = self.available.get_mut(region) {
-                        *available = available.saturating_sub(units);
-                    }
+                    self.kv.take(region, units);
                 }
                 let allocate = runtime::Request::Allocate {
                     owner,
@@ -750,7 +748,9 @@ impl Scheduler {
                     count,
                     units: 0,
                 };
-                self.count_asked(id, class, at, count);
+                if let Some(request) = self.requests.get_mut(&id) {
+                    kv::count_asked(request, class, at, count);
+                }
                 self.submit(allocate);
             }
         }
@@ -768,7 +768,7 @@ impl Scheduler {
                     | runtime::Request::Evict { .. }
             )
         };
-        self.retiring.get(region).is_some_and(|units| *units > 0)
+        self.kv.retiring(region) > 0
             || self
                 .requests
                 .values()
@@ -807,7 +807,7 @@ impl Scheduler {
     /// the device copies of the blocks it names, with their keys in its order. A `PageId` that is
     /// not in `cache`, not on the device, already on the host or being stored there (a block is
     /// offered to the host once, SD §4.4), whose last `Store` stored nothing while nothing that
-    /// could change that has happened since ([`Scheduler::store_refused`]), or of a class without
+    /// could change that has happened since (`Kv::store_refused`), or of a class without
     /// a host region is skipped.
     ///
     /// A policy names a block once. A block whose last `Store` to the host stored nothing is
@@ -820,62 +820,8 @@ impl Scheduler {
             return;
         }
         let storing = self.host_stores();
-
-        // The blocks offered again; one still held back stays recorded, and one with a host copy
-        // or no device copy leaves the record.
-        let mut again: Vec<(u64, u64)> = Vec::new();
-        let mut held_back = HashSet::new();
-        for id in std::mem::take(&mut self.unstored) {
-            let Some(row) = self.cache.get(&id) else {
-                continue;
-            };
-            if row.tiers & HOST != 0 || row.tiers & DEVICE == 0 {
-                continue;
-            }
-            if row.pins > 0 || storing.contains(&row.key) || self.store_refused(row) {
-                held_back.insert(id);
-            } else {
-                again.push((row.last_used, id));
-            }
-        }
-        self.unstored = held_back;
-        again.sort_unstable();
-
-        let mut offered = HashSet::new();
-        let mut stores: Vec<(GroupId, Vec<Key>)> = Vec::new();
-        let named = pages.iter().map(|page| page.0);
-        for id in named.chain(again.into_iter().map(|(_, id)| id)) {
-            let Some(row) = self.cache.get(&id) else {
-                continue;
-            };
-            let hosted = self
-                .classes
-                .get(usize::from(row.class))
-                .is_some_and(|class| class.host.is_some());
-            if row.tiers & HOST != 0
-                || !hosted
-                || storing.contains(&row.key)
-                || self.store_refused(row)
-                || !offered.insert(id)
-            {
-                continue;
-            }
-            let Some(group) = self.holder(row) else {
-                continue;
-            };
-
-            match stores.iter_mut().find(|(store, _)| *store == group) {
-                Some((_, keys)) => keys.push(row.key),
-                None => stores.push((group, vec![row.key])),
-            }
-        }
-
-        for (group, keys) in stores {
-            self.submit(runtime::Request::Store {
-                group,
-                keys,
-                tier: Tier::Host,
-            });
+        for store in self.kv.offload(pages, &storing, &self.groups) {
+            self.submit(store);
         }
     }
 
@@ -902,7 +848,7 @@ impl Scheduler {
             })
             .collect();
         let asks = match self.requests.get(&id) {
-            Some(request) => self.prefetch_requests(request, true),
+            Some(request) => self.kv.prefetch_requests(request, true, &self.kv_step()),
             None => Vec::new(),
         };
         for ask in asks {
@@ -921,7 +867,8 @@ impl Scheduler {
             return;
         };
         if request.keys.is_empty() && request.encodings.is_empty() {
-            let (keys, encodings) = (self.keys_of(request), self.encodings_of(request));
+            let keys = self.kv.keys_of(request, &self.groups);
+            let encodings = self.kv.encodings_of(request);
             if let Some(request) = self.requests.get_mut(&id) {
                 request.keys = keys;
                 request.encodings = encodings;
@@ -970,13 +917,15 @@ impl Scheduler {
         let Some(request) = self.requests.get(&id) else {
             return;
         };
-        let call = self.next_call(request);
+        let step = self.kv_step();
+        let call = kv::next_call(request, &step);
         let holds = call.map(|(phase, start, end)| {
-            self.holds_blocks_for(request, phase, end.saturating_sub(start))
+            let call = (phase, end.saturating_sub(start));
+            kv::holds_blocks_for(request, call, &self.groups, &self.config)
         });
         let short = self.short.get(&id).map(|&(region, units)| {
-            let available = self.available.get(region).copied().unwrap_or(0);
-            let retiring = self.retiring.get(region).copied().unwrap_or(0);
+            let available = self.kv.available(region);
+            let retiring = self.kv.retiring(region);
             (region, units, available, retiring)
         });
         tracing::warn!(
@@ -986,7 +935,7 @@ impl Scheduler {
             drafts = request.num_draft_tokens,
             ?call,
             ?holds,
-            ahead = ?self.ahead(request),
+            ahead = ?kv::ahead(request, &step),
             ?short,
             blocks = ?request.blocks,
             event_credit = request.event_credit,
@@ -1137,7 +1086,7 @@ impl Scheduler {
         let Some(request) = self.requests.get(&id) else {
             return true;
         };
-        let expected = self.expected(request);
+        let expected = self.kv.expected(request, &self.groups, &self.budget);
         // A resumed request's previous life committed its blocks, through another queue pair
         // when it ran on another epoch, whose commits `cache` learns only from a `Listing`; one
         // that imports a lend reads its prompt from the lend.
@@ -1171,9 +1120,8 @@ impl Scheduler {
             if let Some(slots) = self
                 .group(group)
                 .map(|group| usize::from(group.layout.slots))
-                && let Some(free) = self.available.get_mut(slots)
             {
-                *free = free.saturating_sub(1);
+                self.kv.take(slots, 1);
             }
             let owner = self.draw_owner();
             self.owners.insert(owner, id);
@@ -1238,7 +1186,7 @@ impl Scheduler {
             return false;
         }
 
-        if self.settled(request) {
+        if kv::settled(request, &self.groups, &self.budget) {
             self.admitted(id);
             return true;
         }
@@ -1256,9 +1204,7 @@ impl Scheduler {
     /// with what is left (SD §3.5).
     pub(super) fn ask(&mut self, id: RequestId, request: runtime::Request) {
         for (region, units) in self.taken(&request) {
-            if let Some(available) = self.available.get_mut(region) {
-                *available = available.saturating_sub(units);
-            }
+            self.kv.take(region, units);
         }
         if self.submit(request)
             && let Some(row) = self.requests.get_mut(&id)
@@ -1275,7 +1221,7 @@ impl Scheduler {
         let reserve = self.admission_reserve();
         let need = self.units_needed(request, hit);
         need.iter().enumerate().all(|(region, &units)| {
-            let available = self.available.get(region).copied().unwrap_or(0);
+            let available = self.kv.available(region);
             let kept = reserve.get(region).copied().unwrap_or(0);
             units == 0 || available.saturating_sub(kept) >= units
         })
@@ -1283,7 +1229,7 @@ impl Scheduler {
 
     /// Whether `request` can never fit (SD §3.5, §7.2): in some region, the units its admission
     /// holds when no other request holds any exceed the units the region is declared to hold
-    /// ([`Scheduler::declared`]). Below that, `fits` holds once the requests ahead of it have
+    /// (`Kv::declared`). Below that, `fits` holds once the requests ahead of it have
     /// ended, the units they held came back and a resize in progress completed, since its hit is
     /// one its admission holds alone (SD §4.4 "The hit"), so a request this does not refuse is
     /// admitted.
@@ -1292,7 +1238,7 @@ impl Scheduler {
         alone
             .iter()
             .enumerate()
-            .any(|(region, &units)| units > self.declared(region))
+            .any(|(region, &units)| units > self.kv.declared(region))
     }
 
     /// The units of `region` (an index) the entries of `request`'s tables of fixed-size blocks
@@ -1305,7 +1251,7 @@ impl Scheduler {
                 .filter_map(|owner| self.class_regions(owner, class))
                 .any(|regions| regions.contains(&region));
             if there {
-                let each = self.block_units(class, 0).unwrap_or(0);
+                let each = self.kv.block_units(class, 0).unwrap_or(0);
                 let entries = blocks.end.saturating_sub(blocks.first);
                 held = held.saturating_add(entries.saturating_mul(each));
             }
@@ -1483,8 +1429,8 @@ impl Scheduler {
 
         // Retired units come back once the batches that may read them end: the request waits for
         // the capacity words to show them instead of taking victims for them.
-        let available = self.available.get(region).copied().unwrap_or(0);
-        let retiring = self.retiring.get(region).copied().unwrap_or(0);
+        let available = self.kv.available(region);
+        let retiring = self.kv.retiring(region);
         let need = self
             .units_short(id, region)
             .saturating_sub(available)
@@ -1535,11 +1481,8 @@ impl Scheduler {
                 // its id in `cache`, whose eviction frees units of the short region; an id that
                 // names nothing is skipped.
                 Victim::Page(PageId(page)) | Victim::Encoding(EncodingId(page)) => {
-                    if self.cache_unpinned(page)
-                        && let Some(row) = self.cache.get(&page)
-                        && self.class_lies_in(row.class, region)
-                    {
-                        evict.push(row.key);
+                    if let Some(key) = self.kv.victim(page, region, &self.groups) {
+                        evict.push(key);
                     }
                 }
             }
@@ -1557,16 +1500,12 @@ impl Scheduler {
         }
     }
 
-    /// Whether `class`'s blocks lie in `region` (an index) on this scheduler's side.
-    fn class_lies_in(&self, class: u8, region: usize) -> bool {
-        self.classes_in(region).any(|held| held == class)
-    }
-
     /// Whether `region` (an index) is a state region: the region of the recurrent-state class,
     /// whose live state is in the slot and whose every unit is one checkpoint.
     fn state_region(&self, region: usize) -> bool {
-        self.classes_in(region).any(|class| {
-            self.classes
+        self.kv.classes_in(region, &self.groups).any(|class| {
+            self.kv
+                .classes()
                 .get(usize::from(class))
                 .is_some_and(|stated| stated.state_in_slot)
         })
@@ -1574,7 +1513,7 @@ impl Scheduler {
 
     /// Whether running request `id` can never fit in `region`: the units it holds there and the
     /// units its next call still needs there exceed the units the region is declared to hold
-    /// ([`Scheduler::declared`]), so that neither a victim nor a resize in progress could let it
+    /// (`Kv::declared`), so that neither a victim nor a resize in progress could let it
     /// grow (`S/preemption/tokens.rs:133-164`). It ends with
     /// `FinishReason::CacheCapacity` at the length the cache holds, once no call of it is in
     /// flight: those calls write within the blocks it holds and may end it themselves, and their
@@ -1586,7 +1525,7 @@ impl Scheduler {
         };
         let held = self.units_held(request, region);
         let need = self.units_short(id, region);
-        if held.saturating_add(need) <= self.declared(region) {
+        if held.saturating_add(need) <= self.kv.declared(region) {
             return false;
         }
 
@@ -1614,16 +1553,16 @@ impl Scheduler {
             .flat_map(|&(at, group, from, _)| self.receiving(request, (at, group, from)))
             .filter(|&(taken, _)| taken == region)
             .fold(0u32, |units, (_, taken)| units.saturating_add(taken));
-        let Some(owner) = self.kv_owner(request) else {
+        let Some(owner) = kv::kv_owner(request) else {
             return crossings;
         };
         let mut short = crossings;
-        for (class, _, _, needed) in self.ahead(request) {
+        for (class, _, _, needed) in kv::ahead(request, &self.kv_step()) {
             let there = self
                 .class_regions(owner, class)
                 .is_some_and(|regions| regions.contains(&region));
             if there {
-                let each = self.block_units(class, 0).unwrap_or(0);
+                let each = self.kv.block_units(class, 0).unwrap_or(0);
                 short = short.saturating_add(needed.saturating_mul(each));
             }
         }
@@ -1645,7 +1584,8 @@ impl Scheduler {
     /// executor and starting its draft cache again from nothing (`give_up_draft`).
     fn give_up_drafts(&mut self, region: usize, need: u32) -> u32 {
         let mut need = need;
-        for id in self.draft_order(region) {
+        let running = self.running.iter().filter_map(|id| self.requests.get(id));
+        for id in kv::draft_order(running, region, &self.groups) {
             if need == 0 {
                 break;
             }
@@ -1709,7 +1649,11 @@ impl Scheduler {
             .requests
             .values()
             .any(|request| request.status == RequestStatus::Finished);
-        let short = |request: &&Request| self.ahead(request).iter().any(|&(.., needed)| needed > 0);
+        let step = self.kv_step();
+        let short = |request: &&Request| {
+            let ahead = kv::ahead(request, &step);
+            ahead.iter().any(|&(.., needed)| needed > 0)
+        };
         if tokens.len() < 2 || leaving || !tokens.iter().all(short) {
             return;
         }
@@ -2053,7 +1997,7 @@ mod tests {
         scheduler.requests.insert(second.id, second);
         scheduler.running.push(RequestId(2));
         scheduler.short.insert(RequestId(2), (0, 1));
-        scheduler.available[0] = 1;
+        scheduler.kv.available_mut()[0] = 1;
 
         scheduler.allocate_ahead();
         scheduler.post().unwrap();
@@ -2201,19 +2145,19 @@ mod tests {
     fn a_block_the_policy_offloads_is_stored_once_until_its_store_is_answered() {
         let mut bench = bench(4096);
         // Group A's blocks of class `KV` have a host copy region; one is on the device in A.
-        bench.scheduler.classes[usize::from(KV)].host = Some((2, 1));
-        let block = super::super::Cached {
+        bench.scheduler.kv.classes_mut()[usize::from(KV)].host = Some((2, 1));
+        let block = super::super::kv::Cached {
             key: key(1),
             class: KV,
             tokens: 16,
-            tiers: super::super::cache::DEVICE,
+            tiers: super::super::kv::DEVICE,
             groups: 1 << A.0,
             pins: 1,
             last_used: 1,
             refused: None,
         };
-        let page = PageId(super::super::Cached::id(&block.key));
-        bench.scheduler.cache.insert(page.0, block);
+        let page = PageId(super::super::kv::Cached::id(&block.key));
+        bench.scheduler.kv.insert(block);
 
         let store = runtime::Request::Store {
             group: A,
@@ -2245,19 +2189,19 @@ mod tests {
         let mut bench = bench(4096);
         // Group A's blocks of class `KV` have a host copy region (index 2); one no request holds
         // is on the device in A.
-        bench.scheduler.classes[usize::from(KV)].host = Some((2, 1));
-        let block = super::super::Cached {
+        bench.scheduler.kv.classes_mut()[usize::from(KV)].host = Some((2, 1));
+        let block = super::super::kv::Cached {
             key: key(1),
             class: KV,
             tokens: 16,
-            tiers: super::super::cache::DEVICE,
+            tiers: super::super::kv::DEVICE,
             groups: 1 << A.0,
             pins: 0,
             last_used: 1,
             refused: None,
         };
-        let page = PageId(super::super::Cached::id(&block.key));
-        bench.scheduler.cache.insert(page.0, block);
+        let page = PageId(super::super::kv::Cached::id(&block.key));
+        bench.scheduler.kv.insert(block);
         let store = runtime::Request::Store {
             group: A,
             keys: vec![key(1)],
@@ -2285,7 +2229,7 @@ mod tests {
         assert!(offered(&mut bench).is_empty(), "nothing has moved");
 
         // A `Store` into the region stored a block.
-        bench.scheduler.stores[2] += 1;
+        bench.scheduler.kv.stores_mut()[2] += 1;
         assert_eq!(offered(&mut bench), [store]);
         assert!(offered(&mut bench).is_empty(), "it is being stored");
     }

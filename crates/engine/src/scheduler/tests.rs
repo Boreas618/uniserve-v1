@@ -22,11 +22,12 @@ use scheduling::view::Snapshot;
 use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
 use storage::{Key, QueuePair};
 
-use super::cache::DEVICE;
+use super::kv::{Cached, DEVICE};
 use super::policy::ceilings;
 use super::policy::tests::{Fixture, fixture, packaged, packaged_arguments};
 use super::{
-    Blocks, Cached, Capacity, Executor, Message, Output, Policy, Request, RequestStatus, Scheduler,
+    Blocks, Capacity, Executor, Message, Output, Policy, Request, RequestStatus, Scheduler,
+    WorkerGroup,
 };
 
 pub(super) const A: GroupId = GroupId(0);
@@ -120,19 +121,11 @@ fn configs() -> Vec<WorkerGroupConfig> {
     )
 }
 
-/// A scheduler of `config` over the first `groups.len()` of groups A and B, each with its
-/// configuration and capacity, serving `policy` (a module and its package's arguments), on its
-/// queue pair with rings of `ring_bytes`, and the buffer pool's end of that queue pair; or the
-/// constructor's refusal.
-///
-/// The session: regions numbered 4 to 7 (the KV regions of groups A and B, the product region
-/// both state, the slot rows), and the capacity words of region `n` at register `2 + 3 * (n - 4)`.
-fn built(
-    ring_bytes: usize,
-    config: SchedulerConfig,
-    groups: Vec<(WorkerGroupConfig, Capacity)>,
-    policy: (Arc<wasmtime::Module>, Parameters),
-) -> Result<Bench, super::Error> {
+/// The session of the bench's scheduler over the first `count` of groups A and B: regions
+/// numbered 4 to 7 (the KV regions of groups A and B, the product region both state, the slot
+/// rows), class `KV` of one-unit blocks and the sized class `PRODUCT`, which is the class of
+/// trajectories too, and the capacity words of region `n` at register `2 + 3 * (n - 4)`.
+fn layouts(count: usize) -> (runtime::Open, runtime::Opened) {
     let region = |name: &str, units| Region {
         name: name.to_owned(),
         tier: Tier::Device,
@@ -175,7 +168,7 @@ fn built(
         trajectory: PRODUCT,
         peers: Vec::new(),
         groups: vec![group(A, 0), group(B, 1)],
-        schedulers: vec![[A, B][..groups.len()].to_vec()],
+        schedulers: vec![[A, B][..count].to_vec()],
     };
     let opened = runtime::Opened {
         regions: vec![(4, 64), (5, 64), (6, 64), (7, 16)],
@@ -187,7 +180,32 @@ fn built(
         }],
         session: 0,
     };
+    (layout, opened)
+}
 
+/// The session of the bench's scheduler over groups A and B, with its groups as [`capacity`]
+/// states them.
+pub(super) fn session() -> (runtime::Open, runtime::Opened, Vec<WorkerGroup>) {
+    let (layout, opened) = layouts(2);
+    let groups = configs()
+        .into_iter()
+        .zip(&layout.groups)
+        .map(|(config, group)| WorkerGroup::new(config, capacity(), group.clone()).unwrap())
+        .collect();
+    (layout, opened, groups)
+}
+
+/// A scheduler of `config` over the first `groups.len()` of groups A and B, each with its
+/// configuration and capacity, serving `policy` (a module and its package's arguments), on its
+/// queue pair with rings of `ring_bytes`, and the buffer pool's end of that queue pair; or the
+/// constructor's refusal. The session is [`layouts`]'.
+fn built(
+    ring_bytes: usize,
+    config: SchedulerConfig,
+    groups: Vec<(WorkerGroupConfig, Capacity)>,
+    policy: (Arc<wasmtime::Module>, Parameters),
+) -> Result<Bench, super::Error> {
+    let (layout, opened) = layouts(groups.len());
     let pool = QueuePair::create(ring_bytes, 14).unwrap();
     let engine = QueuePair::open(pool.duplicate().unwrap(), true).unwrap();
 
@@ -239,67 +257,74 @@ pub(crate) fn capacity() -> Capacity {
     }
 }
 
+/// Request 1, a token request of three prompt tokens waiting for its admission's answers,
+/// attached to the groups `attachments` names, each with its owner and slot row.
+pub(super) fn attached(attachments: &[(GroupId, OwnerId, u32)]) -> Request {
+    let id = proto::request::RequestId(1);
+    let input = GenerationRequest {
+        trace: 0,
+        request_id: id,
+        prompt_token_ids: vec![1, 2, 3],
+        multimodal_inputs: Default::default(),
+        sampling: Default::default(),
+        max_und_tokens: 4,
+        stop_strings: Vec::new(),
+        stop_token_ids: Vec::new(),
+        priority: 0,
+        cache: Default::default(),
+        include_stop_token: false,
+        generated_token_ids: Vec::new(),
+        adapter: 0,
+        hand_off: false,
+        lend: None,
+    };
+    let now = Instant::now();
+    Request {
+        id,
+        input: input.into(),
+        arrival: now,
+        status: RequestStatus::WaitingForRemoteKvs,
+        placement: [None; crate::batch::Phase::COUNT],
+        attachments: attachments
+            .iter()
+            .map(|&(group, owner, slot)| (group, owner, slot, false))
+            .collect(),
+        scheduled: [0; crate::batch::Phase::COUNT],
+        completed: [0; crate::batch::Phase::COUNT],
+        early: Vec::new(),
+        blocks: vec![Blocks::default(); 2],
+        queued: true,
+        pending: 0,
+        token_ids: vec![1, 2, 3],
+        num_prompt_tokens: 3,
+        num_computed_tokens: 0,
+        num_cached_tokens: 0,
+        num_host_tokens: 0,
+        num_peer_tokens: 0,
+        listing: 0,
+        keys: Vec::new(),
+        spec_token_ids: Vec::new(),
+        num_draft_tokens: 0,
+        num_encoded_inputs: 0,
+        encodings: Vec::new(),
+        unpinned: Vec::new(),
+        crossings: Vec::new(),
+        num_acknowledged_tokens: 0,
+        terminal: None,
+        event_credit: 64,
+        event_window: 64,
+        draft_limit: 0,
+        last_progress: now,
+        dirty: false,
+        path: None,
+    }
+}
+
 impl Bench {
-    /// Request 1, attached to the groups `attachments` names, with live owners.
+    /// Request 1, attached to the groups `attachments` names, with live owners ([`attached`]).
     pub(super) fn attach(&mut self, attachments: &[(GroupId, OwnerId, u32)]) {
-        let id = proto::request::RequestId(1);
-        let input = GenerationRequest {
-            trace: 0,
-            request_id: id,
-            prompt_token_ids: vec![1, 2, 3],
-            multimodal_inputs: Default::default(),
-            sampling: Default::default(),
-            max_und_tokens: 4,
-            stop_strings: Vec::new(),
-            stop_token_ids: Vec::new(),
-            priority: 0,
-            cache: Default::default(),
-            include_stop_token: false,
-            generated_token_ids: Vec::new(),
-            adapter: 0,
-            hand_off: false,
-            lend: None,
-        };
-        let now = Instant::now();
-        let request = Request {
-            id,
-            input: input.into(),
-            arrival: now,
-            status: RequestStatus::WaitingForRemoteKvs,
-            placement: [None; crate::batch::Phase::COUNT],
-            attachments: attachments
-                .iter()
-                .map(|&(group, owner, slot)| (group, owner, slot, false))
-                .collect(),
-            scheduled: [0; crate::batch::Phase::COUNT],
-            completed: [0; crate::batch::Phase::COUNT],
-            early: Vec::new(),
-            blocks: vec![Blocks::default(); 2],
-            queued: true,
-            pending: 0,
-            token_ids: vec![1, 2, 3],
-            num_prompt_tokens: 3,
-            num_computed_tokens: 0,
-            num_cached_tokens: 0,
-            num_host_tokens: 0,
-            num_peer_tokens: 0,
-            listing: 0,
-            keys: Vec::new(),
-            spec_token_ids: Vec::new(),
-            num_draft_tokens: 0,
-            num_encoded_inputs: 0,
-            encodings: Vec::new(),
-            unpinned: Vec::new(),
-            crossings: Vec::new(),
-            num_acknowledged_tokens: 0,
-            terminal: None,
-            event_credit: 64,
-            event_window: 64,
-            draft_limit: 0,
-            last_progress: now,
-            dirty: false,
-            path: None,
-        };
+        let request = attached(attachments);
+        let id = request.id;
         for &(_, owner, _) in attachments {
             self.scheduler.owners.insert(owner, id);
         }
@@ -821,9 +846,9 @@ fn available_is_the_buffer_pools_word_less_the_units_of_allocates_not_yet_answer
     bench.scheduler.submit(allocate(OWNER_A, PRODUCT, 0, 1));
     bench.scheduler.read_capacity();
 
-    assert_eq!(bench.scheduler.available[0], 48);
-    assert_eq!(bench.scheduler.retiring[0], 3);
-    assert_eq!(bench.scheduler.available[2], 36);
+    assert_eq!(bench.scheduler.kv.available(0), 48);
+    assert_eq!(bench.scheduler.kv.retiring(0), 3);
+    assert_eq!(bench.scheduler.kv.available(2), 36);
 }
 
 /// A request marked since the last step is told to the policy at the next `dispatch`, however
@@ -874,7 +899,7 @@ fn the_room_states_the_cache_regions_the_free_slots_and_the_batches_in_flight() 
     scheduler.groups[1].num_requests = 4;
     scheduler.groups[1].in_flight = 2;
     scheduler.groups[1].occupied[Phase::Prefill.index()] = 1;
-    scheduler.available = vec![50, 30, 20, 16];
+    *scheduler.kv.available_mut() = vec![50, 30, 20, 16];
 
     let room = scheduler.room();
     assert_eq!(room.kv_units, 80);
@@ -914,7 +939,7 @@ fn the_snapshot_states_the_requests_the_cache_and_the_serving_groups() {
         cached(2, KV, 0b010, 0),
         cached(3, PRODUCT, 0b001, 0),
     ] {
-        scheduler.cache.insert(Cached::id(&block.key), block);
+        scheduler.kv.insert(block);
     }
 
     let snapshot = scheduler.snapshot();
@@ -1192,7 +1217,7 @@ fn a_flush_evicts_every_cached_block_the_scheduler_knows_of() {
             last_used: 1,
             refused: None,
         };
-        bench.scheduler.cache.insert(Cached::id(&key), block);
+        bench.scheduler.kv.insert(block);
     }
 
     let (reply, replied) = crossbeam_channel::bounded(1);

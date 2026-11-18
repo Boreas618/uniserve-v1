@@ -6,7 +6,9 @@
 //! bound, the scheduler installs the whole of its eviction order there (`install_victims`), takes
 //! none of the units past the bound for its own allocations (`read_capacity`), and asks the
 //! buffer pool again once something there may leave ([`Scheduler::shrink_to_bounds`]); each such
-//! answer sets the region's capacity, and is no drain's `Output::Shrunk`.
+//! answer sets the region's capacity, and is no drain's `Output::Shrunk`. The bound and the
+//! units are the KV decisions' (`Kv::bound`, `Kv::declared`, `Kv::excess`); the requests and
+//! their replies are the scheduler's.
 //!
 //! A grow that stops short is not asked again: the memory it waits for enters the region's space
 //! by the engine's grants, after which the engine resizes the region itself.
@@ -26,7 +28,6 @@ use scheduling::ids::PageId;
 use storage::runtime;
 
 use super::Scheduler;
-use super::cache::HOST;
 
 impl Scheduler {
     /// `Message::Demote`: the cached blocks of region `region` (by number) a shrink to `units`
@@ -36,28 +37,11 @@ impl Scheduler {
     /// tier). `reply` is answered with the blocks offered once every store they started ended
     /// ([`Scheduler::answer_demotions`]); a region the session does not name demotes nothing.
     pub(super) fn demote(&mut self, region: u8, units: u32, reply: Sender<u32>) {
-        let Some(index) = self.region_index(region) else {
+        let Some(index) = self.kv.region_index(region) else {
             let _ = reply.send(0);
             return;
         };
-        let held = self.capacity.get(index).copied().unwrap_or(0);
-        let free = self.available.get(index).copied().unwrap_or(0);
-        let wanted = held.saturating_sub(units).saturating_sub(free);
-
-        let mut freed = 0u32;
-        let mut pages = Vec::new();
-        for &(_, id) in self.order.get(index).into_iter().flatten() {
-            if freed >= wanted {
-                break;
-            }
-            let Some(row) = self.cache.get(&id) else {
-                continue;
-            };
-            freed = freed.saturating_add(self.class_units(row.class, index));
-            if row.tiers & HOST == 0 {
-                pages.push((PageId(id), row.key));
-            }
-        }
+        let pages = self.kv.demotion(index, units);
         let ids: Vec<PageId> = pages.iter().map(|(page, _)| *page).collect();
         self.offload(&ids);
 
@@ -109,11 +93,8 @@ impl Scheduler {
     /// Bounds region `region` (by number) to `units` from here on, and asks the buffer pool for
     /// that size.
     fn set_bound(&mut self, region: u8, units: u32) {
-        if let Some(bound) = self
-            .region_index(region)
-            .and_then(|index| self.bounds.get_mut(index))
-        {
-            *bound = Some(units);
+        if let Some(index) = self.kv.region_index(region) {
+            self.kv.bound(index, units);
         }
         self.submit(runtime::Request::Resize { region, units });
     }
@@ -121,16 +102,11 @@ impl Scheduler {
     /// Answers each `Message::Bound` of region `region` (by number) whose region holds no more
     /// than its bound now, with the units it holds, after a `Resized` set the region's capacity.
     pub(super) fn answer_bounds(&mut self, region: u8) {
-        let Some(index) = self.region_index(region) else {
+        let Some(index) = self.kv.region_index(region) else {
             return;
         };
-        let units = self.capacity.get(index).copied().unwrap_or(0);
-        let reached = self
-            .bounds
-            .get(index)
-            .copied()
-            .flatten()
-            .is_some_and(|bound| units <= bound);
+        let units = self.kv.capacity(index);
+        let reached = self.kv.bound_of(index).is_some_and(|bound| units <= bound);
         if !reached {
             return;
         }
@@ -148,44 +124,13 @@ impl Scheduler {
     /// Answers every `Message::Bound` still owed with the units its region holds now: a drain
     /// ended the bounds, so no shrink toward them follows.
     pub(super) fn end_bounds(&mut self) {
-        self.bounds.fill(None);
+        self.kv.end_bounds();
         for (region, reply) in std::mem::take(&mut self.bounded) {
             let units = self
+                .kv
                 .region_index(region)
-                .and_then(|index| self.capacity.get(index).copied())
-                .unwrap_or(0);
+                .map_or(0, |index| self.kv.capacity(index));
             let _ = reply.send(units);
-        }
-    }
-
-    /// The units region `region` (an index) is declared to hold: the units the engine last
-    /// resized it to, or, before any resize and from a drain on, the units its last `Resized`
-    /// (or the session's `Open`) stated. A request is too large for the region only beyond these.
-    ///
-    /// The region's current units may lie on either side of them for a while: a shrink that
-    /// stopped short holds more until the units held past the bound come free, and a grow that
-    /// stopped short holds fewer until the memory it waits for is granted to the region's space,
-    /// after which the engine resizes the region again — a rollback's promotion grows its regions
-    /// while the target's drain still gives the memory back. A request that fits the declared
-    /// units waits through either; refusing it against the current units would refuse a request
-    /// the region holds once its resize completes.
-    pub(super) fn declared(&self, region: usize) -> u32 {
-        self.bounds
-            .get(region)
-            .copied()
-            .flatten()
-            .unwrap_or_else(|| self.capacity.get(region).copied().unwrap_or(0))
-    }
-
-    /// The units region `region` (an index) holds past its bound, as its last `Resized` stated
-    /// them: what its shrink is still to take. 0 for a region with no bound.
-    pub(super) fn excess(&self, region: usize) -> u32 {
-        match (
-            self.bounds.get(region).copied().flatten(),
-            self.capacity.get(region),
-        ) {
-            (Some(bound), Some(&units)) => units.saturating_sub(bound),
-            _ => 0,
         }
     }
 
@@ -196,19 +141,13 @@ impl Scheduler {
     /// may leave, so the region reaches its bound as the units held past it come free, at the
     /// passes after they do.
     pub(super) fn shrink_to_bounds(&mut self) {
-        let regions: Vec<(u8, usize)> = self
-            .registers
-            .capacity
-            .iter()
-            .filter_map(|&(number, _)| Some((number, self.region_index(number)?)))
-            .collect();
-
-        for (number, index) in regions {
-            let Some(bound) = self.bounds.get(index).copied().flatten() else {
+        self.read_words();
+        for (number, index) in self.kv.used().to_vec() {
+            let Some(bound) = self.kv.bound_of(index) else {
                 continue;
             };
-            let leaves = self.capacity_word(index, 0) > 0;
-            if self.excess(index) == 0 || self.resizing_region(number) || !leaves {
+            let leaves = self.kv.word(index, 0) > 0;
+            if self.kv.excess(index) == 0 || self.resizing_region(number) || !leaves {
                 continue;
             }
 

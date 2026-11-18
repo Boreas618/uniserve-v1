@@ -295,11 +295,11 @@ impl Scheduler {
         let regions = self.kv_regions();
         let kv_units = regions
             .iter()
-            .map(|&region| u64::from(self.available.get(region).copied().unwrap_or(0)))
+            .map(|&region| u64::from(self.kv.available(region)))
             .sum();
         let capacity_units = regions
             .iter()
-            .map(|&region| u64::from(self.capacity.get(region).copied().unwrap_or(0)))
+            .map(|&region| u64::from(self.kv.capacity(region)))
             .sum();
 
         let free = self
@@ -366,7 +366,7 @@ impl Scheduler {
             .filter_map(|id| self.requests.get(id))
             .map(|request| view(request, &self.groups, tokens))
             .collect();
-        let (pages, encodings) = self.cache_views();
+        let (pages, encodings) = self.kv.cache_views(&self.groups);
 
         Snapshot {
             step: self.step,

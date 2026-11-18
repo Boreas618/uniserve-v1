@@ -17,7 +17,7 @@
 //! `next_completion` (`mod.rs`) has matched each completion to its request, handed what gives
 //! entries to the executor, and applied what it states of the cache (`learn`); `answered` applies
 //! the rest to the request the owner is for. What an answer holds of the request's tables, and
-//! the requests it calls for, are the memory rules' (`filled`, `memory.rs`); `answered` keeps the
+//! the requests it calls for, are the KV decisions' (`Kv::filled`, `kv/tables.rs`); `answered` keeps the
 //! request's slots, its admission's count of answers and its transfer.
 //!
 //! An admission (a request in `WaitingForRemoteKvs` that is still queued) counts its answers in
@@ -51,6 +51,7 @@ use scheduling::{End, Event as Change, Nanos, RequestId as PolicyRequestId};
 use storage::Key;
 use storage::runtime::{self, Cause, Completion, GroupId, OwnerId};
 
+use super::kv;
 use super::{
     Error, Output, Request, RequestStatus, Scheduler, WorkerGroup, monotonic_nanos, unix_secs,
 };
@@ -594,7 +595,7 @@ impl Scheduler {
         let Some(request) = self.requests.get(&id) else {
             return;
         };
-        let held = self.draft_class(request).is_none_or(|(class, tokens)| {
+        let held = kv::draft_class(request, &self.groups).is_none_or(|(class, tokens)| {
             request
                 .blocks
                 .get(class)
@@ -975,8 +976,8 @@ impl Scheduler {
     fn save_of(&self, request: &Request) -> Option<runtime::Request> {
         Some(runtime::Request::Save {
             owner: request.owner_on(Phase::Denoise)?,
-            key: request.trajectory_key(self.latent_seed)?,
-            units: self.trajectory_units(request)?,
+            key: request.trajectory_key(self.kv.latent_seed())?,
+            units: self.kv.trajectory_units(request, &self.groups)?,
         })
     }
 
@@ -1018,7 +1019,14 @@ impl Scheduler {
             )));
         }
 
-        if let Some(store) = self.write_policy(&request, &completion) {
+        let holder = owner
+            .and_then(|owner| self.owners.get(&owner))
+            .and_then(|id| self.requests.get(id));
+        let answer = (&request, &completion);
+        if let Some(store) = self
+            .kv
+            .write_policy(answer, holder, &self.groups, &self.budget)
+        {
             self.submit(store);
         }
         match (&request, &completion) {
@@ -1086,7 +1094,7 @@ impl Scheduler {
         let drafted = self
             .requests
             .get(&id)
-            .map_or(0, |request| self.draft_tokens(request));
+            .map_or(0, |request| kv::draft_tokens(request, &self.groups));
         let Some(request) = self.requests.get_mut(&id) else {
             return;
         };
@@ -1186,7 +1194,7 @@ impl Scheduler {
             let drafts = self
                 .requests
                 .get(&id)
-                .and_then(|row| self.draft_class(row))
+                .and_then(|row| kv::draft_class(row, &self.groups))
                 .is_some_and(|(draft, _)| draft == usize::from(*class));
             if drafts {
                 if let Some(blocks) = self
@@ -1242,6 +1250,7 @@ impl Scheduler {
                     blocks.asked = blocks.end;
                 }
                 let index = self
+                    .kv
                     .region_index(*region)
                     .and_then(|index| u8::try_from(index).ok());
                 if let (true, Some(index)) = (running, index) {
@@ -1267,7 +1276,10 @@ impl Scheduler {
             return;
         }
 
-        let settled = self.requests.get(&id).is_some_and(|row| self.settled(row));
+        let settled = self
+            .requests
+            .get(&id)
+            .is_some_and(|row| kv::settled(row, &self.groups, &self.budget));
         if settled {
             self.admitted(id);
         } else {
@@ -1312,10 +1324,8 @@ impl Scheduler {
     /// (`resize.rs`); or, for the shrink of a drain, `Output::Shrunk`, which the engine divides
     /// among the target epoch's schedulers.
     fn resized(&mut self, region: u8, units: u32) {
-        if let Some(index) = self.region_index(region)
-            && let Some(capacity) = self.capacity.get_mut(index)
-        {
-            *capacity = units;
+        if let Some(index) = self.kv.region_index(region) {
+            self.kv.resized(index, units);
         }
         match self.resizing.iter().position(|(owed, _)| *owed == region) {
             Some(at) => {
@@ -1569,9 +1579,9 @@ mod tests {
     };
     use storage::runtime::{self, Cause, Completion, OwnerId};
 
-    use super::super::cache::DEVICE;
+    use super::super::kv::{Cached, DEVICE};
     use super::super::tests::{A, B, Bench, OWNER_A, bench};
-    use super::super::{Blocks, Cached, Output, RequestStatus};
+    use super::super::{Blocks, Output, RequestStatus};
 
     const ID: RequestId = RequestId(1);
     const EOS: u32 = 2;
@@ -2347,7 +2357,7 @@ mod tests {
             }],
         );
         assert_eq!(replied.try_recv(), Ok(30));
-        assert_eq!(bench.scheduler.capacity[1], 30);
+        assert_eq!(bench.scheduler.kv.capacity(1), 30);
         assert!(bench.scheduler.resizing.is_empty());
         assert!(
             !outputs
@@ -2371,7 +2381,7 @@ mod tests {
 
         // Requests still hold two units past the bound.
         answer(&mut bench, &[resized(32)]);
-        assert_eq!(bench.scheduler.capacity[1], 32);
+        assert_eq!(bench.scheduler.kv.capacity(1), 32);
         assert!(replied.try_recv().is_err());
 
         // The scheduler's own shrink toward the bound reaches it once they let them go.
@@ -2471,7 +2481,7 @@ mod tests {
             last_used: 1,
             refused: None,
         };
-        bench.scheduler.cache.insert(Cached::id(&key), cached);
+        bench.scheduler.kv.insert(cached);
         let request = bench.scheduler.requests.get_mut(&ID).unwrap();
         request.keys = vec![vec![key]];
         request.blocks[0] = Blocks {

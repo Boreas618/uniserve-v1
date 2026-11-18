@@ -42,7 +42,7 @@ use proto::request::{
 };
 
 use super::group::variants;
-use super::memory::{kept, restored};
+use super::kv::{kept, restored};
 use super::{Capacity, Request, Scheduler};
 
 /// The sampler's parameter columns of one row.
@@ -779,7 +779,7 @@ fn lookahead(request: &Request, end: u32, bos: u32) -> Option<u32> {
 /// The row of a token request's image encoding on slot `slot`: the image of its next encoder
 /// block to compute, written to that block's encoder output. Encoder input `i`'s output lies at
 /// position `i` of the request's encoder-output table, where its admission allocated it when no
-/// `Pin` found it (`memory.rs`); `Request::encodings` states the position once the output is
+/// `Pin` found it (`kv/tables.rs`); `Request::encodings` states the position once the output is
 /// held, which is what a prefill reading it waits for, not the encode that computes it.
 fn image_row(
     request: &Request,

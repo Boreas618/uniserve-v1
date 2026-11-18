@@ -328,7 +328,7 @@ impl Scheduler {
     /// class move between groups by a transfer instead, and are not asked to.
     fn passes_products(&self, one: &WorkerGroup, other: &WorkerGroup, crossing: bool) -> bool {
         // A session whose classes do not number the product kinds states no product class.
-        let last = usize::from(self.trajectory);
+        let last = usize::from(self.kv.trajectory());
         let Some(first) = last.checked_sub(products(&self.groups).len()) else {
             return true;
         };
@@ -398,10 +398,7 @@ impl Scheduler {
 
     /// The free slots of `group`: the units its slot region has available, one per slot row.
     fn free_slots(&self, group: &WorkerGroup) -> u32 {
-        self.available
-            .get(usize::from(group.layout.slots))
-            .copied()
-            .unwrap_or(0)
+        self.kv.available(usize::from(group.layout.slots))
     }
 }
 
@@ -579,7 +576,7 @@ mod tests {
             crate::scheduler::tests::tuned(),
         )
         .unwrap();
-        scheduler.available = free.to_vec();
+        *scheduler.kv.available_mut() = free.to_vec();
         scheduler
     }
 
@@ -864,7 +861,7 @@ mod tests {
         );
 
         // Equal load and free slots go to the first configured.
-        scheduler.available = vec![4, 4, 4];
+        *scheduler.kv.available_mut() = vec![4, 4, 4];
         assert_eq!(
             scheduler.choose(&fresh, &candidates, None),
             Some(GroupId(1))
@@ -969,7 +966,7 @@ mod tests {
             &[4, 4, 4, 4],
         );
         let products = pipeline().products.len();
-        scheduler.trajectory = u8::try_from(products).unwrap();
+        *scheduler.kv.trajectory_mut() = u8::try_from(products).unwrap();
         let conditioning = pipeline()
             .kind(nn::pipeline::Product::Conditioning)
             .unwrap();
@@ -1018,7 +1015,7 @@ mod tests {
             &[4, 4, 4],
         );
         let products = pipeline().products.len();
-        scheduler.trajectory = u8::try_from(products).unwrap();
+        *scheduler.kv.trajectory_mut() = u8::try_from(products).unwrap();
         let conditioning = pipeline()
             .kind(nn::pipeline::Product::Conditioning)
             .unwrap();
@@ -1037,7 +1034,7 @@ mod tests {
         let mut video = request(1);
         video.placement[Phase::TextEncode.index()] = Some(GroupId(0));
         assert_eq!(scheduler.candidates(&video, Phase::Denoise), [GroupId(1)]);
-        scheduler.available[1] = 0;
+        scheduler.kv.available_mut()[1] = 0;
         assert_eq!(scheduler.candidates(&video, Phase::Denoise), [GroupId(2)]);
     }
 }

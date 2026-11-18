@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 use zeromq::{Socket as _, SocketRecv as _, SocketSend as _, ZmqMessage};
 
-use super::cache::{DEVICE, HOST, REMOTE};
+use super::kv::{DEVICE, HOST, REMOTE};
 
 /// The media of the tier bits of a cached block (`Cached::tiers`), each with its bit.
 const MEDIA: [(u8, Medium); 3] = [

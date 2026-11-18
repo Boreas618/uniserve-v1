@@ -33,23 +33,25 @@
 //!   is drawn as it is written, so the numbers rise in the order the buffer pool takes the
 //!   requests, which it requires (BP §7, R1).
 //! - `next_completion` reads the completion queue, matches each completion to its request by
-//!   number, applies what it states of the cache (`cache.rs`), drops what belongs to a forgotten
-//!   owner (but a `Committed`, which outlives its owner's `Detach`) or to entries a later stamped
-//!   request names (BP §9, obligation 1), and hands every completion that gives entries to the
-//!   executor (`Executor::map`) before the scheduler applies it. A `Copy` it hands over is
-//!   recorded in `copies` until the executor returns its `Finish`, or the step gives it up at its
-//!   bound (SD §4.4).
-//! - `read_capacity` reads the capacity words of every region.
+//!   number, has the KV decisions learn what it states of the cache ([`Kv::learn`]), drops what
+//!   belongs to a forgotten owner (but a `Committed`, which outlives its owner's `Detach`) or to
+//!   entries a later stamped request names (BP §9, obligation 1), and hands every completion that
+//!   gives entries to the executor (`Executor::map`) before the scheduler applies it. A `Copy` it
+//!   hands over is recorded in `copies` until the executor returns its `Finish`, or the step
+//!   gives it up at its bound (SD §4.4).
+//! - `read_capacity` reads the capacity words of every region into the KV decisions.
 //!
-//! The scheduling, admission, update, drain, policy, cache and statistics rules are `impl
-//! Scheduler` blocks of the sibling files (SD §6).
+//! The KV decisions (`specs/kv-cache.md` §1.3) are a type of their own, [`Kv`] (`kv/`), which
+//! owns what the scheduler knows of the buffer pool's cache and regions and decides what each
+//! request asks of them; the scheduler states its requests, groups and step to it and submits
+//! what it returns. The scheduling, admission, update, drain, policy and statistics rules are
+//! `impl Scheduler` blocks of the sibling files (SD §6).
 
-mod cache;
 mod drain;
 mod events;
 mod group;
 mod handoff;
-mod memory;
+mod kv;
 pub mod policy;
 mod request;
 mod resize;
@@ -63,7 +65,7 @@ mod update;
 mod video;
 mod view;
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -82,8 +84,8 @@ use scheduling::Parameters;
 use storage::runtime::{self, Cause, Completion, GroupId, OwnerId, Tier};
 use storage::{Interest, Key, QueuePair, Signals};
 
-pub(crate) use cache::Cached;
 pub(crate) use group::WorkerGroup;
+use kv::{Kv, Step};
 use policy::{Ceilings, Policy, PolicyError, ceilings};
 pub(crate) use request::{Blocks, Request, RequestStatus};
 use schedule::Deferred;
@@ -91,10 +93,6 @@ use schedule::Deferred;
 /// The bytes of a record's length word in a ring of a queue pair (`storage::queue`): a ring of
 /// `max_record()` bytes of record holds that many more.
 const LENGTH_WORD: usize = 8;
-
-/// The bytes of an `Evict` record besides its keys (`storage::runtime`): the request's number,
-/// its variant and the length of its key list.
-const EVICT_RECORD: usize = 13;
 
 /// The phases whose calls hold a sequence of tokens in a group's KV cache, which the group's
 /// longest sequence bounds.
@@ -311,15 +309,13 @@ impl Budget {
 ///
 /// Invariants: every id in `waiting` or `running` is in `requests` with the matching status; an
 /// owner is in `owners` from its `Attach` until its `Detach` is handed to the executor, and no
-/// owner is drawn twice; a block is in its region's `order` exactly when it is in `cache`, on
-/// that region's tier, with no pin of this scheduler's requests; the completions of `outstanding`
-/// always fit the completion queue; a request is in at most one of `stamping`, `held` and
+/// owner is drawn twice; the completions of `outstanding` always fit the completion queue; a request is in at most one of `stamping`, `held` and
 /// `outstanding`; the numbers written into the submission queue rise; all state is touched on the
 /// scheduler's thread only.
 ///
 /// A region is named in completions and requests by its number at the buffer pool, and indexed
-/// here, in every per-region field, by its place in the session's regions (`Open::regions`),
-/// which is how the layout of a group and a class names it too.
+/// here, in every per-region field, by its place in the session's regions (`Open::regions`,
+/// [`Kv::regions`]), which is how the layout of a group and a class names it too.
 pub struct Scheduler {
     config: SchedulerConfig,
     /// The configuration `config` was resolved from against the groups ([`resolved`]), which a
@@ -371,74 +367,16 @@ pub struct Scheduler {
     /// the buffer pool takes only numbers above every one it took.
     next_submission: u64,
 
-    /// The classes of the session; a request names a class by its index here.
-    classes: Vec<runtime::Class>,
-    /// The class of stored trajectories, as the session states it (`Open::trajectory`).
-    trajectory: u8,
-    /// Per region of the session: the number completions and requests name it by, and its tier
-    /// and unit size as the layout states them.
-    regions: Vec<(u8, runtime::Region)>,
     /// Where this queue pair's registers lie: per region it uses, by number, the first of its
     /// three capacity words.
     registers: runtime::Registers,
-    /// Per region, its units, from the answer to `Open` and from `Resized`.
-    capacity: Vec<u32>,
-    /// Per region, the units the engine last resized it to (`Message::Resize`), which bound what
-    /// it holds from then on: while a shrink has stopped short of them, the scheduler installs
-    /// the whole of the region's eviction order, takes none of the units past them for its own
-    /// allocations, and shrinks the region again as units come free (`resize.rs`); they are the
-    /// units a request's admission is judged against (`Scheduler::declared`). `None` before
-    /// the engine resized the region and from a drain on, which leaves the region's size to the
-    /// drain's own shrink or to the epoch serving beside it.
-    bounds: Vec<Option<u32>>,
-    /// Per region, the units an allocation of this queue pair can take: the buffer pool's word,
-    /// less the units of the `Allocate`s held, being stamped or outstanding, and with the units
-    /// of `order` beyond the head this scheduler installed.
-    available: Vec<u32>,
-    /// Per region, the units of retired blocks the buffer pool reclaims once the batches that may
-    /// read them have ended.
-    retiring: Vec<u32>,
-    /// Every cached block the scheduler knows of, by [`Cached::id`].
-    cache: HashMap<u64, Cached>,
-    /// The KV events it publishes of the cached blocks it commits (`kv_events_config`).
-    events: events::Events,
-    /// Per region, the cached blocks no request of this scheduler holds, by last use and id: the
-    /// eviction order it installs.
-    order: Vec<BTreeSet<(u64, u64)>>,
-    /// Per region, the units of the blocks in `order`.
-    ordered: Vec<u32>,
-    /// Per region, the numbers of the keys of the last `Victims` this scheduler submitted there:
-    /// the head of `order` it installed.
-    installed: Vec<Vec<u64>>,
-    /// The blocks a request of this scheduler gave up before the buffer pool answered their
-    /// `Commit`, by [`Cached::id`] of the key: the last use each enters the eviction order with
-    /// once its `Committed` is read, as `unpin` ranked it among its request's blocks then. An
-    /// entry leaves when its `Commit` is answered.
-    given_up: HashMap<u64, u64>,
+    /// The KV decisions: what the scheduler knows of the buffer pool's cache and regions, and
+    /// what each request asks of them (`kv`).
+    kv: Kv,
     /// The request each live owner is for.
     owners: HashMap<OwnerId, RequestId>,
     /// The counter owners are drawn from: the scheduler's data-parallel rank in the top 16 bits.
     next_owner: u64,
-    /// Per cache group, in class order, the seed the key chains of its blocks are rooted at (SD
-    /// §4.3); a request's `CachePolicy::state_seeds` override it. Empty until stated, which roots
-    /// every chain at the zero key, the seed of an empty identity.
-    seeds: Vec<Key>,
-    /// The identity of the weights that compute the scheduler's encoder outputs, which keys them
-    /// (`encoder_output`, SD §4.3): what its encoding groups state (`Capacity::encoder_identity`),
-    /// empty when none does.
-    encoder_identity: String,
-    /// The seed of the keys of stored trajectories (`latent_content`, SD §4.3): what its
-    /// denoising groups state (`Capacity::latent_seed`), 0 when none does.
-    latent_seed: u64,
-    /// Per region, the `Store`s to the host into it that stored a block (answered `Stored` after
-    /// their copy ran): a block whose own `Store` stored nothing waits for this count, among
-    /// others, to move before it is offered to the host again (`Cached::refused`, SD §4.4).
-    stores: Vec<u64>,
-    /// The blocks, by [`Cached::id`], whose last `Store` to the host stored nothing: each step's
-    /// `offload` offers each again once something that could change that answer has happened
-    /// (SD §4.4 "The write policy"). A block leaves when it is offered again, has a host copy, or
-    /// has no device copy.
-    unstored: HashSet<u64>,
     /// Running requests whose next call waits for units of a region since their last shortage:
     /// per request, the region (by index) and the units its `available` must show before the
     /// request asks again (SD §3.6). A request listed here takes no further victims.
@@ -507,10 +445,6 @@ pub struct Scheduler {
     /// The replies owed to `Message::Demote`: the keys of the host stores each demotion issued
     /// and the blocks it demoted, answered once no store of those keys is held or outstanding.
     demoting: Vec<(std::collections::HashSet<storage::Key>, u32, Sender<u32>)>,
-    /// The `List`s submitted, and those answered, which the buffer pool answers in the order it
-    /// takes them: a resumed request waits for one asked after it arrived (SD §4.4, §4.5).
-    lists_asked: u64,
-    lists_answered: u64,
     next_batch: u64,
     step: u64,
     /// The scheduler's data-parallel rank, its index in the session, which its spans name and
@@ -615,37 +549,25 @@ impl Scheduler {
         .map_err(Error::Policy)?;
         let budget = Budget::of(&tuning.load(), &bounds, &config);
 
-        // The page seeds every group of the scheduler states for its cache groups, one per class
-        // in class order: one key chain serves all of them, so groups that state seeds must state
-        // the same. A group without a KV cache states none. Likewise the identity that keys its
-        // encoder outputs and the seed that keys its stored trajectories: a request's outputs
-        // and trajectory are found under one key whichever of its groups computed them. A group
-        // that encodes nothing, or denoises nothing, states none.
-        let stated = || workers.iter().map(|worker| &worker.capacity);
-        let seeds = agreed(stated().map(|capacity| &capacity.seeds))
-            .ok_or_else(|| differ("page seeds for their cache groups"))?;
-        let encoder_identity = agreed(stated().map(|capacity| &capacity.encoder_identity))
-            .ok_or_else(|| differ(ENCODER_IDENTITIES))?;
-        let latent_seed = agreed(stated().map(|capacity| &capacity.latent_seed))
-            .ok_or_else(|| differ("latent seeds for their stored trajectories"))?;
         // The groups of a media deployment serve parts of one pipeline, whose products the
         // session classes in one order: the groups that state a pipeline state the same.
+        let stated = || workers.iter().map(|worker| &worker.capacity);
         agreed(stated().map(|capacity| &capacity.pipeline))
             .ok_or_else(|| differ("media pipelines"))?;
-
-        let regions: Vec<(u8, runtime::Region)> = opened
-            .regions
-            .iter()
-            .zip(&layout.regions)
-            .map(|(&(number, _), region)| (number, region.clone()))
-            .collect();
-        let capacity: Vec<u32> = opened.regions.iter().map(|&(_, units)| units).collect();
-        let count = regions.len();
 
         // Owner numbers carry the data-parallel rank in their top 16 bits, so the schedulers of
         // one session never draw the same owner; the buffer pool takes an owner number only
         // above every one it took, so neither counter starts at 0.
         let rank = u64::try_from(scheduler).unwrap_or(u64::MAX) & 0xffff;
+        let index = u32::try_from(rank).unwrap_or(u32::MAX);
+        let kv = Kv::new(
+            layout,
+            opened,
+            &registers,
+            queue.max_record(),
+            &workers,
+            index,
+        )?;
         let limits = GenerationLimits {
             features: request::served_features(&workers),
             ..limits
@@ -669,31 +591,14 @@ impl Scheduler {
             stamping: HashMap::new(),
             outstanding: HashMap::new(),
             next_submission: 1,
-            classes: layout.classes.clone(),
-            trajectory: layout.trajectory,
-            regions,
             registers,
-            available: capacity.clone(),
-            capacity,
-            bounds: vec![None; count],
-            retiring: vec![0; count],
-            cache: HashMap::new(),
-            events: events::Events::new(u32::try_from(rank).unwrap_or(u32::MAX)),
-            order: vec![BTreeSet::new(); count],
-            ordered: vec![0; count],
-            installed: vec![Vec::new(); count],
-            given_up: HashMap::new(),
+            kv,
             owners: HashMap::new(),
             next_owner: (rank << 48) + 1,
-            seeds,
-            encoder_identity,
-            latent_seed,
             short: HashMap::new(),
             copies: HashMap::new(),
             unmapped: HashMap::new(),
-            released: vec![false; count],
-            stores: vec![0; count],
-            unstored: HashSet::new(),
+            released: vec![false; layout.regions.len()],
             policy,
             executor,
             output,
@@ -710,13 +615,11 @@ impl Scheduler {
             resizing: Vec::new(),
             bounded: Vec::new(),
             demoting: Vec::new(),
-            lists_asked: 0,
-            lists_answered: 0,
             // Batch numbers carry the data-parallel rank from bit 40, so the batches of one
             // process's schedulers, and the spans that name them, never share a number.
             next_batch: rank << 40,
             step: 0,
-            index: u32::try_from(rank).unwrap_or(u32::MAX),
+            index,
         };
 
         // Written at the first step; nothing is scheduled before its `Listing` but what the
@@ -742,7 +645,7 @@ impl Scheduler {
     /// (`kv_events_config.endpoint`) and the rank its KV event batches state. Its index in its
     /// engine until numbered.
     pub(crate) fn number(&mut self, ordinal: u32) {
-        self.events.number(ordinal);
+        self.kv.events().number(ordinal);
     }
 }
 
@@ -1052,7 +955,7 @@ impl Scheduler {
     /// than its new depth submits none until they end.
     fn retune(&mut self, tuning: &Tuning) {
         self.config.report_period = tuning.report_period;
-        self.events.configure(&tuning.kv_events);
+        self.kv.events().configure(&tuning.kv_events);
         for group in &mut self.groups {
             let Some(depth) = tuning.queue_depths.get(group.config.id.0.as_str()) else {
                 continue;
@@ -1163,7 +1066,7 @@ impl Scheduler {
         self.reply_at_boundary();
         self.publish_stats(now);
         // What the step changed of the cache leaves as one batch of KV events.
-        self.events.flush();
+        self.kv.events().flush();
         self.settle_shutdown();
         formed
     }
@@ -1325,17 +1228,10 @@ impl Scheduler {
     }
 
     /// `Flush` (SD §2.4): every cached block the scheduler knows of is evicted; the requests it
-    /// holds continue with what they hold.
-    ///
-    /// `Evict` names every key of `cache`, as many per record as a record holds; the buffer pool
-    /// evicts those that no request pins, and `cache` keeps the keys its `Evicted` does not list.
+    /// holds continue with what they hold ([`Kv::flush`]).
     fn flush(&mut self) {
-        let fits = self.queue.max_record().saturating_sub(EVICT_RECORD) / size_of::<Key>();
-        let keys: Vec<Key> = self.cache.values().map(|row| row.key).collect();
-        for keys in keys.chunks(fits.max(1)) {
-            self.submit(runtime::Request::Evict {
-                keys: keys.to_vec(),
-            });
+        for evict in self.kv.flush() {
+            self.submit(evict);
         }
     }
 
@@ -1477,9 +1373,7 @@ impl Scheduler {
         if self.merge(&request) {
             return false;
         }
-        if request == runtime::Request::List {
-            self.lists_asked += 1;
-        }
+        self.kv.submitted(&request);
 
         let groups = match &request {
             runtime::Request::Release { owner, class, .. }
@@ -1828,7 +1722,7 @@ impl Scheduler {
             // A copy's request is applied, and kept for the answer to its `Finish`, as the keys
             // its copy covers, for which that answer speaks; the executor is handed it as it
             // was written, which the completion answers.
-            let applied = cache::covered(&request, &completion);
+            let applied = kv::covered(&request, &completion);
             if self.matched(id, owner, &request, &applied, &completion, bytes) {
                 return Ok(Some((id, owner, applied, completion)));
             }
@@ -1840,7 +1734,7 @@ impl Scheduler {
     /// [`Scheduler::next_completion`] states: false when it is dropped, true when it was handed
     /// to the executor that takes it, or waits for the slot it is handed under, and is to be
     /// applied. `request` is the request as it was written, which the executor is handed,
-    /// and `applied` the request as it is applied ([`cache::covered`]); `bytes` is what it owed
+    /// and `applied` the request as it is applied ([`kv::covered`]); `bytes` is what it owed
     /// the completion queue.
     fn matched(
         &mut self,
@@ -1965,7 +1859,7 @@ impl Scheduler {
             runtime::Request::Load { class, .. } | runtime::Request::Clone { class, .. } => {
                 Some(*class)
             }
-            runtime::Request::Store { .. } => self.cache.get(&Cached::id(key)).map(|row| row.class),
+            runtime::Request::Store { .. } => self.kv.class_of(key),
             _ => None,
         };
         keys.iter()
@@ -2011,34 +1905,34 @@ impl Scheduler {
         Some((owner, copied))
     }
 
-    /// Reads the `available` and `retiring` words of every region this queue pair uses, raises
-    /// `available` by the units of `order` beyond the installed head, which the buffer pool may
-    /// evict once a later `Victims` names them, and lowers it by the units of the scheduler's
-    /// `Allocate`s, `Load`s and `Clone`s held, being stamped or outstanding, which the buffer
-    /// pool's word may not show yet (a `Load` or a `Clone` answered `Copy` took its blocks then,
-    /// and the word shows them), and by what it counts as evictable of the blocks its `Pin`s
-    /// held, being stamped or outstanding name (`evictable`), which no allocation can evict once
-    /// the buffer pool has taken them. A region that holds more units than its bound lowers it
-    /// by those units too ([`Scheduler::excess`]): they are its shrink's to take, so no
-    /// allocation of this scheduler holds units past the bound.
-    fn read_capacity(&mut self) {
-        let words: Vec<(usize, u32, u32)> = self
+    /// Reads the capacity words of every region this queue pair uses into the KV decisions
+    /// ([`Kv::set_words`]).
+    fn read_words(&mut self) {
+        let words: Vec<(usize, [u32; 3])> = self
             .registers
             .capacity
             .iter()
             .filter_map(|&(number, word)| {
-                let region = self.region_index(number)?;
-                let word = usize::try_from(word).unwrap_or(usize::MAX);
-                Some((region, self.word(word), self.word(word.saturating_add(1))))
+                let region = self.kv.region_index(number)?;
+                let first = usize::try_from(word).unwrap_or(usize::MAX);
+                let word = |at: usize| self.word(first.saturating_add(at));
+                Some((region, [word(0), word(1), word(2)]))
             })
             .collect();
-        for (region, available, retiring) in words {
-            self.available[region] = available
-                .saturating_add(self.beyond_head(region))
-                .saturating_sub(self.excess(region));
-            self.retiring[region] = retiring;
+        for (region, words) in words {
+            self.kv.set_words(region, words);
         }
+    }
 
+    /// Reads the capacity words of every region this queue pair uses and sets what each region
+    /// has available to the scheduler's allocations ([`Kv::read_capacity`]): the buffer pool's
+    /// word, lowered by the units of the scheduler's `Allocate`s, `Load`s and `Clone`s held,
+    /// being stamped or outstanding, which the buffer pool's word may not show yet (a `Load` or a
+    /// `Clone` answered `Copy` took its blocks then, and the word shows them), and by what it
+    /// counts as evictable of the blocks its `Pin`s held, being stamped or outstanding name
+    /// (`Kv::evictable`), which no allocation can evict once the buffer pool has taken them.
+    fn read_capacity(&mut self) {
+        self.read_words();
         let copying = self.copying();
         let waiting = self
             .stamping
@@ -2056,10 +1950,96 @@ impl Scheduler {
             .chain(unanswered)
             .flat_map(|request| self.taken(request))
             .collect();
-        for (region, units) in asked {
-            if let Some(available) = self.available.get_mut(region) {
-                *available = available.saturating_sub(units);
+        self.kv.read_capacity(&asked);
+    }
+
+    /// Tells the KV decisions what the completion of `request` states of the cache
+    /// ([`Kv::learn`]), with the request of the owner it acts for, and counts the blocks it
+    /// evicted. The answer to a `Finish` is the result of its copy's request, which
+    /// `outstanding` keeps, with the copy's group as its stamp; one whose copy is not outstanding
+    /// states nothing.
+    fn learn(&mut self, request: &runtime::Request, completion: &Completion) {
+        self.read_words();
+        let copied;
+        let (asked, copy) = match request {
+            runtime::Request::Finish { copy, after, .. } => match self.outstanding.get(&copy.0) {
+                Some((_, request, _)) => {
+                    copied = request.clone();
+                    (&copied, Some(kv::stamped_groups(after)))
+                }
+                None => return,
+            },
+            request => (request, None),
+        };
+        let holder = owner_of(asked)
+            .and_then(|owner| self.owners.get(&owner))
+            .and_then(|id| self.requests.get(id));
+        let told = &mut self.policy.events;
+        let evicted = self
+            .kv
+            .learn((asked, copy), holder, completion, &self.groups, told);
+        self.count_evicted(evicted);
+    }
+
+    /// Installs the head of each region's eviction order the step's requests may take, ahead of
+    /// every request not yet written, whatever step held it ([`Kv::victims`]): each `Victims`
+    /// replaces one of its region not yet written, which would replace it in turn. Then asks for
+    /// the `List` the KV decisions find due.
+    pub(super) fn install_victims(&mut self) {
+        self.read_words();
+        // Per region, the units the requests not yet written take: those held and those waiting
+        // behind a `Release` being stamped.
+        let mut taking = vec![0u32; self.kv.regions().len()];
+        let waiting = self
+            .stamping
+            .values()
+            .flat_map(|(_, _, following)| following.iter());
+        for request in self.held.iter().chain(waiting) {
+            for (region, units) in self.taken(request) {
+                if let Some(taken) = taking.get_mut(region) {
+                    *taken = taken.saturating_add(units);
+                }
             }
+        }
+        // The blocks the requests outstanding may have made shared and unpinned before their
+        // answers are read: a `Commit`'s block, a `Store`'s and a `Prefetch`'s keys. The
+        // scheduler's own requests thus never make it `List`.
+        let pending = self
+            .outstanding
+            .values()
+            .map(|(_, request, _)| match request {
+                runtime::Request::Commit { .. } => 1,
+                runtime::Request::Store {
+                    keys,
+                    tier: Tier::Host,
+                    ..
+                }
+                | runtime::Request::Prefetch { keys, .. } => keys.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        let pending = u32::try_from(pending).unwrap_or(u32::MAX);
+        let shrinking = self.draining.as_ref().is_some_and(|(.., shrink)| *shrink);
+
+        let (installing, list) = self.kv.victims(
+            (&taking, pending),
+            (shrinking, self.running.len()),
+            &self.config,
+            &self.groups,
+        );
+        let replaced = |held: &runtime::Request| {
+            installing.iter().any(|victims| match (held, victims) {
+                (
+                    runtime::Request::Victims { region: held, .. },
+                    runtime::Request::Victims { region, .. },
+                ) => held == region,
+                _ => false,
+            })
+        };
+        self.held.retain(|held| !replaced(held));
+        self.held.splice(0..0, installing);
+        if list {
+            self.submit(runtime::Request::List);
         }
     }
 
@@ -2082,35 +2062,10 @@ impl Scheduler {
         self.copies.keys().copied().chain(finishes).collect()
     }
 
-    /// Word `at` of the capacity words of `region` (by index) in shared memory: 0 its
-    /// `available` units, 1 its `retiring` units, 2 its `evictable` units (every shared block
-    /// without a pin there, in any eviction order or none). 0 for a region this queue pair has no
-    /// words of.
-    fn capacity_word(&self, region: usize, at: usize) -> u32 {
-        let Some(&(number, _)) = self.regions.get(region) else {
-            return 0;
-        };
-        self.registers
-            .capacity
-            .iter()
-            .find(|(stated, _)| *stated == number)
-            .map_or(0, |&(_, word)| {
-                let first = usize::try_from(word).unwrap_or(usize::MAX);
-                self.word(first.saturating_add(at))
-            })
-    }
-
     /// The register at `index` as a count of units.
     fn word(&self, index: usize) -> u32 {
         let value = self.queue.register(index).load(Ordering::Acquire);
         u32::try_from(value).unwrap_or(u32::MAX)
-    }
-
-    /// The index of the region the buffer pool numbers `number`.
-    fn region_index(&self, number: u8) -> Option<usize> {
-        self.regions
-            .iter()
-            .position(|(stated, _)| *stated == number)
     }
 
     /// The index in `groups` of the group the session numbers `id`.
@@ -2181,7 +2136,7 @@ impl Scheduler {
 
         let classes = match class {
             Some(class) => class..class.saturating_add(1),
-            None => 0..u8::try_from(self.classes.len()).unwrap_or(u8::MAX),
+            None => 0..u8::try_from(self.kv.classes().len()).unwrap_or(u8::MAX),
         };
         for &(group, other, _, _) in &request.attachments {
             if other == owner || groups.contains(&group) {
@@ -2313,7 +2268,7 @@ impl Scheduler {
         if let runtime::Request::Import { owner, tables, .. } = request {
             let mut taken = Vec::new();
             for (class, _, count) in tables {
-                let each = self.block_units(*class, 0).unwrap_or(0);
+                let each = self.kv.block_units(*class, 0).unwrap_or(0);
                 for region in self.class_regions(*owner, *class).unwrap_or_default() {
                     taken.push((region, count.saturating_mul(each)));
                 }
@@ -2326,6 +2281,7 @@ impl Scheduler {
         {
             let count = u32::try_from(keys.len()).unwrap_or(u32::MAX);
             return self
+                .kv
                 .host_block(*class, *units)
                 .map_or_else(Vec::new, |(region, each)| {
                     vec![(region, count.saturating_mul(each))]
@@ -2348,7 +2304,8 @@ impl Scheduler {
                 // A sized block takes its size, which its request computes (SD §4.4 "Classes").
                 let size = self.request_of(*owner).and_then(|row| {
                     let (group, _) = row.attachment(*owner)?;
-                    self.encoding_size(row, *class, *at, group)
+                    self.kv
+                        .encoding_size(row, (*class, *at), group, &self.groups)
                 });
                 let count = u32::try_from(keys.len()).unwrap_or(u32::MAX);
                 (*owner, *class, count, size.unwrap_or(0))
@@ -2366,11 +2323,16 @@ impl Scheduler {
                 let Some((group, _)) = row.attachment(*owner) else {
                     return Vec::new();
                 };
+                let Some(holder) = self.group(group) else {
+                    return Vec::new();
+                };
                 let positions = (*at..).zip(keys);
                 return positions
                     .flat_map(|(at, key)| {
-                        let size = self.encoding_size(row, *class, at, group).unwrap_or(0);
-                        self.evictable(key, group, size)
+                        let size = self
+                            .kv
+                            .encoding_size(row, (*class, at), group, &self.groups);
+                        self.kv.evictable(key, holder, size.unwrap_or(0))
                     })
                     .collect();
             }
@@ -2380,45 +2342,23 @@ impl Scheduler {
             return Vec::new();
         };
 
-        let each = self.block_units(class, units).unwrap_or(0);
+        let each = self.kv.block_units(class, units).unwrap_or(0);
         regions
             .into_iter()
             .map(|region| (region, count.saturating_mul(each)))
             .collect()
     }
 
+    /// The group of `owner`'s attachment.
+    fn owner_group(&self, owner: OwnerId) -> Option<&WorkerGroup> {
+        let (group, _) = self.request_of(owner)?.attachment(owner)?;
+        self.group(group)
+    }
+
     /// The regions, as indices, owner `owner`'s blocks of `class` are taken from: those of the
     /// class in the group of the owner's attachment. `None` when the owner is unknown.
     fn class_regions(&self, owner: OwnerId, class: u8) -> Option<Vec<usize>> {
-        let (group, _) = self.request_of(owner)?.attachment(owner)?;
-        let regions = self.group(group)?.regions(class);
-        Some(regions.iter().map(|&region| usize::from(region)).collect())
-    }
-
-    /// The host region (by index) of `class`, and the units one host copy of its blocks takes
-    /// there: the size the class states for its host copies, else its block size, or `units`
-    /// for a sized class. `None` for a class with no host region.
-    fn host_block(&self, class: u8, units: u32) -> Option<(usize, u32)> {
-        let (region, _) = self.classes.get(usize::from(class))?.host?;
-        let region = usize::from(region);
-        let each = match self.class_units(class, region) {
-            0 => units,
-            each => each,
-        };
-        Some((region, each))
-    }
-
-    /// The units of one block of `class`: the class's block size, or `units` for a sized class.
-    fn block_units(&self, class: u8, units: u32) -> Option<u32> {
-        let stated = self.classes.get(usize::from(class))?.units;
-        Some(if stated > 0 { stated } else { units })
-    }
-
-    /// The runs one block of `class` has in the group of `owner`, and its units.
-    fn block_shape(&self, owner: OwnerId, class: u8, units: u32) -> Option<(usize, usize)> {
-        let runs = self.class_regions(owner, class)?.len().max(1);
-        let units = usize::try_from(self.block_units(class, units)?).ok()?;
-        Some((runs, units.max(1)))
+        Some(Kv::class_regions(self.owner_group(owner)?, class))
     }
 
     /// The most bytes the completion of `request` takes in the completion queue: the largest
@@ -2454,7 +2394,9 @@ impl Scheduler {
                 + LIST
                 + KEY.saturating_mul(evicted)
         };
-        let shape = |owner: OwnerId, class: u8, units: u32| self.block_shape(owner, class, units);
+        let shape = |owner: OwnerId, class: u8, units: u32| {
+            self.kv.block_shape(self.owner_group(owner)?, class, units)
+        };
 
         let fields = match request {
             runtime::Request::Detach { .. }
@@ -2466,7 +2408,10 @@ impl Scheduler {
             runtime::Request::Prefetch {
                 class, units, keys, ..
             } => {
-                let each = self.host_block(*class, *units).map_or(0, |(_, each)| each);
+                let each = self
+                    .kv
+                    .host_block(*class, *units)
+                    .map_or(0, |(_, each)| each);
                 Some(4 + LIST + KEY.saturating_mul(keys.len().saturating_mul(each as usize)))
             }
             // The answers to a `Finish`: the largest is a `Stored` with its empty list.
@@ -2503,7 +2448,9 @@ impl Scheduler {
                 ..
             }
             | runtime::Request::Evict { keys } => Some(LIST + KEY.saturating_mul(keys.len())),
-            runtime::Request::Store { group, keys, .. } => self.store_bytes(*group, keys, &copy),
+            runtime::Request::Store { group, keys, .. } => self
+                .group(*group)
+                .and_then(|group| self.kv.store_bytes(group, keys, &copy)),
             // From the slot's row to one host block of `units`.
             runtime::Request::Save { units, .. } => Some(copy(1, 1, 1, *units as usize)),
             runtime::Request::Restore { .. } => Some(copy(1, 1, 1, 0)),
@@ -2523,8 +2470,9 @@ impl Scheduler {
             }
             runtime::Request::Lend { .. } => Some(0),
             runtime::Request::Resize { region, units } => self
+                .kv
                 .region_index(*region)
-                .and_then(|index| self.capacity.get(index))
+                .map(|index| self.kv.capacity(index))
                 .map(|capacity| 4 + LIST + KEY * capacity.saturating_sub(*units) as usize),
             // The block's runs in the group's regions and receiving regions of the class, and a
             // key evicted per unit its receiving runs take.
@@ -2556,30 +2504,225 @@ impl Scheduler {
                 .map_or(ring, |padded| (padded + LENGTH_WORD).min(ring))
         })
     }
+}
 
-    /// The fields of the largest `Copy` answering a `Store` to the host of `keys` from `group`:
-    /// per key, the runs of its device block in the group, one host run, and an evicted key per
-    /// unit of its host copy. `None` when a key's class or host copy size is not known.
-    fn store_bytes(
-        &self,
-        group: GroupId,
-        keys: &[Key],
-        copy: &impl Fn(usize, usize, usize, usize) -> usize,
-    ) -> Option<usize> {
-        let group = self.group(group)?;
-        let (mut from, mut evicted) = (0usize, 0usize);
-        for key in keys {
-            let class = self.cache.get(&Cached::id(key))?.class;
-            let (_, host) = self.classes.get(usize::from(class))?.host?;
-            let units = if host > 0 {
-                host
-            } else {
-                self.block_units(class, 0).filter(|units| *units > 0)?
-            };
-            from = from.saturating_add(group.regions(class).len().max(1));
-            evicted = evicted.saturating_add(units as usize);
+/// The scheduler's side of its KV decisions (`kv`): each call resolves the request a decision
+/// is for, states the scheduler's step ([`Step`]) and the policy's event sink, and submits what
+/// the decision asks of the buffer pool. The decisions themselves are [`Kv`]'s.
+impl Scheduler {
+    /// What the scheduler states of itself to a KV decision at this step.
+    pub(super) fn kv_step(&self) -> Step<'_> {
+        Step {
+            groups: &self.groups,
+            config: &self.config,
+            budget: &self.budget,
+            prefetch_min_tokens: self.policy.limits.prefetch_min_tokens,
         }
-        Some(copy(keys.len(), from, keys.len(), evicted))
+    }
+
+    /// The first round of request `id`'s admission ([`Kv::admission_requests`]); a video
+    /// request's crossings follow its placement.
+    pub(super) fn admission_requests(&mut self, id: RequestId) -> Vec<runtime::Request> {
+        let crossings = match self.requests.get(&id) {
+            Some(request) if request.is_video() => Some(self.crossings_of(request)),
+            Some(_) => None,
+            None => return Vec::new(),
+        };
+        let step = Step {
+            groups: &self.groups,
+            config: &self.config,
+            budget: &self.budget,
+            prefetch_min_tokens: self.policy.limits.prefetch_min_tokens,
+        };
+        let Some(request) = self.requests.get_mut(&id) else {
+            return Vec::new();
+        };
+        if let Some(crossings) = crossings {
+            request.crossings = crossings;
+        }
+        self.kv.admission_requests(request, &step)
+    }
+
+    /// One more round of request `id`'s admission ([`Kv::missing_requests`]).
+    pub(super) fn missing_requests(&mut self, id: RequestId) -> Vec<runtime::Request> {
+        let step = Step {
+            groups: &self.groups,
+            config: &self.config,
+            budget: &self.budget,
+            prefetch_min_tokens: self.policy.limits.prefetch_min_tokens,
+        };
+        let Some(request) = self.requests.get_mut(&id) else {
+            return Vec::new();
+        };
+        let told = &mut self.policy.events;
+        self.kv.missing_requests(request, &step, told)
+    }
+
+    /// What the answer `completion` to `asked`, one of request `id`'s memory requests, states of
+    /// its tables, and the requests it calls for ([`Kv::filled`]).
+    pub(super) fn filled(
+        &mut self,
+        id: RequestId,
+        asked: &runtime::Request,
+        completion: &Completion,
+    ) -> Vec<runtime::Request> {
+        let step = Step {
+            groups: &self.groups,
+            config: &self.config,
+            budget: &self.budget,
+            prefetch_min_tokens: self.policy.limits.prefetch_min_tokens,
+        };
+        let Some(request) = self.requests.get_mut(&id) else {
+            return Vec::new();
+        };
+        let told = &mut self.policy.events;
+        self.kv.filled(request, (asked, completion), &step, told)
+    }
+
+    /// Whether the admission of request `id`, whose hit `cache` expects to be `expected` tokens,
+    /// waits for a `List` ([`Kv::awaits_listing`]), which is asked here when it is due.
+    pub(super) fn awaits_listing(&mut self, id: RequestId, expected: u32) -> bool {
+        let Some(request) = self.requests.get(&id) else {
+            return false;
+        };
+        let (waits, ask) = self
+            .kv
+            .awaits_listing(request, expected, &self.groups, &self.budget);
+        if ask {
+            self.submit(runtime::Request::List);
+        }
+        waits
+    }
+
+    /// Per region, the units the running requests still need to reach their next call and the
+    /// low watermark ([`Kv::admission_reserve`]), and the runs a video request's crossings not
+    /// asked yet take in their receiving regions.
+    pub(super) fn admission_reserve(&self) -> Vec<u32> {
+        let running = || self.running.iter().filter_map(|id| self.requests.get(id));
+        let mut reserve = self.kv.admission_reserve(running(), &self.kv_step());
+        for request in running() {
+            for &(at, group, from, state) in &request.crossings {
+                if state.is_some() || !request.reads_result(at, &self.groups) {
+                    continue;
+                }
+                for (region, units) in self.receiving(request, (at, group, from)) {
+                    if let Some(reserved) = reserve.get_mut(region) {
+                        *reserved = reserved.saturating_add(units);
+                    }
+                }
+            }
+        }
+        reserve
+    }
+
+    /// Per region, the units the admission of `request` with a prefix hit of `hit` tokens
+    /// allocates ([`Kv::units_needed`]), and for a video request the runs its crossings take.
+    pub(super) fn units_needed(&self, request: &Request, hit: u32) -> Vec<u32> {
+        let units = self
+            .kv
+            .units_needed(request, hit, &self.groups, &self.budget);
+        self.with_crossings(request, units)
+    }
+
+    /// Per region, the units `request`'s admission holds when no other request holds any
+    /// ([`Kv::units_alone`]), and for a video request the runs its crossings take.
+    pub(super) fn units_alone(&self, request: &Request) -> Vec<u32> {
+        let units = self.kv.units_alone(request, &self.groups, &self.budget);
+        self.with_crossings(request, units)
+    }
+
+    /// `units` with the runs a video request's crossings take, each in every memory its reading
+    /// group reads its result in where the block has none.
+    fn with_crossings(&self, request: &Request, mut units: Vec<u32>) -> Vec<u32> {
+        if !request.is_video() {
+            return units;
+        }
+        for (at, group, from, _) in self.crossings_of(request) {
+            for (region, taken) in self.receiving(request, (at, group, from)) {
+                if let Some(units) = units.get_mut(region) {
+                    *units = units.saturating_add(taken);
+                }
+            }
+        }
+        units
+    }
+
+    /// Submits the `Commit`s of the blocks the output of request `id`'s call in `batch`'s row
+    /// `row` showed full ([`Kv::commit_filled`]).
+    pub(super) fn commit_filled(&mut self, id: RequestId, batch: &Batch, row: usize) {
+        let Some(request) = self.requests.get_mut(&id) else {
+            return;
+        };
+        let commits = self
+            .kv
+            .commit_filled(request, (batch, row), &self.groups, &self.budget);
+        for commit in commits {
+            self.submit(commit);
+        }
+    }
+
+    /// Submits the `Commit`s of what request `id` holds and its continuation reads as it leaves
+    /// as migratable ([`Kv::commit_tails`]).
+    pub(super) fn commit_tails(&mut self, id: RequestId) {
+        let Some(request) = self.requests.get_mut(&id) else {
+            return;
+        };
+        let commits = self.kv.commit_tails(request, &self.groups, &self.config);
+        for commit in commits {
+            self.submit(commit);
+        }
+    }
+
+    /// Submits the `Commit` of the encoder output the call in `batch`'s row `row` computed for
+    /// request `id`, which holds it from now on ([`Kv::commit_encoding`]).
+    pub(super) fn commit_encoding(&mut self, id: RequestId, batch: &Batch, row: usize) {
+        let Some(request) = self.requests.get_mut(&id) else {
+            return;
+        };
+        if let Some(commit) = self.kv.commit_encoding(request, (batch, row), &self.groups) {
+            self.submit(commit);
+        }
+    }
+
+    /// Submits the `Release`s of what no later call of request `id` reads after its call in
+    /// `batch`'s row `row` ([`Kv::give_up_behind`]).
+    pub(super) fn give_up_behind(&mut self, id: RequestId, batch: &Batch, row: usize) {
+        let Some(request) = self.requests.get_mut(&id) else {
+            return;
+        };
+        let told = &mut self.policy.events;
+        let context = (&self.groups[..], &self.config);
+        let releases = self.kv.give_up_behind(request, (batch, row), context, told);
+        for release in releases {
+            self.submit(release);
+        }
+    }
+
+    /// Gives up request `id`'s whole draft table ([`Kv::give_up_draft`]) and returns, per region,
+    /// the units the release frees once the buffer pool reclaims them.
+    pub(super) fn give_up_draft(&mut self, id: RequestId) -> Vec<u32> {
+        let none = vec![0; self.kv.regions().len()];
+        let Some(request) = self.requests.get_mut(&id) else {
+            return none;
+        };
+        let told = &mut self.policy.events;
+        let Some((releases, freed, blocks)) = self.kv.give_up_draft(request, &self.groups, told)
+        else {
+            return none;
+        };
+        self.count_given_up_drafts(blocks);
+        for release in releases {
+            self.submit(release);
+        }
+        self.mark(id);
+        freed
+    }
+
+    /// Request `id` gave up the read-only blocks of `keys` ([`Kv::unpin`]).
+    pub(super) fn unpin(&mut self, id: RequestId, keys: &[Key]) {
+        let request = self.requests.get_mut(&id);
+        let told = &mut self.policy.events;
+        self.kv.unpin(request, keys, &self.groups, told);
     }
 }
 

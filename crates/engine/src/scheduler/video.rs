@@ -41,6 +41,7 @@ use storage::Key;
 use storage::key::latent_content;
 use storage::runtime::{self, Cause, Completion, GroupId, OwnerId};
 
+use super::kv::Kv;
 use super::update::migratable;
 use super::{Request, RequestStatus, Scheduler, WorkerGroup};
 
@@ -391,7 +392,7 @@ impl Request {
 
     /// The request's declared results, in position order: per result, the phase whose call
     /// writes it and its product kind, an index into the pipeline's products ([`products`]).
-    fn declared(&self, groups: &[WorkerGroup]) -> Vec<(Phase, usize)> {
+    pub(super) fn declared(&self, groups: &[WorkerGroup]) -> Vec<(Phase, usize)> {
         products(groups)
             .iter()
             .enumerate()
@@ -449,7 +450,11 @@ impl Request {
 
     /// The group that serves `phase` for the request: the one it is placed on, or before its
     /// placement the first group that serves the phase.
-    fn serving<'a>(&self, phase: Phase, groups: &'a [WorkerGroup]) -> Option<&'a WorkerGroup> {
+    pub(super) fn serving<'a>(
+        &self,
+        phase: Phase,
+        groups: &'a [WorkerGroup],
+    ) -> Option<&'a WorkerGroup> {
         match self.placement.get(phase.index()).copied().flatten() {
             Some(id) => groups.iter().find(|group| group.id() == id),
             None => groups.iter().find(|group| group.serves(phase)),
@@ -635,22 +640,30 @@ impl Scheduler {
         }
         Ok(())
     }
+}
 
+/// Where a video request's products lie in the session's classes (SD §4.4 "Classes",
+/// "Products"): the KV decisions size its blocks and find its conditioning by these.
+impl Kv {
     /// Per declared result of a video request, in position order: the phase whose call writes
     /// it, its product class, and the units of its block, rounded up from the bytes the group
     /// that denoises states for the request's captured shape to the unit of the class's region on
-    /// the writing group (SD §4.4 "Classes", "Products"). The request's admission asks for each
-    /// result by an `Allocate` at its position for its owner on the writing group, with these
-    /// units. `None` when a block cannot be sized: no captured shape holds the request, or the
-    /// writing group states no region of the class.
-    pub(super) fn declared_results(&self, request: &Request) -> Option<Vec<(Phase, u8, u32)>> {
-        let (_, _, bytes) = request.media_shape(&self.groups)?;
+    /// the writing group (SD §4.4 "Classes", "Products"), among `groups`. The request's admission
+    /// asks for each result by an `Allocate` at its position for its owner on the writing group,
+    /// with these units. `None` when a block cannot be sized: no captured shape holds the
+    /// request, or the writing group states no region of the class.
+    pub(super) fn declared_results(
+        &self,
+        request: &Request,
+        groups: &[WorkerGroup],
+    ) -> Option<Vec<(Phase, u8, u32)>> {
+        let (_, _, bytes) = request.media_shape(groups)?;
         request
-            .declared(&self.groups)
+            .declared(groups)
             .into_iter()
             .map(|(phase, kind)| {
-                let class = self.product_class(kind)?;
-                let group = request.serving(phase, &self.groups)?;
+                let class = self.product_class(kind, groups)?;
+                let group = request.serving(phase, groups)?;
                 let region = *group.regions(class).first()?;
                 let units = self.units_in(region, *bytes.get(kind)?)?;
                 Some((phase, class, units))
@@ -662,9 +675,13 @@ impl Scheduler {
     /// of the class of stored trajectories: the trajectory bytes of the request's captured shape,
     /// rounded up, or the class's fixed host block size when it states one (SD §3.8, §4.4).
     /// `None` when no captured shape holds the request or the class has no host region.
-    pub(super) fn trajectory_units(&self, request: &Request) -> Option<u32> {
-        let (_, bytes, _) = request.media_shape(&self.groups)?;
-        let (region, units) = self.classes.get(usize::from(self.trajectory))?.host?;
+    pub(super) fn trajectory_units(
+        &self,
+        request: &Request,
+        groups: &[WorkerGroup],
+    ) -> Option<u32> {
+        let (_, bytes, _) = request.media_shape(groups)?;
+        let (region, units) = self.classes().get(usize::from(self.trajectory()))?.host?;
         if units > 0 {
             return Some(units);
         }
@@ -672,25 +689,16 @@ impl Scheduler {
     }
 
     /// The class of a video request's conditioning, the product class of its kind.
-    pub(super) fn conditioning_class(&self) -> Option<u8> {
-        let kind = pipeline(&self.groups)?.kind(Product::Conditioning)?;
-        self.product_class(kind)
+    pub(super) fn conditioning_class(&self, groups: &[WorkerGroup]) -> Option<u8> {
+        let kind = pipeline(groups)?.kind(Product::Conditioning)?;
+        self.product_class(kind, groups)
     }
 
     /// The class of product kind `kind`: the `kind`-th of the classes just before the class of
-    /// stored trajectories, one per product of the pipeline.
-    pub(super) fn product_class(&self, kind: usize) -> Option<u8> {
-        let first = usize::from(self.trajectory).checked_sub(products(&self.groups).len())?;
+    /// stored trajectories, one per product of the pipeline `groups` serve.
+    pub(super) fn product_class(&self, kind: usize, groups: &[WorkerGroup]) -> Option<u8> {
+        let first = usize::from(self.trajectory()).checked_sub(products(groups).len())?;
         u8::try_from(first.checked_add(kind)?).ok()
-    }
-
-    /// The units of the session's region `region` (an index into its regions) that hold `bytes`
-    /// on one rank, a part of each unit (`Region::part_bytes`): at least one, since a block has a
-    /// size.
-    fn units_in(&self, region: u8, bytes: u64) -> Option<u32> {
-        let (_, stated) = self.regions.get(usize::from(region))?;
-        let units = bytes.div_ceil(stated.part_bytes.max(1)).max(1);
-        u32::try_from(units).ok()
     }
 }
 
@@ -713,7 +721,8 @@ impl Scheduler {
                 continue;
             };
             let reading = request.placement[reader.index()].and_then(|id| self.group(id));
-            let (Some(class), Some(group)) = (self.product_class(kind), reading) else {
+            let (Some(class), Some(group)) = (self.kv.product_class(kind, &self.groups), reading)
+            else {
                 continue;
             };
             let Some(from) = self.writer_region(request, at, kind) else {
@@ -721,7 +730,7 @@ impl Scheduler {
             };
             let (Some(written), Some(&(number, _))) = (
                 self.region_memory(from),
-                self.regions.get(usize::from(from)),
+                self.kv.regions().get(usize::from(from)),
             ) else {
                 continue;
             };
@@ -746,7 +755,7 @@ impl Scheduler {
     fn writer_region(&self, request: &Request, at: u32, kind: usize) -> Option<u8> {
         let spec = *products(&self.groups).get(kind)?;
         let phase = spec.writer;
-        let class = self.product_class(kind)?;
+        let class = self.kv.product_class(kind, &self.groups)?;
         let writer = self.group(request.placement[phase.index()]?)?;
         let regions = writer.regions(class);
         match spec.product {
@@ -796,7 +805,7 @@ impl Scheduler {
         let ranks = group.config.ranks.len();
         let regions = (0..products(&self.groups).len())
             .filter(|&kind| group.serves(products(&self.groups)[kind].writer))
-            .filter_map(|kind| self.product_class(kind))
+            .filter_map(|kind| self.kv.product_class(kind, &self.groups))
             .map(|class| group.regions(class))
             .find(|regions| regions.len() == ranks)?;
         self.region_memory(*regions.get(position)?)
@@ -806,7 +815,7 @@ impl Scheduler {
     /// product buffer's main process; `None` for a region whose units exist in every memory that
     /// maps it.
     fn region_memory(&self, region: u8) -> Option<&str> {
-        let (_, stated) = self.regions.get(usize::from(region))?;
+        let (_, stated) = self.kv.regions().get(usize::from(region))?;
         (!stated.memory.is_empty()).then_some(stated.memory.as_str())
     }
 
@@ -841,12 +850,15 @@ impl Scheduler {
             return taken;
         };
         let writer = request.placement[phase.index()].and_then(|id| self.group(id));
-        let (Some(class), Some(reader), Some(writer)) =
-            (self.product_class(kind), self.group(group), writer)
-        else {
+        let (Some(class), Some(reader), Some(writer)) = (
+            self.kv.product_class(kind, &self.groups),
+            self.group(group),
+            writer,
+        ) else {
             return taken;
         };
         let from = self
+            .kv
             .region_index(from)
             .and_then(|index| u8::try_from(index).ok());
         let Some((from, written)) = from.and_then(|from| Some((from, self.region_memory(from)?)))
@@ -855,12 +867,16 @@ impl Scheduler {
         };
 
         // The block's bytes: its units of its writer's region, as its admission sized it.
-        let results = self.declared_results(request).unwrap_or_default();
+        let results = self
+            .kv
+            .declared_results(request, &self.groups)
+            .unwrap_or_default();
         let Some(&(_, _, units)) = results.get(at as usize) else {
             return taken;
         };
         let unit_bytes = |region: u8| {
-            self.regions
+            self.kv
+                .regions()
                 .get(usize::from(region))
                 .map_or(1, |(_, stated)| stated.unit_bytes.max(1))
         };
@@ -921,6 +937,7 @@ impl Scheduler {
             return true;
         };
         let from = self
+            .kv
             .region_index(from)
             .and_then(|index| u8::try_from(index).ok());
         let written = from.and_then(|from| self.region_memory(from));
@@ -952,9 +969,10 @@ impl Scheduler {
                 let Some(&(phase, kind)) = request.declared(&self.groups).get(at as usize) else {
                     continue;
                 };
-                let (Some(owner), Some(class)) =
-                    (request.owner_on(phase), self.product_class(kind))
-                else {
+                let (Some(owner), Some(class)) = (
+                    request.owner_on(phase),
+                    self.kv.product_class(kind, &self.groups),
+                ) else {
                     continue;
                 };
                 let replicate = runtime::Request::Replicate {
@@ -972,9 +990,7 @@ impl Scheduler {
         for (id, index, replicate) in asks {
             // The runs it takes are not available to the step's later requests.
             for (region, units) in self.taken(&replicate) {
-                if let Some(available) = self.available.get_mut(region) {
-                    *available = available.saturating_sub(units);
-                }
+                self.kv.take(region, units);
             }
             let crossing = self
                 .requests
@@ -1026,6 +1042,7 @@ impl Scheduler {
             Completion::Replicated { .. } => self.mark(id),
             Completion::Full { region } => {
                 let index = self
+                    .kv
                     .region_index(*region)
                     .and_then(|index| u8::try_from(index).ok());
                 if let (true, Some(index)) = (self.is_running(id), index) {
@@ -1051,8 +1068,11 @@ impl Scheduler {
             .get(at as usize)
             .map(|&(_, kind)| kind);
         let from = kind.and_then(|kind| self.writer_region(request, at, kind));
-        let from = from.and_then(|from| self.regions.get(usize::from(from)));
-        let results = self.declared_results(request).unwrap_or_default();
+        let from = from.and_then(|from| self.kv.regions().get(usize::from(from)));
+        let results = self
+            .kv
+            .declared_results(request, &self.groups)
+            .unwrap_or_default();
         let (Some(&(number, _)), Some(&(_, _, units)), Some(&(key, _))) =
             (from, results.get(at as usize), request.encodings.first())
         else {
@@ -1169,7 +1189,7 @@ mod tests {
     use nn::pipeline::{Pipeline, Product};
 
     use crate::scheduler::Output;
-    use crate::scheduler::cache::DEVICE;
+    use crate::scheduler::kv::DEVICE;
     use crate::scheduler::{Capacity, Executor, Request, RequestStatus, Scheduler, WorkerGroup};
 
     const A: GroupId = GroupId(0);
@@ -1651,7 +1671,7 @@ mod tests {
     #[test]
     fn a_conditioning_the_admission_finds_is_read_without_a_text_encoding() {
         let (mut scheduler, stamped) = stamping(&[(A, &phases()[..])]);
-        let class = scheduler.conditioning_class().unwrap();
+        let class = scheduler.kv.conditioning_class(&scheduler.groups).unwrap();
         let mut input = video(1, 40, reference());
         input.encoder_inputs = Some(Box::new(EncoderInputs {
             text: [3; 32],
@@ -1662,7 +1682,7 @@ mod tests {
 
         // The conditioning is keyed by what the text encoder reads.
         let mut admitted = request(input, &on(A));
-        admitted.encodings = scheduler.encodings_of(&admitted);
+        admitted.encodings = scheduler.kv.encodings_of(&admitted);
         let key = Key(encoder_output(Product::Conditioning.name(), "", &[3; 32]));
         assert_eq!(admitted.encodings, [(key, None)]);
         let at = admitted.conditioning_position(&scheduler.groups).unwrap();
@@ -1867,7 +1887,10 @@ mod tests {
             request(video(3, 40, Vec::new()), &on(A)),
             request(video(2, 40, reference()), &on(A)),
         ] {
-            let declared = scheduler.declared_results(&request).unwrap();
+            let declared = scheduler
+                .kv
+                .declared_results(&request, &scheduler.groups)
+                .unwrap();
             let mut written = vec![0; declared.len()];
             for phase in phases() {
                 for call in 0..request.video_needed(phase, groups) {
@@ -1903,9 +1926,23 @@ mod tests {
         // two the condition pixels and samples and the vision pixels besides, and no encoded
         // condition of its own.
         let text = request(video(3, 40, Vec::new()), &on(A));
-        assert_eq!(scheduler.declared_results(&text).unwrap().len(), 11);
+        assert_eq!(
+            scheduler
+                .kv
+                .declared_results(&text, &scheduler.groups)
+                .unwrap()
+                .len(),
+            11
+        );
         let conditioned = request(video(2, 40, reference()), &on(A));
-        assert_eq!(scheduler.declared_results(&conditioned).unwrap().len(), 12);
+        assert_eq!(
+            scheduler
+                .kv
+                .declared_results(&conditioned, &scheduler.groups)
+                .unwrap()
+                .len(),
+            12
+        );
     }
 
     /// A trajectory is sized from the smallest captured shape that holds its request, in units of
@@ -1913,7 +1950,11 @@ mod tests {
     #[test]
     fn a_trajectory_is_sized_in_units_of_the_host_latent_region() {
         let scheduler = scheduler(&[(A, &phases()[..])]);
-        let units = |input| scheduler.trajectory_units(&request(input, &on(A)));
+        let units = |input| {
+            scheduler
+                .kv
+                .trajectory_units(&request(input, &on(A)), &scheduler.groups)
+        };
 
         // 10 000 bytes of the shape of 64 prompt rows, 30 000 of the one of 128, and 20 000 of the
         // one with condition rows, in units of 4 096 bytes.
@@ -2247,7 +2288,7 @@ mod tests {
             audio: None,
         }));
         let mut row = request(input, &placement);
-        row.encodings = scheduler.encodings_of(&row);
+        row.encodings = scheduler.kv.encodings_of(&row);
         row.crossings = scheduler.crossings_of(&row);
         let id = row.id;
         scheduler.owners.insert(OwnerId(10), id);
@@ -2325,7 +2366,7 @@ mod tests {
         scheduler.commit_encoding(id, &encoded, 0);
         scheduler.cross();
         scheduler.cross();
-        let class = scheduler.conditioning_class().unwrap();
+        let class = scheduler.kv.conditioning_class(&scheduler.groups).unwrap();
         let commit = runtime::Request::Commit {
             owner: OwnerId(10),
             class,
@@ -2365,7 +2406,7 @@ mod tests {
         scheduler.cross();
         let class = pipeline()
             .kind(Product::EncodedUnits)
-            .and_then(|kind| scheduler.product_class(kind))
+            .and_then(|kind| scheduler.kv.product_class(kind, &scheduler.groups))
             .unwrap();
         let replicate = runtime::Request::Replicate {
             owner: OwnerId(10),

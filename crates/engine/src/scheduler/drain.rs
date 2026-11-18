@@ -93,7 +93,7 @@ impl Scheduler {
     /// Gives a drain's device memory back (SD §3.8): for each device region of this queue pair
     /// with no `Resize` held or outstanding, `Resize { region, units }` giving back the units free
     /// or evictable now that no running request may still take before it ends
-    /// (`Scheduler::units_to_end`), when there are such units; once no request remains, also
+    /// (`Kv::units_to_end`), when there are such units; once no request remains, also
     /// while units still retire, which come free once the batches that may read them have ended;
     /// and when a request that gives units back was answered since the region's last `Resize`
     /// (`Scheduler::released`).
@@ -104,7 +104,7 @@ impl Scheduler {
     /// come free since. Each `Resized` is reported as `Output::Shrunk` (`answered`).
     ///
     /// What a region gives back is never more than it holds beyond the blocks the live requests
-    /// asked for (`Scheduler::units_asked`) and the units the running ones may still take: the
+    /// asked for (`Kv::units_asked`) and the units the running ones may still take: the
     /// scheduler's own count of its requests. `available` alone may show more than the region
     /// can give, since the capacity words read with an answer may not show what it changed yet,
     /// a `Resized` among them, and since it counts, beyond the installed head, the blocks the
@@ -114,16 +114,17 @@ impl Scheduler {
     /// region holds.
     fn shrink_regions(&mut self) {
         let ended = self.requests.is_empty();
-        let kept = self.units_to_end();
+        let running = self.running.iter().filter_map(|id| self.requests.get(id));
+        let kept = self.kv.units_to_end(running, &self.groups, &self.budget);
         // Counted once a region shows something to give back.
         let mut asked: Option<Vec<u32>> = None;
         for (index, number) in self.device_regions() {
             if self.resizing_region(number) {
                 continue;
             }
-            let available = self.available.get(index).copied().unwrap_or(0);
+            let available = self.kv.available(index);
             let kept = kept.get(index).copied().unwrap_or(0);
-            let retiring = self.retiring.get(index).copied().unwrap_or(0);
+            let retiring = self.kv.retiring(index);
             let released = self.released.get(index).copied().unwrap_or(false);
             let idle = |free: u32| free == 0 && (retiring == 0 || !ended) && !released;
             let shown = available.saturating_sub(kept);
@@ -131,8 +132,9 @@ impl Scheduler {
                 continue;
             }
 
-            let capacity = self.capacity.get(index).copied().unwrap_or(0);
-            let units_asked = asked.get_or_insert_with(|| self.units_asked());
+            let capacity = self.kv.capacity(index);
+            let units_asked = asked
+                .get_or_insert_with(|| self.kv.units_asked(self.requests.values(), &self.groups));
             let held = units_asked.get(index).copied().unwrap_or(0);
             let free = shown.min(capacity.saturating_sub(held.saturating_add(kept)));
             if idle(free) {
@@ -151,14 +153,9 @@ impl Scheduler {
     /// The device regions this queue pair uses: each one's index in the session's regions and
     /// the number the buffer pool names it by.
     pub(super) fn device_regions(&self) -> Vec<(usize, u8)> {
-        self.registers
-            .capacity
-            .iter()
-            .filter_map(|&(number, _)| {
-                let index = self.region_index(number)?;
-                let (_, region) = self.regions.get(index)?;
-                (region.tier == Tier::Device).then_some((index, number))
-            })
+        let used = self.kv.used().iter();
+        used.filter(|&&(_, index)| self.kv.on_tier(index, Tier::Device))
+            .map(|&(number, index)| (index, number))
             .collect()
     }
 
@@ -304,7 +301,7 @@ mod tests {
     fn a_shrinking_drain_gives_back_what_came_free_until_nothing_more_does() {
         let (mut bench, outputs) = scheduler();
         let scheduler = &mut bench.scheduler;
-        scheduler.available = vec![10, 0, 0, 0];
+        *scheduler.kv.available_mut() = vec![10, 0, 0, 0];
         let (reply, _replied) = crossbeam_channel::bounded(1);
         scheduler.drain(MigrationCause::Drain, Some(Instant::now()), true, reply);
         scheduler.drain_due(Instant::now());
@@ -326,7 +323,7 @@ mod tests {
         );
 
         // Units still retiring once no request remains come free soon: the region is asked again.
-        bench.scheduler.retiring[1] = 3;
+        bench.scheduler.kv.retiring_mut()[1] = 3;
         bench.scheduler.drain_due(Instant::now());
         assert_eq!(
             written(&mut bench),
@@ -348,7 +345,7 @@ mod tests {
         {
             bench.scheduler.answered(id, owner, request, completion);
         }
-        assert_eq!(bench.scheduler.capacity[0], 54);
+        assert_eq!(bench.scheduler.kv.capacity(0), 54);
         assert!(
             outputs
                 .try_iter()
@@ -356,8 +353,8 @@ mod tests {
         );
 
         // Nothing is free or retiring in region 4 any more.
-        bench.scheduler.available[0] = 0;
-        bench.scheduler.retiring[1] = 0;
+        bench.scheduler.kv.available_mut()[0] = 0;
+        bench.scheduler.kv.retiring_mut()[1] = 0;
         bench.scheduler.drain_due(Instant::now());
         assert!(written(&mut bench).is_empty());
     }
@@ -374,7 +371,7 @@ mod tests {
         request.status = RequestStatus::Running;
         request.queued = false;
         scheduler.running.push(RequestId(1));
-        scheduler.available = vec![0; 4];
+        *scheduler.kv.available_mut() = vec![0; 4];
 
         // At its deadline the running request leaves, and its owner's `Detach` is handed to
         // group A's workers; nothing is free yet.
@@ -439,7 +436,7 @@ mod tests {
     #[test]
     fn a_shrinking_drain_answers_after_the_host_stores_of_its_blocks_end() {
         let (mut bench, _outputs) = scheduler();
-        bench.scheduler.available = vec![0; 4];
+        *bench.scheduler.kv.available_mut() = vec![0; 4];
         let store = runtime::Request::Store {
             group: A,
             keys: vec![storage::Key([7; 32])],
