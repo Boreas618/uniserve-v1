@@ -337,7 +337,7 @@ def _fault(server: Server, trial: Trial) -> dict[str, Any]:
     the update once it rolled back, which the change's answer states as its
     reason (``409``).
     """  # noqa: D205
-    target = admin.serving_engine(server)["pid"]
+    target = admin.serving_engine(server, after=trial.began)["pid"]
     os.kill(target, signal.SIGKILL)
     update = admin.wait_for_log(
         server, "update", after=trial.after, phase="rolled_back"

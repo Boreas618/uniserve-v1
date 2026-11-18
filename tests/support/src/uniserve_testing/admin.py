@@ -561,11 +561,13 @@ def processes(server: Server, **labels: str) -> list[dict[str, Any]]:
     return list(latest.values())
 
 
-def serving_engine(server: Server) -> dict[str, Any]:
+def serving_engine(server: Server, after: int | None = None) -> dict[str, Any]:
     """The main process that serves: the latest state (:func:`processes`)
-    of the launch of group ``engine`` whose generation replica 0 serves.
+    of the launch of group ``engine`` whose generation replica 0 serves, as
+    the leader last sampled it, or in a second after the moment `after`
+    when stated (an update's phase that changed which process serves).
     """  # noqa: D205
-    generation = replica(server).generation
+    generation = replica(server, after=after).generation
     assert generation is not None, "no main process serves"
     (serving,) = [
         process

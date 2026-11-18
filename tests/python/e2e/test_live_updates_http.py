@@ -1336,8 +1336,9 @@ def _fail_the_target(server: Server, after: int) -> dict:
     it entered ``rolled_back``, which serves its kept side again. `after` is
     the daemon's clock the case read before it applied the change.
     """  # noqa: D205
-    admin.wait_for_log(server, "update", after=after, phase="trial")
-    updates.terminate(admin.serving_engine(server)["pid"])
+    trial = admin.wait_for_log(server, "update", after=after, phase="trial")
+    # The target serves from its switch on, which the trial follows.
+    updates.terminate(admin.serving_engine(server, after=trial.time)["pid"])
     return admin.wait_for_log(
         server, "update", after=after, phase="rolled_back"
     ).fields
