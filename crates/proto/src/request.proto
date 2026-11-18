@@ -721,6 +721,10 @@ message ResizeCache {
   uint64 room_bytes = 9;
   // Per-device allocation requirements override room_bytes on named GPUs.
   repeated DeviceBytes device_bytes = 11;
+  // For a fraction change: the deployment's `mem_fraction_static`, and each
+  // worker group's own share by its id, for a group that states one.
+  double deployment_fraction = 14;
+  map<string, double> group_fractions = 15;
 }
 
 message DeviceBytes {
@@ -744,6 +748,13 @@ enum CacheChange {
   // requests that hold the tail run on. Fails, changing nothing, when even
   // the segments the cache cannot give back leave too little room.
   CACHE_CHANGE_MAKE_ROOM = 7;
+  // Lower every rank's share of its GPU to the fractions the command
+  // states: the tail of the KV cache is given back, its blocks without a
+  // host copy demoted to the host tier first, until each device's usage fits
+  // the lower limit, which every rank then reserves under. Fails, changing
+  // nothing, when even the segments the cache cannot give back leave a
+  // device above it.
+  CACHE_CHANGE_FRACTION = 8;
 }
 
 // Where the daemon an engine attaches to listens.

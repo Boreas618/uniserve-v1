@@ -48,8 +48,9 @@ use service::lock;
 pub(crate) struct Usage {
     /// The device's CUDA ordinal.
     device: u32,
-    /// The epoch's limit of the GPU, which the report states.
-    limit: u64,
+    /// The epoch's limit of the GPU, which the report states and every booking restates; lowered
+    /// in place when the deployment's share of the GPU is ([`GraphPool::set_limit`]).
+    limit: AtomicU64,
     /// The bytes each pool maps, at its `PoolKind::index`.
     mapped: [AtomicU64; PoolKind::ALL.len()],
 }
@@ -60,7 +61,7 @@ impl Usage {
     pub(crate) fn report(&self) -> DeviceMemory {
         DeviceMemory {
             device: self.device,
-            budget: self.limit,
+            budget: self.limit.load(Ordering::Acquire),
             pools: PoolKind::ALL
                 .into_iter()
                 .zip(&self.mapped)
@@ -82,9 +83,8 @@ impl Usage {
 /// [`Usage`].
 struct Reservation {
     client: Arc<StorageClient>,
-    /// The GPU's total bytes and the epoch's limit of them, which every reservation restates.
+    /// The GPU's total bytes, which every reservation restates with the limit its usage states.
     total: u64,
-    limit: u64,
     /// The bytes each pool last stated, at its `PoolKind::index`.
     mapped: Mutex<[u64; PoolKind::ALL.len()]>,
     /// Where the bytes of a booking that succeeded are published.
@@ -101,8 +101,9 @@ impl Budget for Reservation {
         // A refused reservation leaves the quota and the kept bytes as they were: the
         // allocator then maps nothing.
         let sum = stated.iter().sum();
+        let limit = self.usage.limit.load(Ordering::Acquire);
         self.client
-            .reserve(device, self.total, self.limit, vec![(Item::GraphPool, sum)])
+            .reserve(device, self.total, limit, vec![(Item::GraphPool, sum)])
             .map_err(|error| platform::Error::InvalidArgument(error.to_string()))?;
 
         for (published, bytes) in self.usage.mapped.iter().zip(stated) {
@@ -123,6 +124,14 @@ pub struct GraphPool {
 }
 
 impl GraphPool {
+    /// The limit of the GPU's quota every booking of the pools restates from now on: the epoch's
+    /// lowered share of the GPU, which the rank reserves under once its cache gave back what the
+    /// lower limit leaves no room for. The pools' address ranges, reserved under the limit they
+    /// opened with, hold any lower one.
+    pub(crate) fn set_limit(&self, limit: u64) {
+        self.usage.limit.store(limit, Ordering::Release);
+    }
+
     /// Maps one region per runner on `device` and reserves the addresses of its scratch and
     /// resident pools.
     ///
@@ -152,13 +161,12 @@ impl GraphPool {
         let usage = Arc::new(Usage {
             device: u32::try_from(device.0)
                 .map_err(|_| Error::Invalid("a CUDA ordinal past u32".into()))?,
-            limit,
+            limit: AtomicU64::new(limit),
             mapped: Default::default(),
         });
         let reservation = Reservation {
             client,
             total,
-            limit,
             mapped: Mutex::new([0; PoolKind::ALL.len()]),
             usage: Arc::clone(&usage),
         };

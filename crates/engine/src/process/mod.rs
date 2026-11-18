@@ -116,6 +116,46 @@ fn policy_slot() -> ModuleSlot {
 }
 
 /// `packages` without the policy's slot: the kernel packages of a generation.
+/// The engine configuration `resize` lowers the shares of the GPUs of, and every deployment
+/// rank's share of its GPU under it, by the rank's number (`WorkerGroupConfig::device_fraction`):
+/// the deployment's `mem_fraction_static` and each group's own share the command states.
+///
+/// # Errors
+///
+/// A share that is no fraction of a GPU, or a rank the configuration's groups do not place.
+fn lowered_shares(
+    config: &proto::config::EngineConfig,
+    resize: &wire::ResizeCache,
+) -> Result<(proto::config::EngineConfig, BTreeMap<u32, f64>)> {
+    let share = |fraction: f64| fraction.is_finite() && fraction > 0.0 && fraction <= 1.0;
+    anyhow::ensure!(
+        share(resize.deployment_fraction) && resize.group_fractions.values().copied().all(share),
+        "the shares of the GPUs must be fractions in (0, 1]"
+    );
+    let mut lowered = config.clone();
+    lowered.mem_fraction_static = resize.deployment_fraction;
+    for group in &mut lowered.parallel.worker_groups {
+        if let Some(&fraction) = resize.group_fractions.get(group.id.0.as_str()) {
+            group.mem_fraction_static = Some(fraction);
+        }
+    }
+    let groups = &lowered.parallel.worker_groups;
+    let ranks: usize = groups.iter().map(|group| group.ranks.len()).sum();
+    let mut fractions = BTreeMap::new();
+    for rank in 0..ranks {
+        let (group, position) = proto::config::WorkerGroupConfig::place_rank(groups, rank)
+            .with_context(|| format!("the deployment's worker groups place no rank {rank}"))?;
+        let placed = &groups[group].ranks[position];
+        let fraction = proto::config::WorkerGroupConfig::device_fraction(
+            groups,
+            placed,
+            lowered.mem_fraction_static,
+        );
+        fractions.insert(u32::try_from(rank)?, fraction);
+    }
+    Ok((lowered, fractions))
+}
+
 fn kernels_of(packages: &Packages) -> Packages {
     let policy = policy_slot();
     packages
@@ -1660,6 +1700,23 @@ impl MainProcess {
                     let made =
                         operations::make_room(&schedulers, &head, &binding, room, &devices, false);
                     done(move |main| main.operated(front, id, made.map(|()| None)))
+                })
+            }
+            Ok(wire::CacheChange::Fraction) => {
+                let (config, fractions) = match lowered_shares(&self.launch.engine_config, resize) {
+                    Ok(lowered) => lowered,
+                    Err(error) => return self.operated(front, id, Err(error)),
+                };
+                Box::new(move || {
+                    let lowered =
+                        operations::lower_fractions(&schedulers, &head, &binding, &fractions);
+                    done(move |main| {
+                        // A relaunch of this process's ranks divides the shares it serves with.
+                        if lowered.is_ok() {
+                            main.launch.engine_config = config;
+                        }
+                        main.operated(front, id, lowered.map(|()| None));
+                    })
                 })
             }
             Ok(wire::CacheChange::Unspecified) | Err(_) => {

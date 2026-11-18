@@ -2071,8 +2071,9 @@ def test_step_changes_under_a_request_keep_its_stream_whole(
 
 
 #: Options each change of which takes effect at the engines' next step: what
-#: every main process reads beside its batches, what a start reads, and the
-#: cache's switches turned off. Each value differs from the deployment's.
+#: every main process reads beside its batches, what a start reads, the
+#: cache's switches turned off, and a lower share of the GPUs (the default
+#: `mem_fraction_static` is 0.7). Each value differs from the deployment's.
 STEP_OPTIONS: list[Config] = [
     {"worker_config": {"watchdog_timeout": "100s"}},
     {"worker_config": {"join_timeout": "100s"}},
@@ -2083,6 +2084,7 @@ STEP_OPTIONS: list[Config] = [
     {"profiling_config": {"nvtx_ranges": True}},
     {"kv_cache_config": {"host_tier": False}},
     {"kv_cache_config": {"prefix_caching": False}},
+    {"mem_fraction_static": 0.6},
 ]
 
 

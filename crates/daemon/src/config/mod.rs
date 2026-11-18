@@ -324,8 +324,11 @@ pub struct Config {
     pub max_logprobs: u32,
     /// Each rank's share of its device's total storage for weights, static
     /// allocations and the KV cache, in (0, 1]. A deployment group's
-    /// `mem_fraction_static` overrides it.
-    #[reload(epoch)]
+    /// `mem_fraction_static` overrides it. Lowered, it takes effect in the serving engines: the
+    /// KV cache gives back its tail, the blocks it evicts demoted to the host tier first, and
+    /// every rank reserves under the lower share; raised, it takes a new epoch, whose ranks
+    /// divide the larger share ([`fraction_effect`]).
+    #[reload(by = fraction_effect)]
     pub mem_fraction_static: f64,
     /// Tensor-parallel workers of each scheduler's group when the
     /// configuration states no `worker_groups`.
@@ -1114,27 +1117,53 @@ fn storage_effect(
     }
 }
 
+/// How a change of `mem_fraction_static` from `previous` to `next` takes effect: a lower share
+/// in the serving engines, which give back what it leaves no room for (`step`); a higher one, and
+/// a start, as a new epoch, whose ranks divide the larger share.
+fn fraction_effect(previous: Option<&f64>, next: &f64) -> proto::reload::Effect {
+    match previous {
+        Some(previous) if next <= previous => proto::reload::Effect::Step,
+        _ => proto::reload::Effect::Epoch,
+    }
+}
+
 /// How a change of `worker_groups` from `previous` to `next` takes effect: at the next step when
-/// the groups differ in their queue depths alone, which no storage is sized by (the schedulers
-/// keep each group's depth of batches in flight from their next step's snapshot); otherwise, and
-/// at a start, as a new epoch, since the groups place the ranks.
+/// the groups differ in their queue depths, which no storage is sized by (the schedulers keep
+/// each group's depth of batches in flight from their next step's snapshot), and in the shares
+/// of their GPUs a group states, each no higher than before (as [`fraction_effect`]); otherwise,
+/// and at a start, as a new epoch, since the groups place the ranks.
 fn groups_effect(
     previous: Option<&Option<Vec<proto::config::WorkerGroupConfig>>>,
     next: &Option<Vec<proto::config::WorkerGroupConfig>>,
 ) -> proto::reload::Effect {
-    let without_depths = |groups: &Option<Vec<proto::config::WorkerGroupConfig>>| {
+    let placement = |groups: &Option<Vec<proto::config::WorkerGroupConfig>>| {
         groups.clone().map(|mut groups| {
             for group in &mut groups {
                 group.queue_depth = 0;
+                group.mem_fraction_static = None;
             }
             groups
         })
     };
-    match previous {
-        Some(previous) if without_depths(previous) == without_depths(next) => {
-            proto::reload::Effect::Step
-        }
-        _ => proto::reload::Effect::Epoch,
+    let Some(previous) = previous else {
+        return proto::reload::Effect::Epoch;
+    };
+    let lowered =
+        previous
+            .iter()
+            .flatten()
+            .zip(next.iter().flatten())
+            .all(
+                |(before, after)| match (before.mem_fraction_static, after.mem_fraction_static) {
+                    (Some(before), Some(after)) => after <= before,
+                    (None, None) => true,
+                    _ => false,
+                },
+            );
+    if lowered && placement(previous) == placement(next) {
+        proto::reload::Effect::Step
+    } else {
+        proto::reload::Effect::Epoch
     }
 }
 

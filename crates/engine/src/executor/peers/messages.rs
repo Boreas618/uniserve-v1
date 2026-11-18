@@ -273,6 +273,15 @@ pub enum DataOperation {
     /// Answers what a generation update that replaces `operators` asks of every rank's device
     /// of the peer (`crate::process::binding::UpdateRoom`).
     UpdateRoom { operators: Vec<String> },
+    /// Answers the bytes each GPU's quota limit of the peer falls by under `fractions`, every
+    /// rank's share of its GPU by the rank's number (`WeightBinding::lowered_limits`).
+    LoweredLimits {
+        fractions: std::collections::BTreeMap<u32, f64>,
+    },
+    /// Takes `fractions` as every rank's share of its GPU (`WeightBinding::set_fractions`).
+    SetFractions {
+        fractions: std::collections::BTreeMap<u32, f64>,
+    },
     /// Runs an operation the daemon commands on every rank beside the batches. Answers the
     /// peer's ranks' [`RankReports`].
     Rank(RankOperation),

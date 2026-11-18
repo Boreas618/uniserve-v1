@@ -303,6 +303,7 @@ impl Room {
 
 /// What one rank's process holds in its GPU's quota beside its pools and the Storage Server's
 /// storages, as `Item::Process`.
+#[derive(Clone, Copy)]
 struct Reservation {
     /// The process as measured when the rank started to serve.
     process: u64,
@@ -495,6 +496,14 @@ fn joined_tables(
 }
 
 /// The room `rank`'s device has ([`Room::of`]).
+/// The share `fractions` states for rank `rank`.
+fn share(fractions: &BTreeMap<u32, f64>, rank: u32) -> Result<f64> {
+    fractions
+        .get(&rank)
+        .copied()
+        .ok_or_else(|| Error::Invalid(format!("the shares of the GPUs name no rank {rank}")))
+}
+
 fn room_of(rank: &Rank) -> Result<Room> {
     let (quota, _) = rank.client.usage(rank.device)?;
     let free = rank.device.memory_info()?.free;
@@ -777,6 +786,94 @@ impl WeightBinding {
             });
         }
         Ok(rooms)
+    }
+
+    /// The bytes each GPU's quota limit falls by when every rank's share of its GPU becomes
+    /// `fractions`'s, by the rank's number, of this process's ranks then every peer's: the room
+    /// the KV cache must leave on the GPU before the lower limit is reserved under
+    /// ([`Self::set_fractions`]). A GPU whose limit does not fall is not named.
+    ///
+    /// # Errors
+    ///
+    /// When a rank's device cannot be read, here or on a peer's host, or `fractions` names no
+    /// share for a rank.
+    pub(crate) fn lowered_limits(
+        &self,
+        fractions: &BTreeMap<u32, f64>,
+    ) -> Result<BTreeMap<[u8; 16], u64>> {
+        let answers = self.ask_peers(None, || DataOperation::LoweredLimits {
+            fractions: fractions.clone(),
+        })?;
+        let here = self.lowered_here(fractions);
+        let (mut lowered, peers) = both(here, answered::<BTreeMap<[u8; 16], u64>>(answers))?;
+        for peer in peers {
+            for (gpu, bytes) in peer {
+                let held = lowered.entry(gpu).or_insert(0);
+                *held = (*held).max(bytes);
+            }
+        }
+        Ok(lowered)
+    }
+
+    /// [`Self::lowered_limits`] of this process's ranks.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::lowered_limits`].
+    pub(crate) fn lowered_here(
+        &self,
+        fractions: &BTreeMap<u32, f64>,
+    ) -> Result<BTreeMap<[u8; 16], u64>> {
+        let mut lowered = BTreeMap::new();
+        for rank in &self.ranks {
+            let rank = lock(rank);
+            let fraction = share(fractions, rank.rank)?;
+            let total = rank.device.memory_info()?.total;
+            let fall =
+                quota_limit(total, rank.fraction).saturating_sub(quota_limit(total, fraction));
+            if fall > 0 {
+                lowered.insert(rank.device.uuid()?.0, fall);
+            }
+        }
+        Ok(lowered)
+    }
+
+    /// Every rank's share of its GPU from now on, `fractions`'s by the rank's number, this
+    /// process's ranks then every peer's: each rank's reservation and its graph pools' bookings
+    /// restate the limit of the new share, which the Storage Server holds the GPU's quota to.
+    /// The caller gave back first what the lower limit leaves no room for
+    /// ([`Self::lowered_limits`]).
+    ///
+    /// # Errors
+    ///
+    /// The quota's refusal of a rank's reservation under the new limit, or a rank whose device
+    /// cannot be read, here or on a peer's host.
+    pub(crate) fn set_fractions(&self, fractions: &BTreeMap<u32, f64>) -> Result<()> {
+        let answers = self.ask_peers(None, || DataOperation::SetFractions {
+            fractions: fractions.clone(),
+        })?;
+        let here = self.set_fractions_here(fractions);
+        both(here, answered::<()>(answers))?;
+        Ok(())
+    }
+
+    /// [`Self::set_fractions`] of this process's ranks.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_fractions`].
+    pub(crate) fn set_fractions_here(&self, fractions: &BTreeMap<u32, f64>) -> Result<()> {
+        let reserved = lock(&self.reserved).clone();
+        for (index, rank) in self.ranks.iter().enumerate() {
+            let mut rank = lock(rank);
+            rank.fraction = share(fractions, rank.rank)?;
+            let total = rank.device.memory_info()?.total;
+            lock(&rank.graphs).set_limit(quota_limit(total, rank.fraction));
+            if let Some(reservation) = reserved.get(index) {
+                self.reserve(&rank, reservation)?;
+            }
+        }
+        Ok(())
     }
 
     /// Runs `operation`, which the daemon commands on every rank, on every peer's ranks

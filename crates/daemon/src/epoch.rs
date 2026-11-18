@@ -702,8 +702,9 @@ mod tests {
             ("max_model_len", |config: &mut Config| {
                 config.max_model_len = Some(NonZeroU32::new(2048).unwrap())
             }),
+            // A larger share is divided by a new epoch's ranks.
             ("mem_fraction_static", |config: &mut Config| {
-                config.mem_fraction_static = 0.5
+                config.mem_fraction_static = 0.9
             }),
             ("lora", |config: &mut Config| {
                 config.lora = Some("org/adapter".to_owned())
@@ -791,6 +792,10 @@ mod tests {
             }),
             ("kv_cache_config.host_tier", |config: &mut Config| {
                 config.kv_cache_config.host_tier = false
+            }),
+            // A smaller share of the GPUs is given back by the serving engines' caches.
+            ("mem_fraction_static", |config: &mut Config| {
+                config.mem_fraction_static = 0.5
             }),
         ];
 

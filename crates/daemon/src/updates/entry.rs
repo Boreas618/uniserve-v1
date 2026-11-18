@@ -779,6 +779,35 @@ impl Replica {
         if current.flush != target.flush {
             self.flush_cache(&running);
         }
+        // A lower share of the GPUs: the cache gives back what it leaves no room for, demoting
+        // the blocks it evicts to the host tier first, and every rank reserves under it.
+        let shares = |config: &EngineConfig| {
+            let groups: BTreeMap<String, f64> = config
+                .parallel
+                .worker_groups
+                .iter()
+                .filter_map(|group| Some((group.id.0.clone(), group.mem_fraction_static?)))
+                .collect();
+            (config.mem_fraction_static, groups)
+        };
+        let lowered = shares(&target_engine);
+        if served
+            .as_ref()
+            .is_some_and(|served| shares(&served.engine_config) != lowered)
+        {
+            let (deployment, groups) = lowered;
+            running
+                .lower_fractions(deployment, groups.clone())
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("the engine did not take the lower shares of the GPUs: {error}")
+                })?;
+            info!(
+                deployment,
+                ?groups,
+                "the engine took the lower shares of the GPUs"
+            );
+        }
         if current.profiling_config.session != target.profiling_config.session {
             self.profile(&running, target.profiling_config.session.clone())
                 .await?;

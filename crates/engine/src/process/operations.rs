@@ -297,6 +297,31 @@ pub(crate) fn make_room(
     Ok(())
 }
 
+/// Lowers every rank's share of its GPU to `fractions`'s, by the rank's number
+/// (`ResizeCache { Fraction }`, `mem_fraction_static` lowered): each GPU's cache gives back its
+/// tail segments, the blocks the shrink evicts demoted to the host tier first, until the GPU's
+/// usage fits the lower limit ([`make_room`]), and every rank then reserves under it. A share
+/// that does not fall gives nothing back.
+///
+/// # Errors
+///
+/// As [`make_room`], with nothing changed, when the cache cannot give back enough; the quota's
+/// refusal of the lower limit.
+pub(crate) fn lower_fractions(
+    schedulers: &[Sender<Message>],
+    head: &Mutex<StorageClient>,
+    binding: &WeightBinding,
+    fractions: &BTreeMap<u32, f64>,
+) -> Result<()> {
+    let lowered = binding.lowered_limits(fractions)?;
+    if !lowered.is_empty() {
+        make_room(schedulers, head, binding, 0, &lowered, true)?;
+    }
+    binding
+        .set_fractions(fractions)
+        .context("reserving under the lower shares of the GPUs")
+}
+
 /// Flushes the cache (`docs/admin.md`, `/admin/flush_cache`): at one boundary every scheduler
 /// evicts every cached block it knows of; the requests it holds keep theirs.
 ///
@@ -468,6 +493,8 @@ fn operate(
                 workers, binding, &operators,
             )?)
         }
+        Operation::LoweredLimits { fractions } => encoded(&binding.lowered_here(&fractions)?),
+        Operation::SetFractions { fractions } => encoded(&binding.set_fractions_here(&fractions)?),
         Operation::Sleep => encoded(&binding.sleep()?),
         Operation::SuspendGraphs => encoded(&binding.suspend_graphs()?),
         Operation::RestoreGraphs => encoded(&binding.restore_graphs()?),

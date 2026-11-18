@@ -979,6 +979,34 @@ impl EngineClient {
                 change: wire::CacheChange::MakeRoom as i32,
                 room_bytes,
                 device_bytes,
+                ..wire::ResizeCache::default()
+            })
+        })
+        .await
+        .map(drop)
+    }
+
+    /// Lowers every rank's share of its GPU to `deployment`, the deployment's
+    /// `mem_fraction_static`, and each worker group's own share `groups` states: the cache
+    /// gives back what the lower limits leave no room for, demoting the blocks it evicts to the
+    /// host tier first, and every rank reserves under them.
+    ///
+    /// # Errors
+    ///
+    /// Fails, changing nothing, when even the segments the cache cannot give back leave a
+    /// device above its lower limit, or when the engine ends first.
+    pub async fn lower_fractions(
+        &self,
+        deployment: f64,
+        groups: std::collections::BTreeMap<String, f64>,
+    ) -> Result<(), String> {
+        self.ask(move |id| {
+            wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
+                id,
+                change: wire::CacheChange::Fraction as i32,
+                deployment_fraction: deployment,
+                group_fractions: groups.into_iter().collect(),
+                ..wire::ResizeCache::default()
             })
         })
         .await
