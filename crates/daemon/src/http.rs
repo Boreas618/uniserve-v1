@@ -935,8 +935,14 @@ mod tests {
     /// Binds a loopback listener on an ephemeral port and returns it with
     /// its address.
     async fn loopback() -> (Listener, String) {
+        loopback_at("127.0.0.1").await
+    }
+
+    /// Binds a listener on an ephemeral port of the loopback address `host` and returns it with
+    /// its address.
+    async fn loopback_at(host: &str) -> (Listener, String) {
         let listener = Listener::bind(&crate::config::AdminConfig {
-            host: "127.0.0.1".to_owned(),
+            host: host.to_owned(),
             port: 0,
             ..crate::config::AdminConfig::default()
         })
@@ -1005,11 +1011,14 @@ mod tests {
     }
 
     /// Shutdown lets a stream already in flight finish, stops accepting
-    /// connections, and returns once drained.
+    /// connections, and returns once drained: by then no descriptor of the client listener is
+    /// open, so a connection is refused whatever else still holds the node.
+    ///
+    /// The server listens on a loopback address of its own, which no other test binds.
     #[tokio::test]
     async fn shutdown_drains_requests_in_flight_and_refuses_new_connections() {
         let engine = Arc::new(served_engine(crate::test_support::CHAT));
-        let (listener, address) = loopback().await;
+        let (listener, address) = loopback_at("127.84.0.1").await;
         let runtime = tempfile::tempdir().unwrap();
         let shutdown = CancellationToken::new();
         let server = spawn_server(

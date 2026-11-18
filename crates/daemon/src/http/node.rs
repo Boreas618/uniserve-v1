@@ -167,8 +167,10 @@ pub(crate) struct Node {
     /// requests until it does: the node's, since a restart hands the whole node over.
     handoff: Arc<Handoff>,
     /// The client listener's descriptors and what a successor needs of them, which each
-    /// deployment's restarter hands over.
-    listener: (ListenerHandoff, Vec<OwnedFd>),
+    /// deployment's restarter hands over; `None` once the node stopped accepting, so that no
+    /// descriptor keeps the listener open past the node's end, however long anything else
+    /// holds the node.
+    listener: Mutex<Option<(ListenerHandoff, Vec<OwnedFd>)>>,
     /// Cancelled once a hot restart's successor serves, or the node ends: the node stops
     /// accepting connections.
     accepting: CancellationToken,
@@ -247,9 +249,11 @@ pub(crate) async fn run(
         instance: instance.path().to_owned(),
         ready: Mutex::new(ready),
         handoff: Arc::new(Handoff::new()),
-        listener: listener
-            .hand_over()
-            .context("duplicating the client listener")?,
+        listener: Mutex::new(Some(
+            listener
+                .hand_over()
+                .context("duplicating the client listener")?,
+        )),
         accepting: CancellationToken::new(),
         shutdown,
         serving: Mutex::new(Serving::Idle),
@@ -301,6 +305,9 @@ pub(crate) async fn run(
     };
 
     let handed_over = node.accepting.is_cancelled() && !node.shutdown.is_cancelled();
+    // The node accepts no connection from here on: its own copy of the client listener closes,
+    // and the server's closes as the server ends.
+    drop(service::lock(&node.listener).take());
     let served = if handed_over {
         // The successor serves: this daemon finishes the requests it took, however long they
         // take, and then the deployment detaches.
@@ -685,15 +692,21 @@ impl Node {
         let name = leader.served_model_name().to_string();
         let programs = Arc::clone(&self).run_programs(&leader);
         let daemon = Arc::new(Mutex::new(daemon));
-        let (listener, descriptors) = &self.listener;
-        let descriptors = descriptors
-            .iter()
-            .map(OwnedFd::try_clone)
-            .collect::<std::io::Result<Vec<_>>>()
-            .context("duplicating the client listener for a restart")?;
+        let (listener, descriptors) = {
+            let held = service::lock(&self.listener);
+            let (listener, descriptors) = held
+                .as_ref()
+                .context("the node stopped accepting before the deployment served")?;
+            let descriptors = descriptors
+                .iter()
+                .map(OwnedFd::try_clone)
+                .collect::<std::io::Result<Vec<_>>>()
+                .context("duplicating the client listener for a restart")?;
+            (listener.clone(), descriptors)
+        };
         let restarter = Arc::new(Restarter::new(
             Arc::clone(&daemon),
-            (listener.clone(), descriptors),
+            (listener, descriptors),
             &self.instance,
             self.deployment.clone(),
             stated,
