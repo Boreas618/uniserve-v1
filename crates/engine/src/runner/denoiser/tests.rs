@@ -21,6 +21,7 @@ use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::runner::address;
 use crate::runner::graphs::Graphs;
 use crate::runner::{Forward, Runner};
+use platform::{DeviceAllocation, DeviceId, DevicePtr, DeviceRange, Stream};
 
 const GROUP: GroupId = GroupId(0);
 
@@ -97,14 +98,19 @@ impl Denoiser for Model {
         Ok(())
     }
 
+    /// A step takes its latents and conditioning as kernel operands, as a launch of any real
+    /// denoiser's does: under a launching context they must be device tensors.
     fn forward(
         &self,
         _: Step,
         _: &VideoRequest,
-        _: &Tensor,
-        _: Option<&Tensor>,
-        _: &Conditioning,
+        video: &Tensor,
+        audio: Option<&Tensor>,
+        cond: &Conditioning,
     ) -> nn::Result<()> {
+        for tensor in [Some(video), audio, Some(&cond.text)].into_iter().flatten() {
+            ops::operand(tensor)?;
+        }
         Ok(())
     }
 
@@ -533,4 +539,56 @@ fn each_layout_is_profiled_its_steps_captured_and_a_batch_with_no_row_returns_no
         .execute(&empty, &tables(PRODUCTS, SLOT, &[]))
         .unwrap();
     assert!(output.calls.is_empty());
+}
+
+/// The capture and rehearsal instances of a runner on a device (`Runner::capturer`) step over
+/// state buffers on the device: the latents and conditioning their forwards hand the model are
+/// operands their graphs' launching contexts compute on, so every step's bucket is rehearsed and
+/// captured beside the runner's graphs.
+#[test]
+#[ignore = "requires a GPU"]
+fn a_device_runners_capture_instances_step_over_state_on_the_device() {
+    let candidates = vec![candidate(8, 8), candidate(16, 8)];
+    let profiled = runner(config(candidates.clone(), 1), memory(0, PRODUCTS, true));
+    profiled.graphs().profile_run(&profiled).unwrap();
+
+    let device = DeviceId(0);
+    let stream = Stream::new(device).unwrap();
+    let region = DeviceAllocation::linear(device, profiled.graphs().peak() as usize).unwrap();
+    let range = DeviceRange::new(DevicePtr::from_address(region.address()), region.len());
+    let kernels = Arc::new(Generation::new(0, []));
+    let graphs = Graphs::new(
+        stream.clone(),
+        Arc::clone(&kernels),
+        range,
+        0,
+        profiled.graphs().input_peak(),
+        2,
+    )
+    .unwrap();
+    let runner = DenoiserRunner::new(
+        Arc::new(Model),
+        config(candidates, 1),
+        graphs,
+        Some(stream),
+        Arc::new(memory(0, PRODUCTS, true)),
+    )
+    .unwrap();
+    runner.graphs().profile_run(&runner).unwrap();
+
+    let capture = runner.capturer(runner.graphs().beside().unwrap()).unwrap();
+    let rehearsal = runner
+        .capturer(runner.graphs().rehearsal().unwrap())
+        .unwrap();
+    for bucket in runner.buckets() {
+        rehearsal
+            .graphs()
+            .rehearse(&*rehearsal, &bucket, &kernels)
+            .unwrap();
+        capture
+            .graphs()
+            .capture(&*capture, &bucket, &kernels)
+            .unwrap();
+    }
+    rehearsal.graphs().release_rehearsal();
 }

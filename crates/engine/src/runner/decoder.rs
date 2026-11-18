@@ -227,7 +227,9 @@ pub(crate) struct DecoderRunner {
     graphs: Graphs,
     /// The rank's media memory, which every media runner of the rank shares.
     memory: Arc<BufferMemory>,
-    /// The stream the graphs replay on; `None` for graphs that hold no device.
+    /// The stream the graphs replay on, on which the runner issues its copies; `None` for graphs
+    /// that hold no device and for a capture or rehearsal instance (`Runner::capturer`), which
+    /// issues no copy.
     stream: Option<Stream>,
     /// A video decoder's communicator with the other ranks its rounds are dealt to, its member
     /// index the rank's place among them ([`RoundConfig::member`]), over which a round's tails
@@ -469,6 +471,10 @@ impl DecoderRunner {
         }
         let base = self.buffers.as_ref().map_or(0, |storage| storage.address());
 
+        // The tensor is on the device of this instance's graphs: a capture or rehearsal instance
+        // issues no copy and holds no stream of its own, and its forward computes on the buffers
+        // under its graphs' launching context.
+        //
         // SAFETY: the tensor lies inside the buffers, which this runner owns for as long as its
         // graphs exist; only the copies it issues on its stream and its graphs write them.
         unsafe {
@@ -476,7 +482,7 @@ impl DecoderRunner {
                 base + offset,
                 shape,
                 dtype,
-                self.stream.as_ref().map(Stream::device),
+                self.graphs.stream().map(Stream::device),
             )
         }
     }

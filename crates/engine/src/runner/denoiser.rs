@@ -169,7 +169,9 @@ pub(crate) struct DenoiserRunner {
     graphs: Graphs,
     /// The rank's media memory, which every media runner of the rank shares.
     memory: Arc<BufferMemory>,
-    /// The stream the graphs replay on; `None` for graphs that hold no device.
+    /// The stream the graphs replay on, on which the runner issues its copies; `None` for graphs
+    /// that hold no device and for a capture or rehearsal instance (`Runner::capturer`), which
+    /// issues no copy.
     stream: Option<Stream>,
     /// Recorded behind a batch's last copy: what `execute` waits for.
     done: Option<Event>,
@@ -361,6 +363,10 @@ impl DenoiserRunner {
         }
         let base = self.state.as_ref().map_or(0, |storage| storage.address());
 
+        // The tensor is on the device of this instance's graphs: a capture or rehearsal instance
+        // issues no copy and holds no stream of its own, and its forward computes on the buffer
+        // under its graphs' launching context.
+        //
         // SAFETY: the tensor lies inside the state buffer, which this runner owns for as long as
         // its graphs exist; only the copies it issues on its stream and its forwards write it.
         unsafe {
@@ -368,7 +374,7 @@ impl DenoiserRunner {
                 base + offset,
                 shape,
                 dtype,
-                self.stream.as_ref().map(Stream::device),
+                self.graphs.stream().map(Stream::device),
             )
         }
     }
