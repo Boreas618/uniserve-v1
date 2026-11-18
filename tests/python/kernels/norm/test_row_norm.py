@@ -16,7 +16,10 @@ The reference is torch in FP64 and the bound ``gamma_n + u_out``: the FP32
 reduction of the row, of ``n = columns`` terms for ``rms_norm`` and
 ``columns + 1`` for ``add_rms_norm``, and one rounding into the output type,
 within the operators' declared ``rounding(n, F32, out)`` (`RmsNorm::tolerance`,
-`AddRmsNorm::tolerance`, ``2 gamma_n + u_out``). The updated residual is one
+`AddRmsNorm::tolerance`, ``2 gamma_n + u_out``), whose absolute part is the
+output type's subnormal unit: a normalized element near zero (an F16 product
+below ``2^-14``, which a few thousand elements of unit scale reach) is stored
+on the subnormal grid, whose rounding is absolute. The updated residual is one
 rounded sum, held to ``u_out`` of itself.
 
 The residual's bound has no absolute term, so a sum that cancels must agree
@@ -24,8 +27,7 @@ relatively; a failure states the count under the floor of its operands'
 magnitudes (``u_out (|x| + |residual|)``) beside the declared one, and the
 declared one decides, since the tolerance is the operator's to change.
 
-An F16 output is checked on a device: its store on Triton's interpreter
-leaves a few elements a unit in the last place outside the bound.
+An F16 output is checked on a device.
 
 A hand-computed case holds ``rms_norm`` to literals, which a mistake the
 kernel and the reference share (a row read as a column, a dropped ``eps``)
@@ -36,6 +38,7 @@ import pytest
 import torch
 from uniserve_testing.kernels.norm.rounding import (
     TORCH_TYPES,
+    UNDERFLOW,
     UNIT_ROUNDOFF,
     gamma,
     interpreter_store,
@@ -168,7 +171,9 @@ def launch_add_rms_norm(
     )
 
 
-def failure(name, difference, expected, declared, relative, floored=None):
+def failure(
+    name, difference, expected, declared, relative, floored=None, absolute=0.0
+):
     """The message of an output outside its bound, with the count under the
     operands' floor where the output has one.
     """  # noqa: D205
@@ -178,7 +183,7 @@ def failure(name, difference, expected, declared, relative, floored=None):
         "max absolute "
         f"{difference.nan_to_num(nan=float('inf')).max().item():.3e}, max "
         f"relative {largest_relative(difference, expected):.3e}, rtol "
-        f"{relative:.3e}"
+        f"{relative:.3e}, atol {absolute:.3e}"
     )
 
 
@@ -288,11 +293,12 @@ def test_every_output_matches_fp64_within_the_operators_bound(
     )
     difference = (out.cpu().double() - expected).abs()
     relative = bound(columns, dtype, operator)
-    declared = outside(difference, relative * expected.abs())
+    declared = outside(difference, UNDERFLOW[dtype] + relative * expected.abs())
     assert declared == 0, failure(
         f"{form}, {case}, {dtype}, the normalized row",
         difference,
         expected,
         declared,
         relative,
+        absolute=UNDERFLOW[dtype],
     )

@@ -23,7 +23,18 @@
 //! |new − old| ≤ 2γₙ Σ|aᵢbᵢ| + u_out·|result|.
 //! ```
 //!
-//! That is the bound this type is written in, and it is always relative to a magnitude:
+//! That is the bound this type is written in, and it is always relative to a magnitude, with one
+//! absolute term: below its smallest normal value an element type's grid is absolute, so a stored
+//! value there is within half a subnormal unit of exact rather than `u_out` of itself (Higham,
+//! §2.1, gradual underflow), and two implementations may store adjacent subnormals. Every bound
+//! that ends in a rounding into the output carries that [`underflow`] unit of the output as its
+//! `atol`, so a result that underflows into the output's subnormal range — an FP16 probability
+//! below `2⁻¹⁴`, an FP16 normalized element near zero — is compared on the grid it is stored on:
+//!
+//! ```text
+//! |new − old| ≤ underflow(out) + (2γₙ + u_out)·|result|.
+//! ```
+//!
 //!
 //! - [`Tolerance::rounding`] is for a reduction whose result is a *scale* of its inputs — a sum of
 //!   squares for a norm, a sum of positive weights — where `Σ|aᵢbᵢ|` and the result are the same
@@ -89,10 +100,11 @@ impl Tolerance {
     }
 
     /// `2γₙ(u) + u_out`: two implementations of a reduction whose result is the scale of its
-    /// inputs, with the reduction accumulated in `accumulate` and rounded once to `output`.
+    /// inputs, with the reduction accumulated in `accumulate` and rounded once to `output`; the
+    /// output's [`underflow`] unit is the absolute part.
     pub fn rounding(reduction: u64, accumulate: DType, output: DType) -> Self {
         Self {
-            atol: 0.0,
+            atol: underflow(output) as f32,
             rtol: relative(2.0 * gamma(reduction, accumulate) + unit_roundoff(output)),
             cancels: false,
         }
@@ -111,10 +123,11 @@ impl Tolerance {
     /// reduction's own into `γ` of the summed counts (Higham, *Accuracy and Stability of Numerical
     /// Algorithms*, 2nd ed., Lemma 3.3), so a product's excess error lengthens the reduction `γ`
     /// is taken over. The `√n` that relates `Σ|aᵢbᵢ|` to the result stays the count of products.
+    /// The output's [`underflow`] unit is the absolute part.
     pub fn split_dot(reduction: u64, extra: u64, accumulate: DType, output: DType) -> Self {
         let products = reduction as f64;
         Self {
-            atol: 0.0,
+            atol: underflow(output) as f32,
             rtol: relative(
                 2.0 * gamma(reduction + extra, accumulate) * products.sqrt()
                     + unit_roundoff(output),
@@ -160,6 +173,28 @@ pub fn unit_roundoff(dtype: DType) -> f64 {
         DType::U8 | DType::U32 | DType::I16 | DType::I32 | DType::I64 => 0.0,
         // An element type the tensor library adds has no bound until it is stated here: a NaN
         // bound holds for no pair of values, so a comparison under it fails instead of passing.
+        _ => f64::NAN,
+    }
+}
+
+/// The spacing of an element type's subnormal grid: its smallest positive subnormal, `2^(1 − bias
+/// − p + 1)` for a `p`-bit significand. An integer rounds nothing.
+///
+/// Below the smallest normal value the representable numbers are evenly spaced by this unit, so a
+/// rounding there errs by up to half of it whatever the value's size, and two implementations
+/// that round near-equal values store them at most one unit apart: the absolute part of a bound
+/// on a result rounded into `dtype`. Every unit but FP64's is exact in FP32, so the `atol` a
+/// tolerance stores is the unit itself.
+pub fn underflow(dtype: DType) -> f64 {
+    match dtype {
+        DType::F64 => f64::from_bits(1),          // 2^-1074
+        DType::F32 => 1.401_298_464_324_817e-45,  // 2^-149
+        DType::BF16 => 9.183_549_615_799_121e-41, // 2^-133
+        DType::F16 => 5.960_464_477_539_063e-8,   // 2^-24
+        DType::F8E4M3 => 1.953_125e-3,            // 2^-9
+        DType::F4 => 0.5,                         // 2^-1
+        DType::U8 | DType::U32 | DType::I16 | DType::I32 | DType::I64 => 0.0,
+        // As for `unit_roundoff`: a type without a stated grid bounds nothing.
         _ => f64::NAN,
     }
 }

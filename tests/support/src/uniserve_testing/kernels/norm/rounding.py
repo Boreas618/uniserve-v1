@@ -28,6 +28,12 @@ TORCH_TYPES = {
 #: `ops::tolerance::unit_roundoff`, per element type.
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24}
 
+#: `ops::tolerance::underflow`, per element type: the spacing of its
+#: subnormal grid, the absolute part of a bound on a value rounded into it.
+#: Below the type's smallest normal a stored value is within half this unit
+#: of exact, not within `UNIT_ROUNDOFF` of itself.
+UNDERFLOW = {"f16": 2.0**-24, "bf16": 2.0**-133, "f32": 2.0**-149}
+
 #: The significand bits of each element type, with the implicit one.
 SIGNIFICAND = {"f16": 11, "bf16": 8, "f32": 24}
 

@@ -697,7 +697,9 @@ impl Op for Softmax {
         // The relative bound holds while every term stays in FP32's normal range: a row whose
         // values spread more than about 87 nats underflows its smaller terms into subnormals,
         // where the grid is absolute and far coarser than `gamma`. A vocabulary-wide row of real
-        // logits does not reach that spread.
+        // logits does not reach that spread. A probability stored below the output type's
+        // smallest normal (`2^-14` for FP16, which a wide row's tail reaches) lies on its
+        // subnormal grid, which the bound's `underflow` unit covers.
         Tolerance::rounding(u64::from(descriptor.columns), DType::F32, descriptor.dtype)
     }
 }

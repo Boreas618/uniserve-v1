@@ -204,7 +204,12 @@ fn tolerance_follows_the_reduction_length_and_dtypes() {
     let norm = Tolerance::rounding(2048, DType::F32, DType::BF16);
     let expected = 2.0 * ops::tolerance::gamma(2048, DType::F32) + unit_roundoff(DType::BF16);
     assert!((f64::from(norm.rtol) - expected).abs() < 1e-9);
-    assert_eq!(norm.atol, 0.0);
+    // Its absolute part is the output's subnormal unit: a BF16 result stored below 2^-126 is
+    // compared on that grid.
+    let subnormal = ops::tolerance::underflow(DType::BF16);
+    assert_eq!(f64::from(norm.atol), subnormal);
+    assert!(norm.allows(0.0, subnormal as f32));
+    assert!(!norm.allows(0.0, 8.0 * subnormal as f32));
 
     // A sum of mixed-sign products is bounded by the same γₙ scaled by √n.
     let dot = Tolerance::dot(2048, DType::F32, DType::BF16);

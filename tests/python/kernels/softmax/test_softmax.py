@@ -17,7 +17,10 @@ probabilities are ``1/columns``.
 
 The reference is torch in FP64 and the bound is the operator's own:
 ``rounding(columns, F32, out)`` for ``softmax``, ``rounding(columns + 1, F32,
-F32)`` for ``log_softmax``, with no tolerance of the check's own choosing.
+F32)`` for ``log_softmax``, with no tolerance of the check's own choosing. Its
+absolute part is the output type's subnormal unit: a row of a few thousand
+logits has probabilities below FP16's smallest normal, ``2^-14``, which are
+stored on its subnormal grid, a rounding that is absolute there.
 
 **``log_softmax`` subtracts, so it is one where an absolute term could be
 needed and the declared bound has none.** ``atol`` is zero, so a
@@ -41,6 +44,9 @@ pytestmark = pytest.mark.unit
 
 #: The output types' unit roundoff, as `ops::tolerance::unit_roundoff` gives it.
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24}
+
+#: The output types' subnormal unit, as `ops::tolerance::underflow` gives it.
+UNDERFLOW = {"f16": 2.0**-24, "bf16": 2.0**-133, "f32": 2.0**-149}
 
 TORCH_TYPES = {
     "f16": torch.float16,
@@ -199,9 +205,9 @@ def test_every_row_matches_torch_within_the_operators_bound(
     if interpreted and dtype == "bf16" and operator == "softmax":
         expected = truncate(expected)
 
-    relative = bound(
-        columns, dtype if operator == "softmax" else "f32", OPERATORS[operator]
-    )
+    stored = dtype if operator == "softmax" else "f32"
+    relative = bound(columns, stored, OPERATORS[operator])
+    absolute = UNDERFLOW[stored]
     if operator == "softmax":
         floor = 0.0
     else:
@@ -213,8 +219,8 @@ def test_every_row_matches_torch_within_the_operators_bound(
     difference = (got - expected).abs()
     # A difference that is not a number is never inside a bound: `<=` keeps it
     # outside, where `>` would let it pass.
-    outside = ~(difference <= relative * expected.abs())
-    scaled = ~(difference <= relative * expected.abs() + floor)
+    outside = ~(difference <= absolute + relative * expected.abs())
+    scaled = ~(difference <= absolute + relative * expected.abs() + floor)
     largest_relative = (
         (difference / expected.abs().clamp(min=1e-30))
         .nan_to_num(nan=float("inf"))
@@ -224,7 +230,8 @@ def test_every_row_matches_torch_within_the_operators_bound(
     assert not outside.any(), (
         f"{operator} {rows} x {columns} of tile {tile}, {dtype}: "
         f"{int(outside.sum())} of {expected.numel()} outside the declared "
-        f"bound {relative:.3e} (per row {outside.sum(dim=-1).tolist()}), "
+        f"bound {relative:.3e}, atol {absolute:.3e} (per row "
+        f"{outside.sum(dim=-1).tolist()}), "
         f"{int(scaled.sum())} outside it with the operands' floor; max "
         f"absolute {difference.nan_to_num(nan=float('inf')).max().item():.3e}, "
         f"max relative {largest_relative:.3e}"
