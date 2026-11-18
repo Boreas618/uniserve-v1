@@ -9,11 +9,14 @@ every column::
     adjusted = repeated - frequency * count - presence   (seen, not -inf)
     out      = adjusted / temperature                     (divide; 0 -> 1)
 
-It is arithmetic, held to the operator's bound ``rounding(5, F32, F32)``:
-``2 gamma_5 + u`` against each element's own magnitude, with no absolute
-part. The floor the operands' magnitudes imply (the penalties are subtracted
-from a value their own magnitudes set, and the bias's sum rounds once before
-them) is reported beside the count that decides.
+Every step is one separately rounded FP32 operation (libdevice's ``add_rn``,
+``div_rn``, ``mul_rn`` and ``sub_rn``), so the program's contract is the FP32
+tensor composition of the same steps in the same order, bit for bit; the
+reference is that composition, evaluated by torch on the host, and every
+element must equal it. A bound relative to each element's own magnitude would
+not describe this arithmetic: where a seen token's penalties nearly cancel its
+logit, the subtraction's rounding is relative to its operands, not to the
+small result.
 
 The cases: the fixture's shape, with penalties, a temperature and a masked
 ``-inf`` logit a count would otherwise penalize; a zero temperature, which
@@ -32,9 +35,6 @@ import pytest
 import torch
 
 pytestmark = [pytest.mark.unit, pytest.mark.gpu]
-
-#: The unit round-off of FP32, as `ops::tolerance::unit_roundoff` gives it.
-UNIT_ROUNDOFF = 2.0**-24
 
 #: The fixture's descriptor: `dtype_bf16_vocabulary_151936_block_1024_extras_0
 #: _divide_true`.
@@ -129,12 +129,6 @@ def launch(kernels, operands, out, extras, divide, block):
         DIVIDE=divide,
         PDL=False,
     )
-
-
-def gamma(reduction):
-    """`gamma_n = n u / (1 - n u)` for `n` FP32 roundings."""
-    terms = reduction * UNIT_ROUNDOFF
-    return terms / (1.0 - terms)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -232,70 +226,53 @@ def test_every_logit_is_shaped_within_the_bound(
     )
 
     # The adjustments first: a flagged row with a slot adds its bias row, and
-    # a row with a mask bans the tokens its bits name.
-    exact = logits.double()
+    # a row with a mask bans the tokens its bits name. Every step is one FP32
+    # operation, rounded as the program rounds it.
+    shaped = logits.float()
     token = torch.arange(vocabulary)
     for row in range(rows):
         if adjustments[row, 0] != 0 and slots[row] >= 0:
-            exact[row] += bias[slots[row].long()].double()
+            shaped[row] = shaped[row] + bias[slots[row].long()]
         if adjustments[row, 1] >= 0:
             mask = bans[adjustments[row, 1].long()].long() & 0xFFFFFFFF
             banned = ((mask[token // 32] >> (token % 32)) & 1) != 0
-            exact[row, banned] = float("-inf")
-    exact_counts = counts.double()
+            shaped[row, banned] = float("-inf")
+    seen = counts.float()
     # A padded row reads no counts.
-    exact_counts[slots < 0] = 0.0
+    seen[slots < 0] = 0.0
     if extras is not None:
         for column in range(extra_count):
             for row in range(rows):
                 if extras[row, column] >= 0:
-                    exact_counts[row, extras[row, column].long()] += 1.0
+                    seen[row, extras[row, column].long()] += 1.0
     temperatures, repetition, frequency, presence = (
-        parameters[:, column].double().unsqueeze(-1) for column in (0, 4, 5, 6)
+        parameters[:, column].unsqueeze(-1) for column in (0, 4, 5, 6)
     )
 
-    repeated = torch.where(exact > 0.0, exact / repetition, exact * repetition)
-    shaped = repeated - frequency * exact_counts - presence
-    applies = (exact_counts > 0.0) & (exact != float("-inf"))
-    expected = torch.where(applies, shaped, exact)
+    repeated = torch.where(
+        shaped > 0.0, shaped / repetition, shaped * repetition
+    )
+    penalized = (repeated - frequency * seen) - presence
+    applies = (seen > 0.0) & (shaped != float("-inf"))
+    expected = torch.where(applies, penalized, shaped)
     if divide:
         expected = expected / torch.where(
             temperatures > 0.0, temperatures, torch.ones_like(temperatures)
         )
-    biased = torch.zeros(rows, vocabulary, dtype=torch.float64)
-    for row in range(rows):
-        if adjustments[row, 0] != 0 and slots[row] >= 0:
-            biased[row] = exact[row].abs()
 
-    got = out.cpu().double()
-    relative = 2.0 * gamma(5) + UNIT_ROUNDOFF
-    floor = UNIT_ROUNDOFF * (
-        repeated.abs().nan_to_num(posinf=0.0)
-        + (frequency * exact_counts).abs()
-        + presence.abs()
-        + biased.nan_to_num(posinf=0.0)
-    )
-    # Equal values differ by nothing, where a masked `-inf` minus itself would
-    # say NaN; a NaN difference is outside every bound.
-    difference = torch.where(
-        got == expected, torch.zeros_like(got), (got - expected).abs()
-    )
-    outside = int((~(difference <= relative * expected.abs())).sum())
-    outside_floor = int(
-        (~(difference <= relative * expected.abs() + floor)).sum()
-    )
+    got = out.cpu()
+    # A NaN, which no shaping produces, is unequal to everything; `-inf`
+    # equals itself.
+    unequal = got != expected
+    difference = (got.double() - expected.double()).abs()
     largest = (
-        (difference / expected.abs().clamp(min=1e-30))
-        .nan_to_num(nan=float("inf"))
-        .max()
-        .item()
+        difference[unequal].nan_to_num(nan=float("inf")).max().item()
+        if unequal.any()
+        else 0.0
     )
-    assert outside == 0, (
+    assert not unequal.any(), (
         f"{case}, {dtype}: {rows} x {vocabulary}, block {block}, extras "
-        f"{extra_count}, "
-        f"divide {divide}, temperature {temperature:g}: {outside} of "
-        f"{expected.numel()} outside rtol {relative:.3e} (max relative "
-        f"{largest:.3e}, max absolute "
-        f"{difference.nan_to_num(nan=float('inf')).max().item():.3e}); with "
-        f"the operands' floor {outside_floor} outside"
+        f"{extra_count}, divide {divide}, temperature {temperature:g}: "
+        f"{int(unequal.sum())} of {expected.numel()} differ from the FP32 "
+        f"composition, max absolute {largest:.3e}"
     )
