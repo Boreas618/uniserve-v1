@@ -153,6 +153,7 @@ impl Config {
             worker_config: Every,
             profiling_config: Every,
             logging_config: Every,
+            export_config: Every,
             chat_config: Of(Kind::Chat),
             image_fetch_config: Of(Kind::Chat),
             video_config: Of(Kind::Video),
@@ -400,6 +401,8 @@ pub struct Config {
     #[reload(daemon)]
     pub logging_config: LoggingConfig,
     #[reload(daemon)]
+    pub export_config: ExportConfig,
+    #[reload(daemon)]
     pub chat_config: ChatConfig,
     #[reload(daemon)]
     pub image_fetch_config: ImageFetchConfig,
@@ -461,6 +464,7 @@ impl Default for Config {
             worker_config: WorkerConfig::default(),
             profiling_config: ProfilingConfig::default(),
             logging_config: LoggingConfig::default(),
+            export_config: ExportConfig::default(),
             chat_config: ChatConfig::default(),
             image_fetch_config: ImageFetchConfig::default(),
             video_config: VideoConfig::default(),
@@ -504,6 +508,35 @@ impl Default for AdminConfig {
             uds: None,
             join: JOIN_PORT,
             event_log: EventLog::default(),
+        }
+    }
+}
+
+/// Where the leader pushes the deployment's observations (`export_config`): an OpenTelemetry
+/// Collector's OTLP/HTTP endpoint, which forwards them to Prometheus or another backend. The
+/// admin API stays the one reading entry; the push is what a store outside the deployment
+/// receives. With no endpoint nothing is pushed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExportConfig {
+    /// The collector's OTLP/HTTP base URL, such as `http://collector:4318`; the metrics go to
+    /// its `/v1/metrics` and the events to its `/v1/logs`, encoded as Protobuf.
+    pub endpoint: Option<String>,
+    /// How often the leader pushes: every completed fine bucket of `stats` and every event
+    /// appended since the last push that the collector accepted.
+    #[serde(with = "values::duration")]
+    pub period: std::time::Duration,
+}
+
+/// The default `export_config.period`: a scrape interval's order, so a collector's series move as
+/// often as a pull would have moved them.
+pub const EXPORT_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl Default for ExportConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            period: EXPORT_PERIOD,
         }
     }
 }

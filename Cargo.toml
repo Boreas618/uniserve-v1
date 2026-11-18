@@ -187,6 +187,8 @@ minijinja-contrib = { version = "2.0", features = ["pycompat"] }
 mooncake_store = { git = "https://github.com/kvcache-ai/Mooncake", tag = "v0.3.13.post1", default-features = false, features = ["dlopen"] }
 # The greatest common divisor a video's display aspect is reduced by.
 num-integer = "0.1.46"
+# The OTLP messages the leader pushes the observation store's tables as (`export_config`).
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "metrics", "logs"] }
 png = "0.18.1"
 # The cross-build interfaces' Protobuf messages and their compiler, which needs
 # no `protoc`.

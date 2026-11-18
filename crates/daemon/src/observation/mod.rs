@@ -33,6 +33,7 @@
 //! (an hour by default, at most `Retention::capacity`).
 
 mod events;
+pub(crate) mod export;
 pub(crate) mod log;
 pub(crate) mod record;
 mod stats;
@@ -365,6 +366,23 @@ impl Store {
     /// The `events` view of control programs.
     pub fn events(&self) -> Events {
         Events::new(self.clone())
+    }
+
+    /// The width of the fine buckets, in nanoseconds.
+    pub(crate) fn fine_width(&self) -> i64 {
+        self.inner.limits.fine_width
+    }
+
+    /// The fine buckets of every series that lie within `[from, to)` (nanoseconds since the Unix
+    /// epoch): what an export of the window sends.
+    pub(crate) fn points(&self, from: i64, to: i64) -> Vec<stats::Point> {
+        let now = nanos(self.now());
+        self.read_stats(now, |table| table.fine(from, to))
+    }
+
+    /// The events appended after `after`, oldest first, at most `limit` of them.
+    pub(crate) fn events_after(&self, after: u64, limit: usize) -> Vec<Event> {
+        self.read_events(|table| table.after(after).take(limit).cloned().collect())
     }
 
     /// Ages the `stats` table to `now` and reads it.

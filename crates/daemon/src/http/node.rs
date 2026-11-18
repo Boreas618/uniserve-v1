@@ -300,6 +300,14 @@ pub(crate) async fn run(
         node.admin_routes(Socket::Harness),
         &node.shutdown,
     );
+    // The push of the observation store to a collector, for the node's life: the options a
+    // daemon starts with are its `export_config`, which a change takes at a restart.
+    tokio::spawn(crate::observation::export::run(
+        node.recorder.store().clone(),
+        options.export_config.clone(),
+        node.deployment.clone(),
+        node.shutdown.clone(),
+    ));
     let mut server = tokio::spawn(super::conn::serve(
         listener,
         super::conn::Server {

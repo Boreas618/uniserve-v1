@@ -147,6 +147,61 @@ impl Histogram {
     }
 }
 
+/// A histogram's buckets as OpenTelemetry's exponential histogram states them at scale 3
+/// (base `2^(1/8)`): the zeros' count, and for each sign the index of its first bucket and the
+/// counts of consecutive buckets from it, the bucket of index `i` holding magnitudes in
+/// `(2^(i/8), 2^((i+1)/8)]`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Exponential {
+    pub zero_count: u64,
+    pub positive: (i32, Vec<u64>),
+    pub negative: (i32, Vec<u64>),
+}
+
+/// The OpenTelemetry exponential histogram scale of the shared bucket scheme: `SCALE` buckets
+/// per power of two is `2^3`.
+pub const EXPONENTIAL_SCALE: i32 = 3;
+
+impl Histogram {
+    /// The buckets as OpenTelemetry's exponential histogram at [`EXPONENTIAL_SCALE`] states them.
+    pub fn exponential(&self) -> Exponential {
+        let mut zero_count = 0;
+        let mut positive = std::collections::BTreeMap::new();
+        let mut negative = std::collections::BTreeMap::new();
+        for (&key, &count) in &self.buckets {
+            match key {
+                0 => zero_count += count,
+                key if key > 0 => {
+                    positive.insert(key - OFFSET, count);
+                }
+                key => {
+                    negative.insert(-key - OFFSET, count);
+                }
+            }
+        }
+        Exponential {
+            zero_count,
+            positive: dense(&positive),
+            negative: dense(&negative),
+        }
+    }
+}
+
+/// Counts by bucket index as the index of the first and the counts of consecutive buckets from
+/// it, empty buckets between them zero.
+fn dense(counts: &BTreeMap<i64, u64>) -> (i32, Vec<u64>) {
+    let (Some((&first, _)), Some((&last, _))) = (counts.first_key_value(), counts.last_key_value())
+    else {
+        return (0, Vec::new());
+    };
+    let mut dense = vec![0; usize::try_from(last - first + 1).unwrap_or(0)];
+    for (&index, &count) in counts {
+        dense[usize::try_from(index - first).unwrap_or(0)] = count;
+    }
+    // Indices of finite values lie within about ±8700 (`OFFSET`).
+    (i32::try_from(first).unwrap_or(i32::MIN), dense)
+}
+
 impl From<&Histogram> for crate::request::wire::Histogram {
     fn from(histogram: &Histogram) -> Self {
         Self {
@@ -248,5 +303,25 @@ mod tests {
         let lowers: Vec<f64> = left.buckets().map(|(lower, _, _)| lower).collect();
         assert!(lowers.is_sorted());
         assert!(left.buckets().all(|(lower, upper, _)| lower <= upper));
+    }
+
+    /// The exponential view states each bucket at OpenTelemetry's index for scale 3: 1.0 lies in
+    /// `(2^(-1/8), 2^0]`, index -1, and 2.0 in `(2^(7/8), 2^1]`, index 7.
+    #[test]
+    fn the_exponential_view_is_opentelemetrys_scale_three() {
+        let mut histogram = Histogram::new();
+        for value in [1.0, 2.0, 2.0, 0.0, -1.0] {
+            histogram.observe(value);
+        }
+        let view = histogram.exponential();
+        assert_eq!(view.zero_count, 1);
+        let (offset, counts) = &view.positive;
+        assert_eq!(*offset, -1);
+        assert_eq!(counts.len(), 9);
+        assert_eq!((counts[0], counts[8]), (1, 2));
+        assert_eq!(counts.iter().sum::<u64>(), 3);
+        assert_eq!(view.negative, (-1, vec![1]));
+        let base = 2f64.powf(2f64.powi(-EXPONENTIAL_SCALE));
+        assert!((base.powi(8) - 2.0).abs() < 1e-12);
     }
 }

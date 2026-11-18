@@ -60,6 +60,8 @@ minijinja-contrib.workspace = true
 # The Build Server's client, which an epoch's modules are selected with
 # (`epoch`, the generation layer of a change).
 build-server.workspace = true
+# The OTLP messages of the observation store's push (`observation::export`).
+opentelemetry-proto.workspace = true
 prost.workspace = true
 processing.workspace = true
 # The program host, which runs the policy package's control and routing programs on the leader

@@ -18,8 +18,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
-use proto::histogram::Histogram;
 use super::{Error, Labels, Retention};
+use proto::histogram::Histogram;
 
 /// How a metric's writes combine within a time bucket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,6 +257,18 @@ struct Metric {
     series: HashMap<Labels, HashMap<u64, Data>>,
 }
 
+/// One fine bucket of one series, owned, as an export reads it ([`Table::fine`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Point {
+    pub(crate) name: String,
+    pub(crate) labels: Labels,
+    pub(crate) revision: u64,
+    pub(crate) instrument: Instrument,
+    /// The bucket's start, in nanoseconds since the Unix epoch.
+    pub(crate) start: i64,
+    pub(crate) value: Value,
+}
+
 /// One row of the `stats` table, borrowed from the storage.
 pub(crate) struct Row<'a> {
     pub(crate) name: &'a str,
@@ -347,6 +359,34 @@ impl Table {
             });
             !metric.series.is_empty()
         });
+    }
+
+    /// The fine buckets that start at or after `from` and end at or before `to` (nanoseconds
+    /// since the Unix epoch), of every series, owned: what an export of the window sends.
+    pub(crate) fn fine(&self, from: i64, to: i64) -> Vec<Point> {
+        let width = self.limits.fine_width;
+        let mut points = Vec::new();
+        for (name, metric) in &self.metrics {
+            for (labels, revisions) in &metric.series {
+                for (&revision, data) in revisions {
+                    let window = data
+                        .fine
+                        .iter()
+                        .filter(|bucket| bucket.start >= from && bucket.start + width <= to);
+                    for bucket in window {
+                        points.push(Point {
+                            name: name.clone(),
+                            labels: labels.clone(),
+                            revision,
+                            instrument: metric.instrument,
+                            start: bucket.start,
+                            value: bucket.value.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        points
     }
 
     /// The instrument of a metric name, if it has been written.

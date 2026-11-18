@@ -434,6 +434,17 @@ The workers' always-on profiling: the fence probes at the entry and exit of the 
 | `log_stats` | `true` | Log engine statistics periodically: request throughput, scheduler occupancy, cache usage and prefix-cache hit rate, as structured fields |
 | `stats_interval` | `"10s"` | Interval of the statistics log line, over which its throughput is averaged |
 
+### `export_config`
+
+**Destination: host layer, daemon.**
+
+The leader pushes the deployment's observation store to an OpenTelemetry Collector over OTLP/HTTP with Protobuf bodies, which forwards it to Prometheus or another backend; `/admin/query` stays the deployment's one reading entry. Every `period` the push sends the `stats` fine buckets completed since the last push the collector accepted to `/v1/metrics`, and the `events` appended since then to `/v1/logs`; a push the collector refuses, or that does not reach it, is sent again with what came after it for as long as the store keeps it. A counter's bucket is a delta monotonic sum over the bucket, a gauge's a gauge at the bucket's end, a histogram's a delta exponential histogram at scale 3 (the store's own bucket scheme, so no observation moves between buckets), and an event a log record named by its kind; a row's labels and its revision are its attributes, and the resource names the service (`uniserve`) and the deployment.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `endpoint` | Unset | The collector's OTLP/HTTP base URL, such as `"http://collector:4318"`; unset pushes nothing |
+| `period` | `"10s"` | How often the leader pushes |
+
 ### `chat_config`
 
 **Destination: host layer.**
