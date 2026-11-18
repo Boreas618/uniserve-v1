@@ -1793,8 +1793,8 @@ impl BufferPool {
         } else if units > now {
             // R10: a unit joins the region only with bytes that are in no region.
             let quota = &mut self.quota[space];
-            self.regions[usize::from(region)].grow(units - now, |offset, bytes| {
-                remove_range(quota, offset, bytes)
+            self.regions[usize::from(region)].grow(units - now, |offset, unit_bytes, units| {
+                take_units(quota, offset, unit_bytes, units)
             });
         }
         Ok(Some(Completion::Resized {
@@ -1842,6 +1842,27 @@ fn remove_range(ranges: &mut BTreeMap<u64, u64>, offset: u64, bytes: u64) -> boo
         ranges.insert(offset + bytes, first + length - offset - bytes);
     }
     true
+}
+
+/// Takes out of a list of free ranges the leading units of `units` units of `unit_bytes` bytes
+/// from byte `offset` that the free range holding `offset` holds whole, and returns how many it
+/// took: none when no free range holds the first unit whole. Neighbouring free ranges are
+/// joined ([`insert_range`]), so the units past those taken start in no free range.
+fn take_units(ranges: &mut BTreeMap<u64, u64>, offset: u64, unit_bytes: u64, units: u32) -> u32 {
+    let holder = ranges
+        .range(..=offset)
+        .next_back()
+        .map(|(first, length)| first + length);
+    let Some(end) = holder.filter(|end| *end > offset) else {
+        return 0;
+    };
+    // Admission refuses a region of units of no bytes, so the division is by a unit's bytes.
+    let whole = (end - offset).checked_div(unit_bytes).unwrap_or(0);
+    let taken = whole.min(u64::from(units)) as u32;
+    if taken > 0 {
+        remove_range(ranges, offset, u64::from(taken) * unit_bytes);
+    }
+    taken
 }
 
 #[cfg(any(test, feature = "verification"))]

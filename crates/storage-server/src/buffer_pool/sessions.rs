@@ -17,7 +17,7 @@ use storage::runtime::{GroupId, Open, Segments, Tier, VERSION};
 
 use super::{
     BufferPool, Class, ClientId, Deferred, Group, Memories, Region, Validity, disowned,
-    insert_range, remove_range,
+    insert_range, remove_range, take_units,
 };
 
 /// The most regions a pool numbers at once: a run names its region by a byte (§11), and a
@@ -250,7 +250,9 @@ impl BufferPool {
         let bytes = (unit_bytes, part_bytes);
         let mut region = Region::new(id, name, tier, space, bytes, reserved, 0, limit);
         if let Some(quota) = self.quota.get_mut(usize::from(space)) {
-            region.grow(units, |offset, bytes| remove_range(quota, offset, bytes));
+            region.grow(units, |offset, unit_bytes, units| {
+                take_units(quota, offset, unit_bytes, units)
+            });
         }
         match reused {
             Some(index) => self.regions[index] = region,
@@ -351,7 +353,9 @@ impl BufferPool {
                     && let Some(quota) = self.quota.get_mut(usize::from(region.space))
                 {
                     let missing = stated.units.saturating_sub(region.units());
-                    region.grow(missing, |offset, bytes| remove_range(quota, offset, bytes));
+                    region.grow(missing, |offset, unit_bytes, units| {
+                        take_units(quota, offset, unit_bytes, units)
+                    });
                 }
                 numbers.push(found as u8);
                 continue;

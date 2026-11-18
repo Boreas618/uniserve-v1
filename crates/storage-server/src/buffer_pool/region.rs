@@ -379,24 +379,30 @@ impl Region {
 
     /// Grows the region by up to `count` units that are outside it and whose
     /// bytes `takes` grants (R10: bytes that have left every other region),
-    /// lowest first. `takes(offset, bytes)` returns whether it took the range
-    /// out of the quota.
-    pub(crate) fn grow(&mut self, count: u32, mut takes: impl FnMut(u64, u64) -> bool) -> u32 {
+    /// lowest first. `takes(offset, unit_bytes, units)` takes out of the quota
+    /// the leading units of `units` consecutive units of `unit_bytes` bytes
+    /// from byte `offset` whose bytes it holds whole, and returns how many it
+    /// took: a unit enters only with all of its bytes, and a run of units
+    /// one free range holds is taken at once, so a region of millions of units
+    /// grows in as many steps as its quota has ranges.
+    pub(crate) fn grow(&mut self, count: u32, mut takes: impl FnMut(u64, u64, u32) -> u32) -> u32 {
         let mut grown = 0;
         let firsts: Vec<u32> = self.outside.keys().copied().collect();
         for first in firsts {
             let Some(mut run) = self.outside.remove(&first) else {
                 continue;
             };
-            // One unit at a time: a unit enters only with all of its bytes.
+            // As many leading units of the run as the quota grants whole, a free range at a time.
             let mut joined = 0;
             while joined < run.count && grown < count {
                 let unit = run.first + joined;
-                if !takes(u64::from(unit) * self.unit_bytes, self.unit_bytes) {
+                let wanted = (run.count - joined).min(count - grown);
+                let taken = takes(u64::from(unit) * self.unit_bytes, self.unit_bytes, wanted);
+                if taken == 0 {
                     break;
                 }
-                joined += 1;
-                grown += 1;
+                joined += taken;
+                grown += taken;
             }
             if joined == run.count {
                 insert_joined(&mut self.free, run);
@@ -539,7 +545,11 @@ mod tests {
         assert_eq!(region.outside_runs().collect::<Vec<_>>(), [(3, 4)]);
 
         // The quota grants the first two units' bytes only.
-        let grown = region.grow(4, |offset, _| offset < 5 * 64);
+        let granted_below: u64 = 5 * 64;
+        let grown = region.grow(4, |offset, unit_bytes, units| {
+            let whole = granted_below.saturating_sub(offset) / unit_bytes;
+            whole.min(u64::from(units)) as u32
+        });
         assert_eq!(grown, 2);
         assert_eq!((region.units(), region.free_units()), (4, 2));
         assert_eq!(region.outside_runs().collect::<Vec<_>>(), [(5, 2)]);
