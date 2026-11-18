@@ -13,8 +13,8 @@
 //! environment as `${NAME}` or `${NAME:-default}` ([`expand_environment`]). Every
 //! path a benchmark states is relative to `root` unless absolute: its
 //! `dataset_path`, `load.warmup_manifest`, `load.priming_manifest`,
-//! `video.media_dir` and `video.reference_root`, and a `tokenizer` that names a
-//! directory under `root`. Unknown keys are refused in every table.
+//! `video.media_dir` and `video.reference_root`, each change's `policy`, and a
+//! `tokenizer` that names a directory under `root`. Unknown keys are refused in every table.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -79,10 +79,12 @@ impl Profile {
 /// client routes requests.
 ///
 /// A process is ready once its listener accepts a connection and, when
-/// `ready_path` names one, that path answers 200. `admin_socket` is the Unix
-/// socket of a single-process server's admin listener, which a timeline load's
-/// changes call and whose event log it reads; a relative path is taken in the
-/// deployment's runtime directory, which the harness creates for it.
+/// `ready_path` names one, that path answers 200. A process with `ready_fd`
+/// reports its readiness records instead (`docs/admin.md`, Listeners): the
+/// harness appends `--ready-fd N` to its command, the process is ready once a
+/// record states that it serves, and the record's admin endpoint is the Unix
+/// socket whose `/admin/query` the run reads the deployment's observations
+/// from and through whose `/admin/policy` a timeline load's changes apply.
 #[derive(Debug, Clone, Serialize)]
 pub struct Server {
     pub name: String,
@@ -92,7 +94,7 @@ pub struct Server {
     pub environment: BTreeMap<String, String>,
     pub replicas: Vec<Server>,
     pub ready_path: Option<String>,
-    pub admin_socket: Option<String>,
+    pub ready_fd: bool,
 }
 
 impl Server {
@@ -262,10 +264,12 @@ fn rate_out<S: serde::Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S
 ///
 /// A change acts once: `at_s` seconds after the load's start, or `delay_s`
 /// seconds after the earlier change `after` ended; with `phase`, the delay
-/// counts from the first admin event, recorded after `after` was issued, that
-/// reports the update entering that phase (`trial` is the end of a switch). Its
-/// action is exactly one of an admin call (`method`, `path`, an optional JSON
-/// `body`), which succeeds on a 2xx answer; a `signal` to the one process whose
+/// counts from the first update event (a `log` event of source `update`),
+/// recorded after `after` was issued, that reports the update entering that
+/// phase (`trial` is the end of a switch). Its action is exactly one of a
+/// `policy`, the directory of the policy package the deployment is to serve,
+/// applied whole with `PUT /admin/policy` (`?force=true` with `force`), which
+/// succeeds on a 2xx answer; a `signal` to the one process whose
 /// command line matches `process` (with `host`, found and signalled there over
 /// ssh); a `command`, which succeeds on exit status 0; or `cancel`, that many of
 /// a closed loop's streams disconnected by the client at once, the earliest
@@ -285,11 +289,9 @@ pub struct Change {
     #[serde(default)]
     pub delay_s: f64,
     #[serde(default)]
-    pub method: Option<String>,
-    #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default)]
-    pub body: Option<serde_json::Map<String, Value>>,
+    pub policy: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
     #[serde(default)]
     pub signal: Option<String>,
     #[serde(default)]
@@ -345,28 +347,23 @@ impl Change {
             "phase and delay_s count from the change after"
         );
         let actions = [
-            self.path.is_some(),
+            self.policy.is_some(),
             self.signal.is_some(),
             !self.command.is_empty(),
             self.cancel.is_some(),
         ];
         ensure!(
             actions.iter().filter(|stated| **stated).count() == 1,
-            "a change states exactly one of path, signal, command and cancel"
+            "a change states exactly one of policy, signal, command and cancel"
         );
-        if let Some(path) = &self.path {
-            ensure!(path.starts_with('/'), "path must be an absolute URL path");
-        }
         ensure!(
-            self.path.is_some() == self.method.is_some(),
-            "method and path go together"
+            self.policy.as_deref() != Some(""),
+            "policy must name a package directory"
         );
-        if let Some(method) = &self.method {
-            ensure!(
-                ["GET", "POST", "PUT", "PATCH", "DELETE"].contains(&method.as_str()),
-                "unknown HTTP method {method:?}"
-            );
-        }
+        ensure!(
+            !self.force || self.policy.is_some(),
+            "force applies only with policy"
+        );
         ensure!(
             self.signal.is_some() == self.process.is_some(),
             "signal and process go together"
@@ -407,9 +404,10 @@ impl Change {
         Ok(())
     }
 
-    /// Whether the change uses the admin listener: its call or its events.
+    /// Whether the change uses the admin socket: to apply its package or to
+    /// wait for an update's phase.
     pub fn calls_admin(&self) -> bool {
-        self.path.is_some() || self.phase.is_some()
+        self.policy.is_some() || self.phase.is_some()
     }
 }
 
@@ -1042,9 +1040,9 @@ fn reject_unknown(
 }
 
 /// One `[servers.<name>]` table. A table with `replicas` lists two or more
-/// single-process tables, each inheriting the table's `host` and `ready_path`
-/// unless it names its own and its `environment` beneath its own, on distinct
-/// listeners.
+/// single-process tables, each inheriting the table's `host`, `ready_path` and
+/// `ready_fd` unless it names its own and its `environment` beneath its own, on
+/// distinct listeners.
 fn server(name: &str, raw: &Value) -> Result<Server> {
     let context = format!("servers.{name}");
     let expanded = expand_environment(raw);
@@ -1057,8 +1055,8 @@ fn server(name: &str, raw: &Value) -> Result<Server> {
             "port",
             "environment",
             "ready_path",
+            "ready_fd",
             "replicas",
-            "admin_socket",
         ],
         &context,
     )?;
@@ -1066,10 +1064,10 @@ fn server(name: &str, raw: &Value) -> Result<Server> {
         return process(name, value, &context);
     };
     ensure!(
-        !["command", "port", "admin_socket"]
+        !["command", "port"]
             .iter()
             .any(|key| value.contains_key(*key)),
-        "{context} declares replicas and cannot also declare a command, port or admin_socket"
+        "{context} declares replicas and cannot also declare a command or port"
     );
     let replicas = replicas
         .as_array()
@@ -1078,13 +1076,21 @@ fn server(name: &str, raw: &Value) -> Result<Server> {
     let host = host(value, &context)?;
     let shared = environment(value, &context)?;
     let ready_path = ready_path(value, &context)?;
+    let ready_fd = ready_fd(value, &context)?;
     let mut instances = Vec::new();
     for (index, item) in replicas.iter().enumerate() {
         let where_ = format!("{context}.replicas[{index}]");
         let item = object(item, &where_)?;
         reject_unknown(
             item,
-            &["command", "host", "port", "environment", "ready_path"],
+            &[
+                "command",
+                "host",
+                "port",
+                "environment",
+                "ready_path",
+                "ready_fd",
+            ],
             &where_,
         )?;
         let mut merged = serde_json::Map::new();
@@ -1092,6 +1098,7 @@ fn server(name: &str, raw: &Value) -> Result<Server> {
         if let Some(path) = &ready_path {
             merged.insert("ready_path".into(), Value::String(path.clone()));
         }
+        merged.insert("ready_fd".into(), Value::Bool(ready_fd));
         for (key, item) in item {
             merged.insert(key.clone(), item.clone());
         }
@@ -1130,7 +1137,7 @@ fn server(name: &str, raw: &Value) -> Result<Server> {
         environment: shared,
         replicas: instances,
         ready_path,
-        admin_socket: None,
+        ready_fd,
     })
 }
 
@@ -1151,11 +1158,6 @@ fn process(name: &str, value: &serde_json::Map<String, Value>, context: &str) ->
         .and_then(Value::as_u64)
         .filter(|port| (1..65536).contains(port))
         .with_context(|| format!("{context}.port must be a valid TCP port"))?;
-    let admin_socket = match value.get("admin_socket") {
-        None => None,
-        Some(Value::String(socket)) if !socket.is_empty() => Some(socket.clone()),
-        Some(_) => bail!("{context}.admin_socket must be a non-empty string"),
-    };
     Ok(Server {
         name: name.to_owned(),
         command,
@@ -1164,8 +1166,18 @@ fn process(name: &str, value: &serde_json::Map<String, Value>, context: &str) ->
         environment: environment(value, context)?,
         replicas: Vec::new(),
         ready_path: ready_path(value, context)?,
-        admin_socket,
+        ready_fd: ready_fd(value, context)?,
     })
+}
+
+/// Whether the server reports readiness records on the descriptor it is
+/// passed (`--ready-fd`); default false.
+fn ready_fd(value: &serde_json::Map<String, Value>, context: &str) -> Result<bool> {
+    match value.get("ready_fd") {
+        None => Ok(false),
+        Some(Value::Bool(stated)) => Ok(*stated),
+        Some(_) => bail!("{context}.ready_fd must be a boolean"),
+    }
 }
 
 fn ready_path(value: &serde_json::Map<String, Value>, context: &str) -> Result<Option<String>> {
@@ -1245,6 +1257,19 @@ fn resolve_paths(value: &mut serde_json::Map<String, Value>, root: &Path) {
                 let resolved = rooted(path);
                 target.insert((*field).to_owned(), Value::String(resolved));
             }
+        }
+    }
+    // Each change's package directory.
+    for change in value
+        .get_mut("changes")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object_mut)
+    {
+        if let Some(Value::String(path)) = change.get("policy") {
+            let resolved = rooted(path);
+            change.insert("policy".into(), Value::String(resolved));
         }
     }
     if let Some(Value::String(tokenizer)) = value.get("tokenizer")
@@ -1435,8 +1460,9 @@ fn metrics(raw: Option<&Value>, context: &str) -> Result<Vec<Metric>> {
 }
 
 /// A point's `[[changes]]`: unique names, each `after` naming an earlier
-/// change; a change that calls the admin listener or waits for its events needs
-/// the server's `admin_socket`; a `cancel` disconnects at most the streams of a
+/// change; a change that applies a package or waits for an update's phase needs
+/// a single-process server that reports its readiness records (`ready_fd`),
+/// whose admin socket it uses; a `cancel` disconnects at most the streams of a
 /// closed loop.
 fn changes(
     raw: Option<&Value>,
@@ -1475,8 +1501,9 @@ fn changes(
             );
         }
         ensure!(
-            !change.calls_admin() || server.admin_socket.is_some(),
-            "{where_} uses the admin listener, and servers.{} states no admin_socket",
+            !change.calls_admin() || (server.replicas.is_empty() && server.ready_fd),
+            "{where_} uses the admin socket, which servers.{} reports only as a single process \
+             with ready_fd",
             server.name
         );
         if let Some(cancel) = change.cancel {

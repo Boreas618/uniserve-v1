@@ -7,10 +7,17 @@
 //! creates, so the host services its processes start belong to it alone; they
 //! are stopped after the processes, their logs kept beside the first process's,
 //! and the directory removed.
+//!
+//! A process whose profile states `ready_fd` is passed the write end of a pipe
+//! as `--ready-fd N` and reports its readiness records on it
+//! ([`service::Readiness`]): it is ready once a record states that it serves,
+//! and that record's admin endpoint is its admin socket.
 
 use std::fs::File;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -30,6 +37,40 @@ struct Process {
     started: Option<Instant>,
     /// Seconds from the launch until the process was first found ready.
     startup_s: Option<f64>,
+    /// The readiness records of a process that reports them, as they arrive.
+    records: Option<mpsc::Receiver<Record>>,
+    /// The admin socket the record that states it serves names.
+    admin: Option<PathBuf>,
+}
+
+/// A readiness record, its settings kept as the server wrote them.
+type Record = service::Readiness<serde_json::Value>;
+
+/// A pipe for readiness records: its read end and its write end, both
+/// close-on-exec.
+fn pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let mut ends = [0; 2];
+    // SAFETY: pipe2(2) writes two descriptors into the array it is given.
+    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: both descriptors were just created and nothing else owns them.
+    Ok(unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) })
+}
+
+/// Reads records from `read` on a thread of its own until the server closes
+/// its end, which it does once it serves or when it ends.
+fn read_records(read: OwnedFd) -> mpsc::Receiver<Record> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = service::ReadyReader::new(read);
+        while let Ok(Some(record)) = reader.next::<serde_json::Value>(Duration::MAX) {
+            if sender.send(record).is_err() {
+                break;
+            }
+        }
+    });
+    receiver
 }
 
 impl Process {
@@ -47,12 +88,27 @@ impl Process {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
+        let ready = if self.profile.ready_fd {
+            let (read, write) = pipe()?;
+            command.args(["--ready-fd", &write.as_raw_fd().to_string()]);
+            Some((read, write))
+        } else {
+            None
+        };
+        // The descriptor the child inherits, its close-on-exec flag cleared
+        // in the child alone.
+        let inherited = ready.as_ref().map(|(_, write)| write.as_raw_fd());
         // A new session makes the process the leader of its own group.
-        // SAFETY: setsid(2) is async-signal-safe, the one call made between
-        // fork and exec.
+        // SAFETY: setsid(2) and fcntl(2) are async-signal-safe, the only calls
+        // made between fork and exec.
         unsafe {
-            std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
                 if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if let Some(fd) = inherited
+                    && libc::fcntl(fd, libc::F_SETFD, 0) != 0
+                {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -64,13 +120,38 @@ impl Process {
                 .spawn()
                 .with_context(|| format!("launching {}", self.launch.command[0]))?,
         );
+        // The write end is the child's alone now, so its exit ends the reader.
+        if let Some((read, write)) = ready {
+            drop(write);
+            self.records = Some(read_records(read));
+        }
         Ok(())
     }
 
-    /// Ready: its listener accepts a connection and, when the profile names a
-    /// readiness path, that path answers 200 (a server that listens before it
-    /// can serve answers an error status there until it can).
-    async fn ready(&self) -> bool {
+    /// Ready: a process that reports readiness records has reported that it
+    /// serves; any other's listener accepts a connection and, when the profile
+    /// names a readiness path, that path answers 200 (a server that listens
+    /// before it can serve answers an error status there until it can).
+    async fn ready(&mut self) -> bool {
+        if let Some(records) = &self.records {
+            while let Ok(record) = records.try_recv() {
+                if record.state == service::State::Serving {
+                    self.admin = record
+                        .endpoints
+                        .admin
+                        .as_ref()
+                        .and_then(|endpoint| endpoint.path())
+                        .map(Path::to_path_buf);
+                    self.records = None;
+                    return true;
+                }
+            }
+            return false;
+        }
+        if self.profile.ready_fd {
+            // Its serving record was read before.
+            return true;
+        }
         let address = format!("{}:{}", self.profile.host, self.profile.port);
         let connected = tokio::time::timeout(
             Duration::from_secs(1),
@@ -172,6 +253,8 @@ impl Deployment {
                         child: None,
                         started: None,
                         startup_s: None,
+                        records: None,
+                        admin: None,
                     }
                 })
                 .collect(),
@@ -231,11 +314,13 @@ impl Deployment {
             .map(|times| times.into_iter().fold(0.0, f64::max))
     }
 
-    /// The first process's admin listener: a relative path is taken in the
-    /// runtime directory.
-    pub fn admin_socket(&self) -> Option<PathBuf> {
-        let socket = self.processes.first()?.profile.admin_socket.as_ref()?;
-        Some(self.runtime.as_ref()?.path().join(socket))
+    /// Each process's admin socket, as its readiness record named it; `None`
+    /// for a process that reports no records.
+    pub fn admin_sockets(&self) -> Vec<Option<PathBuf>> {
+        self.processes
+            .iter()
+            .map(|process| process.admin.clone())
+            .collect()
     }
 
     /// The first process's working directory and environment, which a change's

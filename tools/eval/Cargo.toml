@@ -32,7 +32,13 @@ regex = "1.12"
 reqwest = { workspace = true, features = ["json", "stream", "multipart"] }
 serde.workspace = true
 serde_json = { workspace = true, features = ["float_roundtrip"] }
+# `/admin/query` takes its statement form-encoded.
+serde_urlencoded.workspace = true
+# A server's readiness record (`--ready-fd`), whose endpoints name its admin socket.
+service.workspace = true
 sha2.workspace = true
+# `PUT /admin/policy` carries a policy package as a tar archive of its directory.
+tar.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 time.workspace = true

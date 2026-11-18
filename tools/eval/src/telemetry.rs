@@ -1,86 +1,108 @@
 //! What the servers and the GPUs report while a point runs.
 //!
-//! A server's Prometheus counters are scraped just before the measured window
-//! opens and after it closes, and, for a timeline load, every second of it;
-//! the window's summary is how far each counter advanced (series ending in
-//! `_total`, `_sum` or `_count`; a gauge's difference between two instants means
-//! nothing). The GPUs are sampled through `nvidia-smi`, which reports every GPU
-//! it sees and device-wide memory, so its readings include processes other than
-//! the server under test: memory in MiB, utilization in percent.
+//! A server's observations are its deployment's observation store, read
+//! through its admin socket with `/admin/query` ([`crate::admin`]). Every
+//! counter's total (series ending in `_total`, and a histogram's observation
+//! count and sum as `_count` and `_sum`) is read just before the measured window
+//! opens and after it closes; the window's summary is how far each advanced (a
+//! gauge's difference between two instants means nothing). The store sums a
+//! counter's increases over its whole retained timeline once each, so a total
+//! read twice differs by what was recorded between the reads. A timeline load
+//! also keeps every counter and gauge row the store bucketed from its start on.
+//! The GPUs are sampled through `nvidia-smi`, which reports every GPU it sees and
+//! device-wide memory, so its readings include processes other than the server
+//! under test: memory in MiB, utilization in percent.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Result;
 use serde_json::{Map, Value, json};
 
-use crate::record::Clock;
+/// Every counter's total and every histogram's observation count and sum, by
+/// series ([`series`]).
+const TOTALS: &str = "SELECT name, labels, sum(value) AS total, \
+     sum(histogram['count']) AS count, sum(histogram['sum']) AS sum \
+     FROM stats WHERE ends_with(name, '_total') OR histogram IS NOT NULL \
+     GROUP BY name, labels";
 
-/// A server's `/metrics` exposition, or `None` when it serves none (a non-200
-/// status or any error): a server without metrics still completes its point.
-pub async fn scrape(client: &reqwest::Client, base_url: &str) -> Option<String> {
-    let response = client
-        .get(format!("{}/metrics", base_url.trim_end_matches('/')))
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await
-        .ok()?;
-    if response.status().as_u16() != 200 {
-        return None;
+/// A series' key: its metric's name and its labels sorted by key, as the
+/// Prometheus text format writes a series (`name{key="value",...}`; a series
+/// without labels is its name alone).
+pub fn series(name: &str, labels: &Map<String, Value>) -> String {
+    if labels.is_empty() {
+        return name.to_owned();
     }
-    response.text().await.ok()
+    let mut pairs: Vec<(&String, String)> = labels
+        .iter()
+        .map(|(key, value)| {
+            (
+                key,
+                value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), str::to_owned),
+            )
+        })
+        .collect();
+    pairs.sort();
+    let inner: Vec<String> = pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}", Value::String(value)))
+        .collect();
+    format!("{name}{{{}}}", inner.join(","))
 }
 
-/// An exposition's samples by `name{labels}` as the server rendered it; comment
-/// lines, lines without a numeric value and trailing timestamps are left out.
-pub fn samples(text: &str) -> BTreeMap<String, f64> {
-    let mut samples = BTreeMap::new();
-    for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // Label values may hold spaces: a series' key ends at the closing brace.
-        let (key, rest) = if line.contains('{') {
-            let Some(close) = line.rfind('}') else {
-                continue;
-            };
-            (&line[..=close], &line[close + 1..])
-        } else {
-            line.split_once(' ').unwrap_or((line, ""))
-        };
-        if let Some(value) = rest
-            .split_whitespace()
-            .next()
-            .and_then(|value| value.parse::<f64>().ok())
-        {
-            samples.insert(key.to_owned(), value);
-        }
-    }
-    samples
+/// The metric name of a series key.
+pub fn metric(series: &str) -> &str {
+    series.split('{').next().unwrap_or_default()
 }
 
-/// How far each counter advanced between two scrapes; a series absent from the
+/// The totals the store at `socket` holds now, by series: each counter's
+/// (`name`), each histogram's observation count (`name_count`) and sum
+/// (`name_sum`).
+///
+/// # Errors
+///
+/// When the query fails.
+pub async fn totals(socket: &Path) -> Result<Map<String, Value>> {
+    let mut totals = Map::new();
+    for row in crate::admin::query(socket, TOTALS).await? {
+        let name = row["name"].as_str().unwrap_or_default();
+        let labels = row["labels"].as_object().cloned().unwrap_or_default();
+        if let (Some(count), Some(sum)) = (row["count"].as_f64(), row["sum"].as_f64()) {
+            totals.insert(series(&format!("{name}_count"), &labels), count.into());
+            totals.insert(series(&format!("{name}_sum"), &labels), sum.into());
+        } else if let Some(total) = row["total"].as_f64() {
+            totals.insert(series(name, &labels), total.into());
+        }
+    }
+    Ok(totals)
+}
+
+/// How far each total advanced between two readings; a series absent from the
 /// first started at zero, and one that did not advance (or by a non-finite
 /// amount) is left out.
-pub fn counter_deltas(before: &str, after: &str) -> Map<String, Value> {
-    let start = samples(before);
-    samples(after)
-        .into_iter()
-        .filter(|(key, _)| {
-            let name = key.split('{').next().unwrap_or_default();
-            ["_total", "_sum", "_count"]
-                .iter()
-                .any(|suffix| name.ends_with(suffix))
-        })
+pub fn counter_deltas(
+    before: &Map<String, Value>,
+    after: &Map<String, Value>,
+) -> Map<String, Value> {
+    after
+        .iter()
         .filter_map(|(key, value)| {
-            let delta = value - start.get(&key).copied().unwrap_or(0.0);
-            (delta != 0.0 && delta.is_finite()).then(|| (key, Value::from(delta)))
+            let delta = value.as_f64()? - before.get(key).and_then(Value::as_f64).unwrap_or(0.0);
+            (delta != 0.0 && delta.is_finite()).then(|| (key.clone(), Value::from(delta)))
         })
         .collect()
 }
 
-/// The window's counter deltas; unavailable when either scrape failed.
-pub fn window_summary(before: Option<&str>, after: Option<&str>) -> Value {
+/// The window's counter deltas; unavailable when either reading failed (or
+/// the server has no admin socket).
+pub fn window_summary(
+    before: Option<&Map<String, Value>>,
+    after: Option<&Map<String, Value>>,
+) -> Value {
     match (before, after) {
         (Some(before), Some(after)) => {
             json!({"available": true, "counter_deltas": counter_deltas(before, after)})
@@ -89,12 +111,21 @@ pub fn window_summary(before: Option<&str>, after: Option<&str>) -> Value {
     }
 }
 
-/// Scrapes a fixed set of origins once a second, on the grid of its first tick
-/// (a late wake-up shifts no later tick), until stopped.
-pub struct Scraper {
-    entries: Arc<Mutex<Vec<Value>>>,
-    ticker: tokio::task::JoinHandle<()>,
-    scrapes: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+/// The counter and gauge rows the store at `socket` bucketed from `from_ns`
+/// (nanoseconds since the Unix epoch, on the host's clock) on, in time order:
+/// each row's bucket start (`time`, nanoseconds), metric, labels, value (a
+/// counter's increase within the bucket, a gauge's latest reading in it) and
+/// configuration revision.
+///
+/// # Errors
+///
+/// When the query fails.
+pub async fn buckets(socket: &Path, from_ns: i64) -> Result<Vec<Value>> {
+    let sql = format!(
+        "SELECT CAST(time AS BIGINT) AS time, name, labels, value, revision FROM stats \
+         WHERE histogram IS NULL AND CAST(time AS BIGINT) >= {from_ns} ORDER BY time, name"
+    );
+    crate::admin::query(socket, &sql).await
 }
 
 #[expect(
@@ -103,62 +134,6 @@ pub struct Scraper {
 )]
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().expect("the telemetry's lock")
-}
-
-impl Scraper {
-    /// Takes the first tick now.
-    pub fn start(client: reqwest::Client, origins: Vec<String>, clock: Clock) -> Self {
-        let entries = Arc::new(Mutex::new(Vec::new()));
-        let scrapes: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
-            Arc::new(Mutex::new(Vec::new()));
-        let ticker = {
-            let (entries, scrapes) = (Arc::clone(&entries), Arc::clone(&scrapes));
-            tokio::spawn(async move {
-                let origin_time = clock.now();
-                let mut tick = 0u64;
-                loop {
-                    for origin in &origins {
-                        let (client, entries, origin) = (
-                            client.clone(),
-                            Arc::clone(&entries),
-                            origin.trim_end_matches('/').to_owned(),
-                        );
-                        lock(&scrapes).push(tokio::spawn(async move {
-                            let sent = clock.now();
-                            let text = scrape(&client, &origin).await;
-                            lock(&entries).push(json!({
-                                "origin": origin,
-                                "tick": tick,
-                                "sent": sent,
-                                "received": clock.now(),
-                                "text": text,
-                            }));
-                        }));
-                    }
-                    let next = origin_time + (tick + 1) as f64;
-                    tokio::time::sleep(Duration::from_secs_f64((next - clock.now()).max(0.0)))
-                        .await;
-                    tick += 1;
-                }
-            })
-        };
-        Self {
-            entries,
-            ticker,
-            scrapes,
-        }
-    }
-
-    /// Stops ticking and waits for the scrapes in flight (each ends within its
-    /// own timeout): the entries hold one for every tick taken.
-    pub async fn stop(self) -> Vec<Value> {
-        self.ticker.abort();
-        let pending: Vec<_> = std::mem::take(&mut *lock(&self.scrapes));
-        for scrape in pending {
-            let _ = scrape.await;
-        }
-        std::mem::take(&mut *lock(&self.entries))
-    }
 }
 
 /// One GPU's reading.

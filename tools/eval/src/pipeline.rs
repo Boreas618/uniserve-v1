@@ -5,11 +5,11 @@
 //! `examples.jsonl`, `client.json`, the record streams (`warmup_requests`,
 //! `priming_requests`, `requests` and `gpu_samples`, all `.jsonl`), the media
 //! indices, `server_metrics.json`, a timeline load's `timeline.json` and
-//! `scrapes.jsonl`, `summary.json`, `summary.md`, and `run.json`, the lifecycle
+//! `stats.jsonl`, `summary.json`, `summary.md`, and `run.json`, the lifecycle
 //! record written last as the bundle's commit marker. A run that fails still
 //! writes its streams and a failed `run.json`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -106,6 +106,10 @@ fn run_state(
 /// What a run measures against.
 pub struct Target<'a> {
     pub base_urls: Vec<String>,
+    /// Each origin's admin socket, in the order of `base_urls`: where its
+    /// deployment's observations are read; `None` for a server that reports
+    /// none.
+    pub admin_sockets: Vec<Option<PathBuf>>,
     pub launch: Value,
     pub timeout: Option<Duration>,
     pub deployment: Option<Arc<Deployment>>,
@@ -201,8 +205,8 @@ pub async fn run_point(point: &Point, target: Target<'_>) -> Result<Value> {
                         &Value::Object(lock(&collected.timeline).clone()),
                     )?;
                 }
-                if !collected.scrapes.is_empty() {
-                    bundle.write_jsonl("scrapes.jsonl", &collected.scrapes)?;
+                if !collected.buckets.is_empty() {
+                    bundle.write_jsonl("stats.jsonl", &collected.buckets)?;
                 }
                 Ok(())
             })();
@@ -232,7 +236,8 @@ struct Collected {
     priming: Arc<Mutex<Vec<Record>>>,
     measured: Arc<Mutex<Vec<Record>>>,
     timeline: load::Timeline,
-    scrapes: Vec<Value>,
+    /// A timeline load's `stats` rows, each with its origin.
+    buckets: Vec<Value>,
     gpu_samples: Vec<Value>,
     gpu_summary: Option<Value>,
 }
@@ -464,30 +469,26 @@ async fn measure(
         })
     };
 
+    // Each origin's store: its counters' totals just before the measured
+    // window, and, for a timeline load, the wall clock its rows are kept from.
+    let stores: Vec<(String, Option<PathBuf>)> = router
+        .base_urls
+        .iter()
+        .cloned()
+        .zip(target.admin_sockets.iter().cloned())
+        .collect();
     let metrics_before: Arc<Mutex<Map<String, Value>>> = Arc::new(Mutex::new(Map::new()));
-    let scraper_slot: Arc<Mutex<Option<crate::telemetry::Scraper>>> = Arc::new(Mutex::new(None));
+    let measured_from: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
     let snapshot = {
-        let (client, router, metrics_before, scraper_slot) = (
-            client.clone(),
-            Arc::clone(&router),
+        let (stores, metrics_before, measured_from) = (
+            stores.clone(),
             Arc::clone(&metrics_before),
-            Arc::clone(&scraper_slot),
+            Arc::clone(&measured_from),
         );
-        let timeline = point.load.timeline();
         async move {
-            for origin in &router.base_urls {
-                let text = crate::telemetry::scrape(&client, origin).await;
-                lock(&metrics_before).insert(origin.clone(), text.into());
-            }
-            // A timeline load also scrapes every replica each second, from its
-            // start until its last stream ended.
-            if timeline {
-                *lock(&scraper_slot) = Some(crate::telemetry::Scraper::start(
-                    client.clone(),
-                    router.base_urls.clone(),
-                    clock,
-                ));
-            }
+            let totals = server_totals(&stores).await;
+            *lock(&metrics_before) = totals;
+            *lock(&measured_from) = load::wall();
         }
     };
 
@@ -560,9 +561,12 @@ async fn measure(
     }
     .await;
     sampler.stop();
-    let scraper = lock(&scraper_slot).take();
-    if let Some(scraper) = scraper {
-        lock(collected).scrapes = scraper.stop().await;
+    // A timeline load keeps what each store bucketed from its start on, from
+    // the start of the second it began in.
+    if point.load.timeline() {
+        let from = (*lock(&measured_from) * 1e9) as i64;
+        let from = from - from.rem_euclid(1_000_000_000);
+        lock(collected).buckets = server_buckets(&stores, from).await;
     }
     {
         let mut collected = lock(collected);
@@ -586,13 +590,7 @@ async fn measure(
         }
     }
     // Counters and provenance after the window.
-    let mut metrics_after = Map::new();
-    for origin in &router.base_urls {
-        metrics_after.insert(
-            origin.clone(),
-            crate::telemetry::scrape(&client, origin).await.into(),
-        );
-    }
+    let metrics_after = server_totals(&stores).await;
     let server_version = version(&client, &router.base_urls[0]).await;
 
     // A request a cancel change disconnected is the change's doing: counted
@@ -670,8 +668,8 @@ async fn measure(
                 (
                     origin.clone(),
                     crate::telemetry::window_summary(
-                        before.get(origin).and_then(Value::as_str),
-                        metrics_after.get(origin).and_then(Value::as_str),
+                        before.get(origin).and_then(Value::as_object),
+                        metrics_after.get(origin).and_then(Value::as_object),
                     ),
                 )
             })
@@ -704,8 +702,8 @@ async fn measure(
     )?;
     if point.load.timeline() {
         bundle.write_json("timeline.json", &Value::Object(timeline))?;
-        let scrapes = std::mem::take(&mut lock(collected).scrapes);
-        bundle.write_jsonl("scrapes.jsonl", &scrapes)?;
+        let buckets = std::mem::take(&mut lock(collected).buckets);
+        bundle.write_jsonl("stats.jsonl", &buckets)?;
     }
     bundle.write_json("summary.json", &summary)?;
     bundle.write_text("summary.md", &render_markdown(&summary))?;
@@ -722,6 +720,39 @@ async fn measure(
         ),
     )?;
     Ok(summary)
+}
+
+/// Each origin's counter totals ([`crate::telemetry::totals`]), `null` for an
+/// origin without an admin socket or whose store did not answer: a server
+/// without observations still completes its point.
+async fn server_totals(stores: &[(String, Option<PathBuf>)]) -> Map<String, Value> {
+    let mut totals = Map::new();
+    for (origin, socket) in stores {
+        let read = match socket {
+            Some(socket) => crate::telemetry::totals(socket).await.ok(),
+            None => None,
+        };
+        totals.insert(origin.clone(), read.map_or(Value::Null, Value::Object));
+    }
+    totals
+}
+
+/// Every origin's `stats` rows from `from_ns` on ([`crate::telemetry::buckets`]),
+/// each with its `origin`; an origin whose store did not answer adds one row
+/// holding its `error`.
+async fn server_buckets(stores: &[(String, Option<PathBuf>)], from_ns: i64) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for (origin, socket) in stores {
+        let Some(socket) = socket else { continue };
+        match crate::telemetry::buckets(socket, from_ns).await {
+            Ok(read) => rows.extend(read.into_iter().map(|mut row| {
+                row["origin"] = origin.clone().into();
+                row
+            })),
+            Err(error) => rows.push(json!({"origin": origin, "error": format!("{error:#}")})),
+        }
+    }
+    rows
 }
 
 /// The process's peak resident memory in bytes.

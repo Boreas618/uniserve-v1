@@ -540,8 +540,9 @@ async fn run(
         let mut deployment =
             server::Deployment::start(processes, Duration::from_secs_f64(launch_timeout_s)).await?;
         launch_record["deployment"]["startup_s"] = deployment.startup_s().into();
+        let admin_sockets = deployment.admin_sockets();
         let acting = Arc::new(load::Deployment {
-            admin_socket: deployment.admin_socket(),
+            admin_socket: admin_sockets.first().cloned().flatten(),
             pids: Arc::new(deployment.pid_reader()),
             working_directory: deployment
                 .launch()
@@ -564,6 +565,7 @@ async fn run(
                 point,
                 pipeline::Target {
                     base_urls: server.base_urls(),
+                    admin_sockets: admin_sockets.clone(),
                     launch: launch_record.clone(),
                     timeout: request_timeout_s.map(Duration::from_secs_f64),
                     deployment: Some(Arc::clone(&acting)),

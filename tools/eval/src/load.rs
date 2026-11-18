@@ -256,12 +256,18 @@ pub async fn run(
 /// The phases in which an update has ended: a change waiting for another phase
 /// of it waits no longer.
 const ENDED_PHASES: [&str; 3] = ["committed", "rolled_back", "abandoned"];
-/// Seconds one read of the event log waits for a new event, and between reads
-/// while the listener does not answer.
-const EVENT_WAIT_S: f64 = 10.0;
+/// Seconds between attempts to reopen the event subscription while the admin
+/// socket does not answer.
 const EVENT_RETRY_S: f64 = 1.0;
+/// The deployment's events a timeline records, as the store's subscription
+/// streams them: what its node, engines, updates and profiling sessions log
+/// (`log`), its engine processes' transitions (`process`) and its revisions
+/// (`revision`); request and span events are the records' and profiles' own.
+/// `time` is nanoseconds since the Unix epoch on the host's clock.
+const EVENTS: &str = "SELECT CAST(time AS BIGINT) AS time, kind, labels, fields, revision \
+     FROM events WHERE kind IN ('log', 'process', 'revision')";
 
-/// What a timeline load acts on: the deployment's admin listener, its
+/// What a timeline load acts on: the deployment's admin socket, its
 /// processes, and the environment and directory a change's command runs in.
 pub struct Deployment {
     pub admin_socket: Option<PathBuf>,
@@ -273,7 +279,8 @@ pub struct Deployment {
 /// The timeline record a load fills as it proceeds (so a failed load leaves
 /// what it observed): `load_start`, the run's clock at t = 0; `clock_offset`,
 /// the wall clock less it; `issue_end_s`; per change its declaration,
-/// `issued_s`, `ended_s` and what answered it; and every admin event with
+/// `issued_s`, `ended_s` and what answered it; and every event of the
+/// deployment's log, process and revision events ([`EVENTS`]) with
 /// `received_s` and, from its own time, `at_s`. Times ending in `_s` are
 /// seconds from t = 0.
 pub type Timeline = Arc<Mutex<Map<String, Value>>>;
@@ -299,7 +306,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// # Errors
 ///
 /// [`WarmupFailure`], or the failure of a submission, after every request,
-/// change and the event reader have been stopped.
+/// change and the event subscription have been stopped.
 pub async fn timeline(
     rows: &[Example],
     mut context: Driver<'_>,
@@ -427,14 +434,14 @@ pub async fn timeline(
             state.finished[&change.name].notify_waiters();
         }));
     }
-    if let Some(listener) = deployment
+    if let Some(socket) = deployment
         .as_ref()
         .and_then(|deployment| deployment.admin_socket.clone())
     {
         let record = Arc::clone(&record);
         let state = Arc::clone(&state);
         background.push(tokio::spawn(async move {
-            read_events(&listener, &record, start, offset, &state, clock).await;
+            read_events(&socket, &record, start, offset, &state, clock).await;
         }));
     }
 
@@ -503,7 +510,7 @@ pub async fn timeline(
         Ok(())
     }
     .await;
-    // Every change has ended once issuing stopped; the reader runs until the
+    // Every change has ended once issuing stopped; the subscription runs until the
     // last stream ended, and is stopped here on every path.
     for task in requests.iter().chain(&background) {
         task.abort();
@@ -527,7 +534,7 @@ struct State {
     last_end: Mutex<f64>,
     finished: BTreeMap<String, Arc<Notify>>,
     done: Mutex<BTreeSet<String>>,
-    /// Signalled when admin events arrive.
+    /// Signalled when the deployment's events arrive.
     arrived: Notify,
     /// A closed loop's requests in flight, by issue index.
     flight: Mutex<BTreeMap<usize, tokio::task::AbortHandle>>,
@@ -617,7 +624,15 @@ async fn apply(
     act(change, deployment, timeout_s, target).await
 }
 
-/// The time of the first event from `after_s` on that reports `phase`.
+/// The update phase an event reports: the `phase` of a `log` event of source
+/// `update`.
+fn update_phase(event: &Value) -> Option<&str> {
+    (event["kind"] == "log" && event["labels"]["source"] == "update")
+        .then(|| event["fields"]["phase"].as_str())
+        .flatten()
+}
+
+/// The time of the first update event from `after_s` on that reports `phase`.
 async fn phase_reached(
     phase: &str,
     after_s: f64,
@@ -627,7 +642,7 @@ async fn phase_reached(
 ) -> Result<f64> {
     ensure!(
         deployment.is_some_and(|deployment| deployment.admin_socket.is_some()),
-        "no admin listener reports the update's phases"
+        "no admin socket reports the update's phases"
     );
     loop {
         let arrived = state.arrived.notified();
@@ -646,10 +661,7 @@ async fn phase_reached(
                 if at < after_s {
                     continue;
                 }
-                let reached = event
-                    .get("data")
-                    .and_then(|data| data.get("phase"))
-                    .and_then(Value::as_str);
+                let reached = update_phase(event);
                 if reached == Some(phase) {
                     return Ok(at);
                 }
@@ -726,7 +738,7 @@ async fn disconnect(count: usize, order: &str, state: &State) -> Result<Map<Stri
     Ok(answer)
 }
 
-/// A change's action: an admin call, a signal, or a command.
+/// A change's action: a policy package applied, a signal, or a command.
 async fn act(
     change: &Change,
     deployment: Option<&Deployment>,
@@ -737,26 +749,22 @@ async fn act(
         return signal_on_host(change, host, timeout_s).await;
     }
     let deployment = deployment.context("no deployment to change")?;
-    if let (Some(method), Some(path)) = (&change.method, &change.path) {
-        let listener = deployment
+    if let Some(package) = &change.policy {
+        let socket = deployment
             .admin_socket
             .as_ref()
-            .context("the deployment states no admin listener")?;
-        let body = change.body.as_ref().map(serde_json::to_vec).transpose()?;
-        let (status, text) = tokio::time::timeout(
+            .context("the deployment reports no admin socket")?;
+        let applied = tokio::time::timeout(
             Duration::from_secs_f64(timeout_s),
-            crate::admin::request(listener, method, path, body.as_deref()),
+            crate::admin::apply(socket, Path::new(package), change.force),
         )
         .await
-        .map_err(|_| anyhow!("the admin call outlived {timeout_s}s"))??;
+        .map_err(|_| anyhow!("PUT /admin/policy outlived {timeout_s}s"))??;
         let mut answer = Map::new();
-        answer.insert("status".into(), status.into());
-        answer.insert(
-            "answer".into(),
-            serde_json::from_str(&text).unwrap_or(Value::String(text)),
-        );
-        if !(200..300).contains(&status) {
-            answer.insert("error".into(), format!("HTTP {status}").into());
+        answer.insert("status".into(), applied.status.into());
+        answer.insert("answer".into(), applied.answer);
+        if !(200..300).contains(&applied.status) {
+            answer.insert("error".into(), format!("HTTP {}", applied.status).into());
         }
         return Ok(answer);
     }
@@ -957,70 +965,60 @@ fn signal_target(change: &Change, deployment: &Deployment) -> Result<(u32, Strin
     matches.into_iter().next().context("one match")
 }
 
-/// Reads the admin event log into the timeline until stopped: every event the
-/// log keeps, from its first, `at_s` placing an event's own time on the load's
-/// clock. While the listener does not answer, the first error of each outage is
-/// recorded and the read retried every second.
+/// Reads the deployment's events ([`EVENTS`]) into the timeline until
+/// stopped: every one the store keeps, from its oldest, through the store's
+/// subscription, `at_s` placing an event's own time on the load's clock. While
+/// the admin socket does not answer or the stream breaks, the first error of
+/// each outage is recorded and the subscription reopened every second after
+/// the last message read.
 async fn read_events(
-    listener: &Path,
+    socket: &Path,
     record: &Timeline,
     start: f64,
     offset: f64,
     state: &State,
     clock: Clock,
 ) {
-    let mut after: u64 = 0;
+    let mut after: Option<u64> = None;
     let mut failing = false;
     loop {
-        let path = format!("/admin/events?after={after}&wait={EVENT_WAIT_S}");
-        let page = tokio::time::timeout(
-            Duration::from_secs_f64(EVENT_WAIT_S + 10.0),
-            crate::admin::request(listener, "GET", &path, None),
-        )
-        .await
-        .map_err(|_| anyhow!("the event read timed out"))
-        .and_then(|result| result)
-        .and_then(|(status, text)| {
-            ensure!((200..300).contains(&status), "HTTP {status}");
-            Ok(serde_json::from_str::<Value>(&text)?)
-        });
-        let page = match page {
-            Ok(page) => page,
-            Err(error) => {
-                if !failing {
-                    let received = clock.now() - start;
-                    if let Some(events) =
-                        lock(record).get_mut("events").and_then(Value::as_array_mut)
-                    {
-                        events.push(json!({"error": format!("{error:#}"), "received_s": received}));
+        let error = match crate::admin::Subscription::open(socket, EVENTS, after).await {
+            Ok(mut subscription) => loop {
+                match subscription.next().await {
+                    Ok(Some(message)) => {
+                        failing = false;
+                        after = Some(message.id);
+                        let received = clock.now() - start;
+                        if let Some(events) =
+                            lock(record).get_mut("events").and_then(Value::as_array_mut)
+                        {
+                            for row in message.rows {
+                                let mut event = row.as_object().cloned().unwrap_or_default();
+                                event.insert("received_s".into(), received.into());
+                                if let Some(time) = event.get("time").and_then(Value::as_f64) {
+                                    event.insert(
+                                        "at_s".into(),
+                                        (time / 1e9 - offset - start).into(),
+                                    );
+                                }
+                                events.push(Value::Object(event));
+                            }
+                        }
+                        state.arrived.notify_waiters();
                     }
+                    Ok(None) => break anyhow!("the event subscription ended"),
+                    Err(error) => break error,
                 }
-                failing = true;
-                tokio::time::sleep(Duration::from_secs_f64(EVENT_RETRY_S)).await;
-                continue;
-            }
+            },
+            Err(error) => error,
         };
-        failing = false;
-        let received = clock.now() - start;
-        {
-            let mut timeline = lock(record);
-            if let Some(events) = timeline.get_mut("events").and_then(Value::as_array_mut) {
-                for event in page
-                    .get("events")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    let mut event = event.as_object().cloned().unwrap_or_default();
-                    event.insert("received_s".into(), received.into());
-                    if let Some(time) = event.get("time").and_then(Value::as_f64) {
-                        event.insert("at_s".into(), (time - offset - start).into());
-                    }
-                    events.push(Value::Object(event));
-                }
+        if !failing {
+            let received = clock.now() - start;
+            if let Some(events) = lock(record).get_mut("events").and_then(Value::as_array_mut) {
+                events.push(json!({"error": format!("{error:#}"), "received_s": received}));
             }
         }
-        after = after.max(page.get("next").and_then(Value::as_u64).unwrap_or(after));
-        state.arrived.notify_waiters();
+        failing = true;
+        tokio::time::sleep(Duration::from_secs_f64(EVENT_RETRY_S)).await;
     }
 }

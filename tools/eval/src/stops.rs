@@ -13,21 +13,22 @@
 //!    minimum to maximum, and its longest silence (its longest part in which no
 //!    stream received a token) is at most that maximum: a step held up by the
 //!    stopped process shows there even when none of its gaps ends in the window;
-//! 3. calls are left out only after the headroom, and scheduled again: between
-//!    two consecutive scrapes the left-out counter rises only by calls a window
-//!    explains, and for a window only when some stream received at least the
-//!    headroom's tokens in it. A call left out is reported at most one statistics
-//!    period later and read by the next scrape, so window `[a, b]` explains a
-//!    rise between scrapes `k - 1` and `k` when `k` was answered at or after `a`
-//!    and `k - 1` sent by `b + 2` periods; and every request in flight at a
-//!    window's end completed.
+//! 3. calls are left out only after the headroom, and scheduled again: the
+//!    left-out counter rises (its rows in the run's `stats.jsonl`, each the
+//!    increase the store recorded in one bucket) only by calls a window explains,
+//!    and for a window only when some stream received at least the headroom's
+//!    tokens in it. A call left out is reported at most one statistics period
+//!    later and recorded in the bucket of its report's arrival, so window
+//!    `[a, b]` explains the rise of a bucket `[t, t + 1 s)` when the bucket ends
+//!    at or after `a` and starts by `b + 2` periods; and every request in flight
+//!    at a window's end completed.
 
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Map, Value, json};
 
-use crate::check::{Request, bundle, item, metric_total, request_fault, verdict};
+use crate::check::{Request, bundle, item, request_fault, verdict};
 use crate::metrics::percentile;
 
 /// The scheduler's statistics period in seconds: each report counts the calls
@@ -35,7 +36,10 @@ use crate::metrics::percentile;
 pub const REPORT_PERIOD_S: f64 = 1.0;
 
 /// The daemon's counter of calls left out of a step for late blocks.
-pub const COUNTER: &str = "uniserve:scheduler_calls_without_blocks_total";
+pub const COUNTER: &str = "uniserve_scheduler_calls_without_blocks_total";
+
+/// The width in seconds of the store's buckets the run's `stats.jsonl` holds.
+pub const BUCKET_S: f64 = 1.0;
 
 /// A record's token arrivals, and its stream's end (its last token without a
 /// final event), from the load's start.
@@ -316,7 +320,7 @@ pub fn stop_report(
     Ok(report)
 }
 
-/// Item 3, from the run's scrapes and the windows.
+/// Item 3, from the run's `stats` rows and the windows.
 fn left_out(
     run: &Path,
     timeline: &Map<String, Value>,
@@ -324,47 +328,55 @@ fn left_out(
     counter: &str,
     headroom: usize,
 ) -> Result<Value> {
-    let start = timeline["load_start"].as_f64().unwrap_or(0.0);
-    let text = std::fs::read_to_string(run.join("scrapes.jsonl"))?;
-    let mut scrapes: Vec<Value> = text
+    // A bucket's start is on the host's wall clock; the load's clock is the
+    // wall clock less `clock_offset`.
+    let start = timeline["load_start"].as_f64().unwrap_or(0.0)
+        + timeline["clock_offset"].as_f64().unwrap_or(0.0);
+    let text = std::fs::read_to_string(run.join("stats.jsonl"))?;
+    let rows: Vec<Value> = text
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(serde_json::from_str)
         .collect::<Result<_, _>>()?;
-    scrapes.sort_by_key(|scrape| scrape["tick"].as_u64().unwrap_or(0));
-    let mut readings: indexmap::IndexMap<String, Vec<(f64, f64, f64)>> = indexmap::IndexMap::new();
-    for scrape in &scrapes {
-        if let Some(value) = metric_total(scrape["text"].as_str(), counter) {
-            readings
-                .entry(scrape["origin"].as_str().unwrap_or_default().to_owned())
-                .or_default()
-                .push((
-                    scrape["sent"].as_f64().unwrap_or(0.0) - start,
-                    scrape["received"].as_f64().unwrap_or(0.0) - start,
-                    value,
-                ));
+    // The stores that were read, and each one's rises of the counter by
+    // bucket (summed over its series), from the load's start.
+    let mut read: Vec<&str> = Vec::new();
+    let mut readings: indexmap::IndexMap<&str, std::collections::BTreeMap<i64, f64>> =
+        indexmap::IndexMap::new();
+    for row in &rows {
+        let origin = row["origin"].as_str().unwrap_or_default();
+        if row.get("error").is_some() {
+            continue;
         }
+        if !read.contains(&origin) {
+            read.push(origin);
+        }
+        if row["name"] != counter {
+            continue;
+        }
+        let (Some(time), Some(value)) = (row["time"].as_i64(), row["value"].as_f64()) else {
+            continue;
+        };
+        *readings.entry(origin).or_default().entry(time).or_default() += value;
     }
     let (mut unexplained, mut before_headroom) = (Vec::new(), Vec::new());
     let mut rises = vec![0.0f64; windows.len()];
     let mut total = 0.0;
     for (origin, series) in &readings {
-        total += series[series.len() - 1].2 - series[0].2;
-        for pair in series.windows(2) {
-            let (previous, current) = (pair[0], pair[1]);
-            let rise = current.2 - previous.2;
+        for (time, rise) in series {
+            let rise = *rise;
             if rise <= 0.0 {
                 continue;
             }
+            total += rise;
+            let bucket = *time as f64 / 1e9 - start;
             let place = format!(
-                "{origin}: +{} between the scrapes sent at {:.3} s and answered at {:.3} s",
+                "{origin}: +{} in the bucket from {bucket:.3} s",
                 crate::pipeline::general(rise),
-                previous.0,
-                current.1
             );
             let explaining = windows.iter().position(|window| {
-                current.1 >= window["window_s"][0].as_f64().unwrap_or(0.0)
-                    && previous.0
+                bucket + BUCKET_S >= window["window_s"][0].as_f64().unwrap_or(0.0)
+                    && bucket
                         <= window["window_s"][1].as_f64().unwrap_or(0.0) + 2.0 * REPORT_PERIOD_S
             });
             let Some(index) = explaining else {
@@ -390,12 +402,12 @@ fn left_out(
         .chain(&before_headroom)
         .cloned()
         .collect();
-    if readings.is_empty() {
-        faults.push(format!("no scrape reports {counter}"));
+    if read.is_empty() {
+        faults.push(format!("no server's store was read for {counter}"));
     }
     Ok(json!({
         "pass": faults.is_empty() && in_flight_failed == 0,
-        "scrapes": scrapes.len(),
+        "buckets": readings.values().map(std::collections::BTreeMap::len).sum::<usize>(),
         "total_rise": total,
         "rises_by_window": rises,
         "unexplained": unexplained,
@@ -561,10 +573,10 @@ pub fn render(report: &Value) -> String {
     lines.extend([
         String::new(),
         format!(
-            "Counter `{}`: rose by {} over the run, in {} scrapes; headroom {} tokens.",
+            "Counter `{}`: rose by {} over the run, in {} buckets; headroom {} tokens.",
             report["counter"].as_str().unwrap_or_default(),
             crate::pipeline::general(left["total_rise"].as_f64().unwrap_or(0.0)),
-            left["scrapes"],
+            left["buckets"],
             report["headroom_tokens"]
         ),
         String::new(),

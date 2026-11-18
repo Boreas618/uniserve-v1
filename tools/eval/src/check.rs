@@ -16,14 +16,17 @@
 //! 4. new requests admitted throughout: each request submitted in the change's
 //!    window had its first token by the window's end plus the control's
 //!    99th-percentile time to first token;
-//! 5. the buffer pool's invariants held: the check-failure counter reads 0 in
-//!    every scrape after the window, and the replay verdict is `pass`;
+//! 5. the buffer pool's invariants held: the check-failure counter's total
+//!    reads 0 in every server's store after the window (`server_metrics.json`;
+//!    a counter that never rose has no rows, a total of 0), and the replay
+//!    verdict is `pass`;
 //! 6. with the switch and a block size named (case E4): the target's first
 //!    admission of each prompt the predecessor served before the switch reports
 //!    as cached at least the prompt's whole blocks less its last token.
 //!
 //! The change's window runs from the first change's issue to the latest of every
-//! change's end and every admin event recorded from that issue on. A request is
+//! change's end and every deployment event (`timeline.json`'s `events`)
+//! recorded from that issue on. A request is
 //! submitted when the load issued it, has its first token with the first chunk
 //! that carried a token id, and ends with its last event; one a cancel change
 //! disconnected is counted and left out of every item. A request ended on the
@@ -358,31 +361,29 @@ fn control_label(configuration: Option<&str>) -> String {
     )
 }
 
-/// The sum of a counter's series in a scrape, if it has one.
-pub(crate) fn metric_total(text: Option<&str>, name: &str) -> Option<f64> {
-    let samples = crate::telemetry::samples(text?);
-    let values: Vec<f64> = samples
-        .iter()
-        .filter(|(key, _)| key.split('{').next() == Some(name))
-        .map(|(_, value)| *value)
-        .collect();
-    (!values.is_empty()).then(|| values.iter().sum())
+/// A metric's total over its series in one reading of a store's totals
+/// ([`crate::telemetry::totals`]), 0 when it has none; `None` when the
+/// reading is unavailable.
+fn metric_total(totals: &Value, name: &str) -> Option<f64> {
+    Some(
+        totals
+            .as_object()?
+            .iter()
+            .filter(|(series, _)| crate::telemetry::metric(series) == name)
+            .filter_map(|(_, total)| total.as_f64())
+            .sum(),
+    )
 }
 
-/// Item 5: the check-failure count 0 in every scrape after the window (one at
-/// least must report it), and the replay's `pass`.
+/// Item 5: the check-failure total 0 in every server's store after the window
+/// (one at least must have been read), and the replay's `pass`.
 fn invariants(run: &Path, check_metric: &str, replay: &Path) -> Result<Map<String, Value>> {
     let metrics: Value = serde_json::from_slice(&std::fs::read(run.join("server_metrics.json"))?)?;
     let failures: Map<String, Value> = metrics["after"]
         .as_object()
         .into_iter()
         .flatten()
-        .map(|(origin, text)| {
-            (
-                origin.clone(),
-                metric_total(text.as_str(), check_metric).into(),
-            )
-        })
+        .map(|(origin, totals)| (origin.clone(), metric_total(totals, check_metric).into()))
         .collect();
     let verdict: Value = serde_json::from_slice(
         &std::fs::read(replay).with_context(|| format!("reading {}", replay.display()))?,
